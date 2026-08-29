@@ -507,6 +507,49 @@ pub(crate) struct MintedE2eeSession {
     pub credential: String,
 }
 
+struct MintedSessionDeliveryGuard {
+    auth: Option<AuthService>,
+    session_id: Option<String>,
+}
+
+impl MintedSessionDeliveryGuard {
+    fn new(auth: AuthService, session_id: String) -> Self {
+        Self {
+            auth: Some(auth),
+            session_id: Some(session_id),
+        }
+    }
+
+    fn commit(&mut self) {
+        self.auth = None;
+        self.session_id = None;
+    }
+}
+
+impl Drop for MintedSessionDeliveryGuard {
+    fn drop(&mut self) {
+        let (Some(auth), Some(session_id)) = (self.auth.take(), self.session_id.take()) else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::error!(
+                session_id,
+                "unable to schedule compensation for an undelivered E2EE credential"
+            );
+            return;
+        };
+        runtime.spawn(async move {
+            if let Err(error) = auth.revoke_failed_pairing_session(&session_id).await {
+                tracing::error!(
+                    session_id,
+                    ?error,
+                    "failed to compensate an undelivered E2EE credential"
+                );
+            }
+        });
+    }
+}
+
 struct EstablishedE2eeAdmission {
     accept: E2eeAccept,
     _permit: E2eeEstablishedPermit,
@@ -584,6 +627,7 @@ pub(crate) async fn run_e2ee_session(
             Err(code) => return Ok(EstablishOutcome::Rejected { channel, code }),
         };
 
+        let mut minted_delivery_guard = None;
         let accept = if config.unsafe_no_auth {
             E2eeAccept::Unauthenticated
         } else {
@@ -604,6 +648,10 @@ pub(crate) async fn run_e2ee_session(
                             code: "unauthorized",
                         });
                     };
+                    minted_delivery_guard = Some(MintedSessionDeliveryGuard::new(
+                        auth.clone(),
+                        issued.principal.session_id.clone(),
+                    ));
                     E2eeAccept::Authenticated {
                         principal: issued.principal,
                         minted: Some(MintedE2eeSession {
@@ -659,6 +707,9 @@ pub(crate) async fn run_e2ee_session(
             }
         };
         send_encrypted_frames(&mut ws_writer, &mut channel, &reply).await?;
+        if let Some(guard) = &mut minted_delivery_guard {
+            guard.commit();
+        }
         Ok::<_, E2eeSessionError>(EstablishOutcome::Accepted {
             channel,
             admission: EstablishedE2eeAdmission {
@@ -983,7 +1034,48 @@ fn e2ee_client_metadata() -> crate::auth::ClientMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::HostIdentity;
+    use crate::auth::{HostIdentity, SessionTransport};
+
+    #[tokio::test]
+    async fn incomplete_minted_session_delivery_is_compensated() {
+        let config = ServerConfig::new(".")
+            .with_bind("127.0.0.1", 3773)
+            .with_desktop("desktop-test-seed")
+            .expect("desktop config");
+        let auth = AuthService::new(&config, vec![7_u8; 32]);
+        let issued = auth
+            .exchange_bootstrap(
+                "desktop-test-seed",
+                None,
+                e2ee_client_metadata(),
+                None,
+                SessionTransport::E2ee,
+            )
+            .await
+            .expect("minted E2EE session");
+        let session_id = issued.principal.session_id.clone();
+
+        drop(MintedSessionDeliveryGuard::new(
+            auth.clone(),
+            session_id.clone(),
+        ));
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if auth.list_clients("other-session").await.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("compensating revocation completes");
+        assert!(matches!(
+            auth.authenticate_token(&issued.token, SessionTransport::E2ee)
+                .await,
+            Err(crate::auth::AuthError::InvalidCredential)
+        ));
+    }
 
     struct SnowInitiator {
         transport: snow::TransportState,

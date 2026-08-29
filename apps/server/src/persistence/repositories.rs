@@ -1299,6 +1299,57 @@ impl Repositories {
             })
             .await
     }
+    /// Atomically abandons a reservation whose pairing grant was committed but
+    /// whose encoded offer was never recorded. Completed offers, cancellation
+    /// tombstones, and conflicting request fingerprints are left untouched.
+    pub async fn recover_pending_auth_pairing_offer(
+        &self,
+        principal_id: String,
+        idempotency_key: String,
+        input_fingerprint: String,
+        now: Timestamp,
+    ) -> Result<Option<String>> {
+        self.database
+            .call(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let pruned = transaction.execute(
+                    "DELETE FROM auth_pairing_offer_idempotency WHERE expires_at <= ?",
+                    [&now],
+                )?;
+                let pending_pairing_id = transaction
+                    .query_row(
+                        "SELECT pairing_id FROM auth_pairing_offer_idempotency
+                         WHERE principal_id = ? AND idempotency_key = ?
+                           AND input_fingerprint = ? AND pairing_id IS NOT NULL
+                           AND result_json IS NULL AND cancelled_at IS NULL
+                           AND expires_at > ?",
+                        params![principal_id, idempotency_key, input_fingerprint, now],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                if let Some(pairing_id) = &pending_pairing_id {
+                    transaction.execute(
+                        "UPDATE auth_pairing_links SET revoked_at = ?
+                         WHERE id = ? AND revoked_at IS NULL AND consumed_at IS NULL",
+                        params![now, pairing_id],
+                    )?;
+                    transaction.execute(
+                        "DELETE FROM auth_pairing_offer_idempotency
+                         WHERE principal_id = ? AND idempotency_key = ?
+                           AND input_fingerprint = ? AND pairing_id = ?
+                           AND result_json IS NULL AND cancelled_at IS NULL",
+                        params![principal_id, idempotency_key, input_fingerprint, pairing_id],
+                    )?;
+                }
+                if pruned > 0 || pending_pairing_id.is_some() {
+                    bump_auth_authority_revision_on(&transaction)?;
+                }
+                transaction.commit()?;
+                Ok(pending_pairing_id)
+            })
+            .await
+    }
     pub async fn cancel_auth_pairing_offer(
         &self,
         principal_id: String,

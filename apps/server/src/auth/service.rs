@@ -1125,6 +1125,29 @@ impl AuthService {
         let lookup_key = (principal_id.to_owned(), key.to_owned());
         let mut access_change = None;
         if let Some(repositories) = &self.repositories {
+            let recovered_pairing_id = repositories
+                .recover_pending_auth_pairing_offer(
+                    principal_id.to_owned(),
+                    key.to_owned(),
+                    input_fingerprint.to_owned(),
+                    format_iso(observed_at),
+                )
+                .await
+                .map_err(|error| AuthError::Internal(error.to_string()))?;
+            if let Some(pairing_id) = recovered_pairing_id {
+                let mut state = self.state.lock().await;
+                state.pairing_offer_idempotency.remove(&lookup_key);
+                let removed = state.pairings.remove(&pairing_id).is_some();
+                state.bump_authority_generation();
+                drop(state);
+                if removed {
+                    self.emit_access_change(AuthAccessChange::PairingLinkRemoved {
+                        id: pairing_id,
+                    });
+                }
+                self.ensure_authority_watcher();
+                return Ok(PairingOfferReplay::Fresh);
+            }
             let persisted = repositories
                 .prune_and_get_active_auth_pairing_offer(
                     principal_id.to_owned(),
@@ -1169,8 +1192,29 @@ impl AuthService {
         state
             .pairing_offer_idempotency
             .retain(|_, stored| stored.expires_at_ms > observed_at);
+        let pending_pairing_id = state
+            .pairing_offer_idempotency
+            .get(&lookup_key)
+            .filter(|stored| {
+                stored.result.is_none()
+                    && stored.pairing_id.is_some()
+                    && stored.input_fingerprint == input_fingerprint
+            })
+            .and_then(|stored| stored.pairing_id.clone());
+        if let Some(pairing_id) = pending_pairing_id {
+            state.pairing_offer_idempotency.remove(&lookup_key);
+            let removed = state.pairings.remove(&pairing_id).is_some();
+            state.bump_authority_generation();
+            drop(state);
+            if removed {
+                self.emit_access_change(AuthAccessChange::PairingLinkRemoved { id: pairing_id });
+            }
+            return Ok(PairingOfferReplay::Fresh);
+        }
         Ok(match state.pairing_offer_idempotency.get(&lookup_key) {
-            Some(stored) if stored.result.is_none() => PairingOfferReplay::Cancelled,
+            Some(stored) if stored.result.is_none() && stored.pairing_id.is_none() => {
+                PairingOfferReplay::Cancelled
+            }
             Some(stored) if stored.input_fingerprint == input_fingerprint => stored
                 .result
                 .clone()
@@ -1396,6 +1440,17 @@ impl AuthService {
         if current_session_id == target_session_id {
             return Err(AuthError::CurrentSessionRevokeNotAllowed);
         }
+        self.revoke_session(target_session_id).await
+    }
+
+    pub(crate) async fn revoke_failed_pairing_session(
+        &self,
+        session_id: &str,
+    ) -> Result<bool, AuthError> {
+        self.revoke_session(session_id).await
+    }
+
+    async fn revoke_session(&self, target_session_id: &str) -> Result<bool, AuthError> {
         let revoked_at = now_ms();
         if let Some(repositories) = &self.repositories {
             let revoked = repositories
@@ -3896,7 +3951,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_pairing_offer_can_be_cancelled_after_restart() {
+    async fn pending_pairing_offer_recovers_for_retry_after_restart() {
         let database = crate::persistence::Database::open_in_memory()
             .await
             .expect("in-memory database opens");
@@ -3951,18 +4006,28 @@ mod tests {
             restarted
                 .replay_pairing_offer("principal", "pending-key", "fingerprint")
                 .await,
-            Ok(PairingOfferReplay::Cancelled)
+            Ok(PairingOfferReplay::Fresh)
         ));
-        assert!(
-            restarted
-                .cancel_pairing_offer("principal", "pending-key".to_owned())
-                .await
-                .expect("pending grant cancellation")
-        );
         assert_eq!(
             restarted.share_exposure_state().await.desired_exposure,
             "loopback"
         );
+        assert!(matches!(
+            restarted
+                .issue_share_pairing_offer(
+                    owned_scopes(STANDARD_SCOPES),
+                    Some("Tablet".to_owned()),
+                    "another-device".to_owned(),
+                    true,
+                    PairingOfferReservation::new(
+                        "principal".to_owned(),
+                        "pending-key".to_owned(),
+                        "fingerprint".to_owned(),
+                    ),
+                )
+                .await,
+            Ok(PairingOfferIssuance::Reserved(_))
+        ));
     }
 
     #[tokio::test]
