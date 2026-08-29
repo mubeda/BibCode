@@ -16,6 +16,8 @@ use rusqlite::Connection;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite};
 
@@ -987,6 +989,81 @@ async fn plain_websocket_connected_state_tracks_the_completed_upgrade_lifecycle(
     })
     .await
     .expect("closed WebSocket must be marked disconnected");
+
+    shutdown(handle).await;
+}
+
+#[tokio::test]
+async fn failed_websocket_upgrade_does_not_mark_the_session_connected() {
+    let temp = TempDir::new().expect("temporary base directory");
+    let handle = start_desktop_server(&temp).await;
+    let client = Client::new();
+    let administrator = exchange_token(&client, &handle, DESKTOP_BOOTSTRAP, None).await;
+    let administrator_token = access_token(&administrator);
+    let pairing = get_json(
+        client
+            .post(http_url(&handle, "/api/auth/pairing-token"))
+            .bearer_auth(administrator_token)
+            .json(&json!({ "label": "Failed upgrade client" }))
+            .send()
+            .await
+            .expect("pairing"),
+        StatusCode::OK,
+    )
+    .await;
+    let paired = exchange_token(
+        &client,
+        &handle,
+        pairing["credential"].as_str().expect("credential"),
+        None,
+    )
+    .await;
+    let paired_ticket = websocket_ticket(&client, &handle, access_token(&paired)).await;
+
+    let mut stream = TcpStream::connect(handle.local_addr())
+        .await
+        .expect("raw TCP connection");
+    stream
+        .write_all(
+            format!(
+                "GET /ws?wsTicket={paired_ticket} HTTP/1.1\r\nHost: {}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 12\r\n\r\n",
+                handle.local_addr()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write invalid WebSocket upgrade");
+    let mut response = vec![0_u8; 1_024];
+    let bytes_read = timeout(Duration::from_secs(2), stream.read(&mut response))
+        .await
+        .expect("failed-upgrade response timeout")
+        .expect("read failed-upgrade response");
+    response.truncate(bytes_read);
+    let response = String::from_utf8_lossy(&response);
+    assert!(
+        response.starts_with("HTTP/1.1 400") || response.starts_with("HTTP/1.1 426"),
+        "invalid WebSocket version must reject the upgrade: {response}"
+    );
+
+    let clients = get_json(
+        client
+            .get(http_url(&handle, "/api/auth/clients"))
+            .bearer_auth(administrator_token)
+            .send()
+            .await
+            .expect("clients after failed upgrade"),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(
+        clients
+            .as_array()
+            .expect("clients array")
+            .iter()
+            .filter(|session| session["current"] == false)
+            .all(|session| session["connected"] == false),
+        "a rejected HTTP upgrade must not create a live WebSocket connection"
+    );
 
     shutdown(handle).await;
 }
