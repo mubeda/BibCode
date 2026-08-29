@@ -4,6 +4,18 @@
 //! program-scoped rather than port-scoped. Non-Windows platforms have no managed
 //! firewall here and every call is a successful no-op.
 
+#[cfg(windows)]
+use bibcode_server::process::ProcessRunner;
+#[cfg(any(windows, test))]
+use bibcode_server::process::{OutputMode, ProcessRunInput};
+#[cfg(any(windows, test))]
+use std::time::Duration;
+
+#[cfg(any(windows, test))]
+const FIREWALL_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(any(windows, test))]
+const FIREWALL_COMMAND_MAX_OUTPUT_BYTES: usize = 64 * 1024;
+
 #[cfg_attr(
     all(not(windows), not(test)),
     expect(dead_code, reason = "Windows-only firewall command")
@@ -80,6 +92,14 @@ trait FirewallCommandRunner: Sync {
 #[cfg(windows)]
 struct ProcessFirewallCommandRunner;
 
+#[cfg(any(windows, test))]
+fn firewall_process_input(executable: String, args: Vec<String>) -> ProcessRunInput {
+    ProcessRunInput::new(executable, args)
+        .with_timeout(FIREWALL_COMMAND_TIMEOUT)
+        .with_max_output_bytes(FIREWALL_COMMAND_MAX_OUTPUT_BYTES)
+        .with_output_mode(OutputMode::Truncate)
+}
+
 #[cfg(windows)]
 impl FirewallCommandRunner for ProcessFirewallCommandRunner {
     fn run(
@@ -88,17 +108,14 @@ impl FirewallCommandRunner for ProcessFirewallCommandRunner {
         args: Vec<String>,
     ) -> impl std::future::Future<Output = Result<FirewallCommandOutput, String>> + Send {
         async move {
-            let mut command = tokio::process::Command::new(&executable);
-            command.args(args);
-            bibcode_server::process::configure_background_command(&mut command);
-            let output = command
-                .output()
+            let output = ProcessRunner
+                .run(firewall_process_input(executable.clone(), args))
                 .await
                 .map_err(|error| format!("failed to run {executable}: {error}"))?;
             Ok(FirewallCommandOutput {
-                success: output.status.success(),
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                success: output.code == Some(0),
+                stdout: output.stdout,
+                stderr: output.stderr,
             })
         }
     }
@@ -255,6 +272,17 @@ mod tests {
                 "enable=yes".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn firewall_processes_use_one_bounded_supervised_run() {
+        let input = firewall_process_input("netsh".to_owned(), vec!["advfirewall".to_owned()]);
+
+        assert_eq!(input.timeout, FIREWALL_COMMAND_TIMEOUT);
+        assert_eq!(input.max_output_bytes, FIREWALL_COMMAND_MAX_OUTPUT_BYTES);
+        assert_eq!(input.output_mode, OutputMode::Truncate);
+        assert_eq!(input.command, "netsh");
+        assert_eq!(input.args, ["advfirewall"]);
     }
 
     #[test]
