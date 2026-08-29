@@ -1,5 +1,5 @@
 use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
@@ -7,7 +7,7 @@ use std::{
 use axum::{
     Json, Router,
     body::Body,
-    extract::{FromRef, Request, State, WebSocketUpgrade},
+    extract::{ConnectInfo, FromRef, Request, State, WebSocketUpgrade},
     http::{
         HeaderMap, Method, StatusCode, Uri,
         header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, HOST, LOCATION},
@@ -35,7 +35,10 @@ use crate::{
     },
     production::http_routes::{self, HttpRoutesState},
     remote_update::RemoteUpdateSupport,
-    rpc::{MAX_E2EE_CIPHERTEXT_BYTES, RpcRegistry, RpcSessionContext, run_session},
+    rpc::{
+        E2eePreauthAdmission, MAX_E2EE_CIPHERTEXT_BYTES, RpcRegistry, RpcSessionContext,
+        run_session,
+    },
 };
 
 pub const ENVIRONMENT_DESCRIPTOR_PATH: &str = "/.well-known/bibcode/environment";
@@ -122,6 +125,7 @@ pub(crate) struct AppState {
     pub config: Arc<ServerConfig>,
     pub shutdown: CancellationToken,
     pub rpc_registry: RpcRegistry,
+    pub e2ee_preauth_admission: E2eePreauthAdmission,
     pub auth: auth::AuthService,
     pub http_routes: HttpRoutesState,
     pub admission_gate: RpcAdmissionGate,
@@ -260,14 +264,25 @@ async fn websocket(
     }
 }
 
-async fn websocket_e2ee(State(state): State<AppState>, upgrade: WebSocketUpgrade) -> Response {
+async fn websocket_e2ee(
+    State(state): State<AppState>,
+    peer: Result<ConnectInfo<SocketAddr>, axum::extract::rejection::ExtensionRejection>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
     let session_shutdown = state.shutdown.child_token();
+    let peer_ip = peer
+        .ok()
+        .map(|ConnectInfo(address)| address.ip())
+        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    let preauth_admission = state.e2ee_preauth_admission;
     upgrade
         .max_frame_size(MAX_E2EE_CIPHERTEXT_BYTES)
         .max_message_size(MAX_E2EE_CIPHERTEXT_BYTES)
         .on_upgrade(move |socket| {
             crate::rpc::run_e2ee_session(
                 socket,
+                peer_ip,
+                preauth_admission,
                 state.auth,
                 state.rpc_registry,
                 state.config,
