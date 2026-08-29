@@ -3,6 +3,7 @@ import { EnvironmentId } from "@bibcode/contracts";
 import { useEffect, useRef, useState } from "react";
 
 import { ProjectDataRecoveryDialog } from "./components/desktop/ProjectDataRecoveryDialog";
+import { ConnectionDatabaseRecoveryDialog } from "./components/ConnectionDatabaseRecoveryDialog";
 import { PreviewAutomationHosts } from "./components/preview/PreviewAutomationHosts";
 import { previewBridge } from "./components/preview/previewBridge";
 import { supportsPreviewRuntimeCapability } from "./previewRuntimeCapabilities";
@@ -149,6 +150,7 @@ export function ProjectDataRecoveryCoordinator() {
 export function AppRoot({ router }: { readonly router: AppRouter }) {
   return (
     <AppAtomRegistryProvider>
+      <ConnectionDatabaseRecoveryDialog />
       <ShareExposureReconciler />
       <ThreadLifecycleReconciler />
       <ProjectDataRecoveryCoordinator />

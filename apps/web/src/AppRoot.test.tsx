@@ -12,6 +12,7 @@ vi.mock("./components/preview/previewBridge", () => ({
 }));
 
 import { PreviewAutomationHosts } from "./components/preview/PreviewAutomationHosts";
+import { ConnectionDatabaseRecoveryDialog } from "./components/ConnectionDatabaseRecoveryDialog";
 import { AppAtomRegistryProvider } from "./rpc/atomRegistry";
 import type { AppRouter } from "./router";
 import { ThreadLifecycleReconciler } from "./ThreadLifecycleReconciler";
@@ -30,12 +31,13 @@ describe("AppRoot", () => {
     const children = Children.toArray(
       (root as ReactElement<{ readonly children: ReactNode }>).props.children,
     );
-    expect(children).toHaveLength(5);
-    expect(isValidElement(children[0]) && children[0].type).toBe(ShareExposureReconciler);
-    expect(isValidElement(children[1]) && children[1].type).toBe(ThreadLifecycleReconciler);
-    expect(isValidElement(children[2]) && children[2].type).toBe(ProjectDataRecoveryCoordinator);
-    expect(isValidElement(children[3]) && children[3].type).toBe(RouterProvider);
-    expect(isValidElement(children[4]) && children[4].type).toBe(PreviewAutomationHosts);
+    expect(children).toHaveLength(6);
+    expect(isValidElement(children[0]) && children[0].type).toBe(ConnectionDatabaseRecoveryDialog);
+    expect(isValidElement(children[1]) && children[1].type).toBe(ShareExposureReconciler);
+    expect(isValidElement(children[2]) && children[2].type).toBe(ThreadLifecycleReconciler);
+    expect(isValidElement(children[3]) && children[3].type).toBe(ProjectDataRecoveryCoordinator);
+    expect(isValidElement(children[4]) && children[4].type).toBe(RouterProvider);
+    expect(isValidElement(children[5]) && children[5].type).toBe(PreviewAutomationHosts);
   });
 
   it("omits preview automation hosts when the runtime does not support automation", () => {
@@ -53,10 +55,11 @@ describe("AppRoot", () => {
       (root as ReactElement<{ readonly children: ReactNode }>).props.children,
     );
 
-    expect(children).toHaveLength(4);
-    expect(isValidElement(children[0]) && children[0].type).toBe(ShareExposureReconciler);
-    expect(isValidElement(children[1]) && children[1].type).toBe(ThreadLifecycleReconciler);
-    expect(isValidElement(children[2]) && children[2].type).toBe(ProjectDataRecoveryCoordinator);
-    expect(isValidElement(children[3]) && children[3].type).toBe(RouterProvider);
+    expect(children).toHaveLength(5);
+    expect(isValidElement(children[0]) && children[0].type).toBe(ConnectionDatabaseRecoveryDialog);
+    expect(isValidElement(children[1]) && children[1].type).toBe(ShareExposureReconciler);
+    expect(isValidElement(children[2]) && children[2].type).toBe(ThreadLifecycleReconciler);
+    expect(isValidElement(children[3]) && children[3].type).toBe(ProjectDataRecoveryCoordinator);
+    expect(isValidElement(children[4]) && children[4].type).toBe(RouterProvider);
   });
 });
