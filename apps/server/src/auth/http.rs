@@ -23,8 +23,8 @@ use super::{
     },
     service::{
         AuthError, AuthService, PAIRING_REACH_VALUES, PairingOfferIssuance, PairingOfferReplay,
-        PairingOfferReservation, default_standard_scopes, format_iso, is_loopback_host, now_ms,
-        parse_scopes,
+        PairingOfferReservation, default_standard_scopes, format_iso, is_loopback_host,
+        is_unspecified_host, now_ms, parse_scopes,
     },
 };
 use crate::http::AppState;
@@ -346,7 +346,7 @@ async fn create_pairing_offer(
         _ => return invalid_pairing_offer_response("endpoint must be an http(s) URL"),
     };
     let host = endpoint.host_str().unwrap_or_default();
-    if matches!(host, "" | "0.0.0.0" | "[::]" | "::") || endpoint.port() == Some(0) {
+    if host.is_empty() || is_unspecified_host(host) || endpoint.port() == Some(0) {
         return invalid_pairing_offer_response(
             "endpoint must be a connectable address (no wildcard host, no port 0)",
         );
@@ -954,7 +954,48 @@ fn non_empty(value: Option<String>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use serde::Deserialize;
+
     use super::{MAX_PAIRING_OFFER_IDEMPOTENCY_KEY_BYTES, is_valid_pairing_offer_idempotency_key};
+    use crate::auth::service::{is_loopback_host, is_unspecified_host};
+
+    #[derive(Deserialize)]
+    struct PairingEndpointFixture {
+        endpoint: String,
+        classification: String,
+    }
+
+    #[test]
+    fn pairing_endpoint_loopback_semantics_match_shared_fixtures() {
+        let fixtures: Vec<PairingEndpointFixture> = serde_json::from_str(include_str!(
+            "../../../../packages/shared/fixtures/pairing-endpoint-classification.json"
+        ))
+        .expect("pairing endpoint fixtures");
+
+        for fixture in fixtures {
+            let Ok(endpoint) = url::Url::parse(&fixture.endpoint) else {
+                assert_eq!(fixture.classification, "unconnectable");
+                continue;
+            };
+            let host = endpoint.host_str().unwrap_or_default();
+            let wildcard = host.is_empty() || is_unspecified_host(host);
+            let unconnectable = wildcard || endpoint.port() == Some(0);
+            assert_eq!(
+                unconnectable,
+                fixture.classification == "unconnectable",
+                "{}",
+                fixture.endpoint
+            );
+            if !unconnectable {
+                assert_eq!(
+                    is_loopback_host(host),
+                    fixture.classification == "loopback",
+                    "{}",
+                    fixture.endpoint
+                );
+            }
+        }
+    }
 
     #[test]
     fn pairing_offer_idempotency_keys_are_byte_bounded() {

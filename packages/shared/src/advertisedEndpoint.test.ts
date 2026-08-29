@@ -1,4 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
+import pairingEndpointFixtures from "../fixtures/pairing-endpoint-classification.json" with {
+  type: "json",
+};
 
 import {
   classifyPairingEndpoint,
@@ -9,35 +12,21 @@ import {
 } from "./advertisedEndpoint.ts";
 
 describe("classifyPairingEndpoint", () => {
+  it.each(pairingEndpointFixtures)("classifies $endpoint as $classification", (fixture) => {
+    expect(classifyPairingEndpoint(fixture.endpoint)).toBe(fixture.classification);
+  });
+
   it.each([
-    ["http://127.0.0.1:3773", "loopback"],
-    ["http://[::1]:3773", "loopback"],
-    ["http://[::ffff:127.0.0.1]:3773", "loopback"],
-    ["http://localhost:3773", "loopback"],
-    ["http://192.168.1.20:3773", "private-network"],
-    ["http://[::ffff:192.168.1.20]:3773", "private-network"],
     ["http://10.0.0.5:3773", "private-network"],
     ["http://172.16.0.9:3773", "private-network"],
-    ["http://100.64.12.1:3773", "private-network"],
-    ["http://[fd00::1]:3773", "private-network"],
     ["http://[fdff::1]:3773", "private-network"],
     ["http://[fbff::1]:3773", "public"],
     ["http://[fe80::1]:3773", "private-network"],
     ["http://[febf::1]:3773", "private-network"],
     ["http://[fe7f::1]:3773", "public"],
     ["http://[fec0::1]:3773", "public"],
-    ["http://203.0.113.7:3773", "public"],
-    ["http://[::ffff:203.0.113.7]:3773", "public"],
     ["https://server.example.com", "public"],
-    ["http://example.test/path/:0", "public"],
-    ["http://127.example.test:3773", "public"],
-    ["http://fdcorp.example.test:3773", "public"],
-    ["http://0.0.0.0:3773", "unconnectable"],
-    ["http://[::ffff:0.0.0.0]:3773", "unconnectable"],
-    ["http://[::]:3773", "unconnectable"],
-    ["http://192.168.1.20:0", "unconnectable"],
-    ["not a url", "unconnectable"],
-  ])("classifies %s as %s", (endpoint, expected) => {
+  ])("classifies additional boundary %s as %s", (endpoint, expected) => {
     expect(classifyPairingEndpoint(endpoint)).toBe(expected);
   });
 });
