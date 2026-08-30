@@ -10,6 +10,53 @@ pub struct NetworkAddress {
     pub is_default_route: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdvertisedAddressReachability {
+    Loopback,
+    Lan,
+    PrivateNetwork,
+    Public,
+}
+
+impl AdvertisedAddressReachability {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Loopback => "loopback",
+            Self::Lan => "lan",
+            Self::PrivateNetwork => "private-network",
+            Self::Public => "public",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdvertisedAddressLabelKind {
+    ThisMachine,
+    LocalNetwork,
+    PrivateNetwork,
+    PublicAddress,
+}
+
+impl AdvertisedAddressLabelKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ThisMachine => "This machine",
+            Self::LocalNetwork => "Local network",
+            Self::PrivateNetwork => "Private network",
+            Self::PublicAddress => "Public address",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AdvertisedAddressClassification {
+    pub(crate) reachability: AdvertisedAddressReachability,
+    pub(crate) label_kind: AdvertisedAddressLabelKind,
+    pub(crate) usable: bool,
+    pub(crate) default_eligible: bool,
+    pub(crate) advertise_with_ipv4_listener: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InterfaceObservation {
     pub interface_name: String,
@@ -30,10 +77,11 @@ pub(crate) fn enumerate_advertised_addresses(
     let mut addresses = BTreeMap::<IpAddr, NetworkAddress>::new();
     for observation in provider.interfaces()? {
         let ip = normalize_ip(observation.ip);
-        if !observation.is_up || !is_usable_unicast(ip) {
+        let classification = classify_advertised_address(ip);
+        if !observation.is_up || !classification.advertise_with_ipv4_listener {
             continue;
         }
-        let is_default_route = default_route_ip == Some(ip);
+        let is_default_route = default_route_ip == Some(ip) && classification.default_eligible;
         addresses
             .entry(ip)
             .and_modify(|address| address.is_default_route |= is_default_route)
@@ -62,7 +110,52 @@ pub(crate) fn default_route_ip() -> Option<IpAddr> {
     SystemNetworkInterfaceProvider.default_route_ip()
 }
 
-pub(crate) fn is_cgnat_or_tailscale(ip: IpAddr) -> bool {
+pub(crate) fn classify_advertised_address(ip: IpAddr) -> AdvertisedAddressClassification {
+    let ip = normalize_ip(ip);
+    let usable = is_usable_unicast(ip);
+    let (reachability, label_kind) = if ip.is_loopback() {
+        (
+            AdvertisedAddressReachability::Loopback,
+            AdvertisedAddressLabelKind::ThisMachine,
+        )
+    } else if is_cgnat_or_tailscale(ip) {
+        (
+            AdvertisedAddressReachability::PrivateNetwork,
+            AdvertisedAddressLabelKind::PrivateNetwork,
+        )
+    } else if is_local_network(ip) {
+        (
+            AdvertisedAddressReachability::Lan,
+            AdvertisedAddressLabelKind::LocalNetwork,
+        )
+    } else if is_private_network(ip) {
+        (
+            AdvertisedAddressReachability::PrivateNetwork,
+            AdvertisedAddressLabelKind::PrivateNetwork,
+        )
+    } else {
+        (
+            AdvertisedAddressReachability::Public,
+            AdvertisedAddressLabelKind::PublicAddress,
+        )
+    };
+    let advertise_with_ipv4_listener = usable && ip.is_ipv4();
+    let default_eligible = advertise_with_ipv4_listener
+        && matches!(
+            reachability,
+            AdvertisedAddressReachability::Lan | AdvertisedAddressReachability::PrivateNetwork
+        );
+
+    AdvertisedAddressClassification {
+        reachability,
+        label_kind,
+        usable,
+        default_eligible,
+        advertise_with_ipv4_listener,
+    }
+}
+
+fn is_cgnat_or_tailscale(ip: IpAddr) -> bool {
     match normalize_ip(ip) {
         IpAddr::V4(ipv4) => {
             let octets = ipv4.octets();
@@ -72,10 +165,17 @@ pub(crate) fn is_cgnat_or_tailscale(ip: IpAddr) -> bool {
     }
 }
 
-pub(crate) fn is_private_network(ip: IpAddr) -> bool {
+fn is_private_network(ip: IpAddr) -> bool {
     match normalize_ip(ip) {
         IpAddr::V4(ipv4) => ipv4.is_private() || is_cgnat_or_tailscale(IpAddr::V4(ipv4)),
         IpAddr::V6(ipv6) => (ipv6.segments()[0] & 0xfe00) == 0xfc00,
+    }
+}
+
+fn is_local_network(ip: IpAddr) -> bool {
+    match normalize_ip(ip) {
+        IpAddr::V4(ipv4) => ipv4.is_private() || ipv4.is_link_local(),
+        IpAddr::V6(ipv6) => ipv6.is_unicast_link_local(),
     }
 }
 
@@ -115,7 +215,7 @@ fn normalize_ip(ip: IpAddr) -> IpAddr {
     }
 }
 
-fn is_usable_unicast(ip: IpAddr) -> bool {
+pub(crate) fn is_usable_unicast(ip: IpAddr) -> bool {
     if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
         return false;
     }
@@ -128,19 +228,65 @@ fn is_usable_unicast(ip: IpAddr) -> bool {
 fn address_rank(address: &NetworkAddress) -> u8 {
     if address.is_default_route {
         0
-    } else if is_cgnat_or_tailscale(address.ip) {
-        1
-    } else if is_private_network(address.ip) {
-        2
     } else {
-        3
+        match classify_advertised_address(address.ip).reachability {
+            AdvertisedAddressReachability::PrivateNetwork => 1,
+            AdvertisedAddressReachability::Lan => 2,
+            AdvertisedAddressReachability::Loopback | AdvertisedAddressReachability::Public => 3,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct AdvertisedEndpointClassificationFixture {
+        address: String,
+        advertised_reachability: String,
+        usable: bool,
+        advertise_with_ipv4_listener: bool,
+    }
+
+    fn advertised_endpoint_classification_fixtures() -> Vec<AdvertisedEndpointClassificationFixture>
+    {
+        serde_json::from_str(include_str!(
+            "../../../../packages/shared/fixtures/advertised-endpoint-classification.json"
+        ))
+        .expect("shared advertised endpoint classification fixture")
+    }
+
+    #[test]
+    fn shared_fixture_defines_desktop_address_classification() {
+        for fixture in advertised_endpoint_classification_fixtures() {
+            let address = fixture
+                .address
+                .parse::<IpAddr>()
+                .expect("fixture IP address");
+            let classification = classify_advertised_address(address);
+
+            assert_eq!(
+                classification.reachability.as_str(),
+                fixture.advertised_reachability,
+                "fixture address {}",
+                fixture.address,
+            );
+            assert_eq!(
+                classification.usable, fixture.usable,
+                "fixture address {}",
+                fixture.address,
+            );
+            assert_eq!(
+                classification.advertise_with_ipv4_listener, fixture.advertise_with_ipv4_listener,
+                "fixture address {}",
+                fixture.address,
+            );
+        }
+    }
 
     struct FixtureProvider {
         interfaces: Vec<InterfaceObservation>,
@@ -166,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn filters_deduplicates_and_ranks_all_usable_addresses() {
+    fn filters_deduplicates_and_ranks_ipv4_addresses() {
         let ethernet = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20));
         let tailnet = IpAddr::V4(Ipv4Addr::new(100, 100, 100, 100));
         let vpn = IpAddr::V4(Ipv4Addr::new(10, 8, 0, 2));
@@ -213,12 +359,25 @@ mod tests {
                     ip: vpn,
                     is_default_route: false,
                 },
-                NetworkAddress {
-                    interface_name: "global-v6".to_string(),
-                    ip: global_v6,
-                    is_default_route: false,
-                },
             ]
+        );
+    }
+
+    #[test]
+    fn public_default_route_is_advertised_but_never_default() {
+        let public = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
+        let provider = FixtureProvider {
+            interfaces: vec![observation("internet", public, true)],
+            default_route_ip: Some(public),
+        };
+
+        assert_eq!(
+            enumerate_advertised_addresses(&provider).expect("fixture enumeration"),
+            [NetworkAddress {
+                interface_name: "internet".to_owned(),
+                ip: public,
+                is_default_route: false,
+            }]
         );
     }
 

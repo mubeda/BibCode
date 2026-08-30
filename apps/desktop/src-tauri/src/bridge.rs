@@ -26,8 +26,8 @@ use crate::context_menu::{
 };
 use crate::data_safety;
 use crate::network_interfaces::{
-    NetworkAddress, enumerate_system_advertised_addresses, is_cgnat_or_tailscale,
-    is_private_network,
+    AdvertisedAddressReachability, NetworkAddress, classify_advertised_address,
+    enumerate_system_advertised_addresses,
 };
 use crate::security::{
     CONNECTION_CATALOG_PROTECTION_KIND, protect_string as protect_catalog_string,
@@ -613,44 +613,42 @@ fn advertised_endpoints_for_config(
 
     if config.server_exposure_mode == "network-accessible" {
         for address in network_addresses {
+            let classification = classify_advertised_address(address.ip);
+            if !classification.advertise_with_ipv4_listener {
+                continue;
+            }
             let socket = std::net::SocketAddr::new(address.ip, config.port);
-            let is_tailnet = is_cgnat_or_tailscale(address.ip);
-            let reachability = if is_tailnet {
-                "private-network"
-            } else if is_private_network(address.ip) {
-                "lan"
+            let is_default = address.is_default_route && classification.default_eligible;
+            let description = if classification.reachability
+                == AdvertisedAddressReachability::Public
+            {
+                #[cfg(target_os = "windows")]
+                {
+                    format!(
+                        "Public address through network interface {}. Select explicitly only after reviewing exposure and firewall policy.",
+                        address.interface_name
+                    )
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    format!(
+                        "Public address through network interface {}. Select explicitly only after reviewing exposure. BiBCode does not manage this platform's firewall.",
+                        address.interface_name
+                    )
+                }
             } else {
-                "public"
+                format!(
+                    "Reachable through network interface {}.",
+                    address.interface_name
+                )
             };
             endpoints.push(advertised_endpoint(
                 format!("desktop-network:{socket}"),
-                if address.is_default_route {
-                    "Local network"
-                } else if is_tailnet {
-                    "Private network"
-                } else {
-                    "Additional network"
-                },
+                classification.label_kind.as_str(),
                 format!("http://{socket}"),
-                reachability,
-                Some(address.is_default_route),
-                &format!(
-                    "Reachable through network interface {}.",
-                    address.interface_name
-                ),
-            )?);
-        }
-
-        if network_addresses.is_empty()
-            && let Some(endpoint_url) = &config.endpoint_url
-        {
-            endpoints.push(advertised_endpoint(
-                format!("desktop-network:{endpoint_url}"),
-                "Local network",
-                endpoint_url.clone(),
-                "lan",
-                Some(true),
-                "Reachable from devices on the same network.",
+                classification.reachability.as_str(),
+                Some(is_default),
+                &description,
             )?);
         }
     }
@@ -665,7 +663,16 @@ fn tailscale_endpoints_for_status(
 ) -> Result<Vec<Value>, String> {
     let mut endpoints = Vec::new();
     for address in &status.tailnet_ipv4_addresses {
-        let http_base_url = format!("http://{address}:{}", config.port);
+        let Ok(ip) = address.parse::<std::net::IpAddr>() else {
+            continue;
+        };
+        let classification = classify_advertised_address(ip);
+        if !classification.advertise_with_ipv4_listener
+            || classification.reachability != AdvertisedAddressReachability::PrivateNetwork
+        {
+            continue;
+        }
+        let http_base_url = format!("http://{ip}:{}", config.port);
         endpoints.push(tailscale_advertised_endpoint(
             format!("tailscale-ip:{http_base_url}"),
             "Tailscale IP",
@@ -2697,23 +2704,70 @@ mod tests {
                 is_default_route: true,
             },
             NetworkAddress {
+                interface_name: "Tailnet".to_string(),
+                ip: "100.100.100.100".parse().expect("CGNAT fixture"),
+                is_default_route: false,
+            },
+            NetworkAddress {
+                interface_name: "Internet".to_string(),
+                ip: "8.8.8.8".parse().expect("public fixture"),
+                is_default_route: true,
+            },
+            NetworkAddress {
                 interface_name: "IPv6".to_string(),
-                ip: "2001:db8::20".parse().expect("IPv6 fixture"),
+                ip: "2001:4860:4860::8888".parse().expect("IPv6 fixture"),
                 is_default_route: false,
             },
         ];
         let endpoints = advertised_endpoints_for_config(&network_config, &addresses)
             .expect("LAN endpoints should build");
-        assert_eq!(endpoints.len(), 3);
+        assert_eq!(endpoints.len(), 4);
         assert_eq!(endpoints[1]["id"], "desktop-network:192.168.1.20:13773");
+        assert_eq!(endpoints[1]["label"], "Local network");
         assert_eq!(endpoints[1]["httpBaseUrl"], "http://192.168.1.20:13773/");
         assert_eq!(endpoints[1]["wsBaseUrl"], "ws://192.168.1.20:13773/");
         assert_eq!(endpoints[1]["isDefault"], true);
         assert_eq!(endpoints[1]["reachability"], "lan");
-        assert_eq!(endpoints[2]["id"], "desktop-network:[2001:db8::20]:13773");
-        assert_eq!(endpoints[2]["httpBaseUrl"], "http://[2001:db8::20]:13773/");
+
+        assert_eq!(endpoints[2]["label"], "Private network");
         assert_eq!(endpoints[2]["isDefault"], false);
-        assert_eq!(endpoints[2]["reachability"], "public");
+        assert_eq!(endpoints[2]["reachability"], "private-network");
+
+        assert_eq!(endpoints[3]["label"], "Public address");
+        assert_eq!(endpoints[3]["isDefault"], false);
+        assert_eq!(endpoints[3]["reachability"], "public");
+        assert!(
+            endpoints[3]["description"]
+                .as_str()
+                .expect("public warning")
+                .contains("explicitly")
+        );
+        if !cfg!(windows) {
+            assert!(
+                endpoints[3]["description"]
+                    .as_str()
+                    .expect("firewall warning")
+                    .contains("does not manage this platform's firewall")
+            );
+        }
+        assert!(
+            endpoints
+                .iter()
+                .all(|endpoint| !endpoint["httpBaseUrl"].as_str().unwrap_or("").contains('['))
+        );
+    }
+
+    #[test]
+    fn persisted_endpoint_is_not_reused_when_discovery_has_no_safe_candidate() {
+        let mut config = test_run_config();
+        config.server_exposure_mode = "network-accessible".to_owned();
+        config.endpoint_url = Some("http://8.8.8.8:13773".to_owned());
+
+        let endpoints = advertised_endpoints_for_config(&config, &[])
+            .expect("loopback endpoint should remain available");
+
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0]["reachability"], "loopback");
     }
 
     #[test]
@@ -2971,7 +3025,12 @@ mod tests {
         };
         let status = TailscaleStatus {
             magic_dns_name: Some("desktop.tail.ts.net".to_string()),
-            tailnet_ipv4_addresses: vec!["100.100.100.100".to_string()],
+            tailnet_ipv4_addresses: vec![
+                "100.100.100.100".to_string(),
+                "fd7a:115c:a1e0::1".to_string(),
+                "8.8.8.8".to_string(),
+                "not-an-address".to_string(),
+            ],
         };
 
         let endpoints =

@@ -29,7 +29,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::config::state_dir;
-use crate::network_interfaces::default_route_ip;
+use crate::network_interfaces::{default_route_ip, is_usable_unicast};
 #[cfg(test)]
 use crate::test_support::FixtureEvent;
 
@@ -2740,8 +2740,13 @@ struct ResolvedBackendExposure {
 }
 
 pub fn resolve_lan_advertised_host() -> Option<String> {
-    default_route_ip()
+    select_lan_advertised_host(default_route_ip())
+}
+
+fn select_lan_advertised_host(default_route: Option<IpAddr>) -> Option<String> {
+    default_route
         .filter(IpAddr::is_ipv4)
+        .filter(|ip| is_usable_unicast(*ip))
         .map(|ip| ip.to_string())
 }
 
@@ -5099,6 +5104,28 @@ exit /b 9
                 advertised_host: None,
             }
         );
+    }
+
+    #[test]
+    fn lan_advertised_host_accepts_only_usable_ipv4_defaults() {
+        for accepted in ["192.168.1.20", "100.100.100.100", "8.8.8.8"] {
+            let address = accepted.parse::<IpAddr>().expect("accepted fixture");
+            assert_eq!(
+                select_lan_advertised_host(Some(address)),
+                Some(accepted.to_owned())
+            );
+        }
+        for rejected in [
+            "0.0.0.0",
+            "127.0.0.1",
+            "169.254.1.1",
+            "224.0.0.1",
+            "255.255.255.255",
+            "fd7a:115c:a1e0::1",
+        ] {
+            let address = rejected.parse::<IpAddr>().expect("rejected fixture");
+            assert_eq!(select_lan_advertised_host(Some(address)), None);
+        }
     }
 
     #[test]

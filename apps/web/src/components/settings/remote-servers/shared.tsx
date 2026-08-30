@@ -393,10 +393,15 @@ export function selectPairingEndpoint(
       return selectedEndpoint;
     }
   }
+  const automaticallySelectableEndpoints = availableEndpoints.filter(
+    (endpoint) => endpoint.reachability !== "public",
+  );
   return (
-    availableEndpoints.find((endpoint) => endpoint.isDefault) ??
-    availableEndpoints.find((endpoint) => endpoint.reachability !== "loopback") ??
-    availableEndpoints.find((endpoint) => endpoint.compatibility.hostedHttpsApp === "compatible") ??
+    automaticallySelectableEndpoints.find((endpoint) => endpoint.isDefault) ??
+    automaticallySelectableEndpoints.find((endpoint) => endpoint.reachability !== "loopback") ??
+    automaticallySelectableEndpoints.find(
+      (endpoint) => endpoint.compatibility.hostedHttpsApp === "compatible",
+    ) ??
     null
   );
 }

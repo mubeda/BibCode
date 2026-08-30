@@ -316,6 +316,40 @@ describe("ShareThisHostTab", () => {
     expect(container.textContent).toContain("Pairing grants your user account on this machine");
   });
 
+  it("shows the public-address and unmanaged-firewall warning after explicit selection", async () => {
+    h.networkQuery.data.advertisedEndpoints = [
+      {
+        id: "desktop-network:8.8.8.8:3773",
+        label: "Public address",
+        provider: { id: "desktop-core", label: "Desktop", kind: "core", isAddon: false },
+        httpBaseUrl: "http://8.8.8.8:3773/",
+        wsBaseUrl: "ws://8.8.8.8:3773/",
+        reachability: "public",
+        compatibility: { hostedHttpsApp: "mixed-content-blocked", desktopApp: "compatible" },
+        source: "desktop-core",
+        status: "available",
+        isDefault: false,
+        description:
+          "Public address. Select explicitly only after reviewing exposure. BiBCode does not manage this platform's firewall.",
+      },
+    ];
+    installBridge();
+
+    await renderTab();
+    expect(container.textContent).not.toContain("does not manage this platform's firewall");
+    const addressSelect = container.querySelector<HTMLSelectElement>(
+      'select[aria-label="Share address"]',
+    );
+    if (addressSelect === null) throw new Error("share address selector is missing");
+    await act(async () => {
+      addressSelect.value = "desktop-network:8.8.8.8:3773";
+      addressSelect.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+
+    expect(container.textContent).toContain("Public address. Select explicitly");
+    expect(container.textContent).toContain("does not manage this platform's firewall");
+  });
+
   it("widens before minting and renders code, links, and QR", async () => {
     const order: string[] = [];
     const apply = installBridge(
