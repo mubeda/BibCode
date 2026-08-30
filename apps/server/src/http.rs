@@ -52,6 +52,7 @@ const CONTENT_SECURITY_POLICY_VALUE: &str = "default-src 'self'; connect-src 'se
 const IMMUTABLE_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 const HTML_CACHE_CONTROL: &str = "no-cache";
 const MAX_PLAIN_WEBSOCKET_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PLAIN_WEBSOCKET_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RouteMethod {
@@ -220,7 +221,7 @@ async fn websocket(
     let session_shutdown = state.shutdown.child_token();
     if state.config.unsafe_no_auth {
         return upgrade
-            .max_frame_size(MAX_PLAIN_WEBSOCKET_MESSAGE_BYTES)
+            .max_frame_size(MAX_PLAIN_WEBSOCKET_FRAME_BYTES)
             .max_message_size(MAX_PLAIN_WEBSOCKET_MESSAGE_BYTES)
             .on_upgrade(move |socket| {
                 run_session(
@@ -239,11 +240,11 @@ async fn websocket(
             let expires_at_ms = principal.expires_at_ms;
             let rpc_context = RpcSessionContext::authenticated(principal, auth.clone());
             upgrade
-                .max_frame_size(MAX_PLAIN_WEBSOCKET_MESSAGE_BYTES)
+                .max_frame_size(MAX_PLAIN_WEBSOCKET_FRAME_BYTES)
                 .max_message_size(MAX_PLAIN_WEBSOCKET_MESSAGE_BYTES)
                 .on_upgrade(move |socket| async move {
-                    let Ok(connection_id) = auth
-                        .mark_connected(&session_id, session_shutdown.clone())
+                    let Ok(connection_guard) = auth
+                        .mark_connected_guard(&session_id, session_shutdown.clone())
                         .await
                     else {
                         session_shutdown.cancel();
@@ -261,7 +262,7 @@ async fn websocket(
                     .await;
                     session_shutdown.cancel();
                     let _ = expiration_guard.await;
-                    auth.mark_disconnected(&session_id, connection_id).await;
+                    connection_guard.close().await;
                 })
                 .into_response()
         }

@@ -30,7 +30,7 @@ const MAX_CIPHERTEXT_BYTES: usize = 65_535;
 const MAX_CHUNK_BYTES: usize = 65_518;
 const RECORD_FINAL: u8 = 0;
 const RECORD_CONTINUATION: u8 = 1;
-const E2EE_MAX_PREAUTH_CONNECTIONS_PER_PEER: usize = 4;
+const E2EE_PREAUTH_BURST_PER_LOOPBACK_FORWARDER: usize = 8;
 const E2EE_MAX_ESTABLISHED_CONNECTIONS_PER_PRINCIPAL: usize = 32;
 const E2EE_INBOUND_BUFFER_BUDGET_BYTES_PER_PRINCIPAL: usize = 64 * 1024 * 1024;
 const TOKEN_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
@@ -615,7 +615,13 @@ async fn oversized_binary_frame_closes_the_connection() {
         .send(Message::Binary(vec![0_u8; MAX_CIPHERTEXT_BYTES + 1].into()))
         .await
         .expect("send oversized frame");
-    let _ = next_close_code(&mut socket).await;
+    let outcome = timeout(Duration::from_secs(3), socket.next())
+        .await
+        .expect("oversized authenticated frame reaches a terminal outcome");
+    assert!(matches!(
+        outcome,
+        None | Some(Ok(Message::Close(_))) | Some(Err(_))
+    ));
 }
 
 #[tokio::test]
@@ -679,6 +685,44 @@ async fn authenticated_empty_continuation_is_rejected() {
 }
 
 #[tokio::test]
+async fn incomplete_authenticated_message_closes_after_ten_seconds_without_progress() {
+    let _permit = TEST_PERMIT.acquire().await.expect("test permit");
+    let temp = TempDir::new().expect("temporary base directory");
+    let handle = start_server(&temp).await;
+    let startup = handle.startup_access().expect("startup pairing");
+    let (mut socket, mut transport, reply) =
+        pair_inside_channel(&handle, temp.path(), &startup.credential).await;
+    assert_eq!(reply["type"], "e2ee_authenticated");
+
+    let frame = encrypt_record(&mut transport, RECORD_CONTINUATION, b"partial");
+    socket
+        .send(Message::Binary(frame.into()))
+        .await
+        .expect("send incomplete encrypted message");
+    let outcome = timeout(Duration::from_secs(12), socket.next())
+        .await
+        .expect("incomplete-message progress deadline");
+    assert!(matches!(
+        outcome,
+        None | Some(Ok(Message::Close(_))) | Some(Err(_))
+    ));
+}
+
+#[tokio::test]
+async fn idle_authenticated_connection_has_no_reassembly_deadline() {
+    let _permit = TEST_PERMIT.acquire().await.expect("test permit");
+    let temp = TempDir::new().expect("temporary base directory");
+    let handle = start_server(&temp).await;
+    let startup = handle.startup_access().expect("startup pairing");
+    let (mut socket, mut transport, reply) =
+        pair_inside_channel(&handle, temp.path(), &startup.credential).await;
+    assert_eq!(reply["type"], "e2ee_authenticated");
+
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    assert_get_config(&mut socket, &mut transport).await;
+}
+
+#[tokio::test]
 async fn handshake_timeout_closes_the_socket() {
     let _permit = TEST_PERMIT.acquire().await.expect("test permit");
     let temp = TempDir::new().expect("temporary base directory");
@@ -694,13 +738,13 @@ async fn handshake_timeout_closes_the_socket() {
 }
 
 #[tokio::test]
-async fn preauth_peer_connection_cap_rejects_the_fifth_connection() {
+async fn preauth_loopback_forwarder_bypasses_public_peer_cap_but_keeps_burst_limit() {
     let _permit = TEST_PERMIT.acquire().await.expect("test permit");
     let temp = TempDir::new().expect("temporary base directory");
     let handle = start_server(&temp).await;
     let host_key = read_host_public_key(temp.path());
-    let mut stalled = Vec::with_capacity(E2EE_MAX_PREAUTH_CONNECTIONS_PER_PEER);
-    for _ in 0..E2EE_MAX_PREAUTH_CONNECTIONS_PER_PEER {
+    let mut stalled = Vec::with_capacity(E2EE_PREAUTH_BURST_PER_LOOPBACK_FORWARDER);
+    for _ in 0..E2EE_PREAUTH_BURST_PER_LOOPBACK_FORWARDER {
         stalled.push(noise_connect(handle.local_addr(), &host_key).await);
     }
     let mut overflow = open_socket(handle.local_addr()).await;
@@ -708,7 +752,7 @@ async fn preauth_peer_connection_cap_rejects_the_fifth_connection() {
 
     let (released, _) = stalled.pop().expect("one stalled connection");
     drop(released);
-    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
     let (mut admitted, _) = noise_connect(handle.local_addr(), &host_key).await;
     admitted
         .close(None)
@@ -755,7 +799,11 @@ async fn established_capacity_is_partitioned_by_principal_and_released_on_close(
     let host_key = read_host_public_key(temp.path());
 
     let mut first_principal_sockets = Vec::new();
+    tokio::time::sleep(Duration::from_secs(2)).await;
     for index in 0..E2EE_MAX_ESTABLISHED_CONNECTIONS_PER_PRINCIPAL {
+        if index > 0 && index % E2EE_PREAUTH_BURST_PER_LOOPBACK_FORWARDER == 0 {
+            tokio::time::sleep(Duration::from_secs(8)).await;
+        }
         let source_ip = Ipv4Addr::new(
             127,
             0,
@@ -769,6 +817,7 @@ async fn established_capacity_is_partitioned_by_principal_and_released_on_close(
         first_principal_sockets.push((socket, transport));
     }
 
+    tokio::time::sleep(Duration::from_secs(8)).await;
     let (mut overflow, _transport, reply) = open_authenticated_bearer_socket_from(
         &handle,
         &host_key,
@@ -825,7 +874,7 @@ async fn established_capacity_is_partitioned_by_principal_and_released_on_close(
 }
 
 #[tokio::test]
-async fn inbound_plaintext_capacity_is_partitioned_by_principal_and_released_on_close() {
+async fn inbound_plaintext_capacity_backpressures_by_principal_and_releases_on_close() {
     let _permit = TEST_PERMIT.acquire().await.expect("test permit");
     let temp = TempDir::new().expect("temporary base directory");
     let handle = start_server(&temp).await;
@@ -852,34 +901,38 @@ async fn inbound_plaintext_capacity_is_partitioned_by_principal_and_released_on_
     let host_key = read_host_public_key(temp.path());
     let (mut first_partial, mut first_transport, first_reply) =
         open_authenticated_bearer_socket(&handle, &host_key, &credentials[0]).await;
-    let (mut second_partial, mut second_transport, second_reply) =
+    let (mut waiting, mut waiting_transport, waiting_reply) =
         open_authenticated_bearer_socket(&handle, &host_key, &credentials[0]).await;
     assert_eq!(first_reply, json!({ "type": "e2ee_authenticated" }));
-    assert_eq!(second_reply, json!({ "type": "e2ee_authenticated" }));
+    assert_eq!(waiting_reply, json!({ "type": "e2ee_authenticated" }));
 
     send_encrypted_continuations(
         &mut first_partial,
         &mut first_transport,
-        E2EE_INBOUND_BUFFER_BUDGET_BYTES_PER_PRINCIPAL / 2,
-    )
-    .await;
-    send_encrypted_continuations(
-        &mut second_partial,
-        &mut second_transport,
-        E2EE_INBOUND_BUFFER_BUDGET_BYTES_PER_PRINCIPAL / 2,
+        E2EE_INBOUND_BUFFER_BUDGET_BYTES_PER_PRINCIPAL,
     )
     .await;
 
-    let (mut first_overflow, mut first_overflow_transport, overflow_reply) =
-        open_authenticated_bearer_socket(&handle, &host_key, &credentials[0]).await;
-    assert_eq!(overflow_reply, json!({ "type": "e2ee_authenticated" }));
     send_encrypted(
-        &mut first_overflow,
-        &mut first_overflow_transport,
-        br#"{"_tag":"Ping"}"#,
+        &mut waiting,
+        &mut waiting_transport,
+        json!({
+            "_tag": "Request",
+            "id": "2",
+            "tag": "server.getConfig",
+            "payload": {},
+            "headers": []
+        })
+        .to_string()
+        .as_bytes(),
     )
     .await;
-    let _ = next_close_code(&mut first_overflow).await;
+    assert!(
+        timeout(Duration::from_millis(100), waiting.next())
+            .await
+            .is_err(),
+        "principal pressure must backpressure without closing the waiting socket"
+    );
 
     let (mut other_principal, mut other_transport, other_reply) =
         open_authenticated_bearer_socket(&handle, &host_key, &credentials[1]).await;
@@ -890,14 +943,11 @@ async fn inbound_plaintext_capacity_is_partitioned_by_principal_and_released_on_
         .close(None)
         .await
         .expect("close first partial socket");
-    second_partial
-        .close(None)
-        .await
-        .expect("close second partial socket");
-    let (mut recovered, mut recovered_transport, recovered_reply) =
-        open_authenticated_bearer_socket(&handle, &host_key, &credentials[0]).await;
-    assert_eq!(recovered_reply, json!({ "type": "e2ee_authenticated" }));
-    assert_get_config(&mut recovered, &mut recovered_transport).await;
+    let response = recv_encrypted_json(&mut waiting, &mut waiting_transport).await;
+    assert_eq!(response["_tag"], "Exit");
+    assert_eq!(response["requestId"], "2");
+    assert_eq!(response["exit"]["_tag"], "Success");
+    assert_get_config(&mut waiting, &mut waiting_transport).await;
 }
 
 #[tokio::test]

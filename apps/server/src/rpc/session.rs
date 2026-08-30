@@ -132,6 +132,13 @@ pub(crate) struct WeightedByteGrant {
     bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WeightedByteAcquireError {
+    Oversized,
+    Cancelled,
+    Deadline,
+}
+
 struct WeightedByteWaiterGuard {
     inner: Arc<WeightedByteBudget>,
     id: u64,
@@ -176,36 +183,77 @@ impl WeightedByteBudget {
         bytes: usize,
         deadline: Instant,
     ) -> Option<WeightedByteGrant> {
-        if bytes > self.capacity {
-            return None;
-        }
-        let (receiver, mut guard) = {
-            let mut state = self.state.lock().ok()?;
-            let id = state.next_waiter_id;
-            state.next_waiter_id = state.next_waiter_id.wrapping_add(1);
-            let (sender, receiver) = oneshot::channel();
-            let granted = Arc::new(AtomicBool::new(false));
-            state.waiters.push_back(WeightedByteWaiter {
-                id,
-                bytes,
-                granted: Arc::clone(&granted),
-                sender,
-            });
-            grant_weighted_byte_waiters(&mut state);
-            (
-                receiver,
-                WeightedByteWaiterGuard {
-                    inner: Arc::clone(&self),
-                    id,
-                    bytes,
-                    granted,
-                    active: true,
-                },
-            )
-        };
+        let (receiver, mut guard) = Arc::clone(&self).enqueue(bytes).ok()?;
         timeout_at(deadline, receiver).await.ok()?.ok()?;
         guard.active = false;
         Some(WeightedByteGrant { inner: self, bytes })
+    }
+
+    pub(crate) async fn acquire_cancellable(
+        self: Arc<Self>,
+        bytes: usize,
+        cancellation: &CancellationToken,
+        deadline: Option<Instant>,
+    ) -> Result<WeightedByteGrant, WeightedByteAcquireError> {
+        let (receiver, mut guard) = Arc::clone(&self).enqueue(bytes)?;
+        match deadline {
+            Some(deadline) => {
+                tokio::select! {
+                    () = cancellation.cancelled() => {
+                        return Err(WeightedByteAcquireError::Cancelled);
+                    }
+                    result = timeout_at(deadline, receiver) => {
+                        result
+                            .map_err(|_| WeightedByteAcquireError::Deadline)?
+                            .map_err(|_| WeightedByteAcquireError::Cancelled)?;
+                    }
+                }
+            }
+            None => {
+                tokio::select! {
+                    () = cancellation.cancelled() => {
+                        return Err(WeightedByteAcquireError::Cancelled);
+                    }
+                    result = receiver => {
+                        result.map_err(|_| WeightedByteAcquireError::Cancelled)?;
+                    }
+                }
+            }
+        }
+        guard.active = false;
+        Ok(WeightedByteGrant { inner: self, bytes })
+    }
+
+    fn enqueue(
+        self: Arc<Self>,
+        bytes: usize,
+    ) -> Result<(oneshot::Receiver<()>, WeightedByteWaiterGuard), WeightedByteAcquireError> {
+        if bytes > self.capacity {
+            return Err(WeightedByteAcquireError::Oversized);
+        }
+        let mut state = self.state.lock().expect("weighted byte budget lock");
+        let id = state.next_waiter_id;
+        state.next_waiter_id = state.next_waiter_id.wrapping_add(1);
+        let (sender, receiver) = oneshot::channel();
+        let granted = Arc::new(AtomicBool::new(false));
+        state.waiters.push_back(WeightedByteWaiter {
+            id,
+            bytes,
+            granted: Arc::clone(&granted),
+            sender,
+        });
+        grant_weighted_byte_waiters(&mut state);
+        drop(state);
+        Ok((
+            receiver,
+            WeightedByteWaiterGuard {
+                inner: self,
+                id,
+                bytes,
+                granted,
+                active: true,
+            },
+        ))
     }
 
     pub(crate) fn try_acquire(self: Arc<Self>, bytes: usize) -> Option<WeightedByteGrant> {
@@ -234,6 +282,15 @@ impl WeightedByteGrant {
         let released = self.bytes - bytes;
         self.bytes = bytes;
         release_weighted_bytes(Arc::clone(&self.inner), released);
+        Ok(())
+    }
+
+    pub(crate) fn merge(&mut self, mut other: Self) -> Result<(), ()> {
+        if !Arc::ptr_eq(&self.inner, &other.inner) {
+            return Err(());
+        }
+        self.bytes = self.bytes.checked_add(other.bytes).ok_or(())?;
+        other.bytes = 0;
         Ok(())
     }
 }

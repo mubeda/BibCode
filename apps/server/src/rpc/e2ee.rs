@@ -23,11 +23,15 @@ use super::{
     RpcRegistry, RpcSessionContext,
     session::{
         PUMP_JOIN_TIMEOUT, RpcInboundFrame, RpcOutboundBudget, RpcOutboundFrame,
-        RpcOutboundProcessBudget, SOCKET_WRITE_TIMEOUT, run_session_split_budgeted,
+        RpcOutboundProcessBudget, SOCKET_WRITE_TIMEOUT, WeightedByteAcquireError,
+        WeightedByteBudget, WeightedByteGrant, run_session_split_budgeted,
     },
 };
 use crate::{
-    auth::{AuthService, HostIdentity, NOISE_NK_PARAMS, Principal, SessionTransport},
+    auth::{
+        AuthService, AuthenticatedConnectionGuard, HostIdentity, NOISE_NK_PARAMS, Principal,
+        SessionTransport,
+    },
     config::ServerConfig,
     http::spawn_session_expiration_guard,
 };
@@ -40,7 +44,7 @@ pub(crate) const MAX_E2EE_CHUNK_BYTES: usize = MAX_E2EE_CIPHERTEXT_BYTES - NOISE
 pub(crate) const MAX_E2EE_LOGICAL_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_E2EE_PREAUTH_MESSAGE_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_E2EE_RECORDS_PER_MESSAGE: usize = 2_048;
-const E2EE_INBOUND_RECORD_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const E2EE_INCOMPLETE_MESSAGE_PROGRESS_TIMEOUT: Duration = Duration::from_secs(10);
 const E2EE_LOGICAL_WRITE_BYTES_PER_SECOND: usize = 64 * 1024;
 /// One deadline covering upgrade -> handshake -> e2ee_authenticated.
 pub(crate) const E2EE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -51,6 +55,9 @@ pub(crate) const E2EE_MAX_PREAUTH_CONNECTIONS_PER_PEER: usize = 4;
 const E2EE_PREAUTH_BURST_PER_PEER: u8 = 8;
 const E2EE_PREAUTH_REFILL_INTERVAL: Duration = Duration::from_secs(1);
 const E2EE_PREAUTH_PEER_STATE_TTL: Duration = Duration::from_secs(8);
+const E2EE_MAX_PREAUTH_CONNECTIONS_PER_NETWORK: usize = 16;
+const E2EE_MAX_PREAUTH_TRACKED_PEERS: usize = 1_024;
+const E2EE_MAX_PREAUTH_TRACKED_NETWORKS: usize = 1_024;
 pub(crate) const E2EE_MAX_ESTABLISHED_CONNECTIONS: usize = 64;
 pub(crate) const E2EE_MAX_ESTABLISHED_CONNECTIONS_PER_PRINCIPAL: usize = 32;
 pub(crate) const E2EE_INBOUND_BUFFER_BUDGET_BYTES: usize = 128 * 1024 * 1024;
@@ -123,7 +130,26 @@ pub(crate) struct E2eePreauthAdmission {
 
 struct E2eePreauthAdmissionInner {
     global: Arc<Semaphore>,
-    peers: Mutex<HashMap<IpAddr, E2eePreauthPeerState>>,
+    state: Mutex<E2eePreauthState>,
+}
+
+#[derive(Default)]
+struct E2eePreauthState {
+    peers: HashMap<E2eePreauthPeerKey, E2eePreauthPeerState>,
+    networks: HashMap<E2eePreauthNetworkKey, E2eePreauthNetworkState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum E2eePreauthPeerKey {
+    Public(IpAddr),
+    LoopbackForwarder,
+    Unspecified,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum E2eePreauthNetworkKey {
+    V4(u32),
+    V6(u128),
 }
 
 struct E2eePreauthPeerState {
@@ -133,9 +159,15 @@ struct E2eePreauthPeerState {
     last_activity: tokio::time::Instant,
 }
 
+struct E2eePreauthNetworkState {
+    active: usize,
+    last_activity: tokio::time::Instant,
+}
+
 struct E2eePreauthLease {
     inner: Arc<E2eePreauthAdmissionInner>,
-    peer_ip: IpAddr,
+    peer_key: E2eePreauthPeerKey,
+    network_key: Option<E2eePreauthNetworkKey>,
     _global: OwnedSemaphorePermit,
 }
 
@@ -144,7 +176,7 @@ impl E2eePreauthAdmission {
         Self {
             inner: Arc::new(E2eePreauthAdmissionInner {
                 global: Arc::new(Semaphore::new(E2EE_MAX_PREAUTH_CONNECTIONS)),
-                peers: Mutex::new(HashMap::new()),
+                state: Mutex::new(E2eePreauthState::default()),
             }),
         }
     }
@@ -157,45 +189,103 @@ impl E2eePreauthAdmission {
         let global = Arc::clone(&self.inner.global)
             .try_acquire_owned()
             .map_err(|_| "busy")?;
-        let mut peers = self
+        let (peer_key, network_key) = classify_preauth_peer(peer_ip);
+        let mut admission = self
             .inner
-            .peers
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        peers.retain(|_, state| {
+        admission.peers.retain(|_, state| {
             state.active > 0
                 || now.saturating_duration_since(state.last_activity) < E2EE_PREAUTH_PEER_STATE_TTL
         });
-        let state = peers.entry(peer_ip).or_insert(E2eePreauthPeerState {
-            active: 0,
-            tokens: E2EE_PREAUTH_BURST_PER_PEER,
-            last_refill: now,
-            last_activity: now,
+        admission.networks.retain(|_, state| {
+            state.active > 0
+                || now.saturating_duration_since(state.last_activity) < E2EE_PREAUTH_PEER_STATE_TTL
         });
-        let elapsed_intervals = now.saturating_duration_since(state.last_refill).as_secs()
+        if !admission.peers.contains_key(&peer_key) {
+            if admission.peers.len() >= E2EE_MAX_PREAUTH_TRACKED_PEERS {
+                return Err("busy");
+            }
+            admission.peers.insert(
+                peer_key,
+                E2eePreauthPeerState {
+                    active: 0,
+                    tokens: E2EE_PREAUTH_BURST_PER_PEER,
+                    last_refill: now,
+                    last_activity: now,
+                },
+            );
+        }
+        if let Some(network_key) = network_key
+            && !admission.networks.contains_key(&network_key)
+        {
+            if admission.networks.len() >= E2EE_MAX_PREAUTH_TRACKED_NETWORKS {
+                return Err("busy");
+            }
+            admission.networks.insert(
+                network_key,
+                E2eePreauthNetworkState {
+                    active: 0,
+                    last_activity: now,
+                },
+            );
+        }
+
+        let peer_state = admission
+            .peers
+            .get_mut(&peer_key)
+            .expect("pre-auth peer inserted before admission");
+        let elapsed_intervals = now
+            .saturating_duration_since(peer_state.last_refill)
+            .as_secs()
             / E2EE_PREAUTH_REFILL_INTERVAL.as_secs();
         if elapsed_intervals > 0 {
             let replenished = u8::try_from(elapsed_intervals).unwrap_or(u8::MAX);
-            state.tokens = state
+            peer_state.tokens = peer_state
                 .tokens
                 .saturating_add(replenished)
                 .min(E2EE_PREAUTH_BURST_PER_PEER);
-            state.last_refill += E2EE_PREAUTH_REFILL_INTERVAL
+            peer_state.last_refill += E2EE_PREAUTH_REFILL_INTERVAL
                 .saturating_mul(u32::try_from(elapsed_intervals).unwrap_or(u32::MAX));
         }
-        state.last_activity = now;
-        if state.active >= E2EE_MAX_PREAUTH_CONNECTIONS_PER_PEER {
+        peer_state.last_activity = now;
+        if !matches!(peer_key, E2eePreauthPeerKey::LoopbackForwarder)
+            && peer_state.active >= E2EE_MAX_PREAUTH_CONNECTIONS_PER_PEER
+        {
             return Err("busy");
         }
-        if state.tokens == 0 {
+        if peer_state.tokens == 0 {
             return Err("rate");
         }
-        state.tokens -= 1;
-        state.active += 1;
-        drop(peers);
+        if network_key.is_some_and(|network_key| {
+            admission
+                .networks
+                .get(&network_key)
+                .is_some_and(|state| state.active >= E2EE_MAX_PREAUTH_CONNECTIONS_PER_NETWORK)
+        }) {
+            return Err("busy");
+        }
+
+        let peer_state = admission
+            .peers
+            .get_mut(&peer_key)
+            .expect("pre-auth peer remains present");
+        peer_state.tokens -= 1;
+        peer_state.active += 1;
+        if let Some(network_key) = network_key {
+            let network_state = admission
+                .networks
+                .get_mut(&network_key)
+                .expect("pre-auth network inserted before admission");
+            network_state.active += 1;
+            network_state.last_activity = now;
+        }
+        drop(admission);
         Ok(E2eePreauthLease {
             inner: Arc::clone(&self.inner),
-            peer_ip,
+            peer_key,
+            network_key,
             _global: global,
         })
     }
@@ -203,31 +293,71 @@ impl E2eePreauthAdmission {
     #[cfg(test)]
     fn peer_count(&self) -> usize {
         self.inner
-            .peers
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .peers
+            .len()
+    }
+
+    #[cfg(test)]
+    fn network_count(&self) -> usize {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .networks
             .len()
     }
 }
 
 impl Drop for E2eePreauthLease {
     fn drop(&mut self) {
-        let mut peers = self
+        let now = tokio::time::Instant::now();
+        let mut admission = self
             .inner
-            .peers
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(state) = peers.get_mut(&self.peer_ip) {
+        if let Some(state) = admission.peers.get_mut(&self.peer_key) {
             state.active = state.active.saturating_sub(1);
-            state.last_activity = tokio::time::Instant::now();
+            state.last_activity = now;
+        }
+        if let Some(network_key) = self.network_key
+            && let Some(state) = admission.networks.get_mut(&network_key)
+        {
+            state.active = state.active.saturating_sub(1);
+            state.last_activity = now;
         }
     }
+}
+
+fn classify_preauth_peer(peer_ip: IpAddr) -> (E2eePreauthPeerKey, Option<E2eePreauthNetworkKey>) {
+    let peer_ip = match peer_ip {
+        IpAddr::V6(ip) if ip.to_ipv4_mapped().is_some() => {
+            IpAddr::V4(ip.to_ipv4_mapped().expect("mapped IPv4 checked"))
+        }
+        peer_ip => peer_ip,
+    };
+    if peer_ip.is_unspecified() {
+        return (E2eePreauthPeerKey::Unspecified, None);
+    }
+    if peer_ip.is_loopback() {
+        return (E2eePreauthPeerKey::LoopbackForwarder, None);
+    }
+    let network = match peer_ip {
+        IpAddr::V4(ip) => {
+            E2eePreauthNetworkKey::V4(u32::from(ip) & u32::from_be_bytes([255, 255, 255, 0]))
+        }
+        IpAddr::V6(ip) => E2eePreauthNetworkKey::V6(u128::from(ip) & (u128::MAX << 64)),
+    };
+    (E2eePreauthPeerKey::Public(peer_ip), Some(network))
 }
 
 struct E2eeResourceBudget {
     global_established: Arc<Semaphore>,
     per_principal_established: usize,
-    global_inbound: Arc<Semaphore>,
+    global_inbound: Arc<WeightedByteBudget>,
     per_principal_inbound: usize,
     global_outbound: RpcOutboundProcessBudget,
     principals: Mutex<HashMap<String, std::sync::Weak<PrincipalResourceBudget>>>,
@@ -235,7 +365,7 @@ struct E2eeResourceBudget {
 
 struct PrincipalResourceBudget {
     established: Arc<Semaphore>,
-    inbound: Arc<Semaphore>,
+    inbound: Arc<WeightedByteBudget>,
 }
 
 impl E2eeResourceBudget {
@@ -249,7 +379,7 @@ impl E2eeResourceBudget {
         Self {
             global_established: Arc::new(Semaphore::new(global_established)),
             per_principal_established,
-            global_inbound: Arc::new(Semaphore::new(global_inbound)),
+            global_inbound: Arc::new(WeightedByteBudget::new(global_inbound)),
             per_principal_inbound,
             global_outbound: RpcOutboundProcessBudget::new(global_outbound),
             principals: Mutex::new(HashMap::new()),
@@ -280,13 +410,13 @@ impl E2eeResourceBudget {
         }
         let budget = Arc::new(PrincipalResourceBudget {
             established: Arc::new(Semaphore::new(self.per_principal_established)),
-            inbound: Arc::new(Semaphore::new(self.per_principal_inbound)),
+            inbound: Arc::new(WeightedByteBudget::new(self.per_principal_inbound)),
         });
         principals.insert(principal_id.to_owned(), Arc::downgrade(&budget));
         budget
     }
 
-    fn global_inbound(&self) -> Arc<Semaphore> {
+    fn global_inbound(&self) -> Arc<WeightedByteBudget> {
         Arc::clone(&self.global_inbound)
     }
 
@@ -329,7 +459,7 @@ struct E2eeEstablishedPermit {
 }
 
 impl E2eeEstablishedPermit {
-    fn principal_inbound(&self) -> Option<Arc<Semaphore>> {
+    fn principal_inbound(&self) -> Option<Arc<WeightedByteBudget>> {
         self.principal_budget
             .as_ref()
             .map(|budget| Arc::clone(&budget.inbound))
@@ -346,20 +476,26 @@ struct E2eeInboundBudget {
 }
 
 struct E2eeRecordPermit {
-    global: OwnedSemaphorePermit,
-    principal: Option<OwnedSemaphorePermit>,
-    connection: OwnedSemaphorePermit,
+    global: WeightedByteGrant,
+    principal: Option<WeightedByteGrant>,
+    connection: WeightedByteGrant,
 }
 
 impl E2eeRecordPermit {
     fn merge(&mut self, other: Self) {
-        self.global.merge(other.global);
+        self.global
+            .merge(other.global)
+            .expect("record global grants share one budget");
         match (&mut self.principal, other.principal) {
-            (Some(principal), Some(other)) => principal.merge(other),
+            (Some(principal), Some(other)) => principal
+                .merge(other)
+                .expect("record principal grants share one budget"),
             (None, Some(other)) => self.principal = Some(other),
             (_, None) => {}
         }
-        self.connection.merge(other.connection);
+        self.connection
+            .merge(other.connection)
+            .expect("record connection grants share one budget");
     }
 }
 
@@ -391,6 +527,10 @@ struct DecryptedRecord {
 }
 
 impl E2eeChannel {
+    fn has_incomplete_message(&self) -> bool {
+        self.assembling_records > 0
+    }
+
     #[cfg(test)]
     pub(crate) async fn respond<Rx, Tx>(
         host_identity: &HostIdentity,
@@ -948,10 +1088,10 @@ async fn run_established_e2ee(
         accept,
         _permit: established_permit,
     } = admission;
-    let ((context, expiration_guard, connected_session), established_permit) = match accept {
+    let ((context, expiration_guard, connection_guard), established_permit) = match accept {
         E2eeAccept::Authenticated { principal, .. } => {
             let session_id = principal.session_id.clone();
-            let Ok((connection_id, admitted_permit)) = register_e2ee_connection(
+            let Ok((connection_guard, admitted_permit)) = register_e2ee_connection(
                 &auth,
                 &session_id,
                 session_shutdown.clone(),
@@ -971,7 +1111,7 @@ async fn run_established_e2ee(
                     expires_at_ms,
                     session_shutdown.clone(),
                 )),
-                Some((session_id, connection_id)),
+                Some(connection_guard),
             );
             (session, established_permit)
         }
@@ -1016,9 +1156,33 @@ async fn run_established_e2ee(
 
     let inbound_shutdown = session_shutdown.clone();
     let inbound_channel = Arc::clone(&channel);
-    let inbound_connection_permits = Arc::new(Semaphore::new(MAX_E2EE_LOGICAL_MESSAGE_BYTES));
+    let inbound_connection_permits =
+        Arc::new(WeightedByteBudget::new(MAX_E2EE_LOGICAL_MESSAGE_BYTES));
     let inbound_pump = tokio::spawn(async move {
-        while let Some(frame) = ws_reader.next().await {
+        let mut assembly_deadline = None;
+        loop {
+            let frame = match assembly_deadline {
+                Some(deadline) => {
+                    tokio::select! {
+                        () = inbound_shutdown.cancelled() => break,
+                        frame = timeout_at(deadline, ws_reader.next()) => {
+                            match frame {
+                                Ok(Some(frame)) => frame,
+                                Ok(None) | Err(_) => break,
+                            }
+                        }
+                    }
+                }
+                None => {
+                    tokio::select! {
+                        () = inbound_shutdown.cancelled() => break,
+                        frame = ws_reader.next() => {
+                            let Some(frame) = frame else { break };
+                            frame
+                        }
+                    }
+                }
+            };
             let message = match frame {
                 Ok(Message::Binary(bytes)) => {
                     let record = {
@@ -1040,6 +1204,8 @@ async fn run_established_e2ee(
                         &global_inbound_permits,
                         principal_inbound_permits.as_ref(),
                         &inbound_connection_permits,
+                        &inbound_shutdown,
+                        assembly_deadline,
                     )
                     .await
                     {
@@ -1050,6 +1216,12 @@ async fn run_established_e2ee(
                         .lock()
                         .expect("E2EE channel lock")
                         .assemble_decrypted_record(record, MAX_E2EE_LOGICAL_MESSAGE_BYTES, permit);
+                    let incomplete = inbound_channel
+                        .lock()
+                        .expect("E2EE channel lock")
+                        .has_incomplete_message();
+                    assembly_deadline = incomplete
+                        .then(|| Instant::now() + E2EE_INCOMPLETE_MESSAGE_PROGRESS_TIMEOUT);
                     match decrypted {
                         Ok(Some(BudgetedPlaintext { plaintext, permits })) => {
                             RpcInboundFrame::guarded(
@@ -1094,8 +1266,8 @@ async fn run_established_e2ee(
     }
     reap_pump(outbound_pump).await;
     reap_pump(inbound_pump).await;
-    if let Some((session_id, connection_id)) = connected_session {
-        auth.mark_disconnected(&session_id, connection_id).await;
+    if let Some(connection_guard) = connection_guard {
+        connection_guard.close().await;
     }
 }
 
@@ -1104,9 +1276,12 @@ async fn register_e2ee_connection(
     session_id: &str,
     session_shutdown: CancellationToken,
     established_permit: E2eeEstablishedPermit,
-) -> Result<(u64, E2eeEstablishedPermit), crate::auth::AuthError> {
-    match auth.mark_connected(session_id, session_shutdown).await {
-        Ok(connection_id) => Ok((connection_id, established_permit)),
+) -> Result<(AuthenticatedConnectionGuard, E2eeEstablishedPermit), crate::auth::AuthError> {
+    match auth
+        .mark_connected_guard(session_id, session_shutdown)
+        .await
+    {
+        Ok(connection_guard) => Ok((connection_guard, established_permit)),
         Err(error) => {
             drop(established_permit);
             Err(error)
@@ -1119,9 +1294,9 @@ async fn decrypt_inbound_frame_budgeted(
     channel: &mut E2eeChannel,
     frame: &[u8],
     max_message_bytes: usize,
-    global_budget: &Arc<Semaphore>,
-    principal_budget: Option<&Arc<Semaphore>>,
-    connection_budget: &Arc<Semaphore>,
+    global_budget: &Arc<WeightedByteBudget>,
+    principal_budget: Option<&Arc<WeightedByteBudget>>,
+    connection_budget: &Arc<WeightedByteBudget>,
 ) -> Result<Option<BudgetedPlaintext>, E2eeSessionError> {
     let record = channel.decrypt_record(frame)?;
     channel.validate_decrypted_record(&record, max_message_bytes)?;
@@ -1130,6 +1305,8 @@ async fn decrypt_inbound_frame_budgeted(
         global_budget,
         principal_budget,
         connection_budget,
+        &CancellationToken::new(),
+        None,
     )
     .await?;
     channel.assemble_decrypted_record(record, max_message_bytes, permit)
@@ -1137,37 +1314,48 @@ async fn decrypt_inbound_frame_budgeted(
 
 async fn acquire_inbound_bytes(
     bytes: usize,
-    global_budget: &Arc<Semaphore>,
-    principal_budget: Option<&Arc<Semaphore>>,
-    connection_budget: &Arc<Semaphore>,
+    global_budget: &Arc<WeightedByteBudget>,
+    principal_budget: Option<&Arc<WeightedByteBudget>>,
+    connection_budget: &Arc<WeightedByteBudget>,
+    cancellation: &CancellationToken,
+    deadline: Option<Instant>,
 ) -> Result<Option<E2eeRecordPermit>, E2eeSessionError> {
     if bytes == 0 {
         return Ok(None);
     }
-    let permits = u32::try_from(bytes)
-        .map_err(|_| E2eeSessionError::Protocol("record budget overflow".into()))?;
-    let global = timeout(
-        E2EE_INBOUND_RECORD_WAIT_TIMEOUT,
-        Arc::clone(global_budget).acquire_many_owned(permits),
-    )
-    .await
-    .map_err(|_| E2eeSessionError::Timeout)?
-    .map_err(|_| E2eeSessionError::Protocol("global buffer budget closed".into()))?;
-    let principal = principal_budget
-        .map(|budget| {
-            Arc::clone(budget)
-                .try_acquire_many_owned(permits)
-                .map_err(|_| E2eeSessionError::Protocol("principal buffer budget exhausted".into()))
-        })
-        .transpose()?;
     let connection = Arc::clone(connection_budget)
-        .try_acquire_many_owned(permits)
-        .map_err(|_| E2eeSessionError::Protocol("connection buffer budget exhausted".into()))?;
+        .acquire_cancellable(bytes, cancellation, deadline)
+        .await
+        .map_err(map_inbound_budget_error)?;
+    let principal = if let Some(principal_budget) = principal_budget {
+        Some(
+            Arc::clone(principal_budget)
+                .acquire_cancellable(bytes, cancellation, deadline)
+                .await
+                .map_err(map_inbound_budget_error)?,
+        )
+    } else {
+        None
+    };
+    let global = Arc::clone(global_budget)
+        .acquire_cancellable(bytes, cancellation, deadline)
+        .await
+        .map_err(map_inbound_budget_error)?;
     Ok(Some(E2eeRecordPermit {
         global,
         principal,
         connection,
     }))
+}
+
+fn map_inbound_budget_error(error: WeightedByteAcquireError) -> E2eeSessionError {
+    match error {
+        WeightedByteAcquireError::Oversized => {
+            E2eeSessionError::Protocol("record buffer budget overflow".into())
+        }
+        WeightedByteAcquireError::Cancelled => E2eeSessionError::Closed,
+        WeightedByteAcquireError::Deadline => E2eeSessionError::Timeout,
+    }
 }
 
 async fn reap_pump(mut pump: tokio::task::JoinHandle<()>) {
@@ -1196,7 +1384,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn preauth_admission_partitions_slots_and_refills_peer_tokens() {
         let admission = E2eePreauthAdmission::new();
-        let peer = "127.0.0.2".parse().expect("peer IP");
+        let peer = "198.51.100.42".parse().expect("peer IP");
         let now = tokio::time::Instant::now();
         let mut leases = (0..E2EE_MAX_PREAUTH_CONNECTIONS_PER_PEER)
             .map(|_| admission.try_admit(peer, now).expect("per-peer slot"))
@@ -1227,12 +1415,12 @@ mod tests {
         let now = tokio::time::Instant::now();
         let mut leases = Vec::new();
         for peer_index in 1..=8 {
-            let peer = std::net::Ipv4Addr::new(127, 0, 1, peer_index).into();
+            let peer = std::net::Ipv4Addr::new(198, 18, peer_index, 1).into();
             for _ in 0..E2EE_MAX_PREAUTH_CONNECTIONS_PER_PEER {
                 leases.push(admission.try_admit(peer, now).expect("global slot"));
             }
         }
-        let overflow_peer = "127.0.2.1".parse().expect("overflow peer IP");
+        let overflow_peer = "203.0.113.1".parse().expect("overflow peer IP");
         assert!(matches!(
             admission.try_admit(overflow_peer, now),
             Err("busy")
@@ -1240,13 +1428,130 @@ mod tests {
 
         leases.clear();
         tokio::time::advance(E2EE_PREAUTH_PEER_STATE_TTL).await;
-        let trigger_peer = "127.0.3.1".parse().expect("trigger peer IP");
+        let trigger_peer = "203.0.114.1".parse().expect("trigger peer IP");
         drop(
             admission
                 .try_admit(trigger_peer, tokio::time::Instant::now())
                 .expect("released global slot"),
         );
         assert_eq!(admission.peer_count(), 1);
+        assert_eq!(admission.network_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn one_public_subnet_cannot_consume_more_than_half_the_global_pool() {
+        let admission = E2eePreauthAdmission::new();
+        let now = tokio::time::Instant::now();
+        let mut leases = Vec::new();
+        for host in 1..=16 {
+            let peer = std::net::Ipv4Addr::new(203, 0, 113, host).into();
+            leases.push(admission.try_admit(peer, now).expect("subnet slot"));
+        }
+        let seventeenth = std::net::Ipv4Addr::new(203, 0, 113, 17).into();
+        assert!(matches!(admission.try_admit(seventeenth, now), Err("busy")));
+        drop(leases);
+    }
+
+    #[test]
+    fn preauth_network_keys_canonicalize_ipv4_24_and_ipv6_64() {
+        let (_, first_v4) = classify_preauth_peer("192.0.2.1".parse().expect("first IPv4"));
+        let (_, same_v4) = classify_preauth_peer("192.0.2.200".parse().expect("same IPv4 /24"));
+        let (_, other_v4) = classify_preauth_peer("192.0.3.1".parse().expect("other IPv4 /24"));
+        assert_eq!(first_v4, same_v4);
+        assert_ne!(first_v4, other_v4);
+
+        let (_, first_v6) = classify_preauth_peer("2001:db8:1::1".parse().expect("first IPv6"));
+        let (_, same_v6) =
+            classify_preauth_peer("2001:db8:1::ffff".parse().expect("same IPv6 /64"));
+        let (_, other_v6) = classify_preauth_peer("2001:db8:2::1".parse().expect("other IPv6 /64"));
+        assert_eq!(first_v6, same_v6);
+        assert_ne!(first_v6, other_v6);
+    }
+
+    #[tokio::test]
+    async fn one_ipv6_64_cannot_consume_more_than_half_the_global_pool() {
+        let admission = E2eePreauthAdmission::new();
+        let now = tokio::time::Instant::now();
+        let mut leases = Vec::new();
+        for host in 1..=16 {
+            let peer = std::net::Ipv6Addr::new(0x2001, 0xdb8, 1, 2, 0, 0, 0, host).into();
+            leases.push(admission.try_admit(peer, now).expect("IPv6 subnet slot"));
+        }
+        let seventeenth = std::net::Ipv6Addr::new(0x2001, 0xdb8, 1, 2, 0, 0, 0, 17).into();
+        assert!(matches!(admission.try_admit(seventeenth, now), Err("busy")));
+        drop(leases);
+    }
+
+    #[tokio::test]
+    async fn loopback_forwarder_can_use_global_capacity_without_the_public_peer_cap() {
+        let admission = E2eePreauthAdmission::new();
+        let now = tokio::time::Instant::now();
+        let mut leases = Vec::new();
+        for _ in 0..5 {
+            leases.push(
+                admission
+                    .try_admit("127.0.0.1".parse().expect("loopback"), now)
+                    .expect("trusted loopback-forwarder slot"),
+            );
+        }
+        drop(leases);
+    }
+
+    #[tokio::test]
+    async fn missing_connect_info_uses_the_strict_unspecified_bucket() {
+        let admission = E2eePreauthAdmission::new();
+        let now = tokio::time::Instant::now();
+        let unspecified = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+        let mut leases = (0..E2EE_MAX_PREAUTH_CONNECTIONS_PER_PEER)
+            .map(|_| {
+                admission
+                    .try_admit(unspecified, now)
+                    .expect("strict unspecified slot")
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(admission.try_admit(unspecified, now), Err("busy")));
+        leases.clear();
+    }
+
+    #[tokio::test]
+    async fn unrelated_public_networks_still_stop_at_the_global_cap() {
+        let admission = E2eePreauthAdmission::new();
+        let now = tokio::time::Instant::now();
+        let mut leases = Vec::new();
+        for network in 0..E2EE_MAX_PREAUTH_CONNECTIONS {
+            let peer = std::net::Ipv4Addr::new(198, 19, u8::try_from(network).unwrap(), 1).into();
+            leases.push(admission.try_admit(peer, now).expect("global slot"));
+        }
+        assert!(matches!(
+            admission.try_admit("203.0.113.1".parse().expect("overflow peer"), now),
+            Err("busy")
+        ));
+        drop(leases);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_preauth_peer_and_network_entries_are_pruned_without_exceeding_the_map_cap() {
+        let admission = E2eePreauthAdmission::new();
+        let now = tokio::time::Instant::now();
+        for network in 0..1_024_u16 {
+            let peer = std::net::Ipv6Addr::new(0x2001, 0xdb8, network, 0, 0, 0, 0, 1).into();
+            drop(
+                admission
+                    .try_admit(peer, now)
+                    .expect("tracked peer and network"),
+            );
+        }
+        let overflow = std::net::Ipv6Addr::new(0x2001, 0xdb8, 1_024, 0, 0, 0, 0, 1).into();
+        assert!(matches!(admission.try_admit(overflow, now), Err("busy")));
+
+        tokio::time::advance(E2EE_PREAUTH_PEER_STATE_TTL).await;
+        drop(
+            admission
+                .try_admit(overflow, tokio::time::Instant::now())
+                .expect("expired entries are pruned before admission"),
+        );
+        assert_eq!(admission.peer_count(), 1);
+        assert_eq!(admission.network_count(), 1);
     }
 
     #[tokio::test]
@@ -1642,8 +1947,8 @@ mod tests {
         let (mut initiator, mut responder) = establish().await;
         let continuation = vec![b'f'; MAX_E2EE_CHUNK_BYTES];
         let message_bytes = continuation.len() + b"second".len();
-        let global_budget = Arc::new(Semaphore::new(message_bytes));
-        let connection_budget = Arc::new(Semaphore::new(message_bytes));
+        let global_budget = Arc::new(WeightedByteBudget::new(message_bytes));
+        let connection_budget = Arc::new(WeightedByteBudget::new(message_bytes));
         let frames = initiator_encrypt(
             &mut initiator,
             &[
@@ -1680,20 +1985,20 @@ mod tests {
         assert_eq!(completed.plaintext.len(), MAX_E2EE_CHUNK_BYTES + 6);
         assert!(completed.plaintext.starts_with(&continuation));
         assert!(completed.plaintext.ends_with(b"second"));
-        assert!(Arc::clone(&global_budget).try_acquire_owned().is_err());
-        assert!(Arc::clone(&connection_budget).try_acquire_owned().is_err());
+        assert!(Arc::clone(&global_budget).try_acquire(1).is_none());
+        assert!(Arc::clone(&connection_budget).try_acquire(1).is_none());
         drop(completed);
-        assert!(Arc::clone(&global_budget).try_acquire_owned().is_ok());
-        assert!(Arc::clone(&connection_budget).try_acquire_owned().is_ok());
+        assert!(Arc::clone(&global_budget).try_acquire(1).is_some());
+        assert!(Arc::clone(&connection_budget).try_acquire(1).is_some());
     }
 
     #[tokio::test]
     async fn inbound_global_pressure_waits_for_capacity_instead_of_closing_the_victim() {
         let (mut first_initiator, mut first_responder) = establish().await;
         let (mut second_initiator, mut second_responder) = establish().await;
-        let global_budget = Arc::new(Semaphore::new(MAX_E2EE_CHUNK_BYTES));
-        let first_connection_budget = Arc::new(Semaphore::new(MAX_E2EE_CHUNK_BYTES));
-        let second_connection_budget = Arc::new(Semaphore::new(MAX_E2EE_CHUNK_BYTES));
+        let global_budget = Arc::new(WeightedByteBudget::new(MAX_E2EE_CHUNK_BYTES));
+        let first_connection_budget = Arc::new(WeightedByteBudget::new(MAX_E2EE_CHUNK_BYTES));
+        let second_connection_budget = Arc::new(WeightedByteBudget::new(MAX_E2EE_CHUNK_BYTES));
         let first_frame = initiator_encrypt(
             &mut first_initiator,
             &[record(
@@ -1747,8 +2052,70 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn principal_pressure_backpressures_a_second_connection_without_closing_it() {
+        let (mut first_initiator, mut first_responder) = establish().await;
+        let (mut second_initiator, mut second_responder) = establish().await;
+        let held_bytes = b"held!".len();
+        let global_budget = Arc::new(WeightedByteBudget::new(held_bytes * 2));
+        let principal_budget = Arc::new(WeightedByteBudget::new(held_bytes));
+        let first_connection_budget = Arc::new(WeightedByteBudget::new(held_bytes));
+        let second_connection_budget = Arc::new(WeightedByteBudget::new(held_bytes));
+        let first_frame = initiator_encrypt(
+            &mut first_initiator,
+            &[record(E2EE_RECORD_FLAG_CONTINUATION, b"held!")],
+        )
+        .pop()
+        .unwrap();
+        let second_frame = initiator_encrypt(
+            &mut second_initiator,
+            &[record(E2EE_RECORD_FLAG_FINAL, b"other")],
+        )
+        .pop()
+        .unwrap();
+
+        assert!(
+            decrypt_inbound_frame_budgeted(
+                &mut first_responder,
+                &first_frame,
+                MAX_E2EE_LOGICAL_MESSAGE_BYTES,
+                &global_budget,
+                Some(&principal_budget),
+                &first_connection_budget,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        let waiting = tokio::spawn(async move {
+            decrypt_inbound_frame_budgeted(
+                &mut second_responder,
+                &second_frame,
+                MAX_E2EE_LOGICAL_MESSAGE_BYTES,
+                &global_budget,
+                Some(&principal_budget),
+                &second_connection_budget,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiting.is_finished(),
+            "principal pressure must backpressure instead of returning Protocol"
+        );
+
+        drop(first_responder);
+        assert!(
+            waiting
+                .await
+                .expect("waiting decrypt task")
+                .expect("principal capacity becomes available")
+                .is_some()
+        );
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn inbound_global_pressure_times_out_after_five_seconds() {
+    async fn inbound_global_pressure_waits_past_five_seconds_and_resumes() {
         let (mut initiator, mut responder) = establish().await;
         let frame = initiator_encrypt(
             &mut initiator,
@@ -1756,12 +2123,11 @@ mod tests {
         )
         .pop()
         .unwrap();
-        let global_budget = Arc::new(Semaphore::new(b"blocked".len()));
+        let global_budget = Arc::new(WeightedByteBudget::new(b"blocked".len()));
         let held = Arc::clone(&global_budget)
-            .acquire_many_owned(u32::try_from(b"blocked".len()).unwrap())
-            .await
-            .unwrap();
-        let connection_budget = Arc::new(Semaphore::new(b"blocked".len()));
+            .try_acquire(b"blocked".len())
+            .expect("hold global capacity");
+        let connection_budget = Arc::new(WeightedByteBudget::new(b"blocked".len()));
         let waiting = tokio::spawn(async move {
             decrypt_inbound_frame_budgeted(
                 &mut responder,
@@ -1774,21 +2140,29 @@ mod tests {
             .await
         });
         tokio::task::yield_now().await;
-        tokio::time::advance(E2EE_INBOUND_RECORD_WAIT_TIMEOUT).await;
-        assert!(matches!(
-            waiting.await.expect("waiting decrypt task"),
-            Err(E2eeSessionError::Timeout)
-        ));
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !waiting.is_finished(),
+            "shared capacity pressure has no flat five-second disconnect"
+        );
         drop(held);
+        assert!(
+            waiting
+                .await
+                .expect("waiting decrypt task")
+                .expect("global capacity becomes available")
+                .is_some()
+        );
     }
 
     #[tokio::test]
     async fn one_connection_cannot_monopolize_the_global_budget() {
         let (mut first_initiator, mut first_responder) = establish().await;
         let (mut second_initiator, mut second_responder) = establish().await;
-        let global_budget = Arc::new(Semaphore::new(MAX_E2EE_CHUNK_BYTES * 2));
-        let first_connection_budget = Arc::new(Semaphore::new(MAX_E2EE_CHUNK_BYTES));
-        let second_connection_budget = Arc::new(Semaphore::new(MAX_E2EE_CHUNK_BYTES));
+        let global_budget = Arc::new(WeightedByteBudget::new(MAX_E2EE_CHUNK_BYTES * 2));
+        let first_connection_budget = Arc::new(WeightedByteBudget::new(MAX_E2EE_CHUNK_BYTES * 2));
+        let second_connection_budget = Arc::new(WeightedByteBudget::new(MAX_E2EE_CHUNK_BYTES));
         let continuation = record(
             E2EE_RECORD_FLAG_CONTINUATION,
             &vec![0_u8; MAX_E2EE_CHUNK_BYTES],
@@ -1819,7 +2193,7 @@ mod tests {
             decrypt_inbound_frame_budgeted(
                 &mut first_responder,
                 &first_frames[1],
-                MAX_E2EE_LOGICAL_MESSAGE_BYTES,
+                MAX_E2EE_CHUNK_BYTES,
                 &global_budget,
                 None,
                 &first_connection_budget,
@@ -1852,8 +2226,8 @@ mod tests {
         records.push(record(E2EE_RECORD_FLAG_FINAL, b"done"));
         let frames = initiator_encrypt(&mut initiator, &records);
         let message_bytes = continuation_count + b"done".len();
-        let global_budget = Arc::new(Semaphore::new(message_bytes));
-        let connection_budget = Arc::new(Semaphore::new(message_bytes));
+        let global_budget = Arc::new(WeightedByteBudget::new(message_bytes));
+        let connection_budget = Arc::new(WeightedByteBudget::new(message_bytes));
         let mut completed = None;
 
         for frame in &frames {
@@ -1951,8 +2325,8 @@ mod tests {
             Err(crate::auth::AuthError::InvalidCredential)
         ));
         assert!(session_shutdown.is_cancelled());
-        assert_eq!(global_inbound.available_permits(), 8);
-        assert_eq!(principal_inbound.available_permits(), 4);
+        assert!(Arc::clone(&global_inbound).try_acquire(8).is_some());
+        assert!(Arc::clone(&principal_inbound).try_acquire(4).is_some());
         assert!(
             budget
                 .try_reserve()
