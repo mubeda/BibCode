@@ -1,12 +1,12 @@
 use std::{
     any::Any,
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     future::Future,
     io,
     panic::AssertUnwindSafe,
     pin::Pin,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -16,13 +16,14 @@ use axum::extract::ws::{Message, WebSocket};
 use futures_util::{FutureExt, Sink, SinkExt, Stream, StreamExt};
 use serde_json::{Value, json};
 use tokio::{
-    sync::{Notify, mpsc, oneshot, watch},
+    sync::{mpsc, watch},
     task::JoinHandle,
     time::{Instant, timeout, timeout_at},
 };
 use tokio_util::sync::CancellationToken;
 
 use super::{
+    byte_budget::{RpcOutboundBudget, RpcOutboundBytePermit},
     message::{ClientMessage, RequestId, RpcRequest, ServerMessage},
     methods::{ACTIVE_RPC_METHODS, MethodMode},
 };
@@ -64,580 +65,6 @@ pub(crate) trait RpcResponseEnqueueGuard: Send {
     }
 
     fn enqueue(self: Box<Self>, permit: RpcResponseEnqueuePermit, response: ServerMessage);
-}
-
-#[derive(Clone)]
-pub(crate) struct RpcOutboundBudget {
-    process: RpcOutboundProcessBudget,
-    connection: Arc<WeightedByteBudget>,
-    connection_capacity: usize,
-    #[cfg(test)]
-    after_combined_probe: Option<Arc<Mutex<Option<RpcOutboundProbeGate>>>>,
-}
-
-#[cfg(test)]
-struct RpcOutboundProbeGate {
-    reached: Arc<tokio::sync::Barrier>,
-    resume: Arc<tokio::sync::Barrier>,
-}
-
-impl RpcOutboundBudget {
-    pub(crate) fn new(process: RpcOutboundProcessBudget, connection_capacity: usize) -> Self {
-        Self {
-            process,
-            connection: Arc::new(WeightedByteBudget::new(connection_capacity)),
-            connection_capacity,
-            #[cfg(test)]
-            after_combined_probe: None,
-        }
-    }
-
-    #[cfg(test)]
-    fn with_after_combined_probe(
-        mut self,
-        reached: Arc<tokio::sync::Barrier>,
-        resume: Arc<tokio::sync::Barrier>,
-    ) -> Self {
-        self.after_combined_probe = Some(Arc::new(Mutex::new(Some(RpcOutboundProbeGate {
-            reached,
-            resume,
-        }))));
-        self
-    }
-
-    async fn acquire(&self, bytes: usize, deadline: Instant) -> Result<RpcOutboundBytePermit, ()> {
-        if bytes > self.connection_capacity || bytes > self.process.inner.capacity {
-            return Err(());
-        }
-        let (mut receiver, mut guard) = self.enqueue(bytes)?;
-        loop {
-            let process_changed = self.process.inner.changed.notified();
-            let connection_changed = self.connection.changed.notified();
-            tokio::pin!(process_changed, connection_changed);
-            process_changed.as_mut().enable();
-            connection_changed.as_mut().enable();
-            self.process.grant_combined_waiters();
-
-            #[cfg(test)]
-            if let Some(gate) = self
-                .after_combined_probe
-                .as_ref()
-                .and_then(|gate| gate.lock().expect("outbound probe gate lock").take())
-            {
-                gate.reached.wait().await;
-                gate.resume.wait().await;
-            }
-
-            tokio::select! {
-                biased;
-                result = &mut receiver => {
-                    result.map_err(|_| ())?;
-                    guard.active = false;
-                    return Ok(RpcOutboundBytePermit {
-                        process: WeightedByteGrant {
-                            inner: Arc::clone(&self.process.inner),
-                            bytes,
-                        },
-                        connection: WeightedByteGrant {
-                            inner: Arc::clone(&self.connection),
-                            bytes,
-                        },
-                    });
-                }
-                () = tokio::time::sleep_until(deadline) => return Err(()),
-                () = &mut process_changed => {}
-                () = &mut connection_changed => {}
-            }
-        }
-    }
-
-    fn enqueue(
-        &self,
-        bytes: usize,
-    ) -> Result<(oneshot::Receiver<()>, RpcOutboundCombinedWaiterGuard), ()> {
-        if bytes > self.connection_capacity || bytes > self.process.inner.capacity {
-            return Err(());
-        }
-        let mut state = self.process.combined.lock().map_err(|_| ())?;
-        let id = state.next_waiter_id;
-        state.next_waiter_id = state.next_waiter_id.wrapping_add(1);
-        let (sender, receiver) = oneshot::channel();
-        let granted = Arc::new(AtomicBool::new(false));
-        state.waiters.push_back(RpcOutboundCombinedWaiter {
-            id,
-            bytes,
-            connection: Arc::clone(&self.connection),
-            granted: Arc::clone(&granted),
-            sender,
-        });
-        drop(state);
-        Ok((
-            receiver,
-            RpcOutboundCombinedWaiterGuard {
-                process: self.process.clone(),
-                connection: Arc::clone(&self.connection),
-                id,
-                bytes,
-                granted,
-                active: true,
-            },
-        ))
-    }
-
-    fn try_acquire(&self, bytes: usize) -> Result<RpcOutboundBytePermit, ()> {
-        self.try_acquire_both(bytes).ok_or(())
-    }
-
-    fn try_acquire_both(&self, bytes: usize) -> Option<RpcOutboundBytePermit> {
-        if bytes > self.connection_capacity || bytes > self.process.inner.capacity {
-            return None;
-        }
-
-        // Every two-tier acquisition takes the process-wide combined queue,
-        // shared process lock, and per-connection lock in that order. Capacity
-        // is either reserved from both tiers or from neither.
-        let combined = self.process.combined.lock().ok()?;
-        let mut process_state = self.process.inner.state.lock().ok()?;
-        let mut connection_state = self.connection.state.lock().ok()?;
-        if !combined.waiters.is_empty()
-            || !process_state.waiters.is_empty()
-            || !connection_state.waiters.is_empty()
-            || process_state.available < bytes
-            || connection_state.available < bytes
-        {
-            return None;
-        }
-        process_state.available -= bytes;
-        connection_state.available -= bytes;
-        drop(connection_state);
-        drop(process_state);
-        drop(combined);
-
-        Some(RpcOutboundBytePermit {
-            process: WeightedByteGrant {
-                inner: Arc::clone(&self.process.inner),
-                bytes,
-            },
-            connection: WeightedByteGrant {
-                inner: Arc::clone(&self.connection),
-                bytes,
-            },
-        })
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct RpcOutboundProcessBudget {
-    inner: Arc<WeightedByteBudget>,
-    combined: Arc<Mutex<RpcOutboundCombinedState>>,
-}
-
-struct RpcOutboundCombinedState {
-    next_waiter_id: u64,
-    waiters: VecDeque<RpcOutboundCombinedWaiter>,
-}
-
-struct RpcOutboundCombinedWaiter {
-    id: u64,
-    bytes: usize,
-    connection: Arc<WeightedByteBudget>,
-    granted: Arc<AtomicBool>,
-    sender: oneshot::Sender<()>,
-}
-
-struct RpcOutboundCombinedWaiterGuard {
-    process: RpcOutboundProcessBudget,
-    connection: Arc<WeightedByteBudget>,
-    id: u64,
-    bytes: usize,
-    granted: Arc<AtomicBool>,
-    active: bool,
-}
-
-pub(crate) struct WeightedByteBudget {
-    capacity: usize,
-    state: Mutex<WeightedByteBudgetState>,
-    changed: Notify,
-}
-
-struct WeightedByteBudgetState {
-    available: usize,
-    next_waiter_id: u64,
-    waiters: VecDeque<WeightedByteWaiter>,
-}
-
-struct WeightedByteWaiter {
-    id: u64,
-    bytes: usize,
-    granted: Arc<AtomicBool>,
-    sender: oneshot::Sender<()>,
-}
-
-pub(crate) struct WeightedByteGrant {
-    inner: Arc<WeightedByteBudget>,
-    bytes: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WeightedByteAcquireError {
-    Oversized,
-    Cancelled,
-    Deadline,
-}
-
-struct WeightedByteWaiterGuard {
-    inner: Arc<WeightedByteBudget>,
-    id: u64,
-    bytes: usize,
-    granted: Arc<AtomicBool>,
-    active: bool,
-}
-
-impl RpcOutboundProcessBudget {
-    pub(crate) fn new(capacity: usize) -> Self {
-        Self {
-            inner: Arc::new(WeightedByteBudget::new(capacity)),
-            combined: Arc::new(Mutex::new(RpcOutboundCombinedState {
-                next_waiter_id: 0,
-                waiters: VecDeque::new(),
-            })),
-        }
-    }
-
-    fn grant_combined_waiters(&self) {
-        let mut combined = self.combined.lock().expect("combined outbound budget lock");
-        let mut process_state = self.inner.state.lock().expect("process byte budget lock");
-        if !process_state.waiters.is_empty() {
-            return;
-        }
-
-        loop {
-            let candidate = combined
-                .waiters
-                .iter()
-                .enumerate()
-                .find_map(|(index, waiter)| {
-                    let connection_state = waiter.connection.state.lock().ok()?;
-                    let fits = connection_state.waiters.is_empty()
-                        && waiter.bytes <= process_state.available
-                        && waiter.bytes <= connection_state.available;
-                    drop(connection_state);
-                    fits.then(|| (index, Arc::clone(&waiter.connection)))
-                });
-            let Some((index, connection)) = candidate else {
-                return;
-            };
-            let mut connection_state = connection
-                .state
-                .lock()
-                .expect("connection byte budget lock");
-            let waiter = combined
-                .waiters
-                .remove(index)
-                .expect("selected combined outbound waiter exists");
-            debug_assert!(waiter.bytes <= process_state.available);
-            debug_assert!(waiter.bytes <= connection_state.available);
-            process_state.available -= waiter.bytes;
-            connection_state.available -= waiter.bytes;
-            waiter.granted.store(true, Ordering::Release);
-            if waiter.sender.send(()).is_err() {
-                waiter.granted.store(false, Ordering::Release);
-                process_state.available = process_state
-                    .available
-                    .saturating_add(waiter.bytes)
-                    .min(self.inner.capacity);
-                connection_state.available = connection_state
-                    .available
-                    .saturating_add(waiter.bytes)
-                    .min(connection.capacity);
-            }
-        }
-    }
-
-    #[cfg(test)]
-    async fn acquire(&self, bytes: usize, deadline: Instant) -> Result<WeightedByteGrant, ()> {
-        Arc::clone(&self.inner)
-            .acquire(bytes, deadline)
-            .await
-            .ok_or(())
-    }
-
-    #[cfg(test)]
-    fn try_acquire(&self, bytes: usize) -> Result<WeightedByteGrant, ()> {
-        let combined = self.combined.lock().map_err(|_| ())?;
-        if !combined.waiters.is_empty() {
-            return Err(());
-        }
-        let grant = Arc::clone(&self.inner).try_acquire(bytes).ok_or(())?;
-        drop(combined);
-        Ok(grant)
-    }
-}
-
-impl Drop for RpcOutboundCombinedWaiterGuard {
-    fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-        let mut combined = self
-            .process
-            .combined
-            .lock()
-            .expect("combined outbound budget lock");
-        let mut process_state = self
-            .process
-            .inner
-            .state
-            .lock()
-            .expect("process byte budget lock");
-        let mut connection_state = self
-            .connection
-            .state
-            .lock()
-            .expect("connection byte budget lock");
-        if let Some(index) = combined
-            .waiters
-            .iter()
-            .position(|waiter| waiter.id == self.id)
-        {
-            combined.waiters.remove(index);
-        } else if self.granted.swap(false, Ordering::AcqRel) {
-            process_state.available = process_state
-                .available
-                .saturating_add(self.bytes)
-                .min(self.process.inner.capacity);
-            connection_state.available = connection_state
-                .available
-                .saturating_add(self.bytes)
-                .min(self.connection.capacity);
-        }
-        drop(connection_state);
-        drop(process_state);
-        drop(combined);
-        self.process.grant_combined_waiters();
-        self.process.inner.changed.notify_waiters();
-        self.connection.changed.notify_waiters();
-    }
-}
-
-impl WeightedByteBudget {
-    pub(crate) fn new(capacity: usize) -> Self {
-        Self {
-            capacity,
-            state: Mutex::new(WeightedByteBudgetState {
-                available: capacity,
-                next_waiter_id: 0,
-                waiters: VecDeque::new(),
-            }),
-            changed: Notify::new(),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn acquire(
-        self: Arc<Self>,
-        bytes: usize,
-        deadline: Instant,
-    ) -> Option<WeightedByteGrant> {
-        let (receiver, mut guard) = Arc::clone(&self).enqueue(bytes).ok()?;
-        timeout_at(deadline, receiver).await.ok()?.ok()?;
-        guard.active = false;
-        Some(WeightedByteGrant { inner: self, bytes })
-    }
-
-    pub(crate) async fn acquire_cancellable(
-        self: Arc<Self>,
-        bytes: usize,
-        cancellation: &CancellationToken,
-        deadline: Option<Instant>,
-    ) -> Result<WeightedByteGrant, WeightedByteAcquireError> {
-        let (receiver, mut guard) = Arc::clone(&self).enqueue(bytes)?;
-        match deadline {
-            Some(deadline) => {
-                tokio::select! {
-                    () = cancellation.cancelled() => {
-                        return Err(WeightedByteAcquireError::Cancelled);
-                    }
-                    result = timeout_at(deadline, receiver) => {
-                        result
-                            .map_err(|_| WeightedByteAcquireError::Deadline)?
-                            .map_err(|_| WeightedByteAcquireError::Cancelled)?;
-                    }
-                }
-            }
-            None => {
-                tokio::select! {
-                    () = cancellation.cancelled() => {
-                        return Err(WeightedByteAcquireError::Cancelled);
-                    }
-                    result = receiver => {
-                        result.map_err(|_| WeightedByteAcquireError::Cancelled)?;
-                    }
-                }
-            }
-        }
-        guard.active = false;
-        Ok(WeightedByteGrant { inner: self, bytes })
-    }
-
-    fn enqueue(
-        self: Arc<Self>,
-        bytes: usize,
-    ) -> Result<(oneshot::Receiver<()>, WeightedByteWaiterGuard), WeightedByteAcquireError> {
-        if bytes > self.capacity {
-            return Err(WeightedByteAcquireError::Oversized);
-        }
-        let mut state = self.state.lock().expect("weighted byte budget lock");
-        let id = state.next_waiter_id;
-        state.next_waiter_id = state.next_waiter_id.wrapping_add(1);
-        let (sender, receiver) = oneshot::channel();
-        let granted = Arc::new(AtomicBool::new(false));
-        state.waiters.push_back(WeightedByteWaiter {
-            id,
-            bytes,
-            granted: Arc::clone(&granted),
-            sender,
-        });
-        grant_weighted_byte_waiters(&mut state);
-        drop(state);
-        Ok((
-            receiver,
-            WeightedByteWaiterGuard {
-                inner: self,
-                id,
-                bytes,
-                granted,
-                active: true,
-            },
-        ))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn try_acquire(self: Arc<Self>, bytes: usize) -> Option<WeightedByteGrant> {
-        if bytes > self.capacity {
-            return None;
-        }
-        let mut state = self.state.lock().ok()?;
-        if !state.waiters.is_empty() || state.available < bytes {
-            return None;
-        }
-        state.available -= bytes;
-        drop(state);
-        Some(WeightedByteGrant { inner: self, bytes })
-    }
-}
-
-impl WeightedByteGrant {
-    pub(crate) fn bytes(&self) -> usize {
-        self.bytes
-    }
-
-    fn shrink_to(&mut self, bytes: usize) -> Result<(), ()> {
-        if bytes > self.bytes {
-            return Err(());
-        }
-        let released = self.bytes - bytes;
-        self.bytes = bytes;
-        release_weighted_bytes(Arc::clone(&self.inner), released);
-        Ok(())
-    }
-
-    pub(crate) fn merge(&mut self, mut other: Self) -> Result<(), ()> {
-        if !Arc::ptr_eq(&self.inner, &other.inner) {
-            return Err(());
-        }
-        self.bytes = self.bytes.checked_add(other.bytes).ok_or(())?;
-        other.bytes = 0;
-        Ok(())
-    }
-}
-
-impl Drop for WeightedByteGrant {
-    fn drop(&mut self) {
-        let bytes = std::mem::take(&mut self.bytes);
-        release_weighted_bytes(Arc::clone(&self.inner), bytes);
-    }
-}
-
-impl Drop for WeightedByteWaiterGuard {
-    fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-        cancel_weighted_byte_waiter(
-            Arc::clone(&self.inner),
-            self.id,
-            self.bytes,
-            Arc::clone(&self.granted),
-        );
-    }
-}
-
-fn grant_weighted_byte_waiters(state: &mut WeightedByteBudgetState) {
-    loop {
-        let Some(candidate) = state
-            .waiters
-            .iter()
-            .position(|waiter| waiter.bytes <= state.available)
-        else {
-            return;
-        };
-        let waiter = state
-            .waiters
-            .remove(candidate)
-            .expect("selected weighted waiter exists");
-        state.available -= waiter.bytes;
-        waiter.granted.store(true, Ordering::Release);
-        if waiter.sender.send(()).is_err() {
-            waiter.granted.store(false, Ordering::Release);
-            state.available = state.available.saturating_add(waiter.bytes);
-        }
-    }
-}
-
-fn release_weighted_bytes(inner: Arc<WeightedByteBudget>, bytes: usize) {
-    if bytes == 0 {
-        return;
-    }
-    let mut state = inner.state.lock().expect("weighted byte budget lock");
-    state.available = state.available.saturating_add(bytes).min(inner.capacity);
-    grant_weighted_byte_waiters(&mut state);
-    drop(state);
-    inner.changed.notify_waiters();
-}
-
-fn cancel_weighted_byte_waiter(
-    inner: Arc<WeightedByteBudget>,
-    id: u64,
-    bytes: usize,
-    granted: Arc<AtomicBool>,
-) {
-    let mut state = inner.state.lock().expect("weighted byte budget lock");
-    if let Some(index) = state.waiters.iter().position(|waiter| waiter.id == id) {
-        state.waiters.remove(index);
-    } else if granted.swap(false, Ordering::AcqRel) {
-        state.available = state.available.saturating_add(bytes).min(inner.capacity);
-    }
-    grant_weighted_byte_waiters(&mut state);
-    drop(state);
-    inner.changed.notify_waiters();
-}
-
-pub(crate) struct RpcOutboundBytePermit {
-    process: WeightedByteGrant,
-    connection: WeightedByteGrant,
-}
-
-impl RpcOutboundBytePermit {
-    fn shrink_to(&mut self, bytes: usize) -> Result<(), ()> {
-        let current = self.process.bytes();
-        if bytes > current || self.connection.bytes() != current {
-            return Err(());
-        }
-        self.process.shrink_to(bytes)?;
-        self.connection.shrink_to(bytes)?;
-        Ok(())
-    }
 }
 
 pub(crate) struct RpcOutboundFrame {
@@ -738,6 +165,7 @@ impl RpcOutboundQueue {
         result.map(Some)
     }
 
+    #[cfg(test)]
     fn try_send(&self, message: ServerMessage) -> Result<(), ()> {
         let (payload, budget) = if let Some(budget) = &self.budget {
             let bytes = encoded_server_message_len(&message).map_err(|_| ())?;
@@ -1605,11 +1033,10 @@ async fn run_unary(
     let result = tokio::select! {
         biased;
         () = cancellation.cancelled() => {
-            let _ = send_server_message(
+            let _ = try_send_control_message(
                 &outbound,
-                &session_shutdown,
                 ServerMessage::interrupt(request_id),
-            ).await;
+            );
             return;
         }
         result = handler(request, context, cancellation.clone()) => result,
@@ -1619,8 +1046,8 @@ async fn run_unary(
         enqueue_guard,
     } = result;
     let response = match result {
-        Ok(value) => ServerMessage::success(request_id, Some(value)),
-        Err(error) => ServerMessage::failure(request_id, error),
+        Ok(value) => ServerMessage::success(request_id.clone(), Some(value)),
+        Err(error) => ServerMessage::failure(request_id.clone(), error),
     };
     if let Some(enqueue_guard) = enqueue_guard {
         let encoded_len_bound = if outbound.budget.is_some() {
@@ -1631,13 +1058,27 @@ async fn run_unary(
         } else {
             0
         };
-        if let Ok(permit) =
-            reserve_server_message(&outbound, &session_shutdown, encoded_len_bound).await
-        {
-            enqueue_guard.enqueue(permit, response);
+        match reserve_server_message(&outbound, &session_shutdown, encoded_len_bound).await {
+            Ok(permit) => enqueue_guard.enqueue(permit, response),
+            Err(()) => {
+                let _ = send_unbudgeted_server_message(
+                    &outbound,
+                    &session_shutdown,
+                    ServerMessage::failure(request_id, outbound_admission_failure()),
+                )
+                .await;
+            }
         }
-    } else {
-        let _ = send_server_message(&outbound, &session_shutdown, response).await;
+    } else if send_server_message(&outbound, &session_shutdown, response)
+        .await
+        .is_err()
+    {
+        let _ = send_unbudgeted_server_message(
+            &outbound,
+            &session_shutdown,
+            ServerMessage::failure(request_id, outbound_admission_failure()),
+        )
+        .await;
     }
 }
 
@@ -1656,30 +1097,31 @@ async fn run_stream(
         let item = tokio::select! {
             biased;
             () = cancellation.cancelled() => {
-                let _ = send_server_message(
+                let _ = try_send_control_message(
                     &outbound,
-                    &session_shutdown,
                     ServerMessage::interrupt(request_id),
-                ).await;
+                );
                 return;
             }
             item = stream.recv() => item,
         };
         let Some(item) = item else {
-            let _ = send_server_message(
+            send_stream_terminal(
                 &outbound,
                 &session_shutdown,
-                ServerMessage::success(request_id, None),
+                ServerMessage::success(request_id.clone(), None),
+                request_id,
             )
             .await;
             return;
         };
         match item {
             Err(error) => {
-                let _ = send_server_message(
+                send_stream_terminal(
                     &outbound,
                     &session_shutdown,
-                    ServerMessage::failure(request_id, error),
+                    ServerMessage::failure(request_id.clone(), error),
+                    request_id,
                 )
                 .await;
                 return;
@@ -1705,16 +1147,24 @@ async fn run_stream(
                 .await
                 .is_err()
                 {
+                    // The chunk lost its outbound admission deadline. Ending the
+                    // subscription silently would strand the client, so deliver
+                    // an explicit terminal through the unbudgeted control lane.
+                    let _ = send_unbudgeted_server_message(
+                        &outbound,
+                        &session_shutdown,
+                        ServerMessage::failure(request_id, outbound_admission_failure()),
+                    )
+                    .await;
                     return;
                 }
                 tokio::select! {
                     biased;
                     () = cancellation.cancelled() => {
-                        let _ = send_server_message(
+                        let _ = try_send_control_message(
                             &outbound,
-                            &session_shutdown,
                             ServerMessage::interrupt(request_id),
-                        ).await;
+                        );
                         return;
                     }
                     acknowledgement = acknowledgements.recv() => {
@@ -1743,16 +1193,17 @@ async fn run_latest_stream(
         let item = tokio::select! {
             biased;
             () = cancellation.cancelled() => {
-                let _ = outbound.try_send(ServerMessage::interrupt(request_id));
+                let _ = try_send_control_message(&outbound, ServerMessage::interrupt(request_id));
                 return;
             }
             changed = stream.changed() => {
                 if changed.is_err() {
-                    let _ = send_latest_stream_message(
+                    send_latest_stream_terminal(
                         &outbound,
                         &session_shutdown,
                         &cancellation,
-                        ServerMessage::success(request_id, None),
+                        ServerMessage::success(request_id.clone(), None),
+                        request_id,
                     ).await;
                     return;
                 }
@@ -1764,11 +1215,12 @@ async fn run_latest_stream(
         };
         match item {
             Err(error) => {
-                let _ = send_latest_stream_message(
+                send_latest_stream_terminal(
                     &outbound,
                     &session_shutdown,
                     &cancellation,
-                    ServerMessage::failure(request_id, error),
+                    ServerMessage::failure(request_id.clone(), error),
+                    request_id,
                 )
                 .await;
                 return;
@@ -1796,12 +1248,28 @@ async fn run_latest_stream(
                 .await
                 .is_err()
                 {
+                    if cancellation.is_cancelled() {
+                        let _ = try_send_control_message(
+                            &outbound,
+                            ServerMessage::interrupt(request_id),
+                        );
+                    } else {
+                        let _ = send_unbudgeted_server_message(
+                            &outbound,
+                            &session_shutdown,
+                            ServerMessage::failure(request_id, outbound_admission_failure()),
+                        )
+                        .await;
+                    }
                     return;
                 }
                 tokio::select! {
                     biased;
                     () = cancellation.cancelled() => {
-                        let _ = outbound.try_send(ServerMessage::interrupt(request_id));
+                        let _ = try_send_control_message(
+                            &outbound,
+                            ServerMessage::interrupt(request_id),
+                        );
                         return;
                     }
                     acknowledgement = acknowledgements.recv() => {
@@ -1811,6 +1279,30 @@ async fn run_latest_stream(
                     }
                 }
             }
+        }
+    }
+}
+
+async fn send_latest_stream_terminal(
+    outbound: &RpcOutboundQueue,
+    session_shutdown: &CancellationToken,
+    cancellation: &CancellationToken,
+    primary: ServerMessage,
+    request_id: RequestId,
+) {
+    if send_latest_stream_message(outbound, session_shutdown, cancellation, primary)
+        .await
+        .is_err()
+    {
+        if cancellation.is_cancelled() {
+            let _ = try_send_control_message(outbound, ServerMessage::interrupt(request_id));
+        } else {
+            let _ = send_unbudgeted_server_message(
+                outbound,
+                session_shutdown,
+                ServerMessage::failure(request_id, outbound_admission_failure()),
+            )
+            .await;
         }
     }
 }
@@ -1859,6 +1351,85 @@ async fn send_server_message(
             }
         }
     }
+}
+
+/// Sends a stream terminal, falling back to an explicit unbudgeted admission
+/// failure when the budgeted send cannot be admitted — a subscription must
+/// never end silently.
+async fn send_stream_terminal(
+    outbound: &RpcOutboundQueue,
+    session_shutdown: &CancellationToken,
+    primary: ServerMessage,
+    request_id: RequestId,
+) {
+    if send_server_message(outbound, session_shutdown, primary)
+        .await
+        .is_err()
+    {
+        let _ = send_unbudgeted_server_message(
+            outbound,
+            session_shutdown,
+            ServerMessage::failure(request_id, outbound_admission_failure()),
+        )
+        .await;
+    }
+}
+
+/// Delivers an interrupt without byte budgeting and without waiting: control
+/// messages are bounded (at most one per in-flight request) and must not be
+/// refused because data traffic has admission waiters queued.
+fn try_send_control_message(outbound: &RpcOutboundQueue, message: ServerMessage) -> Result<(), ()> {
+    let payload = if outbound.budget.is_some() {
+        let encoded = serde_json::to_string(&message).map_err(|_| ())?;
+        RpcOutboundPayload::Encoded(Message::Text(encoded.into()))
+    } else {
+        RpcOutboundPayload::Plain(message)
+    };
+    outbound
+        .sender
+        .try_send(RpcOutboundFrame {
+            payload,
+            _budget: None,
+        })
+        .map_err(|_| ())
+}
+
+/// Sends a bounded terminal message that bypasses the byte budget but still
+/// waits for outbound queue capacity under the shared deadline. Used only when
+/// the budgeted path already failed, so the client still observes a terminal.
+async fn send_unbudgeted_server_message(
+    outbound: &RpcOutboundQueue,
+    session_shutdown: &CancellationToken,
+    message: ServerMessage,
+) -> Result<(), ()> {
+    let deadline = Instant::now() + OUTBOUND_SEND_TIMEOUT;
+    let payload = if outbound.budget.is_some() {
+        let encoded = serde_json::to_string(&message).map_err(|_| ())?;
+        RpcOutboundPayload::Encoded(Message::Text(encoded.into()))
+    } else {
+        RpcOutboundPayload::Plain(message)
+    };
+    let frame = RpcOutboundFrame {
+        payload,
+        _budget: None,
+    };
+    tokio::select! {
+        () = session_shutdown.cancelled() => Err(()),
+        result = timeout_at(deadline, outbound.sender.send(frame)) => {
+            match result {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(_)) | Err(_) => Err(()),
+            }
+        }
+    }
+}
+
+fn outbound_admission_failure() -> Value {
+    json!({
+        "_tag": "RpcOutboundAdmissionError",
+        "message": "The response could not be admitted to the outbound byte \
+                    budget before its deadline.",
+    })
 }
 
 async fn reserve_server_message(
@@ -1935,6 +1506,7 @@ fn client_protocol_error(message: String) -> ServerMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rpc::byte_budget::RpcOutboundProcessBudget;
     use futures_util::stream;
     use std::{
         convert::Infallible,
@@ -2053,178 +1625,6 @@ mod tests {
         )
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn outbound_process_budget_admits_a_large_waiter_after_sufficient_release() {
-        let budget = RpcOutboundProcessBudget::new(10);
-        let blocker = budget.try_acquire(8).expect("initial process bytes");
-        let large_budget = budget.clone();
-        let large = tokio::spawn(async move {
-            large_budget
-                .acquire(8, Instant::now() + Duration::from_secs(10))
-                .await
-        });
-        tokio::task::yield_now().await;
-
-        let small = budget
-            .acquire(2, Instant::now() + Duration::from_secs(10))
-            .await
-            .expect("small fitting waiter bypasses the blocked large waiter");
-        assert!(!large.is_finished());
-        drop(small);
-        drop(blocker);
-
-        let large = large
-            .await
-            .expect("large waiter task")
-            .expect("large waiter makes progress after release");
-        assert_eq!(large.bytes(), 8);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn fit_first_budget_does_not_block_small_waiters_behind_an_aged_large_waiter() {
-        let budget = RpcOutboundProcessBudget::new(10);
-        let blocker = budget.try_acquire(8).expect("initial process bytes");
-        let large_budget = budget.clone();
-        let large = tokio::spawn(async move {
-            large_budget
-                .acquire(8, Instant::now() + Duration::from_secs(10))
-                .await
-        });
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(1)).await;
-
-        let small_budget = budget.clone();
-        let small = tokio::spawn(async move {
-            small_budget
-                .acquire(2, Instant::now() + Duration::from_secs(10))
-                .await
-        });
-        tokio::task::yield_now().await;
-        assert!(
-            small.is_finished(),
-            "a fitting small waiter must not be blocked by an aged large waiter"
-        );
-
-        let small = small
-            .await
-            .expect("small waiter task")
-            .expect("small waiter uses currently available capacity");
-        assert_eq!(small.bytes(), 2);
-        assert!(!large.is_finished());
-
-        drop(small);
-        drop(blocker);
-        let large = large
-            .await
-            .expect("large waiter task")
-            .expect("large waiter makes progress after sufficient release");
-        assert_eq!(large.bytes(), 8);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn cancelled_weighted_waiter_is_removed_and_capacity_is_refunded_once() {
-        let budget = RpcOutboundProcessBudget::new(10);
-        let blocker = budget.try_acquire(10).expect("initial process bytes");
-        let waiting_budget = budget.clone();
-        let waiting = tokio::spawn(async move {
-            waiting_budget
-                .acquire(10, Instant::now() + Duration::from_secs(10))
-                .await
-        });
-        tokio::task::yield_now().await;
-        waiting.abort();
-        assert!(matches!(waiting.await, Err(error) if error.is_cancelled()));
-
-        drop(blocker);
-        let recovered = budget
-            .try_acquire(10)
-            .expect("cancelled waiter does not retain process bytes");
-        assert_eq!(recovered.bytes(), 10);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn outbound_connection_wait_uses_the_same_absolute_deadline_as_process_wait() {
-        let budget = RpcOutboundBudget::new(RpcOutboundProcessBudget::new(10), 1);
-        let blocker = budget.try_acquire(1).expect("initial connection byte");
-        let waiting_budget = budget.clone();
-        let waiting = tokio::spawn(async move {
-            waiting_budget
-                .acquire(1, Instant::now() + Duration::from_secs(5))
-                .await
-        });
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(5)).await;
-        tokio::task::yield_now().await;
-
-        assert!(
-            waiting.is_finished(),
-            "connection-tier admission must observe the shared absolute deadline"
-        );
-        assert!(waiting.await.expect("connection waiter task").is_err());
-        drop(blocker);
-    }
-
-    #[tokio::test]
-    async fn two_tier_admission_does_not_hold_connection_bytes_while_process_bytes_are_blocked() {
-        let process = RpcOutboundProcessBudget::new(10);
-        let process_blocker = process.try_acquire(9).expect("hold most process bytes");
-        let budget = RpcOutboundBudget::new(process, 8);
-
-        let large_budget = budget.clone();
-        let large = tokio::spawn(async move {
-            large_budget
-                .acquire(8, Instant::now() + Duration::from_secs(5))
-                .await
-        });
-        tokio::task::yield_now().await;
-
-        let small = timeout(
-            Duration::from_millis(250),
-            budget.acquire(1, Instant::now() + Duration::from_secs(5)),
-        )
-        .await
-        .expect("small response is not blocked by a large response holding connection bytes")
-        .expect("one byte fits both admission tiers");
-        assert!(!large.is_finished());
-
-        drop(small);
-        drop(process_blocker);
-        let large = timeout(Duration::from_secs(1), large)
-            .await
-            .expect("large response proceeds after process capacity is released")
-            .expect("large response task joins")
-            .expect("large response acquires both tiers");
-        assert_eq!(large.process.bytes(), 8);
-        assert_eq!(large.connection.bytes(), 8);
-    }
-
-    #[tokio::test]
-    async fn two_tier_admission_observes_release_between_probe_and_notify_poll() {
-        let process = RpcOutboundProcessBudget::new(1);
-        let blocker = process.try_acquire(1).expect("hold process byte");
-        let reached = Arc::new(tokio::sync::Barrier::new(2));
-        let resume = Arc::new(tokio::sync::Barrier::new(2));
-        let budget = RpcOutboundBudget::new(process, 1)
-            .with_after_combined_probe(Arc::clone(&reached), Arc::clone(&resume));
-        let waiting = tokio::spawn(async move {
-            budget
-                .acquire(1, Instant::now() + Duration::from_secs(5))
-                .await
-        });
-
-        reached.wait().await;
-        drop(blocker);
-        resume.wait().await;
-
-        let permit = timeout(Duration::from_millis(250), waiting)
-            .await
-            .expect("release registered before the probe is not lost")
-            .expect("waiting admission task joins")
-            .expect("both tiers become available");
-        assert_eq!(permit.process.bytes(), 1);
-        assert_eq!(permit.connection.bytes(), 1);
-    }
-
     #[tokio::test]
     async fn session_shutdown_unblocks_a_full_outbound_queue() {
         let (outbound, _receiver) = unbudgeted_outbound(1);
@@ -2333,6 +1733,142 @@ mod tests {
             .await
             .expect("request cancellation unblocks the outbound capacity wait")
             .expect("latest stream task joins");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_admission_expiry_delivers_a_terminal_failure() {
+        let process = RpcOutboundProcessBudget::new(1024);
+        let _blocker = process.try_acquire(1024).expect("hold process capacity");
+        let (sender, mut receiver) = mpsc::channel(8);
+        let outbound = RpcOutboundQueue {
+            sender,
+            budget: Some(RpcOutboundBudget::new(process.clone(), 1024)),
+        };
+        let (chunk_sender, chunk_receiver) = mpsc::channel(1);
+        chunk_sender
+            .try_send(Ok(vec![json!({ "payload": "x".repeat(128) })]))
+            .expect("queue stream chunk");
+        let chunk_receiver = Arc::new(std::sync::Mutex::new(Some(chunk_receiver)));
+        let handler: StreamHandler = Arc::new(move |_request, _context, _cancellation| {
+            chunk_receiver
+                .lock()
+                .expect("stream receiver lock")
+                .take()
+                .expect("single stream invocation")
+        });
+        let request = RpcRequest {
+            id: RequestId::try_from("1").expect("request id"),
+            tag: "test.stream".to_owned(),
+            payload: json!({}),
+            headers: Vec::new(),
+            trace_id: None,
+            span_id: None,
+            sampled: None,
+        };
+        let (_ack_sender, ack_receiver) = mpsc::channel(1);
+        let task = tokio::spawn(run_stream(
+            request,
+            handler,
+            RpcSessionContext::unauthenticated(),
+            CancellationToken::new(),
+            CancellationToken::new(),
+            ack_receiver,
+            outbound,
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(6)).await;
+
+        let frame = timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("a terminal reaches the outbound queue")
+            .expect("terminal frame");
+        let (message, budget) = frame.into_wire().expect("encoded terminal").into_parts();
+        assert!(budget.is_none(), "the terminal bypasses the byte budget");
+        let Message::Text(text) = message else {
+            panic!("expected a text terminal frame");
+        };
+        assert!(
+            text.contains("RpcOutboundAdmissionError"),
+            "admission expiry must surface as an explicit stream failure: {text}"
+        );
+        let decoded: Value = serde_json::from_str(&text).expect("terminal JSON");
+        assert_eq!(decoded["requestId"], "1");
+        drop(chunk_sender);
+        timeout(Duration::from_secs(1), task)
+            .await
+            .expect("stream task ends after the terminal")
+            .expect("stream task joins");
+    }
+
+    #[tokio::test]
+    async fn latest_stream_cancellation_delivers_an_interrupt_past_queued_budget_waiters() {
+        let process = RpcOutboundProcessBudget::new(64);
+        let _blocker = process.try_acquire(64).expect("hold process capacity");
+        let (sender, mut receiver) = mpsc::channel(8);
+        let outbound = RpcOutboundQueue {
+            sender,
+            budget: Some(RpcOutboundBudget::new(process.clone(), 64)),
+        };
+        let waiter_outbound = outbound.clone();
+        let waiter_shutdown = CancellationToken::new();
+        let waiter = tokio::spawn(async move {
+            let _ =
+                send_server_message(&waiter_outbound, &waiter_shutdown, ServerMessage::Pong).await;
+        });
+        tokio::task::yield_now().await;
+
+        let keep_streams = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let handler_streams = Arc::clone(&keep_streams);
+        let handler: LatestStreamHandler = Arc::new(move |_request, _context, _cancellation| {
+            let (stream_sender, stream_receiver) = watch::channel(None);
+            handler_streams
+                .lock()
+                .expect("stream keep-alive lock")
+                .push(stream_sender);
+            stream_receiver
+        });
+        let request = RpcRequest {
+            id: RequestId::try_from("1").expect("request id"),
+            tag: "test.latest".to_owned(),
+            payload: json!({}),
+            headers: Vec::new(),
+            trace_id: None,
+            span_id: None,
+            sampled: None,
+        };
+        let (_ack_sender, ack_receiver) = mpsc::channel(1);
+        let cancellation = CancellationToken::new();
+        let task = tokio::spawn(run_latest_stream(
+            request,
+            handler,
+            RpcSessionContext::unauthenticated(),
+            cancellation.clone(),
+            CancellationToken::new(),
+            ack_receiver,
+            outbound,
+        ));
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+
+        let frame = timeout(Duration::from_millis(500), receiver.recv())
+            .await
+            .expect("the interrupt is delivered despite queued budget waiters")
+            .expect("interrupt frame");
+        let (message, budget) = frame.into_wire().expect("encoded interrupt").into_parts();
+        assert!(budget.is_none(), "interrupts bypass the byte budget");
+        let Message::Text(text) = message else {
+            panic!("expected a text interrupt frame");
+        };
+        assert!(
+            text.contains("Interrupt"),
+            "cancellation must surface as an interrupt exit: {text}"
+        );
+        timeout(Duration::from_secs(1), task)
+            .await
+            .expect("latest stream task ends after the interrupt")
+            .expect("latest stream task joins");
+        waiter.abort();
+        let _ = waiter.await;
     }
 
     #[tokio::test]

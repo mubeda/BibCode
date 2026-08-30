@@ -1,3 +1,4 @@
+mod byte_budget;
 mod e2ee;
 mod message;
 mod methods;

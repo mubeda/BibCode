@@ -219,19 +219,30 @@ returns any over-reserved bytes before enqueueing the response. The queued frame
 through Noise record encryption and every successful or failed WebSocket
 write;
 generic queue capacity therefore cannot hide additional plaintext. Unary
-results, stream chunks and terminals, RPC ping/pong control messages, protocol
-errors, interrupts, and defects use the same admission path. WebSocket-level
-ping/pong frames are transport control and carry no RPC plaintext. A response
-larger than the 64 MiB connection cap fails the session closed immediately;
-otherwise both connection and process byte admission plus the bounded 64-entry
-response queue share one absolute five-second admission deadline. Fit-first
-admission grants every queued request that fits in arrival order; it never turns
-an aged, unfit request into a total blockade. Cancellation removes the waiter
-and refunds a concurrently granted reservation exactly once. Each Noise record
-then receives a fresh five-second WebSocket-sink progress deadline, while the
-whole logical message is bounded by five seconds plus one second per 64 KiB of
-plaintext. Records remain serialized, and the pump retains its one-second join
-bound.
+results, stream chunks, handler-error terminals, RPC ping/pong control
+messages, protocol errors, and defects use the same admission path. Interrupts
+bypass byte admission through a non-blocking control lane, and when a budgeted
+terminal or unary response loses its admission deadline the session delivers an
+explicit unbudgeted `RpcOutboundAdmissionError` terminal instead of ending the
+request silently; both bypasses are bounded by the 64-request in-flight cap at
+one small control message per request. WebSocket-level ping/pong frames are
+transport control and carry no RPC plaintext. A response larger than the
+64 MiB connection cap fails the session closed immediately; otherwise both
+connection and process byte admission plus the bounded 64-entry response queue
+share one absolute five-second admission deadline. Granting is push-based:
+waiters sleep on their own grant channel and every release runs one fit-first
+pass, so admission work per release is one queue scan rather than one scan per
+waiter. Fit-first grants every queued request that fits in arrival order, and
+once the front waiter has waited one second, released process capacity
+accumulates in a reservation for it until it is granted — sustained small
+traffic therefore cannot starve a large response, and the resulting pause for
+younger waiters is bounded by the front waiter's own size rather than being an
+open-ended blockade. Cancellation removes the waiter and refunds both a
+concurrently granted reservation and any accumulated aged-head reservation
+exactly once. Each Noise record then receives a fresh five-second
+WebSocket-sink progress deadline, while the whole logical message is bounded
+by five seconds plus one second per 64 KiB of plaintext. Records remain
+serialized, and the pump retains its one-second join bound.
 Dropping a queued, cancelled, rejected, serialization-failed, encryption-failed,
 or write-failed frame releases its single permit set without double accounting.
 
@@ -241,8 +252,10 @@ Established and inbound admission are principal-partitioned so one session
 cannot consume all of either resource. Outbound admission instead bounds
 aggregate retained plaintext; it is intentionally process/per-connection rather
 than principal-partitioned. Fit-first admission prevents large queued
-reservations from blocking smaller messages that can make progress; a large
-reservation that never fits fails at the shared admission deadline.
+reservations from blocking smaller messages that can make progress, while the
+aged-head reservation guarantees the reverse: a large response eventually wins
+even under sustained small traffic. A large reservation that never fits fails
+at the shared admission deadline with an explicit terminal.
 
 The pairing payload is base64url-unpadded JSON in
 `bibcode://pair?code=<payload>` with version, endpoint, display name, one-time
