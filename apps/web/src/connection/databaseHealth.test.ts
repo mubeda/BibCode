@@ -153,8 +153,11 @@ describe("connection database health", () => {
       const pending = deleteIncompatibleConnectionDatabase();
       deletion.fire("blocked");
 
+      // Attach the rejection expectation before the timer fires so the
+      // settle rejection is never momentarily unhandled.
+      const settleFailure = expect(pending).rejects.toThrow("Close them and try again");
       await vi.advanceTimersByTimeAsync(15_000);
-      await expect(pending).rejects.toThrow("Close them and try again");
+      await settleFailure;
       expect(getConnectionDatabaseHealth()).toMatchObject({ status: "blocked" });
 
       // Health reporting keeps flowing afterwards.
