@@ -749,6 +749,40 @@ export const connectionStorageLayer = Layer.effectContext(
             ),
           }))
           .pipe(Effect.mapError(() => storageIdentityPersistenceError("accept-storage-identity"))),
+      rollbackAcceptance: (identity, previousStorageInstanceId) =>
+        catalog
+          .modify((document) => {
+            const matches = document.acceptedStorageIdentities.some(
+              (candidate) =>
+                candidate.targetKey === identity.targetKey &&
+                candidate.storageInstanceId === identity.storageInstanceId,
+            );
+            if (!matches) {
+              return { mutation: { _tag: "Keep" }, result: false } as const;
+            }
+            const withoutAttempt = removeCatalogValue(
+              document.acceptedStorageIdentities,
+              (candidate) => candidate.targetKey,
+              identity.targetKey,
+            );
+            return {
+              mutation: {
+                _tag: "Set",
+                document: {
+                  ...document,
+                  acceptedStorageIdentities:
+                    previousStorageInstanceId === null
+                      ? withoutAttempt
+                      : replaceCatalogValue(withoutAttempt, (candidate) => candidate.targetKey, {
+                          targetKey: identity.targetKey,
+                          storageInstanceId: previousStorageInstanceId,
+                        }),
+                },
+              },
+              result: true,
+            } as const;
+          })
+          .pipe(Effect.mapError(() => storageIdentityPersistenceError("accept-storage-identity"))),
       transition: (targetKey, decide) =>
         catalog
           .modify((document) => {

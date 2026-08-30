@@ -315,6 +315,26 @@ const makeStorageIdentityHarness = Effect.fn("TestStorageIdentityHarness.make")(
             next.set(targetKey, storageInstanceId);
             return next;
           }).pipe(Effect.andThen(Ref.update(identityAcceptCount, (count) => count + 1))),
+    rollbackAcceptance: (
+      { targetKey, storageInstanceId }: Persistence.AcceptedStorageIdentity,
+      previousStorageInstanceId: string | null,
+    ) =>
+      options?.failAcceptance === true
+        ? Effect.fail(
+            new Persistence.ConnectionPersistenceError({
+              operation: "accept-storage-identity",
+              message: "Storage is unavailable.",
+            }),
+          )
+        : Ref.modify(acceptedIdentities, (current) => {
+            if (current.get(targetKey) !== storageInstanceId) {
+              return [false, current] as const;
+            }
+            const next = new Map(current);
+            if (previousStorageInstanceId === null) next.delete(targetKey);
+            else next.set(targetKey, previousStorageInstanceId);
+            return [true, next] as const;
+          }),
     transition: <A>(
       targetKey: string,
       decide: (

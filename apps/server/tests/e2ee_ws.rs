@@ -8,6 +8,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bibcode_server::{ServerConfig, ServerHandle, ServerRuntime};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::{Client, StatusCode};
+use rusqlite::Connection;
 use serde_json::{Value, json};
 use snow::TransportState;
 use tempfile::TempDir;
@@ -248,13 +249,51 @@ async fn pair_inside_channel(
 }
 
 async fn mint_e2ee_credential(handle: &ServerHandle, root: &Path, pairing: &str) -> String {
-    let (mut socket, _transport, reply) = pair_inside_channel(handle, root, pairing).await;
+    let (mut socket, mut transport, reply) = pair_inside_channel(handle, root, pairing).await;
     let credential = reply["credential"]
         .as_str()
         .expect("minted E2EE credential")
         .to_owned();
+    confirm_pairing(&mut socket, &mut transport, "2").await;
     socket.close(None).await.expect("close pairing socket");
     credential
+}
+
+async fn confirm_pairing(
+    socket: &mut TestSocket,
+    transport: &mut TransportState,
+    request_id: &str,
+) {
+    send_encrypted(
+        socket,
+        transport,
+        json!({
+            "_tag": "Request",
+            "id": request_id,
+            "tag": "auth.confirmPairing",
+            "payload": {},
+            "headers": []
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .await;
+    let response = recv_encrypted_json(socket, transport).await;
+    assert_eq!(response["_tag"], "Exit");
+    assert_eq!(response["requestId"], request_id);
+    assert_eq!(response["exit"]["_tag"], "Success", "{response}");
+    assert_eq!(response["exit"]["value"], json!({}));
+}
+
+fn latest_auth_session_delivery_state(root: &Path) -> String {
+    Connection::open(root.join("userdata/state.sqlite"))
+        .expect("open server database")
+        .query_row(
+            "SELECT delivery_state FROM auth_sessions ORDER BY issued_at DESC, session_id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("latest auth session delivery state")
 }
 
 async fn open_authenticated_bearer_socket(
@@ -352,6 +391,42 @@ async fn exchange_plain_token(client: &Client, handle: &ServerHandle, credential
         .to_owned()
 }
 
+async fn create_off_host_pairing(handle: &ServerHandle) -> (String, String) {
+    let client = Client::new();
+    let startup = handle.startup_access().expect("startup pairing");
+    let admin = exchange_plain_token(&client, handle, &startup.credential).await;
+    let response = client
+        .post(http_url(handle, "/api/auth/pairing-offer"))
+        .bearer_auth(&admin)
+        .json(&json!({
+            "name": "Off-host client",
+            "endpoint": "http://192.168.1.20:3773",
+            "reach": "another-device",
+        }))
+        .send()
+        .await
+        .expect("off-host pairing offer");
+    assert_eq!(response.status(), StatusCode::OK);
+    let code = response.json::<Value>().await.expect("pairing offer JSON")["code"]
+        .as_str()
+        .expect("pairing offer code")
+        .to_owned();
+    let payload = bibcode_server::auth_pairing_code::decode_pairing_code(&code)
+        .expect("pairing code decodes");
+    (admin, payload.token)
+}
+
+async fn share_state(handle: &ServerHandle, admin: &str) -> Value {
+    let response = Client::new()
+        .get(http_url(handle, "/api/auth/share-state"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .expect("share state request");
+    assert_eq!(response.status(), StatusCode::OK);
+    response.json().await.expect("share state JSON")
+}
+
 async fn plain_ws_request(address: SocketAddr, bearer: &str) -> Result<TestSocket, StatusCode> {
     let mut request = ws_url(address, "/ws")
         .into_client_request()
@@ -403,9 +478,13 @@ async fn bearer_form_reconnect_works_with_the_in_channel_credential() {
     let temp = TempDir::new().expect("temporary base directory");
     let handle = start_server(&temp).await;
     let startup = handle.startup_access().expect("startup pairing");
-    let (mut first, _first_transport, reply) =
+    let (mut first, mut first_transport, reply) =
         pair_inside_channel(&handle, temp.path(), &startup.credential).await;
-    let credential = reply["credential"].as_str().expect("minted credential");
+    let credential = reply["credential"]
+        .as_str()
+        .expect("minted credential")
+        .to_owned();
+    confirm_pairing(&mut first, &mut first_transport, "2").await;
     first.close(None).await.expect("close first connection");
 
     let host_key = read_host_public_key(temp.path());
@@ -423,6 +502,86 @@ async fn bearer_form_reconnect_works_with_the_in_channel_credential() {
         json!({ "type": "e2ee_authenticated" })
     );
     assert_get_config(&mut socket, &mut transport).await;
+}
+
+#[tokio::test]
+async fn delivered_pairing_session_stays_pending_until_confirm_rpc() {
+    let _permit = TEST_PERMIT.acquire().await.expect("test permit");
+    let temp = TempDir::new().expect("temporary base directory");
+    let handle = start_server(&temp).await;
+    let (admin, pairing) = create_off_host_pairing(&handle).await;
+    let (mut socket, mut transport, reply) =
+        pair_inside_channel(&handle, temp.path(), &pairing).await;
+
+    assert_eq!(reply["type"], "e2ee_authenticated");
+    assert_eq!(
+        latest_auth_session_delivery_state(temp.path()),
+        "pending-pairing"
+    );
+    assert_eq!(
+        share_state(&handle, &admin).await["desiredExposure"],
+        "wide"
+    );
+    confirm_pairing(&mut socket, &mut transport, "2").await;
+    assert_eq!(latest_auth_session_delivery_state(temp.path()), "active");
+    confirm_pairing(&mut socket, &mut transport, "3").await;
+    assert_eq!(
+        share_state(&handle, &admin).await["desiredExposure"],
+        "wide"
+    );
+}
+
+#[tokio::test]
+async fn closing_before_confirm_revokes_the_pending_session() {
+    let _permit = TEST_PERMIT.acquire().await.expect("test permit");
+    let temp = TempDir::new().expect("temporary base directory");
+    let handle = start_server(&temp).await;
+    let startup = handle.startup_access().expect("startup pairing");
+    let (mut socket, _transport, reply) =
+        pair_inside_channel(&handle, temp.path(), &startup.credential).await;
+    let credential = reply["credential"]
+        .as_str()
+        .expect("minted credential")
+        .to_owned();
+    socket.close(None).await.expect("close bootstrap socket");
+
+    let host_key = read_host_public_key(temp.path());
+    let (mut reconnect, _reconnect_transport, reconnect_reply) =
+        open_authenticated_bearer_socket(&handle, &host_key, &credential).await;
+    assert_eq!(
+        reconnect_reply,
+        json!({ "type": "e2ee_error", "code": "unauthorized" })
+    );
+    let _ = reconnect.close(None).await;
+}
+
+#[tokio::test]
+async fn confirmed_pairing_session_survives_disconnect_and_restart_cleanup() {
+    let _permit = TEST_PERMIT.acquire().await.expect("test permit");
+    let temp = TempDir::new().expect("temporary base directory");
+    let handle = start_server(&temp).await;
+    let startup = handle.startup_access().expect("startup pairing");
+    let (mut socket, mut transport, reply) =
+        pair_inside_channel(&handle, temp.path(), &startup.credential).await;
+    let credential = reply["credential"]
+        .as_str()
+        .expect("minted credential")
+        .to_owned();
+    confirm_pairing(&mut socket, &mut transport, "2").await;
+    socket.close(None).await.expect("close confirmed socket");
+    handle.shutdown();
+    timeout(Duration::from_secs(2), handle.join())
+        .await
+        .expect("server shutdown timeout")
+        .expect("server joins");
+
+    let restarted = start_server(&temp).await;
+    assert_eq!(latest_auth_session_delivery_state(temp.path()), "active");
+    let host_key = read_host_public_key(temp.path());
+    let (mut reconnect, mut reconnect_transport, reconnect_reply) =
+        open_authenticated_bearer_socket(&restarted, &host_key, &credential).await;
+    assert_eq!(reconnect_reply, json!({ "type": "e2ee_authenticated" }));
+    assert_get_config(&mut reconnect, &mut reconnect_transport).await;
 }
 
 #[tokio::test]

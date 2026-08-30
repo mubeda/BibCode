@@ -3,7 +3,12 @@ import * as Rpc from "effect/unstable/rpc/Rpc";
 import * as RpcGroup from "effect/unstable/rpc/RpcGroup";
 
 import { ExternalLauncherError, LaunchEditorInput } from "./editor.ts";
-import { AuthAccessStreamError, AuthAccessStreamEvent, EnvironmentRpcError } from "./auth.ts";
+import {
+  AuthAccessStreamError,
+  AuthAccessStreamEvent,
+  EnvironmentAuthorizationError,
+  EnvironmentRpcError,
+} from "./auth.ts";
 import {
   ActivityCancelSubtreeInput,
   ActivityDetailPage,
@@ -303,6 +308,9 @@ export const WorktreeRemoveInput = Schema.Struct({
 export type WorktreeRemoveInput = typeof WorktreeRemoveInput.Type;
 
 export const WS_METHODS = {
+  // Authentication methods
+  authConfirmPairing: "auth.confirmPairing",
+
   // Project registry methods
   projectsList: "projects.list",
   projectsAdd: "projects.add",
@@ -427,6 +435,14 @@ export const WS_METHODS = {
   subscribeActivity: "subscribeActivity",
   subscribeWorktreeCatalog: "subscribeWorktreeCatalog",
 } as const;
+
+const AuthConfirmPairingEmpty = Schema.Record(Schema.String, Schema.Never);
+
+export const WsAuthConfirmPairingRpc = Rpc.make(WS_METHODS.authConfirmPairing, {
+  payload: AuthConfirmPairingEmpty,
+  success: AuthConfirmPairingEmpty,
+  error: EnvironmentAuthorizationError,
+});
 
 export const WsServerUpsertKeybindingRpc = Rpc.make(WS_METHODS.serverUpsertKeybinding, {
   payload: ServerUpsertKeybindingInput,
@@ -1279,6 +1295,7 @@ export const WsSubscribeActivityRpc = Rpc.make(WS_METHODS.subscribeActivity, {
 });
 
 export const WsRpcGroup = RpcGroup.make(
+  WsAuthConfirmPairingRpc,
   WsServerGetConfigRpc,
   WsServerRefreshProvidersRpc,
   WsServerUpdateProviderRpc,

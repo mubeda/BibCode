@@ -60,6 +60,7 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     read_unary("activity.listRoster"),
     mutation_unary("activity.retrySubtreeCancellation"),
     read_unary("assets.createUrl"),
+    mutation_unary("auth.confirmPairing"),
     read_unary("cloud.getRelayClientStatus"),
     mutation_stream("cloud.installRelayClient"),
     read_unary("filesystem.browse"),
@@ -191,5 +192,10 @@ mod tests {
     #[test]
     fn passive_vcs_summary_is_a_stream_method() {
         assert!(ACTIVE_RPC_METHODS.contains(&read_stream("subscribeVcsStatusSummary")));
+    }
+
+    #[test]
+    fn pairing_confirmation_is_an_active_mutation() {
+        assert!(ACTIVE_RPC_METHODS.contains(&mutation_unary("auth.confirmPairing")));
     }
 }

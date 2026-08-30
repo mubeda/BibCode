@@ -120,6 +120,26 @@ const makeIdentityStore = Effect.fn("TestConnectionDriver.makeIdentityStore")(fu
             next.set(identity.targetKey, identity.storageInstanceId);
             return next;
           }).pipe(Effect.andThen(Ref.update(writes, (current) => [...current, identity]))),
+    rollbackAcceptance: (
+      identity: Persistence.AcceptedStorageIdentity,
+      previousStorageInstanceId: string | null,
+    ) =>
+      options?.failMutation === true
+        ? Effect.fail(
+            new Persistence.ConnectionPersistenceError({
+              operation: "accept-storage-identity",
+              message: "Catalog writer is unavailable.",
+            }),
+          )
+        : Ref.modify(accepted, (current) => {
+            if (current.get(identity.targetKey) !== identity.storageInstanceId) {
+              return [false, current] as const;
+            }
+            const next = new Map(current);
+            if (previousStorageInstanceId === null) next.delete(identity.targetKey);
+            else next.set(identity.targetKey, previousStorageInstanceId);
+            return [true, next] as const;
+          }),
     transition: <A>(
       targetKey: string,
       decide: (acceptedStorageInstanceId: string | null) => IdentityTransition<A>,

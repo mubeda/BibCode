@@ -1,4 +1,4 @@
-import { type EnvironmentId, type RemotePairingCodePayload } from "@bibcode/contracts";
+import { type EnvironmentId, type RemotePairingCodePayload, WS_METHODS } from "@bibcode/contracts";
 import { classifyPairingEndpoint } from "@bibcode/shared/advertisedEndpoint";
 import {
   PairingCodeParseError,
@@ -69,13 +69,11 @@ export interface VerifyPairingCodeInput {
 }
 
 const IDENTITY_MISMATCH_DETAIL = "The server behind this endpoint does not match the pairing code.";
-const POST_BOOTSTRAP_REVOCATION_DETAIL =
-  "This pairing attempt may still appear in the server's client list; revoke it there before retrying.";
-const POST_BOOTSTRAP_IDENTITY_MISMATCH_DETAIL = `${IDENTITY_MISMATCH_DETAIL} ${POST_BOOTSTRAP_REVOCATION_DETAIL}`;
+const POST_BOOTSTRAP_IDENTITY_MISMATCH_DETAIL = IDENTITY_MISMATCH_DETAIL;
 const postBootstrapPersistenceError = (target: string): PairingAddError =>
   new PairingAddError({
     reason: "local-persistence-failed",
-    detail: `The device credential was created, but ${target} could not be saved locally. ${POST_BOOTSTRAP_REVOCATION_DETAIL}`,
+    detail: `The device credential was created, but ${target} could not be saved locally.`,
   });
 const isPairingCodeParseError = Schema.is(PairingCodeParseError);
 const isPairingCodeUnsupportedVersionError = Schema.is(PairingCodeUnsupportedVersionError);
@@ -199,7 +197,7 @@ export const verifyAndAddPairingCode = Effect.fn(
     },
     target,
   };
-  const verified = yield* Effect.scoped(
+  return yield* Effect.scoped(
     Effect.gen(function* () {
       const session = yield* sessions.connect(prepared);
       yield* session.ready;
@@ -230,52 +228,113 @@ export const verifyAndAddPairingCode = Effect.fn(
           detail: POST_BOOTSTRAP_IDENTITY_MISMATCH_DETAIL,
         });
       }
-      return {
+      const verified = {
         credential: authenticated.credential,
         environmentId: descriptor.environmentId,
         storageInstanceId: authenticated.storageInstanceId,
       };
+      const registration = new BearerConnectionRegistration({
+        target,
+        profile: new BearerConnectionProfile({
+          connectionId,
+          environmentId: verified.environmentId,
+          label: payload.name,
+          httpBaseUrl,
+          wsBaseUrl: deriveWsBaseUrl(httpBaseUrl),
+          hostKey: payload.hostKey,
+        }),
+        credential: new BearerConnectionCredential({ token: verified.credential }),
+      });
+      const identity = {
+        targetKey: storageIdentityTargetKey(target),
+        storageInstanceId: verified.storageInstanceId,
+      };
+      let registrationWritten = false;
+      let identityWritten = false;
+      let previousStorageInstanceId: string | null = null;
+      let pairingConfirmed = false;
+      let cleanupCompleted = false;
+
+      const rollbackLocalWrites = () => {
+        return Effect.gen(function* () {
+          const cleanupFailures: string[] = [];
+          if (identityWritten) {
+            const failure = yield* identities
+              .rollbackAcceptance(identity, previousStorageInstanceId)
+              .pipe(
+                Effect.match({
+                  onFailure: (cause) => `identity cleanup failed: ${cause.message}`,
+                  onSuccess: () => null,
+                }),
+              );
+            if (failure !== null) cleanupFailures.push(failure);
+          }
+          if (registrationWritten) {
+            const failure = yield* registry.rollbackRegistration(registration).pipe(
+              Effect.match({
+                onFailure: (cause) => `registration cleanup failed: ${cause.message}`,
+                onSuccess: () => null,
+              }),
+            );
+            if (failure !== null) cleanupFailures.push(failure);
+          }
+          cleanupCompleted = true;
+          return cleanupFailures;
+        });
+      };
+
+      const persistAndConfirm = Effect.gen(function* () {
+        yield* registry
+          .register(registration)
+          .pipe(Effect.mapError(() => postBootstrapPersistenceError("the server connection")));
+        registrationWritten = true;
+        previousStorageInstanceId = yield* identities
+          .transition(identity.targetKey, (currentStorageInstanceId) => ({
+            result: currentStorageInstanceId,
+            mutation: {
+              _tag: "Set" as const,
+              storageInstanceId: identity.storageInstanceId,
+            },
+          }))
+          .pipe(Effect.mapError(() => postBootstrapPersistenceError("the server identity")));
+        identityWritten = true;
+        yield* session.client[WS_METHODS.authConfirmPairing]({}).pipe(
+          Effect.mapError(
+            (error) =>
+              new PairingAddError({
+                reason: "local-persistence-failed",
+                detail: `The local connection was saved, but the server could not confirm pairing: ${error.message}`,
+              }),
+          ),
+        );
+        pairingConfirmed = true;
+        return registration.target.environmentId as EnvironmentId;
+      });
+
+      return yield* persistAndConfirm.pipe(
+        Effect.catch((error) =>
+          Effect.gen(function* () {
+            const cleanupFailures = yield* rollbackLocalWrites();
+            const cleanupDetail =
+              cleanupFailures.length === 0
+                ? " No partial local writes from this attempt remain."
+                : ` Local cleanup also failed: ${cleanupFailures.join("; ")}.`;
+            return yield* new PairingAddError({
+              reason: "local-persistence-failed",
+              detail: `${error.detail}${cleanupDetail}`,
+            });
+          }),
+        ),
+        Effect.ensuring(
+          Effect.suspend(() =>
+            pairingConfirmed || cleanupCompleted
+              ? Effect.void
+              : rollbackLocalWrites().pipe(Effect.ignore),
+          ),
+        ),
+      );
     }),
   ).pipe(
     Effect.mapError((error) => (isPairingAddError(error) ? error : classifyAttemptError(error))),
   );
-
-  const registration = new BearerConnectionRegistration({
-    target,
-    profile: new BearerConnectionProfile({
-      connectionId,
-      environmentId: verified.environmentId,
-      label: payload.name,
-      httpBaseUrl,
-      wsBaseUrl: deriveWsBaseUrl(httpBaseUrl),
-      hostKey: payload.hostKey,
-    }),
-    credential: new BearerConnectionCredential({ token: verified.credential }),
-  });
-  yield* registry
-    .register(registration)
-    .pipe(Effect.mapError(() => postBootstrapPersistenceError("the server connection")));
-  const identityPersistenceError = yield* identities
-    .accept({
-      targetKey: storageIdentityTargetKey(target),
-      storageInstanceId: verified.storageInstanceId,
-    })
-    .pipe(
-      Effect.as(null),
-      Effect.orElseSucceed(() => postBootstrapPersistenceError("the server identity")),
-    );
-  if (identityPersistenceError !== null) {
-    const registrationCleanupFailed = yield* registry.rollbackRegistration(registration).pipe(
-      Effect.as(false),
-      Effect.orElseSucceed(() => true),
-    );
-    if (registrationCleanupFailed) {
-      return yield* new PairingAddError({
-        reason: "local-persistence-failed",
-        detail: `${identityPersistenceError.detail} Local registration cleanup also failed; remove the saved entry manually before retrying.`,
-      });
-    }
-    return yield* identityPersistenceError;
-  }
-  return registration.target.environmentId as EnvironmentId;
 });

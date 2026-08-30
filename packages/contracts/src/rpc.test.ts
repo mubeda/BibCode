@@ -4,6 +4,7 @@ import * as Schema from "effect/Schema";
 import { ORCHESTRATION_WS_METHODS } from "./orchestration.ts";
 import {
   WS_METHODS,
+  WsAuthConfirmPairingRpc,
   WsRpcGroup,
   WsServerGetConfigRpc,
   WsServerConsumeCodexRateLimitResetRpc,
@@ -65,6 +66,8 @@ const decodeWorktreeRemovalError = Schema.decodeUnknownSync(WsWorktreeRemoveRpc.
 const decodeRefreshProviderUsageError = Schema.decodeUnknownSync(
   WsServerRefreshProviderUsageRpc.errorSchema,
 );
+const decodeConfirmPairing = Schema.decodeUnknownSync(WsAuthConfirmPairingRpc.payloadSchema);
+const decodeConfirmPairingSuccess = Schema.decodeUnknownSync(WsAuthConfirmPairingRpc.successSchema);
 
 describe("WS_METHODS", () => {
   it("maps method identifiers to unique dotted wire names", () => {
@@ -82,6 +85,7 @@ describe("WS_METHODS", () => {
 
   it("uses stable wire names for representative methods", () => {
     expect(WS_METHODS.serverGetConfig).toBe("server.getConfig");
+    expect(WS_METHODS.authConfirmPairing).toBe("auth.confirmPairing");
     expect((WS_METHODS as Record<string, string>).serverConsumeCodexRateLimitReset).toBe(
       "server.consumeCodexRateLimitReset",
     );
@@ -193,6 +197,11 @@ describe("individual RPC definitions", () => {
   });
 
   it("tags each RPC with its wire method name", () => {
+    expect(WsAuthConfirmPairingRpc._tag).toBe(WS_METHODS.authConfirmPairing);
+    expect(decodeConfirmPairing({})).toEqual({});
+    expect(decodeConfirmPairingSuccess({})).toEqual({});
+    expect(() => decodeConfirmPairing({ sessionId: "another-session" })).toThrow();
+    expect(() => decodeConfirmPairingSuccess({ confirmed: true })).toThrow();
     expect(WsServerGetConfigRpc._tag).toBe(WS_METHODS.serverGetConfig);
     expect(WsServerConsumeCodexRateLimitResetRpc._tag).toBe(
       WS_METHODS.serverConsumeCodexRateLimitReset,
@@ -266,6 +275,7 @@ describe("WsRpcGroup", () => {
 
   it("registers the individually exported RPCs under their tags", () => {
     const members = [
+      WsAuthConfirmPairingRpc,
       WsServerGetConfigRpc,
       WsServerConsumeCodexRateLimitResetRpc,
       WsVcsPullRpc,

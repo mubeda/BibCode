@@ -22,8 +22,8 @@ use tokio_util::sync::{CancellationToken, PollSender};
 use super::{
     RpcRegistry, RpcSessionContext,
     session::{
-        PUMP_JOIN_TIMEOUT, RpcInboundFrame, RpcOutboundBudget, RpcOutboundFrame,
-        RpcOutboundProcessBudget, SOCKET_WRITE_TIMEOUT, WeightedByteAcquireError,
+        PUMP_JOIN_TIMEOUT, PairingConfirmationLatch, RpcInboundFrame, RpcOutboundBudget,
+        RpcOutboundFrame, RpcOutboundProcessBudget, SOCKET_WRITE_TIMEOUT, WeightedByteAcquireError,
         WeightedByteBudget, WeightedByteGrant, run_session_split_budgeted,
     },
 };
@@ -760,11 +760,13 @@ pub(crate) enum E2eeAccept {
 
 pub(crate) struct MintedE2eeSession {
     pub credential: String,
+    delivery_guard: Box<MintedSessionDeliveryGuard>,
 }
 
 struct MintedSessionDeliveryGuard {
     auth: Option<AuthService>,
     session_id: Option<String>,
+    confirmation: PairingConfirmationLatch,
 }
 
 impl MintedSessionDeliveryGuard {
@@ -772,12 +774,12 @@ impl MintedSessionDeliveryGuard {
         Self {
             auth: Some(auth),
             session_id: Some(session_id),
+            confirmation: PairingConfirmationLatch::default(),
         }
     }
 
-    fn commit(&mut self) {
-        self.auth = None;
-        self.session_id = None;
+    fn confirmation_latch(&self) -> PairingConfirmationLatch {
+        self.confirmation.clone()
     }
 }
 
@@ -786,10 +788,13 @@ impl Drop for MintedSessionDeliveryGuard {
         let (Some(auth), Some(session_id)) = (self.auth.take(), self.session_id.take()) else {
             return;
         };
+        if self.confirmation.is_confirmed() {
+            return;
+        }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             tracing::error!(
                 session_id,
-                "unable to schedule compensation for an undelivered E2EE credential"
+                "unable to schedule compensation for an unconfirmed E2EE credential"
             );
             return;
         };
@@ -798,7 +803,7 @@ impl Drop for MintedSessionDeliveryGuard {
                 tracing::error!(
                     session_id,
                     ?error,
-                    "failed to compensate an undelivered E2EE credential"
+                    "failed to compensate an unconfirmed E2EE credential"
                 );
             }
         });
@@ -885,20 +890,13 @@ pub(crate) async fn run_e2ee_session(
             Err(code) => return Ok(EstablishOutcome::Rejected { channel, code }),
         };
 
-        let mut minted_delivery_guard = None;
         let accept = if config.unsafe_no_auth {
             E2eeAccept::Unauthenticated
         } else {
             match (message.pairing, message.bearer) {
                 (Some(pairing), None) => {
                     let Ok(issued) = auth
-                        .exchange_bootstrap(
-                            &pairing,
-                            None,
-                            e2ee_client_metadata(),
-                            None,
-                            SessionTransport::E2ee,
-                        )
+                        .exchange_pairing_bootstrap(&pairing, e2ee_client_metadata())
                         .await
                     else {
                         return Ok(EstablishOutcome::Rejected {
@@ -906,14 +904,15 @@ pub(crate) async fn run_e2ee_session(
                             code: "unauthorized",
                         });
                     };
-                    minted_delivery_guard = Some(MintedSessionDeliveryGuard::new(
+                    let delivery_guard = MintedSessionDeliveryGuard::new(
                         auth.clone(),
                         issued.principal.session_id.clone(),
-                    ));
+                    );
                     E2eeAccept::Authenticated {
                         principal: issued.principal,
                         minted: Some(MintedE2eeSession {
                             credential: issued.token,
+                            delivery_guard: Box::new(delivery_guard),
                         }),
                     }
                 }
@@ -965,9 +964,6 @@ pub(crate) async fn run_e2ee_session(
             }
         };
         send_encrypted_frames(&mut ws_writer, &mut channel, &reply).await?;
-        if let Some(guard) = &mut minted_delivery_guard {
-            guard.commit();
-        }
         Ok::<_, E2eeSessionError>(EstablishOutcome::Accepted {
             channel,
             admission: EstablishedE2eeAdmission {
@@ -1088,38 +1084,57 @@ async fn run_established_e2ee(
         accept,
         _permit: established_permit,
     } = admission;
-    let ((context, expiration_guard, connection_guard), established_permit) = match accept {
-        E2eeAccept::Authenticated { principal, .. } => {
-            let session_id = principal.session_id.clone();
-            let Ok((connection_guard, admitted_permit)) = register_e2ee_connection(
-                &auth,
-                &session_id,
-                session_shutdown.clone(),
-                established_permit,
-            )
-            .await
-            else {
-                session_shutdown.cancel();
-                let _ = timeout(SOCKET_WRITE_TIMEOUT, ws_writer.close()).await;
-                return;
-            };
-            let established_permit = admitted_permit;
-            let expires_at_ms = principal.expires_at_ms;
-            let session = (
-                RpcSessionContext::authenticated(principal, auth.clone()),
-                Some(spawn_session_expiration_guard(
-                    expires_at_ms,
+    let ((context, expiration_guard, connection_guard, pairing_delivery_guard), established_permit) =
+        match accept {
+            E2eeAccept::Authenticated { principal, minted } => {
+                let session_id = principal.session_id.clone();
+                let Ok((connection_guard, admitted_permit)) = register_e2ee_connection(
+                    &auth,
+                    &session_id,
                     session_shutdown.clone(),
-                )),
-                Some(connection_guard),
-            );
-            (session, established_permit)
-        }
-        E2eeAccept::Unauthenticated => (
-            (RpcSessionContext::unauthenticated(), None, None),
-            established_permit,
-        ),
-    };
+                    established_permit,
+                )
+                .await
+                else {
+                    session_shutdown.cancel();
+                    let _ = timeout(SOCKET_WRITE_TIMEOUT, ws_writer.close()).await;
+                    return;
+                };
+                let established_permit = admitted_permit;
+                let expires_at_ms = principal.expires_at_ms;
+                let (context, pairing_delivery_guard) = match minted {
+                    Some(minted) => {
+                        let latch = minted.delivery_guard.confirmation_latch();
+                        (
+                            RpcSessionContext::authenticated_pending_pairing(
+                                principal,
+                                auth.clone(),
+                                latch,
+                            ),
+                            Some(minted.delivery_guard),
+                        )
+                    }
+                    None => (
+                        RpcSessionContext::authenticated(principal, auth.clone()),
+                        None,
+                    ),
+                };
+                let session = (
+                    context,
+                    Some(spawn_session_expiration_guard(
+                        expires_at_ms,
+                        session_shutdown.clone(),
+                    )),
+                    Some(connection_guard),
+                    pairing_delivery_guard,
+                );
+                (session, established_permit)
+            }
+            E2eeAccept::Unauthenticated => (
+                (RpcSessionContext::unauthenticated(), None, None, None),
+                established_permit,
+            ),
+        };
     let principal_inbound_permits = established_permit.principal_inbound();
     let global_inbound_permits = E2EE_RESOURCE_BUDGET.global_inbound();
     let channel = Arc::new(Mutex::new(channel));
@@ -1269,6 +1284,7 @@ async fn run_established_e2ee(
     if let Some(connection_guard) = connection_guard {
         connection_guard.close().await;
     }
+    drop(pairing_delivery_guard);
 }
 
 async fn register_e2ee_connection(
@@ -1562,13 +1578,7 @@ mod tests {
             .expect("desktop config");
         let auth = AuthService::new(&config, vec![7_u8; 32]);
         let issued = auth
-            .exchange_bootstrap(
-                "desktop-test-seed",
-                None,
-                e2ee_client_metadata(),
-                None,
-                SessionTransport::E2ee,
-            )
+            .exchange_pairing_bootstrap("desktop-test-seed", e2ee_client_metadata())
             .await
             .expect("minted E2EE session");
         let session_id = issued.principal.session_id.clone();
