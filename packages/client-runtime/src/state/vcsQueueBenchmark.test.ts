@@ -12,7 +12,6 @@ import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import { createVcsEnvironmentAtoms } from "./vcs.ts";
 
 function configuredPositiveInteger(name: string, fallback: number): number {
-  // oxlint-disable-next-line bibcode/no-global-process-runtime -- Runnable benchmark accepts bounded sample-count inputs from its controller.
   const value = process.env[name];
   if (value === undefined) return fallback;
   const parsed = Number(value);
@@ -118,7 +117,6 @@ describe("production VCS Atom queue benchmark", () => {
       // @effect-diagnostics-next-line preferSchemaOverJson:off - Machine-local benchmark marker has a fixed internal shape and no wire boundary.
       const encoded = JSON.stringify(summary);
       yield* Effect.sync(() => {
-        // oxlint-disable-next-line bibcode/no-global-process-runtime -- Runnable benchmark publishes one controller-readable result line.
         process.stdout.write(`VCS_QUEUE_BENCHMARK ${encoded}\n`);
       });
       expect(Number.isFinite(summary.p95Ms)).toBe(true);

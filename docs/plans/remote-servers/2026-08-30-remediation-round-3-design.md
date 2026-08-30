@@ -25,6 +25,7 @@ large stream chunk loses every race, its 5 s admission deadline expires, and
 whenever any waiter is queued, silently dropping the interrupt (L13).
 
 Decision.
+
 1. **Push-granting.** Waiters enqueue once and await their own oneshot with the
    caller's absolute deadline. Granting runs only from release paths (permit
    drop/shrink, waiter cancellation), one scan per release. The `Notify`-driven
@@ -99,6 +100,7 @@ topology, one abusive client rate-limits the whole deployment.
 
 Decision — supersedes the round-2 design's rejection (approved by the user's
 fix-all instruction).
+
 1. **Fresh-network reserve.** An admission whose peer/network bucket is already
    active proceeds only while global usage (including this connection) stays
    ≤ `E2EE_PREAUTH_GLOBAL_SOFT_CAP` (24); a bucket's **first** connection may use

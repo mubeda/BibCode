@@ -206,12 +206,12 @@ describe.skipIf(serverBinary === undefined)(
         });
         nextRequestId += 1;
       }
-      expect(await requestTestRpc(channel, String(nextRequestId), "server.getConfig")).toMatchObject(
-        {
-          _tag: "Exit",
-          requestId: String(nextRequestId),
-        },
-      );
+      expect(
+        await requestTestRpc(channel, String(nextRequestId), "server.getConfig"),
+      ).toMatchObject({
+        _tag: "Exit",
+        requestId: String(nextRequestId),
+      });
       channel.close();
 
       const second = await openEncrypted(server, hostKey);
