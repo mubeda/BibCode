@@ -104,8 +104,8 @@ import {
   ITEM_ROW_CLASSNAME,
   ITEM_ROW_INNER_CLASSNAME,
   parseManualDesktopSshTarget,
-  parsePairingUrlFields,
   parseRemotePairingFields,
+  tryResolveRemotePairingHostInput,
 } from "./shared";
 import {
   ADD_SERVER_FAILURE_REASONS,
@@ -1199,10 +1199,10 @@ export function ConnectTab({
     ],
   );
   const handleSavedBackendHostChange = useCallback((value: string) => {
-    const parsedPairingUrl = parsePairingUrlFields(value);
-    if (parsedPairingUrl) {
-      setSavedBackendHost(parsedPairingUrl.host);
-      setSavedBackendPairingCode(parsedPairingUrl.pairingCode);
+    const resolution = tryResolveRemotePairingHostInput(value);
+    if (resolution._tag === "Resolved") {
+      setSavedBackendHost(resolution.host);
+      setSavedBackendPairingCode(resolution.pairingCode);
       return;
     }
     setSavedBackendHost(value);

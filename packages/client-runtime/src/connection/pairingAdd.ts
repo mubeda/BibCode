@@ -73,8 +73,8 @@ export interface VerifyPairingCodeInput {
   readonly allowLoopbackTunnel?: boolean;
 }
 
-const IDENTITY_MISMATCH_DETAIL = "The server behind this endpoint does not match the pairing code.";
-const POST_BOOTSTRAP_IDENTITY_MISMATCH_DETAIL = IDENTITY_MISMATCH_DETAIL;
+const POST_BOOTSTRAP_IDENTITY_MISMATCH_DETAIL =
+  "The server behind this endpoint does not match the pairing code.";
 const postBootstrapPersistenceError = (target: string): PairingAddError =>
   new PairingAddError({
     reason: "local-persistence-failed",

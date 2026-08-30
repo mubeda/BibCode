@@ -1099,27 +1099,39 @@ describe("Remote Servers deterministic helpers", () => {
     ).toBe("alice@host:22");
   });
 
-  it("parses pairing URLs and validates separate remote pairing fields", () => {
-    const { parsePairingUrlFields, parseRemotePairingFields } = remoteServersSettingsInternals;
-    expect(parsePairingUrlFields(" ")).toBeNull();
-    expect(parsePairingUrlFields("not a valid host")).toBeNull();
-    expect(parsePairingUrlFields("https://backend.test/pair")).toBeNull();
-    expect(parsePairingUrlFields("backend.test/pair?token=secret")).toEqual({
-      host: "https://backend.test",
-      pairingCode: "secret",
-    });
-    expect(parsePairingUrlFields("//backend.test/pair?token=secret-2")).toEqual({
-      host: "https://backend.test",
-      pairingCode: "secret-2",
-    });
+  it("parses pairing URLs through the shared owner and validates plain fields", () => {
+    const { parseRemotePairingFields } = remoteServersSettingsInternals;
     expect(
       parseRemotePairingFields({
         host: "https://backend.test/pair?token=url-token",
         pairingCode: "ignored",
       }),
-    ).toEqual({ host: "https://backend.test", pairingCode: "url-token" });
+    ).toEqual({ host: "https://backend.test/", pairingCode: "url-token" });
+    expect(
+      parseRemotePairingFields({ host: "backend.test/pair?token=secret", pairingCode: "" }),
+    ).toEqual({ host: "https://backend.test/", pairingCode: "secret" });
+
+    // The shared owner guards the reachable Connect-tab path: a pairing URL
+    // carrying userinfo is rejected instead of displaying one host while
+    // connecting to another, and unsupported protocols are refused.
+    expect(() =>
+      parseRemotePairingFields({
+        host: "https://trusted.example@attacker.example/pair?token=secret",
+        pairingCode: "",
+      }),
+    ).toThrow("Pairing URL is invalid.");
+    expect(() =>
+      parseRemotePairingFields({ host: "ftp://backend.test/pair?token=x", pairingCode: "" }),
+    ).toThrow("Pairing URL is invalid.");
+
+    // Bare hosts — including malformed ones — defer to the plain fields; the
+    // owner still normalizes them at the next step of the connect flow.
     expect(parseRemotePairingFields({ host: " backend.test ", pairingCode: " code " })).toEqual({
       host: "backend.test",
+      pairingCode: "code",
+    });
+    expect(parseRemotePairingFields({ host: "not a valid host", pairingCode: "code" })).toEqual({
+      host: "not a valid host",
       pairingCode: "code",
     });
     expect(() => parseRemotePairingFields({ host: "", pairingCode: "code" })).toThrow(
