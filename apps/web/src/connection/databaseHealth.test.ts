@@ -9,18 +9,21 @@ import {
   subscribeConnectionDatabaseHealth,
 } from "./databaseHealth";
 
-class FakeRequest {
+class FakeRequest extends EventTarget implements IDBOpenDBRequest {
   error: DOMException | null = null;
-  private readonly listeners = new Map<string, Array<() => void>>();
-
-  addEventListener(type: string, listener: () => void): void {
-    const bucket = this.listeners.get(type) ?? [];
-    bucket.push(listener);
-    this.listeners.set(type, bucket);
-  }
+  onblocked: ((this: IDBOpenDBRequest, ev: IDBVersionChangeEvent) => unknown) | null = null;
+  onerror: ((this: IDBRequest<IDBDatabase>, ev: Event) => unknown) | null = null;
+  onsuccess: ((this: IDBRequest<IDBDatabase>, ev: Event) => unknown) | null = null;
+  onupgradeneeded: ((this: IDBOpenDBRequest, ev: IDBVersionChangeEvent) => unknown) | null = null;
+  readyState: IDBRequestReadyState = "pending";
+  result = {} as IDBDatabase;
+  source = {} as IDBObjectStore;
+  transaction = null;
 
   fire(type: string): void {
-    for (const listener of this.listeners.get(type) ?? []) listener();
+    if (this.readyState === "done") throw new Error("IndexedDB request already settled");
+    if (type === "success" || type === "error") this.readyState = "done";
+    this.dispatchEvent(new Event(type));
   }
 }
 
@@ -31,46 +34,103 @@ afterEach(() => {
 
 describe("connection database health", () => {
   it("classifies version conflicts, blocked opens, generic failures, and later success", () => {
-    const request = new FakeRequest();
     const snapshots: string[] = [];
     const unsubscribe = subscribeConnectionDatabaseHealth(() => {
       snapshots.push(getConnectionDatabaseHealth().status);
     });
-    monitorConnectionDatabaseOpenRequest(request as unknown as IDBOpenDBRequest);
 
-    request.fire("blocked");
+    const blocked = new FakeRequest();
+    monitorConnectionDatabaseOpenRequest(blocked);
+    blocked.fire("blocked");
     expect(getConnectionDatabaseHealth().status).toBe("blocked");
 
-    request.fire("success");
+    const ready = new FakeRequest();
+    monitorConnectionDatabaseOpenRequest(ready);
+    ready.fire("success");
     expect(getConnectionDatabaseHealth().status).toBe("ready");
 
-    request.error = new DOMException("newer database", "VersionError");
-    request.fire("error");
+    const incompatible = new FakeRequest();
+    incompatible.error = new DOMException("newer database", "VersionError");
+    monitorConnectionDatabaseOpenRequest(incompatible);
+    incompatible.fire("error");
     expect(getConnectionDatabaseHealth().status).toBe("incompatible");
 
-    request.error = new DOMException("permission denied", "UnknownError");
-    request.fire("error");
+    const unavailable = new FakeRequest();
+    unavailable.error = new DOMException("permission denied", "UnknownError");
+    monitorConnectionDatabaseOpenRequest(unavailable);
+    unavailable.fire("error");
     expect(getConnectionDatabaseHealth()).toMatchObject({ status: "unavailable" });
     expect(snapshots).toEqual(["blocked", "ready", "incompatible", "unavailable"]);
     unsubscribe();
   });
 
-  it("reports blocked deletion without treating it as success", async () => {
+  it("keeps a blocked deletion pending until that request succeeds", async () => {
+    const open = new FakeRequest();
+    open.error = new DOMException("newer database", "VersionError");
+    monitorConnectionDatabaseOpenRequest(open);
+    open.fire("error");
     const request = new FakeRequest();
-    const deleteDatabase = vi.fn(() => {
-      queueMicrotask(() => request.fire("blocked"));
-      return request as unknown as IDBOpenDBRequest;
-    });
+    const deleteDatabase = vi.fn(() => request);
     vi.stubGlobal("indexedDB", { deleteDatabase });
+    let outcome: "pending" | "deleted" | "blocked" | "rejected" = "pending";
 
-    await expect(deleteIncompatibleConnectionDatabase()).resolves.toBe("blocked");
+    const deletion = deleteIncompatibleConnectionDatabase().then(
+      (result) => {
+        outcome = result;
+        return result;
+      },
+      (cause: unknown) => {
+        outcome = "rejected";
+        throw cause;
+      },
+    );
+    request.fire("blocked");
+    await Promise.resolve();
+
+    expect(outcome).toBe("pending");
+    expect(getConnectionDatabaseHealth()).toMatchObject({ status: "blocked" });
     expect(deleteDatabase).toHaveBeenCalledWith(CONNECTION_DATABASE_NAME);
+
+    request.fire("success");
+    await expect(deletion).resolves.toBe("deleted");
+    expect(getConnectionDatabaseHealth().status).toBe("ready");
+  });
+
+  it("rejects a blocked deletion that later errors and publishes unavailable health", async () => {
+    const request = new FakeRequest();
+    vi.stubGlobal("indexedDB", {
+      deleteDatabase: () => request,
+    });
+    const deletion = deleteIncompatibleConnectionDatabase();
+
+    request.fire("blocked");
+    request.error = new DOMException("deletion denied", "UnknownError");
+    request.fire("error");
+
+    await expect(deletion).rejects.toThrow("deletion denied");
+    expect(getConnectionDatabaseHealth()).toMatchObject({ status: "unavailable" });
+  });
+
+  it("keeps queued deletion health authoritative over competing open events", async () => {
+    const open = new FakeRequest();
+    monitorConnectionDatabaseOpenRequest(open);
+    const deletion = new FakeRequest();
+    vi.stubGlobal("indexedDB", { deleteDatabase: () => deletion });
+
+    const pending = deleteIncompatibleConnectionDatabase();
+    deletion.fire("blocked");
+    open.fire("success");
+
+    expect(getConnectionDatabaseHealth()).toMatchObject({ status: "blocked" });
+    deletion.fire("success");
+    await expect(pending).resolves.toBe("deleted");
+    expect(getConnectionDatabaseHealth()).toMatchObject({ status: "ready" });
   });
 
   it("publishes ready only after successful deletion", async () => {
     const open = new FakeRequest();
     open.error = new DOMException("newer database", "VersionError");
-    monitorConnectionDatabaseOpenRequest(open as unknown as IDBOpenDBRequest);
+    monitorConnectionDatabaseOpenRequest(open);
     open.fire("error");
     const deletion = new FakeRequest();
     vi.stubGlobal("indexedDB", {

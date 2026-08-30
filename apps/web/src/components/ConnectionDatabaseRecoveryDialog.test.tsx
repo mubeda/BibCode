@@ -5,7 +5,9 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 vi.mock("./ui/dialog", () => {
-  const passthrough = ({ children }: { children?: ReactNode }) => <div>{children}</div>;
+  const passthrough = ({ children, ...props }: React.HTMLAttributes<HTMLDivElement>) => (
+    <div {...props}>{children}</div>
+  );
   return {
     Dialog: ({ open, children }: { open: boolean; children?: ReactNode }) =>
       open ? <div>{children}</div> : null,
@@ -13,7 +15,10 @@ vi.mock("./ui/dialog", () => {
     DialogFooter: passthrough,
     DialogHeader: passthrough,
     DialogPanel: passthrough,
-    DialogPopup: passthrough,
+    DialogPopup: ({
+      showCloseButton: _showCloseButton,
+      ...props
+    }: React.HTMLAttributes<HTMLDivElement> & { showCloseButton?: boolean }) => <div {...props} />,
     DialogTitle: passthrough,
   };
 });
@@ -28,18 +33,21 @@ import {
 } from "../connection/databaseHealth";
 import { ConnectionDatabaseRecoveryDialog } from "./ConnectionDatabaseRecoveryDialog";
 
-class FakeRequest {
+class FakeRequest extends EventTarget implements IDBOpenDBRequest {
   error: DOMException | null = null;
-  private readonly listeners = new Map<string, Array<() => void>>();
-
-  addEventListener(type: string, listener: () => void): void {
-    const bucket = this.listeners.get(type) ?? [];
-    bucket.push(listener);
-    this.listeners.set(type, bucket);
-  }
+  onblocked: ((this: IDBOpenDBRequest, ev: IDBVersionChangeEvent) => unknown) | null = null;
+  onerror: ((this: IDBRequest<IDBDatabase>, ev: Event) => unknown) | null = null;
+  onsuccess: ((this: IDBRequest<IDBDatabase>, ev: Event) => unknown) | null = null;
+  onupgradeneeded: ((this: IDBOpenDBRequest, ev: IDBVersionChangeEvent) => unknown) | null = null;
+  readyState: IDBRequestReadyState = "pending";
+  result = {} as IDBDatabase;
+  source = {} as IDBObjectStore;
+  transaction = null;
 
   fire(type: string): void {
-    for (const listener of this.listeners.get(type) ?? []) listener();
+    if (this.readyState === "done") throw new Error("IndexedDB request already settled");
+    if (type === "success" || type === "error") this.readyState = "done";
+    this.dispatchEvent(new Event(type));
   }
 }
 
@@ -54,10 +62,16 @@ function button(text: string): HTMLButtonElement {
   return match!;
 }
 
+function acknowledgementCheckbox(): HTMLInputElement {
+  const match = container.querySelector<HTMLInputElement>('input[type="checkbox"]');
+  expect(match).not.toBeNull();
+  return match!;
+}
+
 function publishOpenEvent(type: "blocked" | "error", error?: DOMException): void {
   const request = new FakeRequest();
   request.error = error ?? null;
-  monitorConnectionDatabaseOpenRequest(request as unknown as IDBOpenDBRequest);
+  monitorConnectionDatabaseOpenRequest(request);
   request.fire(type);
 }
 
@@ -73,12 +87,13 @@ afterEach(async () => {
   await act(async () => root.unmount());
   container.remove();
   resetConnectionDatabaseHealthForTest();
+  vi.unstubAllGlobals();
 });
 
 describe("ConnectionDatabaseRecoveryDialog", () => {
-  it("lists every deleted category and requires confirmation before reset", async () => {
+  it("requires a separate acknowledged confirmation that a double-click cannot trigger", async () => {
     publishOpenEvent("error", new DOMException("newer database", "VersionError"));
-    const deleteDatabase = vi.fn(async () => "blocked" as const);
+    const deleteDatabase = vi.fn(async () => "deleted" as const);
     const reloadPage = vi.fn();
     await act(async () => {
       root.render(
@@ -98,13 +113,26 @@ describe("ConnectionDatabaseRecoveryDialog", () => {
     ]) {
       expect(container.textContent).toContain(text);
     }
+    expect(button("Reload").disabled).toBe(false);
     expect(deleteDatabase).not.toHaveBeenCalled();
+    expect(button("Reset saved connection data").getAttribute("aria-expanded")).toBe("false");
     await act(async () => button("Reset saved connection data").click());
+    await act(async () => button("Reset saved connection data").click());
+    expect(deleteDatabase).not.toHaveBeenCalled();
     expect(container.textContent).toContain("cannot be undone");
-    await act(async () => button("Confirm reset").click());
+    expect(button("Reset saved connection data").getAttribute("aria-expanded")).toBe("true");
+    expect(button("Reset saved connection data").getAttribute("aria-controls")).toBe(
+      "connection-database-reset-confirmation",
+    );
+    expect(button("Delete saved connection data").disabled).toBe(true);
+    expect(document.activeElement).toBe(acknowledgementCheckbox());
+
+    await act(async () => acknowledgementCheckbox().click());
+    expect(button("Delete saved connection data").disabled).toBe(false);
+    await act(async () => button("Delete saved connection data").click());
+
     expect(deleteDatabase).toHaveBeenCalledOnce();
-    expect(container.textContent).toContain("Close other BiBCode tabs and windows");
-    expect(reloadPage).not.toHaveBeenCalled();
+    expect(reloadPage).toHaveBeenCalledOnce();
   });
 
   it("reloads only after successful deletion", async () => {
@@ -120,8 +148,58 @@ describe("ConnectionDatabaseRecoveryDialog", () => {
     });
 
     await act(async () => button("Reset saved connection data").click());
-    await act(async () => button("Confirm reset").click());
+    await act(async () => acknowledgementCheckbox().click());
+    await act(async () => button("Delete saved connection data").click());
     expect(reloadPage).toHaveBeenCalledOnce();
+  });
+
+  it("keeps a blocked deletion visibly pending and reloads after its later success", async () => {
+    publishOpenEvent("error", new DOMException("newer database", "VersionError"));
+    const deletion = new FakeRequest();
+    vi.stubGlobal("indexedDB", {
+      deleteDatabase: () => deletion,
+    });
+    const reloadPage = vi.fn();
+    await act(async () => {
+      root.render(<ConnectionDatabaseRecoveryDialog reloadPage={reloadPage} />);
+    });
+
+    await act(async () => button("Reset saved connection data").click());
+    await act(async () => acknowledgementCheckbox().click());
+    await act(async () => button("Delete saved connection data").click());
+    expect(button("Deleting…").disabled).toBe(true);
+    expect(button("Reload").disabled).toBe(false);
+    await act(async () => deletion.fire("blocked"));
+
+    expect(container.textContent).toContain("queued");
+    expect(container.textContent).toContain("pending");
+    expect(reloadPage).not.toHaveBeenCalled();
+
+    await act(async () => deletion.fire("success"));
+    expect(reloadPage).toHaveBeenCalledOnce();
+  });
+
+  it("does not reload when a blocked deletion later fails", async () => {
+    publishOpenEvent("error", new DOMException("newer database", "VersionError"));
+    const deletion = new FakeRequest();
+    vi.stubGlobal("indexedDB", {
+      deleteDatabase: () => deletion,
+    });
+    const reloadPage = vi.fn();
+    await act(async () => {
+      root.render(<ConnectionDatabaseRecoveryDialog reloadPage={reloadPage} />);
+    });
+
+    await act(async () => button("Reset saved connection data").click());
+    await act(async () => acknowledgementCheckbox().click());
+    await act(async () => button("Delete saved connection data").click());
+    await act(async () => deletion.fire("blocked"));
+    deletion.error = new DOMException("deletion denied", "UnknownError");
+    await act(async () => deletion.fire("error"));
+
+    expect(container.textContent).toContain("could not be deleted");
+    expect(container.querySelectorAll('[role="alert"]')).toHaveLength(1);
+    expect(reloadPage).not.toHaveBeenCalled();
   });
 
   it("keeps blocked and generic unavailable recovery non-destructive", async () => {
@@ -133,9 +211,9 @@ describe("ConnectionDatabaseRecoveryDialog", () => {
     expect(container.textContent).toContain("Connection database is blocked");
     expect(container.textContent).not.toContain("Reset saved connection data");
 
-    reportConnectionDatabaseUnavailable("open denied");
     const copyText = vi.fn(async () => undefined);
     await act(async () => {
+      reportConnectionDatabaseUnavailable("open denied");
       root.render(<ConnectionDatabaseRecoveryDialog reloadPage={reloadPage} copyText={copyText} />);
     });
     await act(async () => button("Copy diagnostics").click());

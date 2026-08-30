@@ -10,11 +10,16 @@ export interface ConnectionDatabaseHealth {
 
 const READY_HEALTH: ConnectionDatabaseHealth = { status: "ready", message: null };
 let health: ConnectionDatabaseHealth = READY_HEALTH;
+let activeDeletionRequest: IDBOpenDBRequest | null = null;
 const listeners = new Set<() => void>();
 
 function publish(next: ConnectionDatabaseHealth): void {
   health = next;
   for (const listener of listeners) listener();
+}
+
+function publishOpenHealth(next: ConnectionDatabaseHealth): void {
+  if (activeDeletionRequest === null) publish(next);
 }
 
 function errorName(error: unknown): string | null {
@@ -24,7 +29,7 @@ function errorName(error: unknown): string | null {
 
 export function monitorConnectionDatabaseOpenRequest(request: IDBOpenDBRequest): void {
   request.addEventListener("blocked", () => {
-    publish({
+    publishOpenHealth({
       status: "blocked",
       message: "Another tab or process is holding an older connection database open.",
     });
@@ -32,22 +37,22 @@ export function monitorConnectionDatabaseOpenRequest(request: IDBOpenDBRequest):
   request.addEventListener("error", () => {
     const error = request.error;
     if (errorName(error) === "VersionError") {
-      publish({
+      publishOpenHealth({
         status: "incompatible",
         message: "This browser has a newer, incompatible BiBCode connection database.",
       });
       return;
     }
-    publish({
+    publishOpenHealth({
       status: "unavailable",
       message: `The connection database could not be opened: ${String(error ?? "unknown error")}`,
     });
   });
-  request.addEventListener("success", () => publish(READY_HEALTH));
+  request.addEventListener("success", () => publishOpenHealth(READY_HEALTH));
 }
 
 export function reportConnectionDatabaseUnavailable(cause: unknown): void {
-  publish({
+  publishOpenHealth({
     status: "unavailable",
     message: `The connection database is unavailable: ${String(cause)}`,
   });
@@ -62,7 +67,7 @@ export function subscribeConnectionDatabaseHealth(listener: () => void): () => v
   return () => listeners.delete(listener);
 }
 
-export function deleteIncompatibleConnectionDatabase(): Promise<"deleted" | "blocked"> {
+export function deleteIncompatibleConnectionDatabase(): Promise<"deleted"> {
   return new Promise((resolve, reject) => {
     if (typeof indexedDB === "undefined") {
       reject(new Error("IndexedDB is unavailable in this browser context."));
@@ -70,20 +75,35 @@ export function deleteIncompatibleConnectionDatabase(): Promise<"deleted" | "blo
     }
     let settled = false;
     const request = indexedDB.deleteDatabase(CONNECTION_DATABASE_NAME);
+    activeDeletionRequest = request;
     request.addEventListener("blocked", () => {
-      if (settled) return;
-      settled = true;
-      resolve("blocked");
+      if (activeDeletionRequest !== request) return;
+      publish({
+        status: "blocked",
+        message:
+          "The browser queued connection database deletion until other BiBCode tabs and windows close.",
+      });
     });
     request.addEventListener("error", () => {
       if (settled) return;
       settled = true;
-      reject(request.error ?? new Error("Unknown IndexedDB deletion error."));
+      const error = request.error ?? new Error("Unknown IndexedDB deletion error.");
+      if (activeDeletionRequest === request) {
+        activeDeletionRequest = null;
+        publish({
+          status: "unavailable",
+          message: `The connection database could not be deleted: ${String(error)}`,
+        });
+      }
+      reject(error);
     });
     request.addEventListener("success", () => {
       if (settled) return;
       settled = true;
-      publish(READY_HEALTH);
+      if (activeDeletionRequest === request) {
+        activeDeletionRequest = null;
+        publish(READY_HEALTH);
+      }
       resolve("deleted");
     });
   });
@@ -91,5 +111,6 @@ export function deleteIncompatibleConnectionDatabase(): Promise<"deleted" | "blo
 
 /** @internal Test isolation for the renderer-wide external store. */
 export function resetConnectionDatabaseHealthForTest(): void {
+  activeDeletionRequest = null;
   publish(READY_HEALTH);
 }
