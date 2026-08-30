@@ -114,6 +114,12 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         "review.getDiffPreview" => Some(SCOPE_REVIEW_WRITE),
         "cloud.getRelayClientStatus" | "cloud.installRelayClient" => Some(SCOPE_RELAY_WRITE),
         "subscribeAuthAccess" => Some(SCOPE_ACCESS_READ),
+        // Two-tier policy: a pending-pairing session confirms its OWN
+        // delivery through the session capability gate (which bypasses this
+        // scope, since standard device grants do not carry access scopes);
+        // any other caller needs access:write. Locked from both directions by
+        // confirm_pairing_policy_is_pending_capability_or_access_write and
+        // the e2ee scope-bypass suite.
         "auth.confirmPairing" => Some(SCOPE_ACCESS_WRITE),
         _ => None,
     }
