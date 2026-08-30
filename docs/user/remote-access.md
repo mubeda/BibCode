@@ -16,18 +16,23 @@ BiBCode HTTP endpoint directly to the public internet.
 ## Browser/hosted and future re-enabled desktop network access
 
 In the browser/hosted UI, or when this desktop presentation is re-enabled, use
-these controls to expose the backend embedded in the desktop app:
+the Share controls to create an address-specific pairing offer:
 
 1. Open **Settings → Connections**.
-2. Under **Manage Local Backend**, enable **Network access**. The desktop app
-   restarts its backend bound to the network-accessible host.
-3. Inspect the reachable endpoints. The list can include loopback, LAN, Tailnet
-   IP, MagicDNS, or verified HTTPS endpoints.
-4. Choose the endpoint you want to use and select **Create Link** to issue a
-   pairing link.
+2. Choose **Another device** for desktop-managed private-network access. The
+   desktop app offers automatic LAN only after it observes a usable private
+   default route; creating the offer then restarts the backend with native
+   network access.
+3. Choose **Custom address** for an SSH tunnel, reverse proxy, public hostname,
+   or separately launched server. Custom addresses are externally managed and
+   never change the desktop listener or firewall.
+4. Inspect the selected endpoint and generate the pairing offer.
 
-The selected endpoint type becomes the default for later links. A LAN endpoint
-can remain the default across ordinary IP address changes.
+Native interface observations are visible to the Share flow before widening,
+but report unavailable while the listener is loopback-only. Public-only and
+non-default private topologies fail closed instead of attempting a native
+widen. Use a custom address backed by an externally managed listener or reverse
+proxy on those hosts.
 
 - A loopback URL works only on the server machine.
 - A plain LAN or Tailnet HTTP URL can be used by a desktop client or by a page

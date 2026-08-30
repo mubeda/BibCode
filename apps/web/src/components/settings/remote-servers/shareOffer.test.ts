@@ -529,6 +529,36 @@ describe("generateShareOffer", () => {
     });
   });
 
+  it("treats an off-host custom address as externally managed without native widening", async () => {
+    const applyServerExposure = vi.fn(async () => wideState);
+    const mintOffer = vi.fn(async (input: { endpoint: string; name: string }) => ({
+      code: "c0de",
+      endpoint: input.endpoint,
+      name: input.name,
+      expiresAt: "2026-08-27T01:00:00.000Z",
+    }));
+    const result = await generateShareOffer({
+      intent: "custom",
+      name: "AI-SERVER",
+      customAddress: "https://server.example.com",
+      selectedOption: { id: "custom", label: "Custom address", httpBaseUrl: null },
+      hasDesktopBridge: true,
+      exposureState: loopbackState,
+      applyServerExposure,
+      mintOffer,
+      ...defaultDeps,
+    });
+
+    expect(applyServerExposure).not.toHaveBeenCalled();
+    expect(mintOffer).toHaveBeenCalledWith(
+      expect.objectContaining({ endpoint: "https://server.example.com/", reach: "custom" }),
+    );
+    expect(result).toMatchObject({
+      ok: true,
+      offer: { endpoint: "https://server.example.com/", endpointClass: "off-host" },
+    });
+  });
+
   it("rejects unconnectable custom addresses before widening or minting", async () => {
     const applyServerExposure = vi.fn();
     const mintOffer = vi.fn();
@@ -554,6 +584,18 @@ describe("resolveShareAddressOptions", () => {
     const options = resolveShareAddressOptions({
       intent: "another-device",
       advertisedEndpoints: [
+        {
+          id: "desktop-network:192.168.1.20:3773",
+          label: "Local network",
+          provider: { id: "desktop-core", label: "Desktop", kind: "core", isAddon: false },
+          httpBaseUrl: "http://192.168.1.20:3773/",
+          wsBaseUrl: "ws://192.168.1.20:3773/",
+          reachability: "lan",
+          compatibility: { hostedHttpsApp: "mixed-content-blocked", desktopApp: "compatible" },
+          source: "desktop-core",
+          status: "unavailable",
+          isDefault: true,
+        },
         {
           id: "tailscale-https",
           label: "Tailscale HTTPS",
@@ -610,7 +652,79 @@ describe("resolveShareAddressOptions", () => {
     });
   });
 
-  it("does not offer a public-only address while native exposure is local-only", () => {
+  it("does not offer a public-only observation while native exposure is local-only", () => {
+    const options = resolveShareAddressOptions({
+      intent: "another-device",
+      advertisedEndpoints: [
+        {
+          id: "desktop-network:8.8.8.8:3773",
+          label: "Public address",
+          provider: { id: "desktop-core", label: "Desktop", kind: "core", isAddon: false },
+          httpBaseUrl: "http://8.8.8.8:3773/",
+          wsBaseUrl: "ws://8.8.8.8:3773/",
+          reachability: "public",
+          compatibility: { hostedHttpsApp: "mixed-content-blocked", desktopApp: "compatible" },
+          source: "desktop-core",
+          status: "unavailable",
+          isDefault: false,
+        },
+      ],
+      exposureState: loopbackState,
+      primaryHttpBaseUrl: "http://127.0.0.1:3773",
+    });
+
+    expect(options).toEqual([]);
+  });
+
+  it("requires a private default-route observation before offering native automatic LAN", () => {
+    const options = resolveShareAddressOptions({
+      intent: "another-device",
+      advertisedEndpoints: [
+        {
+          id: "desktop-network:192.168.2.20:3773",
+          label: "Local network",
+          provider: { id: "desktop-core", label: "Desktop", kind: "core", isAddon: false },
+          httpBaseUrl: "http://192.168.2.20:3773/",
+          wsBaseUrl: "ws://192.168.2.20:3773/",
+          reachability: "lan",
+          compatibility: { hostedHttpsApp: "mixed-content-blocked", desktopApp: "compatible" },
+          source: "desktop-core",
+          status: "unavailable",
+          isDefault: false,
+        },
+      ],
+      exposureState: loopbackState,
+      primaryHttpBaseUrl: "http://127.0.0.1:3773",
+    });
+
+    expect(options).toEqual([]);
+  });
+
+  it("offers native automatic LAN for an observed private default route before widening", () => {
+    const options = resolveShareAddressOptions({
+      intent: "another-device",
+      advertisedEndpoints: [
+        {
+          id: "desktop-network:192.168.1.20:3773",
+          label: "Local network",
+          provider: { id: "desktop-core", label: "Desktop", kind: "core", isAddon: false },
+          httpBaseUrl: "http://192.168.1.20:3773/",
+          wsBaseUrl: "ws://192.168.1.20:3773/",
+          reachability: "lan",
+          compatibility: { hostedHttpsApp: "mixed-content-blocked", desktopApp: "compatible" },
+          source: "desktop-core",
+          status: "unavailable",
+          isDefault: true,
+        },
+      ],
+      exposureState: loopbackState,
+      primaryHttpBaseUrl: "http://127.0.0.1:3773",
+    });
+
+    expect(options).toEqual([expect.objectContaining({ id: "auto-lan", httpBaseUrl: null })]);
+  });
+
+  it("never offers public interface candidates for a native-managed wide server", () => {
     const options = resolveShareAddressOptions({
       intent: "another-device",
       advertisedEndpoints: [
@@ -627,10 +741,15 @@ describe("resolveShareAddressOptions", () => {
           isDefault: false,
         },
       ],
-      exposureState: loopbackState,
+      exposureState: wideState,
       primaryHttpBaseUrl: "http://127.0.0.1:3773",
     });
 
-    expect(options).toEqual([]);
+    expect(options).toEqual([
+      expect.objectContaining({
+        id: "auto-lan",
+        httpBaseUrl: "http://192.168.1.20:3773",
+      }),
+    ]);
   });
 });

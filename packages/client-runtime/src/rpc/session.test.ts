@@ -6,6 +6,7 @@ import {
   WS_METHODS,
 } from "@bibcode/contracts";
 import { describe, expect, it } from "@effect/vitest";
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -201,9 +202,10 @@ const awaitSocket = Effect.fn("TestRpcSessionFactory.awaitSocket")(function* (
 
 const awaitRequest = Effect.fn("TestRpcSessionFactory.awaitRequest")(function* (
   socket: TestWebSocket,
+  index = 0,
 ) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
-    const request = socket.sent[0];
+    const request = socket.sent[index];
     if (request) {
       if (typeof request !== "string") {
         return yield* Effect.die(new Error("Expected a plaintext RPC request."));
@@ -279,6 +281,47 @@ describe("RpcSessionFactory", () => {
       yield* Effect.yieldNow;
       expect(sockets).toHaveLength(1);
     }),
+  );
+
+  it.effect("preserves an unknown-request server defect as an exact die reason", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { factory, sockets } = yield* makeFactory();
+        const session = yield* factory.connect(PREPARED);
+        const readyFiber = yield* Effect.forkChild(session.ready);
+        const socket = yield* awaitSocket(sockets);
+        socket.open();
+        yield* completeInitialConfig(socket);
+        yield* Fiber.join(readyFiber);
+
+        const confirmation = yield* Effect.forkChild(
+          session.client[WS_METHODS.authConfirmPairing]({}).pipe(Effect.exit),
+        );
+        const request = yield* awaitRequest(socket, 1);
+        expect(request).toMatchObject({
+          _tag: "Request",
+          tag: WS_METHODS.authConfirmPairing,
+          payload: {},
+        });
+        socket.serverMessage(
+          encodeJson({
+            _tag: "Defect",
+            defect: `Unknown request tag: ${WS_METHODS.authConfirmPairing}`,
+          }),
+        );
+
+        const exit = yield* Fiber.join(confirmation);
+        expect(exit._tag).toBe("Failure");
+        if (exit._tag !== "Failure") return;
+        const { cause } = exit;
+        expect(cause.reasons).toHaveLength(1);
+        const reason = cause.reasons[0]!;
+        expect(Cause.isDieReason(reason)).toBe(true);
+        if (Cause.isDieReason(reason)) {
+          expect(reason.defect).toBe(`Unknown request tag: ${WS_METHODS.authConfirmPairing}`);
+        }
+      }),
+    ),
   );
 
   it.effect("starts host-key sessions with a binary Noise NK message A", () =>

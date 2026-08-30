@@ -861,16 +861,25 @@ impl RpcSessionContext {
         let (Some(principal), Some(auth)) = (&self.principal, &self.auth) else {
             return false;
         };
-        let Ok(true) = auth
-            .confirm_pending_pairing_session(&principal.session_id)
-            .await
-        else {
-            return false;
-        };
-        if let Some(latch) = &self.pairing_confirmation {
-            latch.mark_confirmed();
+        let session_id = principal.session_id.clone();
+        let auth = auth.clone();
+        let pairing_confirmation = self.pairing_confirmation.clone();
+        let activation = tokio::spawn(async move {
+            let Ok(true) = auth.confirm_pending_pairing_session(&session_id).await else {
+                return false;
+            };
+            if let Some(latch) = pairing_confirmation {
+                latch.mark_confirmed();
+            }
+            true
+        });
+        match activation.await {
+            Ok(confirmed) => confirmed,
+            Err(error) => {
+                tracing::error!(%error, "pairing-session activation task failed");
+                false
+            }
         }
-        true
     }
 
     pub(crate) async fn is_currently_authorized(&self, required_scope: &str) -> bool {

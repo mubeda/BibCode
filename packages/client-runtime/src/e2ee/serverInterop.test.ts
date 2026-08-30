@@ -178,6 +178,15 @@ describe.skipIf(serverBinary === undefined)(
       expect(authenticated.type).toBe("e2ee_authenticated");
       expect(authenticated.credential).toBeTruthy();
       expect(authenticated.storageInstanceId).toBe(payload.storageInstanceId);
+
+      const pending = await openEncrypted(server, hostKey);
+      pending.sendMessage(JSON.stringify({ type: "e2ee_auth", bearer: authenticated.credential }));
+      expect(JSON.parse(await pending.nextMessage())).toEqual({
+        type: "e2ee_error",
+        code: "unauthorized",
+      });
+      pending.close();
+
       expect(await requestTestRpc(channel, "1", "auth.confirmPairing")).toMatchObject({
         _tag: "Exit",
         requestId: "1",

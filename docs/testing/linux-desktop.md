@@ -154,8 +154,9 @@ verify:
   host** tabs; `/settings/connections` redirects there. SSH discovery and
   grant-driven sharing appears because the desktop bridge is present. Generate
   an **Another device** offer, verify the restart completes before the browser
-  URL, deep link, pairing code, and QR code appear, then revoke the last
-  off-host offer or client and verify exposure returns to loopback. Capture the
+  URL, deep link, pairing code, and QR code appear, then revoke the final
+  native-managed **Another device** offer or client and verify exposure returns
+  to loopback. Capture the
   shared runbook's four explicit ceremony outcomes: confirmed local-only,
   another live access reason kept wide, cancellation unconfirmed and deliberately
   unchanged, and cleanup topology unverified. Also cover last-browser-session
@@ -163,14 +164,19 @@ verify:
   of a blackholed create response, and explicit legacy resume after a local-only
   restart. The address picker lists only usable IPv4 candidates until a
   dual-stack listener exists, uses stable address/port IDs, safely preselects a
-  private default, and leaves generation disabled with externally managed
-  listener/reverse-proxy guidance when native discovery has only a public
-  address. An externally managed public endpoint is never preselected and
-  requires explicit public-address/firewall acknowledgement. If Tailscale is installed in its
-  packaged location, discovery must not depend on shell `PATH` and must suppress
-  unusable, public, or IPv6 candidates. Confirm Linux firewall management remains
-  explicitly operator-owned. The local-machine flow still has no Host selector;
-  remote targeting is driven by the environment rail;
+  private default, reports off-host interface observations unavailable before
+  widening, and leaves generation disabled with externally managed
+  listener/reverse-proxy guidance when native discovery has only a public or
+  non-default private address. Public interface candidates remain
+  non-actionable even after native exposure is wide. A custom off-host address
+  mints without changing the native listener or firewall, and later auth
+  revisions do not widen it. An externally managed public endpoint is never
+  preselected and requires explicit public-address/firewall acknowledgement. If
+  Tailscale is installed in its packaged location, discovery must not depend on
+  shell `PATH` and must suppress unusable, public, or IPv6 candidates. Confirm
+  Linux firewall management remains explicitly operator-owned. The local-machine
+  flow still has no Host selector; remote targeting is driven by the environment
+  rail;
 - Remote server updates: with a second BiBCode server saved (headless
   `bibcode serve` is sufficient), open Remote Servers settings, run **Check for
   Server Updates**, and confirm each saved server row shows an update badge
