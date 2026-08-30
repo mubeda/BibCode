@@ -168,9 +168,8 @@ impl RpcOutboundQueue {
     #[cfg(test)]
     fn try_send(&self, message: ServerMessage) -> Result<(), ()> {
         let (payload, budget) = if let Some(budget) = &self.budget {
-            let bytes = encoded_server_message_len(&message).map_err(|_| ())?;
-            let permit = budget.try_acquire(bytes)?;
             let encoded = serde_json::to_string(&message).map_err(|_| ())?;
+            let permit = budget.try_acquire(encoded.len())?;
             (
                 RpcOutboundPayload::Encoded(Message::Text(encoded.into())),
                 Some(permit),
@@ -1344,11 +1343,14 @@ async fn send_server_message(
 ) -> Result<(), ()> {
     let deadline = Instant::now() + OUTBOUND_SEND_TIMEOUT;
     let frame = if outbound.budget.is_some() {
-        let bytes = encoded_server_message_len(&message).map_err(|_| ())?;
-        let budget = outbound
-            .acquire_budget(session_shutdown, bytes, deadline)
-            .await?;
+        // Encode exactly once and drop the value tree before the admission
+        // wait, so the memory resident while waiting is precisely the bytes
+        // that will be charged.
         let encoded = serde_json::to_string(&message).map_err(|_| ())?;
+        drop(message);
+        let budget = outbound
+            .acquire_budget(session_shutdown, encoded.len(), deadline)
+            .await?;
         RpcOutboundFrame {
             payload: RpcOutboundPayload::Encoded(Message::Text(encoded.into())),
             _budget: budget,
