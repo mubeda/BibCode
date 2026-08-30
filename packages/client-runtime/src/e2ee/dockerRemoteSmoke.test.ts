@@ -13,6 +13,7 @@ import {
   AuthSessionState,
   AuthShareStateResult,
   AuthTokenExchangeGrantType,
+  AuthWebSocketTicketResult,
   E2eeAuthenticatedMessage,
   ExecutionEnvironmentDescriptor,
   RemoteUpdateInstallError,
@@ -24,6 +25,7 @@ import * as Schema from "effect/Schema";
 import * as NodeNet from "node:net";
 import * as NodeTimersPromises from "node:timers/promises";
 
+import { MAX_E2EE_CHUNK_BYTES, plaintextRecords } from "./frame.ts";
 import { decodeBase64UrlKey } from "./noise.ts";
 import {
   type EncryptedTestSocket,
@@ -42,6 +44,9 @@ const decodeShareState = Schema.decodeUnknownSync(AuthShareStateResult);
 const decodeUpdateInstallError = Schema.decodeUnknownSync(RemoteUpdateInstallError);
 const decodeUpdateSnapshot = Schema.decodeUnknownSync(RemoteUpdateSnapshot);
 const decodeBrowserSession = Schema.decodeUnknownSync(Schema.toCodecJson(AuthBrowserSessionResult));
+const decodeWebSocketTicket = Schema.decodeUnknownSync(
+  Schema.toCodecJson(AuthWebSocketTicketResult),
+);
 const decodeClientSessions = Schema.decodeUnknownSync(
   Schema.toCodecJson(Schema.Array(AuthClientSession)),
 );
@@ -52,6 +57,8 @@ const decodePairingOfferCancellation = Schema.decodeUnknownSync(
 const decodeSession = Schema.decodeUnknownSync(Schema.toCodecJson(AuthSessionState));
 const E2EE_RECORD_FLAG_CONTINUATION = 0x01;
 const MAX_E2EE_RECORDS_PER_MESSAGE = 2_048;
+const MAX_PLAIN_WEBSOCKET_FRAME_BYTES = 16 * 1024 * 1024;
+const MAXIMUM_RECORD_PROGRESS_DELAY_MS = 5_250;
 
 const RpcSuccess = Schema.TaggedStruct("Exit", {
   requestId: Schema.String,
@@ -72,15 +79,31 @@ const RpcFailure = Schema.TaggedStruct("Exit", {
 const decodeRpcSuccess = Schema.decodeUnknownSync(RpcSuccess);
 const decodeRpcFailure = Schema.decodeUnknownSync(RpcFailure);
 
+function decodeSensitiveResponse<A>(
+  label: string,
+  decode: (input: unknown) => A,
+  input: unknown,
+): A {
+  try {
+    return decode(input);
+  } catch {
+    // The Docker runner must never print credentials, pairing codes, or
+    // WebSocket tickets through a schema error's inspected input.
+    throw new Error(`${label} response failed schema validation`);
+  }
+}
+
 async function fetchJson(path: string, init?: RequestInit): Promise<unknown> {
   const response = await fetch(`${serverUrl!}${path}`, init);
   const body: unknown = await response.json();
-  expect(response.ok, `${response.status} ${JSON.stringify(body)}`).toBe(true);
+  expect(response.ok, `${response.status} request failed for ${path}`).toBe(true);
   return body;
 }
 
 async function exchangeAdministrativeCredential(): Promise<string> {
-  const access = decodeAccessToken(
+  const access = decodeSensitiveResponse(
+    "administrative token exchange",
+    decodeAccessToken,
     await fetchJson("/oauth/token", {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -108,7 +131,9 @@ async function exchangeAdministrativeCredential(): Promise<string> {
 }
 
 async function createOffHostOffer(administrator: string, label: string) {
-  const offer = decodePairingOffer(
+  const offer = decodeSensitiveResponse(
+    "pairing offer",
+    decodePairingOffer,
     await fetchJson("/api/auth/pairing-offer", {
       method: "POST",
       headers: {
@@ -123,8 +148,15 @@ async function createOffHostOffer(administrator: string, label: string) {
       }),
     }),
   );
-  const payload = parsePairingCode(offer.code);
-  expect(payload).toMatchObject({ endpoint: serverUrl, name: label, reach: "another-device" });
+  let payload: ReturnType<typeof parsePairingCode>;
+  try {
+    payload = parsePairingCode(offer.code);
+  } catch {
+    throw new Error("pairing offer contained an invalid pairing code");
+  }
+  expect(payload.endpoint).toBe(serverUrl);
+  expect(payload.name).toBe(label);
+  expect(payload.reach).toBe("another-device");
   return payload;
 }
 
@@ -158,6 +190,67 @@ async function assertRemoteUpdateRpc(channel: EncryptedTestSocket): Promise<void
     _tag: "RemoteUpdateInstallError",
     code: "remote_update_manual_required",
   });
+
+  const statusAfterFailure = decodeRpcSuccess(await requestTestRpc(channel, "4", "updater.status"));
+  expect(decodeUpdateSnapshot(statusAfterFailure.exit.value)).toMatchObject({
+    state: "idle",
+    support: { installMode: "manual", reason: "manual-update-required" },
+  });
+}
+
+async function openAuthenticatedBearer(
+  hostKey: Uint8Array,
+  credential: string,
+): Promise<EncryptedTestSocket> {
+  const channel = await openEncryptedTestSocket(serverUrl!, hostKey);
+  channel.sendMessage(JSON.stringify({ type: "e2ee_auth", bearer: credential }));
+  const authenticated = decodeSensitiveResponse(
+    "bearer authentication",
+    decodeE2eeAuthenticated,
+    JSON.parse(await channel.nextMessage()),
+  );
+  expect(authenticated.type).toBe("e2ee_authenticated");
+  expect("credential" in authenticated).toBe(false);
+  return channel;
+}
+
+async function assertPendingPairingCannotReconnect(
+  hostKey: Uint8Array,
+  credential: string,
+): Promise<void> {
+  const channel = await openEncryptedTestSocket(serverUrl!, hostKey);
+  try {
+    channel.sendMessage(JSON.stringify({ type: "e2ee_auth", bearer: credential }));
+    expect(JSON.parse(await channel.nextMessage())).toEqual({
+      type: "e2ee_error",
+      code: "unauthorized",
+    });
+  } finally {
+    channel.close();
+  }
+}
+
+async function assertMaximumRecordProgress(channel: EncryptedTestSocket): Promise<void> {
+  const requestId = "5";
+  const request = new TextEncoder().encode(
+    JSON.stringify({
+      _tag: "Request",
+      id: requestId,
+      tag: "server.getConfig",
+      payload: { ignored: "x".repeat(MAX_E2EE_CHUNK_BYTES) },
+      headers: [],
+    }),
+  );
+  const records = [...plaintextRecords(request)];
+  expect(records).toHaveLength(2);
+  expect(records[0]).toHaveLength(MAX_E2EE_CHUNK_BYTES + 1);
+
+  channel.sendRecords([records[0]!]);
+  await NodeTimersPromises.setTimeout(MAXIMUM_RECORD_PROGRESS_DELAY_MS);
+  channel.sendRecords([records[1]!]);
+
+  const response = decodeRpcSuccess(await channel.nextMessage().then(JSON.parse));
+  expect(response.requestId).toBe(requestId);
 }
 
 interface SilentPreauthSocket {
@@ -212,10 +305,53 @@ async function assertPreauthPeerOverflowIsRejected(): Promise<void> {
   }
 }
 
+async function assertPlainRouteFrameCap(administrator: string): Promise<void> {
+  const ticket = decodeSensitiveResponse(
+    "WebSocket ticket",
+    decodeWebSocketTicket,
+    await fetchJson("/api/auth/websocket-ticket", {
+      method: "POST",
+      headers: { authorization: `Bearer ${administrator}` },
+    }),
+  );
+  const url = new URL("/ws", serverUrl!);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  url.searchParams.set("wsTicket", ticket.ticket);
+
+  const socket = new WebSocket(url);
+  const closed = new Promise<CloseEvent>((resolve) => {
+    socket.addEventListener("close", (event) => resolve(event), { once: true });
+  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      socket.addEventListener("open", () => resolve(), { once: true });
+      socket.addEventListener("error", () => reject(new Error("plain WebSocket failed to open")), {
+        once: true,
+      });
+    });
+    socket.send(new Uint8Array(MAX_PLAIN_WEBSOCKET_FRAME_BYTES + 1));
+    const close = await Promise.race([
+      closed,
+      NodeTimersPromises.setTimeout(5_000).then(() => {
+        throw new Error("timed out waiting for oversized plain frame rejection");
+      }),
+    ]);
+    expect(close.code).not.toBe(1000);
+  } finally {
+    if (socket.readyState < WebSocket.CLOSING) socket.close();
+  }
+}
+
 async function assertRecordCountOverflowCloses(channel: EncryptedTestSocket): Promise<void> {
-  const continuation = Uint8Array.of(E2EE_RECORD_FLAG_CONTINUATION, 0x78);
-  channel.sendRecords(Array.from({ length: MAX_E2EE_RECORDS_PER_MESSAGE + 1 }, () => continuation));
-  await expect(channel.nextMessage()).rejects.toThrow("E2EE WebSocket closed");
+  try {
+    const continuation = Uint8Array.of(E2EE_RECORD_FLAG_CONTINUATION, 0x78);
+    channel.sendRecords(
+      Array.from({ length: MAX_E2EE_RECORDS_PER_MESSAGE + 1 }, () => continuation),
+    );
+    await expect(channel.nextMessage()).rejects.toThrow("E2EE WebSocket closed");
+  } finally {
+    channel.close();
+  }
 }
 
 async function shareState(administrator: string) {
@@ -243,10 +379,13 @@ async function revokeClient(administrator: string, sessionId: string): Promise<v
 async function assertBrowserPairingRetainsAndRevokesExposure(
   administrator: string,
   e2eeLabel: string,
+  liveE2eeChannel: EncryptedTestSocket,
 ): Promise<void> {
   const browserLabel = "docker-browser";
   const browserPayload = await createOffHostOffer(administrator, browserLabel);
-  const browser = decodeBrowserSession(
+  const browser = decodeSensitiveResponse(
+    "browser pairing",
+    decodeBrowserSession,
     await fetchJson("/api/auth/browser-session", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -273,6 +412,7 @@ async function assertBrowserPairingRetainsAndRevokesExposure(
   expect(browserSession).toBeDefined();
 
   await revokeClient(administrator, e2eeSession!.sessionId);
+  await expect(liveE2eeChannel.nextMessage()).rejects.toThrow("E2EE WebSocket closed");
   expect(await shareState(administrator)).toMatchObject({
     desiredExposure: "wide",
     offHostGrantCount: 1,
@@ -392,29 +532,77 @@ async function dispatchPairingOfferWithoutReadingResponse(input: {
 describe.skipIf(serverUrl === undefined || adminCredential === undefined)(
   "remote server Docker boundary",
   () => {
-    it("pairs, runs E2EE RPC, retains browser exposure, updates, and revokes", async () => {
+    it("confirms pairing, enforces transport caps, isolates updates, and converges exposure", async () => {
       await assertDescriptor();
       const administrator = await exchangeAdministrativeCredential();
       await assertPreauthPeerOverflowIsRejected();
       const e2eeLabel = "docker-e2ee";
       const payload = await createOffHostOffer(administrator, e2eeLabel);
-      const channel = await openEncryptedTestSocket(
-        serverUrl!,
-        decodeBase64UrlKey(payload.hostKey),
-      );
-      channel.sendMessage(JSON.stringify({ type: "e2ee_auth", pairing: payload.token }));
-      const authenticated = decodeE2eeAuthenticated(JSON.parse(await channel.nextMessage()));
-      expect(authenticated).toMatchObject({
-        type: "e2ee_authenticated",
-        credential: expect.any(String),
-        environmentId: expect.any(String),
-        storageInstanceId: payload.storageInstanceId,
-      });
+      const hostKey = decodeBase64UrlKey(payload.hostKey);
+      const pairingChannel = await openEncryptedTestSocket(serverUrl!, hostKey);
+      let reconnect: EncryptedTestSocket | null = null;
+      try {
+        pairingChannel.sendMessage(JSON.stringify({ type: "e2ee_auth", pairing: payload.token }));
+        const authenticated = decodeSensitiveResponse(
+          "in-channel pairing",
+          decodeE2eeAuthenticated,
+          JSON.parse(await pairingChannel.nextMessage()),
+        );
+        expect(authenticated.type).toBe("e2ee_authenticated");
+        expect(authenticated.environmentId).toBeTypeOf("string");
+        expect(authenticated.storageInstanceId).toBe(payload.storageInstanceId);
+        if (!("credential" in authenticated) || typeof authenticated.credential !== "string") {
+          throw new Error("in-channel pairing response omitted its credential");
+        }
+        const credential = authenticated.credential;
 
-      await assertRemoteUpdateRpc(channel);
-      await assertRecordCountOverflowCloses(channel);
-      await assertBrowserPairingRetainsAndRevokesExposure(administrator, e2eeLabel);
-      await assertAmbiguousOfferCancellation(administrator);
+        expect(await shareState(administrator)).toMatchObject({
+          desiredExposure: "wide",
+          offHostGrantCount: 1,
+        });
+        expect(
+          decodeRpcSuccess(await requestTestRpc(pairingChannel, "10", "server.getConfig"))
+            .requestId,
+        ).toBe("10");
+        await assertPendingPairingCannotReconnect(hostKey, credential);
+
+        const confirmed = decodeRpcSuccess(
+          await requestTestRpc(pairingChannel, "11", "auth.confirmPairing"),
+        );
+        expect(confirmed).toEqual({
+          _tag: "Exit",
+          requestId: "11",
+          exit: { _tag: "Success", value: {} },
+        });
+        expect(
+          decodeRpcSuccess(await requestTestRpc(pairingChannel, "12", "auth.confirmPairing")).exit
+            .value,
+        ).toEqual({});
+
+        await assertRemoteUpdateRpc(pairingChannel);
+        await assertMaximumRecordProgress(pairingChannel);
+        pairingChannel.close();
+        await NodeTimersPromises.setTimeout(50);
+
+        reconnect = await openAuthenticatedBearer(hostKey, credential);
+        expect(
+          decodeRpcSuccess(await requestTestRpc(reconnect, "6", "server.getConfig")).requestId,
+        ).toBe("6");
+
+        const recordOverflow = await openAuthenticatedBearer(hostKey, credential);
+        await assertRecordCountOverflowCloses(recordOverflow);
+        await assertPlainRouteFrameCap(administrator);
+        await assertBrowserPairingRetainsAndRevokesExposure(administrator, e2eeLabel, reconnect);
+        await assertAmbiguousOfferCancellation(administrator);
+        expect(await shareState(administrator)).toEqual({
+          desiredExposure: "loopback",
+          offHostGrantCount: 0,
+          legacyGrantCount: 0,
+        });
+      } finally {
+        pairingChannel.close();
+        reconnect?.close();
+      }
     }, 60_000);
   },
 );
