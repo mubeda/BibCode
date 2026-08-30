@@ -1,6 +1,7 @@
 import { EnvironmentId } from "@bibcode/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 
 import {
   BearerConnectionProfile,
@@ -31,6 +32,7 @@ const TARGET = new BearerConnectionTarget({
   label: "Remote environment",
   connectionId: "connection-1",
 });
+const decodeBearerConnectionProfile = Schema.decodeUnknownSync(BearerConnectionProfile);
 
 const ENTRY: ConnectionCatalogEntry = {
   target: TARGET,
@@ -100,19 +102,14 @@ describe("connection presentation", () => {
     expect(connectionTransportSecurity(entry(primary))).toBe("local");
     expect(connectionTransportSecurity(entry(TARGET, Option.some(pinned)))).toBe("e2ee");
     expect(connectionTransportSecurity(ENTRY)).toBe("unencrypted");
-    expect(
-      connectionTransportSecurity(
-        entry(
-          TARGET,
-          Option.some(
-            new BearerConnectionProfile({
-              ...pinned,
-              hostKey: " \t\n ",
-            }),
-          ),
-        ),
-      ),
-    ).toBe("unencrypted");
+    const decodedBlank = decodeBearerConnectionProfile({
+      ...pinned,
+      hostKey: " \t\n ",
+    });
+    expect(decodedBlank.hostKey).toBeNull();
+    expect(connectionTransportSecurity(entry(TARGET, Option.some(decodedBlank)))).toBe(
+      "unencrypted",
+    );
     expect(connectionTransportSecurity(entry(relay))).toBe("channel-secured");
     expect(connectionTransportSecurity(entry(ssh))).toBe("channel-secured");
     expect(

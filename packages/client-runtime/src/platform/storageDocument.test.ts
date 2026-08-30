@@ -59,17 +59,27 @@ const decodeConnectionCatalogDocument = Schema.decodeUnknownSync(ConnectionCatal
 const decodeBearerConnectionProfile = Schema.decodeUnknownSync(BearerConnectionProfile);
 
 describe("ConnectionCatalogDocument", () => {
-  it("decodes legacy bearer profiles without hostKey to null", () => {
-    const decoded = decodeBearerConnectionProfile({
+  it("normalizes absent and blank legacy bearer host keys to null", () => {
+    const rawProfile = {
       _tag: "BearerConnectionProfile",
       connectionId: "bearer:env-1",
       environmentId: "env-1",
       label: "Legacy",
       httpBaseUrl: "http://192.168.1.20:3773/",
       wsBaseUrl: "ws://192.168.1.20:3773/",
-    });
+    };
 
-    expect(decoded.hostKey).toBeNull();
+    for (const hostKey of [undefined, null, "", " \t "] as const) {
+      const decoded = decodeBearerConnectionProfile({
+        ...rawProfile,
+        ...(hostKey === undefined ? {} : { hostKey }),
+      });
+      expect(decoded.hostKey, String(hostKey)).toBeNull();
+    }
+
+    expect(decodeBearerConnectionProfile({ ...rawProfile, hostKey: "host-key" }).hostKey).toBe(
+      "host-key",
+    );
   });
 
   it("decodes a schema-v1 document without accepted storage identities", () => {

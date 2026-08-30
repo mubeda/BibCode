@@ -155,6 +155,9 @@ const normalizeRemoteBaseUrl = (
   }
 
   const url = parseRemoteBaseUrl(normalizedInput, source);
+  if (url.username.length > 0 || url.password.length > 0) {
+    throw new RemoteBackendUrlInvalidError({ source });
+  }
   url.pathname = "/";
   url.search = "";
   url.hash = "";
@@ -194,7 +197,8 @@ export interface ResolvedRemotePairingTarget {
 }
 
 export interface HostedPairingRequest {
-  readonly host: string;
+  readonly httpBaseUrl: string;
+  readonly displayHost: string;
   readonly token: string;
   readonly label: string;
 }
@@ -236,8 +240,17 @@ export const readHostedPairingRequest = (url: URL): HostedPairingRequest | null 
     return null;
   }
 
+  let normalizedHost: URL;
+  try {
+    normalizedHost = normalizeRemoteBaseUrl(host, "hosted-pairing-host");
+  } catch {
+    return null;
+  }
+  const httpBaseUrl = toHttpBaseUrl(normalizedHost);
+
   return {
-    host,
+    httpBaseUrl,
+    displayHost: new URL(httpBaseUrl).host,
     token,
     label,
   };
@@ -261,17 +274,21 @@ export const resolveRemotePairingTarget = (input: {
         protocol: url.protocol,
       });
     }
+    if (url.username.length > 0 || url.password.length > 0) {
+      throw new RemotePairingUrlInvalidError({});
+    }
     const hostedPairingRequest = readHostedPairingRequest(url);
     if (hostedPairingRequest) {
-      const hostedBackendUrl = normalizeRemoteBaseUrl(
-        hostedPairingRequest.host,
-        "hosted-pairing-host",
-      );
+      const hostedBackendUrl = new URL(hostedPairingRequest.httpBaseUrl);
       return {
         credential: hostedPairingRequest.token,
         httpBaseUrl: toHttpBaseUrl(hostedBackendUrl),
         wsBaseUrl: toWsBaseUrl(hostedBackendUrl),
       };
+    }
+    const hostedHost = url.searchParams.get(HOSTED_PAIRING_HOST_PARAM)?.trim() ?? "";
+    if (hostedHost && getPairingTokenFromUrl(url)) {
+      normalizeRemoteBaseUrl(hostedHost, "hosted-pairing-host");
     }
 
     const credential = getPairingTokenFromUrl(url) ?? "";
