@@ -534,6 +534,7 @@ fn advertised_endpoint(
     label: &str,
     http_base_url: String,
     reachability: &str,
+    status: &str,
     is_default: Option<bool>,
     description: &str,
 ) -> Result<Value, String> {
@@ -557,7 +558,7 @@ fn advertised_endpoint(
             "desktopApp": "compatible",
         },
         "source": "desktop-core",
-        "status": "available",
+        "status": status,
         "description": description,
     });
     if let Some(is_default) = is_default {
@@ -607,50 +608,65 @@ fn advertised_endpoints_for_config(
         "This machine",
         config.http_base_url(),
         "loopback",
+        "available",
         None,
         "Loopback endpoint for this desktop app.",
     )?];
 
-    if config.server_exposure_mode == "network-accessible" {
-        for address in network_addresses {
-            let classification = classify_advertised_address(address.ip);
-            if !classification.advertise_with_ipv4_listener {
-                continue;
-            }
-            let socket = std::net::SocketAddr::new(address.ip, config.port);
-            let is_default = address.is_default_route && classification.default_eligible;
-            let description = if classification.reachability
-                == AdvertisedAddressReachability::Public
-            {
+    let network_status = if config.server_exposure_mode == "network-accessible" {
+        "available"
+    } else {
+        "unavailable"
+    };
+    for address in network_addresses {
+        let classification = classify_advertised_address(address.ip);
+        if !classification.advertise_with_ipv4_listener {
+            continue;
+        }
+        let socket = std::net::SocketAddr::new(address.ip, config.port);
+        let is_default = address.is_default_route && classification.default_eligible;
+        let description = if classification.reachability == AdvertisedAddressReachability::Public {
+            if config.server_exposure_mode == "network-accessible" {
                 #[cfg(target_os = "windows")]
                 {
                     format!(
-                        "Public address through network interface {}. Select explicitly only after reviewing exposure and firewall policy.",
+                        "Observed public address through network interface {}. Native sharing never selects it; use only through an externally managed listener or reverse proxy with reviewed firewall policy.",
                         address.interface_name
                     )
                 }
                 #[cfg(not(target_os = "windows"))]
                 {
                     format!(
-                        "Public address through network interface {}. Select explicitly only after reviewing exposure. BiBCode does not manage this platform's firewall.",
+                        "Observed public address through network interface {}. Native sharing never selects it; use only through an externally managed listener or reverse proxy. BiBCode does not manage this platform's firewall.",
                         address.interface_name
                     )
                 }
             } else {
                 format!(
-                    "Reachable through network interface {}.",
+                    "Observed public address through network interface {}. Native sharing requires a private default route; use an externally managed listener or reverse proxy.",
                     address.interface_name
                 )
-            };
-            endpoints.push(advertised_endpoint(
-                format!("desktop-network:{socket}"),
-                classification.label_kind.as_str(),
-                format!("http://{socket}"),
-                classification.reachability.as_str(),
-                Some(is_default),
-                &description,
-            )?);
-        }
+            }
+        } else if network_status == "available" {
+            format!(
+                "Reachable through network interface {}.",
+                address.interface_name
+            )
+        } else {
+            format!(
+                "Observed private address through network interface {}. Enabling native remote access can make it reachable.",
+                address.interface_name
+            )
+        };
+        endpoints.push(advertised_endpoint(
+            format!("desktop-network:{socket}"),
+            classification.label_kind.as_str(),
+            format!("http://{socket}"),
+            classification.reachability.as_str(),
+            network_status,
+            Some(is_default),
+            &description,
+        )?);
     }
 
     Ok(endpoints)
@@ -2740,7 +2756,7 @@ mod tests {
             endpoints[3]["description"]
                 .as_str()
                 .expect("public warning")
-                .contains("explicitly")
+                .contains("never selects")
         );
         if !cfg!(windows) {
             assert!(
@@ -2755,6 +2771,44 @@ mod tests {
                 .iter()
                 .all(|endpoint| !endpoint["httpBaseUrl"].as_str().unwrap_or("").contains('['))
         );
+    }
+
+    #[test]
+    fn local_only_discovery_surfaces_public_only_topology_as_unavailable() {
+        let config = test_run_config();
+        let addresses = [NetworkAddress {
+            interface_name: "Internet".to_string(),
+            ip: "8.8.8.8".parse().expect("public IPv4 fixture"),
+            is_default_route: false,
+        }];
+
+        let endpoints = advertised_endpoints_for_config(&config, &addresses)
+            .expect("local-only endpoint observations should build");
+
+        assert_eq!(endpoints.len(), 2);
+        assert_eq!(endpoints[1]["id"], "desktop-network:8.8.8.8:13773");
+        assert_eq!(endpoints[1]["reachability"], "public");
+        assert_eq!(endpoints[1]["status"], "unavailable");
+        assert_eq!(endpoints[1]["isDefault"], false);
+    }
+
+    #[test]
+    fn local_only_discovery_marks_private_default_candidate_unavailable() {
+        let config = test_run_config();
+        let addresses = [NetworkAddress {
+            interface_name: "Ethernet".to_string(),
+            ip: "192.168.1.20".parse().expect("private IPv4 fixture"),
+            is_default_route: true,
+        }];
+
+        let endpoints = advertised_endpoints_for_config(&config, &addresses)
+            .expect("local-only endpoint observations should build");
+
+        assert_eq!(endpoints.len(), 2);
+        assert_eq!(endpoints[1]["id"], "desktop-network:192.168.1.20:13773");
+        assert_eq!(endpoints[1]["reachability"], "lan");
+        assert_eq!(endpoints[1]["status"], "unavailable");
+        assert_eq!(endpoints[1]["isDefault"], true);
     }
 
     #[test]

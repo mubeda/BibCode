@@ -22,6 +22,8 @@ import * as Option from "effect/Option";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as SubscriptionRef from "effect/SubscriptionRef";
+import { RpcClientError } from "effect/unstable/rpc";
+import * as Socket from "effect/unstable/socket/Socket";
 
 import { remoteHttpClientLayer } from "../rpc/http.ts";
 import * as RpcSession from "../rpc/session.ts";
@@ -101,8 +103,14 @@ interface HarnessOptions {
   readonly identityRollbackFailure?: boolean;
   readonly identityRollbackInterruptOnce?: boolean;
   readonly confirmationFailure?: boolean;
+  readonly confirmationDefect?: unknown;
+  readonly confirmationRpcError?: RpcClientError.RpcClientError;
   readonly confirmationInterrupted?: boolean;
   readonly concurrentIdentityBeforeConfirmationFailure?: string;
+  readonly recoveryConnectionFailures?: Array<ConnectionAttemptError>;
+  readonly recoveryConfigEnvironmentId?: EnvironmentId;
+  readonly recoveryConfigStorageInstanceId?: string;
+  readonly pauseAfterRecoveryVerification?: boolean;
   readonly pauseAfterRegistrationCommit?: boolean;
   readonly pauseAfterIdentityCommit?: boolean;
 }
@@ -127,6 +135,26 @@ const makeHarness = Effect.fn("TestPairingAdd.makeHarness")(function* (
   const releaseRegistration = yield* Deferred.make<void>();
   const identityCommitted = yield* Deferred.make<void>();
   const releaseIdentity = yield* Deferred.make<void>();
+  const recoveryVerified = yield* Deferred.make<void>();
+  const releaseRecovery = yield* Deferred.make<void>();
+  const confirmationOutcome = (): Effect.Effect<
+    {},
+    EnvironmentAuthorizationError | RpcClientError.RpcClientError
+  > => {
+    if (options.confirmationInterrupted === true) return Effect.interrupt;
+    if (options.confirmationDefect !== undefined) return Effect.die(options.confirmationDefect);
+    if (options.confirmationRpcError !== undefined)
+      return Effect.fail(options.confirmationRpcError);
+    if (options.confirmationFailure === true) {
+      return Effect.fail(
+        new EnvironmentAuthorizationError({
+          message: "confirmation rejected",
+          requiredScope: "access:write",
+        }),
+      );
+    }
+    return Effect.succeed({});
+  };
 
   const registry = EnvironmentRegistry.EnvironmentRegistry.of({
     entries,
@@ -173,6 +201,7 @@ const makeHarness = Effect.fn("TestPairingAdd.makeHarness")(function* (
         : Effect.sync(() => {
             registrations.splice(0, registrations.length);
           }),
+    retryNow: () => Effect.sync(() => events.push("retry-supervisor")),
   } as unknown as EnvironmentRegistry.EnvironmentRegistry["Service"]);
   const identities = Persistence.AcceptedStorageIdentityStore.of({
     get: (targetKey) => Effect.succeed(Option.fromUndefinedOr(accepted.get(targetKey))),
@@ -245,12 +274,21 @@ const makeHarness = Effect.fn("TestPairingAdd.makeHarness")(function* (
   const sessions = RpcSession.RpcSessionFactory.of({
     connect: (prepared) => {
       preparedConnections.push(prepared);
+      const recovery = prepared.e2ee?.auth.kind === "bearer";
+      const recoveryFailure = recovery ? options.recoveryConnectionFailures?.shift() : undefined;
+      if (recoveryFailure !== undefined) {
+        return Effect.fail(recoveryFailure);
+      }
       const failure = failures.shift();
       if (failure !== undefined) return Effect.fail(failure);
       const configDescriptor = descriptor({
         ...currentDescriptor,
-        environmentId: options.configEnvironmentId ?? currentDescriptor.environmentId,
-        storageInstanceId: options.configStorageInstanceId ?? currentDescriptor.storageInstanceId,
+        environmentId: recovery
+          ? (options.recoveryConfigEnvironmentId ?? currentDescriptor.environmentId)
+          : (options.configEnvironmentId ?? currentDescriptor.environmentId),
+        storageInstanceId: recovery
+          ? (options.recoveryConfigStorageInstanceId ?? currentDescriptor.storageInstanceId)
+          : (options.configStorageInstanceId ?? currentDescriptor.storageInstanceId),
       });
       return Effect.acquireRelease(
         Effect.succeed({
@@ -268,37 +306,33 @@ const makeHarness = Effect.fn("TestPairingAdd.makeHarness")(function* (
                     options.concurrentIdentityBeforeConfirmationFailure,
                   );
                 }
-              }).pipe(
-                Effect.flatMap(() =>
-                  options.confirmationInterrupted === true
-                    ? Effect.interrupt
-                    : options.confirmationFailure === true
-                      ? Effect.fail(
-                          new EnvironmentAuthorizationError({
-                            message: "confirmation rejected",
-                            requiredScope: "access:write",
-                          }),
-                        )
-                      : Effect.succeed({}),
-                ),
-              ),
+              }).pipe(Effect.flatMap(confirmationOutcome)),
           } as unknown as RpcSession.RpcSession["client"],
-          initialConfig: Effect.sync(() => {
-            events.push("verify");
+          initialConfig: Effect.gen(function* () {
+            events.push(recovery ? "recover-verify" : "verify");
+            if (recovery && options.pauseAfterRecoveryVerification === true) {
+              yield* Deferred.succeed(recoveryVerified, undefined);
+              yield* Deferred.await(releaseRecovery);
+            }
             return { environment: configDescriptor } as ServerConfig;
           }),
           ready: Effect.void,
           probe: Effect.void,
           closed: Effect.never,
-          e2eeAuthenticated: Effect.succeed({
-            type: "e2ee_authenticated" as const,
-            credential: "minted-device-credential",
-            environmentId: options.authenticatedEnvironmentId ?? currentDescriptor.environmentId,
-            storageInstanceId: options.authenticatedStorageInstanceId ?? STORAGE_IDENTITY,
-            ...((options.pairingConfirmationRequired ?? true)
-              ? { pairingConfirmationRequired: true as const }
-              : {}),
-          }),
+          e2eeAuthenticated: Effect.succeed(
+            recovery
+              ? { type: "e2ee_authenticated" as const }
+              : {
+                  type: "e2ee_authenticated" as const,
+                  credential: "minted-device-credential",
+                  environmentId:
+                    options.authenticatedEnvironmentId ?? currentDescriptor.environmentId,
+                  storageInstanceId: options.authenticatedStorageInstanceId ?? STORAGE_IDENTITY,
+                  ...((options.pairingConfirmationRequired ?? true)
+                    ? { pairingConfirmationRequired: true as const }
+                    : {}),
+                },
+          ),
         }),
         () => Effect.sync(() => void (closedSessions += 1)),
       );
@@ -334,6 +368,8 @@ const makeHarness = Effect.fn("TestPairingAdd.makeHarness")(function* (
     releaseRegistration: Deferred.succeed(releaseRegistration, undefined),
     identityCommitted: Deferred.await(identityCommitted),
     releaseIdentity: Deferred.succeed(releaseIdentity, undefined),
+    recoveryVerified: Deferred.await(recoveryVerified),
+    releaseRecovery: Deferred.succeed(releaseRecovery, undefined),
     run: (payload: RemotePairingCodePayload, allowLoopbackTunnel?: boolean) =>
       verifyAndAddPairingCode({
         code: encodePairingCode(payload),
@@ -597,19 +633,226 @@ describe("verifyAndAddPairingCode", () => {
           storageInstanceId: STORAGE_IDENTITY,
         },
       ]);
-      expect(harness.events).toEqual(["verify", "register", "accept-identity", "confirm"]);
-      expect(harness.closedSessions()).toBe(1);
+      expect(harness.events).toEqual([
+        "verify",
+        "register",
+        "accept-identity",
+        "confirm",
+        "recover-verify",
+        "retry-supervisor",
+      ]);
+      expect(harness.preparedConnections[1]).toMatchObject({
+        e2ee: {
+          hostKey: HOST_KEY,
+          auth: { kind: "bearer", credential: "minted-device-credential" },
+        },
+      });
+      expect(harness.closedSessions()).toBe(2);
     }),
   );
 
-  it.effect("saves an active credential from a legacy server without calling confirmation", () =>
+  it.effect("wakes the registered supervisor after the bearer proves activation", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness();
+
+      expect(yield* harness.run(validPayload())).toBe(ENVIRONMENT_ID);
+      expect(harness.events.slice(-2)).toEqual(["recover-verify", "retry-supervisor"]);
+    }),
+  );
+
+  it.effect("confirms a pending credential when the prior server omits the required flag", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({ pairingConfirmationRequired: false });
 
       expect(yield* harness.run(validPayload())).toBe(ENVIRONMENT_ID);
-      expect(harness.events).toEqual(["verify", "register", "accept-identity"]);
+      expect(harness.events).toEqual([
+        "verify",
+        "register",
+        "accept-identity",
+        "confirm",
+        "recover-verify",
+        "retry-supervisor",
+      ]);
       expect(harness.registrations).toHaveLength(1);
       expect(harness.acceptedIdentities).toHaveLength(1);
+      expect(harness.closedSessions()).toBe(2);
+    }),
+  );
+
+  it.effect("keeps an active credential when a legacy server rejects the confirmation tag", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        pairingConfirmationRequired: false,
+        confirmationDefect: "Unknown request tag: auth.confirmPairing",
+      });
+
+      expect(yield* harness.run(validPayload())).toBe(ENVIRONMENT_ID);
+      expect(harness.events).toEqual([
+        "verify",
+        "register",
+        "accept-identity",
+        "confirm",
+        "recover-verify",
+        "retry-supervisor",
+      ]);
+      expect(harness.registrations).toHaveLength(1);
+      expect(harness.acceptedIdentities).toHaveLength(1);
+      expect(harness.closedSessions()).toBe(2);
+    }),
+  );
+
+  it.effect("retains local authority across an ambiguous confirmation defect", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        pairingConfirmationRequired: false,
+        confirmationDefect: "Unknown request tag: auth.confirmPairing ",
+      });
+
+      expect(yield* harness.run(validPayload())).toBe(ENVIRONMENT_ID);
+      expect(harness.events).toEqual([
+        "verify",
+        "register",
+        "accept-identity",
+        "confirm",
+        "recover-verify",
+        "retry-supervisor",
+      ]);
+      expect(harness.registrations).toHaveLength(1);
+      expect(harness.acceptedIdentities).toHaveLength(1);
+      expect(harness.closedSessions()).toBe(2);
+    }),
+  );
+
+  it.effect("recovers a lost confirmation response by authenticating the minted bearer", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        pairingConfirmationRequired: false,
+        confirmationRpcError: new RpcClientError.RpcClientError({
+          reason: new Socket.SocketCloseError({
+            code: 1006,
+            closeReason: "network lost",
+          }),
+        }),
+        recoveryConnectionFailures: [
+          new ConnectionBlockedError({
+            reason: "authentication",
+            detail: "activation still converging",
+          }),
+        ],
+      });
+
+      expect(yield* harness.run(validPayload())).toBe(ENVIRONMENT_ID);
+      expect(harness.events).toEqual([
+        "verify",
+        "register",
+        "accept-identity",
+        "confirm",
+        "recover-verify",
+        "retry-supervisor",
+      ]);
+      expect(harness.registrations).toHaveLength(1);
+      expect(harness.acceptedIdentities).toHaveLength(1);
+      expect(harness.preparedConnections).toHaveLength(3);
+      expect(harness.closedSessions()).toBe(2);
+    }),
+  );
+
+  it.effect("retains authority when a lost confirmation response cannot be proven yet", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        confirmationRpcError: new RpcClientError.RpcClientError({
+          reason: new Socket.SocketCloseError({ code: 1006, closeReason: "confirmation lost" }),
+        }),
+        recoveryConnectionFailures: Array.from(
+          { length: 3 },
+          () =>
+            new ConnectionBlockedError({
+              reason: "authentication",
+              detail: "credential is not active",
+            }),
+        ),
+      });
+
+      expect(yield* harness.run(validPayload())).toBe(ENVIRONMENT_ID);
+      expect(harness.preparedConnections).toHaveLength(4);
+      expect(harness.registrations).toHaveLength(1);
+      expect(harness.acceptedIdentities).toHaveLength(1);
+      expect(harness.events.at(-1)).toBe("retry-supervisor");
+      expect(harness.closedSessions()).toBe(1);
+    }),
+  );
+
+  it.effect("retains confirmed authority when bearer recovery sees a different identity", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        recoveryConfigStorageInstanceId: "different-storage-instance",
+      });
+
+      expect(yield* harness.run(validPayload())).toBe(ENVIRONMENT_ID);
+      expect(harness.preparedConnections).toHaveLength(2);
+      expect(harness.registrations).toHaveLength(1);
+      expect(harness.acceptedIdentities).toHaveLength(1);
+      expect(harness.events.slice(-2)).toEqual(["recover-verify", "retry-supervisor"]);
+      expect(harness.closedSessions()).toBe(2);
+    }),
+  );
+
+  it.effect("retains confirmed authority after all transient bearer probes fail", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        recoveryConnectionFailures: Array.from(
+          { length: 3 },
+          () =>
+            new ConnectionTransientError({
+              reason: "transport",
+              detail: "server restarting",
+            }),
+        ),
+      });
+
+      expect(yield* harness.run(validPayload())).toBe(ENVIRONMENT_ID);
+      expect(harness.preparedConnections).toHaveLength(4);
+      expect(harness.registrations).toHaveLength(1);
+      expect(harness.acceptedIdentities).toHaveLength(1);
+      expect(harness.events.at(-1)).toBe("retry-supervisor");
+      expect(harness.closedSessions()).toBe(1);
+    }),
+  );
+
+  it.effect("retains legacy active authority when its bearer probe is unavailable", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        pairingConfirmationRequired: false,
+        confirmationDefect: "Unknown request tag: auth.confirmPairing",
+        recoveryConnectionFailures: Array.from(
+          { length: 3 },
+          () =>
+            new ConnectionTransientError({
+              reason: "transport",
+              detail: "legacy server unavailable",
+            }),
+        ),
+      });
+
+      expect(yield* harness.run(validPayload())).toBe(ENVIRONMENT_ID);
+      expect(harness.registrations).toHaveLength(1);
+      expect(harness.acceptedIdentities).toHaveLength(1);
+      expect(harness.events.at(-1)).toBe("retry-supervisor");
+    }),
+  );
+
+  it.effect("rejects an unsupported confirmation tag when the server requires confirmation", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        confirmationDefect: "Unknown request tag: auth.confirmPairing",
+      });
+
+      const exit = yield* harness.run(validPayload()).pipe(Effect.exit);
+
+      expect(exit._tag).toBe("Failure");
+      expect(harness.events).toEqual(["verify", "register", "accept-identity", "confirm"]);
+      expect(harness.registrations).toEqual([]);
+      expect(harness.acceptedIdentities).toEqual([]);
       expect(harness.closedSessions()).toBe(1);
     }),
   );
@@ -688,16 +931,44 @@ describe("verifyAndAddPairingCode", () => {
     }),
   );
 
-  it.effect("rolls back local state when pairing confirmation is interrupted", () =>
+  it.effect("finishes pairing through bearer proof when confirmation is interrupted", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({ confirmationInterrupted: true });
-      const exit = yield* harness.run(validPayload()).pipe(Effect.exit);
+      expect(yield* harness.run(validPayload())).toBe(ENVIRONMENT_ID);
 
-      expect(exit._tag).toBe("Failure");
-      expect(harness.events).toEqual(["verify", "register", "accept-identity", "confirm"]);
-      expect(harness.registrations).toEqual([]);
-      expect(harness.acceptedIdentities).toEqual([]);
-      expect(harness.closedSessions()).toBe(1);
+      expect(harness.events).toEqual([
+        "verify",
+        "register",
+        "accept-identity",
+        "confirm",
+        "recover-verify",
+        "retry-supervisor",
+      ]);
+      expect(harness.registrations).toHaveLength(1);
+      expect(harness.acceptedIdentities).toHaveLength(1);
+      expect(harness.closedSessions()).toBe(2);
+    }),
+  );
+
+  it.effect("owns bearer verification through cancellation after local persistence", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ pauseAfterRecoveryVerification: true });
+      const pairing = yield* Effect.forkChild(harness.run(validPayload()));
+      for (let attempt = 0; attempt < 100 && harness.preparedConnections.length < 2; attempt += 1) {
+        yield* Effect.yieldNow;
+      }
+      expect(harness.preparedConnections).toHaveLength(2);
+      yield* harness.recoveryVerified;
+      const interrupting = yield* Effect.forkChild(Fiber.interrupt(pairing));
+      yield* Effect.yieldNow;
+      yield* harness.releaseRecovery;
+      yield* Fiber.await(pairing);
+      yield* Fiber.await(interrupting);
+
+      expect(harness.preparedConnections).toHaveLength(2);
+      expect(harness.registrations).toHaveLength(1);
+      expect(harness.acceptedIdentities).toHaveLength(1);
+      expect(harness.closedSessions()).toBe(2);
     }),
   );
 

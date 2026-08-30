@@ -5,10 +5,12 @@ import {
   PairingCodeUnsupportedVersionError,
   parsePairingCode,
 } from "@bibcode/shared/pairingCode";
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SubscriptionRef from "effect/SubscriptionRef";
+import { RpcClientError } from "effect/unstable/rpc";
 
 import { e2eeSocketUrl } from "../authorization/remote.ts";
 import { fetchRemoteEnvironmentDescriptor } from "../environment/descriptor.ts";
@@ -78,6 +80,52 @@ const postBootstrapPersistenceError = (target: string): PairingAddError =>
 const isPairingCodeParseError = Schema.is(PairingCodeParseError);
 const isPairingCodeUnsupportedVersionError = Schema.is(PairingCodeUnsupportedVersionError);
 const isPairingAddError = Schema.is(PairingAddError);
+const isRpcClientError = Schema.is(RpcClientError.RpcClientError);
+const LEGACY_CONFIRMATION_UNSUPPORTED_DEFECT = `Unknown request tag: ${WS_METHODS.authConfirmPairing}`;
+
+type PairingConfirmationFailureDisposition = "rollback" | "verify-authority";
+
+class PairingBearerVerificationError extends Schema.TaggedErrorClass<PairingBearerVerificationError>()(
+  "PairingBearerVerificationError",
+  {
+    detail: Schema.String,
+    retryable: Schema.Boolean,
+  },
+) {}
+
+const classifyPairingConfirmationFailure = (
+  cause: Cause.Cause<unknown>,
+  pairingConfirmationRequired: boolean,
+): PairingConfirmationFailureDisposition => {
+  if (cause.reasons.length !== 1) return "verify-authority";
+  const reason = cause.reasons[0]!;
+  if (Cause.isInterruptReason(reason)) return "verify-authority";
+  if (Cause.isFailReason(reason)) {
+    return isRpcClientError(reason.error) ? "verify-authority" : "rollback";
+  }
+  if (Cause.isDieReason(reason) && reason.defect === LEGACY_CONFIRMATION_UNSUPPORTED_DEFECT) {
+    return pairingConfirmationRequired ? "rollback" : "verify-authority";
+  }
+  return "verify-authority";
+};
+
+const pairingConfirmationFailure = (cause: Cause.Cause<unknown>): PairingAddError => {
+  const failure = Cause.squash(cause);
+  return new PairingAddError({
+    reason: "local-persistence-failed",
+    detail: `The local connection was saved, but the server could not confirm pairing: ${failure instanceof Error ? failure.message : String(failure)}`,
+  });
+};
+
+const pairingBearerConnectionError = (
+  error: ConnectionAttemptError,
+): PairingBearerVerificationError =>
+  new PairingBearerVerificationError({
+    detail: error.detail,
+    retryable:
+      error._tag === "ConnectionTransientError" ||
+      (error._tag === "ConnectionBlockedError" && error.reason === "authentication"),
+  });
 
 const classifyAttemptError = (error: ConnectionAttemptError): PairingAddError => {
   if (error._tag === "ConnectionBlockedError" && error.reason === "host-identity") {
@@ -233,6 +281,50 @@ export const verifyAndAddPairingCode = Effect.fn(
         environmentId: descriptor.environmentId,
         storageInstanceId: authenticated.storageInstanceId,
       };
+      const bearerPrepared: PreparedConnection = {
+        ...prepared,
+        e2ee: {
+          hostKey: payload.hostKey,
+          auth: { kind: "bearer", credential: verified.credential },
+        },
+      };
+      const verifyPairingBearer = Effect.scoped(
+        Effect.gen(function* () {
+          const recoverySession = yield* sessions
+            .connect(bearerPrepared)
+            .pipe(Effect.mapError(pairingBearerConnectionError));
+          yield* recoverySession.ready.pipe(Effect.mapError(pairingBearerConnectionError));
+          const recoveryAuthenticated = yield* recoverySession.e2eeAuthenticated;
+          if (recoveryAuthenticated === null) {
+            return yield* new PairingBearerVerificationError({
+              detail: "The server did not authenticate the saved device credential.",
+              retryable: false,
+            });
+          }
+          const recoveryConfig = yield* recoverySession.initialConfig.pipe(
+            Effect.mapError(pairingBearerConnectionError),
+          );
+          if (
+            recoveryConfig.environment.environmentId !== verified.environmentId ||
+            recoveryConfig.environment.storageInstanceId !== verified.storageInstanceId
+          ) {
+            return yield* new PairingBearerVerificationError({
+              detail: "The server identity changed while verifying the saved device credential.",
+              retryable: false,
+            });
+          }
+          yield* recoverySession.probe.pipe(Effect.mapError(pairingBearerConnectionError));
+        }),
+      ).pipe(
+        Effect.retry({ times: 2, while: (error) => error.retryable }),
+        Effect.mapError(
+          (error) =>
+            new PairingAddError({
+              reason: "local-persistence-failed",
+              detail: `The local connection was saved, but its device credential could not be verified: ${error.detail}`,
+            }),
+        ),
+      );
       const registration = new BearerConnectionRegistration({
         target,
         profile: new BearerConnectionProfile({
@@ -252,7 +344,7 @@ export const verifyAndAddPairingCode = Effect.fn(
       let registrationWritten = false;
       let identityWritten = false;
       let previousStorageInstanceId: string | null = null;
-      let addCompleted = false;
+      let authorityOwned = false;
       let cleanupCompleted = false;
 
       const rollbackLocalWrites = () => {
@@ -306,44 +398,53 @@ export const verifyAndAddPairingCode = Effect.fn(
             identityWritten = true;
           }),
         );
-        if (authenticated.pairingConfirmationRequired === true) {
-          yield* Effect.uninterruptibleMask((restore) =>
-            Effect.gen(function* () {
-              yield* restore(session.client[WS_METHODS.authConfirmPairing]({})).pipe(
-                Effect.mapError(
-                  (error) =>
-                    new PairingAddError({
-                      reason: "local-persistence-failed",
-                      detail: `The local connection was saved, but the server could not confirm pairing: ${error.message}`,
-                    }),
-                ),
+        yield* Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            const confirmation = yield* restore(
+              session.client[WS_METHODS.authConfirmPairing]({}),
+            ).pipe(Effect.exit);
+            if (confirmation._tag === "Failure") {
+              const disposition = classifyPairingConfirmationFailure(
+                confirmation.cause,
+                authenticated.pairingConfirmationRequired === true,
               );
-              addCompleted = true;
-            }),
-          );
-        } else {
-          addCompleted = true;
-        }
+              if (disposition === "rollback") {
+                return yield* pairingConfirmationFailure(confirmation.cause);
+              }
+              authorityOwned = true;
+            } else {
+              authorityOwned = true;
+            }
+
+            // Once confirmation may have committed, removing the durable local
+            // credential can orphan an active server-side authority. A failed
+            // immediate proof therefore leaves recovery to the saved supervisor.
+            yield* verifyPairingBearer.pipe(Effect.ignore);
+            yield* registry.retryNow(verified.environmentId);
+          }),
+        );
         return registration.target.environmentId as EnvironmentId;
       });
 
       return yield* persistAndConfirm.pipe(
         Effect.catch((error) =>
-          Effect.gen(function* () {
-            const cleanupFailures = yield* rollbackLocalWrites();
-            const cleanupDetail =
-              cleanupFailures.length === 0
-                ? " No partial local writes from this attempt remain."
-                : ` Local cleanup also failed: ${cleanupFailures.join("; ")}.`;
-            return yield* new PairingAddError({
-              reason: "local-persistence-failed",
-              detail: `${error.detail}${cleanupDetail}`,
-            });
-          }),
+          authorityOwned
+            ? Effect.fail(error)
+            : Effect.gen(function* () {
+                const cleanupFailures = yield* rollbackLocalWrites();
+                const cleanupDetail =
+                  cleanupFailures.length === 0
+                    ? " No partial local writes from this attempt remain."
+                    : ` Local cleanup also failed: ${cleanupFailures.join("; ")}.`;
+                return yield* new PairingAddError({
+                  reason: "local-persistence-failed",
+                  detail: `${error.detail}${cleanupDetail}`,
+                });
+              }),
         ),
         Effect.ensuring(
           Effect.suspend(() =>
-            addCompleted || cleanupCompleted
+            authorityOwned || cleanupCompleted
               ? Effect.void
               : rollbackLocalWrites().pipe(Effect.ignore),
           ),

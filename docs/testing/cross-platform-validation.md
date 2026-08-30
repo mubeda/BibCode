@@ -104,9 +104,12 @@ logic, include host-independent fixtures for every affected platform.
 When pairing-offer generation, grant reach metadata, desktop exposure, or
 client revocation changes, validate the complete ceremony on every supported
 native desktop: **Another device** widens before minting and shows one pairing
-code as a deep link, browser URL, and QR code; **This computer only** and a
-loopback custom address never widen; a bind or firewall failure mints nothing;
-and revoking the final off-host offer or client returns the server to loopback.
+code as a deep link, browser URL, and QR code; **This computer only** and every
+**Custom address** remain externally managed and never widen; a bind or firewall
+failure mints nothing; and revoking the final native-managed **Another device**
+offer or client returns the server to loopback. Confirm an off-host custom grant
+remains visible in the off-host count but leaves authoritative desired exposure
+loopback before and after session exchange.
 Also verify browser/headless presentation remains read-only for exposure while
 server-side mint and revocation stay available. Windows additionally owns the
 program-scoped firewall evidence in its platform runbook; Linux and macOS do
@@ -208,6 +211,9 @@ cargo test -p bibcode-desktop bridge::tests::leaving_wsl_only_restarts_the_nativ
 cargo test -p bibcode-desktop network_interfaces::tests::advertised_endpoint_classification_fixtures --lib -- --exact
 cargo test -p bibcode-desktop network_interfaces::tests::public_default_route_is_advertised_but_never_default --lib -- --exact
 cargo test -p bibcode-desktop backend::tests::lan_advertised_host_accepts_only_private_usable_ipv4_defaults --lib -- --exact
+cargo test -p bibcode-desktop bridge::tests::local_only_discovery_surfaces_public_only_topology_as_unavailable --lib -- --exact
+cargo test -p bibcode-desktop bridge::tests::local_only_discovery_marks_private_default_candidate_unavailable --lib -- --exact
+cargo test -p bibcode-server auth::service::tests::custom_off_host_grants_remain_externally_managed_after_exchange --lib -- --exact
 ```
 
 ### Direct E2EE interop gate

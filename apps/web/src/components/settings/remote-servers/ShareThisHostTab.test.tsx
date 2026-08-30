@@ -12,6 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 type AnyProps = Record<string, unknown>;
 
 const h = vi.hoisted(() => ({
+  inputProps: null as AnyProps | null,
   radioGroupProps: null as AnyProps | null,
   cancelOffer: vi.fn(),
   createOffer: vi.fn(),
@@ -102,7 +103,10 @@ vi.mock("../../ui/button", () => ({
 }));
 
 vi.mock("../../ui/input", () => ({
-  Input: (props: AnyProps) => <input {...props} />,
+  Input: (props: AnyProps) => {
+    h.inputProps = props;
+    return <input {...props} />;
+  },
 }));
 
 vi.mock("../../ui/qr-code", () => ({
@@ -151,6 +155,18 @@ const wideState = {
   endpointUrl: "http://192.168.1.20:3773",
   advertisedHost: "192.168.1.20",
 };
+const nativePrivateDefaultObservation: AdvertisedEndpoint = {
+  id: "desktop-network:192.168.1.20:3773",
+  label: "Local network",
+  provider: { id: "desktop-core", label: "Desktop", kind: "core", isAddon: false },
+  httpBaseUrl: "http://192.168.1.20:3773/",
+  wsBaseUrl: "ws://192.168.1.20:3773/",
+  reachability: "lan",
+  compatibility: { hostedHttpsApp: "mixed-content-blocked", desktopApp: "compatible" },
+  source: "desktop-core",
+  status: "unavailable",
+  isDefault: true,
+};
 
 function installBridge(
   applyServerExposure = vi.fn<
@@ -196,6 +212,14 @@ async function selectIntent(intent: "another-device" | "this-computer" | "custom
   });
 }
 
+async function enterCustomAddress(address: string): Promise<void> {
+  const onChange = h.inputProps?.onChange;
+  if (typeof onChange !== "function") throw new Error("Custom address input is not mounted.");
+  await act(async () => {
+    onChange({ target: { value: address } });
+  });
+}
+
 beforeEach(() => {
   domWindow = new Window({ url: "http://127.0.0.1:3773/settings/remote-servers" });
   vi.stubGlobal("window", domWindow as unknown as Window & typeof globalThis);
@@ -211,8 +235,9 @@ beforeEach(() => {
   document.body.append(container);
   root = createRoot(container);
   Object.assign(h.networkQuery.data.serverExposureState, localState);
-  h.networkQuery.data.advertisedEndpoints = [];
+  h.networkQuery.data.advertisedEndpoints = [nativePrivateDefaultObservation];
   h.wslQuery.data.wslOnly = false;
+  h.inputProps = null;
   h.cancelOffer.mockReset().mockResolvedValue(undefined);
   h.createOffer.mockReset().mockImplementation(async (input) => ({
     id: "offer-1",
@@ -325,6 +350,9 @@ describe("ShareThisHostTab", () => {
     expect(container.textContent).toContain("This computer only");
     expect(container.textContent).toContain("Custom address");
     expect(container.textContent).toContain("Pairing grants your user account on this machine");
+    expect(container.textContent).toContain(
+      "Managed automatically for Another device pairings only",
+    );
   });
 
   it("fails closed when native exposure discovers only a public address", async () => {
@@ -525,6 +553,21 @@ describe("ShareThisHostTab", () => {
       expect.any(String),
     );
     expect(container.textContent).toContain("Loopback offer: reachable only through a tunnel");
+  });
+
+  it("mints an externally managed custom offer without invoking native exposure", async () => {
+    const apply = installBridge();
+    await renderTab();
+    await selectIntent("custom");
+    await enterCustomAddress("https://server.example.com");
+    expect(container.textContent).toContain("does not change the native listener or firewall");
+    await click("Generate pairing offer");
+
+    expect(apply).not.toHaveBeenCalled();
+    expect(h.createOffer).toHaveBeenCalledWith(
+      expect.objectContaining({ endpoint: "https://server.example.com/", reach: "custom" }),
+      expect.any(String),
+    );
   });
 
   it("mints against the WSL endpoint without invoking native exposure", async () => {

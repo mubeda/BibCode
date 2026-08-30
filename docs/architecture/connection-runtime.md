@@ -89,12 +89,26 @@ When the server returns `pairingConfirmationRequired: true`, its session is
 `pending-pairing`: the bootstrap channel can perform identity verification, but
 its credential cannot reconnect as steady-state authority. The client registers
 the verified profile and credential, persists the accepted storage identity,
-then calls `auth.confirmPairing` on that same channel. The add returns only after
-confirmation atomically makes that session active. Closing before confirmation
-revokes the pending session, and server startup removes pending sessions left by
-a crash. A legacy client omits the request capability and receives an immediately
-active session from a new server; a new client treats an absent response flag
-from an older server as the same legacy-active flow and skips confirmation. This
+then calls `auth.confirmPairing` on that same channel. The client treats a typed
+confirmation rejection as final. After confirmation succeeds, or when its
+response is genuinely ambiguous, the client opens a second pinned session with
+the minted bearer and rechecks both environment identities. Authentication and
+transient connection failures receive at most two immediate retries. Once the
+confirmation request may have activated the server credential, the durable
+local registration owns that authority and is never rolled back merely because
+the immediate proof fails; its supervisor is explicitly retried and owns later
+recovery. This prevents response loss, a restart, or endpoint churn from leaving
+an active server grant with no retained client credential.
+Closing before confirmation revokes the pending session, and server startup
+removes pending sessions left by a crash.
+
+A legacy client omits the request capability and receives an immediately active
+session from a new server. New clients still attempt `auth.confirmPairing` when
+an older response omits `pairingConfirmationRequired`: the immediately previous
+server created pending sessions without returning that flag. A truly older
+server instead minted an active credential and returns the exact authenticated
+unknown-request-tag defect; only that exact absent-flag case proceeds to bearer
+proof. Near-miss defects and typed authorization failures fail closed. This
 additive negotiation prevents a routing endpoint from
 substituting a different logical environment or persistent store after the
 pinned handshake without leaving a delivered-but-unpersisted durable client.
@@ -143,12 +157,14 @@ without clearing environment-owned data. When compensation itself removes the
 registration, the registry closes the local supervisor and clears owned runtime
 data only after the conditional CAS succeeds.
 
-Pairing confirmation failure applies the same conditional rule to accepted
-identity state: it restores the previous value, or removes the attempt's value,
-only while the value written by that attempt is still current. Registration and
-identity rollback are retried from the bootstrap scope finalizer when
-interruption prevents the first cleanup pass. A concurrent replacement remains
-authoritative and is never reverted by the older failed add.
+A definitive pairing confirmation rejection applies the same conditional rule
+to accepted identity state: it restores the previous value, or removes the
+attempt's value, only while the value written by that attempt is still current.
+Once confirmation may have committed, the local registration is retained
+instead. Registration and identity rollback are retried from the bootstrap
+scope finalizer when interruption prevents the first cleanup pass. A concurrent
+replacement remains authoritative and is never reverted by the older failed
+add.
 
 In browser mode, and in desktop mode when native catalog protection is
 unavailable, IndexedDB performs both compare-only and conditional `put`

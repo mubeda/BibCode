@@ -1494,7 +1494,7 @@ impl AuthService {
                     && pairing.revoked_at_ms.is_none()
                     && pairing.expires_at_ms > now
             })
-            .map(|pairing| pairing.off_host);
+            .map(|pairing| (pairing.reach.as_deref(), pairing.off_host));
         let session_grants = state
             .sessions
             .values()
@@ -1503,18 +1503,24 @@ impl AuthService {
                     && session.revoked_at_ms.is_none()
                     && session.expires_at_ms > now
             })
-            .map(|session| session.off_host);
+            .map(|session| (session.reach.as_deref(), session.off_host));
         let mut off_host_grant_count = 0usize;
+        let mut native_exposure_grant_count = 0usize;
         let mut legacy_grant_count = 0usize;
-        for off_host in link_grants.chain(session_grants) {
+        for (reach, off_host) in link_grants.chain(session_grants) {
             match off_host {
-                Some(true) => off_host_grant_count += 1,
+                Some(true) => {
+                    off_host_grant_count += 1;
+                    if reach == Some("another-device") {
+                        native_exposure_grant_count += 1;
+                    }
+                }
                 Some(false) => {}
                 None => legacy_grant_count += 1,
             }
         }
         ShareExposureState {
-            desired_exposure: if off_host_grant_count > 0 {
+            desired_exposure: if native_exposure_grant_count > 0 {
                 "wide"
             } else {
                 "loopback"
@@ -2475,7 +2481,7 @@ pub fn default_standard_scopes() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::rpc::RpcSessionContext;
+    use crate::rpc::{PairingConfirmationLatch, RpcSessionContext};
 
     use super::*;
 
@@ -3082,6 +3088,108 @@ mod tests {
         database.close().await;
     }
 
+    #[tokio::test]
+    async fn cancelled_confirmation_owns_activation_through_latch_publication() {
+        let database = crate::persistence::Database::open_in_memory()
+            .await
+            .expect("in-memory database opens");
+        database
+            .call(|connection| {
+                crate::persistence::run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("all migrations apply");
+        let repositories = Repositories::new(database.clone());
+        let secrets = tempfile::tempdir().expect("secret store directory");
+        let secret_store = SecretStore::new(secrets.path())
+            .await
+            .expect("secret store opens");
+        let config = ServerConfig::new(".")
+            .with_bind("127.0.0.1", 3773)
+            .with_desktop("desktop-test-seed")
+            .expect("desktop config");
+        let auth = AuthService::new_with_persistence(
+            &config,
+            vec![7_u8; 32],
+            secret_store,
+            repositories.clone(),
+        )
+        .await
+        .expect("persistent auth service starts");
+        let issued = auth
+            .exchange_pairing_bootstrap("desktop-test-seed", ClientMetadata::default())
+            .await
+            .expect("pending session issues");
+        let session_id = issued.principal.session_id.clone();
+        let latch = PairingConfirmationLatch::default();
+        let context = RpcSessionContext::authenticated_pending_pairing(
+            issued.principal,
+            auth.clone(),
+            latch.clone(),
+        );
+
+        let publication_state_guard = auth.state.lock().await;
+        let confirmation = tokio::spawn(async move { context.confirm_current_pairing().await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let persisted = repositories
+                    .get_auth_session(session_id.clone())
+                    .await
+                    .expect("persisted session reads")
+                    .expect("persisted session exists");
+                if persisted.delivery_state == AuthSessionDeliveryState::Active {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("durable activation commits while state publication is blocked");
+        assert_eq!(
+            publication_state_guard
+                .sessions
+                .get(&session_id)
+                .expect("cached pending session exists")
+                .delivery_state,
+            AuthSessionDeliveryState::PendingPairing
+        );
+
+        confirmation.abort();
+        assert!(matches!(confirmation.await, Err(error) if error.is_cancelled()));
+        drop(publication_state_guard);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let active = auth
+                    .state
+                    .lock()
+                    .await
+                    .sessions
+                    .get(&session_id)
+                    .is_some_and(|session| {
+                        session.delivery_state == AuthSessionDeliveryState::Active
+                    });
+                if active && latch.is_confirmed() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned activation publishes cached state and confirmation latch");
+        assert!(
+            !auth
+                .revoke_failed_pairing_session(&session_id)
+                .await
+                .expect("delivery-guard compensation checks the session")
+        );
+        auth.authenticate_token(&issued.token, SessionTransport::E2ee)
+            .await
+            .expect("confirmed credential remains authoritative");
+        database.close().await;
+    }
+
     fn service() -> AuthService {
         let config = ServerConfig::new(".")
             .with_bind("127.0.0.1", 3773)
@@ -3139,7 +3247,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn share_exposure_derives_wide_only_from_off_host_flags() {
+    async fn share_exposure_derives_wide_only_from_native_managed_off_host_grants() {
         let auth = service();
         let state = auth.share_exposure_state().await;
         assert_eq!(state.desired_exposure, "loopback");
@@ -3202,6 +3310,38 @@ mod tests {
             auth.share_exposure_state().await.desired_exposure,
             "loopback"
         );
+    }
+
+    #[tokio::test]
+    async fn custom_off_host_grants_remain_externally_managed_after_exchange() {
+        let auth = service();
+        let custom = auth
+            .issue_share_pairing(
+                owned_scopes(STANDARD_SCOPES),
+                None,
+                "custom".to_owned(),
+                true,
+            )
+            .await
+            .expect("custom off-host pairing");
+
+        let state = auth.share_exposure_state().await;
+        assert_eq!(state.desired_exposure, "loopback");
+        assert_eq!(state.off_host_grant_count, 1);
+
+        auth.exchange_bootstrap(
+            &custom.credential,
+            None,
+            ClientMetadata::default(),
+            None,
+            SessionTransport::Plain,
+        )
+        .await
+        .expect("custom off-host session");
+
+        let state = auth.share_exposure_state().await;
+        assert_eq!(state.desired_exposure, "loopback");
+        assert_eq!(state.off_host_grant_count, 1);
     }
 
     #[tokio::test]

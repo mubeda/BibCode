@@ -44,28 +44,25 @@ export function resolveShareAddressOptions(input: {
       : input.exposureState.mode === "network-accessible"
         ? input.exposureState.endpointUrl
         : null;
-  const availableOffHostEndpoints = input.advertisedEndpoints.filter(
+  const offHostEndpoints = input.advertisedEndpoints.filter(
+    (endpoint) => shareClassForPairingEndpoint(endpoint.httpBaseUrl) === "off-host",
+  );
+  const availableOffHostEndpoints = offHostEndpoints.filter(
+    (endpoint) => endpoint.status === "available",
+  );
+  const nativeManaged = input.exposureState?.management === "native";
+  const nativePrivateDefaultObserved = offHostEndpoints.some(
     (endpoint) =>
-      endpoint.status === "available" &&
-      shareClassForPairingEndpoint(endpoint.httpBaseUrl) === "off-host",
+      endpoint.source === "desktop-core" &&
+      endpoint.isDefault === true &&
+      (endpoint.reachability === "lan" || endpoint.reachability === "private-network"),
   );
   const selectableOffHostEndpoints = availableOffHostEndpoints.filter(
-    (endpoint) =>
-      !(
-        input.exposureState?.management === "native" &&
-        input.exposureState.mode === "local-only" &&
-        endpoint.reachability === "public"
-      ),
+    (endpoint) => !(nativeManaged && endpoint.reachability === "public"),
   );
-  const hasPrivateCandidate = availableOffHostEndpoints.some(
-    (endpoint) => endpoint.reachability === "lan" || endpoint.reachability === "private-network",
-  );
-  const hasOnlyPublicCandidates =
-    availableOffHostEndpoints.some((endpoint) => endpoint.reachability === "public") &&
-    !hasPrivateCandidate;
   const canOfferAutomaticLan =
     (input.exposureState === null && automaticEndpoint !== null) ||
-    (input.exposureState?.mode === "local-only" && !hasOnlyPublicCandidates) ||
+    (nativeManaged && input.exposureState?.mode === "local-only" && nativePrivateDefaultObserved) ||
     (automaticEndpoint !== null &&
       classifyPairingEndpoint(automaticEndpoint) === "private-network");
   if (canOfferAutomaticLan) {
@@ -209,10 +206,10 @@ export async function generateShareOffer(
   }
 
   const endpointClassForWiden =
-    deps.intent === "another-device"
-      ? "off-host"
-      : deps.intent === "custom" && endpoint !== null
-        ? shareClassForPairingEndpoint(endpoint)
+    deps.intent === "custom" && endpoint !== null
+      ? shareClassForPairingEndpoint(endpoint)
+      : deps.intent === "another-device"
+        ? "off-host"
         : "loopback";
   if (endpointClassForWiden === "unconnectable") {
     return {
@@ -226,6 +223,7 @@ export async function generateShareOffer(
 
   let widened = false;
   if (
+    deps.intent === "another-device" &&
     endpointClassForWiden === "off-host" &&
     deps.hasDesktopBridge &&
     deps.applyServerExposure !== null &&

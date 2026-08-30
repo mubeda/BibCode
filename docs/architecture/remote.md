@@ -59,17 +59,23 @@ ranking both call that classifier, so unspecified, loopback, multicast, and
 link-local addresses fail closed. Until the desktop listener is dual-stack,
 discovery emits IPv4 candidates only. It normalizes IPv4-mapped IPv6,
 deduplicates by address, and ranks a usable private default-route address before
-CGNAT/Tailscale and other private addresses. Native-managed sharing accepts only
-private or CGNAT default-route addresses: while the native server is local-only,
-public-only candidates are not actionable and the transition fails closed.
-Public addresses may still be shown for an already externally managed topology,
-but are never preselected and require an explicit public-address and firewall
-warning. A public-only host must use an externally managed `bibcode serve`
-listener or reverse proxy rather than asking the native exposure command to
-infer public-listener authority. Tailscale CLI discovery checks the
-packaged Windows, macOS, and Linux install paths before `PATH` and emits only
-usable private IPv4 candidates. Stable endpoint IDs include the address and port,
-and the user's default is persisted by stable ID rather than array position.
+CGNAT/Tailscale and other private addresses. The native bridge publishes usable
+interface observations even while its listener is loopback-only; those
+off-host observations report `status: unavailable` until the native listener is
+wide. This lets the renderer distinguish a private default route from a
+public-only or non-default topology before it requests privileged mutation.
+Native-managed automatic sharing accepts only a private or CGNAT default-route
+observation. Public interface observations are never actionable in a
+native-managed topology, including after an unrelated transition has made the
+listener wide. A public-only host must use a custom address backed by an
+externally managed `bibcode serve` listener or reverse proxy rather than asking
+the native exposure command to infer public-listener authority. Public
+endpoints in an externally managed topology are never preselected and require
+an explicit public-address and firewall warning. Tailscale CLI discovery checks
+the packaged Windows, macOS, and Linux install paths before `PATH` and emits only
+usable private IPv4 candidates. Stable endpoint IDs include the address and
+port, and the user's default is persisted by stable ID rather than array
+position.
 
 ## Access methods
 
@@ -123,11 +129,15 @@ handshake does not reach the exchange. A negotiated exchange creates a
 `pending-pairing` session and consumes the token before the encrypted credential
 reply is delivered. Pending-session compensation is armed before the SQLite
 issuance job is queued, because a queued database call can outlive cancellation
-of its awaiting future. A delivery guard then owns that session until in-channel confirmation;
-capacity binding, encoding, encryption, or socket-write failure schedules
+of its awaiting future. A delivery guard then owns that session until in-channel
+confirmation; capacity binding, encoding, encryption, or socket-write failure schedules
 best-effort revocation of the undelivered session. After delivery, verification
 or client-persistence failure closes the channel and the same guard revokes the
 delivered-but-unconfirmed session without replacing the original error.
+Confirmation owns its database activation through cached-state publication and
+delivery-latch publication even if cancellation drops the RPC handler future.
+The delivery guard therefore cannot observe an active database row whose
+in-memory state and latch still appear pending.
 The one-time token remains consumed, so the user generates a new offer, but the
 pending credential cannot reconnect as steady-state authority. The server
 returns `e2ee_authenticated` with the minted string credential,
@@ -135,8 +145,12 @@ returns `e2ee_authenticated` with the minted string credential,
 `pairingConfirmationRequired: true` only for that negotiated pending flow. A
 legacy client omits `pairingConfirmation`; a new server then preserves the v1
 behavior by minting an immediately active session and omitting the reply flag.
-A new client talking to an older server likewise treats an absent reply flag as
-an already-active credential and skips `auth.confirmPairing`. A returning device sends
+A new client still attempts `auth.confirmPairing` when the reply flag is absent,
+because the immediately previous server created a pending session without the
+flag. A truly older active-session server returns the exact authenticated
+unknown-request-tag defect; only that exact absent-flag case may proceed to the
+same bearer proof used after a successful or ambiguously lost confirmation
+response. A returning device sends
 `{"type":"e2ee_auth","bearer":"<stored credential>"}` and receives an
 `e2ee_authenticated` acknowledgement. Invalid credentials receive
 `e2ee_error/unauthorized`; malformed protocol receives `e2ee_error/protocol`;
@@ -276,21 +290,41 @@ payload and descriptor, registers the verified profile and credential, accepts
 the storage identity, then calls the empty `auth.confirmPairing` RPC on that same
 channel. Confirmation requires `access:write`, derives the session ID from the
 authenticated context, and idempotently commits only that session to `active`;
-the add succeeds only after that commit. Compatibility is additive: a legacy
-client receives an active credential immediately, while a new client skips
-confirmation when an older server omits `pairingConfirmationRequired`.
+the server owns the durable commit through in-memory publication and delivery-
+latch publication even if the RPC future is cancelled. The client attempts a
+second pinned session that authenticates the minted bearer, rechecks the
+environment and storage identities, and answers a probe. That proof receives at
+most two retries for authentication convergence or transient connection
+failure, then wakes the registered environment supervisor. Once confirmation
+has definitely or possibly activated the credential, the durable local entry
+owns it and remains saved even when the immediate proof cannot complete; the
+supervisor exposes the blocked or reconnecting state and owns later recovery.
+Only a typed confirmation rejection or a required-confirmation server that
+definitively lacks the method permits local rollback. Compatibility is
+additive: a legacy client receives an active credential immediately; a new
+client also confirms against the previous pending-session server even though
+that server omitted `pairingConfirmationRequired`. Only an absent flag plus the
+exact unknown-method defect from a truly older server may bypass confirmation;
+the client still attempts bearer proof. Ambiguous transport loss or interruption
+also proceeds to bearer proof. Typed authorization failures and the exact
+unknown-method response from a server that required confirmation are
+definitively inactive and roll back. Any other unexpected response is treated as
+ambiguous: the client retains the already durable local authority because
+dispatch may have committed, attempts bearer proof, and lets the saved
+supervisor expose any blocked state.
 
-Registration, identity persistence, or confirmation failure rolls back local
-writes best-effort before the bootstrap scope closes. Registration removal is
-conditional on the exact registration still owning the environment, and identity
-rollback restores or removes the prior value only if this attempt's value is
-still current. Concurrent replacements therefore win intact. Closing before
-confirmation revokes the pending server session, and startup cleanup revokes
-pending sessions left by a crash; a confirmed session survives reconnect and
-restart. Failures are classified as `unreachable`, `host-identity-mismatch`,
-`pairing-rejected`, `incompatible`, or `duplicate-storage-identity`, and cleanup
-copy reports any local compensation failure. The client does not claim
-transparent retry with the same one-time code.
+Registration, identity persistence, or definitive pre-activation confirmation
+failure rolls back local writes best-effort before the bootstrap scope closes.
+Registration removal is conditional on the exact registration still owning the
+environment, and identity rollback restores or removes the prior value only if
+this attempt's value is still current. Concurrent replacements therefore win
+intact. Closing before confirmation revokes the pending server session, and
+startup cleanup revokes pending sessions left by a crash; a confirmed session
+survives reconnect and restart. Failures are classified as `unreachable`,
+`host-identity-mismatch`, `pairing-rejected`, `incompatible`, or
+`duplicate-storage-identity`, and cleanup copy reports any local compensation
+failure. The client does not claim transparent retry with the same one-time
+code.
 
 ### Remote Servers settings and pairing entry points
 
@@ -371,24 +405,32 @@ The Share tab mints the complete pairing payload on the server through
 `POST /api/auth/pairing-offer`. Each minted grant records its `reach` intent and
 a mint-time `off_host` classification. The classification comes from the
 validated offered endpoint, so a loopback custom address used through an SSH
-tunnel remains loopback while a custom LAN or public address is off-host. A
-session created by consuming the grant inherits both fields.
+tunnel remains loopback while a custom LAN or public address is off-host for
+trust and audit presentation. A session created by consuming the grant inherits
+both fields. Reach also owns exposure authority: `another-device` is the only
+intent allowed to request native listener widening. Every `custom` address is
+externally managed, so its ceremony and later access revisions never invoke the
+native exposure bridge.
 
 The server is the source of truth for desired exposure.
 `GET /api/auth/share-state` derives `wide` only while at least one unrevoked
-pairing link or client session has `off_host = true`; it otherwise derives
-`loopback`. Every active off-host session counts regardless of access method,
-including `browser-session-cookie`, `bearer-access-token`, and
-`dpop-access-token`; an unrevoked `pending-pairing` session also retains the
-reason during client verification and persistence. Consuming a browser pairing
+pairing link or client session has both `reach = another-device` and
+`off_host = true`; it otherwise derives `loopback`. `offHostGrantCount` still
+counts every active off-host grant, including externally managed custom grants,
+so trust and audit presentation does not erase their reachability. Every native
+exposure reason counts regardless of access method, including
+`browser-session-cookie`, `bearer-access-token`, and `dpop-access-token`; an
+unrevoked `pending-pairing` session also retains the reason during client
+verification and persistence. Consuming an **Another device** browser pairing
 link therefore replaces the one-time-link reason with the browser-session reason
-instead of narrowing and disconnecting the newly paired browser.
+instead of narrowing and disconnecting the newly paired browser. Unknown or
+legacy null reach metadata never grants native widening authority.
 
 Every fresh desktop process starts the actual primary backend local-only under
 the native `ServerExposureCoordinator`, regardless of a previously persisted
 wide setting. Once authenticated, the renderer compares authoritative share
-state with actual runtime topology and requests a widen only when a live
-off-host reason exists. One coordinator serializes exposure applies and every
+state with actual runtime topology and requests a widen only when a live native
+exposure reason exists. One coordinator serializes exposure applies and every
 other settings mutation that can restart the native or WSL topology. Those
 non-exposure mutations preserve the actual runtime exposure across their
 restart instead of reapplying a stale durable mode. Widening uses an
@@ -414,8 +456,8 @@ only after its absence is verified; process, policy, and verification failures
 propagate to the coordinator and are reported as incomplete cleanup. The
 persisted desktop setting records the last completed transition but is neither
 proof of actual topology nor permission to start wide.
-Creating a **This computer only** or loopback-custom grant never widens a later
-launch, and there is no independent manual exposure toggle.
+Creating a **This computer only** grant or any **Custom address** grant never
+widens a later launch, and there is no independent manual exposure toggle.
 
 A fresh start with only legacy null-reach grants remains local-only. If the last
 completed native configuration was network-accessible, the Share tab shows an
@@ -440,10 +482,10 @@ remains, they do block automatic reversion from an already-wide bind. The Share
 tab identifies that condition and tells the user to revoke or re-pair those
 clients. Otherwise, the renderer checks share state at startup and after every
 auth-access revision. It widens a local-only runtime only when the server
-currently reports a live off-host reason, and switches a wide runtime back to
-loopback when the last reason is revoked. After narrowing it reads share state
-once more. If a concurrent new off-host grant appeared during that operation,
-it performs one compensating widen; later revisions schedule a fresh
+currently reports a live native exposure reason, and switches a wide runtime
+back to loopback when the last reason is revoked. After narrowing it reads share
+state once more. If a concurrent new native exposure grant appeared during that
+operation, it performs one compensating widen; later revisions schedule a fresh
 reconciliation rather than creating an internal loop.
 
 Revoking a client invalidates its credential and actively cancels every live

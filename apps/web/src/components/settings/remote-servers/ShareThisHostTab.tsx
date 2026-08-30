@@ -150,15 +150,11 @@ export function ShareThisHostTab(): ReactElement {
   const effectiveName = defaultOfferName(
     offerName === "" ? (primaryEnvironment?.serverConfig?.environment.label ?? null) : offerName,
   );
-  const customEndpointClass =
-    intent === "custom" && customAddress.trim() !== ""
-      ? shareClassForPairingEndpoint(customAddress)
-      : null;
   const willWiden =
     selectedOption !== null &&
     canManageNativeExposure &&
     exposureState?.mode !== "network-accessible" &&
-    (intent === "another-device" || (intent === "custom" && customEndpointClass === "off-host"));
+    intent === "another-device";
 
   const handleRefresh = useCallback(() => {
     refreshDesktopNetworkAccessState();
@@ -331,7 +327,8 @@ export function ShareThisHostTab(): ReactElement {
           <SettingsRow
             title="Custom address"
             description={
-              customAddressError ?? "Enter the http(s) address that the paired client will use."
+              customAddressError ??
+              "Enter an externally managed http(s) address. BiBCode does not change the native listener or firewall."
             }
             status={
               customAddressError ? (
@@ -443,8 +440,9 @@ export function ShareThisHostTab(): ReactElement {
                 </span>
               ) : (
                 <span className="block">
-                  Managed automatically: switches on while at least one off-host pairing exists and
-                  back off when the last one is revoked.
+                  Managed automatically for Another device pairings only: switches on while one
+                  requires native exposure and back off when the last one is revoked. Custom
+                  addresses remain externally managed.
                 </span>
               )}
               {exposureState?.mode === "network-accessible" &&

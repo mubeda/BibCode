@@ -347,8 +347,9 @@ minimum-size, and relevant Windows DPI states. Verify:
   ```
 
   Confirm it is enabled, program-scoped to the exact packaged executable,
-  TCP-only, and limited to Domain/Private profiles. Revoke the last off-host
-  offer or paired client, verify exposure returns to loopback, and confirm the
+  TCP-only, and limited to Domain/Private profiles. Revoke the final
+  native-managed **Another device** offer or paired client, verify exposure
+  returns to loopback, and confirm the
   named rule is absent. Record an elevation or policy denial as failed native
   evidence; do not substitute a manually created rule. Run the host-independent
   deletion-spawn and policy-denial tests, then reproduce a deletion denial
@@ -387,11 +388,16 @@ minimum-size, and relevant Windows DPI states. Verify:
 
 - the address picker lists only usable IPv4 candidates until a dual-stack
   listener exists, uses stable address/port IDs, safely preselects a private
-  default, and leaves generation disabled with externally managed
-  listener/reverse-proxy guidance when native discovery has only a public
-  address. An externally managed public endpoint is never preselected and
-  requires an explicit public-address/firewall warning. A packaged Tailscale CLI is discovered
-  without shell `PATH` and unusable, public, or IPv6 candidates are suppressed;
+  default, reports off-host interface observations unavailable before widening,
+  and leaves generation disabled with externally managed listener/reverse-proxy
+  guidance when native discovery has only a public or non-default private
+  address. Public interface candidates remain non-actionable even after native
+  exposure is wide. A custom off-host address mints without changing the native
+  listener or firewall rule, and later auth revisions do not widen it. An
+  externally managed public endpoint is never preselected and requires an
+  explicit public-address/firewall warning. A packaged Tailscale CLI is
+  discovered without shell `PATH` and unusable, public, or IPv6 candidates are
+  suppressed;
 - seed an incompatible newer connection IndexedDB version and confirm the
   boot-level recovery dialog lists the deleted data classes, keeps **Reload** as
   a non-destructive exit, requires a separately acknowledged confirmation that a
