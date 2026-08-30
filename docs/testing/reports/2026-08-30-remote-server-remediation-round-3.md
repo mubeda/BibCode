@@ -15,7 +15,8 @@ recorded in `docs/plans/remote-servers/2026-08-30-remediation-round-3-design.md`
 - Branch or requested revision: `mubeda/develop`
 - Local HEAD: `a90b0ad9` (revision validated by the final clean full-suite
   run; the report commit itself lands one commit above)
-- Remote HEAD: `8487ce78` (round-2 final; this round is local-only, not pushed)
+- Remote HEAD: `8487ce78` (round-2 final) at validation time; the round was
+  pushed afterwards on user request (see Publication state)
 - Merge base and ahead/behind: branch ahead of `8487ce78` by the 22 round-3
   commits at validation time (23 with this report), listed under Publication
   state; nothing behind
@@ -236,7 +237,9 @@ gates). `execution-report-template.md` was reviewed and remains accurate.
   flag removal), `09f63731` (C18 docs alignment), `8f6f21e3` (C19
   runbooks), `87126ebd` (C20 review reports), `57deed80` (blocked-deletion
   test fix), `a90b0ad9` (T-4 identity respell), plus this report's commit
-- Pushed: no (not requested)
+- Pushed: yes — `origin/develop` fast-forwarded `8487ce78..77a7d4b3` on
+  2026-08-30 (user-requested); `git ls-remote`, the GitHub API, and local
+  HEAD all report `77a7d4b3`
 - Branch merged: no
 - Pull request opened: no
 - Artifacts published: no
