@@ -55,7 +55,19 @@ pub(crate) const E2EE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const E2EE_HOST_IDENTITY_CLOSE_CODE: u16 = 4403;
 pub(crate) const E2EE_MAX_PREAUTH_CONNECTIONS: usize = 32;
 pub(crate) const E2EE_MAX_PREAUTH_CONNECTIONS_PER_PEER: usize = 4;
+/// Peer/network buckets that already hold a connection may only grow while
+/// global pre-auth usage stays at or below this soft cap. The slots above it
+/// are reserved for a bucket's first connection, so a fresh legitimate device
+/// still finds room while a small number of hostile networks saturate their
+/// own buckets. (A wide-prefix holder can still take the reserve with many
+/// distinct first-connections; per-address admission cannot price that out.)
+const E2EE_PREAUTH_GLOBAL_SOFT_CAP: usize = 24;
 const E2EE_PREAUTH_BURST_PER_PEER: u8 = 8;
+/// The loopback-forwarder class aggregates every local client that a reverse
+/// proxy fronts without appending `X-Forwarded-For`, so its bucket is sized
+/// for fleet reconnect storms rather than for one device.
+const E2EE_PREAUTH_BURST_FORWARDER: u8 = 32;
+const E2EE_PREAUTH_FORWARDER_REFILL_PER_INTERVAL: u8 = 8;
 const E2EE_PREAUTH_REFILL_INTERVAL: Duration = Duration::from_secs(1);
 const E2EE_PREAUTH_PEER_STATE_TTL: Duration = Duration::from_secs(8);
 const E2EE_MAX_PREAUTH_CONNECTIONS_PER_NETWORK: usize = 16;
@@ -206,6 +218,15 @@ impl E2eePreauthAdmission {
             state.active > 0
                 || now.saturating_duration_since(state.last_activity) < E2EE_PREAUTH_PEER_STATE_TTL
         });
+        let (burst, refill_per_interval) = match peer_key {
+            E2eePreauthPeerKey::LoopbackForwarder => (
+                E2EE_PREAUTH_BURST_FORWARDER,
+                E2EE_PREAUTH_FORWARDER_REFILL_PER_INTERVAL,
+            ),
+            E2eePreauthPeerKey::Public(_) | E2eePreauthPeerKey::Unspecified => {
+                (E2EE_PREAUTH_BURST_PER_PEER, 1)
+            }
+        };
         if !admission.peers.contains_key(&peer_key) {
             if admission.peers.len() >= E2EE_MAX_PREAUTH_TRACKED_PEERS {
                 return Err("busy");
@@ -214,7 +235,7 @@ impl E2eePreauthAdmission {
                 peer_key,
                 E2eePreauthPeerState {
                     active: 0,
-                    tokens: E2EE_PREAUTH_BURST_PER_PEER,
+                    tokens: burst,
                     last_refill: now,
                     last_activity: now,
                 },
@@ -244,11 +265,10 @@ impl E2eePreauthAdmission {
             .as_secs()
             / E2EE_PREAUTH_REFILL_INTERVAL.as_secs();
         if elapsed_intervals > 0 {
-            let replenished = u8::try_from(elapsed_intervals).unwrap_or(u8::MAX);
-            peer_state.tokens = peer_state
-                .tokens
-                .saturating_add(replenished)
-                .min(E2EE_PREAUTH_BURST_PER_PEER);
+            let replenished = u8::try_from(elapsed_intervals)
+                .unwrap_or(u8::MAX)
+                .saturating_mul(refill_per_interval);
+            peer_state.tokens = peer_state.tokens.saturating_add(replenished).min(burst);
             peer_state.last_refill += E2EE_PREAUTH_REFILL_INTERVAL
                 .saturating_mul(u32::try_from(elapsed_intervals).unwrap_or(u32::MAX));
         }
@@ -268,6 +288,27 @@ impl E2eePreauthAdmission {
                 .is_some_and(|state| state.active >= E2EE_MAX_PREAUTH_CONNECTIONS_PER_NETWORK)
         }) {
             return Err("busy");
+        }
+        // Established buckets only grow while global usage stays within the
+        // soft cap; the remaining slots are a bucket's first-connection
+        // reserve. `global` is already held, so available permits reflect this
+        // admission.
+        let bucket_established = match network_key {
+            Some(network_key) => admission
+                .networks
+                .get(&network_key)
+                .is_some_and(|state| state.active > 0),
+            None => admission
+                .peers
+                .get(&peer_key)
+                .is_some_and(|state| state.active > 0),
+        };
+        if bucket_established {
+            let used_including_this =
+                E2EE_MAX_PREAUTH_CONNECTIONS - self.inner.global.available_permits();
+            if used_including_this > E2EE_PREAUTH_GLOBAL_SOFT_CAP {
+                return Err("busy");
+            }
         }
 
         let peer_state = admission
@@ -335,13 +376,44 @@ impl Drop for E2eePreauthLease {
     }
 }
 
-fn classify_preauth_peer(peer_ip: IpAddr) -> (E2eePreauthPeerKey, Option<E2eePreauthNetworkKey>) {
-    let peer_ip = match peer_ip {
+/// Resolves the admission identity for a pre-auth connection. A loopback
+/// socket is a local reverse proxy or a direct local client: when it carries
+/// `X-Forwarded-For`, the **last** entry — the hop appended by that implicitly
+/// trusted local proxy — is the real client and keys per-peer/per-network
+/// admission; earlier entries are client-controlled and ignored. Remote
+/// sockets can never reach this branch, and an unparseable value falls into
+/// the strict unspecified bucket rather than the exempt forwarder class.
+pub(crate) fn effective_preauth_peer(socket_peer: IpAddr, forwarded_for: Option<&str>) -> IpAddr {
+    let socket_peer = unmap_ipv4(socket_peer);
+    if !socket_peer.is_loopback() {
+        return socket_peer;
+    }
+    let Some(last_hop) = forwarded_for
+        .and_then(|header| header.split(',').next_back())
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    else {
+        return socket_peer;
+    };
+    last_hop
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<IpAddr>()
+        .map(unmap_ipv4)
+        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+}
+
+fn unmap_ipv4(peer_ip: IpAddr) -> IpAddr {
+    match peer_ip {
         IpAddr::V6(ip) if ip.to_ipv4_mapped().is_some() => {
             IpAddr::V4(ip.to_ipv4_mapped().expect("mapped IPv4 checked"))
         }
         peer_ip => peer_ip,
-    };
+    }
+}
+
+fn classify_preauth_peer(peer_ip: IpAddr) -> (E2eePreauthPeerKey, Option<E2eePreauthNetworkKey>) {
+    let peer_ip = unmap_ipv4(peer_ip);
     if peer_ip.is_unspecified() {
         return (E2eePreauthPeerKey::Unspecified, None);
     }
@@ -1517,33 +1589,46 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn preauth_admission_keeps_global_capacity_and_prunes_idle_peers() {
+    #[tokio::test]
+    async fn established_networks_stop_at_the_soft_cap_and_fresh_networks_use_the_reserve() {
         let admission = E2eePreauthAdmission::new();
         let now = tokio::time::Instant::now();
         let mut leases = Vec::new();
-        for peer_index in 1..=8 {
-            let peer = std::net::Ipv4Addr::new(198, 18, peer_index, 1).into();
-            for _ in 0..E2EE_MAX_PREAUTH_CONNECTIONS_PER_PEER {
-                leases.push(admission.try_admit(peer, now).expect("global slot"));
+        // One hostile /24 saturates its per-network cap.
+        for host in 1..=16 {
+            let peer = std::net::Ipv4Addr::new(198, 18, 1, host).into();
+            leases.push(admission.try_admit(peer, now).expect("first network slot"));
+        }
+        // A second hostile /24 grows only until the global soft cap.
+        let mut second_network_slots = 0;
+        for host in 1..=16_u8 {
+            let peer = std::net::Ipv4Addr::new(198, 18, 2, host).into();
+            match admission.try_admit(peer, now) {
+                Ok(lease) => {
+                    leases.push(lease);
+                    second_network_slots += 1;
+                }
+                Err("busy") => break,
+                Err(other) => panic!("unexpected admission error: {other}"),
             }
         }
-        let overflow_peer = "203.0.113.1".parse().expect("overflow peer IP");
+        assert_eq!(
+            second_network_slots,
+            E2EE_PREAUTH_GLOBAL_SOFT_CAP - E2EE_MAX_PREAUTH_CONNECTIONS_PER_NETWORK,
+            "established buckets stop growing at the global soft cap"
+        );
+
+        // A fresh network's first connection still finds room in the reserve.
+        let fresh = admission
+            .try_admit("203.0.113.1".parse().expect("fresh peer IP"), now)
+            .expect("a fresh network uses the reserved headroom");
+        // The hostile networks cannot follow it into the reserve.
         assert!(matches!(
-            admission.try_admit(overflow_peer, now),
+            admission.try_admit(IpAddr::from(std::net::Ipv4Addr::new(198, 18, 2, 99)), now),
             Err("busy")
         ));
-
-        leases.clear();
-        tokio::time::advance(E2EE_PREAUTH_PEER_STATE_TTL).await;
-        let trigger_peer = "203.0.114.1".parse().expect("trigger peer IP");
-        drop(
-            admission
-                .try_admit(trigger_peer, tokio::time::Instant::now())
-                .expect("released global slot"),
-        );
-        assert_eq!(admission.peer_count(), 1);
-        assert_eq!(admission.network_count(), 1);
+        drop(fresh);
+        drop(leases);
     }
 
     #[tokio::test]
@@ -1621,6 +1706,9 @@ mod tests {
         leases.clear();
     }
 
+    // The documented residual: a wide-prefix holder can take the reserve with
+    // many distinct first-connections, and the hard global cap is the final
+    // bound. Per-address admission cannot price that attacker out.
     #[tokio::test]
     async fn unrelated_public_networks_still_stop_at_the_global_cap() {
         let admission = E2eePreauthAdmission::new();
@@ -1635,6 +1723,76 @@ mod tests {
             Err("busy")
         ));
         drop(leases);
+    }
+
+    #[test]
+    fn forwarded_loopback_peers_key_on_the_proxy_appended_client_address() {
+        let loopback: IpAddr = "127.0.0.1".parse().expect("loopback");
+        let client: IpAddr = "203.0.113.7".parse().expect("client");
+
+        // The last entry is the hop the trusted local proxy appended.
+        assert_eq!(
+            effective_preauth_peer(loopback, Some("203.0.113.7")),
+            client
+        );
+        assert_eq!(
+            effective_preauth_peer(loopback, Some("6.6.6.6, 203.0.113.7")),
+            client
+        );
+        assert_eq!(
+            effective_preauth_peer(loopback, Some(" [2001:db8::1] ")),
+            "2001:db8::1".parse::<IpAddr>().expect("v6 client")
+        );
+        // A mapped-IPv6 loopback socket still trusts the header.
+        assert_eq!(
+            effective_preauth_peer(
+                "::ffff:127.0.0.1".parse().expect("mapped"),
+                Some("203.0.113.7")
+            ),
+            client
+        );
+        // Only loopback sockets may carry the header; remote peers keep their
+        // socket address no matter what they send.
+        let remote: IpAddr = "198.51.100.9".parse().expect("remote");
+        assert_eq!(effective_preauth_peer(remote, Some("203.0.113.7")), remote);
+        // No header: the exempt forwarder class remains.
+        assert_eq!(effective_preauth_peer(loopback, None), loopback);
+        assert_eq!(effective_preauth_peer(loopback, Some("  ")), loopback);
+        // Garbage falls into the strict unspecified bucket, not the exempt one.
+        assert_eq!(
+            effective_preauth_peer(loopback, Some("not-an-ip")),
+            IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forwarder_token_bucket_absorbs_a_fleet_reconnect_storm() {
+        let admission = E2eePreauthAdmission::new();
+        let now = tokio::time::Instant::now();
+        let loopback: IpAddr = "127.0.0.1".parse().expect("loopback");
+        // A whole fleet reconnecting through a proxy that sets no header burns
+        // one shared bucket; it must hold far more than one device's burst.
+        for _ in 0..u64::from(E2EE_PREAUTH_BURST_FORWARDER) {
+            drop(
+                admission
+                    .try_admit(loopback, now)
+                    .expect("forwarder burst slot"),
+            );
+        }
+        assert!(matches!(admission.try_admit(loopback, now), Err("rate")));
+        tokio::time::advance(E2EE_PREAUTH_REFILL_INTERVAL).await;
+        let refilled = tokio::time::Instant::now();
+        for _ in 0..u64::from(E2EE_PREAUTH_FORWARDER_REFILL_PER_INTERVAL) {
+            drop(
+                admission
+                    .try_admit(loopback, refilled)
+                    .expect("forwarder refill slot"),
+            );
+        }
+        assert!(matches!(
+            admission.try_admit(loopback, refilled),
+            Err("rate")
+        ));
     }
 
     #[tokio::test(start_paused = true)]

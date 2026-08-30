@@ -170,11 +170,23 @@ is capped at 64 KiB; at most 32 unauthenticated E2EE connections may be in
 flight. A non-loopback socket peer may hold at most four leases, consumes a
 token bucket with burst eight and one-attempt-per-second refill, and shares a
 network bucket with its IPv4 `/24` or IPv6 `/64`; one network may consume at
-most 16 of the global leases. Loopback peers form a trusted-local-forwarder
-class exempt from the public exact-peer and subnet caps but still subject to the
-global and burst limits. Missing peer information uses one strict unspecified
-bucket. Peer and network entries expire and remain hard-capped; the kernel
-socket peer, never forwarding headers, is authoritative. Non-empty handshake
+most 16 of the global leases. Buckets that already hold a connection may only
+grow while global usage stays at or below the 24-lease soft cap; the eight
+slots above it are reserved for a bucket's first connection, so a fresh
+legitimate device still finds room while a small number of hostile networks
+saturate their own buckets (a wide-prefix holder taking the reserve with many
+distinct first-connections remains bounded only by the hard global cap — the
+documented residual). Loopback sockets are the local trust boundary: when one
+carries `X-Forwarded-For`, the last entry — the hop appended by that
+implicitly trusted local reverse proxy — keys per-peer and per-network
+admission as if the client had connected directly, an unparseable value falls
+into the strict unspecified bucket, and remote sockets never have forwarding
+headers honored. Loopback peers without the header form the
+trusted-local-forwarder class, exempt from the public exact-peer and subnet
+caps but still subject to the global limit and to a fleet-sized token bucket
+(burst 32, refill 8 per second). Missing peer information uses one strict
+unspecified bucket. Peer and network entries expire and remain hard-capped;
+for every non-loopback socket the kernel peer address is authoritative. Non-empty handshake
 payloads fail the protocol. Failure to decrypt the first handshake message
 closes with code 4403, which a pinned initiator classifies as a host-identity
 mismatch. Encrypted writers iterate one plaintext record at a time, encrypt it,
