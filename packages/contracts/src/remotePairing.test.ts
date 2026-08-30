@@ -55,7 +55,7 @@ describe("remote pairing contract", () => {
       pairingConfirmation: true,
     });
     expect("pairing" in pairingForm && pairingForm.pairing).toBe("one-time");
-    expect("pairingConfirmation" in pairingForm && pairingForm.pairingConfirmation).toBe(true);
+    expect("pairingConfirmation" in pairingForm).toBe(false);
     expect(decodeAuth({ type: "e2ee_auth", pairing: "legacy" })).toEqual({
       type: "e2ee_auth",
       pairing: "legacy",
