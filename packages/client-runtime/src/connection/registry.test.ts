@@ -909,6 +909,25 @@ describe("EnvironmentRegistry", () => {
     }),
   );
 
+  it.effect("passive state lookup preserves explicit cold disconnect intent", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness([TARGET]);
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+
+        yield* registry.disconnect(TARGET.environmentId);
+        yield* registry.state(TARGET.environmentId);
+        for (let iteration = 0; iteration < 100; iteration += 1) {
+          yield* Effect.yieldNow;
+        }
+
+        const state = yield* registry.state(TARGET.environmentId);
+        expect(state.desired).toBe(false);
+        expect(yield* Ref.get(harness.sessions)).toEqual([]);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
   it.effect("adopts the current structured storage change and retries exactly once", () =>
     Effect.gen(function* () {
       const connectionAttempts = yield* Ref.make(0);
@@ -1290,6 +1309,62 @@ describe("EnvironmentRegistry", () => {
         expect(yield* Ref.get(harness.releasedSessions)).toBe(1);
         expect(yield* Ref.get(harness.cacheClears)).toEqual([]);
         expect(yield* Ref.get(harness.ownedDataClears)).toEqual([]);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  it.effect("preserves explicit disconnect intent across catalog profile drift", () =>
+    Effect.gen(function* () {
+      const first = new BearerConnectionRegistration({
+        target: BEARER_TARGET,
+        profile: BEARER_PROFILE,
+        credential: new BearerConnectionCredential({ token: "first-credential" }),
+      });
+      const replacementTarget = new BearerConnectionTarget({
+        ...BEARER_TARGET,
+        label: "Replacement environment",
+      });
+      const replacement = new BearerConnectionRegistration({
+        target: replacementTarget,
+        profile: new BearerConnectionProfile({
+          ...BEARER_PROFILE,
+          label: replacementTarget.label,
+          httpBaseUrl: "https://replacement.example.test",
+          wsBaseUrl: "wss://replacement.example.test",
+        }),
+        credential: new BearerConnectionCredential({ token: "replacement-credential" }),
+      });
+      const connectionAttempts = yield* Ref.make(0);
+      const harness = yield* makeHarness([], [], [], {
+        beforeSessionConnect: () => Ref.update(connectionAttempts, (count) => count + 1),
+      });
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        yield* registry.register(first);
+        yield* awaitConnectionState(
+          registry,
+          BEARER_TARGET.environmentId,
+          (state) => state.phase === "connected",
+        );
+        yield* registry.disconnect(BEARER_TARGET.environmentId);
+        yield* awaitConnectionState(
+          registry,
+          BEARER_TARGET.environmentId,
+          (state) => state.desired === false,
+        );
+
+        yield* harness.externalRegistrationStore.register(replacement);
+        expect(yield* registry.rollbackRegistration(first)).toBe(false);
+        for (let iteration = 0; iteration < 100; iteration += 1) {
+          yield* Effect.yieldNow;
+        }
+
+        const state = yield* registry.state(BEARER_TARGET.environmentId);
+        expect(state.desired).toBe(false);
+        expect(state.phase).toBe("available");
+        expect(yield* Ref.get(connectionAttempts)).toBe(1);
+        expect(yield* Ref.get(harness.sessions)).toHaveLength(1);
       }).pipe(Effect.provide(harness.layer), Effect.scoped);
     }),
   );
