@@ -83,38 +83,42 @@ deadline or transport failure follows the supervisor's bounded transient retry
 policy.
 
 The verify-then-add flow uses that session to compare the descriptor, pairing
-payload, `e2ee_authenticated` response, and `server.getConfig` identities. New
-clients advertise `pairingConfirmation: true` inside encrypted authentication.
-When the server returns `pairingConfirmationRequired: true`, its session is
-`pending-pairing`: the bootstrap channel can perform identity verification, but
-its credential cannot reconnect as steady-state authority. The client registers
-the verified profile and credential, persists the accepted storage identity,
-then calls `auth.confirmPairing` on that same channel. The client treats a typed
-confirmation rejection as final. After confirmation succeeds, or when its
-response is genuinely ambiguous, the client opens a second pinned session with
-the minted bearer and rechecks both environment identities. Authentication and
-transient connection failures receive at most two immediate retries. Once the
-confirmation request may have activated the server credential, the durable
-local registration owns that authority and is never rolled back merely because
-the immediate proof fails; its supervisor is explicitly retried and owns later
-recovery. This prevents response loss, a restart, or endpoint churn from leaving
-an active server grant with no retained client credential.
-Closing before confirmation revokes the pending session, and server startup
-removes pending sessions left by a crash.
+payload, `e2ee_authenticated` response, and `server.getConfig` identities. The
+pairing authentication message carries no confirmation request flag. The server
+decides delivery from the consumed grant: an off-host grant is persisted as
+`pending-pairing` and returns `pairingConfirmationRequired: true`; an on-host or
+legacy grant is immediately `active` and omits the flag. Migration 49 added the
+persisted `delivery_state` column. For a pending reply, the client registers the
+verified profile and credential, persists the accepted storage identity, then
+calls `auth.confirmPairing` on that same bootstrap channel. Only local
+persistence and the confirmation transition run uninterruptibly. Closing before
+confirmation lets the server revoke the still-pending session; the server also
+runs a best-effort age-gated sweep at startup and every 60 seconds, revoking only
+pending sessions older than the two-minute grace.
 
-A legacy client omits the request capability and receives an immediately active
-session from a new server. New clients still attempt `auth.confirmPairing` when
-an older response omits `pairingConfirmationRequired`: the immediately previous
-server created pending sessions without returning that flag. A truly older
-server instead minted an active credential and returns the exact authenticated
-unknown-request-tag defect; only that exact absent-flag case proceeds to bearer
-proof. A typed confirmation rejection, or that exact unknown-request-tag defect
-when confirmation was required, proves the credential inactive and rolls back.
-Every other near-miss or unexpected response is ambiguous because dispatch may
-have committed, so the client retains its durable local authority and proceeds
-to bearer proof. This additive negotiation prevents a routing endpoint from
-substituting a different logical environment or persistent store after the
-pinned handshake without leaving a delivered-but-unpersisted durable client.
+Pairing opens no second pinned socket. A successful confirmation is conclusive
+and wakes the registered environment supervisor. When confirmation delivery is
+ambiguous, the supervisor's own connection with the saved credential is the
+bearer proof. The client observes `EnvironmentRegistry.stateChanges` for at most
+30 seconds, interruptibly: `connected` proves activation, while blocked
+`authentication`, `host-identity`, or `storage-changed` state conclusively
+rejects the credential. A conclusive rejection conditionally rolls back the
+registration and accepted identity and fails with `pairing-rejected`; an
+inconclusive window retains the durable local authority and leaves later
+recovery to the supervisor. Any confirmation-RPC failure remains a pairing
+failure: a definitive rejection rolls back before the bootstrap scope closes,
+while ambiguous delivery proceeds only through the supervisor proof above.
+
+Compatibility remains additive. A server predating confirmation delivers an
+active credential and may reject `auth.confirmPairing` with the exact
+authenticated unknown-request-tag defect; the client recognizes only that exact
+legacy shape. A prior confirmation-capable server may omit
+`pairingConfirmationRequired`, so the client may make the same idempotent
+confirmation attempt. Other ambiguous transport or response loss is resolved
+through the supervisor proof above rather than fresh handshakes. This prevents a
+routing endpoint from substituting a different logical environment or
+persistent store after the pinned handshake without leaving a
+delivered-but-unpersisted durable client.
 
 Presentation uses `connectionTransportSecurity` as the shared policy:
 non-null bearer `hostKey` is `e2ee`, null is `unencrypted`, relay and SSH are
@@ -160,14 +164,14 @@ without clearing environment-owned data. When compensation itself removes the
 registration, the registry closes the local supervisor and clears owned runtime
 data only after the conditional CAS succeeds.
 
-A definitive pairing confirmation rejection applies the same conditional rule
-to accepted identity state: it restores the previous value, or removes the
-attempt's value, only while the value written by that attempt is still current.
-Once confirmation may have committed, the local registration is retained
-instead. Registration and identity rollback are retried from the bootstrap
-scope finalizer when interruption prevents the first cleanup pass. A concurrent
-replacement remains authoritative and is never reverted by the older failed
-add.
+A definitive pairing confirmation rejection or conclusive supervisor bearer
+rejection applies the same conditional rule to accepted identity state: it
+restores the previous value, or removes the attempt's value, only while the
+value written by that attempt is still current. When activation remains
+ambiguous, the local registration is retained instead. Registration and
+identity rollback are retried from the bootstrap scope finalizer when
+interruption prevents the first cleanup pass. A concurrent replacement remains
+authoritative and is never reverted by the older failed add.
 
 In browser mode, and in desktop mode when native catalog protection is
 unavailable, IndexedDB performs both compare-only and conditional `put`

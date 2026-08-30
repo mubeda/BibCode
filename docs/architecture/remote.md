@@ -132,9 +132,10 @@ credential reply is delivered; an on-host or legacy grant is delivered
 immediately as `active`. Pending-session compensation is armed before the
 SQLite issuance job is queued, because a queued database call can outlive
 cancellation of its awaiting future. A delivery guard then owns that session
-until in-channel confirmation; capacity binding, encoding, encryption, or
-socket-write failure schedules best-effort revocation of the undelivered
-session, and an age-gated sweep — at startup and every minute — durably
+until in-channel confirmation. Capacity binding, encoding, encryption, or
+socket-write failures schedule
+best-effort revocation of the undelivered session. An age-gated sweep — at
+startup and every minute — durably
 revokes pending sessions older than the two-minute confirmation grace, so a
 crash-orphaned unconfirmed credential cannot hold the host's desired exposure
 wide until the next restart while a live confirmation is never raced. After
@@ -360,9 +361,10 @@ failure rolls back local writes best-effort before the bootstrap scope closes.
 Registration removal is conditional on the exact registration still owning the
 environment, and identity rollback restores or removes the prior value only if
 this attempt's value is still current. Concurrent replacements therefore win
-intact. Closing before confirmation revokes the pending server session, and
-startup cleanup revokes pending sessions left by a crash; a confirmed session
-survives reconnect and restart. Failures are classified as `unreachable`,
+intact. Closing before confirmation revokes the pending server session; the
+age-gated startup and periodic sweeps revoke crash-orphaned pending sessions
+only after the two-minute grace. A confirmed session survives reconnect and
+restart. Failures are classified as `unreachable`,
 `host-identity-mismatch`, `pairing-rejected`, `incompatible`, or
 `duplicate-storage-identity`, and cleanup copy reports any local compensation
 failure. The client does not claim transparent retry with the same one-time
@@ -537,21 +539,24 @@ restart: live local connections and running turns drop, while committed SQLite
 state and other durable server state survive. After bounded mint attempts fail,
 the share ceremony makes up to three bounded cancellation attempts with the
 same principal-scoped idempotency key. This revokes a grant whose successful
-response was lost, or tombstones the key ahead of a delayed create. Only after
-cancellation succeeds may the renderer read
-share state and compensate to local-only; if cancellation cannot be confirmed,
-it leaves exposure unchanged because a live credential may exist. Cleanup
-reports exactly one of four outcomes: local-only was confirmed, another live
-reason correctly kept the host wide, cancellation was unconfirmed, or cleanup
-failed and topology could not be verified. No copy promises narrowing without
-the local-only confirmation. The direct path does
-not depend on an auth revision event that may never arrive. The UI distinguishes
-a successful cleanup with local-only confirmation from the other outcomes,
-while the startup/revision reconciler remains a backstop. Mount and topology
-generation state gate work only before the first privileged apply. Once a
-local-only apply commits, its authoritative share-state refetch and, when
-needed, one compensating widen use the captured bridge and must finish even if
-the initiating view unmounts. Every successful apply must return the requested
+response was lost, or tombstones the key ahead of a delayed create. Whether
+cancellation succeeds or fails, an attempt that widened native exposure runs
+cleanup against authoritative share state. A possibly live offer or another
+native-managed reason keeps the host wide; authoritative absence narrows it,
+so a failed cancellation alone cannot strand an otherwise reasonless wildcard
+bind. Cleanup reports exactly one of four outcomes: local-only was confirmed,
+another live reason correctly kept the host wide, cancellation and cleanup
+were both unconfirmed, or cleanup failed and topology could not be verified.
+No copy promises narrowing without the local-only confirmation. The direct
+path does not depend on an auth revision event that may never arrive. The UI
+distinguishes a successful cleanup with local-only confirmation from the other
+outcomes, while the startup/revision reconciler remains a backstop. A failed
+reconciliation pass retries up to three passes at five-second intervals; the
+terminal failure surfaces a warning toast. Mount and topology generation state
+gate work only before the first privileged apply. Once a local-only apply
+commits, its authoritative share-state refetch and, when needed, one
+compensating widen use the captured bridge and must finish even if the
+initiating view unmounts. Every successful apply must return the requested
 actual mode; later revisions schedule fresh reconciliation.
 
 Every auth-authority mutation increments the singleton

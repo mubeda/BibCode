@@ -35,7 +35,7 @@
 - Produces: `send_established_encrypted_message` with per-record five-second progress timeout plus `5 seconds + ceil(plaintext_bytes / 65_536)` aggregate seconds.
 - Consumes later: Task 2 uses `WeightedByteBudget` for global and principal inbound capacity.
 
-- [ ] **Step 1: Write failing allocator and connection-tier tests**
+- [x] **Step 1: Write failing allocator and connection-tier tests**
 
 Add tests that name the production breaks:
 
@@ -59,7 +59,7 @@ async fn cancelled_weighted_waiter_is_removed_and_capacity_is_refunded_once() {
 
 The first test must fail against the aged-head reservation behavior; the second must hang or outlive the deadline against the current connection semaphore.
 
-- [ ] **Step 2: Verify the allocator tests are red**
+- [x] **Step 2: Verify the allocator tests are red**
 
 Run:
 
@@ -71,7 +71,7 @@ cargo test -p bibcode-server --lib cancelled_weighted_waiter_is_removed_and_capa
 
 Expected: each new test fails for the named scheduling/deadline behavior, not a fixture or compilation typo.
 
-- [ ] **Step 3: Generalize the process allocator and replace the connection semaphore**
+- [x] **Step 3: Generalize the process allocator and replace the connection semaphore**
 
 Extract the existing process waiter state into one implementation with this semantic shape:
 
@@ -92,7 +92,7 @@ impl WeightedByteBudget {
 
 Grant the first request that fits during each queue scan, continue scanning for other fitting requests, remove the aged-head total-blockade branch, preserve cancellation-safe waiter removal, and keep exact-once refunds. Give every `RpcOutboundBudget` connection its own `Arc<WeightedByteBudget>` and use the caller's existing absolute deadline for connection then process acquisition.
 
-- [ ] **Step 4: Write failing encrypted-write progress tests**
+- [x] **Step 4: Write failing encrypted-write progress tests**
 
 Replace the current test that pins one flat logical deadline with controlled-sink tests:
 
@@ -115,11 +115,11 @@ async fn outbound_logical_message_enforces_the_size_derived_total_deadline() {
 }
 ```
 
-- [ ] **Step 5: Implement progress and aggregate deadlines**
+- [x] **Step 5: Implement progress and aggregate deadlines**
 
 Compute the aggregate deadline from plaintext length with checked/saturating duration arithmetic. Wrap each `writer.send` in a fresh five-second `timeout`; also fail when the aggregate deadline expires. Do not reset the Noise nonce, pre-encrypt the whole message, or interleave logical messages.
 
-- [ ] **Step 6: Verify and commit Task 1**
+- [x] **Step 6: Verify and commit Task 1**
 
 Run:
 
@@ -154,7 +154,7 @@ git commit --only -m "fix(server): bound encrypted byte admission progress" -- a
 - Produces: `PreauthNetworkKey` canonicalizing IPv4 `/24`, IPv6 `/64`, loopback-forwarder, and unspecified peers.
 - Produces: an RAII authenticated connection guard used by both `/ws` and `/ws-e2ee`.
 
-- [ ] **Step 1: Write failing inbound pressure and assembly-progress tests**
+- [x] **Step 1: Write failing inbound pressure and assembly-progress tests**
 
 Add real multi-connection tests proving:
 
@@ -195,7 +195,7 @@ async fn inbound_permits_release_after_dispatch_before_handler_completion() {
 
 The first fills one principal's budget with an incomplete message, sends a valid request on another socket, proves that socket remains open, releases the first socket, and then receives the valid response.
 
-- [ ] **Step 2: Verify red, then implement cancellable fit-first inbound budgets**
+- [x] **Step 2: Verify red, then implement cancellable fit-first inbound budgets**
 
 Run:
 
@@ -208,7 +208,7 @@ cargo test -p bibcode-server inbound_permits_release_after_dispatch_before_handl
 
 Confirm each test fails for the intended capacity/timeout behavior. Replace the global semaphore and principal `try_acquire_many_owned` with `WeightedByteBudget`. Do not apply a five-second capacity timeout. Select capacity acquisition against session cancellation. Expose `E2eeChannel::has_incomplete_message()`; once it is true, carry one ten-second absolute progress deadline through receipt, decrypt, validation, and budget charging of the next record, and reset it only after the record is accepted. The existing assembler continues to enforce 64 MiB, 2,048 records, and empty-continuation rejection. Release message grants after authorization and dispatch, before a spawned request handler completes.
 
-- [ ] **Step 3: Write failing subnet and loopback-forwarder admission tests**
+- [x] **Step 3: Write failing subnet and loopback-forwarder admission tests**
 
 Add literal cases:
 
@@ -248,7 +248,7 @@ async fn idle_preauth_peer_and_network_entries_are_pruned_without_exceeding_the_
 }
 ```
 
-- [ ] **Step 4: Implement bounded peer and network registries**
+- [x] **Step 4: Implement bounded peer and network registries**
 
 First run:
 
@@ -263,7 +263,7 @@ cargo test -p bibcode-server idle_preauth_peer_and_network_entries_are_pruned_wi
 
 Confirm the new tests fail. Then track exact public peer and network-prefix counters in `E2eePreauthAdmission`. Public exact peers remain capped at four; public `/24` or `/64` prefixes cap at sixteen; loopback skips those two caps but remains under the global 32; unspecified uses the strict exact bucket. TTL prune and hard-cap both maps. A lease owns and releases all counters it acquired.
 
-- [ ] **Step 5: Write route-level cap and connection-accounting tests**
+- [x] **Step 5: Write route-level cap and connection-accounting tests**
 
 Add integration tests that fail if upgrade configuration is deleted:
 
@@ -289,11 +289,11 @@ async fn authenticated_connection_count_is_released_when_the_session_task_aborts
 
 Assert a bounded close/terminal result, not only that a helper returned. Keep the E2EE protocol oversize tests separate.
 
-- [ ] **Step 6: Restore the plain frame cap and add the RAII guard**
+- [x] **Step 6: Restore the plain frame cap and add the RAII guard**
 
 Configure plain routes with `.max_frame_size(16 * 1024 * 1024)` and `.max_message_size(64 * 1024 * 1024)`. Keep E2EE upgrade caps at 65,535. Move post-`mark_connected` cleanup into a guard whose drop path owns exactly one `mark_disconnected` call; normal completion explicitly closes the guard, and cancellation/panic cannot leak it.
 
-- [ ] **Step 7: Verify and commit Task 2**
+- [x] **Step 7: Verify and commit Task 2**
 
 Run:
 
@@ -341,7 +341,7 @@ Commit the task-owned server paths with `fix(server): harden websocket admission
 - Produces: repository operations to create pending pairing sessions, confirm the current pending session idempotently, and revoke pending sessions at startup.
 - Produces: a cloneable confirmation latch in `RpcSessionContext`; only the E2EE-minted session receives it, and the delivery guard observes it on every exit.
 
-- [ ] **Step 1: Write failing migration and repository tests**
+- [x] **Step 1: Write failing migration and repository tests**
 
 Tests must prove existing rows read as active, a new pending row round-trips, confirmation changes only the named session, repeated same-session confirmation succeeds, expiry/pruning treats pending rows like active rows, and startup cleanup revokes every still-pending row while preserving active rows.
 
@@ -354,7 +354,7 @@ cargo test -p bibcode-server pending_auth_session -- --nocapture
 
 Confirm they fail because migration 49 and the repository methods do not exist.
 
-- [ ] **Step 2: Add migration 49 and delivery-state repository APIs**
+- [x] **Step 2: Add migration 49 and delivery-state repository APIs**
 
 Use an additive guarded migration:
 
@@ -372,15 +372,15 @@ revoke_pending_auth_sessions(now) -> Result<Vec<String>>
 
 Every changed row bumps the authoritative access revision through the existing transaction helper.
 
-- [ ] **Step 3: Write failing RPC contract, scope, parity, and wire tests**
+- [x] **Step 3: Write failing RPC contract, scope, parity, and wire tests**
 
 Add literal expectations for `auth.confirmPairing`, its empty input/output schema, active-method inventory, Rust mirror, and exactly `access:write`. Increment the exporter/test's literal active-method count and regenerate `fixtures/rpc-wire/manifest.json` only after the contract is intentionally extended. Run `vp run check:contracts` and verify it is red before adding production registration.
 
-- [ ] **Step 4: Implement the typed confirmation RPC**
+- [x] **Step 4: Implement the typed confirmation RPC**
 
 Register one mutation-unary handler. It obtains the current session ID from `RpcSessionContext`; no request field names another session. Pending-to-active and already-active current sessions return success. After the repository transaction commits, it marks the context's confirmation latch. Missing/revoked/wrong-session state returns the repository's established authorization error shape.
 
-- [ ] **Step 5: Write failing E2EE delivery lifecycle tests**
+- [x] **Step 5: Write failing E2EE delivery lifecycle tests**
 
 Cover:
 
@@ -404,11 +404,11 @@ async fn confirmed_pairing_session_survives_disconnect_and_restart_cleanup() {
 }
 ```
 
-- [ ] **Step 6: Keep the delivery guard armed through confirmation**
+- [x] **Step 6: Keep the delivery guard armed through confirmation**
 
 Mint pairing sessions with `pending-pairing`. Move the still-armed delivery guard and its latch from handshake admission into the established session; do not commit it merely because the encrypted credential reply was written. Share the latch with `RpcSessionContext` and disarm only after the repository confirmation transaction commits. Guard compensation calls a compare-and-revoke-pending repository operation, so a cancellation racing the post-commit latch update cannot revoke an active session. Auth service initialization revokes pending sessions before it publishes share state. Normal bearer sessions continue to be created active.
 
-- [ ] **Step 7: Write failing client rollback/confirmation tests**
+- [x] **Step 7: Write failing client rollback/confirmation tests**
 
 In `pairingAdd.test.ts`, assert order and compensation:
 
@@ -418,11 +418,11 @@ expect(events).toEqual(["verify", "register", "accept-identity", "confirm"]);
 
 Registration, identity, or confirm failure must close the bootstrap session; local registration/identity is rolled back when it was written. Confirmation failure returns `local-persistence-failed` with actual cleanup details, not a manual server-revocation instruction.
 
-- [ ] **Step 8: Move persistence inside the bootstrap scope and confirm**
+- [x] **Step 8: Move persistence inside the bootstrap scope and confirm**
 
 Keep `RpcSession` alive through registration and identity persistence. Call `session.client[WS_METHODS.authConfirmPairing]({})` after both durable local writes. On any later error, perform local rollback before leaving the scope; scope closure lets the server revoke the pending session.
 
-- [ ] **Step 9: Verify interop and commit Task 3**
+- [x] **Step 9: Verify interop and commit Task 3**
 
 Run:
 
@@ -467,31 +467,31 @@ Commit all contract, migration, server (including `rpc/session.rs`), client-runt
 - Produces: normalized hosted request `{ httpBaseUrl, displayHost, token, label }` with `displayHost` derived from `new URL(httpBaseUrl).host`.
 - Produces: bearer-profile decode normalization mapping null/missing/blank `hostKey` to `null`.
 
-- [ ] **Step 1: Write failing URL trust tests**
+- [x] **Step 1: Write failing URL trust tests**
 
 Use literal cases for `https://trusted.example@attacker.example:8080`, `https://user:password@example.test`, and Cyrillic `https://аpple.com`. Assert userinfo is rejected and IDN display is `xn--pple-43d.com`. Pairing-route tests must prove the rendered host and submitted `httpBaseUrl` come from the same normalized request.
 
-- [ ] **Step 2: Reject userinfo and normalize before rendering**
+- [x] **Step 2: Reject userinfo and normalize before rendering**
 
 After parsing the URL, reject when `url.username !== "" || url.password !== ""`. The `packages/shared` parser returns null for invalid targets; valid targets carry one normalized base URL and `URL.host`. Replace the duplicate parser in `apps/web/src/hostedPairing.ts` with the shared owner, and delete raw-host rendering/submission paths.
 
-- [ ] **Step 3: Write and implement query credential scrubbing tests**
+- [x] **Step 3: Write and implement query credential scrubbing tests**
 
 For both `/pair` and `/settings/remote-servers`, read legacy `?code=` once, then assert the route issues an immediate `replace: true` navigation whose search excludes `code` and preserves unrelated safe parameters. The captured code remains available to the one auto-submit/add attempt after replacement. Hosted-browser tokens remain accepted from the fragment, and `stripPairingTokenFromUrl` removes any legacy query `token` without deleting `host`, `label`, `tab`, or `action`.
 
-- [ ] **Step 4: Write failing blank-host-key persistence tests**
+- [x] **Step 4: Write failing blank-host-key persistence tests**
 
 Decode stored profiles containing missing, null, `""`, and `" \t "`; each expected `hostKey` is null. Decode a valid non-empty key unchanged. Resolve authorization for a blank legacy record and assert `/ws`, non-null plain HTTP authorization, and the unencrypted presentation badge.
 
-- [ ] **Step 5: Normalize once at the catalog schema boundary**
+- [x] **Step 5: Normalize once at the catalog schema boundary**
 
 Use an Effect Schema transform/refinement owned by `packages/client-runtime` so all consumers receive `string | null` with blanks already mapped to null. Simplify authorization/presentation checks to consume this invariant without a second policy implementation.
 
-- [ ] **Step 6: Replace the Connect-tab full policy mock**
+- [x] **Step 6: Replace the Connect-tab full policy mock**
 
 Use `vi.importActual`/`importOriginal` to preserve `connectionTransportSecurity` and override only the stateful exports required by the component harness. Delete the copied switch and add a case whose fake implementation previously diverged.
 
-- [ ] **Step 7: Verify and commit Task 4**
+- [x] **Step 7: Verify and commit Task 4**
 
 Run:
 
@@ -523,23 +523,23 @@ Commit the listed Task 4 files as `fix(remote): normalize pairing trust inputs`.
 - Produces: one Rust `classify_advertised_address(IpAddr)` returning reachability, label kind, and default eligibility.
 - Produces: desktop endpoints only for IPv4 addresses accepted by `is_usable_unicast`.
 
-- [ ] **Step 1: Add the literal cross-language classification fixture and red tests**
+- [x] **Step 1: Add the literal cross-language classification fixture and red tests**
 
 Fixture cases include `127.0.0.1`, `169.254.1.1`, `192.168.1.20`, `100.100.100.100`, `8.8.8.8`, `::1`, `fe80::1`, `fd7a:115c:a1e0::1`, and `2001:4860:4860::8888`. Each row has literal `pairingClassification`, `advertisedReachability`, `usable`, and `advertiseWithIpv4Listener` values. TypeScript tests consume pairing fields; Rust tests deserialize and assert desktop fields.
 
-- [ ] **Step 2: Restore default-route usability and centralize Rust classification**
+- [x] **Step 2: Restore default-route usability and centralize Rust classification**
 
 Make `is_usable_unicast` available to `backend.rs`. `resolve_lan_advertised_host` accepts only usable IPv4. Interface enumeration and Tailscale-derived endpoint construction both suppress IPv6 for the current IPv4-only listener. `bridge.rs` uses the classifier result instead of branch order over `is_cgnat_or_tailscale` and `is_private_network`.
 
-- [ ] **Step 3: Write failing presentation/default tests**
+- [x] **Step 3: Write failing presentation/default tests**
 
 Prove RFC1918 default route is labeled `Local network` and selected by default; CGNAT is `Private network`; public is `Public address`, `reachability: public`, and `isDefault: false`; IPv6 produces no available endpoint. If public is the only off-host option, endpoint selection returns null until explicit user selection.
 
-- [ ] **Step 4: Implement safe labels and explicit public selection**
+- [x] **Step 4: Implement safe labels and explicit public selection**
 
 Only usable private/CGNAT IPv4 candidates may be defaults. Add public warning description and preserve Linux/macOS unmanaged-firewall copy. Remove the stale fallback that labels an arbitrary persisted public endpoint `Local network`.
 
-- [ ] **Step 5: Verify and commit Task 5**
+- [x] **Step 5: Verify and commit Task 5**
 
 Run:
 
@@ -577,7 +577,7 @@ Commit the listed Task 5 files as `fix(remote): fail closed on advertised endpoi
 - Produces: a serialized firewall worker whose caller deadline includes spawn and whose timed-out job is followed by verified deletion.
 - Produces: `reconcileShareExposureOnce` compensation that is not gated by component mount after a committed narrow.
 
-- [ ] **Step 1: Write failing shared-recovery and WSL transition tests**
+- [x] **Step 1: Write failing shared-recovery and WSL transition tests**
 
 Injected side-effect tests must assert the exact attempted order even when each prior step fails:
 
@@ -587,27 +587,27 @@ persist local-only -> restart/recover local -> firewall disable -> verify local
 
 Entering WSL-only from wide must close the firewall, persist local-only, and never restart native wide. Leaving WSL-only must start local-only.
 
-- [ ] **Step 2: Extract one recovery routine and route WSL through the coordinator**
+- [x] **Step 2: Extract one recovery routine and route WSL through the coordinator**
 
 Return a combined error containing the initiating error plus every failed safeguard. Do not use `?` inside the safeguard sequence. Keep the existing coordinator mutex across settings, topology, verification, and firewall synchronization.
 
-- [ ] **Step 3: Write failing late-spawn firewall tests**
+- [x] **Step 3: Write failing late-spawn firewall tests**
 
 With an injected worker/runner, hold spawn past the five-second caller deadline, then release it as a successful rule add. Assert the caller already received failure/local-only, the worker next executes delete-and-verify, and no later enable overtakes that cleanup. Add normal idempotent enable/disable and failed-delete verification cases.
 
-- [ ] **Step 4: Implement serialized job ownership and compensating deletion**
+- [x] **Step 4: Implement serialized job ownership and compensating deletion**
 
 The worker, not the timed caller future, owns the spawn task and child. Caller timeout enqueues cleanup behind the outstanding job. The worker publishes completion for diagnostics but never detaches a child that could mutate firewall state after ownership is lost.
 
-- [ ] **Step 5: Write failing unmount and ambiguous-cancel reconciliation tests**
+- [x] **Step 5: Write failing unmount and ambiguous-cancel reconciliation tests**
 
 Prove unmount after a committed narrow cannot suppress a compensating widen when re-fetched state is wide. Prove cancellation retries are bounded and narrowing happens only after authoritative share state returns loopback; unknown/wide state remains wide with honest copy. Preserve the existing pending cancellation tombstone and five-minute offer expiry as later convergence. Bridge calls time out visibly.
 
-- [ ] **Step 6: Separate start gating from mandatory compensation**
+- [x] **Step 6: Separate start gating from mandatory compensation**
 
 Check mount/generation before the first native apply. Once narrow succeeds, always complete the re-fetch and at most one re-widen using the captured bridge. Add bounded cancellation retry followed by authoritative reconciliation; never narrow solely because cancellation threw.
 
-- [ ] **Step 7: Verify and commit Task 6**
+- [x] **Step 7: Verify and commit Task 6**
 
 Run:
 
@@ -637,23 +637,23 @@ Commit the listed Task 6 files as `fix(remote): converge exposure and firewall s
 - Produces: blocked-but-pending reset state; the reset promise settles only on delete success/error.
 - Produces: explicit checkbox confirmation plus always-available Reload.
 
-- [ ] **Step 1: Write failing queued-delete lifecycle tests**
+- [x] **Step 1: Write failing queued-delete lifecycle tests**
 
 Use a real-shaped `IDBOpenDBRequest` fake. Fire `blocked`, assert the reset promise remains unsettled and health is blocked; then fire `success`, assert health becomes ready, reset resolves, and the injected reload boundary runs once. Fire `error` after blocked and assert rejection/unavailable without reload. The production change that must break the test is settling in `onblocked`.
 
-- [ ] **Step 2: Keep ownership until terminal request events**
+- [x] **Step 2: Keep ownership until terminal request events**
 
 Remove the `settled` branch from `onblocked`. Publish blocked status and leave handlers attached. Only `onsuccess` or `onerror` settles. The dialog remains busy while pending and explains that the browser queued deletion until other connections close.
 
-- [ ] **Step 3: Write failing non-destructive and double-click tests**
+- [x] **Step 3: Write failing non-destructive and double-click tests**
 
 Assert Reload renders in the incompatible branch. Dispatch two click events on `Reset saved connection data`; deletion must not run. Check the explicit acknowledgement checkbox, then click the separately rendered destructive confirmation once; deletion runs exactly once.
 
-- [ ] **Step 4: Replace button swapping with checkbox confirmation**
+- [x] **Step 4: Replace button swapping with checkbox confirmation**
 
 Keep Reload enabled when not actively reloading. Disable destructive confirmation until checked and while reset is pending. Do not render the confirmation button at the same pointer location as the initial action.
 
-- [ ] **Step 5: Verify and commit Task 7**
+- [x] **Step 5: Verify and commit Task 7**
 
 Run:
 
@@ -679,19 +679,19 @@ Commit the listed Task 7 files as `fix(web): make connection database reset expl
 - Produces: registry-owned desired-state map independent of disposable supervisor scopes.
 - Produces: a command execution seam whose timeout encloses acquisition, readiness, and RPC.
 
-- [ ] **Step 1: Write failing desired-state lifecycle tests**
+- [x] **Step 1: Write failing desired-state lifecycle tests**
 
 Cover explicit disconnect followed by catalog profile drift: the recreated supervisor remains `desired: false` and does not dial. A passive `state` lookup must not change desired intent. New saved registration and registry bootstrap establish `desired: true` explicitly. Removal clears the stored intent.
 
-- [ ] **Step 2: Move desired ownership above service scopes**
+- [x] **Step 2: Move desired ownership above service scopes**
 
 Add a registry map/ref keyed by `EnvironmentId`. `connect`/`disconnect` update it before acting. `createServiceScope` receives the stored boolean and calls `supervisor.connect` only when true. Catalog drift carries the same value. Read-only state access never writes it.
 
-- [ ] **Step 3: Write failing whole-update deadline tests**
+- [x] **Step 3: Write failing whole-update deadline tests**
 
 Hold `acquireSupervisor` beyond 30 seconds with paused time and assert the update check returns timeout without invoking RPC. Repeat with fast acquisition and a stalled RPC. In fan-out, a timed-out environment releases its worker slot so the next environment starts.
 
-- [ ] **Step 4: Move timeout outside acquisition and RPC**
+- [x] **Step 4: Move timeout outside acquisition and RPC**
 
 Add `readonly timeoutMs?: number` to `EnvironmentAtomOptions`. In
 `createEnvironmentCommand`, build the lazy `runInEnvironment` effect first
@@ -701,7 +701,7 @@ check with `timeoutMs: 30_000` and make its `execute` return the raw
 `request(WS_METHODS.updaterCheck, input)`. Delete the request-only timeout helper
 so acquisition and RPC share one clock.
 
-- [ ] **Step 5: Verify and commit Task 8**
+- [x] **Step 5: Verify and commit Task 8**
 
 Run:
 
@@ -732,21 +732,21 @@ Commit the listed Task 8 files as `fix(client-runtime): preserve remote connecti
 - Consumes: all behavior and commands from Tasks 1-8.
 - Produces: current living architecture, repeatable validation instructions, tested executable SHA, and cross-container evidence.
 
-- [ ] **Step 1: Update living architecture and the historical pointer**
+- [x] **Step 1: Update living architecture and the historical pointer**
 
 Document fit-first admission without aged blockade, five-second record progress plus size-derived aggregate deadline, inbound capacity waiting and ten-second incomplete-message progress, subnet/loopback admission, pending-pairing confirmation, normalized hosted target, IPv4-only advertisement, public-address confirmation, exposure/firewall convergence, IndexedDB pending deletion, supervisor intent, whole-update deadlines, and 16 MiB plain frame cap. State that inbound permits end at dispatch, not request completion.
 
 At the top of the historical spec add only a dated note linking this approved design and `docs/architecture/remote.md`; do not rewrite its historical decisions.
 
-- [ ] **Step 2: Update affected native and connection-runtime runbooks**
+- [x] **Step 2: Update affected native and connection-runtime runbooks**
 
 Verify commands against manifests/source. Add route-cap, pending-pairing, Windows firewall late-spawn, endpoint family, database recovery, reconnect-intent, and whole-update deadline evidence where applicable. Keep platform-specific unavailable evidence explicit.
 
-- [ ] **Step 3: Extend Docker smoke with real boundaries**
+- [x] **Step 3: Extend Docker smoke with real boundaries**
 
 The separate Debian server and Node client containers must cover pending pairing before/after confirmation, authenticated reconnect, subnet admission fixture or exposed helper behavior, maximum-record progress without a flat five-second message failure, route cap close, revocation/final loopback state, updater timeout/result isolation where container-controllable, and cleanup. Do not log credentials.
 
-- [ ] **Step 4: Verify and commit the extended Docker smoke before validation**
+- [x] **Step 4: Verify and commit the extended Docker smoke before validation**
 
 Run the exact `Cross-container remote-server gate` shell block from `docs/testing/cross-platform-validation.md`. Confirm the client test passes and all filtered container, network, and volume listings are empty. Then commit only the executable smoke-test change:
 
@@ -754,7 +754,7 @@ Run the exact `Cross-container remote-server gate` shell block from `docs/testin
 git commit --only -m "test(remote): extend remediation docker smoke" -- packages/client-runtime/src/e2ee/dockerRemoteSmoke.test.ts
 ```
 
-- [ ] **Step 5: Run focused and broad validation against executable HEAD**
+- [x] **Step 5: Run focused and broad validation against executable HEAD**
 
 Record `git rev-parse HEAD`, then run:
 
@@ -776,7 +776,7 @@ BIBCODE_E2EE_SERVER_BIN="$(git rev-parse --show-toplevel)/target/debug/bibcode" 
 
 Re-run the exact current cross-container block from `docs/testing/cross-platform-validation.md`, then verify filtered container, network, volume, and process listings are empty.
 
-- [ ] **Step 6: Write the execution report and commit documentation only**
+- [x] **Step 6: Write the execution report and commit documentation only**
 
 The report names the exact executable tested SHA, dirty protected paths, every command/result/count, Docker runtime, cleanup evidence, unavailable Windows/macOS packaged validation, flakes with provenance, and residual distributed-DoS/platform risk. The final commit contains documentation/report paths only:
 
@@ -784,6 +784,6 @@ The report names the exact executable tested SHA, dirty protected paths, every c
 git commit --only -m "docs(remote): record second remediation validation" -- docs/architecture docs/plans/remote-servers/remote-servers-spec.md docs/testing
 ```
 
-- [ ] **Step 7: Final worktree and history audit**
+- [x] **Step 7: Final worktree and history audit**
 
 Run `git diff --check`, `git status --short`, `git log --oneline 0e4767b5..HEAD`, and inspect every task commit's path list. Confirm no debug output, generated `.codegraph` data, dependency drift, `.repos` edits, protected-review edits, or staged-deletion commits.
