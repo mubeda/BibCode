@@ -3119,9 +3119,9 @@ mod tests {
         assert_eq!(first[15].id, 16);
 
         let second = run_migrations(&mut connection, None)?;
-        assert_eq!(second.len(), 32);
+        assert_eq!(second.len(), 33);
         assert_eq!(second[0].id, 17);
-        assert_eq!(second[31].id, 48);
+        assert_eq!(second[32].id, 49);
 
         let third = run_migrations(&mut connection, None)?;
         assert!(third.is_empty());
@@ -3228,7 +3228,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [40, 41, 42, 43, 44, 45, 46, 47, 48]
+            [40, 41, 42, 43, 44, 45, 46, 47, 48, 49]
         );
         let policy = connection.query_row(
             "SELECT worktree_discovery_json FROM projection_projects WHERE project_id = 'project-1'",
@@ -3265,7 +3265,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [41, 42, 43, 44, 45, 46, 47, 48]
+            [41, 42, 43, 44, 45, 46, 47, 48, 49]
         );
         let pin = connection.query_row(
             "SELECT worktree_repository_key FROM projection_projects WHERE project_id = 'project-legacy'",
@@ -3293,7 +3293,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [42, 43, 44, 45, 46, 47, 48]
+            [42, 43, 44, 45, 46, 47, 48, 49]
         );
         let pin = connection.query_row(
             "SELECT repository_key FROM project_worktree_repository_pins WHERE project_id = 'project-pinned'",
@@ -3433,7 +3433,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [48]
+            [48, 49]
         );
         assert_eq!(
             connection.query_row(
@@ -3462,7 +3462,7 @@ mod tests {
         )?;
 
         let applied = run_migrations(&mut connection, None)?;
-        assert_eq!(applied.len(), 15);
+        assert_eq!(applied.len(), 16);
         assert_eq!(applied[0].id, 34);
         assert_eq!(applied[1].id, 35);
         assert_eq!(applied[2].id, 36);
@@ -3478,6 +3478,7 @@ mod tests {
         assert_eq!(applied[12].id, 46);
         assert_eq!(applied[13].id, 47);
         assert_eq!(applied[14].id, 48);
+        assert_eq!(applied[15].id, 49);
         let value = connection.query_row("SELECT value FROM legacy_user_data", [], |row| {
             row.get::<_, String>(0)
         })?;

@@ -37,6 +37,7 @@ vi.mock("@tanstack/react-router", () => ({
     path,
     useRouteContext: () => h.routeContext,
     useSearch: () => h.routeSearch,
+    useNavigate: () => h.navigate,
   }),
   redirect: (options: unknown) => ({ _tag: "Redirect", options }),
   useCanGoBack: () => h.canGoBack,

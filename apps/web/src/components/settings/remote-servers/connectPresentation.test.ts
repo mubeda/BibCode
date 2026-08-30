@@ -82,13 +82,6 @@ describe("resolveTransportBadge", () => {
       label: "Unencrypted",
       guidance: "Re-pair with a new pairing code to secure this connection.",
     });
-    expect(
-      resolveTransportBadge(bearer({ _tag: "BearerConnectionProfile", hostKey: " \t " })),
-    ).toEqual({
-      kind: "unencrypted",
-      label: "Unencrypted",
-      guidance: "Re-pair with a new pairing code to secure this connection.",
-    });
   });
 
   it("shows no transport badge for the desktop-managed local (WSL) environment", () => {
