@@ -188,6 +188,32 @@ const responderScript = (options?: { failAuth?: boolean; messageBPayload?: Uint8
 };
 
 describe("makeE2eeSocket", () => {
+  it.effect("fails closed when the transport delivers a non-binary frame", () =>
+    Effect.gen(function* () {
+      // A Blob here means the underlying WebSocket was left on binaryType
+      // "blob": asynchronous conversion would reorder ciphertext against the
+      // counter-based Noise nonce, so the channel must fail with a named
+      // invariant instead of an intermittent decrypt error.
+      const inner = Socket.make({
+        runRaw: (handler) =>
+          Effect.suspend(() => {
+            const result = handler(new Blob(["x"]) as unknown as Uint8Array);
+            return result === undefined ? Effect.never : Effect.andThen(result, Effect.never);
+          }),
+        writer: Effect.succeed(() => Effect.void),
+      });
+      const socket = makeE2eeSocket(inner, {
+        hostKey: Buffer.from(new Uint8Array(32)).toString("base64url"),
+        auth: { kind: "bearer", credential: "credential" },
+      });
+
+      const exit = yield* socket.runRaw(() => undefined).pipe(Effect.exit);
+      const cause = findE2eeCause(exit);
+      expect(cause?.reason).toBe("protocol");
+      expect(cause?.message).toContain('binaryType "arraybuffer"');
+    }),
+  );
+
   it.live("handshakes, bootstraps in-channel, then delivers decrypted strings", () =>
     Effect.gen(function* () {
       const { hostKey, script, received } = responderScript();
