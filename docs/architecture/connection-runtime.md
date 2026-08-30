@@ -108,8 +108,11 @@ an older response omits `pairingConfirmationRequired`: the immediately previous
 server created pending sessions without returning that flag. A truly older
 server instead minted an active credential and returns the exact authenticated
 unknown-request-tag defect; only that exact absent-flag case proceeds to bearer
-proof. Near-miss defects and typed authorization failures fail closed. This
-additive negotiation prevents a routing endpoint from
+proof. A typed confirmation rejection, or that exact unknown-request-tag defect
+when confirmation was required, proves the credential inactive and rolls back.
+Every other near-miss or unexpected response is ambiguous because dispatch may
+have committed, so the client retains its durable local authority and proceeds
+to bearer proof. This additive negotiation prevents a routing endpoint from
 substituting a different logical environment or persistent store after the
 pinned handshake without leaving a delivered-but-unpersisted durable client.
 
