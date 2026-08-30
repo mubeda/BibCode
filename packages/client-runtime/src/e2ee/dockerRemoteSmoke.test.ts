@@ -546,7 +546,6 @@ describe.skipIf(serverUrl === undefined || adminCredential === undefined)(
           JSON.stringify({
             type: "e2ee_auth",
             pairing: payload.token,
-            pairingConfirmation: true,
           }),
         );
         const authenticated = decodeSensitiveResponse(

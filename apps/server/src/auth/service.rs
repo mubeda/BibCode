@@ -40,6 +40,11 @@ use crate::persistence::{
 const SESSION_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 const DPOP_SESSION_TTL_MS: i64 = 60 * 60 * 1_000;
 const WEBSOCKET_TICKET_TTL_MS: i64 = 5 * 60 * 1_000;
+/// Pending-pairing sessions older than this are crash orphans: the connection
+/// that could have confirmed them is gone. Younger ones may still be racing a
+/// live confirmation and are left alone.
+const PENDING_PAIRING_SWEEP_GRACE_MS: i64 = 2 * 60 * 1_000;
+const PENDING_PAIRING_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const PAIRING_TTL_MS: i64 = 5 * 60 * 1_000;
 const CLOUD_PAIRING_TTL_MS: i64 = 2 * 60 * 1_000;
 const DESKTOP_BOOTSTRAP_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -359,8 +364,16 @@ impl AuthService {
         let host_identity = HostIdentity::load_or_generate(&secret_store)
             .await
             .map_err(|error| AuthError::Internal(error.to_string()))?;
+        // Crash compensation for unconfirmed pairing credentials is age-gated:
+        // no connection survives a restart, so a young pending session can
+        // never be confirmed anyway, but sweeping only past the grace window
+        // keeps one uniform rule with the periodic sweeper below.
+        let now = now_ms();
         repositories
-            .revoke_pending_auth_sessions(format_iso(now_ms()))
+            .revoke_pending_auth_sessions(
+                format_iso(now),
+                format_iso(now - PENDING_PAIRING_SWEEP_GRACE_MS),
+            )
             .await
             .map_err(|error| AuthError::Internal(error.to_string()))?;
         let service = Self::build(
@@ -372,7 +385,46 @@ impl AuthService {
         );
         service.hydrate_active_state().await?;
         service.ensure_authority_watcher();
+        service.spawn_pending_pairing_sweeper();
         Ok(service)
+    }
+
+    /// Periodically revokes pending-pairing sessions older than the grace
+    /// window. Startup-only sweeping would let a crash-orphaned unconfirmed
+    /// credential keep the host's desired exposure wide until the next
+    /// restart; the periodic sweep bounds that window to minutes, while the
+    /// age gate keeps it from racing a live confirmation.
+    fn spawn_pending_pairing_sweeper(&self) {
+        let Some(repositories) = self.repositories.clone() else {
+            return;
+        };
+        let liveness = Arc::downgrade(&self.state);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(PENDING_PAIRING_SWEEP_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // The first tick fires immediately and duplicates the startup
+            // sweep, which is harmless.
+            loop {
+                interval.tick().await;
+                if liveness.upgrade().is_none() {
+                    break;
+                }
+                let now = now_ms();
+                match repositories
+                    .revoke_pending_auth_sessions(
+                        format_iso(now),
+                        format_iso(now - PENDING_PAIRING_SWEEP_GRACE_MS),
+                    )
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(PersistenceError::WorkerUnavailable) => break,
+                    Err(error) => {
+                        tracing::warn!(?error, "pending-pairing sweep failed");
+                    }
+                }
+            }
+        });
     }
 
     fn build(
@@ -682,20 +734,35 @@ impl AuthService {
         .await
     }
 
+    /// Exchanges a pairing one-time token over the encrypted channel. The
+    /// server — not the client — decides delivery from the grant it consumed:
+    /// an off-host grant mints a pending session that must be confirmed before
+    /// the credential authenticates anywhere, an on-host grant is delivered
+    /// immediately. A client cannot opt out of the guard by omitting a wire
+    /// flag. Returns the issued session and whether confirmation is required.
     pub(crate) async fn exchange_pairing_bootstrap(
         &self,
         credential: &str,
         client: ClientMetadata,
-    ) -> Result<IssuedSession, AuthError> {
-        self.exchange_bootstrap_with_delivery(
-            credential,
-            None,
-            client,
-            None,
-            SessionTransport::E2ee,
-            AuthSessionDeliveryState::PendingPairing,
-        )
-        .await
+    ) -> Result<(IssuedSession, bool), AuthError> {
+        let grant = self.consume_grant(credential, None).await?;
+        let confirmation_required = matches!(grant.off_host, Some(true));
+        let delivery_state = if confirmation_required {
+            AuthSessionDeliveryState::PendingPairing
+        } else {
+            AuthSessionDeliveryState::Active
+        };
+        let issued = self
+            .issue_session_from_grant(
+                grant,
+                None,
+                client,
+                None,
+                SessionTransport::E2ee,
+                delivery_state,
+            )
+            .await?;
+        Ok((issued, confirmation_required))
     }
 
     async fn exchange_bootstrap_with_delivery(
@@ -710,6 +777,26 @@ impl AuthService {
         let grant = self
             .consume_grant(credential, proof_key_thumbprint.as_deref())
             .await?;
+        self.issue_session_from_grant(
+            grant,
+            requested_scopes,
+            client,
+            proof_key_thumbprint,
+            transport,
+            delivery_state,
+        )
+        .await
+    }
+
+    async fn issue_session_from_grant(
+        &self,
+        grant: Grant,
+        requested_scopes: Option<Vec<String>>,
+        client: ClientMetadata,
+        proof_key_thumbprint: Option<String>,
+        transport: SessionTransport,
+        delivery_state: AuthSessionDeliveryState,
+    ) -> Result<IssuedSession, AuthError> {
         let scopes = requested_scopes.unwrap_or_else(|| grant.scopes.clone());
         if !scopes
             .iter()
@@ -3026,9 +3113,19 @@ mod tests {
 
         let initial_state_guard = auth.state.lock().await;
         let exchanging_auth = auth.clone();
+        // The desktop seed consumes no shared state before issuance, which is
+        // what lets this test hold the state lock across the exchange; force
+        // the pending delivery the guard protects through the private seam.
         let exchange = tokio::spawn(async move {
             exchanging_auth
-                .exchange_pairing_bootstrap("desktop-test-seed", ClientMetadata::default())
+                .exchange_bootstrap_with_delivery(
+                    "desktop-test-seed",
+                    None,
+                    ClientMetadata::default(),
+                    None,
+                    SessionTransport::E2ee,
+                    AuthSessionDeliveryState::PendingPairing,
+                )
                 .await
         });
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -3117,10 +3214,20 @@ mod tests {
         )
         .await
         .expect("persistent auth service starts");
-        let issued = auth
-            .exchange_pairing_bootstrap("desktop-test-seed", ClientMetadata::default())
+        let offer = auth
+            .issue_share_pairing(
+                owned_scopes(STANDARD_SCOPES),
+                None,
+                "another-device".to_owned(),
+                true,
+            )
+            .await
+            .expect("off-host share pairing");
+        let (issued, confirmation_required) = auth
+            .exchange_pairing_bootstrap(&offer.credential, ClientMetadata::default())
             .await
             .expect("pending session issues");
+        assert!(confirmation_required);
         let session_id = issued.principal.session_id.clone();
         let latch = PairingConfirmationLatch::default();
         let context = RpcSessionContext::authenticated_pending_pairing(
@@ -3229,6 +3336,130 @@ mod tests {
             .find(|client| client.session_id == session.principal.session_id)
             .expect("paired client");
         assert_eq!(paired.reach.as_deref(), Some("another-device"));
+    }
+
+    #[tokio::test]
+    async fn off_host_pairing_mints_pending_and_refuses_the_bearer_until_confirmed() {
+        let auth = service();
+        let offer = auth
+            .issue_share_pairing(
+                owned_scopes(STANDARD_SCOPES),
+                None,
+                "another-device".to_owned(),
+                true,
+            )
+            .await
+            .expect("off-host share pairing");
+        let (issued, confirmation_required) = auth
+            .exchange_pairing_bootstrap(&offer.credential, ClientMetadata::default())
+            .await
+            .expect("pending session issues");
+        assert!(
+            confirmation_required,
+            "an off-host grant always requires confirmation; the client sends no flag"
+        );
+        assert!(matches!(
+            auth.authenticate_token(&issued.token, SessionTransport::E2ee)
+                .await,
+            Err(AuthError::InvalidCredential)
+        ));
+
+        assert!(
+            auth.confirm_pending_pairing_session(&issued.principal.session_id)
+                .await
+                .expect("confirmation commits")
+        );
+        auth.authenticate_token(&issued.token, SessionTransport::E2ee)
+            .await
+            .expect("confirmed credential authenticates");
+    }
+
+    #[tokio::test]
+    async fn on_host_pairing_mints_an_active_credential_without_confirmation() {
+        let auth = service();
+        let offer = auth
+            .issue_share_pairing(
+                owned_scopes(STANDARD_SCOPES),
+                None,
+                "this-computer".to_owned(),
+                false,
+            )
+            .await
+            .expect("on-host share pairing");
+        let (issued, confirmation_required) = auth
+            .exchange_pairing_bootstrap(&offer.credential, ClientMetadata::default())
+            .await
+            .expect("active session issues");
+        assert!(!confirmation_required);
+        auth.authenticate_token(&issued.token, SessionTransport::E2ee)
+            .await
+            .expect("on-host credential is delivered immediately");
+    }
+
+    #[tokio::test]
+    async fn pending_pairing_sweep_only_revokes_sessions_past_the_grace_window() {
+        let database = crate::persistence::Database::open_in_memory()
+            .await
+            .expect("in-memory database opens");
+        database
+            .call(|connection| {
+                crate::persistence::run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("all migrations apply");
+        let repositories = Repositories::new(database.clone());
+        let secrets = tempfile::tempdir().expect("secret store directory");
+        let secret_store = SecretStore::new(secrets.path())
+            .await
+            .expect("secret store opens");
+        let config = ServerConfig::new(".")
+            .with_bind("127.0.0.1", 3773)
+            .with_desktop("desktop-test-seed")
+            .expect("desktop config");
+        let auth = AuthService::new_with_persistence(
+            &config,
+            vec![7_u8; 32],
+            secret_store,
+            repositories.clone(),
+        )
+        .await
+        .expect("persistent auth service starts");
+        let offer = auth
+            .issue_share_pairing(
+                owned_scopes(STANDARD_SCOPES),
+                None,
+                "another-device".to_owned(),
+                true,
+            )
+            .await
+            .expect("off-host share pairing");
+        let (issued, _) = auth
+            .exchange_pairing_bootstrap(&offer.credential, ClientMetadata::default())
+            .await
+            .expect("pending session issues");
+        let session_id = issued.principal.session_id.clone();
+        let now = now_ms();
+
+        // A sweep whose cutoff predates the mint leaves the fresh pending
+        // session alone — a restart cannot revoke an in-flight pairing.
+        let swept = repositories
+            .revoke_pending_auth_sessions(
+                format_iso(now),
+                format_iso(now - PENDING_PAIRING_SWEEP_GRACE_MS),
+            )
+            .await
+            .expect("age-gated sweep runs");
+        assert!(swept.is_empty(), "fresh pending sessions survive the sweep");
+
+        // Once the session is older than the grace window it is a crash
+        // orphan and the sweep revokes it.
+        let swept = repositories
+            .revoke_pending_auth_sessions(format_iso(now), format_iso(now))
+            .await
+            .expect("expired sweep runs");
+        assert_eq!(swept, vec![session_id]);
+        database.close().await;
     }
 
     #[tokio::test]

@@ -16,6 +16,8 @@ pub(crate) use http::{
 };
 pub(crate) use model::ClientMetadata;
 pub(crate) use model::Principal;
+#[cfg(test)]
+pub(crate) use model::STANDARD_SCOPES;
 pub(crate) use rpc::register_rpc_handlers;
 pub(crate) use scope::{ACTIVITY_READ_SCOPE, authorization_error, required_scope};
 pub(crate) use secret_store::SecretStore;

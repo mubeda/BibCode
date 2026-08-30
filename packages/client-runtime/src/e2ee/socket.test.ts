@@ -226,7 +226,7 @@ describe("makeE2eeSocket", () => {
       yield* Effect.sleep("200 millis");
       yield* Fiber.interrupt(fiber);
       expect(received[0]).toBe(
-        encodeJson({ type: "e2ee_auth", pairing: "one-time-1", pairingConfirmation: true }),
+        encodeJson({ type: "e2ee_auth", pairing: "one-time-1" }),
       );
       expect(received[1]).toBe(encodeJson({ hello: true }));
       expect(delivered).toEqual([encodeJson({ echoed: received[1]?.length })]);
