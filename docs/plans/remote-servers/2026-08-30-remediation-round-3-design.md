@@ -233,7 +233,7 @@ Rust fail-closed behaviour breaks a TS test too.
     (`binaryType` defense + test-double default) + C-F4 ordering
 13. `fix(web)`: D6
 14. `fix(web)`: IndexedDB recovery honesty — M14(c) blocked-open resumes
-    (versionchange handler + bounded open), T4 generation-scoped health mute,
+    (versionchange handler + bounded open), T-4 generation-scoped health mute,
     N8 dialog copy derived from the active catalog backend, C-F6
 15. `fix(web+shared)`: M-S1 one pairing-URL owner; discarded side-effect guard
     made explicit; POST_BOOTSTRAP alias; duplicate timeout helpers unified
