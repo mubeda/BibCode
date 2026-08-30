@@ -1,4 +1,4 @@
-import { useState, useSyncExternalStore } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 
 import {
   deleteIncompatibleConnectionDatabase,
@@ -44,22 +44,27 @@ export function ConnectionDatabaseRecoveryDialog({
     getConnectionDatabaseHealth,
   );
   const [confirmReset, setConfirmReset] = useState(false);
+  const [resetAcknowledged, setResetAcknowledged] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const acknowledgementRef = useRef<HTMLInputElement>(null);
   const open = health.status !== "ready";
+
+  useEffect(() => {
+    if (confirmReset) acknowledgementRef.current?.focus();
+  }, [confirmReset]);
 
   const reset = async () => {
     setBusy(true);
     setError(null);
     try {
-      const result = await deleteDatabase();
-      if (result === "blocked") {
-        setError("Reset is blocked. Close other BiBCode tabs and windows, then try again.");
-        return;
-      }
+      await deleteDatabase();
       reloadPage();
     } catch (cause) {
-      setError(`The connection database could not be deleted: ${String(cause)}`);
+      setConfirmReset(false);
+      setResetAcknowledged(false);
+      const message = `The connection database could not be deleted: ${String(cause)}`;
+      if (getConnectionDatabaseHealth().message !== message) setError(message);
     } finally {
       setBusy(false);
     }
@@ -86,7 +91,7 @@ export function ConnectionDatabaseRecoveryDialog({
                 ? "Connection database is blocked"
                 : "Connection storage is unavailable"}
           </DialogTitle>
-          <DialogDescription>
+          <DialogDescription role={health.status === "unavailable" ? "alert" : undefined}>
             {health.status === "incompatible"
               ? "This browser cannot open connection data written by a newer BiBCode version."
               : health.message}
@@ -105,44 +110,72 @@ export function ConnectionDatabaseRecoveryDialog({
                 Server-side project files and databases are not changed.
               </p>
               {confirmReset ? (
-                <div className="rounded border border-amber-500 p-3">
-                  Confirm deletion of all saved browser connection data. This cannot be undone.
+                <div
+                  id="connection-database-reset-confirmation"
+                  role="status"
+                  className="space-y-3 rounded border border-amber-500 p-3"
+                >
+                  <p>Deleting all saved browser connection data cannot be undone.</p>
+                  <label className="flex items-center gap-2">
+                    <input
+                      ref={acknowledgementRef}
+                      type="checkbox"
+                      checked={resetAcknowledged}
+                      disabled={busy}
+                      className="accent-primary size-4"
+                      onChange={(event) => setResetAcknowledged(event.target.checked)}
+                    />
+                    I understand that this deletes the connection data listed above.
+                  </label>
+                  <Button
+                    variant="destructive"
+                    disabled={!resetAcknowledged || busy}
+                    onClick={() => void reset()}
+                  >
+                    {busy ? "Deleting…" : "Delete saved connection data"}
+                  </Button>
                 </div>
               ) : null}
             </>
           ) : health.status === "blocked" ? (
-            <p>Close other BiBCode tabs or windows using this browser profile, then reload.</p>
+            <div className="space-y-2">
+              <p>Close other BiBCode tabs or windows using this browser profile, then reload.</p>
+              {busy ? (
+                <p role="status">
+                  Deletion is still pending and will continue when those connections close.
+                </p>
+              ) : null}
+            </div>
           ) : (
             <p>Reload to retry. If the problem continues, copy diagnostics before reporting it.</p>
           )}
-          {error ? <p className="text-destructive">{error}</p> : null}
+          {error ? (
+            <p role="alert" className="text-destructive">
+              {error}
+            </p>
+          ) : null}
         </DialogPanel>
         <DialogFooter>
+          {health.status === "unavailable" ? (
+            <Button variant="outline" onClick={() => void copyDiagnostics()}>
+              Copy diagnostics
+            </Button>
+          ) : null}
           {health.status === "incompatible" ? (
-            confirmReset ? (
-              <>
-                <Button variant="outline" disabled={busy} onClick={() => setConfirmReset(false)}>
-                  Cancel
-                </Button>
-                <Button variant="destructive" disabled={busy} onClick={() => void reset()}>
-                  {busy ? "Deleting…" : "Confirm reset"}
-                </Button>
-              </>
-            ) : (
-              <Button variant="destructive" onClick={() => setConfirmReset(true)}>
-                Reset saved connection data
-              </Button>
-            )
-          ) : (
-            <>
-              {health.status === "unavailable" ? (
-                <Button variant="outline" onClick={() => void copyDiagnostics()}>
-                  Copy diagnostics
-                </Button>
-              ) : null}
-              <Button onClick={reloadPage}>Reload</Button>
-            </>
-          )}
+            <Button
+              variant="destructive"
+              disabled={busy}
+              aria-expanded={confirmReset}
+              aria-controls={confirmReset ? "connection-database-reset-confirmation" : undefined}
+              onClick={() => {
+                setConfirmReset(true);
+                setResetAcknowledged(false);
+              }}
+            >
+              Reset saved connection data
+            </Button>
+          ) : null}
+          <Button onClick={reloadPage}>Reload</Button>
         </DialogFooter>
       </DialogPopup>
     </Dialog>
