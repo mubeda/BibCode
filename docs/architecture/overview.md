@@ -279,12 +279,26 @@ optional behavior.
 Direct remote connections use the server-owned pairing/auth authority and the
 client-runtime-owned transport policy described in
 [Remote architecture](./remote.md). Noise E2EE bounds unauthenticated work by
-global and socket-peer admission, bounds authenticated assembly by bytes and
-record count, and uses work-conserving outbound byte admission plus one logical
-write deadline. Desktop exposure remains a privileged `DesktopBridge` operation:
-native starts are local-only, WSL exposure is externally managed, and only
-authoritative live grants or an explicit legacy-resume action can request a
-wide native bind.
+global, exact-peer, IPv4 `/24` or IPv6 `/64`, and loopback-forwarder admission.
+Authenticated assembly uses cancellable fit-first byte pressure, a 10-second
+incomplete-message progress deadline, and releases permits after dispatch rather
+than handler completion. Outbound fit-first admission keeps a five-second
+reservation deadline, gives each record a fresh five-second sink deadline, and
+adds a size-derived aggregate deadline. Desktop exposure remains a privileged
+`DesktopBridge` operation: native starts are local-only, WSL exposure is
+externally managed, and only authoritative live grants or an explicit
+legacy-resume action can request a wide native bind. Pairing credentials remain
+pending until the verified client persists local state and confirms the session.
+Desktop discovery advertises only usable IPv4 addresses until a dual-stack
+listener exists; public candidates are labeled, never defaulted, and require an
+explicit warning acknowledgement. Plain `/ws` caps individual frames at 16 MiB
+while retaining the 64 MiB reassembled-message cap.
+Hosted pairing rejects URL userinfo and renders and submits one normalized host;
+legacy query credentials are scrubbed after capture. Saved blank host keys
+normalize to the legacy plain-transport representation. The environment registry
+owns explicit desired connection intent outside disposable supervisor scopes, so
+passive state reads and catalog-driven scope replacement cannot reconnect an
+explicitly disconnected environment.
 
 First-run creation initializes a randomized same-directory staged SQLite file,
 closes it without retained journal sidecars, and publishes it at `state.sqlite`
@@ -468,6 +482,15 @@ truth. Every fresh native desktop process starts local-only, so the durable
 desktop setting records the last completed transition but is not startup
 permission to listen wide.
 
+The native exposure coordinator also serializes WSL/native topology changes.
+Entering WSL-only first converges native settings, backend, and firewall to
+local-only; leaving it starts native local-only. Local recovery attempts every
+safeguard even after an earlier failure. The Windows firewall worker owns late
+commands after its five-second caller deadline and removes a late-enabled rule
+before processing a later enable. In the renderer, unmount may cancel work only
+before the first privileged apply; once narrowing commits, its authoritative
+refetch and one required compensating widen run to completion.
+
 ## Desktop update protection
 
 The Tauri host coordinates update installation across the complete local
@@ -560,8 +583,9 @@ before asking.
 `updater.install` require `orchestration:operate`
 (`apps/server/src/auth/scope.rs`).
 Desktop delegate calls and each client-side per-environment update check are
-independently bounded to 30 seconds. A timed-out client request is interrupted
-at the RPC command boundary and releases one of the two update-check workers.
+independently bounded to 30 seconds. The client deadline includes supervisor
+acquisition, readiness, and RPC execution; timeout interrupts the whole lazy
+operation and releases one of the two update-check workers.
 
 The WebView engine is the operating system's, so it differs per platform:
 WKWebView on macOS, WebKitGTK on Linux, and WebView2 on Windows. Browser API
@@ -632,9 +656,12 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
   migration preserves an existing valid IndexedDB winner and uses exact CAS
   before replacing corrupt IndexedDB bytes with the only valid legacy catalog.
   A connection-database `VersionError` is handled before the connection runtime
-  starts: the shell offers an explicit, confirmed destructive reset and reloads
-  only after deletion succeeds. Blocked or otherwise unavailable databases
-  remain non-destructive and show actionable health instead of looping at boot.
+  starts: the shell offers a non-destructive reload plus a separately
+  acknowledged destructive reset that a double-click cannot confirm. A blocked
+  deletion remains visibly queued on its original request until success or
+  error; the shell reloads automatically only after actual deletion success.
+  Otherwise unavailable databases remain non-destructive and show actionable
+  health instead of looping at boot.
   Outside that migration, a corrupt authoritative catalog is never rewritten
   as empty: it is quarantined when supported, publishes redacted
   recovery-required health, blocks mutation, and requires an explicit
