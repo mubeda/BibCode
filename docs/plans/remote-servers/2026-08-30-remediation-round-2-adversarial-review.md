@@ -186,13 +186,13 @@ fronting is a documented topology; behind one, every client is `127.0.0.1`, and 
 attacker pins the bucket — reconnect-storm rejections for everyone. Fix: forwarder-sized bucket +
 trusted-proxy `XFF` keying.
 
-**IndexedDB reset dialog (3-axis: security N8 + standards T4 + perf C-F6):** on protected desktop the
+**IndexedDB reset dialog (3-axis: security N8 + standards T-4 + perf C-F6):** on protected desktop the
 reset **over-promises destruction** — it lists servers/credentials/identities as deleted, but those live
 in the native catalog store and only `shell`+`thread` are removed (N8, safe-side but a false purge
 assurance, and the test locks the wrong copy in); a **blocked open never resumes** (`storage.ts:137-153`
 has no `blocked` or `versionchange` handler and no timeout, M14(c), pre-existing); and the fix introduced
 a **health-reporting mute** — `activeDeletionRequest` suppresses every open-path publisher, so a
-permanently-blocked delete permanently mutes all IndexedDB fault reporting for the page (T4, AGENTS.md
+permanently-blocked delete permanently mutes all IndexedDB fault reporting for the page (T-4, AGENTS.md
 prohibits hidden fallbacks). Fix: scope the mute to a generation counter for pre-deletion opens; make
 `blocked` non-terminal.
 
