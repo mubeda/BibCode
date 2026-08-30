@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vite-plus/test";
+import advertisedEndpointFixtures from "../fixtures/advertised-endpoint-classification.json" with { type: "json" };
 import pairingEndpointFixtures from "../fixtures/pairing-endpoint-classification.json" with { type: "json" };
 
 import {
@@ -10,6 +11,14 @@ import {
 } from "./advertisedEndpoint.ts";
 
 describe("classifyPairingEndpoint", () => {
+  it.each(advertisedEndpointFixtures)(
+    "shares literal address classification for $address",
+    (fixture) => {
+      const host = fixture.address.includes(":") ? `[${fixture.address}]` : fixture.address;
+      expect(classifyPairingEndpoint(`http://${host}:3773`)).toBe(fixture.pairingClassification);
+    },
+  );
+
   it.each(pairingEndpointFixtures)("classifies $endpoint as $classification", (fixture) => {
     expect(classifyPairingEndpoint(fixture.endpoint)).toBe(fixture.classification);
   });
