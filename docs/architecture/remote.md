@@ -237,11 +237,14 @@ holds only weak entries and prunes inactive identities while admitting a later
 connection.
 
 Established E2EE RPC output has a process-wide 128 MiB plaintext budget and a
-64 MiB per-connection budget. The generic session first counts an upper bound
-for serialized JSON, admits the request through one process-wide combined
-fit-first queue, and reserves both byte permits in one critical section. It
-never sleeps while retaining only one tier. The session then encodes once and
-returns any over-reserved bytes before enqueueing the response. The queued frame owns those permits
+64 MiB per-connection budget. The generic session encodes each response
+exactly once, drops the JSON value tree, then admits the exact encoded length
+through one process-wide combined fit-first queue, reserving both byte permits
+in one critical section — the memory resident during the admission wait is
+precisely the bytes that will be charged. It never sleeps while retaining only
+one tier. (Guarded activity responses still reserve an upper bound covering
+their possible fallback substitution and shrink after preparing.) The queued
+frame owns those permits
 through Noise record encryption and every successful or failed WebSocket
 write;
 generic queue capacity therefore cannot hide additional plaintext. Unary
