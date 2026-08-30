@@ -54,7 +54,14 @@ const PAIRING_REJECTION_LIMIT: u8 =
     (u8::MAX as usize / PAIRING_ALPHABET.len() * PAIRING_ALPHABET.len()) as u8;
 const ACCESS_EVENT_CAPACITY: usize = 64;
 const AUTHORITY_CONVERGENCE_INTERVAL: Duration = Duration::from_millis(250);
-pub(crate) const PAIRING_REACH_VALUES: [&str; 3] = ["another-device", "this-computer", "custom"];
+pub(crate) const PAIRING_REACH_ANOTHER_DEVICE: &str = "another-device";
+pub(crate) const PAIRING_REACH_THIS_COMPUTER: &str = "this-computer";
+pub(crate) const PAIRING_REACH_CUSTOM: &str = "custom";
+pub(crate) const PAIRING_REACH_VALUES: [&str; 3] = [
+    PAIRING_REACH_ANOTHER_DEVICE,
+    PAIRING_REACH_THIS_COMPUTER,
+    PAIRING_REACH_CUSTOM,
+];
 
 fn is_valid_pairing_reach(value: &str) -> bool {
     PAIRING_REACH_VALUES.contains(&value)
@@ -84,6 +91,8 @@ pub struct AuthService {
     access_events: Arc<broadcast::Sender<AuthAccessEvent>>,
     access_revision: Arc<AtomicU64>,
     authority_watcher_running: Arc<AtomicBool>,
+    /// Redeemed single-use websocket ticket ids, pruned by expiry.
+    redeemed_websocket_tickets: Arc<std::sync::Mutex<HashMap<String, i64>>>,
     dpop: DpopVerifier,
 }
 
@@ -367,15 +376,22 @@ impl AuthService {
         // Crash compensation for unconfirmed pairing credentials is age-gated:
         // no connection survives a restart, so a young pending session can
         // never be confirmed anyway, but sweeping only past the grace window
-        // keeps one uniform rule with the periodic sweeper below.
+        // keeps one uniform rule with the periodic sweeper below. The startup
+        // pass is best-effort — a transiently locked store must not fail
+        // boot when the periodic sweeper converges within a minute anyway.
         let now = now_ms();
-        repositories
+        if let Err(error) = repositories
             .revoke_pending_auth_sessions(
                 format_iso(now),
                 format_iso(now - PENDING_PAIRING_SWEEP_GRACE_MS),
             )
             .await
-            .map_err(|error| AuthError::Internal(error.to_string()))?;
+        {
+            tracing::warn!(
+                ?error,
+                "startup pending-pairing sweep failed; the periodic sweeper retries"
+            );
+        }
         let service = Self::build(
             config,
             signing_secret,
@@ -482,6 +498,7 @@ impl AuthService {
             access_events: Arc::new(access_events),
             access_revision: Arc::new(AtomicU64::new(1)),
             authority_watcher_running: Arc::new(AtomicBool::new(false)),
+            redeemed_websocket_tickets: Arc::new(std::sync::Mutex::new(HashMap::new())),
             dpop: DpopVerifier::new(secret_store),
         }
     }
@@ -904,6 +921,7 @@ impl AuthService {
             v: 1,
             kind: "websocket".to_owned(),
             sid: principal.session_id.clone(),
+            jti: Some(Uuid::new_v4().to_string()),
             iat: issued_at,
             exp: expires_at,
         };
@@ -935,7 +953,29 @@ impl AuthService {
         if record.revoked_at_ms.is_some() || record.expires_at_ms <= observed_at {
             return Err(AuthError::InvalidCredential);
         }
-        Ok(record.principal())
+        // Defense in depth for the no-downgrade invariant: tickets are only
+        // accepted by the plain `/ws` route, so only plain-transport sessions
+        // may redeem them.
+        if record.transport != SessionTransport::Plain {
+            return Err(AuthError::InvalidCredential);
+        }
+        let principal = record.principal();
+        drop(state);
+        // Each ticket is redeemable exactly once; the client mints a fresh
+        // ticket per connection attempt, so replays are always hostile.
+        let Some(jti) = claims.jti else {
+            return Err(AuthError::InvalidCredential);
+        };
+        let mut redeemed = self
+            .redeemed_websocket_tickets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        redeemed.retain(|_, expires_at| *expires_at > observed_at);
+        if redeemed.insert(jti, claims.exp).is_some() {
+            return Err(AuthError::InvalidCredential);
+        }
+        drop(redeemed);
+        Ok(principal)
     }
 
     pub(crate) async fn authorize_session(
@@ -1440,6 +1480,24 @@ impl AuthService {
             }
             return Ok(PairingOfferReplay::Fresh);
         }
+        let stale_completed = state
+            .pairing_offer_idempotency
+            .get(&lookup_key)
+            .is_some_and(|stored| {
+                stored.input_fingerprint == input_fingerprint
+                    && stored.result.is_some()
+                    && stored
+                        .pairing_id
+                        .as_ref()
+                        .is_some_and(|id| !state.pairings.contains_key(id))
+            });
+        if stale_completed {
+            // The recorded offer was consumed or revoked since it was minted;
+            // replaying its result would advertise a dead code as fresh.
+            state.pairing_offer_idempotency.remove(&lookup_key);
+            state.bump_authority_generation();
+            return Ok(PairingOfferReplay::Fresh);
+        }
         Ok(match state.pairing_offer_idempotency.get(&lookup_key) {
             Some(stored) if stored.result.is_none() && stored.pairing_id.is_none() => {
                 PairingOfferReplay::Cancelled
@@ -1598,7 +1656,7 @@ impl AuthService {
             match off_host {
                 Some(true) => {
                     off_host_grant_count += 1;
-                    if reach == Some("another-device") {
+                    if reach == Some(PAIRING_REACH_ANOTHER_DEVICE) {
                         native_exposure_grant_count += 1;
                     }
                 }
@@ -1816,7 +1874,11 @@ impl AuthService {
         Ok(revoked)
     }
 
-    pub async fn mark_connected(
+    /// Test-only convenience over [`Self::mark_connected_guard`]; production
+    /// connection lifecycles must hold the guard so disconnection cannot be
+    /// skipped.
+    #[cfg(test)]
+    async fn mark_connected(
         &self,
         session_id: &str,
         shutdown: CancellationToken,
@@ -1879,7 +1941,7 @@ impl AuthService {
         Ok(guard)
     }
 
-    pub async fn mark_disconnected(&self, session_id: &str, connection_id: u64) {
+    async fn mark_disconnected(&self, session_id: &str, connection_id: u64) {
         let mut state = self.state.lock().await;
         let disconnected = if let Some(connections) = state.live_connections.get_mut(session_id) {
             let disconnected = connections.remove(&connection_id).is_some();
@@ -3463,6 +3525,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn confirm_pairing_policy_is_pending_capability_or_access_write() {
+        use crate::auth::model::SCOPE_ACCESS_WRITE;
+        // The declared scope governs third-party callers…
+        assert_eq!(
+            crate::auth::required_scope("auth.confirmPairing"),
+            Some(SCOPE_ACCESS_WRITE)
+        );
+        // …which standard device grants do not carry, so a delivered
+        // (non-pending) device session cannot invoke confirmation…
+        let auth = service();
+        let offer = auth
+            .issue_share_pairing(
+                owned_scopes(STANDARD_SCOPES),
+                None,
+                "this-computer".to_owned(),
+                false,
+            )
+            .await
+            .expect("on-host share pairing");
+        let (issued, _) = auth
+            .exchange_pairing_bootstrap(&offer.credential, ClientMetadata::default())
+            .await
+            .expect("active session issues");
+        assert!(matches!(
+            auth.authorize_session(&issued.principal.session_id, SCOPE_ACCESS_WRITE)
+                .await,
+            Err(AuthError::ScopeRequired(_))
+        ));
+        // …while a pending session confirms its own delivery through the
+        // session capability gate regardless of scopes (see
+        // pending_pairing_capability_is_limited_to_confirmation and the e2ee
+        // scope-bypass suite).
+    }
+
+    #[tokio::test]
+    async fn websocket_tickets_are_single_use_and_plain_transport_only() {
+        let auth = service();
+        let offer = auth
+            .issue_share_pairing(
+                owned_scopes(STANDARD_SCOPES),
+                None,
+                "this-computer".to_owned(),
+                false,
+            )
+            .await
+            .expect("plain share pairing");
+        let plain = auth
+            .exchange_bootstrap(
+                &offer.credential,
+                None,
+                ClientMetadata::default(),
+                None,
+                SessionTransport::Plain,
+            )
+            .await
+            .expect("plain session");
+        let (ticket, _expires_at) = auth
+            .issue_websocket_ticket(&plain.principal)
+            .expect("ticket issues");
+        auth.verify_websocket_ticket(&ticket)
+            .await
+            .expect("first redemption authenticates");
+        assert!(
+            matches!(
+                auth.verify_websocket_ticket(&ticket).await,
+                Err(AuthError::InvalidCredential)
+            ),
+            "a websocket ticket is redeemable exactly once"
+        );
+
+        let e2ee_offer = auth
+            .issue_share_pairing(
+                owned_scopes(STANDARD_SCOPES),
+                None,
+                "this-computer".to_owned(),
+                false,
+            )
+            .await
+            .expect("e2ee share pairing");
+        let (e2ee_session, _) = auth
+            .exchange_pairing_bootstrap(&e2ee_offer.credential, ClientMetadata::default())
+            .await
+            .expect("e2ee session");
+        let (e2ee_ticket, _expires_at) = auth
+            .issue_websocket_ticket(&e2ee_session.principal)
+            .expect("ticket issues for the wrong transport");
+        assert!(
+            matches!(
+                auth.verify_websocket_ticket(&e2ee_ticket).await,
+                Err(AuthError::InvalidCredential)
+            ),
+            "tickets never authenticate a non-plain-transport session"
+        );
+    }
+
+    #[tokio::test]
     async fn share_pairing_rejects_unknown_reach() {
         let auth = service();
         let error = auth
@@ -4211,6 +4369,66 @@ mod tests {
         ));
     }
 
+    async fn insert_live_pairing(service: &AuthService, id: &str) {
+        let now = now_ms();
+        service.state.lock().await.pairings.insert(
+            id.to_owned(),
+            PairingRecord {
+                id: id.to_owned(),
+                credential: format!("credential-{id}"),
+                scopes: owned_scopes(STANDARD_SCOPES),
+                subject: "one-time-token".to_owned(),
+                label: None,
+                proof_key_thumbprint: None,
+                created_at_ms: now,
+                expires_at_ms: now + PAIRING_TTL_MS,
+                consumed_at_ms: None,
+                revoked_at_ms: None,
+                reach: Some("another-device".to_owned()),
+                off_host: Some(true),
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn replaying_a_consumed_offer_returns_fresh_instead_of_a_dead_code() {
+        let service = service();
+        let offer = PairingOfferResult {
+            id: "offer-consumed".to_owned(),
+            code: "code-consumed".to_owned(),
+            reach: "another-device".to_owned(),
+            endpoint: "http://192.168.1.20:3773".to_owned(),
+            name: "Tablet".to_owned(),
+            expires_at: format_iso(now_ms() + PAIRING_TTL_MS),
+        };
+        insert_live_pairing(&service, &offer.id).await;
+        service
+            .record_pairing_offer(
+                "principal",
+                "request-key".to_owned(),
+                "fingerprint".to_owned(),
+                offer.clone(),
+            )
+            .await
+            .expect("offer records");
+        assert!(matches!(
+            service
+                .replay_pairing_offer("principal", "request-key", "fingerprint")
+                .await,
+            Ok(PairingOfferReplay::Original(result)) if result.id == offer.id
+        ));
+
+        // A device consumes the link; the recorded result now advertises a
+        // dead code and must not be replayed as fresh success.
+        service.state.lock().await.pairings.remove(&offer.id);
+        assert!(matches!(
+            service
+                .replay_pairing_offer("principal", "request-key", "fingerprint")
+                .await,
+            Ok(PairingOfferReplay::Fresh)
+        ));
+    }
+
     #[tokio::test]
     async fn pairing_offer_idempotency_is_scoped_to_the_authenticated_principal() {
         let service = service();
@@ -4222,6 +4440,7 @@ mod tests {
             name: "Tablet A".to_owned(),
             expires_at: format_iso(now_ms() + PAIRING_TTL_MS),
         };
+        insert_live_pairing(&service, &first.id).await;
         service
             .record_pairing_offer(
                 "principal-a",
@@ -4259,6 +4478,7 @@ mod tests {
             name: "Tablet B".to_owned(),
             expires_at: format_iso(now_ms() + PAIRING_TTL_MS),
         };
+        insert_live_pairing(&service, &second.id).await;
         service
             .record_pairing_offer(
                 "principal-b",

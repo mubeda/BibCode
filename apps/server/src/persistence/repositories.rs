@@ -1551,11 +1551,16 @@ impl Repositories {
                     connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let confirmed = transaction
                     .query_row(
-                        "UPDATE auth_sessions SET delivery_state = 'active'
+                        "UPDATE auth_sessions SET delivery_state = ?
                          WHERE session_id = ? AND revoked_at IS NULL AND expires_at > ?
-                           AND delivery_state = 'pending-pairing'
+                           AND delivery_state = ?
                          RETURNING session_id",
-                        params![session_id, now],
+                        params![
+                            AuthSessionDeliveryState::Active.as_str(),
+                            session_id,
+                            now,
+                            AuthSessionDeliveryState::PendingPairing.as_str()
+                        ],
                         |row| row.get::<_, String>(0),
                     )
                     .optional()?
@@ -1568,8 +1573,8 @@ impl Repositories {
                         .query_row(
                             "SELECT 1 FROM auth_sessions
                              WHERE session_id = ? AND revoked_at IS NULL AND expires_at > ?
-                               AND delivery_state = 'active'",
-                            params![session_id, now],
+                               AND delivery_state = ?",
+                            params![session_id, now, AuthSessionDeliveryState::Active.as_str()],
                             |_| Ok(()),
                         )
                         .optional()?
@@ -1593,9 +1598,13 @@ impl Repositories {
                     .query_row(
                         "UPDATE auth_sessions SET revoked_at = ?
                          WHERE session_id = ? AND revoked_at IS NULL
-                           AND delivery_state = 'pending-pairing'
+                           AND delivery_state = ?
                          RETURNING session_id",
-                        params![revoked_at, session_id],
+                        params![
+                            revoked_at,
+                            session_id,
+                            AuthSessionDeliveryState::PendingPairing.as_str()
+                        ],
                         |row| row.get::<_, String>(0),
                     )
                     .optional()?
@@ -1623,12 +1632,19 @@ impl Repositories {
                 let revoked = {
                     let mut statement = transaction.prepare(
                         "UPDATE auth_sessions SET revoked_at = ?
-                         WHERE revoked_at IS NULL AND delivery_state = 'pending-pairing'
+                         WHERE revoked_at IS NULL AND delivery_state = ?
                            AND issued_at <= ?
                          RETURNING session_id",
                     )?;
                     statement
-                        .query_map(params![revoked_at, issued_at_or_before], |row| row.get(0))?
+                        .query_map(
+                            params![
+                                revoked_at,
+                                AuthSessionDeliveryState::PendingPairing.as_str(),
+                                issued_at_or_before
+                            ],
+                            |row| row.get(0),
+                        )?
                         .collect::<rusqlite::Result<Vec<_>>>()?
                 };
                 if !revoked.is_empty() {

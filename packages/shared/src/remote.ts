@@ -1,6 +1,7 @@
 import * as Schema from "effect/Schema";
 
 const PAIRING_TOKEN_PARAM = "token";
+const PAIRING_CODE_PARAM = "code";
 const HOSTED_PAIRING_HOST_PARAM = "host";
 const HOSTED_PAIRING_LABEL_PARAM = "label";
 const SUPPORTED_REMOTE_BACKEND_PROTOCOLS = new Set(["http:", "https:", "ws:", "wss:"]);
@@ -216,11 +217,20 @@ export const getPairingTokenFromUrl = (url: URL): string | null => {
 export const stripPairingTokenFromUrl = (url: URL): URL => {
   const next = new URL(url.toString());
   const hashParams = readHashParams(next);
-  if (hashParams.has(PAIRING_TOKEN_PARAM)) {
-    hashParams.delete(PAIRING_TOKEN_PARAM);
+  let hashChanged = false;
+  for (const secret of [PAIRING_TOKEN_PARAM, PAIRING_CODE_PARAM]) {
+    if (hashParams.has(secret)) {
+      hashParams.delete(secret);
+      hashChanged = true;
+    }
+  }
+  if (hashChanged) {
     next.hash = hashParams.toString();
   }
   next.searchParams.delete(PAIRING_TOKEN_PARAM);
+  // The one-time pairing code embeds the token; it must not survive in the
+  // address bar or history either.
+  next.searchParams.delete(PAIRING_CODE_PARAM);
   return next;
 };
 

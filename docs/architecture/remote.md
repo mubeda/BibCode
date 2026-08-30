@@ -697,7 +697,10 @@ endpoint can install software, start a process, or use SSH.
   and endpoint metadata are not authorization.
 - Bearer or DPoP authentication is performed over HTTP before a WebSocket is
   opened. Only a single-purpose, short-lived `wsTicket` appears in the socket
-  URL.
+  URL; each ticket is redeemable exactly once, only by the plain `/ws` route,
+  and only for a plain-transport session (the client mints a fresh ticket per
+  connection attempt). A process restart forgets redemptions for at most one
+  five-minute ticket window.
 - DPoP binds Connect-issued relay and environment tokens to the client's proof
   key and the target HTTP request.
 - Relay request proofs and environment health/mint responses are independently
