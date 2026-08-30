@@ -14,12 +14,13 @@ import {
   type DesktopDiscoveredSshHost,
   type DesktopSshEnvironmentTarget,
 } from "@bibcode/contracts";
+import { RemotePairingTokenMissingError, resolveRemotePairingTarget } from "@bibcode/shared/remote";
 import * as DateTime from "effect/DateTime";
+import * as Schema from "effect/Schema";
 
 import { cn } from "../../../lib/utils";
 import { resolveDesktopPairingUrl, resolveHostedPairingUrl } from "./pairingUrls";
-import { getPairingTokenFromUrl, setPairingTokenOnUrl } from "../../../pairingUrl";
-import { readHostedPairingRequest } from "../../../hostedPairing";
+import { setPairingTokenOnUrl } from "../../../pairingUrl";
 import type { ServerClientSessionRecord, ServerPairingLinkRecord } from "~/environments/primary";
 import { Popover, PopoverPopup, PopoverTrigger } from "../../ui/popover";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../../ui/tooltip";
@@ -32,6 +33,7 @@ const accessTimestampFormatter = new Intl.DateTimeFormat(undefined, {
   dateStyle: "medium",
   timeStyle: "short",
 });
+const isRemotePairingTokenMissingError = Schema.is(RemotePairingTokenMissingError);
 
 export function formatAccessTimestamp(value: string): string {
   const parsed = new Date(value);
@@ -249,34 +251,39 @@ export function parseManualDesktopSshTarget(input: {
   };
 }
 
-export function parsePairingUrlFields(
-  input: string,
-): { readonly host: string; readonly pairingCode: string } | null {
-  const trimmed = input.trim();
-  if (!trimmed) return null;
-
-  try {
-    const urlLikeInput =
-      /^[a-zA-Z][a-zA-Z\d+.-]*:\/\//u.test(trimmed) || trimmed.startsWith("//")
-        ? trimmed
-        : `https://${trimmed}`;
-    const url = new URL(urlLikeInput, window.location.origin);
-    const hostedPairingRequest = readHostedPairingRequest(url);
-    if (hostedPairingRequest) {
-      return {
-        host: hostedPairingRequest.httpBaseUrl,
-        pairingCode: hostedPairingRequest.token,
-      };
+export function tryResolveRemotePairingHostInput(input: string):
+  | {
+      readonly _tag: "Resolved";
+      readonly host: string;
+      readonly pairingCode: string;
     }
+  | {
+      readonly _tag: "Unresolved";
+      readonly explicitError: unknown | null;
+    } {
+  const rawHost = input.trim();
+  if (!rawHost) return { _tag: "Unresolved", explicitError: null };
 
-    const pairingCode = getPairingTokenFromUrl(url);
-    if (!pairingCode) return null;
+  // Explicit URL inputs surface the shared owner's validation errors during
+  // submit. Bare hosts are coerced only to detect an embedded credential and
+  // otherwise remain plain host + code fields.
+  const explicitlyUrlShaped =
+    /^[a-zA-Z][a-zA-Z\d+.-]*:\/\//u.test(rawHost) || rawHost.startsWith("//");
+  try {
+    const pairingUrl = explicitlyUrlShaped
+      ? new URL(rawHost, window.location.origin).toString()
+      : `https://${rawHost}`;
+    const resolved = resolveRemotePairingTarget({ pairingUrl });
     return {
-      host: url.origin,
-      pairingCode,
+      _tag: "Resolved",
+      host: resolved.httpBaseUrl,
+      pairingCode: resolved.credential,
     };
-  } catch {
-    return null;
+  } catch (error) {
+    return {
+      _tag: "Unresolved",
+      explicitError: explicitlyUrlShaped && !isRemotePairingTokenMissingError(error) ? error : null,
+    };
   }
 }
 
@@ -287,10 +294,22 @@ export function parseRemotePairingFields(input: {
   readonly host: string;
   readonly pairingCode: string;
 } {
-  const parsedPairingUrl = parsePairingUrlFields(input.host);
-  if (parsedPairingUrl) return parsedPairingUrl;
+  const rawHost = input.host.trim();
+  const pairingUrlResolution = tryResolveRemotePairingHostInput(rawHost);
+  if (pairingUrlResolution._tag === "Resolved") {
+    return {
+      host: pairingUrlResolution.host,
+      pairingCode: pairingUrlResolution.pairingCode,
+    };
+  }
+  if (pairingUrlResolution.explicitError !== null) {
+    const error = pairingUrlResolution.explicitError;
+    throw error instanceof Error && error.message
+      ? error
+      : new Error("The pairing link is invalid or unsupported.");
+  }
 
-  const host = input.host.trim();
+  const host = rawHost;
   const pairingCode = input.pairingCode.trim();
   if (!host) {
     throw new Error("Enter a backend host.");
@@ -471,7 +490,6 @@ export const remoteServersSettingsInternals = {
   isHostedAppPairingUrl,
   isTailscaleHttpsEndpoint,
   parseManualDesktopSshTarget,
-  parsePairingUrlFields,
   parseRemotePairingFields,
   resolveAdvertisedEndpointPairingUrl,
   selectPairingEndpoint,

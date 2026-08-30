@@ -298,7 +298,10 @@ export const resolveRemotePairingTarget = (input: {
     }
     const hostedHost = url.searchParams.get(HOSTED_PAIRING_HOST_PARAM)?.trim() ?? "";
     if (hostedHost && getPairingTokenFromUrl(url)) {
+      // readHostedPairingRequest already rejected this hosted-form URL, so
+      // normalization must throw the precise typed backend URL error here.
       normalizeRemoteBaseUrl(hostedHost, "hosted-pairing-host");
+      throw new RemotePairingUrlInvalidError({});
     }
 
     const credential = getPairingTokenFromUrl(url) ?? "";
