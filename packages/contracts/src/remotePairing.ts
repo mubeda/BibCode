@@ -24,7 +24,6 @@ export type RemotePairingCodePayload = typeof RemotePairingCodePayload.Type;
 export const E2eeAuthPairingMessage = Schema.Struct({
   type: Schema.Literal("e2ee_auth"),
   pairing: TrimmedNonEmptyString,
-  pairingConfirmation: Schema.optionalKey(Schema.Literal(true)),
 });
 export type E2eeAuthPairingMessage = typeof E2eeAuthPairingMessage.Type;
 
