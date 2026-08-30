@@ -2043,6 +2043,27 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn outbound_size_allowance_lets_a_large_message_finish_on_a_slow_sink() {
+        let (_initiator, responder) = establish().await;
+        let channel = Arc::new(Mutex::new(responder));
+        // One second per record: far beyond the flat five-second aggregate the
+        // old deadline imposed, but within the size-derived allowance.
+        let mut writer = Box::pin(futures_util::sink::unfold(
+            (),
+            |(), _message: Message| async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Ok::<_, std::convert::Infallible>(())
+            },
+        ));
+        let plaintext = vec![b'x'; 8 * 1024 * 1024];
+        let started = tokio::time::Instant::now();
+
+        send_established_encrypted_message(&mut writer, &channel, &plaintext, started)
+            .await
+            .expect("a compliant slow sink finishes a large message");
+    }
+
     #[tokio::test]
     async fn decrypt_scratch_is_reused_between_records() {
         let (mut initiator, mut responder) = establish().await;
@@ -2477,17 +2498,20 @@ mod tests {
 
     #[tokio::test]
     async fn one_connection_cannot_monopolize_the_global_budget() {
-        let (mut first_initiator, mut first_responder) = establish().await;
+        let (mut first_initiator, first_responder) = establish().await;
         let (mut second_initiator, mut second_responder) = establish().await;
-        let global_budget = Arc::new(WeightedByteBudget::new(MAX_E2EE_CHUNK_BYTES * 2));
+        // Production ratio: the per-connection cap is half the global pool.
+        let global_budget = Arc::new(WeightedByteBudget::new(MAX_E2EE_CHUNK_BYTES * 4));
         let first_connection_budget = Arc::new(WeightedByteBudget::new(MAX_E2EE_CHUNK_BYTES * 2));
-        let second_connection_budget = Arc::new(WeightedByteBudget::new(MAX_E2EE_CHUNK_BYTES));
+        let second_connection_budget = Arc::new(WeightedByteBudget::new(MAX_E2EE_CHUNK_BYTES * 2));
         let continuation = record(
             E2EE_RECORD_FLAG_CONTINUATION,
             &vec![0_u8; MAX_E2EE_CHUNK_BYTES],
         );
-        let first_frames =
-            initiator_encrypt(&mut first_initiator, &[continuation.clone(), continuation]);
+        let first_frames = initiator_encrypt(
+            &mut first_initiator,
+            &[continuation.clone(), continuation.clone(), continuation],
+        );
         let second_frame = initiator_encrypt(
             &mut second_initiator,
             &[record(E2EE_RECORD_FLAG_FINAL, b"second connection")],
@@ -2495,33 +2519,36 @@ mod tests {
         .pop()
         .unwrap();
 
+        // The first connection's third record exhausts its own tier and must
+        // wait there — not fail the protocol — while the global pool still
+        // holds capacity for other connections.
+        let hog_global = Arc::clone(&global_budget);
+        let hog_connection = Arc::clone(&first_connection_budget);
+        let hog = tokio::spawn(async move {
+            let mut responder = first_responder;
+            for frame in &first_frames {
+                decrypt_inbound_frame_budgeted(
+                    &mut responder,
+                    frame,
+                    MAX_E2EE_LOGICAL_MESSAGE_BYTES,
+                    &hog_global,
+                    None,
+                    &hog_connection,
+                    None,
+                )
+                .await
+                .expect("continuation records are legal")
+                .map(|_| ())
+                .ok_or(())
+                .expect_err("continuations never complete a message");
+            }
+        });
+        tokio::task::yield_now().await;
         assert!(
-            decrypt_inbound_frame_budgeted(
-                &mut first_responder,
-                &first_frames[0],
-                MAX_E2EE_LOGICAL_MESSAGE_BYTES,
-                &global_budget,
-                None,
-                &first_connection_budget,
-                None,
-            )
-            .await
-            .unwrap()
-            .is_none()
+            !hog.is_finished(),
+            "the third record waits on the connection tier"
         );
-        assert!(matches!(
-            decrypt_inbound_frame_budgeted(
-                &mut first_responder,
-                &first_frames[1],
-                MAX_E2EE_CHUNK_BYTES,
-                &global_budget,
-                None,
-                &first_connection_budget,
-                None,
-            )
-            .await,
-            Err(E2eeSessionError::Protocol(_))
-        ));
+
         assert!(
             decrypt_inbound_frame_budgeted(
                 &mut second_responder,
@@ -2534,8 +2561,11 @@ mod tests {
             )
             .await
             .unwrap()
-            .is_some()
+            .is_some(),
+            "the per-connection tier leaves global capacity for other connections"
         );
+        hog.abort();
+        let _ = hog.await;
     }
 
     #[tokio::test]
@@ -2569,6 +2599,21 @@ mod tests {
         let completed = completed.expect("final record completes message");
         assert_eq!(completed.plaintext.len(), message_bytes);
         assert!(completed.plaintext.ends_with(b"done"));
+        // The accounting is byte-exact: the budgets sized to the plaintext are
+        // fully consumed while the message is held, and fully refunded on drop.
+        assert!(Arc::clone(&global_budget).try_acquire(1).is_none());
+        assert!(Arc::clone(&connection_budget).try_acquire(1).is_none());
+        drop(completed);
+        assert!(
+            Arc::clone(&global_budget)
+                .try_acquire(message_bytes)
+                .is_some()
+        );
+        assert!(
+            Arc::clone(&connection_budget)
+                .try_acquire(message_bytes)
+                .is_some()
+        );
     }
 
     #[test]

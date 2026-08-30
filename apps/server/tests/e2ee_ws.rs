@@ -883,7 +883,11 @@ async fn oversized_pre_auth_websocket_message_is_rejected() {
         .await
         .expect("send oversized pre-auth message");
 
-    let _ = next_close_code(&mut socket).await;
+    assert_eq!(
+        next_close_code(&mut socket).await,
+        None,
+        "an oversized frame tears the connection down without a graceful coded close"
+    );
 }
 
 #[tokio::test]
@@ -904,7 +908,11 @@ async fn preauth_message_cap_is_64kib() {
             .await
             .expect("send pre-auth record");
     }
-    let _ = next_close_code(&mut socket).await;
+    assert_eq!(
+        next_close_code(&mut socket).await,
+        None,
+        "exceeding the pre-auth message cap closes without a graceful coded close"
+    );
 }
 
 #[tokio::test]
