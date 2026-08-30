@@ -273,13 +273,20 @@ async fn websocket(
 async fn websocket_e2ee(
     State(state): State<AppState>,
     peer: Result<ConnectInfo<SocketAddr>, axum::extract::rejection::ExtensionRejection>,
+    headers: axum::http::HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
     let session_shutdown = state.shutdown.child_token();
-    let peer_ip = peer
+    let socket_peer_ip = peer
         .ok()
         .map(|ConnectInfo(address)| address.ip())
         .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    let peer_ip = crate::rpc::effective_preauth_peer(
+        socket_peer_ip,
+        headers
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok()),
+    );
     let preauth_admission = state.e2ee_preauth_admission;
     upgrade
         .max_frame_size(MAX_E2EE_CIPHERTEXT_BYTES)
