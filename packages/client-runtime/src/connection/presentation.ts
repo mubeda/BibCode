@@ -71,7 +71,7 @@ export function connectionTransportSecurity(
         entry.profile._tag === "Some" && entry.profile.value._tag === "BearerConnectionProfile"
           ? entry.profile.value
           : null;
-      return (profile?.hostKey?.trim().length ?? 0) > 0 ? "e2ee" : "unencrypted";
+      return profile?.hostKey == null ? "unencrypted" : "e2ee";
     }
   }
 }

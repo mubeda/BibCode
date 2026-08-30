@@ -203,45 +203,8 @@ vi.mock("~/connection/currentEnvironmentPresentation", () => ({
   }),
 }));
 
-vi.mock("@bibcode/client-runtime/connection", () => ({
-  connectionStatusText: (connection: { phase: string }) => `status:${connection.phase}`,
-  connectionTransportSecurity: (entry: {
-    target: { _tag: string; connectionId?: string };
-    profile: { _tag: string; value?: { _tag: string; hostKey?: string | null } };
-  }) => {
-    if (
-      entry.target._tag === "PrimaryConnectionTarget" ||
-      entry.target._tag === "UnavailableConnectionTarget" ||
-      entry.target.connectionId?.startsWith("local:")
-    ) {
-      return "local";
-    }
-    if (
-      entry.target._tag === "RelayConnectionTarget" ||
-      entry.target._tag === "SshConnectionTarget"
-    ) {
-      return "channel-secured";
-    }
-    return entry.profile._tag === "Some" &&
-      entry.profile.value?._tag === "BearerConnectionProfile" &&
-      (entry.profile.value.hostKey?.trim().length ?? 0) > 0
-      ? "e2ee"
-      : "unencrypted";
-  },
-  isDesktopLocalConnectionId: (connectionId: string | undefined) =>
-    connectionId?.startsWith("local:") ?? false,
-  RelayConnectionRegistration: class RelayConnectionRegistration {
-    readonly input: unknown;
-    constructor(input: unknown) {
-      this.input = input;
-    }
-  },
-  RelayConnectionTarget: class RelayConnectionTarget {
-    readonly input: unknown;
-    constructor(input: unknown) {
-      this.input = input;
-    }
-  },
+vi.mock("@bibcode/client-runtime/connection", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@bibcode/client-runtime/connection")>()),
 }));
 
 vi.mock("@bibcode/client-runtime/errors", () => ({
@@ -343,7 +306,8 @@ vi.mock("~/connection/onboarding", () => ({
   connectSshEnvironment: h.atoms.connectSsh,
 }));
 
-vi.mock("@bibcode/shared/pairingCode", () => ({
+vi.mock("@bibcode/shared/pairingCode", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@bibcode/shared/pairingCode")>()),
   parsePairingCode: () => {
     if (h.decodedPairingCode === null) throw new Error("invalid pairing code");
     return h.decodedPairingCode;
@@ -1375,7 +1339,7 @@ describe("Remote Servers tabs", () => {
     expect(markup).toContain("Devbox");
     expect(markup).toContain("SSH dev@devbox.internal:2222");
     expect(markup).toContain("Version drift: client 1.0.0, server 2.0.0.");
-    expect(markup).toContain("status:error");
+    expect(markup).toContain("Connection failed. Reason: Error: boom");
     expect(markup).toContain("Copy trace ID");
     expect(markup).toContain("Managed above");
     expect(markup).not.toContain("No saved remote environments");
@@ -2508,6 +2472,14 @@ describe("Remote Servers tabs", () => {
     invoke(findControls("button", "Connect")[0]!, "onClick");
     await flush();
     expect(h.commands.register).toHaveBeenCalledTimes(1);
+    expect(h.commands.register).toHaveBeenCalledWith({
+      _tag: "RelayConnectionRegistration",
+      target: {
+        _tag: "RelayConnectionTarget",
+        environmentId: EnvironmentId.make("environment-online"),
+        label: "Online Env",
+      },
+    });
     expect(h.toastAdd).toHaveBeenCalledWith(
       expect.objectContaining({ title: "Environment connected" }),
     );
@@ -2581,7 +2553,7 @@ describe("Remote Servers tabs", () => {
     const markup = render();
 
     expect(markup.match(/Connecting…/gu)).toHaveLength(2);
-    expect(markup).toContain("status:error");
+    expect(markup).toContain("Connection failed. Reason: Error: transport failed");
     expect(markup).not.toContain("Copy trace ID");
     expect(markup).toContain("SSH build-host.internal");
     expect(markup).toContain("BiBCode Connect");
@@ -2688,6 +2660,6 @@ describe("Remote Servers tabs", () => {
 
     const markup = render();
     expect(markup).toContain("Status unavailable");
-    expect(markup).toContain("status:error");
+    expect(markup).toContain("Connection failed. Reason: connect ECONNREFUSED");
   });
 });

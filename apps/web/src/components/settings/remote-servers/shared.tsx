@@ -264,7 +264,7 @@ export function parsePairingUrlFields(
     const hostedPairingRequest = readHostedPairingRequest(url);
     if (hostedPairingRequest) {
       return {
-        host: hostedPairingRequest.host,
+        host: hostedPairingRequest.httpBaseUrl,
         pairingCode: hostedPairingRequest.token,
       };
     }

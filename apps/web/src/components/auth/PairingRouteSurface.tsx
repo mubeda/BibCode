@@ -42,11 +42,13 @@ export function PairingRouteSurface({
   auth,
   initialCredential,
   initialErrorMessage,
+  onInitialCredentialConsumed,
   onAuthenticated,
 }: {
   auth: AuthSessionState["auth"];
   initialCredential?: string;
   initialErrorMessage?: string;
+  onInitialCredentialConsumed?: () => void;
   onAuthenticated: () => void;
 }) {
   const autoPairTokenRef = useRef<string | null>(
@@ -97,8 +99,9 @@ export function PairingRouteSurface({
 
     autoSubmitAttemptedRef.current = true;
     stripPairingTokenFromUrl();
+    onInitialCredentialConsumed?.();
     void submitCredential(token);
-  }, [submitCredential]);
+  }, [onInitialCredentialConsumed, submitCredential]);
 
   return (
     <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-background px-4 py-10 text-foreground sm:px-6">
@@ -203,7 +206,7 @@ export function HostedPairingRouteSurface() {
     tokenSubmittedRef.current = true;
 
     const result = await connectPairingEnvironment({
-      host: request.host,
+      host: request.httpBaseUrl,
       pairingCode: request.token,
     });
     if (result._tag === "Success") {
@@ -254,7 +257,7 @@ export function HostedPairingRouteSurface() {
 
         {request ? (
           <div className="mt-5 rounded-lg border border-border/70 bg-background/55 px-3 py-3 text-xs leading-relaxed text-muted-foreground">
-            Host: <span className="font-mono text-foreground/80">{request.host}</span>
+            Host: <span className="font-mono text-foreground/80">{request.displayHost}</span>
           </div>
         ) : null}
 

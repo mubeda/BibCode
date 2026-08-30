@@ -1,4 +1,5 @@
-import { createFileRoute, redirect, useNavigate } from "@tanstack/react-router";
+import { createFileRoute, redirect } from "@tanstack/react-router";
+import { useEffect, useRef, useState } from "react";
 
 import {
   HostedPairingRouteSurface,
@@ -8,8 +9,11 @@ import {
 import { extractEmbeddedPairingToken } from "../components/auth/pairingCodeCredential";
 
 export const Route = createFileRoute("/pair")({
-  validateSearch: (search: Record<string, unknown>) =>
-    typeof search.code === "string" && search.code.length > 0 ? { code: search.code } : {},
+  validateSearch: (search: Record<string, unknown>) => ({
+    ...(typeof search.code === "string" && search.code.length > 0 ? { code: search.code } : {}),
+    ...(typeof search.host === "string" && search.host.length > 0 ? { host: search.host } : {}),
+    ...(typeof search.label === "string" && search.label.length > 0 ? { label: search.label } : {}),
+  }),
   beforeLoad: async ({ context, search }) => {
     const { authGateState } = context;
     if (authGateState.status === "hosted-pairing") {
@@ -38,8 +42,29 @@ export const Route = createFileRoute("/pair")({
 
 function PairRouteView() {
   const { authGateState } = Route.useRouteContext();
-  const { code } = Route.useSearch();
-  const navigate = useNavigate();
+  const search = Route.useSearch();
+  const [retainedCode, setRetainedCode] = useState(search.code);
+  const scrubbedQueryCodeRef = useRef<string | null>(null);
+  const consumedCodesRef = useRef(new Set<string>());
+  const navigate = Route.useNavigate();
+  const code = search.code ?? retainedCode;
+
+  useEffect(() => {
+    if (search.code === undefined) {
+      scrubbedQueryCodeRef.current = null;
+      return;
+    }
+    setRetainedCode(search.code);
+    if (scrubbedQueryCodeRef.current === search.code) return;
+    scrubbedQueryCodeRef.current = search.code;
+    void navigate({
+      search: {
+        ...(search.host === undefined ? {} : { host: search.host }),
+        ...(search.label === undefined ? {} : { label: search.label }),
+      },
+      replace: true,
+    });
+  }, [navigate, search.code, search.host, search.label]);
 
   if (!authGateState) {
     return null;
@@ -49,15 +74,23 @@ function PairRouteView() {
     return <HostedPairingRouteSurface />;
   }
 
+  const initialCredential =
+    code === undefined || consumedCodesRef.current.has(code)
+      ? null
+      : extractEmbeddedPairingToken(code);
+
   return (
     <PairingRouteSurface
+      key={code ?? "manual"}
       auth={authGateState.auth}
+      {...(initialCredential === null ? {} : { initialCredential })}
       {...(code === undefined
         ? {}
-        : (() => {
-            const embedded = extractEmbeddedPairingToken(code);
-            return embedded === null ? {} : { initialCredential: embedded };
-          })())}
+        : {
+            onInitialCredentialConsumed: () => {
+              consumedCodesRef.current.add(code);
+            },
+          })}
       onAuthenticated={() => {
         void navigate({ to: "/", replace: true });
       }}

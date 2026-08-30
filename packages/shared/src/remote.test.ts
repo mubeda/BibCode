@@ -178,7 +178,7 @@ describe("remote", () => {
     }
   });
 
-  it("preserves representative bare authorities, paths, query, fragment, and credentials", () => {
+  it("preserves representative bare authorities, paths, query, and fragment", () => {
     const bareAuthorities = [
       {
         host: "devbox:4100/path?query=yes#fragment",
@@ -224,17 +224,17 @@ describe("remote", () => {
         wsBaseUrl,
       });
     }
+  });
 
-    expect(
-      resolveRemotePairingTarget({
-        host: "https://user:%5Csecret@remote.example.com:4400/path/%5Cshare",
-        pairingCode: "code",
-      }),
-    ).toEqual({
-      credential: "code",
-      httpBaseUrl: "https://user:%5Csecret@remote.example.com:4400/",
-      wsBaseUrl: "wss://user:%5Csecret@remote.example.com:4400/",
-    });
+  it("rejects backend URLs containing userinfo", () => {
+    for (const host of [
+      "https://trusted.example@attacker.example:8080",
+      "https://user:password@example.test",
+    ]) {
+      const error = resolveDirectHostError(host);
+      expect(error.cause, host).toBeUndefined();
+      expect(error.protocol, host).toBeUndefined();
+    }
   });
 
   it("validates bare hostname port ranges through URL parsing", () => {
@@ -471,7 +471,7 @@ describe("remote", () => {
     ).toThrowError(RemotePairingTokenMissingError);
     expect(() =>
       resolveRemotePairingTarget({
-        host: "https://user:secret@remote.example.com/path?token=sensitive#fragment",
+        host: "https://remote.example.com/path?token=sensitive#fragment",
       }),
     ).toThrowError(
       expect.objectContaining({
@@ -530,9 +530,13 @@ describe("remote", () => {
 
   it("strips pairing tokens while preserving unrelated query and hash values", () => {
     const stripped = stripPairingTokenFromUrl(
-      new URL("https://remote.example.com/pair?token=query&tab=one#token=hash&label=Desk"),
+      new URL(
+        "https://remote.example.com/pair?token=query&tab=one&host=devbox&action=add-server#token=hash&label=Desk",
+      ),
     );
-    expect(stripped.toString()).toBe("https://remote.example.com/pair?tab=one#label=Desk");
+    expect(stripped.toString()).toBe(
+      "https://remote.example.com/pair?tab=one&host=devbox&action=add-server#label=Desk",
+    );
 
     const queryOnly = stripPairingTokenFromUrl(
       new URL("https://remote.example.com/pair?token=query#label=Desk"),
@@ -557,12 +561,37 @@ describe("remote", () => {
           "https://app.bibcode.codes/pair?host=%20https%3A%2F%2Flan.example%3A444%20&label=%20Office%20#token=%20secret%20",
         ),
       ),
-    ).toEqual({ host: "https://lan.example:444", token: "secret", label: "Office" });
+    ).toEqual({
+      httpBaseUrl: "https://lan.example:444/",
+      displayHost: "lan.example:444",
+      token: "secret",
+      label: "Office",
+    });
     expect(
       readHostedPairingRequest(new URL("https://app.bibcode.codes/pair?host=example.com")),
     ).toBeNull();
     expect(
       readHostedPairingRequest(new URL("https://app.bibcode.codes/pair#token=secret")),
     ).toBeNull();
+  });
+
+  it("rejects hosted backend userinfo and exposes an ASCII display host", () => {
+    for (const host of [
+      "https://trusted.example@attacker.example:8080",
+      "https://user:password@example.test",
+    ]) {
+      const url = new URL("https://app.bibcode.codes/pair#token=secret");
+      url.searchParams.set("host", host);
+      expect(readHostedPairingRequest(url), host).toBeNull();
+    }
+
+    const idnUrl = new URL("https://app.bibcode.codes/pair#token=secret");
+    idnUrl.searchParams.set("host", "https://аpple.com");
+    expect(readHostedPairingRequest(idnUrl)).toEqual({
+      httpBaseUrl: "https://xn--pple-43d.com/",
+      displayHost: "xn--pple-43d.com",
+      token: "secret",
+      label: "",
+    });
   });
 });

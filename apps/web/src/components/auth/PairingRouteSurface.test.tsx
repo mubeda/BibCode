@@ -73,7 +73,12 @@ const testState = vi.hoisted(() => ({
   pairingToken: null as string | null,
   submit: vi.fn<(credential: string) => Promise<void>>(),
   stripCalls: 0,
-  hostedRequest: null as { host: string; token: string; label: string } | null,
+  hostedRequest: null as {
+    httpBaseUrl: string;
+    displayHost: string;
+    token: string;
+    label: string;
+  } | null,
   connect: vi.fn<(input: unknown) => Promise<{ _tag: string; error?: unknown }>>(),
   squashError: null as unknown,
 }));
@@ -289,16 +294,19 @@ describe("PairingRouteSurface markup", () => {
 describe("PairingRouteSurface auto-submit effect", () => {
   it("auto-submits an embedded pairing-code credential", async () => {
     const onAuthenticated = vi.fn();
+    const onInitialCredentialConsumed = vi.fn();
     render(
       <PairingRouteSurface
         auth={auth([])}
         initialCredential="embedded-token"
+        onInitialCredentialConsumed={onInitialCredentialConsumed}
         onAuthenticated={onAuthenticated}
       />,
     );
 
     harness.runEffects();
     expect(testState.submit).toHaveBeenCalledWith("embedded-token");
+    expect(onInitialCredentialConsumed).toHaveBeenCalledOnce();
     await flush();
     expect(onAuthenticated).toHaveBeenCalledTimes(1);
   });
@@ -371,7 +379,12 @@ describe("PairingRouteSurface auto-submit effect", () => {
 });
 
 describe("HostedPairingRouteSurface", () => {
-  const request = { host: "https://backend.example", token: "hosted-token", label: "My Backend" };
+  const request = {
+    httpBaseUrl: "https://xn--pple-43d.com/",
+    displayHost: "xn--pple-43d.com",
+    token: "hosted-token",
+    label: "My Backend",
+  };
 
   it("reports a missing pairing link when no request is present", () => {
     testState.hostedRequest = null;
@@ -386,7 +399,8 @@ describe("HostedPairingRouteSurface", () => {
     testState.hostedRequest = request;
     const markup = render(<HostedPairingRouteSurface />);
     expect(markup).toContain("Pair this backend");
-    expect(markup).toContain("https://backend.example");
+    expect(markup).toContain("xn--pple-43d.com");
+    expect(markup).not.toContain("https://xn--pple-43d.com/");
     expect(ui.filter("Button", (props) => props.children === "Pair this backend")).toHaveLength(1);
   });
 
@@ -402,7 +416,7 @@ describe("HostedPairingRouteSurface", () => {
     const confirm = ui.find("Button", (props) => props.children === "Pair this backend");
     (confirm.onClick as () => void)();
     expect(testState.connect).toHaveBeenCalledWith({
-      host: request.host,
+      host: request.httpBaseUrl,
       pairingCode: request.token,
     });
     await flush();
