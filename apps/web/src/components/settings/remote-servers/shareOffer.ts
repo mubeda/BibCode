@@ -1,5 +1,5 @@
 import type { AdvertisedEndpoint, DesktopServerExposureState } from "@bibcode/contracts";
-import { normalizeHttpBaseUrl } from "@bibcode/shared/advertisedEndpoint";
+import { classifyPairingEndpoint, normalizeHttpBaseUrl } from "@bibcode/shared/advertisedEndpoint";
 import { buildBrowserPairUrl, buildPairingDeepLink } from "@bibcode/shared/pairingCode";
 
 import { shareClassForPairingEndpoint } from "./endpointClass.ts";
@@ -11,6 +11,7 @@ export interface ShareAddressOption {
   readonly label: string;
   readonly httpBaseUrl: string | null;
   readonly description?: string;
+  readonly requiresExplicitSelection?: boolean;
 }
 
 export function resolveShareAddressOptions(input: {
@@ -36,24 +37,53 @@ export function resolveShareAddressOptions(input: {
     return [{ id: "custom", label: "Custom address", httpBaseUrl: null }];
   }
 
-  const options: ShareAddressOption[] = [
-    {
+  const options: ShareAddressOption[] = [];
+  const automaticEndpoint =
+    input.exposureState === null
+      ? input.primaryHttpBaseUrl
+      : input.exposureState.mode === "network-accessible"
+        ? input.exposureState.endpointUrl
+        : null;
+  const availableOffHostEndpoints = input.advertisedEndpoints.filter(
+    (endpoint) =>
+      endpoint.status === "available" &&
+      shareClassForPairingEndpoint(endpoint.httpBaseUrl) === "off-host",
+  );
+  const selectableOffHostEndpoints = availableOffHostEndpoints.filter(
+    (endpoint) =>
+      !(
+        input.exposureState?.management === "native" &&
+        input.exposureState.mode === "local-only" &&
+        endpoint.reachability === "public"
+      ),
+  );
+  const hasPrivateCandidate = availableOffHostEndpoints.some(
+    (endpoint) => endpoint.reachability === "lan" || endpoint.reachability === "private-network",
+  );
+  const hasOnlyPublicCandidates =
+    availableOffHostEndpoints.some((endpoint) => endpoint.reachability === "public") &&
+    !hasPrivateCandidate;
+  const canOfferAutomaticLan =
+    (input.exposureState === null && automaticEndpoint !== null) ||
+    (input.exposureState?.mode === "local-only" && !hasOnlyPublicCandidates) ||
+    (automaticEndpoint !== null &&
+      classifyPairingEndpoint(automaticEndpoint) === "private-network");
+  if (canOfferAutomaticLan) {
+    options.push({
       id: "auto-lan",
       label: "Automatic (LAN)",
-      httpBaseUrl: input.exposureState === null ? input.primaryHttpBaseUrl : null,
+      httpBaseUrl: automaticEndpoint,
       description:
         input.exposureState?.endpointUrl === null
           ? "BiBCode will enable remote access and choose a LAN address."
           : "Use the LAN address selected by BiBCode.",
-    },
-  ];
-  const seen = new Set<string>();
-  for (const endpoint of input.advertisedEndpoints) {
-    if (
-      endpoint.status !== "available" ||
-      shareClassForPairingEndpoint(endpoint.httpBaseUrl) !== "off-host" ||
-      seen.has(endpoint.httpBaseUrl)
-    ) {
+    });
+  }
+  const seen = new Set(
+    canOfferAutomaticLan && automaticEndpoint !== null ? [automaticEndpoint] : [],
+  );
+  for (const endpoint of selectableOffHostEndpoints) {
+    if (seen.has(endpoint.httpBaseUrl)) {
       continue;
     }
     seen.add(endpoint.httpBaseUrl);
@@ -61,6 +91,7 @@ export function resolveShareAddressOptions(input: {
       id: endpoint.id,
       label: endpoint.label,
       httpBaseUrl: endpoint.httpBaseUrl,
+      ...(endpoint.reachability === "public" ? { requiresExplicitSelection: true } : {}),
       ...(endpoint.description === undefined ? {} : { description: endpoint.description }),
     });
   }
@@ -201,11 +232,7 @@ export async function generateShareOffer(
     deps.exposureState?.mode !== "network-accessible"
   ) {
     try {
-      const state = await withRequestTimeout(
-        "Server exposure update",
-        deps.requestTimeoutMs,
-        deps.applyServerExposure("network-accessible"),
-      );
+      const state = await deps.applyServerExposure("network-accessible");
       widened = true;
       if (endpoint === null) endpoint = state.endpointUrl;
     } catch (error) {
@@ -290,7 +317,7 @@ export async function generateShareOffer(
       cancellationError instanceof Error ? cancellationError.message : String(cancellationError);
     message = `${message} Pairing-offer cancellation failed: ${cancellationMessage}`;
   }
-  if (widened && deps.cleanupExposureAfterFailedMint !== null) {
+  if (widened && cancellationSucceeded && deps.cleanupExposureAfterFailedMint !== null) {
     try {
       cleanup = await withRequestTimeout(
         "Remote-access reconciliation",

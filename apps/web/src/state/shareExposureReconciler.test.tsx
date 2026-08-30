@@ -205,6 +205,28 @@ describe("reconcileShareExposureOnce", () => {
     ).rejects.toThrow("Server exposure state timed out after 5ms");
   });
 
+  it("awaits a native exposure mutation past the read deadline", async () => {
+    let finishApply: ((state: typeof localExposure) => void) | undefined;
+    const applyExposure = vi.fn(
+      () =>
+        new Promise<typeof localExposure>((resolve) => {
+          finishApply = resolve;
+        }),
+    );
+    const pending = reconcileShareExposureOnce({
+      getShareState: async () => loopbackDesired,
+      getExposureState: async () => wideExposure,
+      applyExposure,
+      canStartExposure: () => true,
+      operationTimeoutMs: 5,
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(applyExposure).toHaveBeenCalledExactlyOnceWith("local-only");
+    finishApply?.(localExposure);
+    await expect(pending).resolves.toBe("narrowed");
+  });
+
   it("leaves wide exposure unchanged while a legacy grant blocks narrowing", async () => {
     const applyExposure = vi.fn();
     await expect(

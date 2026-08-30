@@ -29,7 +29,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::config::state_dir;
-use crate::network_interfaces::{default_route_ip, is_usable_unicast};
+use crate::network_interfaces::{classify_advertised_address, default_route_ip};
 #[cfg(test)]
 use crate::test_support::FixtureEvent;
 
@@ -2746,7 +2746,7 @@ pub fn resolve_lan_advertised_host() -> Option<String> {
 fn select_lan_advertised_host(default_route: Option<IpAddr>) -> Option<String> {
     default_route
         .filter(IpAddr::is_ipv4)
-        .filter(|ip| is_usable_unicast(*ip))
+        .filter(|ip| classify_advertised_address(*ip).default_eligible)
         .map(|ip| ip.to_string())
 }
 
@@ -5107,8 +5107,8 @@ exit /b 9
     }
 
     #[test]
-    fn lan_advertised_host_accepts_only_usable_ipv4_defaults() {
-        for accepted in ["192.168.1.20", "100.100.100.100", "8.8.8.8"] {
+    fn lan_advertised_host_accepts_only_private_usable_ipv4_defaults() {
+        for accepted in ["192.168.1.20", "100.100.100.100"] {
             let address = accepted.parse::<IpAddr>().expect("accepted fixture");
             assert_eq!(
                 select_lan_advertised_host(Some(address)),
@@ -5119,6 +5119,7 @@ exit /b 9
             "0.0.0.0",
             "127.0.0.1",
             "169.254.1.1",
+            "8.8.8.8",
             "224.0.0.1",
             "255.255.255.255",
             "fd7a:115c:a1e0::1",

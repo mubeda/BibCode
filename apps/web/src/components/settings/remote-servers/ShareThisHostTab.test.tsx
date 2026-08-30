@@ -286,7 +286,7 @@ describe("ShareThisHostTab", () => {
     expect(apply).toHaveBeenCalledWith("network-accessible");
   });
 
-  it("reports a visible timeout when legacy exposure resume blackholes", async () => {
+  it("keeps waiting when legacy exposure resume exceeds the HTTP deadline", async () => {
     Object.assign(h.networkQuery.data.serverExposureState, {
       ...localState,
       configuredMode: "network-accessible",
@@ -296,7 +296,15 @@ describe("ShareThisHostTab", () => {
       offHostGrantCount: 0,
       legacyGrantCount: 1,
     });
-    installBridge(vi.fn(() => new Promise(() => {})));
+    let finishApply: ((state: DesktopServerExposureState) => void) | undefined;
+    installBridge(
+      vi.fn(
+        () =>
+          new Promise<DesktopServerExposureState>((resolve) => {
+            finishApply = resolve;
+          }),
+      ),
+    );
 
     await renderTab();
     await click("Resume legacy remote access");
@@ -304,7 +312,10 @@ describe("ShareThisHostTab", () => {
       await new Promise((resolve) => setTimeout(resolve, 60));
     });
 
-    expect(container.textContent).toContain("Server exposure update timed out after 50ms");
+    expect(container.textContent).not.toContain("Server exposure update timed out");
+    expect(container.textContent).toContain("Resuming…");
+    await act(async () => finishApply?.(wideState));
+    expect(container.textContent).not.toContain("Resuming…");
   });
 
   it("renders every intent and the threat-model copy", async () => {
@@ -316,7 +327,7 @@ describe("ShareThisHostTab", () => {
     expect(container.textContent).toContain("Pairing grants your user account on this machine");
   });
 
-  it("shows the public-address and unmanaged-firewall warning after explicit selection", async () => {
+  it("fails closed when native exposure discovers only a public address", async () => {
     h.networkQuery.data.advertisedEndpoints = [
       {
         id: "desktop-network:8.8.8.8:3773",
@@ -336,18 +347,12 @@ describe("ShareThisHostTab", () => {
     installBridge();
 
     await renderTab();
-    expect(container.textContent).not.toContain("does not manage this platform's firewall");
-    const addressSelect = container.querySelector<HTMLSelectElement>(
-      'select[aria-label="Share address"]',
+    const generate = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent === "Generate pairing offer",
     );
-    if (addressSelect === null) throw new Error("share address selector is missing");
-    await act(async () => {
-      addressSelect.value = "desktop-network:8.8.8.8:3773";
-      addressSelect.dispatchEvent(new Event("change", { bubbles: true }));
-    });
-
-    expect(container.textContent).toContain("Public address. Select explicitly");
-    expect(container.textContent).toContain("does not manage this platform's firewall");
+    expect(generate?.disabled).toBe(true);
+    expect(container.textContent).toContain("Native sharing needs a private network address");
+    expect(container.textContent).toContain("externally managed server or reverse proxy");
   });
 
   it("widens before minting and renders code, links, and QR", async () => {
@@ -478,11 +483,11 @@ describe("ShareThisHostTab", () => {
 
     expect(apply).toHaveBeenCalledExactlyOnceWith("network-accessible");
     expect(container.textContent).toContain(
-      "The offer was not created. Remote access remains enabled because another live access reason still requires it.",
+      "The offer result could not be canceled or confirmed. Remote access was deliberately left unchanged because a live credential may exist.",
     );
   });
 
-  it("narrows after failed cancellation only when authoritative state confirms loopback", async () => {
+  it("does not narrow after failed cancellation even when a read reports loopback", async () => {
     vi.useFakeTimers();
     const apply = installBridge(
       vi.fn(async (desired: "local-only" | "network-accessible") =>
@@ -503,9 +508,9 @@ describe("ShareThisHostTab", () => {
     });
 
     expect(h.cancelOffer).toHaveBeenCalledTimes(3);
-    expect(apply.mock.calls).toEqual([["network-accessible"], ["local-only"]]);
+    expect(apply.mock.calls).toEqual([["network-accessible"]]);
     expect(container.textContent).toContain(
-      "The offer was not created. Remote access is confirmed local-only.",
+      "The offer result could not be canceled or confirmed. Remote access was deliberately left unchanged because a live credential may exist.",
     );
   });
 

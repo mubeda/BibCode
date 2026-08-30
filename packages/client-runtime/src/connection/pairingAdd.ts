@@ -252,7 +252,7 @@ export const verifyAndAddPairingCode = Effect.fn(
       let registrationWritten = false;
       let identityWritten = false;
       let previousStorageInstanceId: string | null = null;
-      let pairingConfirmed = false;
+      let addCompleted = false;
       let cleanupCompleted = false;
 
       const rollbackLocalWrites = () => {
@@ -284,30 +284,46 @@ export const verifyAndAddPairingCode = Effect.fn(
       };
 
       const persistAndConfirm = Effect.gen(function* () {
-        yield* registry
-          .register(registration)
-          .pipe(Effect.mapError(() => postBootstrapPersistenceError("the server connection")));
-        registrationWritten = true;
-        previousStorageInstanceId = yield* identities
-          .transition(identity.targetKey, (currentStorageInstanceId) => ({
-            result: currentStorageInstanceId,
-            mutation: {
-              _tag: "Set" as const,
-              storageInstanceId: identity.storageInstanceId,
-            },
-          }))
-          .pipe(Effect.mapError(() => postBootstrapPersistenceError("the server identity")));
-        identityWritten = true;
-        yield* session.client[WS_METHODS.authConfirmPairing]({}).pipe(
-          Effect.mapError(
-            (error) =>
-              new PairingAddError({
-                reason: "local-persistence-failed",
-                detail: `The local connection was saved, but the server could not confirm pairing: ${error.message}`,
-              }),
-          ),
+        yield* Effect.uninterruptible(
+          Effect.gen(function* () {
+            yield* registry
+              .register(registration)
+              .pipe(Effect.mapError(() => postBootstrapPersistenceError("the server connection")));
+            registrationWritten = true;
+          }),
         );
-        pairingConfirmed = true;
+        yield* Effect.uninterruptible(
+          Effect.gen(function* () {
+            previousStorageInstanceId = yield* identities
+              .transition(identity.targetKey, (currentStorageInstanceId) => ({
+                result: currentStorageInstanceId,
+                mutation: {
+                  _tag: "Set" as const,
+                  storageInstanceId: identity.storageInstanceId,
+                },
+              }))
+              .pipe(Effect.mapError(() => postBootstrapPersistenceError("the server identity")));
+            identityWritten = true;
+          }),
+        );
+        if (authenticated.pairingConfirmationRequired === true) {
+          yield* Effect.uninterruptibleMask((restore) =>
+            Effect.gen(function* () {
+              yield* restore(session.client[WS_METHODS.authConfirmPairing]({})).pipe(
+                Effect.mapError(
+                  (error) =>
+                    new PairingAddError({
+                      reason: "local-persistence-failed",
+                      detail: `The local connection was saved, but the server could not confirm pairing: ${error.message}`,
+                    }),
+                ),
+              );
+              addCompleted = true;
+            }),
+          );
+        } else {
+          addCompleted = true;
+        }
         return registration.target.environmentId as EnvironmentId;
       });
 
@@ -327,7 +343,7 @@ export const verifyAndAddPairingCode = Effect.fn(
         ),
         Effect.ensuring(
           Effect.suspend(() =>
-            pairingConfirmed || cleanupCompleted
+            addCompleted || cleanupCompleted
               ? Effect.void
               : rollbackLocalWrites().pipe(Effect.ignore),
           ),

@@ -234,16 +234,24 @@ async fn pair_inside_channel(
     root: &Path,
     pairing: &str,
 ) -> (TestSocket, TransportState, Value) {
+    pair_inside_channel_with_confirmation(handle, root, pairing, true).await
+}
+
+async fn pair_inside_channel_with_confirmation(
+    handle: &ServerHandle,
+    root: &Path,
+    pairing: &str,
+    pairing_confirmation: bool,
+) -> (TestSocket, TransportState, Value) {
     let host_key = read_host_public_key(root);
     let (mut socket, mut transport) = noise_connect(handle.local_addr(), &host_key).await;
-    send_encrypted(
-        &mut socket,
-        &mut transport,
-        json!({ "type": "e2ee_auth", "pairing": pairing })
-            .to_string()
-            .as_bytes(),
-    )
-    .await;
+    let mut auth = json!({ "type": "e2ee_auth", "pairing": pairing });
+    if pairing_confirmation {
+        auth.as_object_mut()
+            .expect("auth object")
+            .insert("pairingConfirmation".to_owned(), Value::Bool(true));
+    }
+    send_encrypted(&mut socket, &mut transport, auth.to_string().as_bytes()).await;
     let reply = recv_encrypted_json(&mut socket, &mut transport).await;
     (socket, transport, reply)
 }
@@ -469,7 +477,36 @@ async fn pairing_bootstrap_inside_the_channel_serves_get_config() {
     );
     assert_eq!(reply["environmentId"], descriptor["environmentId"]);
     assert_eq!(reply["storageInstanceId"], descriptor["storageInstanceId"]);
+    assert_eq!(reply["pairingConfirmationRequired"], true);
     assert_get_config(&mut socket, &mut transport).await;
+}
+
+#[tokio::test]
+async fn legacy_pairing_client_receives_an_active_credential_without_confirmation() {
+    let _permit = TEST_PERMIT.acquire().await.expect("test permit");
+    let temp = TempDir::new().expect("temporary base directory");
+    let handle = start_server(&temp).await;
+    let startup = handle.startup_access().expect("startup pairing");
+    let (mut socket, _transport, reply) =
+        pair_inside_channel_with_confirmation(&handle, temp.path(), &startup.credential, false)
+            .await;
+    let credential = reply["credential"]
+        .as_str()
+        .expect("legacy credential")
+        .to_owned();
+
+    assert_eq!(reply.get("pairingConfirmationRequired"), None);
+    assert_eq!(latest_auth_session_delivery_state(temp.path()), "active");
+    socket
+        .close(None)
+        .await
+        .expect("close legacy bootstrap socket");
+
+    let host_key = read_host_public_key(temp.path());
+    let (mut reconnect, mut reconnect_transport, reconnect_reply) =
+        open_authenticated_bearer_socket(&handle, &host_key, &credential).await;
+    assert_eq!(reconnect_reply, json!({ "type": "e2ee_authenticated" }));
+    assert_get_config(&mut reconnect, &mut reconnect_transport).await;
 }
 
 #[tokio::test]

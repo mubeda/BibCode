@@ -11,6 +11,8 @@ use bibcode_server::process::{OutputMode, ProcessRunInput};
 #[cfg(windows)]
 use std::sync::OnceLock;
 #[cfg(any(windows, test))]
+use std::sync::{Arc, Mutex};
+#[cfg(any(windows, test))]
 use std::time::Duration;
 #[cfg(any(windows, test))]
 use tokio::sync::{mpsc, oneshot};
@@ -21,6 +23,8 @@ const FIREWALL_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 const FIREWALL_CALLER_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(any(windows, test))]
 const FIREWALL_COMMAND_MAX_OUTPUT_BYTES: usize = 64 * 1024;
+#[cfg(any(windows, test))]
+const FIREWALL_WORKER_WAKE_CAPACITY: usize = 1;
 
 #[cfg_attr(
     all(not(windows), not(test)),
@@ -107,9 +111,16 @@ struct FirewallJob {
 }
 
 #[cfg(any(windows, test))]
+#[derive(Default)]
+struct FirewallWorkerState {
+    pending: Option<FirewallJob>,
+}
+
+#[cfg(any(windows, test))]
 #[derive(Clone)]
 struct FirewallWorker {
-    jobs: mpsc::UnboundedSender<FirewallJob>,
+    state: Arc<Mutex<FirewallWorkerState>>,
+    wake: mpsc::Sender<()>,
 }
 
 #[cfg(any(windows, test))]
@@ -118,9 +129,10 @@ impl FirewallWorker {
     where
         Runner: FirewallCommandRunner + Send + 'static,
     {
-        let (jobs, receiver) = mpsc::unbounded_channel();
-        tokio::spawn(run_firewall_worker(runner, receiver));
-        Self { jobs }
+        let state = Arc::new(Mutex::new(FirewallWorkerState::default()));
+        let (wake, receiver) = mpsc::channel(FIREWALL_WORKER_WAKE_CAPACITY);
+        tokio::spawn(run_firewall_worker(runner, Arc::clone(&state), receiver));
+        Self { state, wake }
     }
 
     async fn sync(
@@ -131,14 +143,32 @@ impl FirewallWorker {
     ) -> Result<(), String> {
         let deadline = tokio::time::Instant::now() + caller_timeout;
         let (completion, receiver) = oneshot::channel();
-        self.jobs
-            .send(FirewallJob {
+        let (superseded, worker_unavailable) = {
+            let mut state = self.state.lock().expect("firewall worker state");
+            let superseded = state.pending.replace(FirewallJob {
                 enabled,
                 program,
                 deadline,
                 completion,
-            })
-            .map_err(|_| "firewall worker is unavailable".to_owned())?;
+            });
+            let worker_unavailable = match self.wake.try_send(()) {
+                Ok(()) | Err(mpsc::error::TrySendError::Full(())) => false,
+                Err(mpsc::error::TrySendError::Closed(())) => {
+                    state.pending.take();
+                    true
+                }
+            };
+            (superseded, worker_unavailable)
+        };
+        if let Some(job) = superseded {
+            let _ = job.completion.send(Err(
+                "firewall worker is saturated; operation was superseded by a newer desired state before execution"
+                    .to_owned(),
+            ));
+        }
+        if worker_unavailable {
+            return Err("firewall worker is unavailable".to_owned());
+        }
 
         match tokio::time::timeout_at(deadline, receiver).await {
             Ok(Ok(result)) => result,
@@ -152,52 +182,61 @@ impl FirewallWorker {
 }
 
 #[cfg(any(windows, test))]
-async fn run_firewall_worker<Runner>(runner: Runner, mut jobs: mpsc::UnboundedReceiver<FirewallJob>)
-where
+async fn run_firewall_worker<Runner>(
+    runner: Runner,
+    state: Arc<Mutex<FirewallWorkerState>>,
+    mut wake: mpsc::Receiver<()>,
+) where
     Runner: FirewallCommandRunner + Send + 'static,
 {
-    while let Some(job) = jobs.recv().await {
-        let already_late = tokio::time::Instant::now() >= job.deadline;
-        let mut result = if already_late {
-            sync_remote_access_rule_with_runner(false, &runner, || {
-                Err("expired firewall job must not add a rule".to_owned())
-            })
-            .await
-        } else {
-            let program = job.program;
-            sync_remote_access_rule_with_runner(job.enabled, &runner, move || {
-                program.ok_or_else(|| "desktop executable was not provided".to_owned())
-            })
-            .await
-        };
-
-        let completed_late = already_late || tokio::time::Instant::now() >= job.deadline;
-        if job.enabled && !already_late && completed_late {
-            let cleanup = sync_remote_access_rule_with_runner(false, &runner, || {
-                Err("firewall cleanup must not add a rule".to_owned())
-            })
-            .await;
-            result = match (result, cleanup) {
-                (_, Ok(())) => Err(
-                    "firewall enable completed after its caller deadline; the late rule was removed"
-                        .to_owned(),
-                ),
-                (Ok(()), Err(cleanup_error)) => Err(format!(
-                    "firewall enable completed after its caller deadline, and cleanup failed: {cleanup_error}"
-                )),
-                (Err(operation_error), Err(cleanup_error)) => Err(format!(
-                    "late firewall operation failed: {operation_error}; cleanup also failed: {cleanup_error}"
-                )),
+    while wake.recv().await.is_some() {
+        loop {
+            let job = { state.lock().expect("firewall worker state").pending.take() };
+            let Some(job) = job else {
+                break;
             };
-        } else if completed_late && result.is_ok() {
-            result = Err("firewall cleanup completed after its caller deadline".to_owned());
-        }
+            let already_late = tokio::time::Instant::now() >= job.deadline;
+            let mut result = if already_late {
+                sync_remote_access_rule_with_runner(false, &runner, || {
+                    Err("expired firewall job must not add a rule".to_owned())
+                })
+                .await
+            } else {
+                let program = job.program;
+                sync_remote_access_rule_with_runner(job.enabled, &runner, move || {
+                    program.ok_or_else(|| "desktop executable was not provided".to_owned())
+                })
+                .await
+            };
 
-        if job.completion.send(result.clone()).is_err() {
-            tracing::warn!(
-                result = ?result,
-                "firewall worker completed an operation after its caller stopped waiting"
-            );
+            let completed_late = already_late || tokio::time::Instant::now() >= job.deadline;
+            if job.enabled && !already_late && completed_late {
+                let cleanup = sync_remote_access_rule_with_runner(false, &runner, || {
+                    Err("firewall cleanup must not add a rule".to_owned())
+                })
+                .await;
+                result = match (result, cleanup) {
+                    (_, Ok(())) => Err(
+                        "firewall enable completed after its caller deadline; the late rule was removed"
+                            .to_owned(),
+                    ),
+                    (Ok(()), Err(cleanup_error)) => Err(format!(
+                        "firewall enable completed after its caller deadline, and cleanup failed: {cleanup_error}"
+                    )),
+                    (Err(operation_error), Err(cleanup_error)) => Err(format!(
+                        "late firewall operation failed: {operation_error}; cleanup also failed: {cleanup_error}"
+                    )),
+                };
+            } else if completed_late && result.is_ok() {
+                result = Err("firewall cleanup completed after its caller deadline".to_owned());
+            }
+
+            if job.completion.send(result.clone()).is_err() {
+                tracing::warn!(
+                    result = ?result,
+                    "firewall worker completed an operation after its caller stopped waiting"
+                );
+            }
         }
     }
 }
@@ -604,6 +643,22 @@ mod tests {
         );
     }
 
+    async fn wait_for_pending_firewall_job(worker: &FirewallWorker) {
+        for _ in 0..1_000 {
+            let has_pending = worker
+                .state
+                .lock()
+                .expect("firewall worker state")
+                .pending
+                .is_some();
+            if has_pending {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("expected a pending firewall job");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn caller_deadline_covers_late_spawn_and_worker_cleans_up_before_later_enable() {
         let runner = LateSpawnFirewallCommandRunner::default();
@@ -661,5 +716,64 @@ mod tests {
             .await
             .expect("later caller task")
             .expect("later enable should succeed after cleanup");
+    }
+
+    #[tokio::test]
+    async fn worker_coalesces_queued_jobs_to_the_latest_desired_state() {
+        let runner = LateSpawnFirewallCommandRunner::default();
+        runner.block_next_add();
+        let worker = FirewallWorker::start(runner.clone());
+        let program = Some(r"C:\Apps\BiBCode\bibcode-desktop.exe".to_owned());
+
+        let active_worker = worker.clone();
+        let active_program = program.clone();
+        let active = tokio::spawn(async move {
+            active_worker
+                .sync(true, active_program, Duration::from_secs(30))
+                .await
+        });
+        wait_for_firewall_calls(&runner, 2).await;
+
+        let superseded_worker = worker.clone();
+        let superseded = tokio::spawn(async move {
+            superseded_worker
+                .sync(true, program, Duration::from_secs(30))
+                .await
+        });
+        wait_for_pending_firewall_job(&worker).await;
+
+        let final_worker = worker.clone();
+        let final_job = tokio::spawn(async move {
+            final_worker
+                .sync(false, None, Duration::from_secs(30))
+                .await
+        });
+
+        let superseded_error = tokio::time::timeout(Duration::from_secs(1), superseded)
+            .await
+            .expect("a replaced queued caller must be released promptly")
+            .expect("superseded caller task")
+            .expect_err("the replaced job must report explicit overload");
+        assert!(superseded_error.contains("superseded"));
+
+        runner.release_add();
+        active
+            .await
+            .expect("active caller task")
+            .expect("active enable");
+        final_job
+            .await
+            .expect("final caller task")
+            .expect("final disable");
+
+        assert_eq!(
+            runner
+                .calls()
+                .iter()
+                .map(|(executable, _)| executable.as_str())
+                .collect::<Vec<_>>(),
+            ["powershell.exe", "netsh", "powershell.exe"],
+            "only the in-flight operation and latest queued state should execute"
+        );
     }
 }

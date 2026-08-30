@@ -542,7 +542,13 @@ describe.skipIf(serverUrl === undefined || adminCredential === undefined)(
       const pairingChannel = await openEncryptedTestSocket(serverUrl!, hostKey);
       let reconnect: EncryptedTestSocket | null = null;
       try {
-        pairingChannel.sendMessage(JSON.stringify({ type: "e2ee_auth", pairing: payload.token }));
+        pairingChannel.sendMessage(
+          JSON.stringify({
+            type: "e2ee_auth",
+            pairing: payload.token,
+            pairingConfirmation: true,
+          }),
+        );
         const authenticated = decodeSensitiveResponse(
           "in-channel pairing",
           decodeE2eeAuthenticated,

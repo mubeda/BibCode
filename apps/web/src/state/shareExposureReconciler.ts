@@ -74,11 +74,7 @@ export async function reconcileShareExposureOnce(
   ]);
   if (shareState.desiredExposure === "wide" && exposureState.mode === "local-only") {
     if (!operations.canStartExposure()) return "unchanged";
-    const applied = await withShareExposureBridgeTimeout(
-      "Server exposure update",
-      operations.applyExposure("network-accessible"),
-      operationTimeoutMs,
-    );
+    const applied = await operations.applyExposure("network-accessible");
     if (applied.mode !== "network-accessible") {
       throw new Error("Server exposure did not reach network-accessible mode.");
     }
@@ -90,11 +86,7 @@ export async function reconcileShareExposureOnce(
   }
 
   if (!operations.canStartExposure()) return "unchanged";
-  const applied = await withShareExposureBridgeTimeout(
-    "Server exposure update",
-    operations.applyExposure("local-only"),
-    operationTimeoutMs,
-  );
+  const applied = await operations.applyExposure("local-only");
   if (applied.mode !== "local-only") {
     throw new Error("Server exposure did not reach local-only mode.");
   }
@@ -102,11 +94,7 @@ export async function reconcileShareExposureOnce(
   const confirmedShareState = await operations.getShareState();
   if (confirmedShareState.desiredExposure !== "wide") return "narrowed";
 
-  const restored = await withShareExposureBridgeTimeout(
-    "Server exposure compensation",
-    operations.applyExposure("network-accessible"),
-    operationTimeoutMs,
-  );
+  const restored = await operations.applyExposure("network-accessible");
   if (restored.mode !== "network-accessible") {
     throw new Error("Server exposure did not return to network-accessible mode.");
   }

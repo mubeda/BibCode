@@ -24,6 +24,7 @@ export type RemotePairingCodePayload = typeof RemotePairingCodePayload.Type;
 export const E2eeAuthPairingMessage = Schema.Struct({
   type: Schema.Literal("e2ee_auth"),
   pairing: TrimmedNonEmptyString,
+  pairingConfirmation: Schema.optionalKey(Schema.Literal(true)),
 });
 export type E2eeAuthPairingMessage = typeof E2eeAuthPairingMessage.Type;
 
@@ -43,6 +44,7 @@ export const E2eeAuthenticatedMessage = Schema.Struct({
   credential: Schema.optionalKey(TrimmedNonEmptyString),
   environmentId: Schema.optionalKey(EnvironmentId),
   storageInstanceId: Schema.optionalKey(TrimmedNonEmptyString),
+  pairingConfirmationRequired: Schema.optionalKey(Schema.Literal(true)),
 });
 export type E2eeAuthenticatedMessage = typeof E2eeAuthenticatedMessage.Type;
 

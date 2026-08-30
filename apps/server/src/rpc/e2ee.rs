@@ -716,6 +716,8 @@ pub(crate) struct E2eeAuthMessage {
     pub r#type: String,
     #[serde(default)]
     pub pairing: Option<String>,
+    #[serde(default, rename = "pairingConfirmation")]
+    pub pairing_confirmation: bool,
     #[serde(default)]
     pub bearer: Option<String>,
 }
@@ -728,6 +730,7 @@ pub(crate) fn e2ee_authenticated_with_credential_json(
     credential: &str,
     environment_id: &str,
     storage_instance_id: Option<&str>,
+    pairing_confirmation_required: bool,
 ) -> Vec<u8> {
     let mut reply = json!({
         "type": "e2ee_authenticated",
@@ -741,6 +744,15 @@ pub(crate) fn e2ee_authenticated_with_credential_json(
             .insert(
                 "storageInstanceId".to_owned(),
                 serde_json::Value::String(storage_instance_id.to_owned()),
+            );
+    }
+    if pairing_confirmation_required {
+        reply
+            .as_object_mut()
+            .expect("static authenticated reply is an object")
+            .insert(
+                "pairingConfirmationRequired".to_owned(),
+                serde_json::Value::Bool(true),
             );
     }
     serde_json::to_vec(&reply).expect("static JSON")
@@ -760,7 +772,7 @@ pub(crate) enum E2eeAccept {
 
 pub(crate) struct MintedE2eeSession {
     pub credential: String,
-    delivery_guard: Box<MintedSessionDeliveryGuard>,
+    delivery_guard: Option<Box<MintedSessionDeliveryGuard>>,
 }
 
 struct MintedSessionDeliveryGuard {
@@ -890,29 +902,42 @@ pub(crate) async fn run_e2ee_session(
             Err(code) => return Ok(EstablishOutcome::Rejected { channel, code }),
         };
 
+        let pairing_confirmation = message.pairing_confirmation;
         let accept = if config.unsafe_no_auth {
             E2eeAccept::Unauthenticated
         } else {
             match (message.pairing, message.bearer) {
                 (Some(pairing), None) => {
-                    let Ok(issued) = auth
-                        .exchange_pairing_bootstrap(&pairing, e2ee_client_metadata())
+                    let issued = if pairing_confirmation {
+                        auth.exchange_pairing_bootstrap(&pairing, e2ee_client_metadata())
+                            .await
+                    } else {
+                        auth.exchange_bootstrap(
+                            &pairing,
+                            None,
+                            e2ee_client_metadata(),
+                            None,
+                            SessionTransport::E2ee,
+                        )
                         .await
-                    else {
+                    };
+                    let Ok(issued) = issued else {
                         return Ok(EstablishOutcome::Rejected {
                             channel,
                             code: "unauthorized",
                         });
                     };
-                    let delivery_guard = MintedSessionDeliveryGuard::new(
-                        auth.clone(),
-                        issued.principal.session_id.clone(),
-                    );
+                    let delivery_guard = pairing_confirmation.then(|| {
+                        Box::new(MintedSessionDeliveryGuard::new(
+                            auth.clone(),
+                            issued.principal.session_id.clone(),
+                        ))
+                    });
                     E2eeAccept::Authenticated {
                         principal: issued.principal,
                         minted: Some(MintedE2eeSession {
                             credential: issued.token,
-                            delivery_guard: Box::new(delivery_guard),
+                            delivery_guard,
                         }),
                     }
                 }
@@ -958,6 +983,7 @@ pub(crate) async fn run_e2ee_session(
                 &minted.credential,
                 &config.environment_id,
                 storage_instance_id.as_deref(),
+                minted.delivery_guard.is_some(),
             ),
             E2eeAccept::Authenticated { minted: None, .. } | E2eeAccept::Unauthenticated => {
                 e2ee_authenticated_json()
@@ -1103,17 +1129,23 @@ async fn run_established_e2ee(
                 let established_permit = admitted_permit;
                 let expires_at_ms = principal.expires_at_ms;
                 let (context, pairing_delivery_guard) = match minted {
-                    Some(minted) => {
-                        let latch = minted.delivery_guard.confirmation_latch();
-                        (
-                            RpcSessionContext::authenticated_pending_pairing(
-                                principal,
-                                auth.clone(),
-                                latch,
-                            ),
-                            Some(minted.delivery_guard),
-                        )
-                    }
+                    Some(minted) => match minted.delivery_guard {
+                        Some(delivery_guard) => {
+                            let latch = delivery_guard.confirmation_latch();
+                            (
+                                RpcSessionContext::authenticated_pending_pairing(
+                                    principal,
+                                    auth.clone(),
+                                    latch,
+                                ),
+                                Some(delivery_guard),
+                            )
+                        }
+                        None => (
+                            RpcSessionContext::authenticated(principal, auth.clone()),
+                            None,
+                        ),
+                    },
                     None => (
                         RpcSessionContext::authenticated(principal, auth.clone()),
                         None,
@@ -1681,15 +1713,19 @@ mod tests {
     #[test]
     fn pairing_reply_omits_an_absent_storage_identity() {
         let absent = serde_json::from_slice::<serde_json::Value>(
-            &e2ee_authenticated_with_credential_json("credential", "environment", None),
+            &e2ee_authenticated_with_credential_json("credential", "environment", None, true),
         )
         .expect("absent storage reply");
         assert!(absent.get("storageInstanceId").is_none());
 
-        let present = serde_json::from_slice::<serde_json::Value>(
-            &e2ee_authenticated_with_credential_json("credential", "environment", Some("storage")),
-        )
-        .expect("present storage reply");
+        let present =
+            serde_json::from_slice::<serde_json::Value>(&e2ee_authenticated_with_credential_json(
+                "credential",
+                "environment",
+                Some("storage"),
+                true,
+            ))
+            .expect("present storage reply");
         assert_eq!(present["storageInstanceId"], "storage");
     }
 

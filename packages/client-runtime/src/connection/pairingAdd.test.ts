@@ -14,7 +14,9 @@ import {
   encodePairingCode,
 } from "@bibcode/shared/pairingCode";
 import { describe, expect, it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Result from "effect/Result";
@@ -90,6 +92,7 @@ interface HarnessOptions {
   readonly accepted?: ReadonlyMap<string, string>;
   readonly authenticatedStorageInstanceId?: string;
   readonly authenticatedEnvironmentId?: EnvironmentId;
+  readonly pairingConfirmationRequired?: boolean;
   readonly configEnvironmentId?: EnvironmentId;
   readonly configStorageInstanceId?: string;
   readonly registrationPersistenceFailure?: boolean;
@@ -100,6 +103,8 @@ interface HarnessOptions {
   readonly confirmationFailure?: boolean;
   readonly confirmationInterrupted?: boolean;
   readonly concurrentIdentityBeforeConfirmationFailure?: string;
+  readonly pauseAfterRegistrationCommit?: boolean;
+  readonly pauseAfterIdentityCommit?: boolean;
 }
 
 const makeHarness = Effect.fn("TestPairingAdd.makeHarness")(function* (
@@ -118,6 +123,10 @@ const makeHarness = Effect.fn("TestPairingAdd.makeHarness")(function* (
   const events: string[] = [];
   let closedSessions = 0;
   let identityRollbackAttempts = 0;
+  const registrationCommitted = yield* Deferred.make<void>();
+  const releaseRegistration = yield* Deferred.make<void>();
+  const identityCommitted = yield* Deferred.make<void>();
+  const releaseIdentity = yield* Deferred.make<void>();
 
   const registry = EnvironmentRegistry.EnvironmentRegistry.of({
     entries,
@@ -129,10 +138,16 @@ const makeHarness = Effect.fn("TestPairingAdd.makeHarness")(function* (
               message: "registration storage unavailable",
             }),
           )
-        : Effect.sync(() => {
-            events.push("register");
-            registrations.push(registration);
-          }),
+        : Effect.uninterruptible(
+            Effect.gen(function* () {
+              events.push("register");
+              registrations.push(registration);
+              if (options.pauseAfterRegistrationCommit === true) {
+                yield* Deferred.succeed(registrationCommitted, undefined);
+                yield* Deferred.await(releaseRegistration);
+              }
+            }),
+          ),
     rollbackRegistration: (registration: ConnectionRegistration) =>
       options.registrationRemovalFailure === true
         ? Effect.fail(
@@ -208,18 +223,24 @@ const makeHarness = Effect.fn("TestPairingAdd.makeHarness")(function* (
               message: "identity storage unavailable",
             }),
           )
-        : Effect.sync(() => {
-            const transition = decide(accepted.get(targetKey) ?? null);
-            if (transition.mutation._tag === "Set") {
-              events.push("accept-identity");
-              accepted.set(targetKey, transition.mutation.storageInstanceId);
-              acceptedIdentities.push({
-                targetKey,
-                storageInstanceId: transition.mutation.storageInstanceId,
-              });
-            }
-            return transition.result;
-          }),
+        : Effect.uninterruptible(
+            Effect.gen(function* () {
+              const transition = decide(accepted.get(targetKey) ?? null);
+              if (transition.mutation._tag === "Set") {
+                events.push("accept-identity");
+                accepted.set(targetKey, transition.mutation.storageInstanceId);
+                acceptedIdentities.push({
+                  targetKey,
+                  storageInstanceId: transition.mutation.storageInstanceId,
+                });
+              }
+              if (options.pauseAfterIdentityCommit === true) {
+                yield* Deferred.succeed(identityCommitted, undefined);
+                yield* Deferred.await(releaseIdentity);
+              }
+              return transition.result;
+            }),
+          ),
   });
   const sessions = RpcSession.RpcSessionFactory.of({
     connect: (prepared) => {
@@ -274,6 +295,9 @@ const makeHarness = Effect.fn("TestPairingAdd.makeHarness")(function* (
             credential: "minted-device-credential",
             environmentId: options.authenticatedEnvironmentId ?? currentDescriptor.environmentId,
             storageInstanceId: options.authenticatedStorageInstanceId ?? STORAGE_IDENTITY,
+            ...((options.pairingConfirmationRequired ?? true)
+              ? { pairingConfirmationRequired: true as const }
+              : {}),
           }),
         }),
         () => Effect.sync(() => void (closedSessions += 1)),
@@ -306,6 +330,10 @@ const makeHarness = Effect.fn("TestPairingAdd.makeHarness")(function* (
     preparedConnections,
     registrations,
     closedSessions: () => closedSessions,
+    registrationCommitted: Deferred.await(registrationCommitted),
+    releaseRegistration: Deferred.succeed(releaseRegistration, undefined),
+    identityCommitted: Deferred.await(identityCommitted),
+    releaseIdentity: Deferred.succeed(releaseIdentity, undefined),
     run: (payload: RemotePairingCodePayload, allowLoopbackTunnel?: boolean) =>
       verifyAndAddPairingCode({
         code: encodePairingCode(payload),
@@ -574,6 +602,18 @@ describe("verifyAndAddPairingCode", () => {
     }),
   );
 
+  it.effect("saves an active credential from a legacy server without calling confirmation", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ pairingConfirmationRequired: false });
+
+      expect(yield* harness.run(validPayload())).toBe(ENVIRONMENT_ID);
+      expect(harness.events).toEqual(["verify", "register", "accept-identity"]);
+      expect(harness.registrations).toHaveLength(1);
+      expect(harness.acceptedIdentities).toHaveLength(1);
+      expect(harness.closedSessions()).toBe(1);
+    }),
+  );
+
   it.effect("rolls back local state when pairing confirmation fails", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({ confirmationFailure: true });
@@ -658,6 +698,78 @@ describe("verifyAndAddPairingCode", () => {
       expect(harness.registrations).toEqual([]);
       expect(harness.acceptedIdentities).toEqual([]);
       expect(harness.closedSessions()).toBe(1);
+    }),
+  );
+
+  it.effect("records registration ownership before observing an interrupt", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ pauseAfterRegistrationCommit: true });
+      const pairing = yield* Effect.forkChild(harness.run(validPayload()));
+      yield* harness.registrationCommitted;
+      const interrupting = yield* Effect.forkChild(Fiber.interrupt(pairing));
+      yield* Effect.yieldNow;
+      yield* harness.releaseRegistration;
+      yield* Fiber.await(pairing);
+      yield* Fiber.await(interrupting);
+
+      expect(harness.registrations).toEqual([]);
+      expect(harness.acceptedIdentities).toEqual([]);
+      expect(harness.closedSessions()).toBe(1);
+    }),
+  );
+
+  it.effect("records identity ownership before observing an interrupt", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ pauseAfterIdentityCommit: true });
+      const pairing = yield* Effect.forkChild(harness.run(validPayload()));
+      yield* harness.identityCommitted;
+      const interrupting = yield* Effect.forkChild(Fiber.interrupt(pairing));
+      yield* Effect.yieldNow;
+      yield* harness.releaseIdentity;
+      yield* Fiber.await(pairing);
+      yield* Fiber.await(interrupting);
+
+      expect(harness.registrations).toEqual([]);
+      expect(harness.acceptedIdentities).toEqual([]);
+      expect(harness.closedSessions()).toBe(1);
+    }),
+  );
+
+  it.effect("rolls back a legacy registration when interrupted after its commit", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        pairingConfirmationRequired: false,
+        pauseAfterRegistrationCommit: true,
+      });
+      const pairing = yield* Effect.forkChild(harness.run(validPayload()));
+      yield* harness.registrationCommitted;
+      const interrupting = yield* Effect.forkChild(Fiber.interrupt(pairing));
+      yield* Effect.yieldNow;
+      yield* harness.releaseRegistration;
+      yield* Fiber.await(pairing);
+      yield* Fiber.await(interrupting);
+
+      expect(harness.registrations).toEqual([]);
+      expect(harness.acceptedIdentities).toEqual([]);
+    }),
+  );
+
+  it.effect("rolls back legacy local writes when interrupted after identity commit", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        pairingConfirmationRequired: false,
+        pauseAfterIdentityCommit: true,
+      });
+      const pairing = yield* Effect.forkChild(harness.run(validPayload()));
+      yield* harness.identityCommitted;
+      const interrupting = yield* Effect.forkChild(Fiber.interrupt(pairing));
+      yield* Effect.yieldNow;
+      yield* harness.releaseIdentity;
+      yield* Fiber.await(pairing);
+      yield* Fiber.await(interrupting);
+
+      expect(harness.registrations).toEqual([]);
+      expect(harness.acceptedIdentities).toEqual([]);
     }),
   );
 

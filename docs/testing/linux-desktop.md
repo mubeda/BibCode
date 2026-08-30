@@ -163,8 +163,10 @@ verify:
   of a blackholed create response, and explicit legacy resume after a local-only
   restart. The address picker lists only usable IPv4 candidates until a
   dual-stack listener exists, uses stable address/port IDs, safely preselects a
-  private default, never preselects a public address, and requires explicit
-  public-address/firewall acknowledgement. If Tailscale is installed in its
+  private default, and leaves generation disabled with externally managed
+  listener/reverse-proxy guidance when native discovery has only a public
+  address. An externally managed public endpoint is never preselected and
+  requires explicit public-address/firewall acknowledgement. If Tailscale is installed in its
   packaged location, discovery must not depend on shell `PATH` and must suppress
   unusable, public, or IPv6 candidates. Confirm Linux firewall management remains
   explicitly operator-owned. The local-machine flow still has no Host selector;
