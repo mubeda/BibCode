@@ -205,26 +205,21 @@ describe("reconcileShareExposureOnce", () => {
     ).rejects.toThrow("Server exposure state timed out after 5ms");
   });
 
-  it("awaits a native exposure mutation past the read deadline", async () => {
-    let finishApply: ((state: typeof localExposure) => void) | undefined;
-    const applyExposure = vi.fn(
-      () =>
-        new Promise<typeof localExposure>((resolve) => {
-          finishApply = resolve;
-        }),
-    );
-    const pending = reconcileShareExposureOnce({
-      getShareState: async () => loopbackDesired,
-      getExposureState: async () => wideExposure,
-      applyExposure,
-      canStartExposure: () => true,
-      operationTimeoutMs: 5,
-    });
-
-    await new Promise((resolve) => setTimeout(resolve, 10));
+  it("times out a blackholed exposure mutation at the operation deadline", async () => {
+    // Every privileged bridge mutation carries an explicit deadline: a wedged
+    // DesktopBridge must surface as a visible failure, not hang the
+    // convergence pass forever.
+    const applyExposure = vi.fn(() => new Promise<typeof localExposure>(() => {}));
+    await expect(
+      reconcileShareExposureOnce({
+        getShareState: async () => loopbackDesired,
+        getExposureState: async () => wideExposure,
+        applyExposure,
+        canStartExposure: () => true,
+        operationTimeoutMs: 5,
+      }),
+    ).rejects.toThrow("Server exposure narrowing timed out after 5ms");
     expect(applyExposure).toHaveBeenCalledExactlyOnceWith("local-only");
-    finishApply?.(localExposure);
-    await expect(pending).resolves.toBe("narrowed");
   });
 
   it("leaves wide exposure unchanged while a legacy grant blocks narrowing", async () => {

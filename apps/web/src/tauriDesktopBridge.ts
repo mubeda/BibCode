@@ -556,16 +556,15 @@ function createTauriDesktopBridge(
       tauriInvokeOr("desktop_bridge_get_advertised_endpoints", undefined, () => []),
     getWslState: () =>
       tauriInvokeOr<DesktopWslState>("desktop_bridge_get_wsl_state", undefined, defaultWslState),
+    // WSL mutations must propagate failures: a swallowed set_wsl_only error
+    // can leave the Windows firewall rule open while the UI reports
+    // local-only. The settings surfaces surface the rejection to the user.
     setWslBackendEnabled: (enabled) =>
-      tauriInvokeOr<DesktopWslState>(
-        "desktop_bridge_set_wsl_backend_enabled",
-        { enabled },
-        defaultWslState,
-      ),
+      tauriInvoke<DesktopWslState>("desktop_bridge_set_wsl_backend_enabled", { enabled }),
     setWslDistro: (distro) =>
-      tauriInvokeOr<DesktopWslState>("desktop_bridge_set_wsl_distro", { distro }, defaultWslState),
+      tauriInvoke<DesktopWslState>("desktop_bridge_set_wsl_distro", { distro }),
     setWslOnly: (enabled) =>
-      tauriInvokeOr<DesktopWslState>("desktop_bridge_set_wsl_only", { enabled }, defaultWslState),
+      tauriInvoke<DesktopWslState>("desktop_bridge_set_wsl_only", { enabled }),
     pickFolder: (options) => tauriInvokeOr("desktop_bridge_pick_folder", { options }, () => null),
     saveDiagnosticLogs: (filename, bytes) =>
       tauriInvokeDesktop<string | null>("desktop_bridge_save_diagnostic_logs", {
