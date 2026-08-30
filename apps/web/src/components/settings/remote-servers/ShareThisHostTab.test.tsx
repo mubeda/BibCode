@@ -509,13 +509,15 @@ describe("ShareThisHostTab", () => {
       await vi.advanceTimersByTimeAsync(4_100);
     });
 
+    // The authoritative share state still reports a live off-host reason, so
+    // the reconciling cleanup keeps the host wide with honest copy.
     expect(apply).toHaveBeenCalledExactlyOnceWith("network-accessible");
     expect(container.textContent).toContain(
-      "The offer result could not be canceled or confirmed. Remote access was deliberately left unchanged because a live credential may exist.",
+      "The offer was not created. Remote access remains enabled because another live access reason still requires it.",
     );
   });
 
-  it("does not narrow after failed cancellation even when a read reports loopback", async () => {
+  it("narrows on the authority's verdict even when cancellation is unconfirmed", async () => {
     vi.useFakeTimers();
     const apply = installBridge(
       vi.fn(async (desired: "local-only" | "network-accessible") =>
@@ -536,9 +538,11 @@ describe("ShareThisHostTab", () => {
     });
 
     expect(h.cancelOffer).toHaveBeenCalledTimes(3);
-    expect(apply.mock.calls).toEqual([["network-accessible"]]);
+    // The authority reports no live sharing reason, so the reconciling
+    // cleanup narrows instead of leaving the host wide until restart.
+    expect(apply.mock.calls).toEqual([["network-accessible"], ["local-only"]]);
     expect(container.textContent).toContain(
-      "The offer result could not be canceled or confirmed. Remote access was deliberately left unchanged because a live credential may exist.",
+      "The offer was not created. Remote access is confirmed local-only.",
     );
   });
 

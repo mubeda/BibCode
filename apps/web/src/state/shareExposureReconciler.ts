@@ -40,24 +40,36 @@ export interface ShareExposureOperations {
 export type ShareExposureReconciliationOutcome = "unchanged" | "narrowed" | "widened" | "rewidened";
 
 export const SHARE_EXPOSURE_BRIDGE_TIMEOUT_MS = 5_000;
+const SHARE_EXPOSURE_RECONCILE_RETRY_LIMIT = 3;
+const SHARE_EXPOSURE_RECONCILE_RETRY_DELAY_MS = 5_000;
 
-export async function withShareExposureBridgeTimeout<A>(
-  operation: string,
+/** One racing primitive shared by every share-exposure deadline helper. */
+export async function raceWithDeadline<A>(
   request: Promise<A>,
-  timeoutMs = SHARE_EXPOSURE_BRIDGE_TIMEOUT_MS,
+  timeoutMs: number,
+  onTimeout: () => Error,
 ): Promise<A> {
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
   const deadline = new Promise<never>((_resolve, reject) => {
-    timeoutId = setTimeout(
-      () => reject(new Error(`${operation} timed out after ${String(timeoutMs)}ms.`)),
-      timeoutMs,
-    );
+    timeoutId = setTimeout(() => reject(onTimeout()), timeoutMs);
   });
   try {
     return await Promise.race([request, deadline]);
   } finally {
     if (timeoutId !== undefined) clearTimeout(timeoutId);
   }
+}
+
+export async function withShareExposureBridgeTimeout<A>(
+  operation: string,
+  request: Promise<A>,
+  timeoutMs = SHARE_EXPOSURE_BRIDGE_TIMEOUT_MS,
+): Promise<A> {
+  return raceWithDeadline(
+    request,
+    timeoutMs,
+    () => new Error(`${operation} timed out after ${String(timeoutMs)}ms.`),
+  );
 }
 
 export async function reconcileShareExposureOnce(
@@ -74,7 +86,11 @@ export async function reconcileShareExposureOnce(
   ]);
   if (shareState.desiredExposure === "wide" && exposureState.mode === "local-only") {
     if (!operations.canStartExposure()) return "unchanged";
-    const applied = await operations.applyExposure("network-accessible");
+    const applied = await withShareExposureBridgeTimeout(
+      "Server exposure widening",
+      operations.applyExposure("network-accessible"),
+      operationTimeoutMs,
+    );
     if (applied.mode !== "network-accessible") {
       throw new Error("Server exposure did not reach network-accessible mode.");
     }
@@ -86,7 +102,11 @@ export async function reconcileShareExposureOnce(
   }
 
   if (!operations.canStartExposure()) return "unchanged";
-  const applied = await operations.applyExposure("local-only");
+  const applied = await withShareExposureBridgeTimeout(
+    "Server exposure narrowing",
+    operations.applyExposure("local-only"),
+    operationTimeoutMs,
+  );
   if (applied.mode !== "local-only") {
     throw new Error("Server exposure did not reach local-only mode.");
   }
@@ -94,7 +114,11 @@ export async function reconcileShareExposureOnce(
   const confirmedShareState = await operations.getShareState();
   if (confirmedShareState.desiredExposure !== "wide") return "narrowed";
 
-  const restored = await operations.applyExposure("network-accessible");
+  const restored = await withShareExposureBridgeTimeout(
+    "Server exposure restore",
+    operations.applyExposure("network-accessible"),
+    operationTimeoutMs,
+  );
   if (restored.mode !== "network-accessible") {
     throw new Error("Server exposure did not return to network-accessible mode.");
   }
@@ -150,12 +174,18 @@ export function useShareExposureReconciler(): void {
   const requestedRef = useRef(false);
   const inFlightRef = useRef<Promise<void> | null>(null);
   const mountedRef = useRef(false);
+  const failureCountRef = useRef(0);
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
       requestedRef.current = false;
+      if (retryTimerRef.current !== null) {
+        clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = null;
+      }
     };
   }, []);
 
@@ -200,8 +230,32 @@ export function useShareExposureReconciler(): void {
                 "No active off-host pairings remain, so the local server is loopback-only again.",
             });
           }
+          failureCountRef.current = 0;
         } catch (error) {
           console.warn("[remote-sharing] Could not reconcile server exposure.", error);
+          failureCountRef.current += 1;
+          if (failureCountRef.current < SHARE_EXPOSURE_RECONCILE_RETRY_LIMIT) {
+            // One failed pass must not abandon convergence until the next
+            // authority revision; retry on a bounded schedule.
+            if (retryTimerRef.current !== null) clearTimeout(retryTimerRef.current);
+            retryTimerRef.current = setTimeout(() => {
+              retryTimerRef.current = null;
+              if (
+                mountedRef.current &&
+                targetRef.current.generation === target.generation
+              ) {
+                requestReconcile();
+              }
+            }, SHARE_EXPOSURE_RECONCILE_RETRY_DELAY_MS);
+          } else {
+            failureCountRef.current = 0;
+            toastManager.add({
+              type: "warning",
+              title: "Remote access state could not be reconciled",
+              description:
+                "The desktop exposure state could not be brought in line with active pairings. Review Remote servers settings.",
+            });
+          }
         }
       }
     };

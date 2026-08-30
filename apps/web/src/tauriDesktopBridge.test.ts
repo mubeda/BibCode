@@ -1329,9 +1329,18 @@ describe("tauriDesktopBridge", () => {
       bridge.setTailscaleServeEnabled({ enabled: true, port: 8443 }),
     ).resolves.toMatchObject({ tailscaleServeEnabled: false });
     await expect(bridge.getWslState()).resolves.toMatchObject({ enabled: false, distros: [] });
-    await expect(bridge.setWslBackendEnabled(true)).resolves.toMatchObject({ enabled: false });
-    await expect(bridge.setWslDistro("Ubuntu")).resolves.toMatchObject({ distro: null });
-    await expect(bridge.setWslOnly(true)).resolves.toMatchObject({ wslOnly: false });
+    // WSL mutations propagate failures instead of pretending a default state:
+    // a swallowed set_wsl_only error could leave the firewall rule open while
+    // the UI reports local-only.
+    await expect(bridge.setWslBackendEnabled(true)).rejects.toThrow(
+      "unsupported fallback command: desktop_bridge_set_wsl_backend_enabled",
+    );
+    await expect(bridge.setWslDistro("Ubuntu")).rejects.toThrow(
+      "unsupported fallback command: desktop_bridge_set_wsl_distro",
+    );
+    await expect(bridge.setWslOnly(true)).rejects.toThrow(
+      "unsupported fallback command: desktop_bridge_set_wsl_only",
+    );
     await expect(bridge.getUpdateState()).resolves.toEqual({
       enabled: false,
       status: "disabled",

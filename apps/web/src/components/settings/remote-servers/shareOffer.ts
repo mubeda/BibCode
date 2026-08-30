@@ -2,6 +2,7 @@ import type { AdvertisedEndpoint, DesktopServerExposureState } from "@bibcode/co
 import { classifyPairingEndpoint, normalizeHttpBaseUrl } from "@bibcode/shared/advertisedEndpoint";
 import { buildBrowserPairUrl, buildPairingDeepLink } from "@bibcode/shared/pairingCode";
 
+import { raceWithDeadline } from "../../../state/shareExposureReconciler.ts";
 import { shareClassForPairingEndpoint } from "./endpointClass.ts";
 
 export type ShareIntent = "another-device" | "this-computer" | "custom";
@@ -160,18 +161,11 @@ async function withRequestTimeout<A>(
   timeoutMs: number,
   request: Promise<A>,
 ): Promise<A> {
-  let timeoutId: ReturnType<typeof setTimeout> | undefined;
-  const deadline = new Promise<never>((_resolve, reject) => {
-    timeoutId = setTimeout(
-      () => reject(new ShareOfferOperationTimeoutError(operation, timeoutMs)),
-      timeoutMs,
-    );
-  });
-  try {
-    return await Promise.race([request, deadline]);
-  } finally {
-    if (timeoutId !== undefined) clearTimeout(timeoutId);
-  }
+  return raceWithDeadline(
+    request,
+    timeoutMs,
+    () => new ShareOfferOperationTimeoutError(operation, timeoutMs),
+  );
 }
 
 function resolveOfferEndpoint(deps: GenerateShareOfferDeps): string | null {
@@ -315,7 +309,12 @@ export async function generateShareOffer(
       cancellationError instanceof Error ? cancellationError.message : String(cancellationError);
     message = `${message} Pairing-offer cancellation failed: ${cancellationMessage}`;
   }
-  if (widened && cancellationSucceeded && deps.cleanupExposureAfterFailedMint !== null) {
+  if (widened && deps.cleanupExposureAfterFailedMint !== null) {
+    // The cleanup consults the authoritative share state, so it is safe to
+    // run even when the cancellation is unconfirmed: a still-live offer keeps
+    // the host wide as an active reason, while a cancelled or consumed one
+    // narrows instead of leaving the host bound to 0.0.0.0 with an open
+    // firewall until the app restarts.
     try {
       cleanup = await withRequestTimeout(
         "Remote-access reconciliation",
@@ -327,11 +326,9 @@ export async function generateShareOffer(
       const cleanupMessage = error instanceof Error ? error.message : String(error);
       message = `${message} Remote-access cleanup failed: ${cleanupMessage}`;
     }
-  } else if (widened) {
-    if (cancellationSucceeded) {
-      cleanup = "cleanup-failed";
-      message = `${message} Remote-access cleanup could not be verified.`;
-    }
+  } else if (widened && cancellationSucceeded) {
+    cleanup = "cleanup-failed";
+    message = `${message} Remote-access cleanup could not be verified.`;
   }
 
   return {

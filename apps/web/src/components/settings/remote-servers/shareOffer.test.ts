@@ -249,9 +249,9 @@ describe("generateShareOffer", () => {
     });
   });
 
-  it("leaves exposure unchanged when blackholed cancellation cannot rule out a live offer", async () => {
+  it("consults the authority when blackholed cancellation cannot rule out a live offer", async () => {
     const cancelOffer = vi.fn(() => new Promise<void>(() => {}));
-    const cleanupExposureAfterFailedMint = vi.fn(async () => "local-confirmed" as const);
+    const cleanupExposureAfterFailedMint = vi.fn(async () => "active-reason" as const);
     const result = await generateShareOffer({
       intent: "another-device",
       name: "AI-SERVER",
@@ -271,12 +271,15 @@ describe("generateShareOffer", () => {
     });
 
     expect(cancelOffer.mock.calls).toEqual([["key-1"], ["key-1"], ["key-1"]]);
-    expect(cleanupExposureAfterFailedMint).not.toHaveBeenCalled();
+    // The cleanup consults the authoritative share state, so it runs even
+    // with the cancellation unconfirmed; a possibly live offer keeps the
+    // host wide as an active reason.
+    expect(cleanupExposureAfterFailedMint).toHaveBeenCalledTimes(1);
     expect(result).toMatchObject({
       ok: false,
       failure: {
         kind: "mint-failed",
-        cleanup: "cancellation-unconfirmed",
+        cleanup: "active-reason",
         message: expect.stringContaining("timed out"),
       },
     });
@@ -286,7 +289,7 @@ describe("generateShareOffer", () => {
     const cancelOffer = vi.fn(async () => {
       throw new Error("server unreachable");
     });
-    const cleanupExposureAfterFailedMint = vi.fn(async () => "local-confirmed" as const);
+    const cleanupExposureAfterFailedMint = vi.fn(async () => "active-reason" as const);
     const sleep = vi.fn(async () => {});
     const result = await generateShareOffer({
       intent: "another-device",
@@ -309,10 +312,10 @@ describe("generateShareOffer", () => {
 
     expect(cancelOffer.mock.calls).toEqual([["key-1"], ["key-1"], ["key-1"]]);
     expect(sleep).toHaveBeenCalledTimes(2);
-    expect(cleanupExposureAfterFailedMint).not.toHaveBeenCalled();
+    expect(cleanupExposureAfterFailedMint).toHaveBeenCalledTimes(1);
     expect(result).toMatchObject({
       ok: false,
-      failure: { kind: "mint-failed", cleanup: "cancellation-unconfirmed" },
+      failure: { kind: "mint-failed", cleanup: "active-reason" },
     });
   });
 
@@ -337,12 +340,12 @@ describe("generateShareOffer", () => {
       cleanupExposureAfterFailedMint,
     });
 
-    expect(cleanupExposureAfterFailedMint).not.toHaveBeenCalled();
+    expect(cleanupExposureAfterFailedMint).toHaveBeenCalledTimes(1);
     expect(result).toMatchObject({
       ok: false,
       failure: {
         kind: "mint-failed",
-        cleanup: "cancellation-unconfirmed",
+        cleanup: "active-reason",
         message: expect.stringContaining("cancellation unconfirmed"),
       },
     });
@@ -440,12 +443,15 @@ describe("generateShareOffer", () => {
     });
 
     expect(cancelOffer).toHaveBeenCalledTimes(3);
-    expect(cleanupExposureAfterFailedMint).not.toHaveBeenCalled();
+    // The authority reports no live sharing reason, so the host narrows
+    // instead of staying bound to 0.0.0.0 with an open firewall until the
+    // app restarts.
+    expect(cleanupExposureAfterFailedMint).toHaveBeenCalledTimes(1);
     expect(result).toMatchObject({
       ok: false,
       failure: {
         kind: "mint-failed",
-        cleanup: "cancellation-unconfirmed",
+        cleanup: "local-confirmed",
         message: expect.stringContaining("Pairing-offer cancellation failed: server unreachable"),
       },
     });
