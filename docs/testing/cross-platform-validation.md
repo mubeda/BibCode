@@ -243,7 +243,8 @@ cargo build -p bibcode-server
 docker version
 
 cleanup_bibcode_remote_docker() {
-  docker rm -f bibcode-remote-server bibcode-remote-client 2>/dev/null || true
+  docker rm -f bibcode-remote-client 2>/dev/null || true
+  docker rm -f bibcode-remote-server 2>/dev/null || true
   docker network rm bibcode-remote-stabilization 2>/dev/null || true
   docker volume rm bibcode-remote-stabilization-data 2>/dev/null || true
 }
