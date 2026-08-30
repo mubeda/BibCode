@@ -16,7 +16,7 @@ use axum::extract::ws::{Message, WebSocket};
 use futures_util::{FutureExt, Sink, SinkExt, Stream, StreamExt};
 use serde_json::{Value, json};
 use tokio::{
-    sync::{mpsc, oneshot, watch},
+    sync::{Notify, mpsc, oneshot, watch},
     task::JoinHandle,
     time::{Instant, timeout, timeout_at},
 };
@@ -71,6 +71,14 @@ pub(crate) struct RpcOutboundBudget {
     process: RpcOutboundProcessBudget,
     connection: Arc<WeightedByteBudget>,
     connection_capacity: usize,
+    #[cfg(test)]
+    after_combined_probe: Option<Arc<Mutex<Option<RpcOutboundProbeGate>>>>,
+}
+
+#[cfg(test)]
+struct RpcOutboundProbeGate {
+    reached: Arc<tokio::sync::Barrier>,
+    resume: Arc<tokio::sync::Barrier>,
 }
 
 impl RpcOutboundBudget {
@@ -79,27 +87,141 @@ impl RpcOutboundBudget {
             process,
             connection: Arc::new(WeightedByteBudget::new(connection_capacity)),
             connection_capacity,
+            #[cfg(test)]
+            after_combined_probe: None,
         }
     }
 
+    #[cfg(test)]
+    fn with_after_combined_probe(
+        mut self,
+        reached: Arc<tokio::sync::Barrier>,
+        resume: Arc<tokio::sync::Barrier>,
+    ) -> Self {
+        self.after_combined_probe = Some(Arc::new(Mutex::new(Some(RpcOutboundProbeGate {
+            reached,
+            resume,
+        }))));
+        self
+    }
+
     async fn acquire(&self, bytes: usize, deadline: Instant) -> Result<RpcOutboundBytePermit, ()> {
-        let connection = Arc::clone(&self.connection)
-            .acquire(bytes, deadline)
-            .await
-            .ok_or(())?;
-        let process = self.process.acquire(bytes, deadline).await?;
-        Ok(RpcOutboundBytePermit {
-            process,
-            connection,
-        })
+        if bytes > self.connection_capacity || bytes > self.process.inner.capacity {
+            return Err(());
+        }
+        let (mut receiver, mut guard) = self.enqueue(bytes)?;
+        loop {
+            let process_changed = self.process.inner.changed.notified();
+            let connection_changed = self.connection.changed.notified();
+            tokio::pin!(process_changed, connection_changed);
+            process_changed.as_mut().enable();
+            connection_changed.as_mut().enable();
+            self.process.grant_combined_waiters();
+
+            #[cfg(test)]
+            if let Some(gate) = self
+                .after_combined_probe
+                .as_ref()
+                .and_then(|gate| gate.lock().expect("outbound probe gate lock").take())
+            {
+                gate.reached.wait().await;
+                gate.resume.wait().await;
+            }
+
+            tokio::select! {
+                biased;
+                result = &mut receiver => {
+                    result.map_err(|_| ())?;
+                    guard.active = false;
+                    return Ok(RpcOutboundBytePermit {
+                        process: WeightedByteGrant {
+                            inner: Arc::clone(&self.process.inner),
+                            bytes,
+                        },
+                        connection: WeightedByteGrant {
+                            inner: Arc::clone(&self.connection),
+                            bytes,
+                        },
+                    });
+                }
+                () = tokio::time::sleep_until(deadline) => return Err(()),
+                () = &mut process_changed => {}
+                () = &mut connection_changed => {}
+            }
+        }
+    }
+
+    fn enqueue(
+        &self,
+        bytes: usize,
+    ) -> Result<(oneshot::Receiver<()>, RpcOutboundCombinedWaiterGuard), ()> {
+        if bytes > self.connection_capacity || bytes > self.process.inner.capacity {
+            return Err(());
+        }
+        let mut state = self.process.combined.lock().map_err(|_| ())?;
+        let id = state.next_waiter_id;
+        state.next_waiter_id = state.next_waiter_id.wrapping_add(1);
+        let (sender, receiver) = oneshot::channel();
+        let granted = Arc::new(AtomicBool::new(false));
+        state.waiters.push_back(RpcOutboundCombinedWaiter {
+            id,
+            bytes,
+            connection: Arc::clone(&self.connection),
+            granted: Arc::clone(&granted),
+            sender,
+        });
+        drop(state);
+        Ok((
+            receiver,
+            RpcOutboundCombinedWaiterGuard {
+                process: self.process.clone(),
+                connection: Arc::clone(&self.connection),
+                id,
+                bytes,
+                granted,
+                active: true,
+            },
+        ))
     }
 
     fn try_acquire(&self, bytes: usize) -> Result<RpcOutboundBytePermit, ()> {
-        let connection = Arc::clone(&self.connection).try_acquire(bytes).ok_or(())?;
-        let process = self.process.try_acquire(bytes)?;
-        Ok(RpcOutboundBytePermit {
-            process,
-            connection,
+        self.try_acquire_both(bytes).ok_or(())
+    }
+
+    fn try_acquire_both(&self, bytes: usize) -> Option<RpcOutboundBytePermit> {
+        if bytes > self.connection_capacity || bytes > self.process.inner.capacity {
+            return None;
+        }
+
+        // Every two-tier acquisition takes the process-wide combined queue,
+        // shared process lock, and per-connection lock in that order. Capacity
+        // is either reserved from both tiers or from neither.
+        let combined = self.process.combined.lock().ok()?;
+        let mut process_state = self.process.inner.state.lock().ok()?;
+        let mut connection_state = self.connection.state.lock().ok()?;
+        if !combined.waiters.is_empty()
+            || !process_state.waiters.is_empty()
+            || !connection_state.waiters.is_empty()
+            || process_state.available < bytes
+            || connection_state.available < bytes
+        {
+            return None;
+        }
+        process_state.available -= bytes;
+        connection_state.available -= bytes;
+        drop(connection_state);
+        drop(process_state);
+        drop(combined);
+
+        Some(RpcOutboundBytePermit {
+            process: WeightedByteGrant {
+                inner: Arc::clone(&self.process.inner),
+                bytes,
+            },
+            connection: WeightedByteGrant {
+                inner: Arc::clone(&self.connection),
+                bytes,
+            },
         })
     }
 }
@@ -107,11 +229,35 @@ impl RpcOutboundBudget {
 #[derive(Clone)]
 pub(crate) struct RpcOutboundProcessBudget {
     inner: Arc<WeightedByteBudget>,
+    combined: Arc<Mutex<RpcOutboundCombinedState>>,
+}
+
+struct RpcOutboundCombinedState {
+    next_waiter_id: u64,
+    waiters: VecDeque<RpcOutboundCombinedWaiter>,
+}
+
+struct RpcOutboundCombinedWaiter {
+    id: u64,
+    bytes: usize,
+    connection: Arc<WeightedByteBudget>,
+    granted: Arc<AtomicBool>,
+    sender: oneshot::Sender<()>,
+}
+
+struct RpcOutboundCombinedWaiterGuard {
+    process: RpcOutboundProcessBudget,
+    connection: Arc<WeightedByteBudget>,
+    id: u64,
+    bytes: usize,
+    granted: Arc<AtomicBool>,
+    active: bool,
 }
 
 pub(crate) struct WeightedByteBudget {
     capacity: usize,
     state: Mutex<WeightedByteBudgetState>,
+    changed: Notify,
 }
 
 struct WeightedByteBudgetState {
@@ -151,9 +297,64 @@ impl RpcOutboundProcessBudget {
     pub(crate) fn new(capacity: usize) -> Self {
         Self {
             inner: Arc::new(WeightedByteBudget::new(capacity)),
+            combined: Arc::new(Mutex::new(RpcOutboundCombinedState {
+                next_waiter_id: 0,
+                waiters: VecDeque::new(),
+            })),
         }
     }
 
+    fn grant_combined_waiters(&self) {
+        let mut combined = self.combined.lock().expect("combined outbound budget lock");
+        let mut process_state = self.inner.state.lock().expect("process byte budget lock");
+        if !process_state.waiters.is_empty() {
+            return;
+        }
+
+        loop {
+            let candidate = combined
+                .waiters
+                .iter()
+                .enumerate()
+                .find_map(|(index, waiter)| {
+                    let connection_state = waiter.connection.state.lock().ok()?;
+                    let fits = connection_state.waiters.is_empty()
+                        && waiter.bytes <= process_state.available
+                        && waiter.bytes <= connection_state.available;
+                    drop(connection_state);
+                    fits.then(|| (index, Arc::clone(&waiter.connection)))
+                });
+            let Some((index, connection)) = candidate else {
+                return;
+            };
+            let mut connection_state = connection
+                .state
+                .lock()
+                .expect("connection byte budget lock");
+            let waiter = combined
+                .waiters
+                .remove(index)
+                .expect("selected combined outbound waiter exists");
+            debug_assert!(waiter.bytes <= process_state.available);
+            debug_assert!(waiter.bytes <= connection_state.available);
+            process_state.available -= waiter.bytes;
+            connection_state.available -= waiter.bytes;
+            waiter.granted.store(true, Ordering::Release);
+            if waiter.sender.send(()).is_err() {
+                waiter.granted.store(false, Ordering::Release);
+                process_state.available = process_state
+                    .available
+                    .saturating_add(waiter.bytes)
+                    .min(self.inner.capacity);
+                connection_state.available = connection_state
+                    .available
+                    .saturating_add(waiter.bytes)
+                    .min(connection.capacity);
+            }
+        }
+    }
+
+    #[cfg(test)]
     async fn acquire(&self, bytes: usize, deadline: Instant) -> Result<WeightedByteGrant, ()> {
         Arc::clone(&self.inner)
             .acquire(bytes, deadline)
@@ -161,8 +362,61 @@ impl RpcOutboundProcessBudget {
             .ok_or(())
     }
 
+    #[cfg(test)]
     fn try_acquire(&self, bytes: usize) -> Result<WeightedByteGrant, ()> {
-        Arc::clone(&self.inner).try_acquire(bytes).ok_or(())
+        let combined = self.combined.lock().map_err(|_| ())?;
+        if !combined.waiters.is_empty() {
+            return Err(());
+        }
+        let grant = Arc::clone(&self.inner).try_acquire(bytes).ok_or(())?;
+        drop(combined);
+        Ok(grant)
+    }
+}
+
+impl Drop for RpcOutboundCombinedWaiterGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut combined = self
+            .process
+            .combined
+            .lock()
+            .expect("combined outbound budget lock");
+        let mut process_state = self
+            .process
+            .inner
+            .state
+            .lock()
+            .expect("process byte budget lock");
+        let mut connection_state = self
+            .connection
+            .state
+            .lock()
+            .expect("connection byte budget lock");
+        if let Some(index) = combined
+            .waiters
+            .iter()
+            .position(|waiter| waiter.id == self.id)
+        {
+            combined.waiters.remove(index);
+        } else if self.granted.swap(false, Ordering::AcqRel) {
+            process_state.available = process_state
+                .available
+                .saturating_add(self.bytes)
+                .min(self.process.inner.capacity);
+            connection_state.available = connection_state
+                .available
+                .saturating_add(self.bytes)
+                .min(self.connection.capacity);
+        }
+        drop(connection_state);
+        drop(process_state);
+        drop(combined);
+        self.process.grant_combined_waiters();
+        self.process.inner.changed.notify_waiters();
+        self.connection.changed.notify_waiters();
     }
 }
 
@@ -175,9 +429,11 @@ impl WeightedByteBudget {
                 next_waiter_id: 0,
                 waiters: VecDeque::new(),
             }),
+            changed: Notify::new(),
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn acquire(
         self: Arc<Self>,
         bytes: usize,
@@ -256,6 +512,7 @@ impl WeightedByteBudget {
         ))
     }
 
+    #[cfg(test)]
     pub(crate) fn try_acquire(self: Arc<Self>, bytes: usize) -> Option<WeightedByteGrant> {
         if bytes > self.capacity {
             return None;
@@ -345,6 +602,8 @@ fn release_weighted_bytes(inner: Arc<WeightedByteBudget>, bytes: usize) {
     let mut state = inner.state.lock().expect("weighted byte budget lock");
     state.available = state.available.saturating_add(bytes).min(inner.capacity);
     grant_weighted_byte_waiters(&mut state);
+    drop(state);
+    inner.changed.notify_waiters();
 }
 
 fn cancel_weighted_byte_waiter(
@@ -360,6 +619,8 @@ fn cancel_weighted_byte_waiter(
         state.available = state.available.saturating_add(bytes).min(inner.capacity);
     }
     grant_weighted_byte_waiters(&mut state);
+    drop(state);
+    inner.changed.notify_waiters();
 }
 
 pub(crate) struct RpcOutboundBytePermit {
@@ -1892,6 +2153,67 @@ mod tests {
         );
         assert!(waiting.await.expect("connection waiter task").is_err());
         drop(blocker);
+    }
+
+    #[tokio::test]
+    async fn two_tier_admission_does_not_hold_connection_bytes_while_process_bytes_are_blocked() {
+        let process = RpcOutboundProcessBudget::new(10);
+        let process_blocker = process.try_acquire(9).expect("hold most process bytes");
+        let budget = RpcOutboundBudget::new(process, 8);
+
+        let large_budget = budget.clone();
+        let large = tokio::spawn(async move {
+            large_budget
+                .acquire(8, Instant::now() + Duration::from_secs(5))
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        let small = timeout(
+            Duration::from_millis(250),
+            budget.acquire(1, Instant::now() + Duration::from_secs(5)),
+        )
+        .await
+        .expect("small response is not blocked by a large response holding connection bytes")
+        .expect("one byte fits both admission tiers");
+        assert!(!large.is_finished());
+
+        drop(small);
+        drop(process_blocker);
+        let large = timeout(Duration::from_secs(1), large)
+            .await
+            .expect("large response proceeds after process capacity is released")
+            .expect("large response task joins")
+            .expect("large response acquires both tiers");
+        assert_eq!(large.process.bytes(), 8);
+        assert_eq!(large.connection.bytes(), 8);
+    }
+
+    #[tokio::test]
+    async fn two_tier_admission_observes_release_between_probe_and_notify_poll() {
+        let process = RpcOutboundProcessBudget::new(1);
+        let blocker = process.try_acquire(1).expect("hold process byte");
+        let reached = Arc::new(tokio::sync::Barrier::new(2));
+        let resume = Arc::new(tokio::sync::Barrier::new(2));
+        let budget = RpcOutboundBudget::new(process, 1)
+            .with_after_combined_probe(Arc::clone(&reached), Arc::clone(&resume));
+        let waiting = tokio::spawn(async move {
+            budget
+                .acquire(1, Instant::now() + Duration::from_secs(5))
+                .await
+        });
+
+        reached.wait().await;
+        drop(blocker);
+        resume.wait().await;
+
+        let permit = timeout(Duration::from_millis(250), waiting)
+            .await
+            .expect("release registered before the probe is not lost")
+            .expect("waiting admission task joins")
+            .expect("both tiers become available");
+        assert_eq!(permit.process.bytes(), 1);
+        assert_eq!(permit.connection.bytes(), 1);
     }
 
     #[tokio::test]

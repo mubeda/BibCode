@@ -163,7 +163,13 @@ describe.skipIf(serverBinary === undefined)(
     it("mints, pairs in-channel, round-trips RPC, and reconnects with the minted bearer", async () => {
       const { payload, hostKey } = await mintedPairing(server);
       const channel = await openEncrypted(server, hostKey);
-      channel.sendMessage(JSON.stringify({ type: "e2ee_auth", pairing: payload.token }));
+      channel.sendMessage(
+        JSON.stringify({
+          type: "e2ee_auth",
+          pairing: payload.token,
+          pairingConfirmation: true,
+        }),
+      );
       const authenticated = JSON.parse(await channel.nextMessage()) as {
         type: string;
         credential?: string;

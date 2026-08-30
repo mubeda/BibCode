@@ -49,8 +49,17 @@ describe("remote pairing contract", () => {
   });
 
   it("round-trips the channel control messages", () => {
-    const pairingForm = decodeAuth({ type: "e2ee_auth", pairing: "one-time" });
+    const pairingForm = decodeAuth({
+      type: "e2ee_auth",
+      pairing: "one-time",
+      pairingConfirmation: true,
+    });
     expect("pairing" in pairingForm && pairingForm.pairing).toBe("one-time");
+    expect("pairingConfirmation" in pairingForm && pairingForm.pairingConfirmation).toBe(true);
+    expect(decodeAuth({ type: "e2ee_auth", pairing: "legacy" })).toEqual({
+      type: "e2ee_auth",
+      pairing: "legacy",
+    });
     const bearerForm = decodeAuth({ type: "e2ee_auth", bearer: "stored" });
     expect("bearer" in bearerForm && bearerForm.bearer).toBe("stored");
 
@@ -60,9 +69,11 @@ describe("remote pairing contract", () => {
       credential: "bearer-token",
       environmentId: "env-1",
       storageInstanceId: "3f2f6a52-6f5f-4f4e-9d38-0a1e2ac21d11",
+      pairingConfirmationRequired: true,
     });
     expect(minted.credential).toBe("bearer-token");
     expect(minted.environmentId).toBe("env-1");
+    expect(minted.pairingConfirmationRequired).toBe(true);
 
     expect(decodeError({ type: "e2ee_error", code: "unauthorized" }).code).toBe("unauthorized");
   });

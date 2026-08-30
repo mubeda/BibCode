@@ -124,6 +124,52 @@ impl Drop for AuthenticatedConnectionGuard {
     }
 }
 
+struct PendingSessionIssuanceGuard {
+    auth: AuthService,
+    session_id: String,
+    armed: bool,
+}
+
+impl PendingSessionIssuanceGuard {
+    fn new(auth: AuthService, session_id: String) -> Self {
+        Self {
+            auth,
+            session_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingSessionIssuanceGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let auth = self.auth.clone();
+        let session_id = self.session_id.clone();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::error!(
+                session_id,
+                "unable to schedule compensation for cancelled pending session issuance"
+            );
+            return;
+        };
+        runtime.spawn(async move {
+            if let Err(error) = auth.revoke_failed_pairing_session(&session_id).await {
+                tracing::error!(
+                    session_id,
+                    ?error,
+                    "failed to compensate cancelled pending session issuance"
+                );
+            }
+        });
+    }
+}
+
 #[derive(Clone)]
 struct DesktopBootstrap {
     credential: String,
@@ -1682,6 +1728,18 @@ impl AuthService {
         session_id: &str,
         shutdown: CancellationToken,
     ) -> Result<u64, AuthError> {
+        let mut guard = self.mark_connected_guard(session_id, shutdown).await?;
+        Ok(guard
+            .connection_id
+            .take()
+            .expect("new authenticated connection guard is armed"))
+    }
+
+    pub(crate) async fn mark_connected_guard(
+        &self,
+        session_id: &str,
+        shutdown: CancellationToken,
+    ) -> Result<AuthenticatedConnectionGuard, AuthError> {
         let mut state = self.state.lock().await;
         let observed_at = now_ms();
         let Some(session) = state.sessions.get_mut(session_id) else {
@@ -1707,6 +1765,11 @@ impl AuthService {
             .or_default()
             .insert(connection_id, shutdown);
         drop(state);
+        let guard = AuthenticatedConnectionGuard {
+            auth: self.clone(),
+            session_id: session_id.to_owned(),
+            connection_id: Some(connection_id),
+        };
         if let Some(repositories) = &self.repositories
             && let Err(error) = repositories
                 .set_auth_session_last_connected_at(
@@ -1720,20 +1783,7 @@ impl AuthService {
             tracing::error!(%error, %session_id, "failed to persist session connection time");
         }
         self.emit_access_change(AuthAccessChange::ClientUpserted(view));
-        Ok(connection_id)
-    }
-
-    pub(crate) async fn mark_connected_guard(
-        &self,
-        session_id: &str,
-        shutdown: CancellationToken,
-    ) -> Result<AuthenticatedConnectionGuard, AuthError> {
-        let connection_id = self.mark_connected(session_id, shutdown).await?;
-        Ok(AuthenticatedConnectionGuard {
-            auth: self.clone(),
-            session_id: session_id.to_owned(),
-            connection_id: Some(connection_id),
-        })
+        Ok(guard)
     }
 
     pub async fn mark_disconnected(&self, session_id: &str, connection_id: u64) {
@@ -1834,6 +1884,9 @@ impl AuthService {
             }
         }
         let view = record.view(false);
+        let mut pending_issuance_guard = (delivery_state
+            == AuthSessionDeliveryState::PendingPairing)
+            .then(|| PendingSessionIssuanceGuard::new(self.clone(), session_id.clone()));
         if let Some(repositories) = &self.repositories {
             repositories
                 .create_auth_session(persisted_auth_session(&record))
@@ -1846,6 +1899,9 @@ impl AuthService {
         drop(state);
         self.emit_access_change(AuthAccessChange::ClientUpserted(view));
         self.ensure_authority_watcher();
+        if let Some(guard) = &mut pending_issuance_guard {
+            guard.disarm();
+        }
         Ok(IssuedSession {
             token,
             principal: Principal {
@@ -2822,6 +2878,208 @@ mod tests {
                 .connected_count,
             0
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_guard_registration_releases_bookkeeping_while_persistence_is_queued() {
+        let database = crate::persistence::Database::open_in_memory()
+            .await
+            .expect("in-memory database opens");
+        database
+            .call(|connection| {
+                crate::persistence::run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("all migrations apply");
+        let repositories = Repositories::new(database.clone());
+        let secrets = tempfile::tempdir().expect("secret store directory");
+        let secret_store = SecretStore::new(secrets.path())
+            .await
+            .expect("secret store opens");
+        let config = ServerConfig::new(".")
+            .with_bind("127.0.0.1", 3773)
+            .with_desktop("desktop-test-seed")
+            .expect("desktop config");
+        let auth =
+            AuthService::new_with_persistence(&config, vec![7_u8; 32], secret_store, repositories)
+                .await
+                .expect("persistent auth service starts");
+        let issued = auth
+            .exchange_bootstrap(
+                "desktop-test-seed",
+                None,
+                ClientMetadata::default(),
+                None,
+                SessionTransport::Plain,
+            )
+            .await
+            .expect("session");
+        let session_id = issued.principal.session_id;
+
+        let (worker_entered_tx, worker_entered_rx) = tokio::sync::oneshot::channel();
+        let (release_worker_tx, release_worker_rx) = std::sync::mpsc::channel();
+        let blocking_database = database.clone();
+        let blocker = tokio::spawn(async move {
+            blocking_database
+                .call(move |_connection| {
+                    worker_entered_tx.send(()).expect("signal blocked worker");
+                    release_worker_rx.recv().expect("worker release signal");
+                    Ok(())
+                })
+                .await
+        });
+        worker_entered_rx.await.expect("database worker is blocked");
+
+        let registering_auth = auth.clone();
+        let registering_session_id = session_id.clone();
+        let registration = tokio::spawn(async move {
+            registering_auth
+                .mark_connected_guard(&registering_session_id, CancellationToken::new())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if auth
+                    .state
+                    .lock()
+                    .await
+                    .sessions
+                    .get(&session_id)
+                    .expect("live session")
+                    .connected_count
+                    == 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("registration mutates in-memory bookkeeping before persistence");
+
+        registration.abort();
+        let registration_result = registration.await;
+        assert!(matches!(registration_result, Err(error) if error.is_cancelled()));
+        release_worker_tx.send(()).expect("release database worker");
+        blocker
+            .await
+            .expect("database blocker joins")
+            .expect("database blocker succeeds");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let state = auth.state.lock().await;
+                let connected_count = state
+                    .sessions
+                    .get(&session_id)
+                    .expect("live session")
+                    .connected_count;
+                let has_live_token = state.live_connections.contains_key(&session_id);
+                drop(state);
+                if connected_count == 0 && !has_live_token {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled registration releases bookkeeping");
+        database.close().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_pending_session_issuance_revokes_durable_commit_before_state_publication() {
+        let database = crate::persistence::Database::open_in_memory()
+            .await
+            .expect("in-memory database opens");
+        database
+            .call(|connection| {
+                crate::persistence::run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("all migrations apply");
+        let repositories = Repositories::new(database.clone());
+        let secrets = tempfile::tempdir().expect("secret store directory");
+        let secret_store = SecretStore::new(secrets.path())
+            .await
+            .expect("secret store opens");
+        let config = ServerConfig::new(".")
+            .with_bind("127.0.0.1", 3773)
+            .with_desktop("desktop-test-seed")
+            .expect("desktop config");
+        let auth = AuthService::new_with_persistence(
+            &config,
+            vec![7_u8; 32],
+            secret_store,
+            repositories.clone(),
+        )
+        .await
+        .expect("persistent auth service starts");
+
+        let initial_state_guard = auth.state.lock().await;
+        let exchanging_auth = auth.clone();
+        let exchange = tokio::spawn(async move {
+            exchanging_auth
+                .exchange_pairing_bootstrap("desktop-test-seed", ClientMetadata::default())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if auth.issuance.try_lock().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("session issuance waits for the initial state lock");
+
+        drop(initial_state_guard);
+        let publication_state_guard = auth.state.lock().await;
+        let pending_session = repositories
+            .list_active_auth_sessions(format_iso(now_ms()))
+            .await
+            .expect("durable sessions list")
+            .into_iter()
+            .find(|session| session.delivery_state == AuthSessionDeliveryState::PendingPairing)
+            .expect("pending session commits before state publication");
+        assert!(
+            !publication_state_guard
+                .sessions
+                .contains_key(&pending_session.session_id)
+        );
+
+        exchange.abort();
+        let exchange_result = exchange.await;
+        assert!(matches!(exchange_result, Err(error) if error.is_cancelled()));
+        drop(publication_state_guard);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let persisted = repositories
+                    .get_auth_session(pending_session.session_id.clone())
+                    .await
+                    .expect("persisted session reads")
+                    .expect("persisted pending session remains auditable");
+                if persisted.revoked_at.is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled pending issuance revokes its durable session");
+        assert!(
+            !auth
+                .state
+                .lock()
+                .await
+                .sessions
+                .contains_key(&pending_session.session_id)
+        );
+        database.close().await;
     }
 
     fn service() -> AuthService {

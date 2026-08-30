@@ -160,7 +160,11 @@ export const makeE2eeSocket = (inner: Socket.Socket, options: E2eeSocketOptions)
                 phase = "auth";
                 const authMessage =
                   options.auth.kind === "pairing"
-                    ? { type: "e2ee_auth", pairing: options.auth.token }
+                    ? {
+                        type: "e2ee_auth",
+                        pairing: options.auth.token,
+                        pairingConfirmation: true,
+                      }
                     : { type: "e2ee_auth", bearer: options.auth.credential };
                 return encryptAndSend(
                   currentTransport(),

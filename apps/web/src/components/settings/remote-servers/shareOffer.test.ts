@@ -91,26 +91,38 @@ describe("generateShareOffer", () => {
     expect(result).toMatchObject({ ok: false, failure: { kind: "widen-failed" } });
   });
 
-  it("times out a blackholed desktop widening call visibly", async () => {
-    const mintOffer = vi.fn();
-    const result = await generateShareOffer({
+  it("awaits native widening past the HTTP request deadline before minting", async () => {
+    let finishWidening: ((state: typeof wideState) => void) | undefined;
+    const applyServerExposure = vi.fn(
+      () =>
+        new Promise<typeof wideState>((resolve) => {
+          finishWidening = resolve;
+        }),
+    );
+    const mintOffer = vi.fn(async (input: { endpoint: string; name: string }) => ({
+      code: "c0de",
+      endpoint: input.endpoint,
+      name: input.name,
+      expiresAt: "2026-08-27T01:00:00.000Z",
+    }));
+    const pending = generateShareOffer({
       intent: "another-device",
       name: "AI-SERVER",
       customAddress: null,
       selectedOption: { id: "auto-lan", label: "Automatic (LAN)", httpBaseUrl: null },
       hasDesktopBridge: true,
       exposureState: loopbackState,
-      applyServerExposure: () => new Promise(() => {}),
+      applyServerExposure,
       mintOffer,
       ...defaultDeps,
       requestTimeoutMs: 5,
     });
 
+    await new Promise((resolve) => setTimeout(resolve, 10));
     expect(mintOffer).not.toHaveBeenCalled();
-    expect(result).toMatchObject({
-      ok: false,
-      failure: { kind: "widen-failed", message: expect.stringContaining("timed out after 5ms") },
-    });
+    finishWidening?.(wideState);
+    await expect(pending).resolves.toMatchObject({ ok: true });
+    expect(mintOffer).toHaveBeenCalledOnce();
   });
 
   it("never widens for this-computer offers", async () => {
@@ -237,7 +249,7 @@ describe("generateShareOffer", () => {
     });
   });
 
-  it("bounds a blackholed cancellation before authoritative exposure reconciliation", async () => {
+  it("leaves exposure unchanged when blackholed cancellation cannot rule out a live offer", async () => {
     const cancelOffer = vi.fn(() => new Promise<void>(() => {}));
     const cleanupExposureAfterFailedMint = vi.fn(async () => "local-confirmed" as const);
     const result = await generateShareOffer({
@@ -259,18 +271,18 @@ describe("generateShareOffer", () => {
     });
 
     expect(cancelOffer.mock.calls).toEqual([["key-1"], ["key-1"], ["key-1"]]);
-    expect(cleanupExposureAfterFailedMint).toHaveBeenCalledOnce();
+    expect(cleanupExposureAfterFailedMint).not.toHaveBeenCalled();
     expect(result).toMatchObject({
       ok: false,
       failure: {
         kind: "mint-failed",
-        cleanup: "local-confirmed",
+        cleanup: "cancellation-unconfirmed",
         message: expect.stringContaining("timed out"),
       },
     });
   });
 
-  it("bounds cancellation retries and reconciles from authoritative loopback state", async () => {
+  it("bounds cancellation retries without narrowing while offer creation remains ambiguous", async () => {
     const cancelOffer = vi.fn(async () => {
       throw new Error("server unreachable");
     });
@@ -297,10 +309,10 @@ describe("generateShareOffer", () => {
 
     expect(cancelOffer.mock.calls).toEqual([["key-1"], ["key-1"], ["key-1"]]);
     expect(sleep).toHaveBeenCalledTimes(2);
-    expect(cleanupExposureAfterFailedMint).toHaveBeenCalledOnce();
+    expect(cleanupExposureAfterFailedMint).not.toHaveBeenCalled();
     expect(result).toMatchObject({
       ok: false,
-      failure: { kind: "mint-failed", cleanup: "local-confirmed" },
+      failure: { kind: "mint-failed", cleanup: "cancellation-unconfirmed" },
     });
   });
 
@@ -325,12 +337,12 @@ describe("generateShareOffer", () => {
       cleanupExposureAfterFailedMint,
     });
 
-    expect(cleanupExposureAfterFailedMint).toHaveBeenCalledOnce();
+    expect(cleanupExposureAfterFailedMint).not.toHaveBeenCalled();
     expect(result).toMatchObject({
       ok: false,
       failure: {
         kind: "mint-failed",
-        cleanup: "active-reason",
+        cleanup: "cancellation-unconfirmed",
         message: expect.stringContaining("cancellation unconfirmed"),
       },
     });
@@ -405,7 +417,7 @@ describe("generateShareOffer", () => {
     });
   });
 
-  it("reports cancellation failure while accepting authoritative local-only reconciliation", async () => {
+  it("does not narrow on cancellation failure even if a stale read reports loopback", async () => {
     const cancelOffer = vi.fn(async () => {
       throw new Error("server unreachable");
     });
@@ -428,12 +440,12 @@ describe("generateShareOffer", () => {
     });
 
     expect(cancelOffer).toHaveBeenCalledTimes(3);
-    expect(cleanupExposureAfterFailedMint).toHaveBeenCalledOnce();
+    expect(cleanupExposureAfterFailedMint).not.toHaveBeenCalled();
     expect(result).toMatchObject({
       ok: false,
       failure: {
         kind: "mint-failed",
-        cleanup: "local-confirmed",
+        cleanup: "cancellation-unconfirmed",
         message: expect.stringContaining("Pairing-offer cancellation failed: server unreachable"),
       },
     });
@@ -596,5 +608,29 @@ describe("resolveShareAddressOptions", () => {
       id: "auto-lan",
       httpBaseUrl: "https://server.example.com/",
     });
+  });
+
+  it("does not offer a public-only address while native exposure is local-only", () => {
+    const options = resolveShareAddressOptions({
+      intent: "another-device",
+      advertisedEndpoints: [
+        {
+          id: "desktop-network:8.8.8.8:3773",
+          label: "Public address",
+          provider: { id: "desktop-core", label: "Desktop", kind: "core", isAddon: false },
+          httpBaseUrl: "http://8.8.8.8:3773/",
+          wsBaseUrl: "ws://8.8.8.8:3773/",
+          reachability: "public",
+          compatibility: { hostedHttpsApp: "mixed-content-blocked", desktopApp: "compatible" },
+          source: "desktop-core",
+          status: "available",
+          isDefault: false,
+        },
+      ],
+      exposureState: loopbackState,
+      primaryHttpBaseUrl: "http://127.0.0.1:3773",
+    });
+
+    expect(options).toEqual([]);
   });
 });

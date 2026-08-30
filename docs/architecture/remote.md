@@ -59,9 +59,14 @@ ranking both call that classifier, so unspecified, loopback, multicast, and
 link-local addresses fail closed. Until the desktop listener is dual-stack,
 discovery emits IPv4 candidates only. It normalizes IPv4-mapped IPv6,
 deduplicates by address, and ranks a usable private default-route address before
-CGNAT/Tailscale and other private addresses. Public IPv4 addresses may be shown
-as **Public address**, but are never preselected; choosing one requires an
-explicit public-address and firewall warning. Tailscale CLI discovery checks the
+CGNAT/Tailscale and other private addresses. Native-managed sharing accepts only
+private or CGNAT default-route addresses: while the native server is local-only,
+public-only candidates are not actionable and the transition fails closed.
+Public addresses may still be shown for an already externally managed topology,
+but are never preselected and require an explicit public-address and firewall
+warning. A public-only host must use an externally managed `bibcode serve`
+listener or reverse proxy rather than asking the native exposure command to
+infer public-listener authority. Tailscale CLI discovery checks the
 packaged Windows, macOS, and Linux install paths before `PATH` and emits only
 usable private IPv4 candidates. Stable endpoint IDs include the address and port,
 and the user's default is persisted by stable ID rather than array position.
@@ -111,20 +116,27 @@ RPC socket adapter attaches. Ciphertext records therefore enter the Noise
 decryptor in WebSocket delivery order without asynchronous `Blob` conversion.
 
 The first logical message authenticates inside the encrypted channel. A new
-device sends `{"type":"e2ee_auth","pairing":"<one-time token>"}`. Only a
-successful exchange consumes that token; a wrong host or failed handshake does
-not reach the exchange. The accepted exchange creates a `pending-pairing`
-session and consumes the token before the encrypted credential reply is
-delivered. A delivery guard owns that session until in-channel confirmation;
+device that supports durable delivery confirmation sends
+`{"type":"e2ee_auth","pairing":"<one-time token>","pairingConfirmation":true}`.
+Only a successful exchange consumes that token; a wrong host or failed
+handshake does not reach the exchange. A negotiated exchange creates a
+`pending-pairing` session and consumes the token before the encrypted credential
+reply is delivered. Pending-session compensation is armed before the SQLite
+issuance job is queued, because a queued database call can outlive cancellation
+of its awaiting future. A delivery guard then owns that session until in-channel confirmation;
 capacity binding, encoding, encryption, or socket-write failure schedules
 best-effort revocation of the undelivered session. After delivery, verification
 or client-persistence failure closes the channel and the same guard revokes the
 delivered-but-unconfirmed session without replacing the original error.
 The one-time token remains consumed, so the user generates a new offer, but the
 pending credential cannot reconnect as steady-state authority. The server
-returns
-`e2ee_authenticated` with the minted string credential plus `environmentId` and,
-when available, `storageInstanceId`. A returning device sends
+returns `e2ee_authenticated` with the minted string credential,
+`environmentId`, optional `storageInstanceId`, and
+`pairingConfirmationRequired: true` only for that negotiated pending flow. A
+legacy client omits `pairingConfirmation`; a new server then preserves the v1
+behavior by minting an immediately active session and omitting the reply flag.
+A new client talking to an older server likewise treats an absent reply flag as
+an already-active credential and skips `auth.confirmPairing`. A returning device sends
 `{"type":"e2ee_auth","bearer":"<stored credential>"}` and receives an
 `e2ee_authenticated` acknowledgement. Invalid credentials receive
 `e2ee_error/unauthorized`; malformed protocol receives `e2ee_error/protocol`;
@@ -186,8 +198,10 @@ connection.
 
 Established E2EE RPC output has a process-wide 128 MiB plaintext budget and a
 64 MiB per-connection budget. The generic session first counts an upper bound
-for serialized JSON, acquires both byte permits, encodes once, then returns any
-over-reserved bytes before enqueueing the response. The queued frame owns those permits
+for serialized JSON, admits the request through one process-wide combined
+fit-first queue, and reserves both byte permits in one critical section. It
+never sleeps while retaining only one tier. The session then encodes once and
+returns any over-reserved bytes before enqueueing the response. The queued frame owns those permits
 through Noise record encryption and every successful or failed WebSocket
 write;
 generic queue capacity therefore cannot hide additional plaintext. Unary
@@ -253,15 +267,18 @@ is embedded in the code and persisted with the grant as described below.
 
 The add flow parses and classifies the endpoint, fetches the public descriptor,
 performs the pinned handshake and in-channel pairing, and calls authenticated
-`server.getConfig` before saving anything. The new session is persisted by the
-server as `pending-pairing`: the bootstrap channel may verify RPC identity, but
-the delivered bearer cannot establish a steady-state reconnect yet. The client
+`server.getConfig` before saving anything. When both peers negotiate pairing
+confirmation, the new session is persisted by the server as `pending-pairing`:
+the bootstrap channel may verify RPC identity, but the delivered bearer cannot
+establish a steady-state reconnect yet. The client
 compares the in-channel environment and storage identities with both the pairing
 payload and descriptor, registers the verified profile and credential, accepts
 the storage identity, then calls the empty `auth.confirmPairing` RPC on that same
 channel. Confirmation requires `access:write`, derives the session ID from the
 authenticated context, and idempotently commits only that session to `active`;
-the add succeeds only after that commit.
+the add succeeds only after that commit. Compatibility is additive: a legacy
+client receives an active credential immediately, while a new client skips
+confirmation when an older server omits `pairingConfirmationRequired`.
 
 Registration, identity persistence, or confirmation failure rolls back local
 writes best-effort before the bootstrap scope closes. Registration removal is
@@ -387,10 +404,12 @@ firewall store, removes only the named BiBCode rule, and re-enumerates to verify
 absence. Firewall commands run through the shared supervised process runner with
 a 15-second process timeout, a 64 KiB truncated-output bound, and kill/reap
 ownership for the process tree. A serialized firewall worker additionally gives
-each caller a five-second deadline that includes spawn. The worker retains a
-late job after its caller returns; a late successful enable is followed by a
-verified delete, and later firewall operations remain queued behind that cleanup
-so a timed-out add cannot become the final state. A missing rule is successful
+each caller a five-second deadline that includes spawn. Its bounded desired-state
+coalescer retains at most one in-flight job and the latest pending state; a newer
+pending request releases the superseded caller with an explicit saturation
+error. The worker retains a late job after its caller returns; a late successful
+enable is followed by a verified delete, and the latest pending firewall state
+waits behind that cleanup so a timed-out add cannot become the final state. A missing rule is successful
 only after its absence is verified; process, policy, and verification failures
 propagate to the coordinator and are reported as incomplete cleanup. The
 persisted desktop setting records the last completed transition but is neither
@@ -467,6 +486,10 @@ ticks. Reconciliation cancels removed sessions' local connection tokens while
 holding the service state lock and before publishing access changes, so an
 already-ACKed stream closes before later authority events are admitted. Local
 revocation still cancels immediately without waiting for the watcher.
+Live-connection registration arms its RAII guard immediately after the
+in-memory count and cancellation token are published, before awaiting SQLite
+connected-state persistence. Cancellation or persistence failure therefore
+removes the token and count even when the database job remains queued.
 
 Each pairing-offer create attempt and cancellation has a five-second deadline
 at both the primary HTTP Effect and ceremony boundary. The HTTP deadline
@@ -475,6 +498,12 @@ test transports that never settle. Five create attempts remain separated by
 the existing two-second backoff. A blackholed response therefore reaches the
 explicit cancellation/cleanup result instead of leaving the renderer waiting
 indefinitely after a native widen.
+
+Privileged native exposure mutations are not raced against those renderer HTTP
+deadlines. The renderer awaits the serialized native coordinator to completion,
+whose restart, process, firewall, and cleanup operations own their own bounded
+deadlines. This prevents the UI from reporting a failed transition while an
+uncancelable desktop command later commits a wide topology.
 
 A wide-bound native primary does not expose the desktop-only maintenance API.
 Update protection therefore degrades while sharing until exposure returns to

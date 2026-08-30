@@ -175,6 +175,7 @@ const responderScript = (options?: { failAuth?: boolean; messageBPayload?: Uint8
           credential: `minted-for-${parsed.pairing}`,
           environmentId: "env-1",
           storageInstanceId: "3f2f6a52-6f5f-4f4e-9d38-0a1e2ac21d11",
+          pairingConfirmationRequired: true,
         });
       } else {
         reply({ type: "e2ee_authenticated" });
@@ -224,7 +225,9 @@ describe("makeE2eeSocket", () => {
       );
       yield* Effect.sleep("200 millis");
       yield* Fiber.interrupt(fiber);
-      expect(received[0]).toBe(encodeJson({ type: "e2ee_auth", pairing: "one-time-1" }));
+      expect(received[0]).toBe(
+        encodeJson({ type: "e2ee_auth", pairing: "one-time-1", pairingConfirmation: true }),
+      );
       expect(received[1]).toBe(encodeJson({ hello: true }));
       expect(delivered).toEqual([encodeJson({ echoed: received[1]?.length })]);
       expect(authenticated[0]?.credential).toBe("minted-for-one-time-1");

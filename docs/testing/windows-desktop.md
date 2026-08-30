@@ -364,6 +364,9 @@ minimum-size, and relevant Windows DPI states. Verify:
   a bounded failure after five seconds even when process spawn is delayed; the
   firewall worker must retain ownership, remove and verify absence of any rule
   enabled after that deadline, and complete that cleanup before a later enable.
+  Burst multiple requests while one command is in flight and confirm the worker
+  retains only the latest pending desired state, reports superseded callers
+  explicitly, and applies that latest state after mandatory late cleanup.
   Separately confirm a hung `netsh` or PowerShell child is terminated and reaped
   by its 15-second process timeout and never retains the exposure coordinator
   indefinitely;
@@ -384,8 +387,10 @@ minimum-size, and relevant Windows DPI states. Verify:
 
 - the address picker lists only usable IPv4 candidates until a dual-stack
   listener exists, uses stable address/port IDs, safely preselects a private
-  default, never preselects a public address, and requires an explicit
-  public-address/firewall warning. A packaged Tailscale CLI is discovered
+  default, and leaves generation disabled with externally managed
+  listener/reverse-proxy guidance when native discovery has only a public
+  address. An externally managed public endpoint is never preselected and
+  requires an explicit public-address/firewall warning. A packaged Tailscale CLI is discovered
   without shell `PATH` and unusable, public, or IPv6 candidates are suppressed;
 - seed an incompatible newer connection IndexedDB version and confirm the
   boot-level recovery dialog lists the deleted data classes, keeps **Reload** as

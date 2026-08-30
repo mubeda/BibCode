@@ -134,7 +134,11 @@ export function ShareThisHostTab(): ReactElement {
   );
   const selectedOption =
     options.find((option) => option.id === selectedOptionId) ??
-    (wslOnlyPrimary ? options.find((option) => option.httpBaseUrl !== null) : options[0]) ??
+    (wslOnlyPrimary
+      ? options.find(
+          (option) => option.httpBaseUrl !== null && option.requiresExplicitSelection !== true,
+        )
+      : options.find((option) => option.requiresExplicitSelection !== true)) ??
     null;
   const wslExposureEndpoint = wslOnlyPrimary
     ? (advertisedEndpoints.find(
@@ -151,6 +155,7 @@ export function ShareThisHostTab(): ReactElement {
       ? shareClassForPairingEndpoint(customAddress)
       : null;
   const willWiden =
+    selectedOption !== null &&
     canManageNativeExposure &&
     exposureState?.mode !== "network-accessible" &&
     (intent === "another-device" || (intent === "custom" && customEndpointClass === "off-host"));
@@ -165,11 +170,7 @@ export function ShareThisHostTab(): ReactElement {
     setIsResumingLegacy(true);
     setLegacyResumeError(null);
     try {
-      await withShareExposureBridgeTimeout(
-        "Server exposure update",
-        desktopBridge.applyServerExposure("network-accessible"),
-        PRIMARY_PAIRING_OFFER_REQUEST_TIMEOUT_MS,
-      );
+      await desktopBridge.applyServerExposure("network-accessible");
       refreshDesktopNetworkAccessState();
       await refreshShareState();
     } catch (error) {
@@ -347,35 +348,45 @@ export function ShareThisHostTab(): ReactElement {
             }
           />
         ) : intent === "another-device" ? (
-          <SettingsRow
-            title="Address"
-            description={selectedOption?.description}
-            control={
-              <div className="flex items-center gap-2">
-                <select
-                  aria-label="Share address"
-                  className="min-h-8 rounded-md border border-input bg-background px-2 text-sm"
-                  value={selectedOption?.id ?? ""}
-                  onChange={(event) => setSelectedOptionId(event.target.value)}
-                >
-                  {options.map((option) => (
-                    <option key={option.id} value={option.id}>
-                      {option.label}
-                    </option>
-                  ))}
-                </select>
-                <Button
-                  size="xs"
-                  variant="outline"
-                  onClick={handleRefresh}
-                  aria-label="Refresh addresses"
-                >
-                  <RefreshCwIcon className="size-3.5" />
-                  Refresh
-                </Button>
-              </div>
-            }
-          />
+          <>
+            <SettingsRow
+              title="Address"
+              description={selectedOption?.description}
+              control={
+                <div className="flex items-center gap-2">
+                  <select
+                    aria-label="Share address"
+                    className="min-h-8 rounded-md border border-input bg-background px-2 text-sm"
+                    value={selectedOption?.id ?? ""}
+                    onChange={(event) => setSelectedOptionId(event.target.value)}
+                  >
+                    {options.map((option) => (
+                      <option key={option.id} value={option.id}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                  <Button
+                    size="xs"
+                    variant="outline"
+                    onClick={handleRefresh}
+                    aria-label="Refresh addresses"
+                  >
+                    <RefreshCwIcon className="size-3.5" />
+                    Refresh
+                  </Button>
+                </div>
+              }
+            />
+            {options.length === 0 &&
+            canManageNativeExposure &&
+            exposureState?.mode === "local-only" ? (
+              <p className="mx-4 mb-3 text-xs text-warning">
+                Native sharing needs a private network address. For a public-only host, use an
+                externally managed server or reverse proxy.
+              </p>
+            ) : null}
+          </>
         ) : null}
         <div className="mx-4 my-3 rounded-md border border-warning/35 bg-warning/10 px-3 py-2 text-xs text-foreground">
           Pairing grants your user account on this machine. A paired client can read and write

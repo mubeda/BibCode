@@ -83,14 +83,19 @@ deadline or transport failure follows the supervisor's bounded transient retry
 policy.
 
 The verify-then-add flow uses that session to compare the descriptor, pairing
-payload, `e2ee_authenticated` response, and `server.getConfig` identities. The
-server session is `pending-pairing`: the bootstrap channel can perform identity
-verification, but its credential cannot reconnect as steady-state authority.
-The client registers the verified profile and credential, persists the accepted
-storage identity, then calls `auth.confirmPairing` on that same channel. The add
-returns only after confirmation atomically makes that session active. Closing
-before confirmation revokes the pending session, and server startup removes
-pending sessions left by a crash. This prevents a routing endpoint from
+payload, `e2ee_authenticated` response, and `server.getConfig` identities. New
+clients advertise `pairingConfirmation: true` inside encrypted authentication.
+When the server returns `pairingConfirmationRequired: true`, its session is
+`pending-pairing`: the bootstrap channel can perform identity verification, but
+its credential cannot reconnect as steady-state authority. The client registers
+the verified profile and credential, persists the accepted storage identity,
+then calls `auth.confirmPairing` on that same channel. The add returns only after
+confirmation atomically makes that session active. Closing before confirmation
+revokes the pending session, and server startup removes pending sessions left by
+a crash. A legacy client omits the request capability and receives an immediately
+active session from a new server; a new client treats an absent response flag
+from an older server as the same legacy-active flow and skips confirmation. This
+additive negotiation prevents a routing endpoint from
 substituting a different logical environment or persistent store after the
 pinned handshake without leaving a delivered-but-unpersisted durable client.
 
@@ -282,7 +287,8 @@ environments as desired; explicit Connect writes `true`, explicit Disconnect
 writes `false`, and removal clears the entry. Catalog/profile drift recreates a
 scope with the stored intent, so a deliberately disconnected environment does
 not reconnect merely because its supervisor was replaced. Passive state lookup
-neither creates a cold supervisor nor changes intent.
+may materialize a cold supervisor for state publication, but it preserves the
+stored intent and does not dial while that intent is disconnected.
 
 Environment commands may place a deadline around the complete lazy
 `runInEnvironment` effect. That deadline includes supervisor acquisition,
