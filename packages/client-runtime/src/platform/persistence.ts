@@ -92,6 +92,10 @@ export class AcceptedStorageIdentityStore extends Context.Service<
     readonly accept: (
       identity: AcceptedStorageIdentity,
     ) => Effect.Effect<void, ConnectionPersistenceError>;
+    readonly rollbackAcceptance: (
+      identity: AcceptedStorageIdentity,
+      previousStorageInstanceId: string | null,
+    ) => Effect.Effect<boolean, ConnectionPersistenceError>;
     readonly transition: <A>(
       targetKey: string,
       decide: (acceptedStorageInstanceId: string | null) => AcceptedStorageIdentityTransition<A>,

@@ -1,9 +1,9 @@
 use bibcode_server::orchestration::TurnDeliveryState;
 use bibcode_server::persistence::{
-    AuthPairingLink, AuthSessionClient, CheckpointDiffBlob, CommandReceipt, Database,
-    NewAuthPairingOffer, NewAuthSession, NewOrchestrationEvent, ProjectionCheckpoint,
-    ProjectionPendingApproval, ProjectionPendingTurnStart, ProjectionProject, ProjectionState,
-    ProjectionThread, ProjectionThreadActivity, ProjectionThreadMessage,
+    AuthPairingLink, AuthSessionClient, AuthSessionDeliveryState, CheckpointDiffBlob,
+    CommandReceipt, Database, NewAuthPairingOffer, NewAuthSession, NewOrchestrationEvent,
+    ProjectionCheckpoint, ProjectionPendingApproval, ProjectionPendingTurnStart, ProjectionProject,
+    ProjectionState, ProjectionThread, ProjectionThreadActivity, ProjectionThreadMessage,
     ProjectionThreadProposedPlan, ProjectionThreadSession, ProjectionTurnById,
     ProviderSessionRuntime, Repositories, WorktreeRemovalReceipt, WorktreeRepositoryPinOutcome,
     run_migrations,
@@ -310,6 +310,7 @@ fn public_repository_api_inventory_is_explicit() {
         "clear_checkpoint_turn_conflict",
         "consume_auth_pairing_link",
         "complete_auth_pairing_offer",
+        "confirm_pending_auth_session",
         "create_auth_pairing_link",
         "create_auth_pairing_link_with_offer",
         "create_auth_session",
@@ -376,6 +377,8 @@ fn public_repository_api_inventory_is_explicit() {
         "revoke_auth_pairing_link",
         "cancel_auth_pairing_offer",
         "revoke_auth_session",
+        "revoke_pending_auth_session",
+        "revoke_pending_auth_sessions",
         "revoke_other_auth_sessions",
         "set_auth_session_last_connected_at",
         "upsert_activity",
@@ -2173,6 +2176,7 @@ async fn auth_pairing_reach_round_trips_through_persistence() {
             expires_at: FUTURE.to_owned(),
             reach: Some("this-computer".to_owned()),
             off_host: Some(false),
+            delivery_state: AuthSessionDeliveryState::Active,
         })
         .await
         .expect("session insert");
@@ -2197,6 +2201,7 @@ async fn auth_sessions_round_trip_order_connect_and_revoke() {
         expires_at: FUTURE.to_owned(),
         reach: None,
         off_host: None,
+        delivery_state: AuthSessionDeliveryState::Active,
     };
     let session_b = NewAuthSession {
         session_id: "session-b".to_owned(),
@@ -2319,4 +2324,121 @@ async fn auth_sessions_round_trip_order_connect_and_revoke() {
         .await
         .expect("auth scope storage type");
     assert_eq!(storage_type, "text");
+}
+
+#[tokio::test]
+async fn pending_auth_sessions_confirm_by_id_and_startup_cleanup_is_selective() {
+    let repositories = migrated_repositories().await;
+    let session = |session_id: &str, delivery_state| NewAuthSession {
+        session_id: session_id.to_owned(),
+        subject: "paired-device".to_owned(),
+        scopes: json!(["orchestration:read"]),
+        method: "bearer-access-token".to_owned(),
+        client: auth_client(session_id),
+        issued_at: T1.to_owned(),
+        expires_at: FUTURE.to_owned(),
+        reach: Some("another-device".to_owned()),
+        off_host: Some(true),
+        delivery_state,
+    };
+    repositories
+        .create_auth_session(session(
+            "pending-confirmed",
+            AuthSessionDeliveryState::PendingPairing,
+        ))
+        .await
+        .expect("pending session insert");
+    repositories
+        .create_auth_session(session(
+            "pending-abandoned",
+            AuthSessionDeliveryState::PendingPairing,
+        ))
+        .await
+        .expect("second pending session insert");
+    repositories
+        .create_auth_session(session("active-session", AuthSessionDeliveryState::Active))
+        .await
+        .expect("active session insert");
+    repositories
+        .create_auth_session(NewAuthSession {
+            expires_at: T2.to_owned(),
+            ..session("pending-expired", AuthSessionDeliveryState::PendingPairing)
+        })
+        .await
+        .expect("expired pending session insert");
+
+    let active_ids = repositories
+        .list_active_auth_sessions(T2.to_owned())
+        .await
+        .expect("active session listing")
+        .into_iter()
+        .map(|session| session.session_id)
+        .collect::<Vec<_>>();
+    assert!(active_ids.contains(&"pending-confirmed".to_owned()));
+    assert!(active_ids.contains(&"pending-abandoned".to_owned()));
+    assert!(active_ids.contains(&"active-session".to_owned()));
+    assert!(!active_ids.contains(&"pending-expired".to_owned()));
+
+    assert_eq!(
+        repositories
+            .get_auth_session("pending-confirmed".to_owned())
+            .await
+            .expect("pending lookup")
+            .expect("pending exists")
+            .delivery_state,
+        AuthSessionDeliveryState::PendingPairing,
+    );
+    assert!(
+        repositories
+            .confirm_pending_auth_session("pending-confirmed".to_owned(), T2.to_owned())
+            .await
+            .expect("pending confirmation")
+    );
+    assert!(
+        repositories
+            .confirm_pending_auth_session("pending-confirmed".to_owned(), T2.to_owned())
+            .await
+            .expect("confirmation is idempotent")
+    );
+    assert!(
+        !repositories
+            .confirm_pending_auth_session("missing".to_owned(), T2.to_owned())
+            .await
+            .expect("missing confirmation is a miss")
+    );
+
+    let mut revoked = repositories
+        .revoke_pending_auth_sessions(TIME_3.to_owned())
+        .await
+        .expect("startup pending cleanup");
+    revoked.sort();
+    assert_eq!(revoked, ["pending-abandoned", "pending-expired"]);
+    assert_eq!(
+        repositories
+            .get_auth_session("pending-confirmed".to_owned())
+            .await
+            .expect("confirmed lookup")
+            .expect("confirmed exists")
+            .delivery_state,
+        AuthSessionDeliveryState::Active,
+    );
+    assert_eq!(
+        repositories
+            .get_auth_session("active-session".to_owned())
+            .await
+            .expect("active lookup")
+            .expect("active exists")
+            .revoked_at,
+        None,
+    );
+    assert_eq!(
+        repositories
+            .get_auth_session("pending-abandoned".to_owned())
+            .await
+            .expect("abandoned lookup")
+            .expect("abandoned exists")
+            .revoked_at
+            .as_deref(),
+        Some(TIME_3),
+    );
 }

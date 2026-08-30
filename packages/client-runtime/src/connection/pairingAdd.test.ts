@@ -1,10 +1,12 @@
 import {
   EnvironmentId,
+  EnvironmentAuthorizationError,
   MIN_COMPATIBLE_REMOTE_PROTOCOL,
   REMOTE_PROTOCOL_VERSION,
   type ExecutionEnvironmentDescriptor,
   type RemotePairingCodePayload,
   type ServerConfig,
+  WS_METHODS,
 } from "@bibcode/contracts";
 import {
   PairingCodeParseError,
@@ -41,6 +43,7 @@ import {
   verifyAndAddPairingCode,
 } from "./pairingAdd.ts";
 import * as EnvironmentRegistry from "./registry.ts";
+import { storageIdentityTargetKey } from "./storageIdentity.ts";
 
 const ENVIRONMENT_ID = EnvironmentId.make("environment-paired");
 const STORAGE_IDENTITY = "3f2f6a52-6f5f-4f4e-9d38-0a1e2ac21d11";
@@ -92,6 +95,11 @@ interface HarnessOptions {
   readonly registrationPersistenceFailure?: boolean;
   readonly identityPersistenceFailure?: boolean;
   readonly registrationRemovalFailure?: boolean;
+  readonly identityRollbackFailure?: boolean;
+  readonly identityRollbackInterruptOnce?: boolean;
+  readonly confirmationFailure?: boolean;
+  readonly confirmationInterrupted?: boolean;
+  readonly concurrentIdentityBeforeConfirmationFailure?: string;
 }
 
 const makeHarness = Effect.fn("TestPairingAdd.makeHarness")(function* (
@@ -107,6 +115,9 @@ const makeHarness = Effect.fn("TestPairingAdd.makeHarness")(function* (
   );
   const accepted = new Map(options.accepted ?? []);
   const failures = options.connectionFailures ?? [];
+  const events: string[] = [];
+  let closedSessions = 0;
+  let identityRollbackAttempts = 0;
 
   const registry = EnvironmentRegistry.EnvironmentRegistry.of({
     entries,
@@ -119,6 +130,7 @@ const makeHarness = Effect.fn("TestPairingAdd.makeHarness")(function* (
             }),
           )
         : Effect.sync(() => {
+            events.push("register");
             registrations.push(registration);
           }),
     rollbackRegistration: (registration: ConnectionRegistration) =>
@@ -158,17 +170,56 @@ const makeHarness = Effect.fn("TestPairingAdd.makeHarness")(function* (
             }),
           )
         : Effect.sync(() => {
+            events.push("accept-identity");
             accepted.set(identity.targetKey, identity.storageInstanceId);
             acceptedIdentities.push(identity);
           }),
+    rollbackAcceptance: (identity, previousStorageInstanceId) => {
+      identityRollbackAttempts += 1;
+      if (options.identityRollbackInterruptOnce === true && identityRollbackAttempts === 1) {
+        return Effect.interrupt;
+      }
+      if (options.identityRollbackFailure === true) {
+        return Effect.fail(
+          new Persistence.ConnectionPersistenceError({
+            operation: "accept-storage-identity",
+            message: "identity cleanup unavailable",
+          }),
+        );
+      }
+      return Effect.sync(() => {
+        if (accepted.get(identity.targetKey) !== identity.storageInstanceId) return false;
+        if (previousStorageInstanceId === null) accepted.delete(identity.targetKey);
+        else accepted.set(identity.targetKey, previousStorageInstanceId);
+        const index = acceptedIdentities.findIndex(
+          (candidate) =>
+            candidate.targetKey === identity.targetKey &&
+            candidate.storageInstanceId === identity.storageInstanceId,
+        );
+        if (index !== -1) acceptedIdentities.splice(index, 1);
+        return true;
+      });
+    },
     transition: (targetKey, decide) =>
-      Effect.sync(() => {
-        const transition = decide(accepted.get(targetKey) ?? null);
-        if (transition.mutation._tag === "Set") {
-          accepted.set(targetKey, transition.mutation.storageInstanceId);
-        }
-        return transition.result;
-      }),
+      options.identityPersistenceFailure === true
+        ? Effect.fail(
+            new Persistence.ConnectionPersistenceError({
+              operation: "accept-storage-identity",
+              message: "identity storage unavailable",
+            }),
+          )
+        : Effect.sync(() => {
+            const transition = decide(accepted.get(targetKey) ?? null);
+            if (transition.mutation._tag === "Set") {
+              events.push("accept-identity");
+              accepted.set(targetKey, transition.mutation.storageInstanceId);
+              acceptedIdentities.push({
+                targetKey,
+                storageInstanceId: transition.mutation.storageInstanceId,
+              });
+            }
+            return transition.result;
+          }),
   });
   const sessions = RpcSession.RpcSessionFactory.of({
     connect: (prepared) => {
@@ -180,19 +231,53 @@ const makeHarness = Effect.fn("TestPairingAdd.makeHarness")(function* (
         environmentId: options.configEnvironmentId ?? currentDescriptor.environmentId,
         storageInstanceId: options.configStorageInstanceId ?? currentDescriptor.storageInstanceId,
       });
-      return Effect.succeed({
-        client: {} as RpcSession.RpcSession["client"],
-        initialConfig: Effect.succeed({ environment: configDescriptor } as ServerConfig),
-        ready: Effect.void,
-        probe: Effect.void,
-        closed: Effect.never,
-        e2eeAuthenticated: Effect.succeed({
-          type: "e2ee_authenticated" as const,
-          credential: "minted-device-credential",
-          environmentId: options.authenticatedEnvironmentId ?? currentDescriptor.environmentId,
-          storageInstanceId: options.authenticatedStorageInstanceId ?? STORAGE_IDENTITY,
+      return Effect.acquireRelease(
+        Effect.succeed({
+          client: {
+            [WS_METHODS.authConfirmPairing]: () =>
+              Effect.sync(() => {
+                events.push("confirm");
+                const latestIdentity = acceptedIdentities.at(-1);
+                if (
+                  latestIdentity !== undefined &&
+                  options.concurrentIdentityBeforeConfirmationFailure !== undefined
+                ) {
+                  accepted.set(
+                    latestIdentity.targetKey,
+                    options.concurrentIdentityBeforeConfirmationFailure,
+                  );
+                }
+              }).pipe(
+                Effect.flatMap(() =>
+                  options.confirmationInterrupted === true
+                    ? Effect.interrupt
+                    : options.confirmationFailure === true
+                      ? Effect.fail(
+                          new EnvironmentAuthorizationError({
+                            message: "confirmation rejected",
+                            requiredScope: "access:write",
+                          }),
+                        )
+                      : Effect.succeed({}),
+                ),
+              ),
+          } as unknown as RpcSession.RpcSession["client"],
+          initialConfig: Effect.sync(() => {
+            events.push("verify");
+            return { environment: configDescriptor } as ServerConfig;
+          }),
+          ready: Effect.void,
+          probe: Effect.void,
+          closed: Effect.never,
+          e2eeAuthenticated: Effect.succeed({
+            type: "e2ee_authenticated" as const,
+            credential: "minted-device-credential",
+            environmentId: options.authenticatedEnvironmentId ?? currentDescriptor.environmentId,
+            storageInstanceId: options.authenticatedStorageInstanceId ?? STORAGE_IDENTITY,
+          }),
         }),
-      });
+        () => Effect.sync(() => void (closedSessions += 1)),
+      );
     },
   });
   const fetchFn = ((input) => {
@@ -215,9 +300,12 @@ const makeHarness = Effect.fn("TestPairingAdd.makeHarness")(function* (
 
   return {
     acceptedIdentities,
+    acceptedIdentity: (targetKey: string) => accepted.get(targetKey),
+    events,
     httpCalls,
     preparedConnections,
     registrations,
+    closedSessions: () => closedSessions,
     run: (payload: RemotePairingCodePayload, allowLoopbackTunnel?: boolean) =>
       verifyAndAddPairingCode({
         code: encodePairingCode(payload),
@@ -386,10 +474,9 @@ describe("verifyAndAddPairingCode", () => {
       expect(error).toBeInstanceOf(PairingAddError);
       if (!isPairingAddError(error)) throw new Error("expected PairingAddError");
       expect(error).toMatchObject({ reason: "host-identity-mismatch" });
-      expect(error.detail).toContain(
-        "This pairing attempt may still appear in the server's client list; revoke it there before retrying.",
-      );
+      expect(error.detail).toBe("The server behind this endpoint does not match the pairing code.");
       expect(harness.registrations).toEqual([]);
+      expect(harness.closedSessions()).toBe(1);
     }),
   );
 
@@ -401,24 +488,23 @@ describe("verifyAndAddPairingCode", () => {
       const error = yield* harness.run(validPayload()).pipe(Effect.flip);
       if (!isPairingAddError(error)) throw new Error("expected PairingAddError");
       expect(error.reason).toBe("host-identity-mismatch");
-      expect(error.detail).toContain(
-        "This pairing attempt may still appear in the server's client list; revoke it there before retrying.",
-      );
+      expect(error.detail).toBe("The server behind this endpoint does not match the pairing code.");
       expect(harness.registrations).toEqual([]);
+      expect(harness.closedSessions()).toBe(1);
     }),
   );
 
-  it.effect("reports server-side residue when registration persistence fails after pairing", () =>
+  it.effect("closes the bootstrap session when registration persistence fails", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({ registrationPersistenceFailure: true });
       const error = yield* harness.run(validPayload()).pipe(Effect.flip);
       if (!isPairingAddError(error)) throw new Error("expected PairingAddError");
       expect(error.reason).toBe("local-persistence-failed");
-      expect(error.detail).toContain(
-        "This pairing attempt may still appear in the server's client list; revoke it there before retrying.",
-      );
+      expect(error.detail).toContain("the server connection could not be saved locally");
+      expect(error.detail).not.toContain("revoke it there");
       expect(harness.registrations).toEqual([]);
       expect(harness.acceptedIdentities).toEqual([]);
+      expect(harness.closedSessions()).toBe(1);
     }),
   );
 
@@ -428,11 +514,10 @@ describe("verifyAndAddPairingCode", () => {
       const error = yield* harness.run(validPayload()).pipe(Effect.flip);
       if (!isPairingAddError(error)) throw new Error("expected PairingAddError");
       expect(error.reason).toBe("local-persistence-failed");
-      expect(error.detail).toContain(
-        "This pairing attempt may still appear in the server's client list; revoke it there before retrying.",
-      );
+      expect(error.detail).toContain("No partial local writes from this attempt remain");
       expect(harness.registrations).toEqual([]);
       expect(harness.acceptedIdentities).toEqual([]);
+      expect(harness.closedSessions()).toBe(1);
     }),
   );
 
@@ -445,8 +530,9 @@ describe("verifyAndAddPairingCode", () => {
       const error = yield* harness.run(validPayload()).pipe(Effect.flip);
       if (!isPairingAddError(error)) throw new Error("expected PairingAddError");
       expect(error.reason).toBe("local-persistence-failed");
-      expect(error.detail).toContain("registration cleanup also failed");
+      expect(error.detail).toContain("registration cleanup failed");
       expect(harness.registrations).toHaveLength(1);
+      expect(harness.closedSessions()).toBe(1);
     }),
   );
 
@@ -483,6 +569,110 @@ describe("verifyAndAddPairingCode", () => {
           storageInstanceId: STORAGE_IDENTITY,
         },
       ]);
+      expect(harness.events).toEqual(["verify", "register", "accept-identity", "confirm"]);
+      expect(harness.closedSessions()).toBe(1);
+    }),
+  );
+
+  it.effect("rolls back local state when pairing confirmation fails", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ confirmationFailure: true });
+      const error = yield* harness.run(validPayload()).pipe(Effect.flip);
+
+      if (!isPairingAddError(error)) throw new Error("expected PairingAddError");
+      expect(error.reason).toBe("local-persistence-failed");
+      expect(error.detail).toContain("confirmation rejected");
+      expect(error.detail).not.toContain("revoke it there");
+      expect(harness.events).toEqual(["verify", "register", "accept-identity", "confirm"]);
+      expect(harness.registrations).toEqual([]);
+      expect(harness.acceptedIdentities).toEqual([]);
+      expect(harness.closedSessions()).toBe(1);
+    }),
+  );
+
+  it.effect("restores a pre-existing identity when pairing confirmation fails", () =>
+    Effect.gen(function* () {
+      const targetKey = storageIdentityTargetKey(
+        new BearerConnectionTarget({
+          environmentId: ENVIRONMENT_ID,
+          label: "AI-SERVER",
+          connectionId: `bearer:${ENVIRONMENT_ID}`,
+        }),
+      );
+      const harness = yield* makeHarness({
+        accepted: new Map([[targetKey, "pre-existing-store"]]),
+        confirmationFailure: true,
+      });
+      yield* harness.run(validPayload()).pipe(Effect.exit);
+
+      expect(harness.acceptedIdentity(targetKey)).toBe("pre-existing-store");
+      expect(harness.registrations).toEqual([]);
+      expect(harness.closedSessions()).toBe(1);
+    }),
+  );
+
+  it.effect("preserves a concurrent identity replacement during confirmation rollback", () =>
+    Effect.gen(function* () {
+      const target = new BearerConnectionTarget({
+        environmentId: ENVIRONMENT_ID,
+        label: "AI-SERVER",
+        connectionId: `bearer:${ENVIRONMENT_ID}`,
+      });
+      const targetKey = storageIdentityTargetKey(target);
+      const harness = yield* makeHarness({
+        accepted: new Map([[targetKey, "pre-existing-store"]]),
+        confirmationFailure: true,
+        concurrentIdentityBeforeConfirmationFailure: "concurrent-store",
+      });
+      yield* harness.run(validPayload()).pipe(Effect.exit);
+
+      expect(harness.acceptedIdentity(targetKey)).toBe("concurrent-store");
+      expect(harness.registrations).toEqual([]);
+      expect(harness.closedSessions()).toBe(1);
+    }),
+  );
+
+  it.effect("reports each local cleanup failure after confirmation rejection", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        confirmationFailure: true,
+        registrationRemovalFailure: true,
+        identityRollbackFailure: true,
+      });
+      const error = yield* harness.run(validPayload()).pipe(Effect.flip);
+
+      if (!isPairingAddError(error)) throw new Error("expected PairingAddError");
+      expect(error.detail).toContain("identity cleanup failed");
+      expect(error.detail).toContain("registration cleanup failed");
+      expect(harness.closedSessions()).toBe(1);
+    }),
+  );
+
+  it.effect("rolls back local state when pairing confirmation is interrupted", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ confirmationInterrupted: true });
+      const exit = yield* harness.run(validPayload()).pipe(Effect.exit);
+
+      expect(exit._tag).toBe("Failure");
+      expect(harness.events).toEqual(["verify", "register", "accept-identity", "confirm"]);
+      expect(harness.registrations).toEqual([]);
+      expect(harness.acceptedIdentities).toEqual([]);
+      expect(harness.closedSessions()).toBe(1);
+    }),
+  );
+
+  it.effect("retries rollback in the scope finalizer when cleanup is interrupted", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        confirmationFailure: true,
+        identityRollbackInterruptOnce: true,
+      });
+      const exit = yield* harness.run(validPayload()).pipe(Effect.exit);
+
+      expect(exit._tag).toBe("Failure");
+      expect(harness.registrations).toEqual([]);
+      expect(harness.acceptedIdentities).toEqual([]);
+      expect(harness.closedSessions()).toBe(1);
     }),
   );
 });

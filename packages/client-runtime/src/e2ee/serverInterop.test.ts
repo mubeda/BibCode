@@ -172,9 +172,14 @@ describe.skipIf(serverBinary === undefined)(
       expect(authenticated.type).toBe("e2ee_authenticated");
       expect(authenticated.credential).toBeTruthy();
       expect(authenticated.storageInstanceId).toBe(payload.storageInstanceId);
-      expect(await requestTestRpc(channel, "1", "server.getConfig")).toMatchObject({
+      expect(await requestTestRpc(channel, "1", "auth.confirmPairing")).toMatchObject({
         _tag: "Exit",
         requestId: "1",
+        exit: { _tag: "Success", value: {} },
+      });
+      expect(await requestTestRpc(channel, "2", "server.getConfig")).toMatchObject({
+        _tag: "Exit",
+        requestId: "2",
       });
       channel.close();
 

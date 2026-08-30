@@ -26,6 +26,10 @@
       "mode": "unary"
     },
     {
+      "name": "auth.confirmPairing",
+      "mode": "unary"
+    },
+    {
       "name": "cloud.getRelayClientStatus",
       "mode": "unary"
     },
@@ -487,6 +491,7 @@
     "typed-failures/assets__createUrl-01.json",
     "typed-failures/assets__createUrl-02.json",
     "typed-failures/assets__createUrl-03.json",
+    "typed-failures/auth__confirmPairing-00.json",
     "typed-failures/cloud__getRelayClientStatus-00.json",
     "typed-failures/cloud__getRelayClientStatus-01.json",
     "typed-failures/filesystem__browse-00.json",
@@ -730,6 +735,7 @@
     "typed-failures/assets__createUrl-01.json": "bca6f869de8d862e69070fee42013122b00c89c2403f106db355f160c3577d4f",
     "typed-failures/assets__createUrl-02.json": "a46f293751782c1a70ab8df9e0769d96bfaa3c300ccff5de8e4949b4ed0e385c",
     "typed-failures/assets__createUrl-03.json": "4b7c52ef6d07485490967099211c72db911423ed7922ed09ae5d3ee50346a7e9",
+    "typed-failures/auth__confirmPairing-00.json": "5da6c3eeca5fc91f0c33b9483d2ae9e1c2f7bb4c5fdc51a31dd5cbb22745e720",
     "typed-failures/cloud__getRelayClientStatus-00.json": "5da6c3eeca5fc91f0c33b9483d2ae9e1c2f7bb4c5fdc51a31dd5cbb22745e720",
     "typed-failures/cloud__getRelayClientStatus-01.json": "fa214553fb01c8ada12425339c30c24664759b9f54f43c796265231d79f7a308",
     "stream-shapes/cloud__installRelayClient-00.json": "d72984e6ed66012583831425f7858d43663cca51511d232cca4cf9b38e69dab0",
@@ -1125,6 +1131,7 @@
     "typed-failures/assets__createUrl-01.json",
     "typed-failures/assets__createUrl-02.json",
     "typed-failures/assets__createUrl-03.json",
+    "typed-failures/auth__confirmPairing-00.json",
     "typed-failures/cloud__getRelayClientStatus-00.json",
     "typed-failures/cloud__getRelayClientStatus-01.json",
     "typed-failures/filesystem__browse-00.json",

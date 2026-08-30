@@ -34,7 +34,7 @@ use crate::persistence::{
     AuthAuthoritySnapshot as PersistedAuthAuthoritySnapshot,
     AuthPairingLink as PersistedPairingLink, AuthPairingOffer as PersistedPairingOffer,
     AuthSession as PersistedAuthSession, AuthSessionClient as PersistedAuthSessionClient,
-    NewAuthPairingOffer, NewAuthSession, PersistenceError, Repositories,
+    AuthSessionDeliveryState, NewAuthPairingOffer, NewAuthSession, PersistenceError, Repositories,
 };
 
 const SESSION_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
@@ -206,6 +206,11 @@ struct AuthGrantMetadata {
     off_host: Option<bool>,
 }
 
+struct AuthSessionIssuanceMetadata {
+    grant: AuthGrantMetadata,
+    delivery_state: AuthSessionDeliveryState,
+}
+
 pub(crate) enum PairingOfferReplay {
     Original(PairingOfferResult),
     Cancelled,
@@ -254,6 +259,7 @@ struct SessionRecord {
     transport: SessionTransport,
     reach: Option<String>,
     off_host: Option<bool>,
+    delivery_state: AuthSessionDeliveryState,
 }
 
 #[derive(Clone)]
@@ -305,6 +311,10 @@ impl AuthService {
         repositories: Repositories,
     ) -> Result<Self, AuthError> {
         let host_identity = HostIdentity::load_or_generate(&secret_store)
+            .await
+            .map_err(|error| AuthError::Internal(error.to_string()))?;
+        repositories
+            .revoke_pending_auth_sessions(format_iso(now_ms()))
             .await
             .map_err(|error| AuthError::Internal(error.to_string()))?;
         let service = Self::build(
@@ -595,10 +605,13 @@ impl AuthService {
             "browser-session-cookie",
             apply_grant_label(client, grant.label),
             transport,
-            AuthGrantMetadata {
-                reach: grant.reach,
-                off_host: grant.off_host,
-                ..AuthGrantMetadata::default()
+            AuthSessionIssuanceMetadata {
+                grant: AuthGrantMetadata {
+                    reach: grant.reach,
+                    off_host: grant.off_host,
+                    ..AuthGrantMetadata::default()
+                },
+                delivery_state: AuthSessionDeliveryState::Active,
             },
         )
         .await
@@ -611,6 +624,42 @@ impl AuthService {
         client: ClientMetadata,
         proof_key_thumbprint: Option<String>,
         transport: SessionTransport,
+    ) -> Result<IssuedSession, AuthError> {
+        self.exchange_bootstrap_with_delivery(
+            credential,
+            requested_scopes,
+            client,
+            proof_key_thumbprint,
+            transport,
+            AuthSessionDeliveryState::Active,
+        )
+        .await
+    }
+
+    pub(crate) async fn exchange_pairing_bootstrap(
+        &self,
+        credential: &str,
+        client: ClientMetadata,
+    ) -> Result<IssuedSession, AuthError> {
+        self.exchange_bootstrap_with_delivery(
+            credential,
+            None,
+            client,
+            None,
+            SessionTransport::E2ee,
+            AuthSessionDeliveryState::PendingPairing,
+        )
+        .await
+    }
+
+    async fn exchange_bootstrap_with_delivery(
+        &self,
+        credential: &str,
+        requested_scopes: Option<Vec<String>>,
+        client: ClientMetadata,
+        proof_key_thumbprint: Option<String>,
+        transport: SessionTransport,
+        delivery_state: AuthSessionDeliveryState,
     ) -> Result<IssuedSession, AuthError> {
         let grant = self
             .consume_grant(credential, proof_key_thumbprint.as_deref())
@@ -633,10 +682,13 @@ impl AuthService {
             method,
             apply_grant_label(client, grant.label),
             transport,
-            AuthGrantMetadata {
-                proof_key_thumbprint,
-                reach: grant.reach,
-                off_host: grant.off_host,
+            AuthSessionIssuanceMetadata {
+                grant: AuthGrantMetadata {
+                    proof_key_thumbprint,
+                    reach: grant.reach,
+                    off_host: grant.off_host,
+                },
+                delivery_state,
             },
         )
         .await
@@ -675,6 +727,7 @@ impl AuthService {
             || record.method != claims.method
             || record.scopes != claims.scopes
             || (record.transport == SessionTransport::E2ee && claims.tr != "e2ee")
+            || record.delivery_state != AuthSessionDeliveryState::Active
         {
             return Err(AuthError::InvalidCredential);
         }
@@ -1490,7 +1543,60 @@ impl AuthService {
         &self,
         session_id: &str,
     ) -> Result<bool, AuthError> {
-        self.revoke_session(session_id).await
+        let revoked_at = now_ms();
+        if let Some(repositories) = &self.repositories {
+            let revoked = repositories
+                .revoke_pending_auth_session(session_id.to_owned(), format_iso(revoked_at))
+                .await
+                .map_err(|error| AuthError::Internal(error.to_string()))?;
+            if !revoked {
+                return Ok(false);
+            }
+        }
+        let mut state = self.state.lock().await;
+        let pending = state.sessions.get(session_id).is_some_and(|session| {
+            session.delivery_state == AuthSessionDeliveryState::PendingPairing
+        });
+        if !pending {
+            return Ok(false);
+        }
+        state.sessions.remove(session_id);
+        cancel_live_connections(&mut state, session_id);
+        state.bump_authority_generation();
+        drop(state);
+        self.emit_access_change(AuthAccessChange::ClientRemoved {
+            session_id: session_id.to_owned(),
+        });
+        Ok(true)
+    }
+
+    pub(crate) async fn confirm_pending_pairing_session(
+        &self,
+        session_id: &str,
+    ) -> Result<bool, AuthError> {
+        let now = now_ms();
+        if let Some(repositories) = &self.repositories {
+            let confirmed = repositories
+                .confirm_pending_auth_session(session_id.to_owned(), format_iso(now))
+                .await
+                .map_err(|error| AuthError::Internal(error.to_string()))?;
+            if !confirmed {
+                return Ok(false);
+            }
+        }
+        let mut state = self.state.lock().await;
+        let Some(session) = state.sessions.get_mut(session_id) else {
+            return Ok(false);
+        };
+        if session.revoked_at_ms.is_some() || session.expires_at_ms <= now {
+            return Ok(false);
+        }
+        if session.delivery_state == AuthSessionDeliveryState::Active {
+            return Ok(true);
+        }
+        session.delivery_state = AuthSessionDeliveryState::Active;
+        state.bump_authority_generation();
+        Ok(true)
     }
 
     async fn revoke_session(&self, target_session_id: &str) -> Result<bool, AuthError> {
@@ -1663,12 +1769,16 @@ impl AuthService {
         method: &str,
         client: ClientMetadata,
         transport: SessionTransport,
-        metadata: AuthGrantMetadata,
+        metadata: AuthSessionIssuanceMetadata,
     ) -> Result<IssuedSession, AuthError> {
-        let AuthGrantMetadata {
-            proof_key_thumbprint,
-            reach,
-            off_host,
+        let AuthSessionIssuanceMetadata {
+            grant:
+                AuthGrantMetadata {
+                    proof_key_thumbprint,
+                    reach,
+                    off_host,
+                },
+            delivery_state,
         } = metadata;
         let _issuance = self.issuance.lock().await;
         let issued_at = now_ms();
@@ -1710,6 +1820,7 @@ impl AuthService {
             transport,
             reach,
             off_host,
+            delivery_state,
         };
         {
             let mut state = self.state.lock().await;
@@ -2013,6 +2124,7 @@ fn persisted_auth_session(record: &SessionRecord) -> NewAuthSession {
         expires_at: format_iso(record.expires_at_ms),
         reach: record.reach.clone(),
         off_host: record.off_host,
+        delivery_state: record.delivery_state,
     }
 }
 
@@ -2123,6 +2235,7 @@ fn session_record_from_persisted(row: PersistedAuthSession) -> Result<SessionRec
         transport: SessionTransport::Plain,
         reach: row.reach,
         off_host: row.off_host,
+        delivery_state: row.delivery_state,
     })
 }
 
@@ -3450,6 +3563,7 @@ mod tests {
                         transport: SessionTransport::Plain,
                         reach: None,
                         off_host: None,
+                        delivery_state: AuthSessionDeliveryState::Active,
                     },
                 );
             }

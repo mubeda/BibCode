@@ -344,6 +344,19 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
         ),
         Effect.andThen(options?.afterStorageIdentityAccept?.(identity) ?? Effect.void),
       ),
+    rollbackAcceptance: (
+      identity: Persistence.AcceptedStorageIdentity,
+      previousStorageInstanceId: string | null,
+    ) =>
+      Ref.modify(acceptedStorageIdentities, (current) => {
+        if (current.get(identity.targetKey) !== identity.storageInstanceId) {
+          return [false, current] as const;
+        }
+        const next = new Map(current);
+        if (previousStorageInstanceId === null) next.delete(identity.targetKey);
+        else next.set(identity.targetKey, previousStorageInstanceId);
+        return [true, next] as const;
+      }),
     transition: <A>(
       targetKey: string,
       decide: (acceptedStorageInstanceId: string | null) => {

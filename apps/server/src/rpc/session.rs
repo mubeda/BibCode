@@ -527,6 +527,21 @@ pub(crate) struct RpcSessionContext {
     principal: Option<Principal>,
     auth: Option<AuthService>,
     admission: Option<RpcPermit>,
+    pairing_confirmation: Option<PairingConfirmationLatch>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct PairingConfirmationLatch(Arc<AtomicBool>);
+
+impl PairingConfirmationLatch {
+    pub(crate) fn mark_confirmed(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    #[must_use]
+    pub(crate) fn is_confirmed(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 impl RpcSessionContext {
@@ -541,6 +556,21 @@ impl RpcSessionContext {
             principal: Some(principal),
             auth: Some(auth),
             admission: None,
+            pairing_confirmation: None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn authenticated_pending_pairing(
+        principal: Principal,
+        auth: AuthService,
+        pairing_confirmation: PairingConfirmationLatch,
+    ) -> Self {
+        Self {
+            principal: Some(principal),
+            auth: Some(auth),
+            admission: None,
+            pairing_confirmation: Some(pairing_confirmation),
         }
     }
 
@@ -560,6 +590,26 @@ impl RpcSessionContext {
         self.principal
             .as_ref()
             .map(|principal| principal.session_id.as_str())
+    }
+
+    fn has_pending_pairing_capability_for(&self, method: &str) -> bool {
+        self.pairing_confirmation.is_some() && method == "auth.confirmPairing"
+    }
+
+    pub(crate) async fn confirm_current_pairing(&self) -> bool {
+        let (Some(principal), Some(auth)) = (&self.principal, &self.auth) else {
+            return false;
+        };
+        let Ok(true) = auth
+            .confirm_pending_pairing_session(&principal.session_id)
+            .await
+        else {
+            return false;
+        };
+        if let Some(latch) = &self.pairing_confirmation {
+            latch.mark_confirmed();
+        }
+        true
     }
 
     pub(crate) async fn is_currently_authorized(&self, required_scope: &str) -> bool {
@@ -1112,7 +1162,11 @@ async fn process_client_message(
                     )
                     .await;
                 };
-                if let Some(auth) = dispatch.session.auth.as_ref() {
+                if let Some(auth) = dispatch.session.auth.as_ref()
+                    && !dispatch
+                        .session
+                        .has_pending_pairing_capability_for(&request.tag)
+                {
                     match auth.authorize_session(&principal.session_id, scope).await {
                         Ok(()) => {}
                         Err(crate::auth::AuthError::ScopeRequired(_)) => {
@@ -1617,6 +1671,20 @@ mod tests {
         pin::Pin,
         task::{Context, Poll},
     };
+
+    #[test]
+    fn pending_pairing_capability_is_limited_to_confirmation() {
+        let context = RpcSessionContext {
+            pairing_confirmation: Some(PairingConfirmationLatch::default()),
+            ..RpcSessionContext::default()
+        };
+
+        assert!(context.has_pending_pairing_capability_for("auth.confirmPairing"));
+        assert!(!context.has_pending_pairing_capability_for("auth.rotateCredential"));
+        assert!(
+            !RpcSessionContext::default().has_pending_pairing_capability_for("auth.confirmPairing")
+        );
+    }
 
     #[derive(Default)]
     struct BlockedSocketSink {

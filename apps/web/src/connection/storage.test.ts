@@ -1250,6 +1250,35 @@ describe("makeCatalogBackend (IndexedDB)", () => {
 // ─────────────────────────────────────────────────────────────────────
 
 describe("connectionStorageLayer", () => {
+  it.effect("rolls back only the matching accepted storage identity", () => {
+    installFakeIndexedDb();
+    vi.stubGlobal("window", {});
+
+    return Effect.gen(function* () {
+      const identities = yield* AcceptedStorageIdentityStore;
+      const first = { targetKey: "bearer:test", storageInstanceId: "store-a" };
+      yield* identities.accept(first);
+      const removed = yield* identities.rollbackAcceptance(first, null);
+      const afterRemoval = yield* identities.get(first.targetKey);
+      expect(removed).toBe(true);
+      expect(Option.isNone(afterRemoval)).toBe(true);
+
+      yield* identities.accept({ ...first, storageInstanceId: "store-previous" });
+      yield* identities.accept(first);
+      const restored = yield* identities.rollbackAcceptance(first, "store-previous");
+      const afterRestore = yield* identities.get(first.targetKey);
+      expect(restored).toBe(true);
+      expect(afterRestore).toEqual(Option.some("store-previous"));
+
+      yield* identities.accept(first);
+      yield* identities.accept({ ...first, storageInstanceId: "store-concurrent" });
+      const preserved = yield* identities.rollbackAcceptance(first, "store-previous");
+      const afterReplacement = yield* identities.get(first.targetKey);
+      expect(preserved).toBe(false);
+      expect(afterReplacement).toEqual(Option.some("store-concurrent"));
+    }).pipe(Effect.provide(connectionStorageLayer));
+  });
+
   it.effect("publishes corrupt catalog health and resets only through the explicit service", () => {
     const handle = installFakeIndexedDb();
     handle.stores.set("catalog", new Map([["document", "{malformed"]]));

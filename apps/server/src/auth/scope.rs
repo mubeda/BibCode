@@ -1,8 +1,8 @@
 use serde_json::{Value, json};
 
 use super::model::{
-    SCOPE_ACCESS_READ, SCOPE_ORCHESTRATION_OPERATE, SCOPE_ORCHESTRATION_READ, SCOPE_RELAY_WRITE,
-    SCOPE_REVIEW_WRITE, SCOPE_TERMINAL_OPERATE,
+    SCOPE_ACCESS_READ, SCOPE_ACCESS_WRITE, SCOPE_ORCHESTRATION_OPERATE, SCOPE_ORCHESTRATION_READ,
+    SCOPE_RELAY_WRITE, SCOPE_REVIEW_WRITE, SCOPE_TERMINAL_OPERATE,
 };
 
 pub(crate) const ACTIVITY_READ_SCOPE: &str = SCOPE_ORCHESTRATION_READ;
@@ -114,6 +114,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         "review.getDiffPreview" => Some(SCOPE_REVIEW_WRITE),
         "cloud.getRelayClientStatus" | "cloud.installRelayClient" => Some(SCOPE_RELAY_WRITE),
         "subscribeAuthAccess" => Some(SCOPE_ACCESS_READ),
+        "auth.confirmPairing" => Some(SCOPE_ACCESS_WRITE),
         _ => None,
     }
 }
@@ -158,6 +159,10 @@ mod tests {
         assert_eq!(
             required_scope("subscribeAuthAccess"),
             Some(SCOPE_ACCESS_READ)
+        );
+        assert_eq!(
+            required_scope("auth.confirmPairing"),
+            Some(SCOPE_ACCESS_WRITE)
         );
         assert_eq!(
             required_scope("updater.status"),

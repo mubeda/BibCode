@@ -1490,7 +1490,7 @@ impl Repositories {
     pub async fn create_auth_session(&self, row: NewAuthSession) -> Result<()> {
         self.database.call(move |connection| {
             let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            transaction.execute("INSERT INTO auth_sessions (session_id, subject, scopes, method, client_label, client_ip_address, client_user_agent, client_device_type, client_os, client_browser, issued_at, expires_at, revoked_at, reach, off_host) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)", params![row.session_id,row.subject,encode_json(&row.scopes)?,row.method,row.client.label,row.client.ip_address,row.client.user_agent,row.client.device_type,row.client.os,row.client.browser,row.issued_at,row.expires_at,row.reach,row.off_host])?;
+            transaction.execute("INSERT INTO auth_sessions (session_id, subject, scopes, method, client_label, client_ip_address, client_user_agent, client_device_type, client_os, client_browser, issued_at, expires_at, revoked_at, reach, off_host, delivery_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)", params![row.session_id,row.subject,encode_json(&row.scopes)?,row.method,row.client.label,row.client.ip_address,row.client.user_agent,row.client.device_type,row.client.os,row.client.browser,row.issued_at,row.expires_at,row.reach,row.off_host,row.delivery_state.as_str()])?;
             bump_auth_authority_revision_on(&transaction)?;
             transaction.commit()?;
             Ok(())
@@ -1533,6 +1533,97 @@ impl Repositories {
                     .optional()?
                     .is_some();
                 if revoked {
+                    bump_auth_authority_revision_on(&transaction)?;
+                }
+                transaction.commit()?;
+                Ok(revoked)
+            })
+            .await
+    }
+    pub async fn confirm_pending_auth_session(
+        &self,
+        session_id: String,
+        now: Timestamp,
+    ) -> Result<bool> {
+        self.database
+            .call(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let confirmed = transaction
+                    .query_row(
+                        "UPDATE auth_sessions SET delivery_state = 'active'
+                         WHERE session_id = ? AND revoked_at IS NULL AND expires_at > ?
+                           AND delivery_state = 'pending-pairing'
+                         RETURNING session_id",
+                        params![session_id, now],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .is_some();
+                let available = if confirmed {
+                    bump_auth_authority_revision_on(&transaction)?;
+                    true
+                } else {
+                    transaction
+                        .query_row(
+                            "SELECT 1 FROM auth_sessions
+                             WHERE session_id = ? AND revoked_at IS NULL AND expires_at > ?
+                               AND delivery_state = 'active'",
+                            params![session_id, now],
+                            |_| Ok(()),
+                        )
+                        .optional()?
+                        .is_some()
+                };
+                transaction.commit()?;
+                Ok(available)
+            })
+            .await
+    }
+    pub async fn revoke_pending_auth_session(
+        &self,
+        session_id: String,
+        revoked_at: Timestamp,
+    ) -> Result<bool> {
+        self.database
+            .call(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let revoked = transaction
+                    .query_row(
+                        "UPDATE auth_sessions SET revoked_at = ?
+                         WHERE session_id = ? AND revoked_at IS NULL
+                           AND delivery_state = 'pending-pairing'
+                         RETURNING session_id",
+                        params![revoked_at, session_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .is_some();
+                if revoked {
+                    bump_auth_authority_revision_on(&transaction)?;
+                }
+                transaction.commit()?;
+                Ok(revoked)
+            })
+            .await
+    }
+    pub async fn revoke_pending_auth_sessions(&self, revoked_at: Timestamp) -> Result<Vec<String>> {
+        self.database
+            .call(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let revoked = {
+                    let mut statement = transaction.prepare(
+                        "UPDATE auth_sessions SET revoked_at = ?
+                         WHERE revoked_at IS NULL AND delivery_state = 'pending-pairing'
+                         RETURNING session_id",
+                    )?;
+                    statement
+                        .query_map([revoked_at], |row| row.get(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                if !revoked.is_empty() {
                     bump_auth_authority_revision_on(&transaction)?;
                 }
                 transaction.commit()?;
@@ -1910,6 +2001,33 @@ pub struct AuthSessionClient {
     pub os: Option<String>,
     pub browser: Option<String>,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuthSessionDeliveryState {
+    Active,
+    PendingPairing,
+}
+
+impl AuthSessionDeliveryState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::PendingPairing => "pending-pairing",
+        }
+    }
+}
+
+impl rusqlite::types::FromSql for AuthSessionDeliveryState {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        match value.as_str()? {
+            "active" => Ok(Self::Active),
+            "pending-pairing" => Ok(Self::PendingPairing),
+            value => Err(rusqlite::types::FromSqlError::Other(
+                format!("invalid auth session delivery state: {value}").into(),
+            )),
+        }
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NewAuthSession {
     pub session_id: String,
@@ -1921,6 +2039,7 @@ pub struct NewAuthSession {
     pub expires_at: Timestamp,
     pub reach: Option<String>,
     pub off_host: Option<bool>,
+    pub delivery_state: AuthSessionDeliveryState,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AuthSession {
@@ -1935,6 +2054,7 @@ pub struct AuthSession {
     pub revoked_at: Option<Timestamp>,
     pub reach: Option<String>,
     pub off_host: Option<bool>,
+    pub delivery_state: AuthSessionDeliveryState,
 }
 
 const THREAD_SELECT: &str = "SELECT thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, unresolved_delivery_state, unresolved_delivery_detail, deleted_at FROM projection_threads";
@@ -1946,7 +2066,7 @@ const PAIRING_SELECT: &str = "SELECT id, credential, method, scopes, subject, la
 const PAIRING_OFFER_SELECT: &str = "SELECT principal_id, idempotency_key, input_fingerprint, pairing_id, result_json, expires_at, cancelled_at FROM auth_pairing_offer_idempotency WHERE expires_at > ? ORDER BY expires_at, principal_id, idempotency_key";
 const PAIRING_OFFER_BY_KEY_SQL: &str = "SELECT principal_id, idempotency_key, input_fingerprint, pairing_id, result_json, expires_at, cancelled_at FROM auth_pairing_offer_idempotency WHERE expires_at > ? AND principal_id = ? AND idempotency_key = ?";
 const PAIRING_RETURNING_SQL: &str = "UPDATE auth_pairing_links SET consumed_at = ? WHERE credential = ? AND revoked_at IS NULL AND consumed_at IS NULL AND expires_at > ? AND (proof_key_thumbprint IS NULL OR proof_key_thumbprint = ?) RETURNING id, credential, method, scopes, subject, label, proof_key_thumbprint, created_at, expires_at, consumed_at, revoked_at, reach, off_host";
-const AUTH_SESSION_SELECT: &str = "SELECT session_id, subject, scopes, method, client_label, client_ip_address, client_user_agent, client_device_type, client_os, client_browser, issued_at, expires_at, last_connected_at, revoked_at, reach, off_host FROM auth_sessions";
+const AUTH_SESSION_SELECT: &str = "SELECT session_id, subject, scopes, method, client_label, client_ip_address, client_user_agent, client_device_type, client_os, client_browser, issued_at, expires_at, last_connected_at, revoked_at, reach, off_host, delivery_state FROM auth_sessions";
 
 fn collect<T, P>(
     connection: &rusqlite::Connection,
@@ -2393,5 +2513,6 @@ fn decode_auth_session(row: &Row<'_>) -> rusqlite::Result<AuthSession> {
         revoked_at: row.get(13)?,
         reach: row.get(14)?,
         off_host: row.get(15)?,
+        delivery_state: row.get(16)?,
     })
 }

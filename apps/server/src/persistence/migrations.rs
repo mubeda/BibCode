@@ -677,6 +677,7 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::new(46, "AuthPairingReach", migration_046),
     Migration::new(47, "AuthPairingOfferIdempotency", migration_047),
     Migration::new(48, "AuthAuthorityRevision", migration_048),
+    Migration::new(49, "AuthPairingDeliveryState", migration_049),
 ];
 
 impl Migration {
@@ -2444,6 +2445,18 @@ fn migration_048(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+fn migration_049(transaction: &Transaction<'_>) -> Result<()> {
+    if table_exists(transaction, "auth_sessions")?
+        && !table_has_column(transaction, "auth_sessions", "delivery_state")?
+    {
+        transaction.execute_batch(
+            "ALTER TABLE auth_sessions
+             ADD COLUMN delivery_state TEXT NOT NULL DEFAULT 'active';",
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2964,7 +2977,7 @@ mod tests {
             .map(|migration| migration.id)
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, (1..=48).collect::<Vec<_>>());
+        assert_eq!(ids, (1..=49).collect::<Vec<_>>());
         assert_eq!(MIGRATIONS[0].name, "OrchestrationEvents");
         assert_eq!(MIGRATIONS[33].name, "ActivityProjection");
         assert_eq!(MIGRATIONS[34].name, "ActivityJournalEventKeyNamespace");
@@ -2982,12 +2995,45 @@ mod tests {
         assert_eq!(MIGRATIONS[43].name, "ProjectionThreadSessionErrorClass");
         assert_eq!(MIGRATIONS[44].name, "ProjectionThreadUnresolvedDelivery");
         assert_eq!(MIGRATIONS[47].name, "AuthAuthorityRevision");
+        assert_eq!(MIGRATIONS[48].name, "AuthPairingDeliveryState");
         assert_eq!(MIGRATIONS[45].name, "AuthPairingReach");
         assert_eq!(MIGRATIONS[46].name, "AuthPairingOfferIdempotency");
 
         let migration = Migration::new(99, "RuntimeFixture", migration_001);
         assert_eq!(migration.id, 99);
         assert_eq!(migration.name, "RuntimeFixture");
+    }
+
+    #[test]
+    fn migration_49_adds_active_pairing_delivery_state() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(48))?;
+        connection.execute(
+            "INSERT INTO auth_sessions (
+               session_id, subject, scopes, method, client_device_type, issued_at, expires_at
+             ) VALUES ('legacy-session', 'legacy-user', '[]', 'bearer-access-token', 'desktop',
+               '2026-01-01T00:00:00.000Z', '2027-01-01T00:00:00.000Z')",
+            [],
+        )?;
+
+        let applied = run_migrations(&mut connection, None)?;
+
+        assert_eq!(
+            applied
+                .iter()
+                .map(|migration| (migration.id, migration.name))
+                .collect::<Vec<_>>(),
+            vec![(49, "AuthPairingDeliveryState")],
+        );
+        assert_eq!(
+            connection.query_row(
+                "SELECT delivery_state FROM auth_sessions WHERE session_id = 'legacy-session'",
+                [],
+                |row| row.get::<_, String>(0),
+            )?,
+            "active",
+        );
+        Ok(())
     }
 
     #[test]
