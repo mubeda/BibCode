@@ -157,9 +157,11 @@ verify:
   URL, deep link, pairing code, and QR code appear, then revoke the final
   native-managed **Another device** offer or client and verify exposure returns
   to loopback. Capture the
-  shared runbook's four explicit ceremony outcomes: confirmed local-only,
-  another live access reason kept wide, cancellation unconfirmed and deliberately
-  unchanged, and cleanup topology unverified. Also cover last-browser-session
+  shared runbook's four explicit ceremony outcomes: authoritative local-only
+  confirmation even after cancellation failure, another live access reason kept
+  wide, cancellation and cleanup both unconfirmed, and cleanup topology
+  unverified. Also cover the three-pass/five-second reconciliation retry and
+  terminal warning toast, last-browser-session
   revocation, one compensating widen during a concurrent grant, bounded handling
   of a blackholed create response, and explicit legacy resume after a local-only
   restart. The address picker lists only usable IPv4 candidates until a

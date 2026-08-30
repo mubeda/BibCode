@@ -258,6 +258,7 @@ same environment, use:
 
 ```powershell
 node scripts/run-msvc-x64.mjs cargo test --workspace -j 2 -- --test-threads=2
+node scripts/run-msvc-x64.mjs cargo clean -p bibcode-server -p bibcode-desktop -p bibcode-updater-verifier
 node scripts/run-msvc-x64.mjs cargo clippy --workspace --all-targets -- -D warnings
 ```
 
@@ -356,9 +357,11 @@ minimum-size, and relevant Windows DPI states. Verify:
   natively and confirm the app reports incomplete cleanup rather than claiming
   the rule was removed. A missing rule is benign only when the persistent
   firewall store can be queried and its absence verified. Capture the shared
-  runbook's four explicit ceremony outcomes: confirmed local-only, another live
-  access reason kept wide, cancellation unconfirmed and deliberately unchanged,
-  and cleanup topology unverified. Also cover last-browser-session revocation
+  runbook's four explicit ceremony outcomes: authoritative local-only
+  confirmation even after cancellation failure, another live access reason kept
+  wide, cancellation and cleanup both unconfirmed, and cleanup topology
+  unverified. Also cover the three-pass/five-second reconciliation retry and
+  terminal warning toast, last-browser-session revocation
   with a local-only restart and removed rule, one compensating widen during a
   concurrent grant, bounded handling of a blackholed create response, and
   explicit legacy resume after a local-only restart. Confirm the caller returns
