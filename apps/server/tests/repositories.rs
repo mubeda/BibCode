@@ -2408,7 +2408,7 @@ async fn pending_auth_sessions_confirm_by_id_and_startup_cleanup_is_selective() 
     );
 
     let mut revoked = repositories
-        .revoke_pending_auth_sessions(TIME_3.to_owned())
+        .revoke_pending_auth_sessions(TIME_3.to_owned(), TIME_3.to_owned())
         .await
         .expect("startup pending cleanup");
     revoked.sort();

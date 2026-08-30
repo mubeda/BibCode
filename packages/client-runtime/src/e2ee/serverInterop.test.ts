@@ -131,8 +131,10 @@ async function mintedPairing(server: RunningServer): Promise<{
     },
     body: JSON.stringify({
       name: "Interop",
-      endpoint: server.httpBaseUrl,
-      reach: "custom",
+      // An off-host reach requires an off-host-classified endpoint; the test
+      // channel still connects to the loopback server address.
+      endpoint: "http://192.168.1.20:3773",
+      reach: "another-device",
     }),
   });
   const offer = (await response.json()) as { code?: string };
@@ -163,39 +165,53 @@ describe.skipIf(serverBinary === undefined)(
     it("mints, pairs in-channel, round-trips RPC, and reconnects with the minted bearer", async () => {
       const { payload, hostKey } = await mintedPairing(server);
       const channel = await openEncrypted(server, hostKey);
+      // No confirmation flag is sent: the server decides delivery from the
+      // grant, and the reply's pairingConfirmationRequired is the client's
+      // only signal. Servers that predate the confirmation flow omit the
+      // field and deliver immediately, so this suite gates both generations.
       channel.sendMessage(
         JSON.stringify({
           type: "e2ee_auth",
           pairing: payload.token,
-          pairingConfirmation: true,
         }),
       );
       const authenticated = JSON.parse(await channel.nextMessage()) as {
         type: string;
         credential?: string;
         storageInstanceId?: string;
+        pairingConfirmationRequired?: boolean;
       };
       expect(authenticated.type).toBe("e2ee_authenticated");
       expect(authenticated.credential).toBeTruthy();
       expect(authenticated.storageInstanceId).toBe(payload.storageInstanceId);
 
-      const pending = await openEncrypted(server, hostKey);
-      pending.sendMessage(JSON.stringify({ type: "e2ee_auth", bearer: authenticated.credential }));
-      expect(JSON.parse(await pending.nextMessage())).toEqual({
-        type: "e2ee_error",
-        code: "unauthorized",
-      });
-      pending.close();
+      let nextRequestId = 1;
+      if (authenticated.pairingConfirmationRequired === true) {
+        const pending = await openEncrypted(server, hostKey);
+        pending.sendMessage(
+          JSON.stringify({ type: "e2ee_auth", bearer: authenticated.credential }),
+        );
+        expect(JSON.parse(await pending.nextMessage())).toEqual({
+          type: "e2ee_error",
+          code: "unauthorized",
+        });
+        pending.close();
 
-      expect(await requestTestRpc(channel, "1", "auth.confirmPairing")).toMatchObject({
-        _tag: "Exit",
-        requestId: "1",
-        exit: { _tag: "Success", value: {} },
-      });
-      expect(await requestTestRpc(channel, "2", "server.getConfig")).toMatchObject({
-        _tag: "Exit",
-        requestId: "2",
-      });
+        expect(
+          await requestTestRpc(channel, String(nextRequestId), "auth.confirmPairing"),
+        ).toMatchObject({
+          _tag: "Exit",
+          requestId: String(nextRequestId),
+          exit: { _tag: "Success", value: {} },
+        });
+        nextRequestId += 1;
+      }
+      expect(await requestTestRpc(channel, String(nextRequestId), "server.getConfig")).toMatchObject(
+        {
+          _tag: "Exit",
+          requestId: String(nextRequestId),
+        },
+      );
       channel.close();
 
       const second = await openEncrypted(server, hostKey);

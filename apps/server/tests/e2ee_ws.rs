@@ -31,7 +31,9 @@ const MAX_CIPHERTEXT_BYTES: usize = 65_535;
 const MAX_CHUNK_BYTES: usize = 65_518;
 const RECORD_FINAL: u8 = 0;
 const RECORD_CONTINUATION: u8 = 1;
-const E2EE_PREAUTH_BURST_PER_LOOPBACK_FORWARDER: usize = 8;
+/// Established buckets stop growing at the server's pre-auth soft cap; the
+/// slots above it are reserved for fresh buckets' first connections.
+const E2EE_PREAUTH_GLOBAL_SOFT_CAP: usize = 24;
 const E2EE_MAX_ESTABLISHED_CONNECTIONS_PER_PRINCIPAL: usize = 32;
 const E2EE_INBOUND_BUFFER_BUDGET_BYTES_PER_PRINCIPAL: usize = 64 * 1024 * 1024;
 const TOKEN_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
@@ -234,23 +236,9 @@ async fn pair_inside_channel(
     root: &Path,
     pairing: &str,
 ) -> (TestSocket, TransportState, Value) {
-    pair_inside_channel_with_confirmation(handle, root, pairing, true).await
-}
-
-async fn pair_inside_channel_with_confirmation(
-    handle: &ServerHandle,
-    root: &Path,
-    pairing: &str,
-    pairing_confirmation: bool,
-) -> (TestSocket, TransportState, Value) {
     let host_key = read_host_public_key(root);
     let (mut socket, mut transport) = noise_connect(handle.local_addr(), &host_key).await;
-    let mut auth = json!({ "type": "e2ee_auth", "pairing": pairing });
-    if pairing_confirmation {
-        auth.as_object_mut()
-            .expect("auth object")
-            .insert("pairingConfirmation".to_owned(), Value::Bool(true));
-    }
+    let auth = json!({ "type": "e2ee_auth", "pairing": pairing });
     send_encrypted(&mut socket, &mut transport, auth.to_string().as_bytes()).await;
     let reply = recv_encrypted_json(&mut socket, &mut transport).await;
     (socket, transport, reply)
@@ -262,7 +250,11 @@ async fn mint_e2ee_credential(handle: &ServerHandle, root: &Path, pairing: &str)
         .as_str()
         .expect("minted E2EE credential")
         .to_owned();
-    confirm_pairing(&mut socket, &mut transport, "2").await;
+    // Mirror the client contract: confirm only when the server says the
+    // delivery is guarded.
+    if reply["pairingConfirmationRequired"] == Value::Bool(true) {
+        confirm_pairing(&mut socket, &mut transport, "2").await;
+    }
     socket.close(None).await.expect("close pairing socket");
     credential
 }
@@ -315,6 +307,19 @@ fn latest_off_host_auth_session_delivery_state(root: &Path) -> String {
             |row| row.get(0),
         )
         .expect("latest off-host auth session delivery state")
+}
+
+fn latest_off_host_auth_session_delivery_state_row(root: &Path) -> Option<(String, bool)> {
+    Connection::open(root.join("userdata/state.sqlite"))
+        .expect("open server database")
+        .query_row(
+            "SELECT delivery_state, revoked_at IS NOT NULL FROM auth_sessions \
+             WHERE reach = 'another-device' AND off_host = 1 \
+             ORDER BY issued_at DESC, session_id DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok()
 }
 
 async fn open_authenticated_bearer_socket(
@@ -490,36 +495,52 @@ async fn pairing_bootstrap_inside_the_channel_serves_get_config() {
     );
     assert_eq!(reply["environmentId"], descriptor["environmentId"]);
     assert_eq!(reply["storageInstanceId"], descriptor["storageInstanceId"]);
-    assert_eq!(reply["pairingConfirmationRequired"], true);
+    // The administrative startup grant is not an off-host share grant, so the
+    // server delivers it immediately with no confirmation requirement.
+    assert_eq!(reply.get("pairingConfirmationRequired"), None);
     assert_get_config(&mut socket, &mut transport).await;
 }
 
 #[tokio::test]
-async fn legacy_pairing_client_receives_an_active_credential_without_confirmation() {
+async fn off_host_pairing_requires_confirmation_even_without_a_client_flag() {
     let _permit = TEST_PERMIT.acquire().await.expect("test permit");
     let temp = TempDir::new().expect("temporary base directory");
     let handle = start_server(&temp).await;
-    let startup = handle.startup_access().expect("startup pairing");
-    let (mut socket, _transport, reply) =
-        pair_inside_channel_with_confirmation(&handle, temp.path(), &startup.credential, false)
-            .await;
+    let (_admin, pairing) = create_off_host_pairing(&handle).await;
+    // The auth message carries no confirmation field at all: the server
+    // decides from the consumed grant, so a client cannot opt out of the
+    // durable-delivery guard by omitting a flag.
+    let (mut socket, mut transport, reply) =
+        pair_inside_channel(&handle, temp.path(), &pairing).await;
     let credential = reply["credential"]
         .as_str()
-        .expect("legacy credential")
+        .expect("minted credential")
         .to_owned();
 
-    assert_eq!(reply.get("pairingConfirmationRequired"), None);
-    assert_eq!(latest_auth_session_delivery_state(temp.path()), "active");
-    socket
-        .close(None)
-        .await
-        .expect("close legacy bootstrap socket");
+    assert_eq!(reply["pairingConfirmationRequired"], true);
+    assert_eq!(
+        latest_off_host_auth_session_delivery_state(temp.path()),
+        "pending-pairing"
+    );
 
     let host_key = read_host_public_key(temp.path());
-    let (mut reconnect, mut reconnect_transport, reconnect_reply) =
+    let (mut pending, _pending_transport, pending_reply) =
         open_authenticated_bearer_socket(&handle, &host_key, &credential).await;
-    assert_eq!(reconnect_reply, json!({ "type": "e2ee_authenticated" }));
-    assert_get_config(&mut reconnect, &mut reconnect_transport).await;
+    assert_eq!(
+        pending_reply,
+        json!({ "type": "e2ee_error", "code": "unauthorized" })
+    );
+    let _ = pending.close(None).await;
+
+    confirm_pairing(&mut socket, &mut transport, "2").await;
+    assert_eq!(
+        latest_off_host_auth_session_delivery_state(temp.path()),
+        "active"
+    );
+    let (mut confirmed, mut confirmed_transport, confirmed_reply) =
+        open_authenticated_bearer_socket(&handle, &host_key, &credential).await;
+    assert_eq!(confirmed_reply, json!({ "type": "e2ee_authenticated" }));
+    assert_get_config(&mut confirmed, &mut confirmed_transport).await;
 }
 
 #[tokio::test]
@@ -589,14 +610,28 @@ async fn closing_before_confirm_revokes_the_pending_session() {
     let _permit = TEST_PERMIT.acquire().await.expect("test permit");
     let temp = TempDir::new().expect("temporary base directory");
     let handle = start_server(&temp).await;
-    let startup = handle.startup_access().expect("startup pairing");
-    let (mut socket, _transport, reply) =
-        pair_inside_channel(&handle, temp.path(), &startup.credential).await;
+    let (_admin, pairing) = create_off_host_pairing(&handle).await;
+    let (mut socket, _transport, reply) = pair_inside_channel(&handle, temp.path(), &pairing).await;
     let credential = reply["credential"]
         .as_str()
         .expect("minted credential")
         .to_owned();
     socket.close(None).await.expect("close bootstrap socket");
+
+    // The delivery-guard revocation is scheduled when the connection drops;
+    // wait for it durably instead of racing the reconnect against it.
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if latest_off_host_auth_session_delivery_state_row(temp.path())
+                .is_some_and(|(state, revoked)| state == "pending-pairing" && revoked)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("unconfirmed session is durably revoked after the socket closes");
 
     let host_key = read_host_public_key(temp.path());
     let (mut reconnect, _reconnect_transport, reconnect_reply) =
@@ -613,9 +648,9 @@ async fn confirmed_pairing_session_survives_disconnect_and_restart_cleanup() {
     let _permit = TEST_PERMIT.acquire().await.expect("test permit");
     let temp = TempDir::new().expect("temporary base directory");
     let handle = start_server(&temp).await;
-    let startup = handle.startup_access().expect("startup pairing");
+    let (_admin, pairing) = create_off_host_pairing(&handle).await;
     let (mut socket, mut transport, reply) =
-        pair_inside_channel(&handle, temp.path(), &startup.credential).await;
+        pair_inside_channel(&handle, temp.path(), &pairing).await;
     let credential = reply["credential"]
         .as_str()
         .expect("minted credential")
@@ -950,13 +985,16 @@ async fn handshake_timeout_closes_the_socket() {
 }
 
 #[tokio::test]
-async fn preauth_loopback_forwarder_bypasses_public_peer_cap_but_keeps_burst_limit() {
+async fn preauth_loopback_forwarder_bypasses_public_peer_cap_until_the_soft_cap() {
     let _permit = TEST_PERMIT.acquire().await.expect("test permit");
     let temp = TempDir::new().expect("temporary base directory");
     let handle = start_server(&temp).await;
     let host_key = read_host_public_key(temp.path());
-    let mut stalled = Vec::with_capacity(E2EE_PREAUTH_BURST_PER_LOOPBACK_FORWARDER);
-    for _ in 0..E2EE_PREAUTH_BURST_PER_LOOPBACK_FORWARDER {
+    // The forwarder class is exempt from the four-per-peer public cap, but an
+    // established bucket still stops at the global soft cap so it cannot
+    // drain the fresh-bucket reserve.
+    let mut stalled = Vec::with_capacity(E2EE_PREAUTH_GLOBAL_SOFT_CAP);
+    for _ in 0..E2EE_PREAUTH_GLOBAL_SOFT_CAP {
         stalled.push(noise_connect(handle.local_addr(), &host_key).await);
     }
     let mut overflow = open_socket(handle.local_addr()).await;
@@ -1012,10 +1050,10 @@ async fn established_capacity_is_partitioned_by_principal_and_released_on_close(
 
     let mut first_principal_sockets = Vec::new();
     tokio::time::sleep(Duration::from_secs(2)).await;
+    // The fleet-sized forwarder burst admits every sequential pre-auth
+    // handshake here without refill pauses; established capacity, not
+    // pre-auth rate, is what this test partitions.
     for index in 0..E2EE_MAX_ESTABLISHED_CONNECTIONS_PER_PRINCIPAL {
-        if index > 0 && index % E2EE_PREAUTH_BURST_PER_LOOPBACK_FORWARDER == 0 {
-            tokio::time::sleep(Duration::from_secs(8)).await;
-        }
         let source_ip = Ipv4Addr::new(
             127,
             0,

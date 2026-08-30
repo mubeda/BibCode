@@ -122,35 +122,38 @@ RPC socket adapter attaches. Ciphertext records therefore enter the Noise
 decryptor in WebSocket delivery order without asynchronous `Blob` conversion.
 
 The first logical message authenticates inside the encrypted channel. A new
-device that supports durable delivery confirmation sends
-`{"type":"e2ee_auth","pairing":"<one-time token>","pairingConfirmation":true}`.
-Only a successful exchange consumes that token; a wrong host or failed
-handshake does not reach the exchange. A negotiated exchange creates a
-`pending-pairing` session and consumes the token before the encrypted credential
-reply is delivered. Pending-session compensation is armed before the SQLite
-issuance job is queued, because a queued database call can outlive cancellation
-of its awaiting future. A delivery guard then owns that session until in-channel
-confirmation; capacity binding, encoding, encryption, or socket-write failure schedules
-best-effort revocation of the undelivered session. After delivery, verification
-or client-persistence failure closes the channel and the same guard revokes the
-delivered-but-unconfirmed session without replacing the original error.
-Confirmation owns its database activation through cached-state publication and
-delivery-latch publication even if cancellation drops the RPC handler future.
-The delivery guard therefore cannot observe an active database row whose
-in-memory state and latch still appear pending.
+device sends `{"type":"e2ee_auth","pairing":"<one-time token>"}` with no
+confirmation field: the **server** decides delivery from the grant it
+consumes, so a client cannot opt out of the durable-delivery guard through the
+wire message. Only a successful exchange consumes that token; a wrong host or
+failed handshake does not reach the exchange. An off-host grant creates a
+`pending-pairing` session and consumes the token before the encrypted
+credential reply is delivered; an on-host or legacy grant is delivered
+immediately as `active`. Pending-session compensation is armed before the
+SQLite issuance job is queued, because a queued database call can outlive
+cancellation of its awaiting future. A delivery guard then owns that session
+until in-channel confirmation; capacity binding, encoding, encryption, or
+socket-write failure schedules best-effort revocation of the undelivered
+session, and an age-gated sweep — at startup and every minute — durably
+revokes pending sessions older than the two-minute confirmation grace, so a
+crash-orphaned unconfirmed credential cannot hold the host's desired exposure
+wide until the next restart while a live confirmation is never raced. After
+delivery, verification or client-persistence failure closes the channel and
+the same guard revokes the delivered-but-unconfirmed session without replacing
+the original error. Confirmation owns its database activation through
+cached-state publication and delivery-latch publication even if cancellation
+drops the RPC handler future. The delivery guard therefore cannot observe an
+active database row whose in-memory state and latch still appear pending.
 The one-time token remains consumed, so the user generates a new offer, but the
 pending credential cannot reconnect as steady-state authority. The server
 returns `e2ee_authenticated` with the minted string credential,
 `environmentId`, optional `storageInstanceId`, and
-`pairingConfirmationRequired: true` only for that negotiated pending flow. A
-legacy client omits `pairingConfirmation`; a new server then preserves the v1
-behavior by minting an immediately active session and omitting the reply flag.
-A new client still attempts `auth.confirmPairing` when the reply flag is absent,
-because the immediately previous server created a pending session without the
-flag. A truly older active-session server returns the exact authenticated
-unknown-request-tag defect; only that exact absent-flag case may proceed to the
-same bearer proof used after a successful or ambiguously lost confirmation
-response. A returning device sends
+`pairingConfirmationRequired: true` exactly when the grant was off-host. The
+reply flag is the client's only confirmation signal: when it is present the
+client must call `auth.confirmPairing` on the same channel before the
+credential authenticates anywhere; when it is absent the credential is already
+active — which is also how a new client interoperates with servers that
+predate the confirmation flow. A returning device sends
 `{"type":"e2ee_auth","bearer":"<stored credential>"}` and receives an
 `e2ee_authenticated` acknowledgement. Invalid credentials receive
 `e2ee_error/unauthorized`; malformed protocol receives `e2ee_error/protocol`;

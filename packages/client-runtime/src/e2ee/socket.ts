@@ -158,13 +158,13 @@ export const makeE2eeSocket = (inner: Socket.Socket, options: E2eeSocketOptions)
                 }
                 transport = initiator.split();
                 phase = "auth";
+                // The server decides from the consumed grant whether delivery
+                // must be confirmed; the reply's pairingConfirmationRequired
+                // is the only signal, so this also interoperates with servers
+                // that predate the confirmation flow.
                 const authMessage =
                   options.auth.kind === "pairing"
-                    ? {
-                        type: "e2ee_auth",
-                        pairing: options.auth.token,
-                        pairingConfirmation: true,
-                      }
+                    ? { type: "e2ee_auth", pairing: options.auth.token }
                     : { type: "e2ee_auth", bearer: options.auth.credential };
                 return encryptAndSend(
                   currentTransport(),

@@ -791,8 +791,6 @@ pub(crate) struct E2eeAuthMessage {
     pub r#type: String,
     #[serde(default)]
     pub pairing: Option<String>,
-    #[serde(default, rename = "pairingConfirmation")]
-    pub pairing_confirmation: bool,
     #[serde(default)]
     pub bearer: Option<String>,
 }
@@ -977,32 +975,24 @@ pub(crate) async fn run_e2ee_session(
             Err(code) => return Ok(EstablishOutcome::Rejected { channel, code }),
         };
 
-        let pairing_confirmation = message.pairing_confirmation;
         let accept = if config.unsafe_no_auth {
             E2eeAccept::Unauthenticated
         } else {
             match (message.pairing, message.bearer) {
                 (Some(pairing), None) => {
-                    let issued = if pairing_confirmation {
-                        auth.exchange_pairing_bootstrap(&pairing, e2ee_client_metadata())
-                            .await
-                    } else {
-                        auth.exchange_bootstrap(
-                            &pairing,
-                            None,
-                            e2ee_client_metadata(),
-                            None,
-                            SessionTransport::E2ee,
-                        )
+                    // The server decides from the consumed grant whether
+                    // delivery must be confirmed; a client cannot opt out of
+                    // the durable-delivery guard through the wire message.
+                    let Ok((issued, confirmation_required)) = auth
+                        .exchange_pairing_bootstrap(&pairing, e2ee_client_metadata())
                         .await
-                    };
-                    let Ok(issued) = issued else {
+                    else {
                         return Ok(EstablishOutcome::Rejected {
                             channel,
                             code: "unauthorized",
                         });
                     };
-                    let delivery_guard = pairing_confirmation.then(|| {
+                    let delivery_guard = confirmation_required.then(|| {
                         Box::new(MintedSessionDeliveryGuard::new(
                             auth.clone(),
                             issued.principal.session_id.clone(),
@@ -1827,10 +1817,23 @@ mod tests {
             .with_desktop("desktop-test-seed")
             .expect("desktop config");
         let auth = AuthService::new(&config, vec![7_u8; 32]);
-        let issued = auth
-            .exchange_pairing_bootstrap("desktop-test-seed", e2ee_client_metadata())
+        let offer = auth
+            .issue_share_pairing(
+                crate::auth::STANDARD_SCOPES
+                    .iter()
+                    .map(|scope| (*scope).to_owned())
+                    .collect(),
+                None,
+                "another-device".to_owned(),
+                true,
+            )
+            .await
+            .expect("off-host share pairing");
+        let (issued, confirmation_required) = auth
+            .exchange_pairing_bootstrap(&offer.credential, e2ee_client_metadata())
             .await
             .expect("minted E2EE session");
+        assert!(confirmation_required);
         let session_id = issued.principal.session_id.clone();
 
         drop(MintedSessionDeliveryGuard::new(

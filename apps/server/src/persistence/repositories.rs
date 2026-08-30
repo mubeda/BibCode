@@ -1608,7 +1608,14 @@ impl Repositories {
             })
             .await
     }
-    pub async fn revoke_pending_auth_sessions(&self, revoked_at: Timestamp) -> Result<Vec<String>> {
+    /// Revokes unconfirmed pairing sessions issued at or before the cutoff.
+    /// The age gate keeps a sweep from racing a confirmation that is still in
+    /// flight on a live connection.
+    pub async fn revoke_pending_auth_sessions(
+        &self,
+        revoked_at: Timestamp,
+        issued_at_or_before: Timestamp,
+    ) -> Result<Vec<String>> {
         self.database
             .call(move |connection| {
                 let transaction =
@@ -1617,10 +1624,11 @@ impl Repositories {
                     let mut statement = transaction.prepare(
                         "UPDATE auth_sessions SET revoked_at = ?
                          WHERE revoked_at IS NULL AND delivery_state = 'pending-pairing'
+                           AND issued_at <= ?
                          RETURNING session_id",
                     )?;
                     statement
-                        .query_map([revoked_at], |row| row.get(0))?
+                        .query_map(params![revoked_at, issued_at_or_before], |row| row.get(0))?
                         .collect::<rusqlite::Result<Vec<_>>>()?
                 };
                 if !revoked.is_empty() {
