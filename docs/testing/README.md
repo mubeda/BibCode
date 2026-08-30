@@ -45,3 +45,12 @@ before the native page. Source, manifests, scripts, tests, CI, and release
 workflows remain executable evidence; if a runbook disagrees with them, stop,
 classify the disagreement, and update the living documentation with the
 behavior change.
+
+Static lint evidence must be freshly re-derived rather than replayed from Cargo
+cache. From the repository root, clean every workspace crate and then lint the
+whole workspace with warnings denied:
+
+```sh
+cargo clean -p bibcode-server -p bibcode-desktop -p bibcode-updater-verifier
+cargo clippy --workspace --all-targets -- -D warnings
+```

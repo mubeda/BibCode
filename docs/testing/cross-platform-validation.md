@@ -123,10 +123,12 @@ test-owned server/profile and controlled failure injection where required:
   local-only;
 - a concurrent live grant shows that remote access remains enabled for another
   live access reason;
-- an unconfirmed cancellation says exposure was deliberately left unchanged
-  because a live credential may exist; and
-- a confirmed cancellation plus failed cleanup says topology could not be
-  verified and does not claim local-only restoration;
+- a failed or blackholed cancellation still runs authoritative cleanup when
+  this attempt widened: loopback authority narrows, while a possibly live offer
+  or another live reason keeps the host wide;
+- cancellation and authoritative cleanup that are both unconfirmed do not
+  claim local-only restoration; and
+- failed cleanup says topology could not be verified;
 - consuming an off-host offer through the browser keeps exposure wide, and
   revoking that last browser session causes one local-only restart; and
 - when a new off-host grant appears during narrowing, the one post-narrow read
@@ -141,6 +143,9 @@ test-owned server/profile and controlled failure injection where required:
   apply cancels that work; after a local-only apply commits, unmount the view and
   prove the mandatory authoritative refetch and one needed compensating widen
   still complete.
+- a failed background reconciliation retries at five-second intervals for at
+  most three passes, then surfaces the warning toast instead of silently waiting
+  for another authority revision.
 
 Record the exposure mode, grant/session row, restart boundary, visible message,
 and screenshot for each outcome. Do not use a later app restart as substitute
@@ -163,7 +168,7 @@ cargo test -p bibcode-server --test e2ee_ws inbound_plaintext_capacity_backpress
 cargo test -p bibcode-server --test e2ee_ws incomplete_authenticated_message_closes_after_ten_seconds_without_progress -- --exact
 cargo test -p bibcode-server --test e2ee_ws idle_authenticated_connection_has_no_reassembly_deadline -- --exact
 cargo test -p bibcode-server --test e2ee_ws pairing_bootstrap_inside_the_channel_serves_get_config -- --exact
-cargo test -p bibcode-server --test e2ee_ws legacy_pairing_client_receives_an_active_credential_without_confirmation -- --exact
+cargo test -p bibcode-server --test e2ee_ws off_host_pairing_requires_confirmation_even_without_a_client_flag -- --exact
 cargo test -p bibcode-server --test e2ee_ws delivered_pairing_session_stays_pending_until_confirm_rpc -- --exact
 cargo test -p bibcode-server --test e2ee_ws closing_before_confirm_revokes_the_pending_session -- --exact
 cargo test -p bibcode-server --test e2ee_ws confirmed_pairing_session_survives_disconnect_and_restart_cleanup -- --exact
@@ -198,6 +203,7 @@ cargo test -p bibcode-server auth::service::tests::pending_pairing_offer_recover
 cargo test -p bibcode-server auth::service::tests::remote_offer_cancellation_converges_dormant_share_state_and_access_events --lib -- --exact
 cargo test -p bibcode-server auth::service::tests::cancelled_guard_registration_releases_bookkeeping_while_persistence_is_queued --lib -- --exact
 cargo test -p bibcode-server auth::service::tests::cancelled_pending_session_issuance_revokes_durable_commit_before_state_publication --lib -- --exact
+cargo test -p bibcode-server auth::service::tests::pending_pairing_sweep_only_revokes_sessions_past_the_grace_window --lib -- --exact
 cargo test -p bibcode-server --lib keeps_one_service_watcher -- --nocapture
 cargo test -p bibcode-server auth::service::tests::cross_service_authentication_starts_watcher_for_the_cached_session --lib -- --exact
 cargo test -p bibcode-server --test repositories pairing_offer_reservations_enforce_the_shared_ -- --nocapture
@@ -215,6 +221,14 @@ cargo test -p bibcode-desktop bridge::tests::local_only_discovery_surfaces_publi
 cargo test -p bibcode-desktop bridge::tests::local_only_discovery_marks_private_default_candidate_unavailable --lib -- --exact
 cargo test -p bibcode-server auth::service::tests::custom_off_host_grants_remain_externally_managed_after_exchange --lib -- --exact
 ```
+
+The pairing-add client suite must prove that the registered supervisor is the
+only bearer proof—no second pinned socket—and that an ambiguous confirmation
+observes `registry.stateChanges` for at most 30 interruptible seconds. Connected
+state proves activation; blocked authentication, host identity, or storage
+change rolls back local writes with `pairing-rejected`; an inconclusive window
+leaves recovery with the supervisor. Local persistence and confirmation remain
+the only uninterruptible segment.
 
 ### Direct E2EE interop gate
 
@@ -506,6 +520,7 @@ cargo test --workspace -j 2 -- --test-threads=2
 vp check
 vp run typecheck
 cargo fmt --all --check
+cargo clean -p bibcode-server -p bibcode-desktop -p bibcode-updater-verifier
 cargo clippy --workspace --all-targets -- -D warnings
 git diff --check
 ```
