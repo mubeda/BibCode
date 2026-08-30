@@ -128,7 +128,7 @@ pub(crate) fn classify_advertised_address(ip: IpAddr) -> AdvertisedAddressClassi
             AdvertisedAddressReachability::Lan,
             AdvertisedAddressLabelKind::LocalNetwork,
         )
-    } else if is_private_network(ip) {
+    } else if is_unique_local_ipv6(ip) {
         (
             AdvertisedAddressReachability::PrivateNetwork,
             AdvertisedAddressLabelKind::PrivateNetwork,
@@ -165,9 +165,9 @@ fn is_cgnat_or_tailscale(ip: IpAddr) -> bool {
     }
 }
 
-fn is_private_network(ip: IpAddr) -> bool {
+fn is_unique_local_ipv6(ip: IpAddr) -> bool {
     match normalize_ip(ip) {
-        IpAddr::V4(ipv4) => ipv4.is_private() || is_cgnat_or_tailscale(IpAddr::V4(ipv4)),
+        IpAddr::V4(_) => false,
         IpAddr::V6(ipv6) => (ipv6.segments()[0] & 0xfe00) == 0xfc00,
     }
 }

@@ -133,11 +133,20 @@ fn is_verified_wide(config: Option<&BackendRunConfig>) -> bool {
 
 fn is_verified_local(config: Option<&BackendRunConfig>) -> bool {
     config.is_none_or(|config| {
-        config.server_exposure_mode == "local-only"
-            && config
+        let bind_is_local = if config.running_distro.is_some() {
+            // A WSL-backed run reaches Windows through WSL's own forwarding;
+            // its bind address is governed by that platform layer (surfaced
+            // as externally managed), so a benign WSL narrow must not be
+            // escalated into a full backend stop over the bind host alone.
+            true
+        } else {
+            config
                 .bind_host
                 .parse::<std::net::IpAddr>()
                 .is_ok_and(|host| host.is_loopback())
+        };
+        config.server_exposure_mode == "local-only"
+            && bind_is_local
             && config.endpoint_url.is_none()
             && config.advertised_host.is_none()
     })

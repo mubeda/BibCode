@@ -26,8 +26,8 @@ use crate::context_menu::{
 };
 use crate::data_safety;
 use crate::network_interfaces::{
-    AdvertisedAddressReachability, NetworkAddress, classify_advertised_address,
-    enumerate_system_advertised_addresses,
+    AdvertisedAddressLabelKind, AdvertisedAddressReachability, NetworkAddress,
+    classify_advertised_address, enumerate_system_advertised_addresses,
 };
 use crate::security::{
     CONNECTION_CATALOG_PROTECTION_KIND, protect_string as protect_catalog_string,
@@ -605,7 +605,7 @@ fn advertised_endpoints_for_config(
 ) -> Result<Vec<Value>, String> {
     let mut endpoints = vec![advertised_endpoint(
         format!("desktop-loopback:{}", config.port),
-        "This machine",
+        AdvertisedAddressLabelKind::ThisMachine.as_str(),
         config.http_base_url(),
         "loopback",
         "available",
@@ -689,11 +689,16 @@ fn tailscale_endpoints_for_status(
             continue;
         }
         let http_base_url = format!("http://{ip}:{}", config.port);
+        let status = if config.server_exposure_mode == "network-accessible" {
+            "available"
+        } else {
+            "unavailable"
+        };
         endpoints.push(tailscale_advertised_endpoint(
             format!("tailscale-ip:{http_base_url}"),
             "Tailscale IP",
             http_base_url,
-            "available",
+            status,
             "mixed-content-blocked",
             "Reachable from devices on the same Tailnet.",
         )?);
@@ -1327,7 +1332,9 @@ impl WslOnlyTransitionOperations for DesktopExposureOperations<'_> {
     fn persist_wsl_only(&self, enabled: bool) -> BoxFuture<'_, Result<(), String>> {
         Box::pin(async move {
             update_desktop_settings(self.app, |settings| {
-                settings.server_exposure_mode = "local-only".to_owned();
+                // The exposure mode is owned by the recover-local flow, which
+                // the enable transition runs before this persists; writing it
+                // here would duplicate that ownership.
                 settings.wsl_only = enabled;
                 if enabled {
                     settings.wsl_backend_enabled = true;
@@ -3121,6 +3128,37 @@ mod tests {
             endpoints[1]["compatibility"]["hostedHttpsApp"],
             "compatible"
         );
+    }
+
+    #[test]
+    fn tailnet_ipv4_endpoints_are_unavailable_while_the_listener_is_loopback_only() {
+        let config = BackendRunConfig {
+            environment_id: "primary".to_string(),
+            label: "Local".to_string(),
+            running_distro: None,
+            port: 13773,
+            bind_host: "127.0.0.1".to_string(),
+            local_host: "127.0.0.1".to_string(),
+            desktop_bootstrap_token: "desktop-token".to_string(),
+            server_exposure_mode: "local-only".to_string(),
+            endpoint_url: None,
+            advertised_host: None,
+            tailscale_serve_enabled: false,
+            tailscale_serve_port: 8443,
+        };
+        let status = TailscaleStatus {
+            magic_dns_name: None,
+            tailnet_ipv4_addresses: vec!["100.100.100.100".to_string()],
+        };
+
+        let endpoints =
+            tailscale_endpoints_for_status(&config, &status, false).expect("endpoints build");
+
+        assert_eq!(endpoints.len(), 1);
+        // A tailnet address can only accept connections once the native
+        // listener binds wide; it is never advertised as available before
+        // that, unlike the previous hard-coded status.
+        assert_eq!(endpoints[0]["status"], "unavailable");
     }
 
     #[test]
