@@ -15,9 +15,11 @@ stay inside it; never cd to the original repo root).
 1. AGENTS.md at the repo root (and any AGENTS.md closer to files you touch). Its Required
    Pre-Work, Architectural Decision Standards, and Task Completion Requirements are binding.
 2. docs/plans/remote-servers/remote-servers-spec.md — the approved design. Section 4 pins
-   cross-phase contracts (names, wire shapes, state machines). These names are NORMATIVE:
-   consume them verbatim. If implementation forces a deviation, amend the spec in the same
-   patch and say so in the commit message — never silently diverge.
+   cross-phase contracts (names, wire shapes, state machines). They are normative as
+   amended in place: dated amendment markers override the original text, and dated
+   remediation design documents under docs/plans/remote-servers/ supersede it where they
+   say so. If implementation forces another deviation, amend the spec in the same patch and
+   say so in the commit message — never silently diverge.
 3. docs/plans/remote-servers/remote-servers-plan.md — the master plan: phase order,
    dependencies, cross-phase interface summary, and the Global Constraints that apply to
    every task.

@@ -194,6 +194,16 @@ credential>"}`. No `/oauth/token` or WebSocket-ticket HTTP round-trips occur for
   `server.getConfig` compared against the pairing payload's `environmentId`/
   `storageInstanceId` before anything is persisted). Failure replies:
   `{"type":"e2ee_error","code":"unauthorized"|"protocol"}` then close.
+  _(Amended 2026-08-30: the successful exchange consumes the one-time token before
+  any post-mint step. Any later failure, including principal-capacity binding, leaves
+  it consumed by design; the global reservation precedes the exchange, so capacity
+  cannot burn the link before minting.)_
+  _(Amended 2026-08-30: delivery confirmation is server-decided from the consumed
+  grant. Off-host grants create a `pending-pairing` session and return
+  `pairingConfirmationRequired: true`, after which the client calls
+  `auth.confirmPairing`; clients send no request flag. Migration 49 shipped the
+  persisted `delivery_state` column. See D4 in the
+  [Round 3 remediation design](./2026-08-30-remediation-round-3-design.md).)_
   _(Amended 2026-08-27 after external review: the original ticket-over-HTTP bootstrap
   leaked credentials on the plaintext hop the channel exists to protect.)_
 - No-downgrade rule: sessions minted through `/ws-e2ee` are recorded with
@@ -204,6 +214,8 @@ credential>"}`. No `/oauth/token` or WebSocket-ticket HTTP round-trips occur for
   (decode-default `"plain"` for pre-existing tokens), so enforcement is restart-safe
   without an `auth_sessions` migration; a persisted column is a possible later hardening,
   not a v1 requirement.
+  _(Amended 2026-08-30: migration 49 added the persisted `delivery_state` column to
+  `auth_sessions`.)_
 - Pre-auth hardening: the reassembled `e2ee_auth` message is capped at 64 KiB (the 64 MiB
   logical-message bound applies only after authentication); handshake + auth must complete
   within the handshake timeout; unauthenticated in-flight E2EE connections are capped.
@@ -336,6 +348,10 @@ control.)_
   reverse proxy — must not widen; the mint persists the computed off-host flag per grant
   so derivation and generator agree). _(Rule pinned 2026-08-27 after external review
   found the generator and server derivation disagreed on `custom`.)_
+  _(Amended 2026-08-30: native exposure widens only for
+  `reach = "another-device"`. Every off-host `custom` address is externally managed and
+  never drives the native listener. See the
+  [Round 3 remediation design](./2026-08-30-remediation-round-3-design.md).)_
 - Transitions (through the existing `DesktopServerExposureState` machinery, never a bare
   config edit): generating the first off-host offer → widen (rebind, Windows firewall
   scope update), with **rollback to loopback on bind failure** and the offer generation
@@ -382,6 +398,9 @@ root and prints the pairing credential JSON in the exact shape
   code + QR, paired-clients list with revocation, exposure state). Sections degrade per
   `EnvironmentPresentationPolicy` (no desktop bridge ⇒ no SSH discovery, no
   exposure-widening controls).
+  _(Amended 2026-08-30: off-host endpoint observations are emitted with
+  `status: "unavailable"` until the listener is wide; tailnet IPv4 status is likewise
+  derived from the current exposure mode.)_
 - Selection semantics (D3/D4): the rail scopes _presentation_ (which environment's
   projects/threads the panel shows and where "Add project" lands); RPC routing continues
   to follow each entity's `environmentId`. A null/absent `activeEnvironmentId` means
