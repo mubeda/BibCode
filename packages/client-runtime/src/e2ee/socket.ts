@@ -139,6 +139,17 @@ export const makeE2eeSocket = (inner: Socket.Socket, options: E2eeSocketOptions)
             if (typeof data === "string") {
               return fail("protocol", "peer sent a plaintext text frame on the E2EE channel");
             }
+            if (!(data instanceof Uint8Array)) {
+              // A Blob here means the underlying WebSocket was not switched to
+              // binaryType "arraybuffer": asynchronous Blob conversion would
+              // reorder ciphertext against the counter-based Noise nonce and
+              // present as an intermittent protocol error. Fail closed and
+              // name the invariant instead.
+              return fail(
+                "protocol",
+                'the E2EE socket delivered a non-binary frame; the underlying WebSocket must use binaryType "arraybuffer"',
+              );
+            }
 
             switch (phase) {
               case "handshake": {

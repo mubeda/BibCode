@@ -758,8 +758,25 @@ export const make = Effect.gen(function* () {
   );
 
   const retryNow = (environmentId: EnvironmentId) =>
-    acquireSupervisor(environmentId).pipe(
-      Effect.flatMap((supervisor) => supervisor.retryNow),
+    withLeaseLock(
+      environmentId,
+      Effect.gen(function* () {
+        // A retry request is connection intent: record it so the kick is not
+        // a silent no-op for an environment the user had disconnected, and so
+        // later catalog drift cannot resurrect a stale desired=false.
+        yield* getEntry(environmentId);
+        yield* Ref.update(desiredStates, (current) => {
+          const next = new Map(current);
+          next.set(environmentId, true);
+          return next;
+        });
+        const acquired = yield* acquireSupervisorLocked(environmentId);
+        if (!acquired.created) {
+          yield* acquired.supervisor.connect;
+        }
+        yield* acquired.supervisor.retryNow;
+      }),
+    ).pipe(
       Effect.catchTag("EnvironmentNotRegisteredError", () => Effect.void),
       Effect.withSpan("EnvironmentRegistry.retryNow"),
     );

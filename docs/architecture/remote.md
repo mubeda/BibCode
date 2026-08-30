@@ -323,37 +323,37 @@ is embedded in the code and persisted with the grant as described below.
 
 The add flow parses and classifies the endpoint, fetches the public descriptor,
 performs the pinned handshake and in-channel pairing, and calls authenticated
-`server.getConfig` before saving anything. When both peers negotiate pairing
-confirmation, the new session is persisted by the server as `pending-pairing`:
-the bootstrap channel may verify RPC identity, but the delivered bearer cannot
-establish a steady-state reconnect yet. The client
+`server.getConfig` before saving anything. When the server requires pairing
+confirmation, the new session is persisted as `pending-pairing`: the bootstrap
+channel may verify RPC identity, but the delivered bearer cannot establish a
+steady-state reconnect yet. The client
 compares the in-channel environment and storage identities with both the pairing
 payload and descriptor, registers the verified profile and credential, accepts
 the storage identity, then calls the empty `auth.confirmPairing` RPC on that same
-channel. Confirmation requires `access:write`, derives the session ID from the
-authenticated context, and idempotently commits only that session to `active`;
-the server owns the durable commit through in-memory publication and delivery-
-latch publication even if the RPC future is cancelled. The client attempts a
-second pinned session that authenticates the minted bearer, rechecks the
-environment and storage identities, and answers a probe. That proof receives at
-most two retries for authentication convergence or transient connection
-failure, then wakes the registered environment supervisor. Once confirmation
-has definitely or possibly activated the credential, the durable local entry
-owns it and remains saved even when the immediate proof cannot complete; the
-supervisor exposes the blocked or reconnecting state and owns later recovery.
-Only a typed confirmation rejection or a required-confirmation server that
-definitively lacks the method permits local rollback. Compatibility is
-additive: a legacy client receives an active credential immediately; a new
-client also confirms against the previous pending-session server even though
-that server omitted `pairingConfirmationRequired`. Only an absent flag plus the
-exact unknown-method defect from a truly older server may bypass confirmation;
-the client still attempts bearer proof. Ambiguous transport loss or interruption
-also proceeds to bearer proof. Typed authorization failures and the exact
-unknown-method response from a server that required confirmation are
-definitively inactive and roll back. Any other unexpected response is treated as
-ambiguous: the client retains the already durable local authority because
-dispatch may have committed, attempts bearer proof, and lets the saved
-supervisor expose any blocked state.
+channel. The pending session confirms its own delivery through the session
+capability gate; any other caller needs `access:write`. Confirmation derives
+the session ID from the authenticated context and idempotently commits only
+that session to `active`; the server owns the durable commit through in-memory
+publication and delivery-latch publication even if the RPC future is
+cancelled. Only the persistence writes and the confirm RPC itself run
+uninterruptibly; everything after them is cancellable, and pairing opens no
+additional verification socket: the registered environment supervisor connects
+with the saved credential, and its state is the bearer proof. A successful
+confirmation is conclusive by itself and wakes the supervisor without waiting.
+After an ambiguous confirmation (transport loss, interruption, or an
+unexpected response — dispatch may have committed), the client watches the
+supervisor's state for a bounded window: a connected supervisor proves the
+commit; a supervisor blocked on authentication, host identity, or a changed
+storage identity conclusively refutes the credential, and the client rolls
+back the saved entry and reports the pairing rejected instead of saving a
+permanently dead entry; anything else keeps the durable local authority and
+leaves recovery to the supervisor, which exposes any blocked or reconnecting
+state. Typed confirmation rejections and the exact unknown-method response
+from a server that required confirmation are definitively inactive and roll
+back immediately. Compatibility is additive: a server that never requires
+confirmation delivers an active credential, and the client's confirm call is
+idempotent there; the exact unknown-method defect from a truly older server is
+treated as that legacy delivery.
 
 Registration, identity persistence, or definitive pre-activation confirmation
 failure rolls back local writes best-effort before the bootstrap scope closes.

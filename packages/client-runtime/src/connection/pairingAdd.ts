@@ -6,9 +6,12 @@ import {
   parsePairingCode,
 } from "@bibcode/shared/pairingCode";
 import * as Cause from "effect/Cause";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { RpcClientError } from "effect/unstable/rpc";
 
@@ -85,14 +88,6 @@ const LEGACY_CONFIRMATION_UNSUPPORTED_DEFECT = `Unknown request tag: ${WS_METHOD
 
 type PairingConfirmationFailureDisposition = "rollback" | "verify-authority";
 
-class PairingBearerVerificationError extends Schema.TaggedErrorClass<PairingBearerVerificationError>()(
-  "PairingBearerVerificationError",
-  {
-    detail: Schema.String,
-    retryable: Schema.Boolean,
-  },
-) {}
-
 const classifyPairingConfirmationFailure = (
   cause: Cause.Cause<unknown>,
   pairingConfirmationRequired: boolean,
@@ -117,15 +112,51 @@ const pairingConfirmationFailure = (cause: Cause.Cause<unknown>): PairingAddErro
   });
 };
 
-const pairingBearerConnectionError = (
-  error: ConnectionAttemptError,
-): PairingBearerVerificationError =>
-  new PairingBearerVerificationError({
-    detail: error.detail,
-    retryable:
-      error._tag === "ConnectionTransientError" ||
-      (error._tag === "ConnectionBlockedError" && error.reason === "authentication"),
-  });
+const PAIRING_BEARER_PROOF_TIMEOUT_MS = 30_000;
+
+type PairingBearerProof = "authenticated" | "rejected" | "inconclusive";
+
+/** Blocked reasons that conclusively refute the saved credential. */
+const CONCLUSIVE_BEARER_REJECTIONS: ReadonlySet<string> = new Set([
+  "authentication",
+  "host-identity",
+  "storage-changed",
+]);
+
+/**
+ * The freshly registered supervisor connects with the saved credential, so
+ * its state is the bearer proof — pairing opens no additional verification
+ * socket. Bounded and interruptible.
+ */
+const pairingBearerProof = (
+  registry: EnvironmentRegistry.EnvironmentRegistry["Service"],
+  environmentId: EnvironmentId,
+): Effect.Effect<PairingBearerProof> =>
+  registry.stateChanges(environmentId).pipe(
+    Stream.filterMap((state) => {
+      if (state.phase === "connected") {
+        return Result.succeed("authenticated" as const);
+      }
+      if (
+        state.phase === "blocked" &&
+        state.lastFailure !== null &&
+        state.lastFailure._tag === "ConnectionBlockedError" &&
+        CONCLUSIVE_BEARER_REJECTIONS.has(state.lastFailure.reason)
+      ) {
+        return Result.succeed("rejected" as const);
+      }
+      return Result.failVoid;
+    }),
+    Stream.runHead,
+    Effect.timeoutOption(Duration.millis(PAIRING_BEARER_PROOF_TIMEOUT_MS)),
+    Effect.map(
+      (outcome): PairingBearerProof =>
+        Option.isSome(outcome) && Option.isSome(outcome.value)
+          ? outcome.value.value
+          : "inconclusive",
+    ),
+    Effect.orElseSucceed((): PairingBearerProof => "inconclusive"),
+  );
 
 const classifyAttemptError = (error: ConnectionAttemptError): PairingAddError => {
   if (error._tag === "ConnectionBlockedError" && error.reason === "host-identity") {
@@ -281,50 +312,6 @@ export const verifyAndAddPairingCode = Effect.fn(
         environmentId: descriptor.environmentId,
         storageInstanceId: authenticated.storageInstanceId,
       };
-      const bearerPrepared: PreparedConnection = {
-        ...prepared,
-        e2ee: {
-          hostKey: payload.hostKey,
-          auth: { kind: "bearer", credential: verified.credential },
-        },
-      };
-      const verifyPairingBearer = Effect.scoped(
-        Effect.gen(function* () {
-          const recoverySession = yield* sessions
-            .connect(bearerPrepared)
-            .pipe(Effect.mapError(pairingBearerConnectionError));
-          yield* recoverySession.ready.pipe(Effect.mapError(pairingBearerConnectionError));
-          const recoveryAuthenticated = yield* recoverySession.e2eeAuthenticated;
-          if (recoveryAuthenticated === null) {
-            return yield* new PairingBearerVerificationError({
-              detail: "The server did not authenticate the saved device credential.",
-              retryable: false,
-            });
-          }
-          const recoveryConfig = yield* recoverySession.initialConfig.pipe(
-            Effect.mapError(pairingBearerConnectionError),
-          );
-          if (
-            recoveryConfig.environment.environmentId !== verified.environmentId ||
-            recoveryConfig.environment.storageInstanceId !== verified.storageInstanceId
-          ) {
-            return yield* new PairingBearerVerificationError({
-              detail: "The server identity changed while verifying the saved device credential.",
-              retryable: false,
-            });
-          }
-          yield* recoverySession.probe.pipe(Effect.mapError(pairingBearerConnectionError));
-        }),
-      ).pipe(
-        Effect.retry({ times: 2, while: (error) => error.retryable }),
-        Effect.mapError(
-          (error) =>
-            new PairingAddError({
-              reason: "local-persistence-failed",
-              detail: `The local connection was saved, but its device credential could not be verified: ${error.detail}`,
-            }),
-        ),
-      );
       const registration = new BearerConnectionRegistration({
         target,
         profile: new BearerConnectionProfile({
@@ -398,7 +385,7 @@ export const verifyAndAddPairingCode = Effect.fn(
             identityWritten = true;
           }),
         );
-        yield* Effect.uninterruptibleMask((restore) =>
+        const confirmed = yield* Effect.uninterruptibleMask((restore) =>
           Effect.gen(function* () {
             const confirmation = yield* restore(
               session.client[WS_METHODS.authConfirmPairing]({}),
@@ -411,18 +398,42 @@ export const verifyAndAddPairingCode = Effect.fn(
               if (disposition === "rollback") {
                 return yield* pairingConfirmationFailure(confirmation.cause);
               }
-              authorityOwned = true;
-            } else {
-              authorityOwned = true;
+              // Ambiguous: the confirmation may have committed server-side,
+              // so removing the durable local credential is no longer safe.
+              return false;
             }
-
-            // Once confirmation may have committed, removing the durable local
-            // credential can orphan an active server-side authority. A failed
-            // immediate proof therefore leaves recovery to the saved supervisor.
-            yield* verifyPairingBearer.pipe(Effect.ignore);
-            yield* registry.retryNow(verified.environmentId);
+            return true;
           }),
         );
+        authorityOwned = true;
+
+        // Interruptible from here on. The supervisor connecting with the
+        // saved credential is the bearer proof, so pairing opens no extra
+        // verification socket and an unresponsive host can no longer pin an
+        // uncancellable fiber through three fresh handshakes.
+        yield* registry.retryNow(verified.environmentId);
+        if (!confirmed) {
+          const proof = yield* pairingBearerProof(registry, verified.environmentId);
+          if (proof === "rejected") {
+            // The server conclusively refuses the credential: the ambiguous
+            // confirmation did not commit and the pending session is revoked.
+            // Reporting success would save a permanently dead entry.
+            // authorityOwned stays true so the outer handler passes this
+            // failure through instead of re-wrapping it; cleanup runs here.
+            const cleanupFailures = yield* rollbackLocalWrites();
+            const cleanupDetail =
+              cleanupFailures.length === 0
+                ? ""
+                : ` Local cleanup also failed: ${cleanupFailures.join("; ")}.`;
+            return yield* new PairingAddError({
+              reason: "pairing-rejected",
+              detail: `The server rejected the paired credential before confirmation completed; the one-time code was consumed, so generate a new pairing code and pair again.${cleanupDetail}`,
+            });
+          }
+          // "authenticated" proves the confirmation committed;
+          // "inconclusive" keeps the saved entry and leaves recovery to the
+          // supervisor, exactly like a lost confirmation reply.
+        }
         return registration.target.environmentId as EnvironmentId;
       });
 

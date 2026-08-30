@@ -21,6 +21,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { RpcClientError } from "effect/unstable/rpc";
 import * as Socket from "effect/unstable/socket/Socket";
@@ -40,6 +41,8 @@ import {
   ConnectionTransientError,
   type ConnectionAttemptError,
   type PreparedConnection,
+  type SupervisorConnectionPhase,
+  type SupervisorConnectionState,
 } from "./model.ts";
 import {
   PairingAddError,
@@ -107,10 +110,8 @@ interface HarnessOptions {
   readonly confirmationRpcError?: RpcClientError.RpcClientError;
   readonly confirmationInterrupted?: boolean;
   readonly concurrentIdentityBeforeConfirmationFailure?: string;
-  readonly recoveryConnectionFailures?: Array<ConnectionAttemptError>;
-  readonly recoveryConfigEnvironmentId?: EnvironmentId;
-  readonly recoveryConfigStorageInstanceId?: string;
-  readonly pauseAfterRecoveryVerification?: boolean;
+  readonly supervisorStates?: ReadonlyArray<SupervisorConnectionState>;
+  readonly supervisorStatesHang?: boolean;
   readonly pauseAfterRegistrationCommit?: boolean;
   readonly pauseAfterIdentityCommit?: boolean;
 }
@@ -135,8 +136,6 @@ const makeHarness = Effect.fn("TestPairingAdd.makeHarness")(function* (
   const releaseRegistration = yield* Deferred.make<void>();
   const identityCommitted = yield* Deferred.make<void>();
   const releaseIdentity = yield* Deferred.make<void>();
-  const recoveryVerified = yield* Deferred.make<void>();
-  const releaseRecovery = yield* Deferred.make<void>();
   const confirmationOutcome = (): Effect.Effect<
     {},
     EnvironmentAuthorizationError | RpcClientError.RpcClientError
@@ -202,6 +201,13 @@ const makeHarness = Effect.fn("TestPairingAdd.makeHarness")(function* (
             registrations.splice(0, registrations.length);
           }),
     retryNow: () => Effect.sync(() => events.push("retry-supervisor")),
+    stateChanges: () => {
+      events.push("observe-supervisor");
+      const states = Stream.fromIterable(options.supervisorStates ?? []);
+      return options.supervisorStatesHang === true
+        ? states.pipe(Stream.concat(Stream.never))
+        : states;
+    },
   } as unknown as EnvironmentRegistry.EnvironmentRegistry["Service"]);
   const identities = Persistence.AcceptedStorageIdentityStore.of({
     get: (targetKey) => Effect.succeed(Option.fromUndefinedOr(accepted.get(targetKey))),
@@ -274,21 +280,12 @@ const makeHarness = Effect.fn("TestPairingAdd.makeHarness")(function* (
   const sessions = RpcSession.RpcSessionFactory.of({
     connect: (prepared) => {
       preparedConnections.push(prepared);
-      const recovery = prepared.e2ee?.auth.kind === "bearer";
-      const recoveryFailure = recovery ? options.recoveryConnectionFailures?.shift() : undefined;
-      if (recoveryFailure !== undefined) {
-        return Effect.fail(recoveryFailure);
-      }
       const failure = failures.shift();
       if (failure !== undefined) return Effect.fail(failure);
       const configDescriptor = descriptor({
         ...currentDescriptor,
-        environmentId: recovery
-          ? (options.recoveryConfigEnvironmentId ?? currentDescriptor.environmentId)
-          : (options.configEnvironmentId ?? currentDescriptor.environmentId),
-        storageInstanceId: recovery
-          ? (options.recoveryConfigStorageInstanceId ?? currentDescriptor.storageInstanceId)
-          : (options.configStorageInstanceId ?? currentDescriptor.storageInstanceId),
+        environmentId: options.configEnvironmentId ?? currentDescriptor.environmentId,
+        storageInstanceId: options.configStorageInstanceId ?? currentDescriptor.storageInstanceId,
       });
       return Effect.acquireRelease(
         Effect.succeed({
@@ -309,30 +306,21 @@ const makeHarness = Effect.fn("TestPairingAdd.makeHarness")(function* (
               }).pipe(Effect.flatMap(confirmationOutcome)),
           } as unknown as RpcSession.RpcSession["client"],
           initialConfig: Effect.gen(function* () {
-            events.push(recovery ? "recover-verify" : "verify");
-            if (recovery && options.pauseAfterRecoveryVerification === true) {
-              yield* Deferred.succeed(recoveryVerified, undefined);
-              yield* Deferred.await(releaseRecovery);
-            }
+            events.push("verify");
             return { environment: configDescriptor } as ServerConfig;
           }),
           ready: Effect.void,
           probe: Effect.void,
           closed: Effect.never,
-          e2eeAuthenticated: Effect.succeed(
-            recovery
-              ? { type: "e2ee_authenticated" as const }
-              : {
-                  type: "e2ee_authenticated" as const,
-                  credential: "minted-device-credential",
-                  environmentId:
-                    options.authenticatedEnvironmentId ?? currentDescriptor.environmentId,
-                  storageInstanceId: options.authenticatedStorageInstanceId ?? STORAGE_IDENTITY,
-                  ...((options.pairingConfirmationRequired ?? true)
-                    ? { pairingConfirmationRequired: true as const }
-                    : {}),
-                },
-          ),
+          e2eeAuthenticated: Effect.succeed({
+            type: "e2ee_authenticated" as const,
+            credential: "minted-device-credential",
+            environmentId: options.authenticatedEnvironmentId ?? currentDescriptor.environmentId,
+            storageInstanceId: options.authenticatedStorageInstanceId ?? STORAGE_IDENTITY,
+            ...((options.pairingConfirmationRequired ?? true)
+              ? { pairingConfirmationRequired: true as const }
+              : {}),
+          }),
         }),
         () => Effect.sync(() => void (closedSessions += 1)),
       );
@@ -368,8 +356,6 @@ const makeHarness = Effect.fn("TestPairingAdd.makeHarness")(function* (
     releaseRegistration: Deferred.succeed(releaseRegistration, undefined),
     identityCommitted: Deferred.await(identityCommitted),
     releaseIdentity: Deferred.succeed(releaseIdentity, undefined),
-    recoveryVerified: Deferred.await(recoveryVerified),
-    releaseRecovery: Deferred.succeed(releaseRecovery, undefined),
     run: (payload: RemotePairingCodePayload, allowLoopbackTunnel?: boolean) =>
       verifyAndAddPairingCode({
         code: encodePairingCode(payload),
@@ -395,6 +381,20 @@ const failureReason = <R>(effect: Effect.Effect<unknown, PairingFailure, R>) =>
     ),
   );
 const isPairingAddError = Schema.is(PairingAddError);
+
+const supervisorState = (
+  phase: SupervisorConnectionPhase,
+  lastFailure: ConnectionAttemptError | null = null,
+): SupervisorConnectionState => ({
+  desired: true,
+  network: "online",
+  phase,
+  stage: null,
+  attempt: 1,
+  generation: 1,
+  lastFailure,
+  retryAt: null,
+});
 
 describe("verifyAndAddPairingCode", () => {
   it.effect("requires explicit acknowledgement before dialing loopback codes", () =>
@@ -638,25 +638,22 @@ describe("verifyAndAddPairingCode", () => {
         "register",
         "accept-identity",
         "confirm",
-        "recover-verify",
         "retry-supervisor",
       ]);
-      expect(harness.preparedConnections[1]).toMatchObject({
-        e2ee: {
-          hostKey: HOST_KEY,
-          auth: { kind: "bearer", credential: "minted-device-credential" },
-        },
-      });
-      expect(harness.closedSessions()).toBe(2);
+      // Pairing opens exactly one socket: the supervisor connecting with the
+      // saved credential is the bearer proof, not a dedicated verification
+      // session.
+      expect(harness.preparedConnections).toHaveLength(1);
+      expect(harness.closedSessions()).toBe(1);
     }),
   );
 
-  it.effect("wakes the registered supervisor after the bearer proves activation", () =>
+  it.effect("wakes the registered supervisor immediately after the confirmed commit", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness();
 
       expect(yield* harness.run(validPayload())).toBe(ENVIRONMENT_ID);
-      expect(harness.events.slice(-2)).toEqual(["recover-verify", "retry-supervisor"]);
+      expect(harness.events.slice(-2)).toEqual(["confirm", "retry-supervisor"]);
     }),
   );
 
@@ -670,12 +667,11 @@ describe("verifyAndAddPairingCode", () => {
         "register",
         "accept-identity",
         "confirm",
-        "recover-verify",
         "retry-supervisor",
       ]);
       expect(harness.registrations).toHaveLength(1);
       expect(harness.acceptedIdentities).toHaveLength(1);
-      expect(harness.closedSessions()).toBe(2);
+      expect(harness.closedSessions()).toBe(1);
     }),
   );
 
@@ -684,6 +680,7 @@ describe("verifyAndAddPairingCode", () => {
       const harness = yield* makeHarness({
         pairingConfirmationRequired: false,
         confirmationDefect: "Unknown request tag: auth.confirmPairing",
+        supervisorStates: [supervisorState("connecting"), supervisorState("connected")],
       });
 
       expect(yield* harness.run(validPayload())).toBe(ENVIRONMENT_ID);
@@ -692,12 +689,12 @@ describe("verifyAndAddPairingCode", () => {
         "register",
         "accept-identity",
         "confirm",
-        "recover-verify",
         "retry-supervisor",
+        "observe-supervisor",
       ]);
       expect(harness.registrations).toHaveLength(1);
       expect(harness.acceptedIdentities).toHaveLength(1);
-      expect(harness.closedSessions()).toBe(2);
+      expect(harness.closedSessions()).toBe(1);
     }),
   );
 
@@ -714,12 +711,12 @@ describe("verifyAndAddPairingCode", () => {
         "register",
         "accept-identity",
         "confirm",
-        "recover-verify",
         "retry-supervisor",
+        "observe-supervisor",
       ]);
       expect(harness.registrations).toHaveLength(1);
       expect(harness.acceptedIdentities).toHaveLength(1);
-      expect(harness.closedSessions()).toBe(2);
+      expect(harness.closedSessions()).toBe(1);
     }),
   );
 
@@ -733,12 +730,7 @@ describe("verifyAndAddPairingCode", () => {
             closeReason: "network lost",
           }),
         }),
-        recoveryConnectionFailures: [
-          new ConnectionBlockedError({
-            reason: "authentication",
-            detail: "activation still converging",
-          }),
-        ],
+        supervisorStates: [supervisorState("connecting"), supervisorState("connected")],
       });
 
       expect(yield* harness.run(validPayload())).toBe(ENVIRONMENT_ID);
@@ -747,74 +739,86 @@ describe("verifyAndAddPairingCode", () => {
         "register",
         "accept-identity",
         "confirm",
-        "recover-verify",
         "retry-supervisor",
+        "observe-supervisor",
       ]);
       expect(harness.registrations).toHaveLength(1);
       expect(harness.acceptedIdentities).toHaveLength(1);
-      expect(harness.preparedConnections).toHaveLength(3);
-      expect(harness.closedSessions()).toBe(2);
+      expect(harness.preparedConnections).toHaveLength(1);
+      expect(harness.closedSessions()).toBe(1);
+    }),
+  );
+
+  it.effect("rolls back and fails when the server conclusively refuses the credential", () =>
+    Effect.gen(function* () {
+      // The confirmation reply was lost, and the supervisor's bearer attempt
+      // is refused outright: the pending session was revoked server-side.
+      // Reporting success here would save a permanently dead entry with the
+      // one-time code burned.
+      const harness = yield* makeHarness({
+        confirmationRpcError: new RpcClientError.RpcClientError({
+          reason: new Socket.SocketCloseError({ code: 1006, closeReason: "revoked" }),
+        }),
+        supervisorStates: [
+          supervisorState(
+            "blocked",
+            new ConnectionBlockedError({
+              reason: "authentication",
+              detail: "credential is not active",
+            }),
+          ),
+        ],
+      });
+
+      const error = yield* harness.run(validPayload()).pipe(Effect.flip);
+      expect(isPairingAddError(error) && error.reason).toBe("pairing-rejected");
+      expect(harness.registrations).toEqual([]);
+      expect(harness.acceptedIdentities).toEqual([]);
     }),
   );
 
   it.effect("retains authority when a lost confirmation response cannot be proven yet", () =>
     Effect.gen(function* () {
+      // No proof arrives before the supervisor stream ends: the confirmation
+      // may still have committed, so the entry is kept and recovery is left
+      // to the supervisor, exactly like a lost confirmation reply.
       const harness = yield* makeHarness({
         confirmationRpcError: new RpcClientError.RpcClientError({
           reason: new Socket.SocketCloseError({ code: 1006, closeReason: "confirmation lost" }),
         }),
-        recoveryConnectionFailures: Array.from(
-          { length: 3 },
-          () =>
-            new ConnectionBlockedError({
-              reason: "authentication",
-              detail: "credential is not active",
-            }),
-        ),
+        supervisorStates: [supervisorState("connecting"), supervisorState("backoff")],
       });
 
       expect(yield* harness.run(validPayload())).toBe(ENVIRONMENT_ID);
-      expect(harness.preparedConnections).toHaveLength(4);
+      expect(harness.preparedConnections).toHaveLength(1);
       expect(harness.registrations).toHaveLength(1);
       expect(harness.acceptedIdentities).toHaveLength(1);
-      expect(harness.events.at(-1)).toBe("retry-supervisor");
+      expect(harness.events.at(-1)).toBe("observe-supervisor");
       expect(harness.closedSessions()).toBe(1);
     }),
   );
 
-  it.effect("retains confirmed authority when bearer recovery sees a different identity", () =>
+  it.effect("retains confirmed authority without consulting the supervisor proof", () =>
     Effect.gen(function* () {
+      // A successful confirmation is conclusive on its own; even a hostile
+      // later supervisor state must not roll the pairing back.
       const harness = yield* makeHarness({
-        recoveryConfigStorageInstanceId: "different-storage-instance",
-      });
-
-      expect(yield* harness.run(validPayload())).toBe(ENVIRONMENT_ID);
-      expect(harness.preparedConnections).toHaveLength(2);
-      expect(harness.registrations).toHaveLength(1);
-      expect(harness.acceptedIdentities).toHaveLength(1);
-      expect(harness.events.slice(-2)).toEqual(["recover-verify", "retry-supervisor"]);
-      expect(harness.closedSessions()).toBe(2);
-    }),
-  );
-
-  it.effect("retains confirmed authority after all transient bearer probes fail", () =>
-    Effect.gen(function* () {
-      const harness = yield* makeHarness({
-        recoveryConnectionFailures: Array.from(
-          { length: 3 },
-          () =>
-            new ConnectionTransientError({
-              reason: "transport",
-              detail: "server restarting",
+        supervisorStates: [
+          supervisorState(
+            "blocked",
+            new ConnectionBlockedError({
+              reason: "authentication",
+              detail: "unrelated later failure",
             }),
-        ),
+          ),
+        ],
       });
 
       expect(yield* harness.run(validPayload())).toBe(ENVIRONMENT_ID);
-      expect(harness.preparedConnections).toHaveLength(4);
+      expect(harness.preparedConnections).toHaveLength(1);
       expect(harness.registrations).toHaveLength(1);
       expect(harness.acceptedIdentities).toHaveLength(1);
-      expect(harness.events.at(-1)).toBe("retry-supervisor");
+      expect(harness.events.slice(-2)).toEqual(["confirm", "retry-supervisor"]);
       expect(harness.closedSessions()).toBe(1);
     }),
   );
@@ -824,20 +828,13 @@ describe("verifyAndAddPairingCode", () => {
       const harness = yield* makeHarness({
         pairingConfirmationRequired: false,
         confirmationDefect: "Unknown request tag: auth.confirmPairing",
-        recoveryConnectionFailures: Array.from(
-          { length: 3 },
-          () =>
-            new ConnectionTransientError({
-              reason: "transport",
-              detail: "legacy server unavailable",
-            }),
-        ),
+        supervisorStates: [supervisorState("offline")],
       });
 
       expect(yield* harness.run(validPayload())).toBe(ENVIRONMENT_ID);
       expect(harness.registrations).toHaveLength(1);
       expect(harness.acceptedIdentities).toHaveLength(1);
-      expect(harness.events.at(-1)).toBe("retry-supervisor");
+      expect(harness.events.at(-1)).toBe("observe-supervisor");
     }),
   );
 
@@ -933,7 +930,10 @@ describe("verifyAndAddPairingCode", () => {
 
   it.effect("finishes pairing through bearer proof when confirmation is interrupted", () =>
     Effect.gen(function* () {
-      const harness = yield* makeHarness({ confirmationInterrupted: true });
+      const harness = yield* makeHarness({
+        confirmationInterrupted: true,
+        supervisorStates: [supervisorState("connected")],
+      });
       expect(yield* harness.run(validPayload())).toBe(ENVIRONMENT_ID);
 
       expect(harness.events).toEqual([
@@ -941,34 +941,36 @@ describe("verifyAndAddPairingCode", () => {
         "register",
         "accept-identity",
         "confirm",
-        "recover-verify",
         "retry-supervisor",
+        "observe-supervisor",
       ]);
       expect(harness.registrations).toHaveLength(1);
       expect(harness.acceptedIdentities).toHaveLength(1);
-      expect(harness.closedSessions()).toBe(2);
+      expect(harness.closedSessions()).toBe(1);
     }),
   );
 
-  it.effect("owns bearer verification through cancellation after local persistence", () =>
+  it.effect("keeps saved authority when cancelled during the bearer proof", () =>
     Effect.gen(function* () {
-      const harness = yield* makeHarness({ pauseAfterRecoveryVerification: true });
+      // The proof wait is interruptible — the old flow held three fresh
+      // handshakes inside an uninterruptible mask for up to 75 seconds. The
+      // interrupt must resolve promptly with the persisted entry intact.
+      const harness = yield* makeHarness({
+        confirmationRpcError: new RpcClientError.RpcClientError({
+          reason: new Socket.SocketCloseError({ code: 1006, closeReason: "confirmation lost" }),
+        }),
+        supervisorStatesHang: true,
+      });
       const pairing = yield* Effect.forkChild(harness.run(validPayload()));
-      for (let attempt = 0; attempt < 100 && harness.preparedConnections.length < 2; attempt += 1) {
+      for (let attempt = 0; attempt < 100 && !harness.events.includes("observe-supervisor"); attempt += 1) {
         yield* Effect.yieldNow;
       }
-      expect(harness.preparedConnections).toHaveLength(2);
-      yield* harness.recoveryVerified;
-      const interrupting = yield* Effect.forkChild(Fiber.interrupt(pairing));
-      yield* Effect.yieldNow;
-      yield* harness.releaseRecovery;
-      yield* Fiber.await(pairing);
-      yield* Fiber.await(interrupting);
+      expect(harness.events.includes("observe-supervisor")).toBe(true);
+      yield* Fiber.interrupt(pairing);
 
-      expect(harness.preparedConnections).toHaveLength(2);
       expect(harness.registrations).toHaveLength(1);
       expect(harness.acceptedIdentities).toHaveLength(1);
-      expect(harness.closedSessions()).toBe(2);
+      expect(harness.closedSessions()).toBe(1);
     }),
   );
 
