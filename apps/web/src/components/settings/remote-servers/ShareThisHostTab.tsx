@@ -22,7 +22,10 @@ import {
   usePrimaryEnvironmentId,
 } from "~/state/environments";
 import { useEnvironmentQuery } from "~/state/query";
-import { reconcileShareExposureOnce } from "~/state/shareExposureReconciler";
+import {
+  reconcileShareExposureOnce,
+  withShareExposureBridgeTimeout,
+} from "~/state/shareExposureReconciler";
 import { randomUUID } from "~/lib/utils";
 
 import { Button } from "../../ui/button";
@@ -162,7 +165,11 @@ export function ShareThisHostTab(): ReactElement {
     setIsResumingLegacy(true);
     setLegacyResumeError(null);
     try {
-      await desktopBridge.applyServerExposure("network-accessible");
+      await withShareExposureBridgeTimeout(
+        "Server exposure update",
+        desktopBridge.applyServerExposure("network-accessible"),
+        PRIMARY_PAIRING_OFFER_REQUEST_TIMEOUT_MS,
+      );
       refreshDesktopNetworkAccessState();
       await refreshShareState();
     } catch (error) {
@@ -213,14 +220,19 @@ export function ShareThisHostTab(): ReactElement {
                 getShareState: getServerShareState,
                 getExposureState: () => desktopBridge.getServerExposureState(),
                 applyExposure: (desired) => desktopBridge.applyServerExposure(desired),
-                canApplyExposure: () => canManageNativeExposureRef.current,
+                canStartExposure: () => canManageNativeExposureRef.current,
+                operationTimeoutMs: PRIMARY_PAIRING_OFFER_REQUEST_TIMEOUT_MS,
               });
               if (outcome === "narrowed") return "local-confirmed";
               if (outcome === "widened" || outcome === "rewidened") return "active-reason";
 
               const [confirmedShareState, confirmedExposureState] = await Promise.all([
                 getServerShareState(),
-                desktopBridge.getServerExposureState(),
+                withShareExposureBridgeTimeout(
+                  "Server exposure state",
+                  desktopBridge.getServerExposureState(),
+                  PRIMARY_PAIRING_OFFER_REQUEST_TIMEOUT_MS,
+                ),
               ]);
               if (
                 confirmedExposureState.mode === "local-only" &&

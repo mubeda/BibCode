@@ -34,7 +34,7 @@ use crate::security::{
     unprotect_string as unprotect_catalog_string,
 };
 use crate::server_exposure::{
-    BoxFuture, ExposureOperations, ServerExposureCoordinator, apply_exposure,
+    BoxFuture, ExposureOperations, ServerExposureCoordinator, apply_exposure, recover_local,
 };
 use crate::ssh::{
     SshEnvironmentEnsureOptions, SshEnvironmentManager, SshEnvironmentTarget,
@@ -1295,6 +1295,46 @@ impl ExposureOperations for DesktopExposureOperations<'_> {
     }
 }
 
+trait WslOnlyTransitionOperations: ExposureOperations {
+    fn persist_wsl_only(&self, enabled: bool) -> BoxFuture<'_, Result<(), String>>;
+    fn restart_topology_local(&self) -> BoxFuture<'_, Result<(), String>>;
+}
+
+impl WslOnlyTransitionOperations for DesktopExposureOperations<'_> {
+    fn persist_wsl_only(&self, enabled: bool) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            update_desktop_settings(self.app, |settings| {
+                settings.server_exposure_mode = "local-only".to_owned();
+                settings.wsl_only = enabled;
+                if enabled {
+                    settings.wsl_backend_enabled = true;
+                }
+            })
+            .map(|_| ())
+        })
+    }
+
+    fn restart_topology_local(&self) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            self.backend
+                .restart_default_if_active_with_exposure(self.app.clone(), "local-only")
+                .await
+                .map(|_| ())
+        })
+    }
+}
+
+async fn transition_wsl_only(
+    operations: &impl WslOnlyTransitionOperations,
+    enabled: bool,
+) -> Result<(), String> {
+    if enabled {
+        recover_local(operations).await?;
+    }
+    operations.persist_wsl_only(enabled).await?;
+    operations.restart_topology_local().await
+}
+
 #[tauri::command]
 pub async fn desktop_bridge_apply_server_exposure(
     app: AppHandle<DesktopRuntime>,
@@ -1403,12 +1443,12 @@ pub async fn desktop_bridge_set_wsl_only(
 ) -> Result<Value, String> {
     coordinator
         .run_exclusive(async {
-            let settings = update_desktop_settings(&app, |settings| {
-                settings.wsl_only = enabled;
-            })?;
-            backend
-                .restart_default_if_active_preserving_exposure(app.clone())
-                .await?;
+            let operations = DesktopExposureOperations {
+                app: &app,
+                backend: backend.inner(),
+            };
+            transition_wsl_only(&operations, enabled).await?;
+            let settings = read_desktop_settings(&app)?;
             Ok(wsl_state(&settings, &backend))
         })
         .await
@@ -1700,6 +1740,175 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Barrier, Mutex, mpsc};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[derive(Default)]
+    struct FakeWslOnlyTransitionState {
+        calls: Vec<String>,
+        current_config: Option<BackendRunConfig>,
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeWslOnlyTransitionOperations {
+        state: Arc<Mutex<FakeWslOnlyTransitionState>>,
+    }
+
+    impl FakeWslOnlyTransitionOperations {
+        fn with_current_mode(mode: &str) -> Self {
+            let operations = Self::default();
+            operations.state.lock().expect("fake state").current_config =
+                Some(test_backend_config_for_exposure(mode));
+            operations
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.state.lock().expect("fake state").calls.clone()
+        }
+    }
+
+    impl ExposureOperations for FakeWslOnlyTransitionOperations {
+        fn native_exposure_available(&self) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        fn persisted_mode(&self) -> Result<String, String> {
+            Ok("network-accessible".to_owned())
+        }
+
+        fn persist_mode<'a>(&'a self, mode: &'a str) -> BoxFuture<'a, Result<(), String>> {
+            Box::pin(async move {
+                self.state
+                    .lock()
+                    .expect("fake state")
+                    .calls
+                    .push(format!("persist:{mode}"));
+                Ok(())
+            })
+        }
+
+        fn current_config(&self) -> Option<BackendRunConfig> {
+            let mut state = self.state.lock().expect("fake state");
+            state.calls.push("verify:local-only".to_owned());
+            state.current_config.clone()
+        }
+
+        fn restart_with_mode<'a>(
+            &'a self,
+            mode: &'a str,
+        ) -> BoxFuture<'a, Result<Option<BackendRunConfig>, String>> {
+            Box::pin(async move {
+                let config = test_backend_config_for_exposure(mode);
+                let mut state = self.state.lock().expect("fake state");
+                state.calls.push(format!("restart-native:{mode}"));
+                state.current_config = Some(config.clone());
+                Ok(Some(config))
+            })
+        }
+
+        fn sync_firewall(&self, enabled: bool) -> BoxFuture<'_, Result<(), String>> {
+            Box::pin(async move {
+                self.state
+                    .lock()
+                    .expect("fake state")
+                    .calls
+                    .push(format!("firewall:{enabled}"));
+                Ok(())
+            })
+        }
+
+        fn stop_backend(&self) -> BoxFuture<'_, Result<(), String>> {
+            Box::pin(async move {
+                self.state
+                    .lock()
+                    .expect("fake state")
+                    .calls
+                    .push("stop".to_owned());
+                Ok(())
+            })
+        }
+    }
+
+    impl WslOnlyTransitionOperations for FakeWslOnlyTransitionOperations {
+        fn persist_wsl_only(&self, enabled: bool) -> BoxFuture<'_, Result<(), String>> {
+            Box::pin(async move {
+                self.state
+                    .lock()
+                    .expect("fake state")
+                    .calls
+                    .push(format!("persist-wsl-only:{enabled}"));
+                Ok(())
+            })
+        }
+
+        fn restart_topology_local(&self) -> BoxFuture<'_, Result<(), String>> {
+            Box::pin(async move {
+                self.state
+                    .lock()
+                    .expect("fake state")
+                    .calls
+                    .push("restart-topology:local-only".to_owned());
+                Ok(())
+            })
+        }
+    }
+
+    fn test_backend_config_for_exposure(mode: &str) -> BackendRunConfig {
+        let wide = mode == "network-accessible";
+        BackendRunConfig {
+            environment_id: "primary".to_owned(),
+            label: "Local".to_owned(),
+            running_distro: None,
+            port: 13773,
+            bind_host: if wide { "0.0.0.0" } else { "127.0.0.1" }.to_owned(),
+            local_host: "127.0.0.1".to_owned(),
+            desktop_bootstrap_token: "desktop-token".to_owned(),
+            server_exposure_mode: mode.to_owned(),
+            endpoint_url: wide.then(|| "http://192.168.1.25:13773".to_owned()),
+            advertised_host: wide.then(|| "192.168.1.25".to_owned()),
+            tailscale_serve_enabled: false,
+            tailscale_serve_port: 443,
+        }
+    }
+
+    #[tokio::test]
+    async fn entering_wsl_only_recovers_native_exposure_before_switching_topology() {
+        let operations = FakeWslOnlyTransitionOperations::with_current_mode("network-accessible");
+
+        transition_wsl_only(&operations, true)
+            .await
+            .expect("WSL-only transition should succeed");
+
+        assert_eq!(
+            operations.calls(),
+            [
+                "persist:local-only",
+                "restart-native:local-only",
+                "firewall:false",
+                "verify:local-only",
+                "persist-wsl-only:true",
+                "restart-topology:local-only",
+            ]
+        );
+        assert!(
+            !operations
+                .calls()
+                .iter()
+                .any(|call| call == "restart-native:network-accessible")
+        );
+    }
+
+    #[tokio::test]
+    async fn leaving_wsl_only_restarts_the_native_topology_explicitly_local_only() {
+        let operations = FakeWslOnlyTransitionOperations::default();
+
+        transition_wsl_only(&operations, false)
+            .await
+            .expect("native transition should succeed");
+
+        assert_eq!(
+            operations.calls(),
+            ["persist-wsl-only:false", "restart-topology:local-only"]
+        );
+    }
 
     #[test]
     fn pick_folder_command_is_async() {

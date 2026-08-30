@@ -128,7 +128,7 @@ describe("reconcileShareExposureOnce", () => {
         getShareState,
         getExposureState: async () => wideExposure,
         applyExposure,
-        canApplyExposure: () => true,
+        canStartExposure: () => true,
       }),
     ).resolves.toBe("narrowed");
     expect(getShareState).toHaveBeenCalledTimes(2);
@@ -142,7 +142,7 @@ describe("reconcileShareExposureOnce", () => {
         getShareState: async () => loopbackDesired,
         getExposureState: async () => wideExposure,
         applyExposure: async () => wideExposure,
-        canApplyExposure: () => true,
+        canStartExposure: () => true,
       }),
     ).rejects.toThrow("did not reach local-only");
     expect(h.refreshNetwork).not.toHaveBeenCalled();
@@ -163,11 +163,46 @@ describe("reconcileShareExposureOnce", () => {
         getShareState,
         getExposureState: async () => wideExposure,
         applyExposure,
-        canApplyExposure: () => true,
+        canStartExposure: () => true,
       }),
     ).resolves.toBe("rewidened");
     expect(applyExposure.mock.calls).toEqual([["local-only"], ["network-accessible"]]);
     expect(h.refreshNetwork).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not gate mandatory compensation after a local-only apply commits", async () => {
+    const getShareState = vi.fn().mockResolvedValueOnce(loopbackDesired).mockResolvedValueOnce({
+      desiredExposure: "wide",
+      offHostGrantCount: 1,
+      legacyGrantCount: 0,
+    });
+    const applyExposure = vi.fn(async (desired: "local-only" | "network-accessible") =>
+      desired === "local-only" ? localExposure : wideExposure,
+    );
+    const canStartExposure = vi.fn(() => applyExposure.mock.calls.length === 0);
+
+    await expect(
+      reconcileShareExposureOnce({
+        getShareState,
+        getExposureState: async () => wideExposure,
+        applyExposure,
+        canStartExposure,
+      }),
+    ).resolves.toBe("rewidened");
+    expect(applyExposure.mock.calls).toEqual([["local-only"], ["network-accessible"]]);
+    expect(canStartExposure).toHaveBeenCalledOnce();
+  });
+
+  it("times out a blackholed exposure bridge read visibly", async () => {
+    await expect(
+      reconcileShareExposureOnce({
+        getShareState: async () => loopbackDesired,
+        getExposureState: () => new Promise(() => {}),
+        applyExposure: async () => localExposure,
+        canStartExposure: () => true,
+        operationTimeoutMs: 5,
+      }),
+    ).rejects.toThrow("Server exposure state timed out after 5ms");
   });
 
   it("leaves wide exposure unchanged while a legacy grant blocks narrowing", async () => {
@@ -177,7 +212,7 @@ describe("reconcileShareExposureOnce", () => {
         getShareState: async () => ({ ...loopbackDesired, legacyGrantCount: 1 }),
         getExposureState: async () => wideExposure,
         applyExposure,
-        canApplyExposure: () => true,
+        canStartExposure: () => true,
       }),
     ).resolves.toBe("unchanged");
     expect(applyExposure).not.toHaveBeenCalled();
@@ -195,7 +230,7 @@ describe("reconcileShareExposureOnce", () => {
         }),
         getExposureState: async () => localExposure,
         applyExposure,
-        canApplyExposure: () => true,
+        canStartExposure: () => true,
       }),
     ).resolves.toBe("widened");
     expect(applyExposure).toHaveBeenCalledExactlyOnceWith("network-accessible");
@@ -382,5 +417,57 @@ describe("useShareExposureReconciler", () => {
     expect(applyServerExposure).not.toHaveBeenCalled();
     expect(h.refreshNetwork).not.toHaveBeenCalled();
     expect(h.toastAdd).not.toHaveBeenCalled();
+  });
+
+  it("re-widens with the captured bridge after unmount when narrowing already committed", async () => {
+    let resolveConfirmedShareState!: (value: {
+      desiredExposure: "wide";
+      offHostGrantCount: number;
+      legacyGrantCount: number;
+    }) => void;
+    h.getShareState
+      .mockResolvedValueOnce({
+        desiredExposure: "loopback",
+        offHostGrantCount: 0,
+        legacyGrantCount: 0,
+      })
+      .mockReturnValueOnce(
+        new Promise((resolve) => {
+          resolveConfirmedShareState = resolve;
+        }),
+      );
+    const getServerExposureState = vi.fn(async () => wideExposure);
+    const applyServerExposure = vi.fn(async (desired: "local-only" | "network-accessible") =>
+      desired === "local-only" ? localExposure : wideExposure,
+    );
+    Object.defineProperty(window, "desktopBridge", {
+      configurable: true,
+      value: { getServerExposureState, applyServerExposure },
+    });
+
+    await act(async () => {
+      root.render(<HookHarness />);
+      for (
+        let attempt = 0;
+        attempt < 20 && applyServerExposure.mock.calls.length === 0;
+        attempt += 1
+      ) {
+        await Promise.resolve();
+      }
+    });
+    expect(applyServerExposure).toHaveBeenCalledExactlyOnceWith("local-only");
+
+    await act(async () => root.render(<></>));
+    await act(async () => {
+      resolveConfirmedShareState({
+        desiredExposure: "wide",
+        offHostGrantCount: 1,
+        legacyGrantCount: 0,
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(applyServerExposure.mock.calls).toEqual([["local-only"], ["network-accessible"]]);
   });
 });

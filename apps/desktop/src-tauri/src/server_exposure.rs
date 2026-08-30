@@ -47,6 +47,22 @@ pub(crate) async fn apply_exposure(
         .await
 }
 
+pub(crate) async fn recover_local(
+    operations: &impl ExposureOperations,
+) -> Result<ExposureTransition, String> {
+    let recovery = recover_local_steps(operations).await;
+    if recovery.errors.is_empty() {
+        Ok(ExposureTransition {
+            current_config: recovery.current_config,
+        })
+    } else {
+        Err(format!(
+            "Could not restore local-only safeguards: {}.",
+            recovery.errors.join("; ")
+        ))
+    }
+}
+
 async fn apply_exposure_locked(
     operations: &impl ExposureOperations,
     desired: &str,
@@ -91,33 +107,17 @@ async fn apply_exposure_locked(
             }
         }
 
-        let recovery_errors = recover_local(operations).await;
-        return Err(format_exposure_error(desired, errors, recovery_errors));
+        let recovery = recover_local_steps(operations).await;
+        return Err(format_exposure_error(desired, errors, recovery.errors));
     }
 
-    let mut persisted_local = true;
-    if let Err(error) = operations.persist_mode("local-only").await {
-        persisted_local = false;
-        errors.push(format!("persist local-only mode: {error}"));
-    }
-    let (current_config, restart_verified) = restart_local(operations, &mut errors).await;
-    if let Err(error) = operations.sync_firewall(false).await {
-        errors.push(format!("close remote-access firewall rule: {error}"));
-    }
-    if !persisted_local {
-        match operations.persist_mode("local-only").await {
-            Ok(()) => persisted_local = true,
-            Err(error) => errors.push(format!("retry persist local-only mode: {error}")),
-        }
-    }
-    if (!restart_verified || !persisted_local)
-        && let Err(error) = operations.stop_backend().await
-    {
-        errors.push(format!("stop unverified backend: {error}"));
-    }
+    let recovery = recover_local_steps(operations).await;
+    errors.extend(recovery.errors);
 
     if errors.is_empty() {
-        Ok(ExposureTransition { current_config })
+        Ok(ExposureTransition {
+            current_config: recovery.current_config,
+        })
     } else {
         Err(format_exposure_error(desired, errors, Vec::new()))
     }
@@ -143,52 +143,44 @@ fn is_verified_local(config: Option<&BackendRunConfig>) -> bool {
     })
 }
 
-async fn restart_local(
-    operations: &impl ExposureOperations,
-    errors: &mut Vec<String>,
-) -> (Option<BackendRunConfig>, bool) {
-    match operations.restart_with_mode("local-only").await {
-        Ok(restarted) => {
-            let current_config = restarted.or_else(|| operations.current_config());
-            if is_verified_local(current_config.as_ref()) {
-                (current_config, true)
-            } else {
-                errors.push("restart did not produce a verified local-only backend".to_owned());
-                (current_config, false)
-            }
-        }
-        Err(error) => {
-            errors.push(format!("restart local-only backend: {error}"));
-            (operations.current_config(), false)
-        }
-    }
+struct LocalRecovery {
+    current_config: Option<BackendRunConfig>,
+    errors: Vec<String>,
 }
 
-async fn recover_local(operations: &impl ExposureOperations) -> Vec<String> {
+async fn recover_local_steps(operations: &impl ExposureOperations) -> LocalRecovery {
     let mut errors = Vec::new();
-    let mut persisted_local = true;
-    if let Err(error) = operations.persist_mode("local-only").await {
-        persisted_local = false;
-        errors.push(format!("recovery persist local-only mode: {error}"));
-    }
-    let (_, restart_verified) = restart_local(operations, &mut errors).await;
-    if let Err(error) = operations.sync_firewall(false).await {
-        errors.push(format!(
-            "recovery close remote-access firewall rule: {error}"
-        ));
-    }
-    if !persisted_local {
-        match operations.persist_mode("local-only").await {
-            Ok(()) => persisted_local = true,
-            Err(error) => errors.push(format!("recovery retry persist local-only mode: {error}")),
+    let persisted_local = match operations.persist_mode("local-only").await {
+        Ok(()) => true,
+        Err(error) => {
+            errors.push(format!("persist local-only mode: {error}"));
+            false
         }
+    };
+    let restarted = match operations.restart_with_mode("local-only").await {
+        Ok(restarted) => restarted,
+        Err(error) => {
+            errors.push(format!("restart local-only backend: {error}"));
+            None
+        }
+    };
+    if let Err(error) = operations.sync_firewall(false).await {
+        errors.push(format!("close remote-access firewall rule: {error}"));
     }
-    if (!restart_verified || !persisted_local)
+    let current_config = operations.current_config().or(restarted);
+    let verified_local = is_verified_local(current_config.as_ref());
+    if !verified_local {
+        errors.push("actual topology is not verified local-only".to_owned());
+    }
+    if (!verified_local || !persisted_local)
         && let Err(error) = operations.stop_backend().await
     {
-        errors.push(format!("recovery stop unverified backend: {error}"));
+        errors.push(format!("stop unverified backend: {error}"));
     }
-    errors
+    LocalRecovery {
+        current_config,
+        errors,
+    }
 }
 
 fn format_exposure_error(
@@ -266,6 +258,22 @@ mod tests {
                 .push_back(Err(detail.to_owned()));
         }
 
+        fn fail_next_firewall(&self, detail: &str) {
+            self.state
+                .lock()
+                .expect("fake state")
+                .firewall_results
+                .push_back(Err(detail.to_owned()));
+        }
+
+        fn fail_next_stop(&self, detail: &str) {
+            self.state
+                .lock()
+                .expect("fake state")
+                .stop_results
+                .push_back(Err(detail.to_owned()));
+        }
+
         fn set_native_exposure_available(&self, available: bool) {
             self.state
                 .lock()
@@ -279,6 +287,10 @@ mod tests {
                 .expect("fake state")
                 .restart_results
                 .push_back(Ok(result));
+        }
+
+        fn set_current_config(&self, config: Option<BackendRunConfig>) {
+            self.state.lock().expect("fake state").current_config = config;
         }
     }
 
@@ -315,11 +327,9 @@ mod tests {
         }
 
         fn current_config(&self) -> Option<BackendRunConfig> {
-            self.state
-                .lock()
-                .expect("fake state")
-                .current_config
-                .clone()
+            let mut state = self.state.lock().expect("fake state");
+            state.calls.push("verify:local-only".to_owned());
+            state.current_config.clone()
         }
 
         fn restart_with_mode<'a>(
@@ -442,6 +452,48 @@ mod tests {
                 "persist:local-only",
                 "restart:local-only",
                 "firewall:false",
+                "verify:local-only",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_widening_attempts_every_local_safeguard_in_order_and_combines_errors() {
+        let coordinator = ServerExposureCoordinator::default();
+        let operations = FakeExposureOperations::with_persisted_mode("local-only");
+        operations.return_next_restart(Some(config_for_mode("network-accessible")));
+        operations.fail_next_firewall("wide firewall failed");
+        operations.fail_next_persist("local persistence failed");
+        operations.fail_next_restart("local restart failed");
+        operations.fail_next_firewall("local firewall cleanup failed");
+        operations.fail_next_stop("backend stop failed");
+
+        let error = apply_exposure(&coordinator, &operations, "network-accessible")
+            .await
+            .expect_err("widening and every local safeguard failure are reported");
+
+        for detail in [
+            "wide firewall failed",
+            "local persistence failed",
+            "local restart failed",
+            "local firewall cleanup failed",
+            "backend stop failed",
+        ] {
+            assert!(
+                error.contains(detail),
+                "missing error detail {detail:?} from {error:?}"
+            );
+        }
+        assert_eq!(
+            operations.calls(),
+            [
+                "restart:network-accessible",
+                "firewall:true",
+                "persist:local-only",
+                "restart:local-only",
+                "firewall:false",
+                "verify:local-only",
+                "stop",
             ]
         );
     }
@@ -467,12 +519,13 @@ mod tests {
                 "persist:local-only",
                 "restart:local-only",
                 "firewall:false",
+                "verify:local-only",
             ]
         );
     }
 
     #[tokio::test]
-    async fn failed_recovery_persistence_does_not_skip_restart_or_firewall_cleanup() {
+    async fn failed_recovery_persistence_still_verifies_and_stops_after_all_safeguards() {
         let coordinator = ServerExposureCoordinator::default();
         let operations = FakeExposureOperations::with_persisted_mode("local-only");
         operations.fail_next_persist("wide settings write failed");
@@ -493,7 +546,8 @@ mod tests {
                 "persist:local-only",
                 "restart:local-only",
                 "firewall:false",
-                "persist:local-only",
+                "verify:local-only",
+                "stop",
             ]
         );
     }
@@ -515,31 +569,30 @@ mod tests {
                 "persist:local-only",
                 "restart:local-only",
                 "firewall:false",
-                "persist:local-only",
+                "verify:local-only",
+                "stop",
             ]
         );
     }
 
     #[tokio::test]
-    async fn narrowing_stops_the_backend_when_local_persistence_cannot_be_recovered() {
+    async fn narrowing_stops_the_backend_when_local_persistence_fails() {
         let coordinator = ServerExposureCoordinator::default();
         let operations = FakeExposureOperations::with_persisted_mode("network-accessible");
         operations.fail_next_persist("first write failed");
-        operations.fail_next_persist("retry write failed");
 
         let error = apply_exposure(&coordinator, &operations, "local-only")
             .await
             .expect_err("persistent settings failure is reported");
 
         assert!(error.contains("first write failed"));
-        assert!(error.contains("retry write failed"));
         assert_eq!(
             operations.calls(),
             [
                 "persist:local-only",
                 "restart:local-only",
                 "firewall:false",
-                "persist:local-only",
+                "verify:local-only",
                 "stop",
             ]
         );
@@ -559,13 +612,14 @@ mod tests {
             .await
             .expect_err("mislabeled wide listener is rejected");
 
-        assert!(error.contains("verified local-only backend"));
+        assert!(error.contains("actual topology is not verified local-only"));
         assert_eq!(
             operations.calls(),
             [
                 "persist:local-only",
                 "restart:local-only",
                 "firewall:false",
+                "verify:local-only",
                 "stop",
             ]
         );
@@ -593,6 +647,7 @@ mod tests {
                 "persist:local-only",
                 "restart:local-only",
                 "firewall:false",
+                "verify:local-only",
             ]
         );
 
@@ -609,7 +664,12 @@ mod tests {
         assert!(error.contains("close failed"));
         assert_eq!(
             narrowing.calls(),
-            ["persist:local-only", "restart:local-only", "firewall:false"]
+            [
+                "persist:local-only",
+                "restart:local-only",
+                "firewall:false",
+                "verify:local-only",
+            ]
         );
     }
 
@@ -617,6 +677,7 @@ mod tests {
     async fn narrowing_restart_failure_closes_firewall_and_stops_the_backend() {
         let coordinator = ServerExposureCoordinator::default();
         let operations = FakeExposureOperations::with_persisted_mode("network-accessible");
+        operations.set_current_config(Some(config_for_mode("network-accessible")));
         operations.fail_next_restart("restart failed");
 
         let error = apply_exposure(&coordinator, &operations, "local-only")
@@ -630,6 +691,7 @@ mod tests {
                 "persist:local-only",
                 "restart:local-only",
                 "firewall:false",
+                "verify:local-only",
                 "stop",
             ]
         );
@@ -655,11 +717,13 @@ mod tests {
             "persist:local-only",
             "restart:local-only",
             "firewall:false",
+            "verify:local-only",
         ];
         let narrow_then_widen = [
             "persist:local-only",
             "restart:local-only",
             "firewall:false",
+            "verify:local-only",
             "restart:network-accessible",
             "firewall:true",
             "persist:network-accessible",

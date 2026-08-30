@@ -91,6 +91,28 @@ describe("generateShareOffer", () => {
     expect(result).toMatchObject({ ok: false, failure: { kind: "widen-failed" } });
   });
 
+  it("times out a blackholed desktop widening call visibly", async () => {
+    const mintOffer = vi.fn();
+    const result = await generateShareOffer({
+      intent: "another-device",
+      name: "AI-SERVER",
+      customAddress: null,
+      selectedOption: { id: "auto-lan", label: "Automatic (LAN)", httpBaseUrl: null },
+      hasDesktopBridge: true,
+      exposureState: loopbackState,
+      applyServerExposure: () => new Promise(() => {}),
+      mintOffer,
+      ...defaultDeps,
+      requestTimeoutMs: 5,
+    });
+
+    expect(mintOffer).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      ok: false,
+      failure: { kind: "widen-failed", message: expect.stringContaining("timed out after 5ms") },
+    });
+  });
+
   it("never widens for this-computer offers", async () => {
     const applyServerExposure = vi.fn();
     const result = await generateShareOffer({
@@ -215,7 +237,8 @@ describe("generateShareOffer", () => {
     });
   });
 
-  it("bounds a blackholed cancellation and reports cleanup as unconfirmed", async () => {
+  it("bounds a blackholed cancellation before authoritative exposure reconciliation", async () => {
+    const cancelOffer = vi.fn(() => new Promise<void>(() => {}));
     const cleanupExposureAfterFailedMint = vi.fn(async () => "local-confirmed" as const);
     const result = await generateShareOffer({
       intent: "another-device",
@@ -231,17 +254,84 @@ describe("generateShareOffer", () => {
       ...defaultDeps,
       requestTimeoutMs: 5,
       classifyMintError: () => "fatal",
-      cancelOffer: () => new Promise(() => {}),
+      cancelOffer,
       cleanupExposureAfterFailedMint,
     });
 
-    expect(cleanupExposureAfterFailedMint).not.toHaveBeenCalled();
+    expect(cancelOffer.mock.calls).toEqual([["key-1"], ["key-1"], ["key-1"]]);
+    expect(cleanupExposureAfterFailedMint).toHaveBeenCalledOnce();
     expect(result).toMatchObject({
       ok: false,
       failure: {
         kind: "mint-failed",
-        cleanup: "cancellation-unconfirmed",
+        cleanup: "local-confirmed",
         message: expect.stringContaining("timed out"),
+      },
+    });
+  });
+
+  it("bounds cancellation retries and reconciles from authoritative loopback state", async () => {
+    const cancelOffer = vi.fn(async () => {
+      throw new Error("server unreachable");
+    });
+    const cleanupExposureAfterFailedMint = vi.fn(async () => "local-confirmed" as const);
+    const sleep = vi.fn(async () => {});
+    const result = await generateShareOffer({
+      intent: "another-device",
+      name: "AI-SERVER",
+      customAddress: null,
+      selectedOption: { id: "auto-lan", label: "Automatic (LAN)", httpBaseUrl: null },
+      hasDesktopBridge: true,
+      exposureState: loopbackState,
+      applyServerExposure: async () => wideState,
+      mintOffer: async () => {
+        throw new Error("mint result unknown");
+      },
+      ...defaultDeps,
+      requestTimeoutMs: 5,
+      classifyMintError: () => "fatal",
+      cancelOffer,
+      cleanupExposureAfterFailedMint,
+      sleep,
+    });
+
+    expect(cancelOffer.mock.calls).toEqual([["key-1"], ["key-1"], ["key-1"]]);
+    expect(sleep).toHaveBeenCalledTimes(2);
+    expect(cleanupExposureAfterFailedMint).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({
+      ok: false,
+      failure: { kind: "mint-failed", cleanup: "local-confirmed" },
+    });
+  });
+
+  it("keeps wide exposure with honest copy when authoritative state still has an active reason", async () => {
+    const cleanupExposureAfterFailedMint = vi.fn(async () => "active-reason" as const);
+    const result = await generateShareOffer({
+      intent: "another-device",
+      name: "AI-SERVER",
+      customAddress: null,
+      selectedOption: { id: "auto-lan", label: "Automatic (LAN)", httpBaseUrl: null },
+      hasDesktopBridge: true,
+      exposureState: loopbackState,
+      applyServerExposure: async () => wideState,
+      mintOffer: async () => {
+        throw new Error("mint result unknown");
+      },
+      ...defaultDeps,
+      classifyMintError: () => "fatal",
+      cancelOffer: async () => {
+        throw new Error("cancellation unconfirmed");
+      },
+      cleanupExposureAfterFailedMint,
+    });
+
+    expect(cleanupExposureAfterFailedMint).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({
+      ok: false,
+      failure: {
+        kind: "mint-failed",
+        cleanup: "active-reason",
+        message: expect.stringContaining("cancellation unconfirmed"),
       },
     });
   });
@@ -315,7 +405,10 @@ describe("generateShareOffer", () => {
     });
   });
 
-  it("reports cancellation failure and does not claim exposure was restored", async () => {
+  it("reports cancellation failure while accepting authoritative local-only reconciliation", async () => {
+    const cancelOffer = vi.fn(async () => {
+      throw new Error("server unreachable");
+    });
     const cleanupExposureAfterFailedMint = vi.fn(async () => "local-confirmed" as const);
     const result = await generateShareOffer({
       intent: "another-device",
@@ -330,18 +423,17 @@ describe("generateShareOffer", () => {
       },
       ...defaultDeps,
       classifyMintError: () => "fatal",
-      cancelOffer: async () => {
-        throw new Error("server unreachable");
-      },
+      cancelOffer,
       cleanupExposureAfterFailedMint,
     });
 
-    expect(cleanupExposureAfterFailedMint).not.toHaveBeenCalled();
+    expect(cancelOffer).toHaveBeenCalledTimes(3);
+    expect(cleanupExposureAfterFailedMint).toHaveBeenCalledOnce();
     expect(result).toMatchObject({
       ok: false,
       failure: {
         kind: "mint-failed",
-        cleanup: "cancellation-unconfirmed",
+        cleanup: "local-confirmed",
         message: expect.stringContaining("Pairing-offer cancellation failed: server unreachable"),
       },
     });
