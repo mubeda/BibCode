@@ -201,7 +201,11 @@ export async function generateShareOffer(
     deps.exposureState?.mode !== "network-accessible"
   ) {
     try {
-      const state = await deps.applyServerExposure("network-accessible");
+      const state = await withRequestTimeout(
+        "Server exposure update",
+        deps.requestTimeoutMs,
+        deps.applyServerExposure("network-accessible"),
+      );
       widened = true;
       if (endpoint === null) endpoint = state.endpointUrl;
     } catch (error) {
@@ -264,29 +268,45 @@ export async function generateShareOffer(
   let message =
     lastError instanceof Error ? lastError.message : "Could not create the pairing offer.";
   let cancellationSucceeded = false;
-  try {
-    await withRequestTimeout(
-      "Pairing-offer cancellation",
-      deps.requestTimeoutMs,
-      deps.cancelOffer(idempotencyKey),
-    );
-    cancellationSucceeded = true;
-  } catch (error) {
+  let cancellationError: unknown = null;
+  const maxCancellationAttempts = 3;
+  for (let attempt = 0; attempt < maxCancellationAttempts; attempt += 1) {
+    if (attempt > 0) await deps.sleep(2_000);
+    try {
+      await withRequestTimeout(
+        "Pairing-offer cancellation",
+        deps.requestTimeoutMs,
+        deps.cancelOffer(idempotencyKey),
+      );
+      cancellationSucceeded = true;
+      break;
+    } catch (error) {
+      cancellationError = error;
+    }
+  }
+  if (!cancellationSucceeded) {
     cleanup = "cancellation-unconfirmed";
-    const cancellationMessage = error instanceof Error ? error.message : String(error);
+    const cancellationMessage =
+      cancellationError instanceof Error ? cancellationError.message : String(cancellationError);
     message = `${message} Pairing-offer cancellation failed: ${cancellationMessage}`;
   }
-  if (cancellationSucceeded && widened && deps.cleanupExposureAfterFailedMint !== null) {
+  if (widened && deps.cleanupExposureAfterFailedMint !== null) {
     try {
-      cleanup = await deps.cleanupExposureAfterFailedMint();
+      cleanup = await withRequestTimeout(
+        "Remote-access reconciliation",
+        deps.requestTimeoutMs,
+        deps.cleanupExposureAfterFailedMint(),
+      );
     } catch (error) {
-      cleanup = "cleanup-failed";
+      cleanup = cancellationSucceeded ? "cleanup-failed" : "cancellation-unconfirmed";
       const cleanupMessage = error instanceof Error ? error.message : String(error);
       message = `${message} Remote-access cleanup failed: ${cleanupMessage}`;
     }
-  } else if (cancellationSucceeded && widened) {
-    cleanup = "cleanup-failed";
-    message = `${message} Remote-access cleanup could not be verified.`;
+  } else if (widened) {
+    if (cancellationSucceeded) {
+      cleanup = "cleanup-failed";
+      message = `${message} Remote-access cleanup could not be verified.`;
+    }
   }
 
   return {

@@ -232,6 +232,7 @@ beforeEach(() => {
 
 afterEach(async () => {
   await act(async () => root.unmount());
+  vi.useRealTimers();
   domWindow.close();
   vi.unstubAllGlobals();
 });
@@ -283,6 +284,27 @@ describe("ShareThisHostTab", () => {
     expect(apply).not.toHaveBeenCalled();
     await click("Resume legacy remote access");
     expect(apply).toHaveBeenCalledWith("network-accessible");
+  });
+
+  it("reports a visible timeout when legacy exposure resume blackholes", async () => {
+    Object.assign(h.networkQuery.data.serverExposureState, {
+      ...localState,
+      configuredMode: "network-accessible",
+    });
+    h.getShareState.mockResolvedValue({
+      desiredExposure: "loopback",
+      offHostGrantCount: 0,
+      legacyGrantCount: 1,
+    });
+    installBridge(vi.fn(() => new Promise(() => {})));
+
+    await renderTab();
+    await click("Resume legacy remote access");
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 60));
+    });
+
+    expect(container.textContent).toContain("Server exposure update timed out after 50ms");
   });
 
   it("renders every intent and the threat-model copy", async () => {
@@ -399,8 +421,40 @@ describe("ShareThisHostTab", () => {
     );
   });
 
-  it("leaves exposure unchanged when offer cancellation cannot be confirmed", async () => {
+  it("keeps exposure wide when cancellation is unconfirmed and authoritative state is wide", async () => {
+    vi.useFakeTimers();
     const apply = installBridge();
+    h.createOffer.mockRejectedValue(
+      Object.assign(new Error("response lost"), {
+        cause: { _tag: "EnvironmentRequestInvalidError" },
+      }),
+    );
+    h.cancelOffer.mockRejectedValue(new Error("server unreachable"));
+    h.getShareState.mockResolvedValue({
+      desiredExposure: "wide",
+      offHostGrantCount: 1,
+      legacyGrantCount: 0,
+    });
+
+    await renderTab();
+    await click("Generate pairing offer");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(4_100);
+    });
+
+    expect(apply).toHaveBeenCalledExactlyOnceWith("network-accessible");
+    expect(container.textContent).toContain(
+      "The offer was not created. Remote access remains enabled because another live access reason still requires it.",
+    );
+  });
+
+  it("narrows after failed cancellation only when authoritative state confirms loopback", async () => {
+    vi.useFakeTimers();
+    const apply = installBridge(
+      vi.fn(async (desired: "local-only" | "network-accessible") =>
+        desired === "local-only" ? localState : wideState,
+      ),
+    );
     h.createOffer.mockRejectedValue(
       Object.assign(new Error("response lost"), {
         cause: { _tag: "EnvironmentRequestInvalidError" },
@@ -410,10 +464,14 @@ describe("ShareThisHostTab", () => {
 
     await renderTab();
     await click("Generate pairing offer");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(4_100);
+    });
 
-    expect(apply).toHaveBeenCalledExactlyOnceWith("network-accessible");
+    expect(h.cancelOffer).toHaveBeenCalledTimes(3);
+    expect(apply.mock.calls).toEqual([["network-accessible"], ["local-only"]]);
     expect(container.textContent).toContain(
-      "The offer result could not be canceled or confirmed. Remote access was deliberately left unchanged because a live credential may exist.",
+      "The offer was not created. Remote access is confirmed local-only.",
     );
   });
 
