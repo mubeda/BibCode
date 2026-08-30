@@ -82,6 +82,48 @@ pub struct AuthService {
     dpop: DpopVerifier,
 }
 
+pub(crate) struct AuthenticatedConnectionGuard {
+    auth: AuthService,
+    session_id: String,
+    connection_id: Option<u64>,
+}
+
+impl AuthenticatedConnectionGuard {
+    pub(crate) async fn close(mut self) {
+        self.disconnect().await;
+    }
+
+    async fn disconnect(&mut self) {
+        let Some(connection_id) = self.connection_id.take() else {
+            return;
+        };
+        self.auth
+            .mark_disconnected(&self.session_id, connection_id)
+            .await;
+    }
+}
+
+impl Drop for AuthenticatedConnectionGuard {
+    fn drop(&mut self) {
+        let Some(connection_id) = self.connection_id.take() else {
+            return;
+        };
+        let auth = self.auth.clone();
+        let session_id = self.session_id.clone();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::error!(
+                %session_id,
+                connection_id,
+                "unable to schedule authenticated connection cleanup"
+            );
+            return;
+        };
+        runtime.spawn(async move {
+            auth.mark_disconnected(&session_id, connection_id).await;
+        });
+    }
+}
+
 #[derive(Clone)]
 struct DesktopBootstrap {
     credential: String,
@@ -1575,6 +1617,19 @@ impl AuthService {
         Ok(connection_id)
     }
 
+    pub(crate) async fn mark_connected_guard(
+        &self,
+        session_id: &str,
+        shutdown: CancellationToken,
+    ) -> Result<AuthenticatedConnectionGuard, AuthError> {
+        let connection_id = self.mark_connected(session_id, shutdown).await?;
+        Ok(AuthenticatedConnectionGuard {
+            auth: self.clone(),
+            session_id: session_id.to_owned(),
+            connection_id: Some(connection_id),
+        })
+    }
+
     pub async fn mark_disconnected(&self, session_id: &str, connection_id: u64) {
         let mut state = self.state.lock().await;
         let disconnected = if let Some(connections) = state.live_connections.get_mut(session_id) {
@@ -2592,6 +2647,68 @@ mod tests {
             1
         );
         auth.mark_disconnected(&session_id, connection_id).await;
+    }
+
+    #[tokio::test]
+    async fn dropped_connection_guard_releases_connected_accounting_exactly_once() {
+        let auth = service();
+        let issued = auth
+            .exchange_bootstrap(
+                "desktop-test-seed",
+                None,
+                ClientMetadata::default(),
+                None,
+                SessionTransport::Plain,
+            )
+            .await
+            .expect("session");
+        let session_id = issued.principal.session_id;
+        let guard = auth
+            .mark_connected_guard(&session_id, CancellationToken::new())
+            .await
+            .expect("connection guard registers");
+        assert_eq!(
+            auth.state
+                .lock()
+                .await
+                .sessions
+                .get(&session_id)
+                .expect("live session")
+                .connected_count,
+            1
+        );
+
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if auth
+                    .state
+                    .lock()
+                    .await
+                    .sessions
+                    .get(&session_id)
+                    .expect("live session")
+                    .connected_count
+                    == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("guard drop schedules disconnect bookkeeping");
+        auth.mark_disconnected(&session_id, u64::MAX).await;
+        assert_eq!(
+            auth.state
+                .lock()
+                .await
+                .sessions
+                .get(&session_id)
+                .expect("live session")
+                .connected_count,
+            0
+        );
     }
 
     fn service() -> AuthService {

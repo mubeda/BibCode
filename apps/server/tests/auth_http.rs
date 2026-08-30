@@ -911,6 +911,39 @@ async fn remote_revocation_closes_an_acked_live_stream_before_later_events() {
 }
 
 #[tokio::test]
+async fn plain_websocket_rejects_a_single_frame_larger_than_16_mib() {
+    let temp = TempDir::new().expect("temporary base directory");
+    let handle = start_desktop_server(&temp).await;
+    let client = Client::new();
+    let administrator = exchange_token(&client, &handle, DESKTOP_BOOTSTRAP, None).await;
+    let ticket = websocket_ticket(&client, &handle, access_token(&administrator)).await;
+    let (mut socket, _) =
+        connect_async(format!("ws://{}/ws?wsTicket={ticket}", handle.local_addr()))
+            .await
+            .expect("authenticated WebSocket");
+
+    let send_result = socket
+        .send(tungstenite::Message::Binary(
+            vec![b' '; 16 * 1024 * 1024 + 1].into(),
+        ))
+        .await;
+    let terminal = if send_result.is_err() {
+        true
+    } else {
+        let outcome = timeout(Duration::from_secs(3), socket.next())
+            .await
+            .expect("oversized plain frame reaches a terminal outcome");
+        matches!(
+            outcome,
+            None | Some(Ok(tungstenite::Message::Close(_))) | Some(Err(_))
+        )
+    };
+    assert!(terminal, "oversized plain frame must terminate the socket");
+
+    shutdown(handle).await;
+}
+
+#[tokio::test]
 async fn plain_websocket_connected_state_tracks_the_completed_upgrade_lifecycle() {
     let temp = TempDir::new().expect("temporary base directory");
     let handle = start_desktop_server(&temp).await;
