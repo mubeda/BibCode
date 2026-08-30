@@ -379,7 +379,6 @@ describe("seeded packaged desktop upgrade harness", () => {
     const root = await NodeFS.promises.mkdtemp(NodePath.join(NodeOS.tmpdir(), "bibcode-command-"));
     const pidPath = NodePath.join(root, "pid.txt");
     try {
-      // oxlint-disable-next-line bibcode/no-global-process-runtime -- The test launches the current Node executable as a bounded child fixture.
       const command = process.execPath;
       await expect(
         runBoundedCommand({
@@ -399,7 +398,6 @@ describe("seeded packaged desktop upgrade harness", () => {
       const pid = Number(await NodeFS.promises.readFile(pidPath, "utf8"));
       let alive = true;
       try {
-        // oxlint-disable-next-line bibcode/no-global-process-runtime -- Signal zero observes only the isolated child fixture.
         process.kill(pid, 0);
       } catch {
         alive = false;

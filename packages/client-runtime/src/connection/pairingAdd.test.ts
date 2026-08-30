@@ -305,7 +305,7 @@ const makeHarness = Effect.fn("TestPairingAdd.makeHarness")(function* (
                 }
               }).pipe(Effect.flatMap(confirmationOutcome)),
           } as unknown as RpcSession.RpcSession["client"],
-          initialConfig: Effect.gen(function* () {
+          initialConfig: Effect.sync(() => {
             events.push("verify");
             return { environment: configDescriptor } as ServerConfig;
           }),
@@ -962,7 +962,11 @@ describe("verifyAndAddPairingCode", () => {
         supervisorStatesHang: true,
       });
       const pairing = yield* Effect.forkChild(harness.run(validPayload()));
-      for (let attempt = 0; attempt < 100 && !harness.events.includes("observe-supervisor"); attempt += 1) {
+      for (
+        let attempt = 0;
+        attempt < 100 && !harness.events.includes("observe-supervisor");
+        attempt += 1
+      ) {
         yield* Effect.yieldNow;
       }
       expect(harness.events.includes("observe-supervisor")).toBe(true);

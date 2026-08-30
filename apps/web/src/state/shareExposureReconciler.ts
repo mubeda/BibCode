@@ -240,10 +240,7 @@ export function useShareExposureReconciler(): void {
             if (retryTimerRef.current !== null) clearTimeout(retryTimerRef.current);
             retryTimerRef.current = setTimeout(() => {
               retryTimerRef.current = null;
-              if (
-                mountedRef.current &&
-                targetRef.current.generation === target.generation
-              ) {
+              if (mountedRef.current && targetRef.current.generation === target.generation) {
                 requestReconcile();
               }
             }, SHARE_EXPOSURE_RECONCILE_RETRY_DELAY_MS);

@@ -147,7 +147,9 @@ describe("ConnectionDatabaseRecoveryDialog", () => {
     });
     publishOpenEvent("error", new DOMException("newer database", "VersionError"));
     await act(async () => {
-      root.render(<ConnectionDatabaseRecoveryDialog deleteDatabase={vi.fn()} reloadPage={vi.fn()} />);
+      root.render(
+        <ConnectionDatabaseRecoveryDialog deleteDatabase={vi.fn()} reloadPage={vi.fn()} />,
+      );
     });
 
     expect(container.textContent).toContain("Cached environment shell state");
