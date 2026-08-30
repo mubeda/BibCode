@@ -10,12 +10,82 @@ import {
   normalizeHttpBaseUrl,
 } from "./advertisedEndpoint.ts";
 
+const advertisedEndpointClassificationExpectations = [
+  {
+    address: "127.0.0.1",
+    pairingClassification: "loopback",
+    advertisedReachability: "loopback",
+    usable: false,
+    advertiseWithIpv4Listener: false,
+  },
+  {
+    address: "169.254.1.1",
+    pairingClassification: "private-network",
+    advertisedReachability: "lan",
+    usable: false,
+    advertiseWithIpv4Listener: false,
+  },
+  {
+    address: "192.168.1.20",
+    pairingClassification: "private-network",
+    advertisedReachability: "lan",
+    usable: true,
+    advertiseWithIpv4Listener: true,
+  },
+  {
+    address: "100.100.100.100",
+    pairingClassification: "private-network",
+    advertisedReachability: "private-network",
+    usable: true,
+    advertiseWithIpv4Listener: true,
+  },
+  {
+    address: "8.8.8.8",
+    pairingClassification: "public",
+    advertisedReachability: "public",
+    usable: true,
+    advertiseWithIpv4Listener: true,
+  },
+  {
+    address: "::1",
+    pairingClassification: "loopback",
+    advertisedReachability: "loopback",
+    usable: false,
+    advertiseWithIpv4Listener: false,
+  },
+  {
+    address: "fe80::1",
+    pairingClassification: "private-network",
+    advertisedReachability: "lan",
+    usable: false,
+    advertiseWithIpv4Listener: false,
+  },
+  {
+    address: "fd7a:115c:a1e0::1",
+    pairingClassification: "private-network",
+    advertisedReachability: "private-network",
+    usable: true,
+    advertiseWithIpv4Listener: false,
+  },
+  {
+    address: "2001:4860:4860::8888",
+    pairingClassification: "public",
+    advertisedReachability: "public",
+    usable: true,
+    advertiseWithIpv4Listener: false,
+  },
+] as const;
+
 describe("classifyPairingEndpoint", () => {
-  it.each(advertisedEndpointFixtures)(
+  it("pins every cross-runtime fixture field", () => {
+    expect(advertisedEndpointFixtures).toEqual(advertisedEndpointClassificationExpectations);
+  });
+
+  it.each(advertisedEndpointClassificationExpectations)(
     "shares literal address classification for $address",
-    (fixture) => {
-      const host = fixture.address.includes(":") ? `[${fixture.address}]` : fixture.address;
-      expect(classifyPairingEndpoint(`http://${host}:3773`)).toBe(fixture.pairingClassification);
+    (expected) => {
+      const host = expected.address.includes(":") ? `[${expected.address}]` : expected.address;
+      expect(classifyPairingEndpoint(`http://${host}:3773`)).toBe(expected.pairingClassification);
     },
   );
 

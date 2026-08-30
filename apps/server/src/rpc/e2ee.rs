@@ -1551,6 +1551,49 @@ mod tests {
     use super::*;
     use crate::auth::{HostIdentity, SessionTransport};
 
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct E2eeTransportConstantsFixture {
+        max_ciphertext_bytes: usize,
+        max_chunk_bytes: usize,
+        max_logical_message_bytes: usize,
+        max_records_per_message: usize,
+        max_preauth_message_bytes: usize,
+        logical_write_bytes_per_second: usize,
+        socket_write_timeout_ms: u64,
+    }
+
+    #[test]
+    fn shared_fixture_matches_server_transport_constants() {
+        let fixture: E2eeTransportConstantsFixture = serde_json::from_str(include_str!(
+            "../../../../packages/shared/fixtures/e2ee-transport-constants.json"
+        ))
+        .expect("shared E2EE transport constants fixture");
+
+        assert_eq!(MAX_E2EE_CIPHERTEXT_BYTES, fixture.max_ciphertext_bytes);
+        assert_eq!(MAX_E2EE_CHUNK_BYTES, fixture.max_chunk_bytes);
+        assert_eq!(
+            MAX_E2EE_LOGICAL_MESSAGE_BYTES,
+            fixture.max_logical_message_bytes
+        );
+        assert_eq!(
+            MAX_E2EE_RECORDS_PER_MESSAGE,
+            fixture.max_records_per_message
+        );
+        assert_eq!(
+            MAX_E2EE_PREAUTH_MESSAGE_BYTES,
+            fixture.max_preauth_message_bytes
+        );
+        assert_eq!(
+            E2EE_LOGICAL_WRITE_BYTES_PER_SECOND,
+            fixture.logical_write_bytes_per_second
+        );
+        assert_eq!(
+            SOCKET_WRITE_TIMEOUT,
+            Duration::from_millis(fixture.socket_write_timeout_ms)
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn preauth_admission_partitions_slots_and_refills_peer_tokens() {
         let admission = E2eePreauthAdmission::new();
