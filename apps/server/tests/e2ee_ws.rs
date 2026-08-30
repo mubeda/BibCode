@@ -304,6 +304,19 @@ fn latest_auth_session_delivery_state(root: &Path) -> String {
         .expect("latest auth session delivery state")
 }
 
+fn latest_off_host_auth_session_delivery_state(root: &Path) -> String {
+    Connection::open(root.join("userdata/state.sqlite"))
+        .expect("open server database")
+        .query_row(
+            "SELECT delivery_state FROM auth_sessions \
+             WHERE reach = 'another-device' AND off_host = 1 \
+             ORDER BY issued_at DESC, session_id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("latest off-host auth session delivery state")
+}
+
 async fn open_authenticated_bearer_socket(
     handle: &ServerHandle,
     host_key: &[u8],
@@ -552,7 +565,7 @@ async fn delivered_pairing_session_stays_pending_until_confirm_rpc() {
 
     assert_eq!(reply["type"], "e2ee_authenticated");
     assert_eq!(
-        latest_auth_session_delivery_state(temp.path()),
+        latest_off_host_auth_session_delivery_state(temp.path()),
         "pending-pairing"
     );
     assert_eq!(
@@ -560,7 +573,10 @@ async fn delivered_pairing_session_stays_pending_until_confirm_rpc() {
         "wide"
     );
     confirm_pairing(&mut socket, &mut transport, "2").await;
-    assert_eq!(latest_auth_session_delivery_state(temp.path()), "active");
+    assert_eq!(
+        latest_off_host_auth_session_delivery_state(temp.path()),
+        "active"
+    );
     confirm_pairing(&mut socket, &mut transport, "3").await;
     assert_eq!(
         share_state(&handle, &admin).await["desiredExposure"],
