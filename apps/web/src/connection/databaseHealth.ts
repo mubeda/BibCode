@@ -9,17 +9,19 @@ export interface ConnectionDatabaseHealth {
 }
 
 const READY_HEALTH: ConnectionDatabaseHealth = { status: "ready", message: null };
+const DELETION_BLOCKED_SETTLE_TIMEOUT_MS = 15_000;
 let health: ConnectionDatabaseHealth = READY_HEALTH;
-let activeDeletionRequest: IDBOpenDBRequest | null = null;
+/**
+ * Starting a deletion bumps the generation, so open requests that predate it
+ * cannot clobber the deletion's status — while every later open publishes
+ * normally. A deletion can therefore never permanently mute fault reporting.
+ */
+let openGeneration = 0;
 const listeners = new Set<() => void>();
 
 function publish(next: ConnectionDatabaseHealth): void {
   health = next;
   for (const listener of listeners) listener();
-}
-
-function publishOpenHealth(next: ConnectionDatabaseHealth): void {
-  if (activeDeletionRequest === null) publish(next);
 }
 
 function errorName(error: unknown): string | null {
@@ -28,6 +30,10 @@ function errorName(error: unknown): string | null {
 }
 
 export function monitorConnectionDatabaseOpenRequest(request: IDBOpenDBRequest): void {
+  const generation = openGeneration;
+  const publishOpenHealth = (next: ConnectionDatabaseHealth) => {
+    if (generation === openGeneration) publish(next);
+  };
   request.addEventListener("blocked", () => {
     publishOpenHealth({
       status: "blocked",
@@ -52,7 +58,7 @@ export function monitorConnectionDatabaseOpenRequest(request: IDBOpenDBRequest):
 }
 
 export function reportConnectionDatabaseUnavailable(cause: unknown): void {
-  publishOpenHealth({
+  publish({
     status: "unavailable",
     message: `The connection database is unavailable: ${String(cause)}`,
   });
@@ -74,36 +80,52 @@ export function deleteIncompatibleConnectionDatabase(): Promise<"deleted"> {
       return;
     }
     let settled = false;
+    let blockedTimer: ReturnType<typeof setTimeout> | undefined;
+    const clearBlockedTimer = () => {
+      if (blockedTimer !== undefined) {
+        clearTimeout(blockedTimer);
+        blockedTimer = undefined;
+      }
+    };
+    // Invalidate pre-deletion open monitors; later opens publish normally.
+    openGeneration += 1;
     const request = indexedDB.deleteDatabase(CONNECTION_DATABASE_NAME);
-    activeDeletionRequest = request;
     request.addEventListener("blocked", () => {
-      if (activeDeletionRequest !== request) return;
       publish({
         status: "blocked",
         message:
           "The browser queued connection database deletion until other BiBCode tabs and windows close.",
       });
+      // A deletion the browser keeps queued must not leave the caller
+      // waiting forever; settle with a descriptive failure while the queued
+      // deletion itself remains pending in the browser.
+      if (blockedTimer !== undefined) return;
+      blockedTimer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        reject(
+          new Error(
+            "Deletion stayed blocked by other BiBCode tabs or windows. Close them and try again.",
+          ),
+        );
+      }, DELETION_BLOCKED_SETTLE_TIMEOUT_MS);
     });
     request.addEventListener("error", () => {
+      clearBlockedTimer();
+      const error = request.error ?? new Error("Unknown IndexedDB deletion error.");
+      publish({
+        status: "unavailable",
+        message: `The connection database could not be deleted: ${String(error)}`,
+      });
       if (settled) return;
       settled = true;
-      const error = request.error ?? new Error("Unknown IndexedDB deletion error.");
-      if (activeDeletionRequest === request) {
-        activeDeletionRequest = null;
-        publish({
-          status: "unavailable",
-          message: `The connection database could not be deleted: ${String(error)}`,
-        });
-      }
       reject(error);
     });
     request.addEventListener("success", () => {
+      clearBlockedTimer();
+      publish(READY_HEALTH);
       if (settled) return;
       settled = true;
-      if (activeDeletionRequest === request) {
-        activeDeletionRequest = null;
-        publish(READY_HEALTH);
-      }
       resolve("deleted");
     });
   });
@@ -111,6 +133,6 @@ export function deleteIncompatibleConnectionDatabase(): Promise<"deleted"> {
 
 /** @internal Test isolation for the renderer-wide external store. */
 export function resetConnectionDatabaseHealthForTest(): void {
-  activeDeletionRequest = null;
+  openGeneration += 1;
   publish(READY_HEALTH);
 }

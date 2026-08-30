@@ -127,6 +127,46 @@ describe("connection database health", () => {
     expect(getConnectionDatabaseHealth()).toMatchObject({ status: "ready" });
   });
 
+  it("publishes open faults observed after a deletion begins", async () => {
+    // A deletion must never permanently mute fault reporting: only open
+    // requests that predate it are suppressed.
+    const deletion = new FakeRequest();
+    vi.stubGlobal("indexedDB", { deleteDatabase: () => deletion });
+    const pending = deleteIncompatibleConnectionDatabase();
+    deletion.fire("blocked");
+
+    const laterOpen = new FakeRequest();
+    laterOpen.error = new DOMException("permission denied", "UnknownError");
+    monitorConnectionDatabaseOpenRequest(laterOpen);
+    laterOpen.fire("error");
+    expect(getConnectionDatabaseHealth()).toMatchObject({ status: "unavailable" });
+
+    deletion.fire("success");
+    await expect(pending).resolves.toBe("deleted");
+  });
+
+  it("settles a permanently blocked deletion with a descriptive failure", async () => {
+    vi.useFakeTimers();
+    try {
+      const deletion = new FakeRequest();
+      vi.stubGlobal("indexedDB", { deleteDatabase: () => deletion });
+      const pending = deleteIncompatibleConnectionDatabase();
+      deletion.fire("blocked");
+
+      await vi.advanceTimersByTimeAsync(15_000);
+      await expect(pending).rejects.toThrow("Close them and try again");
+      expect(getConnectionDatabaseHealth()).toMatchObject({ status: "blocked" });
+
+      // Health reporting keeps flowing afterwards.
+      const laterOpen = new FakeRequest();
+      monitorConnectionDatabaseOpenRequest(laterOpen);
+      laterOpen.fire("success");
+      expect(getConnectionDatabaseHealth().status).toBe("ready");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("publishes ready only after successful deletion", async () => {
     const open = new FakeRequest();
     open.error = new DOMException("newer database", "VersionError");

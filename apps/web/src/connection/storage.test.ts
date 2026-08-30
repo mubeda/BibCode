@@ -43,6 +43,7 @@ import { afterEach, vi } from "vite-plus/test";
 import {
   type CatalogBackend,
   connectionStorageLayer,
+  connectionCatalogLivesInIndexedDb,
   makeCatalogBackend,
   makeCatalogStore,
 } from "./storage";
@@ -201,6 +202,7 @@ function makeFakeDatabase(fault: FaultMode = "none"): FakeDatabaseHandle {
     return created;
   };
   const db = {
+    addEventListener: () => undefined,
     objectStoreNames: { contains: (name: string) => stores.has(name) },
     createObjectStore: (name: string) => {
       ensure(name);
@@ -941,6 +943,26 @@ describe("makeCatalogStore", () => {
 // ─────────────────────────────────────────────────────────────────────
 // makeCatalogBackend
 // ─────────────────────────────────────────────────────────────────────
+
+describe("connectionCatalogLivesInIndexedDb", () => {
+  it("is true without a desktop bridge and false on a protected desktop", () => {
+    vi.stubGlobal("window", {});
+    expect(connectionCatalogLivesInIndexedDb()).toBe(true);
+
+    vi.stubGlobal("window", {
+      desktopBridge: {
+        getConnectionCatalog: vi.fn(),
+        compareAndSetConnectionCatalog: vi.fn(),
+      },
+    });
+    expect(connectionCatalogLivesInIndexedDb()).toBe(false);
+
+    // A bridge missing either catalog method still routes the catalog to
+    // IndexedDB.
+    vi.stubGlobal("window", { desktopBridge: { getConnectionCatalog: vi.fn() } });
+    expect(connectionCatalogLivesInIndexedDb()).toBe(true);
+  });
+});
 
 describe("makeCatalogBackend (desktop bridge)", () => {
   it.effect("reads and compares through the desktop bridge secure storage", () =>

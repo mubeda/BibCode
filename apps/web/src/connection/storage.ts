@@ -117,6 +117,22 @@ function catalogResetPersistenceError() {
   });
 }
 
+const CONNECTION_DATABASE_BLOCKED_OPEN_TIMEOUT_MS = 10_000;
+
+/**
+ * Whether the connection catalog itself lives in IndexedDB. On protected
+ * desktop hosts the catalog (saved servers, credentials, accepted storage
+ * identities) is served from the native store, and an IndexedDB reset only
+ * removes cached shell and thread state.
+ */
+export function connectionCatalogLivesInIndexedDb(): boolean {
+  const bridge = typeof window === "undefined" ? undefined : window.desktopBridge;
+  return (
+    bridge?.getConnectionCatalog === undefined ||
+    bridge.compareAndSetConnectionCatalog === undefined
+  );
+}
+
 const openDatabase = Effect.fn("web.connectionStorage.openDatabase")(function* (
   databaseName = CONNECTION_DATABASE_NAME,
 ) {
@@ -134,6 +150,29 @@ const openDatabase = Effect.fn("web.connectionStorage.openDatabase")(function* (
     if (databaseName === CONNECTION_DATABASE_NAME) {
       monitorConnectionDatabaseOpenRequest(request);
     }
+    // A blocked open (another tab holds an older version) may still complete
+    // once the blocker closes, but it must not stall the storage layer
+    // forever: fail after a bounded wait so the fault surfaces.
+    let blockedTimer: ReturnType<typeof setTimeout> | undefined;
+    const clearBlockedTimer = () => {
+      if (blockedTimer !== undefined) {
+        clearTimeout(blockedTimer);
+        blockedTimer = undefined;
+      }
+    };
+    request.addEventListener("blocked", () => {
+      if (blockedTimer !== undefined) return;
+      blockedTimer = setTimeout(() => {
+        resume(
+          Effect.fail(
+            catalogError(
+              "open",
+              "Another tab or process kept an older connection database open past the wait deadline.",
+            ),
+          ),
+        );
+      }, CONNECTION_DATABASE_BLOCKED_OPEN_TIMEOUT_MS);
+    });
     request.addEventListener("upgradeneeded", () => {
       if (!request.result.objectStoreNames.contains(CATALOG_STORE_NAME)) {
         request.result.createObjectStore(CATALOG_STORE_NAME);
@@ -146,10 +185,19 @@ const openDatabase = Effect.fn("web.connectionStorage.openDatabase")(function* (
       }
     });
     request.addEventListener("error", () => {
+      clearBlockedTimer();
       resume(Effect.fail(catalogError("open", request.error ?? "Unknown IndexedDB error")));
     });
     request.addEventListener("success", () => {
-      resume(Effect.succeed(request.result));
+      clearBlockedTimer();
+      const database = request.result;
+      // Close this connection when another context upgrades or deletes the
+      // database, so one tab can never hold every other tab's recovery
+      // hostage; later operations surface as transient errors.
+      database.addEventListener("versionchange", () => {
+        database.close();
+      });
+      resume(Effect.succeed(database));
     });
   });
 });

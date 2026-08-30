@@ -5,6 +5,7 @@ import {
   getConnectionDatabaseHealth,
   subscribeConnectionDatabaseHealth,
 } from "../connection/databaseHealth";
+import { connectionCatalogLivesInIndexedDb } from "../connection/storage";
 import { Button } from "./ui/button";
 import {
   Dialog,
@@ -16,13 +17,23 @@ import {
   DialogTitle,
 } from "./ui/dialog";
 
-const DELETED_DATA = [
+const CATALOG_DELETED_DATA = [
   "Saved remote servers and connection profiles",
   "Connection credentials and remote DPoP tokens",
   "Accepted storage identities",
-  "Cached environment shell state",
-  "Cached thread state",
 ] as const;
+const CACHE_DELETED_DATA = ["Cached environment shell state", "Cached thread state"] as const;
+
+/**
+ * The reset drops only the IndexedDB database. On protected desktop hosts the
+ * connection catalog lives in the native store, so promising its destruction
+ * here would be false purge assurance.
+ */
+function deletedDataForActiveBackend(): ReadonlyArray<string> {
+  return connectionCatalogLivesInIndexedDb()
+    ? [...CATALOG_DELETED_DATA, ...CACHE_DELETED_DATA]
+    : [...CACHE_DELETED_DATA];
+}
 
 interface ConnectionDatabaseRecoveryDialogProps {
   readonly deleteDatabase?: typeof deleteIncompatibleConnectionDatabase;
@@ -102,7 +113,7 @@ export function ConnectionDatabaseRecoveryDialog({
             <>
               <p>Resetting deletes only this browser&apos;s connection-runtime data:</p>
               <ul className="list-disc space-y-1 pl-5">
-                {DELETED_DATA.map((item) => (
+                {deletedDataForActiveBackend().map((item) => (
                   <li key={item}>{item}</li>
                 ))}
               </ul>
