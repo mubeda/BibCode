@@ -1209,13 +1209,21 @@ async fn run_established_e2ee(
     let inbound_connection_permits =
         Arc::new(WeightedByteBudget::new(MAX_E2EE_LOGICAL_MESSAGE_BYTES));
     let inbound_pump = tokio::spawn(async move {
-        let mut assembly_deadline = None;
+        // Each logical message gets one absolute, size-derived assembly
+        // deadline, established at its first record and extended as records
+        // arrive. Byte admission for every record — including the first — is
+        // bounded by it, so neither a dribbling sender nor pool pressure from
+        // other principals can park this pump or the global pool indefinitely,
+        // while a compliant slow sender is never cut off. The resetting
+        // progress deadline still cuts idle senders early.
+        let mut assembly: Option<InboundAssemblyState> = None;
         loop {
-            let frame = match assembly_deadline {
-                Some(deadline) => {
+            let frame = match &assembly {
+                Some(state) => {
+                    let read_deadline = state.progress_deadline.min(state.absolute_deadline);
                     tokio::select! {
                         () = inbound_shutdown.cancelled() => break,
-                        frame = timeout_at(deadline, ws_reader.next()) => {
+                        frame = timeout_at(read_deadline, ws_reader.next()) => {
                             match frame {
                                 Ok(Some(frame)) => frame,
                                 Ok(None) | Err(_) => break,
@@ -1249,13 +1257,22 @@ async fn run_established_e2ee(
                         }
                         record
                     };
+                    let arrived_at = Instant::now();
+                    let chunk_len = record.chunk.len();
+                    let admission_deadline = match &assembly {
+                        Some(state) => inbound_assembly_deadline(
+                            state.started_at,
+                            state.received_bytes.saturating_add(chunk_len),
+                        ),
+                        None => inbound_assembly_deadline(arrived_at, chunk_len),
+                    };
                     let permit = match acquire_inbound_bytes(
-                        record.chunk.len(),
+                        chunk_len,
                         &global_inbound_permits,
                         principal_inbound_permits.as_ref(),
                         &inbound_connection_permits,
                         &inbound_shutdown,
-                        assembly_deadline,
+                        Some(admission_deadline),
                     )
                     .await
                     {
@@ -1270,8 +1287,27 @@ async fn run_established_e2ee(
                         .lock()
                         .expect("E2EE channel lock")
                         .has_incomplete_message();
-                    assembly_deadline = incomplete
-                        .then(|| Instant::now() + E2EE_INCOMPLETE_MESSAGE_PROGRESS_TIMEOUT);
+                    assembly = if incomplete {
+                        let (started_at, received_bytes) = match assembly.take() {
+                            Some(state) => (
+                                state.started_at,
+                                state.received_bytes.saturating_add(chunk_len),
+                            ),
+                            None => (arrived_at, chunk_len),
+                        };
+                        Some(InboundAssemblyState {
+                            started_at,
+                            received_bytes,
+                            absolute_deadline: inbound_assembly_deadline(
+                                started_at,
+                                received_bytes,
+                            ),
+                            progress_deadline: Instant::now()
+                                + E2EE_INCOMPLETE_MESSAGE_PROGRESS_TIMEOUT,
+                        })
+                    } else {
+                        None
+                    };
                     match decrypted {
                         Ok(Some(BudgetedPlaintext { plaintext, permits })) => {
                             RpcInboundFrame::guarded(
@@ -1348,6 +1384,7 @@ async fn decrypt_inbound_frame_budgeted(
     global_budget: &Arc<WeightedByteBudget>,
     principal_budget: Option<&Arc<WeightedByteBudget>>,
     connection_budget: &Arc<WeightedByteBudget>,
+    deadline: Option<Instant>,
 ) -> Result<Option<BudgetedPlaintext>, E2eeSessionError> {
     let record = channel.decrypt_record(frame)?;
     channel.validate_decrypted_record(&record, max_message_bytes)?;
@@ -1357,10 +1394,30 @@ async fn decrypt_inbound_frame_budgeted(
         principal_budget,
         connection_budget,
         &CancellationToken::new(),
-        None,
+        deadline,
     )
     .await?;
     channel.assemble_decrypted_record(record, max_message_bytes, permit)
+}
+
+/// Rolling per-message assembly bound for the inbound pump.
+struct InboundAssemblyState {
+    started_at: Instant,
+    received_bytes: usize,
+    absolute_deadline: Instant,
+    progress_deadline: Instant,
+}
+
+/// One absolute deadline per logical inbound message: the base write timeout
+/// plus one second per 64 KiB received, mirroring the outbound size-derived
+/// deadline. Compliant senders at or above the floor rate always fit; total
+/// pool occupancy per message stays bounded.
+fn inbound_assembly_deadline(started_at: Instant, received_bytes: usize) -> Instant {
+    let size_seconds = received_bytes.div_ceil(E2EE_LOGICAL_WRITE_BYTES_PER_SECOND);
+    let allowance = Duration::from_secs(u64::try_from(size_seconds).unwrap_or(u64::MAX));
+    started_at
+        .checked_add(SOCKET_WRITE_TIMEOUT.saturating_add(allowance))
+        .unwrap_or(started_at)
 }
 
 async fn acquire_inbound_bytes(
@@ -2014,6 +2071,7 @@ mod tests {
                 &global_budget,
                 None,
                 &connection_budget,
+                None,
             )
             .await
             .unwrap()
@@ -2026,6 +2084,7 @@ mod tests {
             &global_budget,
             None,
             &connection_budget,
+            None,
         )
         .await
         .unwrap()
@@ -2072,6 +2131,7 @@ mod tests {
                 &global_budget,
                 None,
                 &first_connection_budget,
+                None,
             )
             .await
             .unwrap()
@@ -2085,6 +2145,7 @@ mod tests {
                 &global_budget,
                 None,
                 &second_connection_budget,
+                None,
             )
             .await
         });
@@ -2131,6 +2192,7 @@ mod tests {
                 &global_budget,
                 Some(&principal_budget),
                 &first_connection_budget,
+                None,
             )
             .await
             .unwrap()
@@ -2144,6 +2206,7 @@ mod tests {
                 &global_budget,
                 Some(&principal_budget),
                 &second_connection_budget,
+                None,
             )
             .await
         });
@@ -2164,7 +2227,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn inbound_global_pressure_waits_past_five_seconds_and_resumes() {
+    async fn inbound_admission_waits_under_transient_pressure_within_the_message_deadline() {
         let (mut initiator, mut responder) = establish().await;
         let frame = initiator_encrypt(
             &mut initiator,
@@ -2177,6 +2240,9 @@ mod tests {
             .try_acquire(b"blocked".len())
             .expect("hold global capacity");
         let connection_budget = Arc::new(WeightedByteBudget::new(b"blocked".len()));
+        // The first record of a message carries the same absolute size-derived
+        // deadline the pump derives: base timeout plus per-64 KiB allowance.
+        let deadline = inbound_assembly_deadline(Instant::now(), b"blocked".len());
         let waiting = tokio::spawn(async move {
             decrypt_inbound_frame_budgeted(
                 &mut responder,
@@ -2185,6 +2251,7 @@ mod tests {
                 &global_budget,
                 None,
                 &connection_budget,
+                Some(deadline),
             )
             .await
         });
@@ -2202,6 +2269,48 @@ mod tests {
                 .expect("waiting decrypt task")
                 .expect("global capacity becomes available")
                 .is_some()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inbound_admission_fails_at_the_absolute_message_deadline() {
+        let (mut initiator, mut responder) = establish().await;
+        let frame = initiator_encrypt(
+            &mut initiator,
+            &[record(E2EE_RECORD_FLAG_FINAL, b"blocked")],
+        )
+        .pop()
+        .unwrap();
+        let global_budget = Arc::new(WeightedByteBudget::new(b"blocked".len()));
+        let _held = Arc::clone(&global_budget)
+            .try_acquire(b"blocked".len())
+            .expect("hold global capacity");
+        let connection_budget = Arc::new(WeightedByteBudget::new(b"blocked".len()));
+        let deadline = inbound_assembly_deadline(Instant::now(), b"blocked".len());
+        let waiting = tokio::spawn(async move {
+            decrypt_inbound_frame_budgeted(
+                &mut responder,
+                &frame,
+                MAX_E2EE_LOGICAL_MESSAGE_BYTES,
+                &global_budget,
+                None,
+                &connection_budget,
+                Some(deadline),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        // Base 5 s plus the one-second allowance for a sub-64 KiB record.
+        tokio::time::advance(Duration::from_secs(7)).await;
+
+        let result = timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("the wait is bounded by the absolute per-message deadline")
+            .expect("waiting decrypt task");
+        assert!(
+            matches!(result, Err(E2eeSessionError::Timeout)),
+            "capacity never freed: the message admission fails instead of \
+             parking the pool indefinitely"
         );
     }
 
@@ -2233,6 +2342,7 @@ mod tests {
                 &global_budget,
                 None,
                 &first_connection_budget,
+                None,
             )
             .await
             .unwrap()
@@ -2246,6 +2356,7 @@ mod tests {
                 &global_budget,
                 None,
                 &first_connection_budget,
+                None,
             )
             .await,
             Err(E2eeSessionError::Protocol(_))
@@ -2258,6 +2369,7 @@ mod tests {
                 &global_budget,
                 None,
                 &second_connection_budget,
+                None,
             )
             .await
             .unwrap()
@@ -2287,6 +2399,7 @@ mod tests {
                 &global_budget,
                 None,
                 &connection_budget,
+                None,
             )
             .await
             .expect("legal tiny fragment");

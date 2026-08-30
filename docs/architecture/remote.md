@@ -191,12 +191,23 @@ capacity pressure waits until capacity, cancellation, or session shutdown and
 is not itself a protocol violation. Every non-empty decrypted chunk holds its
 permits through assembly, decoding, authorization, and dispatch. The permits
 are released before a spawned request handler completes, so a long-running RPC
-does not retain reassembly capacity. Zero-byte chunks retain no permit. Once a
-continuation starts an incomplete logical message, the next record must be
-received, decrypted, validated, and charged within one absolute 10-second
-progress deadline; that deadline resets only after accepted progress. An idle
-authenticated connection between messages has no assembly deadline. No channel
-mutex or second ciphertext-frame read is held while capacity waits.
+does not retain reassembly capacity. Zero-byte chunks retain no permit. Every
+logical inbound message additionally carries one absolute, size-derived
+assembly deadline established at its first record — the base five-second
+timeout plus one second per 64 KiB received, mirroring the outbound writer's
+floor — and byte admission for every record, including the first, is bounded
+by it. A compliant sender at or above the floor rate is never cut off, while
+neither a dribbling sender nor pool pressure from other principals can park a
+pump or the global pool indefinitely: capacity waits fail at the message's own
+deadline instead of inheriting whatever sliver remains of a progress window.
+Once a continuation starts an incomplete logical message, the next record must
+also be received, decrypted, validated, and charged within the resetting
+10-second progress deadline, which continues to cut idle senders early. An
+idle authenticated connection between messages has no assembly deadline.
+Session teardown joins in-flight request handlers under a bounded deadline and
+aborts stragglers, so a handler that ignores cancellation cannot pin the
+session or the budget permits riding on it. No channel mutex or second
+ciphertext-frame read is held while capacity waits.
 
 Established-socket admission is likewise partitioned. At most 64 E2EE sockets
 are established process-wide, and one authenticated session ID may own at most

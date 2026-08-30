@@ -757,8 +757,25 @@ pub(crate) async fn run_session_split_budgeted<W, R>(
     for request in in_flight.values() {
         request.cancellation.cancel();
     }
-    for (_, request) in in_flight {
-        let _ = request.task.await;
+    // Cancelled handlers are expected to exit promptly; a handler that ignores
+    // cancellation must not pin the session (and every budget permit riding on
+    // it) forever, so the join is bounded and stragglers are aborted.
+    let mut request_tasks: Vec<JoinHandle<()>> = in_flight
+        .into_values()
+        .map(|request| request.task)
+        .collect();
+    let join_all = async {
+        for task in &mut request_tasks {
+            let _ = task.await;
+        }
+    };
+    if timeout(PUMP_JOIN_TIMEOUT, join_all).await.is_err() {
+        for task in &request_tasks {
+            task.abort();
+        }
+        for task in &mut request_tasks {
+            let _ = task.await;
+        }
     }
     drop(outbound);
     drop(completed_sender);
@@ -1869,6 +1886,38 @@ mod tests {
             .expect("latest stream task joins");
         waiter.abort();
         let _ = waiter.await;
+    }
+
+    #[tokio::test]
+    async fn session_teardown_is_bounded_when_a_handler_ignores_cancellation() {
+        let mut registry = RpcRegistry::empty();
+        registry.register_unary("test.hang", |_request, _cancellation| async {
+            std::future::pending::<RpcResult>().await
+        });
+        let (inbound_sender, inbound_receiver) = mpsc::channel(1);
+        let reader = stream::unfold(inbound_receiver, |mut receiver| async {
+            receiver.recv().await.map(|item| (Ok(item), receiver))
+        });
+        let shutdown = CancellationToken::new();
+        let session = tokio::spawn(run_session_split_budgeted(
+            BlockedSocketSink::default(),
+            reader,
+            registry,
+            RpcSessionContext::unauthenticated(),
+            shutdown.clone(),
+            None,
+        ));
+        inbound_sender
+            .send(request_frame(&["1"], "test.hang"))
+            .await
+            .expect("send hanging request");
+        tokio::task::yield_now().await;
+        drop(inbound_sender);
+
+        timeout(Duration::from_secs(3), session)
+            .await
+            .expect("teardown bounds in-flight joins and aborts stragglers")
+            .expect("session task joins");
     }
 
     #[tokio::test]
