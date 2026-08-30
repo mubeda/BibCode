@@ -56,10 +56,11 @@ without exposing secrets.
 ## Pinned direct profiles and sessions
 
 `BearerConnectionProfile` additively stores `hostKey` in the existing schema-v1
-catalog document. Missing values decode to `null`, so no catalog version bump or
-compatibility alias is required. Browser storage persists the document normally;
-the protected desktop catalog encrypts and restores the same serialized document
-as opaque bytes and does not interpret the new field.
+catalog document. The catalog boundary normalizes missing, empty, and
+whitespace-only values to `null`, so no catalog version bump or compatibility
+alias is required. Browser storage persists the document normally; the protected
+desktop catalog encrypts and restores the same serialized document as opaque
+bytes and does not interpret the new field.
 
 `ConnectionResolver` treats a non-null `hostKey` as a hard channel-selection
 rule. It fetches only the unauthenticated descriptor, derives `/ws-e2ee`, and
@@ -82,10 +83,16 @@ deadline or transport failure follows the supervisor's bounded transient retry
 policy.
 
 The verify-then-add flow uses that session to compare the descriptor, pairing
-payload, `e2ee_authenticated` response, and `server.getConfig` identities before
-registering the profile and credential. This prevents a routing endpoint from
+payload, `e2ee_authenticated` response, and `server.getConfig` identities. The
+server session is `pending-pairing`: the bootstrap channel can perform identity
+verification, but its credential cannot reconnect as steady-state authority.
+The client registers the verified profile and credential, persists the accepted
+storage identity, then calls `auth.confirmPairing` on that same channel. The add
+returns only after confirmation atomically makes that session active. Closing
+before confirmation revokes the pending session, and server startup removes
+pending sessions left by a crash. This prevents a routing endpoint from
 substituting a different logical environment or persistent store after the
-pinned handshake.
+pinned handshake without leaving a delivered-but-unpersisted durable client.
 
 Presentation uses `connectionTransportSecurity` as the shared policy:
 non-null bearer `hostKey` is `e2ee`, null is `unencrypted`, relay and SSH are
@@ -130,6 +137,13 @@ registry then retires the failed add's local supervisor and installs that winner
 without clearing environment-owned data. When compensation itself removes the
 registration, the registry closes the local supervisor and clears owned runtime
 data only after the conditional CAS succeeds.
+
+Pairing confirmation failure applies the same conditional rule to accepted
+identity state: it restores the previous value, or removes the attempt's value,
+only while the value written by that attempt is still current. Registration and
+identity rollback are retried from the bootstrap scope finalizer when
+interruption prevents the first cleanup pass. A concurrent replacement remains
+authoritative and is never reverted by the older failed add.
 
 In browser mode, and in desktop mode when native catalog protection is
 unavailable, IndexedDB performs both compare-only and conditional `put`
@@ -261,6 +275,20 @@ the cap. The sequence continues while the connection remains desired. A stable
 30-second connection resets accumulated backoff. Network changes, credential
 changes, catalog reconciliation, and explicit retry requests wake the
 supervisor. Disconnect and scope closure interrupt in-flight work.
+
+`EnvironmentRegistry` owns desired connection intent outside disposable
+supervisor scopes. Registration and startup hydration establish saved
+environments as desired; explicit Connect writes `true`, explicit Disconnect
+writes `false`, and removal clears the entry. Catalog/profile drift recreates a
+scope with the stored intent, so a deliberately disconnected environment does
+not reconnect merely because its supervisor was replaced. Passive state lookup
+neither creates a cold supervisor nor changes intent.
+
+Environment commands may place a deadline around the complete lazy
+`runInEnvironment` effect. That deadline includes supervisor acquisition,
+readiness, and RPC execution, rather than starting only after a session exists.
+Remote update checks use 30 seconds; interruption releases their two-at-a-time
+fan-out slot and isolates the timeout to that environment's result.
 
 `RpcSessionFactory` disables protocol-owned reconnects. This is deliberate: one
 supervisor owns retry state, status, cancellation, and generation fencing, so a

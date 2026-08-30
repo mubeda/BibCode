@@ -4,6 +4,12 @@ Status: **Approved** (decisions confirmed by the user in the design interview, 2
 Location: `docs/plans/remote-servers/` (all specification and planning files for this
 feature live here, per user instruction).
 
+> **Superseded for current behavior (2026-08-29).** This document remains
+> historical design evidence. The approved
+> [Remote Server Remediation Round 2 Design](../../superpowers/specs/2026-08-29-remote-server-remediation-round-2-design.md)
+> and the living [Remote architecture](../../architecture/remote.md) define the
+> current implementation and invariants.
+
 Companion documents:
 
 - `orca-remote-servers-research.md` — primary-source research of the reference

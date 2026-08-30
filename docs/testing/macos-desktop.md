@@ -202,21 +202,33 @@ minimum sizes verify:
   unchanged, and cleanup topology unverified. Also cover last-browser-session
   revocation, one compensating widen during a concurrent grant, bounded handling
   of a blackholed create response, and explicit legacy resume after a local-only
-  restart. The address picker lists every usable non-loopback interface with
-  bracketed IPv6 and stable address/port IDs; a packaged Tailscale installation
-  must be found without shell `PATH`. The local-machine flow still has no Host
-  selector; remote targeting is driven by the environment rail;
+  restart. The address picker lists only usable IPv4 candidates until a
+  dual-stack listener exists, uses stable address/port IDs, safely preselects a
+  private default, never preselects a public address, and requires explicit
+  public-address/firewall acknowledgement. A packaged Tailscale installation
+  must be found without shell `PATH` and must suppress unusable, public, or IPv6
+  candidates. Confirm macOS firewall management remains explicitly
+  operator-owned. The local-machine flow still has no Host selector; remote
+  targeting is driven by the environment rail;
 - Remote server updates: with a second BiBCode server saved (headless
   `bibcode serve` is sufficient), open Remote Servers settings, run **Check for
   Server Updates**, and confirm each saved server row shows an update badge
   (**Manual updates** for a headless server) and a manual-instructions block
   with a copy button. An offline server must show **Status unavailable** without
   blocking the rest of the batch; a blackholed check must settle after 30
-  seconds and release its batch worker;
+  seconds across supervisor acquisition, readiness, and RPC execution, then
+  release its batch worker;
 - seed an incompatible newer connection IndexedDB version and confirm the
-  boot-level recovery dialog lists the deleted data classes, requires explicit
-  confirmation, handles a blocked deletion without reloading, and reloads only
-  after successful deletion;
+  boot-level recovery dialog lists the deleted data classes, keeps **Reload** as
+  a non-destructive exit, requires a separately acknowledged confirmation that a
+  double-click cannot trigger, and treats a blocked deletion as visibly queued
+  until the original request succeeds or errors. It must not reload while
+  blocked or after failure, and reloads automatically only after success;
+- open a hosted `/pair` link whose host includes an IDN and explicit port and
+  confirm the normalized punycode host shown is exactly the destination used.
+  Reject a target containing username/password, and confirm legacy `code` query
+  parameters are removed from both `/pair` and Remote Servers history after
+  being retained for the current attempt;
 - from the OS, opening a well-formed `bibcode://pair?code=...` link while the
   packaged app is running lands on Add Server with the code prefilled. The
   custom scheme is bundle-time-only on macOS and is not an unbundled dev-mode

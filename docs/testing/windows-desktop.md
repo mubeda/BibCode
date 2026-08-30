@@ -220,6 +220,11 @@ When WSL and a supported distribution are usable:
   rail selections remain valid remote hosts;
 - native and WSL paths do not collapse into one project identity;
 - a disposable WSL project can launch its supported session and terminal;
+- entering WSL-only first persists and verifies native local-only exposure and
+  removes the managed firewall rule before switching topology; leaving WSL-only
+  restarts the native backend explicitly local-only before share-state may
+  request a later widen. Confirm both transitions serialize with concurrent
+  exposure/settings mutations;
 - restart retains the correct environment identity; and
 - shutdown does not terminate unrelated WSL processes.
 
@@ -330,7 +335,8 @@ minimum-size, and relevant Windows DPI states. Verify:
   (**Manual updates** for a headless server) and a manual-instructions block
   with a copy button. An offline server must show **Status unavailable** without
   blocking the rest of the batch; a blackholed check must settle after 30
-  seconds and release its batch worker;
+  seconds across supervisor acquisition, readiness, and RPC execution, then
+  release its batch worker;
 - in **Settings → Remote Servers → Share this host**, generate an **Another
   device** offer. Confirm the local server restarts before the pairing offer is
   shown, and that the result contains the browser URL, `bibcode://` deep link,
@@ -354,9 +360,13 @@ minimum-size, and relevant Windows DPI states. Verify:
   and cleanup topology unverified. Also cover last-browser-session revocation
   with a local-only restart and removed rule, one compensating widen during a
   concurrent grant, bounded handling of a blackholed create response, and
-  explicit legacy resume after a local-only restart. Confirm a hung `netsh` or
-  PowerShell operation is terminated and reaped after 15 seconds and never
-  retains the exposure coordinator indefinitely;
+  explicit legacy resume after a local-only restart. Confirm the caller returns
+  a bounded failure after five seconds even when process spawn is delayed; the
+  firewall worker must retain ownership, remove and verify absence of any rule
+  enabled after that deadline, and complete that cleanup before a later enable.
+  Separately confirm a hung `netsh` or PowerShell child is terminated and reaped
+  by its 15-second process timeout and never retains the exposure coordinator
+  indefinitely;
 
 - with WSL-only primary mode active, generate an **Another device** offer from
   a usable WSL advertised endpoint. Confirm the native Windows backend process,
@@ -366,17 +376,28 @@ minimum-size, and relevant Windows DPI states. Verify:
   shown, exposure is described as externally managed by WSL/Hyper-V policy, and
   the native-only **Limited to this machine** and **Managed automatically** copy
   is absent. Start one native reconciliation before the
-  switch and let it resume after WSL-only becomes active; it must produce no
-  exposure side effects. A direct native exposure bridge invocation after the
-  switch must be rejected by the host-side topology guard;
+  switch and let it resume after WSL-only becomes active; work that has not
+  applied must produce no exposure side effects. Separately unmount after a
+  local-only apply commits and prove its authoritative refetch and one required
+  compensating widen still complete. A direct native exposure bridge invocation
+  after the switch must be rejected by the host-side topology guard;
 
-- the address picker lists every active usable Windows interface, ranks the
-  default-route address first, brackets IPv6, uses stable address/port IDs, and
-  discovers a packaged Tailscale CLI without depending on shell `PATH`;
+- the address picker lists only usable IPv4 candidates until a dual-stack
+  listener exists, uses stable address/port IDs, safely preselects a private
+  default, never preselects a public address, and requires an explicit
+  public-address/firewall warning. A packaged Tailscale CLI is discovered
+  without shell `PATH` and unusable, public, or IPv6 candidates are suppressed;
 - seed an incompatible newer connection IndexedDB version and confirm the
-  boot-level recovery dialog lists the deleted data classes, requires explicit
-  confirmation, handles a blocked deletion without reloading, and reloads only
-  after successful deletion;
+  boot-level recovery dialog lists the deleted data classes, keeps **Reload** as
+  a non-destructive exit, requires a separately acknowledged confirmation that a
+  double-click cannot trigger, and treats a blocked deletion as visibly queued
+  until the original request succeeds or errors. It must not reload while
+  blocked or after failure, and reloads automatically only after success;
+- open a hosted `/pair` link whose host includes an IDN and explicit port and
+  confirm the normalized punycode host shown is exactly the destination used.
+  Reject a target containing username/password, and confirm legacy `code` query
+  parameters are removed from both `/pair` and Remote Servers history after
+  being retained for the current attempt;
 
 - from the OS, opening a well-formed `bibcode://pair?code=...` link while the
   packaged app is running focuses that instance and lands on Add Server with
