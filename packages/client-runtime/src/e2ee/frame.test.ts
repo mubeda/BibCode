@@ -1,4 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
+import transportConstants from "../../../shared/fixtures/e2ee-transport-constants.json" with { type: "json" };
 
 import {
   E2EE_RECORD_FLAG_CONTINUATION,
@@ -12,6 +13,7 @@ import {
   RecordAssembler,
   splitIntoRecords,
 } from "./frame.ts";
+import { MAX_NOISE_MESSAGE_BYTES } from "./noise.ts";
 
 const recordAt = (records: ReadonlyArray<Uint8Array>, index: number): Uint8Array => {
   const record = records[index];
@@ -20,6 +22,16 @@ const recordAt = (records: ReadonlyArray<Uint8Array>, index: number): Uint8Array
 };
 
 describe("e2ee record layer", () => {
+  it("matches the shared transport constant fixture", () => {
+    expect(MAX_NOISE_MESSAGE_BYTES).toBe(transportConstants.maxCiphertextBytes);
+    expect(MAX_E2EE_CHUNK_BYTES).toBe(transportConstants.maxChunkBytes);
+    expect(MAX_E2EE_LOGICAL_MESSAGE_BYTES).toBe(transportConstants.maxLogicalMessageBytes);
+    expect(MAX_E2EE_RECORDS_PER_MESSAGE).toBe(transportConstants.maxRecordsPerMessage);
+    expect(MAX_E2EE_PREAUTH_MESSAGE_BYTES).toBe(transportConstants.maxPreauthMessageBytes);
+    // Logical write throughput and socket timeout are server-only policies;
+    // the Rust parity test asserts those fixture fields.
+  });
+
   it("splits small payloads into one final record", () => {
     const records = splitIntoRecords(Uint8Array.from([1, 2, 3]));
     expect(records).toHaveLength(1);
