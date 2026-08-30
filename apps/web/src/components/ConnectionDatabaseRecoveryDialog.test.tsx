@@ -135,6 +135,28 @@ describe("ConnectionDatabaseRecoveryDialog", () => {
     expect(reloadPage).toHaveBeenCalledOnce();
   });
 
+  it("omits catalog categories on a protected desktop where they are not deleted", async () => {
+    // The reset only drops the IndexedDB database; on a protected desktop the
+    // catalog (servers, credentials, identities) lives in the native store,
+    // so listing it as deleted would be a false purge assurance.
+    vi.stubGlobal("window", {
+      desktopBridge: {
+        getConnectionCatalog: vi.fn(),
+        compareAndSetConnectionCatalog: vi.fn(),
+      },
+    });
+    publishOpenEvent("error", new DOMException("newer database", "VersionError"));
+    await act(async () => {
+      root.render(<ConnectionDatabaseRecoveryDialog deleteDatabase={vi.fn()} reloadPage={vi.fn()} />);
+    });
+
+    expect(container.textContent).toContain("Cached environment shell state");
+    expect(container.textContent).toContain("Cached thread state");
+    expect(container.textContent).not.toContain("Saved remote servers");
+    expect(container.textContent).not.toContain("Connection credentials");
+    expect(container.textContent).not.toContain("Accepted storage identities");
+  });
+
   it("reloads only after successful deletion", async () => {
     publishOpenEvent("error", new DOMException("newer database", "VersionError"));
     const reloadPage = vi.fn();
