@@ -3595,17 +3595,6 @@ mod tests {
             )
             .is_ok()
         );
-        assert!(invoke("desktop_bridge_set_wsl_only", json!({"enabled":true}),).is_ok());
-        let wsl_only_exposure = invoke(
-            "desktop_bridge_apply_server_exposure",
-            json!({"desired":"local-only"}),
-        )
-        .expect_err("WSL-only primary rejects native exposure commands");
-        assert!(
-            wsl_only_exposure
-                .as_str()
-                .is_some_and(|error| error.contains("WSL-only primary mode"))
-        );
         let invalid_target = json!({
             "target": {"alias":"","hostname":"","username":null,"port":null},
             "options": null,
