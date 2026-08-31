@@ -760,13 +760,18 @@ export function resolveBoundedCommandLaunch(
   args: ReadonlyArray<string>,
   platform: NodeJS.Platform = nativeProcessPlatform,
   commandProcessor = process.env.ComSpec,
-): { readonly args: ReadonlyArray<string>; readonly command: string } {
+): {
+  readonly args: ReadonlyArray<string>;
+  readonly command: string;
+  readonly windowsVerbatimArguments: boolean;
+} {
   if (platform !== "win32" || !/\.(?:bat|cmd)$/i.test(command)) {
-    return { args, command };
+    return { args, command, windowsVerbatimArguments: false };
   }
   return {
     args: ["/d", "/c", [command, ...args].map(quoteWindowsCommandArgument).join(" ")],
     command: commandProcessor?.trim() || "cmd.exe",
+    windowsVerbatimArguments: true,
   };
 }
 
@@ -800,6 +805,7 @@ export const runBoundedCommand = async (input: {
       env: input.env ?? process.env,
       shell: false,
       stdio: input.inherit ? "inherit" : ["ignore", "pipe", "pipe"],
+      windowsVerbatimArguments: launch.windowsVerbatimArguments,
       windowsHide: true,
     });
     let settled = false;
