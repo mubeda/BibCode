@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 use crate::diagnostics::redact_sensitive_text;
 
+use super::manager::graph::MAX_DIFF_BUFFER_SIZE;
 use super::worktree::{WorktreePruneDryRunRecord, parse_worktree_prune_dry_run};
 use super::{
     ChangeRequest, CreateWorktreeInput, GitCommandDiagnostics, GitCommandError,
@@ -35,6 +36,8 @@ const DEFAULT_OUTPUT_LIMIT: usize = 1_000_000;
 const SUMMARY_STATUS_OUTPUT_LIMIT: usize = 64 * 1024;
 const WATCH_ROOTS_OUTPUT_LIMIT: usize = 16 * 1024;
 const WORKTREE_INVENTORY_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
+const GIT_MANAGER_HISTORY_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
+const GIT_MANAGER_TIPS_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 const WORKTREE_REMOVAL_STATUS_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 const WORKTREE_PRUNE_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 const WORKTREE_PRUNE_GITDIR_LIMIT: u64 = 64 * 1024;
@@ -52,6 +55,11 @@ struct GitExecutionOptions {
     allow_non_zero_exit: bool,
     max_output_bytes: usize,
     output_policy: OutputPolicy,
+}
+
+struct GitExecutionInput {
+    environment: Vec<(OsString, OsString)>,
+    stdin: Option<Vec<u8>>,
 }
 
 pub(crate) type BoxGitProcessFuture<'a> =
@@ -355,6 +363,29 @@ impl GitRepository {
         environment: Vec<(OsString, OsString)>,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute_with_environment_and_stdin(
+            operation,
+            cwd,
+            args,
+            options,
+            GitExecutionInput {
+                environment,
+                stdin: None,
+            },
+            cancellation,
+        )
+        .await
+    }
+
+    async fn execute_with_environment_and_stdin(
+        &self,
+        operation: &str,
+        cwd: &Path,
+        args: &[String],
+        options: GitExecutionOptions,
+        input: GitExecutionInput,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
         self.runner
             .run(
                 ProcessRequest {
@@ -362,8 +393,8 @@ impl GitRepository {
                     command: PathBuf::from("git"),
                     args: args.iter().map(OsString::from).collect(),
                     cwd: cwd.to_path_buf(),
-                    env: environment,
-                    stdin: None,
+                    env: input.environment,
+                    stdin: input.stdin,
                     timeout: DEFAULT_TIMEOUT,
                     max_output_bytes: options.max_output_bytes,
                     output_policy: options.output_policy,
@@ -374,6 +405,444 @@ impl GitRepository {
             )
             .await
             .map_err(|error| git_error(operation, cwd, args.len(), error))
+    }
+
+    pub(crate) async fn git_manager_resolve_tips(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let args = strings(&[
+            "for-each-ref",
+            "--format=%(refname)%09%(objectname)",
+            "refs/heads",
+            "refs/remotes",
+            "refs/tags",
+        ]);
+        self.execute_with_environment(
+            "GitManager.resolveTips",
+            cwd,
+            &args,
+            GitExecutionOptions {
+                allow_non_zero_exit: false,
+                max_output_bytes: GIT_MANAGER_TIPS_OUTPUT_LIMIT,
+                output_policy: OutputPolicy::Error,
+            },
+            git_read_environment(),
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_validate_tips(
+        &self,
+        cwd: &Path,
+        tips: &[String],
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let mut stdin = Vec::new();
+        for tip in tips {
+            stdin.extend_from_slice(tip.as_bytes());
+            stdin.extend_from_slice(b"^{commit}\n");
+        }
+        self.execute_with_environment_and_stdin(
+            "GitManager.validateTips",
+            cwd,
+            &strings(&["cat-file", "--batch-check=%(objectname) %(objecttype)"]),
+            GitExecutionOptions {
+                allow_non_zero_exit: false,
+                max_output_bytes: GIT_MANAGER_TIPS_OUTPUT_LIMIT,
+                output_policy: OutputPolicy::Error,
+            },
+            GitExecutionInput {
+                environment: git_read_environment(),
+                stdin: Some(stdin),
+            },
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_log_page(
+        &self,
+        cwd: &Path,
+        tips: &[String],
+        degraded_to_all_paging: bool,
+        offset: usize,
+        limit: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let format = concat!(
+            "--format=%x1e%H%x1f%h%x1f%s%x1f%b%x1f%an%x1f%ae%x1f%at%x1f",
+            "%cn%x1f%ce%x1f%ct%x1f%P%x1f%D"
+        );
+        let mut args = vec![
+            "log".to_owned(),
+            "--no-show-signature".to_owned(),
+            "--no-color".to_owned(),
+            "-z".to_owned(),
+            "--date=raw".to_owned(),
+            "--name-only".to_owned(),
+            format!("--skip={offset}"),
+            format!("--max-count={limit}"),
+            format.to_owned(),
+        ];
+        if degraded_to_all_paging {
+            args.push("--all".to_owned());
+        } else {
+            args.extend(tips.iter().cloned());
+        }
+        args.push("--".to_owned());
+        self.execute_with_environment(
+            "GitManager.getCommits",
+            cwd,
+            &args,
+            GitExecutionOptions {
+                allow_non_zero_exit: false,
+                max_output_bytes: GIT_MANAGER_HISTORY_OUTPUT_LIMIT,
+                output_policy: OutputPolicy::Error,
+            },
+            git_read_environment(),
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_refs(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.getRefs.refs",
+            cwd,
+            &strings(&[
+                "for-each-ref",
+                "--format=%(refname:short)%09%(objectname)%09%(upstream:short)%09%(worktreepath)%09%(HEAD)",
+                "refs/heads",
+                "refs/remotes",
+                "refs/tags",
+            ]),
+            false,
+            GIT_MANAGER_TIPS_OUTPUT_LIMIT,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_tag_names(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.getRefs.tags",
+            cwd,
+            &strings(&["for-each-ref", "--format=%(refname:short)", "refs/tags"]),
+            false,
+            GIT_MANAGER_TIPS_OUTPUT_LIMIT,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_worktrees(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.getRefs.worktrees",
+            cwd,
+            &strings(&["worktree", "list", "--porcelain"]),
+            false,
+            WORKTREE_INVENTORY_OUTPUT_LIMIT,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_ahead_behind(
+        &self,
+        cwd: &Path,
+        local: &str,
+        upstream: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let range = format!("refs/heads/{local}...{upstream}");
+        self.git_manager_bounded_read(
+            "GitManager.getRefs.aheadBehind",
+            cwd,
+            &[
+                "rev-list".into(),
+                "--left-right".into(),
+                "--count".into(),
+                range,
+                "--".into(),
+            ],
+            false,
+            64 * 1024,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_head_ref(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.getRefs.headRef",
+            cwd,
+            &strings(&["symbolic-ref", "--quiet", "--short", "HEAD"]),
+            true,
+            64 * 1024,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_head_sha(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.getRefs.headSha",
+            cwd,
+            &strings(&["rev-parse", "--verify", "HEAD"]),
+            true,
+            64 * 1024,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_status(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.getRefs.status",
+            cwd,
+            &strings(&[
+                "-c",
+                "core.quotePath=false",
+                "status",
+                "--porcelain=2",
+                "-z",
+                "--untracked-files=all",
+            ]),
+            false,
+            WORKTREE_REMOVAL_STATUS_OUTPUT_LIMIT,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_conflicted_paths(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.getRefs.conflicts",
+            cwd,
+            &strings(&["diff", "--name-only", "--diff-filter=U", "-z", "--"]),
+            false,
+            WORKTREE_REMOVAL_STATUS_OUTPUT_LIMIT,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_remotes(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.getRefs.remotes",
+            cwd,
+            &strings(&["remote"]),
+            false,
+            DEFAULT_OUTPUT_LIMIT,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_git_dir(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.getRefs.gitDir",
+            cwd,
+            &strings(&["rev-parse", "--git-dir"]),
+            false,
+            64 * 1024,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_default_ref(
+        &self,
+        cwd: &Path,
+        current: Option<&str>,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<String>, GitCommandError> {
+        self.default_ref(cwd, current, cancellation).await
+    }
+
+    async fn git_manager_bounded_read(
+        &self,
+        operation: &str,
+        cwd: &Path,
+        args: &[String],
+        allow_non_zero_exit: bool,
+        max_output_bytes: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute_with_environment(
+            operation,
+            cwd,
+            args,
+            GitExecutionOptions {
+                allow_non_zero_exit,
+                max_output_bytes,
+                output_policy: OutputPolicy::Error,
+            },
+            git_read_environment(),
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_working_tree_diff(
+        &self,
+        cwd: &Path,
+        path: &str,
+        staged: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let mut args = vec!["diff".to_owned()];
+        if staged {
+            args.push("--cached".to_owned());
+        }
+        args.extend(strings(&[
+            "--no-ext-diff",
+            "--patch-with-raw",
+            "-z",
+            "--no-color",
+            "HEAD",
+            "--",
+        ]));
+        args.push(path.to_owned());
+        self.git_manager_diff_read(
+            "GitManager.getDiff.workingTree",
+            cwd,
+            &args,
+            false,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_untracked_paths(
+        &self,
+        cwd: &Path,
+        path: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let mut args = strings(&["ls-files", "--others", "--exclude-standard", "-z", "--"]);
+        args.push(path.to_owned());
+        self.git_manager_bounded_read(
+            "GitManager.getDiff.untrackedPaths",
+            cwd,
+            &args,
+            false,
+            DEFAULT_OUTPUT_LIMIT,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_untracked_diff(
+        &self,
+        cwd: &Path,
+        path: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let mut args = strings(&[
+            "diff",
+            "--no-ext-diff",
+            "--patch-with-raw",
+            "-z",
+            "--no-color",
+            "--no-index",
+            "--",
+            "/dev/null",
+        ]);
+        args.push(path.to_owned());
+        self.git_manager_diff_read(
+            "GitManager.getDiff.untracked",
+            cwd,
+            &args,
+            true,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_commit_diff(
+        &self,
+        cwd: &Path,
+        sha: &str,
+        path: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let mut args = vec!["log".to_owned(), sha.to_owned()];
+        args.extend(strings(&[
+            "-m",
+            "-1",
+            "--first-parent",
+            "--patch-with-raw",
+            "--format=",
+            "-z",
+            "--no-color",
+            "--",
+        ]));
+        args.push(path.to_owned());
+        self.git_manager_diff_read("GitManager.getDiff.commit", cwd, &args, false, cancellation)
+            .await
+    }
+
+    async fn git_manager_diff_read(
+        &self,
+        operation: &str,
+        cwd: &Path,
+        args: &[String],
+        allow_non_zero_exit: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute_with_environment(
+            operation,
+            cwd,
+            args,
+            GitExecutionOptions {
+                allow_non_zero_exit,
+                max_output_bytes: MAX_DIFF_BUFFER_SIZE + 1,
+                output_policy: OutputPolicy::Truncate,
+            },
+            git_read_environment(),
+            cancellation,
+        )
+        .await
     }
 
     async fn run(
