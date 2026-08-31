@@ -24,6 +24,7 @@ import {
   updaterTargetFor,
   verifySeededUpgradeOutcome,
   waitForUpgradeCondition,
+  windowsRestartedApplicationCleanupPlan,
 } from "./seeded-desktop-upgrade-smoke.ts";
 
 const absolute = (...parts: ReadonlyArray<string>): string =>
@@ -32,6 +33,19 @@ const absolute = (...parts: ReadonlyArray<string>): string =>
 describe("seeded packaged desktop upgrade harness", () => {
   it("launches the native Vite+ executable on every host", () => {
     expect(seededUpgradeVitePlusExecutable).toBe("vp");
+  });
+
+  it("targets only the exact restarted Windows application image", () => {
+    expect(
+      windowsRestartedApplicationCleanupPlan(
+        String.raw`C:\Program Files\BiBCode\bibcode-desktop.exe`,
+        "win",
+      ),
+    ).toEqual({
+      args: ["/F", "/T", "/IM", "bibcode-desktop.exe"],
+      command: "taskkill.exe",
+    });
+    expect(windowsRestartedApplicationCleanupPlan("/Applications/BiBCode.app", "mac")).toBeNull();
   });
 
   it("canonicalizes symlinked work roots before installing an updater target", async () => {
