@@ -123,6 +123,10 @@ it("assembles final assets without creating a GitHub release in validation-only 
     releaseWorkflow,
     /name: Upload validated release assets\s*\n\s*if: needs\.preflight\.outputs\.validate_only == 'true'[\s\S]*name: validated-release-assets[\s\S]*path:\s*release-assets\/\*/,
   );
+  assert.match(
+    releaseWorkflow,
+    /name: Test\s*\n\s*if: steps\.release_meta\.outputs\.validate_only != 'true'\s*\n\s*run: vp run test/,
+  );
 
   const releaseMutationStepNames = [
     "Require inspected stable draft",
