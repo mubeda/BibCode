@@ -12,6 +12,14 @@ mod worktree;
 
 #[allow(unused_imports)]
 pub use broadcaster::{StatusBroadcaster, StatusSubscription};
+pub use manager::graph::{
+    COMMIT_PAGE_SIZE, GitManagerCommitEntry, GitManagerCommitPage, GitManagerGraphError,
+    MAX_DIFF_BUFFER_SIZE, MAX_DIFF_LINE_CHARACTERS, MAX_PINNED_TIPS, MAX_REASONABLE_DIFF_SIZE,
+};
+pub use manager::refs::{
+    GitManagerBlockedReason, GitManagerInProgressKind, GitManagerInProgressOperation,
+    GitManagerRefEntry, GitManagerRefsError, GitManagerRefsSnapshot, GitManagerWorktreeEntry,
+};
 pub use model::*;
 #[allow(unused_imports)]
 pub use parser::{
