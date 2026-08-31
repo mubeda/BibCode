@@ -1,5 +1,6 @@
 mod broadcaster;
 mod fetch_owner;
+pub mod manager;
 mod model;
 mod parser;
 mod process;

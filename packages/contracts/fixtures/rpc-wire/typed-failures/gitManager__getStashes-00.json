@@ -1,0 +1,23 @@
+{
+  "_tag": "Exit",
+  "requestId": "900719925474099312345",
+  "exit": {
+    "_tag": "Failure",
+    "cause": [
+      {
+        "_tag": "Fail",
+        "error": {
+          "_tag": "GitManagerOperationError",
+          "operation": "kT)p\\",
+          "code": "0^UtUX",
+          "message": "&ypeO",
+          "blocked": {
+            "operation": "b",
+            "code": "default-branch",
+            "message": "NtoS"
+          }
+        }
+      }
+    ]
+  }
+}

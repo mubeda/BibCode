@@ -7,6 +7,7 @@ import {
 } from "@bibcode/client-runtime/connection";
 import { AcceptedStorageIdentityStore } from "@bibcode/client-runtime/platform";
 import { DEFAULT_CLIENT_SETTINGS, type DesktopBridge, EnvironmentId } from "@bibcode/contracts";
+import { makeTestExecutionEnvironmentCapabilities } from "@bibcode/shared/testSupport";
 import { it as effectIt } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import { IDBFactory } from "fake-indexeddb";
@@ -306,14 +307,7 @@ function sensitivePrepared(storageInstanceId: string | null): PreparedConnection
       remoteUpdateSupport: null,
       remoteProtocolVersion: 1,
       minCompatibleRemoteProtocol: 1,
-      capabilities: {
-        repositoryIdentity: true,
-        worktreeCatalog: false,
-        worktreeCatalogRefreshReason: false,
-        vcsStatusSummary: false,
-        activityProtocolVersion: null,
-        remoteUpdateControl: false,
-      },
+      capabilities: makeTestExecutionEnvironmentCapabilities({ repositoryIdentity: true }),
     },
     httpBaseUrl: "https://private.example.test/secret-path",
     socketUrl: "wss://private.example.test/secret-path/ws",
