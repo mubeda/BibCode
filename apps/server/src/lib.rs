@@ -31,6 +31,7 @@ pub mod review;
 mod rpc;
 pub mod server_settings;
 pub mod source_control;
+mod static_assets;
 pub mod terminal;
 pub mod text_generation;
 pub mod vcs;
@@ -72,6 +73,7 @@ pub use rpc::{
     ACTIVE_RPC_METHODS, CauseItem, ClientMessage, InvalidRequestId, MethodMode, RequestId, RpcExit,
     RpcMethodSpec, RpcRegistry, RpcRequest, RpcResult, RpcStreamChunk, ServerMessage, WireMessage,
 };
+pub use static_assets::{ResolvedStaticDir, StaticDirError, StaticDirSource, resolve_static_dir};
 
 #[derive(Debug, Error)]
 pub enum RunError {
