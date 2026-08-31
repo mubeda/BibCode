@@ -541,7 +541,7 @@ describe("packaged desktop UI smoke contract", () => {
     expect(commands).toMatch(/hdiutil attach/);
     expect(commands).toMatch(/hdiutil detach/);
     expect(commands).toContain("-name 'BiBCode.app'");
-    expect(commands).toContain('-Filter "BiBCode.exe"');
+    expect(commands).toContain('"BiBCode.exe", "bibcode-desktop.exe"');
     expect(commands).not.toMatch(/bundle\/macos.*\.app/);
     expect(commands).toMatch(/always\(\)/);
     expect(commands).toMatch(/actions\/upload-artifact/);

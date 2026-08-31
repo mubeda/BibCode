@@ -160,7 +160,9 @@ jobs:
           $installer = Get-ChildItem "target/${{ matrix.rustTarget }}/release/bundle/nsis/*.exe" | Select-Object -First 1
           if ($null -eq $installer) { throw "NSIS installer was not produced." }
           Start-Process -FilePath $installer.FullName -ArgumentList "/S" -Wait
-          $app = Get-ChildItem $env:LOCALAPPDATA -Filter "BiBCode.exe" -File -Recurse |
+          $allowedNames = @("BiBCode.exe", "bibcode-desktop.exe")
+          $app = Get-ChildItem $env:LOCALAPPDATA -File -Recurse |
+            Where-Object { $allowedNames -contains $_.Name } |
             Select-Object -First 1
           if ($null -eq $app) { throw "NSIS-installed BiBCode executable was not found." }
           "BIBCODE_E2E_APP_PATH=$($app.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
