@@ -817,6 +817,42 @@ export const runBoundedCommand = async (input: {
 
 const runCommand = runBoundedCommand;
 
+export function windowsRestartedApplicationCleanupPlan(
+  appBinaryPath: string,
+  platform: SeededUpgradePlatform,
+): { readonly args: ReadonlyArray<string>; readonly command: string } | null {
+  if (platform !== "win") return null;
+  return {
+    args: ["/F", "/T", "/IM", NodePath.win32.basename(appBinaryPath)],
+    command: "taskkill.exe",
+  };
+}
+
+const stopRestartedWindowsApplication = async (
+  appBinaryPath: string,
+  platform: SeededUpgradePlatform,
+): Promise<void> => {
+  const plan = windowsRestartedApplicationCleanupPlan(appBinaryPath, platform);
+  if (plan === null) return;
+  let killed = false;
+  let missesAfterKill = 0;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const result = await runCommand({
+      ...plan,
+      cwd: NodePath.dirname(appBinaryPath),
+      timeoutMs: 10_000,
+    });
+    if (result.exitCode === 0) {
+      killed = true;
+      missesAfterKill = 0;
+    } else if (killed) {
+      missesAfterKill += 1;
+      if (missesAfterKill >= 2) return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+};
+
 const requireCommandSuccess = async (input: Parameters<typeof runCommand>[0]): Promise<void> => {
   const result = await runCommand(input);
   if (result.exitCode !== 0) {
@@ -1243,6 +1279,7 @@ const runUpgradeLane = async (input: {
     wsl: input.wsl,
   } as const;
   await runWebDriverPhase({ ...shared, phase: "seed-and-install", resultPath: beforePath });
+  await stopRestartedWindowsApplication(input.appBinaryPath, input.platform);
   await runWebDriverPhase({ ...shared, phase: "verify", resultPath: afterPath });
   const before = await readObservation<SeededUpgradeObservationBefore>(beforePath);
   const after = await readObservation<SeededUpgradeObservationAfter>(afterPath);
