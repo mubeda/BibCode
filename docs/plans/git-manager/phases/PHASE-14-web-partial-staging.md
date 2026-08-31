@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: invoke `superpowers:subagent-driven-development` (recommended) or `superpowers:executing-plans` before touching code. Atomic steps use checkbox (`- [ ]`) syntax for tracking — tick them off in this file as you go.
 
-**Goal:** Give the Git Manager diff a per-line and per-hunk selection gutter with drag-select and tri-state hunk handles, wired to PHASE-11's partial staging and partial discard.
+**Goal:** Give the Git Manager diff a per-line and per-hunk selection gutter with drag-select and tri-state hunk handles, wired to PHASE-11's partial staging, partial unstaging and partial discard.
 
 **Architecture:** This phase adds an immutable line-selection model and an interactive gutter under `apps/web/src/components/gitManager/staging/`, layered on the existing `@pierre/diffs` renderer rather than a new one. `AnnotatableCodeView` (`apps/web/src/components/diffs/AnnotatableCodeView.tsx`) already exposes `enableGutterUtility`, `enableLineSelection`, controlled `selectedLines` / `onSelectedLinesChange`, `onLineSelectionEnd` and `renderAnnotation`; this phase drives them from a selection model instead of the review-comment flow. It implements Slice 5's client half (`git-manager-plan.md` § Slices). The client computes selection geometry only; every patch is constructed server-side by PHASE-11.
 
@@ -21,7 +21,7 @@
 - **Create:** `apps/web/src/components/gitManager/staging/GitManagerPartialDiscardDialog.tsx` + `.logic.ts` + `.logic.test.ts` — partial discard of a selection, behind confirmation
 - **Modify:** `apps/web/src/components/gitManager/changes/GitManagerDiffPane.tsx` — pass the gutter and the selection into the diff (exact file name to be confirmed against PHASE-05's working tree)
 - **Modify:** `apps/web/src/gitManagerStore.ts` — add ONLY the `staging` view-state slice (`lineSelectionByPath`); do not touch other slices
-- **Modify:** `apps/web/src/state/gitManager.ts` — re-export PHASE-11's partial stage and discard commands (`gitManager.stagePartial`, `gitManager.discardPartial`) if PHASE-11 left the web wrapper incomplete. **There is no partial-unstage method** — see the blocker note below before assuming one.
+- **Modify:** `apps/web/src/state/gitManager.ts` — re-export PHASE-11's partial stage, unstage and discard commands (`gitManager.stagePartial`, `gitManager.unstagePartial`, `gitManager.discardPartial`) if PHASE-11 left the web wrapper incomplete.
 
 ## Dependencies
 
@@ -78,17 +78,17 @@ Invoke these skills via the `Skill` tool BEFORE doing any work. Order matters: a
 	```bash
 	rg -n "enableGutterUtility|enableLineSelection|selectedLines|onSelectedLinesChange|onLineSelectionEnd|renderAnnotation" apps/web/src/components/diffs/AnnotatableCodeView.tsx
 	rg -n "SelectedLineRange|FileDiffMetadata|hunks" apps/web/src/lib/diffRendering.ts apps/web/src/reviewCommentContext.ts
-	rg -n "stagePartial|discardPartial|selectedLines|GitManagerDiffSource" packages/contracts/src/gitManager.ts packages/client-runtime/src/state/gitManager.ts
+	rg -n "stagePartial|unstagePartial|discardPartial|selectedLines|GitManagerDiffSource" packages/contracts/src/gitManager.ts packages/client-runtime/src/state/gitManager.ts
 	rg --files apps/web/src/components/gitManager
 	```
 
 	`AnnotatableCodeView` props (indicative :73 — re-verify) are `files`, `sectionId`, `sectionTitle`, `composerDraftTarget`, `options`, `viewerRef`, `className`, `renderHeaderPrefix`; its internal `CodeView` options include `enableGutterUtility`, `enableLineSelection`, `onLineSelectionEnd` and controlled `selectedLines` (indicative :238-245). `SelectedLineRange` from `@pierre/diffs` is `{ start, end, side, endSide? }` with `side: "additions" | "deletions"`. `packages/contracts/src/gitManager.ts` is authoritative for the wire selection shape PHASE-11 accepts.
 
-	**PHASE-00's Step 00.7 method table is binding and wins every disagreement.** This phase has exactly two mutations available: **`gitManager.stagePartial`** and **`gitManager.discardPartial`**. Any other partial-staging method name you may have seen in an earlier draft does not exist — do not invent one, and read the partial-unstage blocker in Notes for downstream phases before designing the gutter's action set. PHASE-11's `format_selection_patch`, `parse_working_tree_diff` and the `selectedLines` wire field are still correct names: they identify the patch algorithm and the request payload, not the RPC.
+	**PHASE-00's Step 00.7 method table is binding and wins every disagreement.** This phase has exactly three mutations available: **`gitManager.stagePartial`**, **`gitManager.unstagePartial`** and **`gitManager.discardPartial`**. PHASE-11's `format_selection_patch`, `parse_working_tree_diff` and the `selectedLines` wire field are still correct names: they identify the patch algorithm and the request payload, not the RPC.
 
 	**Four contracts PHASE-11 published that this phase must honour exactly:**
-	1. `selectedLines` is a set of **0-based indices over the unified-diff body of the file's current working-tree diff** — the same coordinate space the client's parsed patch uses. Derive the indices from the same diff payload the server produced, or the selection will not line up.
-	2. Every selection request carries the generation the diff was read at. A mismatch returns a structured stale error: re-read the diff and ask the user to re-select rather than retrying blindly. Partial discard fails closed.
+	1. `selectedLines` is a set of **0-based indices over the unified-diff body of the file's current working-tree-source diff** — staged for unstage, unstaged for stage or discard — in the same coordinate space the client's parsed patch uses. Derive the indices from the same diff payload the server produced, or the selection will not line up.
+	2. Every selection request carries the generation the diff was read at. A mismatch returns a structured stale error: re-read the diff and ask the user to re-select rather than retrying blindly. Partial unstage and partial discard fail closed.
 	3. Untracked files are made diffable server-side with `git add --intent-to-add`, so the gutter may be offered on them.
 	4. A **renamed** path falls back to whole-file staging with a stated reason — the reference's index-recreation path is not implemented. Render that reason instead of offering a gutter that cannot work.
 
@@ -134,6 +134,7 @@ Invoke these skills via the `Skill` tool BEFORE doing any work. Order matters: a
 	- each line checkbox carries an `aria-label` naming the line number and side;
 	- each hunk handle exposes `aria-checked` with `"true" | "false" | "mixed"`;
 	- the gutter is keyboard-operable — Space toggles the focused line, Shift+Space extends from the last anchor;
+	- a staged selection exposes a keyboard-reachable partial-unstage control, while an unstaged selection exposes partial-stage;
 	- pointer drag from line A to line B selects the inclusive range through `withRangeSelection`, and a drag that leaves the diff still terminates the drag;
 	- the gutter is **disabled while a commit is in flight and while whitespace is hidden**, matching the reference contract, and renders the reason rather than silently no-opping;
 	- the gutter is **not offered at all** when PHASE-06's `classifyDiffPayload` (`apps/web/src/components/gitManager/history/diffLadder.ts`) reports the file as large-text, binary, submodule or unrenderable, nor on a renamed path — each case renders its stated reason. Reuse `classifyDiffPayload`; do not bypass it, and do not re-implement the size ladder.
@@ -142,7 +143,7 @@ Invoke these skills via the `Skill` tool BEFORE doing any work. Order matters: a
 
 - [ ] **Step 14.9: Wire selection to PHASE-11's staging commands.**
 
-	Modify the Git Manager diff pane created by PHASE-05 to pass `selection`, `onSelectionChange` and the staging actions. Staging a partial selection dispatches **`gitManager.stagePartial`** through the existing environment-scoped Effect Atom command on the per-`(environmentId, cwd)` lane — never a raw RPC `request`. Offer no partial-unstage control: no such method exists (see the blocker note in Notes for downstream phases), and discarding is **not** an acceptable substitute. Assert with a test that changing the selection does not re-issue a stage command, and that the stage command carries the current selection at press time (take a fresh snapshot; do not close over a stale one — agents write to this repository continuously, spec § 6.2).
+	Modify the Git Manager diff pane created by PHASE-05 to pass `selection`, `onSelectionChange` and the staging actions. An unstaged partial selection dispatches **`gitManager.stagePartial`**; a staged partial selection exposes the gutter's unstage control and dispatches **`gitManager.unstagePartial`**. Both go through existing environment-scoped Effect Atom commands on the per-`(environmentId, cwd)` lane — never a raw RPC `request`. Unstaging changes only the index; discarding changes only the working tree. They are **not equivalent and must never be substituted for one another**. Assert with tests that changing the selection does not re-issue either command, that the correct command is chosen from the staged state, and that each command carries the current selection at press time (take a fresh snapshot; do not close over a stale one — agents write to this repository continuously, spec § 6.2).
 
 - [ ] **Step 14.10: Add partial-discard tests, then implement the dialog.**
 
@@ -166,7 +167,7 @@ Invoke these skills via the `Skill` tool BEFORE doing any work. Order matters: a
 
 - [ ] **Step 14.13: Exercise the gutter in the running app.**
 
-	`vp run dev`, open the Git Manager Changes tab on a file with several separated edits, and verify against **both** a local project and a remote-hosted project (attach one per `docs/user/remote-access.md`): drag-selecting a range highlights exactly those lines; a hunk handle shows the mixed state and toggling it selects the whole run; staging a partial selection stages exactly those lines (confirm with `git diff --cached` in a terminal); partial discard removes exactly those lines from the working tree; and the gutter is disabled with a stated reason while a commit runs.
+	`vp run dev`, open the Git Manager Changes tab on a file with several separated edits, and verify against **both** a local project and a remote-hosted project (attach one per `docs/user/remote-access.md`): drag-selecting a range highlights exactly those lines; a hunk handle shows the mixed state and toggling it selects the whole run; staging a partial selection stages exactly those lines (confirm with `git diff --cached` in a terminal); unstaging a partial selection removes exactly those lines from the index without changing the working-tree file; partial discard removes exactly those lines from the working tree without changing the index; and the gutter is disabled with a stated reason while a commit runs.
 
 - [ ] **Step 14.14: TDD proof.** Make `withRangeSelection` ignore its `to` argument and `resolveHunkHandleState` always return `"none"`. Re-run the Step 14.12 test filter and confirm the affected tests DO fail. Restore the real implementations.
 
@@ -182,6 +183,7 @@ Invoke these skills via the `Skill` tool BEFORE doing any work. Order matters: a
 - [ ] No patch text is constructed anywhere in `apps/web` — `rg -n '@@ -|\\+\\+\\+ b/' apps/web/src/components/gitManager/staging` returns nothing; the client sends line indices only.
 - [ ] The gutter is fully keyboard-operable and every control carries an `aria-label` or `aria-checked`; hunk handles expose `"mixed"` for the partial state.
 - [ ] Drag-select is disabled while committing and while whitespace is hidden, with the reason rendered.
+- [ ] The gutter stages unstaged selections and unstages staged selections through their distinct RPC commands; partial discard is never used as an unstage substitute.
 - [ ] The existing `@pierre/diffs` worker pool is reused; `rg -n "DiffWorkerPoolProvider|WorkerPoolContextProvider" apps/web/src/components/gitManager` finds no second pool.
 - [ ] All new tests green: `vp test run apps/web/src/components/gitManager/staging`.
 - [ ] `vp check` clean and `vp run typecheck` clean.
@@ -200,15 +202,11 @@ Invoke these skills via the `Skill` tool BEFORE doing any work. Order matters: a
 - **Naming that is correct and must not be "fixed":** PHASE-11's `format_selection_patch` and `parse_working_tree_diff` are server functions in `apps/server/src/git/manager/patch.rs`, and `selectedLines` is the request payload field. None of them is an RPC name, so none of them conflicts with the `gitManager.*` method table.
 - **Divergence found, already handled here:** the plan assumed the partial-staging gutter is entirely new work. It is not — `AnnotatableCodeView` already exposes gutter and line-selection hooks used by the review-comment flow, and `apps/web/src/lib/diffRendering.ts` already exports `compactPartialHunkOffsets` for partial patches. The new work is the selection model and the staging wiring, not the interaction primitives.
 - **Second divergence:** `apps/web` carried no client-side diff size ladder before this feature — the only tuning constants are in `apps/web/src/components/DiffWorkerPoolProvider.tsx` (`poolSize`, `totalASTLRUCacheSize: 240`, `tokenizeMaxLineLength: 1_000`, indicative :51-77). PHASE-06 introduced the ladder as `classifyDiffPayload` in `apps/web/src/components/gitManager/history/diffLadder.ts` and recorded that the reference's 1MB syntax-highlight cap is already satisfied by the existing pool. Use `classifyDiffPayload`; if it is absent when this phase runs, do not add a ladder here — report it in `tasks.md`.
-- **Blocker, not a naming choice — partial unstaging has no method.** The
-  canonical contract table in `PHASE-00-contracts.md` defines exactly two
-  partial operations: `gitManager.stagePartial` and `gitManager.discardPartial`.
-  There is **no** `gitManager.unstagePartial`. This is a real functional gap
-  rather than an oversight of wording: BiBCode keeps a visible index (unlike the
-  reference implementation, which hides the index and rebuilds it at commit
-  time), so a user who can stage a hunk will reasonably expect to unstage one.
-  If this phase concludes partial unstaging is required for a coherent gutter,
-  **stop and raise it as a blocker** in `tasks.md` § Active blockers so the
-  coordinator can decide whether to add the method to the Phase 00 table. Do
-  not invent a method name, and do not emulate unstaging by discarding — the
-  two are not equivalent and confusing them destroys work.
+- **Resolved partial-unstage contract:** the canonical table in
+  `PHASE-00-contracts.md` defines `gitManager.stagePartial`,
+  `gitManager.unstagePartial` and `gitManager.discardPartial`. The gutter offers
+  `unstagePartial` for staged selections because BiBCode keeps a visible index,
+  unlike the reference implementation's hidden index rebuilt at commit time.
+  Unstaging reverses the selected patch in the index without touching the
+  working tree; discarding reverses it in the working tree without touching the
+  index. They are not equivalent and must never be substituted for one another.
