@@ -152,9 +152,9 @@ export function planServerArtifact(
   const archiveArgs = [
     target.serverArchive === "zip" ? "-a" : undefined,
     target.serverArchive === "zip" ? "-cf" : "-czf",
-    archivePath,
+    archiveName,
     "-C",
-    stagingParent,
+    NodePath.basename(stagingParent),
     distributionRootName,
   ].filter((argument): argument is string => argument !== undefined);
   const cargoArgs = [
@@ -324,7 +324,8 @@ function runCommand(command: ServerArtifactCommand, cwd: string, verbose: boolea
 }
 
 function validateArchive(plan: ServerArtifactPlan): void {
-  const result = NodeChildProcess.spawnSync("tar", ["-tf", plan.archivePath], {
+  const result = NodeChildProcess.spawnSync("tar", ["-tf", plan.archiveName], {
+    cwd: plan.outputDir,
     shell: false,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
@@ -355,7 +356,7 @@ export async function buildServerArtifact(plan: ServerArtifactPlan): Promise<str
   }
   await stageServerDistribution(plan);
   await NodeFS.promises.mkdir(plan.outputDir, { recursive: true });
-  runCommand(plan.archiveCommand, REPOSITORY_ROOT, plan.verbose);
+  runCommand(plan.archiveCommand, plan.outputDir, plan.verbose);
   validateArchive(plan);
   if (plan.target.platform === "linux") {
     const nfpm = await installNfpm(planNfpmInstall("linux", plan.target.arch, plan.repositoryRoot));
