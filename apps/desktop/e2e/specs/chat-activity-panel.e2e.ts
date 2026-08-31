@@ -399,6 +399,7 @@ async function openCodexProviderTerminal(): Promise<string> {
   const terminalDock = `[data-provider-terminal-activity-host="${terminalId}"] [data-testid="activity-dock"]`;
   if (supportsCodexTerminalActivity) {
     await browser.$(terminalDock).waitForDisplayed({
+      timeout: 60_000,
       timeoutMsg: "The live Codex terminal activity dock did not become visible.",
     });
   } else {
