@@ -68,6 +68,7 @@ describe("packaged preferences, native integrations, and platform capabilities",
         throw new Error("Expected the packaged Windows desktop bridge to report WSL state.");
       }
 
+      await browser.url(`${appOrigin}/#/settings/local-environment`);
       await expect(browser.$("//*[normalize-space()='Local environment']")).toBeDisplayed();
       await expect(browser.$("//*[normalize-space()='WSL backend']")).toBeDisplayed();
     }
