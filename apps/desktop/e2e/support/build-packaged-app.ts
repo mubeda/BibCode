@@ -29,7 +29,7 @@ export function planPackagedDesktopUiBuild(
       ...(input.platform === "linux" ? { NO_STRIP: "1" } : {}),
     },
     args: [
-      "../../scripts/run-msvc-x64.mjs",
+      "../../scripts/run-msvc.mjs",
       "pnpm",
       "exec",
       "tauri",

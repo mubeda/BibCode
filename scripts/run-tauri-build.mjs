@@ -3,7 +3,7 @@ import * as NodeOS from "node:os";
 import * as NodeProcess from "node:process";
 import * as NodeURL from "node:url";
 
-import { runMsvcX64 } from "./run-msvc-x64.mjs";
+import { runMsvc } from "./run-msvc.mjs";
 
 export function tauriBuildEnvironment(platform, env) {
   if (platform !== "linux") {
@@ -17,7 +17,7 @@ export function runTauriBuild(options = {}) {
   const platform = options.platform ?? NodeOS.platform();
   const env = options.env ?? NodeProcess.env;
   const args = options.args ?? NodeProcess.argv.slice(2);
-  const runWithToolchain = options.runMsvcX64 ?? runMsvcX64;
+  const runWithToolchain = options.runMsvc ?? runMsvc;
   return runWithToolchain(["pnpm", "exec", "tauri", "build", ...args], {
     env: tauriBuildEnvironment(platform, env),
   });

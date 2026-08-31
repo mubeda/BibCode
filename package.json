@@ -30,7 +30,7 @@
     "test:ui:desktop:build": "vp run --filter @bibcode/desktop test:ui:build",
     "fmt": "vp fmt",
     "fmt:check": "vp fmt --check",
-    "check:contracts": "vp run --filter @bibcode/contracts typecheck && vp test run packages/contracts/scripts/export-rust-rpc-fixtures.test.ts && node packages/contracts/scripts/export-rust-rpc-fixtures.ts && vp test run packages/contracts/src/rpcRustParity.test.ts && node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test rpc_wire",
+    "check:contracts": "vp run --filter @bibcode/contracts typecheck && vp test run packages/contracts/scripts/export-rust-rpc-fixtures.test.ts && node packages/contracts/scripts/export-rust-rpc-fixtures.ts && vp test run packages/contracts/src/rpcRustParity.test.ts && node scripts/run-msvc.mjs cargo test -p bibcode-server --test rpc_wire",
     "dist:desktop:artifact": "node scripts/build-desktop-artifact.ts",
     "dist:desktop:dmg": "node scripts/build-desktop-artifact.ts --platform mac --target dmg",
     "dist:desktop:dmg:arm64": "node scripts/build-desktop-artifact.ts --platform mac --target dmg --arch arm64",
