@@ -60,7 +60,8 @@ it("publishes stable updater metadata atomically from a verified draft", () => {
     releaseWorkflow,
     /if: needs\.preflight\.outputs\.release_channel == 'stable' && needs\.preflight\.outputs\.publish_requested == 'true'[\s\S]*gh release edit/,
   );
-  assert.match(releaseWorkflow, /rm -f release-assets\/updater-\*\.json/);
+  assert.match(releaseWorkflow, /assemble-release-assets\.ts/);
+  assert.match(releaseWorkflow, /pattern:\s*server-\*/);
   assert.match(releaseWorkflow, /files:\s*\|\s*\n\s+release-assets\/\*/);
 });
 
