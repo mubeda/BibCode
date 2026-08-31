@@ -24,6 +24,11 @@ on:
         required: false
         default: false
         type: boolean
+      validate_only:
+        description: "Build and retain final assets without creating a tag or release"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -48,6 +53,7 @@ jobs:
       is_update_candidate: ${{ steps.release_meta.outputs.is_update_candidate }}
       make_latest: ${{ steps.release_meta.outputs.make_latest }}
       publish_requested: ${{ steps.release_meta.outputs.publish_requested }}
+      validate_only: ${{ steps.release_meta.outputs.validate_only }}
       ref: ${{ steps.release_meta.outputs.ref }}
     steps:
       - name: Checkout
@@ -87,10 +93,21 @@ jobs:
         env:
           DISPATCH_CHANNEL: ${{ github.event.inputs.channel }}
           DISPATCH_PUBLISH: ${{ github.event.inputs.publish }}
+          DISPATCH_VALIDATE_ONLY: ${{ github.event.inputs.validate_only }}
           DISPATCH_VERSION: ${{ github.event.inputs.version }}
           NIGHTLY_SHA: ${{ github.sha }}
           NIGHTLY_RUN_NUMBER: ${{ github.run_number }}
         run: |
+          validate_only=false
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && "${DISPATCH_VALIDATE_ONLY:-false}" == "true" ]]; then
+            validate_only=true
+          fi
+          if [[ "$validate_only" == "true" && "${DISPATCH_PUBLISH:-false}" == "true" ]]; then
+            echo "validate_only and publish cannot both be true." >&2
+            exit 1
+          fi
+          echo "validate_only=$validate_only" >> "$GITHUB_OUTPUT"
+
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && "${DISPATCH_CHANNEL:-stable}" == "nightly" ]]; then
             nightly_date="$(date -u +%Y%m%d)"
 
@@ -753,8 +770,16 @@ jobs:
           fi
           "${args[@]}"
 
+      - name: Upload validated release assets
+        if: needs.preflight.outputs.validate_only == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: validated-release-assets
+          path: release-assets/*
+          if-no-files-found: error
+
       - name: Require inspected stable draft
-        if: needs.preflight.outputs.release_channel == 'stable' && needs.preflight.outputs.publish_requested == 'true'
+        if: needs.preflight.outputs.validate_only != 'true' && needs.preflight.outputs.release_channel == 'stable' && needs.preflight.outputs.publish_requested == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -765,14 +790,14 @@ jobs:
           test "$(gh release view "$RELEASE_TAG" --json targetCommitish --jq .targetCommitish)" = "$(git rev-parse HEAD)"
 
       - name: Prepare stable release assets
-        if: needs.preflight.outputs.release_channel == 'stable' && needs.preflight.outputs.publish_requested != 'true'
+        if: needs.preflight.outputs.validate_only != 'true' && needs.preflight.outputs.release_channel == 'stable' && needs.preflight.outputs.publish_requested != 'true'
         shell: bash
         run: |
           set -euo pipefail
           find release-assets -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort > expected-assets.txt
 
       - name: Publish stable release
-        if: needs.preflight.outputs.release_channel == 'stable' && needs.preflight.outputs.publish_requested != 'true' && needs.preflight.outputs.previous_tag != ''
+        if: needs.preflight.outputs.validate_only != 'true' && needs.preflight.outputs.release_channel == 'stable' && needs.preflight.outputs.publish_requested != 'true' && needs.preflight.outputs.previous_tag != ''
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: ${{ needs.preflight.outputs.tag }}
@@ -789,7 +814,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish first stable release
-        if: needs.preflight.outputs.release_channel == 'stable' && needs.preflight.outputs.publish_requested != 'true' && needs.preflight.outputs.previous_tag == ''
+        if: needs.preflight.outputs.validate_only != 'true' && needs.preflight.outputs.release_channel == 'stable' && needs.preflight.outputs.publish_requested != 'true' && needs.preflight.outputs.previous_tag == ''
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: ${{ needs.preflight.outputs.tag }}
@@ -805,7 +830,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish nightly release
-        if: needs.preflight.outputs.release_channel == 'nightly' && needs.preflight.outputs.previous_tag != ''
+        if: needs.preflight.outputs.validate_only != 'true' && needs.preflight.outputs.release_channel == 'nightly' && needs.preflight.outputs.previous_tag != ''
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: ${{ needs.preflight.outputs.tag }}
@@ -821,7 +846,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish first nightly release
-        if: needs.preflight.outputs.release_channel == 'nightly' && needs.preflight.outputs.previous_tag == ''
+        if: needs.preflight.outputs.validate_only != 'true' && needs.preflight.outputs.release_channel == 'nightly' && needs.preflight.outputs.previous_tag == ''
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: ${{ needs.preflight.outputs.tag }}
@@ -836,7 +861,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Verify stable draft release assets
-        if: needs.preflight.outputs.release_channel == 'stable' && needs.preflight.outputs.publish_requested != 'true'
+        if: needs.preflight.outputs.validate_only != 'true' && needs.preflight.outputs.release_channel == 'stable' && needs.preflight.outputs.publish_requested != 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -849,7 +874,7 @@ jobs:
           diff -u expected-assets.txt uploaded-assets.txt
 
       - name: Publish approved stable release
-        if: needs.preflight.outputs.release_channel == 'stable' && needs.preflight.outputs.publish_requested == 'true'
+        if: needs.preflight.outputs.validate_only != 'true' && needs.preflight.outputs.release_channel == 'stable' && needs.preflight.outputs.publish_requested == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -869,7 +894,7 @@ jobs:
 
   finalize:
     name: Finalize release
-    if: ${{ !failure() && !cancelled() && needs.preflight.result == 'success' && needs.release.result == 'success' && needs.preflight.outputs.release_channel == 'stable' && needs.preflight.outputs.publish_requested == 'true' }}
+    if: ${{ needs.preflight.outputs.validate_only != 'true' && !failure() && !cancelled() && needs.preflight.result == 'success' && needs.release.result == 'success' && needs.preflight.outputs.release_channel == 'stable' && needs.preflight.outputs.publish_requested == 'true' }}
     needs: [preflight, release]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
