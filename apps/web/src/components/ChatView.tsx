@@ -4258,7 +4258,6 @@ function ChatViewContent(props: ChatViewProps) {
       openTerminal,
       reserveActiveTerminalId,
       resolvedTheme,
-      serverConfig?.environment.platform.os,
       settings.terminalThemePreference,
       workspaceUnavailable,
     ],
