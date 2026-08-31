@@ -768,9 +768,14 @@ export function resolveBoundedCommandLaunch(
   if (platform !== "win32" || !/\.(?:bat|cmd)$/i.test(command)) {
     return { args, command, windowsVerbatimArguments: false };
   }
-  const commandLine = [command, ...args].map(quoteWindowsCommandArgument).join(" ");
+  if (!/^[A-Za-z0-9_.:\\/-]+$/u.test(command)) {
+    throw new SeededDesktopUpgradeSmokeError(
+      "Windows command-wrapper executable names must not require shell quoting.",
+    );
+  }
+  const commandLine = [command, ...args.map(quoteWindowsCommandArgument)].join(" ");
   return {
-    args: ["/d", "/s", "/c", `"${commandLine}"`],
+    args: ["/d", "/s", "/c", commandLine],
     command: commandProcessor?.trim() || "cmd.exe",
     windowsVerbatimArguments: true,
   };
