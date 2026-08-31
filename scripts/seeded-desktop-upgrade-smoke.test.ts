@@ -17,6 +17,7 @@ import {
   ManagedProcessRegistry,
   parseSeededDesktopUpgradeSmokeArgs,
   redactAndBoundUpgradeEvidence,
+  resolveBoundedCommandLaunch,
   runBoundedCommand,
   seededUpgradeBundleRoot,
   seededUpgradeRustTarget,
@@ -29,6 +30,24 @@ const absolute = (...parts: ReadonlyArray<string>): string =>
   NodePath.resolve("/tmp/bibcode-upgrade-smoke", ...parts);
 
 describe("seeded packaged desktop upgrade harness", () => {
+  it("launches Windows command wrappers through the native command processor", () => {
+    expect(
+      resolveBoundedCommandLaunch(
+        "vp.cmd",
+        ["install", "--frozen-lockfile"],
+        "win32",
+        "C:\\Windows\\System32\\cmd.exe",
+      ),
+    ).toEqual({
+      args: ["/d", "/c", '"vp.cmd" "install" "--frozen-lockfile"'],
+      command: "C:\\Windows\\System32\\cmd.exe",
+    });
+    expect(resolveBoundedCommandLaunch("git.exe", ["status"], "win32", "cmd.exe")).toEqual({
+      args: ["status"],
+      command: "git.exe",
+    });
+  });
+
   it("canonicalizes symlinked work roots before installing an updater target", async () => {
     const temporaryBase = await NodeFS.promises.mkdtemp(
       NodePath.join(NodeOS.tmpdir(), "bibcode-upgrade-canonical-owner-"),

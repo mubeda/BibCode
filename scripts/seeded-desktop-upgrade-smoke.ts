@@ -743,6 +743,32 @@ interface CommandResult {
 
 // oxlint-disable-next-line bibcode/no-global-process-runtime -- The standalone release harness selects the native host executable once.
 const vpExecutable = process.platform === "win32" ? "vp.cmd" : "vp";
+// oxlint-disable-next-line bibcode/no-global-process-runtime -- The standalone release harness selects the native command-launch boundary once.
+const nativeProcessPlatform: NodeJS.Platform = process.platform;
+
+const quoteWindowsCommandArgument = (value: string): string => {
+  if (value.includes("\0") || value.includes("\r") || value.includes("\n")) {
+    throw new SeededDesktopUpgradeSmokeError(
+      "Windows command arguments must not contain control characters.",
+    );
+  }
+  return `"${value.replaceAll('"', '""')}"`;
+};
+
+export function resolveBoundedCommandLaunch(
+  command: string,
+  args: ReadonlyArray<string>,
+  platform: NodeJS.Platform = nativeProcessPlatform,
+  commandProcessor = process.env.ComSpec,
+): { readonly args: ReadonlyArray<string>; readonly command: string } {
+  if (platform !== "win32" || !/\.(?:bat|cmd)$/i.test(command)) {
+    return { args, command };
+  }
+  return {
+    args: ["/d", "/c", [command, ...args].map(quoteWindowsCommandArgument).join(" ")],
+    command: commandProcessor?.trim() || "cmd.exe",
+  };
+}
 
 const terminateChild = async (child: NodeChildProcess.ChildProcess): Promise<void> => {
   if (child.exitCode !== null || child.signalCode !== null) return;
@@ -768,7 +794,8 @@ export const runBoundedCommand = async (input: {
   readonly timeoutMs?: number | undefined;
 }): Promise<CommandResult> =>
   new Promise((resolve, reject) => {
-    const child = NodeChildProcess.spawn(input.command, input.args, {
+    const launch = resolveBoundedCommandLaunch(input.command, input.args);
+    const child = NodeChildProcess.spawn(launch.command, launch.args, {
       cwd: input.cwd,
       env: input.env ?? process.env,
       shell: false,

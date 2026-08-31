@@ -453,14 +453,17 @@ describe("cross-platform release contract", () => {
     expect(preflight.outputs?.publish_requested).toBe(
       "${{ steps.release_meta.outputs.publish_requested }}",
     );
-    expect(requireDraft?.if).toBe(
+    expect(requireDraft?.if).toContain("needs.preflight.outputs.validate_only != 'true'");
+    expect(requireDraft?.if).toContain(
       "needs.preflight.outputs.release_channel == 'stable' && needs.preflight.outputs.publish_requested == 'true'",
     );
     expect(requireDraft?.run).toMatch(/gh release view[^]*isDraft/);
     for (const draftStep of [prepareDraft, createDraft, createFirstDraft, verifyDraft]) {
+      expect(draftStep?.if).toContain("needs.preflight.outputs.validate_only != 'true'");
       expect(draftStep?.if).toContain("needs.preflight.outputs.publish_requested != 'true'");
     }
-    expect(publish?.if).toBe(
+    expect(publish?.if).toContain("needs.preflight.outputs.validate_only != 'true'");
+    expect(publish?.if).toContain(
       "needs.preflight.outputs.release_channel == 'stable' && needs.preflight.outputs.publish_requested == 'true'",
     );
     expect(publish?.run).toMatch(/gh release edit[^]*--draft=false/);
