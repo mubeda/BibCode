@@ -339,23 +339,29 @@ Coordinator-only section. Round summaries, cross-phase decisions, file-conflict 
   working-tree, commit and stash — there is **no** `getCommitDiff` or
   `getStashDiff`), `subscribeGitManagerSignal` (bare `subscribeXxx`, no dot,
   matching every existing stream method), and
-  `gitManager.stagePartial` / `gitManager.discardPartial` (not `*Selection`).
+  `gitManager.stagePartial` / `gitManager.unstagePartial` /
+  `gitManager.discardPartial` (not `*Selection`).
   All nine capability-flag names were already consistent across authors and
   needed no change. Before Round 0 dispatch, re-run:
-  `grep -nE 'gitManager\.(getCommitDiff|getStashDiff|subscribeRepository|stageSelection|discardSelection)|unstagePartial' docs/plans/git-manager/phases/*.md`
+  `grep -nE 'gitManager\.(getCommitDiff|getStashDiff|subscribeRepository|stageSelection|discardSelection)' docs/plans/git-manager/phases/*.md`
   — matches should appear only inside `PHASE-00-contracts.md`, whose
   reconciliation note legitimately quotes the old names.
-- **Open contract question for Phase 00 — stash identity.** The stash arm of
-  `GitManagerDiffSource` identifies a stash by `index`, but stash indices shift
-  on every push and drop, so a cached index can silently resolve to the wrong
-  entry. Phase 09 mitigates by mapping index → `stash@{index}` → sha and failing
-  with a structured error when the index no longer resolves, and the UI must
-  treat that as a refresh trigger rather than a hard failure. **Decide before
-  Phase 00 executes** whether to identify stashes by sha instead; changing it
-  later invalidates Phases 09 and 12.
-- **Known gap to decide, not invent.** Partial *unstaging* has no method in the
-  Phase 00 table. If a phase needs it, it must be added to the table by
-  decision, never introduced ad hoc under a guessed name.
+- **Contract decision made before implementation — stash identity.** The stash
+  arm of `GitManagerDiffSource` carries `sha`, and `GitManagerStashEntry.sha` is
+  its stable identity. Phase 09 resolves that sha against the current stash
+  list to obtain the `stash@{n}` ref git needs and returns a structured error if
+  the stash was dropped or popped. Phase 12 persists the selected sha and passes
+  it directly to `getDiff`, refetching `getStashes` when it is no longer present.
+  This avoids silently selecting a different stash after index shifts or a
+  localStorage-backed reload.
+- **Contract decision made before implementation — partial unstaging.** Phase
+  00 declares `gitManager.unstagePartial` beside `stagePartial` and
+  `discardPartial`, under the existing `gitManagerPartialStaging` capability.
+  BiBCode keeps a visible, incrementally staged index, so it needs a true
+  partial-unstage operation: Phase 11 applies the selected patch with
+  `git apply --cached --reverse` to change only the index, and Phase 14 exposes
+  that control for staged selections. Discard remains a working-tree operation
+  and must never be substituted for unstage.
 - **Superseded predecessor.** `docs/superpowers/plans/2026-08-18-git-manager/`
   is a different, never-implemented plan. Ignore it entirely; it is retained
   only as historical evidence and carries a superseded banner.

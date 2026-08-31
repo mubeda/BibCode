@@ -79,7 +79,7 @@ _(no domain-specific matches for this phase in the current skill inventory; alwa
 	rg -n "gitManager" apps/server/src/rpc/methods.rs
 	```
 
-	Preconditions, each a stop-and-record item in `tasks.md` if it fails: the stash, merge-preview and live-signal methods are present in `ACTIVE_RPC_METHODS` **with stub handlers already registered** (`RpcRegistry::validate_complete()` fails server startup otherwise); `gitManager.getDiff` is already a **real** handler from PHASE-01, not a stub, so this phase extends it rather than replacing it; and PHASE-07's `GitManagerOperationRegistry` and `classify_operation_failure` exist. The landed `packages/contracts/src/gitManager.ts` is authoritative for the method and field names used below (expected: `gitManager.getStashes`, `gitManager.previewMerge`, `subscribeGitManagerSignal` — a bare stream identifier with no dot — and `gitManager.getDiff` with a `GitManagerDiffSource` of `{ _tag: "stash", index, path }` for the stash diff; there is no separate stash-diff method).
+	Preconditions, each a stop-and-record item in `tasks.md` if it fails: the stash, merge-preview and live-signal methods are present in `ACTIVE_RPC_METHODS` **with stub handlers already registered** (`RpcRegistry::validate_complete()` fails server startup otherwise); `gitManager.getDiff` is already a **real** handler from PHASE-01, not a stub, so this phase extends it rather than replacing it; and PHASE-07's `GitManagerOperationRegistry` and `classify_operation_failure` exist. The landed `packages/contracts/src/gitManager.ts` is authoritative for the method and field names used below (expected: `gitManager.getStashes`, `gitManager.previewMerge`, `subscribeGitManagerSignal` — a bare stream identifier with no dot — and `gitManager.getDiff` with a `GitManagerDiffSource` of `{ _tag: "stash", sha, path }` for the stash diff; there is no separate stash-diff method).
 
 - [ ] **Step 09.2: Author the first failing test.**
 
@@ -117,13 +117,13 @@ _(no domain-specific matches for this phase in the current skill inventory; alwa
 
 - [ ] **Step 09.5: Run the test; expect PASS.**
 
-- [ ] **Step 09.6: Add the stash diff and stash operations.** In `stash.rs` and `repository.rs`, using the research § 3.8 command lines verbatim. The wire payload identifies a stash by `index` (the `n` of `stash@{n}`), so every primitive below starts by resolving `index` → `stash@{index}` → the entry's `sha` through the `parse_stash_list` ordering, and fails with a structured error when the index no longer resolves:
-	- file list: `git stash show <sha> --raw --numstat -z --format=format: --no-show-signature --` (whole-stash; it feeds `GitManagerStashEntry`, not a per-path diff)
-	- patch: `git stash show -p <sha> --no-color`, filtered to the requested `path` — this is what the `{ _tag: "stash", index, path }` source of `gitManager.getDiff` returns
+- [ ] **Step 09.6: Add the stash diff and stash operations.** In `stash.rs` and `repository.rs`, using the research § 3.8 command lines verbatim. The stash-diff wire payload identifies a stash by its stable `sha`. Before running a diff command, resolve that sha against the current `parse_stash_list` output to obtain the matching `stash@{n}` selector. If the sha is no longer present because the stash was dropped or popped, fail with a structured error; never reinterpret a shifted list index as the requested stash. Mutation arms continue to use the current selector required by their `GitManagerOperationRequest` variant:
+	- file list: `git stash show <selector> --raw --numstat -z --format=format: --no-show-signature --` (whole-stash; it feeds `GitManagerStashEntry`, not a per-path diff)
+	- patch: `git stash show -p <selector> --no-color`, filtered to the requested `path` — this is what the `{ _tag: "stash", sha, path }` source of `gitManager.getDiff` returns
 	- create: stage untracked paths first, then `git stash push -m "<message>"` — an ordinary, visible entry with no magic marker (spec § 6.3)
 	- apply: `git stash apply --quiet <selector>`; pop: `git stash pop --quiet <selector>`; drop: `git stash drop <selector>`
 
-	A pop that conflicts exits non-zero and **leaves the entry in place**; the executor must report that outcome rather than dropping the entry. Tests: parse of a `--raw --numstat -z` payload including a rename row; the conflicting-pop outcome.
+	A pop that conflicts exits non-zero and **leaves the entry in place**; the executor must report that outcome rather than dropping the entry. Tests: parse of a `--raw --numstat -z` payload including a rename row; sha-to-current-selector resolution for a present stash; structured failure for a sha no longer in the current list; the conflicting-pop outcome.
 
 - [ ] **Step 09.7: Add the merge preview, test first.**
 
@@ -156,7 +156,7 @@ _(no domain-specific matches for this phase in the current skill inventory; alwa
 
 	combined with the current HEAD, hashed to a `u64`. When it differs from the stored value, store it and bump the generation. Add `StatusBroadcaster::subscribe_git_manager_signal(&self, cwd) -> …` — the source for the `subscribeGitManagerSignal` stream — that goes through the **same** `subscribe_inner` entry point the status stream uses, so the existing subscribe-driven poller startup happens even when no status subscriber exists. Add no new task, no new timer and no new watcher. Tests: two ticks with identical refs bump the generation once; a changed ref bumps it again; subscribing with no status subscriber starts the pollers exactly as `subscribe` does.
 
-- [ ] **Step 09.11: Implement the handlers.** In `apps/server/src/production/git_manager_rpc.rs` replace the stubs for `gitManager.getStashes`, `gitManager.previewMerge` and the `subscribeGitManagerSignal` stream, and fill in the `{ _tag: "stash", index, path }` arm of the existing `gitManager.getDiff` handler (resolving `index` to `stash@{index}` and its sha as in Step 09.6). Reads use `execute_read` (`GIT_OPTIONAL_LOCKS=0`) and the read scope; the signal stream is registered with `registry.register_stream(...)` against `subscribe_git_manager_signal`. Log stable codes plus lengths and counts only — never a branch name, ref name, absolute path, remote URL, stash message or git stderr.
+- [ ] **Step 09.11: Implement the handlers.** In `apps/server/src/production/git_manager_rpc.rs` replace the stubs for `gitManager.getStashes`, `gitManager.previewMerge` and the `subscribeGitManagerSignal` stream, and fill in the `{ _tag: "stash", sha, path }` arm of the existing `gitManager.getDiff` handler (resolving the sha against the current stash list to obtain its `stash@{n}` selector as in Step 09.6). Return a structured error when the sha is absent. Reads use `execute_read` (`GIT_OPTIONAL_LOCKS=0`) and the read scope; the signal stream is registered with `registry.register_stream(...)` against `subscribe_git_manager_signal`. Log stable codes plus lengths and counts only — never a branch name, ref name, absolute path, remote URL, stash message or git stderr.
 
 - [ ] **Step 09.12: Full build + test gate.**
 
@@ -183,6 +183,7 @@ _(no domain-specific matches for this phase in the current skill inventory; alwa
 ## Verification
 
 - [ ] The stash list is the full native list, repository-wide, with no message-marker filtering and no per-worktree scoping.
+- [ ] A stash diff resolves its sha against the current stash list, uses the matching `stash@{n}` selector, and returns a structured error when that sha was dropped or popped.
 - [ ] `merge-tree --write-tree --name-only --no-messages -z` drives the mergeability preview; the conflicted count is NUL count minus one.
 - [ ] In-progress detection resolves paths through `git rev-parse --git-path` and works in a linked worktree where `.git` is a file.
 - [ ] The refs/HEAD/worktree generation is computed on the existing ref tick; `rg -n "tokio::spawn|interval\(" apps/server/src/git/broadcaster.rs` shows no new poller task added by this phase.
@@ -196,7 +197,7 @@ _(no domain-specific matches for this phase in the current skill inventory; alwa
 
 ## Notes for downstream phases
 
-- **`parse_stash_list(stdout) -> Vec<GitManagerStashRecord>`** and `GitManagerStashRecord { selector, sha, message, committedAtMs, parents }` in `apps/server/src/git/manager/stash.rs`. **PHASE-12** renders these verbatim; stash entries are repository-wide, so the UI must not present them as belonging to one worktree. There is **no** stash-diff method: **PHASE-12** reads a stash's per-file patch through `gitManager.getDiff` with `source: { _tag: "stash", index, path }`, where `index` is the `n` of `stash@{n}`.
+- **`parse_stash_list(stdout) -> Vec<GitManagerStashRecord>`** and `GitManagerStashRecord { selector, sha, message, committedAtMs, parents }` in `apps/server/src/git/manager/stash.rs`. **PHASE-12** renders these verbatim; stash entries are repository-wide, so the UI must not present them as belonging to one worktree. There is **no** stash-diff method: **PHASE-12** reads a stash's per-file patch through `gitManager.getDiff` with `source: { _tag: "stash", sha, path }`. The server resolves that stable sha to the current `stash@{n}` selector and fails structurally if the stash is no longer present.
 - **`parse_merge_tree_preview(exit_code, stdout) -> GitManagerMergePreview`** with variants `clean`, `conflicted { fileCount }`, `unrelated-histories` in `apps/server/src/git/manager/merge.rs`. **PHASE-12** and **PHASE-15** consume it; neither may re-derive mergeability.
 - **`detect_in_progress_operation(...) -> Option<GitManagerInProgressOperation>`** in `apps/server/src/git/manager/in_progress.rs`, reported on the refs snapshot. **PHASE-12** shows the continue/abort affordance from it regardless of who started the operation; **PHASE-13** reuses it and extends it with rebase progress from `rebase-merge/{msgnum,end}`.
 - **`StatusBroadcaster::subscribe_git_manager_signal(cwd)`** backs the `subscribeGitManagerSignal` stream and yields a monotonically increasing generation. **PHASE-06's** history splicing and **PHASE-10's** toolbar both key their revalidation on that stream. It goes through `subscribe_inner`, so subscribing starts the existing pollers.
