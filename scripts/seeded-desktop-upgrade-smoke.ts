@@ -768,8 +768,9 @@ export function resolveBoundedCommandLaunch(
   if (platform !== "win32" || !/\.(?:bat|cmd)$/i.test(command)) {
     return { args, command, windowsVerbatimArguments: false };
   }
+  const commandLine = [command, ...args].map(quoteWindowsCommandArgument).join(" ");
   return {
-    args: ["/d", "/c", [command, ...args].map(quoteWindowsCommandArgument).join(" ")],
+    args: ["/d", "/s", "/c", `"${commandLine}"`],
     command: commandProcessor?.trim() || "cmd.exe",
     windowsVerbatimArguments: true,
   };
