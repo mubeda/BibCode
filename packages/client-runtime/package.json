@@ -91,6 +91,10 @@
       "types": "./src/state/relayDiscovery.ts",
       "default": "./src/state/relayDiscovery.ts"
     },
+    "./state/remoteUpdates": {
+      "types": "./src/state/remoteUpdates.ts",
+      "default": "./src/state/remoteUpdates.ts"
+    },
     "./state/review": {
       "types": "./src/state/review.ts",
       "default": "./src/state/review.ts"
@@ -143,6 +147,9 @@
   "dependencies": {
     "@bibcode/contracts": "workspace:*",
     "@bibcode/shared": "workspace:*",
+    "@noble/ciphers": "catalog:",
+    "@noble/curves": "catalog:",
+    "@noble/hashes": "catalog:",
     "effect": "catalog:"
   },
   "devDependencies": {

@@ -56,6 +56,7 @@ const makeSupervisor = Effect.fn("TestEnvironmentCommands.makeSupervisor")(funct
     ready: Effect.void,
     probe: Effect.void,
     closed: Effect.never,
+    e2eeAuthenticated: Effect.succeed(null),
   };
   return EnvironmentSupervisor.EnvironmentSupervisor.of({
     target: TARGET,

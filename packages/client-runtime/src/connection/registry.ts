@@ -15,6 +15,7 @@ import * as SubscriptionRef from "effect/SubscriptionRef";
 import * as ClientCapabilities from "../platform/capabilities.ts";
 import {
   type ConnectionCatalogEntry,
+  type ConnectionProfile,
   type ConnectionRegistration,
   type PlatformConnectionRegistration,
   type PrimaryConnectionRegistration,
@@ -70,6 +71,15 @@ export class EnvironmentRegistry extends Context.Service<
     readonly register: (
       registration: ConnectionRegistration,
     ) => Effect.Effect<void, Persistence.ConnectionPersistenceError>;
+    readonly rollbackRegistration: (
+      registration: ConnectionRegistration,
+    ) => Effect.Effect<
+      boolean,
+      | Persistence.ConnectionPersistenceError
+      | ConnectionAttemptError
+      | EnvironmentNotRegisteredError
+      | PlatformEnvironmentRemovalError
+    >;
     readonly registerPlatform: (registration: PrimaryConnectionRegistration) => Effect.Effect<void>;
     readonly reconcilePlatform: (
       registrations: ReadonlyArray<PlatformConnectionRegistration>,
@@ -90,6 +100,8 @@ export class EnvironmentRegistry extends Context.Service<
       | PlatformEnvironmentRemovalError
     >;
     readonly retryNow: (environmentId: EnvironmentId) => Effect.Effect<void>;
+    readonly connect: (environmentId: EnvironmentId) => Effect.Effect<void>;
+    readonly disconnect: (environmentId: EnvironmentId) => Effect.Effect<void>;
     readonly acceptStorageIdentity: (
       environmentId: EnvironmentId,
     ) => Effect.Effect<
@@ -170,6 +182,9 @@ export const make = Effect.gen(function* () {
   const persistedTargetsByEnvironment = yield* Ref.make<
     ReadonlyMap<EnvironmentId, ConnectionTarget>
   >(new Map(persistedTargets.map((target) => [target.environmentId, target])));
+  const desiredStates = yield* Ref.make<ReadonlyMap<EnvironmentId, boolean>>(
+    new Map(persistedTargets.map((target) => [target.environmentId, true])),
+  );
   interface LeaseLock {
     readonly semaphore: Semaphore.Semaphore;
     readonly users: number;
@@ -252,7 +267,7 @@ export const make = Effect.gen(function* () {
   });
 
   const createServiceScope = Effect.fn("EnvironmentRegistry.createServiceScope")(
-    (entry: ConnectionCatalogEntry) =>
+    (entry: ConnectionCatalogEntry, desired: boolean) =>
       Effect.uninterruptible(
         Effect.gen(function* () {
           const environmentId = entry.target.environmentId;
@@ -266,7 +281,9 @@ export const make = Effect.gen(function* () {
             Scope.provide(scope),
             Effect.onError(() => Scope.close(scope, Exit.void)),
           );
-          yield* supervisor.connect;
+          if (desired) {
+            yield* supervisor.connect;
+          }
           yield* SubscriptionRef.update(serviceScopes, (current) => {
             const next = new Map(current);
             next.set(environmentId, { entry, supervisor, scope });
@@ -277,22 +294,36 @@ export const make = Effect.gen(function* () {
       ),
   );
 
+  const acquireSupervisorLocked = Effect.fn("EnvironmentRegistry.acquireSupervisorLocked")(
+    function* (environmentId: EnvironmentId): Effect.fn.Return<
+      {
+        readonly created: boolean;
+        readonly supervisor: EnvironmentSupervisor.EnvironmentSupervisor["Service"];
+      },
+      EnvironmentNotRegisteredError
+    > {
+      const entry = yield* getEntry(environmentId);
+      const existing = (yield* SubscriptionRef.get(serviceScopes)).get(environmentId);
+      if (existing !== undefined) {
+        if (Equal.equals(existing.entry, entry)) {
+          return { created: false, supervisor: existing.supervisor };
+        }
+        yield* closeServiceScope(environmentId);
+      }
+      const desired = (yield* Ref.get(desiredStates)).get(environmentId) ?? false;
+      return {
+        created: true,
+        supervisor: yield* createServiceScope(entry, desired),
+      };
+    },
+  );
+
   const acquireSupervisor = Effect.fn("EnvironmentRegistry.acquireSupervisor")(function* (
     environmentId: EnvironmentId,
   ) {
     return yield* withLeaseLock(
       environmentId,
-      Effect.gen(function* () {
-        const entry = yield* getEntry(environmentId);
-        const existing = (yield* SubscriptionRef.get(serviceScopes)).get(environmentId);
-        if (existing !== undefined) {
-          if (Equal.equals(existing.entry, entry)) {
-            return existing.supervisor;
-          }
-          yield* closeServiceScope(environmentId);
-        }
-        return yield* createServiceScope(entry);
-      }),
+      acquireSupervisorLocked(environmentId).pipe(Effect.map(({ supervisor }) => supervisor)),
     );
   });
 
@@ -390,7 +421,8 @@ export const make = Effect.gen(function* () {
       next.set(target.environmentId, entry);
       return next;
     });
-    yield* createServiceScope(entry);
+    const desired = (yield* Ref.get(desiredStates)).get(target.environmentId) ?? false;
+    yield* createServiceScope(entry, desired);
   });
 
   const register = Effect.fn("EnvironmentRegistry.register")(function* (
@@ -410,6 +442,11 @@ export const make = Effect.gen(function* () {
           next.set(environmentId, registration.target);
           return next;
         });
+        yield* Ref.update(desiredStates, (current) => {
+          const next = new Map(current);
+          next.set(environmentId, true);
+          return next;
+        });
         yield* installEntryLocked(entry);
       }),
     );
@@ -425,6 +462,14 @@ export const make = Effect.gen(function* () {
           yield* Ref.update(platformEnvironmentIds, (current) => {
             const next = new Set(current);
             next.add(target.environmentId);
+            return next;
+          });
+          yield* Ref.update(desiredStates, (current) => {
+            if (current.has(target.environmentId)) {
+              return current;
+            }
+            const next = new Map(current);
+            next.set(target.environmentId, true);
             return next;
           });
 
@@ -500,6 +545,11 @@ export const make = Effect.gen(function* () {
             next.delete(environmentId);
             return next;
           });
+          yield* Ref.update(desiredStates, (current) => {
+            const next = new Map(current);
+            next.delete(environmentId);
+            return next;
+          });
           yield* closeServiceScope(environmentId);
           yield* SubscriptionRef.update(entries, (current) => {
             const next = new Map(current);
@@ -564,63 +614,125 @@ export const make = Effect.gen(function* () {
     yield* Effect.forEach(platformRegistrations, installPlatformRegistration, { discard: true });
   });
 
-  const remove = Effect.fn("EnvironmentRegistry.remove")(function* (environmentId: EnvironmentId) {
-    return yield* withLeaseLock(
-      environmentId,
-      Effect.gen(function* () {
-        if ((yield* Ref.get(platformEnvironmentIds)).has(environmentId)) {
-          return yield* new PlatformEnvironmentRemovalError({
-            environmentId,
-          });
-        }
-        const target = (yield* getEntry(environmentId)).target;
-        const profile =
-          target._tag === "BearerConnectionTarget" || target._tag === "SshConnectionTarget"
-            ? yield* profiles.get(target.connectionId)
-            : Option.none();
-
-        yield* registrations.remove(target);
-        yield* Ref.update(persistedTargetsByEnvironment, (current) => {
-          const next = new Map(current);
-          next.delete(environmentId);
-          return next;
-        });
-        yield* closeServiceScope(environmentId);
-        yield* SubscriptionRef.update(entries, (current) => {
-          const next = new Map(current);
-          next.delete(environmentId);
-          return next;
-        });
-        yield* Effect.all(
-          [
-            cache.clear(environmentId).pipe(
-              Effect.catch((error) =>
-                Effect.logWarning("Could not clear cached environment data after removal.", {
-                  environmentId,
-                  error,
-                }),
-              ),
-            ),
-            ownedDataCleanup.clear(environmentId),
-          ],
-          { concurrency: "unbounded", discard: true },
-        );
-
-        if (
-          target._tag === "SshConnectionTarget" &&
-          Option.isSome(profile) &&
-          isSshConnectionProfile(profile.value)
-        ) {
-          yield* ssh.disconnect(profile.value.target).pipe(
-            Effect.tapError((error) =>
-              Effect.logWarning("Could not disconnect the managed SSH environment.", {
-                environmentId,
+  const cleanupRemovedEntryLocked = Effect.fn("EnvironmentRegistry.cleanupRemovedEntryLocked")(
+    function* (entry: ConnectionCatalogEntry, profile: Option.Option<ConnectionProfile>) {
+      const target = entry.target;
+      yield* Ref.update(persistedTargetsByEnvironment, (current) => {
+        const next = new Map(current);
+        next.delete(target.environmentId);
+        return next;
+      });
+      yield* Ref.update(desiredStates, (current) => {
+        const next = new Map(current);
+        next.delete(target.environmentId);
+        return next;
+      });
+      yield* closeServiceScope(target.environmentId);
+      yield* SubscriptionRef.update(entries, (current) => {
+        const next = new Map(current);
+        next.delete(target.environmentId);
+        return next;
+      });
+      yield* Effect.all(
+        [
+          cache.clear(target.environmentId).pipe(
+            Effect.catch((error) =>
+              Effect.logWarning("Could not clear cached environment data after removal.", {
+                environmentId: target.environmentId,
                 error,
               }),
             ),
-            Effect.ignore,
-          );
+          ),
+          ownedDataCleanup.clear(target.environmentId),
+        ],
+        { concurrency: "unbounded", discard: true },
+      );
+
+      if (
+        target._tag === "SshConnectionTarget" &&
+        Option.isSome(profile) &&
+        isSshConnectionProfile(profile.value)
+      ) {
+        yield* ssh.disconnect(profile.value.target).pipe(
+          Effect.tapError((error) =>
+            Effect.logWarning("Could not disconnect the managed SSH environment.", {
+              environmentId: target.environmentId,
+              error,
+            }),
+          ),
+          Effect.ignore,
+        );
+      }
+    },
+  );
+
+  const removeLocked = Effect.fn("EnvironmentRegistry.removeLocked")(function* (
+    environmentId: EnvironmentId,
+  ) {
+    if ((yield* Ref.get(platformEnvironmentIds)).has(environmentId)) {
+      return yield* new PlatformEnvironmentRemovalError({
+        environmentId,
+      });
+    }
+    const entry = yield* getEntry(environmentId);
+    const profile =
+      entry.target._tag === "BearerConnectionTarget" || entry.target._tag === "SshConnectionTarget"
+        ? yield* profiles.get(entry.target.connectionId)
+        : entry.profile;
+    yield* registrations.remove(entry.target);
+    yield* cleanupRemovedEntryLocked(entry, profile);
+  });
+
+  const remove = Effect.fn("EnvironmentRegistry.remove")(function* (environmentId: EnvironmentId) {
+    return yield* withLeaseLock(environmentId, removeLocked(environmentId));
+  });
+
+  const rollbackRegistration = Effect.fn("EnvironmentRegistry.rollbackRegistration")(function* (
+    registration: ConnectionRegistration,
+  ) {
+    const environmentId = registration.target.environmentId;
+    return yield* withLeaseLock(
+      environmentId,
+      Effect.gen(function* () {
+        const removal = yield* registrations.removeIfMatching(registration);
+        if (!removal.removed) {
+          if ((yield* Ref.get(platformEnvironmentIds)).has(environmentId)) {
+            yield* Ref.update(persistedTargetsByEnvironment, (current) => {
+              const next = new Map(current);
+              if (removal.current === null) next.delete(environmentId);
+              else next.set(environmentId, removal.current.target);
+              return next;
+            });
+            return false;
+          }
+          if (removal.current !== null) {
+            const currentEntry = removal.current;
+            yield* Ref.update(persistedTargetsByEnvironment, (current) => {
+              const next = new Map(current);
+              next.set(environmentId, currentEntry.target);
+              return next;
+            });
+            yield* installEntryLocked(currentEntry);
+            return false;
+          }
+          const entry = (yield* SubscriptionRef.get(entries)).get(environmentId);
+          if (entry !== undefined) {
+            yield* cleanupRemovedEntryLocked(entry, entry.profile);
+          }
+          return false;
         }
+        if ((yield* Ref.get(platformEnvironmentIds)).has(environmentId)) {
+          yield* Ref.update(persistedTargetsByEnvironment, (current) => {
+            const next = new Map(current);
+            next.delete(environmentId);
+            return next;
+          });
+          return true;
+        }
+        const entry = yield* getEntry(environmentId);
+        if (!Equal.equals(entry, connectionRegistrationCatalogEntry(registration))) return true;
+        yield* cleanupRemovedEntryLocked(entry, entry.profile);
+        return true;
       }),
     );
   });
@@ -646,11 +758,68 @@ export const make = Effect.gen(function* () {
   );
 
   const retryNow = (environmentId: EnvironmentId) =>
-    acquireSupervisor(environmentId).pipe(
-      Effect.flatMap((supervisor) => supervisor.retryNow),
+    withLeaseLock(
+      environmentId,
+      Effect.gen(function* () {
+        // A retry request is connection intent: record it so the kick is not
+        // a silent no-op for an environment the user had disconnected, and so
+        // later catalog drift cannot resurrect a stale desired=false.
+        yield* getEntry(environmentId);
+        yield* Ref.update(desiredStates, (current) => {
+          const next = new Map(current);
+          next.set(environmentId, true);
+          return next;
+        });
+        const acquired = yield* acquireSupervisorLocked(environmentId);
+        if (!acquired.created) {
+          yield* acquired.supervisor.connect;
+        }
+        yield* acquired.supervisor.retryNow;
+      }),
+    ).pipe(
       Effect.catchTag("EnvironmentNotRegisteredError", () => Effect.void),
       Effect.withSpan("EnvironmentRegistry.retryNow"),
     );
+  const connect = (environmentId: EnvironmentId) =>
+    withLeaseLock(
+      environmentId,
+      Effect.gen(function* () {
+        yield* getEntry(environmentId);
+        yield* Ref.update(desiredStates, (current) => {
+          const next = new Map(current);
+          next.set(environmentId, true);
+          return next;
+        });
+        const acquired = yield* acquireSupervisorLocked(environmentId);
+        if (!acquired.created) {
+          yield* acquired.supervisor.connect;
+        }
+      }),
+    ).pipe(
+      Effect.catchTag("EnvironmentNotRegisteredError", () => Effect.void),
+      Effect.withSpan("EnvironmentRegistry.connect"),
+    );
+  const disconnect = (environmentId: EnvironmentId) =>
+    withLeaseLock(
+      environmentId,
+      Effect.gen(function* () {
+        const entry = (yield* SubscriptionRef.get(entries)).get(environmentId);
+        if (entry === undefined) {
+          return;
+        }
+        yield* Ref.update(desiredStates, (current) => {
+          const next = new Map(current);
+          next.set(environmentId, false);
+          return next;
+        });
+        const supervisor = (yield* SubscriptionRef.get(serviceScopes)).get(
+          environmentId,
+        )?.supervisor;
+        if (supervisor !== undefined) {
+          yield* supervisor.disconnect;
+        }
+      }),
+    ).pipe(Effect.withSpan("EnvironmentRegistry.disconnect"));
   const acceptStorageIdentity = Effect.fn("EnvironmentRegistry.acceptStorageIdentity")(function* (
     environmentId: EnvironmentId,
   ) {
@@ -737,11 +906,14 @@ export const make = Effect.gen(function* () {
     networkStatus,
     start,
     register,
+    rollbackRegistration,
     registerPlatform,
     reconcilePlatform,
     remove,
     removeRelayEnvironments,
     retryNow,
+    connect,
+    disconnect,
     acceptStorageIdentity,
     state,
     stateChanges,

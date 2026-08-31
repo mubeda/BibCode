@@ -59,6 +59,10 @@ vi.mock("./Sidebar", () => ({
   default: () => <nav data-thread-sidebar />,
 }));
 
+vi.mock("./sidebar/EnvironmentRail", () => ({
+  EnvironmentRail: () => <nav data-environment-rail />,
+}));
+
 vi.mock("./ui/sidebar", () => {
   const Container = ({ children, ...props }: ComponentPropsWithoutRef<"div">) => (
     <div {...props}>{children}</div>

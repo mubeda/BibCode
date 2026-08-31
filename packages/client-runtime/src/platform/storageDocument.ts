@@ -1,14 +1,20 @@
 import * as Effect from "effect/Effect";
+import * as Equal from "effect/Equal";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import {
+  type ConnectionCatalogEntry,
   type ConnectionRegistration,
   ConnectionCredential,
   ConnectionProfile,
 } from "../connection/catalog.ts";
 import { type ConnectionTarget, PersistedConnectionTarget } from "../connection/model.ts";
 import * as TokenStore from "../authorization/tokenStore.ts";
-import { AcceptedStorageIdentitySchema } from "./persistence.ts";
+import {
+  AcceptedStorageIdentitySchema,
+  type ConnectionRegistrationRemovalResult,
+} from "./persistence.ts";
 
 export const StoredConnectionCredential = Schema.Struct({
   connectionId: Schema.String,
@@ -145,4 +151,67 @@ export function removeConnectionFromCatalog(
   target: ConnectionTarget,
 ): ConnectionCatalogDocument {
   return removeConnectionMetadata(document, target, true);
+}
+
+export interface ConditionalConnectionRegistrationRemoval extends ConnectionRegistrationRemovalResult {
+  readonly document: ConnectionCatalogDocument;
+}
+
+function connectionCatalogEntryFromDocument(
+  document: ConnectionCatalogDocument,
+  target: ConnectionCatalogDocument["targets"][number],
+): ConnectionCatalogEntry {
+  const profile =
+    target._tag === "BearerConnectionTarget" || target._tag === "SshConnectionTarget"
+      ? Option.fromUndefinedOr(
+          document.profiles.find((candidate) => candidate.connectionId === target.connectionId),
+        )
+      : Option.none();
+  return { target, profile };
+}
+
+export function removeConnectionRegistrationFromCatalog(
+  document: ConnectionCatalogDocument,
+  registration: ConnectionRegistration,
+): ConditionalConnectionRegistrationRemoval {
+  const target = document.targets.find(
+    (candidate) => candidate.environmentId === registration.target.environmentId,
+  );
+  if (target === undefined) {
+    return { document, removed: false, current: null };
+  }
+  const current = connectionCatalogEntryFromDocument(document, target);
+  if (!Equal.equals(target, registration.target)) {
+    return { document, removed: false, current };
+  }
+
+  if (registration._tag === "BearerConnectionRegistration") {
+    const profile = document.profiles.find(
+      (candidate) => candidate.connectionId === registration.target.connectionId,
+    );
+    const credential = document.credentials.find(
+      (candidate) => candidate.connectionId === registration.target.connectionId,
+    );
+    if (
+      profile === undefined ||
+      !Equal.equals(profile, registration.profile) ||
+      credential === undefined ||
+      !Equal.equals(credential.credential, registration.credential)
+    ) {
+      return { document, removed: false, current };
+    }
+  } else if (registration._tag === "SshConnectionRegistration") {
+    const profile = document.profiles.find(
+      (candidate) => candidate.connectionId === registration.target.connectionId,
+    );
+    if (profile === undefined || !Equal.equals(profile, registration.profile)) {
+      return { document, removed: false, current };
+    }
+  }
+
+  return {
+    document: removeConnectionMetadata(document, registration.target, false),
+    removed: true,
+    current: null,
+  };
 }

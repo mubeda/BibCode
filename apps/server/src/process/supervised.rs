@@ -127,20 +127,46 @@ where
     };
     let mut command = CommandWrap::from(command);
     configure_supervised_background_command_wrap(&mut command);
+    // One absolute budget covers spawn and execution: a stalled process
+    // creation (AV/EDR-wrapped CreateProcess) must not hold the caller — and
+    // whatever lock the caller holds — for longer than the run itself may.
+    let overall_deadline =
+        deadline.unwrap_or_else(|| tokio::time::Instant::now() + execution.timeout);
     #[cfg(windows)]
-    let mut child = tokio::task::spawn_blocking(move || spawn_wrapped(&mut command))
-        .await
-        .map_err(|error| {
-            SupervisedRunError::Spawn(io::Error::other(format!(
-                "supervised process spawn task failed: {error}"
-            )))
-        })?
-        .map_err(SupervisedRunError::Spawn)?;
+    let mut child = {
+        let spawn = tokio::task::spawn_blocking(move || spawn_wrapped(&mut command));
+        match tokio::time::timeout_at(overall_deadline, spawn).await {
+            Ok(joined) => joined
+                .map_err(|error| {
+                    SupervisedRunError::Spawn(io::Error::other(format!(
+                        "supervised process spawn task failed: {error}"
+                    )))
+                })?
+                .map_err(SupervisedRunError::Spawn)?,
+            Err(_) => {
+                // The blocking spawn cannot be interrupted; reap whatever it
+                // eventually produces so a late child never runs unsupervised.
+                tokio::spawn(async move {
+                    if let Ok(Ok(child)) = spawn.await {
+                        terminate_and_wait_owned(child, cleanup_timeout, "late supervised spawn")
+                            .await;
+                    }
+                });
+                return Err(SupervisedRunError::Timeout);
+            }
+        }
+    };
     #[cfg(not(windows))]
     let mut child = spawn_wrapped(&mut command).map_err(SupervisedRunError::Spawn)?;
     observer(child.id());
 
-    let outcome = execute_child(&mut *child, &execution, cancellation, deadline).await;
+    let outcome = execute_child(
+        &mut *child,
+        &execution,
+        cancellation,
+        Some(overall_deadline),
+    )
+    .await;
     if outcome.is_err() {
         terminate_and_wait_owned(child, cleanup_timeout, "supervised process").await;
     }

@@ -263,6 +263,43 @@ contract decoding maps the omitted field from an older or third-party remote
 server to `null`. Normal environment descriptors never include the requested
 or effective data root, alias diagnostics, or any other local filesystem path.
 
+Every current-server descriptor surface also publishes the remote protocol
+compatibility window: `remoteProtocolVersion` and
+`minCompatibleRemoteProtocol` (both `1` today). The numbers are defined once
+per language — TypeScript in `packages/contracts/src/environment.ts`
+(`REMOTE_PROTOCOL_VERSION`, `MIN_COMPATIBLE_REMOTE_PROTOCOL`) and Rust in
+`apps/server/src/http.rs` — and serialized by the well-known descriptor
+route, `server.getConfig`, the initial `subscribeServerConfig` snapshot,
+lifecycle welcome and ready events, and BiBCode Connect descriptors. Contract
+decoding maps both fields to `0` for an older or third-party server, which
+clients classify as legacy limited compatibility. The window supplements —
+never replaces — the default-false capability booleans that continue to gate
+optional behavior.
+
+Direct remote connections use the server-owned pairing/auth authority and the
+client-runtime-owned transport policy described in
+[Remote architecture](./remote.md). Noise E2EE bounds unauthenticated work by
+global, exact-peer, IPv4 `/24` or IPv6 `/64`, and loopback-forwarder admission.
+Authenticated assembly uses cancellable fit-first byte pressure, a 10-second
+incomplete-message progress deadline, and releases permits after dispatch rather
+than handler completion. Outbound fit-first admission keeps a five-second
+reservation deadline, gives each record a fresh five-second sink deadline, and
+adds a size-derived aggregate deadline. Desktop exposure remains a privileged
+`DesktopBridge` operation: native starts are local-only, WSL exposure is
+externally managed, and only authoritative live grants or an explicit
+legacy-resume action can request a wide native bind. Pairing credentials remain
+pending until the verified client persists local state and confirms the session.
+Desktop discovery advertises only usable IPv4 addresses until a dual-stack
+listener exists; public candidates are labeled, never defaulted, and require an
+explicit warning acknowledgement. Plain `/ws` caps individual frames at 16 MiB
+while retaining the 64 MiB reassembled-message cap.
+Hosted pairing rejects URL userinfo and renders and submits one normalized host;
+legacy query credentials are scrubbed after capture. Saved blank host keys
+normalize to the legacy plain-transport representation. The environment registry
+owns explicit desired connection intent outside disposable supervisor scopes, so
+passive state reads and catalog-driven scope replacement cannot reconnect an
+explicitly disconnected environment.
+
 First-run creation initializes a randomized same-directory staged SQLite file,
 closes it without retained journal sidecars, and publishes it at `state.sqlite`
 with an atomic no-replace hard link. Platform file identity checks bind cleanup
@@ -430,6 +467,32 @@ the resolver rejects connection attempts before creating a transport or
 session. Explicit disable or distro replacement is what removes that desired
 identity and clears its environment cache.
 
+## Grant-driven desktop exposure
+
+Native wildcard binds now occur exclusively through the **Share this host**
+offer ceremony. The renderer widens through the verified
+`desktop_bridge_apply_server_exposure` operation only when minting an off-host
+**Another device** grant for a native primary. A bidirectional app-level
+reconciler derives the requested topology from live server grants: it widens a
+local-only native runtime when an off-host `another-device` reason exists and
+restores loopback after the final native-managed reason is revoked. Custom
+addresses remain externally managed and never authorize native listener or
+firewall mutation. WSL-only primaries use their WSL-owned advertised endpoint
+and never enter this native exposure state machine. The previous manual
+network-access toggle is gone; server grant metadata is the policy source of
+truth. Every fresh native desktop process starts local-only, so the durable
+desktop setting records the last completed transition but is not startup
+permission to listen wide.
+
+The native exposure coordinator also serializes WSL/native topology changes.
+Entering WSL-only first converges native settings, backend, and firewall to
+local-only; leaving it starts native local-only. Local recovery attempts every
+safeguard even after an earlier failure. The Windows firewall worker owns late
+commands after its five-second caller deadline and removes a late-enabled rule
+before processing a later enable. In the renderer, unmount may cancel work only
+before the first privileged apply; once narrowing commits, its authoritative
+refetch and one required compensating widen run to completion.
+
 ## Desktop update protection
 
 The Tauri host coordinates update installation across the complete local
@@ -492,6 +555,39 @@ restart the exact prior running set before update coordination is released.
 Stopping the primary in-process backend never sweeps descendants of the shared
 desktop PID; doing so would terminate the system WebView before the installer
 can take ownership of application restart.
+
+### Remote server updates
+
+Every server answers the `updater.status`, `updater.check`, and
+`updater.install` RPC methods (contract:
+`packages/contracts/src/remoteUpdate.ts`; Rust mirror:
+`apps/server/src/remote_update.rs`). All three environment-descriptor
+producers—the well-known route (`apps/server/src/http.rs`),
+`server.getConfig` (`apps/server/src/production/control.rs`), and the
+Connect/relay descriptor (`apps/server/src/lifecycle.rs`)—embed
+`remoteUpdateSupport` and advertise the surface with the default-false
+`remoteUpdateControl` capability. Clients therefore know the install mode
+before asking.
+
+- Desktop-hosted in-process servers run in `interactive` mode.
+  `updater.install` routes through the host's `DesktopUpdateManager` via the
+  `RemoteUpdateDelegate` seam
+  (`apps/desktop/src-tauri/src/remote_update_delegate.rs`), so remote install
+  uses the same update-protection drain as local install and cannot skip backup
+  protection.
+- Headless `bibcode serve` and WSL/external desktop backends run in `manual`
+  mode. `updater.check` refreshes the server's own version,
+  `latestVersion` remains `null` because the server has no update feed, and
+  `updater.install` fails with `remote_update_manual_required`. Clients render
+  copyable operator instructions instead of an install action.
+
+`updater.status` requires `orchestration:read`; `updater.check` and
+`updater.install` require `orchestration:operate`
+(`apps/server/src/auth/scope.rs`).
+Desktop delegate calls and each client-side per-environment update check are
+independently bounded to 30 seconds. The client deadline includes supervisor
+acquisition, readiness, and RPC execution; timeout interrupts the whole lazy
+operation and releases one of the two update-check workers.
 
 The WebView engine is the operating system's, so it differs per platform:
 WKWebView on macOS, WebKitGTK on Linux, and WebView2 on Windows. Browser API
@@ -561,6 +657,13 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
   sources and leaves catalog operations fail-closed. Unprotected legacy
   migration preserves an existing valid IndexedDB winner and uses exact CAS
   before replacing corrupt IndexedDB bytes with the only valid legacy catalog.
+  A connection-database `VersionError` is handled before the connection runtime
+  starts: the shell offers a non-destructive reload plus a separately
+  acknowledged destructive reset that a double-click cannot confirm. A blocked
+  deletion remains visibly queued on its original request until success or
+  error; the shell reloads automatically only after actual deletion success.
+  Otherwise unavailable databases remain non-destructive and show actionable
+  health instead of looping at boot.
   Outside that migration, a corrupt authoritative catalog is never rewritten
   as empty: it is quarantined when supported, publishes redacted
   recovery-required health, blocks mutation, and requires an explicit

@@ -59,6 +59,7 @@ const h = vi.hoisted(() => {
     threads: [],
     environments: [],
     primaryEnvironmentId: null,
+    activeEnvironmentId: null,
     serverConfigs: new Map(),
     clientSettings: null,
     atomValues: {},
@@ -340,6 +341,10 @@ vi.mock("../connection/currentEnvironmentPresentation", () => ({
 vi.mock("../state/entities", () => ({
   useProjects: () => h.state.projects,
   useThreadShells: () => h.state.threads,
+  useActiveEnvironmentId: () => h.state.activeEnvironmentId,
+  setActiveEnvironmentId: (environmentId: unknown) => {
+    h.state.activeEnvironmentId = environmentId;
+  },
   useThreadShellsForProjectRefs: (
     refs: ReadonlyArray<{ environmentId: string; projectId: string }>,
   ) =>
@@ -641,6 +646,9 @@ vi.mock("./CreateWorktreeDialog", () => ({
 }));
 vi.mock("./settings/SettingsSidebarNav", () => ({
   SettingsSidebarNav: h.mk("SettingsSidebarNav"),
+}));
+vi.mock("./sidebar/EnvironmentContextCard", () => ({
+  EnvironmentContextCard: h.mk("EnvironmentContextCard"),
 }));
 vi.mock("./sidebar/SidebarUpdatePill", () => ({
   SidebarUpdatePill: h.mk("SidebarUpdatePill", "span"),
@@ -1039,6 +1047,7 @@ beforeEach(() => {
   h.state.threads = [];
   h.state.environments = [];
   h.state.primaryEnvironmentId = ENV_MAIN;
+  h.state.activeEnvironmentId = null;
   h.state.serverConfigs = new Map();
   h.state.clientSettings = { ...DEFAULT_CLIENT_SETTINGS };
   h.state.atomValues = {
@@ -1513,7 +1522,7 @@ staticDescribe("Sidebar full render", () => {
       { label: "environment.retry", input: ENV_MAIN },
       { label: "environment.adoptStorage", input: ENV_MAIN },
     ]);
-    expect(h.spies.navigate).toHaveBeenCalledWith({ to: "/settings/connections" });
+    expect(h.spies.navigate).toHaveBeenCalledWith({ to: "/settings/remote-servers" });
     expect(h.spies.navigate).toHaveBeenCalledWith({ to: "/settings/diagnostics" });
     expect(h.spies.openProjectDataRecovery).toHaveBeenCalledWith(ENV_MAIN, "manual");
     expect(h.spies.dialogConfirm).toHaveBeenCalledWith(
@@ -1916,6 +1925,98 @@ staticDescribe("Sidebar full render", () => {
     invoke(footerButton!.props, "onClick", mouseEvent());
     expect(h.spies.setOpenMobile).toHaveBeenCalledWith(false);
     expect(h.spies.navigate).toHaveBeenCalledWith({ to: "/settings" });
+  });
+});
+
+staticDescribe("Sidebar environment scoping", () => {
+  function seedTwoEnvironments() {
+    h.state.environments = [
+      environmentFixture({ environmentId: ENV_MAIN, label: "Local", primary: true }),
+      environmentFixture({
+        environmentId: ENV_REMOTE,
+        label: "AI-SERVER",
+        connectionId: "paired-1",
+      }),
+    ];
+    h.state.primaryEnvironmentId = ENV_MAIN;
+    h.state.projects = [
+      makeProject("project-a"),
+      makeProject("project-b", {
+        environmentId: ENV_REMOTE,
+        title: "Remote Repo",
+        workspaceRoot: "/srv/remote-repo",
+      }),
+    ];
+    h.state.threads = [
+      makeThread("thread-local"),
+      makeThread("thread-remote", {
+        environmentId: ENV_REMOTE,
+        projectId: ProjectId.make("project-b"),
+      }),
+    ];
+  }
+
+  it("filters a null selection to local environments", () => {
+    seedTwoEnvironments();
+    h.state.activeEnvironmentId = null;
+    const markup = render(<Sidebar />);
+    expect(markup).toContain("Repo A");
+    expect(markup).not.toContain("Remote Repo");
+  });
+
+  it("filters projects and threads to the selected remote without lifecycle commands", () => {
+    seedTwoEnvironments();
+    h.state.activeEnvironmentId = ENV_REMOTE;
+    h.state.commandCalls = [];
+    const markup = render(<Sidebar />);
+    expect(markup).toContain("Remote Repo");
+    expect(markup).not.toContain("Repo A");
+    expect(
+      h.state.commandCalls.filter((call: { label?: string }) =>
+        String(call.label ?? "").startsWith("environment."),
+      ),
+    ).toEqual([]);
+  });
+
+  it("keeps local environments merged when a local environment is selected", () => {
+    seedTwoEnvironments();
+    h.state.environments.push(
+      environmentFixture({
+        environmentId: ENV_WSL,
+        label: "Ubuntu",
+        connectionId: "local:wsl-ubuntu",
+      }),
+    );
+    h.state.projects.push(
+      makeProject("project-wsl", {
+        environmentId: ENV_WSL,
+        title: "WSL Repo",
+        workspaceRoot: "/home/user/wsl-repo",
+      }),
+    );
+    h.state.activeEnvironmentId = ENV_MAIN;
+    const markup = render(<Sidebar />);
+    expect(markup).toContain("Repo A");
+    expect(markup).toContain("WSL Repo");
+    expect(markup).not.toContain("Remote Repo");
+  });
+
+  it("mounts the environment context card under the brand row", () => {
+    seedTwoEnvironments();
+    h.state.activeEnvironmentId = ENV_REMOTE;
+    render(<Sidebar />);
+    expect(captured("EnvironmentContextCard")).toHaveLength(1);
+  });
+
+  it('labels the add-project trigger "Add project on <name>" only for a remote selection', () => {
+    seedTwoEnvironments();
+    h.state.activeEnvironmentId = ENV_REMOTE;
+    const remoteMarkup = render(<Sidebar />);
+    expect(remoteMarkup).toContain("Add project on AI-SERVER");
+
+    h.state.activeEnvironmentId = ENV_MAIN;
+    const localMarkup = render(<Sidebar />);
+    expect(localMarkup).not.toContain("Add project on");
   });
 });
 
@@ -2464,7 +2565,13 @@ staticDescribe("worktree discovery integration", () => {
   it("keeps retained verification-unavailable rows usable for workspace actions", async () => {
     baseScenario();
     h.state.serverConfigs = new Map([
-      [ENV_MAIN, { environment: { capabilities: { worktreeCatalog: true } } }],
+      [
+        ENV_MAIN,
+        {
+          availableEditors: ["vscode"],
+          environment: { capabilities: { worktreeCatalog: true } },
+        },
+      ],
     ]);
     h.state.worktreeCatalogs.set(`${ENV_MAIN}:${projectA.id}`, {
       repositoryKey: WorktreeRepositoryKey.make("repository:repo-a"),
@@ -2748,6 +2855,10 @@ staticDescribe("thread rows in the full sidebar", () => {
 staticDescribe("thread context menu", () => {
   function setupMenu(clickedId: string | null) {
     baseScenario();
+    h.state.serverConfigs.set(ENV_MAIN, {
+      availableEditors: ["vscode"],
+      environment: { capabilities: { worktreeCatalog: true } },
+    });
     render(<Sidebar />);
     fakeLocalApi();
     if (clickedId !== null) {
@@ -2798,6 +2909,10 @@ staticDescribe("thread context menu", () => {
 
   it("opens a local worktree path in File Explorer", async () => {
     baseScenario();
+    h.state.serverConfigs.set(ENV_MAIN, {
+      availableEditors: ["vscode"],
+      environment: { capabilities: { worktreeCatalog: true } },
+    });
     const openInFileManager = vi.fn(async () => {});
     (globalThis.window as unknown as Record<string, unknown>)["desktopBridge"] = {
       openInFileManager,
@@ -2851,6 +2966,10 @@ staticDescribe("thread context menu", () => {
 
   it("omits File Explorer for a remote row", async () => {
     const { remoteThread } = groupedScenario();
+    h.state.serverConfigs.set(ENV_REMOTE, {
+      availableEditors: ["vscode"],
+      environment: { capabilities: {} },
+    });
     const openInFileManager = vi.fn(async () => {});
     (globalThis.window as unknown as Record<string, unknown>)["desktopBridge"] = {
       openInFileManager,
@@ -2874,8 +2993,39 @@ staticDescribe("thread context menu", () => {
     expect(openInFileManager).not.toHaveBeenCalled();
   });
 
+  it("builds Open in from the row's own environment editors", async () => {
+    const { remoteThread } = groupedScenario();
+    h.state.serverConfigs = new Map([
+      [ENV_MAIN, { environment: { capabilities: {} }, availableEditors: ["vscode"] }],
+      [ENV_REMOTE, { environment: { capabilities: {} }, availableEditors: ["cursor"] }],
+    ]);
+    render(<Sidebar />);
+    fakeLocalApi();
+    let menuItems: Array<{ id: string; children?: Array<{ id: string }> }> = [];
+    h.spies.contextMenuShow.mockImplementation(
+      async (items: Array<{ id: string; children?: Array<{ id: string }> }>) => {
+        menuItems = items;
+        return null;
+      },
+    );
+    const row = mustFindProps(byTestId(`thread-row-${remoteThread.id}`), "remote row");
+
+    invoke(row, "onContextMenu", mouseEvent());
+    await flush();
+
+    const childIds = menuItems
+      .find((item) => item.id === "open-in")
+      ?.children?.map((item) => item.id);
+    expect(childIds).toContain("open-in:cursor");
+    expect(childIds).not.toContain("open-in:vscode");
+  });
+
   it("omits File Explorer when the desktop bridge capability is unavailable", async () => {
     baseScenario();
+    h.state.serverConfigs.set(ENV_MAIN, {
+      availableEditors: ["vscode"],
+      environment: { capabilities: { worktreeCatalog: true } },
+    });
     render(<Sidebar />);
     fakeLocalApi();
     let menuItems: Array<{ id: string; children?: Array<{ id: string }> }> = [];
@@ -3242,6 +3392,10 @@ staticDescribe("primary row", () => {
 
   it("shows the primary-row context menu and handles update / copy / pin actions", async () => {
     baseScenario();
+    h.state.serverConfigs.set(ENV_MAIN, {
+      availableEditors: ["vscode"],
+      environment: { capabilities: { worktreeCatalog: true } },
+    });
     render(<Sidebar />);
     fakeLocalApi();
     const primaryRow = captured("SidebarMenuSubButton").find(
@@ -3285,10 +3439,10 @@ staticDescribe("primary row", () => {
 
   it("opens the local primary checkout in File Explorer even when no editor is available", async () => {
     baseScenario();
-    h.state.atomValues.primaryServerConfig = {
+    h.state.serverConfigs.set(ENV_MAIN, {
       availableEditors: [],
-      environment: { serverVersion: "0.1.0" },
-    };
+      environment: { capabilities: {}, serverVersion: "0.1.0" },
+    });
     const openInFileManager = vi.fn(async () => {});
     (globalThis.window as unknown as Record<string, unknown>)["desktopBridge"] = {
       openInFileManager,
@@ -3338,6 +3492,10 @@ staticDescribe("primary row", () => {
 
   it("suppresses interrupted primary-row actions and reports opaque failures", async () => {
     baseScenario();
+    h.state.serverConfigs.set(ENV_MAIN, {
+      availableEditors: ["vscode"],
+      environment: { capabilities: { worktreeCatalog: true } },
+    });
     render(<Sidebar />);
     fakeLocalApi();
     const primaryRow = captured("SidebarMenuSubButton").find(

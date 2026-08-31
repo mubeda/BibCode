@@ -6,6 +6,7 @@ import {
   WS_METHODS,
 } from "@bibcode/contracts";
 import { describe, expect, it } from "@effect/vitest";
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -13,7 +14,10 @@ import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 import * as Socket from "effect/unstable/socket/Socket";
 
+import { splitIntoRecords } from "../e2ee/frame.ts";
+import { createNkResponder, derivePublicKey } from "../e2ee/noise.ts";
 import {
+  ConnectionBlockedError,
   ConnectionTransientError,
   PrimaryConnectionTarget,
   type PreparedConnection,
@@ -36,7 +40,8 @@ class TestWebSocket {
   static readonly CLOSED = 3;
 
   readyState = TestWebSocket.CONNECTING;
-  readonly sent: string[] = [];
+  binaryType: BinaryType = "blob";
+  readonly sent: Array<string | Uint8Array> = [];
   readonly url: string;
   private readonly listeners = new Map<SocketEventType, Set<SocketListener>>();
 
@@ -54,7 +59,7 @@ class TestWebSocket {
     this.listeners.get(type)?.delete(listener);
   }
 
-  send(data: string) {
+  send(data: string | Uint8Array) {
     this.sent.push(data);
   }
 
@@ -71,7 +76,7 @@ class TestWebSocket {
     this.emit("open", { type: "open" });
   }
 
-  serverMessage(data: string) {
+  serverMessage(data: string | Uint8Array) {
     this.emit("message", { data, type: "message" });
   }
 
@@ -98,17 +103,22 @@ const PREPARED: PreparedConnection = {
     platform: { os: "linux", arch: "x64" },
     serverVersion: "0.0.0-test",
     storageInstanceId: "store-test",
+    remoteUpdateSupport: null,
+    remoteProtocolVersion: 1,
+    minCompatibleRemoteProtocol: 1,
     capabilities: {
       repositoryIdentity: true,
       worktreeCatalog: false,
       worktreeCatalogRefreshReason: false,
       vcsStatusSummary: false,
       activityProtocolVersion: null,
+      remoteUpdateControl: false,
     },
   },
   httpBaseUrl: TARGET.httpBaseUrl,
   socketUrl: "wss://environment.example.test/ws?wsTicket=test",
   httpAuthorization: null,
+  e2ee: null,
   target: TARGET,
 };
 
@@ -122,12 +132,16 @@ const SERVER_CONFIG: ServerConfigType = {
     },
     serverVersion: "0.0.0-test",
     storageInstanceId: null,
+    remoteUpdateSupport: null,
+    remoteProtocolVersion: 1,
+    minCompatibleRemoteProtocol: 1,
     capabilities: {
       repositoryIdentity: true,
       worktreeCatalog: false,
       worktreeCatalogRefreshReason: false,
       vcsStatusSummary: false,
       activityProtocolVersion: null,
+      remoteUpdateControl: false,
     },
   },
   auth: {
@@ -188,15 +202,31 @@ const awaitSocket = Effect.fn("TestRpcSessionFactory.awaitSocket")(function* (
 
 const awaitRequest = Effect.fn("TestRpcSessionFactory.awaitRequest")(function* (
   socket: TestWebSocket,
+  index = 0,
 ) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
-    const request = socket.sent[0];
+    const request = socket.sent[index];
     if (request) {
+      if (typeof request !== "string") {
+        return yield* Effect.die(new Error("Expected a plaintext RPC request."));
+      }
       return decodeRpcRequest(decodeJson(request));
     }
     yield* Effect.yieldNow;
   }
   return yield* Effect.die(new Error("Expected the RPC protocol to send a request."));
+});
+
+const awaitBinaryFrame = Effect.fn("TestRpcSessionFactory.awaitBinaryFrame")(function* (
+  socket: TestWebSocket,
+  index: number,
+) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const frame = socket.sent[index];
+    if (frame instanceof Uint8Array) return frame;
+    yield* Effect.yieldNow;
+  }
+  return yield* Effect.die(new Error(`Expected binary websocket frame ${String(index)}.`));
 });
 
 const completeInitialConfig = Effect.fn("TestRpcSessionFactory.completeInitialConfig")(function* (
@@ -235,7 +265,10 @@ describe("RpcSessionFactory", () => {
 
       const config = yield* session.initialConfig;
       expect(config).toEqual(SERVER_CONFIG);
+      const e2eeAuthenticated = yield* session.e2eeAuthenticated;
+      expect(e2eeAuthenticated).toBeNull();
       expect(socket.sent).toHaveLength(1);
+      expect(typeof socket.sent[0]).toBe("string");
 
       socket.close(1012, "service restart");
       const error = yield* Effect.flip(session.closed);
@@ -248,6 +281,176 @@ describe("RpcSessionFactory", () => {
       yield* Effect.yieldNow;
       expect(sockets).toHaveLength(1);
     }),
+  );
+
+  it.effect("preserves an unknown-request server defect as an exact die reason", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { factory, sockets } = yield* makeFactory();
+        const session = yield* factory.connect(PREPARED);
+        const readyFiber = yield* Effect.forkChild(session.ready);
+        const socket = yield* awaitSocket(sockets);
+        socket.open();
+        yield* completeInitialConfig(socket);
+        yield* Fiber.join(readyFiber);
+
+        const confirmation = yield* Effect.forkChild(
+          session.client[WS_METHODS.authConfirmPairing]({}).pipe(Effect.exit),
+        );
+        const request = yield* awaitRequest(socket, 1);
+        expect(request).toMatchObject({
+          _tag: "Request",
+          tag: WS_METHODS.authConfirmPairing,
+          payload: {},
+        });
+        socket.serverMessage(
+          encodeJson({
+            _tag: "Defect",
+            defect: `Unknown request tag: ${WS_METHODS.authConfirmPairing}`,
+          }),
+        );
+
+        const exit = yield* Fiber.join(confirmation);
+        expect(exit._tag).toBe("Failure");
+        if (exit._tag !== "Failure") return;
+        const { cause } = exit;
+        expect(cause.reasons).toHaveLength(1);
+        const reason = cause.reasons[0]!;
+        expect(Cause.isDieReason(reason)).toBe(true);
+        if (Cause.isDieReason(reason)) {
+          expect(reason.defect).toBe(`Unknown request tag: ${WS_METHODS.authConfirmPairing}`);
+        }
+      }),
+    ),
+  );
+
+  it.effect("starts host-key sessions with a binary Noise NK message A", () =>
+    Effect.gen(function* () {
+      const { factory, sockets } = yield* makeFactory();
+      const hostKey = Buffer.from(
+        derivePublicKey(crypto.getRandomValues(new Uint8Array(32))),
+      ).toString("base64url");
+
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const session = yield* factory.connect({
+            ...PREPARED,
+            socketUrl: "wss://environment.example.test/ws-e2ee",
+            e2ee: {
+              hostKey,
+              auth: { kind: "bearer", credential: "stored-secret" },
+            },
+          });
+          const readyFiber = yield* Effect.forkChild(session.ready);
+          const socket = yield* awaitSocket(sockets);
+          expect(socket.url).toBe("wss://environment.example.test/ws-e2ee");
+          expect(socket.binaryType).toBe("arraybuffer");
+
+          socket.open();
+          for (let attempt = 0; attempt < 100 && socket.sent.length === 0; attempt += 1) {
+            yield* Effect.yieldNow;
+          }
+          expect(socket.sent[0]).toBeInstanceOf(Uint8Array);
+          expect(socket.sent[0]).toHaveLength(48);
+          yield* Fiber.interrupt(readyFiber);
+        }),
+      );
+    }),
+  );
+
+  it.effect("blocks a session when the pinned host identity is rejected", () =>
+    Effect.gen(function* () {
+      const { factory, sockets } = yield* makeFactory();
+      const hostKey = Buffer.from(
+        derivePublicKey(crypto.getRandomValues(new Uint8Array(32))),
+      ).toString("base64url");
+
+      const error = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const session = yield* factory.connect({
+            ...PREPARED,
+            socketUrl: "wss://environment.example.test/ws-e2ee",
+            e2ee: { hostKey, auth: { kind: "bearer", credential: "stored-secret" } },
+          });
+          const readyFiber = yield* Effect.forkChild(Effect.flip(session.ready));
+          const socket = yield* awaitSocket(sockets);
+          socket.open();
+          yield* awaitBinaryFrame(socket, 0);
+          socket.close(4403, "host identity mismatch");
+          return yield* Fiber.join(readyFiber);
+        }),
+      );
+
+      expect(error).toBeInstanceOf(ConnectionBlockedError);
+      expect(error).toMatchObject({ reason: "host-identity" });
+    }),
+  );
+
+  it.effect("blocks a session when in-channel bearer authentication is rejected", () =>
+    Effect.gen(function* () {
+      const { factory, sockets } = yield* makeFactory();
+      const staticPrivate = crypto.getRandomValues(new Uint8Array(32));
+      const responder = createNkResponder({ staticPrivateKey: staticPrivate });
+      const hostKey = Buffer.from(derivePublicKey(staticPrivate)).toString("base64url");
+
+      const error = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const session = yield* factory.connect({
+            ...PREPARED,
+            socketUrl: "wss://environment.example.test/ws-e2ee",
+            e2ee: { hostKey, auth: { kind: "bearer", credential: "stored-secret" } },
+          });
+          const readyFiber = yield* Effect.forkChild(Effect.flip(session.ready));
+          const socket = yield* awaitSocket(sockets);
+          socket.open();
+          responder.readMessageA(yield* awaitBinaryFrame(socket, 0));
+          socket.serverMessage(responder.writeMessageB(new Uint8Array(0)));
+          const transport = responder.split();
+          const authRecord = transport.receive.decryptWithAd(
+            new Uint8Array(0),
+            yield* awaitBinaryFrame(socket, 1),
+          );
+          expect(new TextDecoder().decode(authRecord.subarray(1))).toContain("stored-secret");
+          for (const record of splitIntoRecords(
+            new TextEncoder().encode(encodeJson({ type: "e2ee_error", code: "unauthorized" })),
+          )) {
+            socket.serverMessage(transport.send.encryptWithAd(new Uint8Array(0), record));
+          }
+          return yield* Fiber.join(readyFiber);
+        }),
+      );
+
+      expect(error).toBeInstanceOf(ConnectionBlockedError);
+      expect(error).toMatchObject({ reason: "authentication" });
+    }),
+  );
+
+  it.effect("classifies a stalled encrypted handshake as a transient timeout", () =>
+    Effect.gen(function* () {
+      const { factory, sockets } = yield* makeFactory();
+      const hostKey = Buffer.from(
+        derivePublicKey(crypto.getRandomValues(new Uint8Array(32))),
+      ).toString("base64url");
+
+      const error = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const session = yield* factory.connect({
+            ...PREPARED,
+            socketUrl: "wss://environment.example.test/ws-e2ee",
+            e2ee: { hostKey, auth: { kind: "bearer", credential: "stored-secret" } },
+          });
+          const readyFiber = yield* Effect.forkChild(Effect.flip(session.ready));
+          const socket = yield* awaitSocket(sockets);
+          socket.open();
+          yield* awaitBinaryFrame(socket, 0);
+          yield* TestClock.adjust("10 seconds");
+          return yield* Fiber.join(readyFiber);
+        }),
+      );
+
+      expect(error).toBeInstanceOf(ConnectionTransientError);
+      expect(error).toMatchObject({ reason: "timeout" });
+    }).pipe(Effect.provide(TestClock.layer())),
   );
 
   it.effect("closes the websocket when the session scope is released", () =>

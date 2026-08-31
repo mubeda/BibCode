@@ -3,7 +3,12 @@ import * as Rpc from "effect/unstable/rpc/Rpc";
 import * as RpcGroup from "effect/unstable/rpc/RpcGroup";
 
 import { ExternalLauncherError, LaunchEditorInput } from "./editor.ts";
-import { AuthAccessStreamError, AuthAccessStreamEvent, EnvironmentRpcError } from "./auth.ts";
+import {
+  AuthAccessStreamError,
+  AuthAccessStreamEvent,
+  EnvironmentAuthorizationError,
+  EnvironmentRpcError,
+} from "./auth.ts";
 import {
   ActivityCancelSubtreeInput,
   ActivityDetailPage,
@@ -85,6 +90,7 @@ import {
   TrimmedNonEmptyString,
 } from "./baseSchemas.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
+import { RemoteUpdateInstallError, RemoteUpdateSnapshot } from "./remoteUpdate.ts";
 import {
   RelayClientInstallFailedError,
   RelayClientInstallProgressEventSchema,
@@ -302,6 +308,9 @@ export const WorktreeRemoveInput = Schema.Struct({
 export type WorktreeRemoveInput = typeof WorktreeRemoveInput.Type;
 
 export const WS_METHODS = {
+  // Authentication methods
+  authConfirmPairing: "auth.confirmPairing",
+
   // Project registry methods
   projectsList: "projects.list",
   projectsAdd: "projects.add",
@@ -399,6 +408,11 @@ export const WS_METHODS = {
   serverRefreshProviderUsage: "server.refreshProviderUsage",
   serverConsumeCodexRateLimitReset: "server.consumeCodexRateLimitReset",
 
+  // Remote updater methods
+  updaterStatus: "updater.status",
+  updaterCheck: "updater.check",
+  updaterInstall: "updater.install",
+
   // Cloud environment methods
   cloudGetRelayClientStatus: "cloud.getRelayClientStatus",
   cloudInstallRelayClient: "cloud.installRelayClient",
@@ -421,6 +435,14 @@ export const WS_METHODS = {
   subscribeActivity: "subscribeActivity",
   subscribeWorktreeCatalog: "subscribeWorktreeCatalog",
 } as const;
+
+const AuthConfirmPairingEmpty = Schema.Record(Schema.String, Schema.Never);
+
+export const WsAuthConfirmPairingRpc = Rpc.make(WS_METHODS.authConfirmPairing, {
+  payload: AuthConfirmPairingEmpty,
+  success: AuthConfirmPairingEmpty,
+  error: EnvironmentAuthorizationError,
+});
 
 export const WsServerUpsertKeybindingRpc = Rpc.make(WS_METHODS.serverUpsertKeybinding, {
   payload: ServerUpsertKeybindingInput,
@@ -525,6 +547,24 @@ export const WsServerConsumeCodexRateLimitResetRpc = Rpc.make(
     error: Schema.Union([ServerProviderUsageResetError, EnvironmentRpcError]),
   },
 );
+
+export const WsUpdaterStatusRpc = Rpc.make(WS_METHODS.updaterStatus, {
+  payload: Schema.Struct({}),
+  success: RemoteUpdateSnapshot,
+  error: EnvironmentRpcError,
+});
+
+export const WsUpdaterCheckRpc = Rpc.make(WS_METHODS.updaterCheck, {
+  payload: Schema.Struct({}),
+  success: RemoteUpdateSnapshot,
+  error: EnvironmentRpcError,
+});
+
+export const WsUpdaterInstallRpc = Rpc.make(WS_METHODS.updaterInstall, {
+  payload: Schema.Struct({}),
+  success: RemoteUpdateSnapshot,
+  error: Schema.Union([RemoteUpdateInstallError, EnvironmentRpcError]),
+});
 
 export const WsCloudGetRelayClientStatusRpc = Rpc.make(WS_METHODS.cloudGetRelayClientStatus, {
   payload: Schema.Struct({}),
@@ -1255,6 +1295,7 @@ export const WsSubscribeActivityRpc = Rpc.make(WS_METHODS.subscribeActivity, {
 });
 
 export const WsRpcGroup = RpcGroup.make(
+  WsAuthConfirmPairingRpc,
   WsServerGetConfigRpc,
   WsServerRefreshProvidersRpc,
   WsServerUpdateProviderRpc,
@@ -1270,6 +1311,9 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerGetProviderUsageRpc,
   WsServerRefreshProviderUsageRpc,
   WsServerConsumeCodexRateLimitResetRpc,
+  WsUpdaterStatusRpc,
+  WsUpdaterCheckRpc,
+  WsUpdaterInstallRpc,
   WsCloudGetRelayClientStatusRpc,
   WsCloudInstallRelayClientRpc,
   WsSourceControlLookupRepositoryRpc,

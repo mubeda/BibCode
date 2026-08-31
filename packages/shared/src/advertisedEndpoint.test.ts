@@ -1,11 +1,112 @@
 import { describe, expect, it } from "vite-plus/test";
+import advertisedEndpointFixtures from "../fixtures/advertised-endpoint-classification.json" with { type: "json" };
+import pairingEndpointFixtures from "../fixtures/pairing-endpoint-classification.json" with { type: "json" };
 
 import {
+  classifyPairingEndpoint,
   classifyHostedHttpsCompatibility,
   createAdvertisedEndpoint,
   deriveWsBaseUrl,
   normalizeHttpBaseUrl,
 } from "./advertisedEndpoint.ts";
+
+const advertisedEndpointClassificationExpectations = [
+  {
+    address: "127.0.0.1",
+    pairingClassification: "loopback",
+    advertisedReachability: "loopback",
+    usable: false,
+    advertiseWithIpv4Listener: false,
+  },
+  {
+    address: "169.254.1.1",
+    pairingClassification: "private-network",
+    advertisedReachability: "lan",
+    usable: false,
+    advertiseWithIpv4Listener: false,
+  },
+  {
+    address: "192.168.1.20",
+    pairingClassification: "private-network",
+    advertisedReachability: "lan",
+    usable: true,
+    advertiseWithIpv4Listener: true,
+  },
+  {
+    address: "100.100.100.100",
+    pairingClassification: "private-network",
+    advertisedReachability: "private-network",
+    usable: true,
+    advertiseWithIpv4Listener: true,
+  },
+  {
+    address: "8.8.8.8",
+    pairingClassification: "public",
+    advertisedReachability: "public",
+    usable: true,
+    advertiseWithIpv4Listener: true,
+  },
+  {
+    address: "::1",
+    pairingClassification: "loopback",
+    advertisedReachability: "loopback",
+    usable: false,
+    advertiseWithIpv4Listener: false,
+  },
+  {
+    address: "fe80::1",
+    pairingClassification: "private-network",
+    advertisedReachability: "lan",
+    usable: false,
+    advertiseWithIpv4Listener: false,
+  },
+  {
+    address: "fd7a:115c:a1e0::1",
+    pairingClassification: "private-network",
+    advertisedReachability: "private-network",
+    usable: true,
+    advertiseWithIpv4Listener: false,
+  },
+  {
+    address: "2001:4860:4860::8888",
+    pairingClassification: "public",
+    advertisedReachability: "public",
+    usable: true,
+    advertiseWithIpv4Listener: false,
+  },
+] as const;
+
+describe("classifyPairingEndpoint", () => {
+  it("pins every cross-runtime fixture field", () => {
+    expect(advertisedEndpointFixtures).toEqual(advertisedEndpointClassificationExpectations);
+  });
+
+  it.each(advertisedEndpointClassificationExpectations)(
+    "shares literal address classification for $address",
+    (expected) => {
+      const host = expected.address.includes(":") ? `[${expected.address}]` : expected.address;
+      expect(classifyPairingEndpoint(`http://${host}:3773`)).toBe(expected.pairingClassification);
+    },
+  );
+
+  it.each(pairingEndpointFixtures)("classifies $endpoint as $classification", (fixture) => {
+    expect(classifyPairingEndpoint(fixture.endpoint)).toBe(fixture.classification);
+  });
+
+  it.each([
+    ["http://10.0.0.5:3773", "private-network"],
+    ["http://172.16.0.9:3773", "private-network"],
+    ["http://[fdff::1]:3773", "private-network"],
+    ["http://[fbff::1]:3773", "public"],
+    ["http://[fe80::1]:3773", "private-network"],
+    ["http://[febf::1]:3773", "private-network"],
+    ["http://[fe7f::1]:3773", "public"],
+    ["http://[fec0::1]:3773", "public"],
+    ["https://server.example.com", "public"],
+  ])("classifies additional boundary %s as %s", (endpoint, expected) => {
+    expect(classifyPairingEndpoint(endpoint)).toBe(expected);
+  });
+});
 
 const provider = {
   id: "desktop-core",

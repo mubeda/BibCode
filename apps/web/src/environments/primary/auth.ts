@@ -1,8 +1,12 @@
 import type {
   AuthBrowserSessionResult,
   AuthClientMetadata,
+  AuthCreatePairingOfferInput,
   AuthEnvironmentScope,
   AuthPairingCredentialResult,
+  AuthPairingOfferResult,
+  AuthShareStateResult,
+  RemotePairingReach,
   ServerAuthSessionMethod,
   AuthSessionId,
   AuthSessionState,
@@ -10,7 +14,9 @@ import type {
 import { EnvironmentHttpCommonError, PRIMARY_LOCAL_ENVIRONMENT_ID } from "@bibcode/contracts";
 import type { EnvironmentHttpCommonError as EnvironmentHttpCommonErrorType } from "@bibcode/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import { HttpClientError } from "effect/unstable/http";
 
@@ -27,6 +33,9 @@ const PrimaryEnvironmentRequestOperation = Schema.Literals([
   "exchange-bootstrap-credential",
   "fetch-environment-descriptor",
   "create-pairing-credential",
+  "create-pairing-offer",
+  "cancel-pairing-offer",
+  "get-share-state",
   "list-pairing-links",
   "revoke-pairing-link",
   "list-client-sessions",
@@ -34,6 +43,39 @@ const PrimaryEnvironmentRequestOperation = Schema.Literals([
   "revoke-other-client-sessions",
 ]);
 type PrimaryEnvironmentRequestOperation = typeof PrimaryEnvironmentRequestOperation.Type;
+
+export const PRIMARY_PAIRING_OFFER_REQUEST_TIMEOUT_MS = 5_000;
+
+export class PrimaryEnvironmentRequestTimeoutError extends Schema.TaggedErrorClass<PrimaryEnvironmentRequestTimeoutError>()(
+  "PrimaryEnvironmentRequestTimeoutError",
+  {
+    operation: PrimaryEnvironmentRequestOperation,
+    timeoutMs: Schema.Number,
+  },
+) {
+  override get message(): string {
+    return `Primary environment request timed out during ${this.operation} after ${String(this.timeoutMs)}ms.`;
+  }
+}
+
+const isPrimaryEnvironmentRequestTimeoutError = Schema.is(PrimaryEnvironmentRequestTimeoutError);
+
+function withPrimaryRequestTimeout<A, E, R>(
+  operation: PrimaryEnvironmentRequestOperation,
+  request: Effect.Effect<A, E, R>,
+  timeoutMs = PRIMARY_PAIRING_OFFER_REQUEST_TIMEOUT_MS,
+): Effect.Effect<A, E | PrimaryEnvironmentRequestTimeoutError, R> {
+  return request.pipe(
+    Effect.timeoutOption(Duration.millis(timeoutMs)),
+    Effect.flatMap(
+      Option.match({
+        onNone: () =>
+          Effect.fail(new PrimaryEnvironmentRequestTimeoutError({ operation, timeoutMs })),
+        onSome: Effect.succeed,
+      }),
+    ),
+  );
+}
 
 export class PrimaryEnvironmentRequestError extends Schema.TaggedErrorClass<PrimaryEnvironmentRequestError>()(
   "PrimaryEnvironmentRequestError",
@@ -51,7 +93,9 @@ export class PrimaryEnvironmentRequestError extends Schema.TaggedErrorClass<Prim
     readonly pairingLinkId?: string;
     readonly sessionId?: string;
   }): PrimaryEnvironmentRequestError {
-    const status = readHttpApiStatus(input.cause) ?? 500;
+    const status = isPrimaryEnvironmentRequestTimeoutError(input.cause)
+      ? 504
+      : (readHttpApiStatus(input.cause) ?? 500);
     return new PrimaryEnvironmentRequestError({
       operation: input.operation,
       status,
@@ -125,6 +169,7 @@ export interface ServerPairingLinkRecord {
   readonly label?: string;
   readonly createdAt: string;
   readonly expiresAt: string;
+  readonly reach?: RemotePairingReach;
 }
 
 export interface ServerClientSessionRecord {
@@ -138,6 +183,7 @@ export interface ServerClientSessionRecord {
   readonly lastConnectedAt: string | null;
   readonly connected: boolean;
   readonly current: boolean;
+  readonly reach?: RemotePairingReach;
 }
 
 type ServerAuthGateState =
@@ -321,6 +367,7 @@ export const primaryEnvironmentAuthInternals = {
   isTransientBootstrapError,
   readEnvironmentHttpErrorStatus,
   readHttpApiStatus,
+  withPrimaryRequestTimeout,
 };
 
 async function bootstrapServerAuth(): Promise<ServerAuthGateState> {
@@ -391,6 +438,70 @@ export async function createServerPairingCredential(input?: {
   }
 }
 
+export async function createServerPairingOffer(
+  input: AuthCreatePairingOfferInput,
+  idempotencyKey: string,
+): Promise<AuthPairingOfferResult> {
+  try {
+    return await runPrimaryHttp(
+      withPrimaryRequestTimeout(
+        "create-pairing-offer",
+        PrimaryEnvironmentHttpClient.pipe(
+          Effect.flatMap((client) =>
+            client.auth.pairingOffer({
+              headers: { "idempotency-key": idempotencyKey },
+              payload: input,
+            }),
+          ),
+        ),
+      ),
+    );
+  } catch (error) {
+    throw PrimaryEnvironmentRequestError.fromCause({
+      operation: "create-pairing-offer",
+      cause: error,
+    });
+  }
+}
+
+export async function cancelServerPairingOffer(idempotencyKey: string): Promise<void> {
+  try {
+    await runPrimaryHttp(
+      withPrimaryRequestTimeout(
+        "cancel-pairing-offer",
+        PrimaryEnvironmentHttpClient.pipe(
+          Effect.flatMap((client) =>
+            client.auth.cancelPairingOffer({
+              headers: {},
+              payload: { idempotencyKey },
+            }),
+          ),
+        ),
+      ),
+    );
+  } catch (error) {
+    throw PrimaryEnvironmentRequestError.fromCause({
+      operation: "cancel-pairing-offer",
+      cause: error,
+    });
+  }
+}
+
+export async function getServerShareState(): Promise<AuthShareStateResult> {
+  try {
+    return await runPrimaryHttp(
+      PrimaryEnvironmentHttpClient.pipe(
+        Effect.flatMap((client) => client.auth.shareState({ headers: {} })),
+      ),
+    );
+  } catch (error) {
+    throw PrimaryEnvironmentRequestError.fromCause({
+      operation: "get-share-state",
+      cause: error,
+    });
+  }
+}
+
 export async function listServerPairingLinks(): Promise<ReadonlyArray<ServerPairingLinkRecord>> {
   try {
     const pairingLinks = await runPrimaryHttp(
@@ -411,6 +522,7 @@ export async function listServerPairingLinks(): Promise<ReadonlyArray<ServerPair
           subject: pairingLink.subject,
           createdAt: timestamps.createdAt,
           expiresAt: timestamps.expiresAt,
+          ...(pairingLink.reach === undefined ? {} : { reach: pairingLink.reach }),
         };
       }
       return {
@@ -421,6 +533,7 @@ export async function listServerPairingLinks(): Promise<ReadonlyArray<ServerPair
         label: pairingLink.label,
         createdAt: timestamps.createdAt,
         expiresAt: timestamps.expiresAt,
+        ...(pairingLink.reach === undefined ? {} : { reach: pairingLink.reach }),
       };
     });
   } catch (error) {
@@ -470,6 +583,7 @@ export async function listServerClientSessions(): Promise<
           : DateTime.formatIso(clientSession.lastConnectedAt),
       connected: clientSession.connected,
       current: clientSession.current,
+      ...(clientSession.reach === undefined ? {} : { reach: clientSession.reach }),
     }));
   } catch (error) {
     throw PrimaryEnvironmentRequestError.fromCause({

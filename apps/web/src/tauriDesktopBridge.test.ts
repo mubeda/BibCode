@@ -303,17 +303,22 @@ function sensitivePrepared(storageInstanceId: string | null): PreparedConnection
       platform: { os: "windows", arch: "x64" },
       serverVersion: "0.0.0-test",
       storageInstanceId,
+      remoteUpdateSupport: null,
+      remoteProtocolVersion: 1,
+      minCompatibleRemoteProtocol: 1,
       capabilities: {
         repositoryIdentity: true,
         worktreeCatalog: false,
         worktreeCatalogRefreshReason: false,
         vcsStatusSummary: false,
         activityProtocolVersion: null,
+        remoteUpdateControl: false,
       },
     },
     httpBaseUrl: "https://private.example.test/secret-path",
     socketUrl: "wss://private.example.test/secret-path/ws",
     httpAuthorization: null,
+    e2ee: null,
     target,
   };
 }
@@ -1127,7 +1132,7 @@ describe("tauriDesktopBridge", () => {
     await expect(bridge.disconnectSshEnvironment(sshTarget)).resolves.toBeNull();
     await expect(bridge.resolveSshPasswordPrompt?.("request-1", "secret")).resolves.toBeNull();
     await expect(bridge.getServerExposureState()).resolves.toBeNull();
-    await expect(bridge.setServerExposureMode("network-accessible")).resolves.toBeNull();
+    await expect(bridge.applyServerExposure("network-accessible")).resolves.toBeNull();
     await expect(
       bridge.setTailscaleServeEnabled({ enabled: true, port: 8443 }),
     ).resolves.toBeNull();
@@ -1164,6 +1169,9 @@ describe("tauriDesktopBridge", () => {
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_discover_ssh_hosts", undefined);
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_disconnect_ssh_environment", {
       target: sshTarget,
+    });
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_apply_server_exposure", {
+      desired: "network-accessible",
     });
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_set_wsl_backend_enabled", {
       enabled: true,
@@ -1314,16 +1322,25 @@ describe("tauriDesktopBridge", () => {
     await expect(bridge.openExternal("not a URL")).resolves.toBe(false);
 
     await expect(bridge.getServerExposureState()).resolves.toMatchObject({ mode: "local-only" });
-    await expect(bridge.setServerExposureMode("network-accessible")).resolves.toMatchObject({
-      mode: "local-only",
-    });
+    await expect(bridge.applyServerExposure("network-accessible")).rejects.toThrow(
+      "unsupported fallback command: desktop_bridge_apply_server_exposure",
+    );
     await expect(
       bridge.setTailscaleServeEnabled({ enabled: true, port: 8443 }),
     ).resolves.toMatchObject({ tailscaleServeEnabled: false });
     await expect(bridge.getWslState()).resolves.toMatchObject({ enabled: false, distros: [] });
-    await expect(bridge.setWslBackendEnabled(true)).resolves.toMatchObject({ enabled: false });
-    await expect(bridge.setWslDistro("Ubuntu")).resolves.toMatchObject({ distro: null });
-    await expect(bridge.setWslOnly(true)).resolves.toMatchObject({ wslOnly: false });
+    // WSL mutations propagate failures instead of pretending a default state:
+    // a swallowed set_wsl_only error could leave the firewall rule open while
+    // the UI reports local-only.
+    await expect(bridge.setWslBackendEnabled(true)).rejects.toThrow(
+      "unsupported fallback command: desktop_bridge_set_wsl_backend_enabled",
+    );
+    await expect(bridge.setWslDistro("Ubuntu")).rejects.toThrow(
+      "unsupported fallback command: desktop_bridge_set_wsl_distro",
+    );
+    await expect(bridge.setWslOnly(true)).rejects.toThrow(
+      "unsupported fallback command: desktop_bridge_set_wsl_only",
+    );
     await expect(bridge.getUpdateState()).resolves.toEqual({
       enabled: false,
       status: "disabled",

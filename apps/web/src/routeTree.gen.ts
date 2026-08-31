@@ -20,7 +20,9 @@ import { Route as SettingsConnectionsRouteImport } from './routes/settings.conne
 import { Route as SettingsDiagnosticsRouteImport } from './routes/settings.diagnostics'
 import { Route as SettingsGeneralRouteImport } from './routes/settings.general'
 import { Route as SettingsKeybindingsRouteImport } from './routes/settings.keybindings'
+import { Route as SettingsLocalEnvironmentRouteImport } from './routes/settings.local-environment'
 import { Route as SettingsProvidersRouteImport } from './routes/settings.providers'
+import { Route as SettingsRemoteServersRouteImport } from './routes/settings.remote-servers'
 import { Route as SettingsSourceControlRouteImport } from './routes/settings.source-control'
 import { Route as SettingsStatusBarRouteImport } from './routes/settings.status-bar'
 import { Route as SettingsTerminalRouteImport } from './routes/settings.terminal'
@@ -81,9 +83,20 @@ const SettingsKeybindingsRoute = SettingsKeybindingsRouteImport.update({
   path: '/keybindings',
   getParentRoute: () => SettingsRoute,
 } as any)
+const SettingsLocalEnvironmentRoute =
+  SettingsLocalEnvironmentRouteImport.update({
+    id: '/local-environment',
+    path: '/local-environment',
+    getParentRoute: () => SettingsRoute,
+  } as any)
 const SettingsProvidersRoute = SettingsProvidersRouteImport.update({
   id: '/providers',
   path: '/providers',
+  getParentRoute: () => SettingsRoute,
+} as any)
+const SettingsRemoteServersRoute = SettingsRemoteServersRouteImport.update({
+  id: '/remote-servers',
+  path: '/remote-servers',
   getParentRoute: () => SettingsRoute,
 } as any)
 const SettingsSourceControlRoute = SettingsSourceControlRouteImport.update({
@@ -124,7 +137,9 @@ export interface FileRoutesByFullPath {
   '/settings/diagnostics': typeof SettingsDiagnosticsRoute
   '/settings/general': typeof SettingsGeneralRoute
   '/settings/keybindings': typeof SettingsKeybindingsRoute
+  '/settings/local-environment': typeof SettingsLocalEnvironmentRoute
   '/settings/providers': typeof SettingsProvidersRoute
+  '/settings/remote-servers': typeof SettingsRemoteServersRoute
   '/settings/source-control': typeof SettingsSourceControlRoute
   '/settings/status-bar': typeof SettingsStatusBarRoute
   '/settings/terminal': typeof SettingsTerminalRoute
@@ -141,7 +156,9 @@ export interface FileRoutesByTo {
   '/settings/diagnostics': typeof SettingsDiagnosticsRoute
   '/settings/general': typeof SettingsGeneralRoute
   '/settings/keybindings': typeof SettingsKeybindingsRoute
+  '/settings/local-environment': typeof SettingsLocalEnvironmentRoute
   '/settings/providers': typeof SettingsProvidersRoute
+  '/settings/remote-servers': typeof SettingsRemoteServersRoute
   '/settings/source-control': typeof SettingsSourceControlRoute
   '/settings/status-bar': typeof SettingsStatusBarRoute
   '/settings/terminal': typeof SettingsTerminalRoute
@@ -161,7 +178,9 @@ export interface FileRoutesById {
   '/settings/diagnostics': typeof SettingsDiagnosticsRoute
   '/settings/general': typeof SettingsGeneralRoute
   '/settings/keybindings': typeof SettingsKeybindingsRoute
+  '/settings/local-environment': typeof SettingsLocalEnvironmentRoute
   '/settings/providers': typeof SettingsProvidersRoute
+  '/settings/remote-servers': typeof SettingsRemoteServersRoute
   '/settings/source-control': typeof SettingsSourceControlRoute
   '/settings/status-bar': typeof SettingsStatusBarRoute
   '/settings/terminal': typeof SettingsTerminalRoute
@@ -182,7 +201,9 @@ export interface FileRouteTypes {
     | '/settings/diagnostics'
     | '/settings/general'
     | '/settings/keybindings'
+    | '/settings/local-environment'
     | '/settings/providers'
+    | '/settings/remote-servers'
     | '/settings/source-control'
     | '/settings/status-bar'
     | '/settings/terminal'
@@ -199,7 +220,9 @@ export interface FileRouteTypes {
     | '/settings/diagnostics'
     | '/settings/general'
     | '/settings/keybindings'
+    | '/settings/local-environment'
     | '/settings/providers'
+    | '/settings/remote-servers'
     | '/settings/source-control'
     | '/settings/status-bar'
     | '/settings/terminal'
@@ -218,7 +241,9 @@ export interface FileRouteTypes {
     | '/settings/diagnostics'
     | '/settings/general'
     | '/settings/keybindings'
+    | '/settings/local-environment'
     | '/settings/providers'
+    | '/settings/remote-servers'
     | '/settings/source-control'
     | '/settings/status-bar'
     | '/settings/terminal'
@@ -312,11 +337,25 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof SettingsKeybindingsRouteImport
       parentRoute: typeof SettingsRoute
     }
+    '/settings/local-environment': {
+      id: '/settings/local-environment'
+      path: '/local-environment'
+      fullPath: '/settings/local-environment'
+      preLoaderRoute: typeof SettingsLocalEnvironmentRouteImport
+      parentRoute: typeof SettingsRoute
+    }
     '/settings/providers': {
       id: '/settings/providers'
       path: '/providers'
       fullPath: '/settings/providers'
       preLoaderRoute: typeof SettingsProvidersRouteImport
+      parentRoute: typeof SettingsRoute
+    }
+    '/settings/remote-servers': {
+      id: '/settings/remote-servers'
+      path: '/remote-servers'
+      fullPath: '/settings/remote-servers'
+      preLoaderRoute: typeof SettingsRemoteServersRouteImport
       parentRoute: typeof SettingsRoute
     }
     '/settings/source-control': {
@@ -379,7 +418,9 @@ interface SettingsRouteChildren {
   SettingsDiagnosticsRoute: typeof SettingsDiagnosticsRoute
   SettingsGeneralRoute: typeof SettingsGeneralRoute
   SettingsKeybindingsRoute: typeof SettingsKeybindingsRoute
+  SettingsLocalEnvironmentRoute: typeof SettingsLocalEnvironmentRoute
   SettingsProvidersRoute: typeof SettingsProvidersRoute
+  SettingsRemoteServersRoute: typeof SettingsRemoteServersRoute
   SettingsSourceControlRoute: typeof SettingsSourceControlRoute
   SettingsStatusBarRoute: typeof SettingsStatusBarRoute
   SettingsTerminalRoute: typeof SettingsTerminalRoute
@@ -393,7 +434,9 @@ const SettingsRouteChildren: SettingsRouteChildren = {
   SettingsDiagnosticsRoute: SettingsDiagnosticsRoute,
   SettingsGeneralRoute: SettingsGeneralRoute,
   SettingsKeybindingsRoute: SettingsKeybindingsRoute,
+  SettingsLocalEnvironmentRoute: SettingsLocalEnvironmentRoute,
   SettingsProvidersRoute: SettingsProvidersRoute,
+  SettingsRemoteServersRoute: SettingsRemoteServersRoute,
   SettingsSourceControlRoute: SettingsSourceControlRoute,
   SettingsStatusBarRoute: SettingsStatusBarRoute,
   SettingsTerminalRoute: SettingsTerminalRoute,

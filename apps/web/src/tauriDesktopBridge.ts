@@ -19,6 +19,7 @@ import {
   AuthAccessTokenType,
   AuthEnvironmentBootstrapTokenType,
   AuthTokenExchangeGrantType,
+  DESKTOP_DEEP_LINK_EVENT,
   PRIMARY_LOCAL_ENVIRONMENT_ID,
 } from "@bibcode/contracts";
 import { invoke as importedTauriInvoke, isTauri as isImportedTauri } from "@tauri-apps/api/core";
@@ -365,6 +366,8 @@ function connectionCatalogProtectionCapability(
 function defaultServerExposureState(): DesktopServerExposureState {
   return {
     mode: "local-only",
+    configuredMode: "local-only",
+    management: "native",
     endpointUrl: null,
     advertisedHost: null,
     tailscaleServeEnabled: false,
@@ -502,6 +505,10 @@ function createTauriDesktopBridge(
       tauriInvokeDesktop("desktop_bridge_get_project_data_statuses", undefined),
     onProjectDataStatusChanged: (listener: (event: DesktopProjectDataStatusChangedEvent) => void) =>
       tauriListen(PROJECT_DATA_STATUS_CHANGED_EVENT, listener),
+    getPendingDeepLinks: async () =>
+      (await tauriInvoke<ReadonlyArray<string> | null>("plugin:deep-link|get_current")) ?? [],
+    onDeepLink: (listener: (urls: ReadonlyArray<string>) => void) =>
+      tauriListen(DESKTOP_DEEP_LINK_EVENT, listener),
     restoreProjectData: (environmentId, backupId) =>
       tauriInvokeDesktop("desktop_bridge_restore_project_data", { environmentId, backupId }),
     startEmptyProjectData: (environmentId) =>
@@ -535,12 +542,10 @@ function createTauriDesktopBridge(
         undefined,
         defaultServerExposureState,
       ),
-    setServerExposureMode: (mode) =>
-      tauriInvokeOr<DesktopServerExposureState>(
-        "desktop_bridge_set_server_exposure_mode",
-        { mode },
-        defaultServerExposureState,
-      ),
+    applyServerExposure: (desired) =>
+      tauriInvokeDesktop<DesktopServerExposureState>("desktop_bridge_apply_server_exposure", {
+        desired,
+      }),
     setTailscaleServeEnabled: (input) =>
       tauriInvokeOr<DesktopServerExposureState>(
         "desktop_bridge_set_tailscale_serve_enabled",
@@ -551,16 +556,15 @@ function createTauriDesktopBridge(
       tauriInvokeOr("desktop_bridge_get_advertised_endpoints", undefined, () => []),
     getWslState: () =>
       tauriInvokeOr<DesktopWslState>("desktop_bridge_get_wsl_state", undefined, defaultWslState),
+    // WSL mutations must propagate failures: a swallowed set_wsl_only error
+    // can leave the Windows firewall rule open while the UI reports
+    // local-only. The settings surfaces surface the rejection to the user.
     setWslBackendEnabled: (enabled) =>
-      tauriInvokeOr<DesktopWslState>(
-        "desktop_bridge_set_wsl_backend_enabled",
-        { enabled },
-        defaultWslState,
-      ),
+      tauriInvoke<DesktopWslState>("desktop_bridge_set_wsl_backend_enabled", { enabled }),
     setWslDistro: (distro) =>
-      tauriInvokeOr<DesktopWslState>("desktop_bridge_set_wsl_distro", { distro }, defaultWslState),
+      tauriInvoke<DesktopWslState>("desktop_bridge_set_wsl_distro", { distro }),
     setWslOnly: (enabled) =>
-      tauriInvokeOr<DesktopWslState>("desktop_bridge_set_wsl_only", { enabled }, defaultWslState),
+      tauriInvoke<DesktopWslState>("desktop_bridge_set_wsl_only", { enabled }),
     pickFolder: (options) => tauriInvokeOr("desktop_bridge_pick_folder", { options }, () => null),
     saveDiagnosticLogs: (filename, bytes) =>
       tauriInvokeDesktop<string | null>("desktop_bridge_save_diagnostic_logs", {

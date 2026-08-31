@@ -99,6 +99,253 @@ A focused suite must cover the changed success behavior and its material
 failure, cancellation, retry, restart, and cleanup seams. For cross-platform
 logic, include host-independent fixtures for every affected platform.
 
+### Grant-driven remote sharing
+
+When pairing-offer generation, grant reach metadata, desktop exposure, or
+client revocation changes, validate the complete ceremony on every supported
+native desktop: **Another device** widens before minting and shows one pairing
+code as a deep link, browser URL, and QR code; **This computer only** and every
+**Custom address** remain externally managed and never widen; a bind or firewall
+failure mints nothing; and revoking the final native-managed **Another device**
+offer or client returns the server to loopback. Confirm an off-host custom grant
+remains visible in the off-host count but leaves authoritative desired exposure
+loopback before and after session exchange.
+Also verify browser/headless presentation remains read-only for exposure while
+server-side mint and revocation stay available. Windows additionally owns the
+program-scoped firewall evidence in its platform runbook; Linux and macOS do
+not substitute a firewall assertion.
+
+Capture visual evidence for all exposure-compensation outcomes, using a
+test-owned server/profile and controlled failure injection where required:
+
+- a mint failure after widening plus successful cleanup shows **The offer was
+  not created. Remote access is confirmed local-only.**, and native state is
+  local-only;
+- a concurrent live grant shows that remote access remains enabled for another
+  live access reason;
+- a failed or blackholed cancellation still runs authoritative cleanup when
+  this attempt widened: loopback authority narrows, while a possibly live offer
+  or another live reason keeps the host wide;
+- cancellation and authoritative cleanup that are both unconfirmed do not
+  claim local-only restoration; and
+- failed cleanup says topology could not be verified;
+- consuming an off-host offer through the browser keeps exposure wide, and
+  revoking that last browser session causes one local-only restart; and
+- when a new off-host grant appears during narrowing, the one post-narrow read
+  causes one compensating widen and the resulting offer remains reachable.
+- a blackholed pairing-offer create response reaches the five-second attempt
+  deadline, completes the bounded retry/cancel path, and reports either verified
+  local-only cleanup or explicit cancellation/cleanup failure instead of
+  remaining indefinitely in the generating state.
+- a prior network-accessible native configuration with only legacy grants starts
+  local-only and widens only after **Resume legacy remote access** is selected;
+- unmounting the reconciler or switching topology before its first privileged
+  apply cancels that work; after a local-only apply commits, unmount the view and
+  prove the mandatory authoritative refetch and one needed compensating widen
+  still complete.
+- a failed background reconciliation retries at five-second intervals for at
+  most three passes, then surfaces the warning toast instead of silently waiting
+  for another authority revision.
+
+Record the exposure mode, grant/session row, restart boundary, visible message,
+and screenshot for each outcome. Do not use a later app restart as substitute
+evidence for direct failed-mint cleanup.
+
+Run the living-document contract plus the public WebSocket lifecycle and
+transport-size tests from the repository root whenever this boundary changes:
+
+```sh
+vp test scripts/remote-architecture-contract.test.ts
+vp test packages/contracts/src/rpc.test.ts packages/client-runtime/src/rpc/session.test.ts packages/client-runtime/src/connection/pairingAdd.test.ts packages/client-runtime/src/connection/registry.test.ts packages/client-runtime/src/state/remoteUpdates.test.ts apps/web/src/hostedPairing.test.ts apps/web/src/routes/pair.test.tsx apps/web/src/routes/settings.remote-servers.test.tsx apps/web/src/connection/databaseHealth.test.ts apps/web/src/components/ConnectionDatabaseRecoveryDialog.test.tsx apps/web/src/state/shareExposureReconciler.test.tsx apps/web/src/components/settings/remote-servers/shareOffer.test.ts
+cargo test -p bibcode-server --test auth_http plain_websocket_connected_state_tracks_the_completed_upgrade_lifecycle -- --exact
+cargo test -p bibcode-server --test auth_http plain_websocket_rejects_a_single_frame_larger_than_16_mib -- --exact
+cargo test -p bibcode-server --test auth_http auth_routes_include_browser_cors_and_preflight_headers -- --exact
+cargo test -p bibcode-server --test e2ee_ws oversized_pre_auth_websocket_message_is_rejected -- --exact
+cargo test -p bibcode-server --test e2ee_ws preauth_peer_connection_cap_rejects_the_fifth_connection -- --exact
+cargo test -p bibcode-server --test e2ee_ws preauth_loopback_forwarder_bypasses_public_peer_cap_but_keeps_burst_limit -- --exact
+cargo test -p bibcode-server --test e2ee_ws established_capacity_is_partitioned_by_principal_and_released_on_close -- --exact
+cargo test -p bibcode-server --test e2ee_ws inbound_plaintext_capacity_backpressures_by_principal_and_releases_on_close -- --exact
+cargo test -p bibcode-server --test e2ee_ws incomplete_authenticated_message_closes_after_ten_seconds_without_progress -- --exact
+cargo test -p bibcode-server --test e2ee_ws idle_authenticated_connection_has_no_reassembly_deadline -- --exact
+cargo test -p bibcode-server --test e2ee_ws pairing_bootstrap_inside_the_channel_serves_get_config -- --exact
+cargo test -p bibcode-server --test e2ee_ws off_host_pairing_requires_confirmation_even_without_a_client_flag -- --exact
+cargo test -p bibcode-server --test e2ee_ws delivered_pairing_session_stays_pending_until_confirm_rpc -- --exact
+cargo test -p bibcode-server --test e2ee_ws closing_before_confirm_revokes_the_pending_session -- --exact
+cargo test -p bibcode-server --test e2ee_ws confirmed_pairing_session_survives_disconnect_and_restart_cleanup -- --exact
+cargo test -p bibcode-server rpc::e2ee::tests::preauth_admission_partitions_slots_and_refills_peer_tokens --lib -- --exact
+cargo test -p bibcode-server rpc::e2ee::tests::preauth_network_keys_canonicalize_ipv4_24_and_ipv6_64 --lib -- --exact
+cargo test -p bibcode-server rpc::e2ee::tests::one_public_subnet_cannot_consume_more_than_half_the_global_pool --lib -- --exact
+cargo test -p bibcode-server rpc::e2ee::tests::loopback_forwarder_can_use_global_capacity_without_the_public_peer_cap --lib -- --exact
+cargo test -p bibcode-server rpc::e2ee::tests::missing_connect_info_uses_the_strict_unspecified_bucket --lib -- --exact
+cargo test -p bibcode-server rpc::e2ee::tests::unrelated_public_networks_still_stop_at_the_global_cap --lib -- --exact
+cargo test -p bibcode-server rpc::e2ee::tests::idle_preauth_peer_and_network_entries_are_pruned_without_exceeding_the_map_cap --lib -- --exact
+cargo test -p bibcode-server rpc::e2ee::tests::inbound_empty_continuations_and_excessive_fragmentation_are_rejected --lib -- --exact
+cargo test -p bibcode-server rpc::e2ee::tests::inbound_global_pressure_waits_for_capacity_instead_of_closing_the_victim --lib -- --exact
+cargo test -p bibcode-server rpc::e2ee::tests::inbound_global_pressure_waits_past_five_seconds_and_resumes --lib -- --exact
+cargo test -p bibcode-server rpc::e2ee::tests::incomplete_minted_session_delivery_is_compensated --lib -- --exact
+cargo test -p bibcode-server rpc::e2ee::tests::outbound_logical_message_accepts_progress_across_record_deadlines --lib -- --exact
+cargo test -p bibcode-server rpc::e2ee::tests::outbound_logical_message_rejects_a_stalled_record --lib -- --exact
+cargo test -p bibcode-server rpc::e2ee::tests::outbound_logical_message_enforces_the_size_derived_total_deadline --lib -- --exact
+cargo test -p bibcode-server rpc::e2ee::tests::completed_messages_retain_their_global_buffer_budget --lib -- --exact
+cargo test -p bibcode-server rpc::session::tests::fit_first_budget_does_not_block_small_waiters_behind_an_aged_large_waiter --lib -- --exact
+cargo test -p bibcode-server rpc::session::tests::cancelled_weighted_waiter_is_removed_and_capacity_is_refunded_once --lib -- --exact
+cargo test -p bibcode-server rpc::session::tests::outbound_connection_wait_uses_the_same_absolute_deadline_as_process_wait --lib -- --exact
+cargo test -p bibcode-server rpc::session::tests::two_tier_admission_does_not_hold_connection_bytes_while_process_bytes_are_blocked --lib -- --exact
+cargo test -p bibcode-server rpc::session::tests::two_tier_admission_observes_release_between_probe_and_notify_poll --lib -- --exact
+cargo test -p bibcode-server rpc::session::tests::inbound_guard_is_released_after_dispatch_not_handler_completion --lib -- --exact
+cargo test -p bibcode-server rpc::session::tests::slow_socket_cannot_hide_more_than_one_large_response_in_the_session_queue --lib -- --exact
+cargo test -p bibcode-server rpc::session::tests::slow_sockets_share_one_process_outbound_plaintext_budget --lib -- --exact
+cargo test -p bibcode-server rpc::session::tests::response_larger_than_the_connection_budget_fails_the_session_closed --lib -- --exact
+cargo test -p bibcode-server rpc::session::tests::byte_and_queue_admission_share_one_five_second_deadline --lib -- --exact
+cargo test -p bibcode-server auth::service::tests::completed_pairing_offer_replays_and_cancels_after_restart --lib -- --exact
+cargo test -p bibcode-server auth::service::tests::pending_pairing_offer_can_be_cancelled_after_restart --lib -- --exact
+cargo test -p bibcode-server auth::service::tests::pending_pairing_offer_recovers_for_retry_after_restart --lib -- --exact
+cargo test -p bibcode-server auth::service::tests::remote_offer_cancellation_converges_dormant_share_state_and_access_events --lib -- --exact
+cargo test -p bibcode-server auth::service::tests::cancelled_guard_registration_releases_bookkeeping_while_persistence_is_queued --lib -- --exact
+cargo test -p bibcode-server auth::service::tests::cancelled_pending_session_issuance_revokes_durable_commit_before_state_publication --lib -- --exact
+cargo test -p bibcode-server auth::service::tests::pending_pairing_sweep_only_revokes_sessions_past_the_grace_window --lib -- --exact
+cargo test -p bibcode-server --lib keeps_one_service_watcher -- --nocapture
+cargo test -p bibcode-server auth::service::tests::cross_service_authentication_starts_watcher_for_the_cached_session --lib -- --exact
+cargo test -p bibcode-server --test repositories pairing_offer_reservations_enforce_the_shared_ -- --nocapture
+cargo test -p bibcode-server --test auth_http pairing_offer_authority_is_shared_across_simultaneously_live_servers -- --exact
+cargo test -p bibcode-server --test auth_http remote_revocation_closes_an_acked_live_stream_before_later_events -- --exact
+cargo test -p bibcode-server --test repositories pending_auth_sessions_confirm_by_id_and_startup_cleanup_is_selective -- --exact
+cargo test -p bibcode-desktop firewall::tests --lib -- --nocapture
+cargo test -p bibcode-desktop server_exposure::tests --lib -- --nocapture
+cargo test -p bibcode-desktop bridge::tests::entering_wsl_only_recovers_native_exposure_before_switching_topology --lib -- --exact
+cargo test -p bibcode-desktop bridge::tests::leaving_wsl_only_restarts_the_native_topology_explicitly_local_only --lib -- --exact
+cargo test -p bibcode-desktop network_interfaces::tests::advertised_endpoint_classification_fixtures --lib -- --exact
+cargo test -p bibcode-desktop network_interfaces::tests::public_default_route_is_advertised_but_never_default --lib -- --exact
+cargo test -p bibcode-desktop backend::tests::lan_advertised_host_accepts_only_private_usable_ipv4_defaults --lib -- --exact
+cargo test -p bibcode-desktop bridge::tests::local_only_discovery_surfaces_public_only_topology_as_unavailable --lib -- --exact
+cargo test -p bibcode-desktop bridge::tests::local_only_discovery_marks_private_default_candidate_unavailable --lib -- --exact
+cargo test -p bibcode-server auth::service::tests::custom_off_host_grants_remain_externally_managed_after_exchange --lib -- --exact
+```
+
+The pairing-add client suite must prove that the registered supervisor is the
+only bearer proof—no second pinned socket—and that an ambiguous confirmation
+observes `registry.stateChanges` for at most 30 interruptible seconds. Connected
+state proves activation; blocked authentication, host identity, or storage
+change rolls back local writes with `pairing-rejected`; an inconclusive window
+leaves recovery with the supervisor. Local persistence and confirmation remain
+the only uninterruptible segment.
+
+### Direct E2EE interop gate
+
+When direct pairing, host identity, `/ws-e2ee`, Noise framing, or client E2EE
+session preparation changes, build the current Rust server and run the opt-in
+TypeScript-to-Rust interop suite:
+
+```sh
+cargo build -p bibcode-server
+cd packages/client-runtime
+BIBCODE_E2EE_SERVER_BIN="$(git rev-parse --show-toplevel)/target/debug/bibcode" vp test run src/e2ee/serverInterop.test.ts
+cd ../..
+```
+
+The suite must mint through the real pairing endpoint, pin the persisted host
+key, authenticate the pending bootstrap channel, call `server.getConfig`, prove
+the delivered bearer cannot reconnect before confirmation, confirm through
+`auth.confirmPairing`, then reconnect with the active in-channel credential. It
+must also reassemble a fragmented request and reject a bad pairing token.
+Without `BIBCODE_E2EE_SERVER_BIN`, the same file intentionally reports skipped
+so ordinary `vp test` does not depend on a prebuilt binary.
+
+### Cross-container remote-server gate
+
+When remote authentication, pairing, E2EE, share-state derivation, revocation,
+or remote updates change, run the opt-in smoke test with the server and client
+in distinct Linux containers. Build the current server first, verify Docker is
+available, and use test-owned names so cleanup can be proven:
+
+```sh
+cargo build -p bibcode-server
+docker version
+
+cleanup_bibcode_remote_docker() {
+  docker rm -f bibcode-remote-client 2>/dev/null || true
+  docker rm -f bibcode-remote-server 2>/dev/null || true
+  docker network rm bibcode-remote-stabilization 2>/dev/null || true
+  docker volume rm bibcode-remote-stabilization-data 2>/dev/null || true
+}
+trap cleanup_bibcode_remote_docker EXIT INT TERM
+docker network create bibcode-remote-stabilization
+docker volume create bibcode-remote-stabilization-data
+
+docker run -d --name bibcode-remote-server \
+  --network bibcode-remote-stabilization \
+  --security-opt label=disable \
+  -e DEBIAN_FRONTEND=noninteractive \
+  -v "$PWD/target/debug/bibcode:/usr/local/bin/bibcode:ro" \
+  -v bibcode-remote-stabilization-data:/data \
+  debian:trixie-slim \
+  sh -c 'apt-get update >/dev/null && \
+    apt-get install -y --no-install-recommends ca-certificates >/dev/null && \
+    rm -rf /var/lib/apt/lists/* && \
+    exec /usr/local/bin/bibcode --base-dir /data --host 0.0.0.0 --port 3773 serve'
+
+for attempt in $(seq 1 120); do
+  BIBCODE_DOCKER_PAIRING_JSON=$(docker exec bibcode-remote-server \
+    /usr/local/bin/bibcode --base-dir /data pairing issue --json 2>/dev/null) && break
+  sleep 0.25
+done
+test -n "${BIBCODE_DOCKER_PAIRING_JSON:-}"
+BIBCODE_DOCKER_ADMIN_CREDENTIAL=$(node -e \
+  'process.stdout.write(JSON.parse(process.argv[1]).credential)' \
+  "$BIBCODE_DOCKER_PAIRING_JSON")
+
+docker run --rm --name bibcode-remote-client \
+  --network bibcode-remote-stabilization \
+  --security-opt label=disable \
+  -v "$PWD:/workspace:ro" -w /workspace \
+  --tmpfs /workspace/node_modules/.vite-temp:rw,mode=1777 \
+  -e BIBCODE_DOCKER_SERVER_URL=http://bibcode-remote-server:3773 \
+  -e BIBCODE_DOCKER_ADMIN_CREDENTIAL="$BIBCODE_DOCKER_ADMIN_CREDENTIAL" \
+  node:26-bookworm \
+  ./node_modules/.bin/vp test packages/client-runtime/src/e2ee/dockerRemoteSmoke.test.ts
+
+unset BIBCODE_DOCKER_PAIRING_JSON BIBCODE_DOCKER_ADMIN_CREDENTIAL
+cleanup_bibcode_remote_docker
+trap - EXIT INT TERM
+```
+
+The smoke test must cover descriptor negotiation, administrative token exchange,
+an off-host pairing offer, pinned-host Noise NK authentication, pending
+share-state retention, bootstrap-channel RPC, rejected bearer reconnect before
+confirmation, idempotent `auth.confirmPairing`, and authenticated bearer
+reconnect afterward. It sends a maximum-size Noise record and accepts continued
+progress after more than five seconds, verifies updater status/check, a typed
+manual-install failure, and a later healthy status result, and proves plain
+`/ws` closes a 16 MiB-plus-one-byte frame. It also rejects a fifth silent
+pre-auth socket from the real container peer, closes an authenticated connection
+that exceeds the 2,048-record limit, retains exposure through a browser session,
+actively closes a revoked E2EE session, and reaches final loopback share state.
+Finally, it cancels an ambiguously delivered offer and proves a delayed retry
+cannot recreate its grant.
+
+One fixed-IP Node client cannot independently exercise the IPv4 `/24` fan-out
+classifier, so subnet aggregation remains required focused Rust fixture/unit
+evidence. The production headless container likewise has no injectable hung
+desktop updater delegate or supervisor-acquisition seam; whole-update timeout and
+fan-out-slot release remain required client-runtime tests, while Docker proves
+result isolation. The containers disable SELinux process labeling because both
+host bind mounts are read-only; this keeps the command portable on enforcing
+hosts without relabeling the worktree. The client receives a narrow tmpfs for
+Vite's generated config cache, so the repository itself stays read-only. It must
+not spawn a host server, fall back to loopback, or print a pairing/session
+credential.
+
+After the run, all three commands below must print nothing:
+
+```sh
+docker ps -a --filter name=bibcode-remote- --format '{{.Names}}'
+docker network ls --filter name=bibcode-remote-stabilization --format '{{.Name}}'
+docker volume ls --filter name=bibcode-remote-stabilization-data --format '{{.Name}}'
+```
+
+Record image IDs, architecture, exact command results, and cleanup evidence in
+an execution report. Never record or retain the temporary pairing credential.
+
 ### VCS coordination gates
 
 When VCS status observation, mutation ownership, automatic fetch, or client
@@ -273,6 +520,7 @@ cargo test --workspace -j 2 -- --test-threads=2
 vp check
 vp run typecheck
 cargo fmt --all --check
+cargo clean -p bibcode-server -p bibcode-desktop -p bibcode-updater-verifier
 cargo clippy --workspace --all-targets -- -D warnings
 git diff --check
 ```
@@ -337,15 +585,20 @@ Do not run destructive worktree scenarios against a user repository.
 
 ## Packaged visual validation
 
-Use Codex Computer Use, not Orca, to operate the exact packaged executable.
-Before launch, prove no conflicting BiBCode instance is running. Use disposable
-application data and platform-specific renderer isolation without overwriting a
-user profile.
+Use Codex Computer Use to operate the exact packaged executable. Before launch,
+prove no conflicting BiBCode instance is running. Use disposable application
+data and platform-specific renderer isolation without overwriting a user
+profile.
 
 Capture original-resolution screenshots at normal and minimum supported window
 sizes. Cover relevant:
 
-- Add Project and environment presentation;
+- Add Project and environment presentation, including the left-panel environment
+  rail (Local entry with its WSL sub-picker where applicable, saved-server
+  entries with status dots, the add/manage affordances) and the environment
+  context card with its ⋯ menu when a remote environment is selected—verifying
+  that switching rail selection filters the projects panel without interrupting
+  running sessions on other environments;
 - provider settings and provider/terminal action menus;
 - discovered and adopted external worktrees;
 - Create Worktree exact local and remote ref selection: the exact value appears

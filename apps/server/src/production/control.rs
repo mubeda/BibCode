@@ -2146,12 +2146,16 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
             .storage_instance_id
             .expect("a running server has a prepared persistent store")
             .to_string(),
+        "remoteUpdateSupport": config.remote_update_support,
+        "remoteProtocolVersion": crate::http::REMOTE_PROTOCOL_VERSION,
+        "minCompatibleRemoteProtocol": crate::http::MIN_COMPATIBLE_REMOTE_PROTOCOL,
         "capabilities": {
             "repositoryIdentity": true,
             "worktreeCatalog": true,
             "worktreeCatalogRefreshReason": true,
             "vcsStatusSummary": true,
             "activityProtocolVersion": activity_protocol_registered.then_some(2),
+            "remoteUpdateControl": true,
         },
     })
 }
@@ -5004,6 +5008,27 @@ mod tests {
             true
         );
         assert_eq!(descriptor["capabilities"]["vcsStatusSummary"], true);
+    }
+
+    #[test]
+    fn environment_descriptor_advertises_remote_update_control_and_support() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let config = running_test_config(temp.path());
+        let descriptor = environment_descriptor(&config, false);
+        assert_eq!(descriptor["capabilities"]["remoteUpdateControl"], true);
+        assert_eq!(
+            descriptor["remoteUpdateSupport"],
+            serde_json::json!({ "installMode": "manual", "reason": "manual-update-required" })
+        );
+    }
+
+    #[test]
+    fn environment_descriptor_advertises_the_protocol_compatibility_window() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let config = running_test_config(temp.path());
+        let descriptor = environment_descriptor(&config, false);
+        assert_eq!(descriptor["remoteProtocolVersion"], 1);
+        assert_eq!(descriptor["minCompatibleRemoteProtocol"], 1);
     }
 
     #[tokio::test]

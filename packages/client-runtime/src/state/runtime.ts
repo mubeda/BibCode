@@ -25,6 +25,7 @@ import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 interface EnvironmentAtomOptions<Input, A, E, R> {
   readonly label: string;
   readonly execute: (input: Input) => Effect.Effect<A, E, R>;
+  readonly timeoutMs?: number;
   readonly scheduler?: AtomCommandScheduler;
   readonly concurrency?: AtomCommandConcurrency<{
     readonly environmentId: EnvironmentIdType;
@@ -556,7 +557,12 @@ export function createEnvironmentCommand<R, ER, Input, A, E>(
     label: options.label,
     ...(options.scheduler === undefined ? {} : { scheduler: options.scheduler }),
     ...(options.concurrency === undefined ? {} : { concurrency: options.concurrency }),
-    execute: (target) => runInEnvironment(target.environmentId, options.execute(target.input)),
+    execute: (target) => {
+      const effect = runInEnvironment(target.environmentId, options.execute(target.input));
+      return options.timeoutMs === undefined
+        ? effect
+        : effect.pipe(Effect.timeout(options.timeoutMs));
+    },
   });
 }
 

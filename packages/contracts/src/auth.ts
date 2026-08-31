@@ -2,6 +2,7 @@ import * as Schema from "effect/Schema";
 import * as HttpApiSchema from "effect/unstable/httpapi/HttpApiSchema";
 
 import { AuthSessionId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { RemotePairingReach } from "./remotePairing.ts";
 
 /**
  * Declares the server's overall authentication posture.
@@ -207,6 +208,23 @@ export const AuthPairingCredentialResult = Schema.Struct({
 });
 export type AuthPairingCredentialResult = typeof AuthPairingCredentialResult.Type;
 
+export const AuthPairingOfferResult = Schema.Struct({
+  id: TrimmedNonEmptyString,
+  code: TrimmedNonEmptyString,
+  reach: RemotePairingReach,
+  endpoint: TrimmedNonEmptyString,
+  name: TrimmedNonEmptyString,
+  expiresAt: Schema.DateTimeUtc,
+});
+export type AuthPairingOfferResult = typeof AuthPairingOfferResult.Type;
+
+export const AuthShareStateResult = Schema.Struct({
+  desiredExposure: Schema.Literals(["wide", "loopback"]),
+  offHostGrantCount: Schema.Number,
+  legacyGrantCount: Schema.Number,
+});
+export type AuthShareStateResult = typeof AuthShareStateResult.Type;
+
 export const AuthPairingLink = Schema.Struct({
   id: TrimmedNonEmptyString,
   credential: TrimmedNonEmptyString,
@@ -215,6 +233,7 @@ export const AuthPairingLink = Schema.Struct({
   label: Schema.optionalKey(TrimmedNonEmptyString),
   createdAt: Schema.DateTimeUtc,
   expiresAt: Schema.DateTimeUtc,
+  reach: Schema.optionalKey(RemotePairingReach),
 });
 export type AuthPairingLink = typeof AuthPairingLink.Type;
 
@@ -239,6 +258,7 @@ export const AuthClientSession = Schema.Struct({
   lastConnectedAt: Schema.NullOr(Schema.DateTimeUtc),
   connected: Schema.Boolean,
   current: Schema.Boolean,
+  reach: Schema.optionalKey(RemotePairingReach),
 });
 export type AuthClientSession = typeof AuthClientSession.Type;
 
@@ -345,6 +365,20 @@ export const AuthCreatePairingCredentialInput = Schema.Struct({
   scopes: Schema.optionalKey(AuthEnvironmentScopes),
 });
 export type AuthCreatePairingCredentialInput = typeof AuthCreatePairingCredentialInput.Type;
+
+export const AuthCreatePairingOfferInput = Schema.Struct({
+  name: TrimmedNonEmptyString,
+  endpoint: TrimmedNonEmptyString,
+  reach: RemotePairingReach,
+  label: Schema.optionalKey(TrimmedNonEmptyString),
+  scopes: Schema.optionalKey(AuthEnvironmentScopes),
+});
+export type AuthCreatePairingOfferInput = typeof AuthCreatePairingOfferInput.Type;
+
+export const AuthCancelPairingOfferInput = Schema.Struct({
+  idempotencyKey: TrimmedNonEmptyString,
+});
+export type AuthCancelPairingOfferInput = typeof AuthCancelPairingOfferInput.Type;
 
 export const AuthSessionState = Schema.Struct({
   authenticated: Schema.Boolean,

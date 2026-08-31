@@ -1,0 +1,9 @@
+{
+  "maxCiphertextBytes": 65535,
+  "maxChunkBytes": 65518,
+  "maxLogicalMessageBytes": 67108864,
+  "maxRecordsPerMessage": 2048,
+  "maxPreauthMessageBytes": 65536,
+  "logicalWriteBytesPerSecond": 65536,
+  "socketWriteTimeoutMs": 5000
+}

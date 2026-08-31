@@ -183,6 +183,7 @@ describe("connection onboarding", () => {
               label: "Old label",
               httpBaseUrl: "http://old.example.test/",
               wsBaseUrl: "ws://old.example.test/",
+              hostKey: null,
             }),
           ),
         }),

@@ -8,7 +8,9 @@ import { createDesktopNetworkAccessStateAtom } from "./desktopNetworkAccess";
 
 const serverExposureState: DesktopServerExposureState = {
   advertisedHost: "192.168.1.10",
+  configuredMode: "network-accessible",
   endpointUrl: "http://192.168.1.10:37737",
+  management: "native",
   mode: "network-accessible",
   tailscaleServeEnabled: false,
   tailscaleServePort: 443,

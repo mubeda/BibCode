@@ -45,6 +45,7 @@ describe("settings navigation", () => {
   it("lists the settings sections in the approved order", () => {
     expect(BASE_SETTINGS_NAV_ITEMS.map(({ label, to }) => [label, to])).toEqual([
       ["General", "/settings/general"],
+      ["Remote Servers", "/settings/remote-servers"],
       ["Agents", "/settings/agents"],
       ["Status Bar", "/settings/status-bar"],
       ["Terminal", "/settings/terminal"],
@@ -73,6 +74,15 @@ describe("settings navigation", () => {
     expect(settingsNavItemsFor(windowsPolicy).map((item) => item.label)).toContain(
       "Local environment",
     );
+    expect(
+      settingsNavItemsFor(windowsPolicy)
+        .map(({ label, to }) => [label, to])
+        .slice(0, 3),
+    ).toEqual([
+      ["General", "/settings/general"],
+      ["Remote Servers", "/settings/remote-servers"],
+      ["Local environment", "/settings/local-environment"],
+    ]);
     expect(settingsNavItemsFor(macPolicy).map((item) => item.label)).not.toContain(
       "Local environment",
     );

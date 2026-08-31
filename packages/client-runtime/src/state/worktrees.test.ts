@@ -118,6 +118,7 @@ function session(
     ready: Effect.void,
     probe: Effect.void,
     closed: Effect.never,
+    e2eeAuthenticated: Effect.succeed(null),
   };
 }
 

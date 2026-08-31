@@ -1,10 +1,11 @@
-import { getPairingTokenFromUrl, setPairingTokenOnUrl } from "./pairingUrl";
+import {
+  readHostedPairingRequest as readNormalizedHostedPairingRequest,
+  type HostedPairingRequest,
+} from "@bibcode/shared/remote";
 
-export interface HostedPairingRequest {
-  readonly host: string;
-  readonly token: string;
-  readonly label: string;
-}
+import { setPairingTokenOnUrl } from "./pairingUrl";
+
+export type { HostedPairingRequest };
 
 export type HostedAppChannel = "latest" | "nightly";
 
@@ -51,19 +52,7 @@ export function isHostedStaticApp(url: URL = new URL(window.location.href)): boo
 }
 
 export function readHostedPairingRequest(url: URL = new URL(window.location.href)) {
-  const host = url.searchParams.get("host")?.trim() ?? "";
-  const token = getPairingTokenFromUrl(url)?.trim() ?? "";
-  const label = url.searchParams.get("label")?.trim() ?? "";
-
-  if (!host || !token) {
-    return null;
-  }
-
-  return {
-    host,
-    token,
-    label,
-  } satisfies HostedPairingRequest;
+  return readNormalizedHostedPairingRequest(url);
 }
 
 export function hasHostedPairingRequest(url: URL = new URL(window.location.href)): boolean {

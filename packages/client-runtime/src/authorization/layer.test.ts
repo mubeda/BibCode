@@ -8,12 +8,14 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
 
 import * as ManagedRelay from "../relay/managedRelay.ts";
 import { remoteHttpClientLayer } from "../rpc/http.ts";
 import * as ClientCapabilities from "../platform/capabilities.ts";
 import * as RemoteEnvironmentAuthorization from "./service.ts";
 import * as TokenStore from "./tokenStore.ts";
+import { BearerConnectionProfile } from "../connection/catalog.ts";
 
 const ENVIRONMENT_ID = EnvironmentId.make("environment-1");
 const ENDPOINT = {
@@ -30,12 +32,16 @@ const DESCRIPTOR = {
   },
   serverVersion: "0.0.0-test",
   storageInstanceId: "store-current",
+  remoteUpdateSupport: null,
+  remoteProtocolVersion: 1,
+  minCompatibleRemoteProtocol: 1,
   capabilities: {
     repositoryIdentity: true,
     worktreeCatalog: false,
     worktreeCatalogRefreshReason: false,
     vcsStatusSummary: false,
     activityProtocolVersion: null,
+    remoteUpdateControl: false,
   },
 } satisfies ExecutionEnvironmentDescriptor;
 const BOOTSTRAP: RemoteEnvironmentAuthorization.RelayEnvironmentAuthorization = {
@@ -62,6 +68,8 @@ const websocketTicket = (ticket: string) =>
     ticket,
     expiresAt: "2026-06-06T01:00:00.000Z",
   });
+
+const decodeBearerConnectionProfile = Schema.decodeUnknownEffect(BearerConnectionProfile);
 
 const accessToken = (token: string) =>
   Response.json({
@@ -164,6 +172,72 @@ const makeHarness = Effect.fn("TestRemoteAuthorization.makeHarness")(function* (
 });
 
 describe("RemoteEnvironmentAuthorization", () => {
+  it.effect("authorizes a decoded blank legacy host key as plain bearer transport", () =>
+    Effect.gen(function* () {
+      const profile = yield* decodeBearerConnectionProfile({
+        _tag: "BearerConnectionProfile",
+        connectionId: "bearer:environment-1",
+        environmentId: ENVIRONMENT_ID,
+        label: "Legacy remote",
+        httpBaseUrl: ENDPOINT.httpBaseUrl,
+        wsBaseUrl: ENDPOINT.wsBaseUrl,
+        hostKey: " \t ",
+      });
+      expect(profile.hostKey).toBeNull();
+      const harness = yield* makeHarness({
+        responses: [Response.json(DESCRIPTOR), websocketTicket("legacy-ticket")],
+      });
+
+      const authorized = yield* Effect.gen(function* () {
+        const remote = yield* RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization;
+        return yield* remote.authorizeBearer({
+          expectedEnvironmentId: ENVIRONMENT_ID,
+          httpBaseUrl: profile.httpBaseUrl,
+          wsBaseUrl: profile.wsBaseUrl,
+          bearerToken: "legacy-bearer",
+          hostKey: profile.hostKey,
+        });
+      }).pipe(Effect.provide(harness.layer));
+
+      expect(authorized.socketUrl).toContain("/ws?wsTicket=legacy-ticket");
+      expect(authorized.httpAuthorization).toEqual({
+        _tag: "Bearer",
+        token: "legacy-bearer",
+      });
+      expect(authorized.e2ee).toBeNull();
+      expect(harness.fetch.calls).toHaveLength(2);
+    }),
+  );
+
+  it.effect("keeps host-key bearer credentials inside the E2EE channel", () =>
+    Effect.gen(function* () {
+      const hostKey = "HcMLXPPBHFNvcbHrCVMH-DMh49rd5AGCzSCqAVJ49hM";
+      const harness = yield* makeHarness({ responses: [Response.json(DESCRIPTOR)] });
+
+      const authorized = yield* Effect.gen(function* () {
+        const remote = yield* RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization;
+        return yield* remote.authorizeBearer({
+          expectedEnvironmentId: ENVIRONMENT_ID,
+          httpBaseUrl: ENDPOINT.httpBaseUrl,
+          wsBaseUrl: ENDPOINT.wsBaseUrl,
+          bearerToken: "stored-bearer",
+          hostKey,
+        });
+      }).pipe(Effect.provide(harness.layer));
+
+      expect(authorized.socketUrl).toBe("wss://environment.example.test/ws-e2ee");
+      expect(authorized.e2ee).toEqual({
+        hostKey,
+        auth: { kind: "bearer", credential: "stored-bearer" },
+      });
+      expect(authorized.httpAuthorization).toBeNull();
+      expect(harness.fetch.calls).toHaveLength(1);
+      expect(String(harness.fetch.calls[0]?.[0])).toBe(
+        "https://environment.example.test/.well-known/bibcode/environment",
+      );
+    }),
+  );
+
   it.effect("returns the descriptor fetched while authorizing a bearer connection", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({

@@ -42,6 +42,8 @@ const CORE_TABLES: &[(u32, &str)] = &[
     (13, "projection_thread_proposed_plans"),
     (20, "auth_pairing_links"),
     (20, "auth_sessions"),
+    (47, "auth_pairing_offer_idempotency"),
+    (48, "auth_authority_state"),
     (34, "activity_scopes"),
     (34, "activity_records"),
     (34, "activity_entries"),
@@ -672,6 +674,10 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::new(43, "DurableWorktreeRemovalReceipts", migration_043),
     Migration::new(44, "ProjectionThreadSessionErrorClass", migration_044),
     Migration::new(45, "ProjectionThreadUnresolvedDelivery", migration_045),
+    Migration::new(46, "AuthPairingReach", migration_046),
+    Migration::new(47, "AuthPairingOfferIdempotency", migration_047),
+    Migration::new(48, "AuthAuthorityRevision", migration_048),
+    Migration::new(49, "AuthPairingDeliveryState", migration_049),
 ];
 
 impl Migration {
@@ -2394,6 +2400,63 @@ fn migration_045(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+fn migration_046(transaction: &Transaction<'_>) -> Result<()> {
+    for table in ["auth_pairing_links", "auth_sessions"] {
+        if !table_exists(transaction, table)? {
+            continue;
+        }
+        for (column, definition) in [("reach", "reach TEXT"), ("off_host", "off_host INTEGER")] {
+            if !table_has_column(transaction, table, column)? {
+                transaction
+                    .execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {definition}"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn migration_047(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS auth_pairing_offer_idempotency (
+            principal_id TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            input_fingerprint TEXT NOT NULL,
+            pairing_id TEXT,
+            result_json TEXT,
+            expires_at TEXT NOT NULL,
+            cancelled_at TEXT,
+            PRIMARY KEY (principal_id, idempotency_key),
+            FOREIGN KEY (pairing_id) REFERENCES auth_pairing_links(id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_auth_pairing_offer_idempotency_expiry
+            ON auth_pairing_offer_idempotency(expires_at);",
+    )?;
+    Ok(())
+}
+
+fn migration_048(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS auth_authority_state (
+            singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
+            revision INTEGER NOT NULL CHECK (revision >= 0)
+        );
+        INSERT OR IGNORE INTO auth_authority_state (singleton, revision) VALUES (1, 0);",
+    )?;
+    Ok(())
+}
+
+fn migration_049(transaction: &Transaction<'_>) -> Result<()> {
+    if table_exists(transaction, "auth_sessions")?
+        && !table_has_column(transaction, "auth_sessions", "delivery_state")?
+    {
+        transaction.execute_batch(
+            "ALTER TABLE auth_sessions
+             ADD COLUMN delivery_state TEXT NOT NULL DEFAULT 'active';",
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2914,7 +2977,7 @@ mod tests {
             .map(|migration| migration.id)
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, (1..=45).collect::<Vec<_>>());
+        assert_eq!(ids, (1..=49).collect::<Vec<_>>());
         assert_eq!(MIGRATIONS[0].name, "OrchestrationEvents");
         assert_eq!(MIGRATIONS[33].name, "ActivityProjection");
         assert_eq!(MIGRATIONS[34].name, "ActivityJournalEventKeyNamespace");
@@ -2929,10 +2992,48 @@ mod tests {
         );
         assert_eq!(MIGRATIONS[41].name, "ProjectWorktreeRepositoryPins");
         assert_eq!(MIGRATIONS[42].name, "DurableWorktreeRemovalReceipts");
+        assert_eq!(MIGRATIONS[43].name, "ProjectionThreadSessionErrorClass");
+        assert_eq!(MIGRATIONS[44].name, "ProjectionThreadUnresolvedDelivery");
+        assert_eq!(MIGRATIONS[47].name, "AuthAuthorityRevision");
+        assert_eq!(MIGRATIONS[48].name, "AuthPairingDeliveryState");
+        assert_eq!(MIGRATIONS[45].name, "AuthPairingReach");
+        assert_eq!(MIGRATIONS[46].name, "AuthPairingOfferIdempotency");
 
         let migration = Migration::new(99, "RuntimeFixture", migration_001);
         assert_eq!(migration.id, 99);
         assert_eq!(migration.name, "RuntimeFixture");
+    }
+
+    #[test]
+    fn migration_49_adds_active_pairing_delivery_state() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(48))?;
+        connection.execute(
+            "INSERT INTO auth_sessions (
+               session_id, subject, scopes, method, client_device_type, issued_at, expires_at
+             ) VALUES ('legacy-session', 'legacy-user', '[]', 'bearer-access-token', 'desktop',
+               '2026-01-01T00:00:00.000Z', '2027-01-01T00:00:00.000Z')",
+            [],
+        )?;
+
+        let applied = run_migrations(&mut connection, None)?;
+
+        assert_eq!(
+            applied
+                .iter()
+                .map(|migration| (migration.id, migration.name))
+                .collect::<Vec<_>>(),
+            vec![(49, "AuthPairingDeliveryState")],
+        );
+        assert_eq!(
+            connection.query_row(
+                "SELECT delivery_state FROM auth_sessions WHERE session_id = 'legacy-session'",
+                [],
+                |row| row.get::<_, String>(0),
+            )?,
+            "active",
+        );
+        Ok(())
     }
 
     #[test]
@@ -3018,9 +3119,9 @@ mod tests {
         assert_eq!(first[15].id, 16);
 
         let second = run_migrations(&mut connection, None)?;
-        assert_eq!(second.len(), 29);
+        assert_eq!(second.len(), 33);
         assert_eq!(second[0].id, 17);
-        assert_eq!(second[28].id, 45);
+        assert_eq!(second[32].id, 49);
 
         let third = run_migrations(&mut connection, None)?;
         assert!(third.is_empty());
@@ -3032,7 +3133,7 @@ mod tests {
             [],
             |row| row.get::<_, u32>(0),
         )?;
-        assert_eq!(application_table_count, 26);
+        assert_eq!(application_table_count, 28);
         assert_delivery_schema(&connection)?;
 
         Ok(())
@@ -3127,7 +3228,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [40, 41, 42, 43, 44, 45]
+            [40, 41, 42, 43, 44, 45, 46, 47, 48, 49]
         );
         let policy = connection.query_row(
             "SELECT worktree_discovery_json FROM projection_projects WHERE project_id = 'project-1'",
@@ -3164,7 +3265,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [41, 42, 43, 44, 45]
+            [41, 42, 43, 44, 45, 46, 47, 48, 49]
         );
         let pin = connection.query_row(
             "SELECT worktree_repository_key FROM projection_projects WHERE project_id = 'project-legacy'",
@@ -3192,7 +3293,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [42, 43, 44, 45]
+            [42, 43, 44, 45, 46, 47, 48, 49]
         );
         let pin = connection.query_row(
             "SELECT repository_key FROM project_worktree_repository_pins WHERE project_id = 'project-pinned'",
@@ -3246,6 +3347,106 @@ mod tests {
     }
 
     #[test]
+    fn migration_46_adds_nullable_reach_metadata_to_existing_auth_tables() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(45))?;
+
+        let has_column = |connection: &rusqlite::Connection,
+                          table: &str,
+                          column: &str|
+         -> rusqlite::Result<bool> {
+            let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(columns.iter().any(|candidate| candidate == column))
+        };
+
+        for table in ["auth_pairing_links", "auth_sessions"] {
+            assert!(!has_column(&connection, table, "reach")?);
+            assert!(!has_column(&connection, table, "off_host")?);
+        }
+
+        let applied = run_migrations(&mut connection, Some(46))?;
+        assert_eq!(
+            applied
+                .iter()
+                .map(|migration| migration.id)
+                .collect::<Vec<_>>(),
+            [46]
+        );
+        for table in ["auth_pairing_links", "auth_sessions"] {
+            assert!(has_column(&connection, table, "reach")?);
+            assert!(has_column(&connection, table, "off_host")?);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn migration_47_adds_the_durable_pairing_offer_ledger() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(46))?;
+        assert!(!table_exists(
+            &connection,
+            "auth_pairing_offer_idempotency"
+        )?);
+
+        let applied = run_migrations(&mut connection, Some(47))?;
+        assert_eq!(
+            applied
+                .iter()
+                .map(|migration| migration.id)
+                .collect::<Vec<_>>(),
+            [47]
+        );
+        assert!(table_exists(&connection, "auth_pairing_offer_idempotency")?);
+
+        let columns = connection
+            .prepare("PRAGMA table_info(auth_pairing_offer_idempotency)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(
+            columns,
+            [
+                "principal_id",
+                "idempotency_key",
+                "input_fingerprint",
+                "pairing_id",
+                "result_json",
+                "expires_at",
+                "cancelled_at",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn migration_48_adds_the_auth_authority_revision() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(47))?;
+
+        let applied = run_migrations(&mut connection, None)?;
+        assert_eq!(
+            applied
+                .iter()
+                .map(|migration| migration.id)
+                .collect::<Vec<_>>(),
+            [48, 49]
+        );
+        assert_eq!(
+            connection.query_row(
+                "SELECT revision FROM auth_authority_state WHERE singleton = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
     fn trusts_an_existing_current_effect_ledger_without_rebuilding_data() -> rusqlite::Result<()> {
         let mut connection = rusqlite::Connection::open_in_memory()?;
         connection.execute_batch(
@@ -3261,7 +3462,7 @@ mod tests {
         )?;
 
         let applied = run_migrations(&mut connection, None)?;
-        assert_eq!(applied.len(), 12);
+        assert_eq!(applied.len(), 16);
         assert_eq!(applied[0].id, 34);
         assert_eq!(applied[1].id, 35);
         assert_eq!(applied[2].id, 36);
@@ -3274,6 +3475,10 @@ mod tests {
         assert_eq!(applied[9].id, 43);
         assert_eq!(applied[10].id, 44);
         assert_eq!(applied[11].id, 45);
+        assert_eq!(applied[12].id, 46);
+        assert_eq!(applied[13].id, 47);
+        assert_eq!(applied[14].id, 48);
+        assert_eq!(applied[15].id, 49);
         let value = connection.query_row("SELECT value FROM legacy_user_data", [], |row| {
             row.get::<_, String>(0)
         })?;

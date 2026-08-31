@@ -14,13 +14,17 @@ export {
 } from "./context";
 
 export {
+  cancelServerPairingOffer,
   createServerPairingCredential,
+  createServerPairingOffer,
   fetchSessionState,
   isPrimaryEnvironmentPairingCredentialRejectedError,
   isPrimaryEnvironmentRequestError,
+  getServerShareState,
   listServerClientSessions,
   listServerPairingLinks,
   peekPairingTokenFromUrl,
+  PRIMARY_PAIRING_OFFER_REQUEST_TIMEOUT_MS,
   PrimaryEnvironmentPairingCredentialRejectedError,
   PrimaryEnvironmentRequestError,
   reauthenticatePrimaryEnvironment,

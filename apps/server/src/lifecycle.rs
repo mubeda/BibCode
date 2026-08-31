@@ -24,7 +24,8 @@ use crate::{
         jwt::PersistentJwtCodec,
         server_terminal::ProcessTreeCleanup,
     },
-    rpc::RpcRegistry,
+    remote_update::RemoteUpdateDelegate,
+    rpc::{E2eePreauthAdmission, RpcRegistry},
 };
 
 const SIGNING_KEY_NAME: &str = "server-signing-key";
@@ -33,6 +34,23 @@ const ASSET_KEY_NAME: &str = "asset-access-key";
 const ASSET_KEY_BYTES: usize = 32;
 
 pub struct ServerRuntime;
+
+fn connect_environment_descriptor(config: &ServerConfig) -> serde_json::Value {
+    serde_json::json!({
+        "environmentId": config.environment_id,
+        "label": config.environment_label,
+        "platform": { "os": std::env::consts::OS, "arch": std::env::consts::ARCH },
+        "serverVersion": config.server_version,
+        "storageInstanceId": config
+            .storage_instance_id
+            .expect("a running server has a prepared persistent store")
+            .to_string(),
+        "remoteUpdateSupport": config.remote_update_support,
+        "remoteProtocolVersion": crate::http::REMOTE_PROTOCOL_VERSION,
+        "minCompatibleRemoteProtocol": crate::http::MIN_COMPATIBLE_REMOTE_PROTOCOL,
+        "capabilities": { "repositoryIdentity": true, "remoteUpdateControl": true },
+    })
+}
 
 pub struct ServerHandle {
     local_addr: SocketAddr,
@@ -87,6 +105,7 @@ impl ServerRuntime {
             None,
             ui_process_observer,
             ProcessTreeCleanup::EmbeddedHost,
+            None,
         )
         .await
     }
@@ -100,6 +119,7 @@ impl ServerRuntime {
             None,
             ui_process_observer,
             ProcessTreeCleanup::StandaloneServer,
+            None,
         )
         .await
     }
@@ -113,6 +133,22 @@ impl ServerRuntime {
             None,
             ui_process_observer,
             ProcessTreeCleanup::EmbeddedHost,
+            None,
+        )
+        .await
+    }
+
+    pub async fn start_with_desktop_integration(
+        config: ServerConfig,
+        ui_process_observer: Arc<dyn DesktopUiProcessObserver>,
+        update_delegate: Arc<dyn RemoteUpdateDelegate>,
+    ) -> Result<ServerHandle, ServerError> {
+        Self::start_internal(
+            config,
+            None,
+            ui_process_observer,
+            ProcessTreeCleanup::EmbeddedHost,
+            Some(update_delegate),
         )
         .await
     }
@@ -127,6 +163,7 @@ impl ServerRuntime {
             Some(rpc_registry),
             ui_process_observer,
             ProcessTreeCleanup::EmbeddedHost,
+            None,
         )
         .await
     }
@@ -136,6 +173,7 @@ impl ServerRuntime {
         custom_registry: Option<RpcRegistry>,
         ui_process_observer: Arc<dyn DesktopUiProcessObserver>,
         process_tree_cleanup: ProcessTreeCleanup,
+        update_delegate: Option<Arc<dyn RemoteUpdateDelegate>>,
     ) -> Result<ServerHandle, ServerError> {
         let resolved_data_root = resolve_data_root(config.data_root_request.clone())?;
         config.base_dir = resolved_data_root.effective.clone();
@@ -214,6 +252,7 @@ impl ServerRuntime {
                         asset_secret,
                         ui_process_observer,
                         process_tree_cleanup,
+                        update_delegate,
                     )
                     .await
                     .map_err(ServerError::ProductionInitialize)?,
@@ -267,17 +306,7 @@ impl ServerRuntime {
                         }
                     },
                 );
-                let descriptor = serde_json::json!({
-                    "environmentId": config.environment_id,
-                    "label": config.environment_label,
-                    "platform": { "os": std::env::consts::OS, "arch": std::env::consts::ARCH },
-                    "serverVersion": config.server_version,
-                    "storageInstanceId": config
-                        .storage_instance_id
-                        .expect("a running server has a prepared persistent store")
-                        .to_string(),
-                    "capabilities": { "repositoryIdentity": true },
-                });
+                let descriptor = connect_environment_descriptor(&config);
                 let connect = Arc::new(
                     ConnectMcpService::open(
                         config.database_path(),
@@ -331,6 +360,7 @@ impl ServerRuntime {
             config: Arc::new(config),
             shutdown: shutdown.clone(),
             rpc_registry,
+            e2ee_preauth_admission: E2eePreauthAdmission::new(),
             http_routes,
             auth,
             admission_gate,
@@ -342,9 +372,12 @@ impl ServerRuntime {
         let task_log_sink = log_sink.clone();
         let task = tokio::spawn(async move {
             let _log_sink = task_log_sink;
-            let result = axum::serve(listener, app)
-                .with_graceful_shutdown(server_shutdown.cancelled_owned())
-                .await;
+            let result = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(server_shutdown.cancelled_owned())
+            .await;
             if let Some(runtime) = cleanup_runtime {
                 runtime.shutdown().await;
             }
@@ -553,6 +586,21 @@ impl Drop for ServerHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connect_descriptor_advertises_remote_update_support() {
+        let mut config = ServerConfig::new("/tmp/bibcode-connect-descriptor-test");
+        config.storage_instance_id = Some(crate::persistence::StorageInstanceId::from_uuid(
+            uuid::Uuid::nil(),
+        ));
+        let descriptor = connect_environment_descriptor(&config);
+        assert_eq!(descriptor["capabilities"]["repositoryIdentity"], true);
+        assert_eq!(descriptor["capabilities"]["remoteUpdateControl"], true);
+        assert_eq!(
+            descriptor["remoteUpdateSupport"],
+            serde_json::json!({ "installMode": "manual", "reason": "manual-update-required" })
+        );
+    }
 
     #[tokio::test]
     async fn rejects_relative_programmatic_data_roots_before_creating_state() {

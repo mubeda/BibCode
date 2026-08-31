@@ -13,16 +13,25 @@ use uuid::Uuid;
 use super::{
     model::{
         ACCESS_TOKEN_TYPE, BOOTSTRAP_TOKEN_TYPE, BrowserSessionRequest, BrowserSessionResult,
-        ClientMetadata, CreatePairingRequest, RevokeClientRequest, RevokePairingRequest,
-        SCOPE_ACCESS_READ, SCOPE_ACCESS_WRITE, TOKEN_GRANT_TYPE, TokenExchangeRequest,
-        WebSocketTicketResult,
+        CancelPairingOfferRequest, ClientMetadata, CreatePairingOfferRequest, CreatePairingRequest,
+        PairingOfferResult, RevokeClientRequest, RevokePairingRequest, SCOPE_ACCESS_READ,
+        SCOPE_ACCESS_WRITE, TOKEN_GRANT_TYPE, TokenExchangeRequest, WebSocketTicketResult,
     },
-    service::{AuthError, AuthService, default_standard_scopes, format_iso, now_ms, parse_scopes},
+    pairing_code::{
+        REMOTE_PAIRING_CODE_VERSION, RemotePairingCodePayload, RemotePairingReach,
+        encode_pairing_code,
+    },
+    service::{
+        AuthError, AuthService, PAIRING_REACH_VALUES, PairingOfferIssuance, PairingOfferReplay,
+        PairingOfferReservation, default_standard_scopes, format_iso, is_loopback_host,
+        is_unspecified_host, now_ms, parse_scopes,
+    },
 };
 use crate::http::AppState;
 
 const CREDENTIAL_HEADERS: [(&str, &str); 2] =
     [("cache-control", "no-store"), ("pragma", "no-cache")];
+const MAX_PAIRING_OFFER_IDEMPOTENCY_KEY_BYTES: usize = 128;
 
 pub(crate) fn add_routes(router: Router<AppState>) -> Router<AppState> {
     router
@@ -31,6 +40,9 @@ pub(crate) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         .route("/oauth/token", post(token))
         .route("/api/auth/websocket-ticket", post(websocket_ticket))
         .route("/api/auth/pairing-token", post(pairing_token))
+        .route("/api/auth/pairing-offer", post(create_pairing_offer))
+        .route("/api/auth/pairing-offer/cancel", post(cancel_pairing_offer))
+        .route("/api/auth/share-state", get(share_state))
         .route("/api/auth/pairing-links", get(pairing_links))
         .route("/api/auth/pairing-links/revoke", post(revoke_pairing_link))
         .route("/api/auth/clients", get(clients))
@@ -69,7 +81,11 @@ async fn browser_session(
 ) -> Response {
     let response = match state
         .auth
-        .create_browser_session(payload.credential.trim(), client_metadata(&headers, None))
+        .create_browser_session(
+            payload.credential.trim(),
+            client_metadata(&headers, None),
+            super::SessionTransport::Plain,
+        )
         .await
     {
         Ok(issued) => {
@@ -174,6 +190,7 @@ async fn token_inner(
             requested_scopes,
             presented,
             proof_key_thumbprint,
+            super::SessionTransport::Plain,
         )
         .await?;
     let expires_in = ((issued.principal.expires_at_ms - now_ms()) / 1_000).max(0);
@@ -262,10 +279,294 @@ async fn pairing_token(
     }
 }
 
+async fn create_pairing_offer(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(payload): Json<CreatePairingOfferRequest>,
+) -> Response {
+    let principal =
+        match authenticated_with_scope(&state.auth, &headers, &uri, SCOPE_ACCESS_WRITE).await {
+            Ok(principal) => principal,
+            Err(error) => {
+                return auth_error_for_request(error, &headers, "pairing_offer_issuance_failed");
+            }
+        };
+    let idempotency_key = match headers.get("idempotency-key") {
+        Some(value) => {
+            let Ok(value) = value.to_str() else {
+                return invalid_pairing_offer_response("idempotency key must be valid text");
+            };
+            let key = value.trim();
+            if !is_valid_pairing_offer_idempotency_key(key) {
+                return invalid_pairing_offer_response("idempotency key is invalid");
+            }
+            Some(key.to_owned())
+        }
+        None => None,
+    };
+    let input_fingerprint = format!(
+        "{}\n{}\n{}\n{:?}\n{:?}",
+        payload.name.trim(),
+        payload.endpoint.trim(),
+        payload.reach,
+        payload.label,
+        payload.scopes,
+    );
+    let _offer_guard = if idempotency_key.is_some() {
+        Some(state.auth.lock_pairing_offer_issuance().await)
+    } else {
+        None
+    };
+    if let Some(key) = &idempotency_key {
+        match state
+            .auth
+            .replay_pairing_offer(&principal.session_id, key, &input_fingerprint)
+            .await
+        {
+            Ok(PairingOfferReplay::Original(original)) => return Json(original).into_response(),
+            Ok(PairingOfferReplay::Cancelled) => {
+                return invalid_pairing_offer_response("idempotency key was cancelled");
+            }
+            Ok(PairingOfferReplay::Conflict) => {
+                return invalid_pairing_offer_response(
+                    "idempotency key was already used with a different input",
+                );
+            }
+            Ok(PairingOfferReplay::Fresh) => {}
+            Err(error) => {
+                return auth_error_for_request(error, &headers, "pairing_offer_issuance_failed");
+            }
+        }
+    }
+
+    let endpoint_raw = payload.endpoint.trim();
+    let endpoint = match url::Url::parse(endpoint_raw) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") => url,
+        _ => return invalid_pairing_offer_response("endpoint must be an http(s) URL"),
+    };
+    let host = endpoint.host_str().unwrap_or_default();
+    if host.is_empty() || is_unspecified_host(host) || endpoint.port() == Some(0) {
+        return invalid_pairing_offer_response(
+            "endpoint must be a connectable address (no wildcard host, no port 0)",
+        );
+    }
+    let endpoint_is_loopback = is_loopback_host(host);
+    if !PAIRING_REACH_VALUES.contains(&payload.reach.as_str()) {
+        return invalid_pairing_offer_response("reach does not match the offered endpoint");
+    }
+    let reach_ok = match payload.reach.as_str() {
+        "this-computer" => endpoint_is_loopback,
+        "another-device" => !endpoint_is_loopback,
+        _ => true,
+    };
+    let name = payload.name.trim().to_owned();
+    if !reach_ok || name.is_empty() {
+        return invalid_pairing_offer_response("reach does not match the offered endpoint");
+    }
+    let scopes = payload.scopes.unwrap_or_else(default_standard_scopes);
+    if scopes.is_empty()
+        || scopes
+            .iter()
+            .any(|scope| !super::model::ALL_SCOPES.contains(&scope.as_str()))
+        || scopes
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            != scopes.len()
+        || !scopes
+            .iter()
+            .all(|scope| principal.scopes.iter().any(|granted| granted == scope))
+    {
+        return invalid_pairing_offer_response("requested scope exceeds the caller's grant");
+    }
+    let Some(storage_instance_id) = state.config.storage_instance_id else {
+        return auth_error_for_request(
+            AuthError::Internal("storage identity is unavailable".to_owned()),
+            &headers,
+            "pairing_offer_issuance_failed",
+        );
+    };
+    let label = payload
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| name.clone());
+    let off_host = match payload.reach.as_str() {
+        "another-device" => true,
+        "this-computer" => false,
+        _ => !endpoint_is_loopback,
+    };
+    let issued = if let Some(key) = &idempotency_key {
+        match state
+            .auth
+            .issue_share_pairing_offer(
+                scopes,
+                Some(label),
+                payload.reach.clone(),
+                off_host,
+                PairingOfferReservation::new(
+                    principal.session_id.clone(),
+                    key.clone(),
+                    input_fingerprint.clone(),
+                ),
+            )
+            .await
+        {
+            Ok(PairingOfferIssuance::Reserved(issued)) => issued,
+            Ok(PairingOfferIssuance::Replay(PairingOfferReplay::Original(original))) => {
+                return Json(original).into_response();
+            }
+            Ok(PairingOfferIssuance::Replay(PairingOfferReplay::Cancelled)) => {
+                return invalid_pairing_offer_response("idempotency key was cancelled");
+            }
+            Ok(PairingOfferIssuance::Replay(PairingOfferReplay::Conflict)) => {
+                return invalid_pairing_offer_response(
+                    "idempotency key was already used with a different input",
+                );
+            }
+            Ok(PairingOfferIssuance::Replay(PairingOfferReplay::Fresh)) => {
+                return auth_error_for_request(
+                    AuthError::Internal("pairing offer reservation disappeared".to_owned()),
+                    &headers,
+                    "pairing_offer_issuance_failed",
+                );
+            }
+            Err(error) => {
+                return auth_error_for_request(error, &headers, "pairing_offer_issuance_failed");
+            }
+        }
+    } else {
+        match state
+            .auth
+            .issue_share_pairing(scopes, Some(label), payload.reach.clone(), off_host)
+            .await
+        {
+            Ok(issued) => issued,
+            Err(error) => {
+                return auth_error_for_request(error, &headers, "pairing_offer_issuance_failed");
+            }
+        }
+    };
+    let code_payload = RemotePairingCodePayload {
+        v: REMOTE_PAIRING_CODE_VERSION,
+        endpoint: endpoint_raw.trim_end_matches('/').to_owned(),
+        name: name.clone(),
+        token: issued.credential.clone(),
+        host_key: state.auth.host_identity().public_key_base64url(),
+        reach: match payload.reach.as_str() {
+            "this-computer" => RemotePairingReach::ThisComputer,
+            "another-device" => RemotePairingReach::AnotherDevice,
+            _ => RemotePairingReach::Custom,
+        },
+        storage_instance_id: storage_instance_id.to_string(),
+    };
+    let code = match encode_pairing_code(&code_payload) {
+        Ok(code) => code,
+        Err(error) => {
+            if let Some(key) = &idempotency_key {
+                let _ = state
+                    .auth
+                    .cancel_pairing_offer(&principal.session_id, key.clone())
+                    .await;
+            } else {
+                let _ = state.auth.revoke_pairing(&issued.id).await;
+            }
+            return auth_error_for_request(
+                AuthError::Internal(format!("pairing code encoding failed: {error}")),
+                &headers,
+                "pairing_offer_issuance_failed",
+            );
+        }
+    };
+    let result = PairingOfferResult {
+        id: issued.id,
+        code,
+        reach: payload.reach,
+        endpoint: code_payload.endpoint,
+        name,
+        expires_at: issued.expires_at,
+    };
+    if let Some(key) = idempotency_key
+        && let Err(error) = state
+            .auth
+            .record_pairing_offer(
+                &principal.session_id,
+                key.clone(),
+                input_fingerprint,
+                result.clone(),
+            )
+            .await
+    {
+        let _ = state
+            .auth
+            .cancel_pairing_offer(&principal.session_id, key.clone())
+            .await;
+        return auth_error_for_request(error, &headers, "pairing_offer_issuance_failed");
+    }
+    Json(result).into_response()
+}
+
+async fn cancel_pairing_offer(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(payload): Json<CancelPairingOfferRequest>,
+) -> Response {
+    let principal = match authenticated_with_scope(&state.auth, &headers, &uri, SCOPE_ACCESS_WRITE)
+        .await
+    {
+        Ok(principal) => principal,
+        Err(error) => {
+            return auth_error_for_request(error, &headers, "pairing_offer_cancellation_failed");
+        }
+    };
+    let key = payload.idempotency_key.trim();
+    if !is_valid_pairing_offer_idempotency_key(key) {
+        return invalid_pairing_offer_response("idempotency key is invalid");
+    }
+    let _offer_guard = state.auth.lock_pairing_offer_issuance().await;
+    match state
+        .auth
+        .cancel_pairing_offer(&principal.session_id, key.to_owned())
+        .await
+    {
+        Ok(cancelled) => Json(json!({ "cancelled": cancelled })).into_response(),
+        Err(error) => auth_error_for_request(error, &headers, "pairing_offer_cancellation_failed"),
+    }
+}
+
+fn invalid_pairing_offer_response(detail: &str) -> Response {
+    let trace_id = Uuid::new_v4().to_string();
+    tracing::debug!(target: "bibcode_server::auth", %trace_id, "invalid pairing offer: {detail}");
+    error_response(
+        StatusCode::BAD_REQUEST,
+        "EnvironmentRequestInvalidError",
+        json!({
+            "code": "invalid_request",
+            "reason": "invalid_pairing_offer",
+            "traceId": trace_id,
+        }),
+    )
+}
+
+fn is_valid_pairing_offer_idempotency_key(key: &str) -> bool {
+    !key.is_empty() && key.len() <= MAX_PAIRING_OFFER_IDEMPOTENCY_KEY_BYTES
+}
+
 async fn pairing_links(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
     match authenticated_with_scope(&state.auth, &headers, &uri, SCOPE_ACCESS_READ).await {
         Ok(_) => Json(state.auth.list_pairings().await).into_response(),
         Err(error) => auth_error_for_request(error, &headers, "pairing_links_load_failed"),
+    }
+}
+
+async fn share_state(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
+    match authenticated_with_scope(&state.auth, &headers, &uri, SCOPE_ACCESS_READ).await {
+        Ok(_) => Json(state.auth.share_exposure_state().await).into_response(),
+        Err(error) => auth_error_for_request(error, &headers, "share_state_load_failed"),
     }
 }
 
@@ -393,7 +694,9 @@ async fn authenticate_request_for_method(
         .map(str::trim);
     let token = cookie.or(bearer).or(dpop).filter(|value| !value.is_empty());
     let token = token.ok_or(AuthError::MissingCredential)?;
-    let principal = auth.authenticate_token(token).await?;
+    let principal = auth
+        .authenticate_token(token, super::SessionTransport::Plain)
+        .await?;
     if let Some(expected_thumbprint) = principal.proof_key_thumbprint.as_deref() {
         let dpop_token = dpop.filter(|candidate| *candidate == token);
         let dpop_token = dpop_token.ok_or(AuthError::InvalidCredential)?;
@@ -647,4 +950,64 @@ fn non_empty(value: Option<String>) -> Option<String> {
         let trimmed = value.trim();
         (!trimmed.is_empty()).then(|| trimmed.to_owned())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use serde::Deserialize;
+
+    use super::{MAX_PAIRING_OFFER_IDEMPOTENCY_KEY_BYTES, is_valid_pairing_offer_idempotency_key};
+    use crate::auth::service::{is_loopback_host, is_unspecified_host};
+
+    #[derive(Deserialize)]
+    struct PairingEndpointFixture {
+        endpoint: String,
+        classification: String,
+    }
+
+    #[test]
+    fn pairing_endpoint_loopback_semantics_match_shared_fixtures() {
+        let fixtures: Vec<PairingEndpointFixture> = serde_json::from_str(include_str!(
+            "../../../../packages/shared/fixtures/pairing-endpoint-classification.json"
+        ))
+        .expect("pairing endpoint fixtures");
+
+        for fixture in fixtures {
+            let Ok(endpoint) = url::Url::parse(&fixture.endpoint) else {
+                assert_eq!(fixture.classification, "unconnectable");
+                continue;
+            };
+            let host = endpoint.host_str().unwrap_or_default();
+            let wildcard = host.is_empty() || is_unspecified_host(host);
+            let unconnectable = wildcard || endpoint.port() == Some(0);
+            assert_eq!(
+                unconnectable,
+                fixture.classification == "unconnectable",
+                "{}",
+                fixture.endpoint
+            );
+            if !unconnectable {
+                assert_eq!(
+                    is_loopback_host(host),
+                    fixture.classification == "loopback",
+                    "{}",
+                    fixture.endpoint
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pairing_offer_idempotency_keys_are_byte_bounded() {
+        assert!(!is_valid_pairing_offer_idempotency_key(""));
+        assert!(is_valid_pairing_offer_idempotency_key(
+            &"x".repeat(MAX_PAIRING_OFFER_IDEMPOTENCY_KEY_BYTES)
+        ));
+        assert!(!is_valid_pairing_offer_idempotency_key(
+            &"x".repeat(MAX_PAIRING_OFFER_IDEMPOTENCY_KEY_BYTES + 1)
+        ));
+        assert!(!is_valid_pairing_offer_idempotency_key(
+            &"🦀".repeat(MAX_PAIRING_OFFER_IDEMPOTENCY_KEY_BYTES / 2)
+        ));
+    }
 }

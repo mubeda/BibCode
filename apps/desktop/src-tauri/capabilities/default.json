@@ -3,5 +3,10 @@
   "identifier": "default",
   "description": "Default permissions for the BiBCode Tauri desktop shell.",
   "webviews": ["main"],
-  "permissions": ["allow-desktop-bridge", "allow-desktop-preview", "core:default"]
+  "permissions": [
+    "allow-desktop-bridge",
+    "allow-desktop-preview",
+    "core:default",
+    "deep-link:default"
+  ]
 }

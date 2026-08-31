@@ -33,6 +33,7 @@ const INSTALL_LOCK_RETRY_COUNT: usize = 100;
 const INSTALL_LOCK_RETRY_DELAY: Duration = Duration::from_millis(100);
 const INSTALL_LOCK_STALE_AFTER: Duration = Duration::from_secs(10 * 60);
 const VALIDATION_TIMEOUT: Duration = Duration::from_secs(15);
+const VALIDATION_EXEC_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RelayReleaseArchive {
@@ -457,7 +458,13 @@ impl NativeRelayClient {
                 "write_failed",
                 format!("could not flush relay client download: {error}"),
             )
-        })
+        })?;
+        // Tokio file writes may still own a blocking-task clone after the async
+        // wrapper is dropped. Wait for every in-flight operation, then close the
+        // writable OS handle before checksum validation or execution (Linux
+        // rejects execution with ETXTBSY while that handle remains open).
+        drop(file.into_std().await);
+        Ok(())
     }
 
     fn available(&self, path: &Path, source: &str) -> RelayClientStatus {
@@ -614,13 +621,27 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let mut command = Command::new(program);
-    configure_background_command(&mut command);
-    command.args(args).kill_on_drop(true);
-    let output = timeout(validation_timeout, command.output())
-        .await
-        .map_err(|_| RelayInstallError::new(reason, format!("{message}: timed out")))?
-        .map_err(|error| RelayInstallError::new(reason, format!("{message}: {error}")))?;
+    let program = program.as_ref().to_owned();
+    let args = args
+        .into_iter()
+        .map(|argument| argument.as_ref().to_owned())
+        .collect::<Vec<_>>();
+    let output = timeout(validation_timeout, async {
+        loop {
+            let mut command = Command::new(&program);
+            configure_background_command(&mut command);
+            command.args(&args).kill_on_drop(true);
+            match command.output().await {
+                Err(error) if executable_is_transiently_busy(&error) => {
+                    sleep(VALIDATION_EXEC_RETRY_DELAY).await;
+                }
+                result => return result,
+            }
+        }
+    })
+    .await
+    .map_err(|_| RelayInstallError::new(reason, format!("{message}: timed out")))?
+    .map_err(|error| RelayInstallError::new(reason, format!("{message}: {error}")))?;
     if output.status.success() {
         Ok(())
     } else {
@@ -629,6 +650,16 @@ where
             format!("{message}: exited with {}", output.status),
         ))
     }
+}
+
+#[cfg(unix)]
+fn executable_is_transiently_busy(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ETXTBSY)
+}
+
+#[cfg(not(unix))]
+fn executable_is_transiently_busy(_error: &std::io::Error) -> bool {
+    false
 }
 
 async fn make_executable(path: &Path) -> Result<(), RelayInstallError> {
@@ -907,6 +938,36 @@ mod tests {
         right_result.expect("right relay validation");
         assert_ne!(left_pid, right_pid);
         tokio::join!(left.wait_reaped(), right.wait_reaped());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn relay_validation_retries_a_transient_executable_busy_error() {
+        let temp = TempDir::new().expect("temp dir");
+        let executable = temp.path().join("cloudflared");
+        fs::copy(native_success_executable(), &executable)
+            .await
+            .expect("copy fixture");
+        make_executable(&executable).await.expect("make executable");
+        let writable = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&executable)
+            .expect("hold writable executable");
+        let release = tokio::spawn(async move {
+            sleep(Duration::from_millis(25)).await;
+            drop(writable);
+        });
+
+        run_checked_with_timeout(
+            &executable,
+            [OsString::from("--version")],
+            "validation_failed",
+            "busy executable did not recover",
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("validation retries executable busy");
+        release.await.expect("writable handle release");
     }
 
     #[tokio::test]

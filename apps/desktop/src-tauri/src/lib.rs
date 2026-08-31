@@ -29,7 +29,7 @@ macro_rules! desktop_bridge_commands {
             desktop_bridge_issue_ssh_web_socket_ticket,
             desktop_bridge_resolve_ssh_password_prompt,
             desktop_bridge_get_server_exposure_state,
-            desktop_bridge_set_server_exposure_mode,
+            desktop_bridge_apply_server_exposure,
             desktop_bridge_set_tailscale_serve_enabled,
             desktop_bridge_get_advertised_endpoints,
             desktop_bridge_get_wsl_state,
@@ -83,13 +83,16 @@ macro_rules! bridge_command_names {
 pub fn run() {
     let shell_path_hydration = shell_environment::hydrate_process_path();
     let builder = tauri::Builder::<bridge::DesktopRuntime>::new()
+        .plugin(tauri_plugin_single_instance::init(|_app, _argv, _cwd| {}))
         .manage(backend::BackendSupervisor::new())
+        .manage(server_exposure::ServerExposureCoordinator::default())
         .manage(bridge::ConnectionCatalogCoordinator::new())
         .manage(context_menu::NativeContextMenuManager::new())
         .manage(ssh::SshEnvironmentManager::new())
         .manage(ssh::SshPasswordPromptManager::new())
         .manage(updates::DesktopUpdateManager::new())
         .manage(preview::PreviewHostState::new())
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build());
@@ -103,15 +106,40 @@ pub fn run() {
         window::configure_application_menu(app.handle())?;
         window::restore_main_window_state(app.handle())?;
 
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            use tauri_plugin_deep_link::DeepLinkExt;
+            if let Err(error) = app.deep_link().register_all() {
+                tracing::warn!("failed to register bibcode:// deep-link handler: {error}");
+            }
+        }
+
         let update_app = app.handle().clone();
+        {
+            use tauri_plugin_updater::UpdaterExt as _;
+            let backend = app.state::<crate::backend::BackendSupervisor>();
+            backend.install_remote_update_integration(
+                crate::remote_update_delegate::DesktopRemoteUpdateDelegate::new(update_app.clone()),
+                crate::remote_update_delegate::derive_remote_update_support(
+                    update_app.updater().is_ok(),
+                ),
+            );
+        }
         tauri::async_runtime::spawn(updates::run_background_update_checks(update_app));
 
         let app_handle = app.handle().clone();
         let backend = app.state::<backend::BackendSupervisor>().inner().clone();
+        let exposure_coordinator = app
+            .state::<server_exposure::ServerExposureCoordinator>()
+            .inner()
+            .clone();
         #[cfg(unix)]
         backend::install_termination_signal_handler(app_handle.clone(), backend.clone());
         tauri::async_runtime::spawn(async move {
-            match backend.start_default(app_handle).await {
+            match exposure_coordinator
+                .run_exclusive(backend.start_default(app_handle))
+                .await
+            {
                 Ok(_config) => {}
                 Err(error) => {
                     tracing::error!("failed to start Tauri desktop backend: {error}");
@@ -148,7 +176,7 @@ pub fn run() {
         bridge::desktop_bridge_issue_ssh_web_socket_ticket,
         bridge::desktop_bridge_resolve_ssh_password_prompt,
         bridge::desktop_bridge_get_server_exposure_state,
-        bridge::desktop_bridge_set_server_exposure_mode,
+        bridge::desktop_bridge_apply_server_exposure,
         bridge::desktop_bridge_set_tailscale_serve_enabled,
         bridge::desktop_bridge_get_advertised_endpoints,
         bridge::desktop_bridge_get_wsl_state,
@@ -244,8 +272,12 @@ mod bridge;
 mod config;
 mod context_menu;
 mod data_safety;
+mod firewall;
+mod network_interfaces;
 mod preview;
+mod remote_update_delegate;
 mod security;
+mod server_exposure;
 mod shell_environment;
 pub mod ssh;
 mod tailscale;

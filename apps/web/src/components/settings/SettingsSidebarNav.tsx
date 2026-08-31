@@ -8,6 +8,7 @@ import {
   KeyboardIcon,
   MonitorIcon,
   PanelBottomIcon,
+  ServerIcon,
   Settings2Icon,
   TerminalIcon,
 } from "lucide-react";
@@ -32,7 +33,8 @@ import type { EnvironmentPresentationPolicy } from "~/connection/environmentPres
 
 export type SettingsSectionPath =
   | "/settings/general"
-  | "/settings/connections"
+  | "/settings/remote-servers"
+  | "/settings/local-environment"
   | "/settings/agents"
   | "/settings/status-bar"
   | "/settings/terminal"
@@ -50,6 +52,7 @@ export interface SettingsNavItem {
 
 export const BASE_SETTINGS_NAV_ITEMS: ReadonlyArray<SettingsNavItem> = [
   { label: "General", to: "/settings/general", icon: Settings2Icon },
+  { label: "Remote Servers", to: "/settings/remote-servers", icon: ServerIcon },
   { label: "Agents", to: "/settings/agents", icon: BotIcon },
   { label: "Status Bar", to: "/settings/status-bar", icon: PanelBottomIcon },
   { label: "Terminal", to: "/settings/terminal", icon: TerminalIcon },
@@ -62,7 +65,7 @@ export const BASE_SETTINGS_NAV_ITEMS: ReadonlyArray<SettingsNavItem> = [
 
 const LOCAL_ENVIRONMENT_NAV_ITEM = {
   label: "Local environment",
-  to: "/settings/connections",
+  to: "/settings/local-environment",
   icon: MonitorIcon,
 } as const;
 
@@ -70,7 +73,12 @@ export function settingsNavItemsFor(
   policy: EnvironmentPresentationPolicy,
 ): ReadonlyArray<SettingsNavItem> {
   return policy.showLocalEnvironmentSettings
-    ? [BASE_SETTINGS_NAV_ITEMS[0]!, LOCAL_ENVIRONMENT_NAV_ITEM, ...BASE_SETTINGS_NAV_ITEMS.slice(1)]
+    ? [
+        BASE_SETTINGS_NAV_ITEMS[0]!,
+        BASE_SETTINGS_NAV_ITEMS[1]!,
+        LOCAL_ENVIRONMENT_NAV_ITEM,
+        ...BASE_SETTINGS_NAV_ITEMS.slice(2),
+      ]
     : BASE_SETTINGS_NAV_ITEMS;
 }
 

@@ -12,9 +12,13 @@ import {
   AuthAccessTokenResult,
   AuthBrowserSessionRequest,
   AuthBrowserSessionResult,
+  AuthCancelPairingOfferInput,
   AuthClientSession,
   AuthCreatePairingCredentialInput,
+  AuthCreatePairingOfferInput,
   AuthPairingCredentialResult,
+  AuthPairingOfferResult,
+  AuthShareStateResult,
   AuthPairingLink,
   AuthRevokeClientSessionInput,
   AuthRevokePairingLinkInput,
@@ -50,10 +54,17 @@ const OptionalDpopProofHeaders = Schema.Struct({
   dpop: Schema.optionalKey(Schema.String),
 });
 
+const PairingOfferHeaders = Schema.Struct({
+  authorization: Schema.optionalKey(Schema.String),
+  dpop: Schema.optionalKey(Schema.String),
+  "idempotency-key": Schema.optionalKey(Schema.String),
+});
+
 export const EnvironmentRequestInvalidReason = Schema.Literals([
   "invalid_scope",
   "scope_not_granted",
   "invalid_command",
+  "invalid_pairing_offer",
 ]);
 export type EnvironmentRequestInvalidReason = typeof EnvironmentRequestInvalidReason.Type;
 
@@ -75,6 +86,9 @@ export const EnvironmentInternalErrorReason = Schema.Literals([
   "access_token_issuance_failed",
   "websocket_ticket_issuance_failed",
   "pairing_credential_issuance_failed",
+  "pairing_offer_issuance_failed",
+  "pairing_offer_cancellation_failed",
+  "share_state_load_failed",
   "pairing_links_load_failed",
   "pairing_link_revoke_failed",
   "client_sessions_load_failed",
@@ -324,6 +338,11 @@ export const AuthPairingLinkRevokeResult = Schema.Struct({
 });
 export type AuthPairingLinkRevokeResult = typeof AuthPairingLinkRevokeResult.Type;
 
+export const AuthPairingOfferCancellationResult = Schema.Struct({
+  cancelled: Schema.Boolean,
+});
+export type AuthPairingOfferCancellationResult = typeof AuthPairingOfferCancellationResult.Type;
+
 export const AuthClientSessionRevokeResult = Schema.Struct({
   revoked: Schema.Boolean,
 });
@@ -376,6 +395,29 @@ export class EnvironmentAuthHttpApi extends HttpApiGroup.make("auth")
       payload: AuthCreatePairingCredentialInput,
       success: AuthPairingCredentialResult,
       error: EnvironmentPairingCredentialErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post("pairingOffer", "/api/auth/pairing-offer", {
+      headers: PairingOfferHeaders,
+      payload: AuthCreatePairingOfferInput,
+      success: AuthPairingOfferResult,
+      error: EnvironmentPairingCredentialErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post("cancelPairingOffer", "/api/auth/pairing-offer/cancel", {
+      headers: OptionalBearerHeaders,
+      payload: AuthCancelPairingOfferInput,
+      success: AuthPairingOfferCancellationResult,
+      error: EnvironmentPairingCredentialErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.get("shareState", "/api/auth/share-state", {
+      headers: OptionalBearerHeaders,
+      success: AuthShareStateResult,
+      error: EnvironmentScopedOperationErrors,
     }).middleware(EnvironmentAuthenticatedAuth),
   )
   .add(

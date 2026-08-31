@@ -1,6 +1,9 @@
 use bibcode_server::process::configure_background_command;
 use serde_json::Value;
-use std::{path::Path, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 use tokio::{
     io::AsyncReadExt,
     process::{Child, Command},
@@ -16,12 +19,30 @@ pub struct TailscaleStatus {
     pub tailnet_ipv4_addresses: Vec<String>,
 }
 
-fn tailscale_command() -> &'static str {
-    if cfg!(target_os = "windows") {
-        "tailscale.exe"
-    } else {
-        "tailscale"
+fn tailscale_command_candidates_for(platform: &str) -> Vec<PathBuf> {
+    match platform {
+        "windows" => vec![
+            PathBuf::from(r"C:\Program Files\Tailscale\tailscale.exe"),
+            PathBuf::from(r"C:\Program Files (x86)\Tailscale\tailscale.exe"),
+            PathBuf::from("tailscale.exe"),
+        ],
+        "macos" => vec![
+            PathBuf::from("/Applications/Tailscale.app/Contents/MacOS/Tailscale"),
+            PathBuf::from("/opt/homebrew/bin/tailscale"),
+            PathBuf::from("/usr/local/bin/tailscale"),
+            PathBuf::from("tailscale"),
+        ],
+        _ => vec![
+            PathBuf::from("/usr/bin/tailscale"),
+            PathBuf::from("/usr/local/bin/tailscale"),
+            PathBuf::from("/snap/bin/tailscale"),
+            PathBuf::from("tailscale"),
+        ],
     }
+}
+
+fn tailscale_command_candidates() -> Vec<PathBuf> {
+    tailscale_command_candidates_for(std::env::consts::OS)
 }
 
 fn normalize_magic_dns_name(status: &Value) -> Option<String> {
@@ -94,7 +115,17 @@ pub fn build_tailscale_https_base_url(
 }
 
 pub async fn read_tailscale_status() -> Result<TailscaleStatus, String> {
-    read_tailscale_status_with(Path::new(tailscale_command()), TAILSCALE_STATUS_TIMEOUT).await
+    let mut failures = Vec::new();
+    for candidate in tailscale_command_candidates() {
+        match read_tailscale_status_with(&candidate, TAILSCALE_STATUS_TIMEOUT).await {
+            Ok(status) => return Ok(status),
+            Err(error) => failures.push(format!("{}: {error}", candidate.display())),
+        }
+    }
+    Err(format!(
+        "Could not read Tailscale status from any known CLI location: {}",
+        failures.join("; ")
+    ))
 }
 
 async fn read_tailscale_status_with(
@@ -231,6 +262,37 @@ mod tests {
     const TAILSCALE_STATUS_JSON: &str = r#"{"Self":{"DNSName":"desktop.tail.ts.net.","TailscaleIPs":["100.100.100.100","fd7a:115c:a1e0::1","192.168.1.20"]}}"#;
 
     #[test]
+    fn absolute_tailscale_candidates_precede_path_fallback_on_each_platform() {
+        let windows = tailscale_command_candidates_for("windows");
+        assert!(windows[0].to_string_lossy().starts_with(r"C:\"));
+        assert_eq!(windows.last(), Some(&PathBuf::from("tailscale.exe")));
+
+        let macos = tailscale_command_candidates_for("macos");
+        assert_eq!(
+            macos.first(),
+            Some(&PathBuf::from(
+                "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+            ))
+        );
+        assert_eq!(macos.last(), Some(&PathBuf::from("tailscale")));
+
+        let linux = tailscale_command_candidates_for("linux");
+        assert_eq!(linux.first(), Some(&PathBuf::from("/usr/bin/tailscale")));
+        assert_eq!(linux.last(), Some(&PathBuf::from("tailscale")));
+        assert!(
+            windows[..windows.len() - 1]
+                .iter()
+                .all(|candidate| candidate.to_string_lossy().starts_with(r"C:\"))
+        );
+        assert!(
+            macos[..macos.len() - 1]
+                .iter()
+                .chain(&linux[..linux.len() - 1])
+                .all(|candidate| candidate.is_absolute())
+        );
+    }
+
+    #[test]
     fn detects_tailnet_ipv4_addresses() {
         assert!(is_tailscale_ipv4_address("100.64.0.1"));
         assert!(is_tailscale_ipv4_address("100.127.255.254"));
@@ -294,13 +356,16 @@ mod tests {
 
     #[tokio::test]
     async fn command_and_probe_helpers_reject_invalid_endpoints_without_io() {
+        let fallback = tailscale_command_candidates()
+            .pop()
+            .expect("PATH fallback candidate");
         assert_eq!(
-            tailscale_command(),
-            if cfg!(target_os = "windows") {
+            fallback,
+            PathBuf::from(if cfg!(target_os = "windows") {
                 "tailscale.exe"
             } else {
                 "tailscale"
-            }
+            })
         );
         assert!(!probe_tailscale_https_endpoint("not a URL").await);
     }

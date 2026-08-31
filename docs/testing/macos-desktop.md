@@ -45,7 +45,9 @@ Select focused tests from affected source and verify at least:
 - Unix process-group ownership survives cancellation and natural leader exit,
   reaps late descendants, does not signal peer-runtime roots, and remains
   independent of the Windows-only Job implementation;
-- local-only desktop presentation omits WSL and remote-device controls;
+- Local desktop presentation omits WSL controls while saved remote environments
+  remain selectable in the environment rail without bypassing desktop-owned
+  connection controls;
 - Claude, Codex, Cursor, and OpenCode remain visible while Grok is absent;
 - Activity observation timestamps and keyboard navigation remain correct; and
 - update protection treats long-lived read subscriptions as reads, reports
@@ -182,12 +184,64 @@ report the residual instead of attempting a destructive repair.
 
 ## Packaged UI scenarios
 
-Use Codex Computer Use, not Orca. Confirm the executable path and PID before
-using any frame as evidence. At normal and minimum sizes verify:
+Use Codex Computer Use to operate the packaged executable. Confirm the
+executable path and PID before using any frame as evidence. At normal and
+minimum sizes verify:
 
-- Add Project has no Host selector or remote-device choice for the local Mac;
-- WSL, Connections, SSH, pairing, Tailscale, relay, exposure, and remote retry
-  UI is absent from ordinary desktop presentation;
+- when only the local Mac environment is configured, the rail shows Local and
+  Add Project has no remote target; saved remote environments appear as separate
+  rail entries and become the Add Project target when selected;
+- Settings shows **Remote Servers** with **Connect to a host** and **Share this
+  host** tabs; `/settings/connections` redirects there. SSH discovery and
+  grant-driven sharing appears because the desktop bridge is present. Generate
+  an **Another device** offer, verify the restart completes before the browser
+  URL, deep link, pairing code, and QR code appear, then revoke the final
+  native-managed **Another device** offer or client and verify exposure returns
+  to loopback. Capture the
+  shared runbook's four explicit ceremony outcomes: authoritative local-only
+  confirmation even after cancellation failure, another live access reason kept
+  wide, cancellation and cleanup both unconfirmed, and cleanup topology
+  unverified. Also cover the three-pass/five-second reconciliation retry and
+  terminal warning toast, last-browser-session
+  revocation, one compensating widen during a concurrent grant, bounded handling
+  of a blackholed create response, and explicit legacy resume after a local-only
+  restart. The address picker lists only usable IPv4 candidates until a
+  dual-stack listener exists, uses stable address/port IDs, safely preselects a
+  private default, reports off-host interface observations unavailable before
+  widening, and leaves generation disabled with externally managed
+  listener/reverse-proxy guidance when native discovery has only a public or
+  non-default private address. Public interface candidates remain
+  non-actionable even after native exposure is wide. A custom off-host address
+  mints without changing the native listener or firewall, and later auth
+  revisions do not widen it. An externally managed public endpoint is never
+  preselected and requires explicit public-address/firewall acknowledgement. A
+  packaged Tailscale installation must be found without shell `PATH` and must
+  suppress unusable, public, or IPv6 candidates. Confirm macOS firewall
+  management remains explicitly operator-owned. The local-machine flow still
+  has no Host selector; remote targeting is driven by the environment rail;
+- Remote server updates: with a second BiBCode server saved (headless
+  `bibcode serve` is sufficient), open Remote Servers settings, run **Check for
+  Server Updates**, and confirm each saved server row shows an update badge
+  (**Manual updates** for a headless server) and a manual-instructions block
+  with a copy button. An offline server must show **Status unavailable** without
+  blocking the rest of the batch; a blackholed check must settle after 30
+  seconds across supervisor acquisition, readiness, and RPC execution, then
+  release its batch worker;
+- seed an incompatible newer connection IndexedDB version and confirm the
+  boot-level recovery dialog lists the deleted data classes, keeps **Reload** as
+  a non-destructive exit, requires a separately acknowledged confirmation that a
+  double-click cannot trigger, and treats a blocked deletion as visibly queued
+  until the original request succeeds or errors. It must not reload while
+  blocked or after failure, and reloads automatically only after success;
+- open a hosted `/pair` link whose host includes an IDN and explicit port and
+  confirm the normalized punycode host shown is exactly the destination used.
+  Reject a target containing username/password, and confirm legacy `code` query
+  parameters are removed from both `/pair` and Remote Servers history after
+  being retained for the current attempt;
+- from the OS, opening a well-formed `bibcode://pair?code=...` link while the
+  packaged app is running lands on Add Server with the code prefilled. The
+  custom scheme is bundle-time-only on macOS and is not an unbundled dev-mode
+  check;
 - provider settings and action menus show Claude, Codex, Cursor, and OpenCode
   without Early Access labels and omit Grok/Grok Terminal;
 - external worktree grouping, full paths, actions, physical identity, and

@@ -1,9 +1,10 @@
 import { describe, expect, it } from "@effect/vitest";
+import { EnvironmentId, type ExecutionEnvironmentDescriptor } from "@bibcode/contracts";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
-import { initialConfigOption } from "./session.ts";
+import { compatVerdictFromPrepared, initialConfigOption } from "./session.ts";
 
 class TestConfigError extends Schema.TaggedErrorClass<TestConfigError>()("TestConfigError", {
   message: Schema.String,
@@ -18,4 +19,49 @@ describe("environment session state", () => {
       expect(Option.isNone(result)).toBe(true);
     }),
   );
+});
+
+const currentDescriptor: ExecutionEnvironmentDescriptor = {
+  environmentId: EnvironmentId.make("env-current"),
+  label: "Current",
+  platform: { os: "linux", arch: "x64" },
+  serverVersion: "0.0.0-test",
+  storageInstanceId: null,
+  remoteUpdateSupport: null,
+  remoteProtocolVersion: 1,
+  minCompatibleRemoteProtocol: 1,
+  capabilities: {
+    repositoryIdentity: true,
+    worktreeCatalog: false,
+    worktreeCatalogRefreshReason: false,
+    vcsStatusSummary: false,
+    activityProtocolVersion: null,
+    remoteUpdateControl: false,
+  },
+};
+
+describe("environment compatibility verdict selection", () => {
+  it("yields no verdict before a prepared connection exists", () => {
+    expect(compatVerdictFromPrepared(Option.none())).toBeNull();
+  });
+
+  it("derives the verdict from the prepared connection descriptor", () => {
+    expect(compatVerdictFromPrepared(Option.some({ descriptor: currentDescriptor }))).toEqual({
+      kind: "compatible",
+    });
+  });
+
+  it("classifies a pre-window prepared descriptor as legacy", () => {
+    expect(
+      compatVerdictFromPrepared(
+        Option.some({
+          descriptor: {
+            ...currentDescriptor,
+            remoteProtocolVersion: 0,
+            minCompatibleRemoteProtocol: 0,
+          },
+        }),
+      ),
+    ).toEqual({ kind: "legacy" });
+  });
 });

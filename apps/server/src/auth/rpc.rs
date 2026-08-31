@@ -3,7 +3,8 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    model::{AuthAccessChange, AuthAccessEvent},
+    model::{AuthAccessChange, AuthAccessEvent, SCOPE_ACCESS_WRITE},
+    scope::authorization_error,
     service::AuthService,
 };
 use crate::rpc::{RpcRegistry, RpcSessionContext, RpcStreamChunk};
@@ -11,6 +12,16 @@ use crate::rpc::{RpcRegistry, RpcSessionContext, RpcStreamChunk};
 const AUTH_STREAM_CAPACITY: usize = 8;
 
 pub(crate) fn register_rpc_handlers(registry: &mut RpcRegistry, auth: AuthService) {
+    registry.register_unary_with_context(
+        "auth.confirmPairing",
+        |_request, context, _cancellation| async move {
+            if context.confirm_current_pairing().await {
+                Ok(json!({}))
+            } else {
+                Err(authorization_error(SCOPE_ACCESS_WRITE))
+            }
+        },
+    );
     registry.register_stream_with_context(
         "subscribeAuthAccess",
         move |_request, context, cancellation| {

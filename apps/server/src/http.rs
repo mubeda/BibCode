@@ -1,5 +1,5 @@
 use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
@@ -7,7 +7,7 @@ use std::{
 use axum::{
     Json, Router,
     body::Body,
-    extract::{FromRef, Request, State, WebSocketUpgrade},
+    extract::{ConnectInfo, FromRef, Request, State, WebSocketUpgrade},
     http::{
         HeaderMap, Method, StatusCode, Uri,
         header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, HOST, LOCATION},
@@ -34,16 +34,25 @@ use crate::{
         http_mutability,
     },
     production::http_routes::{self, HttpRoutesState},
-    rpc::{RpcRegistry, RpcSessionContext, run_session},
+    remote_update::RemoteUpdateSupport,
+    rpc::{
+        E2eePreauthAdmission, MAX_E2EE_CIPHERTEXT_BYTES, RpcRegistry, RpcSessionContext,
+        run_session,
+    },
 };
 
 pub const ENVIRONMENT_DESCRIPTOR_PATH: &str = "/.well-known/bibcode/environment";
+pub(crate) const WS_E2EE_PATH: &str = "/ws-e2ee";
+pub(crate) const REMOTE_PROTOCOL_VERSION: u32 = 1;
+pub(crate) const MIN_COMPATIBLE_REMOTE_PROTOCOL: u32 = 1;
 pub const DESKTOP_SHUTDOWN_PATH: &str = "/.well-known/bibcode/desktop/shutdown";
 pub const DESKTOP_SHUTDOWN_TOKEN_HEADER: &str = "x-bibcode-desktop-bootstrap-token";
 
 const CONTENT_SECURITY_POLICY_VALUE: &str = "default-src 'self'; connect-src 'self' http: https: ws: wss:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'";
 const IMMUTABLE_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 const HTML_CACHE_CONTROL: &str = "no-cache";
+const MAX_PLAIN_WEBSOCKET_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PLAIN_WEBSOCKET_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RouteMethod {
@@ -82,6 +91,9 @@ pub const ROUTE_INVENTORY: &[RouteSpec] = &[
     route(RouteMethod::Post, "/oauth/token"),
     route(RouteMethod::Post, "/api/auth/websocket-ticket"),
     route(RouteMethod::Post, "/api/auth/pairing-token"),
+    route(RouteMethod::Post, "/api/auth/pairing-offer"),
+    route(RouteMethod::Post, "/api/auth/pairing-offer/cancel"),
+    route(RouteMethod::Get, "/api/auth/share-state"),
     route(RouteMethod::Get, "/api/auth/pairing-links"),
     route(RouteMethod::Post, "/api/auth/pairing-links/revoke"),
     route(RouteMethod::Get, "/api/auth/clients"),
@@ -97,6 +109,7 @@ pub const ROUTE_INVENTORY: &[RouteSpec] = &[
     route(RouteMethod::Post, "/api/connect/mint-credential"),
     route(RouteMethod::Post, "/api/bibcode-connect/mint-credential"),
     route(RouteMethod::Get, "/ws"),
+    route(RouteMethod::Get, WS_E2EE_PATH),
     route(RouteMethod::Post, "/api/diagnostics/logs.zip"),
     route(RouteMethod::Get, "/api/assets/*"),
     route(RouteMethod::Post, DESKTOP_SHUTDOWN_PATH),
@@ -114,6 +127,7 @@ pub(crate) struct AppState {
     pub config: Arc<ServerConfig>,
     pub shutdown: CancellationToken,
     pub rpc_registry: RpcRegistry,
+    pub e2ee_preauth_admission: E2eePreauthAdmission,
     pub auth: auth::AuthService,
     pub http_routes: HttpRoutesState,
     pub admission_gate: RpcAdmissionGate,
@@ -137,6 +151,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(MAINTENANCE_UPDATE_CANCEL_PATH, post(update_cancel))
         .route(MAINTENANCE_UPDATE_STATUS_PATH, get(update_status))
         .route("/ws", get(websocket))
+        .route(WS_E2EE_PATH, get(websocket_e2ee))
         .fallback(static_or_dev)
         .layer(middleware::from_fn_with_state(
             state.admission_gate.clone(),
@@ -176,6 +191,7 @@ fn cors_layer(config: &ServerConfig) -> CorsLayer {
             axum::http::HeaderName::from_static("b3"),
             axum::http::HeaderName::from_static("traceparent"),
             axum::http::HeaderName::from_static("dpop"),
+            axum::http::HeaderName::from_static("idempotency-key"),
             axum::http::HeaderName::from_static(DESKTOP_MAINTENANCE_TOKEN_HEADER),
         ])
         .max_age(std::time::Duration::from_secs(600));
@@ -205,6 +221,8 @@ async fn websocket(
     let session_shutdown = state.shutdown.child_token();
     if state.config.unsafe_no_auth {
         return upgrade
+            .max_frame_size(MAX_PLAIN_WEBSOCKET_FRAME_BYTES)
+            .max_message_size(MAX_PLAIN_WEBSOCKET_MESSAGE_BYTES)
             .on_upgrade(move |socket| {
                 run_session(
                     socket,
@@ -221,25 +239,20 @@ async fn websocket(
             let session_id = principal.session_id.clone();
             let expires_at_ms = principal.expires_at_ms;
             let rpc_context = RpcSessionContext::authenticated(principal, auth.clone());
-            auth.mark_connected(&session_id).await;
             upgrade
+                .max_frame_size(MAX_PLAIN_WEBSOCKET_FRAME_BYTES)
+                .max_message_size(MAX_PLAIN_WEBSOCKET_MESSAGE_BYTES)
                 .on_upgrade(move |socket| async move {
-                    let expiration_shutdown = session_shutdown.clone();
-                    let expiration_guard = tokio::spawn(async move {
-                        let remaining_ms = expires_at_ms.saturating_sub(
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .ok()
-                                .and_then(|duration| i64::try_from(duration.as_millis()).ok())
-                                .unwrap_or(i64::MAX),
-                        );
-                        tokio::select! {
-                            () = expiration_shutdown.cancelled() => {}
-                            () = tokio::time::sleep(std::time::Duration::from_millis(
-                                u64::try_from(remaining_ms.max(0)).unwrap_or_default(),
-                            )) => expiration_shutdown.cancel(),
-                        }
-                    });
+                    let Ok(connection_guard) = auth
+                        .mark_connected_guard(&session_id, session_shutdown.clone())
+                        .await
+                    else {
+                        session_shutdown.cancel();
+                        drop(socket);
+                        return;
+                    };
+                    let expiration_guard =
+                        spawn_session_expiration_guard(expires_at_ms, session_shutdown.clone());
                     run_session(
                         socket,
                         state.rpc_registry,
@@ -249,12 +262,68 @@ async fn websocket(
                     .await;
                     session_shutdown.cancel();
                     let _ = expiration_guard.await;
-                    auth.mark_disconnected(&session_id).await;
+                    connection_guard.close().await;
                 })
                 .into_response()
         }
         Err(error) => auth::auth_error_response(error),
     }
+}
+
+async fn websocket_e2ee(
+    State(state): State<AppState>,
+    peer: Result<ConnectInfo<SocketAddr>, axum::extract::rejection::ExtensionRejection>,
+    headers: axum::http::HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    let session_shutdown = state.shutdown.child_token();
+    let socket_peer_ip = peer
+        .ok()
+        .map(|ConnectInfo(address)| address.ip())
+        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    let peer_ip = crate::rpc::effective_preauth_peer(
+        socket_peer_ip,
+        headers
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok()),
+    );
+    let preauth_admission = state.e2ee_preauth_admission;
+    upgrade
+        .max_frame_size(MAX_E2EE_CIPHERTEXT_BYTES)
+        .max_message_size(MAX_E2EE_CIPHERTEXT_BYTES)
+        .on_upgrade(move |socket| {
+            crate::rpc::run_e2ee_session(
+                socket,
+                peer_ip,
+                preauth_admission,
+                state.auth,
+                state.rpc_registry,
+                state.config,
+                session_shutdown,
+            )
+        })
+        .into_response()
+}
+
+pub(crate) fn spawn_session_expiration_guard(
+    expires_at_ms: i64,
+    session_shutdown: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let remaining_ms = expires_at_ms.saturating_sub(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+                .unwrap_or(i64::MAX),
+        );
+        tokio::select! {
+            () = session_shutdown.cancelled() => {}
+            () = tokio::time::sleep(std::time::Duration::from_millis(
+                u64::try_from(remaining_ms.max(0)).unwrap_or_default(),
+            )) => session_shutdown.cancel(),
+        }
+    })
 }
 
 #[derive(Serialize)]
@@ -265,6 +334,9 @@ struct EnvironmentDescriptor {
     platform: PlatformDescriptor,
     server_version: String,
     storage_instance_id: String,
+    remote_update_support: RemoteUpdateSupport,
+    remote_protocol_version: u32,
+    min_compatible_remote_protocol: u32,
     capabilities: EnvironmentCapabilities,
 }
 
@@ -278,6 +350,7 @@ struct PlatformDescriptor {
 #[serde(rename_all = "camelCase")]
 struct EnvironmentCapabilities {
     repository_identity: bool,
+    remote_update_control: bool,
 }
 
 async fn environment_descriptor(State(state): State<AppState>) -> Json<EnvironmentDescriptor> {
@@ -294,8 +367,12 @@ async fn environment_descriptor(State(state): State<AppState>) -> Json<Environme
             .storage_instance_id
             .expect("a running server has a prepared persistent store")
             .to_string(),
+        remote_update_support: config.remote_update_support,
+        remote_protocol_version: REMOTE_PROTOCOL_VERSION,
+        min_compatible_remote_protocol: MIN_COMPATIBLE_REMOTE_PROTOCOL,
         capabilities: EnvironmentCapabilities {
             repository_identity: true,
+            remote_update_control: true,
         },
     })
 }

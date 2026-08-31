@@ -9,8 +9,9 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     auth::{ACTIVITY_READ_SCOPE, authorization_error},
     rpc::{
-        RpcRegistry, RpcRequest, RpcResponseEnqueueGuard, RpcSessionContext, RpcStreamChunk,
-        RpcUnaryResult, ServerMessage,
+        PreparedRpcResponse, RpcRegistry, RpcRequest, RpcResponseEnqueueGuard,
+        RpcResponseEnqueuePermit, RpcSessionContext, RpcStreamChunk, RpcUnaryResult, ServerMessage,
+        encoded_server_message_len,
     },
 };
 
@@ -90,18 +91,38 @@ struct ActivityUnaryResponseGuard {
 }
 
 impl RpcResponseEnqueueGuard for ActivityUnaryResponseGuard {
-    fn enqueue(self: Box<Self>, permit: mpsc::OwnedPermit<ServerMessage>, response: ServerMessage) {
+    fn encoded_len_bound(&self, response: &ServerMessage) -> Result<usize, serde_json::Error> {
         let request_id = response
             .request_id()
             .cloned()
             .expect("guarded unary response has a request id");
-        let mut pending = Some((permit, response));
+        let fallback = ServerMessage::failure(request_id, feature_disabled_error());
+        Ok(encoded_server_message_len(response)?.max(encoded_server_message_len(&fallback)?))
+    }
+
+    fn enqueue(self: Box<Self>, permit: RpcResponseEnqueuePermit, response: ServerMessage) {
+        let request_id = response
+            .request_id()
+            .cloned()
+            .expect("guarded unary response has a request id");
+        let fallback = ServerMessage::failure(request_id, feature_disabled_error());
+        let Some(response) = permit.prepare(response) else {
+            return;
+        };
+        let Some(fallback) = permit.prepare(fallback) else {
+            return;
+        };
+        let mut pending: Option<(
+            RpcResponseEnqueuePermit,
+            PreparedRpcResponse,
+            PreparedRpcResponse,
+        )> = Some((permit, response, fallback));
         if !self.controller.publish_if_current(&self.admission, || {
-            let (permit, response) = pending.take().expect("guarded response is pending");
-            permit.send(response);
+            let (permit, response, _) = pending.take().expect("guarded response is pending");
+            permit.send_prepared(response);
         }) {
-            let (permit, _) = pending.expect("stale guarded response is pending");
-            permit.send(ServerMessage::failure(request_id, feature_disabled_error()));
+            let (permit, _, fallback) = pending.expect("stale guarded response is pending");
+            permit.send_prepared(fallback);
         }
     }
 }
@@ -758,7 +779,7 @@ mod tests {
             ActivityScopeSeed, ActivityTargetDispatchDisposition, ProviderActivityControlUpdate,
             ProviderActivityMutation, ProviderActivityNativeTarget,
         },
-        auth::{AuthService, ClientMetadata},
+        auth::{AuthService, ClientMetadata, SessionTransport},
         persistence::{Database, run_migrations},
         rpc::RequestId,
     };
@@ -1624,6 +1645,7 @@ mod tests {
                 None,
                 ClientMetadata::default(),
                 None,
+                SessionTransport::Plain,
             )
             .await
             .expect("authorized session");

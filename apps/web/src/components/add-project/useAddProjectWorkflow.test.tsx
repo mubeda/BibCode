@@ -64,6 +64,7 @@ const testState = {
   },
   operationOverride: null as WorkflowOperations | null,
   onOpenChange: vi.fn(),
+  initialEnvironmentId: null as EnvironmentId | null,
 };
 
 let currentWorkflow: AddProjectWorkflow;
@@ -77,6 +78,7 @@ function WorkflowProbe({ open }: { readonly open: boolean }) {
     hosts: testState.hosts,
     locationLabel: testState.locationLabel,
     primaryEnvironmentId: ENV_PRIMARY,
+    initialEnvironmentId: testState.initialEnvironmentId,
     operations: testState.operationOverride ?? testState.operations,
     pickFolder: testState.pickFolder,
   });
@@ -160,6 +162,7 @@ beforeEach(() => {
   testState.operations.create.mockReset().mockResolvedValue(true);
   testState.operationOverride = null;
   testState.onOpenChange.mockReset();
+  testState.initialEnvironmentId = null;
 });
 
 afterEach(async () => {
@@ -174,6 +177,22 @@ afterEach(async () => {
 });
 
 describe("useAddProjectWorkflowState", () => {
+  it("defaults to the rail-selected host when it is listed", async () => {
+    testState.initialEnvironmentId = ENV_REMOTE;
+
+    const view = await mountWorkflow({ open: true });
+
+    expect(view.current.selectedHost.environmentId).toBe(ENV_REMOTE);
+  });
+
+  it("falls back to the primary host when the rail selection is not listed", async () => {
+    testState.initialEnvironmentId = EnvironmentId.make("unknown");
+
+    const view = await mountWorkflow({ open: true });
+
+    expect(view.current.selectedHost.environmentId).toBe(ENV_PRIMARY);
+  });
+
   it("selects the primary host and resets it on every open", async () => {
     const view = await mountWorkflow({ open: true });
     expect(view.current.selectedHost.environmentId).toBe(ENV_PRIMARY);

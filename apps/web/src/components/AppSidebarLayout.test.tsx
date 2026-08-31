@@ -16,7 +16,11 @@ vi.mock("@tanstack/react-router", () => ({
 }));
 
 vi.mock("./Sidebar", () => ({
-  default: () => null,
+  default: () => <div data-testid="thread-sidebar-mock" />,
+}));
+
+vi.mock("./sidebar/EnvironmentRail", () => ({
+  EnvironmentRail: () => <div data-testid="environment-rail-mock" />,
 }));
 
 vi.mock("./ui/sidebar", () => ({
@@ -48,6 +52,23 @@ afterEach(async () => {
 });
 
 describe("AppSidebarLayout", () => {
+  it("mounts the environment rail before the panel content inside the left sidebar", async () => {
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    mounted.push({ root, container });
+
+    await act(async () => {
+      root.render(<AppSidebarLayout>Workspace</AppSidebarLayout>);
+    });
+
+    const rail = container.querySelector('[data-testid="environment-rail-mock"]');
+    const panel = container.querySelector('[data-testid="thread-sidebar-mock"]');
+    expect(rail).not.toBeNull();
+    expect(panel).not.toBeNull();
+    if (rail === null || panel === null) throw new Error("sidebar layout markers missing");
+    expect(rail.compareDocumentPosition(panel) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+  });
+
   it("routes supported desktop menu actions independently", async () => {
     const checkForUpdate = vi.fn(() => Promise.resolve({ checked: true }));
     Object.assign(window, {
