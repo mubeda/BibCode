@@ -40,9 +40,9 @@ use crate::persistence::{
 const SESSION_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 const DPOP_SESSION_TTL_MS: i64 = 60 * 60 * 1_000;
 const WEBSOCKET_TICKET_TTL_MS: i64 = 5 * 60 * 1_000;
-/// Pending-pairing sessions older than this are crash orphans: the connection
-/// that could have confirmed them is gone. Younger ones may still be racing a
-/// live confirmation and are left alone.
+/// Pending pairing sessions and offer reservations older than this are crash
+/// orphans. Younger rows may still belong to a live request or confirmation and
+/// are left alone.
 const PENDING_PAIRING_SWEEP_GRACE_MS: i64 = 2 * 60 * 1_000;
 const PENDING_PAIRING_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const PAIRING_TTL_MS: i64 = 5 * 60 * 1_000;
@@ -1400,6 +1400,7 @@ impl AuthService {
                     key.to_owned(),
                     input_fingerprint.to_owned(),
                     format_iso(observed_at),
+                    format_iso(observed_at.saturating_sub(PENDING_PAIRING_SWEEP_GRACE_MS)),
                 )
                 .await
                 .map_err(|error| AuthError::Internal(error.to_string()))?;
@@ -1461,25 +1462,6 @@ impl AuthService {
         state
             .pairing_offer_idempotency
             .retain(|_, stored| stored.expires_at_ms > observed_at);
-        let pending_pairing_id = state
-            .pairing_offer_idempotency
-            .get(&lookup_key)
-            .filter(|stored| {
-                stored.result.is_none()
-                    && stored.pairing_id.is_some()
-                    && stored.input_fingerprint == input_fingerprint
-            })
-            .and_then(|stored| stored.pairing_id.clone());
-        if let Some(pairing_id) = pending_pairing_id {
-            state.pairing_offer_idempotency.remove(&lookup_key);
-            let removed = state.pairings.remove(&pairing_id).is_some();
-            state.bump_authority_generation();
-            drop(state);
-            if removed {
-                self.emit_access_change(AuthAccessChange::PairingLinkRemoved { id: pairing_id });
-            }
-            return Ok(PairingOfferReplay::Fresh);
-        }
         let stale_completed = state
             .pairing_offer_idempotency
             .get(&lookup_key)
@@ -4612,6 +4594,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_service_does_not_recover_another_services_young_pending_offer() {
+        let repositories = IndependentAuthRepositories::new().await;
+        let secrets = tempfile::tempdir().expect("secret store directory");
+        let config = ServerConfig::new(".").with_bind("127.0.0.1", 3773);
+        let first = AuthService::new_with_persistence(
+            &config,
+            vec![7_u8; 32],
+            SecretStore::new(secrets.path())
+                .await
+                .expect("first secret store"),
+            repositories.first.clone(),
+        )
+        .await
+        .expect("first live service");
+        let second = AuthService::new_with_persistence(
+            &config,
+            vec![7_u8; 32],
+            SecretStore::new(secrets.path())
+                .await
+                .expect("second secret store"),
+            repositories.second.clone(),
+        )
+        .await
+        .expect("second live service");
+
+        let issued = first
+            .issue_share_pairing_offer(
+                owned_scopes(STANDARD_SCOPES),
+                Some("Tablet".to_owned()),
+                "another-device".to_owned(),
+                true,
+                PairingOfferReservation::new(
+                    "principal".to_owned(),
+                    "concurrent-key".to_owned(),
+                    "fingerprint".to_owned(),
+                ),
+            )
+            .await
+            .expect("first service reserves the offer");
+        let PairingOfferIssuance::Reserved(issued) = issued else {
+            panic!("fresh offer must reserve its grant");
+        };
+
+        assert!(matches!(
+            second
+                .replay_pairing_offer("principal", "concurrent-key", "fingerprint")
+                .await,
+            Ok(PairingOfferReplay::Cancelled)
+        ));
+
+        let result = PairingOfferResult {
+            id: issued.id,
+            code: "encoded-offer".to_owned(),
+            reach: "another-device".to_owned(),
+            endpoint: "http://192.168.1.20:3773".to_owned(),
+            name: "Tablet".to_owned(),
+            expires_at: issued.expires_at,
+        };
+        first
+            .record_pairing_offer(
+                "principal",
+                "concurrent-key".to_owned(),
+                "fingerprint".to_owned(),
+                result.clone(),
+            )
+            .await
+            .expect("first service completes the offer");
+        assert!(matches!(
+            second
+                .replay_pairing_offer("principal", "concurrent-key", "fingerprint")
+                .await,
+            Ok(PairingOfferReplay::Original(replayed)) if replayed.id == result.id
+        ));
+
+        drop((first, second));
+        repositories.close().await;
+    }
+
+    #[tokio::test]
     async fn remote_offer_cancellation_converges_dormant_share_state_and_access_events() {
         let repositories = IndependentAuthRepositories::new().await;
         let secrets = tempfile::tempdir().expect("secret store directory");
@@ -5070,7 +5131,23 @@ mod tests {
             )
             .await
             .expect("pairing and reservation commit");
-        assert!(matches!(issued, PairingOfferIssuance::Reserved(_)));
+        let PairingOfferIssuance::Reserved(issued) = issued else {
+            panic!("fresh offer must reserve its grant");
+        };
+        let stale_created_at = "1970-01-01T00:00:00Z".to_owned();
+        let pairing_id = issued.id;
+        repositories
+            .database()
+            .call(move |connection| {
+                let updated = connection.execute(
+                    "UPDATE auth_pairing_links SET created_at = ? WHERE id = ?",
+                    [stale_created_at, pairing_id],
+                )?;
+                assert_eq!(updated, 1);
+                Ok(())
+            })
+            .await
+            .expect("pending reservation is aged past the recovery grace");
         drop(service);
 
         let restarted = AuthService::new_with_persistence(
