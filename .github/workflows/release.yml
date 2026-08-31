@@ -273,7 +273,7 @@ jobs:
           echo "clerk_cli_oauth_client_id=$CLERK_CLI_OAUTH_CLIENT_ID" >> "$GITHUB_OUTPUT"
           echo "relay_url=https://$relay_domain" >> "$GITHUB_OUTPUT"
 
-  build:
+  build_desktop:
     name: Build ${{ matrix.label }}
     needs: [preflight, relay_public_config]
     if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.relay_public_config.result == 'success' }}
@@ -300,21 +300,26 @@ jobs:
             platform: mac
             target: dmg
             arch: x64
+          - label: Linux arm64
+            runner: ubuntu-22.04-arm
+            platform: linux
+            target: appimage
+            arch: arm64
           - label: Linux x64
             runner: ubuntu-22.04
             platform: linux
             target: appimage
             arch: x64
+          - label: Windows arm64
+            runner: windows-11-vs2026-arm
+            platform: win
+            target: nsis
+            arch: arm64
           - label: Windows x64
             runner: windows-2025
             platform: win
             target: nsis
             arch: x64
-          # - label: Windows arm64
-          #   runner: windows-11-arm
-          #   platform: win
-          #   target: nsis
-          #   arch: arm64
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -450,13 +455,195 @@ jobs:
           path: release-publish/*
           if-no-files-found: error
 
+  build_server:
+    name: Build server ${{ matrix.label }}
+    needs: [preflight, relay_public_config]
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.relay_public_config.result == 'success' }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    env:
+      BIBCODE_CLERK_PUBLISHABLE_KEY: ${{ needs.relay_public_config.outputs.clerk_publishable_key }}
+      BIBCODE_CLERK_JWT_TEMPLATE: ${{ needs.relay_public_config.outputs.clerk_jwt_template }}
+      BIBCODE_CLERK_CLI_OAUTH_CLIENT_ID: ${{ needs.relay_public_config.outputs.clerk_cli_oauth_client_id }}
+      BIBCODE_RELAY_URL: ${{ needs.relay_public_config.outputs.relay_url }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macOS arm64
+            runner: macos-26
+            platform: mac
+            arch: arm64
+            serverOs: darwin
+            serverArch: aarch64
+          - label: macOS x64
+            runner: macos-26-intel
+            platform: mac
+            arch: x64
+            serverOs: darwin
+            serverArch: x86_64
+          - label: Linux arm64
+            runner: ubuntu-22.04-arm
+            platform: linux
+            arch: arm64
+            serverOs: linux
+            serverArch: aarch64
+          - label: Linux x64
+            runner: ubuntu-22.04
+            platform: linux
+            arch: x64
+            serverOs: linux
+            serverArch: x86_64
+          - label: Windows arm64
+            runner: windows-11-vs2026-arm
+            platform: win
+            arch: arm64
+            serverOs: windows
+            serverArch: aarch64
+          - label: Windows x64
+            runner: windows-2025
+            platform: win
+            arch: x64
+            serverOs: windows
+            serverArch: x86_64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.preflight.outputs.ref }}
+          fetch-depth: 0
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1.15.0
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - name: Align package manifest versions to release version
+        run: node scripts/update-release-package-versions.ts "${{ needs.preflight.outputs.version }}"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Build production web client
+        run: vp run --filter @bibcode/web build
+
+      - name: Build Linux server on the compatibility baseline
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker_arch="amd64"
+          expected_uname="x86_64"
+          if [[ "${{ matrix.arch }}" == "arm64" ]]; then
+            docker_arch="arm64"
+            expected_uname="aarch64"
+          fi
+          docker run --rm \
+            --platform "linux/$docker_arch" \
+            --mount "type=bind,source=$GITHUB_WORKSPACE,target=/workspace" \
+            --workdir /workspace \
+            --env EXPECTED_UNAME="$expected_uname" \
+            --env RUST_TARGET="${{ matrix.serverArch }}-unknown-linux-gnu" \
+            ubuntu:20.04 \
+            bash -lc '
+              set -euo pipefail
+              test "$(uname -m)" = "$EXPECTED_UNAME"
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential ca-certificates cmake curl perl pkg-config
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs |
+                sh -s -- -y --profile minimal --default-toolchain 1.97.1
+              /root/.cargo/bin/cargo build -p bibcode-server --bin bibcode --release --target "$RUST_TARGET"
+            '
+
+      - name: Build macOS or Windows server
+        if: matrix.platform != 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_args=(cargo build -p bibcode-server --bin bibcode --release --target "${{ matrix.serverArch }}-${{ matrix.platform == 'mac' && 'apple-darwin' || 'pc-windows-msvc' }}")
+          if [[ "${{ matrix.platform }}" == "win" ]]; then
+            node scripts/run-msvc.mjs "${cargo_args[@]}"
+          else
+            "${cargo_args[@]}"
+          fi
+
+      - name: Build standalone server artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.serverArch }}-${{ matrix.platform == 'mac' && 'apple-darwin' || matrix.platform == 'win' && 'pc-windows-msvc' || 'unknown-linux-gnu' }}/release/bibcode"
+          if [[ "${{ matrix.platform }}" == "win" ]]; then
+            binary="$binary.exe"
+          fi
+          node scripts/build-server-artifact.ts \
+            --platform "${{ matrix.platform }}" \
+            --arch "${{ matrix.arch }}" \
+            --version "${{ needs.preflight.outputs.version }}" \
+            --output-dir server-release \
+            --skip-build \
+            --binary-path "$binary" \
+            --web-dir apps/web/dist \
+            --verbose
+
+      - name: Smoke standalone server distribution
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="server-release/staging/bibcode-server-v${{ needs.preflight.outputs.version }}-${{ matrix.serverOs }}-${{ matrix.serverArch }}/bibcode"
+          if [[ "${{ matrix.platform }}" == "win" ]]; then
+            binary="$binary.exe"
+          fi
+          node scripts/smoke-server-distribution.ts \
+            --binary "$binary" \
+            --expected-version "${{ needs.preflight.outputs.version }}" \
+            --timeout-ms 60000
+
+      - name: Test Linux server packages in native containers
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          deb="$(find server-release -maxdepth 1 -type f -name '*.deb' -print -quit)"
+          rpm="$(find server-release -maxdepth 1 -type f -name '*.rpm' -print -quit)"
+          test -n "$deb"
+          test -n "$rpm"
+          node scripts/test-linux-server-package.ts \
+            --arch "${{ matrix.arch }}" \
+            --expected-version "${{ needs.preflight.outputs.version }}" \
+            --package "$deb" \
+            --run-id "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-deb-${{ matrix.arch }}"
+          node scripts/test-linux-server-package.ts \
+            --arch "${{ matrix.arch }}" \
+            --expected-version "${{ needs.preflight.outputs.version }}" \
+            --package "$rpm" \
+            --run-id "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-rpm-${{ matrix.arch }}"
+
+      - name: Upload server artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: server-${{ matrix.platform }}-${{ matrix.arch }}
+          path: |
+            server-release/*.tar.gz
+            server-release/*.zip
+            server-release/*.deb
+            server-release/*.rpm
+          if-no-files-found: error
+
   # CLI publishing remains omitted until the `bibcode` package has its own npm
   # trusted-publisher binding. Configure that binding before restoring the job.
 
   release:
     name: Publish GitHub Release
-    needs: [preflight, build]
-    if: ${{ !failure() && !cancelled() && needs.preflight.result == 'success' && needs.build.result == 'success' }}
+    needs: [preflight, build_desktop, build_server]
+    if: ${{ !failure() && !cancelled() && needs.preflight.result == 'success' && needs.build_desktop.result == 'success' && needs.build_server.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     # Fork adaptation: publish with the workflow's own GITHUB_TOKEN instead of
@@ -485,7 +672,30 @@ jobs:
         with:
           pattern: desktop-*
           merge-multiple: true
-          path: release-assets
+          path: release-downloads/desktop
+
+      - name: Download all server artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: server-*
+          merge-multiple: true
+          path: release-downloads/server
+
+      - name: Merge isolated release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          for directory in release-downloads/desktop release-downloads/server; do
+            while IFS= read -r -d '' file; do
+              target="release-assets/$(basename "$file")"
+              if [[ -e "$target" ]]; then
+                echo "Duplicate release asset basename: $(basename "$file")" >&2
+                exit 1
+              fi
+              cp "$file" "$target"
+            done < <(find "$directory" -maxdepth 1 -type f -print0)
+          done
 
       - id: release_timestamp
         name: Capture release timestamp
@@ -514,6 +724,35 @@ jobs:
         run: |
           cargo run --locked -p bibcode-updater-verifier -- apps/desktop/src-tauri/tauri.release.conf.json release-assets/latest.json release-assets
 
+      - name: Assemble validated release assets
+        shell: bash
+        env:
+          SERVER_SIGNING_PRIVATE_KEY: ${{ secrets.BIBCODE_SERVER_SIGNING_PRIVATE_KEY }}
+          SERVER_SIGNING_PUBLIC_KEY: ${{ secrets.BIBCODE_SERVER_SIGNING_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          args=(node scripts/assemble-release-assets.ts \
+            --assets-dir release-assets \
+            --version "${{ needs.preflight.outputs.version }}" \
+            --step-summary "$GITHUB_STEP_SUMMARY")
+          if [[ "${{ needs.preflight.outputs.is_update_candidate }}" == "true" ]]; then
+            args+=(--updater)
+          fi
+          if [[ -n "${SERVER_SIGNING_PRIVATE_KEY:-}" || -n "${SERVER_SIGNING_PUBLIC_KEY:-}" ]]; then
+            if [[ -z "${SERVER_SIGNING_PRIVATE_KEY:-}" || -z "${SERVER_SIGNING_PUBLIC_KEY:-}" ]]; then
+              echo "Server signing requires both private and public keys." >&2
+              exit 1
+            fi
+            cargo install minisign --version 0.9.1 --locked
+            private_key="$RUNNER_TEMP/bibcode-server-signing.key"
+            public_key="$RUNNER_TEMP/bibcode-server-signing.pub"
+            printf '%s' "$SERVER_SIGNING_PRIVATE_KEY" > "$private_key"
+            printf '%s' "$SERVER_SIGNING_PUBLIC_KEY" > "$public_key"
+            chmod 600 "$private_key" "$public_key"
+            args+=(--server-signing-key "$private_key" --server-signing-public-key "$public_key")
+          fi
+          "${args[@]}"
+
       - name: Require inspected stable draft
         if: needs.preflight.outputs.release_channel == 'stable' && needs.preflight.outputs.publish_requested == 'true'
         shell: bash
@@ -530,7 +769,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rm -f release-assets/updater-*.json
           find release-assets -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort > expected-assets.txt
 
       - name: Publish stable release
@@ -578,9 +816,7 @@ jobs:
           prerelease: true
           make_latest: false
           files: |
-            release-assets/*.dmg
-            release-assets/*.AppImage
-            release-assets/*.exe
+            release-assets/*
           fail_on_unmatched_files: true
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -595,9 +831,7 @@ jobs:
           prerelease: true
           make_latest: false
           files: |
-            release-assets/*.dmg
-            release-assets/*.AppImage
-            release-assets/*.exe
+            release-assets/*
           fail_on_unmatched_files: true
           token: ${{ secrets.GITHUB_TOKEN }}
 

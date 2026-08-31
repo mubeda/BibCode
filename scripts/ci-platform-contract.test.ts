@@ -33,6 +33,7 @@ interface WorkflowStep {
 
 interface WorkflowJob {
   readonly env?: Record<string, string>;
+  readonly needs?: string | ReadonlyArray<string>;
   readonly outputs?: Record<string, string>;
   readonly "runs-on"?: string;
   readonly strategy?: {
@@ -217,9 +218,9 @@ describe("cross-platform release contract", () => {
 
   it("builds AppImage on Ubuntu 22.04 with the complete Linux prerequisites", () => {
     const { workflow } = readWorkflow(RELEASE_WORKFLOW_PATH);
-    const build = requireJob(workflow, "build");
+    const build = requireJob(workflow, "build_desktop");
     const linux = (build.strategy?.matrix?.include ?? []).find(
-      (entry) => entry.platform === "linux",
+      (entry) => entry.platform === "linux" && entry.arch === "x64",
     );
     const commands = allStepCommands(build);
 
@@ -231,7 +232,7 @@ describe("cross-platform release contract", () => {
 
   it("verifies complete ad-hoc signatures before publishing macOS DMGs", () => {
     const { workflow } = readWorkflow(RELEASE_WORKFLOW_PATH);
-    const steps = requireJob(workflow, "build").steps ?? [];
+    const steps = requireJob(workflow, "build_desktop").steps ?? [];
     const buildIndex = steps.findIndex((step) => step.name === "Build desktop artifact");
     const verifyIndex = steps.findIndex(
       (step) => step.name === "Verify macOS ad-hoc application signature",
@@ -276,7 +277,7 @@ describe("cross-platform release contract", () => {
 
   it("signs and collects updater artifacts only for updater candidates", () => {
     const { workflow } = readWorkflow(RELEASE_WORKFLOW_PATH);
-    const build = requireJob(workflow, "build");
+    const build = requireJob(workflow, "build_desktop");
     const commands = allStepCommands(build);
     const releaseAssets = build.steps?.find((step) => step.name === "Collect release assets");
     const signingCheck = build.steps?.find(
@@ -301,6 +302,99 @@ describe("cross-platform release contract", () => {
     expect(releaseAssets?.run).toMatch(/release\/\*\.sig/);
     expect(releaseAssets?.run).toMatch(/release\/updater-\*\.json/);
     expect(releaseAssets?.run).toMatch(/is_update_candidate/);
+  });
+
+  it("builds independent six-target desktop and server release matrices", () => {
+    const { workflow } = readWorkflow(RELEASE_WORKFLOW_PATH);
+    const desktop = requireJob(workflow, "build_desktop");
+    const server = requireJob(workflow, "build_server");
+    const release = requireJob(workflow, "release");
+
+    expect(desktop.strategy?.matrix?.include).toEqual([
+      { label: "macOS arm64", runner: "macos-26", platform: "mac", target: "dmg", arch: "arm64" },
+      { label: "macOS x64", runner: "macos-26-intel", platform: "mac", target: "dmg", arch: "x64" },
+      {
+        label: "Linux arm64",
+        runner: "ubuntu-22.04-arm",
+        platform: "linux",
+        target: "appimage",
+        arch: "arm64",
+      },
+      {
+        label: "Linux x64",
+        runner: "ubuntu-22.04",
+        platform: "linux",
+        target: "appimage",
+        arch: "x64",
+      },
+      {
+        label: "Windows arm64",
+        runner: "windows-11-vs2026-arm",
+        platform: "win",
+        target: "nsis",
+        arch: "arm64",
+      },
+      {
+        label: "Windows x64",
+        runner: "windows-2025",
+        platform: "win",
+        target: "nsis",
+        arch: "x64",
+      },
+    ]);
+    expect(server.strategy?.matrix?.include).toEqual([
+      {
+        label: "macOS arm64",
+        runner: "macos-26",
+        platform: "mac",
+        arch: "arm64",
+        serverOs: "darwin",
+        serverArch: "aarch64",
+      },
+      {
+        label: "macOS x64",
+        runner: "macos-26-intel",
+        platform: "mac",
+        arch: "x64",
+        serverOs: "darwin",
+        serverArch: "x86_64",
+      },
+      {
+        label: "Linux arm64",
+        runner: "ubuntu-22.04-arm",
+        platform: "linux",
+        arch: "arm64",
+        serverOs: "linux",
+        serverArch: "aarch64",
+      },
+      {
+        label: "Linux x64",
+        runner: "ubuntu-22.04",
+        platform: "linux",
+        arch: "x64",
+        serverOs: "linux",
+        serverArch: "x86_64",
+      },
+      {
+        label: "Windows arm64",
+        runner: "windows-11-vs2026-arm",
+        platform: "win",
+        arch: "arm64",
+        serverOs: "windows",
+        serverArch: "aarch64",
+      },
+      {
+        label: "Windows x64",
+        runner: "windows-2025",
+        platform: "win",
+        arch: "x64",
+        serverOs: "windows",
+        serverArch: "x86_64",
+      },
+    ]);
+    expect(allStepCommands(server)).toContain("scripts/build-server-artifact.ts");
+    expect(allStepCommands(server)).toContain("scripts/smoke-server-distribution.ts");
+    expect(release.needs).toEqual(["preflight", "build_desktop", "build_server"]);
   });
 
   it("cryptographically verifies every updater payload before creating a stable draft", () => {
