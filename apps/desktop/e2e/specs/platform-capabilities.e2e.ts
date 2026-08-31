@@ -43,6 +43,14 @@ describe("packaged preferences, native integrations, and platform capabilities",
     await expect(browser.$("//*[contains(., 'fixture@example.test')]")).toBeDisplayed();
 
     await browser.url(`${appOrigin}/#/settings/connections`);
+    await browser.waitUntil(
+      async () => (await browser.getUrl()).endsWith("/#/settings/remote-servers"),
+      {
+        timeoutMsg: "Legacy Connections settings did not redirect to Remote Servers.",
+      },
+    );
+    await expect(browser.$("//*[normalize-space()='Connect to a host']")).toBeDisplayed();
+    await expect(browser.$("//*[normalize-space()='Share this host']")).toBeDisplayed();
     if (process.env.BIBCODE_E2E_PLATFORM === "win") {
       const wslState = await browser.execute(async () => {
         const bridge = Reflect.get(window, "desktopBridge") as
@@ -62,13 +70,6 @@ describe("packaged preferences, native integrations, and platform capabilities",
 
       await expect(browser.$("//*[normalize-space()='Local environment']")).toBeDisplayed();
       await expect(browser.$("//*[normalize-space()='WSL backend']")).toBeDisplayed();
-    } else {
-      await browser.waitUntil(
-        async () => (await browser.getUrl()).endsWith("/#/settings/general"),
-        {
-          timeoutMsg: "Local-only non-Windows desktop settings did not redirect to General.",
-        },
-      );
     }
 
     await expect(browser.$("//*[normalize-space()='Network access']")).not.toExist();

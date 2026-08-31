@@ -145,7 +145,9 @@ async function openMaterializedFixtureChat(): Promise<{
   );
   if (!(await browser.$(activityThreadSelector).isDisplayed())) {
     await activityProject.waitForDisplayed();
-    await activityProject.click();
+    if ((await activityProject.getAttribute("aria-expanded")) !== "true") {
+      await activityProject.click();
+    }
     await browser.$(activityThreadSelector).waitForDisplayed({
       timeoutMsg: "The RPC-materialized activity thread did not expand in the main sidebar.",
     });
