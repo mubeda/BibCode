@@ -28,7 +28,9 @@ const encodeJson = Schema.encodeSync(Schema.UnknownFromJsonString);
 const artifacts = {
   "darwin-aarch64": "bibcode-update-darwin-aarch64.app.tar.gz",
   "darwin-x86_64": "bibcode-update-darwin-x86_64.app.tar.gz",
+  "linux-aarch64": "BiBCode_0.2.12_arm64.AppImage",
   "linux-x86_64": "BiBCode_0.2.12_amd64.AppImage",
+  "windows-aarch64": "BiBCode_0.2.12_arm64-setup.exe",
   "windows-x86_64": "BiBCode_0.2.12_x64-setup.exe",
 } as const;
 
@@ -59,7 +61,7 @@ const assertFailure = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   effect.pipe(Effect.flip, Effect.asVoid);
 
 it.layer(NodeServices.layer)("build-tauri-update-manifest", (it) => {
-  it.effect("builds a deterministic static manifest from the four updater descriptors", () =>
+  it.effect("builds a deterministic static manifest from the six updater descriptors", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const assetsDir = yield* fs.makeTempDirectoryScoped({ prefix: "tauri-update-manifest-" });
@@ -78,9 +80,17 @@ it.layer(NodeServices.layer)("build-tauri-update-manifest", (it) => {
             signature: TEST_SIGNATURE,
             url: "https://github.com/mubeda/BibCode/releases/download/v0.2.12/bibcode-update-darwin-x86_64.app.tar.gz",
           },
+          "linux-aarch64": {
+            signature: TEST_SIGNATURE,
+            url: "https://github.com/mubeda/BibCode/releases/download/v0.2.12/BiBCode_0.2.12_arm64.AppImage",
+          },
           "linux-x86_64": {
             signature: TEST_SIGNATURE,
             url: "https://github.com/mubeda/BibCode/releases/download/v0.2.12/BiBCode_0.2.12_amd64.AppImage",
+          },
+          "windows-aarch64": {
+            signature: TEST_SIGNATURE,
+            url: "https://github.com/mubeda/BibCode/releases/download/v0.2.12/BiBCode_0.2.12_arm64-setup.exe",
           },
           "windows-x86_64": {
             signature: TEST_SIGNATURE,
@@ -106,9 +116,17 @@ it.layer(NodeServices.layer)("build-tauri-update-manifest", (it) => {
           `      "signature": "${TEST_SIGNATURE}",`,
           '      "url": "https://github.com/mubeda/BibCode/releases/download/v0.2.12/bibcode-update-darwin-x86_64.app.tar.gz"',
           "    },",
+          '    "linux-aarch64": {',
+          `      "signature": "${TEST_SIGNATURE}",`,
+          '      "url": "https://github.com/mubeda/BibCode/releases/download/v0.2.12/BiBCode_0.2.12_arm64.AppImage"',
+          "    },",
           '    "linux-x86_64": {',
           `      "signature": "${TEST_SIGNATURE}",`,
           '      "url": "https://github.com/mubeda/BibCode/releases/download/v0.2.12/BiBCode_0.2.12_amd64.AppImage"',
+          "    },",
+          '    "windows-aarch64": {',
+          `      "signature": "${TEST_SIGNATURE}",`,
+          '      "url": "https://github.com/mubeda/BibCode/releases/download/v0.2.12/BiBCode_0.2.12_arm64-setup.exe"',
           "    },",
           '    "windows-x86_64": {',
           `      "signature": "${TEST_SIGNATURE}",`,
