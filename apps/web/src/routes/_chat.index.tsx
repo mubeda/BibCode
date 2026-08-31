@@ -56,13 +56,13 @@ function HostedStaticOnboardingState() {
               </EmptyTitle>
               <EmptyDescription className="mt-2 text-sm leading-relaxed text-muted-foreground/78">
                 {cloudEnabled
-                  ? "Sign in to BiBCode Connect to connect a linked environment through its managed tunnel, or add a reachable backend manually."
-                  : "Add a reachable backend manually to start working from this browser."}
+                  ? "Sign in to BiBCode Connect to connect a linked environment through its managed tunnel, or add a reachable server manually."
+                  : "Add a reachable server manually to start working from this browser."}
               </EmptyDescription>
               <div className="mt-6 flex justify-center">
-                <Button render={<Link to="/settings/connections" />} size="sm">
+                <Button render={<Link to="/settings/remote-servers" />} size="sm">
                   <PlusIcon className="size-4" />
-                  {cloudEnabled ? "Open Connections" : "Add environment"}
+                  {cloudEnabled ? "Open Remote Servers" : "Add environment"}
                 </Button>
               </div>
             </EmptyHeader>

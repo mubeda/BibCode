@@ -30,6 +30,52 @@ export interface EnvironmentPresentation {
   readonly serverConfig: ServerConfig | null;
 }
 
+export type ConnectionTransportSecurity = "local" | "e2ee" | "channel-secured" | "unencrypted";
+
+export interface ConnectionTransportSecurityInput {
+  readonly target:
+    | { readonly _tag: "PrimaryConnectionTarget" }
+    | { readonly _tag: "UnavailableConnectionTarget" }
+    | { readonly _tag: "RelayConnectionTarget" }
+    | { readonly _tag: "SshConnectionTarget" }
+    | { readonly _tag: "BearerConnectionTarget"; readonly connectionId?: string };
+  readonly profile:
+    | { readonly _tag: "None" }
+    | {
+        readonly _tag: "Some";
+        readonly value: { readonly _tag: string; readonly hostKey?: string | null };
+      };
+}
+
+export const DESKTOP_LOCAL_CONNECTION_ID_PREFIX = "local:";
+
+export function isDesktopLocalConnectionId(connectionId: string | undefined): boolean {
+  return connectionId?.startsWith(DESKTOP_LOCAL_CONNECTION_ID_PREFIX) ?? false;
+}
+
+export function connectionTransportSecurity(
+  entry: ConnectionTransportSecurityInput,
+): ConnectionTransportSecurity {
+  switch (entry.target._tag) {
+    case "PrimaryConnectionTarget":
+    case "UnavailableConnectionTarget":
+      return "local";
+    case "RelayConnectionTarget":
+    case "SshConnectionTarget":
+      return "channel-secured";
+    case "BearerConnectionTarget": {
+      if (isDesktopLocalConnectionId(entry.target.connectionId)) {
+        return "local";
+      }
+      const profile =
+        entry.profile._tag === "Some" && entry.profile.value._tag === "BearerConnectionProfile"
+          ? entry.profile.value
+          : null;
+      return profile?.hostKey == null ? "unencrypted" : "e2ee";
+    }
+  }
+}
+
 export function presentConnectionState(
   state: SupervisorConnectionState,
 ): EnvironmentConnectionPresentation {

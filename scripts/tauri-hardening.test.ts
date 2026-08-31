@@ -380,6 +380,7 @@ it.layer(NodeServices.layer)("Tauri production hardening", (it) => {
         "allow-desktop-bridge",
         "allow-desktop-preview",
         "core:default",
+        "deep-link:default",
       ]);
       assert.match(viteConfig, /tanstackRouter\(\{[\s\S]*?autoCodeSplitting: true,/);
       assert.match(viteConfig, /chunkSizeWarningLimit: 1536,/);
@@ -401,7 +402,10 @@ it.layer(NodeServices.layer)("Tauri production hardening", (it) => {
       assert.equal(yield* fs.exists(path.join(repoRoot, "scripts/run-tauri-build.mjs")), true);
       assert.notMatch(desktopPackage, /pnpm dlx/);
       assert.notMatch(desktopLib, /if\s*!cfg!\(debug_assertions\)[\s\S]*?backend\.start_default/);
-      assert.match(desktopLib, /backend\.start_default\(app_handle\)\.await/);
+      assert.match(
+        desktopLib,
+        /\.run_exclusive\(backend\.start_default\(app_handle\)\)[\s\S]*?\.await/,
+      );
     }),
   );
 });

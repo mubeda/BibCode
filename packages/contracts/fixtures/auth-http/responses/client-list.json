@@ -46,6 +46,7 @@
     "expiresAt": "2026-01-01T01:00:00.000Z",
     "lastConnectedAt": null,
     "connected": false,
-    "current": false
+    "current": false,
+    "reach": "another-device"
   }
 ]

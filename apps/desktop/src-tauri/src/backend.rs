@@ -10,7 +10,7 @@ use std::{
     collections::BTreeMap,
     fmt, fs,
     io::{self, Read, Write},
-    net::{Ipv4Addr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket},
+    net::{IpAddr, Ipv4Addr, TcpListener, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -29,6 +29,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::config::state_dir;
+use crate::network_interfaces::{classify_advertised_address, default_route_ip};
 #[cfg(test)]
 use crate::test_support::FixtureEvent;
 
@@ -589,6 +590,9 @@ pub struct BackendSupervisor {
     state: Arc<Mutex<BackendState>>,
     start_completed: Arc<Notify>,
     ui_process_observer: Arc<Mutex<Option<Arc<dyn DesktopUiProcessObserver>>>>,
+    remote_update_delegate:
+        Arc<Mutex<Option<Arc<dyn bibcode_server::remote_update::RemoteUpdateDelegate>>>>,
+    remote_update_support: Arc<Mutex<Option<bibcode_server::remote_update::RemoteUpdateSupport>>>,
     backend_port_resolver: Arc<dyn BackendPortResolver>,
     wsl_command_resolver: Arc<dyn WslCommandResolver>,
     #[cfg(test)]
@@ -610,6 +614,8 @@ impl fmt::Debug for BackendSupervisor {
             .field("state", &self.state)
             .field("start_completed", &self.start_completed)
             .field("ui_process_observer", &self.ui_process_observer)
+            .field("remote_update_delegate", &"<delegate slot>")
+            .field("remote_update_support", &self.remote_update_support)
             .finish_non_exhaustive()
     }
 }
@@ -620,6 +626,8 @@ impl Default for BackendSupervisor {
             state: Arc::default(),
             start_completed: Arc::default(),
             ui_process_observer: Arc::default(),
+            remote_update_delegate: Arc::default(),
+            remote_update_support: Arc::default(),
             backend_port_resolver: Arc::new(SystemBackendPortResolver),
             wsl_command_resolver: Arc::new(SystemWslCommandResolver),
             #[cfg(test)]
@@ -977,6 +985,15 @@ impl BackendSupervisor {
             .unwrap_or_else(|| Arc::new(UnavailableDesktopUiProcessObserver))
     }
 
+    pub fn install_remote_update_integration(
+        &self,
+        delegate: Arc<dyn bibcode_server::remote_update::RemoteUpdateDelegate>,
+        support: bibcode_server::remote_update::RemoteUpdateSupport,
+    ) {
+        *self.remote_update_delegate.lock().expect("delegate slot") = Some(delegate);
+        *self.remote_update_support.lock().expect("support slot") = Some(support);
+    }
+
     pub fn local_environment_bootstraps(&self) -> Vec<Value> {
         let state = self
             .state
@@ -1076,19 +1093,22 @@ impl BackendSupervisor {
         &self,
         app: AppHandle<R>,
     ) -> Result<BackendRunConfig, String> {
-        self.start_default_with_reason(app, "started").await
+        self.start_default_with_reason(app, "started", Some("local-only"))
+            .await
     }
 
     async fn start_default_with_reason<R: Runtime>(
         &self,
         app: AppHandle<R>,
         reason: &'static str,
+        exposure_override: Option<&str>,
     ) -> Result<BackendRunConfig, String> {
         self.install_ui_process_observer(ui_process_observer::for_app(&app));
         let selection = match default_launch_plans(
             &app,
             self.backend_port_resolver.as_ref(),
             self.wsl_command_resolver.as_ref(),
+            exposure_override,
         ) {
             Ok(selection) => selection,
             Err(error) => {
@@ -1150,9 +1170,33 @@ impl BackendSupervisor {
         Ok(primary_config)
     }
 
-    pub async fn restart_default_if_active<R: Runtime>(
+    pub async fn restart_default_if_active_preserving_exposure<R: Runtime>(
         &self,
         app: AppHandle<R>,
+    ) -> Result<Option<BackendRunConfig>, String> {
+        let exposure_override = self
+            .current_run_config()
+            .map(|config| config.server_exposure_mode);
+        self.restart_default_if_active_with_override(app, exposure_override.as_deref())
+            .await
+    }
+
+    pub async fn restart_default_if_active_with_exposure<R: Runtime>(
+        &self,
+        app: AppHandle<R>,
+        desired: &str,
+    ) -> Result<Option<BackendRunConfig>, String> {
+        if !matches!(desired, "local-only" | "network-accessible") {
+            return Err(format!("Unsupported server exposure mode: {desired}"));
+        }
+        self.restart_default_if_active_with_override(app, Some(desired))
+            .await
+    }
+
+    async fn restart_default_if_active_with_override<R: Runtime>(
+        &self,
+        app: AppHandle<R>,
+        exposure_override: Option<&str>,
     ) -> Result<Option<BackendRunConfig>, String> {
         let is_active = {
             let state = self
@@ -1168,7 +1212,7 @@ impl BackendSupervisor {
         }
 
         self.stop(BackendShutdownConfig::default()).await?;
-        self.start_default_with_reason(app, "restarted")
+        self.start_default_with_reason(app, "restarted", exposure_override)
             .await
             .map(Some)
     }
@@ -1203,9 +1247,21 @@ impl BackendSupervisor {
         let permit =
             self.begin_start_with_update_recovery(reset_restart_attempt, update_recovery)?;
         let ui_process_observer = self.ui_process_observer_for_start();
-        let (config, managed, pid) =
-            start_managed_backend(plan.clone(), readiness, ui_process_observer, permit.run_id)
-                .await?;
+        let remote_update_delegate = self
+            .remote_update_delegate
+            .lock()
+            .expect("delegate slot")
+            .clone();
+        let remote_update_support = *self.remote_update_support.lock().expect("support slot");
+        let (config, managed, pid) = start_managed_backend(
+            plan.clone(),
+            readiness,
+            ui_process_observer,
+            remote_update_delegate,
+            remote_update_support,
+            permit.run_id,
+        )
+        .await?;
         #[cfg(test)]
         self.wait_for_start_publish_gate().await;
         let mut active_plan = plan;
@@ -1734,19 +1790,36 @@ async fn start_managed_backend(
     plan: BackendLaunchPlan,
     readiness: BackendReadinessConfig,
     ui_process_observer: Arc<dyn DesktopUiProcessObserver>,
+    remote_update_delegate: Option<Arc<dyn bibcode_server::remote_update::RemoteUpdateDelegate>>,
+    remote_update_support: Option<bibcode_server::remote_update::RemoteUpdateSupport>,
     run_id: u64,
 ) -> Result<(BackendRunConfig, ManagedBackend, Option<u32>), String> {
     match &plan.target {
         BackendLaunchTarget::InProcess { data_root, .. } => {
             #[cfg(test)]
             prepare_isolated_test_server_settings(&data_root.effective)?;
-            let server_config = server_config_for_launch(data_root.clone(), &plan.config);
-            let handle =
-                ServerRuntime::start_with_ui_process_observer(server_config, ui_process_observer)
+            let mut server_config = server_config_for_launch(data_root.clone(), &plan.config);
+            if let Some(support) = remote_update_support {
+                server_config = server_config.with_remote_update_support(support);
+            }
+            let handle = match remote_update_delegate {
+                Some(delegate) => {
+                    ServerRuntime::start_with_desktop_integration(
+                        server_config,
+                        ui_process_observer,
+                        delegate,
+                    )
                     .await
-                    .map_err(|error| {
-                        format!("Could not start in-process desktop backend: {error}")
-                    })?;
+                }
+                None => {
+                    ServerRuntime::start_with_ui_process_observer(
+                        server_config,
+                        ui_process_observer,
+                    )
+                    .await
+                }
+            }
+            .map_err(|error| format!("Could not start in-process desktop backend: {error}"))?;
 
             let mut config = plan.config.clone();
             config.port = handle.local_addr().port();
@@ -2570,9 +2643,18 @@ fn default_launch_plans<R: Runtime>(
     app: &AppHandle<R>,
     backend_port_resolver: &dyn BackendPortResolver,
     wsl_command_resolver: &dyn WslCommandResolver,
+    exposure_override: Option<&str>,
 ) -> Result<DefaultLaunchPlans, BackendPlanError> {
-    let settings =
+    let mut settings =
         read_backend_desktop_settings(app).map_err(|detail| BackendPlanError::Other { detail })?;
+    if let Some(desired) = exposure_override {
+        if !matches!(desired, "local-only" | "network-accessible") {
+            return Err(BackendPlanError::Other {
+                detail: format!("Unsupported server exposure mode: {desired}"),
+            });
+        }
+        settings.server_exposure_mode = desired.to_string();
+    }
     let log_path =
         primary_backend_log_path(app).map_err(|detail| BackendPlanError::Other { detail })?;
     let port = backend_port_resolver.port();
@@ -2658,17 +2740,14 @@ struct ResolvedBackendExposure {
 }
 
 pub fn resolve_lan_advertised_host() -> Option<String> {
-    let socket = UdpSocket::bind(("0.0.0.0", 0)).ok()?;
-    socket.connect(("8.8.8.8", 80)).ok()?;
-    let address = socket.local_addr().ok()?.ip();
-    if !address.is_ipv4() || address.is_loopback() {
-        return None;
-    }
-    let text = address.to_string();
-    if text.starts_with("169.254.") {
-        return None;
-    }
-    Some(text)
+    select_lan_advertised_host(default_route_ip())
+}
+
+fn select_lan_advertised_host(default_route: Option<IpAddr>) -> Option<String> {
+    default_route
+        .filter(IpAddr::is_ipv4)
+        .filter(|ip| classify_advertised_address(*ip).default_eligible)
+        .map(|ip| ip.to_string())
 }
 
 fn resolve_backend_exposure(
@@ -5028,6 +5107,29 @@ exit /b 9
     }
 
     #[test]
+    fn lan_advertised_host_accepts_only_private_usable_ipv4_defaults() {
+        for accepted in ["192.168.1.20", "100.100.100.100"] {
+            let address = accepted.parse::<IpAddr>().expect("accepted fixture");
+            assert_eq!(
+                select_lan_advertised_host(Some(address)),
+                Some(accepted.to_owned())
+            );
+        }
+        for rejected in [
+            "0.0.0.0",
+            "127.0.0.1",
+            "169.254.1.1",
+            "8.8.8.8",
+            "224.0.0.1",
+            "255.255.255.255",
+            "fd7a:115c:a1e0::1",
+        ] {
+            let address = rejected.parse::<IpAddr>().expect("rejected fixture");
+            assert_eq!(select_lan_advertised_host(Some(address)), None);
+        }
+    }
+
+    #[test]
     fn local_only_exposure_does_not_resolve_lan_route() {
         let settings = BackendDesktopSettings {
             server_exposure_mode: "local-only".to_string(),
@@ -5083,11 +5185,67 @@ exit /b 9
                 handle,
                 &SystemBackendPortResolver,
                 &SystemWslCommandResolver,
+                None,
             )
             .unwrap()
             .plans
             .is_empty()
         );
+    }
+
+    #[test]
+    fn exposure_override_controls_launch_planning_without_changing_persisted_settings() {
+        use crate::config::IsolatedTestDataRoot;
+        use tauri::test::{mock_builder, mock_context, noop_assets};
+
+        let temp = tempfile::tempdir().expect("isolated desktop data root");
+        let app = mock_builder()
+            .manage(IsolatedTestDataRoot::new(temp.path().join("data-root")))
+            .build(mock_context(noop_assets()))
+            .expect("mock Tauri app");
+        let settings_directory = desktop_base_dir(app.handle())
+            .expect("desktop base directory")
+            .join("dev");
+        fs::create_dir_all(&settings_directory).expect("settings directory");
+        let settings_path = settings_directory.join(DESKTOP_SETTINGS_FILE_NAME);
+        fs::write(
+            &settings_path,
+            r#"{"serverExposureMode":"network-accessible"}"#,
+        )
+        .expect("wide desktop settings");
+
+        let local_override = default_launch_plans(
+            app.handle(),
+            &SystemBackendPortResolver,
+            &SystemWslCommandResolver,
+            Some("local-only"),
+        )
+        .expect("local override launch plan")
+        .plans
+        .into_iter()
+        .find(|plan| plan.config.environment_id == PRIMARY_LOCAL_ENVIRONMENT_ID)
+        .expect("primary local plan");
+        assert_eq!(local_override.config.server_exposure_mode, "local-only");
+        assert_eq!(local_override.config.bind_host, DESKTOP_LOOPBACK_HOST);
+
+        fs::write(&settings_path, r#"{"serverExposureMode":"local-only"}"#)
+            .expect("local desktop settings");
+        let wide_override = default_launch_plans(
+            app.handle(),
+            &SystemBackendPortResolver,
+            &SystemWslCommandResolver,
+            Some("network-accessible"),
+        )
+        .expect("wide override launch plan")
+        .plans
+        .into_iter()
+        .find(|plan| plan.config.environment_id == PRIMARY_LOCAL_ENVIRONMENT_ID)
+        .expect("primary wide plan");
+        assert_eq!(
+            wide_override.config.server_exposure_mode,
+            "network-accessible"
+        );
+        assert_eq!(wide_override.config.bind_host, DESKTOP_LAN_BIND_HOST);
     }
 
     #[tokio::test]
@@ -5121,17 +5279,19 @@ exit /b 9
             .await
             .expect("default backend should start");
         assert_ne!(started.port, 0);
+        assert_eq!(started.server_exposure_mode, "local-only");
         assert!(
             TcpListener::bind((Ipv4Addr::LOCALHOST, started.port)).is_err(),
             "the running server must retain its published listener address"
         );
 
         let restarted = supervisor
-            .restart_default_if_active(app.handle().clone())
+            .restart_default_if_active_preserving_exposure(app.handle().clone())
             .await
             .expect("default backend should restart")
             .expect("active backend should produce a replacement config");
         assert_ne!(restarted.port, 0);
+        assert_eq!(restarted.server_exposure_mode, "local-only");
         assert!(
             TcpListener::bind((Ipv4Addr::LOCALHOST, restarted.port)).is_err(),
             "the replacement server must retain its published listener address"
@@ -5488,6 +5648,8 @@ exit /b 9
                 request_timeout: Duration::ZERO,
             },
             Arc::new(UnavailableDesktopUiProcessObserver),
+            None,
+            None,
             0,
         )
         .await
@@ -5505,6 +5667,8 @@ exit /b 9
                 request_timeout: Duration::ZERO,
             },
             Arc::new(UnavailableDesktopUiProcessObserver),
+            None,
+            None,
             1,
         )
         .await
@@ -5525,6 +5689,8 @@ exit /b 9
                 request_timeout: Duration::from_millis(20),
             },
             Arc::new(UnavailableDesktopUiProcessObserver),
+            None,
+            None,
             8,
         )
         .await
@@ -5969,6 +6135,8 @@ $client.Dispose()
                 request_timeout: Duration::from_secs(1),
             },
             Arc::new(UnavailableDesktopUiProcessObserver),
+            None,
+            None,
             10,
         )
         .await
@@ -6048,6 +6216,8 @@ $client.Dispose()
                 request_timeout: Duration::from_secs(1),
             },
             Arc::new(UnavailableDesktopUiProcessObserver),
+            None,
+            None,
             11,
         )
         .await

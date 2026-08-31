@@ -79,8 +79,14 @@ pub struct SessionClaims {
     pub method: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jkt: Option<String>,
+    #[serde(default = "default_transport")]
+    pub tr: String,
     pub iat: i64,
     pub exp: i64,
+}
+
+fn default_transport() -> String {
+    "plain".to_owned()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -88,6 +94,9 @@ pub struct WebSocketClaims {
     pub v: u8,
     pub kind: String,
     pub sid: String,
+    /// Unique ticket id; each ticket is redeemable exactly once.
+    #[serde(default)]
+    pub jti: Option<String>,
     pub iat: i64,
     pub exp: i64,
 }

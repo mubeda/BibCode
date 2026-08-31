@@ -89,6 +89,7 @@ const makePrimaryBroker = Effect.fn("clientRuntime.connection.broker.makePrimary
         httpBaseUrl: target.httpBaseUrl,
         socketUrl: primarySocketUrl(target),
         httpAuthorization: null,
+        e2ee: null,
         target,
       } satisfies PreparedConnection;
     }
@@ -146,6 +147,7 @@ const makeBearerBroker = Effect.fn("clientRuntime.connection.broker.makeBearer")
       httpBaseUrl: profile.httpBaseUrl,
       wsBaseUrl: profile.wsBaseUrl,
       bearerToken: credential.token,
+      hostKey: profile.hostKey,
     });
     return {
       environmentId: authorized.environmentId,
@@ -153,7 +155,8 @@ const makeBearerBroker = Effect.fn("clientRuntime.connection.broker.makeBearer")
       descriptor: authorized.descriptor,
       httpBaseUrl: authorized.httpBaseUrl,
       socketUrl: authorized.socketUrl,
-      httpAuthorization: authorized.httpAuthorization,
+      httpAuthorization: authorized.e2ee === null ? authorized.httpAuthorization : null,
+      e2ee: authorized.e2ee,
       target,
     } satisfies PreparedConnection;
   });
@@ -194,6 +197,7 @@ const makeRelayBroker = Effect.fn("clientRuntime.connection.broker.makeRelay")(f
       httpBaseUrl: authorized.httpBaseUrl,
       socketUrl: authorized.socketUrl,
       httpAuthorization: authorized.httpAuthorization,
+      e2ee: null,
       target,
     } satisfies PreparedConnection;
   }, Effect.withSpan("clientRuntime.connection.broker.relay"));
@@ -250,6 +254,7 @@ const makeSshBroker = Effect.fn("clientRuntime.connection.broker.makeSsh")(funct
       httpBaseUrl: authorized.httpBaseUrl,
       socketUrl: authorized.socketUrl,
       httpAuthorization: authorized.httpAuthorization,
+      e2ee: null,
       target,
     } satisfies PreparedConnection;
   });

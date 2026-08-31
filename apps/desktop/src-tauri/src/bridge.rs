@@ -14,7 +14,9 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_updater::UpdaterExt;
 
-use crate::backend::{BackendPlanError, BackendRunConfig, BackendSupervisor};
+use crate::backend::{
+    BackendPlanError, BackendRunConfig, BackendShutdownConfig, BackendSupervisor,
+};
 use crate::config::{
     app_branding, read_json_file, resolve_pick_folder_default_path, state_dir, write_json_file,
 };
@@ -23,9 +25,16 @@ use crate::context_menu::{
     context_menu_request_has_selectable_items, show_native_context_menu,
 };
 use crate::data_safety;
+use crate::network_interfaces::{
+    AdvertisedAddressLabelKind, AdvertisedAddressReachability, NetworkAddress,
+    classify_advertised_address, enumerate_system_advertised_addresses,
+};
 use crate::security::{
     CONNECTION_CATALOG_PROTECTION_KIND, protect_string as protect_catalog_string,
     unprotect_string as unprotect_catalog_string,
+};
+use crate::server_exposure::{
+    BoxFuture, ExposureOperations, ServerExposureCoordinator, apply_exposure, recover_local,
 };
 use crate::ssh::{
     SshEnvironmentEnsureOptions, SshEnvironmentManager, SshEnvironmentTarget,
@@ -427,8 +436,24 @@ fn update_desktop_settings<R: Runtime>(
 
 fn server_exposure_state(settings: &DesktopSettings, config: Option<&BackendRunConfig>) -> Value {
     if let Some(config) = config {
+        let management = if settings.wsl_only || config.running_distro.is_some() {
+            "external"
+        } else {
+            "native"
+        };
+        let actual_mode = config
+            .bind_host
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .filter(|host| !host.is_loopback())
+            .map_or(
+                config.server_exposure_mode.as_str(),
+                |_| "network-accessible",
+            );
         return json!({
-            "mode": &config.server_exposure_mode,
+            "mode": actual_mode,
+            "configuredMode": &settings.server_exposure_mode,
+            "management": management,
             "endpointUrl": &config.endpoint_url,
             "advertisedHost": &config.advertised_host,
             "tailscaleServeEnabled": config.tailscale_serve_enabled,
@@ -438,6 +463,8 @@ fn server_exposure_state(settings: &DesktopSettings, config: Option<&BackendRunC
 
     json!({
         "mode": &settings.server_exposure_mode,
+        "configuredMode": &settings.server_exposure_mode,
+        "management": if settings.wsl_only { "external" } else { "native" },
         "endpointUrl": null,
         "advertisedHost": null,
         "tailscaleServeEnabled": settings.tailscale_serve_enabled,
@@ -507,6 +534,7 @@ fn advertised_endpoint(
     label: &str,
     http_base_url: String,
     reachability: &str,
+    status: &str,
     is_default: Option<bool>,
     description: &str,
 ) -> Result<Value, String> {
@@ -530,7 +558,7 @@ fn advertised_endpoint(
             "desktopApp": "compatible",
         },
         "source": "desktop-core",
-        "status": "available",
+        "status": status,
         "description": description,
     });
     if let Some(is_default) = is_default {
@@ -571,24 +599,73 @@ fn tailscale_advertised_endpoint(
     }))
 }
 
-fn advertised_endpoints_for_config(config: &BackendRunConfig) -> Result<Vec<Value>, String> {
+fn advertised_endpoints_for_config(
+    config: &BackendRunConfig,
+    network_addresses: &[NetworkAddress],
+) -> Result<Vec<Value>, String> {
     let mut endpoints = vec![advertised_endpoint(
         format!("desktop-loopback:{}", config.port),
-        "This machine",
+        AdvertisedAddressLabelKind::ThisMachine.as_str(),
         config.http_base_url(),
         "loopback",
+        "available",
         None,
         "Loopback endpoint for this desktop app.",
     )?];
 
-    if let Some(endpoint_url) = &config.endpoint_url {
+    let network_status = if config.server_exposure_mode == "network-accessible" {
+        "available"
+    } else {
+        "unavailable"
+    };
+    for address in network_addresses {
+        let classification = classify_advertised_address(address.ip);
+        if !classification.advertise_with_ipv4_listener {
+            continue;
+        }
+        let socket = std::net::SocketAddr::new(address.ip, config.port);
+        let is_default = address.is_default_route && classification.default_eligible;
+        let description = if classification.reachability == AdvertisedAddressReachability::Public {
+            if config.server_exposure_mode == "network-accessible" {
+                #[cfg(target_os = "windows")]
+                {
+                    format!(
+                        "Observed public address through network interface {}. Native sharing never selects it; use only through an externally managed listener or reverse proxy with reviewed firewall policy.",
+                        address.interface_name
+                    )
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    format!(
+                        "Observed public address through network interface {}. Native sharing never selects it; use only through an externally managed listener or reverse proxy. BiBCode does not manage this platform's firewall.",
+                        address.interface_name
+                    )
+                }
+            } else {
+                format!(
+                    "Observed public address through network interface {}. Native sharing requires a private default route; use an externally managed listener or reverse proxy.",
+                    address.interface_name
+                )
+            }
+        } else if network_status == "available" {
+            format!(
+                "Reachable through network interface {}.",
+                address.interface_name
+            )
+        } else {
+            format!(
+                "Observed private address through network interface {}. Enabling native remote access can make it reachable.",
+                address.interface_name
+            )
+        };
         endpoints.push(advertised_endpoint(
-            format!("desktop-lan:{endpoint_url}"),
-            "Local network",
-            endpoint_url.clone(),
-            "lan",
-            Some(true),
-            "Reachable from devices on the same network.",
+            format!("desktop-network:{socket}"),
+            classification.label_kind.as_str(),
+            format!("http://{socket}"),
+            classification.reachability.as_str(),
+            network_status,
+            Some(is_default),
+            &description,
         )?);
     }
 
@@ -602,12 +679,26 @@ fn tailscale_endpoints_for_status(
 ) -> Result<Vec<Value>, String> {
     let mut endpoints = Vec::new();
     for address in &status.tailnet_ipv4_addresses {
-        let http_base_url = format!("http://{address}:{}", config.port);
+        let Ok(ip) = address.parse::<std::net::IpAddr>() else {
+            continue;
+        };
+        let classification = classify_advertised_address(ip);
+        if !classification.advertise_with_ipv4_listener
+            || classification.reachability != AdvertisedAddressReachability::PrivateNetwork
+        {
+            continue;
+        }
+        let http_base_url = format!("http://{ip}:{}", config.port);
+        let status = if config.server_exposure_mode == "network-accessible" {
+            "available"
+        } else {
+            "unavailable"
+        };
         endpoints.push(tailscale_advertised_endpoint(
             format!("tailscale-ip:{http_base_url}"),
             "Tailscale IP",
             http_base_url,
-            "available",
+            status,
             "mixed-content-blocked",
             "Reachable from devices on the same Tailnet.",
         )?);
@@ -1185,43 +1276,141 @@ pub fn desktop_bridge_get_server_exposure_state(
         .map(|settings| server_exposure_state(&settings, backend.current_run_config().as_ref()))
 }
 
+struct DesktopExposureOperations<'a> {
+    app: &'a AppHandle<DesktopRuntime>,
+    backend: &'a BackendSupervisor,
+}
+
+impl ExposureOperations for DesktopExposureOperations<'_> {
+    fn native_exposure_available(&self) -> Result<bool, String> {
+        read_desktop_settings(self.app).map(|settings| !settings.wsl_only)
+    }
+
+    fn persisted_mode(&self) -> Result<String, String> {
+        read_desktop_settings(self.app).map(|settings| settings.server_exposure_mode)
+    }
+
+    fn persist_mode<'a>(&'a self, mode: &'a str) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            update_desktop_settings(self.app, |settings| {
+                settings.server_exposure_mode = mode.to_owned();
+            })
+            .map(|_| ())
+        })
+    }
+
+    fn current_config(&self) -> Option<BackendRunConfig> {
+        self.backend.current_run_config()
+    }
+
+    fn restart_with_mode<'a>(
+        &'a self,
+        mode: &'a str,
+    ) -> BoxFuture<'a, Result<Option<BackendRunConfig>, String>> {
+        Box::pin(async move {
+            self.backend
+                .restart_default_if_active_with_exposure(self.app.clone(), mode)
+                .await
+        })
+    }
+
+    fn sync_firewall(&self, enabled: bool) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(crate::firewall::sync_remote_access_rule(enabled))
+    }
+
+    fn stop_backend(&self) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move { self.backend.stop(BackendShutdownConfig::default()).await })
+    }
+}
+
+trait WslOnlyTransitionOperations: ExposureOperations {
+    fn persist_wsl_only(&self, enabled: bool) -> BoxFuture<'_, Result<(), String>>;
+    fn restart_topology_local(&self) -> BoxFuture<'_, Result<(), String>>;
+}
+
+impl WslOnlyTransitionOperations for DesktopExposureOperations<'_> {
+    fn persist_wsl_only(&self, enabled: bool) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            update_desktop_settings(self.app, |settings| {
+                // The exposure mode is owned by the recover-local flow, which
+                // the enable transition runs before this persists; writing it
+                // here would duplicate that ownership.
+                settings.wsl_only = enabled;
+                if enabled {
+                    settings.wsl_backend_enabled = true;
+                }
+            })
+            .map(|_| ())
+        })
+    }
+
+    fn restart_topology_local(&self) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            self.backend
+                .restart_default_if_active_with_exposure(self.app.clone(), "local-only")
+                .await
+                .map(|_| ())
+        })
+    }
+}
+
+async fn transition_wsl_only(
+    operations: &impl WslOnlyTransitionOperations,
+    enabled: bool,
+) -> Result<(), String> {
+    if enabled {
+        recover_local(operations).await?;
+    }
+    operations.persist_wsl_only(enabled).await?;
+    operations.restart_topology_local().await
+}
+
 #[tauri::command]
-pub async fn desktop_bridge_set_server_exposure_mode(
+pub async fn desktop_bridge_apply_server_exposure(
     app: AppHandle<DesktopRuntime>,
     backend: State<'_, BackendSupervisor>,
-    mode: String,
+    coordinator: State<'_, ServerExposureCoordinator>,
+    desired: String,
 ) -> Result<Value, String> {
-    if !matches!(mode.as_str(), "local-only" | "network-accessible") {
-        return Err(format!("Unsupported server exposure mode: {mode}"));
-    }
-    let settings = update_desktop_settings(&app, |settings| {
-        settings.server_exposure_mode = mode;
-    })?;
-    let restarted_config = backend.restart_default_if_active(app.clone()).await?;
-    let current_config = restarted_config.or_else(|| backend.current_run_config());
-    Ok(server_exposure_state(&settings, current_config.as_ref()))
+    let operations = DesktopExposureOperations {
+        app: &app,
+        backend: backend.inner(),
+    };
+    let transition = apply_exposure(coordinator.inner(), &operations, &desired).await?;
+    let settings = read_desktop_settings(&app)?;
+    Ok(server_exposure_state(
+        &settings,
+        transition.current_config.as_ref(),
+    ))
 }
 
 #[tauri::command]
 pub async fn desktop_bridge_set_tailscale_serve_enabled(
     app: AppHandle<DesktopRuntime>,
     backend: State<'_, BackendSupervisor>,
+    coordinator: State<'_, ServerExposureCoordinator>,
     input: Value,
 ) -> Result<Value, String> {
-    let enabled = input
-        .get("enabled")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let requested_port = input.get("port").and_then(Value::as_u64);
-    let settings = update_desktop_settings(&app, |settings| {
-        settings.tailscale_serve_enabled = enabled;
-        settings.tailscale_serve_port = normalize_tailscale_serve_port(
-            requested_port.or(Some(settings.tailscale_serve_port as u64)),
-        );
-    })?;
-    let restarted_config = backend.restart_default_if_active(app.clone()).await?;
-    let current_config = restarted_config.or_else(|| backend.current_run_config());
-    Ok(server_exposure_state(&settings, current_config.as_ref()))
+    coordinator
+        .run_exclusive(async {
+            let enabled = input
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let requested_port = input.get("port").and_then(Value::as_u64);
+            let settings = update_desktop_settings(&app, |settings| {
+                settings.tailscale_serve_enabled = enabled;
+                settings.tailscale_serve_port = normalize_tailscale_serve_port(
+                    requested_port.or(Some(settings.tailscale_serve_port as u64)),
+                );
+            })?;
+            let restarted_config = backend
+                .restart_default_if_active_preserving_exposure(app.clone())
+                .await?;
+            let current_config = restarted_config.or_else(|| backend.current_run_config());
+            Ok(server_exposure_state(&settings, current_config.as_ref()))
+        })
+        .await
 }
 
 #[tauri::command]
@@ -1236,42 +1425,63 @@ pub fn desktop_bridge_get_wsl_state(
 pub async fn desktop_bridge_set_wsl_backend_enabled(
     app: AppHandle<DesktopRuntime>,
     backend: State<'_, BackendSupervisor>,
+    coordinator: State<'_, ServerExposureCoordinator>,
     enabled: bool,
 ) -> Result<Value, String> {
-    let settings = update_desktop_settings(&app, |settings| {
-        settings.wsl_backend_enabled = enabled;
-        if !enabled {
-            settings.wsl_only = false;
-        }
-    })?;
-    backend.restart_default_if_active(app.clone()).await?;
-    Ok(wsl_state(&settings, &backend))
+    coordinator
+        .run_exclusive(async {
+            let settings = update_desktop_settings(&app, |settings| {
+                settings.wsl_backend_enabled = enabled;
+                if !enabled {
+                    settings.wsl_only = false;
+                }
+            })?;
+            backend
+                .restart_default_if_active_preserving_exposure(app.clone())
+                .await?;
+            Ok(wsl_state(&settings, &backend))
+        })
+        .await
 }
 
 #[tauri::command]
 pub async fn desktop_bridge_set_wsl_distro(
     app: AppHandle<DesktopRuntime>,
     backend: State<'_, BackendSupervisor>,
+    coordinator: State<'_, ServerExposureCoordinator>,
     distro: Option<String>,
 ) -> Result<Value, String> {
-    let settings = update_desktop_settings(&app, |settings| {
-        settings.wsl_distro = normalize_wsl_distro(distro);
-    })?;
-    backend.restart_default_if_active(app.clone()).await?;
-    Ok(wsl_state(&settings, &backend))
+    coordinator
+        .run_exclusive(async {
+            let settings = update_desktop_settings(&app, |settings| {
+                settings.wsl_distro = normalize_wsl_distro(distro);
+            })?;
+            backend
+                .restart_default_if_active_preserving_exposure(app.clone())
+                .await?;
+            Ok(wsl_state(&settings, &backend))
+        })
+        .await
 }
 
 #[tauri::command]
 pub async fn desktop_bridge_set_wsl_only(
     app: AppHandle<DesktopRuntime>,
     backend: State<'_, BackendSupervisor>,
+    coordinator: State<'_, ServerExposureCoordinator>,
     enabled: bool,
 ) -> Result<Value, String> {
-    let settings = update_desktop_settings(&app, |settings| {
-        settings.wsl_only = enabled;
-    })?;
-    backend.restart_default_if_active(app.clone()).await?;
-    Ok(wsl_state(&settings, &backend))
+    coordinator
+        .run_exclusive(async {
+            let operations = DesktopExposureOperations {
+                app: &app,
+                backend: backend.inner(),
+            };
+            transition_wsl_only(&operations, enabled).await?;
+            let settings = read_desktop_settings(&app)?;
+            Ok(wsl_state(&settings, &backend))
+        })
+        .await
 }
 
 #[tauri::command]
@@ -1473,7 +1683,14 @@ pub async fn desktop_bridge_get_advertised_endpoints(
     let Some(config) = backend.current_run_config() else {
         return Ok(Vec::new());
     };
-    let mut endpoints = advertised_endpoints_for_config(&config)?;
+    let network_addresses = match enumerate_system_advertised_addresses() {
+        Ok(addresses) => addresses,
+        Err(error) => {
+            tracing::warn!(%error, "native advertised endpoint enumeration failed");
+            Vec::new()
+        }
+    };
+    let mut endpoints = advertised_endpoints_for_config(&config, &network_addresses)?;
     endpoints.extend(tailscale_advertised_endpoints_for_config(&config).await?);
     Ok(endpoints)
 }
@@ -1553,6 +1770,175 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Barrier, Mutex, mpsc};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[derive(Default)]
+    struct FakeWslOnlyTransitionState {
+        calls: Vec<String>,
+        current_config: Option<BackendRunConfig>,
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeWslOnlyTransitionOperations {
+        state: Arc<Mutex<FakeWslOnlyTransitionState>>,
+    }
+
+    impl FakeWslOnlyTransitionOperations {
+        fn with_current_mode(mode: &str) -> Self {
+            let operations = Self::default();
+            operations.state.lock().expect("fake state").current_config =
+                Some(test_backend_config_for_exposure(mode));
+            operations
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.state.lock().expect("fake state").calls.clone()
+        }
+    }
+
+    impl ExposureOperations for FakeWslOnlyTransitionOperations {
+        fn native_exposure_available(&self) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        fn persisted_mode(&self) -> Result<String, String> {
+            Ok("network-accessible".to_owned())
+        }
+
+        fn persist_mode<'a>(&'a self, mode: &'a str) -> BoxFuture<'a, Result<(), String>> {
+            Box::pin(async move {
+                self.state
+                    .lock()
+                    .expect("fake state")
+                    .calls
+                    .push(format!("persist:{mode}"));
+                Ok(())
+            })
+        }
+
+        fn current_config(&self) -> Option<BackendRunConfig> {
+            let mut state = self.state.lock().expect("fake state");
+            state.calls.push("verify:local-only".to_owned());
+            state.current_config.clone()
+        }
+
+        fn restart_with_mode<'a>(
+            &'a self,
+            mode: &'a str,
+        ) -> BoxFuture<'a, Result<Option<BackendRunConfig>, String>> {
+            Box::pin(async move {
+                let config = test_backend_config_for_exposure(mode);
+                let mut state = self.state.lock().expect("fake state");
+                state.calls.push(format!("restart-native:{mode}"));
+                state.current_config = Some(config.clone());
+                Ok(Some(config))
+            })
+        }
+
+        fn sync_firewall(&self, enabled: bool) -> BoxFuture<'_, Result<(), String>> {
+            Box::pin(async move {
+                self.state
+                    .lock()
+                    .expect("fake state")
+                    .calls
+                    .push(format!("firewall:{enabled}"));
+                Ok(())
+            })
+        }
+
+        fn stop_backend(&self) -> BoxFuture<'_, Result<(), String>> {
+            Box::pin(async move {
+                self.state
+                    .lock()
+                    .expect("fake state")
+                    .calls
+                    .push("stop".to_owned());
+                Ok(())
+            })
+        }
+    }
+
+    impl WslOnlyTransitionOperations for FakeWslOnlyTransitionOperations {
+        fn persist_wsl_only(&self, enabled: bool) -> BoxFuture<'_, Result<(), String>> {
+            Box::pin(async move {
+                self.state
+                    .lock()
+                    .expect("fake state")
+                    .calls
+                    .push(format!("persist-wsl-only:{enabled}"));
+                Ok(())
+            })
+        }
+
+        fn restart_topology_local(&self) -> BoxFuture<'_, Result<(), String>> {
+            Box::pin(async move {
+                self.state
+                    .lock()
+                    .expect("fake state")
+                    .calls
+                    .push("restart-topology:local-only".to_owned());
+                Ok(())
+            })
+        }
+    }
+
+    fn test_backend_config_for_exposure(mode: &str) -> BackendRunConfig {
+        let wide = mode == "network-accessible";
+        BackendRunConfig {
+            environment_id: "primary".to_owned(),
+            label: "Local".to_owned(),
+            running_distro: None,
+            port: 13773,
+            bind_host: if wide { "0.0.0.0" } else { "127.0.0.1" }.to_owned(),
+            local_host: "127.0.0.1".to_owned(),
+            desktop_bootstrap_token: "desktop-token".to_owned(),
+            server_exposure_mode: mode.to_owned(),
+            endpoint_url: wide.then(|| "http://192.168.1.25:13773".to_owned()),
+            advertised_host: wide.then(|| "192.168.1.25".to_owned()),
+            tailscale_serve_enabled: false,
+            tailscale_serve_port: 443,
+        }
+    }
+
+    #[tokio::test]
+    async fn entering_wsl_only_recovers_native_exposure_before_switching_topology() {
+        let operations = FakeWslOnlyTransitionOperations::with_current_mode("network-accessible");
+
+        transition_wsl_only(&operations, true)
+            .await
+            .expect("WSL-only transition should succeed");
+
+        assert_eq!(
+            operations.calls(),
+            [
+                "persist:local-only",
+                "restart-native:local-only",
+                "firewall:false",
+                "verify:local-only",
+                "persist-wsl-only:true",
+                "restart-topology:local-only",
+            ]
+        );
+        assert!(
+            !operations
+                .calls()
+                .iter()
+                .any(|call| call == "restart-native:network-accessible")
+        );
+    }
+
+    #[tokio::test]
+    async fn leaving_wsl_only_restarts_the_native_topology_explicitly_local_only() {
+        let operations = FakeWslOnlyTransitionOperations::default();
+
+        transition_wsl_only(&operations, false)
+            .await
+            .expect("native transition should succeed");
+
+        assert_eq!(
+            operations.calls(),
+            ["persist-wsl-only:false", "restart-topology:local-only"]
+        );
+    }
 
     #[test]
     fn pick_folder_command_is_async() {
@@ -2241,6 +2627,8 @@ mod tests {
             server_exposure_state(&settings, None),
             json!({
                 "mode": "local-only",
+                "configuredMode": "local-only",
+                "management": "native",
                 "endpointUrl": null,
                 "advertisedHost": null,
                 "tailscaleServeEnabled": true,
@@ -2256,8 +2644,29 @@ mod tests {
             server_exposure_state(&settings, Some(&config)),
             json!({
                 "mode": "network-accessible",
+                "configuredMode": "local-only",
+                "management": "native",
                 "endpointUrl": "http://192.168.1.20:13773",
                 "advertisedHost": "192.168.1.20",
+                "tailscaleServeEnabled": false,
+                "tailscaleServePort": 443,
+            })
+        );
+
+        settings.wsl_only = true;
+        config.running_distro = Some("Ubuntu".to_owned());
+        config.bind_host = "0.0.0.0".to_owned();
+        config.server_exposure_mode = "local-only".to_owned();
+        config.endpoint_url = None;
+        config.advertised_host = None;
+        assert_eq!(
+            server_exposure_state(&settings, Some(&config)),
+            json!({
+                "mode": "network-accessible",
+                "configuredMode": "local-only",
+                "management": "external",
+                "endpointUrl": null,
+                "advertisedHost": null,
                 "tailscaleServeEnabled": false,
                 "tailscaleServePort": 443,
             })
@@ -2303,20 +2712,123 @@ mod tests {
     fn advertised_endpoints_serialize_loopback_and_lan_routes() {
         let config = test_run_config();
         let loopback =
-            advertised_endpoints_for_config(&config).expect("loopback endpoint should build");
+            advertised_endpoints_for_config(&config, &[]).expect("loopback endpoint should build");
         assert_eq!(loopback.len(), 1);
         assert_eq!(loopback[0]["id"], "desktop-loopback:13773");
         assert!(loopback[0].get("isDefault").is_none());
 
         let mut network_config = config;
+        network_config.server_exposure_mode = "network-accessible".to_string();
         network_config.endpoint_url = Some("http://192.168.1.20:13773/path".to_string());
-        let endpoints =
-            advertised_endpoints_for_config(&network_config).expect("LAN endpoint should build");
-        assert_eq!(endpoints.len(), 2);
+        let addresses = [
+            NetworkAddress {
+                interface_name: "Ethernet".to_string(),
+                ip: "192.168.1.20".parse().expect("IPv4 fixture"),
+                is_default_route: true,
+            },
+            NetworkAddress {
+                interface_name: "Tailnet".to_string(),
+                ip: "100.100.100.100".parse().expect("CGNAT fixture"),
+                is_default_route: false,
+            },
+            NetworkAddress {
+                interface_name: "Internet".to_string(),
+                ip: "8.8.8.8".parse().expect("public fixture"),
+                is_default_route: true,
+            },
+            NetworkAddress {
+                interface_name: "IPv6".to_string(),
+                ip: "2001:4860:4860::8888".parse().expect("IPv6 fixture"),
+                is_default_route: false,
+            },
+        ];
+        let endpoints = advertised_endpoints_for_config(&network_config, &addresses)
+            .expect("LAN endpoints should build");
+        assert_eq!(endpoints.len(), 4);
+        assert_eq!(endpoints[1]["id"], "desktop-network:192.168.1.20:13773");
+        assert_eq!(endpoints[1]["label"], "Local network");
         assert_eq!(endpoints[1]["httpBaseUrl"], "http://192.168.1.20:13773/");
         assert_eq!(endpoints[1]["wsBaseUrl"], "ws://192.168.1.20:13773/");
         assert_eq!(endpoints[1]["isDefault"], true);
         assert_eq!(endpoints[1]["reachability"], "lan");
+
+        assert_eq!(endpoints[2]["label"], "Private network");
+        assert_eq!(endpoints[2]["isDefault"], false);
+        assert_eq!(endpoints[2]["reachability"], "private-network");
+
+        assert_eq!(endpoints[3]["label"], "Public address");
+        assert_eq!(endpoints[3]["isDefault"], false);
+        assert_eq!(endpoints[3]["reachability"], "public");
+        assert!(
+            endpoints[3]["description"]
+                .as_str()
+                .expect("public warning")
+                .contains("never selects")
+        );
+        if !cfg!(windows) {
+            assert!(
+                endpoints[3]["description"]
+                    .as_str()
+                    .expect("firewall warning")
+                    .contains("does not manage this platform's firewall")
+            );
+        }
+        assert!(
+            endpoints
+                .iter()
+                .all(|endpoint| !endpoint["httpBaseUrl"].as_str().unwrap_or("").contains('['))
+        );
+    }
+
+    #[test]
+    fn local_only_discovery_surfaces_public_only_topology_as_unavailable() {
+        let config = test_run_config();
+        let addresses = [NetworkAddress {
+            interface_name: "Internet".to_string(),
+            ip: "8.8.8.8".parse().expect("public IPv4 fixture"),
+            is_default_route: false,
+        }];
+
+        let endpoints = advertised_endpoints_for_config(&config, &addresses)
+            .expect("local-only endpoint observations should build");
+
+        assert_eq!(endpoints.len(), 2);
+        assert_eq!(endpoints[1]["id"], "desktop-network:8.8.8.8:13773");
+        assert_eq!(endpoints[1]["reachability"], "public");
+        assert_eq!(endpoints[1]["status"], "unavailable");
+        assert_eq!(endpoints[1]["isDefault"], false);
+    }
+
+    #[test]
+    fn local_only_discovery_marks_private_default_candidate_unavailable() {
+        let config = test_run_config();
+        let addresses = [NetworkAddress {
+            interface_name: "Ethernet".to_string(),
+            ip: "192.168.1.20".parse().expect("private IPv4 fixture"),
+            is_default_route: true,
+        }];
+
+        let endpoints = advertised_endpoints_for_config(&config, &addresses)
+            .expect("local-only endpoint observations should build");
+
+        assert_eq!(endpoints.len(), 2);
+        assert_eq!(endpoints[1]["id"], "desktop-network:192.168.1.20:13773");
+        assert_eq!(endpoints[1]["reachability"], "lan");
+        assert_eq!(endpoints[1]["status"], "unavailable");
+        assert_eq!(endpoints[1]["isDefault"], true);
+    }
+
+    #[test]
+    fn persisted_endpoint_is_not_reused_when_discovery_has_no_safe_candidate() {
+        let mut config = test_run_config();
+        config.server_exposure_mode = "network-accessible".to_owned();
+        config.endpoint_url = Some("http://8.8.8.8:13773".to_owned());
+
+        let endpoints = advertised_endpoints_for_config(&config, &[])
+            .expect("loopback endpoint should remain available");
+
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0]["reachability"], "loopback");
     }
 
     #[test]
@@ -2574,7 +3086,12 @@ mod tests {
         };
         let status = TailscaleStatus {
             magic_dns_name: Some("desktop.tail.ts.net".to_string()),
-            tailnet_ipv4_addresses: vec!["100.100.100.100".to_string()],
+            tailnet_ipv4_addresses: vec![
+                "100.100.100.100".to_string(),
+                "fd7a:115c:a1e0::1".to_string(),
+                "8.8.8.8".to_string(),
+                "not-an-address".to_string(),
+            ],
         };
 
         let endpoints =
@@ -2611,6 +3128,37 @@ mod tests {
             endpoints[1]["compatibility"]["hostedHttpsApp"],
             "compatible"
         );
+    }
+
+    #[test]
+    fn tailnet_ipv4_endpoints_are_unavailable_while_the_listener_is_loopback_only() {
+        let config = BackendRunConfig {
+            environment_id: "primary".to_string(),
+            label: "Local".to_string(),
+            running_distro: None,
+            port: 13773,
+            bind_host: "127.0.0.1".to_string(),
+            local_host: "127.0.0.1".to_string(),
+            desktop_bootstrap_token: "desktop-token".to_string(),
+            server_exposure_mode: "local-only".to_string(),
+            endpoint_url: None,
+            advertised_host: None,
+            tailscale_serve_enabled: false,
+            tailscale_serve_port: 8443,
+        };
+        let status = TailscaleStatus {
+            magic_dns_name: None,
+            tailnet_ipv4_addresses: vec!["100.100.100.100".to_string()],
+        };
+
+        let endpoints =
+            tailscale_endpoints_for_status(&config, &status, false).expect("endpoints build");
+
+        assert_eq!(endpoints.len(), 1);
+        // A tailnet address can only accept connections once the native
+        // listener binds wide; it is never advertised as available before
+        // that, unlike the previous hard-coded status.
+        assert_eq!(endpoints[0]["status"], "unavailable");
     }
 
     #[test]
@@ -2803,6 +3351,7 @@ mod tests {
         let app = mock_builder()
             .manage(IsolatedTestDataRoot::new(temp.path().join("data-root")))
             .manage(BackendSupervisor::new())
+            .manage(ServerExposureCoordinator::default())
             .manage(ConnectionCatalogCoordinator::new())
             .manage(NativeContextMenuManager::new())
             .manage(SshEnvironmentManager::new())
@@ -2835,7 +3384,7 @@ mod tests {
                 desktop_bridge_issue_ssh_web_socket_ticket,
                 desktop_bridge_resolve_ssh_password_prompt,
                 desktop_bridge_get_server_exposure_state,
-                desktop_bridge_set_server_exposure_mode,
+                desktop_bridge_apply_server_exposure,
                 desktop_bridge_set_tailscale_serve_enabled,
                 desktop_bridge_get_advertised_endpoints,
                 desktop_bridge_get_wsl_state,
@@ -2964,12 +3513,15 @@ mod tests {
                 "{command} should return its update state",
             );
         }
+        let unsupported_exposure = invoke(
+            "desktop_bridge_apply_server_exposure",
+            json!({"desired":"public-internet"}),
+        )
+        .expect_err("unsupported mode");
         assert!(
-            invoke(
-                "desktop_bridge_set_server_exposure_mode",
-                json!({"mode":"unsupported"}),
-            )
-            .is_err()
+            unsupported_exposure
+                .as_str()
+                .is_some_and(|error| error.contains("Unsupported server exposure mode"))
         );
         assert!(
             invoke(
@@ -3021,10 +3573,11 @@ mod tests {
         assert!(invoke("desktop_bridge_clear_connection_catalog", json!({})).is_ok());
         assert!(
             invoke(
-                "desktop_bridge_set_server_exposure_mode",
-                json!({"mode":"local-only"}),
+                "desktop_bridge_apply_server_exposure",
+                json!({"desired":"local-only"}),
             )
-            .is_ok()
+            .expect("local-only state")["mode"]
+                == "local-only"
         );
         assert!(
             invoke(
@@ -3048,6 +3601,16 @@ mod tests {
             .is_ok()
         );
         assert!(invoke("desktop_bridge_set_wsl_only", json!({"enabled":true}),).is_ok());
+        let wsl_only_exposure = invoke(
+            "desktop_bridge_apply_server_exposure",
+            json!({"desired":"local-only"}),
+        )
+        .expect_err("WSL-only primary rejects native exposure commands");
+        assert!(
+            wsl_only_exposure
+                .as_str()
+                .is_some_and(|error| error.contains("WSL-only primary mode"))
+        );
         let invalid_target = json!({
             "target": {"alias":"","hostname":"","username":null,"port":null},
             "options": null,

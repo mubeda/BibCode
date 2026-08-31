@@ -5436,7 +5436,7 @@ describe("ChatView banners and dialogs", () => {
       target: remoteTarget,
     });
     expect(browserRemoteBanner).toContain("Reconnect");
-    expect(browserRemoteBanner).toContain("Connections");
+    expect(browserRemoteBanner).toContain("Remote Servers");
   });
 
   it("reconnects the environment from the unavailable banner and toasts failures", async () => {
@@ -5468,7 +5468,7 @@ describe("ChatView banners and dialogs", () => {
     ).toBe(true);
 
     (buttons[1]!.props as { onClick: () => void }).onClick();
-    expect(h.navigateCalls).toContainEqual({ to: "/settings/connections" });
+    expect(h.navigateCalls).toContainEqual({ to: "/settings/remote-servers" });
   });
 
   it("dismisses the version mismatch banner persistently", () => {

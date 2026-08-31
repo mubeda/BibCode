@@ -15,13 +15,17 @@ import {
   AuthAdministrativeScopes,
   AuthBrowserSessionRequest,
   AuthBrowserSessionResult,
+  AuthCancelPairingOfferInput,
   AuthClientSession,
   AuthCreatePairingCredentialInput,
+  AuthCreatePairingOfferInput,
   AuthEnvironmentBootstrapTokenType,
   AuthEnvironmentScope,
   AuthEnvironmentScopes,
   AuthAccessTokenType,
   AuthPairingCredentialResult,
+  AuthPairingOfferResult,
+  AuthShareStateResult,
   AuthPairingLink,
   AuthRevokeClientSessionInput,
   AuthRevokePairingLinkInput,
@@ -34,6 +38,7 @@ import {
 import {
   AuthClientSessionRevokeResult,
   AuthOtherClientSessionsRevokeResult,
+  AuthPairingOfferCancellationResult,
   AuthPairingLinkRevokeResult,
   EnvironmentAuthInvalidError,
   EnvironmentHttpApi,
@@ -57,6 +62,9 @@ const authRouteNames = [
   "token",
   "webSocketTicket",
   "pairingCredential",
+  "pairingOffer",
+  "cancelPairingOffer",
+  "shareState",
   "pairingLinks",
   "revokePairingLink",
   "clients",
@@ -186,11 +194,16 @@ const namedSchemas = {
   AuthClientSession,
   AuthClientSessionList,
   AuthClientSessionRevokeResult,
+  AuthCancelPairingOfferInput,
   AuthCreatePairingCredentialInput,
+  AuthCreatePairingOfferInput,
   AuthEnvironmentScope,
   AuthEnvironmentScopes,
   AuthOtherClientSessionsRevokeResult,
   AuthPairingCredentialResult,
+  AuthPairingOfferResult,
+  AuthPairingOfferCancellationResult,
+  AuthShareStateResult,
   AuthPairingLink,
   AuthPairingLinkList,
   AuthPairingLinkRevokeResult,
@@ -320,6 +333,31 @@ addJsonFixture("responses/pairing-create.json", AuthPairingCredentialResult, {
   label: "Fixture pairing link",
   expiresAt: pairingExpiresAt,
 });
+addJsonFixture("requests/pairing-offer.json", AuthCreatePairingOfferInput, {
+  name: "AI-SERVER",
+  endpoint: "http://192.168.1.20:3773",
+  reach: "another-device",
+  label: "Tablet",
+});
+addJsonFixture("responses/pairing-offer.json", AuthPairingOfferResult, {
+  id: "4f8f2f2e-0000-4000-8000-000000000000",
+  code: "eyJ2IjoxfQ",
+  reach: "another-device",
+  endpoint: "http://192.168.1.20:3773",
+  name: "AI-SERVER",
+  expiresAt: "2026-08-27T01:00:00.000Z",
+});
+addJsonFixture("requests/pairing-offer-cancel.json", AuthCancelPairingOfferInput, {
+  idempotencyKey: "fixture-pairing-offer-key",
+});
+addJsonFixture("responses/pairing-offer-cancel.json", AuthPairingOfferCancellationResult, {
+  cancelled: true,
+});
+addJsonFixture("responses/share-state.json", AuthShareStateResult, {
+  desiredExposure: "loopback",
+  offHostGrantCount: 0,
+  legacyGrantCount: 1,
+});
 addJsonFixture("responses/pairing-list.json", AuthPairingLinkList, [
   {
     id: pairingId,
@@ -327,6 +365,7 @@ addJsonFixture("responses/pairing-list.json", AuthPairingLinkList, [
     scopes: standardClientScopes,
     subject: "fixture-client",
     label: "Fixture pairing link",
+    reach: "another-device",
     createdAt: issuedAt,
     expiresAt: pairingExpiresAt,
   },
@@ -372,6 +411,7 @@ addJsonFixture("responses/client-list.json", AuthClientSessionList, [
     lastConnectedAt: null,
     connected: false,
     current: false,
+    reach: "another-device",
   },
 ]);
 addJsonFixture("requests/client-revoke.json", AuthRevokeClientSessionInput, {
@@ -436,6 +476,15 @@ const samples = {
     request: "requests/pairing-create.json",
     success: "responses/pairing-create.json",
   },
+  pairingOffer: {
+    request: "requests/pairing-offer.json",
+    success: "responses/pairing-offer.json",
+  },
+  cancelPairingOffer: {
+    request: "requests/pairing-offer-cancel.json",
+    success: "responses/pairing-offer-cancel.json",
+  },
+  shareState: { success: "responses/share-state.json" },
   pairingLinks: { success: "responses/pairing-list.json" },
   revokePairingLink: {
     request: "requests/pairing-revoke.json",

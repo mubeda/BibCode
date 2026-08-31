@@ -5,7 +5,11 @@ import {
   EnvironmentRequestInvalidError,
   EnvironmentScopeRequiredError,
 } from "@bibcode/contracts";
-import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+import { it } from "@effect/vitest";
+import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
+import * as TestClock from "effect/testing/TestClock";
+import { afterEach, describe, expect, vi } from "vite-plus/test";
 
 import {
   PrimaryEnvironmentRequestError,
@@ -125,6 +129,22 @@ describe("primary environment authentication helpers", () => {
       false,
     );
   });
+
+  it.effect("interrupts a blackholed pairing-offer request at its deadline", () =>
+    Effect.gen(function* () {
+      const errorFiber = yield* primaryEnvironmentAuthInternals
+        .withPrimaryRequestTimeout("create-pairing-offer", Effect.never, 5)
+        .pipe(Effect.flip, Effect.forkChild);
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust("5 millis");
+      const error = yield* Fiber.join(errorFiber);
+      expect(error).toMatchObject({
+        _tag: "PrimaryEnvironmentRequestTimeoutError",
+        operation: "create-pairing-offer",
+        timeoutMs: 5,
+      });
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
 
   it("leaves URLs unchanged when no pairing token exists", () => {
     const replaceState = vi.fn();

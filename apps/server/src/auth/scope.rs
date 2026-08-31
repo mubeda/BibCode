@@ -1,8 +1,8 @@
 use serde_json::{Value, json};
 
 use super::model::{
-    SCOPE_ACCESS_READ, SCOPE_ORCHESTRATION_OPERATE, SCOPE_ORCHESTRATION_READ, SCOPE_RELAY_WRITE,
-    SCOPE_REVIEW_WRITE, SCOPE_TERMINAL_OPERATE,
+    SCOPE_ACCESS_READ, SCOPE_ACCESS_WRITE, SCOPE_ORCHESTRATION_OPERATE, SCOPE_ORCHESTRATION_READ,
+    SCOPE_RELAY_WRITE, SCOPE_REVIEW_WRITE, SCOPE_TERMINAL_OPERATE,
 };
 
 pub(crate) const ACTIVITY_READ_SCOPE: &str = SCOPE_ORCHESTRATION_READ;
@@ -38,6 +38,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "server.getProviderUsage"
         | "server.getSettings"
         | "server.getTraceDiagnostics"
+        | "updater.status"
         | "sourceControl.lookupRepository"
         | "subscribeDiscoveredLocalServers"
         | "subscribePreviewEvents"
@@ -80,6 +81,8 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "server.updateProvider"
         | "server.updateSettings"
         | "server.upsertKeybinding"
+        | "updater.check"
+        | "updater.install"
         | "shell.openInEditor"
         | "sourceControl.cloneRepository"
         | "sourceControl.publishRepository"
@@ -111,6 +114,13 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         "review.getDiffPreview" => Some(SCOPE_REVIEW_WRITE),
         "cloud.getRelayClientStatus" | "cloud.installRelayClient" => Some(SCOPE_RELAY_WRITE),
         "subscribeAuthAccess" => Some(SCOPE_ACCESS_READ),
+        // Two-tier policy: a pending-pairing session confirms its OWN
+        // delivery through the session capability gate (which bypasses this
+        // scope, since standard device grants do not carry access scopes);
+        // any other caller needs access:write. Locked from both directions by
+        // confirm_pairing_policy_is_pending_capability_or_access_write and
+        // the e2ee scope-bypass suite.
+        "auth.confirmPairing" => Some(SCOPE_ACCESS_WRITE),
         _ => None,
     }
 }
@@ -156,6 +166,21 @@ mod tests {
             required_scope("subscribeAuthAccess"),
             Some(SCOPE_ACCESS_READ)
         );
+        assert_eq!(
+            required_scope("auth.confirmPairing"),
+            Some(SCOPE_ACCESS_WRITE)
+        );
+        assert_eq!(
+            required_scope("updater.status"),
+            Some(SCOPE_ORCHESTRATION_READ)
+        );
+        for method in ["updater.check", "updater.install"] {
+            assert_eq!(
+                required_scope(method),
+                Some(SCOPE_ORCHESTRATION_OPERATE),
+                "wrong updater scope for {method}"
+            );
+        }
         for method in [
             "activity.getSnapshot",
             "activity.listDetail",

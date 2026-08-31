@@ -1,7 +1,14 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
-import { EnvironmentId, ProjectId, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import {
+  EnvironmentId,
+  NonNegativeInt,
+  ProjectId,
+  ThreadId,
+  TrimmedNonEmptyString,
+} from "./baseSchemas.ts";
+import { RemoteUpdateSupport } from "./remoteUpdate.ts";
 
 export const ExecutionEnvironmentPlatformOs = Schema.Literals([
   "darwin",
@@ -30,8 +37,12 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   activityProtocolVersion: Schema.NullOr(Schema.Literal(2)).pipe(
     Schema.withDecodingDefault(Effect.succeed(null)),
   ),
+  remoteUpdateControl: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
 });
 export type ExecutionEnvironmentCapabilities = typeof ExecutionEnvironmentCapabilities.Type;
+
+export const REMOTE_PROTOCOL_VERSION = 1;
+export const MIN_COMPATIBLE_REMOTE_PROTOCOL = 1;
 
 export const ExecutionEnvironmentDescriptor = Schema.Struct({
   environmentId: EnvironmentId,
@@ -41,6 +52,11 @@ export const ExecutionEnvironmentDescriptor = Schema.Struct({
   storageInstanceId: Schema.NullOr(TrimmedNonEmptyString).pipe(
     Schema.withDecodingDefault(Effect.succeed(null)),
   ),
+  remoteUpdateSupport: Schema.NullOr(RemoteUpdateSupport).pipe(
+    Schema.withDecodingDefault(Effect.succeed(null)),
+  ),
+  remoteProtocolVersion: NonNegativeInt.pipe(Schema.withDecodingDefault(Effect.succeed(0))),
+  minCompatibleRemoteProtocol: NonNegativeInt.pipe(Schema.withDecodingDefault(Effect.succeed(0))),
   capabilities: ExecutionEnvironmentCapabilities,
 });
 export type ExecutionEnvironmentDescriptor = typeof ExecutionEnvironmentDescriptor.Type;

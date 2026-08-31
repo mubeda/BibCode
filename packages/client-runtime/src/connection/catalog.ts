@@ -1,6 +1,8 @@
 import { DesktopSshEnvironmentTargetSchema, EnvironmentId } from "@bibcode/contracts";
+import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as SchemaTransformation from "effect/SchemaTransformation";
 
 import {
   BearerConnectionTarget,
@@ -17,12 +19,23 @@ const ConnectionProfileBase = {
   label: Schema.String,
 };
 
+const SavedBearerHostKey = Schema.NullOr(Schema.String).pipe(
+  Schema.decode(
+    SchemaTransformation.transform({
+      decode: (hostKey) => (hostKey === null || hostKey.trim().length === 0 ? null : hostKey),
+      encode: (hostKey) => hostKey,
+    }),
+  ),
+  Schema.withDecodingDefault(Effect.succeed(null)),
+);
+
 export class BearerConnectionProfile extends Schema.TaggedClass<BearerConnectionProfile>()(
   "BearerConnectionProfile",
   {
     ...ConnectionProfileBase,
     httpBaseUrl: Schema.String,
     wsBaseUrl: Schema.String,
+    hostKey: SavedBearerHostKey,
   },
 ) {}
 

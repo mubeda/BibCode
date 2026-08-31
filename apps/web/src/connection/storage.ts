@@ -12,6 +12,7 @@ import {
   registerConnectionInCatalog,
   removeCatalogValue,
   removeConnectionFromCatalog,
+  removeConnectionRegistrationFromCatalog,
   replaceCatalogValue,
 } from "@bibcode/client-runtime/platform";
 import { TokenStore } from "@bibcode/client-runtime/authorization";
@@ -34,8 +35,13 @@ import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 
-const DATABASE_NAME = "bibcode:connection-runtime";
-const DATABASE_VERSION = 2;
+import {
+  CONNECTION_DATABASE_NAME,
+  CONNECTION_DATABASE_VERSION,
+  monitorConnectionDatabaseOpenRequest,
+  reportConnectionDatabaseUnavailable,
+} from "./databaseHealth";
+
 const CATALOG_STORE_NAME = "catalog";
 const SHELL_STORE_NAME = "shell";
 const THREAD_STORE_NAME = "thread";
@@ -111,17 +117,62 @@ function catalogResetPersistenceError() {
   });
 }
 
+const CONNECTION_DATABASE_BLOCKED_OPEN_TIMEOUT_MS = 10_000;
+
+/**
+ * Whether the connection catalog itself lives in IndexedDB. On protected
+ * desktop hosts the catalog (saved servers, credentials, accepted storage
+ * identities) is served from the native store, and an IndexedDB reset only
+ * removes cached shell and thread state.
+ */
+export function connectionCatalogLivesInIndexedDb(): boolean {
+  const bridge = typeof window === "undefined" ? undefined : window.desktopBridge;
+  return (
+    bridge?.getConnectionCatalog === undefined ||
+    bridge.compareAndSetConnectionCatalog === undefined
+  );
+}
+
 const openDatabase = Effect.fn("web.connectionStorage.openDatabase")(function* (
-  databaseName = DATABASE_NAME,
+  databaseName = CONNECTION_DATABASE_NAME,
 ) {
   return yield* Effect.callback<IDBDatabase, ConnectionTransientError>((resume) => {
     if (typeof indexedDB === "undefined") {
+      if (databaseName === CONNECTION_DATABASE_NAME) {
+        reportConnectionDatabaseUnavailable("IndexedDB is unavailable in this browser context.");
+      }
       resume(
         Effect.fail(catalogError("open", "IndexedDB is unavailable in this browser context.")),
       );
       return;
     }
-    const request = indexedDB.open(databaseName, DATABASE_VERSION);
+    const request = indexedDB.open(databaseName, CONNECTION_DATABASE_VERSION);
+    if (databaseName === CONNECTION_DATABASE_NAME) {
+      monitorConnectionDatabaseOpenRequest(request);
+    }
+    // A blocked open (another tab holds an older version) may still complete
+    // once the blocker closes, but it must not stall the storage layer
+    // forever: fail after a bounded wait so the fault surfaces.
+    let blockedTimer: ReturnType<typeof setTimeout> | undefined;
+    const clearBlockedTimer = () => {
+      if (blockedTimer !== undefined) {
+        clearTimeout(blockedTimer);
+        blockedTimer = undefined;
+      }
+    };
+    request.addEventListener("blocked", () => {
+      if (blockedTimer !== undefined) return;
+      blockedTimer = setTimeout(() => {
+        resume(
+          Effect.fail(
+            catalogError(
+              "open",
+              "Another tab or process kept an older connection database open past the wait deadline.",
+            ),
+          ),
+        );
+      }, CONNECTION_DATABASE_BLOCKED_OPEN_TIMEOUT_MS);
+    });
     request.addEventListener("upgradeneeded", () => {
       if (!request.result.objectStoreNames.contains(CATALOG_STORE_NAME)) {
         request.result.createObjectStore(CATALOG_STORE_NAME);
@@ -134,10 +185,19 @@ const openDatabase = Effect.fn("web.connectionStorage.openDatabase")(function* (
       }
     });
     request.addEventListener("error", () => {
+      clearBlockedTimer();
       resume(Effect.fail(catalogError("open", request.error ?? "Unknown IndexedDB error")));
     });
     request.addEventListener("success", () => {
-      resume(Effect.succeed(request.result));
+      clearBlockedTimer();
+      const database = request.result;
+      // Close this connection when another context upgrades or deletes the
+      // database, so one tab can never hold every other tab's recovery
+      // hostage; later operations surface as transient errors.
+      database.addEventListener("versionchange", () => {
+        database.close();
+      });
+      resume(Effect.succeed(database));
     });
   });
 });
@@ -615,6 +675,21 @@ export const connectionStorageLayer = Layer.effectContext(
         catalog
           .update((document) => registerConnectionInCatalog(document, registration))
           .pipe(Effect.mapError((cause) => persistenceError("register-connection", cause))),
+      removeIfMatching: (registration) =>
+        catalog
+          .modify((document) => {
+            const removal = removeConnectionRegistrationFromCatalog(document, registration);
+            return removal.removed
+              ? {
+                  mutation: { _tag: "Set", document: removal.document },
+                  result: { removed: true, current: null },
+                }
+              : {
+                  mutation: { _tag: "Keep" },
+                  result: { removed: false, current: removal.current },
+                };
+          })
+          .pipe(Effect.mapError((cause) => persistenceError("remove-connection", cause))),
       remove: (target) =>
         catalog
           .update((document) => removeConnectionFromCatalog(document, target))
@@ -721,6 +796,40 @@ export const connectionStorageLayer = Layer.effectContext(
               identity,
             ),
           }))
+          .pipe(Effect.mapError(() => storageIdentityPersistenceError("accept-storage-identity"))),
+      rollbackAcceptance: (identity, previousStorageInstanceId) =>
+        catalog
+          .modify((document) => {
+            const matches = document.acceptedStorageIdentities.some(
+              (candidate) =>
+                candidate.targetKey === identity.targetKey &&
+                candidate.storageInstanceId === identity.storageInstanceId,
+            );
+            if (!matches) {
+              return { mutation: { _tag: "Keep" }, result: false } as const;
+            }
+            const withoutAttempt = removeCatalogValue(
+              document.acceptedStorageIdentities,
+              (candidate) => candidate.targetKey,
+              identity.targetKey,
+            );
+            return {
+              mutation: {
+                _tag: "Set",
+                document: {
+                  ...document,
+                  acceptedStorageIdentities:
+                    previousStorageInstanceId === null
+                      ? withoutAttempt
+                      : replaceCatalogValue(withoutAttempt, (candidate) => candidate.targetKey, {
+                          targetKey: identity.targetKey,
+                          storageInstanceId: previousStorageInstanceId,
+                        }),
+                },
+              },
+              result: true,
+            } as const;
+          })
           .pipe(Effect.mapError(() => storageIdentityPersistenceError("accept-storage-identity"))),
       transition: (targetKey, decide) =>
         catalog

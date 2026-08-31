@@ -5,11 +5,13 @@ import { useNavigate } from "@tanstack/react-router";
 import { resolveShortcutCommand, shortcutLabelForCommand } from "../keybindings";
 import { primaryServerKeybindingsAtom } from "../state/server";
 import ThreadSidebar from "./Sidebar";
+import { EnvironmentRail } from "./sidebar/EnvironmentRail";
 import { Sidebar, SidebarProvider, SidebarRail, SidebarTrigger, useSidebar } from "./ui/sidebar";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
 
 const THREAD_SIDEBAR_WIDTH_STORAGE_KEY = "chat_thread_sidebar_width";
-const THREAD_SIDEBAR_MIN_WIDTH = 13 * 16;
+const ENVIRONMENT_RAIL_WIDTH = 52;
+const THREAD_SIDEBAR_MIN_WIDTH = 13 * 16 + ENVIRONMENT_RAIL_WIDTH;
 const THREAD_MAIN_CONTENT_MIN_WIDTH = 40 * 16;
 
 function SidebarControl() {
@@ -87,7 +89,12 @@ export function AppSidebarLayout({ children }: { children: ReactNode }) {
           storageKey: THREAD_SIDEBAR_WIDTH_STORAGE_KEY,
         }}
       >
-        <ThreadSidebar />
+        <div className="flex h-full min-h-0 flex-row">
+          <EnvironmentRail />
+          <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col">
+            <ThreadSidebar />
+          </div>
+        </div>
         <SidebarRail />
       </Sidebar>
       {children}

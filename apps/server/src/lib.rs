@@ -26,6 +26,7 @@ pub mod project;
 pub mod provider;
 pub mod provider_terminal;
 pub mod provider_usage;
+pub mod remote_update;
 pub mod review;
 mod rpc;
 pub mod server_settings;
@@ -40,10 +41,14 @@ pub mod worktree_catalog;
 pub(crate) mod test_support;
 
 use clap::Parser;
+use serde::Serialize;
 use serde_json::json;
 use thiserror::Error;
 
-pub use config::{Cli, CliAction, ConfigError, ServerConfig, ServerMode, StorageCommand};
+pub use auth::pairing_code as auth_pairing_code;
+pub use config::{
+    Cli, CliAction, ConfigError, PairingCommand, ServerConfig, ServerMode, StorageCommand,
+};
 pub use data_root::{
     DataRootError, DataRootRequest, DataRootSource, ResolvedDataRoot, resolve_data_root,
 };
@@ -57,6 +62,11 @@ pub use maintenance::{
     MAINTENANCE_UPDATE_COMMIT_PATH, MAINTENANCE_UPDATE_PREPARE_PATH,
     MAINTENANCE_UPDATE_STATUS_PATH, PrepareForUpdateResult, RpcAdmissionGate, RpcMutability,
     http_mutability, rpc_mutability,
+};
+pub use remote_update::{
+    HostUpdaterFuture, HostUpdaterStatus, RemoteUpdateDelegate, RemoteUpdateInstallMode,
+    RemoteUpdateService, RemoteUpdateSnapshot, RemoteUpdateState, RemoteUpdateSupport,
+    RemoteUpdateSupportReason, remote_update_manual_required_error,
 };
 pub use rpc::{
     ACTIVE_RPC_METHODS, CauseItem, ClientMessage, InvalidRequestId, MethodMode, RequestId, RpcExit,
@@ -79,12 +89,17 @@ pub enum RunError {
     Recovery(#[from] persistence::RecoveryError),
     #[error("failed to encode storage command output")]
     StorageOutput(#[source] serde_json::Error),
+    #[error("could not issue a pairing credential: {0}")]
+    PairingIssue(String),
+    #[error("failed to encode pairing command output")]
+    PairingOutput(#[source] serde_json::Error),
 }
 
 pub async fn run_cli() -> Result<(), RunError> {
     match Cli::try_parse()?.into_action()? {
         CliAction::Run(config) => run_server(*config).await,
         CliAction::Storage(command) => run_storage_command(command).await,
+        CliAction::Pairing(command) => run_pairing_command(command).await,
     }
 }
 
@@ -177,6 +192,63 @@ async fn run_storage_command(command: StorageCommand) -> Result<(), RunError> {
             "{}",
             serde_json::to_string_pretty(&value).map_err(RunError::StorageOutput)?
         );
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PairingIssueOutput {
+    id: String,
+    credential: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    expires_at: String,
+}
+
+/// Issues a one-time administrative pairing credential against a data root.
+///
+/// Coexists with a running server on the same root: it takes the shared store
+/// runtime lock (blocking only offline recovery) and writes through the WAL
+/// database, and the server consumes pairing links from the database. Prints
+/// exactly one JSON line to stdout in `--json` mode — the desktop SSH launcher
+/// parses the last non-empty stdout line — and never initializes logging or
+/// other stdout writers.
+async fn run_pairing_command(command: PairingCommand) -> Result<(), RunError> {
+    let PairingCommand::Issue { root, label, json } = command;
+    let _runtime_guard = persistence::StoreRuntimeGuard::acquire(&root.effective)
+        .await
+        .map_err(|error| RunError::PairingIssue(error.to_string()))?;
+    let paths = persistence::StatePaths::from_config(&ServerConfig::new(&root.effective));
+    if !paths.database.exists() {
+        return Err(RunError::PairingIssue(format!(
+            "no BiBCode data store at {}; start the server on this data root first",
+            paths.database.display()
+        )));
+    }
+    let database = persistence::Database::open_existing(&paths.database)
+        .await
+        .map_err(|error| RunError::PairingIssue(error.to_string()))?;
+    let repositories = persistence::Repositories::new(database.clone());
+    let issued = auth::issue_administrative_pairing_link(&repositories, label)
+        .await
+        .map_err(|error| RunError::PairingIssue(format!("{error:?}")));
+    database.close().await;
+    let issued = issued?;
+    let output = PairingIssueOutput {
+        id: issued.id,
+        credential: issued.credential,
+        label: issued.label,
+        expires_at: issued.expires_at,
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&output).map_err(RunError::PairingOutput)?
+        );
+    } else {
+        println!("Pairing credential: {}", output.credential);
+        println!("Expires at: {}", output.expires_at);
     }
     Ok(())
 }

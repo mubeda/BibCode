@@ -49,17 +49,22 @@ function prepared(
       platform: { os: "linux", arch: "x64" },
       serverVersion: "0.0.0-test",
       storageInstanceId,
+      remoteUpdateSupport: null,
+      remoteProtocolVersion: 1,
+      minCompatibleRemoteProtocol: 1,
       capabilities: {
         repositoryIdentity: true,
         worktreeCatalog: false,
         worktreeCatalogRefreshReason: false,
         vcsStatusSummary: false,
         activityProtocolVersion: null,
+        remoteUpdateControl: false,
       },
     },
     httpBaseUrl: connectionTarget.httpBaseUrl,
     socketUrl: `${connectionTarget.wsBaseUrl}/ws`,
     httpAuthorization: null,
+    e2ee: null,
     target: connectionTarget,
   };
 }
@@ -115,6 +120,26 @@ const makeIdentityStore = Effect.fn("TestConnectionDriver.makeIdentityStore")(fu
             next.set(identity.targetKey, identity.storageInstanceId);
             return next;
           }).pipe(Effect.andThen(Ref.update(writes, (current) => [...current, identity]))),
+    rollbackAcceptance: (
+      identity: Persistence.AcceptedStorageIdentity,
+      previousStorageInstanceId: string | null,
+    ) =>
+      options?.failMutation === true
+        ? Effect.fail(
+            new Persistence.ConnectionPersistenceError({
+              operation: "accept-storage-identity",
+              message: "Catalog writer is unavailable.",
+            }),
+          )
+        : Ref.modify(accepted, (current) => {
+            if (current.get(identity.targetKey) !== identity.storageInstanceId) {
+              return [false, current] as const;
+            }
+            const next = new Map(current);
+            if (previousStorageInstanceId === null) next.delete(identity.targetKey);
+            else next.set(identity.targetKey, previousStorageInstanceId);
+            return [true, next] as const;
+          }),
     transition: <A>(
       targetKey: string,
       decide: (acceptedStorageInstanceId: string | null) => IdentityTransition<A>,
@@ -185,6 +210,7 @@ const makeDriver = Effect.fn("TestConnectionDriver.make")(function* (
             ready: Effect.void,
             probe: Effect.void,
             closed: Effect.never,
+            e2eeAuthenticated: Effect.succeed(null),
           } satisfies RpcSession),
         ),
         () => Ref.update(sessionReleaseCount, (count) => count + 1),

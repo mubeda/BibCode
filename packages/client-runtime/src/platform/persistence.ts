@@ -10,7 +10,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 
-import type { ConnectionRegistration } from "../connection/catalog.ts";
+import type { ConnectionCatalogEntry, ConnectionRegistration } from "../connection/catalog.ts";
 import type { ConnectionTarget } from "../connection/model.ts";
 
 export class ConnectionPersistenceError extends Schema.TaggedErrorClass<ConnectionPersistenceError>()(
@@ -41,12 +41,20 @@ export class ConnectionTargetStore extends Context.Service<
   }
 >()("@bibcode/client-runtime/platform/persistence/ConnectionTargetStore") {}
 
+export interface ConnectionRegistrationRemovalResult {
+  readonly removed: boolean;
+  readonly current: ConnectionCatalogEntry | null;
+}
+
 export class ConnectionRegistrationStore extends Context.Service<
   ConnectionRegistrationStore,
   {
     readonly register: (
       registration: ConnectionRegistration,
     ) => Effect.Effect<void, ConnectionPersistenceError>;
+    readonly removeIfMatching: (
+      registration: ConnectionRegistration,
+    ) => Effect.Effect<ConnectionRegistrationRemovalResult, ConnectionPersistenceError>;
     readonly remove: (target: ConnectionTarget) => Effect.Effect<void, ConnectionPersistenceError>;
   }
 >()("@bibcode/client-runtime/platform/persistence/ConnectionRegistrationStore") {}
@@ -84,6 +92,10 @@ export class AcceptedStorageIdentityStore extends Context.Service<
     readonly accept: (
       identity: AcceptedStorageIdentity,
     ) => Effect.Effect<void, ConnectionPersistenceError>;
+    readonly rollbackAcceptance: (
+      identity: AcceptedStorageIdentity,
+      previousStorageInstanceId: string | null,
+    ) => Effect.Effect<boolean, ConnectionPersistenceError>;
     readonly transition: <A>(
       targetKey: string,
       decide: (acceptedStorageInstanceId: string | null) => AcceptedStorageIdentityTransition<A>,

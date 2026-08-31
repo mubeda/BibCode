@@ -360,6 +360,7 @@ const loadSecondaryConnectionRegistration = Effect.fn(
         label,
         httpBaseUrl,
         wsBaseUrl,
+        hostKey: null,
       }),
       credential: new BearerConnectionCredential({ token: access.access_token }),
     }),

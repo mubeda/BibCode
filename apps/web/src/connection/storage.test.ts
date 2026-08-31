@@ -43,6 +43,7 @@ import { afterEach, vi } from "vite-plus/test";
 import {
   type CatalogBackend,
   connectionStorageLayer,
+  connectionCatalogLivesInIndexedDb,
   makeCatalogBackend,
   makeCatalogStore,
 } from "./storage";
@@ -201,6 +202,7 @@ function makeFakeDatabase(fault: FaultMode = "none"): FakeDatabaseHandle {
     return created;
   };
   const db = {
+    addEventListener: () => undefined,
     objectStoreNames: { contains: (name: string) => stores.has(name) },
     createObjectStore: (name: string) => {
       ensure(name);
@@ -269,6 +271,7 @@ const projectId = ProjectId.make("project-1");
 const connectionId = "connection-1";
 const now = "2026-03-29T00:00:00.000Z";
 const modelSelection = { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" } as const;
+const decodeBearerConnectionProfile = Schema.decodeUnknownSync(BearerConnectionProfile);
 
 function bearerRegistration(): BearerConnectionRegistration {
   return new BearerConnectionRegistration({
@@ -283,6 +286,7 @@ function bearerRegistration(): BearerConnectionRegistration {
       label: "Bearer backend",
       httpBaseUrl: "http://127.0.0.1:3201/",
       wsBaseUrl: "ws://127.0.0.1:3201/",
+      hostKey: null,
     }),
     credential: new BearerConnectionCredential({ token: "bearer-token" }),
   });
@@ -304,17 +308,22 @@ function primaryPrepared(storageInstanceId: string | null): PreparedConnection {
       platform: { os: "linux", arch: "x64" },
       serverVersion: "0.0.0-test",
       storageInstanceId,
+      remoteUpdateSupport: null,
+      remoteProtocolVersion: 1,
+      minCompatibleRemoteProtocol: 1,
       capabilities: {
         repositoryIdentity: true,
         worktreeCatalog: false,
         worktreeCatalogRefreshReason: false,
         vcsStatusSummary: false,
         activityProtocolVersion: null,
+        remoteUpdateControl: false,
       },
     },
     httpBaseUrl: target.httpBaseUrl,
     socketUrl: `${target.wsBaseUrl}/ws`,
     httpAuthorization: null,
+    e2ee: null,
     target,
   };
 }
@@ -362,6 +371,19 @@ const remoteToken = new TokenStore.RemoteDpopAccessToken({
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+});
+
+it("decodes persisted legacy bearer profiles with no host key", () => {
+  const decoded = decodeBearerConnectionProfile({
+    _tag: "BearerConnectionProfile",
+    connectionId: "bearer:legacy",
+    environmentId: "environment-legacy",
+    label: "Legacy",
+    httpBaseUrl: "http://192.168.1.20:3773/",
+    wsBaseUrl: "ws://192.168.1.20:3773/",
+  });
+
+  expect(decoded.hostKey).toBeNull();
 });
 
 // ─────────────────────────────────────────────────────────────────────
@@ -922,6 +944,26 @@ describe("makeCatalogStore", () => {
 // makeCatalogBackend
 // ─────────────────────────────────────────────────────────────────────
 
+describe("connectionCatalogLivesInIndexedDb", () => {
+  it("is true without a desktop bridge and false on a protected desktop", () => {
+    vi.stubGlobal("window", {});
+    expect(connectionCatalogLivesInIndexedDb()).toBe(true);
+
+    vi.stubGlobal("window", {
+      desktopBridge: {
+        getConnectionCatalog: vi.fn(),
+        compareAndSetConnectionCatalog: vi.fn(),
+      },
+    });
+    expect(connectionCatalogLivesInIndexedDb()).toBe(false);
+
+    // A bridge missing either catalog method still routes the catalog to
+    // IndexedDB.
+    vi.stubGlobal("window", { desktopBridge: { getConnectionCatalog: vi.fn() } });
+    expect(connectionCatalogLivesInIndexedDb()).toBe(true);
+  });
+});
+
 describe("makeCatalogBackend (desktop bridge)", () => {
   it.effect("reads and compares through the desktop bridge secure storage", () =>
     Effect.gen(function* () {
@@ -1230,6 +1272,35 @@ describe("makeCatalogBackend (IndexedDB)", () => {
 // ─────────────────────────────────────────────────────────────────────
 
 describe("connectionStorageLayer", () => {
+  it.effect("rolls back only the matching accepted storage identity", () => {
+    installFakeIndexedDb();
+    vi.stubGlobal("window", {});
+
+    return Effect.gen(function* () {
+      const identities = yield* AcceptedStorageIdentityStore;
+      const first = { targetKey: "bearer:test", storageInstanceId: "store-a" };
+      yield* identities.accept(first);
+      const removed = yield* identities.rollbackAcceptance(first, null);
+      const afterRemoval = yield* identities.get(first.targetKey);
+      expect(removed).toBe(true);
+      expect(Option.isNone(afterRemoval)).toBe(true);
+
+      yield* identities.accept({ ...first, storageInstanceId: "store-previous" });
+      yield* identities.accept(first);
+      const restored = yield* identities.rollbackAcceptance(first, "store-previous");
+      const afterRestore = yield* identities.get(first.targetKey);
+      expect(restored).toBe(true);
+      expect(afterRestore).toEqual(Option.some("store-previous"));
+
+      yield* identities.accept(first);
+      yield* identities.accept({ ...first, storageInstanceId: "store-concurrent" });
+      const preserved = yield* identities.rollbackAcceptance(first, "store-previous");
+      const afterReplacement = yield* identities.get(first.targetKey);
+      expect(preserved).toBe(false);
+      expect(afterReplacement).toEqual(Option.some("store-concurrent"));
+    }).pipe(Effect.provide(connectionStorageLayer));
+  });
+
   it.effect("publishes corrupt catalog health and resets only through the explicit service", () => {
     const handle = installFakeIndexedDb();
     handle.stores.set("catalog", new Map([["document", "{malformed"]]));
@@ -1394,17 +1465,22 @@ describe("connectionStorageLayer", () => {
           platform: { os: "linux", arch: "x64" },
           serverVersion: "0.0.0-test",
           storageInstanceId,
+          remoteUpdateSupport: null,
+          remoteProtocolVersion: 1,
+          minCompatibleRemoteProtocol: 1,
           capabilities: {
             repositoryIdentity: true,
             worktreeCatalog: false,
             worktreeCatalogRefreshReason: false,
             vcsStatusSummary: false,
             activityProtocolVersion: null,
+            remoteUpdateControl: false,
           },
         },
         httpBaseUrl: target.httpBaseUrl,
         socketUrl: `${target.wsBaseUrl}/ws`,
         httpAuthorization: null,
+        e2ee: null,
         target,
       };
     };
@@ -1803,6 +1879,73 @@ describe("connectionStorageLayer", () => {
 
       yield* registrationStore.remove(bearerRegistration().target);
       expect(yield* targetStore.list).toEqual([]);
+    }).pipe(Effect.provide(connectionStorageLayer));
+  });
+
+  it.effect("preserves a replacement written by another registration store", () => {
+    installFakeIndexedDb();
+    const first = bearerRegistration();
+    const replacement = new BearerConnectionRegistration({
+      target: new BearerConnectionTarget({
+        environmentId,
+        label: "Replacement backend",
+        connectionId,
+      }),
+      profile: new BearerConnectionProfile({
+        connectionId,
+        environmentId,
+        label: "Replacement backend",
+        httpBaseUrl: "https://replacement.example.test/",
+        wsBaseUrl: "wss://replacement.example.test/",
+        hostKey: "replacement-host-key",
+      }),
+      credential: new BearerConnectionCredential({ token: "replacement-token" }),
+    });
+
+    return Effect.gen(function* () {
+      const firstRegistrationStore = yield* ConnectionRegistrationStore;
+      yield* firstRegistrationStore.register(first);
+
+      yield* Effect.gen(function* () {
+        const secondRegistrationStore = yield* ConnectionRegistrationStore;
+        const targetStore = yield* ConnectionTargetStore;
+        const profileStore = yield* ProfileStore.ConnectionProfileStore;
+        const credentialStore = yield* CredentialStore.ConnectionCredentialStore;
+
+        yield* secondRegistrationStore.register(replacement);
+        const removal = yield* firstRegistrationStore.removeIfMatching(first);
+
+        expect(removal).toEqual({
+          removed: false,
+          current: { target: replacement.target, profile: Option.some(replacement.profile) },
+        });
+        expect(yield* targetStore.list).toEqual([replacement.target]);
+        expect(yield* profileStore.get(connectionId)).toEqual(Option.some(replacement.profile));
+        expect(yield* credentialStore.get(connectionId)).toEqual(
+          Option.some(replacement.credential),
+        );
+      }).pipe(Effect.provide(connectionStorageLayer));
+    }).pipe(Effect.provide(connectionStorageLayer));
+  });
+
+  it.effect("conditionally removes the exact durable registration", () => {
+    installFakeIndexedDb();
+    const registration = bearerRegistration();
+
+    return Effect.gen(function* () {
+      const registrationStore = yield* ConnectionRegistrationStore;
+      const targetStore = yield* ConnectionTargetStore;
+      const profileStore = yield* ProfileStore.ConnectionProfileStore;
+      const credentialStore = yield* CredentialStore.ConnectionCredentialStore;
+
+      yield* registrationStore.register(registration);
+      expect(yield* registrationStore.removeIfMatching(registration)).toEqual({
+        removed: true,
+        current: null,
+      });
+      expect(yield* targetStore.list).toEqual([]);
+      expect(yield* profileStore.get(connectionId)).toEqual(Option.none());
+      expect(yield* credentialStore.get(connectionId)).toEqual(Option.none());
     }).pipe(Effect.provide(connectionStorageLayer));
   });
 

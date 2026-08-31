@@ -15,6 +15,7 @@ use url::Url;
 
 use crate::data_root::{DataRootError, DataRootRequest, DataRootSource, ResolvedDataRoot};
 use crate::persistence::StorageInstanceId;
+use crate::remote_update::RemoteUpdateSupport;
 
 pub const DEFAULT_PORT: u16 = 3773;
 
@@ -54,6 +55,9 @@ pub struct ServerConfig {
     pub environment_label: String,
     pub server_version: String,
     pub storage_instance_id: Option<StorageInstanceId>,
+    /// How this server can be updated remotely (spec section 4.5). Headless
+    /// default is manual; the desktop host overrides at launch.
+    pub remote_update_support: RemoteUpdateSupport,
     pub(crate) update_maintenance_drain_timeout: Duration,
     pub(crate) update_maintenance_lease: Duration,
 }
@@ -82,6 +86,7 @@ impl ServerConfig {
             environment_label: "Local".to_owned(),
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
             storage_instance_id: None,
+            remote_update_support: RemoteUpdateSupport::manual(),
             update_maintenance_drain_timeout: Duration::from_secs(30),
             update_maintenance_lease: Duration::from_secs(90),
         }
@@ -91,6 +96,12 @@ impl ServerConfig {
     pub fn with_bind(mut self, host: impl Into<String>, port: u16) -> Self {
         self.host = host.into();
         self.port = port;
+        self
+    }
+
+    #[must_use]
+    pub fn with_remote_update_support(mut self, support: RemoteUpdateSupport) -> Self {
+        self.remote_update_support = support;
         self
     }
 
@@ -179,6 +190,18 @@ mod tests {
     }
 
     #[test]
+    fn server_config_defaults_to_manual_remote_update_support() {
+        let config = ServerConfig::new("/tmp/bibcode-test");
+        assert_eq!(
+            config.remote_update_support,
+            crate::remote_update::RemoteUpdateSupport {
+                install_mode: crate::remote_update::RemoteUpdateInstallMode::Manual,
+                reason: crate::remote_update::RemoteUpdateSupportReason::ManualUpdateRequired,
+            }
+        );
+    }
+
+    #[test]
     fn desktop_bootstrap_wsl_transport_is_explicit_and_defaults_closed() {
         let base = serde_json::json!({
             "mode": "desktop",
@@ -226,6 +249,44 @@ mod tests {
         assert_eq!(request.source, DataRootSource::Environment);
         assert_eq!(request.requested, Some(PathBuf::from("/var/lib/bibcode")));
     }
+
+    #[test]
+    fn pairing_issue_resolves_the_cli_data_root_and_is_not_a_server_command() {
+        let temp = tempfile::tempdir().expect("temporary base directory");
+        let base_dir = temp.path().to_string_lossy().into_owned();
+
+        let action = Cli::try_parse_from([
+            "bibcode",
+            "pairing",
+            "issue",
+            "--base-dir",
+            base_dir.as_str(),
+            "--label",
+            "SSH bootstrap",
+            "--json",
+        ])
+        .expect("parse pairing issue CLI")
+        .into_action()
+        .expect("build pairing action");
+        let CliAction::Pairing(PairingCommand::Issue { root, label, json }) = action else {
+            panic!("pairing issue must produce a pairing action");
+        };
+        assert_eq!(root.requested, PathBuf::from(base_dir.as_str()));
+        assert_eq!(label.as_deref(), Some("SSH bootstrap"));
+        assert!(json);
+
+        let error = Cli::try_parse_from([
+            "bibcode",
+            "pairing",
+            "issue",
+            "--base-dir",
+            base_dir.as_str(),
+        ])
+        .expect("parse pairing issue CLI")
+        .into_server_config()
+        .expect_err("pairing issue is not a server command");
+        assert!(matches!(error, ConfigError::PairingCommandIsNotServer));
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -246,6 +307,8 @@ enum CliCommand {
     Start,
     #[command(about = "Inspect or explicitly recover offline project data.")]
     Storage(StorageArgs),
+    #[command(about = "Manage one-time pairing credentials for a data root.")]
+    Pairing(PairingArgs),
 }
 
 #[derive(Debug, Args)]
@@ -278,10 +341,37 @@ enum StorageSubcommand {
     },
 }
 
+#[derive(Debug, Args)]
+struct PairingArgs {
+    #[command(subcommand)]
+    command: PairingSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum PairingSubcommand {
+    #[command(about = "Create a five-minute administrative pairing credential for this data root.")]
+    Issue {
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub enum CliAction {
     Run(Box<ServerConfig>),
     Storage(StorageCommand),
+    Pairing(PairingCommand),
+}
+
+#[derive(Clone, Debug)]
+pub enum PairingCommand {
+    Issue {
+        root: ResolvedDataRoot,
+        label: Option<String>,
+        json: bool,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -342,6 +432,8 @@ pub enum ConfigError {
     EmptyDesktopBootstrapToken,
     #[error("storage commands cannot be converted into a server configuration")]
     StorageCommandIsNotServer,
+    #[error("pairing commands cannot be converted into a server configuration")]
+    PairingCommandIsNotServer,
     #[error(transparent)]
     DataRoot(#[from] DataRootError),
 }
@@ -374,6 +466,7 @@ impl Cli {
         match self.into_action()? {
             CliAction::Run(config) => Ok(*config),
             CliAction::Storage(_) => Err(ConfigError::StorageCommandIsNotServer),
+            CliAction::Pairing(_) => Err(ConfigError::PairingCommandIsNotServer),
         }
     }
 
@@ -402,6 +495,22 @@ impl Cli {
                     StorageSubcommand::StartEmpty { json } => {
                         StorageCommand::StartEmpty { root, json }
                     }
+                }));
+            }
+            Some(CliCommand::Pairing(pairing)) => {
+                let home_dir = dirs::home_dir().ok_or(DataRootError::HomeDirectoryUnavailable)?;
+                let request = select_data_root_request(
+                    args.base_dir,
+                    bibcode_env_var("BIBCODE_HOME"),
+                    None,
+                    home_dir,
+                );
+                let root = crate::data_root::resolve_data_root(request)?;
+                let PairingSubcommand::Issue { label, json } = pairing.command;
+                return Ok(CliAction::Pairing(PairingCommand::Issue {
+                    root,
+                    label,
+                    json,
                 }));
             }
             command => command,

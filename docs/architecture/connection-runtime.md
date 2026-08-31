@@ -53,6 +53,79 @@ persisted as saved connections.
 Profiles and credentials remain separate so catalog metadata can be listed
 without exposing secrets.
 
+## Pinned direct profiles and sessions
+
+`BearerConnectionProfile` additively stores `hostKey` in the existing schema-v1
+catalog document. The catalog boundary normalizes missing, empty, and
+whitespace-only values to `null`, so no catalog version bump or compatibility
+alias is required. Browser storage persists the document normally; the protected
+desktop catalog encrypts and restores the same serialized document as opaque
+bytes and does not interpret the new field.
+
+`ConnectionResolver` treats a non-null `hostKey` as a hard channel-selection
+rule. It fetches only the unauthenticated descriptor, derives `/ws-e2ee`, and
+builds `PreparedConnection.e2ee` with the pinned key and one of two auth forms:
+`{ kind: "pairing", token }` during verify-then-add or
+`{ kind: "bearer", credential }` on later connections. It does not exchange the
+credential at `/oauth/token` or request `/api/auth/websocket-ticket`.
+`PreparedConnection.httpAuthorization` is `null` whenever `e2ee` is non-null,
+preventing an E2EE-only bearer from being projected as plain-HTTP authority.
+A null host key preserves the legacy ticketed `/ws` path.
+
+`RpcSessionFactory` wraps the ordinary Effect socket with the Noise NK and
+record-layer adapter before constructing the unchanged RPC protocol. The
+wrapper completes the handshake, sends the in-channel auth message, validates
+`e2ee_authenticated`, and only then exposes RPC bytes. The resulting
+`RpcSession.e2eeAuthenticated` effect publishes the authenticated response for
+pairing identity checks; it resolves to `null` for non-E2EE sessions. Handshake
+identity and authentication failures are blocked connection failures, while a
+deadline or transport failure follows the supervisor's bounded transient retry
+policy.
+
+The verify-then-add flow uses that session to compare the descriptor, pairing
+payload, `e2ee_authenticated` response, and `server.getConfig` identities. The
+pairing authentication message carries no confirmation request flag. The server
+decides delivery from the consumed grant: an off-host grant is persisted as
+`pending-pairing` and returns `pairingConfirmationRequired: true`; an on-host or
+legacy grant is immediately `active` and omits the flag. Migration 49 added the
+persisted `delivery_state` column. For a pending reply, the client registers the
+verified profile and credential, persists the accepted storage identity, then
+calls `auth.confirmPairing` on that same bootstrap channel. Only local
+persistence and the confirmation transition run uninterruptibly. Closing before
+confirmation lets the server revoke the still-pending session; the server also
+runs a best-effort age-gated sweep at startup and every 60 seconds, revoking only
+pending sessions older than the two-minute grace.
+
+Pairing opens no second pinned socket. A successful confirmation is conclusive
+and wakes the registered environment supervisor. When confirmation delivery is
+ambiguous, the supervisor's own connection with the saved credential is the
+bearer proof. The client observes `EnvironmentRegistry.stateChanges` for at most
+30 seconds, interruptibly: `connected` proves activation, while blocked
+`authentication`, `host-identity`, or `storage-changed` state conclusively
+rejects the credential. A conclusive rejection conditionally rolls back the
+registration and accepted identity and fails with `pairing-rejected`; an
+inconclusive window retains the durable local authority and leaves later
+recovery to the supervisor. Any confirmation-RPC failure remains a pairing
+failure: a definitive rejection rolls back before the bootstrap scope closes,
+while ambiguous delivery proceeds only through the supervisor proof above.
+
+Compatibility remains additive. A server predating confirmation delivers an
+active credential and may reject `auth.confirmPairing` with the exact
+authenticated unknown-request-tag defect; the client recognizes only that exact
+legacy shape. A prior confirmation-capable server may omit
+`pairingConfirmationRequired`, so the client may make the same idempotent
+confirmation attempt. Other ambiguous transport or response loss is resolved
+through the supervisor proof above rather than fresh handshakes. This prevents a
+routing endpoint from substituting a different logical environment or
+persistent store after the pinned handshake without leaving a
+delivered-but-unpersisted durable client.
+
+Presentation uses `connectionTransportSecurity` as the shared policy:
+non-null bearer `hostKey` is `e2ee`, null is `unencrypted`, relay and SSH are
+`channel-secured`, and primary or desktop-local targets are `local`. Legacy
+direct profiles remain usable but surface re-pair guidance instead of silently
+claiming encrypted transport.
+
 ## Accepted storage identity
 
 The schema-v1 connection catalog additively stores accepted non-null storage
@@ -77,6 +150,28 @@ backend supports quarantine, publishes structured `recovery-required` health,
 and rejects mutations while that revision remains authoritative. An explicit
 reset uses exact compare-and-set to install an empty catalog; a concurrent valid
 repair wins without being overwritten.
+
+Pairing-add compensation uses that same cross-runtime boundary. The registration
+store removes a failed add only when the current durable registration-owned
+target, profile, and credential fields still equal the exact registration being
+compensated. A conflict rereads and re-evaluates the condition, so a replacement
+committed by another tab, WebView, or client runtime wins intact. Compensation
+removes only those registration-owned fields; a same-environment DPoP token or
+accepted storage identity remains untouched. The compare-only result carries the
+current durable catalog entry when another registration won. The environment
+registry then retires the failed add's local supervisor and installs that winner
+without clearing environment-owned data. When compensation itself removes the
+registration, the registry closes the local supervisor and clears owned runtime
+data only after the conditional CAS succeeds.
+
+A definitive pairing confirmation rejection or conclusive supervisor bearer
+rejection applies the same conditional rule to accepted identity state: it
+restores the previous value, or removes the attempt's value, only while the
+value written by that attempt is still current. When activation remains
+ambiguous, the local registration is retained instead. Registration and
+identity rollback are retried from the bootstrap scope finalizer when
+interruption prevents the first cleanup pass. A concurrent replacement remains
+authoritative and is never reverted by the older failed add.
 
 In browser mode, and in desktop mode when native catalog protection is
 unavailable, IndexedDB performs both compare-only and conditional `put`
@@ -209,6 +304,21 @@ the cap. The sequence continues while the connection remains desired. A stable
 changes, catalog reconciliation, and explicit retry requests wake the
 supervisor. Disconnect and scope closure interrupt in-flight work.
 
+`EnvironmentRegistry` owns desired connection intent outside disposable
+supervisor scopes. Registration and startup hydration establish saved
+environments as desired; explicit Connect writes `true`, explicit Disconnect
+writes `false`, and removal clears the entry. Catalog/profile drift recreates a
+scope with the stored intent, so a deliberately disconnected environment does
+not reconnect merely because its supervisor was replaced. Passive state lookup
+may materialize a cold supervisor for state publication, but it preserves the
+stored intent and does not dial while that intent is disconnected.
+
+Environment commands may place a deadline around the complete lazy
+`runInEnvironment` effect. That deadline includes supervisor acquisition,
+readiness, and RPC execution, rather than starting only after a session exists.
+Remote update checks use 30 seconds; interruption releases their two-at-a-time
+fan-out slot and isolates the timeout to that environment's result.
+
 `RpcSessionFactory` disables protocol-owned reconnects. This is deliberate: one
 supervisor owns retry state, status, cancellation, and generation fencing, so a
 stale socket cannot silently become current.
@@ -245,6 +355,19 @@ it retains the last authoritative candidate and adopted-workspace arrays while
 publishing the new health status. Environment and project grouping in React is
 presentation only; it does not merge the scoped catalog sources or grant the
 browser authority over paths.
+
+**Environment rail selection.** The web client's left panel carries an
+environment rail (`apps/web/src/components/sidebar/EnvironmentRail.tsx`):
+Local (the primary environment plus host-managed `local:` desktop backends,
+grouped per the `DESKTOP_LOCAL_CONNECTION_ID_PREFIX` convention) and one entry
+per saved remote environment. Selection writes `activeEnvironmentIdAtom` and
+scopes _presentation only_: the panel filters which environments' projects and
+threads it shows, and **Add project** targets the selected environment.
+Selection never changes supervisor desired state—connections to other
+environments stay live and streaming—and operations on an entity always route
+to the entity's own `environmentId` regardless of selection. When a remote
+environment is selected, a context card under the brand row shows its
+connection status, server version, and compatibility verdict.
 
 One client-runtime presentation selector governs workspace-action availability.
 A cold/no-status row, `present`, and retained `verification-unavailable` remain
@@ -320,3 +443,21 @@ inferred by the bootstrap helper or authorization token cache.
 See [Remote architecture](./remote.md) for access methods and
 [RPC and orchestration](./rpc-and-orchestration.md) for the wire boundary, and
 [Worktree catalog](./worktree-catalog.md) for discovery and lifecycle rules.
+
+## Protocol compatibility verdict
+
+`packages/client-runtime/src/connection/compat.ts` computes a `CompatVerdict`
+(`compatible`, `legacy`, `server-too-old`, or `client-too-old`) from the
+`remoteProtocolVersion` / `minCompatibleRemoteProtocol` pair on the
+environment descriptor. The rule is a two-way window: compatible iff the
+server's version meets this client's floor and this client's version meets
+the server's floor; a descriptor with both fields decode-defaulted to `0`
+predates the window and is `legacy` ("Limited compatibility"), with the
+existing default-false capability booleans still governing behavior. The
+verdict rides the descriptor the resolver fetches on every connection
+attempt: `createEnvironmentSessionAtoms(...).compatVerdictAtom(environmentId)`
+derives it from the supervisor's prepared connection and is `null` until an
+attempt has produced a descriptor. Failed descriptor probes have no separate
+cache: retry pacing is the supervisor's existing 1/2/4/8/16 s reconnection
+backoff, so a startup burst against an unreachable environment is already
+throttled to one attempt per backoff step.

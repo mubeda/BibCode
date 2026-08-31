@@ -59,6 +59,7 @@ import {
   DEFAULT_RUNTIME_MODE,
   DEFAULT_SERVER_SETTINGS,
   EDITORS,
+  type EditorId,
   type EnvironmentId,
   ProjectId,
   ProviderInstanceId,
@@ -96,6 +97,7 @@ import {
   type SidebarThreadSortOrder,
 } from "@bibcode/contracts/settings";
 import { isDesktopLocalConnectionTarget } from "../connection/desktopLocal";
+import { selectRemoteUpdateControlCapability } from "../connection/environmentCompat";
 import { useDesktopLocalBootstraps } from "../connection/useDesktopLocalBootstraps";
 import { isDesktopHost } from "../env";
 import { APP_BASE_NAME, APP_STAGE_LABEL } from "../branding";
@@ -111,6 +113,7 @@ import {
 import {
   useProject,
   useProjects,
+  useActiveEnvironmentId,
   useServerConfigs,
   useThreadShells,
   useThreadShellsForProjectRefs,
@@ -140,6 +143,7 @@ import { readLocalApi } from "../localApi";
 import { useComposerDraftStore } from "../composerDraftStore";
 import { useNewThreadHandler } from "../hooks/useHandleNewThread";
 import { useDesktopUpdateState } from "../state/desktopUpdate";
+import { remoteUpdateEnvironment } from "../state/remoteUpdates";
 import { projectDataSafetyStore } from "../state/projectDataSafety";
 
 import { useThreadActions } from "../hooks/useThreadActions";
@@ -157,6 +161,12 @@ import { buildThreadRouteParams, resolveThreadRouteRef } from "../threadRoutes";
 import { stackedThreadToast, toastManager } from "./ui/toast";
 import { formatRelativeTimeLabel } from "../timestampFormat";
 import { SettingsSidebarNav } from "./settings/SettingsSidebarNav";
+import { EnvironmentContextCard } from "./sidebar/EnvironmentContextCard";
+import { ServerUpdateBadge } from "./settings/ServerUpdateBadge";
+import {
+  resolveAddProjectTargetLabel,
+  selectRailVisibleEnvironmentIds,
+} from "./sidebar/environmentRail.logic";
 import { Kbd } from "./ui/kbd";
 import {
   getArm64IntelBuildWarningDescription,
@@ -266,6 +276,41 @@ import { WorktreeRemovalDialog, type WorktreeRemovalTarget } from "./WorktreeRem
 import { SidebarProjectAvailability } from "./sidebar/SidebarProjectAvailability";
 import { readCurrentEnvironmentPresentationPolicy } from "../connection/currentEnvironmentPresentation";
 
+function SidebarEnvironmentContextCard() {
+  const activeEnvironmentId = useActiveEnvironmentId();
+  const environment = useEnvironment(activeEnvironmentId);
+  const remoteUpdateControl = selectRemoteUpdateControlCapability(
+    environment?.serverConfig ?? null,
+  );
+  const updateQuery = useEnvironmentQuery(
+    remoteUpdateControl && activeEnvironmentId !== null
+      ? remoteUpdateEnvironment.snapshot({ environmentId: activeEnvironmentId, input: {} })
+      : null,
+  );
+  const runCheck = useAtomCommand(remoteUpdateEnvironment.check, { reportFailure: false });
+  const checkForUpdates = useCallback(
+    async (environmentId: EnvironmentId) => {
+      const result = await runCheck({ environmentId, input: {} });
+      if (result._tag === "Success") {
+        updateQuery.refresh();
+      }
+    },
+    [runCheck, updateQuery.refresh],
+  );
+
+  return (
+    <EnvironmentContextCard
+      {...(remoteUpdateControl
+        ? {
+            updateBadge: <ServerUpdateBadge snapshot={updateQuery.data} />,
+            onCheckForUpdates: (environmentId: EnvironmentId) =>
+              void checkForUpdates(environmentId),
+          }
+        : {})}
+    />
+  );
+}
+
 const WorktreeRemovalRequestContext = createContext<
   ((target: WorktreeRemovalTarget) => void) | null
 >(null);
@@ -284,6 +329,7 @@ const SIDEBAR_LIST_ANIMATION_OPTIONS = {
   easing: "ease-out",
 } as const;
 const EMPTY_THREAD_JUMP_LABELS = new Map<string, string>();
+const EMPTY_EDITOR_IDS: ReadonlyArray<EditorId> = [];
 const PROJECT_GROUPING_MODE_LABELS: Record<SidebarProjectGroupingMode, string> = {
   repository: "Group by repository",
   repository_path: "Group by repository path",
@@ -634,7 +680,7 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
   );
   const isThreadRunning =
     thread.session?.status === "running" && thread.session.activeTurnId != null;
-  // Orca-parity nested agent sub-row ("Claude Code – Running · 1h") — shown
+  // Nested agent sub-row ("Claude Code – Running · 1h") — shown
   // for any workspace row with an active/connecting session, broader than
   // `isThreadRunning` above (which additionally requires an active turn and
   // only gates the archive-button swap).
@@ -1240,7 +1286,7 @@ interface SidebarProjectThreadListProps {
 }
 
 /**
- * Orca-parity primary workspace row: the project checkout itself (not a
+ * Primary workspace row: the project checkout itself (not a
  * worktree). Title/subtitle track the checkout's LIVE current branch (not
  * `thread.branch`, which the default thread always carries as `null`). The
  * passive summary keeps this label fresh without mounting full status.
@@ -1520,7 +1566,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
   const togglePinnedThreadKey = useSidebarWorkspaceMetaStore((state) => state.togglePinned);
   const markThreadRowUnread = useSidebarWorkspaceMetaStore((state) => state.markUnread);
   const markThreadRowRead = useSidebarWorkspaceMetaStore((state) => state.markRead);
-  // Orca-parity context menu (item 2): "Update" runs vcs.pull for the row's
+  // "Update" runs vcs.pull for the row's
   // cwd (worktree path or project checkout), same atom-command pattern as
   // `useVcsPullAction` in sourceControlActions.ts -- that hook can't be used
   // here directly because its scope is fixed at mount, while the row clicked
@@ -1532,10 +1578,11 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
   const openInEditorMutation = useAtomCommand(shellEnvironment.openInEditor, {
     reportFailure: false,
   });
-  // TODO(orca-port): this reads the PRIMARY server's available editors; rows
-  // belonging to a different (remote) environment may see an editor list that
-  // doesn't match their actual backend. Acceptable simplification for now.
-  const availableEditors = useAtomValue(primaryServerConfigAtom)?.availableEditors ?? [];
+  const availableEditorsFor = useCallback(
+    (environmentId: EnvironmentId): ReadonlyArray<EditorId> =>
+      serverConfigs.get(environmentId)?.availableEditors ?? EMPTY_EDITOR_IDS,
+    [serverConfigs],
+  );
   const primaryEnvironmentId = usePrimaryEnvironmentId();
   const supportedWorktreeDiscoveryMembers = useMemo(
     () => getSupportedWorktreeDiscoveryMembers(project.memberProjects, serverConfigs),
@@ -1700,7 +1747,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
           },
         });
       };
-      // Orca-parity workspace-row model: the project's `kind: "default"`
+      // Workspace-row model: the project's `kind: "default"`
       // thread is the primary row (rendered separately, see
       // `SidebarPrimaryRow`) — everything else is a worktree/ad-hoc
       // workspace row, ordered pinned-first (sidebarWorkspaceMetaStore) then
@@ -1737,7 +1784,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       ) ?? null
     );
   }, [activeRouteThreadKey, projectExpanded, visibleProjectThreads]);
-  // Orca-parity fix (w3-progress.md KNOWN BUG): the primary row's thread was
+  // The primary row's thread was
   // split out of `visibleProjectThreads`, so `pinnedCollapsedThread` (which
   // only searches that array) never matched it — collapsing a project while
   // routed to its own default thread hid the primary row entirely, unlike
@@ -2248,7 +2295,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     // Server backfill (pinned interface 1) may not have run yet for this
     // project — create the default thread on demand, then navigate.
     const threadId = newThreadId();
-    // TODO(orca-port): this fallback-provider selection is a client-side
+    // This fallback-provider selection is a client-side
     // safety net for the rare pre-backfill case; revisit once every project
     // is guaranteed a default thread server-side.
     const serverConfig = serverConfigs.get(project.environmentId);
@@ -2645,12 +2692,14 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
           : selectWorktreeCatalogCapabilityPolicy(threadServerConfig.environment).removal;
       const isPinned = pinnedThreadKeys.includes(threadKey);
       const isUnread = unreadThreadKeys.includes(threadKey);
-      // Orca-parity "Open in" submenu (item 2): built from the same EDITORS
+      // The "Open in" submenu is built from the same EDITORS
       // list + availableEditors filter as OpenInPicker.tsx, adapted to the
       // native-style {id,label,children} shape `api.contextMenu.show` expects
       // (that component renders its own React menu, so it can't be reused
       // as-is here).
-      const openInEditorOptions = EDITORS.filter((editor) => availableEditors.includes(editor.id));
+      const openInEditorOptions = EDITORS.filter((editor) =>
+        availableEditorsFor(thread.environmentId).includes(editor.id),
+      );
       const canOpenInFileExplorer =
         thread.environmentId === primaryEnvironmentId && typeof window !== "undefined"
           ? window.desktopBridge?.openInFileManager !== undefined
@@ -2845,7 +2894,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     },
     [
       appSettingsConfirmThreadDelete,
-      availableEditors,
+      availableEditorsFor,
       copyPathToClipboard,
       copyThreadIdToClipboard,
       deleteThread,
@@ -2867,7 +2916,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     ],
   );
 
-  // Orca-parity context menu for the primary (project checkout) row. The
+  // Context menu for the primary (project checkout) row. The
   // primary checkout is read-only in the project tree, so destructive project
   // removal stays on the project header menu instead of this branch row.
   const handlePrimaryRowContextMenu = useCallback(
@@ -2883,7 +2932,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         const isPinned = primaryThreadKey !== null && pinnedThreadKeys.includes(primaryThreadKey);
         const isUnread = primaryThreadKey !== null && unreadThreadKeys.includes(primaryThreadKey);
         const openInEditorOptions = EDITORS.filter((editor) =>
-          availableEditors.includes(editor.id),
+          availableEditorsFor(project.environmentId).includes(editor.id),
         );
         const canOpenInFileExplorer =
           project.environmentId === primaryEnvironmentId && typeof window !== "undefined"
@@ -2985,7 +3034,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       })();
     },
     [
-      availableEditors,
+      availableEditorsFor,
       copyPathToClipboard,
       markThreadRowRead,
       markThreadRowUnread,
@@ -3680,6 +3729,7 @@ interface SidebarProjectsContentProps {
   threadPreviewCount: SidebarThreadPreviewCount;
   updateSettings: ReturnType<typeof useUpdateClientSettings>;
   openAddProject: () => void;
+  addProjectLabel: string;
   isManualProjectSorting: boolean;
   projectDnDSensors: ReturnType<typeof useSensors>;
   projectCollisionDetection: CollisionDetection;
@@ -3728,6 +3778,7 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
     threadPreviewCount,
     updateSettings,
     openAddProject,
+    addProjectLabel,
     isManualProjectSorting,
     projectDnDSensors,
     projectCollisionDetection,
@@ -3856,7 +3907,7 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
                 render={
                   <button
                     type="button"
-                    aria-label="Add project"
+                    aria-label={addProjectLabel}
                     data-testid="sidebar-add-project-trigger"
                     className="inline-flex h-6 min-w-6 cursor-pointer items-center justify-center rounded-md px-[calc(--spacing(1)-1px)] text-muted-foreground/60 transition-colors hover:bg-accent hover:text-foreground"
                     onClick={openAddProject}
@@ -3865,7 +3916,7 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
               >
                 <FolderPlusIcon className="size-3.5" />
               </TooltipTrigger>
-              <TooltipPopup side="right">Add project</TooltipPopup>
+              <TooltipPopup side="right">{addProjectLabel}</TooltipPopup>
             </Tooltip>
           </div>
         </div>
@@ -3959,11 +4010,52 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
 });
 
 export default function Sidebar() {
-  const projects = useProjects();
+  const allProjects = useProjects();
   const { environments } = useEnvironments();
+  const activeEnvironmentId = useActiveEnvironmentId();
+  const visibleEnvironmentIds = useMemo(
+    () =>
+      selectRailVisibleEnvironmentIds({
+        activeEnvironmentId,
+        candidates: environments.map((environment) => ({
+          environmentId: environment.environmentId,
+          isLocal:
+            environment.entry.target._tag === "PrimaryConnectionTarget" ||
+            isDesktopLocalConnectionTarget(environment.entry.target),
+        })),
+      }),
+    [activeEnvironmentId, environments],
+  );
+  const addProjectLabel = useMemo(() => {
+    const remoteLabel = resolveAddProjectTargetLabel({
+      activeEnvironmentId,
+      candidates: environments.map((environment) => ({
+        environmentId: environment.environmentId,
+        label: environment.label,
+        isLocal:
+          environment.entry.target._tag === "PrimaryConnectionTarget" ||
+          isDesktopLocalConnectionTarget(environment.entry.target),
+      })),
+    });
+    return remoteLabel === null ? "Add project" : `Add project on ${remoteLabel}`;
+  }, [activeEnvironmentId, environments]);
+  const projects = useMemo(
+    () =>
+      visibleEnvironmentIds === null
+        ? allProjects
+        : allProjects.filter((project) => visibleEnvironmentIds.has(project.environmentId)),
+    [allProjects, visibleEnvironmentIds],
+  );
   const presentation = useMemo(readCurrentEnvironmentPresentationPolicy, []);
   const shellSummary = useEnvironmentShellSummary();
-  const sidebarThreads = useThreadShells();
+  const allSidebarThreads = useThreadShells();
+  const sidebarThreads = useMemo(
+    () =>
+      visibleEnvironmentIds === null
+        ? allSidebarThreads
+        : allSidebarThreads.filter((thread) => visibleEnvironmentIds.has(thread.environmentId)),
+    [allSidebarThreads, visibleEnvironmentIds],
+  );
   const projectExpandedById = useUiStateStore((store) => store.projectExpandedById);
   const projectOrder = useUiStateStore((store) => store.projectOrder);
   const reorderProjects = useUiStateStore((store) => store.reorderProjects);
@@ -3983,7 +4075,7 @@ export default function Sidebar() {
   const sidebarThreadPreviewCount = useClientSettings((s) => s.sidebarThreadPreviewCount);
   const updateSettings = useUpdateClientSettings();
   const handleNewThread = useNewThreadHandler();
-  // Orca port item 5/6: "new workspace" entry points open CreateWorktreeDialog
+  // "New workspace" entry points open CreateWorktreeDialog
   // instead of seeding a draft thread. `createWorktreeDialogProjectRef` is the
   // project the dialog's "Project" select defaults to (null = the global "+"
   // entry point, no preselection) — kept separate from the dialog's open
@@ -4074,7 +4166,7 @@ export default function Sidebar() {
     [retryProjectEnvironment],
   );
   const handleOpenProjectSettings = useCallback(() => {
-    void navigate({ to: "/settings/connections" });
+    void navigate({ to: "/settings/remote-servers" });
   }, [navigate]);
   const handleViewProjectDiagnostics = useCallback(() => {
     void navigate({ to: "/settings/diagnostics" });
@@ -4660,6 +4752,7 @@ export default function Sidebar() {
         <SettingsSidebarNav pathname={pathname} />
       ) : (
         <>
+          <SidebarEnvironmentContextCard />
           <SidebarProjectsContent
             showArm64IntelBuildWarning={showArm64IntelBuildWarning}
             arm64IntelBuildWarningDescription={arm64IntelBuildWarningDescription}
@@ -4672,6 +4765,7 @@ export default function Sidebar() {
             threadPreviewCount={sidebarThreadPreviewCount}
             updateSettings={updateSettings}
             openAddProject={openAddProjectCommandPalette}
+            addProjectLabel={addProjectLabel}
             isManualProjectSorting={isManualProjectSorting}
             projectDnDSensors={projectDnDSensors}
             projectCollisionDetection={projectCollisionDetection}

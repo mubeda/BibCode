@@ -82,9 +82,9 @@
     }
   },
   "inventorySummary": {
-    "javascriptDirect": 80,
-    "javascriptLedger": 79,
-    "rustRegistry": 78,
+    "javascriptDirect": 81,
+    "javascriptLedger": 80,
+    "rustRegistry": 82,
     "rustPath": 1,
     "actions": 9,
     "toolchains": 9
@@ -894,6 +894,17 @@
       "status": "green"
     },
     {
+      "key": "js:catalog:@noble/ciphers",
+      "name": "@noble/ciphers",
+      "current": "2.4.0",
+      "target": "2.4.0",
+      "channel": "stable",
+      "source": "https://www.npmjs.com/package/@noble/ciphers",
+      "cohort": "noble-cryptography",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "green"
+    },
+    {
       "key": "js:catalog:@noble/curves",
       "name": "@noble/curves",
       "current": "2.2.0",
@@ -1521,6 +1532,18 @@
       "status": "current"
     },
     {
+      "key": "rust:workspace:if-addrs",
+      "name": "if-addrs",
+      "current": "0.15.0",
+      "target": "0.15.0",
+      "channel": "stable",
+      "source": "https://crates.io/crates/if-addrs",
+      "cohort": "rust-platform-networking",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "green",
+      "notes": "Cross-platform active-interface enumeration for desktop remote endpoint discovery; filtering, normalization, deduplication, and ranking remain application-owned and fixture-tested."
+    },
+    {
       "key": "rust:workspace:junction",
       "name": "junction",
       "current": "2.0.0",
@@ -1722,6 +1745,17 @@
       "status": "green"
     },
     {
+      "key": "rust:workspace:snow",
+      "name": "snow",
+      "current": "0.10",
+      "target": "0.10",
+      "channel": "stable",
+      "source": "https://crates.io/crates/snow",
+      "cohort": "rust-current",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current"
+    },
+    {
       "key": "rust:workspace:subtle",
       "name": "subtle",
       "current": "2.6.1",
@@ -1777,6 +1811,17 @@
       "status": "current"
     },
     {
+      "key": "rust:workspace:tauri-plugin-deep-link",
+      "name": "tauri-plugin-deep-link",
+      "current": "2",
+      "target": "2",
+      "channel": "stable",
+      "source": "https://crates.io/crates/tauri-plugin-deep-link",
+      "cohort": "rust-current",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current"
+    },
+    {
       "key": "rust:workspace:tauri-plugin-dialog",
       "name": "tauri-plugin-dialog",
       "current": "2.7.2",
@@ -1805,6 +1850,17 @@
       "target": "2.3.5",
       "channel": "stable",
       "source": "https://crates.io/crates/tauri-plugin-shell",
+      "cohort": "rust-current",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current"
+    },
+    {
+      "key": "rust:workspace:tauri-plugin-single-instance",
+      "name": "tauri-plugin-single-instance",
+      "current": "2",
+      "target": "2",
+      "channel": "stable",
+      "source": "https://crates.io/crates/tauri-plugin-single-instance",
       "cohort": "rust-current",
       "platforms": ["linux", "macos", "windows"],
       "status": "current"

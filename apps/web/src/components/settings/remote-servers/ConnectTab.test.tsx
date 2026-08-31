@@ -62,6 +62,9 @@ const h = vi.hoisted(() => {
       getToken: vi.fn(),
     },
     environments: [] as unknown[],
+    threadShells: [] as unknown[],
+    decodedPairingCode: null as null | Record<string, unknown>,
+    compatVerdicts: new Map<string, unknown>(),
     primaryEnvironment: null as unknown,
     relayDiscovery: {
       environments: new Map<string, unknown>(),
@@ -109,28 +112,39 @@ const h = vi.hoisted(() => {
       isPending: false,
       refresh: vi.fn(),
     },
+    remoteUpdateQueries: new Map<string, Record<string, unknown>>(),
     atoms: {
       desktopNetworkAccess: Symbol("desktopNetworkAccessStateAtom"),
       desktopSshHosts: Symbol("desktopSshHostsStateAtom"),
       desktopWsl: Symbol("desktopWslStateAtom"),
       connectPairing: Symbol("connectPairing"),
+      connectRemoteServer: Symbol("connectRemoteServer"),
       connectSsh: Symbol("connectSshEnvironment"),
       catalogRegister: Symbol("environmentCatalog.register"),
+      catalogConnect: Symbol("environmentCatalog.connect"),
+      catalogDisconnect: Symbol("environmentCatalog.disconnect"),
       catalogRemove: Symbol("environmentCatalog.remove"),
       catalogRetryNow: Symbol("environmentCatalog.retryNow"),
       relayRefresh: Symbol("relayEnvironmentDiscovery.refresh"),
       linkPrimary: Symbol("linkPrimaryEnvironment"),
       unlinkPrimary: Symbol("unlinkPrimaryEnvironment"),
+      remoteUpdateCheck: Symbol("remoteUpdateEnvironment.check"),
+      remoteUpdateInstall: Symbol("remoteUpdateEnvironment.install"),
     },
     commands: {
       connectPairing: vi.fn(),
+      connectRemoteServer: vi.fn(),
       connectSsh: vi.fn(),
       register: vi.fn(),
+      connect: vi.fn(),
+      disconnect: vi.fn(),
       remove: vi.fn(),
       retryNow: vi.fn(),
       relayRefresh: vi.fn(),
       link: vi.fn(),
       unlink: vi.fn(),
+      remoteUpdateCheck: vi.fn(),
+      remoteUpdateInstall: vi.fn(),
     },
     refreshDesktopNetworkAccessState: vi.fn(),
     refreshDesktopWslState: vi.fn(),
@@ -170,26 +184,27 @@ vi.mock("@clerk/react", () => ({
   useAuth: () => h.clerkAuth,
 }));
 
+vi.mock("@effect/atom-react", () => ({
+  useAtomValue: (atom: unknown) => {
+    const environmentId = (atom as { environmentId?: string }).environmentId;
+    return environmentId === undefined ? null : (h.compatVerdicts.get(environmentId) ?? null);
+  },
+}));
+
+vi.mock("~/state/session", () => ({
+  environmentSession: {
+    compatVerdictAtom: (environmentId: string) => ({ environmentId }),
+  },
+}));
+
 vi.mock("~/connection/currentEnvironmentPresentation", () => ({
   readCurrentEnvironmentPresentationPolicy: () => ({
     connectionsPresentation: h.connectionsPresentation,
   }),
 }));
 
-vi.mock("@bibcode/client-runtime/connection", () => ({
-  connectionStatusText: (connection: { phase: string }) => `status:${connection.phase}`,
-  RelayConnectionRegistration: class RelayConnectionRegistration {
-    readonly input: unknown;
-    constructor(input: unknown) {
-      this.input = input;
-    }
-  },
-  RelayConnectionTarget: class RelayConnectionTarget {
-    readonly input: unknown;
-    constructor(input: unknown) {
-      this.input = input;
-    }
-  },
+vi.mock("@bibcode/client-runtime/connection", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@bibcode/client-runtime/connection")>()),
 }));
 
 vi.mock("@bibcode/client-runtime/errors", () => ({
@@ -213,7 +228,7 @@ vi.mock("@bibcode/client-runtime/state/runtime", () => ({
   },
 }));
 
-vi.mock("../../hooks/useCopyToClipboard", () => ({
+vi.mock("../../../hooks/useCopyToClipboard", () => ({
   useCopyToClipboard: (options?: {
     onCopy?: (context: unknown) => void;
     onError?: (error: Error, context: unknown) => void;
@@ -230,7 +245,7 @@ vi.mock("../../hooks/useCopyToClipboard", () => ({
   }),
 }));
 
-vi.mock("../../cloud/publicConfig", () => ({
+vi.mock("../../../cloud/publicConfig", () => ({
   hasCloudPublicConfig: () => h.hasCloudConfig,
   resolveRelayClerkTokenOptions: () => ({ template: "relay" }),
 }));
@@ -278,6 +293,8 @@ vi.mock("~/state/auth", () => ({
 vi.mock("~/connection/catalog", () => ({
   environmentCatalog: {
     register: h.atoms.catalogRegister,
+    connect: h.atoms.catalogConnect,
+    disconnect: h.atoms.catalogDisconnect,
     remove: h.atoms.catalogRemove,
     retryNow: h.atoms.catalogRetryNow,
   },
@@ -285,7 +302,21 @@ vi.mock("~/connection/catalog", () => ({
 
 vi.mock("~/connection/onboarding", () => ({
   connectPairing: h.atoms.connectPairing,
+  connectRemoteServer: h.atoms.connectRemoteServer,
   connectSshEnvironment: h.atoms.connectSsh,
+}));
+
+vi.mock("@bibcode/shared/pairingCode", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@bibcode/shared/pairingCode")>()),
+  parsePairingCode: () => {
+    if (h.decodedPairingCode === null) throw new Error("invalid pairing code");
+    return h.decodedPairingCode;
+  },
+}));
+
+vi.mock("@bibcode/shared/advertisedEndpoint", () => ({
+  classifyPairingEndpoint: (endpoint: string) =>
+    endpoint.includes("127.0.0.1") || endpoint.includes("localhost") ? "loopback" : "public",
 }));
 
 vi.mock("~/state/query", () => ({
@@ -295,6 +326,11 @@ vi.mock("~/state/query", () => ({
     if (atom === h.atoms.desktopSshHosts) return h.sshHostsQuery;
     if (atom === h.atoms.desktopWsl) return h.wslQuery;
     if ((atom as { __kind?: string }).__kind === "accessChanges") return h.accessChangesQuery;
+    if ((atom as { __kind?: string }).__kind === "remoteUpdateSnapshot") {
+      return (
+        h.remoteUpdateQueries.get((atom as { environmentId: string }).environmentId) ?? h.nullQuery
+      );
+    }
     return h.nullQuery;
   },
 }));
@@ -313,31 +349,51 @@ vi.mock("~/state/desktopWslState", () => ({
   refreshDesktopWslState: h.refreshDesktopWslState,
 }));
 
+vi.mock("~/state/remoteUpdates", () => ({
+  remoteUpdateEnvironment: {
+    snapshot: ({ environmentId }: { environmentId: string }) => ({
+      __kind: "remoteUpdateSnapshot",
+      environmentId,
+    }),
+    check: h.atoms.remoteUpdateCheck,
+    install: h.atoms.remoteUpdateInstall,
+  },
+}));
+
 vi.mock("~/state/environments", () => ({
   useEnvironments: () => ({ environments: h.environments }),
   usePrimaryEnvironment: () => h.primaryEnvironment,
   useRelayEnvironmentDiscovery: () => h.relayDiscovery,
 }));
 
+vi.mock("~/state/entities", () => ({
+  useThreadShells: () => h.threadShells,
+}));
+
 vi.mock("~/state/relay", () => ({
   relayEnvironmentDiscovery: { refresh: h.atoms.relayRefresh },
 }));
 
-vi.mock("../../state/use-atom-command", () => ({
+vi.mock("../../../state/use-atom-command", () => ({
   useAtomCommand: (atom: unknown) => {
     if (atom === h.atoms.connectPairing) return h.commands.connectPairing;
+    if (atom === h.atoms.connectRemoteServer) return h.commands.connectRemoteServer;
     if (atom === h.atoms.connectSsh) return h.commands.connectSsh;
     if (atom === h.atoms.catalogRegister) return h.commands.register;
+    if (atom === h.atoms.catalogConnect) return h.commands.connect;
+    if (atom === h.atoms.catalogDisconnect) return h.commands.disconnect;
     if (atom === h.atoms.catalogRemove) return h.commands.remove;
     if (atom === h.atoms.catalogRetryNow) return h.commands.retryNow;
     if (atom === h.atoms.relayRefresh) return h.commands.relayRefresh;
     if (atom === h.atoms.linkPrimary) return h.commands.link;
     if (atom === h.atoms.unlinkPrimary) return h.commands.unlink;
+    if (atom === h.atoms.remoteUpdateCheck) return h.commands.remoteUpdateCheck;
+    if (atom === h.atoms.remoteUpdateInstall) return h.commands.remoteUpdateInstall;
     throw new Error("Unexpected atom command in test");
   },
 }));
 
-vi.mock("./settingsLayout", () => ({
+vi.mock("../settingsLayout", () => ({
   useRelativeTimeTick: () => Date.now(),
   SettingsPageContainer: (props: AnyProps) => (
     <div data-testid="settings-page">{props.children as ReactNode}</div>
@@ -377,7 +433,7 @@ function renderSlot(render: unknown, children: unknown): ReactNode {
   );
 }
 
-vi.mock("../ui/button", () => ({
+vi.mock("../../ui/button", () => ({
   Button: (props: AnyProps) => {
     h.controls.push({
       kind: "button",
@@ -392,7 +448,7 @@ vi.mock("../ui/button", () => ({
   },
 }));
 
-vi.mock("../ui/input", () => ({
+vi.mock("../../ui/input", () => ({
   Input: (props: AnyProps) => {
     h.controls.push({
       kind: "input",
@@ -409,14 +465,14 @@ vi.mock("../ui/input", () => ({
   },
 }));
 
-vi.mock("../ui/checkbox", () => ({
+vi.mock("../../ui/checkbox", () => ({
   Checkbox: (props: AnyProps) => {
     h.controls.push({ kind: "checkbox", label: String(props.checked), props });
     return <span data-checkbox data-checked={String(props.checked)} />;
   },
 }));
 
-vi.mock("../ui/dialog", () => ({
+vi.mock("../../ui/dialog", () => ({
   Dialog: (props: AnyProps) => {
     h.controls.push({ kind: "dialog", label: String(props.open), props });
     return <div data-dialog>{props.children as ReactNode}</div>;
@@ -431,7 +487,7 @@ vi.mock("../ui/dialog", () => ({
   DialogClose: (props: AnyProps) => renderSlot(props.render, props.children),
 }));
 
-vi.mock("../ui/alert-dialog", () => ({
+vi.mock("../../ui/alert-dialog", () => ({
   AlertDialog: (props: AnyProps) => {
     h.controls.push({ kind: "alert-dialog", label: String(props.open), props });
     return <div data-alert-dialog>{props.children as ReactNode}</div>;
@@ -444,13 +500,13 @@ vi.mock("../ui/alert-dialog", () => ({
   AlertDialogClose: (props: AnyProps) => renderSlot(props.render, props.children),
 }));
 
-vi.mock("../ui/popover", () => ({
+vi.mock("../../ui/popover", () => ({
   Popover: (props: AnyProps) => <span data-popover>{props.children as ReactNode}</span>,
   PopoverTrigger: (props: AnyProps) => renderSlot(props.render, props.children),
   PopoverPopup: (props: AnyProps) => <div data-popover-popup>{props.children as ReactNode}</div>,
 }));
 
-vi.mock("../ui/menu", () => ({
+vi.mock("../../ui/menu", () => ({
   Menu: (props: AnyProps) => <span data-menu>{props.children as ReactNode}</span>,
   MenuTrigger: (props: AnyProps) => renderSlot(props.render, props.children),
   MenuPopup: (props: AnyProps) => <div data-menu-popup>{props.children as ReactNode}</div>,
@@ -463,7 +519,7 @@ vi.mock("../ui/menu", () => ({
   MenuSeparator: () => <hr />,
 }));
 
-vi.mock("../ui/select", () => ({
+vi.mock("../../ui/select", () => ({
   Select: (props: AnyProps) => {
     h.controls.push({ kind: "select", label: String(props.value), props });
     return (
@@ -486,7 +542,7 @@ vi.mock("../ui/select", () => ({
   ),
 }));
 
-vi.mock("../ui/switch", () => ({
+vi.mock("../../ui/switch", () => ({
   Switch: (props: AnyProps) => {
     h.controls.push({
       kind: "switch",
@@ -504,41 +560,45 @@ vi.mock("../ui/switch", () => ({
   },
 }));
 
-vi.mock("../ui/toast", () => ({
+vi.mock("../../ui/toast", () => ({
   toastManager: { add: h.toastAdd },
   stackedThreadToast: (options: unknown) => options,
 }));
 
-vi.mock("../ui/tooltip", () => ({
+vi.mock("../../ui/tooltip", () => ({
   Tooltip: (props: AnyProps) => <>{props.children as ReactNode}</>,
   TooltipTrigger: (props: AnyProps) => renderSlot(props.render, props.children),
   TooltipPopup: (props: AnyProps) => <div data-tooltip-popup>{props.children as ReactNode}</div>,
 }));
 
-vi.mock("../ui/textarea", () => ({
+vi.mock("../../ui/textarea", () => ({
   Textarea: (props: AnyProps) => {
-    h.controls.push({ kind: "textarea", label: String(props.value), props });
+    h.controls.push({
+      kind: "textarea",
+      label: (props.placeholder as string | undefined) ?? String(props.value),
+      props,
+    });
     return <textarea readOnly defaultValue={props.value as string | undefined} />;
   },
 }));
 
-vi.mock("../ui/qr-code", () => ({
+vi.mock("../../ui/qr-code", () => ({
   QRCodeSvg: (props: AnyProps) => <svg data-qr data-value={String(props.value)} />,
 }));
 
-vi.mock("../ui/skeleton", () => ({
+vi.mock("../../ui/skeleton", () => ({
   Skeleton: () => <div data-skeleton />,
 }));
 
-vi.mock("../ui/spinner", () => ({
+vi.mock("../../ui/spinner", () => ({
   Spinner: () => <span data-spinner />,
 }));
 
-vi.mock("../ui/scroll-area", () => ({
+vi.mock("../../ui/scroll-area", () => ({
   ScrollArea: (props: AnyProps) => <div data-scroll-area>{props.children as ReactNode}</div>,
 }));
 
-vi.mock("../ui/empty", () => ({
+vi.mock("../../ui/empty", () => ({
   Empty: (props: AnyProps) => <div data-empty>{props.children as ReactNode}</div>,
   EmptyDescription: (props: AnyProps) => <p>{props.children as ReactNode}</p>,
   EmptyHeader: (props: AnyProps) => <div>{props.children as ReactNode}</div>,
@@ -546,16 +606,24 @@ vi.mock("../ui/empty", () => ({
   EmptyTitle: (props: AnyProps) => <h3>{props.children as ReactNode}</h3>,
 }));
 
-vi.mock("../ui/group", () => ({
+vi.mock("../../ui/group", () => ({
   Group: (props: AnyProps) => <div data-group>{props.children as ReactNode}</div>,
   GroupSeparator: () => <span data-group-separator />,
 }));
 
-vi.mock("../AnimatedHeight", () => ({
+vi.mock("../../AnimatedHeight", () => ({
   AnimatedHeight: (props: AnyProps) => <div data-animated>{props.children as ReactNode}</div>,
 }));
 
-import { ConnectionsSettings, connectionsSettingsInternals } from "./ConnectionsSettings";
+vi.mock("../../ui/collapsible", () => ({
+  Collapsible: (props: AnyProps) => <div data-collapsible>{props.children as ReactNode}</div>,
+  CollapsibleTrigger: (props: AnyProps) => <button>{props.children as ReactNode}</button>,
+  CollapsibleContent: (props: AnyProps) => <div>{props.children as ReactNode}</div>,
+}));
+
+import { ConnectTab } from "./ConnectTab";
+import { ShareTab } from "./ShareTab";
+import { remoteServersSettingsInternals } from "./shared";
 
 const PRIMARY_ID = EnvironmentId.make("environment-primary");
 const FUTURE = DateTime.makeUnsafe("2099-01-01T00:00:00.000Z");
@@ -587,23 +655,33 @@ function clearRegistries(): void {
   h.copies.length = 0;
 }
 
-function render(node: ReactElement = <ConnectionsSettings />): string {
+function render(
+  node: ReactElement = (
+    <>
+      <ConnectTab />
+      <ShareTab />
+    </>
+  ),
+): string {
   clearRegistries();
   return renderToStaticMarkup(node);
 }
 
-async function mountConnections(): Promise<HTMLDivElement> {
+async function mountConnections(
+  node: ReactElement = (
+    <>
+      <ConnectTab />
+      <ShareTab />
+    </>
+  ),
+): Promise<HTMLDivElement> {
   clearRegistries();
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
   mountedTrees.push({ container, root });
-  await act(async () => root.render(<ConnectionsSettings />));
+  await act(async () => root.render(node));
   return container;
-}
-
-async function click(element: HTMLElement): Promise<void> {
-  await act(async () => element.click());
 }
 
 function findControls(kind: string, label: string): CapturedControl[] {
@@ -630,9 +708,9 @@ function invoke(entry: CapturedControl, handlerName: string, ...args: unknown[])
 
 /** Click the first button with the given label that actually has an onClick handler. */
 function clickButton(label: string): void {
-  const target = findControls("button", label).find(
-    (entry) => typeof entry.props.onClick === "function",
-  );
+  const target = [...findControls("button", label)]
+    .toReversed()
+    .find((entry) => typeof entry.props.onClick === "function");
   if (!target) {
     throw new Error(`No clickable button labelled ${label}`);
   }
@@ -670,7 +748,7 @@ function stubBrowserWindow(options?: {
 }
 
 interface DesktopBridgeStub {
-  setServerExposureMode: ReturnType<typeof vi.fn>;
+  applyServerExposure: ReturnType<typeof vi.fn>;
   setTailscaleServeEnabled: ReturnType<typeof vi.fn>;
   setWslBackendEnabled: ReturnType<typeof vi.fn>;
   setWslDistro: ReturnType<typeof vi.fn>;
@@ -690,7 +768,7 @@ function createDesktopBridgeStub(): DesktopBridgeStub {
     preflightError: null,
   };
   return {
-    setServerExposureMode: vi.fn(async () => ({})),
+    applyServerExposure: vi.fn(async () => ({})),
     setTailscaleServeEnabled: vi.fn(async () => ({})),
     setWslBackendEnabled: vi.fn(async () => wslState),
     setWslDistro: vi.fn(async () => wslState),
@@ -834,6 +912,18 @@ function environment(input: {
   };
   readonly serverConfig?: unknown;
 }) {
+  const serverConfigSource =
+    input.serverConfig !== null && typeof input.serverConfig === "object"
+      ? (input.serverConfig as Record<string, unknown>)
+      : null;
+  const descriptorSource =
+    serverConfigSource?.environment !== null && typeof serverConfigSource?.environment === "object"
+      ? (serverConfigSource.environment as Record<string, unknown>)
+      : {};
+  const capabilitiesSource =
+    descriptorSource.capabilities !== null && typeof descriptorSource.capabilities === "object"
+      ? (descriptorSource.capabilities as Record<string, unknown>)
+      : {};
   return {
     environmentId: EnvironmentId.make(input.id),
     label: input.label,
@@ -842,7 +932,16 @@ function environment(input: {
       traceId: null,
       ...(input.connection ?? { phase: "disconnected" }),
     },
-    serverConfig: input.serverConfig ?? null,
+    serverConfig:
+      serverConfigSource === null
+        ? null
+        : {
+            ...serverConfigSource,
+            environment: {
+              ...descriptorSource,
+              capabilities: { remoteUpdateControl: false, ...capabilitiesSource },
+            },
+          },
     entry: {
       target: { _tag: input.targetTag ?? "SavedConnectionTarget", label: input.label },
       profile: input.sshTarget
@@ -900,6 +999,9 @@ beforeEach(() => {
   h.clerkAuth.getToken.mockReset();
   h.clerkAuth.getToken.mockResolvedValue("clerk-token");
   h.environments = [];
+  h.threadShells = [];
+  h.decodedPairingCode = null;
+  h.compatVerdicts.clear();
   h.primaryEnvironment = { environmentId: PRIMARY_ID, serverConfig: null };
   h.relayDiscovery = { environments: new Map(), refreshing: false };
   h.primarySessionState = { data: null };
@@ -919,6 +1021,7 @@ beforeEach(() => {
   h.sshHostsQuery = { data: null, error: null, isPending: false, refresh: vi.fn() };
   h.wslQuery = { data: null, error: null, isPending: false, refresh: vi.fn() };
   h.accessChangesQuery = { data: null, error: null, isPending: false, refresh: vi.fn() };
+  h.remoteUpdateQueries.clear();
   for (const command of Object.values(h.commands)) {
     command.mockReset();
     command.mockResolvedValue(success(undefined));
@@ -949,9 +1052,9 @@ afterEach(async () => {
   vi.unstubAllGlobals();
 });
 
-describe("ConnectionsSettings deterministic helpers", () => {
+describe("Remote Servers deterministic helpers", () => {
   it("parses manual SSH targets and rejects every invalid boundary", () => {
-    const { formatDesktopSshTarget, parseManualDesktopSshTarget } = connectionsSettingsInternals;
+    const { formatDesktopSshTarget, parseManualDesktopSshTarget } = remoteServersSettingsInternals;
 
     expect(() => parseManualDesktopSshTarget({ host: " ", username: "", port: "" })).toThrow(
       "SSH host or alias is required.",
@@ -996,27 +1099,39 @@ describe("ConnectionsSettings deterministic helpers", () => {
     ).toBe("alice@host:22");
   });
 
-  it("parses pairing URLs and validates separate remote pairing fields", () => {
-    const { parsePairingUrlFields, parseRemotePairingFields } = connectionsSettingsInternals;
-    expect(parsePairingUrlFields(" ")).toBeNull();
-    expect(parsePairingUrlFields("not a valid host")).toBeNull();
-    expect(parsePairingUrlFields("https://backend.test/pair")).toBeNull();
-    expect(parsePairingUrlFields("backend.test/pair?token=secret")).toEqual({
-      host: "https://backend.test",
-      pairingCode: "secret",
-    });
-    expect(parsePairingUrlFields("//backend.test/pair?token=secret-2")).toEqual({
-      host: "https://backend.test",
-      pairingCode: "secret-2",
-    });
+  it("parses pairing URLs through the shared owner and validates plain fields", () => {
+    const { parseRemotePairingFields } = remoteServersSettingsInternals;
     expect(
       parseRemotePairingFields({
         host: "https://backend.test/pair?token=url-token",
         pairingCode: "ignored",
       }),
-    ).toEqual({ host: "https://backend.test", pairingCode: "url-token" });
+    ).toEqual({ host: "https://backend.test/", pairingCode: "url-token" });
+    expect(
+      parseRemotePairingFields({ host: "backend.test/pair?token=secret", pairingCode: "" }),
+    ).toEqual({ host: "https://backend.test/", pairingCode: "secret" });
+
+    // The shared owner guards the reachable Connect-tab path: a pairing URL
+    // carrying userinfo is rejected instead of displaying one host while
+    // connecting to another, and unsupported protocols are refused.
+    expect(() =>
+      parseRemotePairingFields({
+        host: "https://trusted.example@attacker.example/pair?token=secret",
+        pairingCode: "",
+      }),
+    ).toThrow("Pairing URL is invalid.");
+    expect(() =>
+      parseRemotePairingFields({ host: "ftp://backend.test/pair?token=x", pairingCode: "" }),
+    ).toThrow("Pairing URL is invalid.");
+
+    // Bare hosts — including malformed ones — defer to the plain fields; the
+    // owner still normalizes them at the next step of the connect flow.
     expect(parseRemotePairingFields({ host: " backend.test ", pairingCode: " code " })).toEqual({
       host: "backend.test",
+      pairingCode: "code",
+    });
+    expect(parseRemotePairingFields({ host: "not a valid host", pairingCode: "code" })).toEqual({
+      host: "not a valid host",
       pairingCode: "code",
     });
     expect(() => parseRemotePairingFields({ host: "", pairingCode: "code" })).toThrow(
@@ -1035,7 +1150,7 @@ describe("ConnectionsSettings deterministic helpers", () => {
       formatDesktopSshConnectionError,
       isHostedAppPairingUrl,
       isTailscaleHttpsEndpoint,
-    } = connectionsSettingsInternals;
+    } = remoteServersSettingsInternals;
     expect(formatAccessTimestamp("not-a-date")).toBe("not-a-date");
     expect(formatAccessTimestamp("2025-01-01T12:00:00.000Z")).not.toBe("2025-01-01T12:00:00.000Z");
     expect(formatDesktopSshConnectionError("opaque")).toBe("Failed to connect SSH host.");
@@ -1114,7 +1229,7 @@ describe("ConnectionsSettings deterministic helpers", () => {
       sortDesktopPairingLinks,
       toDesktopClientSessionRecord,
       toDesktopPairingLinkRecord,
-    } = connectionsSettingsInternals;
+    } = remoteServersSettingsInternals;
     const loopback = endpoint({
       id: "desktop-loopback:1",
       label: "Loopback",
@@ -1179,38 +1294,7 @@ describe("ConnectionsSettings deterministic helpers", () => {
   });
 });
 
-describe("ConnectionsSettings", () => {
-  it("dispatches Windows to local settings and other desktops away from remote controls", () => {
-    stubDesktopWindow();
-    h.wslQuery.data = {
-      enabled: true,
-      distro: "Ubuntu",
-      available: true,
-      wslOnly: false,
-      distros: [{ name: "Ubuntu", isDefault: true, version: 2 }],
-      preflightError: null,
-    } satisfies DesktopWslState;
-    h.connectionsPresentation = "local-wsl";
-
-    const localMarkup = render();
-    expect(localMarkup).toContain("Local environment");
-    expect(localMarkup).toContain("WSL backend");
-    for (const hiddenText of [
-      "Network access",
-      "Tailscale HTTPS",
-      "Authorized clients",
-      "BiBCode Connect",
-      "Remote environments",
-      "Add environment",
-      "SSH",
-    ]) {
-      expect(localMarkup).not.toContain(hiddenText);
-    }
-
-    h.connectionsPresentation = "redirect-general";
-    expect(render()).toBe("");
-  });
-
+describe("Remote Servers tabs", () => {
   it("shows the administrative-access notice for non-admin browser sessions", () => {
     stubBrowserWindow();
     h.hasCloudConfig = false;
@@ -1258,7 +1342,7 @@ describe("ConnectionsSettings", () => {
       environment({
         id: "environment-idle",
         label: "Idle Env",
-        connection: { phase: "disconnected" },
+        connection: { phase: "available" },
       }),
     ];
 
@@ -1267,7 +1351,7 @@ describe("ConnectionsSettings", () => {
     expect(markup).toContain("Devbox");
     expect(markup).toContain("SSH dev@devbox.internal:2222");
     expect(markup).toContain("Version drift: client 1.0.0, server 2.0.0.");
-    expect(markup).toContain("status:error");
+    expect(markup).toContain("Connection failed. Reason: Error: boom");
     expect(markup).toContain("Copy trace ID");
     expect(markup).toContain("Managed above");
     expect(markup).not.toContain("No saved remote environments");
@@ -1275,30 +1359,341 @@ describe("ConnectionsSettings", () => {
     // Disconnect the connected SSH environment.
     invoke(control("button", "Disconnect"), "onClick");
     await flush();
-    expect(h.commands.remove).toHaveBeenCalledWith(EnvironmentId.make("environment-ssh"));
+    expect(h.commands.disconnect).toHaveBeenCalledWith(EnvironmentId.make("environment-ssh"));
+    expect(h.commands.remove).not.toHaveBeenCalled();
 
     // Connect the idle environment.
     invoke(control("button", "Connect"), "onClick");
     await flush();
-    expect(h.commands.retryNow).toHaveBeenCalledWith(EnvironmentId.make("environment-idle"));
+    expect(h.commands.connect).toHaveBeenCalledWith(EnvironmentId.make("environment-idle"));
 
     // Failures surface a toast.
-    h.commands.retryNow.mockResolvedValueOnce(failure(new Error("connect failed")));
+    h.commands.connect.mockResolvedValueOnce(failure(new Error("connect failed")));
     invoke(control("button", "Connect"), "onClick");
     await flush();
     expect(h.toastAdd).toHaveBeenCalledWith(
       expect.objectContaining({ title: "Could not connect backend" }),
     );
 
-    h.commands.remove.mockResolvedValueOnce(failure(new Error("remove failed")));
+    h.commands.disconnect.mockResolvedValueOnce(failure(new Error("disconnect failed")));
     invoke(control("button", "Disconnect"), "onClick");
     await flush();
     expect(h.toastAdd).toHaveBeenCalledWith(
-      expect.objectContaining({ title: "Could not remove backend" }),
+      expect.objectContaining({ title: "Could not disconnect backend" }),
     );
   });
 
-  it("manages pairing links and authorized clients for a remote-reachable browser admin", async () => {
+  it("Disconnect latches instead of removing, and Remove moves behind a confirmation", async () => {
+    stubBrowserWindow();
+    h.hasCloudConfig = false;
+    h.environments = [
+      environment({
+        id: "env-1",
+        label: "AI-SERVER",
+        targetTag: "BearerConnectionTarget",
+        connection: { phase: "connected" },
+      }),
+    ];
+
+    const container = await mountConnections();
+    invoke(control("button", "Disconnect"), "onClick");
+    await flush();
+    expect(h.commands.disconnect).toHaveBeenCalledWith(EnvironmentId.make("env-1"));
+    expect(h.commands.remove).not.toHaveBeenCalled();
+
+    await act(async () => {
+      invoke(control("menu-item", "Remove server…"), "onClick");
+    });
+    expect(container.textContent).toContain("Remove AI-SERVER?");
+    expect(h.commands.remove).not.toHaveBeenCalled();
+
+    await act(async () => {
+      invoke(findControls("button", "Remove server").at(-1)!, "onClick");
+      await flush();
+    });
+    expect(h.commands.remove).toHaveBeenCalledWith(EnvironmentId.make("env-1"));
+  });
+
+  it("renders a latched available environment as Disconnected with a Connect action", () => {
+    stubBrowserWindow();
+    h.hasCloudConfig = false;
+    h.environments = [
+      environment({
+        id: "env-1",
+        label: "AI-SERVER",
+        targetTag: "BearerConnectionTarget",
+        connection: { phase: "available" },
+      }),
+    ];
+
+    const markup = render(<ConnectTab />);
+    expect(markup).toContain("Disconnected");
+    expect(markup).toContain("Connect");
+  });
+
+  it("escalates removal confirmation when the environment owns running work", async () => {
+    stubBrowserWindow();
+    h.hasCloudConfig = false;
+    h.environments = [
+      environment({
+        id: "env-1",
+        label: "AI-SERVER",
+        targetTag: "BearerConnectionTarget",
+        connection: { phase: "connected" },
+      }),
+    ];
+    h.threadShells = [
+      { environmentId: EnvironmentId.make("env-1"), session: { status: "running" } },
+      { environmentId: EnvironmentId.make("env-1"), session: { status: "running" } },
+      { environmentId: EnvironmentId.make("env-2"), session: { status: "running" } },
+    ];
+
+    const container = await mountConnections();
+    await act(async () => {
+      invoke(control("menu-item", "Remove server…"), "onClick");
+    });
+    expect(container.textContent).toContain("2 running sessions");
+    expect(h.commands.remove).not.toHaveBeenCalled();
+  });
+
+  describe("Add Server flow", () => {
+    async function enterPairingCode(value: string): Promise<void> {
+      await act(async () => {
+        invoke(control("textarea", "bibcode://pair?code=…"), "onChange", {
+          target: { value },
+        });
+      });
+    }
+
+    function latestAddServerButton(): CapturedControl {
+      const button = [...findControls("button", "Add Server")]
+        .toReversed()
+        .find((entry) => typeof entry.props.onClick === "function");
+      if (!button) throw new Error("No Add Server submit button");
+      return button;
+    }
+
+    async function submitAddServer(): Promise<void> {
+      await act(async () => {
+        invoke(latestAddServerButton(), "onClick");
+        await flush();
+      });
+    }
+
+    async function acknowledgeTunnel(): Promise<void> {
+      await act(async () => {
+        invoke(findControls("checkbox", "false").at(-1)!, "onCheckedChange", true);
+      });
+    }
+
+    it("submits a normalized pairing code through connectRemoteServer", async () => {
+      stubBrowserWindow();
+      h.hasCloudConfig = false;
+      await mountConnections();
+      await enterPairingCode("bibcode://pair?code=abc123");
+      await submitAddServer();
+      expect(h.commands.connectRemoteServer).toHaveBeenCalledWith({
+        code: "abc123",
+        allowLoopbackTunnel: false,
+      });
+    });
+
+    it("renders classified failure copy for a rejected pairing", async () => {
+      stubBrowserWindow();
+      h.hasCloudConfig = false;
+      h.commands.connectRemoteServer.mockResolvedValueOnce(
+        failure({ _tag: "PairingAddError", reason: "pairing-rejected", detail: "expired" }),
+      );
+      const container = await mountConnections();
+      await enterPairingCode("abc123");
+      await submitAddServer();
+      expect(container.textContent).toContain("Pairing rejected");
+      expect(container.textContent).toContain("Codes are single-use and expire");
+    });
+
+    it("requires tunnel acknowledgement for a this-computer code", async () => {
+      stubBrowserWindow();
+      h.hasCloudConfig = false;
+      h.decodedPairingCode = {
+        v: 1,
+        endpoint: "http://127.0.0.1:3773",
+        name: "LOCAL-ONLY",
+        token: "t",
+        hostKey: "k",
+        reach: "this-computer",
+        storageInstanceId: "s",
+      };
+      const container = await mountConnections();
+      await enterPairingCode("abc123");
+      expect(container.textContent).toContain("only reachable on the server itself");
+      expect(latestAddServerButton().props.disabled).toBe(true);
+      await acknowledgeTunnel();
+      expect(latestAddServerButton().props.disabled).toBe(false);
+      await submitAddServer();
+      expect(h.commands.connectRemoteServer).toHaveBeenCalledWith({
+        code: "abc123",
+        allowLoopbackTunnel: true,
+      });
+    });
+
+    it("reveals acknowledgement when the flow demands it, then retries with it", async () => {
+      stubBrowserWindow();
+      h.hasCloudConfig = false;
+      h.commands.connectRemoteServer
+        .mockResolvedValueOnce(
+          failure({
+            _tag: "PairingLoopbackAcknowledgementRequiredError",
+            endpoint: "http://127.0.0.1:3773",
+          }),
+        )
+        .mockResolvedValueOnce(success(EnvironmentId.make("env-9")));
+      const container = await mountConnections();
+      await enterPairingCode("abc123");
+      await submitAddServer();
+      expect(container.textContent).toContain("only reachable on the server itself");
+      await acknowledgeTunnel();
+      await submitAddServer();
+      expect(h.commands.connectRemoteServer).toHaveBeenLastCalledWith({
+        code: "abc123",
+        allowLoopbackTunnel: true,
+      });
+    });
+
+    it("keeps manual entry under Advanced and SSH as a first-class mode", () => {
+      stubDesktopWindow();
+      const markup = render(<ConnectTab />);
+      expect(markup).toContain("Pairing code");
+      expect(markup).toContain("SSH");
+      expect(markup).toContain("Advanced");
+      expect(markup).toContain("Troubleshooting");
+    });
+
+    it("consumes an initial pairing code when its prefilled dialog closes", async () => {
+      stubBrowserWindow();
+      const onPairingCodeConsumed = vi.fn();
+      await mountConnections(
+        <ConnectTab initialPairingCode="abc123" onPairingCodeConsumed={onPairingCodeConsumed} />,
+      );
+      await act(async () => {
+        invoke(findControls("dialog", "true").at(-1)!, "onOpenChange", false);
+      });
+      expect(onPairingCodeConsumed).toHaveBeenCalledTimes(1);
+    });
+
+    it("opens and consumes the one-shot add-server action", async () => {
+      stubBrowserWindow();
+      const onAddServerActionConsumed = vi.fn();
+
+      await mountConnections(
+        <ConnectTab initialAddServerOpen onAddServerActionConsumed={onAddServerActionConsumed} />,
+      );
+
+      expect(findControls("dialog", "true")).not.toHaveLength(0);
+      expect(onAddServerActionConsumed).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("Check for Server Updates placement", () => {
+    it("is hidden while the Phase 7 capability seam is off", () => {
+      stubBrowserWindow();
+      expect(render(<ConnectTab />)).not.toContain("Check for Server Updates");
+    });
+
+    it("renders in the Saved servers header when the seam is enabled", () => {
+      stubBrowserWindow();
+      h.environments = [
+        environment({
+          id: "env-capable",
+          label: "Capable server",
+          serverConfig: {
+            environment: { capabilities: { remoteUpdateControl: true } },
+          },
+        }),
+      ];
+      expect(render(<ConnectTab showServerUpdateCheck />)).toContain("Check for Server Updates");
+    });
+
+    it("renders update badges only for servers advertising update control", () => {
+      stubBrowserWindow();
+      h.hasCloudConfig = false;
+      const capableId = EnvironmentId.make("env-capable");
+      h.environments = [
+        environment({ id: "env-legacy", label: "Legacy server" }),
+        environment({
+          id: capableId,
+          label: "Capable server",
+          serverConfig: {
+            environment: {
+              serverVersion: "0.4.2",
+              capabilities: { remoteUpdateControl: true },
+            },
+          },
+        }),
+      ];
+      h.remoteUpdateQueries.set(capableId, {
+        data: {
+          serverVersion: "0.4.2",
+          latestVersion: null,
+          state: "idle",
+          error: null,
+          support: { installMode: "manual", reason: "manual-update-required" },
+        },
+        error: null,
+        isPending: false,
+        refresh: vi.fn(),
+      });
+
+      const markup = render(<ConnectTab />);
+      expect(markup.match(/data-variant="manual"/gu)).toHaveLength(1);
+      expect(markup).toContain("Manual updates");
+      expect(markup).toContain("Copy instructions");
+    });
+
+    it("keeps a failed batch check local to the row as Status unavailable", async () => {
+      stubBrowserWindow();
+      h.hasCloudConfig = false;
+      const environmentId = EnvironmentId.make("env-check-failure");
+      h.environments = [
+        environment({
+          id: environmentId,
+          label: "Offline update server",
+          serverConfig: {
+            environment: {
+              serverVersion: "0.4.2",
+              capabilities: { remoteUpdateControl: true },
+            },
+          },
+        }),
+      ];
+      h.remoteUpdateQueries.set(environmentId, {
+        data: {
+          serverVersion: "0.4.2",
+          latestVersion: null,
+          state: "up-to-date",
+          error: null,
+          support: { installMode: "interactive", reason: "available" },
+        },
+        error: null,
+        isPending: false,
+        refresh: vi.fn(),
+      });
+      h.commands.remoteUpdateCheck.mockResolvedValueOnce(failure(new Error("offline")));
+
+      const container = await mountConnections(<ConnectTab />);
+      await act(async () => {
+        invoke(control("button", "Check for Server Updates"), "onClick");
+        await flush();
+      });
+
+      expect(container.textContent).toContain("Status unavailable");
+      expect(h.commands.remoteUpdateCheck).toHaveBeenCalledExactlyOnceWith({
+        environmentId,
+        input: {},
+      });
+    });
+  });
+
+  it("manages pairing links and paired clients for a browser admin", async () => {
     stubBrowserWindow();
     h.primarySessionState = {
       data: { authenticated: true, scopes: ADMIN_SCOPES, auth: { policy: "remote-reachable" } },
@@ -1340,16 +1735,16 @@ describe("ConnectionsSettings", () => {
       ],
     });
 
-    const markup = render();
+    const onAccessRevoked = vi.fn();
+    const markup = render(<ShareTab onAccessRevoked={onAccessRevoked} />);
 
-    expect(markup).toContain("Authorized clients");
+    expect(markup).toContain("Paired clients");
     expect(markup).toContain("Living room iPad");
     expect(markup).toContain("1 scope");
     expect(markup).toContain("Pairing link");
     expect(markup).not.toContain("credential-pl-expired");
     expect(markup).toContain("This device");
     expect(markup).toContain("macOS · Safari");
-    expect(markup).toContain("This backend is already configured for remote access.");
 
     // Copy the shareable pairing URL (current-origin fallback: no endpoints).
     invoke(control("button", "Copy pairing URL for: URL"), "onClick");
@@ -1385,7 +1780,9 @@ describe("ConnectionsSettings", () => {
 
     // The reveal textarea selects its content on focus/click.
     const selectSpy = vi.fn();
-    const textarea = h.controls.find((entry) => entry.kind === "textarea");
+    const textarea = h.controls.find(
+      (entry) => entry.kind === "textarea" && typeof entry.props.onFocus === "function",
+    );
     invoke(textarea!, "onFocus", { currentTarget: { select: selectSpy } });
     invoke(textarea!, "onClick", { currentTarget: { select: selectSpy } });
     expect(selectSpy).toHaveBeenCalledTimes(2);
@@ -1406,6 +1803,7 @@ describe("ConnectionsSettings", () => {
     invoke(findControls("button", "Revoke").at(-1)!, "onClick");
     await flush();
     expect(h.revokeServerClientSession).toHaveBeenCalled();
+    expect(onAccessRevoked).toHaveBeenCalledTimes(2);
     h.toastAdd.mockClear();
     h.revokeServerClientSession.mockRejectedValueOnce(new Error("session revoke failed"));
     invoke(findControls("button", "Revoke").at(-1)!, "onClick");
@@ -1437,28 +1835,6 @@ describe("ConnectionsSettings", () => {
       expect.objectContaining({ title: "Could not revoke other clients" }),
     );
 
-    // Create-link dialog: scope presets, checkbox toggles, create + cancel.
-    invoke(findControls("checkbox", "true")[0]!, "onCheckedChange", false);
-    invoke(findControls("checkbox", "false")[0]!, "onCheckedChange", true);
-    invoke(control("button", "Read only"), "onClick");
-    invoke(control("button", "Standard"), "onClick");
-    const labelInput = control("input", "e.g. Living room iPad");
-    invoke(labelInput, "onChange", { target: { value: "Kitchen tablet" } });
-
-    h.toastAdd.mockClear();
-    clickButton("Create link");
-    await flush();
-    expect(h.createServerPairingCredential).toHaveBeenCalled();
-    expect(h.toastAdd).not.toHaveBeenCalled();
-
-    h.createServerPairingCredential.mockRejectedValueOnce(new Error("create failed"));
-    clickButton("Create link");
-    await flush();
-    expect(h.toastAdd).toHaveBeenCalledWith(
-      expect.objectContaining({ title: "Could not create pairing URL" }),
-    );
-
-    clickButton("Cancel");
     for (const dialog of findControls("dialog", "false")) {
       invoke(dialog, "onOpenChange", false);
       invoke(dialog, "onOpenChange", true);
@@ -1485,7 +1861,7 @@ describe("ConnectionsSettings", () => {
     expect(markup).toContain("Clipboard copy is unavailable here.");
   });
 
-  it("shows the local-only network notice for non-remote browser admins", () => {
+  it("keeps paired-client management available for local-only browser admins", () => {
     stubBrowserWindow();
     h.hasCloudConfig = false;
     h.primarySessionState = {
@@ -1494,8 +1870,8 @@ describe("ConnectionsSettings", () => {
 
     const markup = render();
 
-    expect(markup).toContain("This backend is only reachable on this machine.");
-    expect(markup).not.toContain("Authorized clients");
+    expect(markup).toContain("Paired clients");
+    expect(markup).not.toContain("Enable network access");
   });
 
   it("renders the full desktop backend surface and drives its handlers", async () => {
@@ -1572,12 +1948,10 @@ describe("ConnectionsSettings", () => {
     const markup = render();
 
     expect(markup).toContain("Version drift");
-    expect(markup).toContain("Network access");
-    expect(markup).toContain("Reachable at");
     expect(markup).toContain("http://192.168.1.20:5133");
     expect(markup).toContain("Tailscale HTTPS");
     expect(markup).toContain("BiBCode Connect");
-    expect(markup).toContain("Authorized clients");
+    expect(markup).toContain("Paired clients");
 
     // The pairing link resolves URLs against the advertised endpoints.
     expect(markup).toContain("Copy pairing URL for: LAN");
@@ -1599,19 +1973,14 @@ describe("ConnectionsSettings", () => {
     );
     h.copyBehavior = "copy";
 
-    // Network exposure switch stages a confirmation.
-    invoke(control("switch", "Enable network access"), "onCheckedChange", false);
-    invoke(control("switch", "Enable network access"), "onCheckedChange", true);
-
-    // The exposure confirm button is a no-op until a change is pending.
+    // Only the Tailscale confirmation owns a restart control here.
     for (const entry of findControls("button", "Restart and disable")) {
       invoke(entry, "onClick");
     }
     await flush();
-    // Only the tailscale-disable confirmation reaches the bridge.
     expect(bridge.setTailscaleServeEnabled).toHaveBeenCalledTimes(1);
     expect(bridge.setTailscaleServeEnabled).toHaveBeenCalledWith({ enabled: false, port: 443 });
-    expect(bridge.setServerExposureMode).not.toHaveBeenCalled();
+    expect(bridge.applyServerExposure).not.toHaveBeenCalled();
     expect(h.refreshDesktopNetworkAccessState).toHaveBeenCalled();
 
     // Disabling tailscale can fail with a toast.
@@ -1656,7 +2025,7 @@ describe("ConnectionsSettings", () => {
       invoke(dialog, "onOpenChange", false);
     }
 
-    // Add-environment dialog (remote mode by default on desktop).
+    // Add-environment dialog (manual fields live under Advanced).
     const hostInput = control("input", "backend.example.com");
     invoke(hostInput, "onChange", {
       target: { value: "https://pairhost.example.com/pair?token=abc123" },
@@ -1672,7 +2041,7 @@ describe("ConnectionsSettings", () => {
 
     // Adding with empty fields fails fast with a toast.
     h.toastAdd.mockClear();
-    clickButton("Add environment");
+    clickButton("Add manually");
     await flush();
     expect(h.toastAdd).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -1686,11 +2055,8 @@ describe("ConnectionsSettings", () => {
     expect(control("switch", "Enable BiBCode Connect")).toBeDefined();
   });
 
-  it("confirms staged desktop exposure changes", async () => {
+  it("does not expose a manual desktop network-access control", () => {
     const bridge = stubDesktopWindow();
-    // Pin every null-initialised piece of dialog state to a pending value so
-    // the confirmation handlers run their apply paths.
-    h.stateOverrides.set(null, "network-accessible");
     h.networkAccessQuery.data = {
       serverExposureState: {
         mode: "local-only",
@@ -1702,40 +2068,15 @@ describe("ConnectionsSettings", () => {
       advertisedEndpoints: [],
     };
     const markup = render();
-    expect(markup).toContain("Enable network access?");
-
-    for (const entry of findControls("button", "Restart and enable")) {
-      if (typeof entry.props.onClick === "function") {
-        invoke(entry, "onClick");
-      }
-    }
-    for (const entry of findControls("button", "Restart and disable")) {
-      if (typeof entry.props.onClick === "function") {
-        invoke(entry, "onClick");
-      }
-    }
-    await flush();
-    expect(bridge.setServerExposureMode).toHaveBeenCalledWith("network-accessible");
-    expect(h.refreshDesktopNetworkAccessState).toHaveBeenCalled();
-
-    // Exposure change failures surface a toast.
-    h.toastAdd.mockClear();
-    bridge.setServerExposureMode.mockRejectedValueOnce(new Error("exposure failed"));
-    for (const entry of findControls("button", "Restart and enable")) {
-      if (typeof entry.props.onClick === "function") {
-        invoke(entry, "onClick");
-      }
-    }
-    await flush();
-    expect(h.toastAdd).toHaveBeenCalledWith(
-      expect.objectContaining({ title: "Could not update network access" }),
-    );
+    expect(markup).not.toContain("Enable network access");
+    expect(markup).not.toContain("Enable network access?");
+    expect(bridge.applyServerExposure).not.toHaveBeenCalled();
   });
 
   it("renders busy states with the endpoint rail expanded and SSH mode active", async () => {
     stubDesktopWindow();
     h.stateOverrides.set(false, true);
-    h.stateOverrides.set("remote", "ssh");
+    h.stateOverrides.set("pairing-code", "ssh");
     h.stateOverrides.set("443", "0");
     h.networkAccessQuery.data = {
       serverExposureState: {
@@ -1801,7 +2142,6 @@ describe("ConnectionsSettings", () => {
     expect(markup).toContain("Restarting…");
     expect(markup).toContain("Adding…");
     expect(markup).toContain("Revoking…");
-    expect(markup).toContain("Creating…");
 
     // The endpoint rail is expanded and renders per-endpoint actions.
     expect(markup).toContain("LAN");
@@ -1851,7 +2191,7 @@ describe("ConnectionsSettings", () => {
 
     render();
 
-    clickButton("Add environment");
+    clickButton("Add manually");
     await flush();
     expect(h.commands.connectPairing).toHaveBeenCalledWith({
       host: "pairhost.example.com",
@@ -1862,7 +2202,7 @@ describe("ConnectionsSettings", () => {
     // Failure path.
     h.toastAdd.mockClear();
     h.commands.connectPairing.mockResolvedValueOnce(failure(new Error("pairing rejected")));
-    clickButton("Add environment");
+    clickButton("Add manually");
     await flush();
     expect(h.toastAdd).toHaveBeenCalledWith(
       expect.objectContaining({ title: "Could not add backend", description: "pairing rejected" }),
@@ -1871,14 +2211,14 @@ describe("ConnectionsSettings", () => {
     // Interrupted commands stay silent.
     h.toastAdd.mockClear();
     h.commands.connectPairing.mockResolvedValueOnce(failure(new Error("interrupted"), true));
-    clickButton("Add environment");
+    clickButton("Add manually");
     await flush();
     expect(h.toastAdd).not.toHaveBeenCalled();
   });
 
   it("adds SSH backends with parsed manual targets", async () => {
     stubDesktopWindow();
-    h.stateOverrides.set("remote", "ssh");
+    h.stateOverrides.set("pairing-code", "ssh");
     h.stateOverrides.set("", "10.0.0.5:2222");
     h.wslQuery.data = null;
     h.sshHostsQuery.data = [];
@@ -1916,7 +2256,7 @@ describe("ConnectionsSettings", () => {
 
   it("rejects manual SSH targets with invalid ports", async () => {
     stubDesktopWindow();
-    h.stateOverrides.set("remote", "ssh");
+    h.stateOverrides.set("pairing-code", "ssh");
     h.stateOverrides.set("", "user@wsl-box");
     h.wslQuery.data = null;
     h.sshHostsQuery.data = [];
@@ -1930,7 +2270,7 @@ describe("ConnectionsSettings", () => {
 
   it("parses bracketed IPv6 SSH hosts", async () => {
     stubDesktopWindow();
-    h.stateOverrides.set("remote", "ssh");
+    h.stateOverrides.set("pairing-code", "ssh");
     h.stateOverrides.set("", "[2001:db8::1]:8443");
     h.wslQuery.data = null;
     h.sshHostsQuery.data = [];
@@ -2144,6 +2484,14 @@ describe("ConnectionsSettings", () => {
     invoke(findControls("button", "Connect")[0]!, "onClick");
     await flush();
     expect(h.commands.register).toHaveBeenCalledTimes(1);
+    expect(h.commands.register).toHaveBeenCalledWith({
+      _tag: "RelayConnectionRegistration",
+      target: {
+        _tag: "RelayConnectionTarget",
+        environmentId: EnvironmentId.make("environment-online"),
+        label: "Online Env",
+      },
+    });
     expect(h.toastAdd).toHaveBeenCalledWith(
       expect.objectContaining({ title: "Environment connected" }),
     );
@@ -2217,14 +2565,14 @@ describe("ConnectionsSettings", () => {
     const markup = render();
 
     expect(markup.match(/Connecting…/gu)).toHaveLength(2);
-    expect(markup).toContain("status:error");
+    expect(markup).toContain("Connection failed. Reason: Error: transport failed");
     expect(markup).not.toContain("Copy trace ID");
     expect(markup).toContain("SSH build-host.internal");
     expect(markup).toContain("BiBCode Connect");
     expect(control("switch", "Enable BiBCode Connect").props.disabled).toBe(true);
   });
 
-  it("renders each network reachability fallback and toggles endpoint details", async () => {
+  it("renders every available network endpoint row", () => {
     installMountedDesktopWindow();
     const exposureState = {
       mode: "network-accessible",
@@ -2233,36 +2581,6 @@ describe("ConnectionsSettings", () => {
       tailscaleServeEnabled: false,
       tailscaleServePort: 443,
     };
-    h.networkAccessQuery.data = {
-      serverExposureState: exposureState,
-      advertisedEndpoints: [],
-    };
-
-    let markup = render();
-    expect(markup).toContain("Reachable at https://desktop.example.com");
-
-    h.networkAccessQuery.data = {
-      serverExposureState: {
-        ...exposureState,
-        endpointUrl: null,
-        advertisedHost: "desktop.lan",
-      },
-      advertisedEndpoints: [],
-    };
-    markup = render();
-    expect(markup).toContain("Pairing links use desktop.lan");
-
-    h.networkAccessQuery.data = {
-      serverExposureState: {
-        ...exposureState,
-        endpointUrl: null,
-        advertisedHost: null,
-      },
-      advertisedEndpoints: [],
-    };
-    markup = render();
-    expect(markup).toContain("Exposed on all interfaces.");
-
     h.networkAccessQuery.data = {
       serverExposureState: exposureState,
       advertisedEndpoints: [
@@ -2279,24 +2597,9 @@ describe("ConnectionsSettings", () => {
         }),
       ],
     };
-    const container = await mountConnections();
-    const detailsToggle = Array.from(container.querySelectorAll("button")).find(
-      (button) => button.textContent?.includes("+1") === true,
-    );
-    expect(detailsToggle).toBeDefined();
-    expect(detailsToggle?.getAttribute("aria-expanded")).toBe("false");
-    expect(container.textContent).toContain("http://192.168.1.20:5133");
-    expect(container.textContent).not.toContain("http://192.168.1.21:5133");
-
-    await click(detailsToggle!);
-    expect(detailsToggle?.getAttribute("aria-expanded")).toBe("true");
-    expect(detailsToggle?.textContent).toContain("Hide");
-    expect(container.textContent).toContain("http://192.168.1.21:5133");
-
-    await click(detailsToggle!);
-    expect(detailsToggle?.getAttribute("aria-expanded")).toBe("false");
-    expect(detailsToggle?.textContent).toContain("+1");
-    expect(container.textContent).not.toContain("http://192.168.1.21:5133");
+    const markup = render();
+    expect(markup).toContain("http://192.168.1.20:5133");
+    expect(markup).toContain("http://192.168.1.21:5133");
   });
 
   it("shows a skeleton while the first relay refresh is in flight", () => {
@@ -2318,5 +2621,57 @@ describe("ConnectionsSettings", () => {
     const markup = render();
     expect(markup).toContain("No saved remote environments");
     expect(markup).toContain("connect one from BiBCode Connect");
+  });
+
+  it("shows version, compatibility, and transport metadata for a saved server", () => {
+    stubBrowserWindow();
+    const environmentId = EnvironmentId.make("env-presentation");
+    h.compatVerdicts.set(environmentId, { kind: "legacy" });
+    h.environments = [
+      {
+        environmentId,
+        label: "AI-SERVER",
+        relayManaged: false,
+        serverConfig: {
+          environment: {
+            serverVersion: "1.4.2",
+            capabilities: { remoteUpdateControl: false },
+          },
+        },
+        connection: { phase: "connected", error: null, traceId: null },
+        entry: {
+          target: { _tag: "BearerConnectionTarget", connectionId: "bearer:env-presentation" },
+          profile: Option.some({ _tag: "BearerConnectionProfile", hostKey: null }),
+        },
+      },
+    ];
+
+    const markup = render();
+    expect(markup).toContain("AI-SERVER");
+    expect(markup).toContain("BiBCode v1.4.2");
+    expect(markup).toContain("Limited compatibility");
+    expect(markup).toContain("Unencrypted");
+  });
+
+  it("shows Status unavailable after a failed probe without a cached descriptor", () => {
+    stubBrowserWindow();
+    const environmentId = EnvironmentId.make("env-unavailable");
+    h.environments = [
+      {
+        environmentId,
+        label: "LAB",
+        relayManaged: false,
+        serverConfig: null,
+        connection: { phase: "error", error: "connect ECONNREFUSED", traceId: null },
+        entry: {
+          target: { _tag: "BearerConnectionTarget", connectionId: "bearer:env-unavailable" },
+          profile: Option.none(),
+        },
+      },
+    ];
+
+    const markup = render();
+    expect(markup).toContain("Status unavailable");
+    expect(markup).toContain("Connection failed. Reason: connect ECONNREFUSED");
   });
 });

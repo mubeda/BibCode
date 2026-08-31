@@ -15,11 +15,15 @@ import {
   AuthAdministrativeScopes,
   AuthBrowserSessionRequest,
   AuthBrowserSessionResult,
+  AuthCancelPairingOfferInput,
   AuthClientSession,
   AuthCreatePairingCredentialInput,
+  AuthCreatePairingOfferInput,
   AuthEnvironmentScope,
   AuthEnvironmentScopes,
   AuthPairingCredentialResult,
+  AuthPairingOfferResult,
+  AuthShareStateResult,
   AuthPairingLink,
   AuthRevokeClientSessionInput,
   AuthRevokePairingLinkInput,
@@ -31,6 +35,7 @@ import {
 import {
   AuthClientSessionRevokeResult,
   AuthOtherClientSessionsRevokeResult,
+  AuthPairingOfferCancellationResult,
   AuthPairingLinkRevokeResult,
   EnvironmentAuthInvalidError,
   EnvironmentHttpApi,
@@ -88,6 +93,30 @@ const authRouteContract = [
     requestContentTypes: ["application/json"],
     successStatuses: [200],
     errorStatuses: [400, 401, 403, 500],
+  },
+  {
+    name: "pairingOffer",
+    method: "POST",
+    path: "/api/auth/pairing-offer",
+    requestContentTypes: ["application/json"],
+    successStatuses: [200],
+    errorStatuses: [400, 401, 403, 500],
+  },
+  {
+    name: "cancelPairingOffer",
+    method: "POST",
+    path: "/api/auth/pairing-offer/cancel",
+    requestContentTypes: ["application/json"],
+    successStatuses: [200],
+    errorStatuses: [400, 401, 403, 500],
+  },
+  {
+    name: "shareState",
+    method: "GET",
+    path: "/api/auth/share-state",
+    requestContentTypes: [],
+    successStatuses: [200],
+    errorStatuses: [401, 403, 500],
   },
   {
     name: "pairingLinks",
@@ -300,11 +329,16 @@ const namedSchemas = {
   AuthClientSession,
   AuthClientSessionList,
   AuthClientSessionRevokeResult,
+  AuthCancelPairingOfferInput,
   AuthCreatePairingCredentialInput,
+  AuthCreatePairingOfferInput,
   AuthEnvironmentScope,
   AuthEnvironmentScopes,
   AuthOtherClientSessionsRevokeResult,
   AuthPairingCredentialResult,
+  AuthPairingOfferResult,
+  AuthPairingOfferCancellationResult,
+  AuthShareStateResult,
   AuthPairingLink,
   AuthPairingLinkList,
   AuthPairingLinkRevokeResult,
@@ -359,6 +393,15 @@ const expectedSamples = {
     request: "requests/pairing-create.json",
     success: "responses/pairing-create.json",
   },
+  pairingOffer: {
+    request: "requests/pairing-offer.json",
+    success: "responses/pairing-offer.json",
+  },
+  cancelPairingOffer: {
+    request: "requests/pairing-offer-cancel.json",
+    success: "responses/pairing-offer-cancel.json",
+  },
+  shareState: { success: "responses/share-state.json" },
   pairingLinks: { success: "responses/pairing-list.json" },
   revokePairingLink: {
     request: "requests/pairing-revoke.json",
@@ -381,6 +424,8 @@ const expectedFixtures = [
   "requests/browser-session.json",
   "requests/client-revoke.json",
   "requests/pairing-create.json",
+  "requests/pairing-offer-cancel.json",
+  "requests/pairing-offer.json",
   "requests/pairing-revoke.json",
   "requests/token-form.txt",
   "responses/browser-session.json",
@@ -389,8 +434,11 @@ const expectedFixtures = [
   "responses/client-revoke.json",
   "responses/pairing-create.json",
   "responses/pairing-list.json",
+  "responses/pairing-offer-cancel.json",
+  "responses/pairing-offer.json",
   "responses/pairing-revoke.json",
   "responses/session.json",
+  "responses/share-state.json",
   "responses/token.json",
   "responses/websocket-ticket.json",
   "scopes.json",
@@ -408,6 +456,14 @@ const fixtureDecoders = new Map<string, (value: unknown) => unknown>([
   [
     "requests/pairing-create.json",
     Schema.decodeUnknownSync(Schema.toCodecJson(AuthCreatePairingCredentialInput)),
+  ],
+  [
+    "requests/pairing-offer.json",
+    Schema.decodeUnknownSync(Schema.toCodecJson(AuthCreatePairingOfferInput)),
+  ],
+  [
+    "requests/pairing-offer-cancel.json",
+    Schema.decodeUnknownSync(Schema.toCodecJson(AuthCancelPairingOfferInput)),
   ],
   [
     "requests/pairing-revoke.json",
@@ -434,6 +490,14 @@ const fixtureDecoders = new Map<string, (value: unknown) => unknown>([
     Schema.decodeUnknownSync(Schema.toCodecJson(AuthPairingCredentialResult)),
   ],
   [
+    "responses/pairing-offer.json",
+    Schema.decodeUnknownSync(Schema.toCodecJson(AuthPairingOfferResult)),
+  ],
+  [
+    "responses/pairing-offer-cancel.json",
+    Schema.decodeUnknownSync(Schema.toCodecJson(AuthPairingOfferCancellationResult)),
+  ],
+  [
     "responses/pairing-list.json",
     Schema.decodeUnknownSync(Schema.toCodecJson(AuthPairingLinkList)),
   ],
@@ -442,6 +506,10 @@ const fixtureDecoders = new Map<string, (value: unknown) => unknown>([
     Schema.decodeUnknownSync(Schema.toCodecJson(AuthPairingLinkRevokeResult)),
   ],
   ["responses/session.json", Schema.decodeUnknownSync(Schema.toCodecJson(AuthSessionState))],
+  [
+    "responses/share-state.json",
+    Schema.decodeUnknownSync(Schema.toCodecJson(AuthShareStateResult)),
+  ],
   ["responses/token.json", Schema.decodeUnknownSync(Schema.toCodecJson(AuthAccessTokenResult))],
   [
     "responses/websocket-ticket.json",
@@ -488,7 +556,7 @@ describe("Rust auth HTTP fixture parity", () => {
     const manifest = JSON.parse(NodeFS.readFileSync(manifestPath, "utf8")) as Manifest;
     expect(manifest.formatVersion).toBe(1);
     expect(manifest.routes).toEqual(currentRoutes());
-    expect(manifest.routes).toHaveLength(10);
+    expect(manifest.routes).toHaveLength(13);
     expect(
       manifest.routes.map(({ name, method, path, requestContentTypes, successes, errors }) => ({
         name,

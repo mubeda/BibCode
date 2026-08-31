@@ -24,12 +24,16 @@ const BASE_ENVIRONMENT = {
   },
   serverVersion: "0.0.0-test",
   storageInstanceId: null,
+  remoteUpdateSupport: null,
+  remoteProtocolVersion: 1,
+  minCompatibleRemoteProtocol: 1,
   capabilities: {
     repositoryIdentity: true,
     worktreeCatalog: false,
     worktreeCatalogRefreshReason: false,
     vcsStatusSummary: false,
     activityProtocolVersion: null,
+    remoteUpdateControl: false,
   },
 } satisfies ExecutionEnvironmentDescriptor;
 
@@ -94,12 +98,16 @@ describe("environmentBootstrap", () => {
       },
       serverVersion: "0.0.0-test",
       storageInstanceId: "0d93cbea-f237-4f37-8829-d816667be35f",
+      remoteUpdateSupport: null,
+      remoteProtocolVersion: 1,
+      minCompatibleRemoteProtocol: 1,
       capabilities: {
         repositoryIdentity: true,
         worktreeCatalog: false,
         worktreeCatalogRefreshReason: false,
         vcsStatusSummary: false,
         activityProtocolVersion: null,
+        remoteUpdateControl: false,
       },
     } satisfies ExecutionEnvironmentDescriptor;
     writePrimaryEnvironmentDescriptor(descriptor);

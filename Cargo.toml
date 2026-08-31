@@ -19,6 +19,7 @@ getrandom = "0.4.3"
 gtk = "0.18"
 hmac = "0.13.0"
 httpdate = "1.0.3"
+if-addrs = "0.15.0"
 junction = "2.0.0"
 libc = "0.2"
 mime_guess = "2.0.5"
@@ -50,14 +51,17 @@ semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11.0"
+snow = "0.10"
 sysinfo = "0.39.6"
 subtle = "2.6.1"
 bibcode-server = { path = "apps/server" }
 tauri = { version = "2.11.5", features = ["unstable", "devtools", "image-png"] }
 tauri-build = { version = "2.6.3", features = [] }
+tauri-plugin-deep-link = "2"
 tauri-plugin-dialog = "2.7.2"
 tauri-plugin-opener = "2.5.4"
 tauri-plugin-shell = "2.3.5"
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 tauri-plugin-store = "2.4.4"
 tauri-plugin-updater = "2.10.1"
 tauri-plugin-wdio = "=1.2.0"

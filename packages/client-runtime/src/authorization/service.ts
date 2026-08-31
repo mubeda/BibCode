@@ -2,12 +2,17 @@ import { EnvironmentId, type ExecutionEnvironmentDescriptor } from "@bibcode/con
 import type { RelayManagedEndpoint } from "@bibcode/contracts/relay";
 import {
   exchangeRemoteDpopAccessToken,
+  e2eeSocketUrl,
   type RemoteEnvironmentAuthError,
   resolveRemoteDpopWebSocketConnectionUrl,
   resolveRemoteWebSocketConnectionUrl,
 } from "./remote.ts";
 import { environmentMismatchError, mapRemoteEnvironmentError } from "../connection/errors.ts";
-import { ConnectionBlockedError, type ConnectionAttemptError } from "../connection/model.ts";
+import {
+  ConnectionBlockedError,
+  type ConnectionAttemptError,
+  type PreparedE2eeChannel,
+} from "../connection/model.ts";
 import { fetchRemoteEnvironmentDescriptor } from "../environment/descriptor.ts";
 import { environmentEndpointUrl } from "../environment/endpoint.ts";
 import * as ClientCapabilities from "../platform/capabilities.ts";
@@ -36,7 +41,8 @@ export interface AuthorizedRemoteEnvironment {
   readonly descriptor: ExecutionEnvironmentDescriptor;
   readonly httpBaseUrl: string;
   readonly socketUrl: string;
-  readonly httpAuthorization: PreparedHttpAuthorization;
+  readonly httpAuthorization: PreparedHttpAuthorization | null;
+  readonly e2ee: PreparedE2eeChannel | null;
 }
 
 export class RemoteEnvironmentAuthorization extends Context.Service<
@@ -47,6 +53,7 @@ export class RemoteEnvironmentAuthorization extends Context.Service<
       readonly httpBaseUrl: string;
       readonly wsBaseUrl: string;
       readonly bearerToken: string;
+      readonly hostKey?: string | null;
     }) => Effect.Effect<AuthorizedRemoteEnvironment, ConnectionAttemptError>;
     readonly authorizeDpop: (input: {
       readonly expectedEnvironmentId: EnvironmentId;
@@ -110,6 +117,7 @@ export const make = Effect.gen(function* () {
       readonly httpBaseUrl: string;
       readonly wsBaseUrl: string;
       readonly bearerToken: string;
+      readonly hostKey?: string | null;
     }) {
       const descriptor = yield* fetchDescriptor(input.httpBaseUrl).pipe(
         Effect.provideService(HttpClient.HttpClient, httpClient),
@@ -120,24 +128,38 @@ export const make = Effect.gen(function* () {
           actual: descriptor.environmentId,
         });
       }
-      const socketUrl = yield* resolveRemoteWebSocketConnectionUrl({
-        wsBaseUrl: input.wsBaseUrl,
-        httpBaseUrl: input.httpBaseUrl,
-        bearerToken: input.bearerToken,
-      }).pipe(
-        Effect.mapError(mapRemoteEnvironmentError),
-        Effect.provideService(HttpClient.HttpClient, httpClient),
-      );
+      const e2ee =
+        input.hostKey === undefined || input.hostKey === null
+          ? null
+          : {
+              hostKey: input.hostKey,
+              auth: { kind: "bearer" as const, credential: input.bearerToken },
+            };
+      const socketUrl =
+        e2ee === null
+          ? yield* resolveRemoteWebSocketConnectionUrl({
+              wsBaseUrl: input.wsBaseUrl,
+              httpBaseUrl: input.httpBaseUrl,
+              bearerToken: input.bearerToken,
+            }).pipe(
+              Effect.mapError(mapRemoteEnvironmentError),
+              Effect.provideService(HttpClient.HttpClient, httpClient),
+            )
+          : e2eeSocketUrl(input.wsBaseUrl);
       return {
         descriptor,
         environmentId: descriptor.environmentId,
         label: descriptor.label,
         httpBaseUrl: input.httpBaseUrl,
         socketUrl,
-        httpAuthorization: {
-          _tag: "Bearer" as const,
-          token: input.bearerToken,
-        },
+        httpAuthorization:
+          e2ee === null
+            ? {
+                _tag: "Bearer" as const,
+                token: input.bearerToken,
+              }
+            : null,
+        e2ee,
       };
     },
   );
@@ -226,6 +248,7 @@ export const make = Effect.gen(function* () {
               _tag: "Dpop" as const,
               accessToken: cached.value.accessToken,
             },
+            e2ee: null,
           };
         }
         if (cachedConnection.failure._tag === "ConnectionBlockedError") {
@@ -307,6 +330,7 @@ export const make = Effect.gen(function* () {
           _tag: "Dpop" as const,
           accessToken: token.accessToken,
         },
+        e2ee: null,
       };
     },
   );

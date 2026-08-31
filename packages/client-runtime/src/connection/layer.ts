@@ -21,7 +21,9 @@ const driverLayer = ConnectionDriver.layer.pipe(
 
 const registryLayer = EnvironmentRegistry.layer.pipe(Layer.provide(driverLayer));
 
-const onboardingLayer = ConnectionOnboarding.layer.pipe(Layer.provide(registryLayer));
+const onboardingLayer = ConnectionOnboarding.layer.pipe(
+  Layer.provide(Layer.mergeAll(registryLayer, RpcSession.layer)),
+);
 
 const connectionServicesLayer = Layer.mergeAll(
   registryLayer,

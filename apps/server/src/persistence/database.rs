@@ -374,6 +374,10 @@ pub enum PersistenceError {
     CommitRejected,
     #[error("command receipt ownership changed before finalization ({0})")]
     CommandReceiptConflict(String),
+    #[error("pairing offer principal capacity exceeded")]
+    PairingOfferPrincipalCapacityExceeded,
+    #[error("pairing offer idempotency capacity exceeded")]
+    PairingOfferGlobalCapacityExceeded,
     #[error("SQLite online backup {0}")]
     BackupStopped(String),
     #[error("the SQLite worker is no longer available")]

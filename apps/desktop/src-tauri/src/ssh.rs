@@ -36,6 +36,12 @@ const SSH_CHILD_REAPER_CAPACITY: usize = 32;
 const REMOTE_PORT_SCAN_WINDOW: u16 = 200;
 const REMOTE_READY_TIMEOUT_MS: u64 = 15_000;
 const REMOTE_REUSE_READY_TIMEOUT_MS: u64 = 2_000;
+/// Remote command that mints the one-time SSH bootstrap pairing credential.
+/// Must target the same `--base-dir` the launch script passes to `serve`
+/// (`SERVER_HOME`), and must print a JSON line with a `credential` field —
+/// see `parse_remote_pairing_credential`.
+pub const REMOTE_PAIRING_ISSUE_COMMAND: &str =
+    r#"bibcode pairing issue --base-dir "$HOME/.bibcode" --json"#;
 const ASKPASS_POSIX_SCRIPT: &str = r#"#!/bin/sh
 if [ "${BIBCODE_SSH_AUTH_SECRET+x}" = "x" ]; then
   printf "%s\n" "$BIBCODE_SSH_AUTH_SECRET"
@@ -1374,7 +1380,7 @@ async fn issue_remote_pairing_token(
     args.extend([
         "sh".to_string(),
         "-lc".to_string(),
-        "bibcode auth pairing create --base-dir \"$HOME/.bibcode\" --json".to_string(),
+        REMOTE_PAIRING_ISSUE_COMMAND.to_string(),
     ]);
     let mut command = Command::new(ssh_command());
     configure_background_command(&mut command);

@@ -624,14 +624,18 @@ export const PersistedSavedEnvironmentRecordSchema = Schema.Struct({
 export type PersistedSavedEnvironmentRecord = typeof PersistedSavedEnvironmentRecordSchema.Type;
 
 export type DesktopServerExposureMode = "local-only" | "network-accessible";
+export type DesktopServerExposureManagement = "native" | "external";
 
 export const DesktopServerExposureModeSchema = Schema.Literals([
   "local-only",
   "network-accessible",
 ]);
+export const DesktopServerExposureManagementSchema = Schema.Literals(["native", "external"]);
 
 export interface DesktopServerExposureState {
   mode: DesktopServerExposureMode;
+  configuredMode: DesktopServerExposureMode;
+  management: DesktopServerExposureManagement;
   endpointUrl: string | null;
   advertisedHost: string | null;
   tailscaleServeEnabled: boolean;
@@ -640,6 +644,8 @@ export interface DesktopServerExposureState {
 
 export const DesktopServerExposureStateSchema = Schema.Struct({
   mode: DesktopServerExposureModeSchema,
+  configuredMode: DesktopServerExposureModeSchema,
+  management: DesktopServerExposureManagementSchema,
   endpointUrl: Schema.NullOr(Schema.String),
   advertisedHost: Schema.NullOr(Schema.String),
   tailscaleServeEnabled: Schema.Boolean,
@@ -1183,6 +1189,9 @@ export const DesktopPreviewAutomationWaitForInputSchema = Schema.Struct({
   input: PreviewAutomationWaitForInput,
 });
 
+/** Tauri deep-link plugin runtime event carrying the opened URLs. */
+export const DESKTOP_DEEP_LINK_EVENT = "deep-link://new-url";
+
 export interface DesktopBridge {
   getHostMetadata?: () => Promise<DesktopBridgeHostMetadata>;
   getAppBranding: () => DesktopAppBranding | null;
@@ -1205,6 +1214,10 @@ export interface DesktopBridge {
   onProjectDataStatusChanged?: (
     listener: (event: DesktopProjectDataStatusChangedEvent) => void,
   ) => () => void;
+  /** URLs the OS handed to the app before the webview subscribed. */
+  getPendingDeepLinks?: () => Promise<ReadonlyArray<string>>;
+  /** Subscribe to bibcode:// URLs opened while the app is running. */
+  onDeepLink?: (listener: (urls: ReadonlyArray<string>) => void) => () => void;
   restoreProjectData?: (
     environmentId: string,
     backupId: string,
@@ -1232,7 +1245,7 @@ export interface DesktopBridge {
   onSshPasswordPrompt: (listener: (request: DesktopSshPasswordPromptRequest) => void) => () => void;
   resolveSshPasswordPrompt: (requestId: string, password: string | null) => Promise<void>;
   getServerExposureState: () => Promise<DesktopServerExposureState>;
-  setServerExposureMode: (mode: DesktopServerExposureMode) => Promise<DesktopServerExposureState>;
+  applyServerExposure: (desired: DesktopServerExposureMode) => Promise<DesktopServerExposureState>;
   setTailscaleServeEnabled: (input: {
     readonly enabled: boolean;
     readonly port?: number;

@@ -11,11 +11,14 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::orchestration::{ProviderTurnDelivery, TurnDeliveryState};
+use crate::{
+    auth::limits::{MAX_ACTIVE_PAIRING_OFFERS, MAX_ACTIVE_PAIRING_OFFERS_PER_PRINCIPAL},
+    orchestration::{ProviderTurnDelivery, TurnDeliveryState},
+};
 
 use super::{Database, PersistenceError, Result};
 
@@ -1042,7 +1045,370 @@ impl Repositories {
     }
 
     pub async fn create_auth_pairing_link(&self, row: AuthPairingLink) -> Result<()> {
-        self.database.call(move |connection| { connection.execute("INSERT INTO auth_pairing_links (id, credential, method, scopes, subject, label, proof_key_thumbprint, created_at, expires_at, consumed_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)", params![row.id,row.credential,row.method,encode_json(&row.scopes)?,row.subject,row.label,row.proof_key_thumbprint,row.created_at,row.expires_at])?; Ok(()) }).await
+        self.database
+            .call(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                insert_auth_pairing_link_on(&transaction, &row)?;
+                bump_auth_authority_revision_on(&transaction)?;
+                transaction.commit()?;
+                Ok(())
+            })
+            .await
+    }
+    pub async fn create_auth_pairing_link_with_offer(
+        &self,
+        row: AuthPairingLink,
+        offer: NewAuthPairingOffer,
+    ) -> Result<AuthPairingOfferReservation> {
+        self.database
+            .call(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let pruned = transaction.execute(
+                    "DELETE FROM auth_pairing_offer_idempotency WHERE expires_at <= ?",
+                    [&row.created_at],
+                )?;
+                let existing = transaction
+                    .query_row(
+                        PAIRING_OFFER_BY_KEY_SQL,
+                        params![row.created_at, offer.principal_id, offer.idempotency_key],
+                        decode_pairing_offer,
+                    )
+                    .optional()?;
+                if let Some(offer) = existing {
+                    let pairing = match &offer.pairing_id {
+                        Some(pairing_id) => transaction
+                            .query_row(
+                                &(PAIRING_SELECT.to_owned()
+                                    + " WHERE id = ? AND revoked_at IS NULL
+                                         AND consumed_at IS NULL AND expires_at > ?"),
+                                params![pairing_id, row.created_at],
+                                decode_pairing_link,
+                            )
+                            .optional()?,
+                        None => None,
+                    };
+                    if pruned > 0 {
+                        bump_auth_authority_revision_on(&transaction)?;
+                    }
+                    transaction.commit()?;
+                    return Ok(AuthPairingOfferReservation {
+                        offer,
+                        pairing,
+                        reserved: false,
+                    });
+                }
+                ensure_auth_pairing_offer_capacity_on(&transaction, &offer.principal_id)?;
+                insert_auth_pairing_link_on(&transaction, &row)?;
+                transaction.execute(
+                    "INSERT INTO auth_pairing_offer_idempotency (
+                        principal_id, idempotency_key, input_fingerprint, pairing_id,
+                        result_json, expires_at, cancelled_at
+                     ) VALUES (?, ?, ?, ?, NULL, ?, NULL)",
+                    params![
+                        offer.principal_id,
+                        offer.idempotency_key,
+                        offer.input_fingerprint,
+                        row.id,
+                        offer.expires_at,
+                    ],
+                )?;
+                let persisted = AuthPairingOffer {
+                    principal_id: offer.principal_id,
+                    idempotency_key: offer.idempotency_key,
+                    input_fingerprint: offer.input_fingerprint,
+                    pairing_id: Some(row.id.clone()),
+                    result: None,
+                    expires_at: offer.expires_at,
+                    cancelled_at: None,
+                };
+                bump_auth_authority_revision_on(&transaction)?;
+                transaction.commit()?;
+                Ok(AuthPairingOfferReservation {
+                    offer: persisted,
+                    pairing: Some(row),
+                    reserved: true,
+                })
+            })
+            .await
+    }
+    pub async fn complete_auth_pairing_offer(
+        &self,
+        principal_id: String,
+        idempotency_key: String,
+        result: Value,
+    ) -> Result<bool> {
+        self.database
+            .call(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let completed = transaction
+                    .query_row(
+                        "UPDATE auth_pairing_offer_idempotency SET result_json = ?
+                         WHERE principal_id = ? AND idempotency_key = ?
+                           AND cancelled_at IS NULL AND pairing_id IS NOT NULL
+                         RETURNING idempotency_key",
+                        params![encode_json(&result)?, principal_id, idempotency_key],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .is_some();
+                if completed {
+                    bump_auth_authority_revision_on(&transaction)?;
+                }
+                transaction.commit()?;
+                Ok(completed)
+            })
+            .await
+    }
+    pub async fn prune_and_list_active_auth_pairing_offers(
+        &self,
+        now: Timestamp,
+    ) -> Result<Vec<AuthPairingOffer>> {
+        self.database
+            .call(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let pruned = transaction.execute(
+                    "DELETE FROM auth_pairing_offer_idempotency WHERE expires_at <= ?",
+                    [&now],
+                )?;
+                let offers = collect(
+                    &transaction,
+                    PAIRING_OFFER_SELECT,
+                    [&now],
+                    decode_pairing_offer,
+                )?;
+                if pruned > 0 {
+                    bump_auth_authority_revision_on(&transaction)?;
+                }
+                transaction.commit()?;
+                Ok(offers)
+            })
+            .await
+    }
+    pub async fn load_auth_authority_snapshot(
+        &self,
+        now: Timestamp,
+    ) -> Result<AuthAuthoritySnapshot> {
+        self.database
+            .call(move |connection| {
+                let transaction = connection.transaction()?;
+                let revision = auth_authority_revision_on(&transaction)?;
+                let pairings = collect(
+                    &transaction,
+                    &(PAIRING_SELECT.to_owned()
+                        + " WHERE revoked_at IS NULL AND consumed_at IS NULL
+                             AND expires_at > ? ORDER BY created_at DESC, id DESC"),
+                    [&now],
+                    decode_pairing_link,
+                )?;
+                let offers = collect(
+                    &transaction,
+                    PAIRING_OFFER_SELECT,
+                    [&now],
+                    decode_pairing_offer,
+                )?;
+                let sessions = collect(
+                    &transaction,
+                    &(AUTH_SESSION_SELECT.to_owned()
+                        + " WHERE revoked_at IS NULL AND expires_at > ?
+                             ORDER BY issued_at DESC, session_id DESC"),
+                    [&now],
+                    decode_auth_session,
+                )?;
+                let next_expiry_at = transaction.query_row(
+                    "SELECT MIN(expires_at) FROM (
+                        SELECT MIN(expires_at) AS expires_at FROM auth_pairing_links
+                         WHERE revoked_at IS NULL AND consumed_at IS NULL AND expires_at > ?
+                        UNION ALL
+                        SELECT MIN(expires_at) AS expires_at FROM auth_pairing_offer_idempotency
+                         WHERE expires_at > ?
+                        UNION ALL
+                        SELECT MIN(expires_at) AS expires_at FROM auth_sessions
+                         WHERE revoked_at IS NULL AND expires_at > ?
+                     )",
+                    params![now, now, now],
+                    |row| row.get::<_, Option<String>>(0),
+                )?;
+                transaction.commit()?;
+                Ok(AuthAuthoritySnapshot {
+                    revision,
+                    next_expiry_at,
+                    pairings,
+                    offers,
+                    sessions,
+                })
+            })
+            .await
+    }
+    pub async fn auth_authority_revision(&self) -> Result<u64> {
+        self.database
+            .call(|connection| auth_authority_revision_on(connection))
+            .await
+    }
+    pub async fn prune_and_get_active_auth_pairing_offer(
+        &self,
+        principal_id: String,
+        idempotency_key: String,
+        now: Timestamp,
+    ) -> Result<Option<AuthPairingOfferReservation>> {
+        self.database
+            .call(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let pruned = transaction.execute(
+                    "DELETE FROM auth_pairing_offer_idempotency WHERE expires_at <= ?",
+                    [&now],
+                )?;
+                let offer = transaction
+                    .query_row(
+                        PAIRING_OFFER_BY_KEY_SQL,
+                        params![now, principal_id, idempotency_key],
+                        decode_pairing_offer,
+                    )
+                    .optional()?;
+                let authority = match offer {
+                    Some(offer) => {
+                        let pairing = match &offer.pairing_id {
+                            Some(pairing_id) => transaction
+                                .query_row(
+                                    &(PAIRING_SELECT.to_owned()
+                                        + " WHERE id = ? AND revoked_at IS NULL
+                                             AND consumed_at IS NULL AND expires_at > ?"),
+                                    params![pairing_id, now],
+                                    decode_pairing_link,
+                                )
+                                .optional()?,
+                            None => None,
+                        };
+                        Some(AuthPairingOfferReservation {
+                            offer,
+                            pairing,
+                            reserved: false,
+                        })
+                    }
+                    None => None,
+                };
+                if pruned > 0 {
+                    bump_auth_authority_revision_on(&transaction)?;
+                }
+                transaction.commit()?;
+                Ok(authority)
+            })
+            .await
+    }
+    /// Atomically abandons a reservation whose pairing grant was committed but
+    /// whose encoded offer was never recorded. Completed offers, cancellation
+    /// tombstones, and conflicting request fingerprints are left untouched.
+    pub async fn recover_pending_auth_pairing_offer(
+        &self,
+        principal_id: String,
+        idempotency_key: String,
+        input_fingerprint: String,
+        now: Timestamp,
+    ) -> Result<Option<String>> {
+        self.database
+            .call(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let pruned = transaction.execute(
+                    "DELETE FROM auth_pairing_offer_idempotency WHERE expires_at <= ?",
+                    [&now],
+                )?;
+                let pending_pairing_id = transaction
+                    .query_row(
+                        "SELECT pairing_id FROM auth_pairing_offer_idempotency
+                         WHERE principal_id = ? AND idempotency_key = ?
+                           AND input_fingerprint = ? AND pairing_id IS NOT NULL
+                           AND result_json IS NULL AND cancelled_at IS NULL
+                           AND expires_at > ?",
+                        params![principal_id, idempotency_key, input_fingerprint, now],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                if let Some(pairing_id) = &pending_pairing_id {
+                    transaction.execute(
+                        "UPDATE auth_pairing_links SET revoked_at = ?
+                         WHERE id = ? AND revoked_at IS NULL AND consumed_at IS NULL",
+                        params![now, pairing_id],
+                    )?;
+                    transaction.execute(
+                        "DELETE FROM auth_pairing_offer_idempotency
+                         WHERE principal_id = ? AND idempotency_key = ?
+                           AND input_fingerprint = ? AND pairing_id = ?
+                           AND result_json IS NULL AND cancelled_at IS NULL",
+                        params![principal_id, idempotency_key, input_fingerprint, pairing_id],
+                    )?;
+                }
+                if pruned > 0 || pending_pairing_id.is_some() {
+                    bump_auth_authority_revision_on(&transaction)?;
+                }
+                transaction.commit()?;
+                Ok(pending_pairing_id)
+            })
+            .await
+    }
+    pub async fn cancel_auth_pairing_offer(
+        &self,
+        principal_id: String,
+        idempotency_key: String,
+        cancelled_at: Timestamp,
+        expires_at: Timestamp,
+    ) -> Result<AuthPairingOfferCancellation> {
+        self.database
+            .call(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                transaction.execute(
+                    "DELETE FROM auth_pairing_offer_idempotency WHERE expires_at <= ?",
+                    [&cancelled_at],
+                )?;
+                let existing_pairing_id = transaction
+                    .query_row(
+                        "SELECT pairing_id FROM auth_pairing_offer_idempotency
+                         WHERE principal_id = ? AND idempotency_key = ?",
+                        params![principal_id, idempotency_key],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()?;
+                if existing_pairing_id.is_none() {
+                    ensure_auth_pairing_offer_capacity_on(&transaction, &principal_id)?;
+                }
+                let pairing_id = existing_pairing_id.flatten();
+                let revoked = if let Some(pairing_id) = &pairing_id {
+                    transaction
+                        .query_row(
+                            "UPDATE auth_pairing_links SET revoked_at = ?
+                             WHERE id = ? AND revoked_at IS NULL AND consumed_at IS NULL
+                             RETURNING id",
+                            params![cancelled_at, pairing_id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()?
+                        .is_some()
+                } else {
+                    false
+                };
+                transaction.execute(
+                    "INSERT INTO auth_pairing_offer_idempotency (
+                        principal_id, idempotency_key, input_fingerprint, pairing_id,
+                        result_json, expires_at, cancelled_at
+                     ) VALUES (?, ?, '', NULL, NULL, ?, ?)
+                     ON CONFLICT (principal_id, idempotency_key) DO UPDATE SET
+                        input_fingerprint = '', pairing_id = NULL, result_json = NULL,
+                        expires_at = excluded.expires_at, cancelled_at = excluded.cancelled_at",
+                    params![principal_id, idempotency_key, expires_at, cancelled_at],
+                )?;
+                bump_auth_authority_revision_on(&transaction)?;
+                transaction.commit()?;
+                Ok(AuthPairingOfferCancellation {
+                    pairing_id,
+                    revoked,
+                })
+            })
+            .await
     }
     pub async fn consume_auth_pairing_link(
         &self,
@@ -1053,14 +1419,20 @@ impl Repositories {
     ) -> Result<Option<AuthPairingLink>> {
         self.database
             .call(move |connection| {
-                connection
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let pairing = transaction
                     .query_row(
                         PAIRING_RETURNING_SQL,
                         params![consumed_at, credential, now, proof_key_thumbprint],
                         decode_pairing_link,
                     )
-                    .optional()
-                    .map_err(Into::into)
+                    .optional()?;
+                if pairing.is_some() {
+                    bump_auth_authority_revision_on(&transaction)?;
+                }
+                transaction.commit()?;
+                Ok(pairing)
             })
             .await
     }
@@ -1077,7 +1449,9 @@ impl Repositories {
     ) -> Result<bool> {
         self.database
             .call(move |connection| {
-                Ok(connection
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let revoked = transaction
                     .query_row(
                         "UPDATE auth_pairing_links SET revoked_at = ? \
                  WHERE id = ? AND revoked_at IS NULL AND consumed_at IS NULL \
@@ -1086,7 +1460,12 @@ impl Repositories {
                         |row| row.get::<_, String>(0),
                     )
                     .optional()?
-                    .is_some())
+                    .is_some();
+                if revoked {
+                    bump_auth_authority_revision_on(&transaction)?;
+                }
+                transaction.commit()?;
+                Ok(revoked)
             })
             .await
     }
@@ -1109,7 +1488,13 @@ impl Repositories {
     }
 
     pub async fn create_auth_session(&self, row: NewAuthSession) -> Result<()> {
-        self.database.call(move |connection| { connection.execute("INSERT INTO auth_sessions (session_id, subject, scopes, method, client_label, client_ip_address, client_user_agent, client_device_type, client_os, client_browser, issued_at, expires_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)", params![row.session_id,row.subject,encode_json(&row.scopes)?,row.method,row.client.label,row.client.ip_address,row.client.user_agent,row.client.device_type,row.client.os,row.client.browser,row.issued_at,row.expires_at])?; Ok(()) }).await
+        self.database.call(move |connection| {
+            let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute("INSERT INTO auth_sessions (session_id, subject, scopes, method, client_label, client_ip_address, client_user_agent, client_device_type, client_os, client_browser, issued_at, expires_at, revoked_at, reach, off_host, delivery_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)", params![row.session_id,row.subject,encode_json(&row.scopes)?,row.method,row.client.label,row.client.ip_address,row.client.user_agent,row.client.device_type,row.client.os,row.client.browser,row.issued_at,row.expires_at,row.reach,row.off_host,row.delivery_state.as_str()])?;
+            bump_auth_authority_revision_on(&transaction)?;
+            transaction.commit()?;
+            Ok(())
+        }).await
     }
     pub async fn get_auth_session(&self, session_id: String) -> Result<Option<AuthSession>> {
         self.database
@@ -1135,7 +1520,9 @@ impl Repositories {
     ) -> Result<bool> {
         self.database
             .call(move |connection| {
-                Ok(connection
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let revoked = transaction
                     .query_row(
                         "UPDATE auth_sessions SET revoked_at = ? \
                  WHERE session_id = ? AND revoked_at IS NULL \
@@ -1144,7 +1531,127 @@ impl Repositories {
                         |row| row.get::<_, String>(0),
                     )
                     .optional()?
-                    .is_some())
+                    .is_some();
+                if revoked {
+                    bump_auth_authority_revision_on(&transaction)?;
+                }
+                transaction.commit()?;
+                Ok(revoked)
+            })
+            .await
+    }
+    pub async fn confirm_pending_auth_session(
+        &self,
+        session_id: String,
+        now: Timestamp,
+    ) -> Result<bool> {
+        self.database
+            .call(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let confirmed = transaction
+                    .query_row(
+                        "UPDATE auth_sessions SET delivery_state = ?
+                         WHERE session_id = ? AND revoked_at IS NULL AND expires_at > ?
+                           AND delivery_state = ?
+                         RETURNING session_id",
+                        params![
+                            AuthSessionDeliveryState::Active.as_str(),
+                            session_id,
+                            now,
+                            AuthSessionDeliveryState::PendingPairing.as_str()
+                        ],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .is_some();
+                let available = if confirmed {
+                    bump_auth_authority_revision_on(&transaction)?;
+                    true
+                } else {
+                    transaction
+                        .query_row(
+                            "SELECT 1 FROM auth_sessions
+                             WHERE session_id = ? AND revoked_at IS NULL AND expires_at > ?
+                               AND delivery_state = ?",
+                            params![session_id, now, AuthSessionDeliveryState::Active.as_str()],
+                            |_| Ok(()),
+                        )
+                        .optional()?
+                        .is_some()
+                };
+                transaction.commit()?;
+                Ok(available)
+            })
+            .await
+    }
+    pub async fn revoke_pending_auth_session(
+        &self,
+        session_id: String,
+        revoked_at: Timestamp,
+    ) -> Result<bool> {
+        self.database
+            .call(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let revoked = transaction
+                    .query_row(
+                        "UPDATE auth_sessions SET revoked_at = ?
+                         WHERE session_id = ? AND revoked_at IS NULL
+                           AND delivery_state = ?
+                         RETURNING session_id",
+                        params![
+                            revoked_at,
+                            session_id,
+                            AuthSessionDeliveryState::PendingPairing.as_str()
+                        ],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .is_some();
+                if revoked {
+                    bump_auth_authority_revision_on(&transaction)?;
+                }
+                transaction.commit()?;
+                Ok(revoked)
+            })
+            .await
+    }
+    /// Revokes unconfirmed pairing sessions issued at or before the cutoff.
+    /// The age gate keeps a sweep from racing a confirmation that is still in
+    /// flight on a live connection.
+    pub async fn revoke_pending_auth_sessions(
+        &self,
+        revoked_at: Timestamp,
+        issued_at_or_before: Timestamp,
+    ) -> Result<Vec<String>> {
+        self.database
+            .call(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let revoked = {
+                    let mut statement = transaction.prepare(
+                        "UPDATE auth_sessions SET revoked_at = ?
+                         WHERE revoked_at IS NULL AND delivery_state = ?
+                           AND issued_at <= ?
+                         RETURNING session_id",
+                    )?;
+                    statement
+                        .query_map(
+                            params![
+                                revoked_at,
+                                AuthSessionDeliveryState::PendingPairing.as_str(),
+                                issued_at_or_before
+                            ],
+                            |row| row.get(0),
+                        )?
+                        .collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                if !revoked.is_empty() {
+                    bump_auth_authority_revision_on(&transaction)?;
+                }
+                transaction.commit()?;
+                Ok(revoked)
             })
             .await
     }
@@ -1153,14 +1660,33 @@ impl Repositories {
         current_session_id: String,
         revoked_at: Timestamp,
     ) -> Result<Vec<String>> {
-        self.database.call(move |connection| { let mut statement = connection.prepare("UPDATE auth_sessions SET revoked_at = ? WHERE session_id <> ? AND revoked_at IS NULL RETURNING session_id")?; statement.query_map(params![revoked_at,current_session_id], |row| row.get(0))?.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into) }).await
+        self.database.call(move |connection| {
+            let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let revoked = {
+                let mut statement = transaction.prepare("UPDATE auth_sessions SET revoked_at = ? WHERE session_id <> ? AND revoked_at IS NULL RETURNING session_id")?;
+                statement.query_map(params![revoked_at,current_session_id], |row| row.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            if !revoked.is_empty() {
+                bump_auth_authority_revision_on(&transaction)?;
+            }
+            transaction.commit()?;
+            Ok(revoked)
+        }).await
     }
     pub async fn set_auth_session_last_connected_at(
         &self,
         session_id: String,
         last_connected_at: Timestamp,
     ) -> Result<()> {
-        self.database.call(move |connection| { connection.execute("UPDATE auth_sessions SET last_connected_at = ? WHERE session_id = ? AND revoked_at IS NULL", params![last_connected_at,session_id])?; Ok(()) }).await
+        self.database.call(move |connection| {
+            let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let changed = transaction.execute("UPDATE auth_sessions SET last_connected_at = ? WHERE session_id = ? AND revoked_at IS NULL", params![last_connected_at,session_id])?;
+            if changed > 0 {
+                bump_auth_authority_revision_on(&transaction)?;
+            }
+            transaction.commit()?;
+            Ok(())
+        }).await
     }
 
     async fn delete(&self, sql: &'static str, id: String) -> Result<()> {
@@ -1451,6 +1977,44 @@ pub struct AuthPairingLink {
     pub expires_at: Timestamp,
     pub consumed_at: Option<Timestamp>,
     pub revoked_at: Option<Timestamp>,
+    pub reach: Option<String>,
+    pub off_host: Option<bool>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NewAuthPairingOffer {
+    pub principal_id: String,
+    pub idempotency_key: String,
+    pub input_fingerprint: String,
+    pub expires_at: Timestamp,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AuthPairingOffer {
+    pub principal_id: String,
+    pub idempotency_key: String,
+    pub input_fingerprint: String,
+    pub pairing_id: Option<String>,
+    pub result: Option<Value>,
+    pub expires_at: Timestamp,
+    pub cancelled_at: Option<Timestamp>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AuthPairingOfferReservation {
+    pub offer: AuthPairingOffer,
+    pub pairing: Option<AuthPairingLink>,
+    pub reserved: bool,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AuthAuthoritySnapshot {
+    pub revision: u64,
+    pub next_expiry_at: Option<Timestamp>,
+    pub pairings: Vec<AuthPairingLink>,
+    pub offers: Vec<AuthPairingOffer>,
+    pub sessions: Vec<AuthSession>,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthPairingOfferCancellation {
+    pub pairing_id: Option<String>,
+    pub revoked: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AuthSessionClient {
@@ -1461,6 +2025,33 @@ pub struct AuthSessionClient {
     pub os: Option<String>,
     pub browser: Option<String>,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuthSessionDeliveryState {
+    Active,
+    PendingPairing,
+}
+
+impl AuthSessionDeliveryState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::PendingPairing => "pending-pairing",
+        }
+    }
+}
+
+impl rusqlite::types::FromSql for AuthSessionDeliveryState {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        match value.as_str()? {
+            "active" => Ok(Self::Active),
+            "pending-pairing" => Ok(Self::PendingPairing),
+            value => Err(rusqlite::types::FromSqlError::Other(
+                format!("invalid auth session delivery state: {value}").into(),
+            )),
+        }
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NewAuthSession {
     pub session_id: String,
@@ -1470,6 +2061,9 @@ pub struct NewAuthSession {
     pub client: AuthSessionClient,
     pub issued_at: Timestamp,
     pub expires_at: Timestamp,
+    pub reach: Option<String>,
+    pub off_host: Option<bool>,
+    pub delivery_state: AuthSessionDeliveryState,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AuthSession {
@@ -1482,6 +2076,9 @@ pub struct AuthSession {
     pub expires_at: Timestamp,
     pub last_connected_at: Option<Timestamp>,
     pub revoked_at: Option<Timestamp>,
+    pub reach: Option<String>,
+    pub off_host: Option<bool>,
+    pub delivery_state: AuthSessionDeliveryState,
 }
 
 const THREAD_SELECT: &str = "SELECT thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, unresolved_delivery_state, unresolved_delivery_detail, deleted_at FROM projection_threads";
@@ -1489,9 +2086,11 @@ const MESSAGE_SELECT: &str = "SELECT message_id, thread_id, turn_id, role, text,
 const PROVIDER_TURN_DELIVERY_SELECT: &str = "SELECT command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at FROM provider_turn_outbox";
 const TURN_SELECT: &str = "SELECT thread_id, turn_id, pending_message_id, source_proposed_plan_thread_id, source_proposed_plan_id, assistant_message_id, state, requested_at, started_at, completed_at, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json FROM projection_turns";
 const TURN_UPSERT_SQL: &str = "INSERT INTO projection_turns (thread_id, turn_id, pending_message_id, source_proposed_plan_thread_id, source_proposed_plan_id, assistant_message_id, state, requested_at, started_at, completed_at, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (thread_id, turn_id) DO UPDATE SET pending_message_id=excluded.pending_message_id, source_proposed_plan_thread_id=excluded.source_proposed_plan_thread_id, source_proposed_plan_id=excluded.source_proposed_plan_id, assistant_message_id=excluded.assistant_message_id, state=excluded.state, requested_at=excluded.requested_at, started_at=excluded.started_at, completed_at=excluded.completed_at, checkpoint_turn_count=excluded.checkpoint_turn_count, checkpoint_ref=excluded.checkpoint_ref, checkpoint_status=excluded.checkpoint_status, checkpoint_files_json=excluded.checkpoint_files_json";
-const PAIRING_SELECT: &str = "SELECT id, credential, method, scopes, subject, label, proof_key_thumbprint, created_at, expires_at, consumed_at, revoked_at FROM auth_pairing_links";
-const PAIRING_RETURNING_SQL: &str = "UPDATE auth_pairing_links SET consumed_at = ? WHERE credential = ? AND revoked_at IS NULL AND consumed_at IS NULL AND expires_at > ? AND (proof_key_thumbprint IS NULL OR proof_key_thumbprint = ?) RETURNING id, credential, method, scopes, subject, label, proof_key_thumbprint, created_at, expires_at, consumed_at, revoked_at";
-const AUTH_SESSION_SELECT: &str = "SELECT session_id, subject, scopes, method, client_label, client_ip_address, client_user_agent, client_device_type, client_os, client_browser, issued_at, expires_at, last_connected_at, revoked_at FROM auth_sessions";
+const PAIRING_SELECT: &str = "SELECT id, credential, method, scopes, subject, label, proof_key_thumbprint, created_at, expires_at, consumed_at, revoked_at, reach, off_host FROM auth_pairing_links";
+const PAIRING_OFFER_SELECT: &str = "SELECT principal_id, idempotency_key, input_fingerprint, pairing_id, result_json, expires_at, cancelled_at FROM auth_pairing_offer_idempotency WHERE expires_at > ? ORDER BY expires_at, principal_id, idempotency_key";
+const PAIRING_OFFER_BY_KEY_SQL: &str = "SELECT principal_id, idempotency_key, input_fingerprint, pairing_id, result_json, expires_at, cancelled_at FROM auth_pairing_offer_idempotency WHERE expires_at > ? AND principal_id = ? AND idempotency_key = ?";
+const PAIRING_RETURNING_SQL: &str = "UPDATE auth_pairing_links SET consumed_at = ? WHERE credential = ? AND revoked_at IS NULL AND consumed_at IS NULL AND expires_at > ? AND (proof_key_thumbprint IS NULL OR proof_key_thumbprint = ?) RETURNING id, credential, method, scopes, subject, label, proof_key_thumbprint, created_at, expires_at, consumed_at, revoked_at, reach, off_host";
+const AUTH_SESSION_SELECT: &str = "SELECT session_id, subject, scopes, method, client_label, client_ip_address, client_user_agent, client_device_type, client_os, client_browser, issued_at, expires_at, last_connected_at, revoked_at, reach, off_host, delivery_state FROM auth_sessions";
 
 fn collect<T, P>(
     connection: &rusqlite::Connection,
@@ -1506,6 +2105,78 @@ where
     Ok(statement
         .query_map(params, decode)?
         .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+fn insert_auth_pairing_link_on(connection: &Connection, row: &AuthPairingLink) -> Result<()> {
+    connection.execute(
+        "INSERT INTO auth_pairing_links (
+            id, credential, method, scopes, subject, label, proof_key_thumbprint,
+            created_at, expires_at, consumed_at, revoked_at, reach, off_host
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)",
+        params![
+            row.id,
+            row.credential,
+            row.method,
+            encode_json(&row.scopes)?,
+            row.subject,
+            row.label,
+            row.proof_key_thumbprint,
+            row.created_at,
+            row.expires_at,
+            row.reach,
+            row.off_host,
+        ],
+    )?;
+    Ok(())
+}
+fn auth_authority_revision_on(connection: &Connection) -> Result<u64> {
+    let revision = connection.query_row(
+        "SELECT revision FROM auth_authority_state WHERE singleton = 1",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    u64::try_from(revision)
+        .map_err(|_| PersistenceError::Corrupt("auth authority revision is negative".to_owned()))
+}
+fn bump_auth_authority_revision_on(connection: &Connection) -> Result<()> {
+    let changed = connection.execute(
+        "UPDATE auth_authority_state SET revision = revision + 1
+         WHERE singleton = 1 AND revision < 9223372036854775807",
+        [],
+    )?;
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err(PersistenceError::Corrupt(
+            "auth authority revision is unavailable or exhausted".to_owned(),
+        ))
+    }
+}
+fn ensure_auth_pairing_offer_capacity_on(
+    connection: &Connection,
+    principal_id: &str,
+) -> Result<()> {
+    let principal_count = connection.query_row(
+        "SELECT COUNT(*) FROM auth_pairing_offer_idempotency WHERE principal_id = ?",
+        [principal_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if principal_count
+        >= i64::try_from(MAX_ACTIVE_PAIRING_OFFERS_PER_PRINCIPAL)
+            .expect("pairing offer principal quota fits i64")
+    {
+        return Err(PersistenceError::PairingOfferPrincipalCapacityExceeded);
+    }
+    let global_count = connection.query_row(
+        "SELECT COUNT(*) FROM auth_pairing_offer_idempotency",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if global_count
+        >= i64::try_from(MAX_ACTIVE_PAIRING_OFFERS).expect("pairing offer global quota fits i64")
+    {
+        return Err(PersistenceError::PairingOfferGlobalCapacityExceeded);
+    }
+    Ok(())
 }
 fn encode_json(value: &Value) -> Result<String> {
     serde_json::to_string(value).map_err(|error| {
@@ -1828,6 +2499,22 @@ fn decode_pairing_link(row: &Row<'_>) -> rusqlite::Result<AuthPairingLink> {
         expires_at: row.get(8)?,
         consumed_at: row.get(9)?,
         revoked_at: row.get(10)?,
+        reach: row.get(11)?,
+        off_host: row.get(12)?,
+    })
+}
+fn decode_pairing_offer(row: &Row<'_>) -> rusqlite::Result<AuthPairingOffer> {
+    Ok(AuthPairingOffer {
+        principal_id: row.get(0)?,
+        idempotency_key: row.get(1)?,
+        input_fingerprint: row.get(2)?,
+        pairing_id: row.get(3)?,
+        result: row
+            .get::<_, Option<String>>(4)?
+            .map(|value| decode_json(value, "result_json"))
+            .transpose()?,
+        expires_at: row.get(5)?,
+        cancelled_at: row.get(6)?,
     })
 }
 fn decode_auth_session(row: &Row<'_>) -> rusqlite::Result<AuthSession> {
@@ -1848,5 +2535,8 @@ fn decode_auth_session(row: &Row<'_>) -> rusqlite::Result<AuthSession> {
         expires_at: row.get(11)?,
         last_connected_at: row.get(12)?,
         revoked_at: row.get(13)?,
+        reach: row.get(14)?,
+        off_host: row.get(15)?,
+        delivery_state: row.get(16)?,
     })
 }

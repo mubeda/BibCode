@@ -1,4 +1,5 @@
 export * from "./catalog.ts";
+export * from "./compat.ts";
 export * as Connectivity from "./connectivity.ts";
 export * as CredentialStore from "./credentialStore.ts";
 export {
@@ -9,6 +10,7 @@ export {
 export * from "./errors.ts";
 export * as Connection from "./layer.ts";
 export * from "./model.ts";
+export * from "./pairingAdd.ts";
 export {
   type BearerConnectionUpdateInput,
   ConnectionOnboarding,

@@ -18,11 +18,33 @@ describe("hostedPairing", () => {
     const url = new URL("https://app.example.test/pair?host=100.64.1.2:3773&token=ABCD1234");
 
     expect(readHostedPairingRequest(url)).toEqual({
-      host: "100.64.1.2:3773",
+      httpBaseUrl: "https://100.64.1.2:3773/",
+      displayHost: "100.64.1.2:3773",
       token: "ABCD1234",
       label: "",
     });
     expect(hasHostedPairingRequest(url)).toBe(true);
+  });
+
+  it("rejects misleading userinfo and normalizes IDNs before display", () => {
+    for (const host of [
+      "https://trusted.example@attacker.example:8080",
+      "https://user:password@example.test",
+    ]) {
+      const url = new URL("https://app.example.test/pair#token=ABCD1234");
+      url.searchParams.set("host", host);
+      expect(readHostedPairingRequest(url), host).toBeNull();
+      expect(hasHostedPairingRequest(url), host).toBe(false);
+    }
+
+    const url = new URL("https://app.example.test/pair#token=ABCD1234");
+    url.searchParams.set("host", "https://аpple.com");
+    expect(readHostedPairingRequest(url)).toEqual({
+      httpBaseUrl: "https://xn--pple-43d.com/",
+      displayHost: "xn--pple-43d.com",
+      token: "ABCD1234",
+      label: "",
+    });
   });
 
   it("prefers hash tokens so generated hosted links do not put credentials in search params", () => {

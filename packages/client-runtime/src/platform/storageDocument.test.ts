@@ -1,5 +1,6 @@
 import { EnvironmentId } from "@bibcode/contracts";
 import { describe, expect, it } from "@effect/vitest";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import * as TokenStore from "../authorization/tokenStore.ts";
@@ -21,6 +22,7 @@ import {
   EMPTY_CONNECTION_CATALOG_DOCUMENT,
   registerConnectionInCatalog,
   removeConnectionFromCatalog,
+  removeConnectionRegistrationFromCatalog,
 } from "./storageDocument.ts";
 
 const ENVIRONMENT_ID = EnvironmentId.make("environment-1");
@@ -36,6 +38,7 @@ const BEARER_PROFILE = new BearerConnectionProfile({
   label: BEARER_TARGET.label,
   httpBaseUrl: "https://remote.example.test",
   wsBaseUrl: "wss://remote.example.test",
+  hostKey: null,
 });
 const BEARER_CREDENTIAL = new BearerConnectionCredential({
   token: "bearer-token",
@@ -53,8 +56,32 @@ const REMOTE_TOKEN = new TokenStore.RemoteDpopAccessToken({
   dpopThumbprint: "thumbprint",
 });
 const decodeConnectionCatalogDocument = Schema.decodeUnknownSync(ConnectionCatalogDocument);
+const decodeBearerConnectionProfile = Schema.decodeUnknownSync(BearerConnectionProfile);
 
 describe("ConnectionCatalogDocument", () => {
+  it("normalizes absent and blank legacy bearer host keys to null", () => {
+    const rawProfile = {
+      _tag: "BearerConnectionProfile",
+      connectionId: "bearer:env-1",
+      environmentId: "env-1",
+      label: "Legacy",
+      httpBaseUrl: "http://192.168.1.20:3773/",
+      wsBaseUrl: "ws://192.168.1.20:3773/",
+    };
+
+    for (const hostKey of [undefined, null, "", " \t "] as const) {
+      const decoded = decodeBearerConnectionProfile({
+        ...rawProfile,
+        ...(hostKey === undefined ? {} : { hostKey }),
+      });
+      expect(decoded.hostKey, String(hostKey)).toBeNull();
+    }
+
+    expect(decodeBearerConnectionProfile({ ...rawProfile, hostKey: "host-key" }).hostKey).toBe(
+      "host-key",
+    );
+  });
+
   it("decodes a schema-v1 document without accepted storage identities", () => {
     const oldDocument = {
       schemaVersion: 1,
@@ -153,6 +180,61 @@ describe("ConnectionCatalogDocument", () => {
     expect(removeConnectionFromCatalog(registered, BEARER_TARGET)).toEqual(
       EMPTY_CONNECTION_CATALOG_DOCUMENT,
     );
+  });
+
+  it("does not conditionally remove a replacement registration", () => {
+    const first = new BearerConnectionRegistration({
+      target: BEARER_TARGET,
+      profile: BEARER_PROFILE,
+      credential: BEARER_CREDENTIAL,
+    });
+    const replacement = new BearerConnectionRegistration({
+      target: new BearerConnectionTarget({
+        ...BEARER_TARGET,
+        label: "Replacement",
+      }),
+      profile: new BearerConnectionProfile({
+        ...BEARER_PROFILE,
+        label: "Replacement",
+        httpBaseUrl: "https://replacement.example.test",
+        wsBaseUrl: "wss://replacement.example.test",
+      }),
+      credential: new BearerConnectionCredential({ token: "replacement-token" }),
+    });
+    const document = registerConnectionInCatalog(
+      registerConnectionInCatalog(EMPTY_CONNECTION_CATALOG_DOCUMENT, first),
+      replacement,
+    );
+
+    expect(removeConnectionRegistrationFromCatalog(document, first)).toEqual({
+      document,
+      removed: false,
+      current: { target: replacement.target, profile: Option.some(replacement.profile) },
+    });
+  });
+
+  it("conditionally removes the exact registration", () => {
+    const registration = new BearerConnectionRegistration({
+      target: BEARER_TARGET,
+      profile: BEARER_PROFILE,
+      credential: BEARER_CREDENTIAL,
+    });
+    const document = registerConnectionInCatalog(
+      {
+        ...EMPTY_CONNECTION_CATALOG_DOCUMENT,
+        remoteDpopTokens: [REMOTE_TOKEN],
+      },
+      registration,
+    );
+
+    expect(removeConnectionRegistrationFromCatalog(document, registration)).toEqual({
+      document: {
+        ...EMPTY_CONNECTION_CATALOG_DOCUMENT,
+        remoteDpopTokens: [REMOTE_TOKEN],
+      },
+      removed: true,
+      current: null,
+    });
   });
 
   it("persists the normalized SSH profile beside its target", () => {

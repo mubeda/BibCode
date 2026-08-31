@@ -1,6 +1,7 @@
 import * as Schema from "effect/Schema";
 
 const PAIRING_TOKEN_PARAM = "token";
+const PAIRING_CODE_PARAM = "code";
 const HOSTED_PAIRING_HOST_PARAM = "host";
 const HOSTED_PAIRING_LABEL_PARAM = "label";
 const SUPPORTED_REMOTE_BACKEND_PROTOCOLS = new Set(["http:", "https:", "ws:", "wss:"]);
@@ -155,6 +156,9 @@ const normalizeRemoteBaseUrl = (
   }
 
   const url = parseRemoteBaseUrl(normalizedInput, source);
+  if (url.username.length > 0 || url.password.length > 0) {
+    throw new RemoteBackendUrlInvalidError({ source });
+  }
   url.pathname = "/";
   url.search = "";
   url.hash = "";
@@ -194,7 +198,8 @@ export interface ResolvedRemotePairingTarget {
 }
 
 export interface HostedPairingRequest {
-  readonly host: string;
+  readonly httpBaseUrl: string;
+  readonly displayHost: string;
   readonly token: string;
   readonly label: string;
 }
@@ -212,11 +217,20 @@ export const getPairingTokenFromUrl = (url: URL): string | null => {
 export const stripPairingTokenFromUrl = (url: URL): URL => {
   const next = new URL(url.toString());
   const hashParams = readHashParams(next);
-  if (hashParams.has(PAIRING_TOKEN_PARAM)) {
-    hashParams.delete(PAIRING_TOKEN_PARAM);
+  let hashChanged = false;
+  for (const secret of [PAIRING_TOKEN_PARAM, PAIRING_CODE_PARAM]) {
+    if (hashParams.has(secret)) {
+      hashParams.delete(secret);
+      hashChanged = true;
+    }
+  }
+  if (hashChanged) {
     next.hash = hashParams.toString();
   }
   next.searchParams.delete(PAIRING_TOKEN_PARAM);
+  // The one-time pairing code embeds the token; it must not survive in the
+  // address bar or history either.
+  next.searchParams.delete(PAIRING_CODE_PARAM);
   return next;
 };
 
@@ -236,8 +250,17 @@ export const readHostedPairingRequest = (url: URL): HostedPairingRequest | null 
     return null;
   }
 
+  let normalizedHost: URL;
+  try {
+    normalizedHost = normalizeRemoteBaseUrl(host, "hosted-pairing-host");
+  } catch {
+    return null;
+  }
+  const httpBaseUrl = toHttpBaseUrl(normalizedHost);
+
   return {
-    host,
+    httpBaseUrl,
+    displayHost: new URL(httpBaseUrl).host,
     token,
     label,
   };
@@ -261,17 +284,24 @@ export const resolveRemotePairingTarget = (input: {
         protocol: url.protocol,
       });
     }
+    if (url.username.length > 0 || url.password.length > 0) {
+      throw new RemotePairingUrlInvalidError({});
+    }
     const hostedPairingRequest = readHostedPairingRequest(url);
     if (hostedPairingRequest) {
-      const hostedBackendUrl = normalizeRemoteBaseUrl(
-        hostedPairingRequest.host,
-        "hosted-pairing-host",
-      );
+      const hostedBackendUrl = new URL(hostedPairingRequest.httpBaseUrl);
       return {
         credential: hostedPairingRequest.token,
         httpBaseUrl: toHttpBaseUrl(hostedBackendUrl),
         wsBaseUrl: toWsBaseUrl(hostedBackendUrl),
       };
+    }
+    const hostedHost = url.searchParams.get(HOSTED_PAIRING_HOST_PARAM)?.trim() ?? "";
+    if (hostedHost && getPairingTokenFromUrl(url)) {
+      // readHostedPairingRequest already rejected this hosted-form URL, so
+      // normalization must throw the precise typed backend URL error here.
+      normalizeRemoteBaseUrl(hostedHost, "hosted-pairing-host");
+      throw new RemotePairingUrlInvalidError({});
     }
 
     const credential = getPairingTokenFromUrl(url) ?? "";

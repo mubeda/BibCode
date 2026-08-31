@@ -52,22 +52,588 @@ Contracts live in
 [`remoteAccess.ts`](../../packages/contracts/src/remoteAccess.ts), and URL
 normalization lives in
 [`advertisedEndpoint.ts`](../../packages/shared/src/advertisedEndpoint.ts).
-Desktop discovery can add host capabilities such as Tailscale endpoints. The
-user's default is persisted by stable endpoint ID rather than by array position.
+Desktop discovery can add host capabilities such as Tailscale endpoints. One
+native address classifier owns usable-unicast admission, advertised reachability,
+safe labeling, and default eligibility. Interface enumeration and default-route
+ranking both call that classifier, so unspecified, loopback, multicast, and
+link-local addresses fail closed. Until the desktop listener is dual-stack,
+discovery emits IPv4 candidates only. It normalizes IPv4-mapped IPv6,
+deduplicates by address, and ranks a usable private default-route address before
+CGNAT/Tailscale and other private addresses. The native bridge publishes usable
+interface observations even while its listener is loopback-only; those
+off-host observations report `status: unavailable` until the native listener is
+wide. This lets the renderer distinguish a private default route from a
+public-only or non-default topology before it requests privileged mutation.
+Native-managed automatic sharing accepts only a private or CGNAT default-route
+observation. Public interface observations are never actionable in a
+native-managed topology, including after an unrelated transition has made the
+listener wide. A public-only host must use a custom address backed by an
+externally managed `bibcode serve` listener or reverse proxy rather than asking
+the native exposure command to infer public-listener authority. Public
+endpoints in an externally managed topology are never preselected and require
+an explicit public-address and firewall warning. Tailscale CLI discovery checks
+the packaged Windows, macOS, and Linux install paths before `PATH` and emits only
+usable private IPv4 candidates. Stable endpoint IDs include the address and
+port, and the user's default is persisted by stable ID rather than array
+position.
 
 ## Access methods
 
 ### Direct bearer access
 
-Manual pairing produces a one-time bootstrap credential and advertised
-endpoint. The onboarding flow saves the endpoint profile separately from the
-credential, exchanges the bootstrap at `/oauth/token`, verifies the returned
-environment identity, and obtains a WebSocket ticket from
-`/api/auth/websocket-ticket`.
+Legacy manual pairing produces a one-time bootstrap credential and advertised
+endpoint. A profile without a pinned host key saves the endpoint separately
+from the credential, exchanges the bootstrap at `/oauth/token`, verifies the
+returned environment identity, and obtains a WebSocket ticket from
+`/api/auth/websocket-ticket`. This legacy route remains available for existing
+profiles, but its connection presentation is `unencrypted` with guidance to
+pair again.
 
 Pairing links may carry a bootstrap in the URL fragment. Fragments are not sent
 to the hosting web server. Compatibility parsing accepts older query-form links,
 but newly generated links use the fragment form.
+
+### Direct-connection E2EE
+
+New direct pairings pin a server identity and carry RPC over an encrypted
+WebSocket. The server generates one static X25519 responder key on first use and
+stores the 64-byte private-then-public record as the secret
+`host-identity-x25519` (`host-identity-x25519.bin` in the filesystem-backed
+store). Public-key encoding is unpadded base64url of the raw 32 bytes. The public
+key is distributed only in pairing codes; the unauthenticated descriptor never
+publishes it.
+
+The encrypted route is `/ws-e2ee` and uses
+`Noise_NK_25519_ChaChaPoly_SHA256`. The client initiator pins the responder
+static key from the pairing code. Both handshake messages require empty
+payloads. After the handshake, every binary WebSocket message is one Noise
+transport ciphertext containing one record:
+
+- byte `0x00` marks the final chunk and byte `0x01` marks a continuation;
+- a chunk is at most 65,518 bytes, keeping ciphertext within Noise's 65,535-byte
+  message limit; and
+- reassembled logical messages are capped at 64 MiB and at 2,048 records, and
+  are exactly the bytes consumed by the unchanged RPC protocol. Empty
+  continuations are invalid, so record-object overhead is bounded independently
+  of byte count.
+
+Browser clients set the E2EE socket's `binaryType` to `arraybuffer` before the
+RPC socket adapter attaches. Ciphertext records therefore enter the Noise
+decryptor in WebSocket delivery order without asynchronous `Blob` conversion.
+
+The first logical message authenticates inside the encrypted channel. A new
+device sends `{"type":"e2ee_auth","pairing":"<one-time token>"}` with no
+confirmation field: the **server** decides delivery from the grant it
+consumes, so a client cannot opt out of the durable-delivery guard through the
+wire message. Only a successful exchange consumes that token; a wrong host or
+failed handshake does not reach the exchange. An off-host grant creates a
+`pending-pairing` session and consumes the token before the encrypted
+credential reply is delivered; an on-host or legacy grant is delivered
+immediately as `active`. Pending-session compensation is armed before the
+SQLite issuance job is queued, because a queued database call can outlive
+cancellation of its awaiting future. A delivery guard then owns that session
+until in-channel confirmation. Capacity binding, encoding, encryption, or
+socket-write failures schedule
+best-effort revocation of the undelivered session. An age-gated sweep — at
+startup and every minute — durably
+revokes pending sessions older than the two-minute confirmation grace, so a
+crash-orphaned unconfirmed credential cannot hold the host's desired exposure
+wide until the next restart while a live confirmation is never raced. After
+delivery, verification or client-persistence failure closes the channel and
+the same guard revokes the delivered-but-unconfirmed session without replacing
+the original error. Confirmation owns its database activation through
+cached-state publication and delivery-latch publication even if cancellation
+drops the RPC handler future. The delivery guard therefore cannot observe an
+active database row whose in-memory state and latch still appear pending.
+The one-time token remains consumed, so the user generates a new offer, but the
+pending credential cannot reconnect as steady-state authority. The server
+returns `e2ee_authenticated` with the minted string credential,
+`environmentId`, optional `storageInstanceId`, and
+`pairingConfirmationRequired: true` exactly when the grant was off-host. The
+reply flag is the client's only confirmation signal: when it is present the
+client must call `auth.confirmPairing` on the same channel before the
+credential authenticates anywhere; when it is absent the credential is already
+active — which is also how a new client interoperates with servers that
+predate the confirmation flow. A returning device sends
+`{"type":"e2ee_auth","bearer":"<stored credential>"}` and receives an
+`e2ee_authenticated` acknowledgement. Invalid credentials receive
+`e2ee_error/unauthorized`; malformed protocol receives `e2ee_error/protocol`;
+both paths close the socket.
+
+Sessions minted by this route have the signed token claim `transport: "e2ee"`.
+Plain WebSocket and authenticated plain-HTTP surfaces reject that credential;
+tokens without a transport claim decode as `plain` for compatibility. Client
+preparation also sets `httpAuthorization` to `null` for a pinned profile, so an
+E2EE-only credential is not exposed as a usable HTTP authorization capability.
+
+Pre-auth work is bounded independently of normal RPC traffic. The complete
+upgrade, handshake, and authentication sequence has one 10-second deadline;
+the WebSocket upgrade caps both frames and reassembled WebSocket messages at
+65,535 bytes before application buffering; the authentication logical message
+is capped at 64 KiB; at most 32 unauthenticated E2EE connections may be in
+flight. A non-loopback socket peer may hold at most four leases, consumes a
+token bucket with burst eight and one-attempt-per-second refill, and shares a
+network bucket with its IPv4 `/24` or IPv6 `/64`; one network may consume at
+most 16 of the global leases. Buckets that already hold a connection may only
+grow while global usage stays at or below the 24-lease soft cap; the eight
+slots above it are reserved for a bucket's first connection, so a fresh
+legitimate device still finds room while a small number of hostile networks
+saturate their own buckets (a wide-prefix holder taking the reserve with many
+distinct first-connections remains bounded only by the hard global cap — the
+documented residual). Loopback sockets are the local trust boundary: when one
+carries `X-Forwarded-For`, the last entry — the hop appended by that
+implicitly trusted local reverse proxy — keys per-peer and per-network
+admission as if the client had connected directly, an unparseable value falls
+into the strict unspecified bucket, and remote sockets never have forwarding
+headers honored. Loopback peers without the header form the
+trusted-local-forwarder class, exempt from the public exact-peer and subnet
+caps but still subject to the global limit and to a fleet-sized token bucket
+(burst 32, refill 8 per second). Missing peer information uses one strict
+unspecified bucket. Peer and network entries expire and remain hard-capped;
+for every non-loopback socket the kernel peer address is authoritative. Non-empty handshake
+payloads fail the protocol. Failure to decrypt the first handshake message
+closes with code 4403, which a pinned initiator classifies as a host-identity
+mismatch. Encrypted writers iterate one plaintext record at a time, encrypt it,
+release the channel lock, and await its bounded write before producing the next
+record. The receiver reuses one bounded decrypt scratch buffer. Transport cipher
+nonces are monotonically increasing 64-bit counters. V1 does not rekey:
+exhaustion or any AEAD/protocol error fails closed and requires a new connection.
+
+Authenticated receivers additionally share a process-wide 128 MiB plaintext
+budget. Each authenticated session ID has a 64 MiB aggregate budget across all
+of its sockets, and each connection retains its separate 64 MiB offender limit.
+The process and principal tiers use cancellable fit-first byte admission:
+capacity pressure waits until capacity, cancellation, or session shutdown and
+is not itself a protocol violation. Every non-empty decrypted chunk holds its
+permits through assembly, decoding, authorization, and dispatch. The permits
+are released before a spawned request handler completes, so a long-running RPC
+does not retain reassembly capacity. Zero-byte chunks retain no permit. Every
+logical inbound message additionally carries one absolute, size-derived
+assembly deadline established at its first record — the base five-second
+timeout plus one second per 64 KiB received, mirroring the outbound writer's
+floor — and byte admission for every record, including the first, is bounded
+by it. A compliant sender at or above the floor rate is never cut off, while
+neither a dribbling sender nor pool pressure from other principals can park a
+pump or the global pool indefinitely: capacity waits fail at the message's own
+deadline instead of inheriting whatever sliver remains of a progress window.
+Once a continuation starts an incomplete logical message, the next record must
+also be received, decrypted, validated, and charged within the resetting
+10-second progress deadline, which continues to cut idle senders early. An
+idle authenticated connection between messages has no assembly deadline.
+Session teardown joins in-flight request handlers under a bounded deadline and
+aborts stragglers, so a handler that ignores cancellation cannot pin the
+session or the budget permits riding on it. No channel mutex or second
+ciphertext-frame read is held while capacity waits.
+
+Established-socket admission is likewise partitioned. At most 64 E2EE sockets
+are established process-wide, and one authenticated session ID may own at most
+32 of them; unsafe no-auth development sockets remain subject to the global cap.
+The global reservation is taken before credential exchange, then bound to the
+authenticated session ID (the persisted session, not the human subject). The
+resulting lease owns both permits until the
+session ends, so handshake/authentication rejection, timeout, socket error,
+session cancellation, revocation, nonce or AEAD failure, shutdown, and ordinary
+close all return capacity through the same drop path. The principal budget map
+holds only weak entries and prunes inactive identities while admitting a later
+connection.
+
+Established E2EE RPC output has a process-wide 128 MiB plaintext budget and a
+64 MiB per-connection budget. The generic session encodes each response
+exactly once, drops the JSON value tree, then admits the exact encoded length
+through one process-wide combined fit-first queue, reserving both byte permits
+in one critical section — the memory resident during the admission wait is
+precisely the bytes that will be charged. It never sleeps while retaining only
+one tier. (Guarded activity responses still reserve an upper bound covering
+their possible fallback substitution and shrink after preparing.) The queued
+frame owns those permits
+through Noise record encryption and every successful or failed WebSocket
+write;
+generic queue capacity therefore cannot hide additional plaintext. Unary
+results, stream chunks, handler-error terminals, RPC ping/pong control
+messages, protocol errors, and defects use the same admission path. Interrupts
+bypass byte admission through a non-blocking control lane, and when a budgeted
+terminal or unary response loses its admission deadline the session delivers an
+explicit unbudgeted `RpcOutboundAdmissionError` terminal instead of ending the
+request silently; both bypasses are bounded by the 64-request in-flight cap at
+one small control message per request. WebSocket-level ping/pong frames are
+transport control and carry no RPC plaintext. A response larger than the
+64 MiB connection cap fails the session closed immediately; otherwise both
+connection and process byte admission plus the bounded 64-entry response queue
+share one absolute five-second admission deadline. Granting is push-based:
+waiters sleep on their own grant channel and every release runs one fit-first
+pass, so admission work per release is one queue scan rather than one scan per
+waiter. Fit-first grants every queued request that fits in arrival order, and
+once the front waiter has waited one second, released process capacity
+accumulates in a reservation for it until it is granted — sustained small
+traffic therefore cannot starve a large response, and the resulting pause for
+younger waiters is bounded by the front waiter's own size rather than being an
+open-ended blockade. Cancellation removes the waiter and refunds both a
+concurrently granted reservation and any accumulated aged-head reservation
+exactly once. Each Noise record then receives a fresh five-second
+WebSocket-sink progress deadline, while the whole logical message is bounded
+by five seconds plus one second per 64 KiB of plaintext. Records remain
+serialized, and the pump retains its one-second join bound.
+Dropping a queued, cancelled, rejected, serialization-failed, encryption-failed,
+or write-failed frame releases its single permit set without double accounting.
+
+Together, these limits preserve the 65,535-byte ciphertext record ceiling,
+65,518-byte plaintext chunk size, and 64 MiB logical-message contract.
+Established and inbound admission are principal-partitioned so one session
+cannot consume all of either resource. Outbound admission instead bounds
+aggregate retained plaintext; it is intentionally process/per-connection rather
+than principal-partitioned. Fit-first admission prevents large queued
+reservations from blocking smaller messages that can make progress, while the
+aged-head reservation guarantees the reverse: a large response eventually wins
+even under sustained small traffic. A large reservation that never fits fails
+at the shared admission deadline with an explicit terminal.
+
+The pairing payload is base64url-unpadded JSON in
+`bibcode://pair?code=<payload>` with version, endpoint, display name, one-time
+token, host public key, reach intent, and persistent storage identity. An
+authenticated caller with `access:write` mints it through
+`POST /api/auth/pairing-offer`. `Idempotency-Key` makes identical retries return
+the original offer and rejects reuse with different input. Entries are scoped
+to the authenticated principal and persisted in
+`auth_pairing_offer_idempotency`. The pairing grant and a pending principal/key
+reservation commit in one SQLite transaction; the encoded result completes that
+reservation before the HTTP response is sent. After a crash in the pending
+window, a matching retry under the issuance lock atomically revokes the
+incomplete grant, removes the reservation, and returns the key to fresh
+issuance. A fingerprint mismatch still fails and a cancellation tombstone still
+blocks issuance.
+Active results, pending reservations, and tombstones hydrate before capacity
+checks and remain under bounded, expiring caps: 128 live entries per principal
+and 4,096 globally. Expired rows are pruned at startup and inside every
+reservation or cancellation transaction. For a persisted server, one immediate
+SQLite transaction is the authority for a principal/key lookup, an existing or
+pending result, admission under both caps, and the new pairing-plus-reservation
+write. Simultaneously live services therefore return the persisted winner rather
+than treating a process-local cache miss or stale capacity count as authority.
+Pairing, pairing-offer, and session capacity constants live together in
+`apps/server/src/auth/limits.rs`; persistence and the in-memory authority consume
+that policy rather than mirroring numeric limits.
+An authenticated `POST /api/auth/pairing-offer/cancel` names the same key. It
+atomically revokes the mapped pairing grant and stores an expiring tombstone,
+so cancellation remains safe after a lost response, across a process restart,
+and before a delayed create reaches the issuance lock. A cancelled key cannot
+mint or replay an offer. New tombstones obey the same durable per-principal and
+global caps; replacing an existing keyed row does not consume another slot.
+The server validates that `this-computer` uses loopback, `another-device` does
+not use loopback, and that no offered endpoint is wildcard or port zero. Reach
+is embedded in the code and persisted with the grant as described below.
+
+The add flow parses and classifies the endpoint, fetches the public descriptor,
+performs the pinned handshake and in-channel pairing, and calls authenticated
+`server.getConfig` before saving anything. When the server requires pairing
+confirmation, the new session is persisted as `pending-pairing`: the bootstrap
+channel may verify RPC identity, but the delivered bearer cannot establish a
+steady-state reconnect yet. The client
+compares the in-channel environment and storage identities with both the pairing
+payload and descriptor, registers the verified profile and credential, accepts
+the storage identity, then calls the empty `auth.confirmPairing` RPC on that same
+channel. The pending session confirms its own delivery through the session
+capability gate; any other caller needs `access:write`. Confirmation derives
+the session ID from the authenticated context and idempotently commits only
+that session to `active`; the server owns the durable commit through in-memory
+publication and delivery-latch publication even if the RPC future is
+cancelled. Only the persistence writes and the confirm RPC itself run
+uninterruptibly; everything after them is cancellable, and pairing opens no
+additional verification socket: the registered environment supervisor connects
+with the saved credential, and its state is the bearer proof. A successful
+confirmation is conclusive by itself and wakes the supervisor without waiting.
+After an ambiguous confirmation (transport loss, interruption, or an
+unexpected response — dispatch may have committed), the client watches the
+supervisor's state for a bounded window: a connected supervisor proves the
+commit; a supervisor blocked on authentication, host identity, or a changed
+storage identity conclusively refutes the credential, and the client rolls
+back the saved entry and reports the pairing rejected instead of saving a
+permanently dead entry; anything else keeps the durable local authority and
+leaves recovery to the supervisor, which exposes any blocked or reconnecting
+state. Typed confirmation rejections and the exact unknown-method response
+from a server that required confirmation are definitively inactive and roll
+back immediately. Compatibility is additive: a server that never requires
+confirmation delivers an active credential, and the client's confirm call is
+idempotent there; the exact unknown-method defect from a truly older server is
+treated as that legacy delivery.
+
+Registration, identity persistence, or definitive pre-activation confirmation
+failure rolls back local writes best-effort before the bootstrap scope closes.
+Registration removal is conditional on the exact registration still owning the
+environment, and identity rollback restores or removes the prior value only if
+this attempt's value is still current. Concurrent replacements therefore win
+intact. Closing before confirmation revokes the pending server session; the
+age-gated startup and periodic sweeps revoke crash-orphaned pending sessions
+only after the two-minute grace. A confirmed session survives reconnect and
+restart. Failures are classified as `unreachable`,
+`host-identity-mismatch`, `pairing-rejected`, `incompatible`, or
+`duplicate-storage-identity`, and cleanup copy reports any local compensation
+failure. The client does not claim transparent retry with the same one-time
+code.
+
+### Remote Servers settings and pairing entry points
+
+Settings exposes remote connectivity at `/settings/remote-servers` as **Remote
+Servers**. `/settings/connections` redirects there. On Windows desktop, WSL
+backend controls remain in **Local environment** at
+`/settings/local-environment`.
+
+The **Connect to a host** tab lists saved servers with connection status,
+version, compatibility, and transport security. **Add Server** accepts a
+pairing code first, keeps manual endpoint-and-token entry under **Advanced**,
+and presents SSH as a first-class desktop option. BiBCode Connect relay rows
+remain part of the same tab. The **Share this host** tab owns exposure and
+pairing-code generation for the primary environment.
+
+Hosted `/pair` parses and normalizes its destination once before rendering or
+network access. URLs with a non-empty username or password are rejected; the
+confirmation displays the normalized `URL.host`, including punycode and an
+explicit port, and submission uses the same normalized base URL. Both `/pair`
+and the Remote Servers settings route remove a legacy query-string `code`
+immediately after retaining it for the current add attempt. Saved profiles
+normalize a missing, empty, or whitespace-only `hostKey` to `null` at the
+catalog boundary, so only a non-empty key selects E2EE.
+
+Connection persistence is monitored before the connection runtime starts. An
+IndexedDB `VersionError` exposes an explicit destructive reset dialog that lists
+the saved profiles, credentials, host identities, and cached connection state
+that will be deleted. Reset requires a separate acknowledgement, so the second
+click of a double-click cannot confirm destruction, and **Reload** remains a
+safe alternative. IndexedDB reports blocked deletion as queued rather than
+cancelled: the dialog stays pending, asks the user to close other BiBCode tabs or
+windows, and observes the original request until it succeeds or errors. Generic
+unavailability remains non-destructive. The app reloads automatically only
+after deletion actually succeeds.
+
+### Remote server updates
+
+The typed update surface consists of `updater.status`, `updater.check`, and
+`updater.install`. Each successful call returns a snapshot containing
+`serverVersion`, nullable `latestVersion`, lifecycle `state`, nullable `error`,
+and `support` (`installMode` plus `reason`). A server that cannot install on
+behalf of the caller rejects `updater.install` with
+`RemoteUpdateInstallError` code `remote_update_manual_required`. The TypeScript
+wire contract is `packages/contracts/src/remoteUpdate.ts`; its Rust mirror and
+state owner are in `apps/server/src/remote_update.rs`.
+
+The well-known descriptor, `server.getConfig`, and the Connect/relay descriptor
+all embed `remoteUpdateSupport`. Clients render update controls only when the
+additive, default-false `remoteUpdateControl` capability is true. The Remote
+Servers settings page checks all capable saved environments through
+`packages/client-runtime/src/state/remoteUpdates.ts`, with at most two requests
+in flight. Each environment check has one 30-second Effect deadline around the
+whole lazy operation, including supervisor acquisition, readiness, and RPC
+execution. Timeout interrupts that work and releases its fan-out worker.
+Disconnecting a registered but cold environment is a no-op and never creates a
+supervisor merely to disconnect it. One failed or offline environment remains **Status unavailable**
+without cancelling or blocking the rest of the batch. A last-known
+`update-available` snapshot also turns that environment's rail dot amber.
+
+The update feed URL is baked into the desktop release configuration only
+(`apps/desktop/src-tauri/tauri.release.conf.json`); the server binary has no
+feed access. A `manual`-mode server therefore never reports a `latestVersion`:
+the snapshot is honest about what the server can know, and manual-mode UI copy
+instructs the operator instead of guessing. Teaching servers a feed URL is a
+possible future extension, deliberately out of scope for v1.
+
+On a desktop-integrated server, every call to the hosting updater delegate is
+bounded to 30 seconds. A delegate that does not answer produces a successful
+typed snapshot with `state: "error"` and the updater-timeout message, including
+for an install request; it cannot pin an environment's single-flight update
+operation indefinitely. Plain authenticated WebSockets enter the live-client
+registry only after the HTTP upgrade completes, and unregister from the same
+upgrade-owned lifecycle.
+
+### Share ceremony and exposure
+
+The Share tab mints the complete pairing payload on the server through
+`POST /api/auth/pairing-offer`. Each minted grant records its `reach` intent and
+a mint-time `off_host` classification. The classification comes from the
+validated offered endpoint, so a loopback custom address used through an SSH
+tunnel remains loopback while a custom LAN or public address is off-host for
+trust and audit presentation. A session created by consuming the grant inherits
+both fields. Reach also owns exposure authority: `another-device` is the only
+intent allowed to request native listener widening. Every `custom` address is
+externally managed, so its ceremony and later access revisions never invoke the
+native exposure bridge.
+
+The server is the source of truth for desired exposure.
+`GET /api/auth/share-state` derives `wide` only while at least one unrevoked
+pairing link or client session has both `reach = another-device` and
+`off_host = true`; it otherwise derives `loopback`. `offHostGrantCount` still
+counts every active off-host grant, including externally managed custom grants,
+so trust and audit presentation does not erase their reachability. Every native
+exposure reason counts regardless of access method, including
+`browser-session-cookie`, `bearer-access-token`, and `dpop-access-token`; an
+unrevoked `pending-pairing` session also retains the reason during client
+verification and persistence. Consuming an **Another device** browser pairing
+link therefore replaces the one-time-link reason with the browser-session reason
+instead of narrowing and disconnecting the newly paired browser. Unknown or
+legacy null reach metadata never grants native widening authority.
+
+Every fresh desktop process starts the actual primary backend local-only under
+the native `ServerExposureCoordinator`, regardless of a previously persisted
+wide setting. Once authenticated, the renderer compares authoritative share
+state with actual runtime topology and requests a widen only when a live native
+exposure reason exists. One coordinator serializes exposure applies and every
+other settings mutation that can restart the native or WSL topology. Those
+non-exposure mutations preserve the actual runtime exposure across their
+restart instead of reapplying a stale durable mode. Widening uses an
+ephemeral launch override, verifies a network-accessible advertised endpoint,
+opens the program-scoped `BiBCode Remote Access` Windows Firewall rule, and
+persists network-accessible only after those native side effects succeed. Any
+failure attempts every local safeguard even if an earlier recovery step fails:
+persist local-only, restart with a local-only override, close the firewall, and
+stop an unverified backend. Narrowing persists local-only first, restarts and
+verifies local topology, then closes the firewall; it never restores durable
+wide state as compensation. On Windows, closing enumerates the persistent
+firewall store, removes only the named BiBCode rule, and re-enumerates to verify
+absence. Firewall commands run through the shared supervised process runner with
+a 15-second process timeout, a 64 KiB truncated-output bound, and kill/reap
+ownership for the process tree. A serialized firewall worker additionally gives
+each caller a five-second deadline that includes spawn. Its bounded desired-state
+coalescer retains at most one in-flight job and the latest pending state; a newer
+pending request releases the superseded caller with an explicit saturation
+error. The worker retains a late job after its caller returns; a late successful
+enable is followed by a verified delete, and the latest pending firewall state
+waits behind that cleanup so a timed-out add cannot become the final state. A missing rule is successful
+only after its absence is verified; process, policy, and verification failures
+propagate to the coordinator and are reported as incomplete cleanup. The
+persisted desktop setting records the last completed transition but is neither
+proof of actual topology nor permission to start wide.
+Creating a **This computer only** grant or any **Custom address** grant never
+widens a later launch, and there is no independent manual exposure toggle.
+
+A fresh start with only legacy null-reach grants remains local-only. If the last
+completed native configuration was network-accessible, the Share tab shows an
+explicit **Resume legacy remote access** action; it never silently widens.
+
+This coordinator governs only a native primary. When Windows desktop is in
+WSL-only mode, the Share tab chooses an available WSL-owned advertised endpoint
+and neither the offer ceremony nor the reconciler calls the native exposure
+bridge. The reported exposure management mode is `external`: WSL/Hyper-V routing
+and firewall policy remain an operator responsibility rather than an implied
+desktop guarantee. Entering WSL-only first converges native exposure to
+persisted and verified local-only state and closes the Windows firewall rule,
+then switches topology under the same coordinator. Leaving WSL-only starts the
+native topology explicitly local-only and lets authoritative share-state
+reconciliation decide whether a later widen is justified. The privileged
+exposure operation rereads authoritative desktop settings inside the coordinator
+and rejects native transitions while WSL-only is active.
+
+Compatibility grants whose persisted reach and off-host fields are `NULL`
+never cause an automatic widen. While any unrevoked legacy one-time-token grant
+remains, they do block automatic reversion from an already-wide bind. The Share
+tab identifies that condition and tells the user to revoke or re-pair those
+clients. Otherwise, the renderer checks share state at startup and after every
+auth-access revision. It widens a local-only runtime only when the server
+currently reports a live native exposure reason, and switches a wide runtime
+back to loopback when the last reason is revoked. After narrowing it reads share
+state once more. If a concurrent new native exposure grant appeared during that
+operation, it performs one compensating widen; later revisions schedule a fresh
+reconciliation rather than creating an internal loop.
+
+Revoking a client invalidates its credential and actively cancels every live
+plain or E2EE WebSocket registered to that session. Revoking all other clients
+does the same for each affected session. Exposure changes still use a backend
+restart: live local connections and running turns drop, while committed SQLite
+state and other durable server state survive. After bounded mint attempts fail,
+the share ceremony makes up to three bounded cancellation attempts with the
+same principal-scoped idempotency key. This revokes a grant whose successful
+response was lost, or tombstones the key ahead of a delayed create. Whether
+cancellation succeeds or fails, an attempt that widened native exposure runs
+cleanup against authoritative share state. A possibly live offer or another
+native-managed reason keeps the host wide; authoritative absence narrows it,
+so a failed cancellation alone cannot strand an otherwise reasonless wildcard
+bind. Cleanup reports exactly one of four outcomes: local-only was confirmed,
+another live reason correctly kept the host wide, cancellation and cleanup
+were both unconfirmed, or cleanup failed and topology could not be verified.
+No copy promises narrowing without the local-only confirmation. The direct
+path does not depend on an auth revision event that may never arrive. The UI
+distinguishes a successful cleanup with local-only confirmation from the other
+outcomes, while the startup/revision reconciler remains a backstop. A failed
+reconciliation pass retries up to three passes at five-second intervals; the
+terminal failure surfaces a warning toast. Mount and topology generation state
+gate work only before the first privileged apply. Once a local-only apply
+commits, its authoritative share-state refetch and, when needed, one
+compensating widen use the captured bridge and must finish even if the
+initiating view unmounts. Every successful apply must return the requested
+actual mode; later revisions schedule fresh reconciliation.
+
+Every auth-authority mutation increments the singleton
+`auth_authority_state.revision` in the same SQLite transaction. Each live
+`AuthService` owns at most one convergence watcher while it has a cached active
+grant or session, a registered live connection, or a `subscribeAuthAccess`
+receiver. The watcher checks only that scalar every 250 ms when authority is
+unchanged; it reads and decodes one coherent, read-only pairing/offer/session
+snapshot only after the revision changes or the snapshot's nearest active
+expiry is reached. It stops after the final authority consumer disappears and
+uses a release-and-recheck handoff so a concurrent subscriber or grant cannot
+lose watcher ownership. Thus a committed change on another live service is
+eligible for reconciliation on the next 250 ms check (plus the bounded SQLite
+queue/read), without a poller per socket or repeated full-table scans on idle
+ticks. Reconciliation cancels removed sessions' local connection tokens while
+holding the service state lock and before publishing access changes, so an
+already-ACKed stream closes before later authority events are admitted. Local
+revocation still cancels immediately without waiting for the watcher.
+Live-connection registration arms its RAII guard immediately after the
+in-memory count and cancellation token are published, before awaiting SQLite
+connected-state persistence. Cancellation or persistence failure therefore
+removes the token and count even when the database job remains queued.
+
+Each pairing-offer create attempt and cancellation has a five-second deadline
+at both the primary HTTP Effect and ceremony boundary. The HTTP deadline
+interrupts the underlying request; the outer deadline also bounds injected or
+test transports that never settle. Five create attempts remain separated by
+the existing two-second backoff. A blackholed response therefore reaches the
+explicit cancellation/cleanup result instead of leaving the renderer waiting
+indefinitely after a native widen.
+
+Privileged native exposure mutations are not raced against those renderer HTTP
+deadlines. The renderer awaits the serialized native coordinator to completion,
+whose restart, process, firewall, and cleanup operations own their own bounded
+deadlines. This prevents the UI from reporting a failed transition while an
+uncancelable desktop command later commits a wide topology.
+
+A wide-bound native primary does not expose the desktop-only maintenance API.
+Update protection therefore degrades while sharing until exposure returns to
+loopback; update preparation must not assume maintenance routes exist in that
+state.
+
+Pairing links converge on that Add Server flow. Web clients accept
+`/pair?code=...`; desktop bundles register `bibcode://pair?code=...` with the
+Tauri deep-link plugin and use the single-instance plugin to route links to the
+running application. Both entry points open Remote Servers with the code
+prefilled. macOS scheme registration happens when the application bundle is
+created, so custom-scheme links cannot be validated against an unbundled dev
+process.
+
+A saved direct bearer profile with a non-null `hostKey` always selects
+`/ws-e2ee`; no `/oauth/token` or `/api/auth/websocket-ticket` request is made.
+A profile whose additively decoded `hostKey` is null, empty, or whitespace is a
+legacy `/ws` profile.
+Relay and SSH selection is unchanged. `connectionTransportSecurity` is the
+single presentation policy for `e2ee`, `unencrypted`, `channel-secured`, and
+`local` badges.
+
+Plain `/ws` explicitly caps a WebSocket frame at 16 MiB and a reassembled
+WebSocket message at 64 MiB. Its authenticated session enters connected
+bookkeeping only inside the successful upgrade-owned task; a failed upgrade
+cannot leak a live connection count or revocation token.
+
+#### Host-key HTTP audit
+
+Pinned profiles allow one pre-auth HTTP request: the unauthenticated
+`/.well-known/bibcode/environment` descriptor, which is only a routing hint and
+is re-verified over RPC. The production call-site audit is:
+
+| Call site or surface                                                                                                                      | Host-key verdict                                                                                                                                                                                                                            |
+| ----------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `environment/descriptor.ts`, `authorization/service.ts`, and `connection/pairingAdd.ts` descriptor fetches                                | Allowed unauthenticated descriptor request. Pairing and reconnect both re-verify identity inside E2EE.                                                                                                                                      |
+| `/oauth/token`, `/api/auth/session`, and `/api/auth/websocket-ticket` helpers in `authorization/remote.ts` and `authorization/service.ts` | Not reachable for a profile with `hostKey`; those helpers serve legacy bearer, primary, relay, and SSH flows.                                                                                                                               |
+| `PreparedConnection.httpAuthorization`                                                                                                    | Explicitly `null` whenever `PreparedConnection.e2ee` is non-null. Pinned bearer credentials exist only in the E2EE auth form.                                                                                                               |
+| `assets.createUrl` and `apps/web/src/assets/assetUrls.ts`                                                                                 | URL issuance is authenticated RPC over E2EE. The resulting `/api/assets/<signed capability>/<path>` GET is a documented exception: it carries a bounded, expiring, resource-scoped HMAC capability and no bearer authorization.             |
+| `apps/web/src/diagnostics/downloadDiagnosticLogs.ts`                                                                                      | Direct authenticated HTTP is primary-environment-only and cannot target a saved bearer profile. Environment-scoped remote diagnostics are therefore unavailable until represented as RPC; an E2EE bearer must not be added to this request. |
+| `rpc/http.ts` HTTP API client and primary/cloud-link callers                                                                              | The module is a transport constructor, not an independent request. Its host-key callers are limited to the descriptor row above; primary and Connect control-plane calls are not saved host-key targets.                                    |
 
 ### BiBCode Connect
 
@@ -90,6 +656,15 @@ profile, probes or launches `bibcode` remotely, establishes local forwarding,
 and returns a local HTTP/WSS bootstrap plus bearer credential to the connection
 runtime. The resulting `SshConnectionTarget` enters the same authorization and
 RPC pipeline as other targets.
+
+Fresh setup mints its bootstrap credential by running
+`bibcode pairing issue --base-dir "$HOME/.bibcode" --json` on the remote host
+(the same data root the launched `serve` uses). The command writes a one-time
+administrative pairing link into that root's auth store and prints one JSON
+line whose `credential` field the desktop exchanges at `/oauth/token`. Because
+the server consumes pairing links from the database and the store runtime lock
+is shared, the command works beside the already-running remote server without
+a restart.
 
 SSH is a desktop capability. Browser clients cannot assume a local SSH binary,
 process supervision, or access to the user's SSH configuration.
@@ -127,7 +702,10 @@ endpoint can install software, start a process, or use SSH.
   and endpoint metadata are not authorization.
 - Bearer or DPoP authentication is performed over HTTP before a WebSocket is
   opened. Only a single-purpose, short-lived `wsTicket` appears in the socket
-  URL.
+  URL; each ticket is redeemable exactly once, only by the plain `/ws` route,
+  and only for a plain-transport session (the client mints a fresh ticket per
+  connection attempt). A process restart forgets redemptions for at most one
+  five-minute ticket window.
 - DPoP binds Connect-issued relay and environment tokens to the client's proof
   key and the target HTTP request.
 - Relay request proofs and environment health/mint responses are independently
@@ -154,10 +732,6 @@ performed on the machine that owns that server and filesystem.
 
 - OS-backed protection for the desktop connection catalog is implemented on
   Windows; other platforms currently use renderer storage fallback.
-- The desktop SSH launcher and forwarding implementation exist, but fresh SSH
-  setup is currently blocked: its pairing step invokes the removed
-  `bibcode auth pairing create` command while the native CLI exposes only
-  `start` and `serve`.
 - Desktop SSH and some advertised endpoint providers are host capabilities and
   are unavailable in an ordinary browser.
 - Endpoint availability is advisory. The connection supervisor still verifies

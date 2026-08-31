@@ -1,14 +1,16 @@
 use bibcode_server::orchestration::TurnDeliveryState;
 use bibcode_server::persistence::{
-    AuthPairingLink, AuthSessionClient, CheckpointDiffBlob, CommandReceipt, Database,
-    NewAuthSession, NewOrchestrationEvent, ProjectionCheckpoint, ProjectionPendingApproval,
-    ProjectionPendingTurnStart, ProjectionProject, ProjectionState, ProjectionThread,
-    ProjectionThreadActivity, ProjectionThreadMessage, ProjectionThreadProposedPlan,
-    ProjectionThreadSession, ProjectionTurnById, ProviderSessionRuntime, Repositories,
-    WorktreeRemovalReceipt, WorktreeRepositoryPinOutcome, run_migrations,
+    AuthPairingLink, AuthSessionClient, AuthSessionDeliveryState, CheckpointDiffBlob,
+    CommandReceipt, Database, NewAuthPairingOffer, NewAuthSession, NewOrchestrationEvent,
+    ProjectionCheckpoint, ProjectionPendingApproval, ProjectionPendingTurnStart, ProjectionProject,
+    ProjectionState, ProjectionThread, ProjectionThreadActivity, ProjectionThreadMessage,
+    ProjectionThreadProposedPlan, ProjectionThreadSession, ProjectionTurnById,
+    ProviderSessionRuntime, Repositories, WorktreeRemovalReceipt, WorktreeRepositoryPinOutcome,
+    run_migrations,
 };
 use serde::Serialize;
 use serde_json::json;
+use tempfile::TempDir;
 
 const T0: &str = "2026-07-10T10:00:00.000Z";
 const T1: &str = "2026-07-10T10:01:00.000Z";
@@ -29,6 +31,25 @@ async fn migrated_repositories() -> Repositories {
         .expect("all migrations apply");
     database.quick_check().await.expect("database is healthy");
     Repositories::new(database)
+}
+
+async fn migrated_repository_pair() -> (TempDir, Repositories, Repositories) {
+    let temp = TempDir::new().expect("temporary SQLite directory");
+    let path = temp.path().join("state.sqlite");
+    let first = Database::create_new(&path)
+        .await
+        .expect("first SQLite connection opens");
+    first
+        .call(|connection| {
+            run_migrations(connection, None)?;
+            Ok(())
+        })
+        .await
+        .expect("all migrations apply");
+    let second = Database::open_existing(&path)
+        .await
+        .expect("second SQLite connection opens");
+    (temp, Repositories::new(first), Repositories::new(second))
 }
 
 fn assert_row_eq<T: Serialize>(actual: &T, expected: &T) {
@@ -284,10 +305,14 @@ fn public_repository_api_inventory_is_explicit() {
 
     let mut expected = vec![
         "append_event",
+        "auth_authority_revision",
         "claim_provider_turn",
         "clear_checkpoint_turn_conflict",
         "consume_auth_pairing_link",
+        "complete_auth_pairing_offer",
+        "confirm_pending_auth_session",
         "create_auth_pairing_link",
+        "create_auth_pairing_link_with_offer",
         "create_auth_session",
         "database",
         "delete_activities_by_thread",
@@ -334,10 +359,14 @@ fn public_repository_api_inventory_is_explicit() {
         "list_threads_by_project",
         "load_worktree_catalog_projection",
         "list_turns_by_thread",
+        "load_auth_authority_snapshot",
         "max_event_sequence",
         "min_last_applied_sequence",
         "pin_project_worktree_repository_key",
         "prepare_reserved_command_receipt",
+        "prune_and_list_active_auth_pairing_offers",
+        "prune_and_get_active_auth_pairing_offer",
+        "recover_pending_auth_pairing_offer",
         "new",
         "read_events_from_sequence",
         "release_reserved_command_receipt",
@@ -346,7 +375,10 @@ fn public_repository_api_inventory_is_explicit() {
         "replace_pending_turn_start",
         "prepare_worktree_removal_receipt",
         "revoke_auth_pairing_link",
+        "cancel_auth_pairing_offer",
         "revoke_auth_session",
+        "revoke_pending_auth_session",
+        "revoke_pending_auth_sessions",
         "revoke_other_auth_sessions",
         "set_auth_session_last_connected_at",
         "upsert_activity",
@@ -1584,6 +1616,8 @@ async fn auth_pairing_links_consume_and_revoke_atomically() {
         expires_at: FUTURE.to_owned(),
         consumed_at: None,
         revoked_at: None,
+        reach: None,
+        off_host: None,
     };
     let later_pairing = AuthPairingLink {
         id: "pairing-b".to_owned(),
@@ -1687,6 +1721,474 @@ async fn auth_pairing_links_consume_and_revoke_atomically() {
 }
 
 #[tokio::test]
+async fn auth_authority_revision_changes_only_with_authority_transactions() {
+    let repositories = migrated_repositories().await;
+    assert_eq!(
+        repositories
+            .auth_authority_revision()
+            .await
+            .expect("initial auth revision"),
+        0
+    );
+    repositories
+        .upsert_project(project("unrelated", T1))
+        .await
+        .expect("unrelated durable mutation");
+    assert_eq!(
+        repositories
+            .auth_authority_revision()
+            .await
+            .expect("unchanged auth revision"),
+        0
+    );
+    repositories
+        .create_auth_pairing_link(pairing_offer_link(9_000))
+        .await
+        .expect("auth authority mutation");
+    assert_eq!(
+        repositories
+            .auth_authority_revision()
+            .await
+            .expect("created auth revision"),
+        1
+    );
+    assert!(
+        repositories
+            .revoke_auth_pairing_link("pairing-quota-9000".to_owned(), TIME_3.to_owned())
+            .await
+            .expect("auth revocation")
+    );
+    assert_eq!(
+        repositories
+            .auth_authority_revision()
+            .await
+            .expect("revoked auth revision"),
+        2
+    );
+}
+
+#[tokio::test]
+async fn pairing_offer_reservation_completion_and_cancellation_are_durable() {
+    let repositories = migrated_repositories().await;
+    let pairing = AuthPairingLink {
+        id: "pairing-offer".to_owned(),
+        credential: "credential-offer".to_owned(),
+        method: "one-time-token".to_owned(),
+        scopes: json!(["orchestration:read"]),
+        subject: "one-time-token".to_owned(),
+        label: Some("Tablet".to_owned()),
+        proof_key_thumbprint: None,
+        created_at: T1.to_owned(),
+        expires_at: FUTURE.to_owned(),
+        consumed_at: None,
+        revoked_at: None,
+        reach: Some("another-device".to_owned()),
+        off_host: Some(true),
+    };
+    repositories
+        .create_auth_pairing_link_with_offer(
+            pairing.clone(),
+            NewAuthPairingOffer {
+                principal_id: "principal".to_owned(),
+                idempotency_key: "request-key".to_owned(),
+                input_fingerprint: "fingerprint".to_owned(),
+                expires_at: FUTURE.to_owned(),
+            },
+        )
+        .await
+        .expect("pairing and reservation commit together");
+    let conflicting_pairing = AuthPairingLink {
+        id: "pairing-conflict".to_owned(),
+        credential: "credential-conflict".to_owned(),
+        ..pairing
+    };
+    let existing = repositories
+        .create_auth_pairing_link_with_offer(
+            conflicting_pairing,
+            NewAuthPairingOffer {
+                principal_id: "principal".to_owned(),
+                idempotency_key: "request-key".to_owned(),
+                input_fingerprint: "other fingerprint".to_owned(),
+                expires_at: FUTURE.to_owned(),
+            },
+        )
+        .await
+        .expect("existing keyed authority");
+    assert!(!existing.reserved);
+    assert_eq!(existing.offer.input_fingerprint, "fingerprint");
+    assert!(
+        repositories
+            .get_auth_pairing_link_by_credential("credential-conflict".to_owned())
+            .await
+            .expect("rolled-back link lookup")
+            .is_none(),
+        "the losing keyed candidate must not insert a pairing link"
+    );
+    let pending = repositories
+        .prune_and_list_active_auth_pairing_offers(T2.to_owned())
+        .await
+        .expect("pending reservation");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].pairing_id.as_deref(), Some("pairing-offer"));
+    assert!(pending[0].result.is_none());
+
+    let result = json!({
+        "id": "pairing-offer",
+        "code": "encoded-offer",
+        "reach": "another-device",
+        "endpoint": "http://192.168.1.20:3773",
+        "name": "Tablet",
+        "expiresAt": FUTURE,
+    });
+    assert!(
+        repositories
+            .complete_auth_pairing_offer(
+                "principal".to_owned(),
+                "request-key".to_owned(),
+                result.clone(),
+            )
+            .await
+            .expect("offer completion")
+    );
+    assert_eq!(
+        repositories
+            .prune_and_list_active_auth_pairing_offers(T2.to_owned())
+            .await
+            .expect("completed reservation")[0]
+            .result
+            .as_ref(),
+        Some(&result)
+    );
+
+    let cancellation = repositories
+        .cancel_auth_pairing_offer(
+            "principal".to_owned(),
+            "request-key".to_owned(),
+            TIME_3.to_owned(),
+            FUTURE.to_owned(),
+        )
+        .await
+        .expect("offer cancellation");
+    assert!(cancellation.revoked);
+    assert_eq!(cancellation.pairing_id.as_deref(), Some("pairing-offer"));
+    assert!(
+        repositories
+            .list_active_auth_pairing_links(T2.to_owned())
+            .await
+            .expect("revoked grant is absent")
+            .is_empty()
+    );
+    let tombstone = repositories
+        .prune_and_list_active_auth_pairing_offers(TIME_3.to_owned())
+        .await
+        .expect("durable tombstone");
+    assert_eq!(tombstone.len(), 1);
+    assert!(tombstone[0].pairing_id.is_none());
+    assert!(tombstone[0].result.is_none());
+    assert_eq!(tombstone[0].cancelled_at.as_deref(), Some(TIME_3));
+}
+
+#[tokio::test]
+async fn pending_pairing_offer_recovery_revokes_the_grant_and_releases_the_key() {
+    let repositories = migrated_repositories().await;
+    repositories
+        .create_auth_pairing_link_with_offer(
+            pairing_offer_link(17),
+            NewAuthPairingOffer {
+                principal_id: "principal".to_owned(),
+                idempotency_key: "interrupted-request".to_owned(),
+                input_fingerprint: "same-input".to_owned(),
+                expires_at: FUTURE.to_owned(),
+            },
+        )
+        .await
+        .expect("pending pairing offer");
+
+    assert!(
+        repositories
+            .recover_pending_auth_pairing_offer(
+                "principal".to_owned(),
+                "interrupted-request".to_owned(),
+                "different-input".to_owned(),
+                T2.to_owned(),
+            )
+            .await
+            .expect("conflicting recovery lookup")
+            .is_none(),
+        "a conflicting request must not abandon another request's grant"
+    );
+    assert_eq!(
+        repositories
+            .list_active_auth_pairing_links(T2.to_owned())
+            .await
+            .expect("conflicting recovery preserves the grant")
+            .len(),
+        1
+    );
+
+    let recovered = repositories
+        .recover_pending_auth_pairing_offer(
+            "principal".to_owned(),
+            "interrupted-request".to_owned(),
+            "same-input".to_owned(),
+            T2.to_owned(),
+        )
+        .await
+        .expect("atomic pending-offer recovery");
+    assert_eq!(recovered.as_deref(), Some("pairing-quota-17"));
+    assert!(
+        repositories
+            .list_active_auth_pairing_links(T2.to_owned())
+            .await
+            .expect("abandoned grant lookup")
+            .is_empty()
+    );
+    assert!(
+        repositories
+            .prune_and_get_active_auth_pairing_offer(
+                "principal".to_owned(),
+                "interrupted-request".to_owned(),
+                T2.to_owned(),
+            )
+            .await
+            .expect("released idempotency key lookup")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn concurrent_pairing_offer_reservations_return_the_persisted_keyed_authority() {
+    let (_temp, first, second) = migrated_repository_pair().await;
+    let reserve = |repositories: Repositories, index| async move {
+        repositories
+            .create_auth_pairing_link_with_offer(
+                pairing_offer_link(index),
+                NewAuthPairingOffer {
+                    principal_id: "principal".to_owned(),
+                    idempotency_key: "shared-key".to_owned(),
+                    input_fingerprint: "fingerprint".to_owned(),
+                    expires_at: FUTURE.to_owned(),
+                },
+            )
+            .await
+    };
+
+    let (first_result, second_result) = tokio::join!(reserve(first.clone(), 1), reserve(second, 2));
+    let first_result = first_result.expect("first reservation outcome");
+    let second_result = second_result.expect("second reservation outcome");
+    assert_ne!(first_result.reserved, second_result.reserved);
+    assert_eq!(
+        first_result.offer.pairing_id,
+        second_result.offer.pairing_id
+    );
+    assert_eq!(
+        first
+            .list_active_auth_pairing_links(T2.to_owned())
+            .await
+            .expect("active keyed pairing")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn pairing_offer_writes_prune_expired_ledger_rows() {
+    let repositories = migrated_repositories().await;
+    for index in 0..3 {
+        repositories
+            .cancel_auth_pairing_offer(
+                "principal".to_owned(),
+                format!("expired-{index}"),
+                T1.to_owned(),
+                T1.to_owned(),
+            )
+            .await
+            .expect("expired tombstone insert");
+    }
+    repositories
+        .cancel_auth_pairing_offer(
+            "principal".to_owned(),
+            "live".to_owned(),
+            T2.to_owned(),
+            FUTURE.to_owned(),
+        )
+        .await
+        .expect("live tombstone insert prunes expired rows");
+
+    let rows = repositories
+        .prune_and_list_active_auth_pairing_offers(T2.to_owned())
+        .await
+        .expect("bounded ledger");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].idempotency_key, "live");
+}
+
+#[tokio::test]
+async fn pairing_offer_reservations_enforce_the_shared_principal_quota() {
+    let (_temp, first, second) = migrated_repository_pair().await;
+    for index in 0..128 {
+        let repositories = if index % 2 == 0 { &first } else { &second };
+        repositories
+            .create_auth_pairing_link_with_offer(
+                pairing_offer_link(index),
+                NewAuthPairingOffer {
+                    principal_id: "principal".to_owned(),
+                    idempotency_key: format!("key-{index}"),
+                    input_fingerprint: format!("fingerprint-{index}"),
+                    expires_at: FUTURE.to_owned(),
+                },
+            )
+            .await
+            .expect("reservation within principal quota");
+    }
+
+    assert!(
+        first
+            .create_auth_pairing_link_with_offer(
+                pairing_offer_link(128),
+                NewAuthPairingOffer {
+                    principal_id: "principal".to_owned(),
+                    idempotency_key: "key-128".to_owned(),
+                    input_fingerprint: "fingerprint-128".to_owned(),
+                    expires_at: FUTURE.to_owned(),
+                },
+            )
+            .await
+            .is_err(),
+        "the durable principal quota must reject reservation 129"
+    );
+    assert!(
+        second
+            .cancel_auth_pairing_offer(
+                "principal".to_owned(),
+                "cancelled-overflow".to_owned(),
+                T2.to_owned(),
+                FUTURE.to_owned(),
+            )
+            .await
+            .is_err(),
+        "a new cancellation tombstone must obey the durable principal quota"
+    );
+}
+
+#[tokio::test]
+async fn pairing_offer_reservations_enforce_the_shared_global_quota() {
+    let (_temp, first, second) = migrated_repository_pair().await;
+    for index in 0..4_096 {
+        let repositories = if index % 2 == 0 { &first } else { &second };
+        repositories
+            .create_auth_pairing_link_with_offer(
+                pairing_offer_link(index),
+                NewAuthPairingOffer {
+                    principal_id: format!("principal-{}", index / 128),
+                    idempotency_key: format!("key-{index}"),
+                    input_fingerprint: format!("fingerprint-{index}"),
+                    expires_at: FUTURE.to_owned(),
+                },
+            )
+            .await
+            .expect("reservation within global quota");
+    }
+
+    assert!(
+        first
+            .create_auth_pairing_link_with_offer(
+                pairing_offer_link(4_096),
+                NewAuthPairingOffer {
+                    principal_id: "overflow-principal".to_owned(),
+                    idempotency_key: "overflow-key".to_owned(),
+                    input_fingerprint: "overflow-fingerprint".to_owned(),
+                    expires_at: FUTURE.to_owned(),
+                },
+            )
+            .await
+            .is_err(),
+        "the durable global quota must reject reservation 4,097"
+    );
+    assert!(
+        second
+            .cancel_auth_pairing_offer(
+                "overflow-principal".to_owned(),
+                "cancelled-global-overflow".to_owned(),
+                T2.to_owned(),
+                FUTURE.to_owned(),
+            )
+            .await
+            .is_err(),
+        "a new cancellation tombstone must obey the durable global quota"
+    );
+}
+
+fn pairing_offer_link(index: usize) -> AuthPairingLink {
+    AuthPairingLink {
+        id: format!("pairing-quota-{index}"),
+        credential: format!("credential-quota-{index}"),
+        method: "one-time-token".to_owned(),
+        scopes: json!(["orchestration:read"]),
+        subject: "one-time-token".to_owned(),
+        label: Some(format!("Client {index}")),
+        proof_key_thumbprint: None,
+        created_at: T1.to_owned(),
+        expires_at: FUTURE.to_owned(),
+        consumed_at: None,
+        revoked_at: None,
+        reach: Some("another-device".to_owned()),
+        off_host: Some(true),
+    }
+}
+
+#[tokio::test]
+async fn auth_pairing_reach_round_trips_through_persistence() {
+    let repositories = migrated_repositories().await;
+    repositories
+        .create_auth_pairing_link(AuthPairingLink {
+            id: "pairing-reach".to_owned(),
+            credential: "credential-reach".to_owned(),
+            method: "one-time-token".to_owned(),
+            scopes: json!(["orchestration:read"]),
+            subject: "one-time-token".to_owned(),
+            label: Some("Tablet".to_owned()),
+            proof_key_thumbprint: None,
+            created_at: T1.to_owned(),
+            expires_at: FUTURE.to_owned(),
+            consumed_at: None,
+            revoked_at: None,
+            reach: Some("another-device".to_owned()),
+            off_host: Some(true),
+        })
+        .await
+        .expect("pairing insert");
+    let links = repositories
+        .list_active_auth_pairing_links(T2.to_owned())
+        .await
+        .expect("active pairing listing");
+    assert_eq!(links[0].reach.as_deref(), Some("another-device"));
+    assert_eq!(links[0].off_host, Some(true));
+
+    repositories
+        .create_auth_session(NewAuthSession {
+            session_id: "session-reach".to_owned(),
+            subject: "one-time-token".to_owned(),
+            scopes: json!(["orchestration:read"]),
+            method: "bearer-access-token".to_owned(),
+            client: auth_client("Tablet"),
+            issued_at: T1.to_owned(),
+            expires_at: FUTURE.to_owned(),
+            reach: Some("this-computer".to_owned()),
+            off_host: Some(false),
+            delivery_state: AuthSessionDeliveryState::Active,
+        })
+        .await
+        .expect("session insert");
+    let sessions = repositories
+        .list_active_auth_sessions(T2.to_owned())
+        .await
+        .expect("active session listing");
+    assert_eq!(sessions[0].reach.as_deref(), Some("this-computer"));
+    assert_eq!(sessions[0].off_host, Some(false));
+}
+
+#[tokio::test]
 async fn auth_sessions_round_trip_order_connect_and_revoke() {
     let repositories = migrated_repositories().await;
     let session_a = NewAuthSession {
@@ -1697,6 +2199,9 @@ async fn auth_sessions_round_trip_order_connect_and_revoke() {
         client: auth_client("Laptop"),
         issued_at: T1.to_owned(),
         expires_at: FUTURE.to_owned(),
+        reach: None,
+        off_host: None,
+        delivery_state: AuthSessionDeliveryState::Active,
     };
     let session_b = NewAuthSession {
         session_id: "session-b".to_owned(),
@@ -1819,4 +2324,121 @@ async fn auth_sessions_round_trip_order_connect_and_revoke() {
         .await
         .expect("auth scope storage type");
     assert_eq!(storage_type, "text");
+}
+
+#[tokio::test]
+async fn pending_auth_sessions_confirm_by_id_and_startup_cleanup_is_selective() {
+    let repositories = migrated_repositories().await;
+    let session = |session_id: &str, delivery_state| NewAuthSession {
+        session_id: session_id.to_owned(),
+        subject: "paired-device".to_owned(),
+        scopes: json!(["orchestration:read"]),
+        method: "bearer-access-token".to_owned(),
+        client: auth_client(session_id),
+        issued_at: T1.to_owned(),
+        expires_at: FUTURE.to_owned(),
+        reach: Some("another-device".to_owned()),
+        off_host: Some(true),
+        delivery_state,
+    };
+    repositories
+        .create_auth_session(session(
+            "pending-confirmed",
+            AuthSessionDeliveryState::PendingPairing,
+        ))
+        .await
+        .expect("pending session insert");
+    repositories
+        .create_auth_session(session(
+            "pending-abandoned",
+            AuthSessionDeliveryState::PendingPairing,
+        ))
+        .await
+        .expect("second pending session insert");
+    repositories
+        .create_auth_session(session("active-session", AuthSessionDeliveryState::Active))
+        .await
+        .expect("active session insert");
+    repositories
+        .create_auth_session(NewAuthSession {
+            expires_at: T2.to_owned(),
+            ..session("pending-expired", AuthSessionDeliveryState::PendingPairing)
+        })
+        .await
+        .expect("expired pending session insert");
+
+    let active_ids = repositories
+        .list_active_auth_sessions(T2.to_owned())
+        .await
+        .expect("active session listing")
+        .into_iter()
+        .map(|session| session.session_id)
+        .collect::<Vec<_>>();
+    assert!(active_ids.contains(&"pending-confirmed".to_owned()));
+    assert!(active_ids.contains(&"pending-abandoned".to_owned()));
+    assert!(active_ids.contains(&"active-session".to_owned()));
+    assert!(!active_ids.contains(&"pending-expired".to_owned()));
+
+    assert_eq!(
+        repositories
+            .get_auth_session("pending-confirmed".to_owned())
+            .await
+            .expect("pending lookup")
+            .expect("pending exists")
+            .delivery_state,
+        AuthSessionDeliveryState::PendingPairing,
+    );
+    assert!(
+        repositories
+            .confirm_pending_auth_session("pending-confirmed".to_owned(), T2.to_owned())
+            .await
+            .expect("pending confirmation")
+    );
+    assert!(
+        repositories
+            .confirm_pending_auth_session("pending-confirmed".to_owned(), T2.to_owned())
+            .await
+            .expect("confirmation is idempotent")
+    );
+    assert!(
+        !repositories
+            .confirm_pending_auth_session("missing".to_owned(), T2.to_owned())
+            .await
+            .expect("missing confirmation is a miss")
+    );
+
+    let mut revoked = repositories
+        .revoke_pending_auth_sessions(TIME_3.to_owned(), TIME_3.to_owned())
+        .await
+        .expect("startup pending cleanup");
+    revoked.sort();
+    assert_eq!(revoked, ["pending-abandoned", "pending-expired"]);
+    assert_eq!(
+        repositories
+            .get_auth_session("pending-confirmed".to_owned())
+            .await
+            .expect("confirmed lookup")
+            .expect("confirmed exists")
+            .delivery_state,
+        AuthSessionDeliveryState::Active,
+    );
+    assert_eq!(
+        repositories
+            .get_auth_session("active-session".to_owned())
+            .await
+            .expect("active lookup")
+            .expect("active exists")
+            .revoked_at,
+        None,
+    );
+    assert_eq!(
+        repositories
+            .get_auth_session("pending-abandoned".to_owned())
+            .await
+            .expect("abandoned lookup")
+            .expect("abandoned exists")
+            .revoked_at
+            .as_deref(),
+        Some(TIME_3),
+    );
 }

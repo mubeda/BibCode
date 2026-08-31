@@ -1,0 +1,20 @@
+[
+  { "endpoint": "http://127.0.0.1:3773", "classification": "loopback" },
+  { "endpoint": "http://[::1]:3773", "classification": "loopback" },
+  { "endpoint": "http://[::ffff:127.0.0.1]:3773", "classification": "loopback" },
+  { "endpoint": "http://localhost:3773", "classification": "loopback" },
+  { "endpoint": "http://192.168.1.20:3773", "classification": "private-network" },
+  { "endpoint": "http://[::ffff:192.168.1.20]:3773", "classification": "private-network" },
+  { "endpoint": "http://100.64.12.1:3773", "classification": "private-network" },
+  { "endpoint": "http://[fd00::1]:3773", "classification": "private-network" },
+  { "endpoint": "http://203.0.113.7:3773", "classification": "public" },
+  { "endpoint": "http://[::ffff:203.0.113.7]:3773", "classification": "public" },
+  { "endpoint": "http://example.test/path/:0", "classification": "public" },
+  { "endpoint": "http://127.example.test:3773", "classification": "public" },
+  { "endpoint": "http://fdcorp.example.test:3773", "classification": "public" },
+  { "endpoint": "http://0.0.0.0:3773", "classification": "unconnectable" },
+  { "endpoint": "http://[::ffff:0.0.0.0]:3773", "classification": "unconnectable" },
+  { "endpoint": "http://[::]:3773", "classification": "unconnectable" },
+  { "endpoint": "http://192.168.1.20:0", "classification": "unconnectable" },
+  { "endpoint": "not a url", "classification": "unconnectable" }
+]

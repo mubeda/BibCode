@@ -70,7 +70,7 @@ describe("createEnvironmentCatalogAtoms", () => {
         expect.objectContaining({ _tag: "Some", value: AVAILABLE_CONNECTION_STATE }),
       );
       expect(harness.followStream).toHaveBeenCalledWith(environmentId, expect.anything());
-      expect(harness.commandConfigs).toHaveLength(5);
+      expect(harness.commandConfigs).toHaveLength(7);
       for (const config of harness.commandConfigs) {
         expect(config.scheduler).toBe(harness.scheduler);
         expect(config.concurrency).toMatchObject({ mode: "serial" });
@@ -81,12 +81,22 @@ describe("createEnvironmentCatalogAtoms", () => {
 
       const service = {
         register: vi.fn((input: unknown) => Effect.succeed(input)),
+        connect: vi.fn((input: unknown) => Effect.succeed(input)),
+        disconnect: vi.fn((input: unknown) => Effect.succeed(input)),
         remove: vi.fn((input: unknown) => Effect.succeed(input)),
         removeRelayEnvironments: vi.fn(() => Effect.void),
         retryNow: vi.fn((input: unknown) => Effect.succeed(input)),
         acceptStorageIdentity: vi.fn((input: unknown) => Effect.succeed(input)),
       };
-      const inputs = [{ id: "target" }, environmentId, undefined, environmentId, environmentId];
+      const inputs = [
+        { id: "target" },
+        environmentId,
+        environmentId,
+        environmentId,
+        undefined,
+        environmentId,
+        environmentId,
+      ];
       for (const [index, input] of inputs.entries()) {
         const execute = harness.commandConfigs[index]!.execute as (
           value: unknown,
@@ -94,6 +104,8 @@ describe("createEnvironmentCatalogAtoms", () => {
         yield* execute(input).pipe(Effect.provideService(EnvironmentRegistry, service as never));
       }
       expect(service.register).toHaveBeenCalledWith({ id: "target" });
+      expect(service.connect).toHaveBeenCalledWith(environmentId);
+      expect(service.disconnect).toHaveBeenCalledWith(environmentId);
       expect(service.remove).toHaveBeenCalledWith(environmentId);
       expect(service.removeRelayEnvironments).toHaveBeenCalled();
       expect(service.retryNow).toHaveBeenCalledWith(environmentId);

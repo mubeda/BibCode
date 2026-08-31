@@ -121,6 +121,9 @@ describe("auth HTTP fixture exporter", () => {
       "token",
       "webSocketTicket",
       "pairingCredential",
+      "pairingOffer",
+      "cancelPairingOffer",
+      "shareState",
       "pairingLinks",
       "revokePairingLink",
       "clients",
@@ -135,9 +138,9 @@ describe("auth HTTP fixture exporter", () => {
       "errors/operation-forbidden.json",
       "errors/internal.json",
     ]);
-    expect(manifest.fixtures).toHaveLength(21);
+    expect(manifest.fixtures).toHaveLength(26);
     expect(manifest.fixtures).toEqual([...manifest.fixtures].toSorted());
-    expect(Object.keys(manifest.schemaFingerprints)).toHaveLength(24);
+    expect(Object.keys(manifest.schemaFingerprints)).toHaveLength(29);
 
     for (const route of manifest.routes) {
       const payloadKeys = route.payloads.map(

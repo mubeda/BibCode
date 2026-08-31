@@ -273,6 +273,8 @@ async fn binds_an_ephemeral_port_and_serves_the_environment_descriptor() {
     let descriptor: Value = response.json().await.expect("environment JSON");
     assert_eq!(descriptor["environmentId"], "local");
     assert_eq!(descriptor["capabilities"]["repositoryIdentity"], true);
+    assert_eq!(descriptor["remoteProtocolVersion"], 1);
+    assert_eq!(descriptor["minCompatibleRemoteProtocol"], 1);
     assert!(descriptor["capabilities"].get("worktreeCatalog").is_none());
     assert!(
         descriptor["capabilities"]
@@ -1093,6 +1095,9 @@ fn expected_routes() -> Vec<(&'static str, &'static str)> {
         ("POST", "/oauth/token"),
         ("POST", "/api/auth/websocket-ticket"),
         ("POST", "/api/auth/pairing-token"),
+        ("POST", "/api/auth/pairing-offer"),
+        ("POST", "/api/auth/pairing-offer/cancel"),
+        ("GET", "/api/auth/share-state"),
         ("GET", "/api/auth/pairing-links"),
         ("POST", "/api/auth/pairing-links/revoke"),
         ("GET", "/api/auth/clients"),
@@ -1108,6 +1113,7 @@ fn expected_routes() -> Vec<(&'static str, &'static str)> {
         ("POST", "/api/connect/mint-credential"),
         ("POST", "/api/bibcode-connect/mint-credential"),
         ("GET", "/ws"),
+        ("GET", "/ws-e2ee"),
         ("POST", "/api/diagnostics/logs.zip"),
         ("GET", "/api/assets/*"),
         ("POST", "/.well-known/bibcode/desktop/shutdown"),

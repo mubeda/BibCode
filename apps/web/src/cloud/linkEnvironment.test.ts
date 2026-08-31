@@ -137,6 +137,7 @@ function registryLayer(options?: {
         ready: Effect.void,
         probe: Effect.void,
         closed: Effect.never,
+        e2eeAuthenticated: Effect.succeed(null),
       };
       const target = new PrimaryConnectionTarget({
         environmentId: EnvironmentId.make(TARGET.environmentId),
@@ -261,12 +262,16 @@ describe("web cloud link environment client", () => {
       platform: { os: "darwin", arch: "arm64" },
       serverVersion: "0.0.0-test",
       storageInstanceId: null,
+      remoteUpdateSupport: null,
+      remoteProtocolVersion: 1,
+      minCompatibleRemoteProtocol: 1,
       capabilities: {
         repositoryIdentity: true,
         worktreeCatalog: false,
         worktreeCatalogRefreshReason: false,
         vcsStatusSummary: false,
         activityProtocolVersion: null,
+        remoteUpdateControl: false,
       },
     });
 

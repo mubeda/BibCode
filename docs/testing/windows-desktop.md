@@ -60,8 +60,9 @@ Select focused tests from affected source and verify at least:
   state;
 - independent runtimes cannot terminate each other's process roots;
 - local Windows and WSL presentation follows current environment capability;
-- remote device, SSH, Tailscale, relay, and connection actions do not mount in
-  ordinary desktop presentation; and
+- saved remote environments appear in the environment rail without exposing
+  privileged SSH, Tailscale, relay, or connection-lifecycle controls outside
+  their owning settings and desktop-bridge boundaries; and
 - update protection treats long-lived read subscriptions as reads, reports
   staged progress and active mutation counts while preparing, rejects a forged
   first-attempt bypass, and offers the acknowledged no-backup path only after a
@@ -214,10 +215,16 @@ wsl.exe --list --verbose
 When WSL and a supported distribution are usable:
 
 - Settings shows **Local environment** and WSL status/setup controls;
-- Add Project offers **This device** plus only WSL locations with a matching
-  usable bootstrap;
+- Add Project targets the selected environment; Local offers **This device**
+  plus only WSL locations with a matching usable bootstrap, while saved remote
+  rail selections remain valid remote hosts;
 - native and WSL paths do not collapse into one project identity;
 - a disposable WSL project can launch its supported session and terminal;
+- entering WSL-only first persists and verifies native local-only exposure and
+  removes the managed firewall rule before switching topology; leaving WSL-only
+  restarts the native backend explicitly local-only before share-state may
+  request a later widen. Confirm both transitions serialize with concurrent
+  exposure/settings mutations;
 - restart retains the correct environment identity; and
 - shutdown does not terminate unrelated WSL processes.
 
@@ -230,8 +237,8 @@ When WSL is unavailable:
 - local Windows projects remain usable.
 
 Do not install a distribution or change system WSL configuration without
-permission. SSH, Tailscale, relay, and remote-device targets remain absent in
-both branches of the matrix.
+permission. Remote-server targets and exposure controls are validated in the
+packaged UI scenarios independently of the WSL branch.
 
 For update validation, use an isolated `BIBCODE_HOME` and disposable native
 project; include a disposable WSL project when WSL is usable. Keep a read
@@ -251,6 +258,7 @@ same environment, use:
 
 ```powershell
 node scripts/run-msvc-x64.mjs cargo test --workspace -j 2 -- --test-threads=2
+node scripts/run-msvc-x64.mjs cargo clean -p bibcode-server -p bibcode-desktop -p bibcode-updater-verifier
 node scripts/run-msvc-x64.mjs cargo clippy --workspace --all-targets -- -D warnings
 ```
 
@@ -309,13 +317,105 @@ the E2E build in the current worktree, not an installed production copy.
 
 ## Packaged UI scenarios
 
-Use Codex Computer Use, not Orca. Capture normal, minimum-size, and relevant
-Windows DPI states. Verify:
+Use Codex Computer Use to operate the packaged executable. Capture normal,
+minimum-size, and relevant Windows DPI states. Verify:
 
-- Add Project shows **This device** and usable WSL locations only;
-- Local Environment is visible and never empty;
-- Connections, SSH, pairing, Tailscale, relay, exposure, and remote retry UI is
-  absent from ordinary desktop presentation;
+- the environment rail groups **This device** and usable WSL locations under
+  Local, shows saved remote servers separately, and Add Project targets the
+  current rail selection;
+- **Local environment** is visible at `/settings/local-environment` and never
+  empty;
+- Settings shows **Remote Servers** with **Connect to a host** and **Share this
+  host** tabs; `/settings/connections` redirects there. SSH discovery and
+  grant-driven sharing appears because the desktop bridge is present.
+  remote targeting is driven by the environment rail rather than mixing saved
+  servers into the Local WSL picker;
+- Remote server updates: with a second BiBCode server saved (headless
+  `bibcode serve` is sufficient), open Remote Servers settings, run **Check for
+  Server Updates**, and confirm each saved server row shows an update badge
+  (**Manual updates** for a headless server) and a manual-instructions block
+  with a copy button. An offline server must show **Status unavailable** without
+  blocking the rest of the batch; a blackholed check must settle after 30
+  seconds across supervisor acquisition, readiness, and RPC execution, then
+  release its batch worker;
+- in **Settings → Remote Servers → Share this host**, generate an **Another
+  device** offer. Confirm the local server restarts before the pairing offer is
+  shown, and that the result contains the browser URL, `bibcode://` deep link,
+  pairing code, and QR code. Then inspect the firewall rule:
+
+  ```powershell
+  netsh advfirewall firewall show rule name="BiBCode Remote Access"
+  ```
+
+  Confirm it is enabled, program-scoped to the exact packaged executable,
+  TCP-only, and limited to Domain/Private profiles. Revoke the final
+  native-managed **Another device** offer or paired client, verify exposure
+  returns to loopback, and confirm the
+  named rule is absent. Record an elevation or policy denial as failed native
+  evidence; do not substitute a manually created rule. Run the host-independent
+  deletion-spawn and policy-denial tests, then reproduce a deletion denial
+  natively and confirm the app reports incomplete cleanup rather than claiming
+  the rule was removed. A missing rule is benign only when the persistent
+  firewall store can be queried and its absence verified. Capture the shared
+  runbook's four explicit ceremony outcomes: authoritative local-only
+  confirmation even after cancellation failure, another live access reason kept
+  wide, cancellation and cleanup both unconfirmed, and cleanup topology
+  unverified. Also cover the three-pass/five-second reconciliation retry and
+  terminal warning toast, last-browser-session revocation
+  with a local-only restart and removed rule, one compensating widen during a
+  concurrent grant, bounded handling of a blackholed create response, and
+  explicit legacy resume after a local-only restart. Confirm the caller returns
+  a bounded failure after five seconds even when process spawn is delayed; the
+  firewall worker must retain ownership, remove and verify absence of any rule
+  enabled after that deadline, and complete that cleanup before a later enable.
+  Burst multiple requests while one command is in flight and confirm the worker
+  retains only the latest pending desired state, reports superseded callers
+  explicitly, and applies that latest state after mandatory late cleanup.
+  Separately confirm a hung `netsh` or PowerShell child is terminated and reaped
+  by its 15-second process timeout and never retains the exposure coordinator
+  indefinitely;
+
+- with WSL-only primary mode active, generate an **Another device** offer from
+  a usable WSL advertised endpoint. Confirm the native Windows backend process,
+  native exposure state, and `BiBCode Remote Access` firewall rule do not change;
+  the ceremony and reconciler must not call the native exposure bridge for this
+  topology. In the Exposure section, confirm the available off-host WSL URL is
+  shown, exposure is described as externally managed by WSL/Hyper-V policy, and
+  the native-only **Limited to this machine** and **Managed automatically** copy
+  is absent. Start one native reconciliation before the
+  switch and let it resume after WSL-only becomes active; work that has not
+  applied must produce no exposure side effects. Separately unmount after a
+  local-only apply commits and prove its authoritative refetch and one required
+  compensating widen still complete. A direct native exposure bridge invocation
+  after the switch must be rejected by the host-side topology guard;
+
+- the address picker lists only usable IPv4 candidates until a dual-stack
+  listener exists, uses stable address/port IDs, safely preselects a private
+  default, reports off-host interface observations unavailable before widening,
+  and leaves generation disabled with externally managed listener/reverse-proxy
+  guidance when native discovery has only a public or non-default private
+  address. Public interface candidates remain non-actionable even after native
+  exposure is wide. A custom off-host address mints without changing the native
+  listener or firewall rule, and later auth revisions do not widen it. An
+  externally managed public endpoint is never preselected and requires an
+  explicit public-address/firewall warning. A packaged Tailscale CLI is
+  discovered without shell `PATH` and unusable, public, or IPv6 candidates are
+  suppressed;
+- seed an incompatible newer connection IndexedDB version and confirm the
+  boot-level recovery dialog lists the deleted data classes, keeps **Reload** as
+  a non-destructive exit, requires a separately acknowledged confirmation that a
+  double-click cannot trigger, and treats a blocked deletion as visibly queued
+  until the original request succeeds or errors. It must not reload while
+  blocked or after failure, and reloads automatically only after success;
+- open a hosted `/pair` link whose host includes an IDN and explicit port and
+  confirm the normalized punycode host shown is exactly the destination used.
+  Reject a target containing username/password, and confirm legacy `code` query
+  parameters are removed from both `/pair` and Remote Servers history after
+  being retained for the current attempt;
+
+- from the OS, opening a well-formed `bibcode://pair?code=...` link while the
+  packaged app is running focuses that instance and lands on Add Server with
+  the code prefilled;
 - provider settings and action menus contain Claude, Codex, Cursor, and
   OpenCode without Early Access labels and omit Grok/Grok Terminal;
 - external worktrees group by parent, expose full paths accessibly, adopt

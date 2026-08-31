@@ -110,6 +110,40 @@ pub struct PairingCredentialResult {
     pub expires_at: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+pub struct CreatePairingOfferRequest {
+    pub name: String,
+    pub endpoint: String,
+    pub reach: String,
+    pub label: Option<String>,
+    pub scopes: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelPairingOfferRequest {
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairingOfferResult {
+    pub id: String,
+    pub code: String,
+    pub reach: String,
+    pub endpoint: String,
+    pub name: String,
+    pub expires_at: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareExposureState {
+    pub desired_exposure: String,
+    pub off_host_grant_count: usize,
+    pub legacy_grant_count: usize,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PairingLinkView {
@@ -121,6 +155,8 @@ pub struct PairingLinkView {
     pub label: Option<String>,
     pub created_at: String,
     pub expires_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reach: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -134,7 +170,7 @@ pub struct RevokeClientRequest {
     pub session_id: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -163,7 +199,7 @@ impl Default for ClientMetadata {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientSessionView {
     pub session_id: String,
@@ -176,6 +212,8 @@ pub struct ClientSessionView {
     pub last_connected_at: Option<String>,
     pub connected: bool,
     pub current: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reach: Option<String>,
 }
 
 #[derive(Clone, Debug)]

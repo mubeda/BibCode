@@ -190,6 +190,17 @@ export const resolveRemoteWebSocketConnectionUrl = Effect.fn(
   return url.toString();
 });
 
+/** Builds the credential-free websocket endpoint for a host-key-pinned channel. */
+export function e2eeSocketUrl(wsBaseUrl: string): string {
+  const url = new URL(wsBaseUrl);
+  if (url.pathname === "" || url.pathname === "/") {
+    url.pathname = "/ws-e2ee";
+  }
+  url.search = "";
+  url.hash = "";
+  return url.toString();
+}
+
 export const resolveRemoteDpopWebSocketConnectionUrl = Effect.fn(
   "clientRuntime.authorization.resolveRemoteDpopWebSocketConnectionUrl",
 )(function* (input: {
