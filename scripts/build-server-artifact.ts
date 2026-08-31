@@ -14,6 +14,7 @@ import {
   type ReleasePlatform,
   type ReleaseTarget,
 } from "./lib/release-targets.ts";
+import { installNfpm, planNfpmInstall } from "./install-nfpm.ts";
 
 const REPOSITORY_ROOT = NodePath.resolve(import.meta.dirname, "..");
 const VERSION_PATTERN = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:[-+][0-9A-Za-z.-]+)?$/;
@@ -42,6 +43,7 @@ export interface ServerArtifactPaths {
 export interface ServerArtifactCommand {
   readonly command: string;
   readonly args: ReadonlyArray<string>;
+  readonly env?: Readonly<Record<string, string>>;
 }
 
 export interface ServerArtifactPlan {
@@ -58,6 +60,9 @@ export interface ServerArtifactPlan {
   readonly webDir: string;
   readonly guidePath: string;
   readonly licensePath: string;
+  readonly repositoryRoot: string;
+  readonly packageArtifacts: ReadonlyArray<string>;
+  readonly packageCommands: ReadonlyArray<ServerArtifactCommand>;
   readonly skipBuild: boolean;
   readonly verbose: boolean;
   readonly buildCommands: ReadonlyArray<ServerArtifactCommand>;
@@ -169,6 +174,52 @@ export function planServerArtifact(
           args: [NodePath.join(repositoryRoot, "scripts/run-msvc.mjs"), "cargo", ...cargoArgs],
         }
       : { command: "cargo", args: cargoArgs };
+  const packageArtifacts =
+    target.platform === "linux"
+      ? [
+          NodePath.join(outputDir, `bibcode-server_${input.version}_${target.debArch}.deb`),
+          NodePath.join(outputDir, `bibcode-server-${input.version}-1.${target.rpmArch}.rpm`),
+        ]
+      : [];
+  const nfpmExecutable =
+    target.platform === "linux"
+      ? planNfpmInstall("linux", target.arch, repositoryRoot).executablePath
+      : undefined;
+  const packageEnvironment = {
+    BIBCODE_SERVER_PACKAGE_ROOT: stagingDir,
+    BIBCODE_SERVER_PACKAGE_VERSION: input.version,
+  };
+  const packageCommands =
+    target.platform === "linux" && nfpmExecutable !== undefined
+      ? [
+          {
+            command: nfpmExecutable,
+            args: [
+              "package",
+              "--config",
+              NodePath.join(repositoryRoot, "apps/server/package/nfpm.yaml"),
+              "--packager",
+              "deb",
+              "--target",
+              packageArtifacts[0]!,
+            ],
+            env: { ...packageEnvironment, BIBCODE_SERVER_PACKAGE_ARCH: target.debArch! },
+          },
+          {
+            command: nfpmExecutable,
+            args: [
+              "package",
+              "--config",
+              NodePath.join(repositoryRoot, "apps/server/package/nfpm.yaml"),
+              "--packager",
+              "rpm",
+              "--target",
+              packageArtifacts[1]!,
+            ],
+            env: { ...packageEnvironment, BIBCODE_SERVER_PACKAGE_ARCH: target.rpmArch! },
+          },
+        ]
+      : [];
 
   return {
     target,
@@ -184,6 +235,9 @@ export function planServerArtifact(
     webDir,
     guidePath,
     licensePath,
+    repositoryRoot,
+    packageArtifacts,
+    packageCommands,
     skipBuild: input.skipBuild ?? false,
     verbose: input.verbose ?? false,
     buildCommands: [
@@ -256,6 +310,7 @@ export async function stageServerDistribution(
 function runCommand(command: ServerArtifactCommand, cwd: string, verbose: boolean): void {
   const result = NodeChildProcess.spawnSync(command.command, [...command.args], {
     cwd,
+    env: { ...process.env, ...command.env },
     shell: false,
     stdio: verbose ? "inherit" : ["ignore", "pipe", "pipe"],
     encoding: "utf8",
@@ -302,6 +357,20 @@ export async function buildServerArtifact(plan: ServerArtifactPlan): Promise<str
   await NodeFS.promises.mkdir(plan.outputDir, { recursive: true });
   runCommand(plan.archiveCommand, REPOSITORY_ROOT, plan.verbose);
   validateArchive(plan);
+  if (plan.target.platform === "linux") {
+    const nfpm = await installNfpm(planNfpmInstall("linux", plan.target.arch, plan.repositoryRoot));
+    if (plan.packageCommands.some((command) => command.command !== nfpm)) {
+      throw new ServerArtifactConfigurationError("nFPM command path changed after planning.");
+    }
+    for (const command of plan.packageCommands) {
+      runCommand(command, plan.repositoryRoot, plan.verbose);
+    }
+    for (const artifact of plan.packageArtifacts) {
+      if (!NodeFS.existsSync(artifact) || !NodeFS.statSync(artifact).isFile()) {
+        throw new ServerArtifactConfigurationError(`nFPM did not produce ${artifact}.`);
+      }
+    }
+  }
   return plan.archivePath;
 }
 
