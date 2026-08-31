@@ -17,8 +17,8 @@ import {
   ManagedProcessRegistry,
   parseSeededDesktopUpgradeSmokeArgs,
   redactAndBoundUpgradeEvidence,
-  resolveBoundedCommandLaunch,
   runBoundedCommand,
+  seededUpgradeVitePlusExecutable,
   seededUpgradeBundleRoot,
   seededUpgradeRustTarget,
   updaterTargetFor,
@@ -30,24 +30,8 @@ const absolute = (...parts: ReadonlyArray<string>): string =>
   NodePath.resolve("/tmp/bibcode-upgrade-smoke", ...parts);
 
 describe("seeded packaged desktop upgrade harness", () => {
-  it("launches Windows command wrappers through the native command processor", () => {
-    expect(
-      resolveBoundedCommandLaunch(
-        "vp.cmd",
-        ["install", "--frozen-lockfile"],
-        "win32",
-        "C:\\Windows\\System32\\cmd.exe",
-      ),
-    ).toEqual({
-      args: ["/d", "/s", "/c", 'vp.cmd "install" "--frozen-lockfile"'],
-      command: "C:\\Windows\\System32\\cmd.exe",
-      windowsVerbatimArguments: true,
-    });
-    expect(resolveBoundedCommandLaunch("git.exe", ["status"], "win32", "cmd.exe")).toEqual({
-      args: ["status"],
-      command: "git.exe",
-      windowsVerbatimArguments: false,
-    });
+  it("launches the native Vite+ executable on every host", () => {
+    expect(seededUpgradeVitePlusExecutable).toBe("vp");
   });
 
   it("canonicalizes symlinked work roots before installing an updater target", async () => {

@@ -741,45 +741,7 @@ interface CommandResult {
   readonly stdout: string;
 }
 
-// oxlint-disable-next-line bibcode/no-global-process-runtime -- The standalone release harness selects the native host executable once.
-const vpExecutable = process.platform === "win32" ? "vp.cmd" : "vp";
-// oxlint-disable-next-line bibcode/no-global-process-runtime -- The standalone release harness selects the native command-launch boundary once.
-const nativeProcessPlatform: NodeJS.Platform = process.platform;
-
-const quoteWindowsCommandArgument = (value: string): string => {
-  if (value.includes("\0") || value.includes("\r") || value.includes("\n")) {
-    throw new SeededDesktopUpgradeSmokeError(
-      "Windows command arguments must not contain control characters.",
-    );
-  }
-  return `"${value.replaceAll('"', '""')}"`;
-};
-
-export function resolveBoundedCommandLaunch(
-  command: string,
-  args: ReadonlyArray<string>,
-  platform: NodeJS.Platform = nativeProcessPlatform,
-  commandProcessor = process.env.ComSpec,
-): {
-  readonly args: ReadonlyArray<string>;
-  readonly command: string;
-  readonly windowsVerbatimArguments: boolean;
-} {
-  if (platform !== "win32" || !/\.(?:bat|cmd)$/i.test(command)) {
-    return { args, command, windowsVerbatimArguments: false };
-  }
-  if (!/^[A-Za-z0-9_.:\\/-]+$/u.test(command)) {
-    throw new SeededDesktopUpgradeSmokeError(
-      "Windows command-wrapper executable names must not require shell quoting.",
-    );
-  }
-  const commandLine = [command, ...args.map(quoteWindowsCommandArgument)].join(" ");
-  return {
-    args: ["/d", "/s", "/c", commandLine],
-    command: commandProcessor?.trim() || "cmd.exe",
-    windowsVerbatimArguments: true,
-  };
-}
+export const seededUpgradeVitePlusExecutable = "vp";
 
 const terminateChild = async (child: NodeChildProcess.ChildProcess): Promise<void> => {
   if (child.exitCode !== null || child.signalCode !== null) return;
@@ -805,13 +767,11 @@ export const runBoundedCommand = async (input: {
   readonly timeoutMs?: number | undefined;
 }): Promise<CommandResult> =>
   new Promise((resolve, reject) => {
-    const launch = resolveBoundedCommandLaunch(input.command, input.args);
-    const child = NodeChildProcess.spawn(launch.command, launch.args, {
+    const child = NodeChildProcess.spawn(input.command, input.args, {
       cwd: input.cwd,
       env: input.env ?? process.env,
       shell: false,
       stdio: input.inherit ? "inherit" : ["ignore", "pipe", "pipe"],
-      windowsVerbatimArguments: launch.windowsVerbatimArguments,
       windowsHide: true,
     });
     let settled = false;
@@ -930,14 +890,14 @@ const buildPackagedApplication = async (input: {
   readonly targetDirectory: string;
 }): Promise<void> => {
   await requireCommandSuccess({
-    command: vpExecutable,
+    command: seededUpgradeVitePlusExecutable,
     args: ["install", "--frozen-lockfile"],
     cwd: input.checkout,
     inherit: true,
     timeoutMs: 10 * 60_000,
   });
   await requireCommandSuccess({
-    command: vpExecutable,
+    command: seededUpgradeVitePlusExecutable,
     args: [
       "run",
       "--filter",
@@ -1143,7 +1103,7 @@ const runWebDriverPhase = async (input: {
     { mode: 0o600 },
   );
   const result = await runCommand({
-    command: vpExecutable,
+    command: seededUpgradeVitePlusExecutable,
     args: ["exec", "wdio", "run", configPath],
     cwd: NodePath.join(input.repositoryRoot, "apps", "desktop"),
     env: {
