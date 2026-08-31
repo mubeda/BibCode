@@ -57,7 +57,7 @@ function packageScript(
   const install =
     target.format === "deb"
       ? "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates procps && apt-get install -y /artifacts/package.deb"
-      : "dnf install -y curl ca-certificates procps-ng /artifacts/package.rpm";
+      : "dnf install -y curl-minimal ca-certificates procps-ng /artifacts/package.rpm";
   const inspect =
     target.format === "deb"
       ? "dpkg-deb --field /artifacts/package.deb Package Version Architecture"
