@@ -94,6 +94,12 @@ function parseJson(text: string, description: string): Record<string, unknown> {
   throw new ServerDistributionSmokeError(`${description} was not a JSON object.`);
 }
 
+export function isExpectedServerShutdownExit(platform: NodeJS.Platform, exitCode: number): boolean {
+  // Node implements SIGTERM through forced process termination on Windows,
+  // where the observed child exit status is 1 rather than a graceful POSIX 0.
+  return exitCode === 0 || (platform === "win32" && exitCode === 1);
+}
+
 export async function smokeServerDistribution(
   input: ServerDistributionSmokeInput,
 ): Promise<ServerDistributionSmokeResult> {
@@ -219,7 +225,9 @@ export async function smokeServerDistribution(
       throw new ServerDistributionSmokeError("Pairing token response was incomplete.");
     }
 
-    child.kill("SIGTERM");
+    if (!child.kill("SIGTERM")) {
+      throw new ServerDistributionSmokeError("Could not request server shutdown.");
+    }
     const exitCode = await withTimeout(
       new Promise<number>((resolve, reject) => {
         child.once("error", reject);
@@ -228,7 +236,8 @@ export async function smokeServerDistribution(
       timeoutMs,
       "Server shutdown",
     );
-    if (exitCode !== 0) {
+    // oxlint-disable-next-line bibcode/no-global-process-runtime -- This native smoke validates the host process it just terminated.
+    if (!isExpectedServerShutdownExit(NodeOS.platform(), exitCode)) {
       throw new ServerDistributionSmokeError(`Server shutdown exited with ${exitCode}.`);
     }
     return {
