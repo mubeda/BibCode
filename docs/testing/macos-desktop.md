@@ -10,6 +10,9 @@ Intel x64. A native run proves only the host architecture unless another native
 Mac executes the other artifact. Record macOS build, hardware architecture,
 and whether translation is involved.
 
+Standalone server releases provide native ARM64 and x64 `.tar.gz` archives containing
+`bibcode` and the matching web client. Validate the archive matching the native host.
+
 ## Host and toolchain inventory
 
 Record:

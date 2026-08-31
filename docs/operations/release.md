@@ -1,7 +1,7 @@
 # Release Checklist
 
-This document describes the Tauri 2 desktop release workflow. The repository
-does not package or publish Electron artifacts.
+This document describes the Tauri 2 desktop and native standalone-server release
+workflow. The repository does not package or publish Electron artifacts.
 
 ## Release Workflow
 
@@ -14,34 +14,58 @@ The preflight job runs `vp check`, `vp run typecheck`, and `vp run test`. The
 build matrix then creates native Tauri installers on the matching operating
 system:
 
-| Platform | Runner           | Architecture | Installer       |
-| -------- | ---------------- | ------------ | --------------- |
-| macOS    | `macos-26`       | arm64        | DMG             |
-| macOS    | `macos-26-intel` | x64          | DMG             |
-| Linux    | `ubuntu-22.04`   | x64          | AppImage        |
-| Windows  | `windows-2025`   | x64          | NSIS executable |
+| Platform | Runner                  | Architecture | Installer       |
+| -------- | ----------------------- | ------------ | --------------- |
+| macOS    | `macos-26`              | arm64        | DMG             |
+| macOS    | `macos-26-intel`        | x64          | DMG             |
+| Linux    | `ubuntu-22.04-arm`      | arm64        | AppImage        |
+| Linux    | `ubuntu-22.04`          | x64          | AppImage        |
+| Windows  | `windows-11-vs2026-arm` | arm64        | NSIS executable |
+| Windows  | `windows-2025`          | x64          | NSIS executable |
 
 Each matrix job installs the frontend build toolchain and Rust, restores Cargo
 caches, and runs `scripts/build-desktop-artifact.ts`. Tauri compiles the native
 host and in-process server and embeds the built React assets. No Node runtime or
 TypeScript server is packaged.
 
+A separate native matrix builds `bibcode` plus the matching static web client for the
+same six targets. macOS and Linux receive `.tar.gz` archives; Windows receives `.zip`.
+Linux also receives direct-download `.deb` and `.rpm` packages for both architectures.
+The Linux server binary is compiled on an Ubuntu 20.04 compatibility baseline, then its
+packages are installed and exercised on Ubuntu 22.04, Ubuntu 24.04, Debian 12, Rocky
+Linux 9, and Fedora 44.
+
 Numeric stable versions are updater candidates and are marked latest only after
 manual publication approval. Stable prerelease versions and manual nightly
-releases are GitHub prereleases, are never marked latest, and remain
-installer-only.
+releases are GitHub prereleases, are never marked latest, and publish desktop
+installers plus standalone server distributions without updater metadata.
 
 ## Supported Platforms
 
 - macOS 11 or newer on Apple Silicon (`arm64`) and Intel (`x64`);
-- Windows 10 or 11 on `x64`;
-- Linux `x64` AppImages built on Ubuntu 22.04 and exercised on Ubuntu 22.04,
+- Windows 10 or 11 on `x64`, and Windows 11 on ARM64;
+- Linux x64 and ARM64 AppImages built on matching Ubuntu 22.04 runners and exercised on Ubuntu 22.04,
   Ubuntu 24.04, and Debian 12.
 
-Windows on ARM remains unsupported until the native release and validation
-matrix is enabled. `scripts/run-msvc.mjs` already selects the requested MSVC
-architecture. Linux release artifacts use Ubuntu 22.04 to keep the
-runtime glibc compatibility floor below the portable Ubuntu 24.04 CI jobs.
+`scripts/run-msvc.mjs` selects the requested native MSVC architecture. Linux desktop
+release artifacts use Ubuntu 22.04; standalone server builds use the older compatibility
+baseline described above.
+
+## Standalone Server Assets
+
+Each release contains `bibcode-server-v<version>-<os>-<architecture>.tar.gz` for macOS
+and Linux or `.zip` for Windows. Public OS/architecture keys are
+`darwin-{aarch64,x86_64}`, `linux-{aarch64,x86_64}`, and
+`windows-{aarch64,x86_64}`. Linux also publishes:
+
+- `bibcode-server_<version>_arm64.deb`
+- `bibcode-server_<version>_amd64.deb`
+- `bibcode-server-<version>-1.aarch64.rpm`
+- `bibcode-server-<version>-1.x86_64.rpm`
+
+The packages are direct GitHub Release downloads, not hosted APT or RPM repositories.
+Every release includes `bibcode-server-SHA256SUMS`; optional server `.minisig` files
+appear only when both dedicated server-signing secrets are configured.
 
 ## Version Source
 
@@ -86,6 +110,11 @@ signed/unnotarized. Tauri updater signatures verify update payloads; they do
 not replace Apple Developer ID signing, macOS notarization, or Windows
 Authenticode.
 
+Every server artifact is covered by `bibcode-server-SHA256SUMS`. If both
+`BIBCODE_SERVER_SIGNING_PRIVATE_KEY` and `BIBCODE_SERVER_SIGNING_PUBLIC_KEY` are
+configured, release assembly also creates and verifies `.minisig` files. Server signing
+is optional and uses a key separate from the mandatory Tauri updater key.
+
 Keep a password-protected backup of the updater private key in an approved
 offline recovery location, with access restricted to release maintainers. Keep
 its passphrase in a separate approved secret store.
@@ -113,7 +142,9 @@ Every stable `latest.json` has exactly these signed manifest targets:
 
 - `darwin-aarch64`
 - `darwin-x86_64`
+- `linux-aarch64`
 - `linux-x86_64`
+- `windows-aarch64`
 - `windows-x86_64`
 
 The payload URLs inside the manifest must be tag-specific HTTPS GitHub Release
@@ -122,9 +153,9 @@ only to fetch `latest.json`. Before creating a draft, release CI verifies every
 manifest payload with the public key from the release overlay and requires each
 manifest signature to match its adjacent `.sig` asset.
 
-Stable-channel and nightly prereleases are installer-only. They never receive
-the updater signing overlay, updater signatures, descriptors, or `latest.json`,
-and never feed the app updater.
+Stable-channel and nightly prereleases never receive the updater signing overlay,
+updater signatures, descriptors, or `latest.json`, and never feed the app updater. They
+still publish the validated standalone server matrix and checksums.
 
 ### Update installation safety
 

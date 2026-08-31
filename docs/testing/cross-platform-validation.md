@@ -99,6 +99,30 @@ A focused suite must cover the changed success behavior and its material
 failure, cancellation, retry, restart, and cleanup seams. For cross-platform
 logic, include host-independent fixtures for every affected platform.
 
+### Native release distribution evidence
+
+For every desktop target, build and install the native artifact, inspect the installed
+executable architecture, run the packaged UI suite, retain bounded screenshots/logs, and
+exercise a seeded update. The required matrix is macOS ARM64/x64, Linux ARM64/x64, and
+Windows ARM64/x64. A cross-compiled or emulated executable is compatibility evidence, not
+a native pass.
+
+For every standalone server target, inspect the native executable, run `bibcode
+--version`, start the staged distribution without `--static-dir`, fetch `/`, read the
+environment descriptor, issue and exchange pairing material, then terminate and prove
+cleanup. Linux additionally installs and removes both package formats in native
+containers:
+
+| Format | Required systems                      |
+| ------ | ------------------------------------- |
+| `.deb` | Ubuntu 22.04, Ubuntu 24.04, Debian 12 |
+| `.rpm` | Rocky Linux 9, Fedora 44              |
+
+Package removal must delete `/usr/bin/bibcode` and package-owned documentation/web
+assets while preserving a test sentinel in the isolated BiBCode data root. Record the
+archive/package name, reported architecture, version, startup result, pairing result,
+shutdown result, and evidence artifact location in the execution report.
+
 ### Grant-driven remote sharing
 
 When pairing-offer generation, grant reach metadata, desktop exposure, or
