@@ -8,7 +8,7 @@ page contains only native Windows additions.
 The supported Windows release target is Windows 10 or 11 on x64. Release and
 native smoke workflows use the x64 MSVC toolchain and build an NSIS installer.
 Windows ARM commands may exist for development experiments, but they are not a
-supported release target while `scripts/run-msvc-x64.mjs` remains x64-specific.
+supported release target until the native release and validation matrices are enabled.
 
 Record the exact Windows edition, build, architecture, and whether the host is
 physical or virtual. Do not silently substitute Wine, WSL, or a cross-compiled
@@ -40,7 +40,7 @@ wsl.exe --list --verbose
 
 Record missing MSVC, Windows SDK, WebView2, WSL, or distribution capabilities.
 Do not install or enable system components without permission. Package scripts
-already route Rust/Tauri commands through `scripts/run-msvc-x64.mjs`; use the
+already route Rust/Tauri commands through `scripts/run-msvc.mjs`; use the
 documented scripts rather than constructing an unverified Visual Studio
 environment.
 
@@ -78,10 +78,10 @@ Before measuring an idle window, verify the current event-driven observation
 boundary on native Windows:
 
 ```powershell
-node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --lib git::broadcaster::tests::ref_poll_is_replaced_by_watcher_and_safety_status_reads -- --exact --nocapture
-node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --lib git::watcher -- --nocapture
-node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --lib production::runtime::tests::structured_terminal_process_exit_immediately_invalidates_status_under_watcher_fallback -- --exact --nocapture
-node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test production_git_vcs_rpc native_watcher_publishes_external_worktree_and_head_changes_to_status_subscribers -- --exact --nocapture
+node scripts/run-msvc.mjs cargo test -p bibcode-server --lib git::broadcaster::tests::ref_poll_is_replaced_by_watcher_and_safety_status_reads -- --exact --nocapture
+node scripts/run-msvc.mjs cargo test -p bibcode-server --lib git::watcher -- --nocapture
+node scripts/run-msvc.mjs cargo test -p bibcode-server --lib production::runtime::tests::structured_terminal_process_exit_immediately_invalidates_status_under_watcher_fallback -- --exact --nocapture
+node scripts/run-msvc.mjs cargo test -p bibcode-server --test production_git_vcs_rpc native_watcher_publishes_external_worktree_and_head_changes_to_status_subscribers -- --exact --nocapture
 vp test run packages/client-runtime/src/state/vcs.test.ts apps/web/src/components/GitActionsControl.test.tsx
 ```
 
@@ -257,9 +257,9 @@ the package-specific MSVC launcher. When a direct native Rust command needs the
 same environment, use:
 
 ```powershell
-node scripts/run-msvc-x64.mjs cargo test --workspace -j 2 -- --test-threads=2
-node scripts/run-msvc-x64.mjs cargo clean -p bibcode-server -p bibcode-desktop -p bibcode-updater-verifier
-node scripts/run-msvc-x64.mjs cargo clippy --workspace --all-targets -- -D warnings
+node scripts/run-msvc.mjs cargo test --workspace -j 2 -- --test-threads=2
+node scripts/run-msvc.mjs cargo clean -p bibcode-server -p bibcode-desktop -p bibcode-updater-verifier
+node scripts/run-msvc.mjs cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 Run the desktop E2E support contract natively on Windows:

@@ -61,7 +61,7 @@ describe("Rust coverage runner", () => {
     ).toEqual({
       command: process.execPath,
       args: [
-        NodePath.join("X:/bibcode", "scripts", "run-msvc-x64.mjs"),
+        NodePath.join("X:/bibcode", "scripts", "run-msvc.mjs"),
         "cargo",
         "llvm-cov",
         "--workspace",

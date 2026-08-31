@@ -81,16 +81,14 @@ describe("cross-platform CI contract", () => {
     const releaseGuide = NodeFS.readFileSync(RELEASE_GUIDE_PATH, "utf8");
 
     expect(serverPackage.scripts.test).toBe(
-      "node ../../scripts/run-msvc-x64.mjs cargo test -p bibcode-server -j 2",
+      "node ../../scripts/run-msvc.mjs cargo test -p bibcode-server -j 2",
     );
     expect(desktopPackage.scripts.test).toBe(
-      "node ../../scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop -j 2",
+      "node ../../scripts/run-msvc.mjs cargo test -p bibcode-desktop -j 2",
     );
     expect(rustWorkspaceTestStep?.run).toBe("cargo test --workspace -j 2");
     expect(ciWorkflow).not.toContain("--test-threads=1");
-    expect(releaseGuide).toContain(
-      "node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop -j 2",
-    );
+    expect(releaseGuide).toContain("node scripts/run-msvc.mjs cargo test -p bibcode-desktop -j 2");
     expect(releaseGuide).not.toContain("cargo test -p bibcode-desktop -j 2 -- --test-threads=1");
   });
 

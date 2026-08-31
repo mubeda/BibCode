@@ -38,8 +38,9 @@ installer-only.
 - Linux `x64` AppImages built on Ubuntu 22.04 and exercised on Ubuntu 22.04,
   Ubuntu 24.04, and Debian 12.
 
-Windows on ARM remains unsupported until `scripts/run-msvc-x64.mjs` is made
-architecture-aware. Linux release artifacts use Ubuntu 22.04 to keep the
+Windows on ARM remains unsupported until the native release and validation
+matrix is enabled. `scripts/run-msvc.mjs` already selects the requested MSVC
+architecture. Linux release artifacts use Ubuntu 22.04 to keep the
 runtime glibc compatibility floor below the portable Ubuntu 24.04 CI jobs.
 
 ## Version Source
@@ -263,7 +264,7 @@ infrastructure:
 ```powershell
 vp test scripts/tauri-hardening.test.ts scripts/build-desktop-artifact.test.ts scripts/build-tauri-update-manifest.test.ts scripts/ci-platform-contract.test.ts scripts/release-workflow.test.ts scripts/workflow-dependencies.test.ts
 vp test apps/web/src/components/settings/SettingsPanels.test.tsx apps/web/src/components/AppSidebarLayout.test.tsx apps/web/src/tauriDesktopBridge.test.ts apps/web/src/components/desktopUpdate.logic.test.ts apps/web/src/state/desktopUpdate.test.ts
-node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop -j 2
+node scripts/run-msvc.mjs cargo test -p bibcode-desktop -j 2
 ```
 
 Build the native artifact for the current operating system:

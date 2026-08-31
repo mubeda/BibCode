@@ -148,8 +148,7 @@ jobs:
             platform: win
             target: nsis
             arch: x64
-          # Windows ARM remains disabled while scripts/run-msvc-x64.mjs is
-          # intentionally architecture-specific.
+          # Windows ARM remains disabled until its native runner is added to this matrix.
           - label: macOS arm64
             runner: macos-26
             platform: mac
