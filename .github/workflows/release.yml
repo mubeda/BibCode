@@ -570,6 +570,8 @@ jobs:
             --mount "type=bind,source=$GITHUB_WORKSPACE,target=/workspace" \
             --workdir /workspace \
             --env EXPECTED_UNAME="$expected_uname" \
+            --env HOST_GID="$(id -g)" \
+            --env HOST_UID="$(id -u)" \
             --env RUST_TARGET="${{ matrix.serverArch }}-unknown-linux-gnu" \
             ubuntu:20.04 \
             bash -lc '
@@ -580,6 +582,7 @@ jobs:
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs |
                 sh -s -- -y --profile minimal --default-toolchain 1.97.1
               /root/.cargo/bin/cargo build -p bibcode-server --bin bibcode --release --target "$RUST_TARGET"
+              chown -R "$HOST_UID:$HOST_GID" /workspace/target
             '
 
       - name: Build macOS or Windows server
