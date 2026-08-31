@@ -39,7 +39,7 @@ describe("seeded packaged desktop upgrade harness", () => {
         "C:\\Windows\\System32\\cmd.exe",
       ),
     ).toEqual({
-      args: ["/d", "/s", "/c", '""vp.cmd" "install" "--frozen-lockfile""'],
+      args: ["/d", "/s", "/c", 'vp.cmd "install" "--frozen-lockfile"'],
       command: "C:\\Windows\\System32\\cmd.exe",
       windowsVerbatimArguments: true,
     });
