@@ -18,6 +18,9 @@ import {
   parseSeededDesktopUpgradeSmokeArgs,
   redactAndBoundUpgradeEvidence,
   runBoundedCommand,
+  seededUpgradeBundleRoot,
+  seededUpgradeRustTarget,
+  updaterTargetFor,
   verifySeededUpgradeOutcome,
   waitForUpgradeCondition,
 } from "./seeded-desktop-upgrade-smoke.ts";
@@ -131,7 +134,7 @@ describe("seeded packaged desktop upgrade harness", () => {
     ).toThrow(/WSL.*Windows x64/);
   });
 
-  it("rejects invalid target combinations, relative roots, and private-key command arguments", () => {
+  it("accepts Windows ARM64 while rejecting relative roots and private-key arguments", () => {
     const base = [
       "--platform",
       "win",
@@ -154,7 +157,7 @@ describe("seeded packaged desktop upgrade harness", () => {
       "--artifact-dir",
       absolute("evidence"),
     ];
-    expect(() => parseSeededDesktopUpgradeSmokeArgs(base, "/repo")).toThrow(/Windows x64/);
+    expect(parseSeededDesktopUpgradeSmokeArgs(base, "/repo").arch).toBe("arm64");
     expect(() =>
       parseSeededDesktopUpgradeSmokeArgs(
         base.with(3, "x64").with(base.indexOf(absolute("work")), "relative"),
@@ -167,6 +170,16 @@ describe("seeded packaged desktop upgrade harness", () => {
         "/repo",
       ),
     ).toThrow(/private-key|Unknown option/);
+  });
+
+  it("maps Linux and Windows ARM64 to their native updater and Rust targets", () => {
+    expect(updaterTargetFor("linux", "arm64")).toBe("linux-aarch64");
+    expect(updaterTargetFor("win", "arm64")).toBe("windows-aarch64");
+    expect(seededUpgradeRustTarget("linux", "arm64")).toBe("aarch64-unknown-linux-gnu");
+    expect(seededUpgradeRustTarget("win", "arm64")).toBe("aarch64-pc-windows-msvc");
+    expect(seededUpgradeBundleRoot("/tmp/build", "win", "arm64")).toBe(
+      NodePath.join("/tmp/build", "aarch64-pc-windows-msvc", "release", "bundle"),
+    );
   });
 
   it("creates disjoint roots for real previous and protected baseline lanes", () => {
