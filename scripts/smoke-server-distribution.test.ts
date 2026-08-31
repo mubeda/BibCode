@@ -5,7 +5,10 @@ import * as NodePath from "node:path";
 
 import { afterEach, expect, it } from "vite-plus/test";
 
-import { smokeServerDistribution } from "./smoke-server-distribution.ts";
+import {
+  isExpectedServerShutdownExit,
+  smokeServerDistribution,
+} from "./smoke-server-distribution.ts";
 
 const temporaryRoots: string[] = [];
 
@@ -13,6 +16,14 @@ afterEach(() => {
   for (const root of temporaryRoots.splice(0)) {
     NodeFS.rmSync(root, { recursive: true, force: true });
   }
+});
+
+it("accepts only the Windows termination exit used by Node child cleanup", () => {
+  expect(isExpectedServerShutdownExit("win32", 0)).toBe(true);
+  expect(isExpectedServerShutdownExit("win32", 1)).toBe(true);
+  expect(isExpectedServerShutdownExit("win32", 2)).toBe(false);
+  expect(isExpectedServerShutdownExit("linux", 1)).toBe(false);
+  expect(isExpectedServerShutdownExit("darwin", 1)).toBe(false);
 });
 
 it("proves packaged web, descriptor, pairing exchange, and clean shutdown", async () => {
