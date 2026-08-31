@@ -15,7 +15,14 @@ describe("packaged preferences, native integrations, and platform capabilities",
     await expect(settings).toBeDisplayed();
     await settings.click();
     const appOrigin = await browser.execute(() => window.location.origin);
-    await browser.url(`${appOrigin}/#/settings/about`);
+    const about = browser.$(
+      "//button[@data-sidebar='menu-button'][.//span[normalize-space()='About']]",
+    );
+    await expect(about).toBeDisplayed();
+    await about.click();
+    await browser.waitUntil(async () => (await browser.getUrl()).endsWith("/#/settings/about"), {
+      timeoutMsg: "About settings did not become active.",
+    });
     const checkForUpdates = browser.$("button=Check for Updates");
     await checkForUpdates.scrollIntoView();
     await expect(checkForUpdates).toBeDisplayed();
