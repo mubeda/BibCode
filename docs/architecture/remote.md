@@ -296,19 +296,23 @@ the original offer and rejects reuse with different input. Entries are scoped
 to the authenticated principal and persisted in
 `auth_pairing_offer_idempotency`. The pairing grant and a pending principal/key
 reservation commit in one SQLite transaction; the encoded result completes that
-reservation before the HTTP response is sent. After a crash in the pending
-window, a matching retry under the issuance lock atomically revokes the
-incomplete grant, removes the reservation, and returns the key to fresh
-issuance. A fingerprint mismatch still fails and a cancellation tombstone still
-blocks issuance.
+reservation before the HTTP response is sent. A young pending reservation is
+never treated as abandoned: another live server returns a retry failure while
+the owning request is still encoding, then replays the recorded winner after it
+commits. After the two-minute crash-recovery grace, a matching retry atomically
+revokes the incomplete grant, removes the stale reservation, and returns the key
+to fresh issuance. A fingerprint mismatch still fails and a cancellation
+tombstone still blocks issuance.
 Active results, pending reservations, and tombstones hydrate before capacity
 checks and remain under bounded, expiring caps: 128 live entries per principal
 and 4,096 globally. Expired rows are pruned at startup and inside every
 reservation or cancellation transaction. For a persisted server, one immediate
 SQLite transaction is the authority for a principal/key lookup, an existing or
 pending result, admission under both caps, and the new pairing-plus-reservation
-write. Simultaneously live services therefore return the persisted winner rather
-than treating a process-local cache miss or stale capacity count as authority.
+write. Simultaneously live services therefore return the persisted winner (or a
+bounded retry failure while that winner is pending) rather than treating a
+process-local cache miss, a young peer-owned reservation, or stale capacity
+count as authority.
 Pairing, pairing-offer, and session capacity constants live together in
 `apps/server/src/auth/limits.rs`; persistence and the in-memory authority consume
 that policy rather than mirroring numeric limits.
