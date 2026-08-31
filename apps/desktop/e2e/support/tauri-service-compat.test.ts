@@ -64,6 +64,7 @@ describe("@wdio/tauri-service compatibility", () => {
     expect(wdioConfig).toContain("const desktopUiSpecFiles =");
     expect(wdioConfig).toContain("[desktopUiSpecFiles]");
     expect(wdioConfig).toContain("connectionRetryCount: 0");
+    expect(wdioConfig).toContain("commandTimeout: 60_000");
     expect(wdioConfig).toContain("beforeTest: async () =>");
     expect(wdioConfig).toContain('document.readyState === "complete"');
     expect(wdioConfig).toContain(
@@ -74,6 +75,8 @@ describe("@wdio/tauri-service compatibility", () => {
     expect(wdioConfig).not.toContain("done(error)");
     expect(wdioConfig).not.toContain("done()");
     expect(wdioConfig).not.toContain("browser.waitUntil");
+    expect(wdioConfig).toContain("data-bibcode-desktop-ui-automation");
+    expect(wdioConfig).not.toContain("sheet.insertRule");
     expect(wdioConfig).toContain("window.localStorage.clear()");
     expect(wdioConfig).toContain("window.sessionStorage.clear()");
     expect(wdioConfig).toContain('indexedDB.open("bibcode:connection-runtime", 2)');
