@@ -72,6 +72,10 @@ describe("server artifact builder", () => {
         "bibcode-server-v0.4.3-linux-aarch64",
       ],
     });
+    expect(plan.packageArtifacts).toEqual([
+      NodePath.join(root, "out", "bibcode-server_0.4.3_arm64.deb"),
+      NodePath.join(root, "out", "bibcode-server-0.4.3-1.aarch64.rpm"),
+    ]);
   });
 
   it("stages the executable, web client, guide, and license under one versioned root", async () => {
