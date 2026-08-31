@@ -3,12 +3,15 @@
 Read [Cross-platform validation](./cross-platform-validation.md) first. This
 page contains only native Windows additions.
 
-## Supported native target
+## Supported native targets
 
-The supported Windows release target is Windows 10 or 11 on x64. Release and
-native smoke workflows use the x64 MSVC toolchain and build an NSIS installer.
-Windows ARM commands may exist for development experiments, but they are not a
-supported release target until the native release and validation matrices are enabled.
+The supported Windows release targets are Windows 10 or 11 on x64 and Windows 11 on
+ARM64. Release and native smoke workflows use the matching MSVC toolchain and build an
+NSIS installer. Native ARM64 evidence must come from `windows-11-vs2026-arm`; emulation
+or an x64 application mislabeled as ARM64 does not count.
+
+Standalone server releases provide native ARM64 and x64 `.zip` archives with the
+matching web client.
 
 Record the exact Windows edition, build, architecture, and whether the host is
 physical or virtual. Do not silently substitute Wine, WSL, or a cross-compiled

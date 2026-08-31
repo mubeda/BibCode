@@ -1,10 +1,9 @@
 # Remote Access
 
-The v0.3.14 macOS, Linux, and Windows desktop UI is presented as local-only.
-Remote connection, pairing, SSH, Tailscale, network-exposure, and BiBCode
-Connect controls are hidden without removing their underlying implementation.
-Windows keeps **Settings → Local environment** for WSL. The browser/hosted UI
-retains the full remote workflow described below.
+The macOS, Linux, and Windows desktop UI exposes saved remote environments and
+host-sharing controls under **Settings → Remote Servers**. Windows also keeps
+**Settings → Local environment** for WSL. Browser/hosted clients can connect to a
+reachable server but cannot perform desktop-owned listener, firewall, or SSH operations.
 
 Remote access connects a browser or another desktop app to the BiBCode server
 running on a different machine. That server owns projects, files, Git state,
@@ -13,12 +12,11 @@ terminals, provider CLIs, credentials, and agent sessions.
 Use a trusted private network such as a LAN or tailnet. Do not expose a plain
 BiBCode HTTP endpoint directly to the public internet.
 
-## Browser/hosted and future re-enabled desktop network access
+## Desktop and browser network access
 
-In the browser/hosted UI, or when this desktop presentation is re-enabled, use
-the Share controls to create an address-specific pairing offer:
+Use the Share controls to create an address-specific pairing offer:
 
-1. Open **Settings → Connections**.
+1. Open **Settings → Remote Servers → Share this host**.
 2. Choose **Another device** for desktop-managed private-network access. The
    desktop app offers automatic LAN only after it observes a usable private
    default route; creating the offer then restarts the backend with native
@@ -56,6 +54,11 @@ Serve setup flags.
 `bibcode start` and `bibcode serve` run the same native server. `start` opens the
 startup URL in a browser by default; `serve` does not.
 
+Download the signed-release checksum set and the native archive or Linux package for
+your host by following [Standalone server installation](./server-installation.md).
+Published server distributions contain the matching built web client and discover it
+automatically.
+
 For example, bind to a trusted Tailnet address and serve built web assets:
 
 ```bash
@@ -80,9 +83,10 @@ The CLI does not print a QR code. It also has no `auth` or `project` subcommands
 no positional working-directory argument, and no `--tailscale-serve` flags. Use
 `bibcode serve --help` for the implemented options.
 
-`--static-dir` is needed only when this server should deliver the web client.
-A separately hosted HTTPS web app can connect directly to an HTTPS/WSS backend
-without the backend serving static files.
+`--static-dir` explicitly overrides packaged web discovery and must contain
+`index.html`. A source-built or intentionally API-only server can omit static assets. A
+separately hosted HTTPS web app can connect directly to an HTTPS/WSS backend without the
+backend serving static files.
 
 ## Pairing
 
@@ -107,10 +111,11 @@ The hosted app saves the backend address, but it does not proxy traffic. The
 browser still connects directly to the backend, which must therefore be
 reachable over HTTPS/WSS from that browser.
 
-In the browser/hosted UI, create and revoke additional access from
-**Settings → Connections**. There is no current CLI access-management command.
+Create and revoke additional access from **Settings → Remote Servers**. There is no
+general CLI access-management surface; the focused `bibcode pairing issue` command
+exists for desktop-managed SSH bootstrap.
 
-## Browser/hosted and future re-enabled desktop-managed SSH status
+## Desktop-managed SSH
 
 The desktop contains an SSH launcher that can install a small runner under
 `~/.bibcode-ssh-launch/<state-key>`, start or reuse `bibcode serve` on remote
@@ -120,13 +125,8 @@ loopback, and create a local port forward. The remote host must provide:
 - `curl` or `wget` for the readiness probe; and
 - each provider CLI and its credentials.
 
-However, end-to-end setup of a new SSH environment is **currently unavailable**.
-The desktop pairing step invokes `bibcode auth pairing create`, while the native
-CLI currently implements only `start` and `serve`. Do not rely on the SSH **Add
-environment** flow until that CLI mismatch is resolved.
-
 The launcher does not install Node.js, npm, npx, package-manager shims, or a
-BiBCode binary on the remote host.
+BiBCode binary on the remote host. Install a matching standalone server release first.
 
 ## Windows Subsystem for Linux
 

@@ -32,3 +32,21 @@ Removal deletes package-owned files but preserves `~/.bibcode`.
 
 BiBCode does not host APT, DNF, or YUM repositories. Verify the downloaded package against
 `bibcode-server-SHA256SUMS` from the same GitHub Release before installation.
+
+For one downloaded asset on Linux:
+
+```sh
+asset='bibcode-server-vVERSION-linux-aarch64.tar.gz'
+grep "  $asset$" bibcode-server-SHA256SUMS | sha256sum --check -
+```
+
+On macOS, replace `sha256sum --check` with `shasum -a 256 -c`. Checksums are mandatory
+release assets. A release may also contain `<asset>.minisig`; server signatures are
+optional until a dedicated public signing identity is configured. Verify a present
+signature only with the maintainer-published server public key, never with the Tauri
+desktop-updater key.
+
+Archives contain one versioned directory with `bibcode` or `bibcode.exe`, `web/`,
+`README.md`, and `LICENSE`. Linux packages own `/usr/bin/bibcode`,
+`/usr/share/bibcode/web`, and `/usr/share/doc/bibcode-server`. They do not create a
+service, user, firewall rule, or machine-wide configuration.

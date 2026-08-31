@@ -5,10 +5,14 @@ page contains only native Linux additions.
 
 ## Supported native target
 
-The supported release target is Linux x64 AppImage built on Ubuntu 22.04. CI
-also exercises Ubuntu 24.04, and release support includes Ubuntu 22.04,
-Ubuntu 24.04, and Debian 12. Record any different distribution as compatibility
-exploration rather than silently broadening support.
+The supported desktop release targets are Linux ARM64 and x64 AppImages built on
+matching Ubuntu 22.04 runners. CI also exercises Ubuntu 24.04, and desktop release
+support includes Ubuntu 22.04, Ubuntu 24.04, and Debian 12. Record any different
+distribution as compatibility exploration rather than silently broadening support.
+
+Standalone server releases add ARM64/x64 `.tar.gz`, `.deb`, and `.rpm` artifacts. Native
+package evidence covers Ubuntu 22.04, Ubuntu 24.04, Debian 12, Rocky Linux 9, and Fedora
+44 as prescribed by the shared runbook.
 
 ## Distribution, desktop, and toolchain inventory
 
