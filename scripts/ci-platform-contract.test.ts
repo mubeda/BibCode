@@ -212,6 +212,19 @@ describe("cross-platform CI contract", () => {
     }
     expect(commands).not.toContain("libappindicator3-dev");
   });
+
+  it("installs xdg-utils in every Linux AppImage build workflow", () => {
+    const jobs = [
+      requireJob(readWorkflow(CI_WORKFLOW_PATH).workflow, "native_desktop"),
+      requireJob(readWorkflow(RELEASE_WORKFLOW_PATH).workflow, "build_desktop"),
+      requireJob(readWorkflow(DESKTOP_UI_WORKFLOW_PATH).workflow, "desktop_ui_smoke"),
+      requireJob(readWorkflow(DESKTOP_UPGRADE_WORKFLOW_PATH).workflow, "seeded_upgrade_smoke"),
+    ];
+
+    for (const job of jobs) {
+      expect(allStepCommands(job)).toContain("xdg-utils");
+    }
+  });
 });
 
 describe("cross-platform release contract", () => {

@@ -85,6 +85,7 @@ jobs:
             libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
+            xdg-utils \
             patchelf
 
       - id: release_meta
@@ -378,6 +379,7 @@ jobs:
             libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
+            xdg-utils \
             patchelf
 
       - name: Verify stable updater signing configuration

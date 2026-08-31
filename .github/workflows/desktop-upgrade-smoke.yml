@@ -75,7 +75,7 @@ jobs:
           s''udo apt-get install -y \
             build-essential curl wget file libxdo-dev libssl-dev \
             libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
-            librsvg2-dev patchelf xvfb xdotool
+            librsvg2-dev xdg-utils patchelf xvfb xdotool
 
       - name: Install frozen dependencies
         run: vp install --frozen-lockfile
