@@ -418,6 +418,7 @@ describe("cross-platform release contract", () => {
       },
     ]);
     expect(allStepCommands(server)).toContain("scripts/build-server-artifact.ts");
+    expect(allStepCommands(server)).toContain('chown -R "$HOST_UID:$HOST_GID" /workspace/target');
     expect(allStepCommands(server)).toContain("scripts/smoke-server-distribution.ts");
     expect(release.needs).toEqual(["preflight", "build_desktop", "build_server"]);
   });
