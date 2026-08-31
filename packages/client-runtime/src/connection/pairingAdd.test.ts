@@ -13,6 +13,7 @@ import {
   PairingCodeUnsupportedVersionError,
   encodePairingCode,
 } from "@bibcode/shared/pairingCode";
+import { makeTestExecutionEnvironmentCapabilities } from "@bibcode/shared/testSupport";
 import { describe, expect, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -78,14 +79,7 @@ const descriptor = (
   remoteUpdateSupport: null,
   remoteProtocolVersion: REMOTE_PROTOCOL_VERSION,
   minCompatibleRemoteProtocol: MIN_COMPATIBLE_REMOTE_PROTOCOL,
-  capabilities: {
-    repositoryIdentity: true,
-    worktreeCatalog: false,
-    worktreeCatalogRefreshReason: false,
-    vcsStatusSummary: false,
-    activityProtocolVersion: null,
-    remoteUpdateControl: false,
-  },
+  capabilities: makeTestExecutionEnvironmentCapabilities({ repositoryIdentity: true }),
   ...overrides,
 });
 

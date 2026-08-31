@@ -37,6 +37,7 @@ import { type RpcSession } from "@bibcode/client-runtime/rpc";
 import { EnvironmentRegistry } from "@bibcode/client-runtime/connection";
 import { ManagedRelay } from "@bibcode/client-runtime/relay";
 import { remoteHttpClientLayer } from "@bibcode/client-runtime/rpc";
+import { makeTestExecutionEnvironmentCapabilities } from "@bibcode/shared/testSupport";
 import { __resetDesktopPrimaryAuthForTests } from "../environments/primary/desktopAuth";
 import {
   resetPrimaryEnvironmentDescriptorForTests,
@@ -265,14 +266,7 @@ describe("web cloud link environment client", () => {
       remoteUpdateSupport: null,
       remoteProtocolVersion: 1,
       minCompatibleRemoteProtocol: 1,
-      capabilities: {
-        repositoryIdentity: true,
-        worktreeCatalog: false,
-        worktreeCatalogRefreshReason: false,
-        vcsStatusSummary: false,
-        activityProtocolVersion: null,
-        remoteUpdateControl: false,
-      },
+      capabilities: makeTestExecutionEnvironmentCapabilities({ repositoryIdentity: true }),
     });
 
     expect(readPrimaryCloudLinkTarget()).toEqual({

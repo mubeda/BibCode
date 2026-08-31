@@ -1,4 +1,5 @@
 import { EnvironmentId, type ExecutionEnvironmentDescriptor } from "@bibcode/contracts";
+import { makeTestExecutionEnvironmentCapabilities } from "@bibcode/shared/testSupport";
 import * as Effect from "effect/Effect";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
@@ -27,14 +28,7 @@ const BASE_ENVIRONMENT = {
   remoteUpdateSupport: null,
   remoteProtocolVersion: 1,
   minCompatibleRemoteProtocol: 1,
-  capabilities: {
-    repositoryIdentity: true,
-    worktreeCatalog: false,
-    worktreeCatalogRefreshReason: false,
-    vcsStatusSummary: false,
-    activityProtocolVersion: null,
-    remoteUpdateControl: false,
-  },
+  capabilities: makeTestExecutionEnvironmentCapabilities({ repositoryIdentity: true }),
 } satisfies ExecutionEnvironmentDescriptor;
 
 let disposeHttpTest: (() => Promise<void>) | undefined;
@@ -101,14 +95,7 @@ describe("environmentBootstrap", () => {
       remoteUpdateSupport: null,
       remoteProtocolVersion: 1,
       minCompatibleRemoteProtocol: 1,
-      capabilities: {
-        repositoryIdentity: true,
-        worktreeCatalog: false,
-        worktreeCatalogRefreshReason: false,
-        vcsStatusSummary: false,
-        activityProtocolVersion: null,
-        remoteUpdateControl: false,
-      },
+      capabilities: makeTestExecutionEnvironmentCapabilities({ repositoryIdentity: true }),
     } satisfies ExecutionEnvironmentDescriptor;
     writePrimaryEnvironmentDescriptor(descriptor);
 

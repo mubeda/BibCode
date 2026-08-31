@@ -1,6 +1,7 @@
 pub mod agent_activity;
 pub mod connect_mcp;
 pub mod control;
+pub mod git_manager_rpc;
 pub mod git_vcs;
 pub mod host_paths;
 pub mod http_routes;

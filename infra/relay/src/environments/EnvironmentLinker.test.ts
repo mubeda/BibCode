@@ -4,6 +4,7 @@ import type {
   RelayEnvironmentLinkRequest,
 } from "@bibcode/contracts/relay";
 import { RELAY_LINK_PROOF_TYP } from "@bibcode/shared/relayJwt";
+import { makeTestExecutionEnvironmentCapabilities } from "@bibcode/shared/testSupport";
 import { describe, expect, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -82,14 +83,7 @@ const makeRequestFor = (managedTunnelsEnabled: boolean) =>
         remoteUpdateSupport: null,
         remoteProtocolVersion: 1,
         minCompatibleRemoteProtocol: 1,
-        capabilities: {
-          repositoryIdentity: true,
-          worktreeCatalog: false,
-          worktreeCatalogRefreshReason: false,
-          vcsStatusSummary: false,
-          activityProtocolVersion: null,
-          remoteUpdateControl: false,
-        },
+        capabilities: makeTestExecutionEnvironmentCapabilities({ repositoryIdentity: true }),
       },
       environmentPublicKey: environmentKeyPair.publicKey.trim(),
       endpoint: {

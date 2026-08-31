@@ -37,6 +37,7 @@ use crate::{
         agent_activity::ProductionAgentActivity,
         connect_mcp::ConnectMcpService,
         control::{NativeServerControl, ProviderUpdateCheckTask},
+        git_manager_rpc::{GitManagerRpcServices, register_git_manager_rpc},
         git_vcs::{GitVcsRpcServices, WorktreeRemovalTaskTracker, register_git_vcs_rpc},
         http_routes::{
             AssetHttpResponse, DiagnosticLogsHttpResponse, HttpRouteError, JsonOperation,
@@ -387,6 +388,7 @@ impl ProductionRuntime {
         );
         register_workspace_preview_rpc(&mut registry, workspace_preview);
         register_git_vcs_rpc(&mut registry, git_vcs);
+        register_git_manager_rpc(&mut registry, GitManagerRpcServices);
         let worktree_catalog_rpc =
             WorktreeCatalogRpcServices::new(worktree_catalog.clone(), orchestration.clone())
                 .with_status_broadcaster(status_broadcaster.clone())
