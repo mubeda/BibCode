@@ -15,11 +15,14 @@ with `validate_only=true`, `publish=false`, and a unique prerelease version such
 as `0.4.2-validation.123`. This path runs the complete native desktop and server
 matrices, assembles and checksums the public asset set, and uploads it as the
 `validated-release-assets` Actions artifact. It does not create or modify a Git
-tag or GitHub Release. `validate_only` and `publish` are mutually exclusive.
+tag or GitHub Release. It runs `vp check` and `vp run typecheck` before the
+native matrices and relies on the pull-request CI workflow for the full test
+graph. `validate_only` and `publish` are mutually exclusive.
 
-The preflight job runs `vp check`, `vp run typecheck`, and `vp run test`. The
-build matrix then creates native Tauri installers on the matching operating
-system:
+Publication-capable preflight runs `vp check`, `vp run typecheck`, and
+`vp run test`; validation-only preflight skips the duplicated full test graph
+after check and typecheck. The build matrix then creates native Tauri installers
+on the matching operating system:
 
 | Platform | Runner                  | Architecture | Installer       |
 | -------- | ----------------------- | ------------ | --------------- |

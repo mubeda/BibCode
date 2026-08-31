@@ -175,6 +175,7 @@ jobs:
         run: vp run typecheck
 
       - name: Test
+        if: steps.release_meta.outputs.validate_only != 'true'
         run: vp run test
 
       - id: previous_tag
