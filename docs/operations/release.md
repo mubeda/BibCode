@@ -10,6 +10,13 @@ workflow. The repository does not package or publish Electron artifacts.
 - stable releases from tags matching `v*.*.*`; and
 - manual stable or nightly releases through `workflow_dispatch`.
 
+For validation-only release-candidate verification from a feature branch, dispatch the workflow
+with `validate_only=true`, `publish=false`, and a unique prerelease version such
+as `0.4.2-validation.123`. This path runs the complete native desktop and server
+matrices, assembles and checksums the public asset set, and uploads it as the
+`validated-release-assets` Actions artifact. It does not create or modify a Git
+tag or GitHub Release. `validate_only` and `publish` are mutually exclusive.
+
 The preflight job runs `vp check`, `vp run typecheck`, and `vp run test`. The
 build matrix then creates native Tauri installers on the matching operating
 system:
@@ -243,21 +250,23 @@ bootstrap credentials, update-signing secrets, tokens, and database contents.
 1. Confirm the intended version and commit have passed the local verification
    commands below. Create and push the intended tag (or dispatch `stable` with
    that explicit version) with `publish` left at its default `false`.
-2. Confirm the four native build jobs complete and that the stable jobs received
+2. Confirm the six native desktop and six native server build jobs complete and
+   that the stable desktop jobs received
    the two signing secrets above. Do not inspect or print their values.
 3. Confirm the workflow's descriptor-validation and updater-signature steps
-   passed. The workflow must validate exactly four `updater-*.json` descriptors,
+   passed. The workflow must validate exactly six `updater-*.json` descriptors,
    one for each manifest target listed above, before it removes those internal
    descriptors from the public asset set.
 4. Let the workflow create the GitHub Release as a **draft**. Before allowing
    publication, inspect its uploaded assets and `latest.json`:
 
-   - `latest.json` has exactly the four manifest target entries above;
+   - `latest.json` has exactly the six manifest target entries above;
    - each target has a nonempty signature and a tag-specific HTTPS payload URL;
    - the release contains a nonempty `.sig` asset for each target;
-   - the release contains `latest.json`, the two macOS DMGs, Linux AppImage,
-     and Windows NSIS installer, plus the updater payload archives required by
-     the manifest; and
+   - the release contains `latest.json`, two macOS DMGs, two Linux AppImages,
+     and two Windows NSIS installers, plus the standalone server archives,
+     Linux `.deb`/`.rpm` packages, and updater payload archives required by the
+     manifest; and
    - no private key or passphrase is present in any asset, manifest, or log.
 
 5. Compare the draft's sorted asset names with the workflow's
