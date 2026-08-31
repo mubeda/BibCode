@@ -15,6 +15,7 @@ import {
   makeMockUpdateRouteLayer,
   makeMockUpdateServerLayer,
   makeResolveMockUpdateServerConfig,
+  MOCK_UPDATE_LOOPBACK_HOST,
   MOCK_UPDATE_READY_PATH,
   openValidatedUpdateFile,
   resolveByteRange,
@@ -22,6 +23,10 @@ import {
   resolveMockUpdateServerConfig,
   runMockUpdateServerMain,
 } from "./mock-update-server.ts";
+
+it("pins the updater server and probes to the same IPv4 loopback host", () => {
+  assert.equal(MOCK_UPDATE_LOOPBACK_HOST, "127.0.0.1");
+});
 
 const withMockUpdateServer = <A, E, R>(rootRealPath: string, effect: Effect.Effect<A, E, R>) =>
   effect.pipe(

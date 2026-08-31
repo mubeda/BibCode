@@ -8,7 +8,7 @@ import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodeUtil from "node:util";
 
-import { MOCK_UPDATE_READY_PATH } from "./mock-update-server.ts";
+import { MOCK_UPDATE_LOOPBACK_HOST, MOCK_UPDATE_READY_PATH } from "./mock-update-server.ts";
 import { requireReleaseTarget, type TauriUpdaterTarget } from "./lib/release-targets.ts";
 
 export type SeededUpgradePlatform = "linux" | "mac" | "win";
@@ -966,7 +966,7 @@ const publishCandidateUpdater = async (input: {
   await NodeFS.promises.copyFile(signaturePath, NodePath.join(input.updaterRoot, signatureName));
   const manifest = buildLocalUpdaterManifest({
     artifact: payloadName,
-    baseUrl: `http://127.0.0.1:${input.updaterPort}/`,
+    baseUrl: `http://${MOCK_UPDATE_LOOPBACK_HOST}:${input.updaterPort}/`,
     candidateVersion: input.candidateVersion,
     signature: await NodeFS.promises.readFile(signaturePath, "utf8"),
     target: updaterTargetFor(input.platform, input.arch),
@@ -1185,7 +1185,9 @@ const startMockUpdateServer = async (input: {
       probe: async () => {
         if (startupError !== undefined) throw startupError;
         try {
-          const response = await fetch(`http://127.0.0.1:${input.port}${MOCK_UPDATE_READY_PATH}`);
+          const response = await fetch(
+            `http://${MOCK_UPDATE_LOOPBACK_HOST}:${input.port}${MOCK_UPDATE_READY_PATH}`,
+          );
           return response.ok;
         } catch {
           return false;
@@ -1360,7 +1362,7 @@ export async function runSeededDesktopUpgradeSmoke(
     mode: 0o700,
   });
 
-  const endpoint = `http://127.0.0.1:${input.updaterPort}/latest.json`;
+  const endpoint = `http://${MOCK_UPDATE_LOOPBACK_HOST}:${input.updaterPort}/latest.json`;
   const candidateOverlay = NodePath.join(runRoot, "candidate-overlay.json");
   const previousOverlay = NodePath.join(runRoot, "previous-overlay.json");
   const protectedOverlay = NodePath.join(runRoot, "protected-overlay.json");
