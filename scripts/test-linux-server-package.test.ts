@@ -49,4 +49,19 @@ describe("Linux server package smoke", () => {
     expect(plan.script).toContain("apt-get remove -y bibcode-server");
     expect(plan.script).toContain('test -f "$state_root/preserved-sentinel"');
   });
+
+  it("keeps RPM smoke compatible with minimal Rocky and Fedora images", () => {
+    const plan = buildLinuxPackageSmokePlan(
+      { format: "rpm", image: "rockylinux:9" },
+      {
+        arch: "x64",
+        expectedVersion: "0.4.3",
+        packagePath: NodePath.resolve("/tmp/bibcode-server-0.4.3-1.x86_64.rpm"),
+        runId: "run-18",
+      },
+    );
+
+    expect(plan.script).toContain("dnf install -y curl-minimal ca-certificates procps-ng");
+    expect(plan.script).not.toContain("dnf install -y curl ");
+  });
 });
