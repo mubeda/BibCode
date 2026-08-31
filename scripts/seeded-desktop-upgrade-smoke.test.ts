@@ -41,10 +41,12 @@ describe("seeded packaged desktop upgrade harness", () => {
     ).toEqual({
       args: ["/d", "/c", '"vp.cmd" "install" "--frozen-lockfile"'],
       command: "C:\\Windows\\System32\\cmd.exe",
+      windowsVerbatimArguments: true,
     });
     expect(resolveBoundedCommandLaunch("git.exe", ["status"], "win32", "cmd.exe")).toEqual({
       args: ["status"],
       command: "git.exe",
+      windowsVerbatimArguments: false,
     });
   });
 
