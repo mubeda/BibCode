@@ -110,10 +110,22 @@ describe("cross-platform CI contract", () => {
     expect(matrix).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
+          runner: "ubuntu-22.04-arm",
+          platform: "linux",
+          target: "appimage",
+          arch: "arm64",
+        }),
+        expect.objectContaining({
           runner: "ubuntu-22.04",
           platform: "linux",
           target: "appimage",
           arch: "x64",
+        }),
+        expect.objectContaining({
+          runner: "windows-11-vs2026-arm",
+          platform: "win",
+          target: "nsis",
+          arch: "arm64",
         }),
         expect.objectContaining({
           runner: "windows-2025",
@@ -135,7 +147,7 @@ describe("cross-platform CI contract", () => {
         }),
       ]),
     );
-    expect(matrix.some((entry) => entry.platform === "win" && entry.arch === "arm64")).toBe(false);
+    expect(matrix).toHaveLength(6);
   });
 
   it("installs dependencies once in every CI job", () => {
@@ -485,7 +497,17 @@ describe("packaged desktop UI smoke contract", () => {
     expect(smoke.strategy?.["fail-fast"]).toBe(false);
     expect(matrix).toEqual(
       expect.arrayContaining([
+        expect.objectContaining({
+          runner: "ubuntu-22.04-arm",
+          platform: "linux",
+          arch: "arm64",
+        }),
         expect.objectContaining({ runner: "ubuntu-22.04", platform: "linux", arch: "x64" }),
+        expect.objectContaining({
+          runner: "windows-11-vs2026-arm",
+          platform: "win",
+          arch: "arm64",
+        }),
         expect.objectContaining({ runner: "windows-2025", platform: "win", arch: "x64" }),
         expect.objectContaining({ runner: "macos-26", platform: "mac", arch: "arm64" }),
         expect.objectContaining({
@@ -495,6 +517,7 @@ describe("packaged desktop UI smoke contract", () => {
         }),
       ]),
     );
+    expect(matrix).toHaveLength(6);
     expect(commands).toMatch(/vp install --frozen-lockfile/);
     expect(commands).toMatch(/test:ui:build/);
     expect(commands).toMatch(/test:ui:desktop/);
@@ -524,7 +547,9 @@ describe("packaged desktop UI smoke contract", () => {
     const smoke = requireJob(workflow, "desktop_ui_smoke");
     const resolveStep = smoke.steps?.find((step) => step.name === "Resolve Linux AppImage");
 
-    expect(resolveStep?.run).toContain('find "$GITHUB_WORKSPACE/target/release/bundle/appimage"');
+    expect(resolveStep?.run).toContain(
+      'find "$GITHUB_WORKSPACE/target/${{ matrix.rustTarget }}/release/bundle/appimage"',
+    );
     expect(resolveStep?.run).toContain('echo "BIBCODE_E2E_APP_PATH=$app_path"');
   });
 
@@ -562,9 +587,11 @@ describe("packaged desktop UI smoke contract", () => {
     const evidencePaths = String(evidenceStep?.with?.path);
 
     expect(packageStep?.if).toBe("always()");
-    expect(packagePaths).toContain("target/release/bundle/appimage/*.AppImage");
-    expect(packagePaths).toContain("target/release/bundle/nsis/*.exe");
-    expect(packagePaths).toContain("target/release/bundle/dmg/*.dmg");
+    expect(packagePaths).toContain(
+      "target/${{ matrix.rustTarget }}/release/bundle/appimage/*.AppImage",
+    );
+    expect(packagePaths).toContain("target/${{ matrix.rustTarget }}/release/bundle/nsis/*.exe");
+    expect(packagePaths).toContain("target/${{ matrix.rustTarget }}/release/bundle/dmg/*.dmg");
     expect(evidencePaths).toContain("/*.png");
     expect(evidencePaths).toContain("/*.log");
     expect(evidencePaths).not.toContain("/state/");
@@ -591,11 +618,25 @@ describe("seeded packaged desktop upgrade contract", () => {
     expect(smoke.strategy?.["fail-fast"]).toBe(false);
     expect(smoke.strategy?.matrix?.include).toEqual([
       {
+        label: "Linux arm64 AppImage",
+        runner: "ubuntu-22.04-arm",
+        platform: "linux",
+        arch: "arm64",
+        bundle: "appimage",
+      },
+      {
         label: "Linux x64 AppImage",
         runner: "ubuntu-22.04",
         platform: "linux",
         arch: "x64",
         bundle: "appimage",
+      },
+      {
+        label: "Windows arm64 NSIS",
+        runner: "windows-11-vs2026-arm",
+        platform: "win",
+        arch: "arm64",
+        bundle: "nsis",
       },
       {
         label: "Windows x64 NSIS",

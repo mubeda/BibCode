@@ -9,6 +9,7 @@ import * as NodeFS from "node:fs";
 import * as NodeUtil from "node:util";
 
 import { MOCK_UPDATE_READY_PATH } from "./mock-update-server.ts";
+import { requireReleaseTarget, type TauriUpdaterTarget } from "./lib/release-targets.ts";
 
 export type SeededUpgradePlatform = "linux" | "mac" | "win";
 export type SeededUpgradeArch = "arm64" | "x64";
@@ -139,11 +140,6 @@ export function parseSeededDesktopUpgradeSmokeArgs(
       `${platform} packaged upgrades require the ${expectedBundle} bundle.`,
     );
   }
-  if (platform === "win" && arch !== "x64") {
-    throw new SeededDesktopUpgradeSmokeError(
-      "The supported Windows updater target is Windows x64.",
-    );
-  }
   if (values.wsl === true && (platform !== "win" || arch !== "x64")) {
     throw new SeededDesktopUpgradeSmokeError("WSL upgrade coverage requires Windows x64.");
   }
@@ -255,12 +251,6 @@ export function buildSeededUpgradeOverlay(input: {
     },
   };
 }
-
-export type TauriUpdaterTarget =
-  | "darwin-aarch64"
-  | "darwin-x86_64"
-  | "linux-x86_64"
-  | "windows-x86_64";
 
 export function buildLocalUpdaterManifest(input: {
   readonly artifact: string;
@@ -866,14 +856,15 @@ const findExactlyOne = async (
   return matches[0]!;
 };
 
-const updaterTargetFor = (
+export const updaterTargetFor = (
   platform: SeededUpgradePlatform,
   arch: SeededUpgradeArch,
-): TauriUpdaterTarget => {
-  if (platform === "win") return "windows-x86_64";
-  if (platform === "linux") return "linux-x86_64";
-  return arch === "arm64" ? "darwin-aarch64" : "darwin-x86_64";
-};
+): TauriUpdaterTarget => requireReleaseTarget(platform, arch).updaterTarget;
+
+export const seededUpgradeRustTarget = (
+  platform: SeededUpgradePlatform,
+  arch: SeededUpgradeArch,
+): string => requireReleaseTarget(platform, arch).rustTarget;
 
 const writeBuildOverlay = async (input: {
   readonly createUpdaterArtifacts: boolean;
@@ -891,6 +882,7 @@ const writeBuildOverlay = async (input: {
 };
 
 const buildPackagedApplication = async (input: {
+  readonly arch: SeededUpgradeArch;
   readonly bundle: SeededDesktopUpgradeSmokeInput["bundle"];
   readonly checkout: string;
   readonly overlayPath: string;
@@ -922,6 +914,8 @@ const buildPackagedApplication = async (input: {
       input.overlayPath,
       "--bundles",
       input.platform === "mac" ? "app,dmg" : input.bundle,
+      "--target",
+      seededUpgradeRustTarget(input.platform, input.arch),
     ],
     cwd: input.checkout,
     env: { ...input.signingEnvironment, CARGO_TARGET_DIR: input.targetDirectory },
@@ -930,16 +924,21 @@ const buildPackagedApplication = async (input: {
   });
 };
 
-const bundleRoot = (targetDirectory: string): string =>
-  NodePath.join(targetDirectory, "release", "bundle");
+export const seededUpgradeBundleRoot = (
+  targetDirectory: string,
+  platform: SeededUpgradePlatform,
+  arch: SeededUpgradeArch,
+): string =>
+  NodePath.join(targetDirectory, seededUpgradeRustTarget(platform, arch), "release", "bundle");
 
 const baselinePackage = async (
   targetDirectory: string,
   platform: SeededUpgradePlatform,
+  arch: SeededUpgradeArch,
 ): Promise<string> => {
   const suffix = platform === "mac" ? ".dmg" : platform === "linux" ? ".AppImage" : ".exe";
   return findExactlyOne(
-    bundleRoot(targetDirectory),
+    seededUpgradeBundleRoot(targetDirectory, platform, arch),
     (path) => path.endsWith(suffix) && !path.endsWith(`${suffix}.sig`),
     `${platform} baseline package`,
   );
@@ -954,7 +953,7 @@ const publishCandidateUpdater = async (input: {
   readonly updaterRoot: string;
 }): Promise<void> => {
   const signaturePath = await findExactlyOne(
-    bundleRoot(input.candidateBuildRoot),
+    seededUpgradeBundleRoot(input.candidateBuildRoot, input.platform, input.arch),
     (path) => path.endsWith(".sig"),
     "candidate updater signature",
   );
@@ -1442,6 +1441,7 @@ export async function runSeededDesktopUpgradeSmoke(
     });
 
     await buildPackagedApplication({
+      arch: input.arch,
       bundle: input.bundle,
       checkout: input.repositoryRoot,
       overlayPath: candidateOverlay,
@@ -1451,6 +1451,7 @@ export async function runSeededDesktopUpgradeSmoke(
     });
     if (!input.wsl) {
       await buildPackagedApplication({
+        arch: input.arch,
         bundle: input.bundle,
         checkout: layout.previousStable.checkout,
         overlayPath: previousOverlay,
@@ -1460,6 +1461,7 @@ export async function runSeededDesktopUpgradeSmoke(
       });
     }
     await buildPackagedApplication({
+      arch: input.arch,
       bundle: input.bundle,
       checkout: layout.protectedBaseline.checkout,
       overlayPath: protectedOverlay,
@@ -1488,6 +1490,7 @@ export async function runSeededDesktopUpgradeSmoke(
       const previousPackage = await baselinePackage(
         layout.previousStable.buildRoot,
         input.platform,
+        input.arch,
       );
       const previousApp = await installBaselinePackage({
         laneRoot: NodePath.dirname(layout.previousStable.dataRoot),
@@ -1512,6 +1515,7 @@ export async function runSeededDesktopUpgradeSmoke(
     const protectedPackage = await baselinePackage(
       layout.protectedBaseline.buildRoot,
       input.platform,
+      input.arch,
     );
     const protectedApp = await installBaselinePackage({
       laneRoot: NodePath.dirname(layout.protectedBaseline.dataRoot),

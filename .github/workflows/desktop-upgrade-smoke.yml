@@ -17,11 +17,25 @@ jobs:
       matrix:
         include:
           - {
+              label: Linux arm64 AppImage,
+              runner: ubuntu-22.04-arm,
+              platform: linux,
+              arch: arm64,
+              bundle: appimage,
+            }
+          - {
               label: Linux x64 AppImage,
               runner: ubuntu-22.04,
               platform: linux,
               arch: x64,
               bundle: appimage,
+            }
+          - {
+              label: Windows arm64 NSIS,
+              runner: windows-11-vs2026-arm,
+              platform: win,
+              arch: arm64,
+              bundle: nsis,
             }
           - {
               label: Windows x64 NSIS,
