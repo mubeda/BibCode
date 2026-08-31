@@ -10,7 +10,10 @@ import {
   type PersistedUiState,
   persistState,
   reorderProjects,
+  resolveAgentsGroupExpanded,
   resolveProjectExpanded,
+  setAgentsGroupExpanded,
+  setAgentsSectionExpanded,
   setDefaultAdvertisedEndpointKey,
   setProjectExpanded,
   setThreadChangedFilesExpanded,
@@ -19,6 +22,8 @@ import {
 
 function makeUiState(overrides: Partial<UiState> = {}): UiState {
   return {
+    agentsSectionExpanded: true,
+    agentsGroupExpandedById: {},
     projectExpandedById: {},
     projectOrder: [],
     threadLastVisitedAtById: {},
@@ -27,6 +32,26 @@ function makeUiState(overrides: Partial<UiState> = {}): UiState {
     ...overrides,
   };
 }
+
+const initialUiState = parsePersistedState({});
+
+describe("agents section expansion", () => {
+  it("defaults the section expanded and the done group collapsed", () => {
+    expect(initialUiState.agentsSectionExpanded).toBe(true);
+    expect(resolveAgentsGroupExpanded({}, "done")).toBe(false);
+    expect(resolveAgentsGroupExpanded({}, "working")).toBe(true);
+    expect(resolveAgentsGroupExpanded({ done: true }, "done")).toBe(true);
+  });
+
+  it("updates immutably and no-ops on same value", () => {
+    const collapsed = setAgentsSectionExpanded(initialUiState, false);
+    expect(collapsed.agentsSectionExpanded).toBe(false);
+    expect(setAgentsSectionExpanded(collapsed, false)).toBe(collapsed);
+    const next = setAgentsGroupExpanded(initialUiState, "done", true);
+    expect(next.agentsGroupExpandedById).toEqual({ done: true });
+    expect(setAgentsGroupExpanded(next, "done", true)).toBe(next);
+  });
+});
 
 describe("uiStateStore pure functions", () => {
   it("stores server timestamps without moving visit state backwards", () => {
@@ -155,6 +180,11 @@ describe("uiStateStore pure functions", () => {
 describe("parsePersistedState", () => {
   it("hydrates raw UI-owned state without server entities", () => {
     const parsed = parsePersistedState({
+      agentsSectionExpanded: false,
+      agentsGroupExpandedById: {
+        done: true,
+        invalid: "no" as unknown as boolean,
+      },
       projectExpandedById: {
         logical: false,
         invalid: "no" as unknown as boolean,
@@ -174,6 +204,10 @@ describe("parsePersistedState", () => {
     });
 
     expect(parsed).toEqual({
+      agentsSectionExpanded: false,
+      agentsGroupExpandedById: {
+        done: true,
+      },
       projectExpandedById: {
         logical: false,
       },
@@ -203,6 +237,8 @@ describe("parsePersistedState", () => {
     expect(resolveProjectExpanded(parsed.projectExpandedById, [projectAKey])).toBe(true);
     expect(resolveProjectExpanded(parsed.projectExpandedById, [projectBKey])).toBe(false);
     expect(resolveProjectExpanded(parsed.projectExpandedById, ["unknown"])).toBe(true);
+    expect(parsed.agentsSectionExpanded).toBe(true);
+    expect(parsed.agentsGroupExpandedById).toEqual({});
   });
 
   it("preserves legacy expanded-only semantics for one-way migration", () => {
@@ -224,6 +260,8 @@ describe("parsePersistedState", () => {
 
   it("sanitizes malformed records and changed-file collections", () => {
     const parsed = parsePersistedState({
+      agentsSectionExpanded: "no" as never,
+      agentsGroupExpandedById: null as never,
       projectExpandedById: null as never,
       projectOrder: null as never,
       threadLastVisitedAtById: null as never,
@@ -274,6 +312,10 @@ describe("uiStateStore persistence", () => {
 
   it("persists raw UI preferences including thread visit markers", () => {
     const state = makeUiState({
+      agentsSectionExpanded: false,
+      agentsGroupExpandedById: {
+        done: true,
+      },
       projectExpandedById: {
         logical: false,
       },
@@ -296,6 +338,10 @@ describe("uiStateStore persistence", () => {
       localStorageStub.getItem(PERSISTED_STATE_KEY) ?? "{}",
     ) as PersistedUiState;
     expect(persisted).toEqual({
+      agentsSectionExpanded: false,
+      agentsGroupExpandedById: {
+        done: true,
+      },
       projectExpandedById: {
         logical: false,
       },

@@ -11,6 +11,8 @@ const LEGACY_PERSISTED_STATE_KEYS = [
 ] as const;
 
 export interface PersistedUiState {
+  agentsSectionExpanded?: boolean;
+  agentsGroupExpandedById?: Record<string, boolean>;
   projectExpandedById?: Record<string, boolean>;
   projectOrder?: string[];
   threadLastVisitedAtById?: Record<string, string>;
@@ -35,9 +37,14 @@ export interface UiEndpointState {
   defaultAdvertisedEndpointKey: string | null;
 }
 
-export interface UiState extends UiProjectState, UiThreadState, UiEndpointState {}
+export interface UiState extends UiProjectState, UiThreadState, UiEndpointState {
+  agentsSectionExpanded: boolean;
+  agentsGroupExpandedById: Record<string, boolean>;
+}
 
 const initialState: UiState = {
+  agentsSectionExpanded: true,
+  agentsGroupExpandedById: {},
   projectExpandedById: {},
   projectOrder: [],
   threadLastVisitedAtById: {},
@@ -115,6 +122,9 @@ export function parsePersistedState(parsed: PersistedUiState): UiState {
       : sanitizeStringArray(parsed.projectOrder);
 
   return {
+    agentsSectionExpanded:
+      typeof parsed.agentsSectionExpanded === "boolean" ? parsed.agentsSectionExpanded : true,
+    agentsGroupExpandedById: sanitizeBooleanRecord(parsed.agentsGroupExpandedById),
     projectExpandedById,
     projectOrder,
     threadLastVisitedAtById: sanitizeTimestampRecord(parsed.threadLastVisitedAtById),
@@ -200,6 +210,8 @@ export function persistState(state: UiState): void {
     window.localStorage.setItem(
       PERSISTED_STATE_KEY,
       JSON.stringify({
+        agentsSectionExpanded: state.agentsSectionExpanded,
+        agentsGroupExpandedById: state.agentsGroupExpandedById,
         projectExpandedById,
         projectOrder: state.projectOrder,
         threadLastVisitedAtById: state.threadLastVisitedAtById,
@@ -341,6 +353,40 @@ export function resolveProjectExpanded(
   return projectExpandedById[LEGACY_PROJECT_EXPANSION_DEFAULT_KEY] ?? true;
 }
 
+export function resolveAgentsGroupExpanded(
+  agentsGroupExpandedById: Readonly<Record<string, boolean>>,
+  groupId: string,
+): boolean {
+  return agentsGroupExpandedById[groupId] ?? groupId !== "done";
+}
+
+export function setAgentsSectionExpanded(state: UiState, expanded: boolean): UiState {
+  if (state.agentsSectionExpanded === expanded) {
+    return state;
+  }
+  return {
+    ...state,
+    agentsSectionExpanded: expanded,
+  };
+}
+
+export function setAgentsGroupExpanded(
+  state: UiState,
+  groupId: string,
+  expanded: boolean,
+): UiState {
+  if (state.agentsGroupExpandedById[groupId] === expanded) {
+    return state;
+  }
+  return {
+    ...state,
+    agentsGroupExpandedById: {
+      ...state.agentsGroupExpandedById,
+      [groupId]: expanded,
+    },
+  };
+}
+
 export function setProjectExpanded(
   state: UiState,
   projectIds: string | readonly string[],
@@ -410,6 +456,8 @@ interface UiStateStore extends UiState {
   markThreadUnread: (threadId: string, latestTurnCompletedAt: string | null | undefined) => void;
   setThreadChangedFilesExpanded: (threadId: string, turnId: string, expanded: boolean) => void;
   setDefaultAdvertisedEndpointKey: (key: string | null) => void;
+  setAgentsSectionExpanded: (expanded: boolean) => void;
+  setAgentsGroupExpanded: (groupId: string, expanded: boolean) => void;
   setProjectExpanded: (projectIds: string | readonly string[], expanded: boolean) => void;
   reorderProjects: (
     currentProjectOrder: readonly string[],
@@ -428,6 +476,10 @@ export const useUiStateStore = create<UiStateStore>((set) => ({
     set((state) => setThreadChangedFilesExpanded(state, threadId, turnId, expanded)),
   setDefaultAdvertisedEndpointKey: (key) =>
     set((state) => setDefaultAdvertisedEndpointKey(state, key)),
+  setAgentsSectionExpanded: (expanded) =>
+    set((state) => setAgentsSectionExpanded(state, expanded)),
+  setAgentsGroupExpanded: (groupId, expanded) =>
+    set((state) => setAgentsGroupExpanded(state, groupId, expanded)),
   setProjectExpanded: (projectIds, expanded) =>
     set((state) => setProjectExpanded(state, projectIds, expanded)),
   reorderProjects: (currentProjectOrder, draggedProjectIds, targetProjectIds) =>
