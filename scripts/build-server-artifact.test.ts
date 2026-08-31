@@ -27,6 +27,16 @@ afterEach(() => {
 });
 
 describe("server artifact builder", () => {
+  it("expands every nFPM content source from the staged package root", () => {
+    const config = NodeFS.readFileSync(
+      NodePath.resolve(import.meta.dirname, "../apps/server/package/nfpm.yaml"),
+      "utf8",
+    );
+    expect(
+      config.match(/- src: \$\{BIBCODE_SERVER_PACKAGE_ROOT\}[^\n]*\n\s+expand: true/g),
+    ).toHaveLength(4);
+  });
+
   it("defaults CLI version and output from the repository server package", () => {
     const root = temporaryRoot();
     NodeFS.mkdirSync(NodePath.join(root, "apps/server"), { recursive: true });
