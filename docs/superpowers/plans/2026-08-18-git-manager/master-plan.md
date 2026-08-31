@@ -1,5 +1,16 @@
 # Git Manager — Master Plan
 
+> **SUPERSEDED (2026-08-31).** This plan was never implemented — every phase in
+> its tracker is `pending` and none of the RPCs it designs exist in the code.
+> It has been superseded in full by `docs/plans/git-manager/`, which specifies a
+> GitHub-Desktop-shaped Git Manager including the working directory, staging,
+> commit, stash, history rewriting and conflict resolution — all of which this
+> plan explicitly excluded. Its verified technical findings (tip-pinned history
+> paging, the status-broadcaster generation signal, reuse of the worktree
+> catalog's repository lock, the server-authored guard module, and the RPC
+> wire-fixture count gate) were carried forward. Retained as historical
+> evidence only; do not execute it.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: use `superpowers:subagent-driven-development` (recommended) or `superpowers:executing-plans` to implement this plan phase-by-phase. Run `/decompose-plan docs/superpowers/plans/2026-08-18-git-manager` first to turn the Implementation Outline below into atomic phase files.
 
 **Goal:** Give every BiBCode project a Fork-style Git Manager — a project-scoped center-panel view with a ref tree (branches, remote branches, tags, worktrees), a lane commit graph with commit detail and diffs, and fetch/pull/push/merge/branch/tag operations with server-enforced guards.
