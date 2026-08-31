@@ -138,10 +138,15 @@ No task is complete until all applicable requirements have evidence:
 3. Successful `vp check` and `vp run typecheck`.
 4. For Rust changes, `cargo fmt --all --check`, relevant Rust tests, and Clippy
    for affected targets with warnings denied.
-5. Final `git diff` and `git status --short` review for unintended edits,
+5. For React changes under `apps/web`, a review of the changed components and
+   hooks against the `vercel-react-best-practices` skill
+   (`/vercel-react-best-practices`) — always, not only when performance is
+   suspected. An agent without access to that skill must report this check as
+   not run instead of skipping it silently.
+6. Final `git diff` and `git status --short` review for unintended edits,
    generated files, debug output, dependency drift, and missing documentation.
-6. A synced configured vendored subtree when its matching dependency changes.
-7. Report the exact validation commands, any command that could not run, and
+7. A synced configured vendored subtree when its matching dependency changes.
+8. Report the exact validation commands, any command that could not run, and
    residual risk.
 
 `vp test` is the built-in Vite+ test command and `vp run test` is the workspace
