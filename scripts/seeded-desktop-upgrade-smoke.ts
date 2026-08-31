@@ -15,6 +15,8 @@ export type SeededUpgradePlatform = "linux" | "mac" | "win";
 export type SeededUpgradeArch = "arm64" | "x64";
 export type SeededUpgradeLane = "previous-stable" | "protected-baseline";
 
+const MOCK_UPDATE_READY_TIMEOUT_MS = 60_000;
+
 export interface SeededDesktopUpgradeSmokeInput {
   readonly arch: SeededUpgradeArch;
   readonly artifactDirectory: string;
@@ -1189,7 +1191,7 @@ const startMockUpdateServer = async (input: {
           return false;
         }
       },
-      timeoutMs: 15_000,
+      timeoutMs: MOCK_UPDATE_READY_TIMEOUT_MS,
     });
     return child;
   } catch (error) {
