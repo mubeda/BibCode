@@ -3608,6 +3608,27 @@ staticDescribe("new thread entry points", () => {
       mustFindProps(byAriaLabel("New main-branch chat in Repo A"), "row main chat"),
     ).toBeDefined();
     expect(mustFindProps(byAriaLabel("New worktree in Repo A"), "row worktree")).toBeDefined();
+    expect(mustFindProps(byAriaLabel("Git Manager for Repo A"), "row Git Manager")).toBeDefined();
+  });
+
+  it("navigates idempotently to one project-scoped Git Manager", () => {
+    baseScenario();
+    render(<Sidebar />);
+    const gitManager = mustFindProps(byTestId("git-manager-button"), "Git Manager button");
+    const firstClick = mouseEvent();
+    const secondClick = mouseEvent();
+
+    invoke(gitManager, "onClick", firstClick);
+    invoke(gitManager, "onClick", secondClick);
+
+    const navigation = {
+      to: "/project/$environmentId/$projectId/git",
+      params: { environmentId: ENV_MAIN, projectId: projectA.id },
+    };
+    expect(h.spies.navigate).toHaveBeenNthCalledWith(1, navigation);
+    expect(h.spies.navigate).toHaveBeenNthCalledWith(2, navigation);
+    expect(firstClick.preventDefault).toHaveBeenCalled();
+    expect(secondClick.stopPropagation).toHaveBeenCalled();
   });
 });
 
@@ -3650,6 +3671,25 @@ staticDescribe("grouped and remote projects", () => {
     await flush();
 
     expect(h.spies.contextMenuShow).toHaveBeenCalled();
+  });
+
+  it("opens the chosen grouped-project member's Git Manager", async () => {
+    groupedScenario();
+    render(<Sidebar />);
+    fakeLocalApi();
+    h.spies.contextMenuShow.mockImplementation(
+      async (items: Array<{ id: string }>) => items[1]!.id,
+    );
+
+    const gitManager = mustFindProps(byTestId("git-manager-button"), "Git Manager button");
+    invoke(gitManager, "onClick", mouseEvent());
+    await flush();
+
+    expect(h.spies.contextMenuShow).toHaveBeenCalled();
+    expect(h.spies.navigate).toHaveBeenCalledWith({
+      to: "/project/$environmentId/$projectId/git",
+      params: { environmentId: ENV_REMOTE, projectId: ProjectId.make("project-a-remote") },
+    });
   });
 
   it("does not create a grouped-project chat when its picker is unavailable or cancelled", async () => {
