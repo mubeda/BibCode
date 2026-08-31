@@ -1,5 +1,72 @@
 # Changelog
 
+## [v0.4.2] - 2026-08-25
+
+BiBCode v0.4.2 makes desktop updates easier to understand and recover from,
+while keeping Codex and Claude terminal interfaces readable across app-theme
+changes.
+
+### Safer, observable desktop updates
+
+- Added live update-protection progress for every local backend, including the
+  current protection stage, elapsed time, and active mutation count while
+  BiBCode drains work, quiesces the runtime, checkpoints SQLite, creates a
+  verified backup, and stops the backend.
+- Classified RPC methods through the typed contract inventory so long-lived
+  read subscriptions do not block an update, while unknown methods still fail
+  closed as mutations.
+- Kept verified backup protection as the default and the primary retry path.
+  Installing without a backup is available only after a real protection
+  attempt fails and the user explicitly acknowledges the risk; the native host
+  rejects forged first-attempt bypasses.
+- Preserved exact backend-topology safety for the acknowledged fallback: the
+  desktop host still snapshots and stops the running native and WSL backends,
+  restarts that same set if installation fails, and reports each environment
+  as skipped instead of protected.
+- Improved the protection-failure dialog so retry, exact secondary exclusions,
+  and the destructive no-backup action remain distinct and correctly laid out.
+
+### Terminal and agent compatibility
+
+- Kept each Codex terminal on its launch palette until an explicit restart, so
+  changing the BiBCode app theme cannot make Codex composer text disappear or
+  leave the terminal half-repainted on macOS, Linux, or Windows.
+- Applied the resolved terminal palette when opening agent and script
+  terminals, including the OSC foreground, background, cursor, and Windows
+  console markers that terminal applications snapshot at spawn.
+- Prevented a light in-band color-scheme reply from selecting Claude Code's
+  broken fullscreen light path inside the embedded xterm host, while retaining
+  dark-scheme and OSC color support.
+- Removed inherited `NO_COLOR`/disabled-color host settings from PTY launches
+  unless the launch explicitly opts out, and advertised true-color support so
+  agent TUIs do not silently lose their ANSI colors.
+- Changed the device-local terminal-theme default to **Follow app theme**;
+  **Always dark** remains available for users who prefer a fixed terminal
+  palette.
+
+### Release reliability
+
+- Prevented the chat surface from reading an unavailable nested platform value
+  while server configuration is still partial, so opening a local draft cannot
+  fail during configuration bootstrap.
+- Made the startup activity-recovery test use a current fixture timestamp so it
+  continues to exercise unresolved-versus-completed recovery after the
+  production 30-day completed-activity retention window advances.
+
+### Compatibility and downloads
+
+- No database migration or intentional breaking API change is included. New
+  updater progress and skipped-protection fields are additive and decode with
+  safe defaults.
+- The release pipeline provides macOS 11+ Apple Silicon and Intel DMGs, a Linux
+  x64 AppImage, and a Windows 10/11 x64 NSIS installer, plus signed updater
+  payloads and the four-platform `latest.json` manifest.
+- macOS builds remain ad-hoc signed and unnotarized; Windows installers remain
+  without Authenticode. Tauri updater payloads are independently signed and
+  verified by BiBCode.
+
+**Full changelog:** [v0.4.1...v0.4.2](https://github.com/mubeda/BibCode/compare/v0.4.1...v0.4.2)
+
 ## [v0.4.1] - 2026-08-24
 
 BiBCode v0.4.1 is a reliability release for Git/worktree coordination, the
@@ -169,3 +236,4 @@ flow.
 
 [v0.4.0]: https://github.com/mubeda/BibCode/releases/tag/v0.4.0
 [v0.4.1]: https://github.com/mubeda/BibCode/releases/tag/v0.4.1
+[v0.4.2]: https://github.com/mubeda/BibCode/releases/tag/v0.4.2
