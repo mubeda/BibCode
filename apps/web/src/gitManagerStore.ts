@@ -12,6 +12,15 @@ const GIT_MANAGER_VIEW_STATE_LIMIT = 2;
 export type GitManagerTab = "changes" | "history";
 export type GitManagerOpenDropdown = "branch" | "sync" | null;
 
+export interface SerializedGitManagerLineSelection {
+  readonly type: "all" | "partial" | "none";
+  readonly basis: "all" | "none";
+  readonly diverging: ReadonlyArray<number>;
+  readonly selectable: ReadonlyArray<number> | null;
+  readonly area: "staged" | "unstaged";
+  readonly generation: number;
+}
+
 export interface GitManagerToolbarViewState {
   readonly branchFilterText: string;
   readonly openDropdown: GitManagerOpenDropdown;
@@ -25,6 +34,7 @@ export interface GitManagerViewState {
   readonly selectedFilePath: string | null;
   readonly selectedStashSha: string | null;
   readonly stashPaneOpen: boolean;
+  readonly lineSelectionByPath: Record<string, SerializedGitManagerLineSelection>;
   readonly filterText: string;
   readonly loadedPageCount: number;
   readonly loadedPageCursors: ReadonlyArray<number>;
@@ -53,6 +63,7 @@ export const DEFAULT_GIT_MANAGER_VIEW_STATE: GitManagerViewState = Object.freeze
   selectedFilePath: null,
   selectedStashSha: null,
   stashPaneOpen: false,
+  lineSelectionByPath: Object.freeze({}),
   filterText: "",
   loadedPageCount: 0,
   loadedPageCursors: Object.freeze([]),
@@ -74,6 +85,11 @@ interface GitManagerStoreState {
   readonly setSelectedFile: (ref: ScopedProjectRef, path: string | null) => void;
   readonly setSelectedStash: (ref: ScopedProjectRef, sha: string | null) => void;
   readonly setStashPaneOpen: (ref: ScopedProjectRef, open: boolean) => void;
+  readonly setLineSelection: (
+    ref: ScopedProjectRef,
+    path: string,
+    selection: SerializedGitManagerLineSelection | null,
+  ) => void;
   readonly setFilterText: (ref: ScopedProjectRef, text: string) => void;
   readonly setLoadedPageCount: (ref: ScopedProjectRef, count: number) => void;
   readonly setLoadedPageCursors: (ref: ScopedProjectRef, cursors: ReadonlyArray<number>) => void;
@@ -158,6 +174,44 @@ function nonNegativeIntegerArray(value: unknown): ReadonlyArray<number> {
   );
 }
 
+function sortedNonNegativeIntegerArray(value: unknown): ReadonlyArray<number> {
+  return [...new Set(nonNegativeIntegerArray(value))].sort((left, right) => left - right);
+}
+
+function sanitizeLineSelection(value: unknown): SerializedGitManagerLineSelection | null {
+  if (value === null || typeof value !== "object") return null;
+  const candidate = value as Record<string, unknown>;
+  const type =
+    candidate.type === "all" || candidate.type === "partial" || candidate.type === "none"
+      ? candidate.type
+      : null;
+  const basis = candidate.basis === "all" || candidate.basis === "none" ? candidate.basis : null;
+  const area = candidate.area === "staged" || candidate.area === "unstaged" ? candidate.area : null;
+  if (type === null || basis === null || area === null) return null;
+  return {
+    type,
+    basis,
+    diverging: sortedNonNegativeIntegerArray(candidate.diverging),
+    selectable:
+      candidate.selectable === null ? null : sortedNonNegativeIntegerArray(candidate.selectable),
+    area,
+    generation: nonNegativeIntegerOr(candidate.generation, 0),
+  };
+}
+
+function sanitizeLineSelectionByPath(
+  value: unknown,
+): Record<string, SerializedGitManagerLineSelection> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
+  const result: Record<string, SerializedGitManagerLineSelection> = {};
+  for (const [path, selection] of Object.entries(value)) {
+    if (path.trim().length === 0) continue;
+    const sanitized = sanitizeLineSelection(selection);
+    if (sanitized !== null) result[path] = sanitized;
+  }
+  return result;
+}
+
 function sanitizeViewState(value: unknown): PersistedGitManagerViewState | null {
   if (value === null || typeof value !== "object") return null;
   const candidate = value as Record<string, unknown>;
@@ -168,6 +222,7 @@ function sanitizeViewState(value: unknown): PersistedGitManagerViewState | null 
     selectedFilePath: nullableString(candidate.selectedFilePath),
     selectedStashSha: nullableString(candidate.selectedStashSha),
     stashPaneOpen: candidate.stashPaneOpen === true,
+    lineSelectionByPath: sanitizeLineSelectionByPath(candidate.lineSelectionByPath),
     filterText: stringOr(candidate.filterText, ""),
     loadedPageCount: nonNegativeIntegerOr(candidate.loadedPageCount, 0),
     loadedPageCursors: nonNegativeIntegerArray(candidate.loadedPageCursors),
@@ -275,6 +330,19 @@ export const useGitManagerStore = create<GitManagerStoreState>()(
       setStashPaneOpen: (ref, open) =>
         set((state) =>
           updateProject(state, ref, (current) => ({ ...current, stashPaneOpen: open })),
+        ),
+      setLineSelection: (ref, path, selection) =>
+        set((state) =>
+          updateProject(state, ref, (current) => {
+            const lineSelectionByPath = { ...current.lineSelectionByPath };
+            if (selection === null) {
+              delete lineSelectionByPath[path];
+            } else {
+              const sanitized = sanitizeLineSelection(selection);
+              if (sanitized !== null) lineSelectionByPath[path] = sanitized;
+            }
+            return { ...current, lineSelectionByPath };
+          }),
         ),
       setFilterText: (ref, text) =>
         set((state) => updateProject(state, ref, (current) => ({ ...current, filterText: text }))),

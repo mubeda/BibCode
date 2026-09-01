@@ -230,6 +230,30 @@ describe("AnnotatableCodeView", () => {
     expect(harness.setters[0]).toHaveBeenCalledWith(null);
   });
 
+  it("forwards a controlled non-comment selection mode", () => {
+    const selectedLines = {
+      id: "file-1",
+      range: { start: 1, end: 3, side: "additions" },
+    } as const;
+    const onSelectedLinesChange = vi.fn();
+    const onLineSelectionEnd = vi.fn();
+    const props = renderView({
+      enableGutterUtility: false,
+      enableLineSelection: true,
+      selectedLines,
+      onSelectedLinesChange,
+      onLineSelectionEnd,
+    });
+
+    expect(props.selectedLines).toBe(selectedLines);
+    expect(props.onSelectedLinesChange).toBe(onSelectedLinesChange);
+    expect(props.options).toMatchObject({
+      enableGutterUtility: false,
+      enableLineSelection: true,
+      onLineSelectionEnd,
+    });
+  });
+
   it("ignores invalid selections and starts a draft for a diff selection", () => {
     const props = renderView();
     const beginComment = (props.options as Record<string, unknown>).onLineSelectionEnd as (
