@@ -1,7 +1,10 @@
+import type { GitManagerImageDiffSide } from "@bibcode/contracts";
 import type { FileDiffMetadata } from "@pierre/diffs";
 import { memo, useCallback, useMemo, useRef, type KeyboardEvent, type PointerEvent } from "react";
 
 import { classifyDiffPayload, type DiffPayloadMeasurements } from "../history/diffLadder";
+import { GitManagerStoredImageDiff } from "../diff/GitManagerImageDiffModeContext";
+import { buildImageDataUri } from "../diff/gitManagerImageDiff.logic";
 import {
   type GitManagerContiguousRun,
   type GitManagerSelectableDiffLine,
@@ -19,6 +22,12 @@ import {
 export type GitManagerStagingDiffKind = "text" | "binary" | "submodule" | "unrenderable";
 const DISABLED_REASON_ID = "git-manager-staging-gutter-disabled-reason";
 
+export interface GitManagerStagingImagePayload extends DiffPayloadMeasurements {
+  readonly kind: "image";
+  readonly before: GitManagerImageDiffSide;
+  readonly after: GitManagerImageDiffSide;
+}
+
 export interface GitManagerStagingGutterProps {
   readonly fileDiff: FileDiffMetadata;
   readonly selection: GitManagerLineSelection;
@@ -26,7 +35,7 @@ export interface GitManagerStagingGutterProps {
   readonly disabledReason: string | null;
   readonly area?: "staged" | "unstaged";
   readonly diffKind?: GitManagerStagingDiffKind;
-  readonly payload?: DiffPayloadMeasurements;
+  readonly payload?: DiffPayloadMeasurements | GitManagerStagingImagePayload;
   readonly onApplySelection?: () => void;
   readonly onRequestDiscard?: () => void;
 }
@@ -186,7 +195,7 @@ const GutterRunControl = memo(function GutterRunControl({
   );
 }, runSelectionEqual);
 
-export const GitManagerStagingGutter = memo(function GitManagerStagingGutter({
+const GitManagerTextStagingGutter = memo(function GitManagerTextStagingGutter({
   fileDiff,
   selection,
   onSelectionChange,
@@ -316,4 +325,29 @@ export const GitManagerStagingGutter = memo(function GitManagerStagingGutter({
       ))}
     </aside>
   );
+});
+
+function isImagePayload(
+  payload: DiffPayloadMeasurements | GitManagerStagingImagePayload | undefined,
+): payload is GitManagerStagingImagePayload {
+  return (
+    payload !== undefined &&
+    classifyDiffPayload(payload) === "image" &&
+    "before" in payload &&
+    "after" in payload
+  );
+}
+
+export const GitManagerStagingGutter = memo(function GitManagerStagingGutter(
+  props: GitManagerStagingGutterProps,
+) {
+  if (isImagePayload(props.payload)) {
+    return (
+      <GitManagerStoredImageDiff
+        after={buildImageDataUri(props.payload.after)}
+        before={buildImageDataUri(props.payload.before)}
+      />
+    );
+  }
+  return <GitManagerTextStagingGutter {...props} />;
 });

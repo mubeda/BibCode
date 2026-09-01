@@ -4,11 +4,17 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
+import { useGitManagerStore } from "../../../gitManagerStore";
 import { GitManagerImageDiff } from "./GitManagerImageDiff";
+import {
+  GitManagerImageDiffModeProvider,
+  GitManagerStoredImageDiff,
+} from "./GitManagerImageDiffModeContext";
 
 const before = "data:image/png;base64,iVBORw0KGgo=";
 const after = "data:image/png;base64,YWZ0ZXI=";
 const noop = () => undefined;
+const projectRef = { environmentId: "env-a", projectId: "project-a" } as never;
 
 let container: HTMLDivElement;
 let root: Root;
@@ -29,6 +35,7 @@ beforeEach(() => {
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
+  useGitManagerStore.setState({ byProjectKey: {} });
 });
 
 afterEach(async () => {
@@ -90,5 +97,29 @@ describe("GitManagerImageDiff", () => {
     expect(container.querySelectorAll("img")).toHaveLength(1);
     expect(container.textContent).toContain("Before image unavailable");
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("reads and updates the project-scoped image mode through the Git Manager store", async () => {
+    useGitManagerStore.getState().setImageDiffMode(projectRef, "onion");
+    await act(async () =>
+      root.render(
+        <GitManagerImageDiffModeProvider projectRef={projectRef}>
+          <GitManagerStoredImageDiff after={after} before={before} />
+        </GitManagerImageDiffModeProvider>,
+      ),
+    );
+
+    const onion = [...container.querySelectorAll<HTMLButtonElement>("button")].find(
+      (button) => button.textContent === "Onion-skin",
+    );
+    expect(onion?.getAttribute("aria-pressed")).toBe("true");
+    const difference = [...container.querySelectorAll<HTMLButtonElement>("button")].find(
+      (button) => button.textContent === "Difference",
+    );
+    await act(async () => difference?.click());
+
+    expect(useGitManagerStore.getState().selectViewState(projectRef).imageDiffMode).toBe(
+      "difference",
+    );
   });
 });
