@@ -405,7 +405,10 @@ root and prints the pairing credential JSON in the exact shape
   projects/threads the panel shows and where "Add project" lands); RPC routing continues
   to follow each entity's `environmentId`. A null/absent `activeEnvironmentId` means
   **Local is selected and the panel filters to Local** — "no selection" must never render
-  as "show everything". The rail's `attention` (amber) dot covers both
+  as "show everything". Exception: the Agents section in the left panel is the single
+  cross-environment surface; it ignores rail selection by design, and clicking one of
+  its rows re-points rail selection to the row's environment so every other surface
+  remains scoped. The rail's `attention` (amber) dot covers both
   compatibility-limited and update-available states; Phase 7 wires the update input into
   the Phase 6 dot.
 
