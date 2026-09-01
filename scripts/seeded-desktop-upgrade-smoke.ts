@@ -304,7 +304,19 @@ import * as NodeFS from "node:fs";
 
 const input = ${serializedInput};
 
+async function waitForDesktopBridge() {
+  await browser.waitUntil(
+    async () => browser.execute(() => Boolean(window.desktopBridge)),
+    {
+      timeout: 60000,
+      interval: 100,
+      timeoutMsg: "The packaged desktop bridge did not become ready.",
+    },
+  );
+}
+
 async function observe(seed) {
+  await waitForDesktopBridge();
   return browser.execute(async (parameters, seed) => {
     const bridge = window.desktopBridge;
     if (!bridge) throw new Error("The packaged desktop bridge is unavailable.");
