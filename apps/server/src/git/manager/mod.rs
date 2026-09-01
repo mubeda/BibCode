@@ -6,5 +6,6 @@ pub mod guards;
 pub mod in_progress;
 pub mod merge;
 pub mod operations;
+pub mod patch;
 pub mod refs;
 pub mod stash;

@@ -1,13 +1,6 @@
 //! Registers the Git Manager RPC contract surface.
 
-use std::{
-    path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Duration,
-};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -29,9 +22,11 @@ use crate::{
             operations::{
                 CoAuthor, CommitRequest, DiscardError, DiscardRequest,
                 GitManagerOperationError as DomainOperationError, GitManagerOperationRequest,
-                commit_arguments, commit_message_body, discard_paths, parse_undo_commit_message,
-                run_branch_or_sync_operation,
+                PartialSelectionError, PartialSelectionRequest, commit_arguments,
+                commit_message_body, discard_partial, discard_paths, parse_undo_commit_message,
+                run_branch_or_sync_operation, stage_partial, unstage_partial,
             },
+            patch::{diff_generation, parse_working_tree_diff},
             refs::{GitManagerRefsError, GitManagerRefsSnapshot, build_refs_snapshot},
             stash::{self, GitManagerStashError},
         },
@@ -45,7 +40,6 @@ use crate::{
     },
 };
 
-static NEXT_DIFF_GENERATION: AtomicU64 = AtomicU64::new(1);
 const OPERATION_STREAM_CAPACITY: usize = 8;
 
 pub const GIT_MANAGER_UNARY_METHODS: &[&str] = &[
@@ -293,6 +287,14 @@ impl ConfiguredGitManagerRpcServices {
         self.handle_read_unary(request, cancellation).await
     }
 
+    pub async fn mutation_unary(
+        &self,
+        request: RpcRequest,
+        cancellation: CancellationToken,
+    ) -> RpcResult {
+        self.handle_mutation_unary(request, cancellation).await
+    }
+
     pub fn git_manager_signal_stream(
         &self,
         request: RpcRequest,
@@ -493,6 +495,66 @@ impl ConfiguredGitManagerRpcServices {
                 )
                 .await
             }
+            "gitManager.stagePartial"
+            | "gitManager.unstagePartial"
+            | "gitManager.discardPartial" => {
+                let operation = match request.tag.as_str() {
+                    "gitManager.stagePartial" => PartialMutation::Stage,
+                    "gitManager.unstagePartial" => PartialMutation::Unstage,
+                    "gitManager.discardPartial" => PartialMutation::Discard,
+                    _ => unreachable!("partial mutation tag was matched above"),
+                };
+                let input: GitManagerPartialSelectionInput =
+                    decode(request.payload, operation.rpc_name())?;
+                validate_pathspecs(
+                    operation.git_operation_name(),
+                    &input.cwd,
+                    std::slice::from_ref(&input.path),
+                )
+                .map_err(|_| {
+                    operation_error(
+                        operation.rpc_name(),
+                        "invalid-path",
+                        "The requested partial-selection path is invalid.",
+                    )
+                })?;
+                let project_id = input.project_id;
+                let selection = PartialSelectionRequest {
+                    cwd: input.cwd.clone(),
+                    path: input.path,
+                    selected_lines: input.selected_lines,
+                    base_generation: input.base_generation,
+                };
+                self.run_mutation_for_project(
+                    operation.rpc_name(),
+                    input.cwd,
+                    project_id,
+                    operation.guard_name(),
+                    cancellation,
+                    move |services, _cwd, token| async move {
+                        let outcome = match operation {
+                            PartialMutation::Stage => {
+                                stage_partial(&services.repository, &selection, &token).await
+                            }
+                            PartialMutation::Unstage => {
+                                unstage_partial(&services.repository, &selection, &token).await
+                            }
+                            PartialMutation::Discard => {
+                                discard_partial(&services.repository, &selection, &token).await
+                            }
+                        }
+                        .map_err(|error| partial_selection_error(operation.rpc_name(), error))?;
+                        let mut value = json!({ "generation": outcome.generation });
+                        if let Some(reason) = outcome.fallback_reason
+                            && let Some(fields) = value.as_object_mut()
+                        {
+                            fields.insert("fallbackReason".to_owned(), json!(reason));
+                        }
+                        Ok(value)
+                    },
+                )
+                .await
+            }
             "gitManager.discard" => {
                 let input: GitManagerDiscardInput = decode(request.payload, &request.tag)?;
                 if input.paths.is_empty() {
@@ -581,6 +643,47 @@ impl ConfiguredGitManagerRpcServices {
         F: FnOnce(Self, PathBuf, CancellationToken) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = RpcResult> + Send + 'static,
     {
+        self.run_mutation_with_optional_project(operation, cwd, None, None, cancellation, action)
+            .await
+    }
+
+    async fn run_mutation_for_project<F, Fut>(
+        &self,
+        operation: &'static str,
+        cwd: PathBuf,
+        project_id: String,
+        guard_operation: &'static str,
+        cancellation: CancellationToken,
+        action: F,
+    ) -> RpcResult
+    where
+        F: FnOnce(Self, PathBuf, CancellationToken) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = RpcResult> + Send + 'static,
+    {
+        self.run_mutation_with_optional_project(
+            operation,
+            cwd,
+            Some(project_id),
+            Some(guard_operation),
+            cancellation,
+            action,
+        )
+        .await
+    }
+
+    async fn run_mutation_with_optional_project<F, Fut>(
+        &self,
+        operation: &'static str,
+        cwd: PathBuf,
+        requested_project_id: Option<String>,
+        guard_operation: Option<&'static str>,
+        cancellation: CancellationToken,
+        action: F,
+    ) -> RpcResult
+    where
+        F: FnOnce(Self, PathBuf, CancellationToken) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = RpcResult> + Send + 'static,
+    {
         let services = self.clone();
         await_server_owned_mutation(async move {
             let (Some(catalog), Some(repositories), Some(availability)) = (
@@ -603,6 +706,16 @@ impl ConfiguredGitManagerRpcServices {
                         "The selected checkout is not owned by exactly one BiBCode project.",
                     )
                 })?;
+            if requested_project_id
+                .as_deref()
+                .is_some_and(|requested| requested != project_id)
+            {
+                return Err(operation_error(
+                    operation,
+                    "project-mismatch",
+                    "The selected checkout does not belong to the requested project.",
+                ));
+            }
             catalog
                 .refresh(&project_id, CatalogRefreshTrigger::Explicit)
                 .await
@@ -632,6 +745,14 @@ impl ConfiguredGitManagerRpcServices {
                     &project_id,
                     &lock_cancellation,
                     || async move {
+                        if let Some(guard_operation) = guard_operation {
+                            let snapshot = locked_services
+                                .refs_snapshot(operation, &locked_cwd, &operation_cancellation)
+                                .await?;
+                            if let Some(reason) = operation_blocked(&snapshot, guard_operation) {
+                                return Err(blocked_error(operation, reason));
+                            }
+                        }
                         locked_services
                             .run_fenced_mutation(
                                 operation,
@@ -733,6 +854,9 @@ pub fn register_git_manager_rpc(
                 | "gitManager.commit"
                 | "gitManager.undoCommit"
                 | "gitManager.discard"
+                | "gitManager.stagePartial"
+                | "gitManager.unstagePartial"
+                | "gitManager.discardPartial"
         )
     }) {
         let services = services.clone();
@@ -758,6 +882,9 @@ pub fn register_git_manager_rpc(
         "gitManager.commit",
         "gitManager.undoCommit",
         "gitManager.discard",
+        "gitManager.stagePartial",
+        "gitManager.unstagePartial",
+        "gitManager.discardPartial",
     ] {
         let services = services.clone();
         registry.register_unary(method, move |request, cancellation| {
@@ -848,6 +975,16 @@ struct GitManagerDiscardInput {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct GitManagerPartialSelectionInput {
+    cwd: PathBuf,
+    project_id: String,
+    path: String,
+    selected_lines: Vec<usize>,
+    base_generation: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GitManagerGetCommitsInput {
     cwd: PathBuf,
     pinned_tips: Option<Vec<String>>,
@@ -890,6 +1027,39 @@ enum DiffSizeClass {
     Patch,
     LargeText,
     Unrenderable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PartialMutation {
+    Stage,
+    Unstage,
+    Discard,
+}
+
+impl PartialMutation {
+    const fn rpc_name(self) -> &'static str {
+        match self {
+            Self::Stage => "gitManager.stagePartial",
+            Self::Unstage => "gitManager.unstagePartial",
+            Self::Discard => "gitManager.discardPartial",
+        }
+    }
+
+    const fn git_operation_name(self) -> &'static str {
+        match self {
+            Self::Stage => "GitManager.stagePartial",
+            Self::Unstage => "GitManager.unstagePartial",
+            Self::Discard => "GitManager.discardPartial",
+        }
+    }
+
+    const fn guard_name(self) -> &'static str {
+        match self {
+            Self::Stage => "stage-partial",
+            Self::Unstage => "unstage-partial",
+            Self::Discard => "discard-partial",
+        }
+    }
 }
 
 fn validate_commit_input(input: &GitManagerCommitInput) -> Result<(), Value> {
@@ -979,6 +1149,9 @@ fn operation_guard_name(operation: &str) -> &'static str {
         "gitManager.commit" => "commit",
         "gitManager.undoCommit" => "undo-commit",
         "gitManager.discard" => "discard",
+        "gitManager.stagePartial" => "stage-partial",
+        "gitManager.unstagePartial" => "unstage-partial",
+        "gitManager.discardPartial" => "discard-partial",
         _ => "git-manager-mutation",
     }
 }
@@ -1004,6 +1177,26 @@ fn mutation_git_error(operation: &str, _error: GitCommandError) -> Value {
 fn discard_error(operation: &str, error: DiscardError) -> Value {
     match error {
         DiscardError::Git(error) => mutation_git_error(operation, error),
+    }
+}
+
+fn partial_selection_error(operation: &str, error: PartialSelectionError) -> Value {
+    match error {
+        PartialSelectionError::Stale => operation_error(
+            operation,
+            "stale-selection",
+            "The selected diff changed; refresh it and select the lines again.",
+        ),
+        PartialSelectionError::DiffTooLarge => operation_error(
+            operation,
+            "diff-too-large",
+            "The selected diff is too large for safe partial staging.",
+        ),
+        PartialSelectionError::Git(_) => operation_error(
+            operation,
+            "git-command-failed",
+            "Git could not apply the selected lines.",
+        ),
     }
 }
 
@@ -1097,6 +1290,7 @@ async fn get_diff(
 
 fn render_diff(source: GitManagerDiffSource, output: ProcessOutput) -> Value {
     let truncated = output.stdout_truncated;
+    let generation = diff_generation(&parse_working_tree_diff(&output.stdout));
     let byte_length = if truncated {
         MAX_DIFF_BUFFER_SIZE + 1
     } else {
@@ -1113,7 +1307,7 @@ fn render_diff(source: GitManagerDiffSource, output: ProcessOutput) -> Value {
         0
     };
     let metadata = json!({
-        "generation": NEXT_DIFF_GENERATION.fetch_add(1, Ordering::Relaxed),
+        "generation": generation,
         "source": source,
         "byteLength": byte_length,
         "longestLineLength": longest_line_length,
@@ -1435,6 +1629,20 @@ mod tests {
             assert_eq!(
                 crate::auth::required_scope(method),
                 Some("orchestration:read")
+            );
+        }
+    }
+
+    #[test]
+    fn partial_staging_handlers_require_the_operate_scope() {
+        for method in [
+            "gitManager.stagePartial",
+            "gitManager.unstagePartial",
+            "gitManager.discardPartial",
+        ] {
+            assert_eq!(
+                crate::auth::required_scope(method),
+                Some("orchestration:operate")
             );
         }
     }

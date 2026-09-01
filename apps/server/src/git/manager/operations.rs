@@ -23,6 +23,7 @@ use super::{
     guards::{GuardInput, evaluate_guards},
     in_progress::detect_in_progress_operation,
     merge,
+    patch::{diff_generation, format_selection_patch, parse_working_tree_diff},
     refs::build_refs_snapshot,
     stash,
 };
@@ -64,6 +65,34 @@ pub struct DiscardOutcome {
     pub permanently_discarded: Vec<String>,
     pub trash_unavailable: Vec<String>,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PartialSelectionRequest {
+    pub cwd: PathBuf,
+    pub path: String,
+    pub selected_lines: Vec<usize>,
+    pub base_generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PartialSelectionOutcome {
+    pub generation: u64,
+    pub patch_byte_length: usize,
+    pub fallback_reason: Option<&'static str>,
+}
+
+#[derive(Debug, Error)]
+pub enum PartialSelectionError {
+    #[error(transparent)]
+    Git(#[from] GitCommandError),
+    #[error("the selected diff generation is stale")]
+    Stale,
+    #[error("the selected diff is too large to stage safely")]
+    DiffTooLarge,
+}
+
+const RENAME_WHOLE_FILE_FALLBACK: &str =
+    "Partial staging is unavailable for renamed paths; the whole file was staged.";
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 #[error("the operating-system trash is unavailable")]
@@ -465,6 +494,309 @@ pub struct GitManagerOperationError {
     pub message: String,
     pub blocked: Option<Box<GitManagerBlockedReason>>,
     pub outputs: Vec<ProcessOutput>,
+}
+
+pub async fn stage_partial(
+    repository: &GitRepository,
+    request: &PartialSelectionRequest,
+    cancellation: &CancellationToken,
+) -> Result<PartialSelectionOutcome, PartialSelectionError> {
+    let fresh = read_partial_diff(repository, request, false, cancellation).await?;
+    let mut parsed = parse_working_tree_diff(&fresh.patch);
+    reject_stale(&parsed, request)?;
+
+    if diff_records_rename(&fresh.patch) {
+        repository
+            .stage_files(
+                &request.cwd,
+                std::slice::from_ref(&request.path),
+                cancellation,
+            )
+            .await?;
+        tracing::debug!(
+            operation = "gitManager.stagePartial",
+            code = "rename-whole-file-fallback",
+            selected_line_count = request.selected_lines.len(),
+            "Git Manager partial staging used a whole-file fallback"
+        );
+        let generation = refreshed_generation(repository, request, false, cancellation).await?;
+        return Ok(PartialSelectionOutcome {
+            generation,
+            patch_byte_length: 0,
+            fallback_reason: Some(RENAME_WHOLE_FILE_FALLBACK),
+        });
+    }
+
+    let Some(mut patch) = format_selection_patch(&parsed, &request.selected_lines) else {
+        return Ok(noop_partial_outcome(diff_generation(&parsed)));
+    };
+    if fresh.untracked {
+        repository
+            .git_manager_intent_to_add(&request.cwd, &request.path, cancellation)
+            .await?;
+        let reread = repository
+            .git_manager_working_tree_diff(&request.cwd, &request.path, false, cancellation)
+            .await?;
+        if reread.stdout_truncated {
+            clear_intent(repository, request).await?;
+            return Err(PartialSelectionError::DiffTooLarge);
+        }
+        parsed = parse_working_tree_diff(&reread.stdout);
+        if diff_generation(&parsed) != request.base_generation {
+            clear_intent(repository, request).await?;
+            return Err(PartialSelectionError::Stale);
+        }
+        let Some(reread_patch) = format_selection_patch(&parsed, &request.selected_lines) else {
+            clear_intent(repository, request).await?;
+            return Ok(noop_partial_outcome(diff_generation(&parsed)));
+        };
+        patch = reread_patch;
+    }
+
+    let patch_byte_length = patch.len();
+    log_partial_apply("gitManager.stagePartial", request, patch_byte_length);
+    let result = repository
+        .git_manager_apply_partial_patch(
+            "GitManager.stagePartial.apply",
+            &request.cwd,
+            patch.into_bytes(),
+            true,
+            false,
+            cancellation,
+        )
+        .await;
+    if fresh.untracked && result.is_err() {
+        let _ = clear_intent(repository, request).await;
+    }
+    result?;
+    let generation = refreshed_generation(repository, request, false, cancellation).await?;
+    Ok(PartialSelectionOutcome {
+        generation,
+        patch_byte_length,
+        fallback_reason: None,
+    })
+}
+
+pub async fn unstage_partial(
+    repository: &GitRepository,
+    request: &PartialSelectionRequest,
+    cancellation: &CancellationToken,
+) -> Result<PartialSelectionOutcome, PartialSelectionError> {
+    apply_staged_reverse_patch(repository, request, cancellation).await
+}
+
+pub async fn discard_partial(
+    repository: &GitRepository,
+    request: &PartialSelectionRequest,
+    cancellation: &CancellationToken,
+) -> Result<PartialSelectionOutcome, PartialSelectionError> {
+    let fresh = read_partial_diff(repository, request, false, cancellation).await?;
+    let mut parsed = parse_working_tree_diff(&fresh.patch);
+    reject_stale(&parsed, request)?;
+    let Some(mut patch) = format_selection_patch(&parsed, &request.selected_lines) else {
+        return Ok(noop_partial_outcome(diff_generation(&parsed)));
+    };
+
+    if fresh.untracked {
+        repository
+            .git_manager_intent_to_add(&request.cwd, &request.path, cancellation)
+            .await?;
+        let reread = repository
+            .git_manager_working_tree_diff(&request.cwd, &request.path, false, cancellation)
+            .await?;
+        if reread.stdout_truncated {
+            clear_intent(repository, request).await?;
+            return Err(PartialSelectionError::DiffTooLarge);
+        }
+        parsed = parse_working_tree_diff(&reread.stdout);
+        if diff_generation(&parsed) != request.base_generation {
+            clear_intent(repository, request).await?;
+            return Err(PartialSelectionError::Stale);
+        }
+        let Some(reread_patch) = format_selection_patch(&parsed, &request.selected_lines) else {
+            clear_intent(repository, request).await?;
+            return Ok(noop_partial_outcome(diff_generation(&parsed)));
+        };
+        patch = reread_patch;
+    }
+
+    let patch_byte_length = patch.len();
+    log_partial_apply("gitManager.discardPartial", request, patch_byte_length);
+    let result = repository
+        .git_manager_apply_partial_patch(
+            "GitManager.discardPartial.apply",
+            &request.cwd,
+            patch.into_bytes(),
+            false,
+            true,
+            cancellation,
+        )
+        .await;
+    if let Err(error) = result {
+        if fresh.untracked {
+            let _ = clear_intent(repository, request).await;
+        }
+        return Err(error.into());
+    }
+    if fresh.untracked {
+        clear_intent(repository, request).await?;
+    }
+    let generation = refreshed_generation(repository, request, false, cancellation).await?;
+    Ok(PartialSelectionOutcome {
+        generation,
+        patch_byte_length,
+        fallback_reason: None,
+    })
+}
+
+#[derive(Debug)]
+struct FreshPartialDiff {
+    patch: String,
+    untracked: bool,
+}
+
+async fn apply_staged_reverse_patch(
+    repository: &GitRepository,
+    request: &PartialSelectionRequest,
+    cancellation: &CancellationToken,
+) -> Result<PartialSelectionOutcome, PartialSelectionError> {
+    let fresh = read_partial_diff(repository, request, true, cancellation).await?;
+    let parsed = parse_working_tree_diff(&fresh.patch);
+    reject_stale(&parsed, request)?;
+    let Some(patch) = format_selection_patch(&parsed, &request.selected_lines) else {
+        return Ok(noop_partial_outcome(diff_generation(&parsed)));
+    };
+    let patch_byte_length = patch.len();
+    log_partial_apply("gitManager.unstagePartial", request, patch_byte_length);
+    repository
+        .git_manager_apply_partial_patch(
+            "GitManager.unstagePartial.apply",
+            &request.cwd,
+            patch.into_bytes(),
+            true,
+            true,
+            cancellation,
+        )
+        .await?;
+    let generation = refreshed_generation(repository, request, true, cancellation).await?;
+    Ok(PartialSelectionOutcome {
+        generation,
+        patch_byte_length,
+        fallback_reason: None,
+    })
+}
+
+async fn read_partial_diff(
+    repository: &GitRepository,
+    request: &PartialSelectionRequest,
+    staged: bool,
+    cancellation: &CancellationToken,
+) -> Result<FreshPartialDiff, PartialSelectionError> {
+    let output = repository
+        .git_manager_working_tree_diff(&request.cwd, &request.path, staged, cancellation)
+        .await?;
+    if output.stdout_truncated {
+        return Err(PartialSelectionError::DiffTooLarge);
+    }
+    if staged || !output.stdout.is_empty() {
+        return Ok(FreshPartialDiff {
+            patch: output.stdout,
+            untracked: false,
+        });
+    }
+
+    let untracked = repository
+        .git_manager_untracked_paths(&request.cwd, &request.path, cancellation)
+        .await?;
+    if untracked.stdout.is_empty() {
+        return Ok(FreshPartialDiff {
+            patch: output.stdout,
+            untracked: false,
+        });
+    }
+    let output = repository
+        .git_manager_untracked_diff(&request.cwd, &request.path, cancellation)
+        .await?;
+    if output.stdout_truncated {
+        return Err(PartialSelectionError::DiffTooLarge);
+    }
+    Ok(FreshPartialDiff {
+        patch: output.stdout,
+        untracked: true,
+    })
+}
+
+fn reject_stale(
+    parsed: &super::patch::ParsedFileDiff,
+    request: &PartialSelectionRequest,
+) -> Result<(), PartialSelectionError> {
+    let generation = diff_generation(parsed);
+    if generation == request.base_generation {
+        return Ok(());
+    }
+    tracing::debug!(
+        operation = "gitManager.partial",
+        code = "stale-selection",
+        selected_line_count = request.selected_lines.len(),
+        "Git Manager rejected a stale partial selection"
+    );
+    Err(PartialSelectionError::Stale)
+}
+
+async fn refreshed_generation(
+    repository: &GitRepository,
+    request: &PartialSelectionRequest,
+    staged: bool,
+    cancellation: &CancellationToken,
+) -> Result<u64, PartialSelectionError> {
+    let fresh = read_partial_diff(repository, request, staged, cancellation).await?;
+    Ok(diff_generation(&parse_working_tree_diff(&fresh.patch)))
+}
+
+async fn clear_intent(
+    repository: &GitRepository,
+    request: &PartialSelectionRequest,
+) -> Result<(), PartialSelectionError> {
+    repository
+        .git_manager_clear_intent_to_add(&request.cwd, &request.path, &CancellationToken::new())
+        .await?;
+    Ok(())
+}
+
+fn noop_partial_outcome(generation: u64) -> PartialSelectionOutcome {
+    PartialSelectionOutcome {
+        generation,
+        patch_byte_length: 0,
+        fallback_reason: None,
+    }
+}
+
+fn log_partial_apply(
+    operation: &'static str,
+    request: &PartialSelectionRequest,
+    patch_byte_length: usize,
+) {
+    tracing::debug!(
+        operation,
+        code = "partial-patch-apply",
+        selected_line_count = request.selected_lines.len(),
+        patch_byte_length,
+        "Git Manager is applying a partial selection"
+    );
+}
+
+fn diff_records_rename(diff: &str) -> bool {
+    diff.lines()
+        .any(|line| line.starts_with("rename from ") || line.starts_with("rename to "))
+        || diff
+            .find("diff --git ")
+            .map_or(diff, |patch_start| &diff[..patch_start])
+            .split_ascii_whitespace()
+            .any(|field| {
+                field
+                    .strip_prefix('R')
+                    .is_some_and(|score| score.bytes().take_while(u8::is_ascii_digit).count() > 0)
+            })
 }
 
 pub async fn run_branch_or_sync_operation(
