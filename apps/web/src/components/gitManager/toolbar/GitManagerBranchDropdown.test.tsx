@@ -78,6 +78,8 @@ async function renderDropdown(
     root?.render(
       <GitManagerBranchDropdown
         currentBranchName="main"
+        branchDisabledReason={null}
+        mergeDisabledReason={null}
         projectRef={projectRef}
         recentNames={[]}
         refs={refs}
@@ -170,5 +172,47 @@ describe("GitManagerBranchDropdown", () => {
 
     expect(rowButton("future").disabled).toBe(true);
     expect(document.body.textContent).toContain(message);
+  });
+
+  it("disables branch mutations with their reason while merge and worktree surfaces remain", async () => {
+    const reason = "This environment does not support Git Manager branch and sync operations.";
+    const callbacks = await renderDropdown([branch("feature")], {
+      branchDisabledReason: reason,
+    });
+
+    expect(rowButton("feature")).toMatchObject({ disabled: true, title: reason });
+    expect(
+      document.querySelector<HTMLButtonElement>('[aria-label="Rename feature"]'),
+    ).toMatchObject({ disabled: true, title: reason });
+    expect(
+      document.querySelector<HTMLButtonElement>('[aria-label="Delete feature"]'),
+    ).toMatchObject({ disabled: true, title: reason });
+    expect(document.body.textContent).toContain(reason);
+
+    const merge = rowButton("Choose a branch to merge into main");
+    expect(merge.disabled).toBe(false);
+    await act(async () => merge.click());
+    expect(rowButton("feature").disabled).toBe(false);
+    await act(async () => rowButton("feature").click());
+    expect(callbacks.onMergeInto).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "feature" }),
+    );
+    expect(callbacks.onSelectBranch).not.toHaveBeenCalled();
+  });
+
+  it("disables merge with its reason while ordinary branch checkout remains available", async () => {
+    const reason = "This environment does not support Git Manager stash and merge operations.";
+    const callbacks = await renderDropdown([branch("feature")], {
+      mergeDisabledReason: reason,
+    });
+
+    const merge = rowButton("Choose a branch to merge into main");
+    expect(merge).toMatchObject({ disabled: true, title: reason });
+    expect(document.body.textContent).toContain(reason);
+    expect(rowButton("feature").disabled).toBe(false);
+    await act(async () => rowButton("feature").click());
+    expect(callbacks.onSelectBranch).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "feature" }),
+    );
   });
 });

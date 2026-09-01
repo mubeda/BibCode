@@ -14,6 +14,8 @@ export interface GitManagerSwitchWithChangesDialogProps {
   readonly open: boolean;
   readonly branchName: string;
   readonly busy: boolean;
+  readonly branchDisabledReason?: string | null;
+  readonly stashDisabledReason?: string | null;
   readonly onOpenChange: (open: boolean) => void;
   readonly onResolve: (resolution: { readonly strategy: "stash" | "bring" }) => Promise<void>;
 }
@@ -22,9 +24,12 @@ export const GitManagerSwitchWithChangesDialog = memo(function GitManagerSwitchW
   open,
   branchName,
   busy,
+  branchDisabledReason = null,
+  stashDisabledReason = null,
   onOpenChange,
   onResolve,
 }: GitManagerSwitchWithChangesDialogProps) {
+  const leaveChangesDisabledReason = branchDisabledReason ?? stashDisabledReason;
   const leaveChanges = useCallback(() => void onResolve({ strategy: "stash" }), [onResolve]);
   const bringChanges = useCallback(() => void onResolve({ strategy: "bring" }), [onResolve]);
 
@@ -48,12 +53,41 @@ export const GitManagerSwitchWithChangesDialog = memo(function GitManagerSwitchW
           </p>
         </div>
         <DialogFooter>
-          <Button disabled={busy} variant="outline" onClick={leaveChanges}>
+          <Button
+            aria-describedby={
+              leaveChangesDisabledReason === null
+                ? undefined
+                : "git-manager-switch-stash-disabled-reason"
+            }
+            disabled={busy || leaveChangesDisabledReason !== null}
+            title={leaveChangesDisabledReason ?? undefined}
+            variant="outline"
+            onClick={leaveChanges}
+          >
             Leave my changes
           </Button>
-          <Button disabled={busy} onClick={bringChanges}>
+          {leaveChangesDisabledReason === null ? null : (
+            <span className="sr-only" id="git-manager-switch-stash-disabled-reason">
+              {leaveChangesDisabledReason}
+            </span>
+          )}
+          <Button
+            aria-describedby={
+              branchDisabledReason === null
+                ? undefined
+                : "git-manager-switch-branch-disabled-reason"
+            }
+            disabled={busy || branchDisabledReason !== null}
+            title={branchDisabledReason ?? undefined}
+            onClick={bringChanges}
+          >
             Bring my changes
           </Button>
+          {branchDisabledReason === null ? null : (
+            <span className="sr-only" id="git-manager-switch-branch-disabled-reason">
+              {branchDisabledReason}
+            </span>
+          )}
         </DialogFooter>
       </DialogPopup>
     </Dialog>

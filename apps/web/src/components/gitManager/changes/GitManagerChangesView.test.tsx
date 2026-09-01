@@ -20,6 +20,7 @@ const h = vi.hoisted(() => ({
   } as Record<string, unknown> | null,
   commits: null as Record<string, unknown> | null,
   signalGeneration: 1 as number | null,
+  liveSignalAvailable: true,
   availableEditors: [] as string[],
   statusError: null as string | null,
   statusEmission: null as AsyncResult.AsyncResult<unknown, unknown> | null,
@@ -99,7 +100,12 @@ vi.mock("../../../state/entities", () => ({
         "environment-1",
         {
           availableEditors: h.availableEditors,
-          environment: { capabilities: { gitManagerCommitOperations: true } },
+          environment: {
+            capabilities: {
+              gitManagerCommitOperations: true,
+              gitManagerLiveSignal: h.liveSignalAvailable,
+            },
+          },
         },
       ],
     ]),
@@ -224,6 +230,7 @@ beforeEach(() => {
   };
   h.commits = null;
   h.signalGeneration = 1;
+  h.liveSignalAvailable = true;
   h.availableEditors = [];
   h.statusError = null;
   h.statusEmission = null;
@@ -269,6 +276,18 @@ afterEach(async () => {
 });
 
 describe("GitManagerChangesView", () => {
+  it("keeps explicit change reads available without opening the live signal", async () => {
+    h.liveSignalAvailable = false;
+    h.status = statusWith("src/manual-refresh.ts");
+
+    await renderView();
+
+    expect(h.signalAtom).not.toHaveBeenCalled();
+    expect(h.statusAtom).toHaveBeenCalledOnce();
+    expect(h.refsAtom).toHaveBeenCalledOnce();
+    expect(container.textContent).toContain("src/manual-refresh.ts");
+  });
+
   it("repopulates from the status subscription after a reconnect", async () => {
     await renderView();
     expect(container.textContent).toContain("Connecting to changes");

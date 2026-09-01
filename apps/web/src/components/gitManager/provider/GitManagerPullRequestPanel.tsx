@@ -98,23 +98,25 @@ const CheckRow = memo(function CheckRow({ check }: CheckRowProps) {
 
 export interface GitManagerPullRequestPanelProps {
   readonly scope: { readonly environmentId: EnvironmentId; readonly cwd: string };
+  readonly disabledReason?: string | null;
   readonly onRefresh: () => void;
 }
 
 export const GitManagerPullRequestPanel = memo(function GitManagerPullRequestPanel({
   scope,
+  disabledReason = null,
   onRefresh,
 }: GitManagerPullRequestPanelProps) {
   const [requested, setRequested] = useState(false);
   const queryAtom = useMemo(
     () =>
-      requested
+      requested && disabledReason === null
         ? gitManagerEnvironment.listPullRequests({
             environmentId: scope.environmentId,
             input: { cwd: scope.cwd },
           })
         : null,
-    [requested, scope.cwd, scope.environmentId],
+    [disabledReason, requested, scope.cwd, scope.environmentId],
   );
   const query = useEnvironmentQuery(queryAtom);
   const result: GitManagerPullRequestsResult | null = query.data ?? null;
@@ -131,16 +133,20 @@ export const GitManagerPullRequestPanel = memo(function GitManagerPullRequestPan
   const createPullRequestPending = createPullRequest.isPending;
 
   const refresh = useCallback(() => {
+    if (disabledReason !== null) return;
     onRefresh();
     if (requested) {
       query.refresh();
     } else {
       setRequested(true);
     }
-  }, [onRefresh, query.refresh, requested]);
+  }, [disabledReason, onRefresh, query.refresh, requested]);
   const create = useCallback(() => {
+    if (disabledReason !== null) return;
     void createPullRequestRun(createPullRequestAction(randomUUID()));
-  }, [createPullRequestRun]);
+  }, [createPullRequestRun, disabledReason]);
+  const disabledReasonId =
+    disabledReason === null ? undefined : "git-manager-pull-request-panel-disabled-reason";
 
   return (
     <section aria-label="Pull requests and checks" className="flex min-h-0 flex-col gap-3 p-3">
@@ -152,11 +158,25 @@ export const GitManagerPullRequestPanel = memo(function GitManagerPullRequestPan
           </p>
         </div>
         <div className="flex gap-2">
-          <Button disabled={createPullRequestPending} size="xs" variant="outline" onClick={create}>
+          <Button
+            aria-describedby={disabledReasonId}
+            disabled={disabledReason !== null || createPullRequestPending}
+            size="xs"
+            title={disabledReason ?? undefined}
+            variant="outline"
+            onClick={create}
+          >
             <GitPullRequestIcon aria-hidden="true" />
             Create pull request
           </Button>
-          <Button disabled={query.isPending} size="xs" variant="outline" onClick={refresh}>
+          <Button
+            aria-describedby={disabledReasonId}
+            disabled={disabledReason !== null || query.isPending}
+            size="xs"
+            title={disabledReason ?? undefined}
+            variant="outline"
+            onClick={refresh}
+          >
             <RefreshCwIcon aria-hidden="true" />
             Refresh
           </Button>
@@ -169,9 +189,10 @@ export const GitManagerPullRequestPanel = memo(function GitManagerPullRequestPan
             ? "text-xs text-destructive"
             : "text-xs text-muted-foreground"
         }
+        id={disabledReasonId}
         role={presentation.kind === "loading" ? "status" : undefined}
       >
-        {presentation.message}
+        {disabledReason ?? presentation.message}
       </p>
       {requested && pullRequests.length > 0 ? (
         <div className="space-y-2">

@@ -50,6 +50,7 @@ export interface GitManagerMergeDialogProps {
   readonly projectRef: ScopedProjectRef;
   readonly refs: ReadonlyArray<GitManagerRefEntry>;
   readonly recentNames?: ReadonlyArray<string>;
+  readonly disabledReason?: string | null;
   readonly onOpenChange: (open: boolean) => void;
   readonly onFinished?: () => void;
 }
@@ -60,6 +61,7 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
   projectRef,
   refs,
   recentNames = NO_RECENT_BRANCHES,
+  disabledReason: capabilityDisabledReason = null,
   onOpenChange,
   onFinished = noop,
 }: GitManagerMergeDialogProps) {
@@ -101,19 +103,20 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
 
   const previewAtom = useMemo(
     () =>
-      !open || selectedSource === null
+      !open || selectedSource === null || capabilityDisabledReason !== null
         ? null
         : gitManagerEnvironment.previewMerge({
             environmentId,
             input: { cwd, source: selectedSource },
           }),
-    [cwd, environmentId, open, selectedSource],
+    [capabilityDisabledReason, cwd, environmentId, open, selectedSource],
   );
   const previewQuery = useEnvironmentQuery(previewAtom);
   const preview = previewQuery.data?.source === selectedSource ? previewQuery.data : null;
   const summary = preview === null ? null : summarizeMergePreview(preview);
   const copy = resolveMergeConfirmCopy(mode);
   const disabledReason =
+    capabilityDisabledReason ??
     blockedReason?.message ??
     (operationRunning
       ? "The selected Git operation is running."

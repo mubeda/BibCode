@@ -127,7 +127,13 @@ vi.mock("../ui/tabs", () => ({
 vi.mock("./GitManagerToolbar", () => ({
   GitManagerToolbar: (props: Record<string, unknown>) => {
     h.toolbarProps.push(props);
-    return <div data-testid="git-manager-toolbar" />;
+    return (
+      <div data-testid="git-manager-toolbar">
+        {props.branchSyncDisabledReason as React.ReactNode}
+        {props.stashMergeDisabledReason as React.ReactNode}
+        {props.tagDisabledReason as React.ReactNode}
+      </div>
+    );
   },
 }));
 
@@ -159,10 +165,22 @@ const projectRef = {
   projectId: "project-1",
 } as never;
 
-function config(gitManagerReads: boolean): ServerConfig {
+function config(
+  gitManagerReads: boolean,
+  overrides: Parameters<typeof makeTestExecutionEnvironmentCapabilities>[0] = {},
+): ServerConfig {
   return {
     environment: {
-      capabilities: makeTestExecutionEnvironmentCapabilities({ gitManagerReads }),
+      capabilities: makeTestExecutionEnvironmentCapabilities({
+        gitManagerReads,
+        gitManagerBranchSyncOperations: true,
+        gitManagerStashMergeOperations: true,
+        gitManagerRewriteOperations: true,
+        gitManagerTagOperations: true,
+        gitManagerLiveSignal: true,
+        gitManagerPullRequests: true,
+        ...overrides,
+      }),
     },
   } as ServerConfig;
 }
@@ -294,6 +312,59 @@ describe("GitManagerPanel", () => {
     expect(useGitManagerStore.getState().selectViewState(projectRef).selectedWorktreeCwd).toBe(
       "/opaque/worktree",
     );
+  });
+
+  it.each([
+    [
+      "gitManagerBranchSyncOperations",
+      "This environment does not support Git Manager branch and sync operations.",
+    ],
+    [
+      "gitManagerStashMergeOperations",
+      "This environment does not support Git Manager stash and merge operations.",
+    ],
+    [
+      "gitManagerRewriteOperations",
+      "This environment does not support Git Manager rewrite operations.",
+    ],
+    ["gitManagerTagOperations", "This environment does not support Git Manager tag operations."],
+    [
+      "gitManagerPullRequests",
+      "This environment does not support Git Manager pull request operations.",
+    ],
+  ] as const)("degrades only the %s surface and renders its reason", (capability, reason) => {
+    h.serverConfig = config(true, { [capability]: false });
+
+    const markup = renderPanel();
+
+    expect(markup).toContain(reason);
+    expect(markup).toContain("Changes");
+    expect(markup).toContain("History");
+    expect(markup).not.toContain("Git Manager Unavailable");
+    expect(h.refsAtom).toHaveBeenCalled();
+  });
+
+  it("uses explicit reads without a live subscription or timer when live updates are unsupported", () => {
+    const setIntervalSpy = vi.spyOn(window, "setInterval");
+    const setTimeoutSpy = vi.spyOn(window, "setTimeout");
+    h.serverConfig = config(true, { gitManagerLiveSignal: false });
+
+    try {
+      const markup = renderPanel();
+
+      expect(markup).toContain(
+        "This environment does not support Git Manager live updates. Use Refresh to load new repository data.",
+      );
+      expect(markup).toContain("Changes");
+      expect(markup).toContain("History");
+      expect(h.signalAtom).not.toHaveBeenCalled();
+      expect(h.refsAtom).toHaveBeenCalled();
+      expect(setIntervalSpy).not.toHaveBeenCalled();
+      expect(setTimeoutSpy).not.toHaveBeenCalled();
+    } finally {
+      setIntervalSpy.mockRestore();
+      setTimeoutSpy.mockRestore();
+    }
   });
 
   it("releases every server subscription when the panel unmounts", () => {

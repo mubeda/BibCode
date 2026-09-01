@@ -26,6 +26,7 @@ export interface GitManagerSyncButtonProps {
   readonly currentBranchName: string | null;
   readonly remote: string;
   readonly blockedReason: GitManagerBlockedReason | null;
+  readonly disabledReason: string | null;
   readonly onOperation: (kind: SyncOperationKind) => void;
 }
 
@@ -47,10 +48,11 @@ export const GitManagerSyncButton = memo(function GitManagerSyncButton({
   currentBranchName,
   remote,
   blockedReason,
+  disabledReason: capabilityDisabledReason,
   onOperation,
 }: GitManagerSyncButtonProps) {
   const [confirmForcePush, setConfirmForcePush] = useState(false);
-  const disabledReason = blockedReason?.message ?? state.disabledReason;
+  const disabledReason = capabilityDisabledReason ?? blockedReason?.message ?? state.disabledReason;
   const disabled = disabledReason !== null;
   const descriptionId = disabled ? "git-manager-sync-disabled-reason" : undefined;
   const activate = useCallback(() => {

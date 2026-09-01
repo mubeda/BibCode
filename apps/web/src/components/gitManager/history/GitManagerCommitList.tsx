@@ -30,6 +30,7 @@ export interface GitManagerCommitListProps {
   readonly multiCommitSelection?: ReadonlyArray<string>;
   readonly onMultiSelect?: (sha: string, mode: "range" | "toggle") => void;
   readonly onCommitDrop?: (resolution: GitManagerCommitDropResolution) => void;
+  readonly rewriteDisabledReason?: string | null;
 }
 
 interface GitManagerCommitRowProps {
@@ -39,6 +40,7 @@ interface GitManagerCommitRowProps {
   readonly onSelect: (sha: string) => void;
   readonly onContextMenu?: (sha: string, event: MouseEvent<HTMLButtonElement>) => void;
   readonly onMultiSelect?: (sha: string, mode: "range" | "toggle") => void;
+  readonly rewriteDisabledReason: string | null;
 }
 
 function commitRowPropsEqual(
@@ -57,7 +59,8 @@ function commitRowPropsEqual(
     previous.tabbable === next.tabbable &&
     previous.onSelect === next.onSelect &&
     previous.onContextMenu === next.onContextMenu &&
-    previous.onMultiSelect === next.onMultiSelect
+    previous.onMultiSelect === next.onMultiSelect &&
+    previous.rewriteDisabledReason === next.rewriteDisabledReason
   );
 }
 
@@ -68,9 +71,10 @@ const GitManagerCommitRow = memo(function GitManagerCommitRow({
   onSelect,
   onContextMenu,
   onMultiSelect,
+  rewriteDisabledReason,
 }: GitManagerCommitRowProps) {
   const author = deriveAuthorIdentity({ name: commit.authorName, email: commit.authorEmail });
-  const drag = useGitManagerCommitDragSource(commit.sha);
+  const drag = useGitManagerCommitDragSource(commit.sha, rewriteDisabledReason !== null);
   const select = useCallback(
     (event: MouseEvent<HTMLButtonElement>) => {
       if (event.shiftKey && onMultiSelect !== undefined) {
@@ -91,6 +95,9 @@ const GitManagerCommitRow = memo(function GitManagerCommitRow({
       {...drag.attributes}
       {...drag.listeners}
       type="button"
+      aria-describedby={
+        rewriteDisabledReason === null ? undefined : "git-manager-history-rewrite-disabled-reason"
+      }
       aria-label={`${commit.shortSha} ${commit.subject}`}
       aria-selected={selected}
       className={cn(
@@ -98,11 +105,12 @@ const GitManagerCommitRow = memo(function GitManagerCommitRow({
         selected ? "bg-accent text-accent-foreground" : "hover:bg-muted/45",
         drag.isDragging && "select-none opacity-40",
       )}
-      data-commit-drag-source={commit.sha}
+      data-commit-drag-source={rewriteDisabledReason === null ? commit.sha : undefined}
       data-commit-sha={commit.sha}
       role="option"
       style={{ transform: drag.transform }}
       tabIndex={tabbable ? 0 : -1}
+      title={rewriteDisabledReason ?? undefined}
       onClick={select}
       onContextMenu={(event) => onContextMenu?.(commit.sha, event)}
     >
@@ -147,6 +155,7 @@ export const GitManagerCommitList = memo(function GitManagerCommitList({
   multiCommitSelection,
   onMultiSelect,
   onCommitDrop,
+  rewriteDisabledReason = null,
 }: GitManagerCommitListProps) {
   const listRef = useRef<LegendListRef | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -170,12 +179,20 @@ export const GitManagerCommitList = memo(function GitManagerCommitList({
           selected={item.sha === selectedSha || multiCommitSelection?.includes(item.sha) === true}
           tabbable={item.sha === selectedSha || (selectedSha === null && index === 0)}
           onSelect={onSelect}
+          rewriteDisabledReason={rewriteDisabledReason}
           {...(onContextMenu === undefined ? {} : { onContextMenu })}
           {...(onMultiSelect === undefined ? {} : { onMultiSelect })}
         />
       </div>
     ),
-    [multiCommitSelection, onContextMenu, onMultiSelect, onSelect, selectedSha],
+    [
+      multiCommitSelection,
+      onContextMenu,
+      onMultiSelect,
+      onSelect,
+      rewriteDisabledReason,
+      selectedSha,
+    ],
   );
   const initialScrollIndex = Math.max(
     0,
@@ -248,7 +265,7 @@ export const GitManagerCommitList = memo(function GitManagerCommitList({
       <GitManagerCommitDndContext
         commitShas={commitShas}
         {...(multiCommitSelection === undefined ? {} : { multiCommitSelection })}
-        {...(onCommitDrop === undefined ? {} : { onCommitDrop })}
+        {...(onCommitDrop === undefined || rewriteDisabledReason !== null ? {} : { onCommitDrop })}
       >
         <LegendList<GitManagerCommitEntry>
           ref={listRef}
@@ -263,6 +280,11 @@ export const GitManagerCommitList = memo(function GitManagerCommitList({
           onViewableItemsChanged={handleViewableItemsChanged}
         />
       </GitManagerCommitDndContext>
+      {rewriteDisabledReason === null ? null : (
+        <span className="sr-only" id="git-manager-history-rewrite-disabled-reason">
+          {rewriteDisabledReason}
+        </span>
+      )}
       {isLoadingMore ? (
         <p aria-live="polite" className="shrink-0 px-3 py-2 text-xs text-muted-foreground">
           Loading more commits…

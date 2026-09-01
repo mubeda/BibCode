@@ -76,6 +76,7 @@ interface GitManagerStashRowViewProps {
   readonly row: GitManagerStashRow;
   readonly selected: boolean;
   readonly operationInFlight: boolean;
+  readonly disabledReason: string | null;
   readonly onSelectStash: (sha: string) => void;
   readonly onApply: (sha: string) => void | Promise<void>;
   readonly onPop: (sha: string) => void | Promise<void>;
@@ -90,6 +91,7 @@ function stashRowViewPropsEqual(
     stashRowsEqual(previous.row, next.row) &&
     previous.selected === next.selected &&
     previous.operationInFlight === next.operationInFlight &&
+    previous.disabledReason === next.disabledReason &&
     previous.onSelectStash === next.onSelectStash &&
     previous.onApply === next.onApply &&
     previous.onPop === next.onPop &&
@@ -101,13 +103,16 @@ const GitManagerStashRowView = memo(function GitManagerStashRowView({
   row,
   selected,
   operationInFlight,
+  disabledReason,
   onSelectStash,
   onApply,
   onPop,
   onRequestDrop,
 }: GitManagerStashRowViewProps) {
   const selector = `stash@{${row.index}}`;
-  const descriptionId = row.blocked === null ? undefined : `git-manager-stash-${row.sha}-blocked`;
+  const actionDisabledReason = disabledReason ?? row.blocked?.message ?? null;
+  const descriptionId =
+    actionDisabledReason === null ? undefined : `git-manager-stash-${row.sha}-blocked`;
   const actions = resolveStashActionState(row, { operationInFlight });
   const select = useCallback(() => onSelectStash(row.sha), [onSelectStash, row.sha]);
   const apply = useCallback(() => void onApply(row.sha), [onApply, row.sha]);
@@ -141,9 +146,9 @@ const GitManagerStashRowView = memo(function GitManagerStashRowView({
       <Button
         aria-describedby={descriptionId}
         aria-label={`Apply ${selector}`}
-        disabled={!actions.apply.enabled}
+        disabled={disabledReason !== null || !actions.apply.enabled}
         size="icon-xs"
-        title={actions.apply.reason ?? `Apply ${selector}`}
+        title={disabledReason ?? actions.apply.reason ?? `Apply ${selector}`}
         variant="ghost"
         onClick={apply}
       >
@@ -152,9 +157,9 @@ const GitManagerStashRowView = memo(function GitManagerStashRowView({
       <Button
         aria-describedby={descriptionId}
         aria-label={`Pop ${selector}`}
-        disabled={!actions.pop.enabled}
+        disabled={disabledReason !== null || !actions.pop.enabled}
         size="icon-xs"
-        title={actions.pop.reason ?? `Pop ${selector}`}
+        title={disabledReason ?? actions.pop.reason ?? `Pop ${selector}`}
         variant="ghost"
         onClick={pop}
       >
@@ -164,17 +169,17 @@ const GitManagerStashRowView = memo(function GitManagerStashRowView({
         aria-describedby={descriptionId}
         aria-label={`Drop ${selector}`}
         className="text-destructive"
-        disabled={!actions.drop.enabled}
+        disabled={disabledReason !== null || !actions.drop.enabled}
         size="icon-xs"
-        title={actions.drop.reason ?? `Drop ${selector}`}
+        title={disabledReason ?? actions.drop.reason ?? `Drop ${selector}`}
         variant="ghost"
         onClick={requestDrop}
       >
         <Trash2Icon aria-hidden="true" />
       </Button>
-      {row.blocked === null ? null : (
+      {actionDisabledReason === null ? null : (
         <span className="sr-only" id={descriptionId}>
-          {row.blocked.message}
+          {actionDisabledReason}
         </span>
       )}
     </div>
@@ -186,6 +191,7 @@ export interface GitManagerStashListProps {
   readonly projectRef: ScopedProjectRef;
   readonly entries: ReadonlyArray<GitManagerStashEntry>;
   readonly blockedReasons?: ReadonlyArray<GitManagerBlockedReason>;
+  readonly disabledReason?: string | null;
   readonly selectedSha: string | null;
   readonly onSelectStash: (sha: string) => void;
   readonly onApply: (sha: string) => void | Promise<void>;
@@ -199,6 +205,7 @@ export const GitManagerStashList = memo(function GitManagerStashList({
   projectRef,
   entries,
   blockedReasons = EMPTY_BLOCKED_REASONS,
+  disabledReason = null,
   selectedSha,
   onSelectStash,
   onApply,
@@ -245,6 +252,7 @@ export const GitManagerStashList = memo(function GitManagerStashList({
   const renderItem = useCallback(
     ({ item }: { item: GitManagerStashRow; index: number }) => (
       <GitManagerStashRowView
+        disabledReason={disabledReason}
         operationInFlight={operationInFlight}
         row={item}
         selected={item.sha === selectedSha}
@@ -254,7 +262,7 @@ export const GitManagerStashList = memo(function GitManagerStashList({
         onSelectStash={onSelectStash}
       />
     ),
-    [onApply, onPop, onSelectStash, operationInFlight, requestDrop, selectedSha],
+    [disabledReason, onApply, onPop, onSelectStash, operationInFlight, requestDrop, selectedSha],
   );
 
   return (
