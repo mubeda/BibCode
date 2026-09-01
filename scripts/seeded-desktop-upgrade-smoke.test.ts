@@ -52,15 +52,11 @@ describe("seeded packaged desktop upgrade harness", () => {
         "mac",
       ),
     ).toEqual({
-      args: [
-        "-TERM",
-        "-f",
-        String.raw`^/private/tmp/BiBCode \(test\)\.app/Contents/MacOS/bibcode-desktop([[:space:]]|$)`,
-      ],
+      args: ["-TERM", "-x", "bibcode-desktop"],
       command: "pkill",
     });
     expect(restartedApplicationCleanupPlan("/tmp/installed/BiBCode.AppImage", "linux")).toEqual({
-      args: ["-TERM", "-f", String.raw`^/tmp/installed/BiBCode\.AppImage([[:space:]]|$)`],
+      args: ["-TERM", "-x", "bibcode-desktop"],
       command: "pkill",
     });
   });
