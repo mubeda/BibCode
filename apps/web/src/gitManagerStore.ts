@@ -10,6 +10,12 @@ const GIT_MANAGER_STORAGE_VERSION = 1;
 const GIT_MANAGER_VIEW_STATE_LIMIT = 2;
 
 export type GitManagerTab = "changes" | "history";
+export type GitManagerOpenDropdown = "branch" | "sync" | null;
+
+export interface GitManagerToolbarViewState {
+  readonly branchFilterText: string;
+  readonly openDropdown: GitManagerOpenDropdown;
+}
 
 export interface GitManagerViewState {
   readonly selectedWorktreeCwd: string | null;
@@ -29,7 +35,13 @@ type PersistedGitManagerViewState = Omit<GitManagerViewState, "selectedWorktreeC
 
 interface PersistedGitManagerState {
   readonly byProjectKey: Record<string, PersistedGitManagerViewState>;
+  readonly toolbarByProjectKey: Record<string, GitManagerToolbarViewState>;
 }
+
+export const DEFAULT_GIT_MANAGER_TOOLBAR_VIEW_STATE: GitManagerToolbarViewState = Object.freeze({
+  branchFilterText: "",
+  openDropdown: null,
+});
 
 export const DEFAULT_GIT_MANAGER_VIEW_STATE: GitManagerViewState = Object.freeze({
   selectedWorktreeCwd: null,
@@ -47,7 +59,9 @@ export const DEFAULT_GIT_MANAGER_VIEW_STATE: GitManagerViewState = Object.freeze
 
 interface GitManagerStoreState {
   readonly byProjectKey: Record<string, GitManagerViewState>;
+  readonly toolbarByProjectKey: Record<string, GitManagerToolbarViewState>;
   readonly selectViewState: (ref: ScopedProjectRef) => GitManagerViewState;
+  readonly selectToolbarViewState: (ref: ScopedProjectRef) => GitManagerToolbarViewState;
   readonly touchProject: (ref: ScopedProjectRef) => void;
   readonly setSelectedWorktree: (ref: ScopedProjectRef, cwd: string) => void;
   readonly setActiveTab: (ref: ScopedProjectRef, tab: GitManagerTab) => void;
@@ -59,6 +73,8 @@ interface GitManagerStoreState {
   readonly setLoadedPageCursors: (ref: ScopedProjectRef, cursors: ReadonlyArray<number>) => void;
   readonly setScrollAnchor: (ref: ScopedProjectRef, anchor: string | null) => void;
   readonly setCommitDraft: (ref: ScopedProjectRef, draft: string) => void;
+  readonly setBranchFilterText: (ref: ScopedProjectRef, text: string) => void;
+  readonly setOpenDropdown: (ref: ScopedProjectRef, value: GitManagerOpenDropdown) => void;
 }
 
 function nextLastUsedAt(byProjectKey: Record<string, GitManagerViewState>): number {
@@ -83,18 +99,36 @@ function retainMostRecent<T extends { readonly lastUsedAt: number }>(
 }
 
 function updateProject(
-  state: Pick<GitManagerStoreState, "byProjectKey">,
+  state: Pick<GitManagerStoreState, "byProjectKey" | "toolbarByProjectKey">,
   ref: ScopedProjectRef,
   update: (current: GitManagerViewState) => GitManagerViewState,
-): Pick<GitManagerStoreState, "byProjectKey"> {
+): Pick<GitManagerStoreState, "byProjectKey" | "toolbarByProjectKey"> {
   const key = projectKey(ref);
   const current = state.byProjectKey[key] ?? DEFAULT_GIT_MANAGER_VIEW_STATE;
   const updated = {
     ...update(current),
     lastUsedAt: nextLastUsedAt(state.byProjectKey),
   };
+  const byProjectKey = retainMostRecent({ ...state.byProjectKey, [key]: updated });
   return {
-    byProjectKey: retainMostRecent({ ...state.byProjectKey, [key]: updated }),
+    byProjectKey,
+    toolbarByProjectKey: Object.fromEntries(
+      Object.entries(state.toolbarByProjectKey).filter(([toolbarKey]) =>
+        Object.hasOwn(byProjectKey, toolbarKey),
+      ),
+    ),
+  };
+}
+
+function updateToolbarProject(
+  state: Pick<GitManagerStoreState, "toolbarByProjectKey">,
+  ref: ScopedProjectRef,
+  update: (current: GitManagerToolbarViewState) => GitManagerToolbarViewState,
+): Pick<GitManagerStoreState, "toolbarByProjectKey"> {
+  const key = projectKey(ref);
+  const current = state.toolbarByProjectKey[key] ?? DEFAULT_GIT_MANAGER_TOOLBAR_VIEW_STATE;
+  return {
+    toolbarByProjectKey: { ...state.toolbarByProjectKey, [key]: update(current) },
   };
 }
 
@@ -135,15 +169,31 @@ function sanitizeViewState(value: unknown): PersistedGitManagerViewState | null 
   };
 }
 
+function sanitizeToolbarViewState(value: unknown): GitManagerToolbarViewState | null {
+  if (value === null || typeof value !== "object") return null;
+  const candidate = value as Record<string, unknown>;
+  return {
+    branchFilterText: stringOr(candidate.branchFilterText, ""),
+    openDropdown:
+      candidate.openDropdown === "branch" || candidate.openDropdown === "sync"
+        ? candidate.openDropdown
+        : null,
+  };
+}
+
 export function sanitizePersistedGitManagerState(
   persistedState: unknown,
 ): PersistedGitManagerState {
   if (persistedState === null || typeof persistedState !== "object") {
-    return { byProjectKey: {} };
+    return { byProjectKey: {}, toolbarByProjectKey: {} };
   }
-  const raw = (persistedState as { byProjectKey?: unknown }).byProjectKey;
+  const rawState = persistedState as {
+    byProjectKey?: unknown;
+    toolbarByProjectKey?: unknown;
+  };
+  const raw = rawState.byProjectKey;
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
-    return { byProjectKey: {} };
+    return { byProjectKey: {}, toolbarByProjectKey: {} };
   }
 
   const byProjectKey: Record<string, PersistedGitManagerViewState> = {};
@@ -156,12 +206,22 @@ export function sanitizePersistedGitManagerState(
     const viewState = sanitizeViewState(value);
     if (viewState !== null) byProjectKey[key] = viewState;
   }
-  return { byProjectKey: retainMostRecent(byProjectKey) };
+  const retainedByProjectKey = retainMostRecent(byProjectKey);
+  const toolbarByProjectKey: Record<string, GitManagerToolbarViewState> = {};
+  const rawToolbar = rawState.toolbarByProjectKey;
+  if (rawToolbar !== null && typeof rawToolbar === "object" && !Array.isArray(rawToolbar)) {
+    for (const [key, value] of Object.entries(rawToolbar)) {
+      if (!Object.hasOwn(retainedByProjectKey, key)) continue;
+      const toolbarViewState = sanitizeToolbarViewState(value);
+      if (toolbarViewState !== null) toolbarByProjectKey[key] = toolbarViewState;
+    }
+  }
+  return { byProjectKey: retainedByProjectKey, toolbarByProjectKey };
 }
 
 function restoreGitManagerState(
   persistedState: unknown,
-): Pick<GitManagerStoreState, "byProjectKey"> {
+): Pick<GitManagerStoreState, "byProjectKey" | "toolbarByProjectKey"> {
   const persisted = sanitizePersistedGitManagerState(persistedState);
   return {
     byProjectKey: Object.fromEntries(
@@ -170,6 +230,7 @@ function restoreGitManagerState(
         { ...viewState, selectedWorktreeCwd: null },
       ]),
     ),
+    toolbarByProjectKey: persisted.toolbarByProjectKey,
   };
 }
 
@@ -177,8 +238,11 @@ export const useGitManagerStore = create<GitManagerStoreState>()(
   persist(
     (set, get) => ({
       byProjectKey: {},
+      toolbarByProjectKey: {},
       selectViewState: (ref) =>
         get().byProjectKey[projectKey(ref)] ?? DEFAULT_GIT_MANAGER_VIEW_STATE,
+      selectToolbarViewState: (ref) =>
+        get().toolbarByProjectKey[projectKey(ref)] ?? DEFAULT_GIT_MANAGER_TOOLBAR_VIEW_STATE,
       touchProject: (ref) => set((state) => updateProject(state, ref, (current) => current)),
       setSelectedWorktree: (ref, cwd) =>
         set((state) =>
@@ -219,6 +283,14 @@ export const useGitManagerStore = create<GitManagerStoreState>()(
       setCommitDraft: (ref, draft) =>
         set((state) =>
           updateProject(state, ref, (current) => ({ ...current, commitDraft: draft })),
+        ),
+      setBranchFilterText: (ref, text) =>
+        set((state) =>
+          updateToolbarProject(state, ref, (current) => ({ ...current, branchFilterText: text })),
+        ),
+      setOpenDropdown: (ref, value) =>
+        set((state) =>
+          updateToolbarProject(state, ref, (current) => ({ ...current, openDropdown: value })),
         ),
     }),
     {
