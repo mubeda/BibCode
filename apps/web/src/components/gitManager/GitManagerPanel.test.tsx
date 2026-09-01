@@ -73,7 +73,12 @@ vi.mock("../../state/worktrees", () => ({
 }));
 
 vi.mock("../../state/gitManager", () => ({
-  gitManagerEnvironment: { signal: h.signalAtom },
+  gitManagerEnvironment: {
+    signal: h.signalAtom,
+    commit: { label: "test:commit" },
+    undoCommit: { label: "test:undo-commit" },
+    discard: { label: "test:discard" },
+  },
 }));
 
 vi.mock("../ui/tabs", () => ({
