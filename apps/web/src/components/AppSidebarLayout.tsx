@@ -1,5 +1,5 @@
 import { useAtomValue } from "@effect/atom-react";
-import { useEffect, type ReactNode } from "react";
+import { useEffect, type CSSProperties, type ReactNode } from "react";
 import * as TanStackRouter from "@tanstack/react-router";
 
 import { resolveShortcutCommand, shortcutLabelForCommand } from "../keybindings";
@@ -12,6 +12,13 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
 const THREAD_SIDEBAR_WIDTH_STORAGE_KEY = "chat_thread_sidebar_width";
 const ENVIRONMENT_RAIL_WIDTH = 52;
 const THREAD_SIDEBAR_MIN_WIDTH = 13 * 16 + ENVIRONMENT_RAIL_WIDTH;
+// Wider than the shared primitive's 16rem default: 13px titles and 12px badges
+// truncate in a 204px content column, and 268px matches the reference app's rows.
+// A width the user has dragged to is stored under the storage key and wins.
+const THREAD_SIDEBAR_DEFAULT_WIDTH = 268 + ENVIRONMENT_RAIL_WIDTH;
+const THREAD_SIDEBAR_PROVIDER_STYLE = {
+  "--sidebar-width": `${THREAD_SIDEBAR_DEFAULT_WIDTH}px`,
+} as CSSProperties;
 const THREAD_MAIN_CONTENT_MIN_WIDTH = 40 * 16;
 
 const useAppPathname =
@@ -91,7 +98,7 @@ export function AppSidebarLayout({ children }: { children: ReactNode }) {
   }
 
   return (
-    <SidebarProvider className="h-dvh! min-h-0!" defaultOpen>
+    <SidebarProvider className="h-dvh! min-h-0!" defaultOpen style={THREAD_SIDEBAR_PROVIDER_STYLE}>
       <Sidebar
         side="left"
         collapsible="offcanvas"

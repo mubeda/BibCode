@@ -23,9 +23,14 @@ vi.mock("./sidebar/EnvironmentRail", () => ({
   EnvironmentRail: () => <div data-testid="environment-rail-mock" />,
 }));
 
+const sidebarProviderProps: Array<Record<string, unknown>> = [];
+
 vi.mock("./ui/sidebar", () => ({
   Sidebar: ({ children }: { children?: ReactNode }) => <>{children}</>,
-  SidebarProvider: ({ children }: { children?: ReactNode }) => <>{children}</>,
+  SidebarProvider: ({ children, ...props }: { children?: ReactNode } & Record<string, unknown>) => {
+    sidebarProviderProps.push(props);
+    return <>{children}</>;
+  },
   SidebarRail: () => null,
   SidebarTrigger: () => null,
   useSidebar: () => ({ toggleSidebar: vi.fn() }),
@@ -52,6 +57,22 @@ afterEach(async () => {
 });
 
 describe("AppSidebarLayout", () => {
+  it("opens the left sidebar at 320px by default so 13px titles and 12px badges fit", async () => {
+    sidebarProviderProps.length = 0;
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    await act(async () => {
+      root.render(<AppSidebarLayout>Workspace</AppSidebarLayout>);
+    });
+    const style = sidebarProviderProps[0]?.["style"] as Record<string, string> | undefined;
+    expect(style?.["--sidebar-width"]).toBe("320px");
+    await act(async () => {
+      root.unmount();
+    });
+    container.remove();
+  });
+
   it("mounts the environment rail before the panel content inside the left sidebar", async () => {
     const container = document.createElement("div");
     const root = createRoot(container);

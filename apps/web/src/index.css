@@ -48,11 +48,8 @@
     sans-serif;
   --font-mono:
     "SF Mono", "SFMono-Regular", "JetBrains Mono", Consolas, "Liberation Mono", Menlo, monospace;
-  /* Declared text-size floor (11px). Secondary labels, badges, and timestamps
-     use it; new UI never goes below it and older screens are being swept to it
-     (UI.md, Typography). */
-  --text-2xs: 0.6875rem;
-  --text-2xs--line-height: 1rem;
+  /* text-xs (12px) is the declared text-size floor: new UI never goes below it
+     and older screens are being swept to it (UI.md, Typography). */
   --color-warning-foreground: var(--warning-foreground);
   --color-warning: var(--warning);
   --color-success-foreground: var(--success-foreground);

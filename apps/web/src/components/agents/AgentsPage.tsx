@@ -150,7 +150,7 @@ export function AgentsPage() {
           <ArrowLeftIcon className="size-4" aria-hidden />
         </Button>
         <h1 className="text-sm font-medium">agents</h1>
-        <span className="rounded-full bg-muted px-2 py-0.5 text-2xs font-medium tabular-nums text-muted-foreground">
+        <span className="rounded-full bg-muted px-2 py-0.5 text-xs font-medium tabular-nums text-muted-foreground">
           {unreadCount} unread
         </span>
       </header>
@@ -237,7 +237,7 @@ export function AgentsPage() {
                     <div key={group.id} className="min-w-0">
                       <button
                         type="button"
-                        className="flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left text-2xs font-medium text-muted-foreground hover:bg-accent hover:text-foreground"
+                        className="flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left text-xs font-medium text-muted-foreground hover:bg-accent hover:text-foreground"
                         data-testid={`agents-group-${group.id}`}
                         aria-expanded={groupExpanded}
                         onClick={() => setAgentsGroupExpanded(group.id, !groupExpanded)}
@@ -252,7 +252,7 @@ export function AgentsPage() {
                           />
                           <span className="truncate">{group.label}</span>
                         </span>
-                        <span className="rounded-full bg-muted px-1.5 py-0.5 text-2xs tabular-nums text-muted-foreground">
+                        <span className="rounded-full bg-muted px-1.5 py-0.5 text-xs tabular-nums text-muted-foreground">
                           {group.rows.length}
                         </span>
                       </button>

@@ -58,7 +58,7 @@ export function AgentsNavRow() {
           >
             <BotIcon className="size-4 text-foreground/60" aria-hidden />
             <span className="flex-1 truncate text-left text-[13px] font-medium">Agents</span>
-            <span className="rounded-full bg-muted px-1.5 py-0.5 text-2xs font-medium tabular-nums text-muted-foreground">
+            <span className="rounded-full bg-muted px-1.5 py-0.5 text-xs font-medium tabular-nums text-muted-foreground">
               {unreadCount}
             </span>
           </SidebarMenuButton>
