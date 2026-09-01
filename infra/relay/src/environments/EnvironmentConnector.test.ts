@@ -16,6 +16,7 @@ import { describe, expect, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
 import * as Crypto from "effect/Crypto";
 import { RELAY_HEALTH_RESPONSE_TYP, RELAY_MINT_RESPONSE_TYP } from "@bibcode/shared/relayJwt";
+import { makeTestExecutionEnvironmentCapabilities } from "@bibcode/shared/testSupport";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -141,14 +142,7 @@ function signHealthResponse(
       remoteUpdateSupport: null,
       remoteProtocolVersion: 1,
       minCompatibleRemoteProtocol: 1,
-      capabilities: {
-        repositoryIdentity: true,
-        worktreeCatalog: false,
-        worktreeCatalogRefreshReason: false,
-        vcsStatusSummary: false,
-        activityProtocolVersion: null,
-        remoteUpdateControl: false,
-      },
+      capabilities: makeTestExecutionEnvironmentCapabilities({ repositoryIdentity: true }),
     },
     checkedAt: DateTime.formatIso(DateTime.makeUnsafe(requestProof.iat * 1_000)),
     ...payloadOverrides,

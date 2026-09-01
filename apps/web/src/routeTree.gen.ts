@@ -29,6 +29,7 @@ import { Route as SettingsStatusBarRouteImport } from './routes/settings.status-
 import { Route as SettingsTerminalRouteImport } from './routes/settings.terminal'
 import { Route as ChatEnvironmentIdThreadIdRouteImport } from './routes/_chat.$environmentId.$threadId'
 import { Route as ChatDraftDraftIdRouteImport } from './routes/_chat.draft.$draftId'
+import { Route as ChatProjectEnvironmentIdProjectIdGitRouteImport } from './routes/_chat.project.$environmentId.$projectId.git'
 
 const ChatRoute = ChatRouteImport.update({
   id: '/_chat',
@@ -131,6 +132,12 @@ const ChatDraftDraftIdRoute = ChatDraftDraftIdRouteImport.update({
   path: '/draft/$draftId',
   getParentRoute: () => ChatRoute,
 } as any)
+const ChatProjectEnvironmentIdProjectIdGitRoute =
+  ChatProjectEnvironmentIdProjectIdGitRouteImport.update({
+    id: '/project/$environmentId/$projectId/git',
+    path: '/project/$environmentId/$projectId/git',
+    getParentRoute: () => ChatRoute,
+  } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof ChatIndexRoute
@@ -152,6 +159,7 @@ export interface FileRoutesByFullPath {
   '/settings/terminal': typeof SettingsTerminalRoute
   '/$environmentId/$threadId': typeof ChatEnvironmentIdThreadIdRoute
   '/draft/$draftId': typeof ChatDraftDraftIdRoute
+  '/project/$environmentId/$projectId/git': typeof ChatProjectEnvironmentIdProjectIdGitRoute
 }
 export interface FileRoutesByTo {
   '/agents': typeof AgentsRoute
@@ -173,6 +181,7 @@ export interface FileRoutesByTo {
   '/': typeof ChatIndexRoute
   '/$environmentId/$threadId': typeof ChatEnvironmentIdThreadIdRoute
   '/draft/$draftId': typeof ChatDraftDraftIdRoute
+  '/project/$environmentId/$projectId/git': typeof ChatProjectEnvironmentIdProjectIdGitRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -196,6 +205,7 @@ export interface FileRoutesById {
   '/_chat/': typeof ChatIndexRoute
   '/_chat/$environmentId/$threadId': typeof ChatEnvironmentIdThreadIdRoute
   '/_chat/draft/$draftId': typeof ChatDraftDraftIdRoute
+  '/_chat/project/$environmentId/$projectId/git': typeof ChatProjectEnvironmentIdProjectIdGitRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -219,6 +229,7 @@ export interface FileRouteTypes {
     | '/settings/terminal'
     | '/$environmentId/$threadId'
     | '/draft/$draftId'
+    | '/project/$environmentId/$projectId/git'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/agents'
@@ -240,6 +251,7 @@ export interface FileRouteTypes {
     | '/'
     | '/$environmentId/$threadId'
     | '/draft/$draftId'
+    | '/project/$environmentId/$projectId/git'
   id:
     | '__root__'
     | '/_chat'
@@ -262,6 +274,7 @@ export interface FileRouteTypes {
     | '/_chat/'
     | '/_chat/$environmentId/$threadId'
     | '/_chat/draft/$draftId'
+    | '/_chat/project/$environmentId/$projectId/git'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -413,6 +426,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ChatDraftDraftIdRouteImport
       parentRoute: typeof ChatRoute
     }
+    '/_chat/project/$environmentId/$projectId/git': {
+      id: '/_chat/project/$environmentId/$projectId/git'
+      path: '/project/$environmentId/$projectId/git'
+      fullPath: '/project/$environmentId/$projectId/git'
+      preLoaderRoute: typeof ChatProjectEnvironmentIdProjectIdGitRouteImport
+      parentRoute: typeof ChatRoute
+    }
   }
 }
 
@@ -420,12 +440,15 @@ interface ChatRouteChildren {
   ChatIndexRoute: typeof ChatIndexRoute
   ChatEnvironmentIdThreadIdRoute: typeof ChatEnvironmentIdThreadIdRoute
   ChatDraftDraftIdRoute: typeof ChatDraftDraftIdRoute
+  ChatProjectEnvironmentIdProjectIdGitRoute: typeof ChatProjectEnvironmentIdProjectIdGitRoute
 }
 
 const ChatRouteChildren: ChatRouteChildren = {
   ChatIndexRoute: ChatIndexRoute,
   ChatEnvironmentIdThreadIdRoute: ChatEnvironmentIdThreadIdRoute,
   ChatDraftDraftIdRoute: ChatDraftDraftIdRoute,
+  ChatProjectEnvironmentIdProjectIdGitRoute:
+    ChatProjectEnvironmentIdProjectIdGitRoute,
 }
 
 const ChatRouteWithChildren = ChatRoute._addFileChildren(ChatRouteChildren)

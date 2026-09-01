@@ -8,6 +8,7 @@ import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import * as TestClock from "effect/testing/TestClock";
+import { makeTestExecutionEnvironmentCapabilities } from "@bibcode/shared/testSupport";
 
 import * as Persistence from "../platform/persistence.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
@@ -64,14 +65,7 @@ const PREPARED_CONNECTION: PreparedConnection = {
     remoteUpdateSupport: null,
     remoteProtocolVersion: 1,
     minCompatibleRemoteProtocol: 1,
-    capabilities: {
-      repositoryIdentity: true,
-      worktreeCatalog: false,
-      worktreeCatalogRefreshReason: false,
-      vcsStatusSummary: false,
-      activityProtocolVersion: null,
-      remoteUpdateControl: false,
-    },
+    capabilities: makeTestExecutionEnvironmentCapabilities({ repositoryIdentity: true }),
   },
   httpBaseUrl: TARGET.httpBaseUrl,
   socketUrl: "wss://environment.example.test/ws",

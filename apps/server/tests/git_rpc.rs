@@ -59,6 +59,84 @@ fn production_vcs_observation_has_no_periodic_ref_worker() {
     assert!(!production_git_vcs.contains("Duration::from_secs(3)"));
 }
 
+#[test]
+fn production_git_manager_has_no_background_poller_or_direct_network_client() {
+    let sources = [
+        (
+            "git/manager/mod.rs",
+            include_str!("../src/git/manager/mod.rs"),
+        ),
+        (
+            "git/manager/conflicts.rs",
+            include_str!("../src/git/manager/conflicts.rs"),
+        ),
+        (
+            "git/manager/generation.rs",
+            include_str!("../src/git/manager/generation.rs"),
+        ),
+        (
+            "git/manager/graph.rs",
+            include_str!("../src/git/manager/graph.rs"),
+        ),
+        (
+            "git/manager/guards.rs",
+            include_str!("../src/git/manager/guards.rs"),
+        ),
+        (
+            "git/manager/in_progress.rs",
+            include_str!("../src/git/manager/in_progress.rs"),
+        ),
+        (
+            "git/manager/merge.rs",
+            include_str!("../src/git/manager/merge.rs"),
+        ),
+        (
+            "git/manager/operations.rs",
+            include_str!("../src/git/manager/operations.rs"),
+        ),
+        (
+            "git/manager/patch.rs",
+            include_str!("../src/git/manager/patch.rs"),
+        ),
+        (
+            "git/manager/refs.rs",
+            include_str!("../src/git/manager/refs.rs"),
+        ),
+        (
+            "git/manager/rewrite.rs",
+            include_str!("../src/git/manager/rewrite.rs"),
+        ),
+        (
+            "git/manager/stash.rs",
+            include_str!("../src/git/manager/stash.rs"),
+        ),
+        (
+            "git/manager/tags.rs",
+            include_str!("../src/git/manager/tags.rs"),
+        ),
+        (
+            "source_control/checks.rs",
+            include_str!("../src/source_control/checks.rs"),
+        ),
+    ];
+
+    for (path, source) in sources {
+        let production = source
+            .split_once("\nmod tests {")
+            .map_or(source, |(production, _tests)| production);
+        for forbidden in ["interval(", "sleep_until", "https://", "reqwest"] {
+            assert!(
+                !production.contains(forbidden),
+                "production {path} must not contain {forbidden}"
+            );
+        }
+        assert!(
+            !(production.contains("tokio::spawn") && production.contains("loop {")),
+            "production {path} must not pair tokio::spawn with a loop"
+        );
+    }
+}
+
 fn git(cwd: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .args(args)

@@ -2154,6 +2154,15 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
             "worktreeCatalog": true,
             "worktreeCatalogRefreshReason": true,
             "vcsStatusSummary": true,
+            "gitManagerReads": true,
+            "gitManagerCommitOperations": true,
+            "gitManagerBranchSyncOperations": true,
+            "gitManagerStashMergeOperations": true,
+            "gitManagerPartialStaging": true,
+            "gitManagerRewriteOperations": true,
+            "gitManagerTagOperations": true,
+            "gitManagerLiveSignal": true,
+            "gitManagerPullRequests": true,
             "activityProtocolVersion": activity_protocol_registered.then_some(2),
             "remoteUpdateControl": true,
         },
@@ -5008,6 +5017,22 @@ mod tests {
             true
         );
         assert_eq!(descriptor["capabilities"]["vcsStatusSummary"], true);
+        for capability in [
+            "gitManagerReads",
+            "gitManagerCommitOperations",
+            "gitManagerBranchSyncOperations",
+            "gitManagerStashMergeOperations",
+            "gitManagerPartialStaging",
+            "gitManagerRewriteOperations",
+            "gitManagerTagOperations",
+            "gitManagerLiveSignal",
+            "gitManagerPullRequests",
+        ] {
+            assert_eq!(
+                descriptor["capabilities"][capability], true,
+                "Git Manager capability {capability} was not advertised"
+            );
+        }
     }
 
     #[test]

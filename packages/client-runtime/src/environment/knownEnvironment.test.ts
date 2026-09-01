@@ -4,6 +4,7 @@ import {
   ThreadId,
   type ExecutionEnvironmentDescriptor,
 } from "@bibcode/contracts";
+import { makeTestExecutionEnvironmentCapabilities } from "@bibcode/shared/testSupport";
 import { describe, expect, it } from "vite-plus/test";
 
 import { attachEnvironmentDescriptor, createKnownEnvironment } from "./knownEnvironment.ts";
@@ -55,14 +56,10 @@ describe("known environment bootstrap helpers", () => {
       remoteUpdateSupport: null,
       remoteProtocolVersion: 1,
       minCompatibleRemoteProtocol: 1,
-      capabilities: {
+      capabilities: makeTestExecutionEnvironmentCapabilities({
         repositoryIdentity: true,
-        worktreeCatalog: false,
-        worktreeCatalogRefreshReason: false,
-        vcsStatusSummary: false,
         activityProtocolVersion: 2,
-        remoteUpdateControl: false,
-      },
+      }),
     } satisfies ExecutionEnvironmentDescriptor;
 
     expect(attachEnvironmentDescriptor(environment, descriptor).storageInstanceId).toBe(
@@ -88,14 +85,7 @@ describe("known environment bootstrap helpers", () => {
       remoteUpdateSupport: null,
       remoteProtocolVersion: 1,
       minCompatibleRemoteProtocol: 1,
-      capabilities: {
-        repositoryIdentity: true,
-        worktreeCatalog: false,
-        worktreeCatalogRefreshReason: false,
-        vcsStatusSummary: false,
-        activityProtocolVersion: null,
-        remoteUpdateControl: false,
-      },
+      capabilities: makeTestExecutionEnvironmentCapabilities({ repositoryIdentity: true }),
     } satisfies ExecutionEnvironmentDescriptor;
 
     expect(attachEnvironmentDescriptor(environment, descriptor).descriptor).toEqual(descriptor);

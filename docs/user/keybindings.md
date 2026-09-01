@@ -104,6 +104,12 @@ surface them.
 - `modelPicker.jump.1` through `modelPicker.jump.9`: jump to a model/provider row while the model picker is open
 - `script.{id}.run`: run a project script by id (for example `script.test.run`)
 
+Git Manager currently registers no `KeybindingCommand` values. Open it from the
+project header's **Git Manager** button, then use the panel's keyboard-operable
+lists, menus, dialogs, and buttons. RPC tags such as `gitManager.getRefs` and
+`gitManager.runOperation` are protocol method names, not keybinding commands;
+putting them in `keybindings.json` makes that rule invalid and it is ignored.
+
 ### Key Syntax
 
 Supported modifiers:

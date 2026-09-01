@@ -1,5 +1,6 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, hash_map::DefaultHasher},
+    hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
     time::Duration,
@@ -76,10 +77,28 @@ struct RepositoryState {
     remote_ref_name: Option<Option<String>>,
     pending_local_reconcile: bool,
     remote_refresh_requests: watch::Sender<u64>,
-    subscribers: HashMap<u64, mpsc::Sender<StatusPublication<VcsStatusStreamEvent>>>,
+    git_manager_signature: Option<u64>,
+    git_manager_generation: watch::Sender<u64>,
+    subscribers: HashMap<u64, RepositorySubscriber>,
     poller_cancellation: CancellationToken,
     retirement_cancellation: CancellationToken,
     tasks: TaskTracker,
+}
+
+enum RepositorySubscriber {
+    Status(mpsc::Sender<StatusPublication<VcsStatusStreamEvent>>),
+    GitManager,
+}
+
+#[derive(Clone, Copy)]
+enum SubscriptionKind {
+    Status,
+    GitManager,
+}
+
+enum BroadcasterSubscription {
+    Status(StatusSubscription),
+    GitManager(GitManagerSignalSubscription),
 }
 
 struct RepositoryRetirementFence(CancellationToken);
@@ -97,6 +116,15 @@ struct StatusWatcherAttachment {
 
 pub struct StatusSubscription {
     receiver: mpsc::Receiver<StatusPublication<VcsStatusStreamEvent>>,
+    cancellation: CancellationToken,
+    broadcaster: StatusBroadcaster,
+    cwd: PathBuf,
+    subscriber_id: u64,
+}
+
+pub struct GitManagerSignalSubscription {
+    receiver: watch::Receiver<u64>,
+    pending_initial: bool,
     cancellation: CancellationToken,
     broadcaster: StatusBroadcaster,
     cwd: PathBuf,
@@ -189,6 +217,35 @@ impl StatusBroadcaster {
         cwd: PathBuf,
         cancellation: CancellationToken,
     ) -> Result<StatusSubscription, GitCommandError> {
+        match self
+            .subscribe_kind(cwd, cancellation, SubscriptionKind::Status)
+            .await?
+        {
+            BroadcasterSubscription::Status(subscription) => Ok(subscription),
+            BroadcasterSubscription::GitManager(_) => unreachable!("status subscription kind"),
+        }
+    }
+
+    pub async fn subscribe_git_manager_signal(
+        &self,
+        cwd: PathBuf,
+        cancellation: CancellationToken,
+    ) -> Result<GitManagerSignalSubscription, GitCommandError> {
+        match self
+            .subscribe_kind(cwd, cancellation, SubscriptionKind::GitManager)
+            .await?
+        {
+            BroadcasterSubscription::GitManager(subscription) => Ok(subscription),
+            BroadcasterSubscription::Status(_) => unreachable!("Git Manager subscription kind"),
+        }
+    }
+
+    async fn subscribe_kind(
+        &self,
+        cwd: PathBuf,
+        cancellation: CancellationToken,
+        kind: SubscriptionKind,
+    ) -> Result<BroadcasterSubscription, GitCommandError> {
         let setup_cancellation = self.inner.subscription_cancellation.child_token();
         let broadcaster = self.clone();
         let error_cwd = cwd.clone();
@@ -211,6 +268,7 @@ impl StatusBroadcaster {
                         cwd,
                         setup_cancellation,
                         cancellation,
+                        kind,
                     ) => result,
                 };
                 result
@@ -226,7 +284,8 @@ impl StatusBroadcaster {
         cwd: PathBuf,
         setup_cancellation: CancellationToken,
         subscriber_cancellation: CancellationToken,
-    ) -> Result<StatusSubscription, GitCommandError> {
+        kind: SubscriptionKind,
+    ) -> Result<BroadcasterSubscription, GitCommandError> {
         let cwd = tokio::fs::canonicalize(&cwd).await.unwrap_or(cwd);
         loop {
             self.await_retired_lifecycle(&cwd).await;
@@ -322,6 +381,7 @@ impl StatusBroadcaster {
                     let start_poller = !state.repositories.contains_key(&cwd);
                     let entry = state.repositories.entry(cwd.clone()).or_insert_with(|| {
                         let (remote_refresh_requests, _) = watch::channel(0);
+                        let (git_manager_generation, _) = watch::channel(0);
                         let tasks = TaskTracker::new();
                         let retirement_cancellation = CancellationToken::new();
                         let retirement_wait = retirement_cancellation.clone();
@@ -339,6 +399,8 @@ impl StatusBroadcaster {
                             remote_ref_name: None,
                             pending_local_reconcile: false,
                             remote_refresh_requests,
+                            git_manager_signature: None,
+                            git_manager_generation,
                             subscribers: HashMap::new(),
                             poller_cancellation: CancellationToken::new(),
                             retirement_cancellation,
@@ -359,25 +421,32 @@ impl StatusBroadcaster {
                     } else {
                         reconcile_remote_after_local_publication(entry, false);
                     }
-                    entry.subscribers.insert(subscriber_id, sender);
+                    entry.subscribers.insert(
+                        subscriber_id,
+                        match kind {
+                            SubscriptionKind::Status => RepositorySubscriber::Status(sender),
+                            SubscriptionKind::GitManager => RepositorySubscriber::GitManager,
+                        },
+                    );
                     let lifecycle_insertion_reservation = start_poller.then(|| entry.tasks.token());
                     let initial_remote = (entry.remote_fence.as_ref() == Some(&fence)
                         && entry.remote_ref_name.as_ref() == Some(&local.ref_name))
                     .then(|| entry.remote.clone().flatten())
                     .flatten();
-                    entry
-                        .subscribers
-                        .get(&subscriber_id)
-                        .expect("subscriber was just registered")
-                        .try_send(StatusPublication {
-                            value: VcsStatusStreamEvent::Snapshot {
+                    if let Some(RepositorySubscriber::Status(subscriber)) =
+                        entry.subscribers.get(&subscriber_id)
+                    {
+                        subscriber
+                            .try_send(StatusPublication {
+                                value: VcsStatusStreamEvent::Snapshot {
+                                    local: local.clone(),
+                                    remote: initial_remote,
+                                },
                                 local: local.clone(),
-                                remote: initial_remote,
-                            },
-                            local: local.clone(),
-                            fence: fence.clone(),
-                        })
-                        .expect("new bounded subscription has capacity for its snapshot");
+                                fence: fence.clone(),
+                            })
+                            .expect("new bounded subscription has capacity for its snapshot");
+                    }
                     Some(Ok((
                         subscriber_id,
                         start_poller,
@@ -385,6 +454,7 @@ impl StatusBroadcaster {
                         local_refresh_requests,
                         entry.remote_refresh_requests.subscribe(),
                         entry.remote_refresh_requests.clone(),
+                        entry.git_manager_generation.subscribe(),
                         entry.lifecycle_id,
                         entry.repository_key.clone(),
                         entry.tasks.clone(),
@@ -427,6 +497,7 @@ impl StatusBroadcaster {
                 local_refresh_requests,
                 remote_refresh_requests,
                 remote_reconcile,
+                git_manager_generation,
                 lifecycle_id,
                 repository_key,
                 lifecycle_tasks,
@@ -511,12 +582,24 @@ impl StatusBroadcaster {
             if !admitted {
                 return Err(broadcaster_shutdown_error(&cwd));
             }
-            return Ok(StatusSubscription {
-                receiver,
-                cancellation: subscriber_cancellation,
-                broadcaster: self.clone(),
-                cwd,
-                subscriber_id,
+            return Ok(match kind {
+                SubscriptionKind::Status => BroadcasterSubscription::Status(StatusSubscription {
+                    receiver,
+                    cancellation: subscriber_cancellation,
+                    broadcaster: self.clone(),
+                    cwd,
+                    subscriber_id,
+                }),
+                SubscriptionKind::GitManager => {
+                    BroadcasterSubscription::GitManager(GitManagerSignalSubscription {
+                        receiver: git_manager_generation,
+                        pending_initial: true,
+                        cancellation: subscriber_cancellation,
+                        broadcaster: self.clone(),
+                        cwd,
+                        subscriber_id,
+                    })
+                }
             });
         }
     }
@@ -845,11 +928,16 @@ impl StatusBroadcaster {
             .status_owner
             .acquire_read_fence(cwd, cancellation)
             .await?;
-        let observed = self
-            .inner
-            .repository
-            .observed_remote_status(cwd, cancellation)
-            .await?;
+        let (observed, refs) = tokio::try_join!(
+            self.inner
+                .repository
+                .observed_remote_status(cwd, cancellation),
+            self.inner
+                .repository
+                .git_manager_signal_refs(cwd, cancellation),
+        )?;
+        let git_manager_signature =
+            hash_git_manager_signature(&refs.stdout, &observed.head_signature);
         let (retirement, request_local_refresh) = self
             .inner
             .status_owner
@@ -859,6 +947,11 @@ impl StatusBroadcaster {
                     .repositories
                     .get_mut(cwd)
                     .filter(|entry| Some(entry.lifecycle_id) == lifecycle_id)?;
+                update_git_manager_signature(
+                    &mut entry.git_manager_signature,
+                    &entry.git_manager_generation,
+                    git_manager_signature,
+                );
                 if entry.local.ref_name != observed.ref_name {
                     let request_local_refresh = !entry.pending_local_reconcile;
                     entry.pending_local_reconcile = true;
@@ -975,6 +1068,16 @@ impl StatusBroadcaster {
     /// automatic-fetch ownership is tracked separately.
     pub fn active_poller_count(&self) -> usize {
         self.lock_state().repositories.len()
+    }
+
+    #[cfg(test)]
+    fn active_status_subscriber_count_for_test(&self) -> usize {
+        self.lock_state()
+            .repositories
+            .values()
+            .flat_map(|entry| entry.subscribers.values())
+            .filter(|subscriber| matches!(subscriber, RepositorySubscriber::Status(_)))
+            .count()
     }
 
     #[cfg(test)]
@@ -1688,6 +1791,50 @@ impl Drop for StatusSubscription {
     }
 }
 
+impl GitManagerSignalSubscription {
+    pub async fn recv(&mut self) -> Option<u64> {
+        if self.cancellation.is_cancelled() {
+            return None;
+        }
+        if self.pending_initial {
+            self.pending_initial = false;
+            return Some(*self.receiver.borrow_and_update());
+        }
+        tokio::select! {
+            biased;
+            _ = self.cancellation.cancelled() => None,
+            changed = self.receiver.changed() => {
+                changed.ok().map(|()| *self.receiver.borrow_and_update())
+            }
+        }
+    }
+}
+
+impl Drop for GitManagerSignalSubscription {
+    fn drop(&mut self) {
+        self.broadcaster.release(&self.cwd, self.subscriber_id);
+    }
+}
+
+fn hash_git_manager_signature(refs: &str, head: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    refs.hash(&mut hasher);
+    head.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn update_git_manager_signature(
+    current: &mut Option<u64>,
+    generation: &watch::Sender<u64>,
+    observed: u64,
+) {
+    if *current == Some(observed) {
+        return;
+    }
+    *current = Some(observed);
+    generation.send_modify(|value| *value = value.saturating_add(1));
+}
+
 fn clear_remote_for_ref_change(entry: &mut RepositoryState) {
     entry.remote = None;
     entry.remote_fence = None;
@@ -1725,13 +1872,16 @@ fn publish(entry: &mut RepositoryState, event: VcsStatusStreamEvent, fence: &Sta
         local: entry.local.clone(),
         fence: fence.clone(),
     };
-    entry.subscribers.retain(
-        |_, subscriber| match subscriber.try_send(publication.clone()) {
-            Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(_)) => false,
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
-        },
-    );
+    entry.subscribers.retain(|_, subscriber| match subscriber {
+        RepositorySubscriber::Status(subscriber) => {
+            match subscriber.try_send(publication.clone()) {
+                Ok(()) => true,
+                Err(mpsc::error::TrySendError::Full(_)) => false,
+                Err(mpsc::error::TrySendError::Closed(_)) => false,
+            }
+        }
+        RepositorySubscriber::GitManager => true,
+    });
 }
 
 #[cfg(test)]
@@ -1845,6 +1995,9 @@ mod tests {
                     | "GitVcsDriver.statusDetailsRemote.defaultDelta" => (1, String::new()),
                     "GitVcsDriver.defaultRef.candidate" => (0, String::new()),
                     "GitVcsDriver.currentRef" => (0, "main\n".to_owned()),
+                    "GitManager.signal.refs" => {
+                        (0, "deadbeef\trefs/heads/main\t/repository\n".to_owned())
+                    }
                     operation => panic!("unexpected idle observation Git operation {operation}"),
                 };
                 Ok(ProcessOutput {
@@ -1889,6 +2042,9 @@ mod tests {
                     }
                     "GitVcsDriver.currentRef" => (0, "main\n".to_owned()),
                     "GitVcsDriver.remoteProvider" => (1, String::new()),
+                    "GitManager.signal.refs" => {
+                        (0, "deadbeef\trefs/heads/main\t/repository\n".to_owned())
+                    }
                     operation => panic!("unexpected subscription-setup Git operation {operation}"),
                 };
                 Ok(ProcessOutput {
@@ -1960,6 +2116,9 @@ mod tests {
                     }
                     "GitVcsDriver.defaultRef.originHead" | "GitVcsDriver.defaultRef.candidate" => {
                         (1, String::new())
+                    }
+                    "GitManager.signal.refs" => {
+                        (0, format!("deadbeef\trefs/heads/{branch}\t/repository\n"))
                     }
                     operation => panic!("unexpected epoch Git operation {operation}"),
                 };
@@ -2067,6 +2226,10 @@ mod tests {
                     | "GitVcsDriver.remoteProvider"
                     | "GitVcsDriver.defaultRef.originHead"
                     | "GitVcsDriver.defaultRef.candidate" => Ok(Self::output(1, String::new())),
+                    "GitManager.signal.refs" => Ok(Self::output(
+                        0,
+                        "deadbeef\trefs/heads/main\t/repository\n".to_owned(),
+                    )),
                     operation => panic!("unexpected remote-mismatch Git operation {operation}"),
                 }
             })
@@ -2316,6 +2479,10 @@ mod tests {
                     "GitVcsDriver.refreshRemoteStatus.upstream" => {
                         (0, format!("{remote}/{branch}\n"))
                     }
+                    "GitManager.signal.refs" => (
+                        0,
+                        format!("deadbeef\trefs/heads/{branch}\t{}\n", request.cwd.display()),
+                    ),
                     "GitVcsDriver.automaticFetch.fetch"
                     | "GitVcsDriver.refreshRemoteStatus.fetch" => {
                         self.fetches.fetch_add(1, Ordering::SeqCst);
@@ -2966,7 +3133,12 @@ mod tests {
             let cwd = cwd.clone();
             tokio::spawn(async move {
                 broadcaster
-                    .subscribe_inner(cwd, CancellationToken::new(), CancellationToken::new())
+                    .subscribe_inner(
+                        cwd,
+                        CancellationToken::new(),
+                        CancellationToken::new(),
+                        SubscriptionKind::Status,
+                    )
                     .await
             })
         };
@@ -4569,6 +4741,7 @@ mod tests {
     ) -> mpsc::Receiver<StatusPublication<VcsStatusStreamEvent>> {
         let (sender, receiver) = mpsc::channel(4);
         let (remote_refresh_requests, _) = watch::channel(0);
+        let (git_manager_generation, _) = watch::channel(0);
         let mut local = VcsStatusLocalResult::non_repository();
         local.is_repo = true;
         local.ref_name = Some(ref_name.to_owned());
@@ -4596,12 +4769,84 @@ mod tests {
                 remote_ref_name: None,
                 pending_local_reconcile: false,
                 remote_refresh_requests,
-                subscribers: HashMap::from([(lifecycle_id, sender)]),
+                git_manager_signature: None,
+                git_manager_generation,
+                subscribers: HashMap::from([(lifecycle_id, RepositorySubscriber::Status(sender))]),
                 poller_cancellation: CancellationToken::new(),
                 retirement_cancellation,
                 tasks,
             },
         );
         receiver
+    }
+
+    #[test]
+    fn identical_ref_ticks_bump_once_and_a_changed_ref_bumps_again() {
+        let (generation, _) = watch::channel(0_u64);
+        let mut signature = None;
+        let first = hash_git_manager_signature(
+            "aaaaaaaa\trefs/heads/main\t/repository\n",
+            "# branch.oid aaaaaaaa\0# branch.head main",
+        );
+        let unchanged = hash_git_manager_signature(
+            "aaaaaaaa\trefs/heads/main\t/repository\n",
+            "# branch.oid aaaaaaaa\0# branch.head main",
+        );
+        let changed = hash_git_manager_signature(
+            "bbbbbbbb\trefs/heads/main\t/repository\n",
+            "# branch.oid bbbbbbbb\0# branch.head main",
+        );
+
+        update_git_manager_signature(&mut signature, &generation, first);
+        assert_eq!(*generation.borrow(), 1);
+        update_git_manager_signature(&mut signature, &generation, unchanged);
+        assert_eq!(*generation.borrow(), 1);
+        update_git_manager_signature(&mut signature, &generation, changed);
+        assert_eq!(*generation.borrow(), 2);
+    }
+
+    #[tokio::test]
+    async fn git_manager_signal_subscription_starts_pollers_without_a_status_subscriber() {
+        let fixture = tempfile::tempdir().expect("temporary repository");
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.name", "Git Manager Test"][..],
+            &["config", "user.email", "git-manager@example.test"][..],
+        ] {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(fixture.path())
+                .output()
+                .expect("git fixture starts");
+            assert!(output.status.success());
+        }
+        fs::write(fixture.path().join("tracked.txt"), "base\n").expect("fixture file");
+        for args in [
+            &["add", "tracked.txt"][..],
+            &["commit", "-q", "-m", "base"][..],
+        ] {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(fixture.path())
+                .output()
+                .expect("git fixture starts");
+            assert!(output.status.success());
+        }
+        let broadcaster = StatusBroadcaster::new(
+            Arc::new(GitRepository::default()),
+            Duration::from_secs(3_600),
+            4,
+        );
+
+        let mut signal = broadcaster
+            .subscribe_git_manager_signal(fixture.path().to_path_buf(), CancellationToken::new())
+            .await
+            .expect("Git Manager signal subscription");
+
+        assert_eq!(broadcaster.active_poller_count(), 1);
+        assert_eq!(broadcaster.active_status_subscriber_count_for_test(), 0);
+        assert!(signal.recv().await.is_some());
+        drop(signal);
+        broadcaster.shutdown().await;
     }
 }

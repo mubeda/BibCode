@@ -34,6 +34,23 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
     Schema.withDecodingDefault(Effect.succeed(false)),
   ),
   vcsStatusSummary: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  gitManagerReads: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  gitManagerCommitOperations: Schema.Boolean.pipe(
+    Schema.withDecodingDefault(Effect.succeed(false)),
+  ),
+  gitManagerBranchSyncOperations: Schema.Boolean.pipe(
+    Schema.withDecodingDefault(Effect.succeed(false)),
+  ),
+  gitManagerStashMergeOperations: Schema.Boolean.pipe(
+    Schema.withDecodingDefault(Effect.succeed(false)),
+  ),
+  gitManagerPartialStaging: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  gitManagerRewriteOperations: Schema.Boolean.pipe(
+    Schema.withDecodingDefault(Effect.succeed(false)),
+  ),
+  gitManagerTagOperations: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  gitManagerLiveSignal: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  gitManagerPullRequests: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   activityProtocolVersion: Schema.NullOr(Schema.Literal(2)).pipe(
     Schema.withDecodingDefault(Effect.succeed(null)),
   ),

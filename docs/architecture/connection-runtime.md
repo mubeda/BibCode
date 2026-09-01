@@ -394,6 +394,32 @@ one bulk lane per environment. These are responsiveness bounds, not correctness
 locks: the server's command receipts, mutation locks, generation checks,
 physical identity, and repository verification remain authoritative.
 
+## Git Manager capability negotiation
+
+The negotiated environment descriptor carries nine additive Git Manager
+capabilities. Every field decodes to `false` when an older or third-party server
+omits it, and current WebSocket server configurations advertise all nine as
+`true`:
+
+| Capability                       | Surface it describes                                                         | Shipped false-or-missing behavior                                                                                                            |
+| -------------------------------- | ---------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `gitManagerReads`                | Panel shell, refs, history, diffs, stashes, and merge preview                | The project route renders **Git Manager Unavailable**, names the missing capability, and starts no Git Manager query or signal subscription. |
+| `gitManagerCommitOperations`     | Commit/amend, undo, and whole-file discard                                   | The Changes view remains readable and keeps these controls disabled with an explanatory reason.                                              |
+| `gitManagerPartialStaging`       | Partial stage, unstage, and discard                                          | The diff remains readable, but line/hunk mutation controls are disabled with an explanatory reason.                                          |
+| `gitManagerBranchSyncOperations` | Branch lifecycle and fetch/pull/push                                         | Declared and advertised, but the current React toolbar does not yet consult this field.                                                      |
+| `gitManagerStashMergeOperations` | Stash and merge operations                                                   | Declared and advertised, but the current React repository surfaces do not yet consult this field.                                            |
+| `gitManagerRewriteOperations`    | Rebase, cherry-pick, squash, reorder, revert, reset, and conflict operations | Declared and advertised, but the current React surface does not yet consult this field.                                                      |
+| `gitManagerTagOperations`        | Tag create, delete, and push                                                 | Declared and advertised, but the current React tag surface does not yet consult this field.                                                  |
+| `gitManagerLiveSignal`           | `subscribeGitManagerSignal`                                                  | Declared and advertised, but the current React panel does not yet use the field to suppress the subscription.                                |
+| `gitManagerPullRequests`         | Explicit pull-request and check reads                                        | Declared and advertised, but the current React provider pane does not yet consult this field.                                                |
+
+Consequently, the shipped older-server degradation is complete for the base
+panel, commit operations, and partial staging. The six remaining feature flags
+preserve wire compatibility by decoding false, but they do not yet prevent the
+corresponding React controls from issuing an unavailable method. Treat that as
+a current compatibility limitation rather than assuming the advertised
+feature-by-feature split is fully enforced by the client.
+
 ## Shell projection authority
 
 Shell projection keeps connection availability separate from project count.
