@@ -222,54 +222,59 @@ export function AgentsPage() {
           </div>
 
           <div className="min-h-0 flex-1 overflow-y-auto px-2 py-1.5">
-            {rows.length === 0 ? (
-              <div className="px-2 py-3 text-xs text-muted-foreground/60">No agents yet</div>
-            ) : groups.length === 0 ? (
-              <div className="px-2 py-3 text-xs text-muted-foreground/60">No agents found</div>
-            ) : (
-              groups.map((group) => {
-                const groupExpanded = resolveAgentsGroupExpanded(agentsGroupExpandedById, group.id);
-                return (
-                  <div key={group.id} className="min-w-0">
-                    <button
-                      type="button"
-                      className="flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left text-[10px] font-medium text-muted-foreground/70 hover:bg-accent hover:text-foreground"
-                      data-testid={`agents-group-${group.id}`}
-                      aria-expanded={groupExpanded}
-                      onClick={() => setAgentsGroupExpanded(group.id, !groupExpanded)}
-                    >
-                      <span className="flex min-w-0 items-center gap-1">
-                        <ChevronRightIcon
-                          className={cn(
-                            "size-3 shrink-0 transition-transform",
-                            groupExpanded && "rotate-90",
-                          )}
-                          aria-hidden
-                        />
-                        <span className="truncate">{group.label}</span>
-                      </span>
-                      <span className="rounded-full bg-muted px-1.5 py-0.5 text-[9px] tabular-nums text-muted-foreground/70">
-                        {group.rows.length}
-                      </span>
-                    </button>
-
-                    {groupExpanded ? (
-                      <SidebarMenu role="list" className="gap-0.5">
-                        {group.rows.map((row) => (
-                          <AgentsRow
-                            key={row.key}
-                            row={row}
-                            selected={row.key === selectedKey}
-                            onSelect={handleSelect}
-                            onJumpToWorkspace={handleJumpToWorkspace}
+            <div className="min-w-0" data-text-surface="card">
+              {rows.length === 0 ? (
+                <div className="px-2 py-3 text-xs text-muted-foreground/60">No agents yet</div>
+              ) : groups.length === 0 ? (
+                <div className="px-2 py-3 text-xs text-muted-foreground/60">No agents found</div>
+              ) : (
+                groups.map((group) => {
+                  const groupExpanded = resolveAgentsGroupExpanded(
+                    agentsGroupExpandedById,
+                    group.id,
+                  );
+                  return (
+                    <div key={group.id} className="min-w-0">
+                      <button
+                        type="button"
+                        className="flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left text-[10px] font-medium text-muted-foreground/70 hover:bg-accent hover:text-foreground"
+                        data-testid={`agents-group-${group.id}`}
+                        aria-expanded={groupExpanded}
+                        onClick={() => setAgentsGroupExpanded(group.id, !groupExpanded)}
+                      >
+                        <span className="flex min-w-0 items-center gap-1">
+                          <ChevronRightIcon
+                            className={cn(
+                              "size-3 shrink-0 transition-transform",
+                              groupExpanded && "rotate-90",
+                            )}
+                            aria-hidden
                           />
-                        ))}
-                      </SidebarMenu>
-                    ) : null}
-                  </div>
-                );
-              })
-            )}
+                          <span className="truncate">{group.label}</span>
+                        </span>
+                        <span className="rounded-full bg-muted px-1.5 py-0.5 text-[9px] tabular-nums text-muted-foreground/70">
+                          {group.rows.length}
+                        </span>
+                      </button>
+
+                      {groupExpanded ? (
+                        <SidebarMenu role="list" className="gap-0.5">
+                          {group.rows.map((row) => (
+                            <AgentsRow
+                              key={row.key}
+                              row={row}
+                              selected={row.key === selectedKey}
+                              onSelect={handleSelect}
+                              onJumpToWorkspace={handleJumpToWorkspace}
+                            />
+                          ))}
+                        </SidebarMenu>
+                      ) : null}
+                    </div>
+                  );
+                })
+              )}
+            </div>
           </div>
         </aside>
 

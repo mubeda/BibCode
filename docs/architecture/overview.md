@@ -605,7 +605,11 @@ rather than assuming the Chromium behavior that browser mode and Windows
 happen to share. On Linux the desktop host pins its own GtkSettings text hinting
 to `hintslight` when the session requests full hinting because WebKitGTK renders
 DM Sans body text with uneven whole-pixel letter gaps under full hinting. The
-override is process-local, so the user's system preference is unchanged.
+override is process-local, so the user's system preference is unchanged. The
+same webview paints text inside composited scroll containers grayscale unless
+an ancestor inside the scroller paints a background, so the main reading
+surfaces mark their content wrapper with `data-text-surface` and the Linux
+webview CSS paints the matching theme token on it to keep LCD subpixel text.
 
 Center chat-panel creation reserves and activates its client surface before the
 server command settles. A confirmed command failure removes that reservation;
