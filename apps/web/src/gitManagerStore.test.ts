@@ -115,6 +115,62 @@ describe("gitManagerStore", () => {
     });
   });
 
+  it("persists JSON-safe line selections per path with sorted unique indices", async () => {
+    const project = ref("env-a", "p1");
+    useGitManagerStore.getState().setLineSelection(project, "src/file.ts", {
+      type: "partial",
+      basis: "none",
+      diverging: [5, 1, 5, 3],
+      selectable: [5, 3, 1],
+      area: "unstaged",
+      generation: 42,
+    });
+
+    expect(useGitManagerStore.getState().selectViewState(project).lineSelectionByPath).toEqual({
+      "src/file.ts": {
+        type: "partial",
+        basis: "none",
+        diverging: [1, 3, 5],
+        selectable: [1, 3, 5],
+        area: "unstaged",
+        generation: 42,
+      },
+    });
+    const serialized = persisted.get(GIT_MANAGER_STORAGE_KEY);
+    expect(serialized).toBeDefined();
+
+    useGitManagerStore.setState({ byProjectKey: {} });
+    persisted.set(GIT_MANAGER_STORAGE_KEY, serialized!);
+    await useGitManagerStore.persist.rehydrate();
+
+    expect(useGitManagerStore.getState().selectViewState(project).lineSelectionByPath).toEqual({
+      "src/file.ts": expect.objectContaining({ diverging: [1, 3, 5], generation: 42 }),
+    });
+  });
+
+  it("removes a path selection without repersisting checkout selection", () => {
+    const project = ref("env-a", "p1");
+    const store = useGitManagerStore.getState();
+    store.setSelectedWorktree(project, "/opaque/worktree");
+    store.setLineSelection(project, "src/file.ts", {
+      type: "all",
+      basis: "all",
+      diverging: [],
+      selectable: [0],
+      area: "staged",
+      generation: 7,
+    });
+    store.setLineSelection(project, "src/file.ts", null);
+
+    expect(store.selectViewState(project).lineSelectionByPath).toEqual({});
+    const serialized = JSON.parse(persisted.get(GIT_MANAGER_STORAGE_KEY)!) as {
+      state: { byProjectKey: Record<string, Record<string, unknown>> };
+    };
+    expect(serialized.state.byProjectKey[projectKey(project)]).not.toHaveProperty(
+      "selectedWorktreeCwd",
+    );
+  });
+
   it("keeps checkout selection in memory while persisting the tab and commit draft", async () => {
     const project = ref("env-a", "p1");
     const store = useGitManagerStore.getState();

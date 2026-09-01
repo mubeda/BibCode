@@ -32,6 +32,7 @@ import { joinWorkspacePath, parentRelativePath } from "../../files/FileTreeConte
 import { GitManagerAgentActivity } from "./GitManagerAgentActivity";
 import { GitManagerCommitBox, type GitManagerCommitSubmission } from "./GitManagerCommitBox";
 import { GitManagerDiscardDialog } from "./GitManagerDiscardDialog";
+import { GitManagerDiffPane, type GitManagerPartialArea } from "./GitManagerDiffPane";
 import { GitManagerChangesList } from "./GitManagerChangesList";
 import {
   buildChangeRows,
@@ -274,6 +275,20 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
   const commitDisabledReason = commitOperationsAvailable
     ? null
     : "This environment does not support Git Manager commit operations.";
+  const partialStagingAvailable =
+    serverConfig?.environment?.capabilities.gitManagerPartialStaging === true;
+  const partialStagingDisabledReason = partialStagingAvailable
+    ? null
+    : "This environment does not support partial staging.";
+  const selectedRow = useMemo(
+    () => rows.find((row) => row.path === selectedPath) ?? null,
+    [rows, selectedPath],
+  );
+  const selectedAreas = useMemo<ReadonlyArray<GitManagerPartialArea>>(() => {
+    if (selectedRow?.area === "staged") return ["staged"];
+    if (selectedRow?.area === "unstaged") return ["unstaged"];
+    return ["unstaged", "staged"];
+  }, [selectedRow?.area]);
 
   const handleSelect = useCallback(
     (path: string) => setSelectedFile(stableProjectRef, path),
@@ -647,6 +662,17 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
             onSelect={handleSelect}
             onToggle={handleToggle}
           />
+          {selectedRow === null ? null : (
+            <GitManagerDiffPane
+              availableAreas={selectedAreas}
+              key={selectedRow.path}
+              mutationBusy={mutationBusy}
+              partialStagingDisabledReason={partialStagingDisabledReason}
+              path={selectedRow.path}
+              projectRef={stableProjectRef}
+              scope={scope}
+            />
+          )}
         </>
       )}
       {mutationError === null ? null : (
