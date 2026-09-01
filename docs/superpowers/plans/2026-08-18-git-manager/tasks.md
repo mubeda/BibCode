@@ -1,5 +1,8 @@
 # Git Manager — Task Tracker
 
+> **SUPERSEDED (2026-08-31)** by `docs/plans/git-manager/`. No phase below was
+> ever started. See the note at the top of `master-plan.md`.
+
 **Single source of truth for phase progress.** Every teammate MUST update this file at two points (on pickup, on completion) — see § "Update protocol". This plan is commit-free: no row tracks git commits.
 
 **Last updated:** 2026-08-18 — by coordinator (plan decomposition)

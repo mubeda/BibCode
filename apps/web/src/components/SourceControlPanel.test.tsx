@@ -279,14 +279,12 @@ vi.mock("~/lib/sourceControlActions", () => ({
   useSourceControlActionRunning: () => testState.isBusy,
 }));
 
-vi.mock("~/sourceControlPanelStore", () => ({
-  useSourceControlPanelStore: <T,>(selector: (store: Record<string, unknown>) => T): T =>
-    selector({
-      byThreadKey: {},
-      setMessage: testState.setMessage,
-      clearDraft: testState.clearDraft,
-    }),
-  selectThreadSourceControlDraft: () => testState.draft,
+vi.mock("~/sourceControlDraft", () => ({
+  useSourceControlDraft: () => ({
+    message: testState.draft.message,
+    setMessage: testState.setMessage,
+    clear: testState.clearDraft,
+  }),
 }));
 
 vi.mock("~/rightPanelStore", () => ({
@@ -829,7 +827,7 @@ describe("SourceControlPanel", () => {
       }),
     );
     expect(testState.runAction.mock.calls[0]?.[0]).not.toHaveProperty("filePaths");
-    expect(testState.clearDraft).toHaveBeenCalledWith(THREAD_REF);
+    expect(testState.clearDraft).toHaveBeenCalledWith();
     expect(testState.toast.add).toHaveBeenCalledWith(expect.objectContaining({ type: "loading" }));
     expect(testState.toast.update).toHaveBeenCalledWith(
       "toast-1",
@@ -1441,7 +1439,7 @@ describe("SourceControlPanel", () => {
   it("drafts the commit message and generates one on demand", async () => {
     render(buildProps());
     captured.textareas[0]?.onChange({ target: { value: "typed message" } });
-    expect(testState.setMessage).toHaveBeenCalledWith(THREAD_REF, "typed message");
+    expect(testState.setMessage).toHaveBeenCalledWith("typed message");
 
     const tree = callPanel();
     const generate = nativeButton(
@@ -1452,7 +1450,7 @@ describe("SourceControlPanel", () => {
     await flushPromises();
     // Staged files exist, so generation scopes to them.
     expect(testState.runGenerate).toHaveBeenCalledWith({ filePaths: [STAGED_FILE.path] });
-    expect(testState.setMessage).toHaveBeenLastCalledWith(THREAD_REF, "Generated message");
+    expect(testState.setMessage).toHaveBeenLastCalledWith("Generated message");
   });
 
   it("ignores canceled generations and surfaces generation failures", async () => {

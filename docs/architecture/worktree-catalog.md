@@ -23,6 +23,15 @@ authority.
 lives in the server catalog, orchestration, and availability services; React
 does not reproduce it.
 
+Git Manager mutations reuse the catalog service's same process-local lock set
+and acquisition order: stable project identity first, then the optional lock
+for the pinned physical repository. Their non-waiting acquisition reports
+`operation-in-flight` when either lock is held, including by a catalog mutation;
+they do not introduce a second repository mutex. Unlike durable catalog
+commands, a Git Manager operation has no orchestration receipt, but its lock,
+workspace-admission lease, cancellation token, supervised Git process, and VCS
+mutation fence remain owned together until that request settles.
+
 ## Identity and trust
 
 Clients address candidates by project ID, opaque worktree key, and catalog

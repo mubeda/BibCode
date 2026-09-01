@@ -380,12 +380,18 @@ refresh scheduling changes, run the current focused owners before broad gates:
 ```sh
 vp run check:contracts
 vp test run apps/web/src/components/SourceControlPanel.test.tsx apps/web/src/components/files/FileBrowserPanel.test.tsx apps/web/src/components/GitActionsControl.test.tsx apps/web/src/components/Sidebar.test.tsx apps/web/src/components/ThreadStatusIndicators.test.tsx
+vp test run packages/contracts/src/gitManager.test.ts packages/contracts/src/environment.test.ts apps/web/src/gitManagerStore.test.ts apps/web/src/components/gitManager scripts/privacy-contract.test.ts
 node scripts/run-msvc.mjs cargo test -p bibcode-server git:: -- --nocapture
+node scripts/run-msvc.mjs cargo test -p bibcode-server --lib git::manager:: -- --nocapture
 node scripts/run-msvc.mjs cargo test -p bibcode-server --lib git::broadcaster::tests::ref_poll_is_replaced_by_watcher_and_safety_status_reads -- --exact --nocapture
 node scripts/run-msvc.mjs cargo test -p bibcode-server --lib terminal::manager::tests::retained_process_exit_callback_does_not_hold_terminal_publication -- --exact --nocapture
 node scripts/run-msvc.mjs cargo test -p bibcode-server --lib production::runtime::tests::structured_terminal_process_exit_immediately_invalidates_status_under_watcher_fallback -- --exact --nocapture
 node scripts/run-msvc.mjs cargo test -p bibcode-server --lib production::runtime::tests::provider_lifecycle_and_delivery_events_do_not_trigger_git_status_reads -- --exact --nocapture
 node scripts/run-msvc.mjs cargo test -p bibcode-server --test production_git_vcs_rpc -- --nocapture
+node scripts/run-msvc.mjs cargo test -p bibcode-server --test git_manager_reads -- --nocapture
+node scripts/run-msvc.mjs cargo test -p bibcode-server --test git_manager_commit -- --nocapture
+node scripts/run-msvc.mjs cargo test -p bibcode-server --test production_git_manager_rpc -- --nocapture
+node scripts/run-msvc.mjs cargo test -p bibcode-server --test git_rpc -- --nocapture
 vp test run packages/client-runtime/src/state/vcs.test.ts apps/web/src/components/GitActionsControl.test.tsx
 ```
 
@@ -406,6 +412,13 @@ For the event-driven VCS boundary, retain separate evidence for:
 - one 125 ms trailing watcher read and one immediate structured-terminal read;
 - reconnect plus hidden, reveal, focus, and Git-menu explicit catch-up; and
 - execution-host routing for native, WSL-direct, and SSH/server workspaces.
+
+For the Git Manager boundary, retain separate evidence for tip-pinned paging
+and generation splicing; the shared project-then-repository lock rejecting a
+competing Git Manager or catalog mutation with `operation-in-flight`;
+server-authored blocked copy rendered unchanged; stream cancellation reaching
+the Git child; and one explicit provider refresh after an idle interval that
+produced no provider process or browser network request.
 
 Host-independent event-shape and routing tests are compatibility evidence, not
 native evidence for another operating system or remote host. Record unavailable
@@ -609,6 +622,454 @@ packaged application:
 
 Do not run destructive worktree scenarios against a user repository.
 
+## Git Manager validation scenario
+
+Run this scenario only against the exact packaged application and disposable
+repositories. Destructive Git Manager scenarios must never run against a user
+repository. Record the resulting paths, revisions, screenshots, command output,
+and timings in the execution report, not in this runbook.
+
+### Disposable Git Manager fixture
+
+Run the following in a POSIX-compatible shell with Git and Node.js available.
+On Windows, use Git Bash so the same fixture recipe applies. It creates one
+fixture family in the operating system's temporary area: a primary repository,
+two independent project clones for cache and isolation checks, one linked
+worktree whose path contains a space, and a bare `origin`. The configured
+`origin` looks like a supported provider remote so the explicit provider pane
+is reachable, while repository Git traffic is rewritten locally to the bare
+repository and never needs a network or real forge.
+
+```sh
+set -eu
+
+GIT_MANAGER_FIXTURE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/bibcode-git-manager.XXXXXX")"
+GIT_MANAGER_FIXTURE_REMOTE="https://github.com/bibcode-validation/git-manager-fixture.git"
+GIT_MANAGER_FIXTURE_ORIGIN_URL="$(node -e \
+  'process.stdout.write(require("node:url").pathToFileURL(process.argv[1]).href)' \
+  "$GIT_MANAGER_FIXTURE_ROOT/origin.git")"
+export GIT_MANAGER_FIXTURE_ROOT GIT_MANAGER_FIXTURE_REMOTE
+
+git init --bare --quiet "$GIT_MANAGER_FIXTURE_ROOT/origin.git"
+git init --quiet -b main "$GIT_MANAGER_FIXTURE_ROOT/main"
+git -C "$GIT_MANAGER_FIXTURE_ROOT/main" config user.name \
+  "BiBCode Git Manager Fixture"
+git -C "$GIT_MANAGER_FIXTURE_ROOT/main" config user.email \
+  "git-manager-fixture@example.test"
+git -C "$GIT_MANAGER_FIXTURE_ROOT/main" config \
+  "url.$GIT_MANAGER_FIXTURE_ORIGIN_URL.insteadOf" "$GIT_MANAGER_FIXTURE_REMOTE"
+git -C "$GIT_MANAGER_FIXTURE_ROOT/main" remote add origin \
+  "$GIT_MANAGER_FIXTURE_REMOTE"
+
+cd "$GIT_MANAGER_FIXTURE_ROOT/main"
+
+write_fixture_png() {
+  node - "$1" "$2" "$3" "$4" <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+const zlib = require("node:zlib");
+
+const [output, redText, greenText, blueText] = process.argv.slice(2);
+const red = Number(redText);
+const green = Number(greenText);
+const blue = Number(blueText);
+const crcTable = Array.from({ length: 256 }, (_, index) => {
+  let value = index;
+  for (let bit = 0; bit < 8; bit += 1) {
+    value = (value & 1) === 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+  }
+  return value >>> 0;
+});
+
+function crc32(buffer) {
+  let value = 0xffffffff;
+  for (const byte of buffer) value = crcTable[(value ^ byte) & 0xff] ^ (value >>> 8);
+  return (value ^ 0xffffffff) >>> 0;
+}
+
+function chunk(type, data) {
+  const typeBytes = Buffer.from(type, "ascii");
+  const length = Buffer.alloc(4);
+  const checksum = Buffer.alloc(4);
+  length.writeUInt32BE(data.length);
+  checksum.writeUInt32BE(crc32(Buffer.concat([typeBytes, data])));
+  return Buffer.concat([length, typeBytes, data, checksum]);
+}
+
+const header = Buffer.alloc(13);
+header.writeUInt32BE(2, 0);
+header.writeUInt32BE(2, 4);
+header[8] = 8;
+header[9] = 6;
+const row = [0, red, green, blue, 255, red, green, blue, 255];
+const pixels = Buffer.from([...row, ...row]);
+const png = Buffer.concat([
+  Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+  chunk("IHDR", header),
+  chunk("IDAT", zlib.deflateSync(pixels)),
+  chunk("IEND", Buffer.alloc(0)),
+]);
+fs.mkdirSync(path.dirname(output), { recursive: true });
+fs.writeFileSync(output, png);
+NODE
+}
+
+{
+  printf '%s\n' "section one target"
+  for line in 1 2 3 4 5 6 7 8 9 10; do
+    printf 'section one stable %s\n' "$line"
+  done
+  printf '%s\n' "section two target"
+  for line in 1 2 3 4 5 6 7 8 9 10; do
+    printf 'section two stable %s\n' "$line"
+  done
+  printf '%s\n' "section three target"
+  for line in 1 2 3 4 5 6 7 8 9 10; do
+    printf 'section three stable %s\n' "$line"
+  done
+} > partial.txt
+printf '%s\n' "main base" > conflict.txt
+printf '%s\n' "tracked discard baseline" > discard.txt
+printf '%s\n' "tracked stash baseline" > stash.txt
+write_fixture_png images/modified.png 220 40 40
+write_fixture_png images/deleted.png 40 180 80
+git add .
+git commit --quiet -m "fixture baseline"
+
+fixture_commit=1
+while [ "$fixture_commit" -le 105 ]; do
+  printf 'history fixture %s\n' "$fixture_commit" >> history.txt
+  git add history.txt
+  git commit --quiet -m "history fixture $fixture_commit"
+  fixture_commit=$((fixture_commit + 1))
+done
+
+write_fixture_png images/modified.png 40 90 220
+write_fixture_png images/added.png 220 180 40
+rm -- images/deleted.png
+git add -A images
+git commit --quiet -m "image diff fixtures"
+git tag -a fixture-annotated -m "annotated fixture tag"
+git tag fixture-lightweight
+
+git switch --quiet -c conflict-continue
+printf '%s\n' "topic resolution" > conflict.txt
+git add conflict.txt
+git commit --quiet -m "conflicting topic for continue"
+git switch --quiet main
+git switch --quiet -c conflict-abort
+printf '%s\n' "topic resolution" > conflict.txt
+git add conflict.txt
+git commit --quiet -m "conflicting topic for abort"
+git switch --quiet main
+printf '%s\n' "main resolution" > conflict.txt
+git add conflict.txt
+git commit --quiet -m "conflicting main change"
+
+git switch --quiet -c merge-ready
+printf '%s\n' "merge preview fixture" > merge-ready.txt
+git add merge-ready.txt
+git commit --quiet -m "merge-ready change"
+git switch --quiet main
+git switch --quiet -c cherry-source
+printf '%s\n' "cherry-pick fixture" > cherry-source.txt
+git add cherry-source.txt
+git commit --quiet -m "cherry-pick source"
+git switch --quiet main
+git switch --quiet -c rewrite-sandbox
+printf '%s\n' "rewrite first" > rewrite.txt
+git add rewrite.txt
+git commit --quiet -m "rewrite first"
+printf '%s\n' "rewrite second" >> rewrite.txt
+git add rewrite.txt
+git commit --quiet -m "rewrite second"
+git switch --quiet main
+
+git push --quiet -u origin main
+git -C "$GIT_MANAGER_FIXTURE_ROOT/origin.git" symbolic-ref HEAD refs/heads/main
+git push --quiet origin fixture-annotated
+
+git switch --quiet -c force-lease
+git push --quiet -u origin force-lease
+printf '%s\n' "local side" > force-local.txt
+git add force-local.txt
+git commit --quiet -m "force-with-lease local side"
+git switch --quiet main
+git switch --quiet -c push-ready
+git push --quiet -u origin push-ready
+printf '%s\n' "push-ready local change" > push-ready.txt
+git add push-ready.txt
+git commit --quiet -m "push-ready local commit"
+git switch --quiet main
+git switch --quiet -c publish-ready
+printf '%s\n' "publish-ready local change" > publish-ready.txt
+git add publish-ready.txt
+git commit --quiet -m "publish-ready local commit"
+git switch --quiet main
+
+git clone --quiet "$GIT_MANAGER_FIXTURE_ORIGIN_URL" "$GIT_MANAGER_FIXTURE_ROOT/project-two"
+git -C "$GIT_MANAGER_FIXTURE_ROOT/project-two" config user.name \
+  "BiBCode Git Manager Fixture"
+git -C "$GIT_MANAGER_FIXTURE_ROOT/project-two" config user.email \
+  "git-manager-fixture@example.test"
+git -C "$GIT_MANAGER_FIXTURE_ROOT/project-two" config \
+  "url.$GIT_MANAGER_FIXTURE_ORIGIN_URL.insteadOf" "$GIT_MANAGER_FIXTURE_REMOTE"
+git -C "$GIT_MANAGER_FIXTURE_ROOT/project-two" remote set-url origin \
+  "$GIT_MANAGER_FIXTURE_REMOTE"
+printf '%s\n' "remote main update" > "$GIT_MANAGER_FIXTURE_ROOT/project-two/remote-update.txt"
+git -C "$GIT_MANAGER_FIXTURE_ROOT/project-two" add remote-update.txt
+git -C "$GIT_MANAGER_FIXTURE_ROOT/project-two" commit --quiet -m "remote main update"
+git -C "$GIT_MANAGER_FIXTURE_ROOT/project-two" push --quiet origin main
+git -C "$GIT_MANAGER_FIXTURE_ROOT/project-two" switch --quiet force-lease
+printf '%s\n' "remote side" > "$GIT_MANAGER_FIXTURE_ROOT/project-two/force-remote.txt"
+git -C "$GIT_MANAGER_FIXTURE_ROOT/project-two" add force-remote.txt
+git -C "$GIT_MANAGER_FIXTURE_ROOT/project-two" commit --quiet -m \
+  "force-with-lease remote side"
+git -C "$GIT_MANAGER_FIXTURE_ROOT/project-two" push --quiet origin force-lease
+printf '%s\n' "project two only" > \
+  "$GIT_MANAGER_FIXTURE_ROOT/project-two/project-two-only.txt"
+
+git clone --quiet "$GIT_MANAGER_FIXTURE_ORIGIN_URL" "$GIT_MANAGER_FIXTURE_ROOT/project-three"
+git -C "$GIT_MANAGER_FIXTURE_ROOT/project-three" config user.name \
+  "BiBCode Git Manager Fixture"
+git -C "$GIT_MANAGER_FIXTURE_ROOT/project-three" config user.email \
+  "git-manager-fixture@example.test"
+git -C "$GIT_MANAGER_FIXTURE_ROOT/project-three" config \
+  "url.$GIT_MANAGER_FIXTURE_ORIGIN_URL.insteadOf" "$GIT_MANAGER_FIXTURE_REMOTE"
+git -C "$GIT_MANAGER_FIXTURE_ROOT/project-three" remote set-url origin \
+  "$GIT_MANAGER_FIXTURE_REMOTE"
+printf '%s\n' "project three only" > \
+  "$GIT_MANAGER_FIXTURE_ROOT/project-three/project-three-only.txt"
+
+printf '%s\n' "stash one" >> stash.txt
+git add stash.txt
+git stash push --quiet -m "fixture stash one"
+printf '%s\n' "stash two" >> stash.txt
+git add stash.txt
+git stash push --quiet -m "fixture stash two"
+
+awk '
+  $0 == "section one target" { print "section one changed"; next }
+  $0 == "section two target" { print "section two changed"; next }
+  $0 == "section three target" { print "section three changed"; next }
+  { print }
+' partial.txt > partial.txt.next
+mv -- partial.txt.next partial.txt
+printf '%s\n' "tracked discard changed" > discard.txt
+printf '%s\n' "untracked discard fixture" > untracked-discard.txt
+
+git worktree add --quiet -b occupied "$GIT_MANAGER_FIXTURE_ROOT/occupied worktree" main
+git worktree list --porcelain
+git rev-list --count --all
+git stash list
+git status --short
+git for-each-ref --format='%(refname:short) %(objecttype)' refs/tags
+git ls-remote --heads origin
+```
+
+The final checks must show more than 100 reachable commits, two stash entries,
+the `occupied` linked worktree, both tag kinds, and the three intended working
+tree changes. Keep the exported root available to the companion shell for the
+procedure below. Add `main`, `project-two`, and `project-three` as three distinct
+BiBCode projects; do not add `origin.git` or the linked worktree as separate
+projects. Remove only this exact temporary root during the runbook's
+[Cleanup](#cleanup).
+
+### Local packaged-application procedure
+
+The following are packaged-surface acceptance steps. Do not substitute a raw
+RPC or command-line Git operation when a named Git Manager control is missing;
+record that step as **FAIL**. The companion-shell commands below are exceptions
+used only to create repository states that cannot be held while the application
+starts.
+
+1. Hover the primary fixture project's header and choose its **Git Manager**
+   branch-icon button. Confirm the centre route is the project-scoped `/git`
+   route, choosing the button again focuses the same manager, and reload returns
+   to that route. Confirm every fresh open starts on **Main Checkout**, including
+   after a prior linked-worktree selection and after reload.
+2. Use the **Worktree** selector to choose `occupied worktree` and verify Changes,
+   History, branch, and sync data retarget together. Return to **Main Checkout**,
+   open the branch dropdown, and choose `occupied`. The row must name the owning
+   worktree and say **Switch to worktree**; choosing it visibly redirects the
+   selector instead of issuing checkout. Attempt rename and delete from that
+   row and confirm the server-authored blocked presentation names the owning
+   worktree path.
+3. On **Main Checkout**, inspect the Changes rows for `partial.txt`,
+   `discard.txt`, and `untracked-discard.txt`, then select each file and inspect
+   its diff. While these changes are dirty, request a branch switch and confirm
+   the dialog explains **Leave my changes** as an ordinary visible stash and
+   **Bring my changes** as carrying the working tree; choose **Bring my changes**
+   and then return to `main` the same way. In `partial.txt`, use the
+   partial-staging gutter to toggle one line, one complete **Changed lines** run,
+   and a dragged range; apply the selection and confirm only those lines move
+   between **Unstaged** and **Staged**. Switch the diff between both areas,
+   unstage a selected line, and exercise **Discard selected lines…** behind its
+   confirmation. Then commit one included whole-file change, add another
+   included whole-file change through **Amend Last Commit**, and confirm the
+   commit is replaced rather than duplicated. Choose **Undo**, accept its
+   explicit confirmation, and confirm the message and changes return without
+   deleting files. Exercise whole-file discard and **Discard All**; tracked
+   content must restore, an untracked path must use OS trash when available, and
+   a trash failure must require the separate permanent-discard confirmation.
+   Finish with a clean checkout.
+4. Open **History**, scroll until the loaded list crosses the 100-commit page
+   boundary, and select commits on both sides of that boundary. Confirm the
+   selected commit's metadata, changed-file list, and per-file diff agree with
+   Git. While the older page remains loaded, run this in the companion shell:
+
+   ```sh
+   printf '%s\n' "generation splice fixture" >> \
+     "$GIT_MANAGER_FIXTURE_ROOT/occupied worktree/generation.txt"
+   git -C "$GIT_MANAGER_FIXTURE_ROOT/occupied worktree" add generation.txt
+   git -C "$GIT_MANAGER_FIXTURE_ROOT/occupied worktree" commit -m \
+     "generation splice fixture"
+   ```
+
+   Confirm the new commit is spliced above the pinned history generation while
+   the loaded older page, selection, and scroll context remain coherent, with no
+   duplicate or missing rows.
+
+5. From **Main Checkout**, create and check out a disposable branch, rename it,
+   return to `main`, and delete the disposable branch through its confirmation.
+   Confirm the dropdown's Default, Recent, and Other groups, current marker, and
+   filtering stay current after each operation. Repeat the occupied-branch
+   redirect from step 2 after these mutations to prove its owner was not lost.
+6. On `main`, choose **Fetch origin** and confirm the remote-only main commit is
+   discovered; choose **Pull origin** and confirm it arrives locally. Check out
+   `push-ready` and choose **Push origin**; check out `publish-ready` and choose
+   **Publish branch to origin**, confirming an upstream is established. Check
+   out `force-lease` after the fetch and confirm its divergent state offers
+   **Force push origin**. The confirmation must state `--force-with-lease` and
+   the operation must stop if the lease is stale; no bare force-push path is
+   acceptable. Return to `main`.
+7. Open **Stashes** and confirm both native entries appear. Select each entry and
+   each changed file to inspect its per-entry diff. Apply one entry and verify it
+   remains listed, clean the applied changes, then pop that entry and verify it
+   is removed; clean again and drop the other entry through its destructive
+   confirmation. Open **Merge…**, select `merge-ready`, review the server-computed
+   ahead/behind and mergeability preview, then merge and confirm the operation's
+   started-to-finished presentation and resulting history.
+8. Check out `conflict-continue` in the panel and create the deliberate rebase
+   conflict from the companion shell:
+
+   ```sh
+   if git -C "$GIT_MANAGER_FIXTURE_ROOT/main" rebase main; then
+     printf '%s\n' "expected rebase conflict did not occur" >&2
+     exit 1
+   fi
+   git -C "$GIT_MANAGER_FIXTURE_ROOT/main" status --short
+   ```
+
+   Confirm the panel reports **Rebase underway**, presents `conflict.txt` as
+   conflicted, and blocks unrelated mutations with the server-authored pending
+   operation reason. Resolve the file in an editor, stage it, and choose
+   **Continue**; the rebase must complete and the strip must clear. Then check out
+   `conflict-abort`, create the same deliberate conflict, choose **Abort**, accept
+   the confirmation, and confirm the pre-rebase branch and clean operation state
+   are restored.
+
+9. Check out `rewrite-sandbox`. In History, use the commit actions to
+   cherry-pick the `cherry-pick source` commit, revert the resulting commit, and
+   reset to the earlier `rewrite first` commit. Confirm cherry-pick and revert
+   publish their operation state, and reset is unavailable until its explicit
+   mode/effect confirmation is accepted. If the History action menu or any of
+   these confirmations is absent, record **FAIL**; server primitives or an
+   unmounted component are not packaged-application evidence.
+10. Create an annotated tag from the toolbar, delete a disposable local tag
+    through its confirmation, and push `fixture-lightweight` to `origin`; confirm
+    the remote tag appears only after the explicit push. In History, select the
+    `image diff fixtures` commit and inspect `images/modified.png`,
+    `images/added.png`, and `images/deleted.png`. Exercise **2-up**, **Swipe**,
+    **Onion-skin**, and **Difference** for the two-sided modification, then
+    confirm the added file has no Before image and the deleted file has no After
+    image. If delete or push is absent from the routed tag surface, record
+    **FAIL** rather than substituting command-line Git.
+11. Open **Show pull requests**, confirm the pane says provider data loads only
+    on demand, and choose **Refresh** exactly once. Confirm one
+    `gitManager.listPullRequests` refresh is sent through the environment's
+    existing RPC connection. A configured provider may run separate pull-request
+    and checks subcommands on the server; a missing CLI, credentials, or the
+    fixture's intentionally nonexistent forge repository must produce the
+    provider pane's explicit error or unavailable presentation without retrying
+    in the background.
+12. Validate the two-project view isolation before the cache limit. Give `main`
+    and `project-two` different Changes filters, selected files, and active tabs,
+    then alternate between their project-header buttons. Each project must
+    restore only its own selection, filter, and tab and must never render paths,
+    refs, stashes, history, or operation events from the other project.
+13. Validate the two-entry least-recently-used view-state bound. Set distinctive
+    state in `main`, then `project-two`, revisit `main` to make `project-two` least
+    recent, and set different state in `project-three`. Revisit `main` and
+    `project-three` and confirm both states survive. Finally revisit
+    `project-two` and confirm its evicted selection, filter, and tab return to
+    defaults. The panels must not remain mounted or subscribed while hidden.
+14. Complete the [zero-telemetry observation](#zero-telemetry-observation) below
+    and record it separately from the automated evidence under
+    [VCS coordination gates](#vcs-coordination-gates).
+
+### Zero-telemetry observation
+
+This packaged-application check is mandatory; automated source and component
+tests do not replace it.
+
+1. Open browser developer tools, select **Network**, preserve the log, filter to
+   third-party hosts, and clear the existing entries. Leave the Git Manager and
+   its pull-request pane open and completely idle for at least ten minutes.
+   Confirm the filtered log remains empty: no provider poll, avatar lookup,
+   analytics, error report, feature flag, asset CDN, or other third-party
+   request is permitted.
+2. Keep the log and WebSocket-frame view open, then choose **Refresh** in the
+   pull-request pane exactly once. Confirm in decoded frames or the server
+   operation log that exactly one `gitManager.listPullRequests` provider-refresh
+   invocation crosses the existing BiBCode connection and that no direct browser
+   request targets the provider or any other third-party host. Server-side
+   provider subcommands are permitted only as work owned by that one explicit
+   invocation.
+3. Render History author identities and every image-diff case, then run this in
+   the developer-tools Console:
+
+   ```js
+   document
+     .querySelector('section[aria-label="Repository history"]')
+     ?.querySelectorAll('img[src^="http://"], img[src^="https://"]');
+   ```
+
+   Confirm the result is empty. Author identity must be local initials or a
+   deterministic local identicon, and repository images must use local `data:`
+   sources rather than an HTTP or HTTPS source.
+
+The automated counterparts live in `scripts/privacy-contract.test.ts`,
+`apps/web/src/components/gitManager/gitManagerTelemetry.test.tsx`, the inline
+`mod telemetry` in `apps/server/src/git/manager/mod.rs`, and the source-text
+tripwire in `apps/server/tests/git_rpc.rs`. Run them through
+[VCS coordination gates](#vcs-coordination-gates); the manual pass above is the
+evidence for the packaged application.
+
+### Remote-hosted Git Manager run
+
+Create the disposable fixture on the remote host, attach that environment by
+following [Remote access](../user/remote-access.md), add the three fixture
+projects to that environment, and repeat the complete local packaged-application
+procedure and zero-telemetry observation against the remote-owned project. This
+second run is required. Verify these remote deltas and no substitutes:
+
+- the panel forwards the server-owned `workspaceRoot` as an opaque value, never
+  resolves it through the client filesystem, and never substitutes a local
+  path;
+- deliberately disconnecting the environment renders **Git Manager
+  Unavailable**, names the disconnection reason, and does not re-dial the
+  environment;
+- reconnecting the environment transparently re-attaches status and operation
+  subscriptions, after which external repository changes and streamed operation
+  events resume without reloading or reopening the panel; and
+- an attached compatibility server whose descriptor omits one optional
+  capability degrades only that surface. Prefer omitting
+  `gitManagerPartialStaging`: the diff must remain readable, its line/hunk
+  mutation controls must explain that partial staging is unsupported, and the
+  rest of the panel must remain usable. Use an actual advertised descriptor,
+  not a client-side edit; record the server build and descriptor in the report.
+
 ## Packaged visual validation
 
 Use Codex Computer Use to operate the exact packaged executable. Before launch,
@@ -630,6 +1091,10 @@ sizes. Cover relevant:
 - Create Worktree exact local and remote ref selection: the exact value appears
   once, the derived name remains correct, and a remote-to-local race succeeds
   without duplicate branch creation;
+- Git Manager opened from the project header, its worktree selector, a Changes
+  list with the partial-staging gutter, History with a selected commit diff, the
+  branch dropdown, fetch/pull/push/force-with-lease sync states, the native
+  stash list, and an in-progress/conflicted repository state;
 - thread creation, switching, persistence, and streaming;
 - terminal input/output and panel switching, including reopening the global right panel after a
   sibling chat suppresses a previously active Activity surface;

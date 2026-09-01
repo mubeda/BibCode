@@ -30,6 +30,7 @@ import {
   ProviderInstanceId,
   ThreadId,
 } from "@bibcode/contracts";
+import { makeTestExecutionEnvironmentCapabilities } from "@bibcode/shared/testSupport";
 import { describe, expect, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -311,14 +312,7 @@ function primaryPrepared(storageInstanceId: string | null): PreparedConnection {
       remoteUpdateSupport: null,
       remoteProtocolVersion: 1,
       minCompatibleRemoteProtocol: 1,
-      capabilities: {
-        repositoryIdentity: true,
-        worktreeCatalog: false,
-        worktreeCatalogRefreshReason: false,
-        vcsStatusSummary: false,
-        activityProtocolVersion: null,
-        remoteUpdateControl: false,
-      },
+      capabilities: makeTestExecutionEnvironmentCapabilities({ repositoryIdentity: true }),
     },
     httpBaseUrl: target.httpBaseUrl,
     socketUrl: `${target.wsBaseUrl}/ws`,
@@ -1468,14 +1462,7 @@ describe("connectionStorageLayer", () => {
           remoteUpdateSupport: null,
           remoteProtocolVersion: 1,
           minCompatibleRemoteProtocol: 1,
-          capabilities: {
-            repositoryIdentity: true,
-            worktreeCatalog: false,
-            worktreeCatalogRefreshReason: false,
-            vcsStatusSummary: false,
-            activityProtocolVersion: null,
-            remoteUpdateControl: false,
-          },
+          capabilities: makeTestExecutionEnvironmentCapabilities({ repositoryIdentity: true }),
         },
         httpBaseUrl: target.httpBaseUrl,
         socketUrl: `${target.wsBaseUrl}/ws`,

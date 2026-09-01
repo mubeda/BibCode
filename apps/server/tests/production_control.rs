@@ -4,7 +4,7 @@ use std::{
 };
 
 use bibcode_server::{
-    ACTIVE_RPC_METHODS, MethodMode, RpcRegistry, ServerConfig,
+    ACTIVE_RPC_METHODS, MethodMode, RpcRegistry, ServerConfig, ServerRuntime,
     persistence::StorageInstanceId,
     production::{
         control::NativeServerControl, runtime::finalize_rpc_registry,
@@ -81,6 +81,47 @@ fn rpc_inventory_includes_activity_control_mutations_as_unary_methods() {
             ("activity.retrySubtreeCancellation", MethodMode::Unary),
         ]
     );
+}
+
+#[tokio::test]
+async fn production_runtime_registers_every_git_manager_method() {
+    let git_manager_methods = ACTIVE_RPC_METHODS
+        .iter()
+        .filter(|method| {
+            method.name.starts_with("gitManager.") || method.name == "subscribeGitManagerSignal"
+        })
+        .map(|method| (method.name, method.mode))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        git_manager_methods,
+        [
+            ("gitManager.commit", MethodMode::Unary),
+            ("gitManager.discard", MethodMode::Unary),
+            ("gitManager.discardPartial", MethodMode::Unary),
+            ("gitManager.getCommits", MethodMode::Unary),
+            ("gitManager.getDiff", MethodMode::Unary),
+            ("gitManager.getRefs", MethodMode::Unary),
+            ("gitManager.getStashes", MethodMode::Unary),
+            ("gitManager.listPullRequests", MethodMode::Unary),
+            ("gitManager.previewMerge", MethodMode::Unary),
+            ("gitManager.runOperation", MethodMode::Stream),
+            ("gitManager.stagePartial", MethodMode::Unary),
+            ("gitManager.undoCommit", MethodMode::Unary),
+            ("gitManager.unstagePartial", MethodMode::Unary),
+            ("subscribeGitManagerSignal", MethodMode::Stream),
+        ]
+    );
+
+    let directory = tempfile::tempdir().expect("temporary state directory");
+    let config = test_config(directory.path())
+        .with_bind("127.0.0.1", 0)
+        .with_unsafe_no_auth();
+    let runtime = ServerRuntime::start(config)
+        .await
+        .expect("the real production runtime registers every Git Manager method");
+    runtime.shutdown();
+    runtime.join().await.expect("production runtime joins");
 }
 
 async fn fixture() -> (TempDir, NativeServerControl) {
