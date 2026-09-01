@@ -16,11 +16,12 @@ const h = vi.hoisted(() => ({
       return { result: new Promise(() => undefined), cancel: vi.fn() };
     },
   ),
+  previewMerge: vi.fn(() => ({ kind: "preview" })),
 }));
 
 vi.mock("../../../state/gitManager", () => ({
   gitManagerEnvironment: {
-    previewMerge: vi.fn(() => ({ kind: "preview" })),
+    previewMerge: h.previewMerge,
   },
   runGitManagerOperation: h.runOperation,
 }));
@@ -76,11 +77,16 @@ function branch(name: string, current = false): GitManagerRefEntry {
 let container: HTMLDivElement;
 let root: Root | null;
 
-async function renderDialog(refs: ReadonlyArray<GitManagerRefEntry>, onOpenChange = vi.fn()) {
+async function renderDialog(
+  refs: ReadonlyArray<GitManagerRefEntry>,
+  onOpenChange = vi.fn(),
+  disabledReason: string | null = null,
+) {
   await act(async () =>
     root?.render(
       <GitManagerMergeDialog
         open
+        disabledReason={disabledReason}
         scope={{ environmentId: "env-a" as never, cwd: "/repo" }}
         projectRef={{ environmentId: "env-a", projectId: "project-a" } as never}
         refs={refs}
@@ -110,6 +116,7 @@ beforeEach(() => {
   h.error = null;
   h.onEvent = null;
   h.runOperation.mockClear();
+  h.previewMerge.mockClear();
 });
 
 afterEach(async () => {
@@ -146,6 +153,17 @@ describe("GitManagerMergeDialog", () => {
     expect(confirm.title).toBe(message);
     expect(confirm.getAttribute("aria-describedby")).toBe("git-manager-merge-disabled-reason");
     expect(container.textContent).toContain(message);
+  });
+
+  it("skips merge preview and disables confirmation with the capability reason only", async () => {
+    const reason = "This environment does not support Git Manager stash and merge operations.";
+    await renderDialog([branch("main", true), branch("feature")], vi.fn(), reason);
+
+    expect(h.previewMerge).not.toHaveBeenCalled();
+    expect(buttonWithText("Merge")).toMatchObject({ disabled: true, title: reason });
+    expect(container.textContent).toContain(reason);
+    expect(buttonWithText("Cancel").disabled).toBe(false);
+    expect(container.textContent).toContain("feature");
   });
 
   it("closes on finished and stays open with the failure code on failed", async () => {

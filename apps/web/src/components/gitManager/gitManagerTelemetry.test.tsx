@@ -161,7 +161,15 @@ let root: Root;
 function config(): ServerConfig {
   return {
     environment: {
-      capabilities: makeTestExecutionEnvironmentCapabilities({ gitManagerReads: true }),
+      capabilities: makeTestExecutionEnvironmentCapabilities({
+        gitManagerReads: true,
+        gitManagerBranchSyncOperations: true,
+        gitManagerStashMergeOperations: true,
+        gitManagerRewriteOperations: true,
+        gitManagerTagOperations: true,
+        gitManagerLiveSignal: true,
+        gitManagerPullRequests: true,
+      }),
     },
   } as ServerConfig;
 }

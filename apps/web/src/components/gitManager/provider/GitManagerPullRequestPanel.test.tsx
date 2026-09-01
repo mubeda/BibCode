@@ -41,10 +41,11 @@ import { GitManagerPullRequestPanel } from "./GitManagerPullRequestPanel";
 let container: HTMLDivElement;
 let root: Root;
 
-async function renderPanel(onRefresh = vi.fn()) {
+async function renderPanel(onRefresh = vi.fn(), disabledReason: string | null = null) {
   await act(async () =>
     root.render(
       <GitManagerPullRequestPanel
+        disabledReason={disabledReason}
         scope={{ environmentId: "env-a" as never, cwd: "/repo" }}
         onRefresh={onRefresh}
       />,
@@ -102,6 +103,19 @@ describe("GitManagerPullRequestPanel", () => {
     expect(h.listRequests).toHaveBeenCalledOnce();
     expect(h.refreshRequests).toHaveBeenCalledOnce();
     expect(onRefresh).toHaveBeenCalledTimes(2);
+  });
+
+  it("disables provider actions with their reason while the rest of the pane remains", async () => {
+    const reason = "This environment does not support Git Manager pull request operations.";
+    const onRefresh = await renderPanel(vi.fn(), reason);
+
+    expect(container.textContent).toContain("Pull requests and checks");
+    expect(container.textContent).toContain(reason);
+    expect(button("Create pull request")).toMatchObject({ disabled: true, title: reason });
+    expect(button("Refresh")).toMatchObject({ disabled: true, title: reason });
+    expect(h.listRequests).not.toHaveBeenCalled();
+    expect(h.createPr).not.toHaveBeenCalled();
+    expect(onRefresh).not.toHaveBeenCalled();
   });
 
   it("renders unavailable as explanation and loaded checks as local text", async () => {
