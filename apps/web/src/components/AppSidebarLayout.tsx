@@ -1,6 +1,6 @@
 import { useAtomValue } from "@effect/atom-react";
 import { useEffect, type ReactNode } from "react";
-import { useNavigate } from "@tanstack/react-router";
+import * as TanStackRouter from "@tanstack/react-router";
 
 import { resolveShortcutCommand, shortcutLabelForCommand } from "../keybindings";
 import { primaryServerKeybindingsAtom } from "../state/server";
@@ -13,6 +13,11 @@ const THREAD_SIDEBAR_WIDTH_STORAGE_KEY = "chat_thread_sidebar_width";
 const ENVIRONMENT_RAIL_WIDTH = 52;
 const THREAD_SIDEBAR_MIN_WIDTH = 13 * 16 + ENVIRONMENT_RAIL_WIDTH;
 const THREAD_MAIN_CONTENT_MIN_WIDTH = 40 * 16;
+
+const useAppPathname =
+  "useLocation" in TanStackRouter
+    ? () => TanStackRouter.useLocation({ select: (location) => location.pathname })
+    : () => "/";
 
 function SidebarControl() {
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
@@ -53,7 +58,8 @@ function SidebarControl() {
 }
 
 export function AppSidebarLayout({ children }: { children: ReactNode }) {
-  const navigate = useNavigate();
+  const navigate = TanStackRouter.useNavigate();
+  const pathname = useAppPathname();
   useEffect(() => {
     const onMenuAction = window.desktopBridge?.onMenuAction;
     if (typeof onMenuAction !== "function") {
@@ -75,6 +81,14 @@ export function AppSidebarLayout({ children }: { children: ReactNode }) {
       unsubscribe?.();
     };
   }, [navigate]);
+
+  if (pathname === "/agents") {
+    return (
+      <SidebarProvider className="h-dvh! min-h-0!" defaultOpen>
+        {children}
+      </SidebarProvider>
+    );
+  }
 
   return (
     <SidebarProvider className="h-dvh! min-h-0!" defaultOpen>
