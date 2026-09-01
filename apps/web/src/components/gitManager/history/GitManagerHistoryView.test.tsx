@@ -17,6 +17,7 @@ const h = vi.hoisted(() => ({
   } | null,
   contextMenuShow: vi.fn(),
   dndProps: null as Record<string, unknown> | null,
+  signalAtom: vi.fn(() => ({ kind: "signal" })),
 }));
 
 vi.mock("@legendapp/list/react", () => ({
@@ -43,7 +44,7 @@ vi.mock("../../../localApi", () => ({
 vi.mock("../../../state/gitManager", () => ({
   gitManagerEnvironment: {
     getCommits: vi.fn(() => ({ kind: "commits" })),
-    signal: vi.fn(() => ({ kind: "signal" })),
+    signal: h.signalAtom,
   },
 }));
 
@@ -103,6 +104,7 @@ beforeEach(() => {
   h.commitPage = null;
   h.contextMenuShow.mockReset();
   h.dndProps = null;
+  h.signalAtom.mockClear();
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
@@ -193,6 +195,7 @@ describe("GitManagerHistoryView rewrite reachability", () => {
     await act(async () =>
       root?.render(
         <GitManagerHistoryView
+          branchSyncDisabledReason={null}
           blockedReasons={[
             {
               operation: "reset",
@@ -200,8 +203,11 @@ describe("GitManagerHistoryView rewrite reachability", () => {
               message: "Server says the repository mutation lane is occupied.",
             },
           ]}
+          liveSignalAvailable
           projectRef={{ environmentId: "environment-1", projectId: "project-1" } as never}
+          rewriteDisabledReason={null}
           scope={{ environmentId: "environment-1" as never, cwd: "/opaque/repository" }}
+          tagDisabledReason={null}
           onAction={onAction}
         />,
       ),
@@ -256,9 +262,13 @@ describe("GitManagerHistoryView rewrite reachability", () => {
     await act(async () =>
       root?.render(
         <GitManagerHistoryView
+          branchSyncDisabledReason={null}
           blockedReasons={[]}
+          liveSignalAvailable
           projectRef={{ environmentId: "environment-1", projectId: "project-1" } as never}
+          rewriteDisabledReason={null}
           scope={{ environmentId: "environment-1" as never, cwd: "/opaque/repository" }}
+          tagDisabledReason={null}
           onAction={onAction}
         />,
       ),
@@ -296,9 +306,13 @@ describe("GitManagerHistoryView rewrite reachability", () => {
     await act(async () =>
       root?.render(
         <GitManagerHistoryView
+          branchSyncDisabledReason={null}
           blockedReasons={[]}
+          liveSignalAvailable
           projectRef={{ environmentId: "environment-1", projectId: "project-1" } as never}
+          rewriteDisabledReason={null}
           scope={{ environmentId: "environment-1" as never, cwd: "/opaque/repository" }}
+          tagDisabledReason={null}
           onAction={vi.fn()}
         />,
       ),
@@ -323,5 +337,93 @@ describe("GitManagerHistoryView rewrite reachability", () => {
       ]),
     );
     expect(h.dndProps?.multiCommitSelection).toEqual(commits.map((entry) => entry.sha));
+  });
+
+  it("keeps rewrite entries disabled with their reason while branch, tag, and copy remain available", async () => {
+    const selectedCommit = commit(13);
+    const reason = "This environment does not support Git Manager rewrite operations.";
+    h.commitPage = {
+      generation: 1,
+      pinnedTips: [selectedCommit.sha],
+      commits: [selectedCommit],
+      nextOffset: null,
+      exhausted: true,
+      degradedToAllPaging: false,
+    };
+    h.contextMenuShow.mockResolvedValue(null);
+
+    await act(async () =>
+      root?.render(
+        <GitManagerHistoryView
+          branchSyncDisabledReason={null}
+          blockedReasons={[]}
+          liveSignalAvailable
+          projectRef={{ environmentId: "environment-1", projectId: "project-1" } as never}
+          rewriteDisabledReason={reason}
+          scope={{ environmentId: "environment-1" as never, cwd: "/opaque/repository" }}
+          tagDisabledReason={null}
+          onAction={vi.fn()}
+        />,
+      ),
+    );
+    await act(async () => {
+      container
+        .querySelector<HTMLButtonElement>(`button[data-commit-sha="${selectedCommit.sha}"]`)
+        ?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true }));
+      await Promise.resolve();
+    });
+
+    const [items] = h.contextMenuShow.mock.calls[0] ?? [];
+    expect(items).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "reset",
+          disabled: true,
+          label: expect.stringContaining(reason),
+        }),
+        expect.objectContaining({
+          id: "cherry-pick",
+          disabled: true,
+          label: expect.stringContaining(reason),
+        }),
+        expect.objectContaining({ id: "create-branch", disabled: false }),
+        expect.objectContaining({ id: "create-tag", disabled: false }),
+        expect.objectContaining({ id: "copy-sha", disabled: false }),
+      ]),
+    );
+    expect(container.textContent).toContain(reason);
+  });
+
+  it("opens no live subscription and keeps explicit history refresh available", async () => {
+    const selectedCommit = commit(14);
+    h.commitPage = {
+      generation: 1,
+      pinnedTips: [selectedCommit.sha],
+      commits: [selectedCommit],
+      nextOffset: null,
+      exhausted: true,
+      degradedToAllPaging: false,
+    };
+
+    await act(async () =>
+      root?.render(
+        <GitManagerHistoryView
+          branchSyncDisabledReason={null}
+          blockedReasons={[]}
+          liveSignalAvailable={false}
+          projectRef={{ environmentId: "environment-1", projectId: "project-1" } as never}
+          rewriteDisabledReason={null}
+          scope={{ environmentId: "environment-1" as never, cwd: "/opaque/repository" }}
+          tagDisabledReason={null}
+          onAction={vi.fn()}
+        />,
+      ),
+    );
+
+    expect(h.signalAtom).not.toHaveBeenCalled();
+    expect(container.textContent).toContain("Commit 14");
+    expect(
+      container.querySelector<HTMLButtonElement>('[aria-label="Refresh history"]'),
+    ).not.toBeNull();
   });
 });

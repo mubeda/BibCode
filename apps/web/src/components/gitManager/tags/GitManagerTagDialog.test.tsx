@@ -118,4 +118,15 @@ describe("GitManagerTagDialog", () => {
     expect(container.textContent).toContain("not deleted there");
     expect(button("Delete Tag").className).toContain("destructive");
   });
+
+  it("disables tag submission with the capability reason while cancellation remains available", async () => {
+    const reason = "This environment does not support Git Manager tag operations.";
+    await renderDialog({ action: "delete", disabledReason: reason, tag: "release/v1" });
+
+    expect(button("Delete Tag")).toMatchObject({ disabled: true, title: reason });
+    expect(container.textContent).toContain(reason);
+    expect(button("Cancel").disabled).toBe(false);
+    await act(async () => button("Delete Tag").click());
+    expect(h.runOperation).not.toHaveBeenCalled();
+  });
 });

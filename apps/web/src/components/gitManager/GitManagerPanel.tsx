@@ -49,6 +49,7 @@ import { GitManagerStashList } from "./stash/GitManagerStashList";
 import { resolveStashIndex } from "./stash/GitManagerStashList.logic";
 import {
   resolveGitManagerAvailability,
+  resolveGitManagerCapabilityDisabledReasons,
   type GitManagerAvailability,
 } from "./gitManagerAvailability";
 import { GitManagerChangesView } from "./changes/GitManagerChangesView";
@@ -166,6 +167,12 @@ interface GitManagerRepositorySurfacesProps {
   };
   readonly projectRef: ScopedProjectRef;
   readonly signalGeneration: number | null;
+  readonly branchSyncDisabledReason: string | null;
+  readonly stashMergeDisabledReason: string | null;
+  readonly rewriteDisabledReason: string | null;
+  readonly tagDisabledReason: string | null;
+  readonly pullRequestsDisabledReason: string | null;
+  readonly liveSignalDisabledReason: string | null;
   readonly activeTab: GitManagerTab;
   readonly onTabChange: (value: string | number | null) => void;
 }
@@ -174,6 +181,12 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
   scope,
   projectRef,
   signalGeneration,
+  branchSyncDisabledReason,
+  stashMergeDisabledReason,
+  rewriteDisabledReason,
+  tagDisabledReason,
+  pullRequestsDisabledReason,
+  liveSignalDisabledReason,
   activeTab,
   onTabChange,
 }: GitManagerRepositorySurfacesProps) {
@@ -229,13 +242,13 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
   );
   const stashesAtom = useMemo(
     () =>
-      !stashPaneOpen
+      !stashPaneOpen || stashMergeDisabledReason !== null
         ? null
         : (gitManagerEnvironment.getStashes?.({
             environmentId,
             input: { cwd },
           }) ?? null),
-    [cwd, environmentId, stashPaneOpen],
+    [cwd, environmentId, stashMergeDisabledReason, stashPaneOpen],
   );
   const refsQuery = useEnvironmentQuery(refsAtom);
   const stashesQuery = useEnvironmentQuery(stashesAtom);
@@ -267,6 +280,8 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
     repositoryBlockedReasons.find((reason) => reason.operation === "continue") ?? null;
   const inProgressOperation = snapshot?.inProgressOperation ?? null;
   const resumableOperation = asResumableOperation(inProgressOperation);
+  const resumableOperationDisabledReason =
+    resumableOperation?.kind === "merge" ? stashMergeDisabledReason : rewriteDisabledReason;
   const externalMultiCommitKind = asMultiCommitKind(inProgressOperation);
   const conflictedPaths = snapshot?.conflictedPaths ?? EMPTY_CONFLICT_PATHS;
   const conflicts: ReadonlyArray<GitManagerConflictState> = conflictedPaths.map((path) => ({
@@ -420,19 +435,35 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
       const operationBase = { cwd, projectId };
       switch (action._tag) {
         case "reset":
+          if (rewriteDisabledReason !== null) {
+            setHistoryActionMessage(rewriteDisabledReason);
+            return;
+          }
           setResetTargetSha(action.sha);
           return;
         case "revert":
+          if (rewriteDisabledReason !== null) {
+            setHistoryActionMessage(rewriteDisabledReason);
+            return;
+          }
           setHistoryActionMessage(null);
           void executeOperation({ _tag: "revert", ...operationBase, sha: action.sha });
           return;
         case "cherry-pick":
+          if (rewriteDisabledReason !== null) {
+            setHistoryActionMessage(rewriteDisabledReason);
+            return;
+          }
           runMultiCommitOperation(
             createMultiCommitState("cherry-pick", "show-progress", action.shas),
             { _tag: "cherry-pick", ...operationBase, shas: action.shas as [string, ...string[]] },
           );
           return;
         case "squash":
+          if (rewriteDisabledReason !== null) {
+            setHistoryActionMessage(rewriteDisabledReason);
+            return;
+          }
           if (action.shas.length < 2) {
             setHistoryActionMessage("Select at least two commits to squash.");
             return;
@@ -445,6 +476,10 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
           });
           return;
         case "reorder":
+          if (rewriteDisabledReason !== null) {
+            setHistoryActionMessage(rewriteDisabledReason);
+            return;
+          }
           startHistoryRewrite("reorder", action.shas, {
             _tag: "reorder",
             ...operationBase,
@@ -453,27 +488,52 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
           });
           return;
         case "prepare-reorder":
+          if (rewriteDisabledReason !== null) {
+            setHistoryActionMessage(rewriteDisabledReason);
+            return;
+          }
           setHistoryActionMessage(
             "Drag the selected commit to an insertion line, then drop it to reorder history.",
           );
           return;
         case "create-branch":
+          if (branchSyncDisabledReason !== null) {
+            setHistoryActionMessage(branchSyncDisabledReason);
+            return;
+          }
           setHistoryBranchDialog({ kind: "create", baseBranch: action.sha });
           return;
         case "create-tag":
+          if (tagDisabledReason !== null) {
+            setHistoryActionMessage(tagDisabledReason);
+            return;
+          }
           setHistoryTagTargetSha(action.sha);
       }
     },
-    [cwd, executeOperation, projectId, runMultiCommitOperation, startHistoryRewrite],
+    [
+      branchSyncDisabledReason,
+      cwd,
+      executeOperation,
+      projectId,
+      rewriteDisabledReason,
+      runMultiCommitOperation,
+      startHistoryRewrite,
+      tagDisabledReason,
+    ],
   );
   const openRebaseDialog = useCallback(() => {
     setHistoryActionMessage(null);
+    if (rewriteDisabledReason !== null) {
+      setHistoryActionMessage(rewriteDisabledReason);
+      return;
+    }
     setPendingRewriteRequest(null);
     setMultiCommitState({
       ...createMultiCommitState("rebase", "choose-branch", []),
       commitsArePushed: currentBranch?.upstream !== null && currentBranch?.upstream !== undefined,
     });
-  }, [currentBranch?.upstream]);
+  }, [currentBranch?.upstream, rewriteDisabledReason]);
   const cancelMultiCommitOperation = useCallback(() => {
     cancelOperation();
     setPendingRewriteRequest(null);
@@ -483,6 +543,10 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
   }, [cancelOperation]);
   const runRebase = useCallback(
     (state: GitManagerMultiCommitState) => {
+      if (rewriteDisabledReason !== null) {
+        setHistoryActionMessage(rewriteDisabledReason);
+        return;
+      }
       if (state.selectedBranch === null || currentBranchName === null) return;
       runMultiCommitOperation(state, {
         _tag: "rebase",
@@ -492,7 +556,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
         target: currentBranchName,
       });
     },
-    [currentBranchName, cwd, projectId, runMultiCommitOperation],
+    [currentBranchName, cwd, projectId, rewriteDisabledReason, runMultiCommitOperation],
   );
   const advanceMultiCommit = useCallback(
     (event: GitManagerMultiCommitEvent) => {
@@ -569,6 +633,10 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
   }, [cwd, projectId, runMultiCommitOperation]);
   const runStashMutation = useCallback(
     async (kind: "stash-apply" | "stash-pop" | "stash-drop", sha: string) => {
+      if (stashMergeDisabledReason !== null) {
+        setHistoryActionMessage(stashMergeDisabledReason);
+        return;
+      }
       const index = resolveStashIndex(stashes, sha);
       if (index === null) {
         refreshStashes();
@@ -576,7 +644,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
       }
       await executeOperation({ _tag: kind, cwd, projectId, index });
     },
-    [cwd, executeOperation, projectId, refreshStashes, stashes],
+    [cwd, executeOperation, projectId, refreshStashes, stashes, stashMergeDisabledReason],
   );
   const runStashApply = useCallback(
     (sha: string) => runStashMutation("stash-apply", sha),
@@ -606,13 +674,23 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
     () => setProviderPaneOpen(projectRef, !providerPaneOpen),
     [projectRef, providerPaneOpen, setProviderPaneOpen],
   );
-  const openMergeDialog = useCallback(() => setMergeDialogOpen(true), []);
+  const openMergeDialog = useCallback(() => {
+    if (stashMergeDisabledReason !== null) {
+      setHistoryActionMessage(stashMergeDisabledReason);
+      return;
+    }
+    setMergeDialogOpen(true);
+  }, [stashMergeDisabledReason]);
   const handleMergeFinished = useCallback(() => refreshRefs(), [refreshRefs]);
   const closeHistoryBranchDialog = useCallback(() => {
     if (!operationRunning) setHistoryBranchDialog(null);
   }, [operationRunning]);
   const submitHistoryBranchDialog = useCallback(
     async (submission: GitManagerBranchDialogSubmission) => {
+      if (branchSyncDisabledReason !== null) {
+        setHistoryActionMessage(branchSyncDisabledReason);
+        return;
+      }
       if (submission.kind !== "create") return;
       if (
         await executeOperation({
@@ -627,7 +705,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
         setHistoryBranchDialog(null);
       }
     },
-    [cwd, executeOperation, projectId],
+    [branchSyncDisabledReason, cwd, executeOperation, projectId],
   );
   const closeHistoryTagDialog = useCallback((open: boolean) => {
     if (!open) setHistoryTagTargetSha(null);
@@ -635,47 +713,61 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
   const closeResetDialog = useCallback(() => setResetTargetSha(null), []);
   const confirmReset = useCallback(
     (mode: GitManagerResetMode) => {
+      if (rewriteDisabledReason !== null) {
+        setHistoryActionMessage(rewriteDisabledReason);
+        return;
+      }
       const sha = resetTargetSha;
       if (sha === null) return;
       setResetTargetSha(null);
       void executeOperation({ _tag: "reset", cwd, projectId, sha, mode });
     },
-    [cwd, executeOperation, projectId, resetTargetSha],
+    [cwd, executeOperation, projectId, resetTargetSha, rewriteDisabledReason],
   );
   const continueInProgress = useCallback(() => {
     if (resumableOperation === null) return;
+    if (resumableOperationDisabledReason !== null) {
+      setHistoryActionMessage(resumableOperationDisabledReason);
+      return;
+    }
     void executeOperation({
       _tag: "continue",
       cwd,
       projectId,
       operation: resumableOperation.kind,
     });
-  }, [cwd, executeOperation, projectId, resumableOperation]);
+  }, [cwd, executeOperation, projectId, resumableOperation, resumableOperationDisabledReason]);
   const abortInProgress = useCallback(() => {
     if (resumableOperation === null) return;
+    if (resumableOperationDisabledReason !== null) {
+      setHistoryActionMessage(resumableOperationDisabledReason);
+      return;
+    }
     void executeOperation({
       _tag: "abort",
       cwd,
       projectId,
       operation: resumableOperation.kind,
     });
-  }, [cwd, executeOperation, projectId, resumableOperation]);
+  }, [cwd, executeOperation, projectId, resumableOperation, resumableOperationDisabledReason]);
   const mergeDisabledReason =
-    refsQuery.isPending || snapshot === null
+    stashMergeDisabledReason ??
+    (refsQuery.isPending || snapshot === null
       ? "Loading branches."
       : localBranches.every((branch) => branch.current)
         ? "No source branch is available."
-        : null;
+        : null);
   const rebaseBlockedReason =
     currentBranch?.blocked.find((reason) => reason.operation === "rebase") ?? null;
   const rebaseDisabledReason =
-    refsQuery.isPending || snapshot === null
+    rewriteDisabledReason ??
+    (refsQuery.isPending || snapshot === null
       ? "Loading branches."
       : currentBranch === null
         ? "Check out a branch before rebasing."
         : localBranches.every((branch) => branch.current)
           ? "No base branch is available."
-          : (rebaseBlockedReason?.message ?? null);
+          : (rebaseBlockedReason?.message ?? null));
   const historyOperationError =
     operationEvent?._tag === "failed"
       ? (operationEvent.blocked?.message ?? operationEvent.message)
@@ -686,12 +778,18 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
 
   return (
     <>
+      {liveSignalDisabledReason === null ? null : (
+        <p className="border-b border-border px-3 py-2 text-xs text-muted-foreground" role="status">
+          {liveSignalDisabledReason}
+        </p>
+      )}
       {presentedMultiCommitState === null ? (
         <GitManagerOperationBanner operation={operationEvent} onCancel={cancelOperation} />
       ) : null}
       {resumableOperation === null ? null : (
         <GitManagerInProgressStrip
           blocked={inProgressBlocked}
+          disabledReason={resumableOperationDisabledReason}
           operation={resumableOperation}
           onAbort={abortInProgress}
           onContinue={continueInProgress}
@@ -699,25 +797,47 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
       )}
       <div className="flex items-center justify-end gap-2 border-b border-border px-4 py-1.5">
         <Button
+          aria-describedby={
+            pullRequestsDisabledReason === null
+              ? undefined
+              : "git-manager-pull-requests-disabled-reason"
+          }
           aria-expanded={providerPaneOpen}
           aria-label={`${providerPaneOpen ? "Hide" : "Show"} pull requests and checks`}
+          disabled={pullRequestsDisabledReason !== null}
           size="xs"
+          title={pullRequestsDisabledReason ?? undefined}
           variant="ghost"
           onClick={toggleProviderPane}
         >
           <GitPullRequestIcon aria-hidden="true" />
           {providerPaneOpen ? "Hide pull requests" : "Show pull requests"}
         </Button>
+        {pullRequestsDisabledReason === null ? null : (
+          <span className="sr-only" id="git-manager-pull-requests-disabled-reason">
+            {pullRequestsDisabledReason}
+          </span>
+        )}
         <Button
+          aria-describedby={
+            stashMergeDisabledReason === null ? undefined : "git-manager-stash-disabled-reason"
+          }
           aria-expanded={stashPaneOpen}
           aria-label="Toggle repository stashes"
+          disabled={stashMergeDisabledReason !== null}
           size="xs"
+          title={stashMergeDisabledReason ?? undefined}
           variant="ghost"
           onClick={toggleStashPane}
         >
           <ArchiveIcon aria-hidden="true" />
           Stashes{stashPaneOpen && !stashesQuery.isPending ? ` (${stashes.length})` : ""}
         </Button>
+        {stashMergeDisabledReason === null ? null : (
+          <span className="sr-only" id="git-manager-stash-disabled-reason">
+            {stashMergeDisabledReason}
+          </span>
+        )}
         <Button
           aria-describedby={
             mergeDisabledReason === null ? undefined : "git-manager-merge-trigger-reason"
@@ -765,7 +885,11 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
       )}
       {providerPaneOpen ? (
         <div className="h-80 min-h-0 overflow-auto border-b border-border">
-          <GitManagerPullRequestPanel scope={scope} onRefresh={refreshRefs} />
+          <GitManagerPullRequestPanel
+            disabledReason={pullRequestsDisabledReason}
+            scope={scope}
+            onRefresh={refreshRefs}
+          />
         </div>
       ) : null}
       {stashPaneOpen ? (
@@ -773,34 +897,43 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
           aria-label="Repository stash browser"
           className="grid h-80 min-h-0 grid-cols-[minmax(14rem,32%)_minmax(0,1fr)] border-b border-border"
         >
-          <div className="min-h-0 border-r border-border">
-            {stashesQuery.error !== null && stashes.length === 0 ? (
-              <p className="p-3 text-xs text-destructive">{stashesQuery.error}</p>
-            ) : (
-              <GitManagerStashList
-                blockedReasons={stashBlockedReasons}
+          {stashMergeDisabledReason !== null ? (
+            <p className="col-span-2 p-3 text-xs text-muted-foreground">
+              {stashMergeDisabledReason}
+            </p>
+          ) : (
+            <>
+              <div className="min-h-0 border-r border-border">
+                {stashesQuery.error !== null && stashes.length === 0 ? (
+                  <p className="p-3 text-xs text-destructive">{stashesQuery.error}</p>
+                ) : (
+                  <GitManagerStashList
+                    blockedReasons={stashBlockedReasons}
+                    disabledReason={stashMergeDisabledReason}
+                    entries={stashes}
+                    operationInFlight={operationRunning}
+                    projectRef={projectRef}
+                    scope={scope}
+                    selectedSha={selectedStashSha}
+                    onApply={runStashApply}
+                    onDrop={runStashDrop}
+                    onPop={runStashPop}
+                    onSelectStash={selectStash}
+                  />
+                )}
+              </div>
+              <GitManagerStashDiff
                 entries={stashes}
-                operationInFlight={operationRunning}
                 projectRef={projectRef}
                 scope={scope}
-                selectedSha={selectedStashSha}
-                onApply={runStashApply}
-                onDrop={runStashDrop}
-                onPop={runStashPop}
-                onSelectStash={selectStash}
+                selectedPath={selectedFilePath}
+                selectedStashSha={selectedStashSha}
+                stashesPending={stashesQuery.isPending}
+                onRefreshStashes={refreshStashes}
+                onSelectPath={selectStashFile}
               />
-            )}
-          </div>
-          <GitManagerStashDiff
-            entries={stashes}
-            projectRef={projectRef}
-            scope={scope}
-            selectedPath={selectedFilePath}
-            selectedStashSha={selectedStashSha}
-            stashesPending={stashesQuery.isPending}
-            onRefreshStashes={refreshStashes}
-            onSelectPath={selectStashFile}
-          />
+            </>
+          )}
         </section>
       ) : null}
       <Tabs className="min-h-0 flex-1 gap-0" value={activeTab} onValueChange={onTabChange}>
@@ -827,8 +960,12 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
           {activeTab === "history" ? (
             <GitManagerHistoryView
               blockedReasons={repositoryBlockedReasons}
+              branchSyncDisabledReason={branchSyncDisabledReason}
+              liveSignalAvailable={liveSignalDisabledReason === null}
               projectRef={projectRef}
+              rewriteDisabledReason={rewriteDisabledReason}
               scope={scope}
+              tagDisabledReason={tagDisabledReason}
               onAction={handleHistoryAction}
             />
           ) : null}
@@ -836,6 +973,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
       </Tabs>
       {presentedMultiCommitState === null ? null : (
         <GitManagerMultiCommitOperationDialog
+          disabledReason={rewriteDisabledReason}
           state={presentedMultiCommitState}
           onAdvance={advanceMultiCommit}
           onCancel={cancelMultiCommitOperation}
@@ -845,6 +983,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
       <GitManagerBranchDialogs
         busy={operationRunning}
         dialog={historyBranchDialog}
+        disabledReason={branchSyncDisabledReason}
         errorMessage={historyOperationError}
         refs={localBranches}
         onClose={closeHistoryBranchDialog}
@@ -852,6 +991,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
       />
       <GitManagerTagDialog
         action="create"
+        disabledReason={tagDisabledReason}
         existingTags={historyTagNames}
         open={historyTagTargetSha !== null}
         projectRef={projectRef}
@@ -863,11 +1003,13 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
         onOpenChange={closeHistoryTagDialog}
       />
       <GitManagerResetDialog
+        disabledReason={rewriteDisabledReason}
         sha={resetTargetSha}
         onClose={closeResetDialog}
         onConfirm={confirmReset}
       />
       <GitManagerMergeDialog
+        disabledReason={stashMergeDisabledReason}
         open={mergeDialogOpen}
         projectRef={projectRef}
         recentNames={recentNames}
@@ -890,6 +1032,7 @@ export const GitManagerPanel = memo(function GitManagerPanel({ projectRef }: Git
   const connection = useEnvironmentConnectionState(environmentId);
   const serverConfig = useServerConfigs().get(environmentId) ?? null;
   const availability = resolveGitManagerAvailability(connection.data, serverConfig);
+  const capabilityDisabledReasons = resolveGitManagerCapabilityDisabledReasons(serverConfig);
   const catalogProjectId = project?.id ?? null;
   const storeKey = projectKey(stableProjectRef);
   const [selectionOwnerKey, setSelectionOwnerKey] = useState<string | null>(null);
@@ -932,13 +1075,15 @@ export const GitManagerPanel = memo(function GitManagerPanel({ projectRef }: Git
   );
   const signalAtom = useMemo(
     () =>
-      availability.kind === "ready" && activeCwd !== null
+      availability.kind === "ready" &&
+      activeCwd !== null &&
+      capabilityDisabledReasons.liveSignal === null
         ? gitManagerEnvironment.signal({
             environmentId,
             input: { cwd: activeCwd },
           })
         : null,
-    [activeCwd, availability.kind, environmentId],
+    [activeCwd, availability.kind, capabilityDisabledReasons.liveSignal, environmentId],
   );
   const signalQuery = useEnvironmentQuery(signalAtom);
   const signalGeneration = signalQuery.data?.generation ?? null;
@@ -970,19 +1115,29 @@ export const GitManagerPanel = memo(function GitManagerPanel({ projectRef }: Git
     <GitManagerImageDiffModeProvider projectRef={stableProjectRef}>
       <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col bg-background">
         <GitManagerToolbar
+          branchSyncDisabledReason={capabilityDisabledReasons.branchSync}
           projectRef={stableProjectRef}
           mainCheckoutCwd={mainCheckoutCwd}
           selectedWorktreeCwd={activeCwd}
           worktrees={worktrees}
           catalogPending={catalog.isPending}
           catalogError={catalog.error}
+          liveSignalAvailable={capabilityDisabledReasons.liveSignal === null}
+          stashMergeDisabledReason={capabilityDisabledReasons.stashMerge}
+          tagDisabledReason={capabilityDisabledReasons.tag}
           onSelectedWorktreeChange={handleWorktreeChange}
         />
         <GitManagerRepositorySurfaces
           activeTab={viewState.activeTab}
+          branchSyncDisabledReason={capabilityDisabledReasons.branchSync}
+          liveSignalDisabledReason={capabilityDisabledReasons.liveSignal}
           projectRef={stableProjectRef}
+          pullRequestsDisabledReason={capabilityDisabledReasons.pullRequests}
+          rewriteDisabledReason={capabilityDisabledReasons.rewrite}
           scope={activeScope}
           signalGeneration={signalGeneration}
+          stashMergeDisabledReason={capabilityDisabledReasons.stashMerge}
+          tagDisabledReason={capabilityDisabledReasons.tag}
           onTabChange={handleTabChange}
         />
       </div>

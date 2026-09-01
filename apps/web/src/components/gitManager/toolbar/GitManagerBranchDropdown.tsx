@@ -86,6 +86,8 @@ function branchRowPropsEqual(
   return (
     previous.selectedWorktreeCwd === next.selectedWorktreeCwd &&
     previous.mergeMode === next.mergeMode &&
+    previous.branchDisabledReason === next.branchDisabledReason &&
+    previous.mergeDisabledReason === next.mergeDisabledReason &&
     previous.onSelectBranch === next.onSelectBranch &&
     previous.onSwitchWorktree === next.onSwitchWorktree &&
     previous.onMergeInto === next.onMergeInto &&
@@ -107,6 +109,8 @@ interface GitManagerBranchRowProps {
   readonly refEntry: GitManagerRefEntry;
   readonly selectedWorktreeCwd: string;
   readonly mergeMode: boolean;
+  readonly branchDisabledReason: string | null;
+  readonly mergeDisabledReason: string | null;
   readonly onSelectBranch: (ref: GitManagerRefEntry) => void;
   readonly onSwitchWorktree: (worktreePath: string) => void;
   readonly onMergeInto: (ref: GitManagerRefEntry) => void;
@@ -118,6 +122,8 @@ const GitManagerBranchRow = memo(function GitManagerBranchRow({
   refEntry,
   selectedWorktreeCwd,
   mergeMode,
+  branchDisabledReason,
+  mergeDisabledReason,
   onSelectBranch,
   onSwitchWorktree,
   onMergeInto,
@@ -135,11 +141,28 @@ const GitManagerBranchRow = memo(function GitManagerBranchRow({
       !(reason.operation === "branch-checkout" && reason.code === "dirty-working-tree"),
   );
   const blockedReason = unknownReason ?? checkoutBlock ?? null;
-  const displayReason = refEntry.blocked[0]?.message ?? null;
+  const capabilityDisabledReason = mergeMode
+    ? mergeDisabledReason
+    : redirectPath === null
+      ? branchDisabledReason
+      : null;
+  const currentMergeReason =
+    mergeMode && refEntry.current ? "Choose a different branch to merge." : null;
+  const displayReason =
+    capabilityDisabledReason ??
+    blockedReason?.message ??
+    currentMergeReason ??
+    refEntry.blocked[0]?.message ??
+    null;
   const descriptionId =
     displayReason === null ? undefined : `git-manager-branch-${encodeURIComponent(refEntry.name)}`;
-  const disabled = blockedReason !== null || (mergeMode && refEntry.current);
-  const title = blockedReason?.message ?? displayReason ?? undefined;
+  const branchActionDescriptionId =
+    branchDisabledReason === null
+      ? undefined
+      : `git-manager-branch-${encodeURIComponent(refEntry.name)}-actions`;
+  const disabled =
+    capabilityDisabledReason !== null || blockedReason !== null || currentMergeReason !== null;
+  const title = displayReason ?? undefined;
   const activate = useCallback(() => {
     if (disabled) return;
     if (mergeMode) {
@@ -183,16 +206,22 @@ const GitManagerBranchRow = memo(function GitManagerBranchRow({
           )}
         </button>
         <button
+          aria-describedby={branchActionDescriptionId}
           aria-label={`Rename ${refEntry.name}`}
           className="pointer-events-none h-full shrink-0 px-1.5 text-[10px] text-muted-foreground opacity-0 hover:bg-accent group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100 focus:pointer-events-auto focus:opacity-100 pointer-coarse:pointer-events-auto pointer-coarse:opacity-100"
+          disabled={branchDisabledReason !== null}
+          title={branchDisabledReason ?? undefined}
           type="button"
           onClick={() => onRenameBranch(refEntry)}
         >
           Rename
         </button>
         <button
+          aria-describedby={branchActionDescriptionId}
           aria-label={`Delete ${refEntry.name}`}
           className="pointer-events-none h-full shrink-0 px-1.5 text-[10px] text-destructive opacity-0 hover:bg-destructive/10 group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100 focus:pointer-events-auto focus:opacity-100 pointer-coarse:pointer-events-auto pointer-coarse:opacity-100"
+          disabled={branchDisabledReason !== null}
+          title={branchDisabledReason ?? undefined}
           type="button"
           onClick={() => onDeleteBranch(refEntry)}
         >
@@ -202,6 +231,11 @@ const GitManagerBranchRow = memo(function GitManagerBranchRow({
       {displayReason === null ? null : (
         <span className="sr-only" id={descriptionId}>
           {displayReason}
+        </span>
+      )}
+      {branchDisabledReason === null ? null : (
+        <span className="sr-only" id={branchActionDescriptionId}>
+          {branchDisabledReason}
         </span>
       )}
     </>
@@ -214,6 +248,8 @@ export interface GitManagerBranchDropdownProps {
   readonly recentNames: ReadonlyArray<string>;
   readonly currentBranchName: string | null;
   readonly selectedWorktreeCwd: string;
+  readonly branchDisabledReason: string | null;
+  readonly mergeDisabledReason: string | null;
   readonly onSelectBranch: (ref: GitManagerRefEntry) => void;
   readonly onSwitchWorktree: (worktreePath: string) => void;
   readonly onCreateBranch: () => void;
@@ -228,6 +264,8 @@ export const GitManagerBranchDropdown = memo(function GitManagerBranchDropdown({
   recentNames,
   currentBranchName,
   selectedWorktreeCwd,
+  branchDisabledReason,
+  mergeDisabledReason,
   onSelectBranch,
   onSwitchWorktree,
   onCreateBranch,
@@ -340,7 +378,9 @@ export const GitManagerBranchDropdown = memo(function GitManagerBranchDropdown({
         </div>
       ) : (
         <GitManagerBranchRow
+          branchDisabledReason={branchDisabledReason}
           mergeMode={mergeMode}
+          mergeDisabledReason={mergeDisabledReason}
           refEntry={item.ref}
           selectedWorktreeCwd={selectedWorktreeCwd}
           onDeleteBranch={handleDeleteBranch}
@@ -352,11 +392,13 @@ export const GitManagerBranchDropdown = memo(function GitManagerBranchDropdown({
       ),
     [
       mergeMode,
+      branchDisabledReason,
       handleDeleteBranch,
       handleMergeInto,
       handleRenameBranch,
       handleSelectBranch,
       handleSwitchWorktree,
+      mergeDisabledReason,
       selectedWorktreeCwd,
     ],
   );
@@ -407,8 +449,13 @@ export const GitManagerBranchDropdown = memo(function GitManagerBranchDropdown({
         </div>
         <div className="flex items-center gap-2 border-t border-border p-2">
           <Button
+            aria-describedby={
+              branchDisabledReason === null ? undefined : "git-manager-create-branch-reason"
+            }
             className="flex-1 justify-start"
+            disabled={branchDisabledReason !== null}
             size="sm"
+            title={branchDisabledReason ?? undefined}
             variant="ghost"
             onClick={handleCreateBranch}
           >
@@ -416,9 +463,18 @@ export const GitManagerBranchDropdown = memo(function GitManagerBranchDropdown({
             New branch
           </Button>
           <Button
+            aria-describedby={
+              mergeDisabledReason === null && currentBranchName !== null
+                ? undefined
+                : "git-manager-branch-merge-reason"
+            }
             className={cn("flex-1 justify-start", mergeMode && "bg-accent")}
-            disabled={currentBranchName === null}
+            disabled={mergeDisabledReason !== null || currentBranchName === null}
             size="sm"
+            title={
+              mergeDisabledReason ??
+              (currentBranchName === null ? "Check out a branch before merging." : undefined)
+            }
             variant="ghost"
             onClick={handleMergeMode}
           >
@@ -427,6 +483,16 @@ export const GitManagerBranchDropdown = memo(function GitManagerBranchDropdown({
               ? "Select a branch above"
               : `Choose a branch to merge into ${currentBranchName ?? "HEAD"}`}
           </Button>
+          {branchDisabledReason === null ? null : (
+            <span className="sr-only" id="git-manager-create-branch-reason">
+              {branchDisabledReason}
+            </span>
+          )}
+          {mergeDisabledReason === null && currentBranchName !== null ? null : (
+            <span className="sr-only" id="git-manager-branch-merge-reason">
+              {mergeDisabledReason ?? "Check out a branch before merging."}
+            </span>
+          )}
         </div>
       </PopoverPopup>
     </Popover>

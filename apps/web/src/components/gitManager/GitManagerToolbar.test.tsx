@@ -19,18 +19,20 @@ const h = vi.hoisted(() => ({
   refreshRefs: vi.fn(),
   tagDialogProps: [] as Array<Record<string, unknown>>,
   menuItemProps: [] as Array<Record<string, unknown>>,
+  refsAtom: vi.fn(() => ({ kind: "refs" })),
+  signalAtom: vi.fn(() => ({ kind: "signal" })),
 }));
 
 vi.mock("../../state/gitManager", () => ({
   gitManagerEnvironment: {
-    getRefs: vi.fn(() => ({ kind: "refs" })),
-    signal: vi.fn(() => ({ kind: "signal" })),
+    getRefs: h.refsAtom,
+    signal: h.signalAtom,
   },
 }));
 
 vi.mock("../../state/query", () => ({
-  useEnvironmentQuery: (atom: { kind: string }) => ({
-    data: atom.kind === "refs" ? h.snapshot : null,
+  useEnvironmentQuery: (atom: { kind: string } | null) => ({
+    data: atom?.kind === "refs" ? h.snapshot : null,
     error: null,
     isPending: false,
     refresh: h.refreshRefs,
@@ -142,6 +144,10 @@ function renderToolbar(
       worktrees={worktrees}
       catalogPending={false}
       catalogError={null}
+      branchSyncDisabledReason={null}
+      liveSignalAvailable
+      stashMergeDisabledReason={null}
+      tagDisabledReason={null}
       onSelectedWorktreeChange={() => undefined}
       {...overrides}
     />,
@@ -155,6 +161,8 @@ beforeEach(() => {
   h.refreshRefs.mockClear();
   h.tagDialogProps.length = 0;
   h.menuItemProps.length = 0;
+  h.refsAtom.mockClear();
+  h.signalAtom.mockClear();
   useGitManagerStore.setState({ byProjectKey: {} });
 });
 
@@ -205,6 +213,10 @@ describe("GitManagerToolbar", () => {
             worktrees={worktrees}
             catalogPending={false}
             catalogError={null}
+            branchSyncDisabledReason={null}
+            liveSignalAvailable
+            stashMergeDisabledReason={null}
+            tagDisabledReason={null}
             onSelectedWorktreeChange={() => undefined}
           />,
         ),
@@ -254,5 +266,41 @@ describe("GitManagerToolbar", () => {
 
     expect(markup).toContain("Fetch origin");
     expect(markup).not.toContain('aria-label="1 ahead"');
+  });
+
+  it("disables branch sync operations with their reason while tag and worktree controls remain", () => {
+    const reason = "This environment does not support Git Manager branch and sync operations.";
+    h.snapshot = refsSnapshot([ref("release/v1")]);
+
+    const markup = renderToolbar({ branchSyncDisabledReason: reason });
+
+    expect(markup).toContain(`title="${reason}"`);
+    expect(markup).toContain(reason);
+    expect(markup).toContain('aria-label="Choose branch"');
+    expect(markup).toContain('aria-label="Worktree"');
+    expect(markup).toContain("Tags…");
+  });
+
+  it("disables tag operations with their reason while branch sync remains available", () => {
+    const reason = "This environment does not support Git Manager tag operations.";
+    h.snapshot = refsSnapshot([ref("release/v1")]);
+
+    const markup = renderToolbar({ tagDisabledReason: reason });
+
+    expect(markup).toContain(`title="${reason}"`);
+    expect(markup).toContain(reason);
+    expect(markup).toContain('aria-label="Choose branch"');
+    expect(markup).toContain("Fetch origin");
+  });
+
+  it("skips the live signal subscription without disabling explicit repository reads", () => {
+    h.snapshot = refsSnapshot();
+
+    const markup = renderToolbar({ liveSignalAvailable: false });
+
+    expect(h.signalAtom).not.toHaveBeenCalled();
+    expect(h.refsAtom).toHaveBeenCalledOnce();
+    expect(markup).toContain('aria-label="Choose branch"');
+    expect(markup).toContain("Fetch origin");
   });
 });

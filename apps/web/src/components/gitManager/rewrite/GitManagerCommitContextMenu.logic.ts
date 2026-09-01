@@ -20,6 +20,9 @@ export interface GitManagerCommitMenuItem {
 export interface GitManagerCommitMenuContext {
   readonly loadedCommits: ReadonlyArray<GitManagerCommitEntry>;
   readonly blockedReasons: ReadonlyArray<GitManagerBlockedReason>;
+  readonly branchSyncDisabledReason: string | null;
+  readonly rewriteDisabledReason: string | null;
+  readonly tagDisabledReason: string | null;
 }
 
 export interface GitManagerCommitSelectionPresentation {
@@ -113,6 +116,36 @@ function applyServerBlocks(
   });
 }
 
+function capabilityDisabledReason(
+  id: GitManagerCommitMenuItemId,
+  context: GitManagerCommitMenuContext,
+): string | null {
+  switch (id) {
+    case "reset":
+    case "revert":
+    case "cherry-pick":
+    case "reorder":
+    case "squash":
+      return context.rewriteDisabledReason;
+    case "create-branch":
+      return context.branchSyncDisabledReason;
+    case "create-tag":
+      return context.tagDisabledReason;
+    case "copy-sha":
+      return null;
+  }
+}
+
+function applyCapabilityBlocks(
+  items: ReadonlyArray<GitManagerCommitMenuItem>,
+  context: GitManagerCommitMenuContext,
+): ReadonlyArray<GitManagerCommitMenuItem> {
+  return items.map((menuItem) => {
+    const disabledReason = capabilityDisabledReason(menuItem.id, context);
+    return disabledReason === null ? menuItem : { ...menuItem, enabled: false, disabledReason };
+  });
+}
+
 export function buildCommitMenuItems(
   selection: ReadonlyArray<string>,
   context: GitManagerCommitMenuContext,
@@ -123,29 +156,35 @@ export function buildCommitMenuItems(
       : selectionContainsMerge(selection, context.loadedCommits)
         ? "Merge commits cannot be squashed or reordered."
         : null;
-    return applyServerBlocks(
-      [
-        item("cherry-pick", `Cherry-Pick ${selection.length}`),
-        structuralReason === null
-          ? item("squash", `Squash ${selection.length}`)
-          : disabledItem("squash", `Squash ${selection.length}`, structuralReason),
-        structuralReason === null
-          ? item("reorder", `Reorder ${selection.length}`)
-          : disabledItem("reorder", `Reorder ${selection.length}`, structuralReason),
-      ],
-      context.blockedReasons,
+    return applyCapabilityBlocks(
+      applyServerBlocks(
+        [
+          item("cherry-pick", `Cherry-Pick ${selection.length}`),
+          structuralReason === null
+            ? item("squash", `Squash ${selection.length}`)
+            : disabledItem("squash", `Squash ${selection.length}`, structuralReason),
+          structuralReason === null
+            ? item("reorder", `Reorder ${selection.length}`)
+            : disabledItem("reorder", `Reorder ${selection.length}`, structuralReason),
+        ],
+        context.blockedReasons,
+      ),
+      context,
     );
   }
-  return applyServerBlocks(
-    [
-      item("reset", "Reset to Commit"),
-      item("revert", "Revert"),
-      item("cherry-pick", "Cherry-Pick"),
-      item("reorder", "Reorder"),
-      item("create-branch", "Create Branch from Commit"),
-      item("create-tag", "Create Tag"),
-      item("copy-sha", "Copy SHA"),
-    ],
-    context.blockedReasons,
+  return applyCapabilityBlocks(
+    applyServerBlocks(
+      [
+        item("reset", "Reset to Commit"),
+        item("revert", "Revert"),
+        item("cherry-pick", "Cherry-Pick"),
+        item("reorder", "Reorder"),
+        item("create-branch", "Create Branch from Commit"),
+        item("create-tag", "Create Tag"),
+        item("copy-sha", "Copy SHA"),
+      ],
+      context.blockedReasons,
+    ),
+    context,
   );
 }
