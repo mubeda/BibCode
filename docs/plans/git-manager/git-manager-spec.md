@@ -176,7 +176,7 @@ running agent sessions. Therefore:
 - **Live refresh.** Status, refs and history stay current from repository
   change events, not from window focus and timers. GitHub Desktop performs no
   filesystem watching at all; BiBCode already has a `notify`-based watcher and
-  must use it. Desktop's focus-plus-timer model is the *fallback contract* —
+  must use it. Desktop's focus-plus-timer model is the _fallback contract_ —
   what must remain correct if watching is lost.
 - **No locking against agents.** Committing takes a fresh status snapshot
   immediately before staging and commits what is selected, per ordinary git
@@ -244,7 +244,7 @@ Two classes:
   failure toast is a worse experience than a disabled button; a race that
   slips through produces a structured error carrying the same message. These
   refusals are never bypassed with `--ignore-other-worktrees`, `worktree add
-  -f`, or `update-ref`.
+-f`, or `update-ref`.
 - **app-policy** — git permits the operation and only a pre-computed guard can
   block it.
 
@@ -257,18 +257,18 @@ branch succeeds and the other worktree's HEAD silently follows.
 
 Required guards:
 
-| Operation | Condition | Class | Behaviour |
-| --- | --- | --- | --- |
-| Checkout / switch | branch held by another worktree | git-enforced | **Redirect** (§ 7.1) |
-| Checkout / switch | branch is already current here | app-policy | Disabled: "Already checked out." |
-| Checkout / merge / rebase | working tree dirty | git-enforced | Blocked, naming the uncommitted changes |
-| Delete branch | branch held by a worktree (including one whose directory is missing) | git-enforced | Blocked, naming the worktree path; the missing-directory case says the worktree must be removed or pruned first |
-| Delete branch | branch is current or default | mixed | Blocked with the specific reason |
-| Rename branch | branch held by another worktree | **app-policy** | Blocked (§ 7.2) |
-| Force-move / reset a branch | branch held by another worktree | git-enforced | Blocked, naming the worktree path |
-| Pull / fetch into a named local branch | destination held by another worktree | git-enforced | Blocked, naming the worktree path |
-| Any mutation | another Git Manager operation holds the repository lock | app-policy | Blocked: `operation-in-flight` |
-| Any mutation | a merge, rebase or cherry-pick is in progress | app-policy | Blocked, naming the pending operation; the resolve/abort path is exempt |
+| Operation                              | Condition                                                            | Class          | Behaviour                                                                                                       |
+| -------------------------------------- | -------------------------------------------------------------------- | -------------- | --------------------------------------------------------------------------------------------------------------- |
+| Checkout / switch                      | branch held by another worktree                                      | git-enforced   | **Redirect** (§ 7.1)                                                                                            |
+| Checkout / switch                      | branch is already current here                                       | app-policy     | Disabled: "Already checked out."                                                                                |
+| Checkout / merge / rebase              | working tree dirty                                                   | git-enforced   | Blocked, naming the uncommitted changes                                                                         |
+| Delete branch                          | branch held by a worktree (including one whose directory is missing) | git-enforced   | Blocked, naming the worktree path; the missing-directory case says the worktree must be removed or pruned first |
+| Delete branch                          | branch is current or default                                         | mixed          | Blocked with the specific reason                                                                                |
+| Rename branch                          | branch held by another worktree                                      | **app-policy** | Blocked (§ 7.2)                                                                                                 |
+| Force-move / reset a branch            | branch held by another worktree                                      | git-enforced   | Blocked, naming the worktree path                                                                               |
+| Pull / fetch into a named local branch | destination held by another worktree                                 | git-enforced   | Blocked, naming the worktree path                                                                               |
+| Any mutation                           | another Git Manager operation holds the repository lock              | app-policy     | Blocked: `operation-in-flight`                                                                                  |
+| Any mutation                           | a merge, rebase or cherry-pick is in progress                        | app-policy     | Blocked, naming the pending operation; the resolve/abort path is exempt                                         |
 
 Guards are re-validated server-side under the repository lock immediately
 before execution, because a pre-computed guard can go stale. A stale client
@@ -383,25 +383,25 @@ count gate.
 
 Recorded so later readers know which choices were made deliberately and why.
 
-| # | Decision | Rationale |
-| --- | --- | --- |
-| 1 | Panel operates on a selectable checkout, defaulting to the main checkout | Agents work in worktrees, so the changes users want to review often live there; defaulting to the main checkout keeps the entry point predictable |
-| 2 | Pull requests and checks kept; sign-in and forks excluded | BiBCode's provider-CLI integration already delivers PRs without any in-app sign-in |
-| 3 | Ambient credentials only for network operations | The machines that own these repositories already push from them; a credential-prompt flow across a remote-server boundary is a separate security-sensitive design |
-| 4 | All destructive actions kept, each behind confirmation | Parity with the reference implementation; removing them would push users back to the CLI |
-| 5 | Live refresh plus plain git commit semantics | Better than the reference implementation, which does no watching; coordinating with agents would be complexity without a correctness gain |
-| 6 | Commit draft and view state persisted per project | A lost half-written commit message is the eviction cost users actually resent |
-| 7 | Button focuses an existing manager rather than opening a second | "One manager per project" stated as a constraint |
-| 8 | Vertical slices | Every phase leaves the application shippable and end-to-end testable |
-| 9 | Supersede the 2026-08-18 plan | Nothing was implemented, and its exclusions contradict this specification |
-| 10 | Project route, not a centre tab | "One per project, isolated to it" falls out for free; smaller change against the thread-keyed centre-panel store |
-| 11 | Cache view state, not mounted panels | Mounted hidden panels hold live subscriptions and diff-worker memory for no visible gain |
-| 12 | Coexist with the existing per-thread Source Control panel, sharing state | Two independent commit drafts for one checkout would be a defect source |
-| 13 | Physical project keying | Every action must run on the machine owning that checkout |
-| 14 | Full native stash list | Marker-scoped stashes would hide work done by agents and on the CLI |
-| 15 | Reuse the existing diff renderer, port the reference's limits | The worker-pool renderer is the performance-critical part and already exists and is tuned |
-| 16 | Local-only author identity | No third-party contact, no email leakage, works offline and on remote servers |
-| 17 | Occupied-branch checkout redirects rather than refuses | Both reference implementations converged on it independently |
-| 18 | Rename of a held branch blocked for now | Allowing it needs a transactional catalog update, a separate change |
-| 19 | Detect externally started operations | Agents run git constantly; tracking only our own operations would show a confidently wrong repository |
-| 20 | Zero telemetry, enforced by test | Stated as a mandatory constraint by the requester |
+| #   | Decision                                                                 | Rationale                                                                                                                                                         |
+| --- | ------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | Panel operates on a selectable checkout, defaulting to the main checkout | Agents work in worktrees, so the changes users want to review often live there; defaulting to the main checkout keeps the entry point predictable                 |
+| 2   | Pull requests and checks kept; sign-in and forks excluded                | BiBCode's provider-CLI integration already delivers PRs without any in-app sign-in                                                                                |
+| 3   | Ambient credentials only for network operations                          | The machines that own these repositories already push from them; a credential-prompt flow across a remote-server boundary is a separate security-sensitive design |
+| 4   | All destructive actions kept, each behind confirmation                   | Parity with the reference implementation; removing them would push users back to the CLI                                                                          |
+| 5   | Live refresh plus plain git commit semantics                             | Better than the reference implementation, which does no watching; coordinating with agents would be complexity without a correctness gain                         |
+| 6   | Commit draft and view state persisted per project                        | A lost half-written commit message is the eviction cost users actually resent                                                                                     |
+| 7   | Button focuses an existing manager rather than opening a second          | "One manager per project" stated as a constraint                                                                                                                  |
+| 8   | Vertical slices                                                          | Every phase leaves the application shippable and end-to-end testable                                                                                              |
+| 9   | Supersede the 2026-08-18 plan                                            | Nothing was implemented, and its exclusions contradict this specification                                                                                         |
+| 10  | Project route, not a centre tab                                          | "One per project, isolated to it" falls out for free; smaller change against the thread-keyed centre-panel store                                                  |
+| 11  | Cache view state, not mounted panels                                     | Mounted hidden panels hold live subscriptions and diff-worker memory for no visible gain                                                                          |
+| 12  | Coexist with the existing per-thread Source Control panel, sharing state | Two independent commit drafts for one checkout would be a defect source                                                                                           |
+| 13  | Physical project keying                                                  | Every action must run on the machine owning that checkout                                                                                                         |
+| 14  | Full native stash list                                                   | Marker-scoped stashes would hide work done by agents and on the CLI                                                                                               |
+| 15  | Reuse the existing diff renderer, port the reference's limits            | The worker-pool renderer is the performance-critical part and already exists and is tuned                                                                         |
+| 16  | Local-only author identity                                               | No third-party contact, no email leakage, works offline and on remote servers                                                                                     |
+| 17  | Occupied-branch checkout redirects rather than refuses                   | Both reference implementations converged on it independently                                                                                                      |
+| 18  | Rename of a held branch blocked for now                                  | Allowing it needs a transactional catalog update, a separate change                                                                                               |
+| 19  | Detect externally started operations                                     | Agents run git constantly; tracking only our own operations would show a confidently wrong repository                                                             |
+| 20  | Zero telemetry, enforced by test                                         | Stated as a mandatory constraint by the requester                                                                                                                 |

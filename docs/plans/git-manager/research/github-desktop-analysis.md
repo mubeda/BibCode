@@ -22,53 +22,53 @@ so §3 records the exact git commands and parse formats each feature needs.
 
 ### 1.1 Changes view (working directory)
 
-| Feature | Behavior contract | Key sources |
-|---|---|---|
-| File list | One row per changed path, tri-state checkbox (On/Off/Mixed per `DiffSelectionType All/Partial/None`), status octicon, 29px rows, virtualized, filterable | `app/src/ui/changes/filter-changes-list.tsx` (`RowHeight = 29` at :85; the old `changes-list.tsx` no longer exists), `app/src/ui/changes/changed-file.tsx` |
-| Include-all header | Tri-state checkbox mirroring `WorkingDirectoryStatus.includeAll`; when a filter is active it operates only on visible files; label "N of M changed files" | `filter-changes-list.tsx:1248-1281`, `app/src/models/status.ts:405-421` |
-| Selection semantics | Mouse click changes viewed file only; Space/Enter toggles inclusion; a Partial file toggles to excluded; double-click opens in external editor | `app/src/ui/changes/sidebar.tsx:301-336`, `filter-changes-list.tsx:1132-1134` |
-| File filter | Free text + five AND-combined boolean filters (included/excluded/new/modified/deleted); "hidden changes will be committed" warning + `ConfirmCommitFilteredChanges` popup; filters cleared after commit | `app/src/ui/changes/changes-list-filter-options.tsx`, `app/src/lib/app-state.ts` (`IFileListFilterState`), `filter-changes-list.tsx:1394-1422` |
-| File context menu | Discard (…), Ignore file / Ignore folder (ancestor submenu) / Ignore all `<ext>` (max 5 extensions), Include/Exclude selected, Copy (relative) path, Reveal, Open in editor / default program | `filter-changes-list.tsx:657-857` |
-| Partial staging | Per-line checkboxes on the gutter, drag-select ranges, per-hunk handles with All/Partial/None state; "hunk" = a run of consecutive added/deleted lines, not a `@@` hunk; disabled while committing or when whitespace is hidden | `app/src/ui/diff/side-by-side-diff.tsx` (drag :1246-1354, hunk click :1386-1402), `app/src/ui/diff/side-by-side-diff-row.tsx`, `app/src/ui/diff/diff-explorer.ts` |
-| DiffSelection model | Immutable: default type (All/None) + a `Set` of diverging unified-diff line indices + optional selectable-line set; `withLineSelection/withRangeSelection/withToggleLineSelection/withSelectAll/withSelectNone` | `app/src/models/diff/diff-selection.ts` (`export enum DiffSelectionType { All, Partial, None }` at :6) |
-| Commit box | Summary (required) + description; button "Commit N files to **branch**"; disabled without summary (except single-file placeholder auto-summary "Update foo.ts"); >50-char summary hint (`IdealSummaryLength = 50`, `app/src/lib/wrap-rich-text-commit-message.ts:11`); Cmd/Ctrl+Enter commits | `app/src/ui/changes/commit-message.tsx` (1854 lines; the real component — `ui/commit-message/commit-message-dialog.tsx` is just a dialog wrapper reused by squash/reword) |
-| Commit options | Bypass commit hooks (`--no-verify`), Signed-off-by (`--signoff`), Allow empty (`--allow-empty`); pre-commit gates: oversized-file (LFS) check, conflict-marker check | `commit-message.tsx:1082-1129`, `app/src/ui/changes/sidebar.tsx:159-221` |
-| Co-authors | Toggleable author input with autocomplete; emits `Co-Authored-By: Name <email>` trailers; unknown authors trigger a confirmation dialog. GitHub-gated in Desktop (`isCoAuthorInputEnabled`) — BibCode can keep the trailer UI without the GitHub autocomplete | `commit-message.tsx:577-615, 816`, `app/src/lib/git/interpret-trailers.ts` |
-| Amend | "Amend last commit" mode entered from history context menu; warns via `WarnForcePush` if the commit was pushed; inline notice with "Stop amending"; suppresses the Undo strip | `app/src/lib/stores/app-store.ts:5735-5770`, `commit-message.tsx:1251-1267` |
-| Undo commit | Inline strip under the sidebar for the most recent local commit ("Committed <time> — Undo"); hidden when commit has tags, while amending, or during rebase conflicts; disabled while pushing/committing; warning dialog when working dir dirty; merge commits always warn | `app/src/ui/changes/undo-commit.tsx`, `sidebar.tsx:338-386`, `app/src/ui/undo/warn-local-changes-before-undo.tsx`, `app-store.ts:5790-5828` |
-| Discard | Whole-file discard moves files to OS trash first (retry dialog offers permanent discard on trash failure); "Discard all"; partial discard of a right-clicked line/range; confirmation dialogs list up to `MaxFilesToList = 10` paths | `app/src/ui/discard-changes/` , `app/src/lib/stores/git-store.ts:1545-1620`, `app/src/lib/git/apply.ts:102-120` |
-| Stash | One logical stash per branch via message marker `!!GitHub_Desktop<branch>` (`app/src/lib/git/stash.ts:19`); "Stashed Changes" row under the list opens a read-only stash diff viewer with Restore/Discard; switch-branch prompt offers "leave changes" (stash) vs "bring changes"; overwrite-stash confirmation | `app/src/ui/stashing/`, `app/src/ui/stash-changes/stash-and-switch-branch-dialog.tsx`, `app/src/models/uncommitted-changes-strategy.ts` |
-| .gitignore | Context-menu ignore actions append to root `.gitignore`; repository-settings tab has a plain-textarea editor of the file | `app/src/lib/git/gitignore.ts`, `app/src/ui/repository-settings/git-ignore.tsx` |
-| Submodules | List rows show submodule state: uncommittable (dirty submodule, checkbox disabled) vs partially committable (forced Mixed); diff pane shows a "Submodule changes" interstitial (old/new SHA, inner-changes note) instead of a text diff | `filter-changes-list.tsx:429-470`, `app/src/ui/diff/submodule-diff.tsx`, `app/src/models/status.ts:113` |
-| Blank slates | "No local changes" pane with suggested actions (view stash → pull/push → PR); filter-miss blank slate with "Clear filters"; multi-selection pane "N files selected" | `app/src/ui/changes/no-changes.tsx`, `multiple-selection.tsx` |
+| Feature             | Behavior contract                                                                                                                                                                                                                                                                                               | Key sources                                                                                                                                                               |
+| ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| File list           | One row per changed path, tri-state checkbox (On/Off/Mixed per `DiffSelectionType All/Partial/None`), status octicon, 29px rows, virtualized, filterable                                                                                                                                                        | `app/src/ui/changes/filter-changes-list.tsx` (`RowHeight = 29` at :85; the old `changes-list.tsx` no longer exists), `app/src/ui/changes/changed-file.tsx`                |
+| Include-all header  | Tri-state checkbox mirroring `WorkingDirectoryStatus.includeAll`; when a filter is active it operates only on visible files; label "N of M changed files"                                                                                                                                                       | `filter-changes-list.tsx:1248-1281`, `app/src/models/status.ts:405-421`                                                                                                   |
+| Selection semantics | Mouse click changes viewed file only; Space/Enter toggles inclusion; a Partial file toggles to excluded; double-click opens in external editor                                                                                                                                                                  | `app/src/ui/changes/sidebar.tsx:301-336`, `filter-changes-list.tsx:1132-1134`                                                                                             |
+| File filter         | Free text + five AND-combined boolean filters (included/excluded/new/modified/deleted); "hidden changes will be committed" warning + `ConfirmCommitFilteredChanges` popup; filters cleared after commit                                                                                                         | `app/src/ui/changes/changes-list-filter-options.tsx`, `app/src/lib/app-state.ts` (`IFileListFilterState`), `filter-changes-list.tsx:1394-1422`                            |
+| File context menu   | Discard (…), Ignore file / Ignore folder (ancestor submenu) / Ignore all `<ext>` (max 5 extensions), Include/Exclude selected, Copy (relative) path, Reveal, Open in editor / default program                                                                                                                   | `filter-changes-list.tsx:657-857`                                                                                                                                         |
+| Partial staging     | Per-line checkboxes on the gutter, drag-select ranges, per-hunk handles with All/Partial/None state; "hunk" = a run of consecutive added/deleted lines, not a `@@` hunk; disabled while committing or when whitespace is hidden                                                                                 | `app/src/ui/diff/side-by-side-diff.tsx` (drag :1246-1354, hunk click :1386-1402), `app/src/ui/diff/side-by-side-diff-row.tsx`, `app/src/ui/diff/diff-explorer.ts`         |
+| DiffSelection model | Immutable: default type (All/None) + a `Set` of diverging unified-diff line indices + optional selectable-line set; `withLineSelection/withRangeSelection/withToggleLineSelection/withSelectAll/withSelectNone`                                                                                                 | `app/src/models/diff/diff-selection.ts` (`export enum DiffSelectionType { All, Partial, None }` at :6)                                                                    |
+| Commit box          | Summary (required) + description; button "Commit N files to **branch**"; disabled without summary (except single-file placeholder auto-summary "Update foo.ts"); >50-char summary hint (`IdealSummaryLength = 50`, `app/src/lib/wrap-rich-text-commit-message.ts:11`); Cmd/Ctrl+Enter commits                   | `app/src/ui/changes/commit-message.tsx` (1854 lines; the real component — `ui/commit-message/commit-message-dialog.tsx` is just a dialog wrapper reused by squash/reword) |
+| Commit options      | Bypass commit hooks (`--no-verify`), Signed-off-by (`--signoff`), Allow empty (`--allow-empty`); pre-commit gates: oversized-file (LFS) check, conflict-marker check                                                                                                                                            | `commit-message.tsx:1082-1129`, `app/src/ui/changes/sidebar.tsx:159-221`                                                                                                  |
+| Co-authors          | Toggleable author input with autocomplete; emits `Co-Authored-By: Name <email>` trailers; unknown authors trigger a confirmation dialog. GitHub-gated in Desktop (`isCoAuthorInputEnabled`) — BibCode can keep the trailer UI without the GitHub autocomplete                                                   | `commit-message.tsx:577-615, 816`, `app/src/lib/git/interpret-trailers.ts`                                                                                                |
+| Amend               | "Amend last commit" mode entered from history context menu; warns via `WarnForcePush` if the commit was pushed; inline notice with "Stop amending"; suppresses the Undo strip                                                                                                                                   | `app/src/lib/stores/app-store.ts:5735-5770`, `commit-message.tsx:1251-1267`                                                                                               |
+| Undo commit         | Inline strip under the sidebar for the most recent local commit ("Committed <time> — Undo"); hidden when commit has tags, while amending, or during rebase conflicts; disabled while pushing/committing; warning dialog when working dir dirty; merge commits always warn                                       | `app/src/ui/changes/undo-commit.tsx`, `sidebar.tsx:338-386`, `app/src/ui/undo/warn-local-changes-before-undo.tsx`, `app-store.ts:5790-5828`                               |
+| Discard             | Whole-file discard moves files to OS trash first (retry dialog offers permanent discard on trash failure); "Discard all"; partial discard of a right-clicked line/range; confirmation dialogs list up to `MaxFilesToList = 10` paths                                                                            | `app/src/ui/discard-changes/` , `app/src/lib/stores/git-store.ts:1545-1620`, `app/src/lib/git/apply.ts:102-120`                                                           |
+| Stash               | One logical stash per branch via message marker `!!GitHub_Desktop<branch>` (`app/src/lib/git/stash.ts:19`); "Stashed Changes" row under the list opens a read-only stash diff viewer with Restore/Discard; switch-branch prompt offers "leave changes" (stash) vs "bring changes"; overwrite-stash confirmation | `app/src/ui/stashing/`, `app/src/ui/stash-changes/stash-and-switch-branch-dialog.tsx`, `app/src/models/uncommitted-changes-strategy.ts`                                   |
+| .gitignore          | Context-menu ignore actions append to root `.gitignore`; repository-settings tab has a plain-textarea editor of the file                                                                                                                                                                                        | `app/src/lib/git/gitignore.ts`, `app/src/ui/repository-settings/git-ignore.tsx`                                                                                           |
+| Submodules          | List rows show submodule state: uncommittable (dirty submodule, checkbox disabled) vs partially committable (forced Mixed); diff pane shows a "Submodule changes" interstitial (old/new SHA, inner-changes note) instead of a text diff                                                                         | `filter-changes-list.tsx:429-470`, `app/src/ui/diff/submodule-diff.tsx`, `app/src/models/status.ts:113`                                                                   |
+| Blank slates        | "No local changes" pane with suggested actions (view stash → pull/push → PR); filter-miss blank slate with "Clear filters"; multi-selection pane "N files selected"                                                                                                                                             | `app/src/ui/changes/no-changes.tsx`, `multiple-selection.tsx`                                                                                                             |
 
 ### 1.2 History view
 
-| Feature | Behavior contract | Key sources |
-|---|---|---|
-| Commit list | 100 commits per batch (`CommitBatchSize = 100`, `app/src/lib/stores/git-store.ts:104`); infinite scroll triggers ≤10 rows from bottom (`CloseToBottomThreshold = 10`, `app/src/ui/history/compare.tsx:79`) with 500ms re-entrancy guard; 50px rows; multi-select; unpushed-commit ↑ indicator; first tag rendered as chip | `app/src/ui/history/commit-list.tsx`, `commit-list-item.tsx` |
-| Commit detail | Expandable summary (72-char wrap into body), avatar/author, short SHA + copy button, +/− line counts, tags; resizable changed-file list (29px rows); per-file diff (read-only); throttled file loading (200ms) | `app/src/ui/history/selected-commits.tsx`, `expandable-commit-summary.tsx`, `file-list.tsx` |
-| Commit context menu (single) | Amend (row 0), Undo (local, row 0), Reset to commit (rows within local history), Checkout commit (detached-HEAD warning dialog), Reorder, Revert, Create branch from commit, Create tag, Delete tag (unpushed only), Cherry-pick, Copy SHA / tags, View on GitHub | `commit-list.tsx:724-865` |
-| Commit context menu (multi) | Cherry-pick N / Squash N / Reorder N commits (contiguity computed; merge commits block squash/reorder) | `commit-list.tsx:926-952`, `compare.tsx:298-326` |
-| Non-contiguous selection | Diff suppressed; blank slate explains range selection and drag affordances | `selected-commits.tsx:340-369` |
-| Compare-to-branch | Filter box atop history swaps in a branch list; picking a branch shows tabs "Behind (N)" / "Ahead (N)"; Behind tab includes a merge call-to-action with a dropdown of exactly three actions: Create a merge commit / Squash and merge / Rebase, plus a mergeability preview (clean / N conflicted files / unrelated histories) | `app/src/ui/history/compare.tsx`, `compare-branch-list-item.tsx`, `merge-call-to-action-with-conflicts.tsx`, `app/src/ui/lib/update-branch.ts:10-31` |
-| Drag & drop | Single drag payload type (`DragType.Commit`); drop targets: branch row = cherry-pick, "New branch" pseudo-row = cherry-pick to new branch, another commit = squash, list insertion point = reorder, PR row = cherry-pick onto PR branch [GH]. Keyboard reorder mode (↑/↓ + Enter) exists. Drag manager is a singleton outside app state for perf | `app/src/models/drag-drop.ts`, `app/src/lib/drag-and-drop-manager.ts`, `app/src/ui/lib/draggable.tsx`, `app/src/ui/lib/list/list-item-insertion-overlay.tsx` |
+| Feature                      | Behavior contract                                                                                                                                                                                                                                                                                                                                | Key sources                                                                                                                                                  |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Commit list                  | 100 commits per batch (`CommitBatchSize = 100`, `app/src/lib/stores/git-store.ts:104`); infinite scroll triggers ≤10 rows from bottom (`CloseToBottomThreshold = 10`, `app/src/ui/history/compare.tsx:79`) with 500ms re-entrancy guard; 50px rows; multi-select; unpushed-commit ↑ indicator; first tag rendered as chip                        | `app/src/ui/history/commit-list.tsx`, `commit-list-item.tsx`                                                                                                 |
+| Commit detail                | Expandable summary (72-char wrap into body), avatar/author, short SHA + copy button, +/− line counts, tags; resizable changed-file list (29px rows); per-file diff (read-only); throttled file loading (200ms)                                                                                                                                   | `app/src/ui/history/selected-commits.tsx`, `expandable-commit-summary.tsx`, `file-list.tsx`                                                                  |
+| Commit context menu (single) | Amend (row 0), Undo (local, row 0), Reset to commit (rows within local history), Checkout commit (detached-HEAD warning dialog), Reorder, Revert, Create branch from commit, Create tag, Delete tag (unpushed only), Cherry-pick, Copy SHA / tags, View on GitHub                                                                                | `commit-list.tsx:724-865`                                                                                                                                    |
+| Commit context menu (multi)  | Cherry-pick N / Squash N / Reorder N commits (contiguity computed; merge commits block squash/reorder)                                                                                                                                                                                                                                           | `commit-list.tsx:926-952`, `compare.tsx:298-326`                                                                                                             |
+| Non-contiguous selection     | Diff suppressed; blank slate explains range selection and drag affordances                                                                                                                                                                                                                                                                       | `selected-commits.tsx:340-369`                                                                                                                               |
+| Compare-to-branch            | Filter box atop history swaps in a branch list; picking a branch shows tabs "Behind (N)" / "Ahead (N)"; Behind tab includes a merge call-to-action with a dropdown of exactly three actions: Create a merge commit / Squash and merge / Rebase, plus a mergeability preview (clean / N conflicted files / unrelated histories)                   | `app/src/ui/history/compare.tsx`, `compare-branch-list-item.tsx`, `merge-call-to-action-with-conflicts.tsx`, `app/src/ui/lib/update-branch.ts:10-31`         |
+| Drag & drop                  | Single drag payload type (`DragType.Commit`); drop targets: branch row = cherry-pick, "New branch" pseudo-row = cherry-pick to new branch, another commit = squash, list insertion point = reorder, PR row = cherry-pick onto PR branch [GH]. Keyboard reorder mode (↑/↓ + Enter) exists. Drag manager is a singleton outside app state for perf | `app/src/models/drag-drop.ts`, `app/src/lib/drag-and-drop-manager.ts`, `app/src/ui/lib/draggable.tsx`, `app/src/ui/lib/list/list-item-insertion-overlay.tsx` |
 
 ### 1.3 Branches & operations
 
-| Feature | Behavior contract | Key sources |
-|---|---|---|
-| Branch foldout | Filterable list grouped Default / Recent (max 5, from reflog; `RecentBranchesLimit = 5`, `git-store.ts:109`) / Other; 30px rows; current branch check-mark; per-row last-commit date; "New Branch" button; bottom "Choose a branch to merge into **current**" button; Branches/Pull-Requests tab bar only for GitHub repos | `app/src/ui/branches/branch-list.tsx`, `group-branches.ts`, `branches-container.tsx` |
-| Create branch | Name validated (duplicate check immediate, ref rules debounced 500ms); base choice via segmented control: default branch vs current branch (target-commit and detached/unborn variants); uncommitted changes handled at checkout time, not in this dialog | `app/src/ui/create-branch/create-branch-dialog.tsx` |
-| Switch branch w/ changes | Strategy enum `AskForConfirmation / StashOnCurrentBranch / MoveToNewBranch`; "Switch branch" dialog with two options ("Leave my changes" = stash, "Bring my changes"); overwrite-stash warning when a stash exists | `app/src/ui/stash-changes/stash-and-switch-branch-dialog.tsx`, `app-store.ts:4577-4643` |
-| Rename / delete | Rename dialog (local branches only; validates rules; warns about remote presence). Delete dialog warns "cannot be undone" + optional "Yes, delete this branch on the remote" checkbox when the branch exists upstream | `app/src/ui/rename-branch/`, `app/src/ui/delete-branch/delete-branch-dialog.tsx:218-242` |
-| Merge | "Choose a branch to merge into X" dialog with mergeability preview (via `merge-tree`), ahead/behind count, and the 3-way operation dropdown (merge / squash-merge / rebase) | `app/src/ui/multi-commit-operation/choose-branch/merge-choose-branch-dialog.tsx`, `base-choose-branch-dialog.tsx` (no `ui/merge/` directory exists) |
-| Rebase | Chooser previews "This will update X by applying its N commits on top of Y" / fast-forward variant; force-push warning dialog before history rewrites (`Rebase/Squash/Reorder/Amend`); Changes tab swaps commit box for a "Continue rebase" button disabled until conflicts resolved | `choose-branch/rebase-choose-branch-dialog.tsx`, `multi-commit-operation/dialog/warn-force-push-dialog.tsx`, `app/src/ui/changes/continue-rebase.tsx` |
-| Multi-commit framework | One state machine drives merge/rebase/cherry-pick/squash/reorder: steps `ChooseBranch, WarnForcePush, ShowProgress, ShowConflicts, HideConflicts, ConfirmAbort, CreateBranch` (+2 Copilot [FLAG]); progress dialog "Commit i of N"; conflicts dialog lists unmerged files with Open-in-editor / ours-theirs resolution; abort confirmation; success/undo banners | `app/src/models/multi-commit-operation.ts`, `app/src/ui/multi-commit-operation/` |
-| Conflict resolution | Marker conflicts show "N conflicts" (= ceil(markerCount/3)) and resolve to a green check at 0 markers; binary/manual conflicts get a "Resolve ▾" ours/theirs menu (strings passed literally to `git checkout --ours/--theirs`); resolved rows offer Undo; committing files with live markers raises a warning dialog | `app/src/ui/lib/conflicts/unmerged-file.tsx`, `app/src/models/manual-conflict-resolution.ts`, `app/src/ui/merge-conflicts/commit-conflicts-warning.tsx` |
-| Tags | Create-tag dialog (max name 245 chars, duplicate check); delete-tag confirmation (context menu allows deleting unpushed tags only); unpushed tags tracked per-repo in localStorage and pushed as extra refspecs with the next branch push; folded into the toolbar "ahead" count | `app/src/ui/create-tag/`, `app/src/ui/delete-tag/`, `app/src/lib/stores/helpers/tags-to-push-storage.ts` |
-| Banners | Success banners 5s (merge/rebase, undo-completed) or 15s with an Undo link (cherry-pick/squash/reorder); conflict banners are non-dismissable with a "View conflicts" link | `app/src/models/banner.ts`, `app/src/ui/banners/` |
-| Undo/redo of operations | Cherry-pick/squash/reorder banners carry `onUndo` which resets to the recorded pre-operation tip (`originalBranchTip` in `IMultiCommitOperationState`) | `app/src/lib/app-state.ts`, `app/src/ui/banners/success-banner.tsx` |
+| Feature                  | Behavior contract                                                                                                                                                                                                                                                                                                                                                | Key sources                                                                                                                                             |
+| ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Branch foldout           | Filterable list grouped Default / Recent (max 5, from reflog; `RecentBranchesLimit = 5`, `git-store.ts:109`) / Other; 30px rows; current branch check-mark; per-row last-commit date; "New Branch" button; bottom "Choose a branch to merge into **current**" button; Branches/Pull-Requests tab bar only for GitHub repos                                       | `app/src/ui/branches/branch-list.tsx`, `group-branches.ts`, `branches-container.tsx`                                                                    |
+| Create branch            | Name validated (duplicate check immediate, ref rules debounced 500ms); base choice via segmented control: default branch vs current branch (target-commit and detached/unborn variants); uncommitted changes handled at checkout time, not in this dialog                                                                                                        | `app/src/ui/create-branch/create-branch-dialog.tsx`                                                                                                     |
+| Switch branch w/ changes | Strategy enum `AskForConfirmation / StashOnCurrentBranch / MoveToNewBranch`; "Switch branch" dialog with two options ("Leave my changes" = stash, "Bring my changes"); overwrite-stash warning when a stash exists                                                                                                                                               | `app/src/ui/stash-changes/stash-and-switch-branch-dialog.tsx`, `app-store.ts:4577-4643`                                                                 |
+| Rename / delete          | Rename dialog (local branches only; validates rules; warns about remote presence). Delete dialog warns "cannot be undone" + optional "Yes, delete this branch on the remote" checkbox when the branch exists upstream                                                                                                                                            | `app/src/ui/rename-branch/`, `app/src/ui/delete-branch/delete-branch-dialog.tsx:218-242`                                                                |
+| Merge                    | "Choose a branch to merge into X" dialog with mergeability preview (via `merge-tree`), ahead/behind count, and the 3-way operation dropdown (merge / squash-merge / rebase)                                                                                                                                                                                      | `app/src/ui/multi-commit-operation/choose-branch/merge-choose-branch-dialog.tsx`, `base-choose-branch-dialog.tsx` (no `ui/merge/` directory exists)     |
+| Rebase                   | Chooser previews "This will update X by applying its N commits on top of Y" / fast-forward variant; force-push warning dialog before history rewrites (`Rebase/Squash/Reorder/Amend`); Changes tab swaps commit box for a "Continue rebase" button disabled until conflicts resolved                                                                             | `choose-branch/rebase-choose-branch-dialog.tsx`, `multi-commit-operation/dialog/warn-force-push-dialog.tsx`, `app/src/ui/changes/continue-rebase.tsx`   |
+| Multi-commit framework   | One state machine drives merge/rebase/cherry-pick/squash/reorder: steps `ChooseBranch, WarnForcePush, ShowProgress, ShowConflicts, HideConflicts, ConfirmAbort, CreateBranch` (+2 Copilot [FLAG]); progress dialog "Commit i of N"; conflicts dialog lists unmerged files with Open-in-editor / ours-theirs resolution; abort confirmation; success/undo banners | `app/src/models/multi-commit-operation.ts`, `app/src/ui/multi-commit-operation/`                                                                        |
+| Conflict resolution      | Marker conflicts show "N conflicts" (= ceil(markerCount/3)) and resolve to a green check at 0 markers; binary/manual conflicts get a "Resolve ▾" ours/theirs menu (strings passed literally to `git checkout --ours/--theirs`); resolved rows offer Undo; committing files with live markers raises a warning dialog                                             | `app/src/ui/lib/conflicts/unmerged-file.tsx`, `app/src/models/manual-conflict-resolution.ts`, `app/src/ui/merge-conflicts/commit-conflicts-warning.tsx` |
+| Tags                     | Create-tag dialog (max name 245 chars, duplicate check); delete-tag confirmation (context menu allows deleting unpushed tags only); unpushed tags tracked per-repo in localStorage and pushed as extra refspecs with the next branch push; folded into the toolbar "ahead" count                                                                                 | `app/src/ui/create-tag/`, `app/src/ui/delete-tag/`, `app/src/lib/stores/helpers/tags-to-push-storage.ts`                                                |
+| Banners                  | Success banners 5s (merge/rebase, undo-completed) or 15s with an Undo link (cherry-pick/squash/reorder); conflict banners are non-dismissable with a "View conflicts" link                                                                                                                                                                                       | `app/src/models/banner.ts`, `app/src/ui/banners/`                                                                                                       |
+| Undo/redo of operations  | Cherry-pick/squash/reorder banners carry `onUndo` which resets to the recorded pre-operation tip (`originalBranchTip` in `IMultiCommitOperationState`)                                                                                                                                                                                                           | `app/src/lib/app-state.ts`, `app/src/ui/banners/success-banner.tsx`                                                                                     |
 
 ### 1.4 Push / pull / fetch
 
@@ -120,7 +120,7 @@ popup stack (`app/src/ui/app.tsx:4027-4059, 3329-3342`). Repository view
 (`app/src/ui/repository.tsx:645-653`) is a flex row:
 
 - **Sidebar** (resizable, default 250px, min 220 — `app-store.ts:455-475,
-  2713-2726`): a `TabBar` with `Changes` (badge = changed-file count) and
+2713-2726`): a `TabBar` with `Changes` (badge = changed-file count) and
   `History` tabs, then either `ChangesSidebar` or `CompareSidebar`.
   Ctrl+Tab toggles tabs (`repository.tsx:687-715`); Cmd/Ctrl+1/2 select them
   via the menu (`app/src/main-process/menu/build-default-menu.ts:185-191`).
@@ -164,12 +164,12 @@ FocusTrap).
    7. force-push recommended → "Force push <remote>" (custom double-arrow icon),
    8. behind>0 → "Pull <remote>" (or "with rebase" per `pull.rebase`),
    9. else → "Push <remote>".
-   Ahead/behind counts render inside the button (tags-to-push added to ahead).
-   Dropdown items: Fetch always; Force push offered only in the pull state when
-   available, with an inline history-rewrite warning
-   (`push-pull-button.tsx:435-510, 619-623`, `push-pull-button-dropdown.tsx`).
-   A revert-in-progress replaces this button with a progress stub
-   (`app/src/ui/toolbar/revert-progress.tsx`).
+      Ahead/behind counts render inside the button (tags-to-push added to ahead).
+      Dropdown items: Fetch always; Force push offered only in the pull state when
+      available, with an inline history-rewrite warning
+      (`push-pull-button.tsx:435-510, 619-623`, `push-pull-button-dropdown.tsx`).
+      A revert-in-progress replaces this button with a progress stub
+      (`app/src/ui/toolbar/revert-progress.tsx`).
 
 ### 2.3 Foldouts, popups, banners
 
@@ -180,9 +180,9 @@ export enum FoldoutType {
   Repository,
   Branch,
   AppMenu,
-  AddMenu,   // vestigial — never shown in this tree
+  AddMenu, // vestigial — never shown in this tree
   PushPull,
-  Worktree,  // [FLAG]
+  Worktree, // [FLAG]
 }
 ```
 
@@ -282,7 +282,7 @@ skipped; an untracked entry replaces a staged-delete entry at the same path.
 
 ### 3.2 The no-visible-index staging model
 
-Desktop hides git's index entirely; the checkbox/line selection state *is* the
+Desktop hides git's index entirely; the checkbox/line selection state _is_ the
 staging model, applied at commit time:
 
 1. `createCommit` (`app/src/lib/git/commit.ts`): `git reset -- .` (unstageAll)
@@ -300,7 +300,7 @@ staging model, applied at commit time:
 4. Partial discard = reverse patch applied to the worktree:
    `git apply --unidiff-zero --whitespace=nowarn -`
    (`apply.ts discardChangesFromSelection`); full discard = trash + `git
-   checkout HEAD -- <paths>` (`app/src/lib/git/checkout.ts:210-219`).
+checkout HEAD -- <paths>` (`app/src/lib/git/checkout.ts:210-219`).
 
 Merge-conflict commit: `git commit --no-edit --cleanup=strip` after staging +
 manual resolutions (`commit.ts createMergeCommit`).
@@ -335,8 +335,8 @@ after "Show diff anyway"); `MaxCharactersPerLine = 5000` (any longer line →
 ### 3.5 History and branches
 
 - Commits: `git log [range] --date=raw [--max-count=N] [--skip=N] -z
-  --format=<delimited: %H %h %s %b "%an <%ae> %ad" "%cn <%ce> %cd" %P
-  %(trailers:unfold,only) %D> --no-show-signature --no-color --`
+--format=<delimited: %H %h %s %b "%an <%ae> %ad" "%cn <%ce> %cd" %P
+%(trailers:unfold,only) %D> --no-show-signature --no-color --`
   (`log.ts:120-205`), NUL-delimited custom parser
   (`app/src/lib/git/git-delimiter-parser.ts`); tags from `%D`; summary/body
   capped at 100KB; exit 128 tolerated (unborn HEAD ⇒ empty history).
@@ -368,12 +368,12 @@ after "Show diff anyway"); `MaxCharactersPerLine = 5000` (any longer line →
   (`fetch.ts:39-89`); progress parsers for fetch/pull/push/checkout live in
   `app/src/lib/progress/` and read `--progress` stderr.
 - Pull: `-c rebase.backend=merge git pull [--ff if pull.ff unset]
-  --recurse-submodules [--progress] [--no-verify] <remote>` (`pull.ts:29-130`).
+--recurse-submodules [--progress] [--no-verify] <remote>` (`pull.ts:29-130`).
 - Push: `git push <remote> <local>[:<remoteBranch>] [tag refspecs…]
-  [--set-upstream when no upstream] [--force-with-lease] [--no-verify]
-  [--progress]` (`push.ts:48-119`). Never bare `--force`.
+[--set-upstream when no upstream] [--force-with-lease] [--no-verify]
+[--progress]` (`push.ts:48-119`). Never bare `--force`.
 - Unpushed-tag detection: `git push <remote> <branch> --follow-tags --dry-run
-  --no-verify --porcelain` parsed (`app/src/lib/git/tag.ts:86-131`).
+--no-verify --porcelain` parsed (`app/src/lib/git/tag.ts:86-131`).
 - Default remote = `origin` else first remote
   (`app/src/lib/stores/helpers/find-default-remote.ts`); current remote =
   the tip branch's upstream remote else default. Default branch resolved from
@@ -386,7 +386,7 @@ after "Show diff anyway"); `MaxCharactersPerLine = 5000` (any longer line →
   AlreadyUpToDate (stdout == `Already up to date.\n`) / Failed; squash then
   `git commit --no-edit` (`merge.ts:30-93`).
 - Mergeability preview: `git merge-tree --write-tree --name-only --no-messages
-  -z <oursTip> <theirsTip>` (exit 0/1); conflicted count = NUL count − 1;
+-z <oursTip> <theirsTip>` (exit 0/1); conflicted count = NUL count − 1;
   unrelated histories ⇒ Invalid (`app/src/lib/git/merge-tree.ts`).
 - Rebase: `-c rebase.backend=merge git rebase <base> <target>`; progress from
   stderr lines `Rebasing (n/m)` (`rebase.ts:279-316`); continue = stage files +
@@ -397,7 +397,7 @@ after "Show diff anyway"); `MaxCharactersPerLine = 5000` (any longer line →
   OutstandingFilesNotStaged (`rebase.ts:410-428`).
 - Interactive rebase (squash/reorder/amend-older): write a todo file, run
   `git -c sequence.editor=cat "<todo>" > rebase [--no-verify] -i
-  <lastRetainedCommitRef | --root>` with `GIT_EDITOR=:`
+<lastRetainedCommitRef | --root>` with `GIT_EDITOR=:`
   (`rebase.ts:570-627`). Squash todo built by replaying log order with
   pick/squash lines and the message injected via `GIT_EDITOR=cat "<msg>" >`
   (`app/src/lib/git/squash.ts`); reorder todo likewise
@@ -439,7 +439,7 @@ branch: `git commit-tree` + `git stash store` + drop old (:95-118).
 - Gitignore: read/write the root `.gitignore` directly (line endings per
   `core.autocrlf`), append escaped patterns (`gitignore.ts`).
 - Co-author trailers: `git interpret-trailers --parse` / `--trailer
-  Co-Authored-By=…` (`app/src/lib/git/interpret-trailers.ts`).
+Co-Authored-By=…` (`app/src/lib/git/interpret-trailers.ts`).
 
 ---
 
@@ -478,19 +478,19 @@ tailer, `app/src/lib/tailer.ts`). Freshness comes from three sources:
 3. **Timers** (all skewed by ≤30s to avoid thundering herds, all
    elapsed-time-aware):
 
-| What | Interval | Source |
-|---|---|---|
-| Selected-repo background fetch | server poll-interval, default 60 min, floor 5 min | `app/src/lib/stores/helpers/background-fetcher.ts:7-23` |
-| Global fetch throttle (vs `FETCH_HEAD` mtime — survives restarts) | 30 min | `app-store.ts:528-531, 2351-2386` |
-| All-repos sidebar indicator sweep (skips selected repo; pausable mid-sweep) | 15 min, first run +2 min | `helpers/repository-indicator-updater.ts:3-14`, `app-store.ts:533-536` |
-| PR list poll [GH] | 30 min, floor 2 min | `helpers/pull-request-updater.ts:5-12` |
-| CI status poll [GH] | 3 min, 6 concurrent, 60s cache floor | `commit-status-store.ts:107-125` |
-| Branch prune (merged, >14 days stale, protected names skipped) | timer 4h, gate 24h | `helpers/branch-pruner.ts:22-35,85-88,148-188` |
+| What                                                                        | Interval                                          | Source                                                                 |
+| --------------------------------------------------------------------------- | ------------------------------------------------- | ---------------------------------------------------------------------- |
+| Selected-repo background fetch                                              | server poll-interval, default 60 min, floor 5 min | `app/src/lib/stores/helpers/background-fetcher.ts:7-23`                |
+| Global fetch throttle (vs `FETCH_HEAD` mtime — survives restarts)           | 30 min                                            | `app-store.ts:528-531, 2351-2386`                                      |
+| All-repos sidebar indicator sweep (skips selected repo; pausable mid-sweep) | 15 min, first run +2 min                          | `helpers/repository-indicator-updater.ts:3-14`, `app-store.ts:533-536` |
+| PR list poll [GH]                                                           | 30 min, floor 2 min                               | `helpers/pull-request-updater.ts:5-12`                                 |
+| CI status poll [GH]                                                         | 3 min, 6 concurrent, 60s cache floor              | `commit-status-store.ts:107-125`                                       |
+| Branch prune (merged, >14 days stale, protected names skipped)              | timer 4h, gate 24h                                | `helpers/branch-pruner.ts:22-35,85-88,148-188`                         |
 
 **BibCode note:** BibCode already has workspace change detection
 (`docs/plans/2026-08-18-workspace-change-detection-design.md`) and a Rust
 server that can watch the filesystem; Desktop's focus+timer model is the
-*fallback contract* (what must stay correct without watching), and its
+_fallback contract_ (what must stay correct without watching), and its
 post-action refresh sequencing is directly reusable.
 
 ### 4.3 Concurrency and locking
@@ -533,7 +533,7 @@ gating in `app/src/lib/endpoint-capabilities.ts`. Entangled features:
 - **Pull requests**: PR list tab in the branch foldout, PR badge + quick view,
   notifications, checks (`app/src/lib/stores/pull-request-store.ts`,
   `app/src/ui/branches/pull-request-*`, `app/src/ui/open-pull-request/`).
-  Note: the "Preview Pull Request" diff itself is *local git*
+  Note: the "Preview Pull Request" diff itself is _local git_
   (merge-base compare, `app-store.ts:9861-9905`) — only the final "Create"
   button is a github.com URL. A provider-agnostic "compare branches" view can
   keep the local part.
@@ -579,7 +579,7 @@ pure git and survives (§3.6).
    server should expose them as typed RPCs mirroring Desktop's operation
    results (e.g. rebase result enum, merge result enum, progress events
    parsed from `--progress` stderr / `Rebasing (n/m)` / cherry-pick stdout),
-   plus the `.git` state probes (MERGE_HEAD, rebase-merge/*, sequencer/*,
+   plus the `.git` state probes (MERGE_HEAD, `rebase-merge/*`, `sequencer/*`,
    CHERRY_PICK_HEAD, SQUASH_MSG) that make externally-started operations
    resumable in the UI.
 3. **Contract-critical invariants**: hidden index rebuilt per commit

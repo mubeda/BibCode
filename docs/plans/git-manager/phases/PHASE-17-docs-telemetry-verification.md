@@ -55,8 +55,8 @@ Invoke these skills via the `Skill` tool BEFORE doing any work. Order matters: a
 
 **Matched for this phase:**
 
-5. `Skill(skill="superpowers:requesting-code-review")` — *this closes the slice; the whole feature needs a review pass*
-6. `Skill(skill="code-review")` — *the final `git diff` sweep across sixteen phases of accumulated change*
+5. `Skill(skill="superpowers:requesting-code-review")` — _this closes the slice; the whole feature needs a review pass_
+6. `Skill(skill="code-review")` — _the final `git diff` sweep across sixteen phases of accumulated change_
 
 ## Documents to Read
 
@@ -92,79 +92,79 @@ Invoke these skills via the `Skill` tool BEFORE doing any work. Order matters: a
 
 - [ ] **Step 17.7: Author the first failing telemetry test — the static contract.**
 
-	Path: `scripts/privacy-contract.test.ts`, inside the existing `describe("zero-telemetry privacy contract", …)` block.
+  Path: `scripts/privacy-contract.test.ts`, inside the existing `describe("zero-telemetry privacy contract", …)` block.
 
-	Add `it("adds no dependency for the Git Manager", …)` asserting that the dependency **name** lists of `apps/web/package.json` (`dependencies` + `devDependencies`) and of `apps/server/Cargo.toml` (`[dependencies]` keys) match an inline expected array. This makes any future addition a visible, deliberate test edit rather than a silent drift — which is exactly what spec constraint 6 and § 9's last bullet require. Write the expected arrays deliberately wrong first so the test fails.
+  Add `it("adds no dependency for the Git Manager", …)` asserting that the dependency **name** lists of `apps/web/package.json` (`dependencies` + `devDependencies`) and of `apps/server/Cargo.toml` (`[dependencies]` keys) match an inline expected array. This makes any future addition a visible, deliberate test edit rather than a silent drift — which is exactly what spec constraint 6 and § 9's last bullet require. Write the expected arrays deliberately wrong first so the test fails.
 
 - [ ] **Step 17.8: Run it; expect FAIL, then correct the expected arrays and re-run to PASS.**
 
-	```bash
-	vp test run scripts/privacy-contract.test.ts
-	```
+  ```bash
+  vp test run scripts/privacy-contract.test.ts
+  ```
 
 - [ ] **Step 17.9: Add the static host-scan case, red first.**
 
-	In the same describe block, add `it("contacts no third-party host from Git Manager code", …)`: scan every file under `apps/web/src/components/gitManager`, `apps/web/src/gitManagerStore.ts`, `packages/client-runtime/src/state/gitManager.ts`, `apps/server/src/git/manager` and `apps/server/src/source_control/checks.rs` and assert none contains an absolute `http://` or `https://` URL literal, `sendBeacon`, `navigator.connection`, `gravatar`, `avatars.githubusercontent.com`, or an `import` of a network client. Reuse the file's existing `sourceFiles` walker and the `telemetryViolations` shape rather than writing a second walker. Prove red by temporarily adding a URL literal to one of those files, then remove it.
+  In the same describe block, add `it("contacts no third-party host from Git Manager code", …)`: scan every file under `apps/web/src/components/gitManager`, `apps/web/src/gitManagerStore.ts`, `packages/client-runtime/src/state/gitManager.ts`, `apps/server/src/git/manager` and `apps/server/src/source_control/checks.rs` and assert none contains an absolute `http://` or `https://` URL literal, `sendBeacon`, `navigator.connection`, `gravatar`, `avatars.githubusercontent.com`, or an `import` of a network client. Reuse the file's existing `sourceFiles` walker and the `telemetryViolations` shape rather than writing a second walker. Prove red by temporarily adding a URL literal to one of those files, then remove it.
 
 - [ ] **Step 17.10: Add the web runtime test, red first.**
 
-	Path: `apps/web/src/components/gitManager/gitManagerTelemetry.test.tsx`, with `// @vitest-environment happy-dom` as line 1.
+  Path: `apps/web/src/components/gitManager/gitManagerTelemetry.test.tsx`, with `// @vitest-environment happy-dom` as line 1.
 
-	**Build the harness in-file:** `msw` 2.15.0 is a devDependency of `apps/web` but is used by no test today and there is no global setup file, so nothing exists to extend. Use `setupServer` from `msw/node` with `onUnhandledRequest: "error"` in `beforeAll`, `server.resetHandlers()` in `afterEach`, `server.close()` in `afterAll`, and register **zero** handlers — any request at all is therefore a failure. Additionally `vi.stubGlobal("fetch", …)` with a function that throws, and stub `Image`, `WebSocket` and `XMLHttpRequest` the same way, so a request made outside msw's interception still fails loudly.
+  **Build the harness in-file:** `msw` 2.15.0 is a devDependency of `apps/web` but is used by no test today and there is no global setup file, so nothing exists to extend. Use `setupServer` from `msw/node` with `onUnhandledRequest: "error"` in `beforeAll`, `server.resetHandlers()` in `afterEach`, `server.close()` in `afterAll`, and register **zero** handlers — any request at all is therefore a failure. Additionally `vi.stubGlobal("fetch", …)` with a function that throws, and stub `Image`, `WebSocket` and `XMLHttpRequest` the same way, so a request made outside msw's interception still fails loudly.
 
-	Then assert, in order:
-	1. Rendering the Git Manager panel with the environment atoms stubbed issues no request and constructs no `Image`.
-	2. `vi.useFakeTimers()` plus `await vi.advanceTimersByTimeAsync(60 * 60 * 1000)` issues no provider request and no third-party request — this is the "no background timer issues provider calls" clause of spec § 9 made executable.
-	3. Pressing Refresh on `GitManagerPullRequestPanel` dispatches exactly one provider command through the environment-scoped atom, and no direct network call.
-	4. Every rendered author identity is local — an identicon or initials derived from the commit email — and no `img` has an `http`/`https` `src`.
+  Then assert, in order:
+  1.  Rendering the Git Manager panel with the environment atoms stubbed issues no request and constructs no `Image`.
+  2.  `vi.useFakeTimers()` plus `await vi.advanceTimersByTimeAsync(60 * 60 * 1000)` issues no provider request and no third-party request — this is the "no background timer issues provider calls" clause of spec § 9 made executable.
+  3.  Pressing Refresh on `GitManagerPullRequestPanel` dispatches exactly one provider command through the environment-scoped atom, and no direct network call.
+  4.  Every rendered author identity is local — an identicon or initials derived from the commit email — and no `img` has an `http`/`https` `src`.
 
-	Prove red by temporarily adding a `useEffect(() => { void fetch("https://example.invalid"); }, [])` to the panel, then remove it.
+  Prove red by temporarily adding a `useEffect(() => { void fetch("https://example.invalid"); }, [])` to the panel, then remove it.
 
 - [ ] **Step 17.11: Add the Rust runtime test, red first.**
 
-	Path: `apps/server/src/git/manager/mod.rs`, inline `#[cfg(test)] mod telemetry`.
+  Path: `apps/server/src/git/manager/mod.rs`, inline `#[cfg(test)] mod telemetry`.
 
-	It must be **inline**, not an integration test in `apps/server/tests/`: the injection seam `GitProcessRunner` is `pub(crate)` (`apps/server/src/git/repository.rs`, indicative :60) and is not reachable from an integration target. Use `GitRepository::with_runner_for_test(Arc<dyn GitProcessRunner>)` (indicative :260) with a recording runner in the style of `RecordingGitRunner` (indicative :5035) that captures every `ProcessRequest`. Then assert:
-	1. Driving each Git Manager read and each operation records only requests whose `command` is `git`.
-	2. Every recorded request carries the non-interactive environment — `GIT_TERMINAL_PROMPT=0`, empty `GIT_ASKPASS`, `SSH_ASKPASS_REQUIRE=never`, `GIT_CONFIG_NOSYSTEM=1` — and every read additionally carries `GIT_OPTIONAL_LOCKS=0`.
-	3. Constructing the services and then letting the runtime idle records **zero** requests: no Git Manager code path starts a timer. Scope this assertion to the Git Manager surface and state in a comment that `apps/server/src/git/summary.rs`'s 30-second subscriber-scoped cycle (`SUMMARY_FRESHNESS`, indicative :20) and `apps/server/src/git/fetch_owner.rs`'s automatic fetch predate this feature, are git-only or provider-on-subscription, and are deliberately out of scope.
-	4. The only non-`git` process the feature can spawn is the provider CLI, and only from inside the explicit pull-request/checks handler — assert it by driving that handler and nothing else.
+  It must be **inline**, not an integration test in `apps/server/tests/`: the injection seam `GitProcessRunner` is `pub(crate)` (`apps/server/src/git/repository.rs`, indicative :60) and is not reachable from an integration target. Use `GitRepository::with_runner_for_test(Arc<dyn GitProcessRunner>)` (indicative :260) with a recording runner in the style of `RecordingGitRunner` (indicative :5035) that captures every `ProcessRequest`. Then assert:
+  1.  Driving each Git Manager read and each operation records only requests whose `command` is `git`.
+  2.  Every recorded request carries the non-interactive environment — `GIT_TERMINAL_PROMPT=0`, empty `GIT_ASKPASS`, `SSH_ASKPASS_REQUIRE=never`, `GIT_CONFIG_NOSYSTEM=1` — and every read additionally carries `GIT_OPTIONAL_LOCKS=0`.
+  3.  Constructing the services and then letting the runtime idle records **zero** requests: no Git Manager code path starts a timer. Scope this assertion to the Git Manager surface and state in a comment that `apps/server/src/git/summary.rs`'s 30-second subscriber-scoped cycle (`SUMMARY_FRESHNESS`, indicative :20) and `apps/server/src/git/fetch_owner.rs`'s automatic fetch predate this feature, are git-only or provider-on-subscription, and are deliberately out of scope.
+  4.  The only non-`git` process the feature can spawn is the provider CLI, and only from inside the explicit pull-request/checks handler — assert it by driving that handler and nothing else.
 
-	Prove red by temporarily changing one Git Manager command to spawn a different program, then restore it.
+  Prove red by temporarily changing one Git Manager command to spawn a different program, then restore it.
 
 - [ ] **Step 17.12: Add the Rust source-text tripwire, red first.**
 
-	In `apps/server/tests/git_rpc.rs`, add a test in the style of the existing `production_vcs_observation_has_no_periodic_ref_worker` (indicative :36): `include_str!` the Git Manager modules and `apps/server/src/source_control/checks.rs`, truncate each at its `\nmod tests {` boundary, and assert the production halves contain none of `"interval("`, `"sleep_until"`, `"tokio::spawn"` paired with a loop, `"https://"`, or `"reqwest"`. This catches a reintroduced poller in review even when the runtime test is skipped.
+  In `apps/server/tests/git_rpc.rs`, add a test in the style of the existing `production_vcs_observation_has_no_periodic_ref_worker` (indicative :36): `include_str!` the Git Manager modules and `apps/server/src/source_control/checks.rs`, truncate each at its `\nmod tests {` boundary, and assert the production halves contain none of `"interval("`, `"sleep_until"`, `"tokio::spawn"` paired with a loop, `"https://"`, or `"reqwest"`. This catches a reintroduced poller in review even when the runtime test is skipped.
 
 - [ ] **Step 17.13: Run every gate.**
 
-	```bash
-	vp run check:contracts
-	vp check
-	vp run typecheck
-	vp test run scripts/privacy-contract.test.ts apps/web/src/components/gitManager
-	vp run test
-	cargo fmt --all --check
-	cargo test -p bibcode-server
-	cargo clippy -p bibcode-server --all-targets -- -D warnings
-	```
+  ```bash
+  vp run check:contracts
+  vp check
+  vp run typecheck
+  vp test run scripts/privacy-contract.test.ts apps/web/src/components/gitManager
+  vp run test
+  cargo fmt --all --check
+  cargo test -p bibcode-server
+  cargo clippy -p bibcode-server --all-targets -- -D warnings
+  ```
 
-	Static lint evidence must be freshly derived rather than replayed from the Cargo cache, per `docs/testing/README.md`:
+  Static lint evidence must be freshly derived rather than replayed from the Cargo cache, per `docs/testing/README.md`:
 
-	```bash
-	cargo clean -p bibcode-server -p bibcode-desktop -p bibcode-updater-verifier
-	cargo clippy --workspace --all-targets -- -D warnings
-	```
+  ```bash
+  cargo clean -p bibcode-server -p bibcode-desktop -p bibcode-updater-verifier
+  cargo clippy --workspace --all-targets -- -D warnings
+  ```
 
-	Record every command that could not run and why.
+  Record every command that could not run and why.
 
 - [ ] **Step 17.14: End-to-end verification against a LOCAL project.**
 
-	`vp run dev`, open a local project's Git Manager, and exercise one read, one mutation and one provider action on every surface: the changes list and a per-file diff; staging a partial line selection and committing; creating, checking out, renaming and deleting a branch; fetch, pull and push; stash apply and drop; a merge with a mergeability preview; a rebase that conflicts, resolved with theirs and continued; a cherry-pick by drag; a revert; a reset behind its confirmation; a tag created and pushed; an image diff in all four modes; and the pull-request pane refreshed once by hand. Confirm the occupied-branch redirect switches the panel to the owning worktree and says why. Record the evidence in a report created from `docs/testing/execution-report-template.md`.
+  `vp run dev`, open a local project's Git Manager, and exercise one read, one mutation and one provider action on every surface: the changes list and a per-file diff; staging a partial line selection and committing; creating, checking out, renaming and deleting a branch; fetch, pull and push; stash apply and drop; a merge with a mergeability preview; a rebase that conflicts, resolved with theirs and continued; a cherry-pick by drag; a revert; a reset behind its confirmation; a tag created and pushed; an image diff in all four modes; and the pull-request pane refreshed once by hand. Confirm the occupied-branch redirect switches the panel to the owning worktree and says why. Record the evidence in a report created from `docs/testing/execution-report-template.md`.
 
 - [ ] **Step 17.15: End-to-end verification against a REMOTE-HOSTED project.**
 
-	Attach a remote environment per `docs/user/remote-access.md` and repeat Step 17.14 against a project owned by it. Additionally verify: the panel never resolves a path client-side and treats `workspaceRoot` as opaque; disconnecting the environment renders the explicit unavailable state naming the reason and does **not** re-dial it; reconnecting re-attaches the status and operation subscriptions transparently; and a server that lacks a capability degrades that one surface rather than erroring the panel. This is the feature's main environmental risk (`git-manager-plan.md` § Risks) and both runs are required.
+  Attach a remote environment per `docs/user/remote-access.md` and repeat Step 17.14 against a project owned by it. Additionally verify: the panel never resolves a path client-side and treats `workspaceRoot` as opaque; disconnecting the environment renders the explicit unavailable state naming the reason and does **not** re-dial it; reconnecting re-attaches the status and operation subscriptions transparently; and a server that lacks a capability degrades that one surface rather than erroring the panel. This is the feature's main environmental risk (`git-manager-plan.md` § Risks) and both runs are required.
 
 - [ ] **Step 17.16: Final review sweep.** Run `git diff` and `git status --short` across the whole feature and check for unintended edits, generated files, debug output, dependency drift, `.codegraph/` data, and any living document left behind. Invoke `superpowers:requesting-code-review` for the accumulated change.
 
@@ -195,7 +195,7 @@ Invoke these skills via the `Skill` tool BEFORE doing any work. Order matters: a
 - **Divergences found while writing this phase, which its steps already account for:**
   1. `scripts/privacy-contract.test.ts` **already exists** and already owns a `describe("zero-telemetry privacy contract")` block with a forbidden-marker source scan, a dedicated-telemetry-module absence check, and third-party-telemetry-off assertions. The Git Manager cases extend it; they do not create a new contract file.
   2. `msw` 2.15.0 is a devDependency of `apps/web` but **no test uses it**, `apps/web/public/mockServiceWorker.js` is a leftover artifact, and there is **no global test setup file** anywhere in the repository. The web telemetry harness must therefore be built in-file.
-  3. No test in this repository asserts the *absence* of network calls today. `onUnhandledRequest` appears nowhere; `vi.stubGlobal("fetch", …)` is used only to return canned responses. This phase introduces the pattern.
+  3. No test in this repository asserts the _absence_ of network calls today. `onUnhandledRequest` appears nowhere; `vi.stubGlobal("fetch", …)` is used only to return canned responses. This phase introduces the pattern.
   4. The `GitProcessRunner` injection seam is `pub(crate)`, so the Rust runtime telemetry test must be an inline `#[cfg(test)]` unit test, not an integration test under `apps/server/tests/`.
   5. `apps/server/src/maintenance.rs` has no read-only allowlist constant; mutability is derived from `ACTIVE_RPC_METHODS` in `apps/server/src/rpc/methods.rs` and an unlisted method fails safe as a mutation.
   6. Two pre-existing periodic workers must be named and excluded by scope in the telemetry test rather than being flagged: `apps/server/src/git/summary.rs`'s 30-second subscriber-scoped provider enrichment and `apps/server/src/git/fetch_owner.rs`'s automatic git fetch. Neither belongs to this feature.

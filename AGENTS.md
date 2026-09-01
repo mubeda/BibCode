@@ -155,6 +155,7 @@ No task is complete until all applicable requirements have evidence:
    correctly — render behaviour, hook rules, wasted work. `UI.md` asks whether
    the thing built is the right thing for the person using it. A panel can be
    flawlessly memoised and still ask a question the user cannot answer.
+
 7. Final `git diff` and `git status --short` review for unintended edits,
    generated files, debug output, dependency drift, and missing documentation.
 8. A synced configured vendored subtree when its matching dependency changes.

@@ -44,21 +44,27 @@ _(2–4 numbered bullets in plain English. Reference the spec's § 1 Outcome. Ca
 _(Quick summary by layer. The full map lives in each phase file's "Files" section.)_
 
 **Contracts (`packages/contracts`):**
+
 - _(to be filled — file paths)_
 
 **Server (`apps/server`):**
+
 - _(to be filled)_
 
 **Client runtime (`packages/client-runtime`):**
+
 - _(to be filled)_
 
 **Web (`apps/web`):**
+
 - _(to be filled)_
 
 **Documentation (`docs/`):**
+
 - _(to be filled)_
 
 **Tests:**
+
 - _(to be filled — list each new test file and the test count)_
 
 Total: _(N)_ new tests. Build status: _(0 warnings / 0 errors, or report deviations)_.
@@ -115,6 +121,7 @@ _(Numbered list. For each: what the spec or plan assumed, what the code does, an
 Run `/code-review` against the branch. Focus areas specific to this feature:
 
 **Constraint compliance (check first — these are the reasons the feature is shaped this way):**
+
 1. No code path can add, create, clone, publish, remove or delete a repository.
 2. No outbound request to any host other than a configured git remote or the
    configured provider CLI; no background provider polling; no new dependency.
@@ -125,6 +132,7 @@ Run `/code-review` against the branch. Focus areas specific to this feature:
 5. Only the worktree catalog's existing repository lock is used.
 
 **Rust:**
+
 - Every git invocation goes through the supervised process path with a timeout,
   output cap and cancellation token, and the non-interactive git environment.
 - Every mutation passes through the status broadcaster's mutation fence.
@@ -133,6 +141,7 @@ Run `/code-review` against the branch. Focus areas specific to this feature:
 - Error classification is used for reporting only, never for guard decisions.
 
 **React:**
+
 - Hook rules, stale closures, unstable references in virtualised lists.
 - Re-render behaviour under a live status stream — this panel updates
   continuously while agents write, so a re-render storm is a real risk.
@@ -145,6 +154,7 @@ Run `/code-review` against the branch. Focus areas specific to this feature:
   rather than duplicated.
 
 **Contracts:**
+
 - Every new method registered in all required places with exactly one scope;
   read-only methods do not require a write scope.
 - Capability flags default to false.

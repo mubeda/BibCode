@@ -43,7 +43,7 @@ Invoke these skills via the `Skill` tool BEFORE doing any work. Order matters: a
 
 **Matched for this phase:**
 
-5. `Skill(skill="codebase-design")` — *the guard function is the feature's deepest single-purpose interface*
+5. `Skill(skill="codebase-design")` — _the guard function is the feature's deepest single-purpose interface_
 
 ## Documents to Read
 
@@ -66,42 +66,42 @@ If a file does not exist, report it back in the per-phase notes section of `task
 
 - [ ] **Step 02.1: Locate the surface area being changed.** Line numbers are indicative; re-verify.
 
-	```bash
-	rg -n 'GitManagerBlockedCode|GitManagerBlockedReason' packages/contracts/src/gitManager.ts
-	rg -n 'pub struct WorktreeDescriptor' -A20 apps/server/src/worktree_catalog/model.rs
-	cat apps/server/src/git/manager/guards.rs
-	```
+  ```bash
+  rg -n 'GitManagerBlockedCode|GitManagerBlockedReason' packages/contracts/src/gitManager.ts
+  rg -n 'pub struct WorktreeDescriptor' -A20 apps/server/src/worktree_catalog/model.rs
+  cat apps/server/src/git/manager/guards.rs
+  ```
 
-	Confirm the nine codes PHASE-00 declared: `worktree-checked-out`, `dirty-working-tree`, `operation-in-flight`, `merge-in-progress`, `current-branch`, `default-branch`, `no-upstream`, `detached-head`, `no-remote`. If the working tree disagrees with this list, the working tree wins — record the deviation in `tasks.md`.
+  Confirm the nine codes PHASE-00 declared: `worktree-checked-out`, `dirty-working-tree`, `operation-in-flight`, `merge-in-progress`, `current-branch`, `default-branch`, `no-upstream`, `detached-head`, `no-remote`. If the working tree disagrees with this list, the working tree wins — record the deviation in `tasks.md`.
 
 - [ ] **Step 02.2: Author the first failing test.** Path: `apps/server/src/git/manager/guards.rs` (inline `#[cfg(test)]`)
 
-	```rust
-	#[test]
-	fn checkout_of_a_branch_held_by_another_worktree_is_blocked() {
-	    let input = GuardInput {
-	        refs: vec![branch("feature", Occupancy::Worktree("/repo/wt-feature"))],
-	        dirty: false,
-	        default_branch: Some("main".into()),
-	        current_branch: Some("main".into()),
-	        in_progress: None,
-	        lock_held: false,
-	    };
-	    let blocked = evaluate_guards(&input);
-	    let reason = blocked["feature"]
-	        .iter()
-	        .find(|reason| reason.operation == "checkout")
-	        .expect("checkout is blocked");
-	    assert_eq!(reason.code, BlockedCode::WorktreeCheckedOut);
-	    assert!(reason.message.contains("/repo/wt-feature"));
-	}
-	```
+  ```rust
+  #[test]
+  fn checkout_of_a_branch_held_by_another_worktree_is_blocked() {
+      let input = GuardInput {
+          refs: vec![branch("feature", Occupancy::Worktree("/repo/wt-feature"))],
+          dirty: false,
+          default_branch: Some("main".into()),
+          current_branch: Some("main".into()),
+          in_progress: None,
+          lock_held: false,
+      };
+      let blocked = evaluate_guards(&input);
+      let reason = blocked["feature"]
+          .iter()
+          .find(|reason| reason.operation == "checkout")
+          .expect("checkout is blocked");
+      assert_eq!(reason.code, BlockedCode::WorktreeCheckedOut);
+      assert!(reason.message.contains("/repo/wt-feature"));
+  }
+  ```
 
 - [ ] **Step 02.3: Run the new test; expect FAIL** (`evaluate_guards` and its input types do not exist).
 
-	```bash
-	cargo test -p bibcode-server git::manager::guards
-	```
+  ```bash
+  cargo test -p bibcode-server git::manager::guards
+  ```
 
 - [ ] **Step 02.4: Implement the minimum to make Step 02.2 pass.** Path: `apps/server/src/git/manager/guards.rs`. Define `GuardInput`, `GuardedRef`, `Occupancy`, `BlockedCode`, `BlockedReason { operation, code, message }`, and `pub fn evaluate_guards(input: &GuardInput) -> BTreeMap<String, Vec<BlockedReason>>`. No `async`, no `tokio`, no `std::fs`, no `Command`, no imports from `crate::production` or `crate::rpc`.
 
@@ -109,51 +109,51 @@ If a file does not exist, report it back in the per-phase notes section of `task
 
 - [ ] **Step 02.6+: Add one failing test per remaining case, in this order.** Each fails first, then passes.
 
-	| Test | Operation | Code | Required message content |
-	| --- | --- | --- | --- |
-	| already the current branch here | `checkout` | `current-branch` | "Already checked out." |
-	| dirty working tree | `checkout`, `merge`, `rebase` | `dirty-working-tree` | names the uncommitted changes |
-	| delete a branch held by a worktree | `delete-branch` | `worktree-checked-out` | names the worktree path |
-	| delete a branch whose worktree directory is **missing** | `delete-branch` | `worktree-checked-out` | says the worktree must be removed or pruned first |
-	| delete the current branch | `delete-branch` | `current-branch` | states it is the current branch |
-	| delete the default branch | `delete-branch` | `default-branch` | states it is the default branch |
-	| rename a branch held by another worktree | `rename-branch` | `worktree-checked-out` | names the worktree path (app-policy: git would allow it) |
-	| force-move / reset a held branch | `force-move`, `reset` | `worktree-checked-out` | names the worktree path |
-	| pull/fetch into a held destination branch | `fetch`, `pull` | `worktree-checked-out` | names the worktree path |
-	| any mutation while the repository lock is held | every mutating operation | `operation-in-flight` | names the running operation |
-	| any mutation while a merge/rebase/cherry-pick is in progress | every mutating operation except resolve/abort | `merge-in-progress` | names the pending operation |
-	| push with no upstream | `push` | `no-upstream` | states the branch has no upstream |
-	| push/fetch/pull with no remote configured | `push`, `fetch`, `pull` | `no-remote` | states no remote is configured |
-	| any branch operation while HEAD is detached | `commit-to-branch` | `detached-head` | states HEAD is detached |
-	| **negative case** — a clean, non-current local branch with an upstream, no lock, no in-progress operation | — | — | the blocked list is **empty** |
+  | Test                                                                                                      | Operation                                     | Code                   | Required message content                                 |
+  | --------------------------------------------------------------------------------------------------------- | --------------------------------------------- | ---------------------- | -------------------------------------------------------- |
+  | already the current branch here                                                                           | `checkout`                                    | `current-branch`       | "Already checked out."                                   |
+  | dirty working tree                                                                                        | `checkout`, `merge`, `rebase`                 | `dirty-working-tree`   | names the uncommitted changes                            |
+  | delete a branch held by a worktree                                                                        | `delete-branch`                               | `worktree-checked-out` | names the worktree path                                  |
+  | delete a branch whose worktree directory is **missing**                                                   | `delete-branch`                               | `worktree-checked-out` | says the worktree must be removed or pruned first        |
+  | delete the current branch                                                                                 | `delete-branch`                               | `current-branch`       | states it is the current branch                          |
+  | delete the default branch                                                                                 | `delete-branch`                               | `default-branch`       | states it is the default branch                          |
+  | rename a branch held by another worktree                                                                  | `rename-branch`                               | `worktree-checked-out` | names the worktree path (app-policy: git would allow it) |
+  | force-move / reset a held branch                                                                          | `force-move`, `reset`                         | `worktree-checked-out` | names the worktree path                                  |
+  | pull/fetch into a held destination branch                                                                 | `fetch`, `pull`                               | `worktree-checked-out` | names the worktree path                                  |
+  | any mutation while the repository lock is held                                                            | every mutating operation                      | `operation-in-flight`  | names the running operation                              |
+  | any mutation while a merge/rebase/cherry-pick is in progress                                              | every mutating operation except resolve/abort | `merge-in-progress`    | names the pending operation                              |
+  | push with no upstream                                                                                     | `push`                                        | `no-upstream`          | states the branch has no upstream                        |
+  | push/fetch/pull with no remote configured                                                                 | `push`, `fetch`, `pull`                       | `no-remote`            | states no remote is configured                           |
+  | any branch operation while HEAD is detached                                                               | `commit-to-branch`                            | `detached-head`        | states HEAD is detached                                  |
+  | **negative case** — a clean, non-current local branch with an upstream, no lock, no in-progress operation | —                                             | —                      | the blocked list is **empty**                            |
 
-	Notes that must hold in the implementation:
-	- Occupancy counts **registered** worktrees, including one whose directory is missing (research § A.3). A prunable registration produces the prune-first message, not the plain one.
-	- The resolve/abort path is exempt from `merge-in-progress` — otherwise the user cannot get out of a conflicted state.
-	- Renaming a held branch is blocked as **app policy**, not because git refuses it; git allows the rename and silently retargets the other worktree's HEAD (spec § 7.2).
-	- Messages are the user-facing text. They are payload, never a log line.
+  Notes that must hold in the implementation:
+  - Occupancy counts **registered** worktrees, including one whose directory is missing (research § A.3). A prunable registration produces the prune-first message, not the plain one.
+  - The resolve/abort path is exempt from `merge-in-progress` — otherwise the user cannot get out of a conflicted state.
+  - Renaming a held branch is blocked as **app policy**, not because git refuses it; git allows the rename and silently retargets the other worktree's HEAD (spec § 7.2).
+  - Messages are the user-facing text. They are payload, never a log line.
 
 - [ ] **Step 02.k-3: Full build + test gate.**
 
-	```bash
-	cargo fmt --all --check
-	cargo test -p bibcode-server git::manager::guards
-	cargo test -p bibcode-server
-	cargo clippy -p bibcode-server --all-targets -- -D warnings
-	vp check
-	vp run typecheck
-	```
+  ```bash
+  cargo fmt --all --check
+  cargo test -p bibcode-server git::manager::guards
+  cargo test -p bibcode-server
+  cargo clippy -p bibcode-server --all-targets -- -D warnings
+  vp check
+  vp run typecheck
+  ```
 
-	Expected: zero warnings, zero errors, all tests green.
+  Expected: zero warnings, zero errors, all tests green.
 
 - [ ] **Step 02.k-2: Purity and isolation check.**
 
-	```bash
-	rg -n 'async|tokio|std::fs|std::process|Command|crate::production|crate::rpc|CancellationToken' apps/server/src/git/manager/guards.rs
-	git status --short
-	```
+  ```bash
+  rg -n 'async|tokio|std::fs|std::process|Command|crate::production|crate::rpc|CancellationToken' apps/server/src/git/manager/guards.rs
+  git status --short
+  ```
 
-	The first command must return nothing. `git status --short` must show `apps/server/src/git/manager/guards.rs` as the only file this phase changed.
+  The first command must return nothing. `git status --short` must show `apps/server/src/git/manager/guards.rs` as the only file this phase changed.
 
 - [ ] **Step 02.k: TDD proof.** Make `evaluate_guards` return an empty map unconditionally. Re-run `cargo test -p bibcode-server git::manager::guards` and confirm every positive case fails while the negative case still passes. Then make it return one hard-coded reason for every ref and confirm the negative case fails. Restore.
 

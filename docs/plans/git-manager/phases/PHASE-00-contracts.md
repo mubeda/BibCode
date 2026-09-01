@@ -64,7 +64,7 @@ Invoke these skills via the `Skill` tool BEFORE doing any work. Order matters: a
 
 **Matched for this phase:**
 
-5. `Skill(skill="codebase-design")` — *the whole feature's wire boundary is designed once, here*
+5. `Skill(skill="codebase-design")` — _the whole feature's wire boundary is designed once, here_
 
 ## Documents to Read
 
@@ -89,97 +89,103 @@ If a file does not exist, report it back in the per-phase notes section of `task
 
 - [ ] **Step 00.1: Locate and re-read every registration site.** Line numbers below are indicative; re-verify each against the working tree.
 
-	```bash
-	rg -n 'WS_METHODS = \{|RpcGroup.make' packages/contracts/src/rpc.ts
-	rg -n 'ACTIVE_RPC_METHODS' apps/server/src/rpc/methods.rs
-	rg -n 'required_scope' apps/server/src/auth/scope.rs
-	rg -n 'EnvironmentSubscriptionRpcTag' packages/client-runtime/src/rpc/client.ts
-	rg -n 'Expected 101|Expected 18|Expected 65|242|23 orchestration' packages/contracts/scripts/export-rust-rpc-fixtures.ts
-	rg -n 'toHaveLength|toBe\(' packages/contracts/scripts/export-rust-rpc-fixtures.test.ts
-	rg -n 'assert_eq!\(rust_methods.len|manifest\.' apps/server/tests/rpc_wire.rs
-	rg -n 'validate_complete' apps/server/src/rpc/session.rs apps/server/src/production/runtime.rs
-	```
+  ```bash
+  rg -n 'WS_METHODS = \{|RpcGroup.make' packages/contracts/src/rpc.ts
+  rg -n 'ACTIVE_RPC_METHODS' apps/server/src/rpc/methods.rs
+  rg -n 'required_scope' apps/server/src/auth/scope.rs
+  rg -n 'EnvironmentSubscriptionRpcTag' packages/client-runtime/src/rpc/client.ts
+  rg -n 'Expected 101|Expected 18|Expected 65|242|23 orchestration' packages/contracts/scripts/export-rust-rpc-fixtures.ts
+  rg -n 'toHaveLength|toBe\(' packages/contracts/scripts/export-rust-rpc-fixtures.test.ts
+  rg -n 'assert_eq!\(rust_methods.len|manifest\.' apps/server/tests/rpc_wire.rs
+  rg -n 'validate_complete' apps/server/src/rpc/session.rs apps/server/src/production/runtime.rs
+  ```
 
-	Record the three count sites and today's numbers in `tasks.md`. At the time of decomposition they all agreed: **101 methods, 18 stream methods, 65 top-level stream shapes, 65 stream-shape fixtures, 23 orchestration event shapes, 242 typed failure fixtures.** Confirm before changing anything. Note that `apps/server/src/maintenance.rs` has **no allowlist to edit** — `rpc_mutability` derives from the `mutability` field you set in `ACTIVE_RPC_METHODS`, so declaring reads with `read_unary`/`read_stream` *is* the maintenance classification.
+  Record the three count sites and today's numbers in `tasks.md`. At the time of decomposition they all agreed: **101 methods, 18 stream methods, 65 top-level stream shapes, 65 stream-shape fixtures, 23 orchestration event shapes, 242 typed failure fixtures.** Confirm before changing anything. Note that `apps/server/src/maintenance.rs` has **no allowlist to edit** — `rpc_mutability` derives from the `mutability` field you set in `ACTIVE_RPC_METHODS`, so declaring reads with `read_unary`/`read_stream` _is_ the maintenance classification.
 
 - [ ] **Step 00.2: Author the first failing test.** Path: `packages/contracts/src/gitManager.test.ts`
 
-	```ts
-	import { Schema } from "effect/schema";
-	import { describe, expect, it } from "vitest";
-	import { GitManagerBlockedReason } from "./gitManager.ts";
+  ```ts
+  import { Schema } from "effect/schema";
+  import { describe, expect, it } from "vitest";
+  import { GitManagerBlockedReason } from "./gitManager.ts";
 
-	describe("GitManagerBlockedReason", () => {
-	  it("round-trips a server-authored blocked reason verbatim", () => {
-	    const decoded = Schema.decodeUnknownSync(GitManagerBlockedReason)({
-	      operation: "checkout",
-	      code: "worktree-checked-out",
-	      message: "Checkout is blocked: this branch is already checked out in another worktree.",
-	    });
-	    expect(decoded.message).toBe(
-	      "Checkout is blocked: this branch is already checked out in another worktree.",
-	    );
-	  });
-	});
-	```
+  describe("GitManagerBlockedReason", () => {
+    it("round-trips a server-authored blocked reason verbatim", () => {
+      const decoded = Schema.decodeUnknownSync(GitManagerBlockedReason)({
+        operation: "checkout",
+        code: "worktree-checked-out",
+        message: "Checkout is blocked: this branch is already checked out in another worktree.",
+      });
+      expect(decoded.message).toBe(
+        "Checkout is blocked: this branch is already checked out in another worktree.",
+      );
+    });
+  });
+  ```
 
 - [ ] **Step 00.3: Run the new test; expect FAIL** (the module does not exist yet).
 
-	```bash
-	vp test run packages/contracts/src/gitManager.test.ts
-	```
+  ```bash
+  vp test run packages/contracts/src/gitManager.test.ts
+  ```
 
 - [ ] **Step 00.4: Implement the minimum to make Step 00.2 pass.** Path: `packages/contracts/src/gitManager.ts`
 
-	```ts
-	export const GitManagerBlockedCode = Schema.Literals([
-	  "worktree-checked-out", "dirty-working-tree", "operation-in-flight",
-	  "merge-in-progress", "current-branch", "default-branch",
-	  "no-upstream", "detached-head", "no-remote",
-	]);
-	export const GitManagerBlockedReason = Schema.Struct({
-	  operation: TrimmedNonEmptyStringSchema,
-	  code: GitManagerBlockedCode,
-	  message: TrimmedNonEmptyStringSchema,
-	});
-	```
+  ```ts
+  export const GitManagerBlockedCode = Schema.Literals([
+    "worktree-checked-out",
+    "dirty-working-tree",
+    "operation-in-flight",
+    "merge-in-progress",
+    "current-branch",
+    "default-branch",
+    "no-upstream",
+    "detached-head",
+    "no-remote",
+  ]);
+  export const GitManagerBlockedReason = Schema.Struct({
+    operation: TrimmedNonEmptyStringSchema,
+    code: GitManagerBlockedCode,
+    message: TrimmedNonEmptyStringSchema,
+  });
+  ```
 
-	Follow `packages/contracts/src/git.ts` for imports and style. **Do not touch `GitManagerError` or `GitManagerServiceError` in `git.ts`** — they are the internal git service's error types and mean something else.
+  Follow `packages/contracts/src/git.ts` for imports and style. **Do not touch `GitManagerError` or `GitManagerServiceError` in `git.ts`** — they are the internal git service's error types and mean something else.
 
 - [ ] **Step 00.5: Run the test; expect PASS.**
 
 - [ ] **Step 00.6: Add the remaining schemas, one failing test each.** Required symbols, in this order:
-	`GitManagerWorktreeEntry`, `GitManagerRefEntry` (name, tipSha, upstream, ahead, behind, current, isDefault, worktreePath, blocked: array of `GitManagerBlockedReason`), `GitManagerRefsSnapshot` (generation, headRef, detachedSha, isDirty, defaultBranch, remotes, localBranches, remoteBranches, tags, worktrees, inProgressOperation, conflictedPaths), `GitManagerCommitEntry` (sha, shortSha, parents, decorations, subject, body, author/committer name+email+timestamp), `GitManagerCommitPage` (generation, pinnedTips, commits, nextOffset, exhausted, degradedToAllPaging), `GitManagerDiffSource` (tagged union `{ _tag: "working-tree", path, staged } | { _tag: "commit", sha, path } | { _tag: "stash", sha, path }`), `GitManagerDiff`, `GitManagerStashEntry` (whose `sha` is the stable stash identity; any `index` is current-list presentation data only), `GitManagerConflictState`, `GitManagerMergePreview`, `GitManagerOperationRequest` (tagged union covering branch/sync, stash/merge, rewrite and tag families), `GitManagerOperationEvent` (`started | output | finished | failed`), `GitManagerSignalEvent`, and the error class `GitManagerOperationError` with fields `{ operation, code, message, blocked: NullOr(GitManagerBlockedReason) }`. Every `message` field is server-authored and rendered verbatim.
+      `GitManagerWorktreeEntry`, `GitManagerRefEntry` (name, tipSha, upstream, ahead, behind, current, isDefault, worktreePath, blocked: array of `GitManagerBlockedReason`), `GitManagerRefsSnapshot` (generation, headRef, detachedSha, isDirty, defaultBranch, remotes, localBranches, remoteBranches, tags, worktrees, inProgressOperation, conflictedPaths), `GitManagerCommitEntry` (sha, shortSha, parents, decorations, subject, body, author/committer name+email+timestamp), `GitManagerCommitPage` (generation, pinnedTips, commits, nextOffset, exhausted, degradedToAllPaging), `GitManagerDiffSource` (tagged union `{ _tag: "working-tree", path, staged } | { _tag: "commit", sha, path } | { _tag: "stash", sha, path }`), `GitManagerDiff`, `GitManagerStashEntry` (whose `sha` is the stable stash identity; any `index` is current-list presentation data only), `GitManagerConflictState`, `GitManagerMergePreview`, `GitManagerOperationRequest` (tagged union covering branch/sync, stash/merge, rewrite and tag families), `GitManagerOperationEvent` (`started | output | finished | failed`), `GitManagerSignalEvent`, and the error class `GitManagerOperationError` with fields `{ operation, code, message, blocked: NullOr(GitManagerBlockedReason) }`. Every `message` field is server-authored and rendered verbatim.
 
 - [ ] **Step 00.7: Declare the fourteen methods in `packages/contracts/src/rpc.ts`.** This table is binding for every downstream phase.
 
-	| WS method | Mode | Scope | Capability flag | Landing phase |
-	| --- | --- | --- | --- | --- |
-	| `gitManager.getRefs` | unary | read | `gitManagerReads` | 01 |
-	| `gitManager.getCommits` | unary | read | `gitManagerReads` | 01 |
-	| `gitManager.getDiff` | unary | read | `gitManagerReads` | 01 |
-	| `gitManager.getStashes` | unary | read | `gitManagerStashMergeOperations` | 09 |
-	| `gitManager.previewMerge` | unary | read | `gitManagerStashMergeOperations` | 09 |
-	| `gitManager.listPullRequests` | unary | read | `gitManagerPullRequests` | 16 |
-	| `subscribeGitManagerSignal` | stream | read | `gitManagerLiveSignal` | 09 |
-	| `gitManager.commit` | unary | operate | `gitManagerCommitOperations` | 04 |
-	| `gitManager.undoCommit` | unary | operate | `gitManagerCommitOperations` | 04 |
-	| `gitManager.discard` | unary | operate | `gitManagerCommitOperations` | 04 |
-	| `gitManager.stagePartial` | unary | operate | `gitManagerPartialStaging` | 11 |
-	| `gitManager.unstagePartial` | unary | operate | `gitManagerPartialStaging` | 11 |
-	| `gitManager.discardPartial` | unary | operate | `gitManagerPartialStaging` | 11 |
-	| `gitManager.runOperation` | stream | operate | `gitManagerBranchSyncOperations`, `gitManagerStashMergeOperations`, `gitManagerRewriteOperations`, `gitManagerTagOperations` | 07/09/13/16 |
+  | WS method                     | Mode   | Scope   | Capability flag                                                                                                              | Landing phase |
+  | ----------------------------- | ------ | ------- | ---------------------------------------------------------------------------------------------------------------------------- | ------------- |
+  | `gitManager.getRefs`          | unary  | read    | `gitManagerReads`                                                                                                            | 01            |
+  | `gitManager.getCommits`       | unary  | read    | `gitManagerReads`                                                                                                            | 01            |
+  | `gitManager.getDiff`          | unary  | read    | `gitManagerReads`                                                                                                            | 01            |
+  | `gitManager.getStashes`       | unary  | read    | `gitManagerStashMergeOperations`                                                                                             | 09            |
+  | `gitManager.previewMerge`     | unary  | read    | `gitManagerStashMergeOperations`                                                                                             | 09            |
+  | `gitManager.listPullRequests` | unary  | read    | `gitManagerPullRequests`                                                                                                     | 16            |
+  | `subscribeGitManagerSignal`   | stream | read    | `gitManagerLiveSignal`                                                                                                       | 09            |
+  | `gitManager.commit`           | unary  | operate | `gitManagerCommitOperations`                                                                                                 | 04            |
+  | `gitManager.undoCommit`       | unary  | operate | `gitManagerCommitOperations`                                                                                                 | 04            |
+  | `gitManager.discard`          | unary  | operate | `gitManagerCommitOperations`                                                                                                 | 04            |
+  | `gitManager.stagePartial`     | unary  | operate | `gitManagerPartialStaging`                                                                                                   | 11            |
+  | `gitManager.unstagePartial`   | unary  | operate | `gitManagerPartialStaging`                                                                                                   | 11            |
+  | `gitManager.discardPartial`   | unary  | operate | `gitManagerPartialStaging`                                                                                                   | 11            |
+  | `gitManager.runOperation`     | stream | operate | `gitManagerBranchSyncOperations`, `gitManagerStashMergeOperations`, `gitManagerRewriteOperations`, `gitManagerTagOperations` | 07/09/13/16   |
 
-	Every method declares `error: GitManagerOperationError`. Add the `WS_METHODS` key, the `Rpc.make(...)` const (streams add `stream: true`), and membership in `RpcGroup.make` — omitting the group registration is a hard "stale identifier" failure in the export script.
+  Every method declares `error: GitManagerOperationError`. Add the `WS_METHODS` key, the `Rpc.make(...)` const (streams add `stream: true`), and membership in `RpcGroup.make` — omitting the group registration is a hard "stale identifier" failure in the export script.
 
 - [ ] **Step 00.8: Add the nine default-false capability booleans** to `ExecutionEnvironmentCapabilities` in `packages/contracts/src/environment.ts` (indicative :30-42), each `Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false)))`: `gitManagerReads`, `gitManagerCommitOperations`, `gitManagerBranchSyncOperations`, `gitManagerStashMergeOperations`, `gitManagerPartialStaging`, `gitManagerRewriteOperations`, `gitManagerTagOperations`, `gitManagerLiveSignal`, `gitManagerPullRequests`. Add a decoding-default test asserting each is `false` when absent from the payload.
 
 - [ ] **Step 00.9: Complete the Rust registration.**
-	1. `apps/server/src/rpc/methods.rs` — add each method to `ACTIVE_RPC_METHODS` in its existing alphabetical position, using `read_unary` / `read_stream` for reads and `mutation_unary` / `mutation_stream` for mutations.
-	2. `apps/server/src/auth/scope.rs` — append the six read methods and the stream to the existing `SCOPE_ORCHESTRATION_READ` match arm's list, and the seven mutations to the `SCOPE_ORCHESTRATION_OPERATE` list. The inline test `every_active_rpc_method_has_exactly_one_declared_scope` fails otherwise.
-	3. `apps/server/src/production/git_manager_rpc.rs` — `GIT_MANAGER_UNARY_METHODS`, `GIT_MANAGER_STREAM_METHODS`, a `GitManagerRpcServices` struct, and `pub fn register_git_manager_rpc(registry: &mut RpcRegistry, services: GitManagerRpcServices)` modelled on `register_git_vcs_rpc` (apps/server/src/production/git_vcs.rs, indicative :395-419). Register a stub for every method, including the `gitManager.stagePartial` / `gitManager.unstagePartial` / `gitManager.discardPartial` set. Every handler returns a `GitManagerOperationError` with `code = "not-implemented"` for now.
-	4. `apps/server/src/production/mod.rs` and `apps/server/src/production/runtime.rs` — declare the module and call `register_git_manager_rpc` beside `register_git_vcs_rpc` (indicative runtime.rs:389).
-	5. `apps/server/src/production/control.rs` `environment_descriptor` (indicative :2140-2160) — declare all nine capabilities `true`.
+  1.  `apps/server/src/rpc/methods.rs` — add each method to `ACTIVE_RPC_METHODS` in its existing alphabetical position, using `read_unary` / `read_stream` for reads and `mutation_unary` / `mutation_stream` for mutations.
+  2.  `apps/server/src/auth/scope.rs` — append the six read methods and the stream to the existing `SCOPE_ORCHESTRATION_READ` match arm's list, and the seven mutations to the `SCOPE_ORCHESTRATION_OPERATE` list. The inline test `every_active_rpc_method_has_exactly_one_declared_scope` fails otherwise.
+  3.  `apps/server/src/production/git_manager_rpc.rs` — `GIT_MANAGER_UNARY_METHODS`, `GIT_MANAGER_STREAM_METHODS`, a `GitManagerRpcServices` struct, and `pub fn register_git_manager_rpc(registry: &mut RpcRegistry, services: GitManagerRpcServices)` modelled on `register_git_vcs_rpc` (apps/server/src/production/git_vcs.rs, indicative :395-419). Register a stub for every method, including the `gitManager.stagePartial` / `gitManager.unstagePartial` / `gitManager.discardPartial` set. Every handler returns a `GitManagerOperationError` with `code = "not-implemented"` for now.
+  4.  `apps/server/src/production/mod.rs` and `apps/server/src/production/runtime.rs` — declare the module and call `register_git_manager_rpc` beside `register_git_vcs_rpc` (indicative runtime.rs:389).
+  5.  `apps/server/src/production/control.rs` `environment_descriptor` (indicative :2140-2160) — declare all nine capabilities `true`.
 
 - [ ] **Step 00.10: Create the server submodule skeleton.** `apps/server/src/git/manager/mod.rs` declaring `pub mod graph; pub mod guards; pub mod operations; pub mod refs;`, each file existing with only a doc comment (and `#![allow(dead_code)]` if Clippy objects). Add `mod manager;` plus `pub use manager;` re-exports to `apps/server/src/git/mod.rs`. This exists so PHASE-01 and PHASE-02 can run in parallel touching only their own file.
 
@@ -187,25 +193,25 @@ If a file does not exist, report it back in the per-phase notes section of `task
 
 - [ ] **Step 00.12: Regenerate the fixtures and reconcile all three count sites.**
 
-	```bash
-	node packages/contracts/scripts/export-rust-rpc-fixtures.ts
-	```
+  ```bash
+  node packages/contracts/scripts/export-rust-rpc-fixtures.ts
+  ```
 
-	It will throw with the real new numbers in the message (e.g. "Expected 101 active RPC methods, found 114"). Set the guards in `packages/contracts/scripts/export-rust-rpc-fixtures.ts`, the assertions in `packages/contracts/scripts/export-rust-rpc-fixtures.test.ts`, and the assertions in `apps/server/tests/rpc_wire.rs` to the **same** actual values. Re-run until the export writes fixtures cleanly. Never hand-edit anything under `packages/contracts/fixtures/rpc-wire/`.
+  It will throw with the real new numbers in the message (e.g. "Expected 101 active RPC methods, found 114"). Set the guards in `packages/contracts/scripts/export-rust-rpc-fixtures.ts`, the assertions in `packages/contracts/scripts/export-rust-rpc-fixtures.test.ts`, and the assertions in `apps/server/tests/rpc_wire.rs` to the **same** actual values. Re-run until the export writes fixtures cleanly. Never hand-edit anything under `packages/contracts/fixtures/rpc-wire/`.
 
 - [ ] **Step 00.13: Full build + test gate.**
 
-	```bash
-	vp run check:contracts
-	vp run typecheck
-	vp check
-	vp test run packages/contracts
-	cargo fmt --all --check
-	cargo test -p bibcode-server
-	cargo clippy -p bibcode-server --all-targets -- -D warnings
-	```
+  ```bash
+  vp run check:contracts
+  vp run typecheck
+  vp check
+  vp test run packages/contracts
+  cargo fmt --all --check
+  cargo test -p bibcode-server
+  cargo clippy -p bibcode-server --all-targets -- -D warnings
+  ```
 
-	Expected: zero warnings, zero errors, all tests green. `cargo test -p bibcode-server` must include `production_control` and `rpc_wire`.
+  Expected: zero warnings, zero errors, all tests green. `cargo test -p bibcode-server` must include `production_control` and `rpc_wire`.
 
 - [ ] **Step 00.14: Prove the production registry is still complete.** Add a test in `apps/server/tests/production_control.rs` (or extend the existing `complete_registry` suite) asserting `finalize_rpc_registry` succeeds with every `gitManager.*` method registered, and fails when one is excluded. This is the guard that stops a later phase from removing a stub without adding a handler.
 

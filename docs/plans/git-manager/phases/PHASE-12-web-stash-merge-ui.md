@@ -55,8 +55,8 @@ Invoke these skills via the `Skill` tool BEFORE doing any work. Order matters: a
 
 **Matched for this phase:**
 
-5. `Skill(skill="web-design-guidelines")` — *destructive stash actions need labelled, keyboard-reachable confirmations*
-6. `Skill(skill="vercel-react-best-practices")` — *stash list re-renders on every status generation bump*
+5. `Skill(skill="web-design-guidelines")` — _destructive stash actions need labelled, keyboard-reachable confirmations_
+6. `Skill(skill="vercel-react-best-practices")` — _stash list re-renders on every status generation bump_
 
 ## Documents to Read
 
@@ -80,102 +80,102 @@ Invoke these skills via the `Skill` tool BEFORE doing any work. Order matters: a
 
 - [ ] **Step 12.1: Locate the surface area being changed.**
 
-	```bash
-	rg -n "GitManagerStash|GitManagerConflictState|GitManagerMerge|inProgressOperation" packages/contracts/src/gitManager.ts
-	rg -n "getStashes|getDiff|previewMerge|runOperation" packages/client-runtime/src/state/gitManager.ts apps/web/src/state/gitManager.ts
-	rg -n "GitManagerStashEntry|GitManagerDiffSource|GitManagerMergePreview" packages/contracts/src/gitManager.ts
-	rg --files apps/web/src/components/gitManager
-	rg -n "gitManagerStore" apps/web/src --glob '*.ts*'
-	```
+  ```bash
+  rg -n "GitManagerStash|GitManagerConflictState|GitManagerMerge|inProgressOperation" packages/contracts/src/gitManager.ts
+  rg -n "getStashes|getDiff|previewMerge|runOperation" packages/client-runtime/src/state/gitManager.ts apps/web/src/state/gitManager.ts
+  rg -n "GitManagerStashEntry|GitManagerDiffSource|GitManagerMergePreview" packages/contracts/src/gitManager.ts
+  rg --files apps/web/src/components/gitManager
+  rg -n "gitManagerStore" apps/web/src --glob '*.ts*'
+  ```
 
-	**PHASE-00's Step 00.7 method table is binding and wins every disagreement.** Only four RPCs sit behind this phase:
+  **PHASE-00's Step 00.7 method table is binding and wins every disagreement.** Only four RPCs sit behind this phase:
 
-	- `gitManager.getStashes` → the full native stash list as `GitManagerStashEntry` values. **A stash's changed-file list comes from here too** — there is no separate file-list call.
-	- `gitManager.getDiff` with a `GitManagerDiffSource` of `{ _tag: "stash", sha, path }` → the patch for **one path** inside one stash. **There is no dedicated stash-diff method**, whatever an earlier draft may have said: `getDiff` is the single diff method, and its `working-tree` / `commit` / `stash` source arms are exactly why it is one method and not three.
-	- `gitManager.previewMerge` → `GitManagerMergePreview`.
-	- Every mutation — `stash-push`, `stash-apply`, `stash-pop`, `stash-drop`, `merge`, `squash-merge` — is a `GitManagerOperationRequest` variant on the single `gitManager.runOperation` stream.
+  - `gitManager.getStashes` → the full native stash list as `GitManagerStashEntry` values. **A stash's changed-file list comes from here too** — there is no separate file-list call.
+  - `gitManager.getDiff` with a `GitManagerDiffSource` of `{ _tag: "stash", sha, path }` → the patch for **one path** inside one stash. **There is no dedicated stash-diff method**, whatever an earlier draft may have said: `getDiff` is the single diff method, and its `working-tree` / `commit` / `stash` source arms are exactly why it is one method and not three.
+  - `gitManager.previewMerge` → `GitManagerMergePreview`.
+  - Every mutation — `stash-push`, `stash-apply`, `stash-pop`, `stash-drop`, `merge`, `squash-merge` — is a `GitManagerOperationRequest` variant on the single `gitManager.runOperation` stream.
 
-	Read the exact field names of `GitManagerStashEntry`, `GitManagerDiffSource` and `GitManagerMergePreview` from `packages/contracts/src/gitManager.ts` in the working tree. PHASE-09's `GitManagerStashRecord` is a **server-internal Rust parse type** in `apps/server/src/git/manager/stash.rs`, not the wire schema — the web consumes `GitManagerStashEntry`. `GitManagerMergePreview`'s variants are `clean`, `conflicted { fileCount }` and `unrelated-histories`; `GitManagerInProgressOperation` rides on the refs snapshot. Record any further deviation in the per-phase notes of `tasks.md`.
+  Read the exact field names of `GitManagerStashEntry`, `GitManagerDiffSource` and `GitManagerMergePreview` from `packages/contracts/src/gitManager.ts` in the working tree. PHASE-09's `GitManagerStashRecord` is a **server-internal Rust parse type** in `apps/server/src/git/manager/stash.rs`, not the wire schema — the web consumes `GitManagerStashEntry`. `GitManagerMergePreview`'s variants are `clean`, `conflicted { fileCount }` and `unrelated-histories`; `GitManagerInProgressOperation` rides on the refs snapshot. Record any further deviation in the per-phase notes of `tasks.md`.
 
-	Read PHASE-03's `apps/web/src/gitManagerStore.ts` API before touching it: `useGitManagerStore` with `selectViewState(ref)` and the actions `touchProject`, `setSelectedWorktree`, `setActiveTab`, `setSelectedRef`, `setSelectedCommit`, `setSelectedFile`, `setFilterText`, `setScrollAnchor`, `setLoadedPageCount`. Read PHASE-03's `gitManagerAvailability.ts` — capability gating goes through it, never through an ad-hoc `serverConfig` read.
+  Read PHASE-03's `apps/web/src/gitManagerStore.ts` API before touching it: `useGitManagerStore` with `selectViewState(ref)` and the actions `touchProject`, `setSelectedWorktree`, `setActiveTab`, `setSelectedRef`, `setSelectedCommit`, `setSelectedFile`, `setFilterText`, `setScrollAnchor`, `setLoadedPageCount`. Read PHASE-03's `gitManagerAvailability.ts` — capability gating goes through it, never through an ad-hoc `serverConfig` read.
 
 - [ ] **Step 12.2: Author the first failing test.**
 
-	Path: `apps/web/src/components/gitManager/stash/GitManagerStashList.logic.test.ts`
+  Path: `apps/web/src/components/gitManager/stash/GitManagerStashList.logic.test.ts`
 
-	Import `describe, expect, it` from `"vite-plus/test"`. Pin one behaviour: `buildStashRows(entries, blockedReasons)` returns one row per `GitManagerStashEntry` in the server's order (LIFO, `stash@{0}` first), each row carrying the entry's `index`, its identity fields and `blocked: GitManagerBlockedReason | null` taken verbatim from the server payload — never recomputed. Assert the list is repository-wide and is **not** filtered or grouped by the selected worktree (spec § 6.3; research doc `worktree-checkout-restrictions.md` cross-cutting rule 4; PHASE-09's downstream note repeats this).
+  Import `describe, expect, it` from `"vite-plus/test"`. Pin one behaviour: `buildStashRows(entries, blockedReasons)` returns one row per `GitManagerStashEntry` in the server's order (LIFO, `stash@{0}` first), each row carrying the entry's `index`, its identity fields and `blocked: GitManagerBlockedReason | null` taken verbatim from the server payload — never recomputed. Assert the list is repository-wide and is **not** filtered or grouped by the selected worktree (spec § 6.3; research doc `worktree-checkout-restrictions.md` cross-cutting rule 4; PHASE-09's downstream note repeats this).
 
-	Retain and test `resolveStashIndex(entries, sha)` only for apply/pop/drop mutation dispatch, whose current operation variants still need the entry's current `stash@{n}` selector: it returns the entry's **current** `index`, or `null` when the sha is gone. Stash indices shift on every push and drop, so an index is only valid against the list it came from. The stash `getDiff` source does not use this helper; it carries the selected sha directly.
+  Retain and test `resolveStashIndex(entries, sha)` only for apply/pop/drop mutation dispatch, whose current operation variants still need the entry's current `stash@{n}` selector: it returns the entry's **current** `index`, or `null` when the sha is gone. Stash indices shift on every push and drop, so an index is only valid against the list it came from. The stash `getDiff` source does not use this helper; it carries the selected sha directly.
 
 - [ ] **Step 12.3: Run the new test; expect FAIL** (the logic module does not exist yet).
 
-	```bash
-	vp test run apps/web/src/components/gitManager/stash/GitManagerStashList.logic.test.ts
-	```
+  ```bash
+  vp test run apps/web/src/components/gitManager/stash/GitManagerStashList.logic.test.ts
+  ```
 
 - [ ] **Step 12.4: Implement the minimum to make Step 12.2 pass.**
 
-	Path: `apps/web/src/components/gitManager/stash/GitManagerStashList.logic.ts`
+  Path: `apps/web/src/components/gitManager/stash/GitManagerStashList.logic.ts`
 
-	Export `interface GitManagerStashRow`, `buildStashRows(...)`, and nothing else yet. Keep it pure — no React, no atom access.
+  Export `interface GitManagerStashRow`, `buildStashRows(...)`, and nothing else yet. Keep it pure — no React, no atom access.
 
 - [ ] **Step 12.5: Run the test; expect PASS.**
 
 - [ ] **Step 12.6: Add the stash action-enablement and confirm-copy tests, then implement.**
 
-	In the same logic module add `resolveStashActionState(row, { operationInFlight })` returning `{ apply, pop, drop }` each as `{ enabled: boolean; reason: string | null }`, where `reason` is the server's `message` verbatim when blocked and `null` otherwise, and `resolveStashDiscardDialogCopy(row)` returning `{ title, body, confirmLabel, destructive: true }` for drop. Mirror `resolveDiscardDialogCopy` in `apps/web/src/components/SourceControlPanel.logic.ts` (indicative :146 — re-verify). Cover: an `operation-in-flight` blocked reason disables all three; a `null` blocked reason enables all three; the drop copy names the stash ref and says the entry cannot be recovered.
+  In the same logic module add `resolveStashActionState(row, { operationInFlight })` returning `{ apply, pop, drop }` each as `{ enabled: boolean; reason: string | null }`, where `reason` is the server's `message` verbatim when blocked and `null` otherwise, and `resolveStashDiscardDialogCopy(row)` returning `{ title, body, confirmLabel, destructive: true }` for drop. Mirror `resolveDiscardDialogCopy` in `apps/web/src/components/SourceControlPanel.logic.ts` (indicative :146 — re-verify). Cover: an `operation-in-flight` blocked reason disables all three; a `null` blocked reason enables all three; the drop copy names the stash ref and says the entry cannot be recovered.
 
 - [ ] **Step 12.7: Add the component test for the stash list, then implement the component.**
 
-	Path: `apps/web/src/components/gitManager/stash/GitManagerStashList.test.tsx`, then `GitManagerStashList.tsx`.
+  Path: `apps/web/src/components/gitManager/stash/GitManagerStashList.test.tsx`, then `GitManagerStashList.tsx`.
 
-	Follow the dominant house style in `apps/web/src/components/SourceControlSection.test.tsx`: `vi.hoisted` harness + `renderToStaticMarkup` from `react-dom/server`, no jsdom. Assert: rows render at the fixed 29px changed-file row height contract from the spec § 8; each icon-only action carries an `aria-label`; a disabled action exposes its server-authored reason through both `title` and `aria-describedby`; selecting a row calls the `onSelectStash` prop exactly once with the entry **sha**, never its index. Virtualize with `@legendapp/list` (already a dependency, `3.3.3`). The component receives `{ scope: { environmentId, cwd }, projectRef }` from `GitManagerPanel`, matching the prop contract PHASE-03 published for every child surface.
+  Follow the dominant house style in `apps/web/src/components/SourceControlSection.test.tsx`: `vi.hoisted` harness + `renderToStaticMarkup` from `react-dom/server`, no jsdom. Assert: rows render at the fixed 29px changed-file row height contract from the spec § 8; each icon-only action carries an `aria-label`; a disabled action exposes its server-authored reason through both `title` and `aria-describedby`; selecting a row calls the `onSelectStash` prop exactly once with the entry **sha**, never its index. Virtualize with `@legendapp/list` (already a dependency, `3.3.3`). The component receives `{ scope: { environmentId, cwd }, projectRef }` from `GitManagerPanel`, matching the prop contract PHASE-03 published for every child surface.
 
 - [ ] **Step 12.8: Add the stash-diff pane test, then implement it.**
 
-	Path: `apps/web/src/components/gitManager/stash/GitManagerStashDiff.tsx`.
+  Path: `apps/web/src/components/gitManager/stash/GitManagerStashDiff.tsx`.
 
-	Render the selected stash's changed-file list from the `GitManagerStashEntry` already returned by `gitManager.getStashes` — do **not** issue a call for it. For the selected path, pass `selectedStashSha` straight through to `gitManagerEnvironment.getDiff({ environmentId, input: { cwd, source: { _tag: "stash", sha: selectedStashSha, path } } })`. Do not resolve an index for the diff request. Hand the patch to `getRenderablePatch(patch, "git-manager-stash")` from `apps/web/src/lib/diffRendering.ts` and render through the existing `AnnotatableCodeView` path used by `apps/web/src/components/DiffPanel.tsx`. Do NOT add a second diff renderer or a second worker pool — `DiffWorkerPoolProvider` already bounds the pool.
+  Render the selected stash's changed-file list from the `GitManagerStashEntry` already returned by `gitManager.getStashes` — do **not** issue a call for it. For the selected path, pass `selectedStashSha` straight through to `gitManagerEnvironment.getDiff({ environmentId, input: { cwd, source: { _tag: "stash", sha: selectedStashSha, path } } })`. Do not resolve an index for the diff request. Hand the patch to `getRenderablePatch(patch, "git-manager-stash")` from `apps/web/src/lib/diffRendering.ts` and render through the existing `AnnotatableCodeView` path used by `apps/web/src/components/DiffPanel.tsx`. Do NOT add a second diff renderer or a second worker pool — `DiffWorkerPoolProvider` already bounds the pool.
 
-	Assert: the `raw` fallback branch of `RenderablePatch` renders its `reason` rather than throwing; a selected sha missing from the current entries renders an "entry no longer present" state and refetches the list instead of issuing `getDiff`; and a structured missing-stash `GitManagerOperationError` from the server is an expected outcome when the stash is dropped or popped between list and diff. In that case the UI refetches `gitManager.getStashes` rather than surfacing a hard failure.
+  Assert: the `raw` fallback branch of `RenderablePatch` renders its `reason` rather than throwing; a selected sha missing from the current entries renders an "entry no longer present" state and refetches the list instead of issuing `getDiff`; and a structured missing-stash `GitManagerOperationError` from the server is an expected outcome when the stash is dropped or popped between list and diff. In that case the UI refetches `gitManager.getStashes` rather than surfacing a hard failure.
 
 - [ ] **Step 12.9: Add the merge-dialog logic tests, then implement the logic module.**
 
-	Path: `apps/web/src/components/gitManager/merge/GitManagerMergeDialog.logic.ts` + `.logic.test.ts`.
+  Path: `apps/web/src/components/gitManager/merge/GitManagerMergeDialog.logic.ts` + `.logic.test.ts`.
 
-	Export `summarizeMergePreview(preview)` mapping PHASE-09's `GitManagerMergePreview` — whose variants are exactly `clean`, `conflicted { fileCount }` and `unrelated-histories` — to the three presentations in `research/github-desktop-analysis.md` § 1.3 / § 3.7: clean ("This will merge N commits from `<source>` into `<current>`"), conflicted ("There will be N conflicted files"), unrelated histories (merge disabled). Do **not** re-derive mergeability; PHASE-09's `parse_merge_tree_preview` is the only place it is computed. Also export `resolveMergeConfirmCopy(mode)` for `mode: "merge" | "squash"`. Assert ahead/behind counts come from the server payload and are never recomputed client-side.
+  Export `summarizeMergePreview(preview)` mapping PHASE-09's `GitManagerMergePreview` — whose variants are exactly `clean`, `conflicted { fileCount }` and `unrelated-histories` — to the three presentations in `research/github-desktop-analysis.md` § 1.3 / § 3.7: clean ("This will merge N commits from `<source>` into `<current>`"), conflicted ("There will be N conflicted files"), unrelated histories (merge disabled). Do **not** re-derive mergeability; PHASE-09's `parse_merge_tree_preview` is the only place it is computed. Also export `resolveMergeConfirmCopy(mode)` for `mode: "merge" | "squash"`. Assert ahead/behind counts come from the server payload and are never recomputed client-side.
 
 - [ ] **Step 12.10: Add the merge-dialog component test, then implement it.**
 
-	Path: `apps/web/src/components/gitManager/merge/GitManagerMergeDialog.tsx` + `.test.tsx`.
+  Path: `apps/web/src/components/gitManager/merge/GitManagerMergeDialog.tsx` + `.test.tsx`.
 
-	Build on `Dialog`/`DialogPopup`/`DialogHeader`/`DialogTitle`/`DialogDescription`/`DialogFooter` from `apps/web/src/components/ui/dialog.tsx` — not `AlertDialog`; the destructive-confirm convention in this codebase is a plain `Dialog` driven by nullable `pending*` state. Reuse PHASE-10's `groupBranches({ refs, recentNames, filter })` from `apps/web/src/components/gitManager/toolbar/branchGrouping.ts` for the source-branch picker; it is the only branch-list shaping function. The dialog dispatches a `GitManagerOperationRequest` of kind `merge` or `squash-merge` through the `createRuntimeCommand` wrapper PHASE-10 established — `gitManager.runOperation` is a streaming **command** in `EnvironmentStreamCommandRpcTag`, never `runStream` called from a component, and never a raw RPC `request`. Its progress renders through PHASE-10's single `<GitManagerOperationBanner>`; do not add a second operation banner. Assert: the confirm button is disabled while the preview is pending and while the preview is `unrelated-histories`; a server blocked reason renders verbatim and disables confirm; the dialog closes on `finished` and stays open showing the failure code on `failed`.
+  Build on `Dialog`/`DialogPopup`/`DialogHeader`/`DialogTitle`/`DialogDescription`/`DialogFooter` from `apps/web/src/components/ui/dialog.tsx` — not `AlertDialog`; the destructive-confirm convention in this codebase is a plain `Dialog` driven by nullable `pending*` state. Reuse PHASE-10's `groupBranches({ refs, recentNames, filter })` from `apps/web/src/components/gitManager/toolbar/branchGrouping.ts` for the source-branch picker; it is the only branch-list shaping function. The dialog dispatches a `GitManagerOperationRequest` of kind `merge` or `squash-merge` through the `createRuntimeCommand` wrapper PHASE-10 established — `gitManager.runOperation` is a streaming **command** in `EnvironmentStreamCommandRpcTag`, never `runStream` called from a component, and never a raw RPC `request`. Its progress renders through PHASE-10's single `<GitManagerOperationBanner>`; do not add a second operation banner. Assert: the confirm button is disabled while the preview is pending and while the preview is `unrelated-histories`; a server blocked reason renders verbatim and disables confirm; the dialog closes on `finished` and stays open showing the failure code on `failed`.
 
 - [ ] **Step 12.11: Add the in-progress strip tests, then implement it.**
 
-	Path: `apps/web/src/components/gitManager/GitManagerInProgressStrip.tsx` + `.logic.ts` + `.logic.test.ts`.
+  Path: `apps/web/src/components/gitManager/GitManagerInProgressStrip.tsx` + `.logic.ts` + `.logic.test.ts`.
 
-	**This is not PHASE-10's `<GitManagerOperationBanner>` and must not replace it.** That banner renders the *live operation stream* this client dispatched; this strip renders the *repository's persisted in-progress state* from PHASE-09's `detect_in_progress_operation` probes, which is present after a reconnect, after a server restart, and when an agent or a terminal started the operation (spec § 6.6). Both can be visible at once and each must be individually testable.
+  **This is not PHASE-10's `<GitManagerOperationBanner>` and must not replace it.** That banner renders the _live operation stream_ this client dispatched; this strip renders the _repository's persisted in-progress state_ from PHASE-09's `detect_in_progress_operation` probes, which is present after a reconnect, after a server restart, and when an agent or a terminal started the operation (spec § 6.6). Both can be visible at once and each must be individually testable.
 
-	Cover every kind `GitManagerInProgressOperation` reports — merge, rebase, cherry-pick, revert — and assert: the strip is `role="alert"` and non-dismissable; it offers Continue and Abort; Abort goes behind a confirmation; every other mutation control receives the server's blocking reason rather than a locally invented one; and the strip survives a reconnect (re-render from a fresh snapshot with the same in-progress kind must not flicker to the idle state).
+  Cover every kind `GitManagerInProgressOperation` reports — merge, rebase, cherry-pick, revert — and assert: the strip is `role="alert"` and non-dismissable; it offers Continue and Abort; Abort goes behind a confirmation; every other mutation control receives the server's blocking reason rather than a locally invented one; and the strip survives a reconnect (re-render from a fresh snapshot with the same in-progress kind must not flicker to the idle state).
 
 - [ ] **Step 12.12: Add the store slice and its test.**
 
-	Modify `apps/web/src/gitManagerStore.ts` to add only `selectedStashSha: string | null` and `stashPaneOpen: boolean` inside the existing per-project view-state record, plus their setters alongside PHASE-03's existing action set. **Store the sha, never the index** — this state is persisted across reloads and stash indices shift on every push and drop, so a persisted index would silently resolve to a different entry. The store key stays `(environmentId, projectId)` — never a bare `projectId` — and the persisted key stays `bibcode:git-manager-state:v1`. PHASE-03's note is explicit that a field is either already there or is requested through `tasks.md`: request these two before editing. If the sanitiser drops unknown fields, add both in the same edit. Extend PHASE-03's existing store test rather than creating a parallel one.
+  Modify `apps/web/src/gitManagerStore.ts` to add only `selectedStashSha: string | null` and `stashPaneOpen: boolean` inside the existing per-project view-state record, plus their setters alongside PHASE-03's existing action set. **Store the sha, never the index** — this state is persisted across reloads and stash indices shift on every push and drop, so a persisted index would silently resolve to a different entry. The store key stays `(environmentId, projectId)` — never a bare `projectId` — and the persisted key stays `bibcode:git-manager-state:v1`. PHASE-03's note is explicit that a field is either already there or is requested through `tasks.md`: request these two before editing. If the sanitiser drops unknown fields, add both in the same edit. Extend PHASE-03's existing store test rather than creating a parallel one.
 
 - [ ] **Step 12.13: Full build + test gate.**
 
-	```bash
-	vp test run apps/web/src/components/gitManager/stash apps/web/src/components/gitManager/merge apps/web/src/components/gitManager/GitManagerInProgressStrip.logic.test.ts apps/web/src/gitManagerStore.test.ts
-	vp run typecheck
-	vp check
-	```
+  ```bash
+  vp test run apps/web/src/components/gitManager/stash apps/web/src/components/gitManager/merge apps/web/src/components/gitManager/GitManagerInProgressStrip.logic.test.ts apps/web/src/gitManagerStore.test.ts
+  vp run typecheck
+  vp check
+  ```
 
-	Expected: zero warnings, zero errors, all tests green.
+  Expected: zero warnings, zero errors, all tests green.
 
 - [ ] **Step 12.14: Exercise the panel in the running app.**
 
-	`vp run dev`, open a project's Git Manager, and verify against **both** a local project and a remote-hosted project (attach one per `docs/user/remote-access.md`): the stash list shows entries created on the command line; apply/pop/drop each work and refresh the list; the per-entry diff renders; the merge dialog shows all three preview presentations; and starting `git merge` manually in a terminal makes the in-progress banner appear without any client-side inference.
+  `vp run dev`, open a project's Git Manager, and verify against **both** a local project and a remote-hosted project (attach one per `docs/user/remote-access.md`): the stash list shows entries created on the command line; apply/pop/drop each work and refresh the list; the per-entry diff renders; the merge dialog shows all three preview presentations; and starting `git merge` manually in a terminal makes the in-progress banner appear without any client-side inference.
 
 - [ ] **Step 12.15: TDD proof.** Make `buildStashRows` return `[]` unconditionally and `summarizeMergePreview` return the clean presentation unconditionally. Re-run the Step 12.13 test filter and confirm the affected tests DO fail. Restore the real implementations.
 

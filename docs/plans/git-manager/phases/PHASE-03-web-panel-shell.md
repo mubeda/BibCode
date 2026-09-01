@@ -53,8 +53,8 @@ Invoke these skills via the `Skill` tool BEFORE doing any work. Order matters: a
 
 **Matched for this phase:**
 
-5. `Skill(skill="web-design-guidelines")` — *the new icon-only sidebar button and tabs need labels and keyboard access*
-6. `Skill(skill="vercel-react-best-practices")` — *the panel must not hold subscriptions for unviewed projects*
+5. `Skill(skill="web-design-guidelines")` — _the new icon-only sidebar button and tabs need labels and keyboard access_
+6. `Skill(skill="vercel-react-best-practices")` — _the panel must not hold subscriptions for unviewed projects_
 
 ## Documents to Read
 
@@ -79,49 +79,48 @@ If a file does not exist, report it back in the per-phase notes section of `task
 
 - [ ] **Step 03.1: Locate the surface area being changed.** Line numbers are indicative; re-verify.
 
-	```bash
-	ls apps/web/src/routes/
-	rg -n 'new-worktree-button|handleCreateWorktreeClick|runProjectMemberAction|openWorktreeForProjectMember|SIDEBAR_ICON_ACTION_BUTTON_CLASS' apps/web/src/components/Sidebar.tsx
-	rg -n 'projectKey|parseProjectKey' packages/client-runtime/src/state/entities.ts
-	rg -n 'useEnvironmentConnectionState' apps/web/src/state/environments.ts
-	cat apps/web/src/connection/environmentCompat.ts
-	```
+  ```bash
+  ls apps/web/src/routes/
+  rg -n 'new-worktree-button|handleCreateWorktreeClick|runProjectMemberAction|openWorktreeForProjectMember|SIDEBAR_ICON_ACTION_BUTTON_CLASS' apps/web/src/components/Sidebar.tsx
+  rg -n 'projectKey|parseProjectKey' packages/client-runtime/src/state/entities.ts
+  rg -n 'useEnvironmentConnectionState' apps/web/src/state/environments.ts
+  cat apps/web/src/connection/environmentCompat.ts
+  ```
 
-	Confirm the **flat dot-separated** file-route convention (`_chat.$environmentId.$threadId.tsx`), so the new file is `_chat.project.$environmentId.$projectId.git.tsx` giving the URL `/project/$environmentId/$projectId/git`. Confirm `apps/web/src/routeTree.gen.ts` is tracked and plugin-generated — **never hand-edit it**; it regenerates when the dev server or build runs.
+  Confirm the **flat dot-separated** file-route convention (`_chat.$environmentId.$threadId.tsx`), so the new file is `_chat.project.$environmentId.$projectId.git.tsx` giving the URL `/project/$environmentId/$projectId/git`. Confirm `apps/web/src/routeTree.gen.ts` is tracked and plugin-generated — **never hand-edit it**; it regenerates when the dev server or build runs.
 
 - [ ] **Step 03.2: Author the first failing test.** Path: `apps/web/src/gitManagerStore.test.ts`
 
-	```ts
-	import { describe, expect, it } from "vitest";
-	import { useGitManagerStore } from "./gitManagerStore";
+  ```ts
+  import { describe, expect, it } from "vitest";
+  import { useGitManagerStore } from "./gitManagerStore";
 
-	const ref = (environmentId: string, projectId: string) =>
-	  ({ environmentId, projectId }) as never;
+  const ref = (environmentId: string, projectId: string) => ({ environmentId, projectId }) as never;
 
-	describe("gitManagerStore", () => {
-	  it("evicts the least recently used project when a third is touched", () => {
-	    const store = useGitManagerStore.getState();
-	    store.touchProject(ref("env-a", "p1"));
-	    store.touchProject(ref("env-a", "p2"));
-	    store.touchProject(ref("env-a", "p3"));
-	    const keys = Object.keys(useGitManagerStore.getState().byProjectKey);
-	    expect(keys).toHaveLength(2);
-	    expect(keys).not.toContain("env-a:p1");
-	  });
+  describe("gitManagerStore", () => {
+    it("evicts the least recently used project when a third is touched", () => {
+      const store = useGitManagerStore.getState();
+      store.touchProject(ref("env-a", "p1"));
+      store.touchProject(ref("env-a", "p2"));
+      store.touchProject(ref("env-a", "p3"));
+      const keys = Object.keys(useGitManagerStore.getState().byProjectKey);
+      expect(keys).toHaveLength(2);
+      expect(keys).not.toContain("env-a:p1");
+    });
 
-	  it("keys by environment and project, not by bare project id", () => {
-	    const store = useGitManagerStore.getState();
-	    store.setActiveTab(ref("env-a", "p1"), "history");
-	    expect(store.selectViewState(ref("env-b", "p1")).activeTab).toBe("changes");
-	  });
-	});
-	```
+    it("keys by environment and project, not by bare project id", () => {
+      const store = useGitManagerStore.getState();
+      store.setActiveTab(ref("env-a", "p1"), "history");
+      expect(store.selectViewState(ref("env-b", "p1")).activeTab).toBe("changes");
+    });
+  });
+  ```
 
 - [ ] **Step 03.3: Run the new test; expect FAIL** (the store does not exist yet).
 
-	```bash
-	vp test run apps/web/src/gitManagerStore.test.ts
-	```
+  ```bash
+  vp test run apps/web/src/gitManagerStore.test.ts
+  ```
 
 - [ ] **Step 03.4: Implement the minimum to make Step 03.2 pass.** Path: `apps/web/src/gitManagerStore.ts`. Follow `apps/web/src/sourceControlPanelStore.ts` exactly: `create<…>()(persist(…))` with `name: "bibcode:git-manager-state:v1"`, `version: 1`, `storage: createJSONStorage(() => resolveStorage(...))` from `./lib/storage`, and `partialize` to the state record. Key with `projectKey(ref)` from `@bibcode/client-runtime/state/entities` — **never a bare `projectId`**, which collides across environments. State per project: `selectedWorktreeCwd`, `activeTab` (`"changes" | "history"`), `selectedRef`, `selectedCommitSha`, `selectedFilePath`, `filterText`, `loadedPageCount`, `scrollAnchor`, `commitDraft`, `lastUsedAt`. `touchProject` sets `lastUsedAt` and evicts down to the two most recent.
 
@@ -131,42 +130,42 @@ If a file does not exist, report it back in the per-phase notes section of `task
 
 - [ ] **Step 03.7: Create the web atom wrapper.** Path: `apps/web/src/state/gitManager.ts`
 
-	```ts
-	import { createGitManagerEnvironmentAtoms } from "@bibcode/client-runtime/state/git-manager";
+  ```ts
+  import { createGitManagerEnvironmentAtoms } from "@bibcode/client-runtime/state/git-manager";
 
-	import { connectionAtomRuntime } from "../connection/runtime";
+  import { connectionAtomRuntime } from "../connection/runtime";
 
-	export const gitManagerEnvironment = createGitManagerEnvironmentAtoms(connectionAtomRuntime);
-	```
+  export const gitManagerEnvironment = createGitManagerEnvironmentAtoms(connectionAtomRuntime);
+  ```
 
-	Mirrors `apps/web/src/state/vcs.ts`. No other web file may call `request` directly.
+  Mirrors `apps/web/src/state/vcs.ts`. No other web file may call `request` directly.
 
 - [ ] **Step 03.8: Build the panel shell.** Path: `apps/web/src/components/gitManager/GitManagerPanel.tsx`. Props: `{ projectRef: ScopedProjectRef }`. It resolves the project through `useProject(projectRef)` (`apps/web/src/state/entities.ts`, indicative :122-125), treats `workspaceRoot` as an **opaque** path (it may live on a remote host — never resolve or join it client-side), reads the view state from the store, renders the `unavailable` state from Step 03.6 verbatim when not `ready`, and otherwise renders the toolbar plus a Changes/History tab strip with empty panes. Tabs use `@base-ui/react` primitives and are keyboard-navigable. Failing test first: the panel renders the disconnected reason and issues **no** RPC when the environment is disconnected.
 
-- [ ] **Step 03.9: Build the toolbar skeleton with the worktree selector.** Path: `apps/web/src/components/gitManager/GitManagerToolbar.tsx`. Three segments per spec § 5, with only segment 1 functional in this phase: the worktree selector listing the project's main checkout plus its worktrees (from the existing worktree-catalog atoms), **defaulting to the main checkout on open** and persisting the choice into the store for the session. Segments 2 and 3 render disabled placeholders with `aria-label`s; PHASE-10 fills them. Failing test first: opening the panel selects the main checkout even when the store holds a worktree from a previous session for a *different* project.
+- [ ] **Step 03.9: Build the toolbar skeleton with the worktree selector.** Path: `apps/web/src/components/gitManager/GitManagerToolbar.tsx`. Three segments per spec § 5, with only segment 1 functional in this phase: the worktree selector listing the project's main checkout plus its worktrees (from the existing worktree-catalog atoms), **defaulting to the main checkout on open** and persisting the choice into the store for the session. Segments 2 and 3 render disabled placeholders with `aria-label`s; PHASE-10 fills them. Failing test first: opening the panel selects the main checkout even when the store holds a worktree from a previous session for a _different_ project.
 
 - [ ] **Step 03.10: Create the route.** Path: `apps/web/src/routes/_chat.project.$environmentId.$projectId.git.tsx`. `createFileRoute` with a component that reads `Route.useParams()`, builds the `ScopedProjectRef`, and renders `<GitManagerPanel projectRef={…} />`. A missing or unknown project redirects the same way `_chat.$environmentId.$threadId.tsx` handles a missing thread. The route encodes the panel, so a reload lands back on the same project (spec § 4).
 
 - [ ] **Step 03.11: Add the sidebar button.** In `apps/web/src/components/Sidebar.tsx`, add a `handleOpenGitManagerClick` next to `handleCreateWorktreeClick` (indicative :2514-2519) that calls the **existing** `runProjectMemberAction` (indicative :2475-2497) so a grouped row disambiguates to one physical project exactly as "New worktree" does. The member action navigates to `/project/$environmentId/$projectId/git`. Add the button inside the same hover strip (indicative `<div>` at :3140), immediately **after** the `new-worktree-button` block, reusing `SIDEBAR_ICON_ACTION_BUTTON_CLASS`, the `Tooltip`/`TooltipTrigger` shape, a `lucide-react` icon, `data-testid="git-manager-button"`, and `aria-label={`Git Manager for ${project.displayName}`}`. Clicking it when the panel is already open navigates to the same route, which focuses rather than duplicating (spec § 4, decision 7).
 
 - [ ] **Step 03.12: Add the remaining tests.** One at a time, each failing first:
-	- The sidebar button on a multi-member group opens the member chooser and navigates for the chosen member only.
-	- Navigating twice to the same project does not create a second panel.
-	- View state survives a store rehydrate for the two most recent projects and is gone for the third.
-	- `commitDraft` round-trips through the store and its persisted key. **Do not** assert anything about the existing per-thread Source Control draft here: `apps/web/src/sourceControlPanelStore.ts` is keyed `byThreadKey` (a scoped *thread* key), this store is keyed by project, and reconciling the two is PHASE-08's job. This phase only provides the field.
-	- The panel holds no subscription when unmounted (assert the atom family is not subscribed after unmount).
+  - The sidebar button on a multi-member group opens the member chooser and navigates for the chosen member only.
+  - Navigating twice to the same project does not create a second panel.
+  - View state survives a store rehydrate for the two most recent projects and is gone for the third.
+  - `commitDraft` round-trips through the store and its persisted key. **Do not** assert anything about the existing per-thread Source Control draft here: `apps/web/src/sourceControlPanelStore.ts` is keyed `byThreadKey` (a scoped _thread_ key), this store is keyed by project, and reconciling the two is PHASE-08's job. This phase only provides the field.
+  - The panel holds no subscription when unmounted (assert the atom family is not subscribed after unmount).
 
 - [ ] **Step 03.13: Full build + test gate.**
 
-	```bash
-	vp test run apps/web/src/gitManagerStore.test.ts
-	vp test run apps/web/src/components/gitManager
-	vp test run apps/web/src/components/Sidebar.test.tsx
-	vp run typecheck
-	vp check
-	```
+  ```bash
+  vp test run apps/web/src/gitManagerStore.test.ts
+  vp test run apps/web/src/components/gitManager
+  vp test run apps/web/src/components/Sidebar.test.tsx
+  vp run typecheck
+  vp check
+  ```
 
-	Expected: zero warnings, zero errors, all tests green. `routeTree.gen.ts` regenerates during the dev/build run — commit nothing, but confirm it changed and was **not** hand-edited.
+  Expected: zero warnings, zero errors, all tests green. `routeTree.gen.ts` regenerates during the dev/build run — commit nothing, but confirm it changed and was **not** hand-edited.
 
 - [ ] **Step 03.14: Stack-specific verification.** Run the app (`vp run dev`), open a **local** project and a **remote-hosted** project, click the new sidebar button on each, reload the page, and confirm both land back in the Git Manager on the correct project. Disconnect the remote environment and confirm the panel shows the unavailable state and does not re-dial. `superpowers:verification-before-completion` is mandatory here.
 

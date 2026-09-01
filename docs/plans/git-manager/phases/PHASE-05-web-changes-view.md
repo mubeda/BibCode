@@ -53,8 +53,8 @@ Invoke these skills via the `Skill` tool BEFORE doing any work. Order matters: a
 
 **Matched for this phase:**
 
-5. `Skill(skill="vercel-react-best-practices")` — *a list re-rendering under a live agent-driven stream is the hot path here*
-6. `Skill(skill="web-design-guidelines")` — *checkboxes, context menu and status badges need labels and keyboard access*
+5. `Skill(skill="vercel-react-best-practices")` — _a list re-rendering under a live agent-driven stream is the hot path here_
+6. `Skill(skill="web-design-guidelines")` — _checkboxes, context menu and status badges need labels and keyboard access_
 
 ## Documents to Read
 
@@ -79,59 +79,59 @@ If a file does not exist, report it back in the per-phase notes section of `task
 
 - [ ] **Step 05.1: Locate the surface area being changed.** Line numbers are indicative; re-verify.
 
-	```bash
-	rg -n 'vcsEnvironment.status' apps/web/src/components/SourceControlPanel.tsx
-	rg -n 'VcsWorkingTreeFileStatus|VcsStagingArea' packages/contracts/src/git.ts
-	rg -n 'buildRowContextMenu|getRowActions' apps/web/src/components/SourceControlRowActions.logic.ts
-	rg -n 'useThreadShellsForProjectRefs' apps/web/src/state/entities.ts
-	rg -n 'LegendList' apps/web/src/components/BranchToolbarBranchSelector.tsx
-	```
+  ```bash
+  rg -n 'vcsEnvironment.status' apps/web/src/components/SourceControlPanel.tsx
+  rg -n 'VcsWorkingTreeFileStatus|VcsStagingArea' packages/contracts/src/git.ts
+  rg -n 'buildRowContextMenu|getRowActions' apps/web/src/components/SourceControlRowActions.logic.ts
+  rg -n 'useThreadShellsForProjectRefs' apps/web/src/state/entities.ts
+  rg -n 'LegendList' apps/web/src/components/BranchToolbarBranchSelector.tsx
+  ```
 
-	Note that `VcsWorkingTreeFileStatus` (indicative git.ts:48-55) is `modified | added | deleted | renamed | copied | untracked` — **no unmerged and no submodule state**. Conflict presentation therefore joins `GitManagerRefsSnapshot.conflictedPaths` from `gitManager.getRefs` onto the stream's file list; submodule presentation joins the refs snapshot's worktree/submodule information. Record in `tasks.md` if the working tree disagrees.
+  Note that `VcsWorkingTreeFileStatus` (indicative git.ts:48-55) is `modified | added | deleted | renamed | copied | untracked` — **no unmerged and no submodule state**. Conflict presentation therefore joins `GitManagerRefsSnapshot.conflictedPaths` from `gitManager.getRefs` onto the stream's file list; submodule presentation joins the refs snapshot's worktree/submodule information. Record in `tasks.md` if the working tree disagrees.
 
 - [ ] **Step 05.2: Author the first failing test.** Path: `apps/web/src/components/gitManager/changes/changesList.logic.test.ts`
 
-	```ts
-	import { describe, expect, it } from "vitest";
-	import { buildChangeRows } from "./changesList.logic";
+  ```ts
+  import { describe, expect, it } from "vitest";
+  import { buildChangeRows } from "./changesList.logic";
 
-	describe("buildChangeRows", () => {
-	  it("marks a file as conflicted when the refs snapshot lists it", () => {
-	    const rows = buildChangeRows({
-	      files: [
-	        { path: "src/a.ts", insertions: 1, deletions: 0, status: "modified", area: "unstaged" },
-	        { path: "src/b.ts", insertions: 2, deletions: 2, status: "modified", area: "unstaged" },
-	      ],
-	      conflictedPaths: ["src/b.ts"],
-	      submodulePaths: [],
-	      filterText: "",
-	      excludedPaths: new Set(),
-	    });
-	    expect(rows.map((row) => row.path)).toEqual(["src/a.ts", "src/b.ts"]);
-	    expect(rows[1]!.conflicted).toBe(true);
-	    expect(rows[0]!.conflicted).toBe(false);
-	  });
-	});
-	```
+  describe("buildChangeRows", () => {
+    it("marks a file as conflicted when the refs snapshot lists it", () => {
+      const rows = buildChangeRows({
+        files: [
+          { path: "src/a.ts", insertions: 1, deletions: 0, status: "modified", area: "unstaged" },
+          { path: "src/b.ts", insertions: 2, deletions: 2, status: "modified", area: "unstaged" },
+        ],
+        conflictedPaths: ["src/b.ts"],
+        submodulePaths: [],
+        filterText: "",
+        excludedPaths: new Set(),
+      });
+      expect(rows.map((row) => row.path)).toEqual(["src/a.ts", "src/b.ts"]);
+      expect(rows[1]!.conflicted).toBe(true);
+      expect(rows[0]!.conflicted).toBe(false);
+    });
+  });
+  ```
 
 - [ ] **Step 05.3: Run the new test; expect FAIL** (`buildChangeRows` does not exist).
 
-	```bash
-	vp test run apps/web/src/components/gitManager/changes/changesList.logic.test.ts
-	```
+  ```bash
+  vp test run apps/web/src/components/gitManager/changes/changesList.logic.test.ts
+  ```
 
 - [ ] **Step 05.4: Implement the minimum to make Step 05.2 pass.** Path: `apps/web/src/components/gitManager/changes/changesList.logic.ts`. Export `ChangeRow` and `buildChangeRows(input)` — a pure function, no React, no atoms. Keep every subsequent behaviour in this module so it stays unit-testable without rendering.
 
 - [ ] **Step 05.5: Run the test; expect PASS.**
 
 - [ ] **Step 05.6+: Add the remaining behaviour, one failing test at a time.**
-	1. **Filtering** — free text over the path, case-insensitive, plus the boolean filters (included / excluded / new / modified / deleted) combined with AND. When a filter hides an included file, `buildChangeRows` reports `hiddenIncludedCount` so the view can warn "hidden changes will be committed".
-	2. **Inclusion state** — tri-state per the reference implementation (`all | partial | none`). Partial exists in the model now so PHASE-14's gutter has somewhere to write; in this phase a file is only `all` or `none`. Toggling a `partial` file goes to excluded.
-	3. **Include-all header** — mirrors the visible rows only when a filter is active, and labels "N of M changed files".
-	4. **Selection semantics** — a click changes the *viewed* file only; Space/Enter toggles inclusion. These are two different interactions and must not be conflated.
-	5. **Submodule rows** — a dirty submodule is uncommittable (checkbox disabled with a reason); a partially committable submodule is forced to `partial`.
-	6. **Conflicted rows** — rendered with a distinct badge and excluded from inclusion toggling until resolved. Marker counts land in PHASE-15; this phase shows the conflicted state only.
-	7. **Blank slates** — "No local changes", and a filter-miss slate with "Clear filters".
+  1.  **Filtering** — free text over the path, case-insensitive, plus the boolean filters (included / excluded / new / modified / deleted) combined with AND. When a filter hides an included file, `buildChangeRows` reports `hiddenIncludedCount` so the view can warn "hidden changes will be committed".
+  2.  **Inclusion state** — tri-state per the reference implementation (`all | partial | none`). Partial exists in the model now so PHASE-14's gutter has somewhere to write; in this phase a file is only `all` or `none`. Toggling a `partial` file goes to excluded.
+  3.  **Include-all header** — mirrors the visible rows only when a filter is active, and labels "N of M changed files".
+  4.  **Selection semantics** — a click changes the _viewed_ file only; Space/Enter toggles inclusion. These are two different interactions and must not be conflated.
+  5.  **Submodule rows** — a dirty submodule is uncommittable (checkbox disabled with a reason); a partially committable submodule is forced to `partial`.
+  6.  **Conflicted rows** — rendered with a distinct badge and excluded from inclusion toggling until resolved. Marker counts land in PHASE-15; this phase shows the conflicted state only.
+  7.  **Blank slates** — "No local changes", and a filter-miss slate with "Clear filters".
 
 - [ ] **Step 05.7: Build the virtualised list.** `GitManagerChangesList.tsx` uses `@legendapp/list` at a fixed **29px** row height (spec § 8), keyed by path. Rows are memoised and receive stable callbacks; the list must not re-render every row when the stream emits an unchanged snapshot. Failing test first: emitting the same status snapshot twice renders each row's body once.
 
@@ -139,17 +139,17 @@ If a file does not exist, report it back in the per-phase notes section of `task
 
 - [ ] **Step 05.9: Build the context menu.** Reuse the native menu path (`readLocalApi()?.contextMenu.show`) with the browser fallback in `apps/web/src/contextMenuFallback.ts`, following `buildRowContextMenu` in `SourceControlRowActions.logic.ts`. Items: Ignore file / Ignore folder / Ignore all `<ext>` (cap the extension submenu at 5), Include/Exclude selected, Copy path, Copy relative path, Reveal, Open in editor. **Discard is present but disabled with a "lands in PHASE-08" affordance removed before that phase completes** — or omit it entirely and let PHASE-08 add it; record which you chose in `tasks.md`.
 
-- [ ] **Step 05.10: Build the agent-activity indicator.** `GitManagerAgentActivity.tsx` is **presentation only** — it never gates or delays a git operation (spec § 6.2). Source: `useThreadShellsForProjectRefs([projectRef])` (`apps/web/src/state/entities.ts`, indicative :116-120), filtered to threads whose `worktreePath` matches the selected `cwd` (a `null` `worktreePath` means the main checkout) and whose `session.status` is `"starting"` or `"running"`. Render a passive badge naming how many sessions are active. Failing test first: a running session in a *different* worktree does not light the indicator.
+- [ ] **Step 05.10: Build the agent-activity indicator.** `GitManagerAgentActivity.tsx` is **presentation only** — it never gates or delays a git operation (spec § 6.2). Source: `useThreadShellsForProjectRefs([projectRef])` (`apps/web/src/state/entities.ts`, indicative :116-120), filtered to threads whose `worktreePath` matches the selected `cwd` (a `null` `worktreePath` means the main checkout) and whose `session.status` is `"starting"` or `"running"`. Render a passive badge naming how many sessions are active. Failing test first: a running session in a _different_ worktree does not light the indicator.
 
 - [ ] **Step 05.11: Full build + test gate.**
 
-	```bash
-	vp test run apps/web/src/components/gitManager/changes
-	vp run typecheck
-	vp check
-	```
+  ```bash
+  vp test run apps/web/src/components/gitManager/changes
+  vp run typecheck
+  vp check
+  ```
 
-	Expected: zero warnings, zero errors, all tests green.
+  Expected: zero warnings, zero errors, all tests green.
 
 - [ ] **Step 05.12: Stack-specific verification.** Run the app (`vp run dev`), open the Git Manager on a **local** project and on a **remote-hosted** project. Modify files outside the app and confirm the list updates from the stream without a manual refresh. Start an agent session in the selected checkout and confirm the indicator appears. Verify keyboard navigation and that every icon-only control has an `aria-label`. `superpowers:verification-before-completion` is mandatory here.
 

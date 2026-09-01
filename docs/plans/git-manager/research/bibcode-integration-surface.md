@@ -21,7 +21,7 @@ numbers are from the working tree at the time of writing and will drift.
   `apps/web/src/components/ChatView.tsx:1267-1308`, and the tab title/icon
   switches in `CenterPanelTabs.tsx:73-96` / `CenterPanelSplitLayout.tsx:97-114`.
   Layout math (`centerPanelLayout.ts`) is kind-agnostic and needs no change.
-- **Crucial structural fact**: today center surfaces are *only* chat threads
+- **Crucial structural fact**: today center surfaces are _only_ chat threads
   and terminals, keyed per **host thread**; diff/source-control/files are
   **right-panel** per-thread surfaces (`rightPanelStore.ts:19-29`). A
   per-**project** git manager is the first center surface keyed by project, not
@@ -60,7 +60,7 @@ numbers are from the working tree at the time of writing and will drift.
   `SidebarProjectItem` rows (memoized, `:1518-3357`).
 - Project rows are grouped: `buildSidebarProjectSnapshots` in
   `apps/web/src/sidebarProjectGrouping.ts:71-156` merges physical projects into
-  one visible `SidebarProjectSnapshot` (`:18-32`) per *logical project* (see §6),
+  one visible `SidebarProjectSnapshot` (`:18-32`) per _logical project_ (see §6),
   with `memberProjects`/`environmentPresence` so one row can span local + remote
   environments.
 
@@ -93,7 +93,7 @@ Handler chain (the template the Git Manager button should copy):
 Note the important step-1 nuance for the Git Manager: because a sidebar row may
 represent several physical projects (possibly on different environments), a
 "per project" panel action must either disambiguate the member like
-`runProjectMemberAction` does, or define the panel per *physical* project ref.
+`runProjectMemberAction` does, or define the panel per _physical_ project ref.
 
 ### Other project actions (wiring pattern)
 
@@ -136,6 +136,7 @@ State libraries: server-derived state uses **Effect Atom**
   (`apps/web/src/routes/settings.*.tsx`). So the Git Manager is genuinely a new
   center-panel kind, with the right-panel Source Control/Diff surfaces as prior
   art for content.
+
 - Layout: pure algebra in `apps/web/src/centerPanelLayout.ts` — leaf/split tree
   (`:17-31`), max 4 groups (`MAX_CENTER_PANEL_GROUPS = 4`, `:1`), split ratio
   clamped to `[0.15, 0.85]` (`:3-4`), automatic collapse/merge
@@ -163,7 +164,7 @@ State libraries: server-derived state uses **Effect Atom**
   measured pane rects (`:113-198`). Splitting/resizing therefore never remounts
   content.
 - Mount decision (`CenterPanelSurfaceHosts.tsx:240-252`): a surface is mounted
-  only if it is some group's **active** tab, *except* the host chat surface
+  only if it is some group's **active** tab, _except_ the host chat surface
   (`chat:host`), which stays mounted and is hidden with
   `visibility:hidden; pointer-events:none` (`:227-234`, `:272-275`).
   **Inactive tabs unmount; there is no LRU or mounted-panel pool anywhere in
@@ -279,16 +280,16 @@ Schemas in `packages/contracts/src/git.ts`, `vcs.ts`, `sourceControl.ts`,
 `worktree.ts`, `review.ts`; method names in `rpc.ts` `WS_METHODS`
 (`:310-408`, vcs block `:335-353`, streams `:425-437`). Inventory:
 
-| Method | Mode | Notes |
-| --- | --- | --- |
-| `subscribeVcsStatus` | stream | `VcsStatusInput{cwd}` → snapshot/localUpdated/remoteUpdated events (`git.ts:281-293`) |
-| `subscribeVcsStatusSummary` | stream (latest) | capability-gated passive summary (`vcs.ts:72-117`) |
-| `git.runStackedAction` | stream | actions `commit`, `push`, `create_pr`, `commit_push`, `commit_push_pr` (`git.ts:11-17`) with phase/hook progress events (`git.ts:455-503`) |
-| `vcs.refreshStatus`, `vcs.pull`, `vcs.listRefs`, `vcs.listCommits`, `vcs.clone`, `vcs.createRef`, `vcs.switchRef`, `vcs.init`, `vcs.stageFiles`, `vcs.unstageFiles`, `vcs.discardFiles`, `vcs.generateCommitMessage` | unary | all `cwd`-addressed (`git.ts:109-223`) |
-| `git.resolvePullRequest`, `git.preparePullRequestThread` | unary | PR resolution (`git.ts:172-182`) |
-| `sourceControl.lookupRepository` / `.cloneRepository` / `.publishRepository`, `server.discoverSourceControl` | unary | provider integration (`sourceControl.ts`) |
-| `review.getDiffPreview` | unary | source kinds only `working-tree` and `branch-range` (`review.ts:13`) — **no per-commit diff** |
-| `subscribeWorktreeCatalog` (latest stream), `vcs.refreshWorktreeCatalog`, `worktree.adopt/createManaged/createPanel/retarget/getRemovalPlan/removeFromBibCode/remove/updateDiscoveryPolicy` | — | worktree catalog surface (`worktree.ts`, `rpc.ts:934-1011`) |
+| Method                                                                                                                                                                                                               | Mode            | Notes                                                                                                                                      |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `subscribeVcsStatus`                                                                                                                                                                                                 | stream          | `VcsStatusInput{cwd}` → snapshot/localUpdated/remoteUpdated events (`git.ts:281-293`)                                                      |
+| `subscribeVcsStatusSummary`                                                                                                                                                                                          | stream (latest) | capability-gated passive summary (`vcs.ts:72-117`)                                                                                         |
+| `git.runStackedAction`                                                                                                                                                                                               | stream          | actions `commit`, `push`, `create_pr`, `commit_push`, `commit_push_pr` (`git.ts:11-17`) with phase/hook progress events (`git.ts:455-503`) |
+| `vcs.refreshStatus`, `vcs.pull`, `vcs.listRefs`, `vcs.listCommits`, `vcs.clone`, `vcs.createRef`, `vcs.switchRef`, `vcs.init`, `vcs.stageFiles`, `vcs.unstageFiles`, `vcs.discardFiles`, `vcs.generateCommitMessage` | unary           | all `cwd`-addressed (`git.ts:109-223`)                                                                                                     |
+| `git.resolvePullRequest`, `git.preparePullRequestThread`                                                                                                                                                             | unary           | PR resolution (`git.ts:172-182`)                                                                                                           |
+| `sourceControl.lookupRepository` / `.cloneRepository` / `.publishRepository`, `server.discoverSourceControl`                                                                                                         | unary           | provider integration (`sourceControl.ts`)                                                                                                  |
+| `review.getDiffPreview`                                                                                                                                                                                              | unary           | source kinds only `working-tree` and `branch-range` (`review.ts:13`) — **no per-commit diff**                                              |
+| `subscribeWorktreeCatalog` (latest stream), `vcs.refreshWorktreeCatalog`, `worktree.adopt/createManaged/createPanel/retarget/getRemovalPlan/removeFromBibCode/remove/updateDiscoveryPolicy`                          | —               | worktree catalog surface (`worktree.ts`, `rpc.ts:934-1011`)                                                                                |
 
 Scopes: reads `orchestration:read`, mutations `orchestration:operate`
 (`apps/server/src/auth/scope.rs:42-104`). Legacy `vcs.createWorktree` /
@@ -339,19 +340,19 @@ worktree management, clone/init/publish.
 
 Missing, by layer:
 
-| Feature | Server | Contract/RPC | UI |
-| --- | --- | --- | --- |
-| Standalone `vcs.commit` / `vcs.push` unary | fn exists (`repository.rs:3110/:3177`) | missing (stacked stream only) | via stacked control |
-| Hunk-level staging | missing | missing (file-path arrays only, `git.ts:119-122`) | missing |
-| Stash push/pop/list | missing | missing | missing |
-| Merge / rebase / cherry-pick / revert / amend | missing | missing | missing |
-| User-invoked fetch | background only (`fetch_owner.rs`) | missing | missing |
-| Non-ff pull | `--ff-only` hard-coded (`repository.rs:3087`) | — | — |
-| Branch delete | missing | missing | missing |
-| Branch rename | fn exists (`repository.rs:2893`) | missing | missing |
-| Per-commit diff ("click a commit") | missing | `review.ts:13` lacks a commit source kind | missing |
-| Merge-conflict modeling | porcelain unmerged states not in `VcsWorkingTreeFileStatus` (`git.ts:48-55`) | missing | missing |
-| Remotes list/add | internal only (`repository.rs:1078`) | `VcsListRemotesResult` unwired (`vcs.ts:56`) | missing |
+| Feature                                       | Server                                                                       | Contract/RPC                                      | UI                  |
+| --------------------------------------------- | ---------------------------------------------------------------------------- | ------------------------------------------------- | ------------------- |
+| Standalone `vcs.commit` / `vcs.push` unary    | fn exists (`repository.rs:3110/:3177`)                                       | missing (stacked stream only)                     | via stacked control |
+| Hunk-level staging                            | missing                                                                      | missing (file-path arrays only, `git.ts:119-122`) | missing             |
+| Stash push/pop/list                           | missing                                                                      | missing                                           | missing             |
+| Merge / rebase / cherry-pick / revert / amend | missing                                                                      | missing                                           | missing             |
+| User-invoked fetch                            | background only (`fetch_owner.rs`)                                           | missing                                           | missing             |
+| Non-ff pull                                   | `--ff-only` hard-coded (`repository.rs:3087`)                                | —                                                 | —                   |
+| Branch delete                                 | missing                                                                      | missing                                           | missing             |
+| Branch rename                                 | fn exists (`repository.rs:2893`)                                             | missing                                           | missing             |
+| Per-commit diff ("click a commit")            | missing                                                                      | `review.ts:13` lacks a commit source kind         | missing             |
+| Merge-conflict modeling                       | porcelain unmerged states not in `VcsWorkingTreeFileStatus` (`git.ts:48-55`) | missing                                           | missing             |
+| Remotes list/add                              | internal only (`repository.rs:1078`)                                         | `VcsListRemotesResult` unwired (`vcs.ts:56`)      | missing             |
 
 ## 4. RPC/WebSocket protocol
 
@@ -502,7 +503,7 @@ Constraints on the git manager panel:
    `environmentId` and never call a local git or resolve paths client-side.
 2. Git RPCs are `cwd`-addressed (`VcsStatusInput{cwd}`,
    `packages/contracts/src/git.ts:109-112`): resolve `projectId →
-   EnvironmentProject.workspaceRoot` via `useProject(ref)`
+EnvironmentProject.workspaceRoot` via `useProject(ref)`
    (`apps/web/src/state/entities.ts:122-125`); the path is a remote-host
    absolute path — treat it as opaque.
 3. Any new panel store must key by `(environmentId, projectId)` (use
@@ -523,7 +524,7 @@ Constraints on the git manager panel:
   `environmentId` on the record — the client scopes it:
   `EnvironmentProject extends OrchestrationProjectShell { environmentId }`
   (`packages/client-runtime/src/state/models.ts:11-13`).
-  (`packages/contracts/src/project.ts` is the per-project *filesystem* RPC
+  (`packages/contracts/src/project.ts` is the per-project _filesystem_ RPC
   surface, not the record.)
 - Client state pipeline: `orchestration.subscribeShell` subscription
   (`client-runtime/src/state/shell.ts:287`) → per-environment snapshot atom →
@@ -596,7 +597,7 @@ Constraints on the git manager panel:
    per-thread (one `cwd`); a project-scoped manager must pick a default `cwd`
    (primary `workspaceRoot`?) and decide whether/how to switch among worktrees.
 2. **What does "one per project" key on** — physical `(environmentId,
-   projectId)` or the sidebar's logical project (which can span environments)?
+projectId)` or the sidebar's logical project (which can span environments)?
    The sidebar button will need member disambiguation either way
    (`runProjectMemberAction`).
 3. **Where does the panel live in the thread-keyed center layout?** Option (a):

@@ -70,85 +70,85 @@ If a file does not exist, report it back in the per-phase notes section of `task
 
 - [ ] **Step 04.1: Locate the surface area being changed.** Line numbers are indicative; re-verify.
 
-	```bash
-	rg -n 'pub async fn commit|pub async fn stage_files|pub async fn unstage_files|pub async fn discard_files' apps/server/src/git/repository.rs
-	rg -n 'vcs.stageFiles" \| "vcs.unstageFiles"' -A45 apps/server/src/production/git_vcs.rs
-	rg -n 'async fn run_owned_git_mutation' -A30 apps/server/src/production/git_vcs.rs
-	rg -n 'fn validate_pathspecs' apps/server/src/git/repository.rs
-	```
+  ```bash
+  rg -n 'pub async fn commit|pub async fn stage_files|pub async fn unstage_files|pub async fn discard_files' apps/server/src/git/repository.rs
+  rg -n 'vcs.stageFiles" \| "vcs.unstageFiles"' -A45 apps/server/src/production/git_vcs.rs
+  rg -n 'async fn run_owned_git_mutation' -A30 apps/server/src/production/git_vcs.rs
+  rg -n 'fn validate_pathspecs' apps/server/src/git/repository.rs
+  ```
 
-	The stage/unstage/discard arm (indicative git_vcs.rs:522-568) is the exact template: decode → `validate_pathspecs` → `run_owned_git_mutation(method, cwd, workspace_admission, cancellation, …)`, which takes the mutation fence via `broadcaster.begin_mutation(cwd)` before running. Read `GitRepository::commit` (indicative repository.rs:3110-3173) — it hard-codes `-m` and rebuilds the index with `reset` + `add -A`. **Do not change it**; existing callers (`git.runStackedAction`) depend on it.
+  The stage/unstage/discard arm (indicative git_vcs.rs:522-568) is the exact template: decode → `validate_pathspecs` → `run_owned_git_mutation(method, cwd, workspace_admission, cancellation, …)`, which takes the mutation fence via `broadcaster.begin_mutation(cwd)` before running. Read `GitRepository::commit` (indicative repository.rs:3110-3173) — it hard-codes `-m` and rebuilds the index with `reset` + `add -A`. **Do not change it**; existing callers (`git.runStackedAction`) depend on it.
 
 - [ ] **Step 04.2: Author the first failing test.** Path: `apps/server/src/git/manager/operations.rs` (inline `#[cfg(test)]`)
 
-	```rust
-	#[test]
-	fn builds_commit_arguments_from_the_request_options() {
-	    let request = CommitRequest {
-	        summary: "Fix the parser".into(),
-	        description: Some("Handles NUL records.".into()),
-	        amend: true,
-	        no_verify: true,
-	        signoff: true,
-	        allow_empty: false,
-	        co_authors: vec![CoAuthor {
-	            name: "Ann Author".into(),
-	            email: "ann@example.test".into(),
-	        }],
-	    };
-	    let args = commit_arguments(&request);
-	    assert_eq!(args[0], "commit");
-	    assert!(args.contains(&"--amend".to_owned()));
-	    assert!(args.contains(&"--no-verify".to_owned()));
-	    assert!(args.contains(&"--signoff".to_owned()));
-	    assert!(!args.contains(&"--allow-empty".to_owned()));
-	    assert!(args.contains(&"-F".to_owned()) && args.contains(&"-".to_owned()));
-	    assert_eq!(
-	        commit_message_body(&request),
-	        "Fix the parser\n\nHandles NUL records.\n\nCo-Authored-By: Ann Author <ann@example.test>\n"
-	    );
-	}
-	```
+  ```rust
+  #[test]
+  fn builds_commit_arguments_from_the_request_options() {
+      let request = CommitRequest {
+          summary: "Fix the parser".into(),
+          description: Some("Handles NUL records.".into()),
+          amend: true,
+          no_verify: true,
+          signoff: true,
+          allow_empty: false,
+          co_authors: vec![CoAuthor {
+              name: "Ann Author".into(),
+              email: "ann@example.test".into(),
+          }],
+      };
+      let args = commit_arguments(&request);
+      assert_eq!(args[0], "commit");
+      assert!(args.contains(&"--amend".to_owned()));
+      assert!(args.contains(&"--no-verify".to_owned()));
+      assert!(args.contains(&"--signoff".to_owned()));
+      assert!(!args.contains(&"--allow-empty".to_owned()));
+      assert!(args.contains(&"-F".to_owned()) && args.contains(&"-".to_owned()));
+      assert_eq!(
+          commit_message_body(&request),
+          "Fix the parser\n\nHandles NUL records.\n\nCo-Authored-By: Ann Author <ann@example.test>\n"
+      );
+  }
+  ```
 
 - [ ] **Step 04.3: Run the new test; expect FAIL** (`commit_arguments` does not exist).
 
-	```bash
-	cargo test -p bibcode-server git::manager::operations
-	```
+  ```bash
+  cargo test -p bibcode-server git::manager::operations
+  ```
 
 - [ ] **Step 04.4: Implement the minimum to make Step 04.2 pass.** Path: `apps/server/src/git/manager/operations.rs`. Add `CommitRequest`, `CoAuthor`, `commit_arguments(&CommitRequest) -> Vec<String>` and `commit_message_body(&CommitRequest) -> String`. The message goes on **stdin** via `git commit -F -`, never as an argument — a summary or description can contain anything. `ProcessRequest` already carries a `stdin` field.
 
 - [ ] **Step 04.5: Run the test; expect PASS.**
 
 - [ ] **Step 04.6+: Add the remaining behaviour, one failing test at a time.**
-	1. **`gitManager.commit`** — a new `GitRepository::commit_with_options(cwd, args, message, cancellation)` that runs `git commit -F -` with the constructed arguments and returns the new sha via `rev-parse HEAD`. It **does not** call `reset` or `add -A`: staging is already visible in the index, set by `vcs.stageFiles` / `vcs.unstageFiles`. Take a fresh status snapshot immediately before committing (spec § 6.2) and return an empty-commit outcome rather than an error when nothing is staged and `--allow-empty` was not requested.
-	2. **`gitManager.undoCommit`** — `git reset --mixed <parentSha>` for the normal case; for the initial commit, restore deleted files with `git checkout HEAD -- <paths>`, delete the ref with `git update-ref -d HEAD`, then unstage. Return the undone commit's message and co-author trailers so the client can restore the draft. Refuse when the commit carries tags, when a rebase is in progress, or when the head commit is not local — return a structured `GitManagerOperationError`, never raw stderr. **`update-ref -d HEAD` here is the documented initial-commit path and is not a worktree-guard bypass**; plumbing `update-ref` to move a branch remains forbidden.
-	3. **`gitManager.discard`** — whole-file and discard-all. Move files to the OS trash where the platform supports it, then `git checkout HEAD -- <paths>`; when trashing fails, return a distinguishable `trash-unavailable` outcome so the client can offer a permanent-discard confirmation rather than silently deleting. Untracked files are removed, not checked out.
-	4. Every handler calls `validate_pathspecs` before touching the filesystem and runs inside `run_owned_git_mutation` so the mutation fence and the admission lease apply.
-	5. A concurrent second Git Manager mutation on the same repository is rejected with `operation-in-flight` — **never queued silently**.
+  1.  **`gitManager.commit`** — a new `GitRepository::commit_with_options(cwd, args, message, cancellation)` that runs `git commit -F -` with the constructed arguments and returns the new sha via `rev-parse HEAD`. It **does not** call `reset` or `add -A`: staging is already visible in the index, set by `vcs.stageFiles` / `vcs.unstageFiles`. Take a fresh status snapshot immediately before committing (spec § 6.2) and return an empty-commit outcome rather than an error when nothing is staged and `--allow-empty` was not requested.
+  2.  **`gitManager.undoCommit`** — `git reset --mixed <parentSha>` for the normal case; for the initial commit, restore deleted files with `git checkout HEAD -- <paths>`, delete the ref with `git update-ref -d HEAD`, then unstage. Return the undone commit's message and co-author trailers so the client can restore the draft. Refuse when the commit carries tags, when a rebase is in progress, or when the head commit is not local — return a structured `GitManagerOperationError`, never raw stderr. **`update-ref -d HEAD` here is the documented initial-commit path and is not a worktree-guard bypass**; plumbing `update-ref` to move a branch remains forbidden.
+  3.  **`gitManager.discard`** — whole-file and discard-all. Move files to the OS trash where the platform supports it, then `git checkout HEAD -- <paths>`; when trashing fails, return a distinguishable `trash-unavailable` outcome so the client can offer a permanent-discard confirmation rather than silently deleting. Untracked files are removed, not checked out.
+  4.  Every handler calls `validate_pathspecs` before touching the filesystem and runs inside `run_owned_git_mutation` so the mutation fence and the admission lease apply.
+  5.  A concurrent second Git Manager mutation on the same repository is rejected with `operation-in-flight` — **never queued silently**.
 
 - [ ] **Step 04.7: Add integration tests.** Path: `apps/server/tests/git_manager_commit.rs`, following `apps/server/tests/production_git_vcs_rpc.rs` for harness shape. Over the wire: staging a file with `vcs.stageFiles` then `gitManager.commit` produces exactly that commit; `--amend` rewrites the head; a co-author trailer appears in `git log --format=%B`; `gitManager.undoCommit` restores the working tree and returns the message; `gitManager.discard` restores a modified file; a commit attempt with only the **read** scope is rejected; a second concurrent mutation is rejected with `operation-in-flight`.
 
 - [ ] **Step 04.8: Full build + test gate.**
 
-	```bash
-	cargo fmt --all --check
-	cargo test -p bibcode-server
-	cargo clippy -p bibcode-server --all-targets -- -D warnings
-	vp check
-	vp run typecheck
-	```
+  ```bash
+  cargo fmt --all --check
+  cargo test -p bibcode-server
+  cargo clippy -p bibcode-server --all-targets -- -D warnings
+  vp check
+  vp run typecheck
+  ```
 
-	Expected: zero warnings, zero errors, all tests green.
+  Expected: zero warnings, zero errors, all tests green.
 
 - [ ] **Step 04.9: Constraint review.**
 
-	```bash
-	rg -n 'ignore-other-worktrees|worktree add -f|--force\b|update-ref' apps/server/src/git/manager apps/server/src/production/git_manager_rpc.rs
-	git diff -- apps/server/src | rg 'tracing::(info|warn|error|debug)!' -A3
-	```
+  ```bash
+  rg -n 'ignore-other-worktrees|worktree add -f|--force\b|update-ref' apps/server/src/git/manager apps/server/src/production/git_manager_rpc.rs
+  git diff -- apps/server/src | rg 'tracing::(info|warn|error|debug)!' -A3
+  ```
 
-	The first must return only the documented initial-commit `update-ref -d HEAD`. The second must show no interpolated branch name, ref name, absolute path, remote URL or git stderr — stable codes plus lengths and counts only. Confirm nothing added here can add, create, clone, publish or remove a repository.
+  The first must return only the documented initial-commit `update-ref -d HEAD`. The second must show no interpolated branch name, ref name, absolute path, remote URL or git stderr — stable codes plus lengths and counts only. Confirm nothing added here can add, create, clone, publish or remove a repository.
 
 - [ ] **Step 04.10: TDD proof.** Make `commit_arguments` drop every flag and make `gitManager.discard` a no-op. Re-run `cargo test -p bibcode-server git::manager::operations` and the new integration test; confirm they fail. Restore.
 
