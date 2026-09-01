@@ -1,6 +1,7 @@
 //! Serialized Git Manager mutation operations.
 
 use std::{
+    collections::BTreeSet,
     ffi::OsString,
     future::Future,
     path::{Path, PathBuf},
@@ -14,17 +15,20 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::git::{
-    GitCommandError, GitManagerBlockedReason, GitManagerRefsSnapshot, GitRepository, OutputPolicy,
-    ProcessOutput, ProcessRequest, ProcessRunner, StatusBroadcaster, validate_pathspecs,
+    GitCommandError, GitManagerBlockedReason, GitManagerInProgressKind, GitManagerRefsSnapshot,
+    GitRepository, OutputPolicy, ProcessOutput, ProcessRequest, ProcessRunner, StatusBroadcaster,
+    validate_pathspecs,
 };
 use crate::worktree_catalog::{ProjectMutationAttempt, WorktreeCatalogService};
 
 use super::{
+    conflicts::ConflictSide,
     guards::{GuardInput, evaluate_guards},
     in_progress::detect_in_progress_operation,
     merge,
     patch::{diff_generation, format_selection_patch, parse_working_tree_diff},
     refs::build_refs_snapshot,
+    rewrite::{build_reorder_todo, build_squash_todo, resolve_last_retained_commit_ref},
     stash,
 };
 
@@ -139,11 +143,15 @@ pub enum DiscardError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GitManagerFailureCode {
+    Completed,
+    AlreadyUpToDate,
     Authentication,
     NonFastForward,
     StaleInfo,
     LocalChangesOverwritten,
     Conflicts,
+    ConflictsEncountered,
+    OutstandingFilesNotStaged,
     NoUpstream,
     Cancelled,
     TimedOut,
@@ -154,11 +162,15 @@ impl GitManagerFailureCode {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Completed => "completed",
+            Self::AlreadyUpToDate => "already-up-to-date",
             Self::Authentication => "authentication",
             Self::NonFastForward => "non-fast-forward",
             Self::StaleInfo => "stale-info",
             Self::LocalChangesOverwritten => "local-changes-overwritten",
             Self::Conflicts => "conflicts",
+            Self::ConflictsEncountered => "conflicts-encountered",
+            Self::OutstandingFilesNotStaged => "outstanding-files-not-staged",
             Self::NoUpstream => "no-upstream",
             Self::Cancelled => "cancelled",
             Self::TimedOut => "timed-out",
@@ -168,9 +180,13 @@ impl GitManagerFailureCode {
 }
 
 #[must_use]
-pub fn classify_operation_failure(_exit_code: i32, stderr: &str) -> GitManagerFailureCode {
+pub fn classify_operation_failure(exit_code: i32, stderr: &str) -> GitManagerFailureCode {
     let stderr = stderr.to_ascii_lowercase();
-    if stderr.contains("was interrupted") || stderr.contains("cancelled") {
+    if exit_code == 0 && stderr.contains("is up to date") {
+        GitManagerFailureCode::AlreadyUpToDate
+    } else if exit_code == 0 {
+        GitManagerFailureCode::Completed
+    } else if stderr.contains("was interrupted") || stderr.contains("cancelled") {
         GitManagerFailureCode::Cancelled
     } else if stderr.contains("timed out") {
         GitManagerFailureCode::TimedOut
@@ -190,6 +206,11 @@ pub fn classify_operation_failure(_exit_code: i32, stderr: &str) -> GitManagerFa
         GitManagerFailureCode::StaleInfo
     } else if stderr.contains("your local changes to the following files would be overwritten") {
         GitManagerFailureCode::LocalChangesOverwritten
+    } else if stderr.contains("needs merge") || stderr.contains("you must edit all merge conflicts")
+    {
+        GitManagerFailureCode::OutstandingFilesNotStaged
+    } else if stderr.contains("could not apply") {
+        GitManagerFailureCode::ConflictsEncountered
     } else if stderr.contains("conflict (") || stderr.contains("automatic merge failed") {
         GitManagerFailureCode::Conflicts
     } else if stderr.contains("there is no tracking information") {
@@ -204,6 +225,44 @@ pub fn classify_operation_failure(_exit_code: i32, stderr: &str) -> GitManagerFa
 pub enum GitManagerCheckoutStrategy {
     Stash,
     Bring,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum GitManagerResetMode {
+    Hard,
+    Soft,
+    Mixed,
+}
+
+impl GitManagerResetMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Hard => "hard",
+            Self::Soft => "soft",
+            Self::Mixed => "mixed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum GitManagerPendingOperation {
+    Merge,
+    Rebase,
+    CherryPick,
+    Revert,
+}
+
+impl GitManagerPendingOperation {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Merge => "merge",
+            Self::Rebase => "rebase",
+            Self::CherryPick => "cherry-pick",
+            Self::Revert => "revert",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -306,38 +365,52 @@ pub enum GitManagerOperationRequest {
     Rebase {
         cwd: PathBuf,
         project_id: String,
+        base: String,
+        target: String,
     },
     CherryPick {
         cwd: PathBuf,
         project_id: String,
+        shas: Vec<String>,
     },
     Squash {
         cwd: PathBuf,
         project_id: String,
+        shas: Vec<String>,
+        message: String,
     },
     Reorder {
         cwd: PathBuf,
         project_id: String,
+        shas: Vec<String>,
+        insert_before_sha: Option<String>,
     },
     Revert {
         cwd: PathBuf,
         project_id: String,
+        sha: String,
     },
     Reset {
         cwd: PathBuf,
         project_id: String,
+        sha: String,
+        mode: GitManagerResetMode,
     },
     Continue {
         cwd: PathBuf,
         project_id: String,
+        operation: GitManagerPendingOperation,
     },
     Abort {
         cwd: PathBuf,
         project_id: String,
+        operation: GitManagerPendingOperation,
     },
     ResolveConflict {
         cwd: PathBuf,
         project_id: String,
+        path: String,
+        side: ConflictSide,
     },
     TagCreate {
         cwd: PathBuf,
@@ -454,7 +527,7 @@ impl GitManagerOperationRequest {
     }
 
     #[must_use]
-    pub const fn is_implemented_through_phase_09(&self) -> bool {
+    pub const fn is_implemented_through_phase_13(&self) -> bool {
         matches!(
             self,
             Self::BranchCreate { .. }
@@ -475,6 +548,15 @@ impl GitManagerOperationRequest {
                 | Self::StashDrop { .. }
                 | Self::Merge { .. }
                 | Self::SquashMerge { .. }
+                | Self::Rebase { .. }
+                | Self::CherryPick { .. }
+                | Self::Squash { .. }
+                | Self::Reorder { .. }
+                | Self::Revert { .. }
+                | Self::Reset { .. }
+                | Self::Continue { .. }
+                | Self::Abort { .. }
+                | Self::ResolveConflict { .. }
         )
     }
 }
@@ -807,7 +889,7 @@ pub async fn run_branch_or_sync_operation(
     cancellation: CancellationToken,
 ) -> Result<GitManagerOperationOutcome, GitManagerOperationError> {
     let operation = request.operation();
-    if !request.is_implemented_through_phase_09() {
+    if !request.is_implemented_through_phase_13() {
         return Err(operation_error(
             operation,
             "not-implemented",
@@ -922,6 +1004,17 @@ fn blocked_reason_for_operation(
         GitManagerOperationRequest::BranchCreate { .. } => {
             (snapshot.head_ref.as_deref(), "branch-create")
         }
+        GitManagerOperationRequest::Rebase { target, .. } => (Some(target.as_str()), "rebase"),
+        GitManagerOperationRequest::CherryPick { .. } => {
+            (snapshot.head_ref.as_deref(), "cherry-pick")
+        }
+        GitManagerOperationRequest::Squash { .. } => (snapshot.head_ref.as_deref(), "squash"),
+        GitManagerOperationRequest::Reorder { .. } => (snapshot.head_ref.as_deref(), "reorder"),
+        GitManagerOperationRequest::Revert { .. } => (snapshot.head_ref.as_deref(), "revert"),
+        GitManagerOperationRequest::Reset { .. } => (snapshot.head_ref.as_deref(), "reset"),
+        GitManagerOperationRequest::Continue { .. }
+        | GitManagerOperationRequest::Abort { .. }
+        | GitManagerOperationRequest::ResolveConflict { .. } => return None,
         _ => return None,
     };
     let branch_reasons = branch.and_then(|branch| blocked.get(branch));
@@ -1160,6 +1253,200 @@ async fn execute_branch_or_sync_operation(
                 .map_err(|error| git_command_error(operation, error, Vec::new()))?;
             require_last_success(operation, outputs)?
         }
+        GitManagerOperationRequest::Rebase {
+            cwd, base, target, ..
+        } => {
+            validate_revision(operation, base)?;
+            validate_revision(operation, target)?;
+            one_output(
+                operation,
+                repository
+                    .git_manager_rebase(cwd, base, target, cancellation)
+                    .await,
+            )?
+        }
+        GitManagerOperationRequest::CherryPick { cwd, shas, .. } => {
+            validate_revisions(operation, shas, 1)?;
+            one_output(
+                operation,
+                repository
+                    .git_manager_cherry_pick(cwd, shas, cancellation)
+                    .await,
+            )?
+        }
+        GitManagerOperationRequest::Squash {
+            cwd, shas, message, ..
+        } => {
+            validate_revisions(operation, shas, 2)?;
+            if message.trim().is_empty() || message.trim() != message {
+                return Err(operation_error(
+                    operation,
+                    "invalid-request",
+                    "The squash message must be trimmed and non-empty.",
+                ));
+            }
+            let log_order = repository
+                .git_manager_rewrite_log_order(cwd, cancellation)
+                .await
+                .map_err(|error| git_command_error(operation, error, Vec::new()))?;
+            let (rewrite_order, oldest_touched) = rewrite_range(&log_order, shas, None, false)
+                .map_err(|message| operation_error(operation, "invalid-request", message))?;
+            let squashed = shas
+                .iter()
+                .filter(|sha| *sha != &oldest_touched)
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let todo = build_squash_todo(&rewrite_order, &squashed, &oldest_touched);
+            let parent = repository
+                .git_manager_commit_parent(cwd, &oldest_touched, cancellation)
+                .await
+                .map_err(|error| git_command_error(operation, error, Vec::new()))?;
+            let retained = resolve_last_retained_commit_ref(&oldest_touched, parent.as_deref());
+            one_output(
+                operation,
+                repository
+                    .git_manager_interactive_rebase(
+                        cwd,
+                        &todo,
+                        Some(message),
+                        retained.as_deref(),
+                        cancellation,
+                    )
+                    .await,
+            )?
+        }
+        GitManagerOperationRequest::Reorder {
+            cwd,
+            shas,
+            insert_before_sha,
+            ..
+        } => {
+            validate_revisions(operation, shas, 1)?;
+            if let Some(insert_before_sha) = insert_before_sha.as_deref() {
+                validate_revision(operation, insert_before_sha)?;
+                if shas.iter().any(|sha| sha == insert_before_sha) {
+                    return Err(operation_error(
+                        operation,
+                        "invalid-request",
+                        "The reorder insertion target cannot be one of the moved commits.",
+                    ));
+                }
+            }
+            let log_order = repository
+                .git_manager_rewrite_log_order(cwd, cancellation)
+                .await
+                .map_err(|error| git_command_error(operation, error, Vec::new()))?;
+            let (rewrite_order, oldest_touched) = rewrite_range(
+                &log_order,
+                shas,
+                insert_before_sha.as_deref(),
+                insert_before_sha.is_none(),
+            )
+            .map_err(|message| operation_error(operation, "invalid-request", message))?;
+            let todo = build_reorder_todo(&rewrite_order, shas, insert_before_sha.as_deref());
+            let parent = repository
+                .git_manager_commit_parent(cwd, &oldest_touched, cancellation)
+                .await
+                .map_err(|error| git_command_error(operation, error, Vec::new()))?;
+            let retained = resolve_last_retained_commit_ref(&oldest_touched, parent.as_deref());
+            one_output(
+                operation,
+                repository
+                    .git_manager_interactive_rebase(
+                        cwd,
+                        &todo,
+                        None,
+                        retained.as_deref(),
+                        cancellation,
+                    )
+                    .await,
+            )?
+        }
+        GitManagerOperationRequest::Revert { cwd, sha, .. } => {
+            validate_revision(operation, sha)?;
+            let merge_commit = repository
+                .git_manager_is_merge_commit(cwd, sha, cancellation)
+                .await
+                .map_err(|error| git_command_error(operation, error, Vec::new()))?;
+            one_output(
+                operation,
+                repository
+                    .git_manager_revert(cwd, sha, merge_commit, cancellation)
+                    .await,
+            )?
+        }
+        GitManagerOperationRequest::Reset { cwd, sha, mode, .. } => {
+            validate_revision(operation, sha)?;
+            one_output(
+                operation,
+                repository
+                    .git_manager_reset(cwd, sha, mode.as_str(), cancellation)
+                    .await,
+            )?
+        }
+        GitManagerOperationRequest::Continue {
+            cwd,
+            operation: pending,
+            ..
+        } => {
+            validate_recovery_operation(snapshot, *pending, operation)?;
+            let skip_empty = *pending == GitManagerPendingOperation::Rebase
+                && repository
+                    .git_manager_index_is_empty(cwd, cancellation)
+                    .await
+                    .map_err(|error| git_command_error(operation, error, Vec::new()))?;
+            one_output(
+                operation,
+                repository
+                    .git_manager_continue(cwd, pending.as_str(), skip_empty, cancellation)
+                    .await,
+            )?
+        }
+        GitManagerOperationRequest::Abort {
+            cwd,
+            operation: pending,
+            ..
+        } => {
+            validate_recovery_operation(snapshot, *pending, operation)?;
+            one_output(
+                operation,
+                repository
+                    .git_manager_abort(cwd, pending.as_str(), cancellation)
+                    .await,
+            )?
+        }
+        GitManagerOperationRequest::ResolveConflict {
+            cwd, path, side, ..
+        } => {
+            validate_pathspecs(
+                "GitManager.resolveConflict",
+                cwd,
+                std::slice::from_ref(path),
+            )
+            .map_err(|_| {
+                operation_error(
+                    operation,
+                    "invalid-path",
+                    "The requested conflict path is invalid.",
+                )
+            })?;
+            let selected_side_deleted = repository
+                .git_manager_conflict_side_deleted(cwd, path, *side, cancellation)
+                .await
+                .map_err(|error| git_command_error(operation, error, Vec::new()))?
+                .ok_or_else(|| {
+                    operation_error(
+                        operation,
+                        "conflict-not-found",
+                        "The requested path is no longer conflicted.",
+                    )
+                })?;
+            let outputs = repository
+                .git_manager_resolve_conflict(cwd, path, *side, selected_side_deleted, cancellation)
+                .await
+                .map_err(|error| git_command_error(operation, error, Vec::new()))?;
+            require_last_success(operation, outputs)?
+        }
         _ => {
             return Err(operation_error(
                 operation,
@@ -1170,7 +1457,13 @@ async fn execute_branch_or_sync_operation(
     };
     Ok(GitManagerOperationOutcome {
         operation: operation.to_owned(),
-        message: if outputs.iter().any(merge::is_already_up_to_date) {
+        message: if outputs.iter().any(|output| {
+            merge::is_already_up_to_date(output)
+                || classify_operation_failure(output.exit_code, &output.stdout)
+                    == GitManagerFailureCode::AlreadyUpToDate
+                || classify_operation_failure(output.exit_code, &output.stderr)
+                    == GitManagerFailureCode::AlreadyUpToDate
+        }) {
             "Already up to date.".to_owned()
         } else {
             "Git operation completed.".to_owned()
@@ -1188,6 +1481,102 @@ fn validate_merge_source(operation: &str, source: &str) -> Result<(), GitManager
         ));
     }
     Ok(())
+}
+
+fn validate_revision(operation: &str, revision: &str) -> Result<(), GitManagerOperationError> {
+    if revision.is_empty() || revision.trim() != revision || revision.starts_with('-') {
+        return Err(operation_error(
+            operation,
+            "invalid-request",
+            "A Git revision must be trimmed, non-empty, and cannot start with an option prefix.",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_revisions(
+    operation: &str,
+    revisions: &[String],
+    minimum: usize,
+) -> Result<(), GitManagerOperationError> {
+    if revisions.len() < minimum {
+        return Err(operation_error(
+            operation,
+            "invalid-request",
+            "The operation does not include enough commits.",
+        ));
+    }
+    let mut unique = BTreeSet::new();
+    for revision in revisions {
+        validate_revision(operation, revision)?;
+        if !unique.insert(revision) {
+            return Err(operation_error(
+                operation,
+                "invalid-request",
+                "The operation includes the same commit more than once.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_range(
+    log_order: &[String],
+    moved_shas: &[String],
+    insert_before_sha: Option<&str>,
+    through_root: bool,
+) -> Result<(Vec<String>, String), &'static str> {
+    if log_order.is_empty() {
+        return Err("The current branch has no commits to rewrite.");
+    }
+    let mut oldest_index = 0;
+    for sha in moved_shas {
+        let index = log_order
+            .iter()
+            .position(|candidate| candidate == sha)
+            .ok_or("A selected commit is no longer on the current first-parent history.")?;
+        oldest_index = oldest_index.max(index);
+    }
+    if let Some(insert_before_sha) = insert_before_sha {
+        let index = log_order
+            .iter()
+            .position(|candidate| candidate == insert_before_sha)
+            .ok_or("The reorder insertion target is no longer on the current history.")?;
+        oldest_index = oldest_index.max(index);
+    } else if through_root {
+        oldest_index = log_order.len() - 1;
+    }
+    let rewrite_order = log_order[..=oldest_index].to_vec();
+    let oldest_touched = rewrite_order
+        .last()
+        .expect("a non-empty prefix was selected")
+        .clone();
+    Ok((rewrite_order, oldest_touched))
+}
+
+fn validate_recovery_operation(
+    snapshot: &GitManagerRefsSnapshot,
+    requested: GitManagerPendingOperation,
+    operation: &str,
+) -> Result<(), GitManagerOperationError> {
+    let detected = snapshot
+        .in_progress_operation
+        .as_ref()
+        .and_then(|pending| match pending.kind {
+            GitManagerInProgressKind::Merge => Some(GitManagerPendingOperation::Merge),
+            GitManagerInProgressKind::Rebase => Some(GitManagerPendingOperation::Rebase),
+            GitManagerInProgressKind::CherryPick => Some(GitManagerPendingOperation::CherryPick),
+            GitManagerInProgressKind::Revert => Some(GitManagerPendingOperation::Revert),
+            GitManagerInProgressKind::Squash => None,
+        });
+    if detected == Some(requested) {
+        return Ok(());
+    }
+    Err(operation_error(
+        operation,
+        "operation-not-in-progress",
+        "The requested recovery operation does not match the repository state.",
+    ))
 }
 
 fn remote_tracking_ref<'a>(
@@ -1294,6 +1683,8 @@ fn refs_snapshot_error(
 
 const fn failure_message(code: GitManagerFailureCode) -> &'static str {
     match code {
+        GitManagerFailureCode::Completed => "Git operation completed.",
+        GitManagerFailureCode::AlreadyUpToDate => "Already up to date.",
         GitManagerFailureCode::Authentication => {
             "Authentication failed. Check the configured credentials and try again."
         }
@@ -1307,6 +1698,12 @@ const fn failure_message(code: GitManagerFailureCode) -> &'static str {
             "Git stopped because local changes would be overwritten."
         }
         GitManagerFailureCode::Conflicts => "Git stopped because the operation produced conflicts.",
+        GitManagerFailureCode::ConflictsEncountered => {
+            "Git stopped because the history rewrite produced conflicts."
+        }
+        GitManagerFailureCode::OutstandingFilesNotStaged => {
+            "Git cannot continue until every conflict is resolved and staged."
+        }
         GitManagerFailureCode::NoUpstream => "The current branch has no configured upstream.",
         GitManagerFailureCode::Cancelled => "The Git Manager operation was cancelled.",
         GitManagerFailureCode::TimedOut => "The Git Manager operation timed out.",
@@ -1636,6 +2033,56 @@ mod tests {
     use super::*;
     use crate::git::GitRepository;
 
+    fn git_output(cwd: &Path, args: &[&str]) -> std::process::Output {
+        Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "Git Manager Test")
+            .env("GIT_AUTHOR_EMAIL", "git-manager@example.test")
+            .env("GIT_COMMITTER_NAME", "Git Manager Test")
+            .env("GIT_COMMITTER_EMAIL", "git-manager@example.test")
+            .output()
+            .expect("git fixture starts")
+    }
+
+    fn git(cwd: &Path, args: &[&str]) -> String {
+        let output = git_output(cwd, args);
+        assert!(
+            output.status.success(),
+            "git fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    fn operation_snapshot(cwd: &Path) -> GitManagerRefsSnapshot {
+        GitManagerRefsSnapshot {
+            generation: 1,
+            head_ref: Some("main".into()),
+            detached_sha: None,
+            is_dirty: false,
+            default_branch: Some("main".into()),
+            remotes: Vec::new(),
+            local_branches: vec![crate::git::GitManagerRefEntry {
+                name: "main".into(),
+                tip_sha: git(cwd, &["rev-parse", "HEAD"]),
+                upstream: None,
+                ahead: 0,
+                behind: 0,
+                current: true,
+                is_default: true,
+                worktree_path: Some(cwd.to_string_lossy().into_owned()),
+                blocked: Vec::new(),
+            }],
+            remote_branches: Vec::new(),
+            tags: Vec::new(),
+            worktrees: Vec::new(),
+            in_progress_operation: None,
+            conflicted_paths: Vec::new(),
+        }
+    }
+
     struct RecordingTrash {
         destination: PathBuf,
         trashed: Mutex<Vec<PathBuf>>,
@@ -1726,6 +2173,29 @@ mod tests {
     }
 
     #[test]
+    fn classifies_rebase_outcomes_without_a_second_stderr_matcher() {
+        assert_eq!(
+            classify_operation_failure(0, "Current branch topic is up to date."),
+            GitManagerFailureCode::AlreadyUpToDate
+        );
+        assert_eq!(
+            classify_operation_failure(0, ""),
+            GitManagerFailureCode::Completed
+        );
+        assert_eq!(
+            classify_operation_failure(1, "error: could not apply abcdef1... topic"),
+            GitManagerFailureCode::ConflictsEncountered
+        );
+        assert_eq!(
+            classify_operation_failure(
+                1,
+                "file.txt: needs merge\nYou must edit all merge conflicts and then mark them as resolved using git add"
+            ),
+            GitManagerFailureCode::OutstandingFilesNotStaged
+        );
+    }
+
+    #[test]
     fn conflicting_pop_stdout_is_reported_as_a_conflict() {
         let error = require_last_success(
             "stash-pop",
@@ -1788,8 +2258,94 @@ mod tests {
                 no_verify: false,
             },
         ] {
-            assert!(request.is_implemented_through_phase_09());
+            assert!(request.is_implemented_through_phase_13());
         }
+    }
+
+    #[test]
+    fn phase_13_operation_requests_decode_all_contract_fields() {
+        let rebase: GitManagerOperationRequest = serde_json::from_value(serde_json::json!({
+            "_tag": "rebase",
+            "cwd": "/repo",
+            "projectId": "project-1",
+            "base": "main",
+            "target": "topic"
+        }))
+        .expect("rebase request");
+        assert!(matches!(
+            rebase,
+            GitManagerOperationRequest::Rebase { base, target, .. }
+                if base == "main" && target == "topic"
+        ));
+
+        let squash: GitManagerOperationRequest = serde_json::from_value(serde_json::json!({
+            "_tag": "squash",
+            "cwd": "/repo",
+            "projectId": "project-1",
+            "shas": ["bbbbbbb", "aaaaaaa"],
+            "message": "combined"
+        }))
+        .expect("squash request");
+        assert!(matches!(
+            squash,
+            GitManagerOperationRequest::Squash { shas, message, .. }
+                if shas == ["bbbbbbb", "aaaaaaa"] && message == "combined"
+        ));
+
+        let recovery: GitManagerOperationRequest = serde_json::from_value(serde_json::json!({
+            "_tag": "resolve-conflict",
+            "cwd": "/repo",
+            "projectId": "project-1",
+            "path": "nested/file.txt",
+            "side": "theirs"
+        }))
+        .expect("resolution request");
+        assert!(matches!(
+            recovery,
+            GitManagerOperationRequest::ResolveConflict {
+                path,
+                side: super::ConflictSide::Theirs,
+                ..
+            } if path == "nested/file.txt"
+        ));
+    }
+
+    #[tokio::test]
+    async fn cherry_pick_operation_arm_applies_the_requested_commit() {
+        let repository = tempfile::tempdir().expect("temporary repository");
+        git(repository.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(repository.path().join("base.txt"), "base\n").expect("base file");
+        git(repository.path(), &["add", "base.txt"]);
+        git(repository.path(), &["commit", "-q", "-m", "base"]);
+        git(repository.path(), &["checkout", "-q", "-b", "source"]);
+        std::fs::write(repository.path().join("picked.txt"), "picked\n").expect("picked file");
+        git(repository.path(), &["add", "picked.txt"]);
+        git(repository.path(), &["commit", "-q", "-m", "picked"]);
+        let picked_sha = git(repository.path(), &["rev-parse", "HEAD"]);
+        git(repository.path(), &["checkout", "-q", "main"]);
+        let snapshot = operation_snapshot(repository.path());
+        let request = GitManagerOperationRequest::CherryPick {
+            cwd: repository.path().to_path_buf(),
+            project_id: "project-1".into(),
+            shas: vec![picked_sha],
+        };
+
+        let outcome = execute_branch_or_sync_operation(
+            &GitRepository::default(),
+            &snapshot,
+            &request,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("cherry-pick operation");
+
+        assert_eq!(outcome.operation, "cherry-pick");
+        assert_eq!(outcome.outputs.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(repository.path().join("picked.txt"))
+                .expect("picked file exists"),
+            "picked\n"
+        );
     }
 
     #[test]
@@ -1876,6 +2432,48 @@ mod tests {
                 .message
                 .contains("remove or prune the worktree first")
         );
+    }
+
+    #[test]
+    fn rebase_guard_revalidation_blocks_a_target_held_by_another_worktree() {
+        let worktree_path = "/repo/topic-worktree";
+        let snapshot = crate::git::GitManagerRefsSnapshot {
+            generation: 1,
+            head_ref: Some("main".into()),
+            detached_sha: None,
+            is_dirty: false,
+            default_branch: Some("main".into()),
+            remotes: Vec::new(),
+            local_branches: vec![crate::git::GitManagerRefEntry {
+                name: "topic".into(),
+                tip_sha: "0123456789012345678901234567890123456789".into(),
+                upstream: None,
+                ahead: 0,
+                behind: 0,
+                current: false,
+                is_default: false,
+                worktree_path: Some(worktree_path.into()),
+                blocked: Vec::new(),
+            }],
+            remote_branches: Vec::new(),
+            tags: Vec::new(),
+            worktrees: Vec::new(),
+            in_progress_operation: None,
+            conflicted_paths: Vec::new(),
+        };
+        let request = GitManagerOperationRequest::Rebase {
+            cwd: PathBuf::from("/repo"),
+            project_id: "project-1".into(),
+            base: "main".into(),
+            target: "topic".into(),
+        };
+
+        let reason = blocked_reason_for_operation(&snapshot, &request)
+            .expect("occupied rebase target is blocked before Git");
+
+        assert_eq!(reason.operation, "rebase");
+        assert_eq!(reason.code, "worktree-checked-out");
+        assert!(reason.message.contains(worktree_path));
     }
 
     #[test]

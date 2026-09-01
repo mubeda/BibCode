@@ -62,6 +62,22 @@ struct GitExecutionInput {
     stdin: Option<Vec<u8>>,
 }
 
+struct RewriteTempFiles {
+    directory: PathBuf,
+    todo: PathBuf,
+    message: Option<PathBuf>,
+}
+
+impl Drop for RewriteTempFiles {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.todo);
+        if let Some(message) = self.message.as_ref() {
+            let _ = fs::remove_file(message);
+        }
+        let _ = fs::remove_dir(&self.directory);
+    }
+}
+
 pub(crate) type BoxGitProcessFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ProcessOutput, ProcessError>> + Send + 'a>>;
 
@@ -699,6 +715,118 @@ impl GitRepository {
         .await
     }
 
+    pub async fn git_manager_conflict_states(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<super::manager::conflicts::GitManagerConflictState>, GitCommandError> {
+        let status = self
+            .execute(
+                "GitManager.conflicts.status",
+                cwd,
+                &strings(&[
+                    "-c",
+                    "core.quotePath=false",
+                    "status",
+                    "--porcelain=2",
+                    "-z",
+                    "--untracked-files=all",
+                ]),
+                true,
+                cancellation,
+            )
+            .await?;
+        let records = status
+            .stdout
+            .split('\0')
+            .flat_map(str::lines)
+            .filter_map(parse_porcelain_v2_line)
+            .collect::<Vec<_>>();
+        let entries = super::manager::conflicts::unmerged_entries(&records);
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let markers = self
+            .execute(
+                "GitManager.conflicts.markers",
+                cwd,
+                &strings(&["diff", "--check"]),
+                true,
+                cancellation,
+            )
+            .await?;
+        let numstat = self
+            .execute(
+                "GitManager.conflicts.numstat",
+                cwd,
+                &strings(&["diff", "--numstat", "-z"]),
+                true,
+                cancellation,
+            )
+            .await?;
+        let mut attribute_input = entries
+            .iter()
+            .flat_map(|entry| entry.path.bytes().chain(std::iter::once(0)))
+            .collect::<Vec<_>>();
+        if attribute_input.last() != Some(&0) {
+            attribute_input.push(0);
+        }
+        let attributes = self
+            .execute_with_stdin(
+                "GitManager.conflicts.attributes",
+                cwd,
+                &strings(&["check-attr", "--stdin", "-z", "merge"]),
+                attribute_input,
+                false,
+                cancellation,
+            )
+            .await?;
+        let marker_output = format!("{}\n{}", markers.stdout, markers.stderr);
+        let marker_counts = super::manager::conflicts::count_conflict_markers(&marker_output);
+        let binary_paths =
+            super::manager::conflicts::binary_conflict_paths(&numstat.stdout, &attributes.stdout);
+        Ok(super::manager::conflicts::build_conflict_states(
+            &entries,
+            &binary_paths,
+            &marker_counts,
+        ))
+    }
+
+    pub(crate) async fn git_manager_conflict_side_deleted(
+        &self,
+        cwd: &Path,
+        path: &str,
+        side: super::manager::conflicts::ConflictSide,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<bool>, GitCommandError> {
+        let status = self
+            .execute(
+                "GitManager.resolveConflict.status",
+                cwd,
+                &strings(&[
+                    "-c",
+                    "core.quotePath=false",
+                    "status",
+                    "--porcelain=2",
+                    "-z",
+                    "--untracked-files=all",
+                ]),
+                true,
+                cancellation,
+            )
+            .await?;
+        let records = status
+            .stdout
+            .split('\0')
+            .flat_map(str::lines)
+            .filter_map(parse_porcelain_v2_line)
+            .collect::<Vec<_>>();
+        Ok(super::manager::conflicts::unmerged_entries(&records)
+            .into_iter()
+            .find(|entry| entry.path == path)
+            .map(|entry| entry.side_deleted(side)))
+    }
+
     pub(crate) async fn git_manager_remotes(
         &self,
         cwd: &Path,
@@ -754,10 +882,41 @@ impl GitRepository {
                 "--git-path",
                 "rebase-apply",
                 "--git-path",
+                "rebase-merge/msgnum",
+                "--git-path",
+                "rebase-merge/end",
+                "--git-path",
+                "sequencer/abort-safety",
+                "--git-path",
+                "sequencer/head",
+                "--git-path",
                 "sequencer/todo",
             ]),
             false,
             128 * 1024,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_count_commit_range(
+        &self,
+        cwd: &Path,
+        from: &str,
+        to: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.getRefs.inProgressCount",
+            cwd,
+            &[
+                "rev-list".to_owned(),
+                "--count".to_owned(),
+                format!("{from}..{to}"),
+                "--".to_owned(),
+            ],
+            false,
+            64 * 1024,
             cancellation,
         )
         .await
@@ -4032,6 +4191,325 @@ impl GitRepository {
         .await
     }
 
+    pub(crate) async fn git_manager_rebase(
+        &self,
+        cwd: &Path,
+        base: &str,
+        target: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute(
+            "GitManager.rebase",
+            cwd,
+            &[
+                "-c".to_owned(),
+                "rebase.backend=merge".to_owned(),
+                "rebase".to_owned(),
+                base.to_owned(),
+                target.to_owned(),
+            ],
+            true,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_interactive_rebase(
+        &self,
+        cwd: &Path,
+        todo: &str,
+        message: Option<&str>,
+        last_retained_commit_ref: Option<&str>,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let operation = if message.is_some() {
+            "GitManager.squash"
+        } else {
+            "GitManager.reorder"
+        };
+        let files = create_rewrite_temp_files(operation, cwd, todo, message).await?;
+        let sequence_editor = editor_redirect_command(&files.todo);
+        let mut environment = git_environment();
+        environment.push((
+            "GIT_EDITOR".into(),
+            files.message.as_ref().map_or_else(
+                || OsString::from(":"),
+                |path| editor_redirect_command(path).into(),
+            ),
+        ));
+        let mut args = strings(&[
+            "-c",
+            "rebase.backend=merge",
+            "-c",
+            &format!("sequence.editor={sequence_editor}"),
+            "rebase",
+            "-i",
+        ]);
+        args.push(last_retained_commit_ref.map_or_else(|| "--root".to_owned(), str::to_owned));
+        self.execute_with_environment(
+            operation,
+            cwd,
+            &args,
+            GitExecutionOptions {
+                allow_non_zero_exit: true,
+                max_output_bytes: DEFAULT_OUTPUT_LIMIT,
+                output_policy: OutputPolicy::Truncate,
+            },
+            environment,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_cherry_pick(
+        &self,
+        cwd: &Path,
+        shas: &[String],
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let mut args = strings(&["cherry-pick", "--empty=keep", "-m", "1"]);
+        args.extend(shas.iter().cloned());
+        self.execute("GitManager.cherryPick", cwd, &args, true, cancellation)
+            .await
+    }
+
+    pub(crate) async fn git_manager_revert(
+        &self,
+        cwd: &Path,
+        sha: &str,
+        merge_commit: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let mut args = vec!["revert".to_owned()];
+        if merge_commit {
+            args.extend(strings(&["-m", "1"]));
+        }
+        args.push(sha.to_owned());
+        self.execute("GitManager.revert", cwd, &args, true, cancellation)
+            .await
+    }
+
+    pub(crate) async fn git_manager_reset(
+        &self,
+        cwd: &Path,
+        sha: &str,
+        mode: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute(
+            "GitManager.reset",
+            cwd,
+            &["reset".to_owned(), format!("--{mode}"), sha.to_owned()],
+            true,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_rewrite_log_order(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<String>, GitCommandError> {
+        let output = self
+            .execute(
+                "GitManager.rewrite.logOrder",
+                cwd,
+                &strings(&["rev-list", "--first-parent", "HEAD", "--"]),
+                false,
+                cancellation,
+            )
+            .await?;
+        Ok(output
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|sha| !sha.is_empty())
+            .map(str::to_owned)
+            .collect())
+    }
+
+    pub(crate) async fn git_manager_commit_parent(
+        &self,
+        cwd: &Path,
+        sha: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<String>, GitCommandError> {
+        let output = self
+            .execute(
+                "GitManager.rewrite.parent",
+                cwd,
+                &[
+                    "rev-list".to_owned(),
+                    "--parents".to_owned(),
+                    "-n".to_owned(),
+                    "1".to_owned(),
+                    sha.to_owned(),
+                    "--".to_owned(),
+                ],
+                false,
+                cancellation,
+            )
+            .await?;
+        let mut fields = output.stdout.split_whitespace();
+        if fields.next() != Some(sha) {
+            return Err(simple_error(
+                "GitManager.rewrite.parent",
+                cwd,
+                "Git returned malformed rewrite parent data.",
+            ));
+        }
+        Ok(fields.next().map(str::to_owned))
+    }
+
+    pub(crate) async fn git_manager_is_merge_commit(
+        &self,
+        cwd: &Path,
+        sha: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, GitCommandError> {
+        let output = self
+            .execute(
+                "GitManager.revert.parents",
+                cwd,
+                &[
+                    "show".to_owned(),
+                    "-s".to_owned(),
+                    "--format=%P".to_owned(),
+                    sha.to_owned(),
+                    "--".to_owned(),
+                ],
+                false,
+                cancellation,
+            )
+            .await?;
+        Ok(output.stdout.split_whitespace().nth(1).is_some())
+    }
+
+    pub(crate) async fn git_manager_index_is_empty(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, GitCommandError> {
+        let output = self
+            .execute(
+                "GitManager.continue.staged",
+                cwd,
+                &strings(&["diff", "--cached", "--quiet", "--"]),
+                true,
+                cancellation,
+            )
+            .await?;
+        match output.exit_code {
+            0 => Ok(true),
+            1 => Ok(false),
+            _ => Err(simple_error(
+                "GitManager.continue.staged",
+                cwd,
+                "Git could not inspect the staged conflict resolution.",
+            )),
+        }
+    }
+
+    pub(crate) async fn git_manager_continue(
+        &self,
+        cwd: &Path,
+        operation: &str,
+        skip_empty: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let args = match operation {
+            "rebase" => vec![
+                "-c".to_owned(),
+                "rebase.backend=merge".to_owned(),
+                "rebase".to_owned(),
+                if skip_empty { "--skip" } else { "--continue" }.to_owned(),
+            ],
+            "cherry-pick" => strings(&["cherry-pick", "--continue"]),
+            "revert" => strings(&["revert", "--continue"]),
+            "merge" => strings(&["commit", "--no-edit", "--cleanup=strip"]),
+            _ => {
+                return Err(simple_error(
+                    "GitManager.continue",
+                    cwd,
+                    "Git Manager received an unsupported continue operation.",
+                ));
+            }
+        };
+        let mut environment = git_environment();
+        environment.push(("GIT_EDITOR".into(), ":".into()));
+        self.execute_with_environment(
+            "GitManager.continue",
+            cwd,
+            &args,
+            GitExecutionOptions {
+                allow_non_zero_exit: true,
+                max_output_bytes: DEFAULT_OUTPUT_LIMIT,
+                output_policy: OutputPolicy::Truncate,
+            },
+            environment,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_abort(
+        &self,
+        cwd: &Path,
+        operation: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let args = match operation {
+            "rebase" => strings(&["-c", "rebase.backend=merge", "rebase", "--abort"]),
+            "cherry-pick" => strings(&["cherry-pick", "--abort"]),
+            "revert" => strings(&["revert", "--abort"]),
+            "merge" => strings(&["merge", "--abort"]),
+            _ => {
+                return Err(simple_error(
+                    "GitManager.abort",
+                    cwd,
+                    "Git Manager received an unsupported abort operation.",
+                ));
+            }
+        };
+        self.execute("GitManager.abort", cwd, &args, true, cancellation)
+            .await
+    }
+
+    pub(crate) async fn git_manager_resolve_conflict(
+        &self,
+        cwd: &Path,
+        path: &str,
+        side: super::manager::conflicts::ConflictSide,
+        selected_side_deleted: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<ProcessOutput>, GitCommandError> {
+        let plan =
+            super::manager::conflicts::plan_manual_resolution(path, side, selected_side_deleted);
+        let checkout = self
+            .execute(
+                "GitManager.resolveConflict.checkout",
+                cwd,
+                &plan[0],
+                true,
+                cancellation,
+            )
+            .await?;
+        if checkout.exit_code != 0 && !selected_side_deleted {
+            return Ok(vec![checkout]);
+        }
+        let stage = self
+            .execute(
+                "GitManager.resolveConflict.stage",
+                cwd,
+                &plan[1],
+                true,
+                cancellation,
+            )
+            .await?;
+        Ok(vec![checkout, stage])
+    }
+
     pub async fn switch_ref(
         &self,
         cwd: &Path,
@@ -6142,6 +6620,89 @@ fn same_worktree_path(registered: &str, path: &Path) -> bool {
     }
 }
 
+async fn create_rewrite_temp_files(
+    operation: &str,
+    cwd: &Path,
+    todo_contents: &str,
+    message_contents: Option<&str>,
+) -> Result<RewriteTempFiles, GitCommandError> {
+    let mut directory = None;
+    for _ in 0..8 {
+        let candidate =
+            std::env::temp_dir().join(format!("bibcode-git-manager-rewrite-{}", Uuid::new_v4()));
+        match tokio::fs::create_dir(&candidate).await {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+
+                    if tokio::fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700))
+                        .await
+                        .is_err()
+                    {
+                        let _ = tokio::fs::remove_dir(&candidate).await;
+                        return Err(simple_error(
+                            operation,
+                            cwd,
+                            "Git Manager could not protect its temporary rewrite directory.",
+                        ));
+                    }
+                }
+                directory = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(_) => {
+                return Err(simple_error(
+                    operation,
+                    cwd,
+                    "Git Manager could not create its temporary rewrite directory.",
+                ));
+            }
+        }
+    }
+    let directory = directory.ok_or_else(|| {
+        simple_error(
+            operation,
+            cwd,
+            "Git Manager could not reserve a temporary rewrite directory.",
+        )
+    })?;
+    let todo = directory.join("todo");
+    let message = message_contents.map(|_| directory.join("message"));
+    let files = RewriteTempFiles {
+        directory,
+        todo,
+        message,
+    };
+    if tokio::fs::write(&files.todo, todo_contents).await.is_err() {
+        return Err(simple_error(
+            operation,
+            cwd,
+            "Git Manager could not write its temporary rewrite todo.",
+        ));
+    }
+    if let (Some(path), Some(contents)) = (files.message.as_ref(), message_contents)
+        && tokio::fs::write(path, contents).await.is_err()
+    {
+        return Err(simple_error(
+            operation,
+            cwd,
+            "Git Manager could not write its temporary squash message.",
+        ));
+    }
+    Ok(files)
+}
+
+fn editor_redirect_command(path: &Path) -> String {
+    let path = display_path(path)
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('$', "\\$")
+        .replace('`', "\\`");
+    format!("cat \"{path}\" >")
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -6681,6 +7242,407 @@ mod tests {
             .collect::<Vec<_>>()
         );
         assert!(!args.iter().any(|argument| argument == "--force"));
+    }
+
+    #[tokio::test]
+    async fn git_manager_history_rewrite_commands_match_the_command_contract() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([
+                ("GitManager.rebase".into(), process_output("")),
+                ("GitManager.cherryPick".into(), process_output("")),
+                ("GitManager.revert".into(), process_output("")),
+                ("GitManager.reset".into(), process_output("")),
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+        let cwd = Path::new("/repo");
+        let cancellation = CancellationToken::new();
+
+        repository
+            .git_manager_rebase(cwd, "main", "topic", &cancellation)
+            .await
+            .expect("rebase command");
+        repository
+            .git_manager_cherry_pick(cwd, &["aaaaaaa".into(), "bbbbbbb".into()], &cancellation)
+            .await
+            .expect("cherry-pick command");
+        repository
+            .git_manager_revert(cwd, "ccccccc", false, &cancellation)
+            .await
+            .expect("non-merge revert command");
+        repository
+            .git_manager_revert(cwd, "ddddddd", true, &cancellation)
+            .await
+            .expect("merge revert command");
+        for mode in ["hard", "soft", "mixed"] {
+            repository
+                .git_manager_reset(cwd, "eeeeeee", mode, &cancellation)
+                .await
+                .expect("reset command");
+        }
+
+        let args = runner
+            .requests()
+            .into_iter()
+            .map(|request| request.args)
+            .collect::<Vec<_>>();
+        let expected = [
+            vec!["-c", "rebase.backend=merge", "rebase", "main", "topic"],
+            vec![
+                "cherry-pick",
+                "--empty=keep",
+                "-m",
+                "1",
+                "aaaaaaa",
+                "bbbbbbb",
+            ],
+            vec!["revert", "ccccccc"],
+            vec!["revert", "-m", "1", "ddddddd"],
+            vec!["reset", "--hard", "eeeeeee"],
+            vec!["reset", "--soft", "eeeeeee"],
+            vec!["reset", "--mixed", "eeeeeee"],
+        ]
+        .into_iter()
+        .map(|args| args.into_iter().map(OsString::from).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+        assert_eq!(args, expected);
+        assert!(runner.requests().iter().all(|request| {
+            request
+                .env
+                .iter()
+                .any(|(key, value)| key == "GIT_TERMINAL_PROMPT" && value == "0")
+                && !request
+                    .env
+                    .iter()
+                    .any(|(key, _)| key == "GIT_OPTIONAL_LOCKS")
+        }));
+    }
+
+    #[tokio::test]
+    async fn interactive_rebase_uses_temporary_todo_and_editor_files_then_cleans_them() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([
+                ("GitManager.squash".into(), process_output("")),
+                ("GitManager.reorder".into(), process_output("")),
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+        let cancellation = CancellationToken::new();
+
+        repository
+            .git_manager_interactive_rebase(
+                Path::new("/repo"),
+                "pick aaaaaaa\nsquash bbbbbbb\n",
+                Some("combined message\n"),
+                Some("aaaaaaa^"),
+                &cancellation,
+            )
+            .await
+            .expect("squash rebase command");
+        repository
+            .git_manager_interactive_rebase(
+                Path::new("/repo"),
+                "pick bbbbbbb\npick aaaaaaa\n",
+                None,
+                None,
+                &cancellation,
+            )
+            .await
+            .expect("root reorder command");
+
+        let requests = runner.requests();
+        assert_eq!(requests.len(), 2);
+        for (index, request) in requests.iter().enumerate() {
+            assert_eq!(request.args[0], "-c");
+            assert_eq!(request.args[1], "rebase.backend=merge");
+            assert_eq!(request.args[2], "-c");
+            let sequence_editor = request.args[3].to_string_lossy();
+            let todo_path = editor_file_path(&sequence_editor, "sequence.editor=")
+                .expect("sequence editor file path");
+            assert!(!todo_path.exists(), "todo file is removed after execution");
+            assert_eq!(request.args[4], "rebase");
+            assert_eq!(request.args[5], "-i");
+            assert_eq!(
+                request.args[6],
+                if index == 0 { "aaaaaaa^" } else { "--root" }
+            );
+            assert!(request.stdin.is_none());
+        }
+        let squash_editor = requests[0]
+            .env
+            .iter()
+            .find(|(key, _)| key == "GIT_EDITOR")
+            .map(|(_, value)| value.to_string_lossy().into_owned())
+            .expect("squash editor");
+        let message_path =
+            editor_file_path(&squash_editor, "").expect("squash message editor file path");
+        assert!(
+            !message_path.exists(),
+            "message file is removed after execution"
+        );
+        assert!(
+            requests[1]
+                .env
+                .iter()
+                .any(|(key, value)| key == "GIT_EDITOR" && value == ":")
+        );
+    }
+
+    fn editor_file_path(editor: &str, prefix: &str) -> Option<PathBuf> {
+        editor
+            .strip_prefix(prefix)?
+            .strip_prefix("cat \"")?
+            .strip_suffix("\" >")
+            .map(PathBuf::from)
+    }
+
+    #[tokio::test]
+    async fn recovery_commands_set_the_editor_and_preserve_command_order() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([
+                ("GitManager.continue".into(), process_output("")),
+                ("GitManager.abort".into(), process_output("")),
+                (
+                    "GitManager.resolveConflict.checkout".into(),
+                    process_output(""),
+                ),
+                (
+                    "GitManager.resolveConflict.stage".into(),
+                    process_output(""),
+                ),
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+        let cwd = Path::new("/repo");
+        let cancellation = CancellationToken::new();
+
+        for (operation, skip) in [
+            ("rebase", false),
+            ("rebase", true),
+            ("cherry-pick", false),
+            ("revert", false),
+            ("merge", false),
+        ] {
+            repository
+                .git_manager_continue(cwd, operation, skip, &cancellation)
+                .await
+                .expect("continue command");
+        }
+        for operation in ["rebase", "cherry-pick", "revert", "merge"] {
+            repository
+                .git_manager_abort(cwd, operation, &cancellation)
+                .await
+                .expect("abort command");
+        }
+        repository
+            .git_manager_resolve_conflict(
+                cwd,
+                "nested/file.txt",
+                crate::git::manager::conflicts::ConflictSide::Ours,
+                false,
+                &cancellation,
+            )
+            .await
+            .expect("ours resolution");
+        repository
+            .git_manager_resolve_conflict(
+                cwd,
+                "deleted.txt",
+                crate::git::manager::conflicts::ConflictSide::Theirs,
+                true,
+                &cancellation,
+            )
+            .await
+            .expect("deleted-side resolution");
+
+        let requests = runner.requests();
+        let args = requests
+            .iter()
+            .map(|request| {
+                request
+                    .args
+                    .iter()
+                    .map(|argument| argument.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                vec!["-c", "rebase.backend=merge", "rebase", "--continue"],
+                vec!["-c", "rebase.backend=merge", "rebase", "--skip"],
+                vec!["cherry-pick", "--continue"],
+                vec!["revert", "--continue"],
+                vec!["commit", "--no-edit", "--cleanup=strip"],
+                vec!["-c", "rebase.backend=merge", "rebase", "--abort"],
+                vec!["cherry-pick", "--abort"],
+                vec!["revert", "--abort"],
+                vec!["merge", "--abort"],
+                vec!["checkout", "--ours", "--", "nested/file.txt"],
+                vec!["add", "--", "nested/file.txt"],
+                vec!["checkout", "--theirs", "--", "deleted.txt"],
+                vec!["rm", "--", "deleted.txt"],
+            ]
+        );
+        assert!(requests[..5].iter().all(|request| {
+            request
+                .env
+                .iter()
+                .any(|(key, value)| key == "GIT_EDITOR" && value == ":")
+        }));
+    }
+
+    #[tokio::test]
+    async fn conflict_state_uses_porcelain_markers_numstat_and_binary_attributes() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([
+                (
+                    "GitManager.conflicts.status".into(),
+                    process_output(
+                        "u UU N... 100644 100644 100644 100644 aaaaaaa bbbbbbb ccccccc text.txt\0\
+                         u AA N... 100644 100644 100644 100644 aaaaaaa bbbbbbb ccccccc image.dat\0",
+                    ),
+                ),
+                (
+                    "GitManager.conflicts.markers".into(),
+                    process_result(
+                        2,
+                        "",
+                        "text.txt:1: leftover conflict marker\n\
+                         text.txt:3: leftover conflict marker\n\
+                         text.txt:5: leftover conflict marker\n",
+                    ),
+                ),
+                (
+                    "GitManager.conflicts.numstat".into(),
+                    process_output("-\t-\timage.dat\0"),
+                ),
+                (
+                    "GitManager.conflicts.attributes".into(),
+                    process_output("image.dat\0merge\0binary\0"),
+                ),
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+
+        let states = repository
+            .git_manager_conflict_states(Path::new("/repo"), &CancellationToken::new())
+            .await
+            .expect("conflict state");
+
+        assert_eq!(states.len(), 2);
+        assert_eq!(states[0].path, "text.txt");
+        assert_eq!(states[0].marker_count, 3);
+        assert_eq!(
+            states[1].kind,
+            crate::git::manager::conflicts::ConflictKind::Binary
+        );
+        let requests = runner.requests();
+        let args = requests
+            .iter()
+            .map(|request| request.args.clone())
+            .collect::<Vec<_>>();
+        let expected = [
+            vec![
+                "-c",
+                "core.quotePath=false",
+                "status",
+                "--porcelain=2",
+                "-z",
+                "--untracked-files=all",
+            ],
+            vec!["diff", "--check"],
+            vec!["diff", "--numstat", "-z"],
+            vec!["check-attr", "--stdin", "-z", "merge"],
+        ]
+        .into_iter()
+        .map(|args| args.into_iter().map(OsString::from).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+        assert_eq!(args, expected);
+        assert_eq!(
+            requests[3].stdin.as_deref(),
+            Some(b"text.txt\0image.dat\0".as_slice())
+        );
+        assert!(requests.iter().all(|request| {
+            !request
+                .env
+                .iter()
+                .any(|(key, _)| key == "GIT_OPTIONAL_LOCKS")
+        }));
+    }
+
+    #[tokio::test]
+    async fn rewrite_inspection_reads_history_parents_and_staged_emptiness() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([
+                (
+                    "GitManager.rewrite.logOrder".into(),
+                    process_output("bbbbbbb\naaaaaaa\n"),
+                ),
+                (
+                    "GitManager.rewrite.parent".into(),
+                    process_output("aaaaaaa 0000000\n"),
+                ),
+                (
+                    "GitManager.revert.parents".into(),
+                    process_output("1111111 2222222\n"),
+                ),
+                (
+                    "GitManager.continue.staged".into(),
+                    process_result(1, "", ""),
+                ),
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+        let cancellation = CancellationToken::new();
+
+        assert_eq!(
+            repository
+                .git_manager_rewrite_log_order(Path::new("/repo"), &cancellation)
+                .await
+                .expect("history order"),
+            ["bbbbbbb", "aaaaaaa"]
+        );
+        assert_eq!(
+            repository
+                .git_manager_commit_parent(Path::new("/repo"), "aaaaaaa", &cancellation)
+                .await
+                .expect("parent probe"),
+            Some("0000000".to_owned())
+        );
+        assert!(
+            repository
+                .git_manager_is_merge_commit(Path::new("/repo"), "ccccccc", &cancellation)
+                .await
+                .expect("merge-parent probe")
+        );
+        assert!(
+            !repository
+                .git_manager_index_is_empty(Path::new("/repo"), &cancellation)
+                .await
+                .expect("staged probe")
+        );
+
+        let args = runner
+            .requests()
+            .into_iter()
+            .map(|request| request.args)
+            .collect::<Vec<_>>();
+        let expected = [
+            vec!["rev-list", "--first-parent", "HEAD", "--"],
+            vec!["rev-list", "--parents", "-n", "1", "aaaaaaa", "--"],
+            vec!["show", "-s", "--format=%P", "ccccccc", "--"],
+            vec!["diff", "--cached", "--quiet", "--"],
+        ]
+        .into_iter()
+        .map(|args| args.into_iter().map(OsString::from).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+        assert_eq!(args, expected);
     }
 
     #[tokio::test]

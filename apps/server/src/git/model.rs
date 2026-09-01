@@ -13,6 +13,7 @@ pub enum VcsWorkingTreeFileStatus {
     Renamed,
     Copied,
     Untracked,
+    Conflicted,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
