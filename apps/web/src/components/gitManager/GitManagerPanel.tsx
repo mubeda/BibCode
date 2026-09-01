@@ -19,6 +19,7 @@ import {
   type GitManagerAvailability,
 } from "./gitManagerAvailability";
 import { GitManagerChangesView } from "./changes/GitManagerChangesView";
+import { GitManagerHistoryView } from "./history/GitManagerHistoryView";
 import { GitManagerToolbar } from "./GitManagerToolbar";
 
 const EMPTY_WORKTREES: ReadonlyArray<VcsWorktreeDescriptor> = Object.freeze([]);
@@ -189,7 +190,9 @@ export const GitManagerPanel = memo(function GitManagerPanel({ projectRef }: Git
           <GitManagerChangesView scope={activeScope} projectRef={stableProjectRef} />
         </TabsPanel>
         <TabsPanel className="min-h-0 flex-1 gap-0 p-4" value="history">
-          <p className="text-sm text-muted-foreground">Commit history will appear here.</p>
+          {viewState.activeTab === "history" ? (
+            <GitManagerHistoryView scope={activeScope} projectRef={stableProjectRef} />
+          ) : null}
         </TabsPanel>
       </Tabs>
     </div>

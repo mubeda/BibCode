@@ -19,6 +19,7 @@ export interface GitManagerViewState {
   readonly selectedFilePath: string | null;
   readonly filterText: string;
   readonly loadedPageCount: number;
+  readonly loadedPageCursors: ReadonlyArray<number>;
   readonly scrollAnchor: string | null;
   readonly commitDraft: string;
   readonly lastUsedAt: number;
@@ -38,6 +39,7 @@ export const DEFAULT_GIT_MANAGER_VIEW_STATE: GitManagerViewState = Object.freeze
   selectedFilePath: null,
   filterText: "",
   loadedPageCount: 0,
+  loadedPageCursors: Object.freeze([]),
   scrollAnchor: null,
   commitDraft: "",
   lastUsedAt: 0,
@@ -54,6 +56,7 @@ interface GitManagerStoreState {
   readonly setSelectedFile: (ref: ScopedProjectRef, path: string | null) => void;
   readonly setFilterText: (ref: ScopedProjectRef, text: string) => void;
   readonly setLoadedPageCount: (ref: ScopedProjectRef, count: number) => void;
+  readonly setLoadedPageCursors: (ref: ScopedProjectRef, cursors: ReadonlyArray<number>) => void;
   readonly setScrollAnchor: (ref: ScopedProjectRef, anchor: string | null) => void;
   readonly setCommitDraft: (ref: ScopedProjectRef, draft: string) => void;
 }
@@ -107,6 +110,14 @@ function nonNegativeIntegerOr(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : fallback;
 }
 
+function nonNegativeIntegerArray(value: unknown): ReadonlyArray<number> {
+  if (!Array.isArray(value)) return [];
+  return value.filter(
+    (cursor): cursor is number =>
+      typeof cursor === "number" && Number.isSafeInteger(cursor) && cursor >= 0,
+  );
+}
+
 function sanitizeViewState(value: unknown): PersistedGitManagerViewState | null {
   if (value === null || typeof value !== "object") return null;
   const candidate = value as Record<string, unknown>;
@@ -117,6 +128,7 @@ function sanitizeViewState(value: unknown): PersistedGitManagerViewState | null 
     selectedFilePath: nullableString(candidate.selectedFilePath),
     filterText: stringOr(candidate.filterText, ""),
     loadedPageCount: nonNegativeIntegerOr(candidate.loadedPageCount, 0),
+    loadedPageCursors: nonNegativeIntegerArray(candidate.loadedPageCursors),
     scrollAnchor: nullableString(candidate.scrollAnchor),
     commitDraft: stringOr(candidate.commitDraft, ""),
     lastUsedAt: nonNegativeIntegerOr(candidate.lastUsedAt, 0),
@@ -191,6 +203,13 @@ export const useGitManagerStore = create<GitManagerStoreState>()(
           updateProject(state, ref, (current) => ({
             ...current,
             loadedPageCount: nonNegativeIntegerOr(count, current.loadedPageCount),
+          })),
+        ),
+      setLoadedPageCursors: (ref, cursors) =>
+        set((state) =>
+          updateProject(state, ref, (current) => ({
+            ...current,
+            loadedPageCursors: nonNegativeIntegerArray(cursors),
           })),
         ),
       setScrollAnchor: (ref, anchor) =>
