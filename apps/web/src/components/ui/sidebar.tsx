@@ -683,6 +683,7 @@ function SidebarContent({ className, ...props }: React.ComponentProps<"div">) {
         )}
         data-sidebar="content"
         data-slot="sidebar-content"
+        data-text-surface="sidebar"
         {...props}
       />
     </ScrollArea>

@@ -215,3 +215,63 @@ Verification: rebuild the AppImage, capture the packaged app under Xwayland
 with the same temporary-HOME harness, and require the “prim ary” and “No t
 hreads yet” gaps to be gone and the 13px matrix to measure 0 gaps on every DM
 Sans row.
+
+## Revision 4 (same day) — LCD text inside scroll containers is app-side after all
+
+After Revision 3 the packaged app still read noticeably softer than the
+reference Electron app. Measuring color fringing (the share of text ink pixels
+carrying subpixel color) on an Xwayland capture of the packaged app: the static
+title text was 0.956, every text inside the sidebar and other scrollers 0.000.
+Revision 2 recorded grayscale-in-scrollers as "engine behavior with no public
+knob, not fixable app-side". That sentence is retracted: the Revision 2 harness
+never tested a painted descendant inside the scroller.
+
+A real WebKitGTK 2.52 window on the user's session (Xwayland, accelerated
+compositing, `gtk-xft-rgba=rgb`) rendered 30 DOM variants. The rule that
+survived every case:
+
+- Text placed directly on the scrolled contents of an `overflow: auto` element
+  renders grayscale (0.000), whatever background the scroller itself paints
+  (`#fff`, `#fefefe`, `#f7f7f7`, 50% white, `background-attachment: local`).
+- Text inside any ancestor _within_ the scroller that paints a background
+  renders LCD (0.91–0.94). Partial coverage, half width, 99% alpha, a light
+  grey, a fade `mask-image` on the scroller, nesting three levels deep, and a
+  composited wrapper (`will-change: transform`, `translateZ(0)`) all pass; the
+  plain painted wrapper is the cheapest and is the one used.
+- A plain block outside any scroller renders LCD (0.936), matching the
+  reference app's fringe ratio measured on the user's earlier screenshot.
+- The Wayland web process paints the same way when compositing is disabled,
+  so the rule is a property of composited scroll layers, not of the backend.
+- Two more suppressors found by bisecting the real sidebar DOM in the same
+  harness: the scroll-fade `mask-image` that `ScrollArea` applies to its
+  viewport (sidebar crop 0.000 with it, 0.667 without it; icons count as ink)
+  and any element `opacity` below 1 on the text's ancestors (0.015). A
+  translucent text _color_, `color-mix` with transparency, a `button`, a
+  transformed ancestor, and `position: fixed` all keep LCD.
+- Observation not relied on: in a dark scroller (`#1a1a1a` with light text) even
+  bare text showed color fringes. The painted-wrapper rule held in dark theme
+  too, so the implementation does not depend on this.
+
+Font candidates (DM Sans 400/450, Geist 400, Adwaita Sans, Noto Sans, Open Sans)
+were rendered inside an LCD-enabled scroller at `hintslight` and `hintfull`.
+At `hintslight` every font reads evenly; DM Sans 450 is the current shipped
+face. At `hintfull` every font including Geist shows whole-pixel letter gaps
+("lo aded"). The typeface was therefore never the lever; the hinting pin from
+Revision 3 stays.
+
+**Decision:** keep DM Sans and the `hintslight` pin; mark the content wrapper
+of each main reading surface with `data-text-surface="background|card|sidebar"`
+and, under `html[data-linux-webkit]` only, paint the matching theme token on it.
+Surfaces covered: sidebar content, chat timeline rows, the Agents view list, and
+the settings scroller. The Linux webview also drops the `ScrollArea` scroll-fade
+mask (cosmetic) because it suppresses LCD text underneath it. Not covered (still grayscale until marked): popovers,
+the command palette, git manager panes, file preview and diff virtualizers, and
+the other `ScrollArea` consumers. A `will-change` layer per surface was rejected:
+it adds GPU memory on tall transcripts for no measured gain over the painted
+wrapper.
+
+Verification: rebuild the AppImage, capture it under Xwayland with the same
+temporary-HOME harness, and require the sidebar text crop's fringe ratio to
+rise from 0.000 to at least 0.85 while the static title stays LCD. The chat
+timeline is verified by analog (per-row painted wrapper equals harness
+variants 8 and 24) because the throwaway HOME has no thread to render.
