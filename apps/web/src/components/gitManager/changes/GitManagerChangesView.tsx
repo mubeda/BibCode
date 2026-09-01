@@ -1,11 +1,14 @@
 import { projectKey } from "@bibcode/client-runtime/state/entities";
 import { EnvironmentRpcUnavailableError } from "@bibcode/client-runtime/rpc";
-import type {
-  ContextMenuItem,
-  EditorId,
-  EnvironmentId,
-  ScopedProjectRef,
-  VcsStatusResult,
+import { squashAtomCommandFailure } from "@bibcode/client-runtime/state/runtime";
+import {
+  type ContextMenuItem,
+  GitManagerOperationError,
+  type EditorId,
+  type EnvironmentId,
+  type GitManagerUndoCommitResult,
+  type ScopedProjectRef,
+  type VcsStatusResult,
 } from "@bibcode/contracts";
 import * as Cause from "effect/Cause";
 import * as Schema from "effect/Schema";
@@ -27,6 +30,8 @@ import { useAtomCommand } from "../../../state/use-atom-command";
 import { vcsEnvironment } from "../../../state/vcs";
 import { joinWorkspacePath, parentRelativePath } from "../../files/FileTreeContextMenu.logic";
 import { GitManagerAgentActivity } from "./GitManagerAgentActivity";
+import { GitManagerCommitBox, type GitManagerCommitSubmission } from "./GitManagerCommitBox";
+import { GitManagerDiscardDialog } from "./GitManagerDiscardDialog";
 import { GitManagerChangesList } from "./GitManagerChangesList";
 import {
   buildChangeRows,
@@ -45,6 +50,7 @@ type ChangeContextAction =
   | "ignore-file"
   | "ignore-folder"
   | "ignore-extension"
+  | "discard"
   | "toggle-inclusion"
   | "copy-path"
   | "copy-relative-path"
@@ -62,6 +68,12 @@ const FILTER_NAMES: ReadonlyArray<keyof ChangeFilters> = Object.freeze([
   "deleted",
 ]);
 const isEnvironmentRpcUnavailableError = Schema.is(EnvironmentRpcUnavailableError);
+const isGitManagerOperationError = Schema.is(GitManagerOperationError);
+
+interface PendingDiscard {
+  readonly paths: ReadonlyArray<string>;
+  readonly disposition: "trash" | "permanent";
+}
 
 function isEnvironmentUnavailable(
   emission: AsyncResult.AsyncResult<unknown, unknown> | undefined,
@@ -81,6 +93,7 @@ function contextMenuItems(
   row: ChangeRow,
   editorAvailable: boolean,
   revealAvailable: boolean,
+  commitOperationsAvailable: boolean,
 ): ContextMenuItem<ChangeContextAction>[] {
   const extension = fileExtension(row.path);
   const ignoreExtensionItems: ContextMenuItem<ChangeContextAction>[] =
@@ -109,6 +122,7 @@ function contextMenuItems(
       label: row.inclusion === "none" ? "Include selected" : "Exclude selected",
       disabled: inclusionDisabled,
     },
+    { id: "discard", label: "Discard changes", disabled: !commitOperationsAvailable },
     { id: "copy-path", label: "Copy path", icon: "copy" },
     { id: "copy-relative-path", label: "Copy relative path", icon: "copy" },
     { id: "reveal", label: "Reveal", disabled: !revealAvailable },
@@ -125,6 +139,15 @@ function errorPanel(title: string, message: string) {
       </div>
     </div>
   );
+}
+
+function gitManagerMutationErrorMessage(error: unknown): string {
+  if (isGitManagerOperationError(error)) {
+    return error.blocked?.message ?? error.message;
+  }
+  return error instanceof Error && error.message.trim().length > 0
+    ? error.message
+    : "Git could not complete the requested operation.";
 }
 
 export const GitManagerChangesView = memo(function GitManagerChangesView({
@@ -155,6 +178,9 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
   const setSelectedFile = useGitManagerStore((state) => state.setSelectedFile);
   const [filters, setFilters] = useState<ChangeFilters>(() => DEFAULT_CHANGE_FILTERS);
   const [excludedPaths, setExcludedPaths] = useState<ReadonlySet<string>>(() => new Set());
+  const [mutationBusy, setMutationBusy] = useState(false);
+  const [mutationError, setMutationError] = useState<string | null>(null);
+  const [pendingDiscard, setPendingDiscard] = useState<PendingDiscard | null>(null);
   const readsAvailable = typeof gitManagerEnvironment.getRefs === "function";
 
   const statusAtom = useMemo(
@@ -169,11 +195,19 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
     () => (readsAvailable ? gitManagerEnvironment.signal({ environmentId, input: { cwd } }) : null),
     [cwd, environmentId, readsAvailable],
   );
+  const latestCommitAtom = useMemo(() => {
+    const getCommits = gitManagerEnvironment.getCommits;
+    return typeof getCommits === "function"
+      ? getCommits({ environmentId, input: { cwd, offset: 0, limit: 1 } })
+      : null;
+  }, [cwd, environmentId]);
   const statusQuery = useEnvironmentQuery(statusAtom);
   const refsQuery = useEnvironmentQuery(refsAtom);
   const signalQuery = useEnvironmentQuery(signalAtom);
+  const latestCommitQuery = useEnvironmentQuery(latestCommitAtom);
   const signalGeneration = signalQuery.data?.generation ?? null;
   const refreshRefs = refsQuery.refresh;
+  const refreshLatestCommit = latestCommitQuery.refresh;
   useEffect(() => {
     if (signalGeneration !== null) refreshRefs();
   }, [refreshRefs, signalGeneration]);
@@ -185,6 +219,12 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
   const revealInFileManager = useAtomCommand(shellEnvironment.openInEditor, {
     reportFailure: false,
   });
+  const refreshStatus = useAtomCommand(vcsEnvironment.refreshStatus, { reportFailure: false });
+  const stageFiles = useAtomCommand(vcsEnvironment.stageFiles, { reportFailure: false });
+  const unstageFiles = useAtomCommand(vcsEnvironment.unstageFiles, { reportFailure: false });
+  const commit = useAtomCommand(gitManagerEnvironment.commit, { reportFailure: false });
+  const undoCommit = useAtomCommand(gitManagerEnvironment.undoCommit, { reportFailure: false });
+  const discard = useAtomCommand(gitManagerEnvironment.discard, { reportFailure: false });
 
   const files = statusQuery.data?.workingTree.files ?? EMPTY_FILES;
   const conflictedPaths = refsQuery.data?.conflictedPaths ?? EMPTY_PATHS;
@@ -203,6 +243,37 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
   const rowsRef = useRef(rows);
   rowsRef.current = rows;
   const header = useMemo(() => changeRowsHeader(rows), [rows]);
+  const includedPaths = useMemo(() => {
+    const conflicted = new Set(conflictedPaths);
+    const included = new Set<string>();
+    for (const file of files) {
+      if (!excludedPaths.has(file.path) && !conflicted.has(file.path)) included.add(file.path);
+    }
+    return [...included];
+  }, [conflictedPaths, excludedPaths, files]);
+  const includedPathsRef = useRef(includedPaths);
+  includedPathsRef.current = includedPaths;
+  const allChangedPaths = useMemo(() => [...new Set(files.map((file) => file.path))], [files]);
+  const latestCommit = latestCommitQuery.data?.commits[0] ?? null;
+  const localBranches = refsQuery.data?.localBranches ?? [];
+  const currentBranch = localBranches.find((branch) => branch.current) ?? null;
+  const currentBranchHasLocalCommit =
+    currentBranch !== null && (currentBranch.upstream === null || currentBranch.ahead > 0);
+  const latestCommittedAtMs = latestCommit?.committedAtMs ?? null;
+  const latestCommitParentCount = latestCommit?.parents.length ?? 0;
+  const latestLocalCommit = useMemo(
+    () =>
+      currentBranchHasLocalCommit && latestCommittedAtMs !== null
+        ? { committedAtMs: latestCommittedAtMs, isMerge: latestCommitParentCount > 1 }
+        : null,
+    [currentBranchHasLocalCommit, latestCommitParentCount, latestCommittedAtMs],
+  );
+  const branch = refsQuery.data?.headRef ?? statusQuery.data?.refName ?? "HEAD";
+  const commitOperationsAvailable =
+    serverConfig?.environment?.capabilities.gitManagerCommitOperations === true;
+  const commitDisabledReason = commitOperationsAvailable
+    ? null
+    : "This environment does not support Git Manager commit operations.";
 
   const handleSelect = useCallback(
     (path: string) => setSelectedFile(stableProjectRef, path),
@@ -235,6 +306,148 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
     setFilterText(stableProjectRef, "");
     setFilters(DEFAULT_CHANGE_FILTERS);
   }, [setFilterText, stableProjectRef]);
+  const handleCommit = useCallback(
+    async (input: GitManagerCommitSubmission) => {
+      const selectedAtInvocation = new Set(includedPathsRef.current);
+      setMutationBusy(true);
+      setMutationError(null);
+      try {
+        const freshStatus = await refreshStatus({ environmentId, input: { cwd } });
+        if (freshStatus._tag === "Failure") {
+          const message = gitManagerMutationErrorMessage(squashAtomCommandFailure(freshStatus));
+          setMutationError(message);
+          throw new Error(message);
+        }
+
+        const pathsToStage = new Set<string>();
+        const pathsToUnstage = new Set<string>();
+        for (const file of freshStatus.value.workingTree.files) {
+          if (selectedAtInvocation.has(file.path)) {
+            if (file.area !== "staged") pathsToStage.add(file.path);
+          } else if (file.area === "staged") {
+            pathsToUnstage.add(file.path);
+          }
+        }
+        if (selectedAtInvocation.size > 0 && pathsToStage.size === 0) {
+          const freshPaths = new Set(freshStatus.value.workingTree.files.map((file) => file.path));
+          if (![...selectedAtInvocation].some((path) => freshPaths.has(path))) {
+            const message =
+              "The selected changes are no longer present. Review the refreshed status before committing.";
+            setMutationError(message);
+            throw new Error(message);
+          }
+        }
+        if (pathsToUnstage.size > 0) {
+          const result = await unstageFiles({
+            environmentId,
+            input: { cwd, filePaths: [...pathsToUnstage] },
+          });
+          if (result._tag === "Failure") {
+            const message = gitManagerMutationErrorMessage(squashAtomCommandFailure(result));
+            setMutationError(message);
+            throw new Error(message);
+          }
+        }
+        if (pathsToStage.size > 0) {
+          const result = await stageFiles({
+            environmentId,
+            input: { cwd, filePaths: [...pathsToStage] },
+          });
+          if (result._tag === "Failure") {
+            const message = gitManagerMutationErrorMessage(squashAtomCommandFailure(result));
+            setMutationError(message);
+            throw new Error(message);
+          }
+        }
+        const result = await commit({
+          environmentId,
+          input: {
+            cwd,
+            summary: input.summary,
+            description: input.description,
+            amend: input.amend,
+            noVerify: input.noVerify,
+            signoff: input.signoff,
+            allowEmpty: input.allowEmpty,
+            coAuthors: [...input.coAuthors],
+          },
+        });
+        if (result._tag === "Failure") {
+          const message = gitManagerMutationErrorMessage(squashAtomCommandFailure(result));
+          setMutationError(message);
+          throw new Error(message);
+        }
+        refreshRefs();
+        refreshLatestCommit();
+      } finally {
+        setMutationBusy(false);
+      }
+    },
+    [
+      commit,
+      cwd,
+      environmentId,
+      refreshLatestCommit,
+      refreshRefs,
+      refreshStatus,
+      stageFiles,
+      unstageFiles,
+    ],
+  );
+  const handleUndo = useCallback(async (): Promise<GitManagerUndoCommitResult | null> => {
+    setMutationBusy(true);
+    setMutationError(null);
+    try {
+      const result = await undoCommit({ environmentId, input: { cwd } });
+      if (result._tag === "Failure") {
+        setMutationError(gitManagerMutationErrorMessage(squashAtomCommandFailure(result)));
+        return null;
+      }
+      refreshRefs();
+      refreshLatestCommit();
+      return result.value;
+    } finally {
+      setMutationBusy(false);
+    }
+  }, [cwd, environmentId, refreshLatestCommit, refreshRefs, undoCommit]);
+  const requestDiscardAll = useCallback(() => {
+    if (allChangedPaths.length > 0) {
+      setPendingDiscard({ paths: allChangedPaths, disposition: "trash" });
+    }
+  }, [allChangedPaths]);
+  const handleDiscardOpenChange = useCallback((open: boolean) => {
+    if (!open) setPendingDiscard(null);
+  }, []);
+  const confirmDiscard = useCallback(async (): Promise<"keep-open" | void> => {
+    const requested = pendingDiscard;
+    if (requested === null) return;
+    setMutationBusy(true);
+    setMutationError(null);
+    try {
+      const result = await discard({
+        environmentId,
+        input: {
+          cwd,
+          paths: [...requested.paths] as [string, ...string[]],
+          permitPermanent: requested.disposition === "permanent",
+        },
+      });
+      if (result._tag === "Failure") {
+        const message = gitManagerMutationErrorMessage(squashAtomCommandFailure(result));
+        setMutationError(message);
+        throw new Error(message);
+      }
+      if (requested.disposition === "trash" && result.value.trashUnavailable.length > 0) {
+        setPendingDiscard({
+          paths: result.value.trashUnavailable,
+          disposition: "permanent",
+        });
+        return "keep-open";
+      }
+    } finally {
+      setMutationBusy(false);
+    }
+  }, [cwd, discard, environmentId, pendingDiscard]);
   const handleOpenExternal = useCallback(
     (path: string) => {
       if (availableEditors.length === 0) return;
@@ -249,11 +462,22 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
       if (row === undefined || api === undefined) return;
       const revealAvailable = availableEditors.includes("file-manager");
       void api.contextMenu
-        .show(contextMenuItems(row, availableEditors.length > 0, revealAvailable), position)
+        .show(
+          contextMenuItems(
+            row,
+            availableEditors.length > 0,
+            revealAvailable,
+            commitOperationsAvailable,
+          ),
+          position,
+        )
         .then(async (action) => {
           switch (action) {
             case "toggle-inclusion":
               handleToggle(path);
+              return;
+            case "discard":
+              setPendingDiscard({ paths: [path], disposition: "trash" });
               return;
             case "copy-path":
               await navigator.clipboard?.writeText(joinWorkspacePath(cwd, path));
@@ -282,7 +506,15 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
         })
         .catch(() => undefined);
     },
-    [availableEditors, cwd, environmentId, handleOpenExternal, handleToggle, revealInFileManager],
+    [
+      availableEditors,
+      commitOperationsAvailable,
+      cwd,
+      environmentId,
+      handleOpenExternal,
+      handleToggle,
+      revealInFileManager,
+    ],
   );
 
   const statusUnavailable = isEnvironmentUnavailable(statusQuery.emission);
@@ -344,6 +576,21 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
           cwd={cwd}
           mainCheckoutCwd={mainCheckoutCwd}
         />
+        <Button
+          aria-describedby={commitOperationsAvailable ? undefined : "git-manager-discard-disabled"}
+          disabled={!commitOperationsAvailable || mutationBusy || allChangedPaths.length === 0}
+          size="sm"
+          title={commitDisabledReason ?? undefined}
+          variant="destructive-outline"
+          onClick={requestDiscardAll}
+        >
+          Discard All
+        </Button>
+        {commitOperationsAvailable ? null : (
+          <span className="sr-only" id="git-manager-discard-disabled">
+            {commitDisabledReason}
+          </span>
+        )}
       </div>
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-border/70 px-2 py-1.5">
         {FILTER_NAMES.map((name) => (
@@ -401,6 +648,33 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
             onToggle={handleToggle}
           />
         </>
+      )}
+      {mutationError === null ? null : (
+        <p aria-live="polite" className="border-t border-border px-3 py-2 text-xs text-destructive">
+          {mutationError}
+        </p>
+      )}
+      <GitManagerCommitBox
+        branch={branch}
+        disabledReason={commitDisabledReason}
+        includedPaths={includedPaths}
+        isBusy={mutationBusy}
+        latestCommit={latestLocalCommit}
+        scope={scope}
+        workingTreeDirty={refsQuery.data.isDirty === true}
+        onCommit={handleCommit}
+        onUndo={handleUndo}
+      />
+      {pendingDiscard === null ? null : (
+        <GitManagerDiscardDialog
+          disposition={pendingDiscard.disposition}
+          errorMessage={mutationError}
+          isBusy={mutationBusy}
+          open
+          paths={pendingDiscard.paths}
+          onConfirm={confirmDiscard}
+          onOpenChange={handleDiscardOpenChange}
+        />
       )}
     </section>
   );
