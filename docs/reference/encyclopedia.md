@@ -48,18 +48,26 @@ transcript. They appear as center-panel tabs, not left-panel rows.
 
 ### Left Panel
 
-The navigator for Search, the cross-environment Agents section, and
-environment-scoped project/worktree rows. It shows project groups, primary
-rows, worktree rows, pin/unread state, context menus, and running agent
-sub-rows.
+The navigator for Search, the cross-environment Agents nav row, and
+environment-scoped project/worktree rows. The Agents row's unread badge
+aggregates across environments, and selecting it opens the full-screen Agents
+view. The panel also shows project groups, primary rows, worktree rows,
+pin/unread state, context menus, and running agent sub-rows.
 
-### Agents Section
+### Agents View
 
-The cross-environment thread navigator in the left panel. It shows one row per
-non-archived thread with a session, with a status pill and capped one-line
-conversation preview; rows remain bold and unread until visited. It is the
-sanctioned exception to environment-rail scoping. Clicking a row opens its
-thread and re-points the rail selection to that row's environment.
+The full-takeover cross-environment thread navigator opened from the Agents nav
+row. Its top strip has a back arrow and **N unread** badge. Its list column has
+a filter, grouping by Status, Project, or Environment, an unread-only bell, and
+a **Mark all read** menu. Status groups show counts, with Done collapsed by
+default. Rows show status, title, project · branch, conversation preview,
+environment, and relative time; non-live environments are greyed, and rows
+remain bold and unread until visited. Selecting a row marks it read and shows
+its live session in the right pane while the list remains visible.
+
+The view and the nav row's unread badge are the sanctioned exception to
+environment-rail scoping. The per-row **Jump to workspace** action exits the
+view and re-points rail selection to the row's environment.
 
 ### Center Panel
 
