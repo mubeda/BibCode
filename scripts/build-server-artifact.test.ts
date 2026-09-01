@@ -29,6 +29,17 @@ afterEach(() => {
 });
 
 describe("server artifact builder", () => {
+  it("loads both Windows PowerShell ZIP assemblies in dependency order", () => {
+    const script = NodeFS.readFileSync(
+      NodePath.resolve(import.meta.dirname, "create-portable-zip.ps1"),
+      "utf8",
+    );
+    expect(script.indexOf("System.IO.Compression\n")).toBeGreaterThanOrEqual(0);
+    expect(script.indexOf("System.IO.Compression.FileSystem")).toBeGreaterThan(
+      script.indexOf("System.IO.Compression\n"),
+    );
+  });
+
   it("expands every nFPM content source from the staged package root", () => {
     const config = NodeFS.readFileSync(
       NodePath.resolve(import.meta.dirname, "../apps/server/package/nfpm.yaml"),
