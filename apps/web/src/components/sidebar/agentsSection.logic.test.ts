@@ -7,6 +7,8 @@ import { describe, expect, it } from "vite-plus/test";
 import type { ThreadStatusPill } from "../Sidebar.logic";
 import {
   buildAgentRows,
+  buildAgentViewGroups,
+  countUnreadAgentRows,
   groupAgentRows,
   resolveAgentGroup,
   resolveAgentPreviewLine,
@@ -298,5 +300,213 @@ describe("groupAgentRows", () => {
     const longSearchRow = { ...rows[0]!, searchText: pastByteLimit };
     expect(groupAgentRows([longSearchRow], atByteLimit)[0]?.rows).toEqual([longSearchRow]);
     expect(groupAgentRows([longSearchRow], pastByteLimit)).toEqual([]);
+  });
+});
+
+describe("buildAgentViewGroups", () => {
+  it("builds status groups in fixed order with prefixed ids and elides empty groups", () => {
+    const rows = buildRows([
+      makeShell({
+        id: ThreadId.make("thread-done"),
+        updatedAt: "2026-08-31T11:00:00.000Z",
+      }),
+      makeShell({
+        id: ThreadId.make("thread-blocked"),
+        updatedAt: "2026-08-31T12:00:00.000Z",
+        hasPendingApprovals: true,
+      }),
+      makeShell({
+        id: ThreadId.make("thread-working-old"),
+        updatedAt: "2026-08-31T13:00:00.000Z",
+        session: makeSession({ status: "running" }),
+      }),
+      makeShell({
+        id: ThreadId.make("thread-working-new"),
+        updatedAt: "2026-08-31T14:00:00.000Z",
+        session: makeSession({ status: "running" }),
+      }),
+    ]);
+
+    const groups = buildAgentViewGroups(rows, {
+      query: "",
+      groupBy: "status",
+      unreadOnly: false,
+      unreadThreadKeys: [],
+      selectedKey: null,
+    });
+
+    expect(groups.map(({ id, label }) => ({ id, label }))).toEqual([
+      { id: "status:working", label: "Working" },
+      { id: "status:blocked", label: "Pending Approval" },
+      { id: "status:done", label: "Done" },
+    ]);
+    expect(groups[0]?.rows.map((row) => row.shell.id)).toEqual([
+      ThreadId.make("thread-working-new"),
+      ThreadId.make("thread-working-old"),
+    ]);
+  });
+
+  it("uses normalized query filtering and fails closed past the byte cap", () => {
+    const rows = buildRows([
+      makeShell({
+        id: ThreadId.make("thread-match"),
+        conversationPreview: {
+          prompt: "Initial prompt",
+          tool: null,
+          assistantMessage: "Assistant Reply",
+        },
+      }),
+      makeShell({ id: ThreadId.make("thread-other"), title: "Unrelated work" }),
+    ]);
+    const options = {
+      groupBy: "status",
+      unreadOnly: false,
+      unreadThreadKeys: [],
+      selectedKey: null,
+    } as const;
+
+    expect(
+      buildAgentViewGroups(rows, { ...options, query: "  ASSISTANT   REPLY " }).flatMap((group) =>
+        group.rows.map((row) => row.shell.id),
+      ),
+    ).toEqual([ThreadId.make("thread-match")]);
+    expect(buildAgentViewGroups(rows, { ...options, query: "x".repeat(2049) })).toEqual([]);
+  });
+
+  it("groups by project with Unknown fallback and orders groups by their newest row", () => {
+    const projectB = ProjectId.make("project-b");
+    const unknownProject = ProjectId.make("project-unknown");
+    const rows = buildRows(
+      [
+        makeShell({
+          id: ThreadId.make("thread-alpha-old"),
+          updatedAt: "2026-08-31T11:00:00.000Z",
+        }),
+        makeShell({
+          id: ThreadId.make("thread-beta"),
+          projectId: projectB,
+          updatedAt: "2026-08-31T14:00:00.000Z",
+        }),
+        makeShell({
+          id: ThreadId.make("thread-unknown"),
+          projectId: unknownProject,
+          updatedAt: "2026-08-31T12:00:00.000Z",
+        }),
+        makeShell({
+          id: ThreadId.make("thread-alpha-new"),
+          updatedAt: "2026-08-31T15:00:00.000Z",
+        }),
+      ],
+      {
+        projectTitleById: new Map<string, string>([
+          [PROJECT_A, "Project Alpha"],
+          [projectB, "Project Beta"],
+        ]),
+      },
+    );
+
+    const groups = buildAgentViewGroups(rows, {
+      query: "",
+      groupBy: "project",
+      unreadOnly: false,
+      unreadThreadKeys: [],
+      selectedKey: null,
+    });
+
+    expect(groups.map(({ id, label }) => ({ id, label }))).toEqual([
+      { id: "project:Project Alpha", label: "Project Alpha" },
+      { id: "project:Project Beta", label: "Project Beta" },
+      { id: "project:Unknown", label: "Unknown" },
+    ]);
+    expect(groups[0]?.rows.map((row) => row.shell.id)).toEqual([
+      ThreadId.make("thread-alpha-new"),
+      ThreadId.make("thread-alpha-old"),
+    ]);
+  });
+
+  it("groups by environment with Unknown fallback and recency ordering", () => {
+    const unknownEnvironment = EnvironmentId.make("environment-unknown");
+    const rows = buildRows([
+      makeShell({
+        id: ThreadId.make("thread-local-new"),
+        updatedAt: "2026-08-31T13:00:00.000Z",
+      }),
+      makeShell({
+        id: ThreadId.make("thread-build-farm"),
+        environmentId: ENVIRONMENT_B,
+        updatedAt: "2026-08-31T14:00:00.000Z",
+      }),
+      makeShell({
+        id: ThreadId.make("thread-unknown-environment"),
+        environmentId: unknownEnvironment,
+        updatedAt: "2026-08-31T12:00:00.000Z",
+      }),
+      makeShell({
+        id: ThreadId.make("thread-local-old"),
+        updatedAt: "2026-08-31T11:00:00.000Z",
+      }),
+    ]);
+
+    const groups = buildAgentViewGroups(rows, {
+      query: "",
+      groupBy: "environment",
+      unreadOnly: false,
+      unreadThreadKeys: [],
+      selectedKey: null,
+    });
+
+    expect(groups.map(({ id, label }) => ({ id, label }))).toEqual([
+      { id: "environment:Build farm", label: "Build farm" },
+      { id: "environment:Local", label: "Local" },
+      { id: "environment:Unknown", label: "Unknown" },
+    ]);
+    expect(groups[1]?.rows.map((row) => row.shell.id)).toEqual([
+      ThreadId.make("thread-local-new"),
+      ThreadId.make("thread-local-old"),
+    ]);
+  });
+
+  it("keeps only unread rows plus the selected row when unread-only is enabled", () => {
+    const rows = buildRows([
+      makeShell({
+        id: ThreadId.make("thread-unread"),
+        updatedAt: "2026-08-31T14:00:00.000Z",
+      }),
+      makeShell({
+        id: ThreadId.make("thread-selected-read"),
+        updatedAt: "2026-08-31T13:00:00.000Z",
+      }),
+      makeShell({
+        id: ThreadId.make("thread-hidden-read"),
+        updatedAt: "2026-08-31T15:00:00.000Z",
+      }),
+    ]);
+
+    const groups = buildAgentViewGroups(rows, {
+      query: "",
+      groupBy: "status",
+      unreadOnly: true,
+      unreadThreadKeys: [rows[0]!.key],
+      selectedKey: rows[1]!.key,
+    });
+
+    expect(groups.flatMap((group) => group.rows.map((row) => row.shell.id))).toEqual([
+      ThreadId.make("thread-unread"),
+      ThreadId.make("thread-selected-read"),
+    ]);
+  });
+});
+
+describe("countUnreadAgentRows", () => {
+  it("counts rows whose keys are unread", () => {
+    const rows = buildRows([
+      makeShell({ id: ThreadId.make("thread-unread-a") }),
+      makeShell({ id: ThreadId.make("thread-read") }),
+      makeShell({ id: ThreadId.make("thread-unread-b") }),
+    ]);
+
+    expect(countUnreadAgentRows(rows, [rows[0]!.key, "environment-a:missing", rows[2]!.key])).toBe(
+      2,
+    );
   });
 });

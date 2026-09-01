@@ -3,6 +3,7 @@ import type { EnvironmentThreadShell } from "@bibcode/client-runtime/state/model
 import type { EnvironmentAvailabilityStatus } from "@bibcode/client-runtime/state/shell";
 import type { OrchestrationConversationPreview, ScopedThreadRef } from "@bibcode/contracts";
 
+import { selectIsUnread } from "../../sidebarWorkspaceMetaStore";
 import { normalizeSearchText } from "../CommandPalette.logic";
 import { resolveThreadStatusPill, type ThreadStatusPill } from "../Sidebar.logic";
 
@@ -34,6 +35,14 @@ export interface AgentRow {
 
 export interface AgentGroup {
   readonly id: AgentGroupId;
+  readonly label: string;
+  readonly rows: ReadonlyArray<AgentRow>;
+}
+
+export type AgentsGroupByMode = "status" | "project" | "environment";
+
+export interface AgentViewGroup {
+  readonly id: string;
   readonly label: string;
   readonly rows: ReadonlyArray<AgentRow>;
 }
@@ -148,4 +157,65 @@ export function groupAgentRows(
     }
     return [{ id, label, rows: groupRows.sort(compareAgentRows) }];
   });
+}
+
+export function buildAgentViewGroups(
+  rows: ReadonlyArray<AgentRow>,
+  options: {
+    readonly query: string;
+    readonly groupBy: AgentsGroupByMode;
+    readonly unreadOnly: boolean;
+    readonly unreadThreadKeys: ReadonlyArray<string>;
+    readonly selectedKey: string | null;
+  },
+): ReadonlyArray<AgentViewGroup> {
+  const filteredGroups = groupAgentRows(rows, options.query);
+  const visibleGroups = options.unreadOnly
+    ? filteredGroups.flatMap((group) => {
+        const visibleRows = group.rows.filter(
+          (row) =>
+            row.key === options.selectedKey || selectIsUnread(options.unreadThreadKeys, row.key),
+        );
+        return visibleRows.length === 0 ? [] : [{ ...group, rows: visibleRows }];
+      })
+    : filteredGroups;
+  if (options.groupBy === "status") {
+    return visibleGroups.map((group) => ({
+      id: `status:${group.id}`,
+      label: group.label,
+      rows: group.rows,
+    }));
+  }
+
+  const filteredRows = visibleGroups.flatMap((group) => group.rows);
+  const rowsByLabel = new Map<string, AgentRow[]>();
+  for (const row of filteredRows) {
+    const rowLabel = options.groupBy === "project" ? row.projectTitle : row.environmentLabel;
+    const label = rowLabel === "" ? "Unknown" : rowLabel;
+    const labelRows = rowsByLabel.get(label);
+    if (labelRows === undefined) {
+      rowsByLabel.set(label, [row]);
+    } else {
+      labelRows.push(row);
+    }
+  }
+
+  return Array.from(rowsByLabel, ([label, labelRows]) => ({
+    id: `${options.groupBy}:${label}`,
+    label,
+    rows: labelRows.sort(compareAgentRows),
+  })).sort((left, right) => compareAgentRows(left.rows[0]!, right.rows[0]!));
+}
+
+export function countUnreadAgentRows(
+  rows: ReadonlyArray<AgentRow>,
+  unreadThreadKeys: ReadonlyArray<string>,
+): number {
+  let count = 0;
+  for (const row of rows) {
+    if (selectIsUnread(unreadThreadKeys, row.key)) {
+      count += 1;
+    }
+  }
+  return count;
 }
