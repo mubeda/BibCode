@@ -72,7 +72,7 @@ export const AgentsRow = memo(
             <div className="flex min-w-0 items-center gap-1.5">
               <span
                 className={cn(
-                  "inline-flex shrink-0 items-center gap-1 text-2xs font-medium",
+                  "inline-flex shrink-0 items-center gap-1 text-xs font-medium",
                   row.pill?.colorClass ?? "text-muted-foreground",
                 )}
               >
@@ -90,17 +90,17 @@ export const AgentsRow = memo(
               </span>
             </div>
             {projectBranch ? (
-              <div className="truncate text-2xs text-muted-foreground">{projectBranch}</div>
+              <div className="truncate text-xs text-muted-foreground">{projectBranch}</div>
             ) : null}
             {row.previewLine ? (
-              <div className="truncate text-2xs text-muted-foreground">{row.previewLine}</div>
+              <div className="truncate text-xs text-muted-foreground">{row.previewLine}</div>
             ) : null}
             <div className="flex min-w-0 items-center justify-between gap-2 pt-0.5">
-              <span className="min-w-0 truncate rounded bg-muted px-1 py-0.5 text-2xs font-medium text-muted-foreground">
+              <span className="min-w-0 truncate rounded bg-muted px-1 py-0.5 text-xs font-medium text-muted-foreground">
                 {row.environmentLabel}
                 {environmentStatus ? ` · ${environmentStatus}` : null}
               </span>
-              <span className="shrink-0 text-2xs tabular-nums text-muted-foreground">
+              <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
                 {formatRelativeTimeLabel(row.shell.updatedAt)}
               </span>
             </div>

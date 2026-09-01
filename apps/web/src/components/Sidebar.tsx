@@ -1063,7 +1063,7 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
                 data-thread-selection-safe
                 data-testid={`thread-archive-confirm-${thread.id}`}
                 aria-label={`Confirm archive ${thread.title}`}
-                className="absolute top-1/2 right-1 inline-flex h-5 -translate-y-1/2 cursor-pointer items-center rounded-md bg-destructive/12 px-2 text-2xs font-medium text-destructive transition-colors hover:bg-destructive/18 focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-destructive/40"
+                className="absolute top-1/2 right-1 inline-flex h-5 -translate-y-1/2 cursor-pointer items-center rounded-md bg-destructive/12 px-2 text-xs font-medium text-destructive transition-colors hover:bg-destructive/18 focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-destructive/40"
                 onPointerDown={stopPropagationOnPointerDown}
                 onClick={handleConfirmArchiveClick}
               >
@@ -1130,7 +1130,7 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
                       render={
                         <span
                           aria-label={jumpLabel}
-                          className="inline-flex h-5 items-center rounded-full border border-border/80 bg-background/90 px-1.5 font-mono text-2xs font-medium tracking-tight text-foreground shadow-sm"
+                          className="inline-flex h-5 items-center rounded-full border border-border/80 bg-background/90 px-1.5 font-mono text-xs font-medium tracking-tight text-foreground shadow-sm"
                         />
                       }
                     >
@@ -1140,7 +1140,7 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
                   </Tooltip>
                 ) : (
                   <span
-                    className={`text-2xs tabular-nums ${
+                    className={`text-xs tabular-nums ${
                       isHighlighted
                         ? "text-foreground/72 dark:text-foreground/82"
                         : "text-muted-foreground/40"
@@ -1185,7 +1185,7 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
         <div
           data-thread-selection-safe
           data-testid={`thread-delivery-row-${thread.id}`}
-          className="flex items-center gap-1.5 truncate pr-2 pb-0.5 pl-6 text-2xs text-muted-foreground"
+          className="flex items-center gap-1.5 truncate pr-2 pb-0.5 pl-6 text-xs text-muted-foreground"
         >
           <span
             className={
@@ -1211,7 +1211,7 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
         <div
           data-thread-selection-safe
           data-testid={`thread-agent-row-${thread.id}`}
-          className="flex items-center gap-1.5 truncate pr-2 pb-0.5 pl-6 text-2xs text-muted-foreground"
+          className="flex items-center gap-1.5 truncate pr-2 pb-0.5 pl-6 text-xs text-muted-foreground"
         >
           <span
             className={
@@ -1361,7 +1361,7 @@ function SidebarPrimaryRow(props: {
             <PinIcon aria-label="Pinned" className="size-3 shrink-0 text-muted-foreground/50" />
           )}
           <span className="min-w-0 flex-1 truncate">{title}</span>
-          <span className="shrink-0 rounded border border-border bg-muted px-1.5 py-px text-2xs font-medium text-muted-foreground">
+          <span className="shrink-0 rounded border border-border bg-muted px-1.5 py-px text-xs font-medium text-muted-foreground">
             primary
           </span>
         </span>
@@ -1467,7 +1467,7 @@ const SidebarProjectThreadList = memo(function SidebarProjectThreadList(
             render={showMoreButtonRender}
             data-thread-selection-safe
             size="sm"
-            className="h-6 w-full translate-x-0 justify-start px-2 text-left text-2xs text-muted-foreground hover:bg-accent hover:text-foreground"
+            className="h-6 w-full translate-x-0 justify-start px-2 text-left text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
             onClick={() => {
               expandThreadListForProject(projectKey);
             }}
@@ -1485,7 +1485,7 @@ const SidebarProjectThreadList = memo(function SidebarProjectThreadList(
             render={showLessButtonRender}
             data-thread-selection-safe
             size="sm"
-            className="h-6 w-full translate-x-0 justify-start px-2 text-left text-2xs text-muted-foreground hover:bg-accent hover:text-foreground"
+            className="h-6 w-full translate-x-0 justify-start px-2 text-left text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
             onClick={() => {
               collapseThreadListForProject(projectKey);
             }}
@@ -3123,7 +3123,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
               {project.displayName}
             </span>
             {project.groupedProjectCount > 1 ? (
-              <span className="shrink-0 text-2xs text-muted-foreground">
+              <span className="shrink-0 text-xs text-muted-foreground">
                 {project.groupedProjectCount} projects
               </span>
             ) : null}
@@ -3717,7 +3717,7 @@ export function SidebarBrandContent({
         {appBaseName}
       </span>
       {stageLabel ? (
-        <span className="sidebar-brand-stage shrink-0 items-center whitespace-nowrap rounded-full bg-muted/50 px-1.5 py-0.5 text-2xs font-medium uppercase tracking-[0.12em] text-muted-foreground/60">
+        <span className="sidebar-brand-stage shrink-0 items-center whitespace-nowrap rounded-full bg-muted/50 px-1.5 py-0.5 text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground/60">
           {stageLabel}
         </span>
       ) : null}
@@ -3892,7 +3892,7 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
               <SearchIcon className="size-4 text-foreground/60" />
               <span className="flex-1 truncate text-left text-[13px] font-medium">Search</span>
               {commandPaletteShortcutLabel ? (
-                <Kbd className="h-4 min-w-0 rounded-sm px-1.5 text-2xs">
+                <Kbd className="h-4 min-w-0 rounded-sm px-1.5 text-xs">
                   {commandPaletteShortcutLabel}
                 </Kbd>
               ) : null}
@@ -3927,7 +3927,7 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
       <LocalSecondaryStatus />
       <SidebarGroup className="px-2 py-2">
         <div className="mb-1 flex items-center justify-between pl-2 pr-1.5">
-          <span className="text-2xs font-medium uppercase tracking-wider text-muted-foreground">
+          <span className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
             Projects
           </span>
           <div className="flex items-center gap-1">

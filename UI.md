@@ -168,7 +168,7 @@ Optimize for user control, predictability, and task completion. Every surprise, 
 
 ### Typography
 
-- The smallest text in the app is the `text-2xs` token (11px). Never write `text-[9px]`, `text-[10px]`, or another arbitrary size below it, and use the token instead of a `text-[11px]` literal.
+- The smallest text in the app is `text-xs` (12px). Never write `text-[9px]`, `text-[10px]`, `text-[11px]`, or another arbitrary size below it; badges, key hints, counts, and timestamps use `text-xs`.
 - Navigation rows are 13px medium and thread titles 13px regular, both on `text-foreground/80`; project titles are 13px medium on `text-foreground/90`.
 - `text-muted-foreground` is already the secondary color. Do not alpha-reduce it further for text (`text-muted-foreground/70` and similar); badges, subtitles, timestamps, and empty states use the solid token. Alpha is fine on icon tints.
 - Do not add global letter-spacing to body text; under hinted rendering the fractional advances become uneven letter gaps.
