@@ -2114,6 +2114,7 @@ staticDescribe("Sidebar manual project sorting", () => {
       (entry) => typeof entry.props["onPointerDownCapture"] === "function",
     )!;
     expect(header).toBeDefined();
+    expect(header.props["aria-expanded"]).toBe(true);
 
     // Drag in progress: click swallowed.
     onDragStart({ active: { id: keyA } });

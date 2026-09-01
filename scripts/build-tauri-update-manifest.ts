@@ -10,14 +10,12 @@ import * as Schema from "effect/Schema";
 import { Command, Flag } from "effect/unstable/cli";
 import { fromJsonStringPretty } from "@bibcode/shared/schemaJson";
 
-export const TAURI_UPDATE_TARGETS = [
-  "darwin-aarch64",
-  "darwin-x86_64",
-  "linux-x86_64",
-  "windows-x86_64",
-] as const;
+import {
+  TAURI_UPDATE_TARGETS,
+  type TauriUpdaterTarget as TauriUpdateTarget,
+} from "./lib/release-targets.ts";
 
-type TauriUpdateTarget = (typeof TAURI_UPDATE_TARGETS)[number];
+export { TAURI_UPDATE_TARGETS };
 
 export interface BuildTauriUpdateManifestInput {
   readonly assetsDir: string;
@@ -85,7 +83,7 @@ const UpdaterArtifactDescriptorSchema = Schema.Struct({
     if (signature !== `${artifact}.sig`) return "signature must be <artifact>.sig";
     const suffix = target.startsWith("darwin-")
       ? ".app.tar.gz"
-      : target === "linux-x86_64"
+      : target.startsWith("linux-")
         ? ".AppImage"
         : ".exe";
     return artifact.endsWith(suffix) ? undefined : `artifact must end with ${suffix}`;
@@ -99,7 +97,9 @@ const TauriUpdateManifestSchema = Schema.Struct({
   platforms: Schema.Struct({
     "darwin-aarch64": Schema.Struct({ signature: Schema.String, url: Schema.String }),
     "darwin-x86_64": Schema.Struct({ signature: Schema.String, url: Schema.String }),
+    "linux-aarch64": Schema.Struct({ signature: Schema.String, url: Schema.String }),
     "linux-x86_64": Schema.Struct({ signature: Schema.String, url: Schema.String }),
+    "windows-aarch64": Schema.Struct({ signature: Schema.String, url: Schema.String }),
     "windows-x86_64": Schema.Struct({ signature: Schema.String, url: Schema.String }),
   }),
 });

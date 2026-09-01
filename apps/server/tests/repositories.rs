@@ -1911,6 +1911,7 @@ async fn pending_pairing_offer_recovery_revokes_the_grant_and_releases_the_key()
                 "interrupted-request".to_owned(),
                 "different-input".to_owned(),
                 T2.to_owned(),
+                T2.to_owned(),
             )
             .await
             .expect("conflicting recovery lookup")
@@ -1926,11 +1927,27 @@ async fn pending_pairing_offer_recovery_revokes_the_grant_and_releases_the_key()
         1
     );
 
+    assert!(
+        repositories
+            .recover_pending_auth_pairing_offer(
+                "principal".to_owned(),
+                "interrupted-request".to_owned(),
+                "same-input".to_owned(),
+                T2.to_owned(),
+                T0.to_owned(),
+            )
+            .await
+            .expect("young pending offer lookup")
+            .is_none(),
+        "a young reservation may still belong to another live server"
+    );
+
     let recovered = repositories
         .recover_pending_auth_pairing_offer(
             "principal".to_owned(),
             "interrupted-request".to_owned(),
             "same-input".to_owned(),
+            T2.to_owned(),
             T2.to_owned(),
         )
         .await
