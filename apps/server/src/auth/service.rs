@@ -3483,6 +3483,11 @@ mod tests {
             .await
             .expect("pending session issues");
         let session_id = issued.principal.session_id.clone();
+        // The service owns an immediate background sweep. Drop its final
+        // strong state owner before exercising repository cutoffs directly so
+        // the background task cannot race the two deterministic assertions.
+        drop(auth);
+        tokio::task::yield_now().await;
         let now = now_ms();
 
         // A sweep whose cutoff predates the mint leaves the fresh pending
