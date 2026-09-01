@@ -536,6 +536,8 @@ describe("seeded packaged desktop upgrade harness", () => {
     });
     const combined = `${seed}\n${verify}`;
 
+    expect(combined).toContain("The packaged desktop bridge did not become ready.");
+    expect(combined).toContain("browser.waitUntil");
     expect(combined).toContain("getLocalEnvironmentBootstraps");
     expect(combined).toContain("getLocalEnvironmentBearerToken");
     expect(combined).toContain("/.well-known/bibcode/environment");
