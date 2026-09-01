@@ -161,6 +161,7 @@ import { buildThreadRouteParams, resolveThreadRouteRef } from "../threadRoutes";
 import { stackedThreadToast, toastManager } from "./ui/toast";
 import { formatRelativeTimeLabel } from "../timestampFormat";
 import { SettingsSidebarNav } from "./settings/SettingsSidebarNav";
+import { AgentsSection } from "./sidebar/AgentsSection";
 import { EnvironmentContextCard } from "./sidebar/EnvironmentContextCard";
 import { ServerUpdateBadge } from "./settings/ServerUpdateBadge";
 import {
@@ -3737,6 +3738,7 @@ interface SidebarProjectsContentProps {
   handleProjectDragEnd: (event: DragEndEvent) => void;
   handleProjectDragCancel: (event: DragCancelEvent) => void;
   handleNewThread: ReturnType<typeof useNewThreadHandler>;
+  navigateToThread: (threadRef: ScopedThreadRef) => void;
   openCreateWorktreeDialog: (projectRef?: ScopedProjectRef | null) => void;
   archiveThread: ReturnType<typeof useThreadActions>["archiveThread"];
   deleteThread: ReturnType<typeof useThreadActions>["deleteThread"];
@@ -3786,6 +3788,7 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
     handleProjectDragEnd,
     handleProjectDragCancel,
     handleNewThread,
+    navigateToThread,
     openCreateWorktreeDialog,
     archiveThread,
     deleteThread,
@@ -3862,6 +3865,7 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
           </SidebarMenuItem>
         </SidebarMenu>
       </SidebarGroup>
+      <AgentsSection navigateToThread={navigateToThread} />
       {showArm64IntelBuildWarning && arm64IntelBuildWarningDescription ? (
         <SidebarGroup className="px-2 pt-2 pb-0">
           <Alert variant="warning" className="rounded-2xl border-warning/40 bg-warning/8">
@@ -4773,6 +4777,7 @@ export default function Sidebar() {
             handleProjectDragEnd={handleProjectDragEnd}
             handleProjectDragCancel={handleProjectDragCancel}
             handleNewThread={handleNewThread}
+            navigateToThread={navigateToThread}
             openCreateWorktreeDialog={openCreateWorktreeDialog}
             archiveThread={archiveThread}
             deleteThread={deleteThread}
