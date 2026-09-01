@@ -31,6 +31,7 @@ export interface GitManagerViewState {
   readonly activeTab: GitManagerTab;
   readonly selectedRef: string | null;
   readonly selectedCommitSha: string | null;
+  readonly multiCommitSelection: ReadonlyArray<string>;
   readonly selectedFilePath: string | null;
   readonly selectedStashSha: string | null;
   readonly stashPaneOpen: boolean;
@@ -60,6 +61,7 @@ export const DEFAULT_GIT_MANAGER_VIEW_STATE: GitManagerViewState = Object.freeze
   activeTab: "changes",
   selectedRef: null,
   selectedCommitSha: null,
+  multiCommitSelection: Object.freeze([]),
   selectedFilePath: null,
   selectedStashSha: null,
   stashPaneOpen: false,
@@ -82,6 +84,7 @@ interface GitManagerStoreState {
   readonly setActiveTab: (ref: ScopedProjectRef, tab: GitManagerTab) => void;
   readonly setSelectedRef: (ref: ScopedProjectRef, name: string | null) => void;
   readonly setSelectedCommit: (ref: ScopedProjectRef, sha: string | null) => void;
+  readonly setMultiCommitSelection: (ref: ScopedProjectRef, shas: ReadonlyArray<string>) => void;
   readonly setSelectedFile: (ref: ScopedProjectRef, path: string | null) => void;
   readonly setSelectedStash: (ref: ScopedProjectRef, sha: string | null) => void;
   readonly setStashPaneOpen: (ref: ScopedProjectRef, open: boolean) => void;
@@ -174,6 +177,17 @@ function nonNegativeIntegerArray(value: unknown): ReadonlyArray<number> {
   );
 }
 
+function nonEmptyUniqueStringArray(value: unknown): ReadonlyArray<string> {
+  if (!Array.isArray(value)) return [];
+  return [
+    ...new Set(
+      value.filter(
+        (entry): entry is string => typeof entry === "string" && entry.trim().length > 0,
+      ),
+    ),
+  ];
+}
+
 function sortedNonNegativeIntegerArray(value: unknown): ReadonlyArray<number> {
   return [...new Set(nonNegativeIntegerArray(value))].sort((left, right) => left - right);
 }
@@ -219,6 +233,7 @@ function sanitizeViewState(value: unknown): PersistedGitManagerViewState | null 
     activeTab: candidate.activeTab === "history" ? "history" : "changes",
     selectedRef: nullableString(candidate.selectedRef),
     selectedCommitSha: nullableString(candidate.selectedCommitSha),
+    multiCommitSelection: nonEmptyUniqueStringArray(candidate.multiCommitSelection),
     selectedFilePath: nullableString(candidate.selectedFilePath),
     selectedStashSha: nullableString(candidate.selectedStashSha),
     stashPaneOpen: candidate.stashPaneOpen === true,
@@ -318,6 +333,13 @@ export const useGitManagerStore = create<GitManagerStoreState>()(
       setSelectedCommit: (ref, sha) =>
         set((state) =>
           updateProject(state, ref, (current) => ({ ...current, selectedCommitSha: sha })),
+        ),
+      setMultiCommitSelection: (ref, shas) =>
+        set((state) =>
+          updateProject(state, ref, (current) => ({
+            ...current,
+            multiCommitSelection: nonEmptyUniqueStringArray(shas),
+          })),
         ),
       setSelectedFile: (ref, path) =>
         set((state) =>

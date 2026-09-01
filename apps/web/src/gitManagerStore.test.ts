@@ -227,4 +227,32 @@ describe("gitManagerStore", () => {
       expect.objectContaining({ activeTab: "changes", lastUsedAt: 0 }),
     );
   });
+
+  it("persists a sanitized per-project multi-commit selection without persisting the checkout", async () => {
+    const project = ref("env-a", "p1");
+    const store = useGitManagerStore.getState();
+    store.setSelectedWorktree(project, "/opaque/worktree");
+    store.setMultiCommitSelection(project, ["commit-b", "", "commit-a", "commit-b"]);
+
+    expect(store.selectViewState(project).multiCommitSelection).toEqual(["commit-b", "commit-a"]);
+    const serialized = persisted.get(GIT_MANAGER_STORAGE_KEY);
+    const parsed = JSON.parse(serialized!) as {
+      state: { byProjectKey: Record<string, Record<string, unknown>> };
+    };
+    expect(parsed.state.byProjectKey[projectKey(project)]).toMatchObject({
+      multiCommitSelection: ["commit-b", "commit-a"],
+    });
+    expect(parsed.state.byProjectKey[projectKey(project)]).not.toHaveProperty(
+      "selectedWorktreeCwd",
+    );
+
+    useGitManagerStore.setState({ byProjectKey: {} });
+    persisted.set(GIT_MANAGER_STORAGE_KEY, serialized!);
+    await useGitManagerStore.persist.rehydrate();
+
+    expect(useGitManagerStore.getState().selectViewState(project)).toMatchObject({
+      selectedWorktreeCwd: null,
+      multiCommitSelection: ["commit-b", "commit-a"],
+    });
+  });
 });

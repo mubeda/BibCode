@@ -1,8 +1,14 @@
 import type { GitManagerCommitEntry } from "@bibcode/contracts";
 import { LegendList, type LegendListRef, type OnViewableItemsChanged } from "@legendapp/list/react";
-import { memo, useCallback, useRef, type KeyboardEvent, type MouseEvent } from "react";
+import { memo, useCallback, useMemo, useRef, type KeyboardEvent, type MouseEvent } from "react";
 
 import { cn } from "../../../lib/utils";
+import {
+  GitManagerCommitDndContext,
+  GitManagerCommitInsertionTarget,
+  type GitManagerCommitDropResolution,
+  useGitManagerCommitDragSource,
+} from "../rewrite/gitManagerCommitDrag";
 import { deriveAuthorIdentity } from "./authorIdentity";
 import { shouldLoadNextPage } from "./commitPaging";
 
@@ -21,6 +27,8 @@ export interface GitManagerCommitListProps {
   readonly onReachEnd: () => void;
   readonly isLoadingMore: boolean;
   readonly onContextMenu?: (sha: string, event: MouseEvent<HTMLButtonElement>) => void;
+  readonly multiCommitSelection?: ReadonlyArray<string>;
+  readonly onCommitDrop?: (resolution: GitManagerCommitDropResolution) => void;
 }
 
 interface GitManagerCommitRowProps {
@@ -58,17 +66,24 @@ const GitManagerCommitRow = memo(function GitManagerCommitRow({
   onContextMenu,
 }: GitManagerCommitRowProps) {
   const author = deriveAuthorIdentity({ name: commit.authorName, email: commit.authorEmail });
+  const drag = useGitManagerCommitDragSource(commit.sha);
   return (
     <button
+      ref={drag.setNodeRef}
+      {...drag.attributes}
+      {...drag.listeners}
       type="button"
       aria-label={`${commit.shortSha} ${commit.subject}`}
       aria-selected={selected}
       className={cn(
-        "flex h-[50px] w-full min-w-0 items-center gap-2 border-b border-border/60 px-3 text-left transition-colors focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring",
+        "flex h-[50px] w-full min-w-0 touch-manipulation items-center gap-2 border-b border-border/60 px-3 text-left transition-colors focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring",
         selected ? "bg-accent text-accent-foreground" : "hover:bg-muted/45",
+        drag.isDragging && "select-none opacity-40",
       )}
+      data-commit-drag-source={commit.sha}
       data-commit-sha={commit.sha}
       role="option"
+      style={{ transform: drag.transform }}
       tabIndex={tabbable ? 0 : -1}
       onClick={() => onSelect(commit.sha)}
       onContextMenu={(event) => onContextMenu?.(commit.sha, event)}
@@ -111,6 +126,8 @@ export const GitManagerCommitList = memo(function GitManagerCommitList({
   onReachEnd,
   isLoadingMore,
   onContextMenu,
+  multiCommitSelection,
+  onCommitDrop,
 }: GitManagerCommitListProps) {
   const listRef = useRef<LegendListRef | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -123,16 +140,20 @@ export const GitManagerCommitList = memo(function GitManagerCommitList({
   onSelectRef.current = onSelect;
   onReachEndRef.current = onReachEnd;
   isLoadingMoreRef.current = isLoadingMore;
+  const commitShas = useMemo(() => commits.map((commit) => commit.sha), [commits]);
 
   const renderCommit = useCallback(
     ({ item, index }: { item: GitManagerCommitEntry; index: number }) => (
-      <GitManagerCommitRow
-        commit={item}
-        selected={item.sha === selectedSha}
-        tabbable={item.sha === selectedSha || (selectedSha === null && index === 0)}
-        onSelect={onSelect}
-        {...(onContextMenu === undefined ? {} : { onContextMenu })}
-      />
+      <div className="relative h-[50px]" data-commit-list-item={item.sha}>
+        <GitManagerCommitInsertionTarget beforeSha={item.sha} />
+        <GitManagerCommitRow
+          commit={item}
+          selected={item.sha === selectedSha}
+          tabbable={item.sha === selectedSha || (selectedSha === null && index === 0)}
+          onSelect={onSelect}
+          {...(onContextMenu === undefined ? {} : { onContextMenu })}
+        />
+      </div>
     ),
     [onContextMenu, onSelect, selectedSha],
   );
@@ -203,18 +224,24 @@ export const GitManagerCommitList = memo(function GitManagerCommitList({
       className="flex min-h-0 flex-1 flex-col overflow-hidden"
       onKeyDown={handleKeyDown}
     >
-      <LegendList<GitManagerCommitEntry>
-        ref={listRef}
-        className="min-h-0 flex-1 overflow-x-hidden overscroll-y-contain"
-        data={commits}
-        estimatedItemSize={COMMIT_ROW_HEIGHT}
-        getFixedItemSize={getCommitRowSize}
-        initialScrollIndex={initialScrollIndex}
-        keyExtractor={getCommitKey}
-        maintainVisibleContentPosition={MAINTAIN_VISIBLE_COMMIT_POSITION}
-        renderItem={renderCommit}
-        onViewableItemsChanged={handleViewableItemsChanged}
-      />
+      <GitManagerCommitDndContext
+        commitShas={commitShas}
+        {...(multiCommitSelection === undefined ? {} : { multiCommitSelection })}
+        {...(onCommitDrop === undefined ? {} : { onCommitDrop })}
+      >
+        <LegendList<GitManagerCommitEntry>
+          ref={listRef}
+          className="min-h-0 flex-1 overflow-x-hidden overscroll-y-contain"
+          data={commits}
+          estimatedItemSize={COMMIT_ROW_HEIGHT}
+          getFixedItemSize={getCommitRowSize}
+          initialScrollIndex={initialScrollIndex}
+          keyExtractor={getCommitKey}
+          maintainVisibleContentPosition={MAINTAIN_VISIBLE_COMMIT_POSITION}
+          renderItem={renderCommit}
+          onViewableItemsChanged={handleViewableItemsChanged}
+        />
+      </GitManagerCommitDndContext>
       {isLoadingMore ? (
         <p aria-live="polite" className="shrink-0 px-3 py-2 text-xs text-muted-foreground">
           Loading more commits…
