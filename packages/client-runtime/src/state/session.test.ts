@@ -1,5 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
 import { EnvironmentId, type ExecutionEnvironmentDescriptor } from "@bibcode/contracts";
+import { makeTestExecutionEnvironmentCapabilities } from "@bibcode/shared/testSupport";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -30,14 +31,7 @@ const currentDescriptor: ExecutionEnvironmentDescriptor = {
   remoteUpdateSupport: null,
   remoteProtocolVersion: 1,
   minCompatibleRemoteProtocol: 1,
-  capabilities: {
-    repositoryIdentity: true,
-    worktreeCatalog: false,
-    worktreeCatalogRefreshReason: false,
-    vcsStatusSummary: false,
-    activityProtocolVersion: null,
-    remoteUpdateControl: false,
-  },
+  capabilities: makeTestExecutionEnvironmentCapabilities({ repositoryIdentity: true }),
 };
 
 describe("environment compatibility verdict selection", () => {

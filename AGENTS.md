@@ -138,10 +138,28 @@ No task is complete until all applicable requirements have evidence:
 3. Successful `vp check` and `vp run typecheck`.
 4. For Rust changes, `cargo fmt --all --check`, relevant Rust tests, and Clippy
    for affected targets with warnings denied.
-5. Final `git diff` and `git status --short` review for unintended edits,
+5. For React changes under `apps/web`, a review of the changed components and
+   hooks against the `vercel-react-best-practices` skill
+   (`/vercel-react-best-practices`) — always, not only when performance is
+   suspected. An agent without access to that skill must report this check as
+   not run instead of skipping it silently.
+6. For any change to what a user sees or interacts with — new or reworked
+   screens, panels, dialogs, menus, forms, empty and error states, copy, or
+   interaction flows — a review against [`UI.md`](UI.md) at the repository
+   root. It governs design quality: matching the user's mental model, keeping
+   defaults safe and unsurprising, making disabled states explain themselves,
+   making errors actionable, and preserving user work.
+
+   These two reviews cover different failures and neither substitutes for the
+   other. `vercel-react-best-practices` asks whether the component is built
+   correctly — render behaviour, hook rules, wasted work. `UI.md` asks whether
+   the thing built is the right thing for the person using it. A panel can be
+   flawlessly memoised and still ask a question the user cannot answer.
+
+7. Final `git diff` and `git status --short` review for unintended edits,
    generated files, debug output, dependency drift, and missing documentation.
-6. A synced configured vendored subtree when its matching dependency changes.
-7. Report the exact validation commands, any command that could not run, and
+8. A synced configured vendored subtree when its matching dependency changes.
+9. Report the exact validation commands, any command that could not run, and
    residual risk.
 
 `vp test` is the built-in Vite+ test command and `vp run test` is the workspace

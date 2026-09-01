@@ -6,6 +6,7 @@ import {
   ContainerIcon,
   FolderGit2Icon,
   FolderPlusIcon,
+  GitBranchIcon,
   Globe2Icon,
   LoaderIcon,
   MessageSquarePlusIcon,
@@ -1607,6 +1608,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     (settings) => settings.sidebarThreadPreviewCount,
   );
   const router = useRouter();
+  const navigate = useNavigate();
   const { isMobile, setOpenMobile } = useSidebar();
   const markThreadUnread = useUiStateStore((state) => state.markThreadUnread);
   const setProjectExpanded = useUiStateStore((state) => state.setProjectExpanded);
@@ -2518,6 +2520,24 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     [openWorktreeForProjectMember, runProjectMemberAction],
   );
 
+  const openGitManagerForProjectMember = useCallback(
+    (member: SidebarProjectGroupMember) => {
+      if (isMobile) setOpenMobile(false);
+      void navigate({
+        to: "/project/$environmentId/$projectId/git",
+        params: { environmentId: member.environmentId, projectId: member.id },
+      });
+    },
+    [isMobile, navigate, setOpenMobile],
+  );
+
+  const handleOpenGitManagerClick = useCallback(
+    (event: React.MouseEvent<HTMLButtonElement>) => {
+      runProjectMemberAction(event, openGitManagerForProjectMember);
+    },
+    [openGitManagerForProjectMember, runProjectMemberAction],
+  );
+
   const attemptArchiveThread = useCallback(
     async (threadRef: ScopedThreadRef) => {
       const result = await archiveThread(threadRef);
@@ -3170,6 +3190,22 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
               <FolderGit2Icon className="size-3.5" />
             </TooltipTrigger>
             <TooltipPopup side="top">New worktree</TooltipPopup>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <button
+                  type="button"
+                  aria-label={`Git Manager for ${project.displayName}`}
+                  data-testid="git-manager-button"
+                  className={SIDEBAR_ICON_ACTION_BUTTON_CLASS}
+                  onClick={handleOpenGitManagerClick}
+                />
+              }
+            >
+              <GitBranchIcon aria-hidden="true" className="size-3.5" />
+            </TooltipTrigger>
+            <TooltipPopup side="top">Git Manager</TooltipPopup>
           </Tooltip>
         </div>
       </div>

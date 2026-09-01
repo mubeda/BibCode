@@ -177,6 +177,14 @@ flowchart TB
   registered processes, while host-owned children remain under the host
   lifecycle.
 
+- **Git Manager (`apps/server/src/git/manager/`)** owns repository generations,
+  refs and worktree occupancy snapshots, tip-pinned history pages, diff and
+  patch parsing, server-authored guards, in-progress/conflict inspection, and
+  the branch, sync, stash, merge, rewrite, conflict, and tag operation
+  primitives. `apps/server/src/production/git_manager_rpc.rs` adapts those
+  owners to the typed RPC registry and the worktree catalog's existing mutation
+  arbitration.
+
 - **Contracts (`packages/contracts`)** contains Effect schemas and TypeScript
   contracts only. It defines persisted models, RPC methods, HTTP APIs, desktop
   bridge values, and provider events without application runtime logic.
@@ -730,6 +738,13 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
 - `packages/contracts` remains schema-only.
 - Rust owns all production backend behavior. TypeScript is limited to clients,
   contracts, shared utilities, relay infrastructure, and development tooling.
+- The Git Manager performs no repository lifecycle: it cannot add, create,
+  clone, publish, remove, or delete a repository, and every request remains
+  scoped to the checkout selected for its project.
+- Git Manager force-push always uses `--force-with-lease`. Its execution paths
+  forbid bare `--force`, `--ignore-other-worktrees`, forced
+  `git worktree add -f`, and plumbing `update-ref` as ways to bypass the
+  server's worktree-aware guards.
 - Git worktree registration, directory availability, and path ownership are
   resolved by the server catalog. Clients do not infer recovery from directory
   existence or treat a degraded observation as an authoritative empty set.

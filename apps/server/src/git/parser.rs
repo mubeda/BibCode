@@ -10,6 +10,9 @@ pub struct PorcelainRecord {
     pub index_changed: bool,
     pub worktree_changed: bool,
     pub untracked: bool,
+    pub unmerged: bool,
+    pub status_code: String,
+    pub submodule: bool,
 }
 
 fn status_char(value: char) -> VcsWorkingTreeFileStatus {
@@ -18,6 +21,7 @@ fn status_char(value: char) -> VcsWorkingTreeFileStatus {
         'D' => VcsWorkingTreeFileStatus::Deleted,
         'R' => VcsWorkingTreeFileStatus::Renamed,
         'C' => VcsWorkingTreeFileStatus::Copied,
+        'U' => VcsWorkingTreeFileStatus::Conflicted,
         _ => VcsWorkingTreeFileStatus::Modified,
     }
 }
@@ -50,6 +54,9 @@ pub fn parse_porcelain_v2_line(line: &str) -> Option<PorcelainRecord> {
             index_changed: false,
             worktree_changed: false,
             untracked: true,
+            unmerged: false,
+            status_code: "??".to_owned(),
+            submodule: false,
         });
     }
     if line.starts_with("! ") || line.starts_with("# ") {
@@ -65,6 +72,7 @@ pub fn parse_porcelain_v2_line(line: &str) -> Option<PorcelainRecord> {
     let mut chars = xy.chars();
     let index_char = chars.next().unwrap_or('.');
     let worktree_char = chars.next().unwrap_or('.');
+    let submodule = fields.get(2).is_some_and(|value| value.starts_with('S'));
     let path_start = match kind {
         '2' => 9,
         'u' => 10,
@@ -74,13 +82,24 @@ pub fn parse_porcelain_v2_line(line: &str) -> Option<PorcelainRecord> {
     if path.is_empty() {
         return None;
     }
+    let (index_status, worktree_status) = if kind == 'u' {
+        (
+            VcsWorkingTreeFileStatus::Conflicted,
+            VcsWorkingTreeFileStatus::Conflicted,
+        )
+    } else {
+        (status_char(index_char), status_char(worktree_char))
+    };
     Some(PorcelainRecord {
         path: path.to_owned(),
-        index_status: status_char(index_char),
-        worktree_status: status_char(worktree_char),
+        index_status,
+        worktree_status,
         index_changed: kind == 'u' || index_char != '.',
         worktree_changed: kind == 'u' || worktree_char != '.',
         untracked: false,
+        unmerged: kind == 'u',
+        status_code: format!("{index_char}{worktree_char}"),
+        submodule,
     })
 }
 
@@ -126,5 +145,40 @@ mod tests {
             "src/new.rs"
         );
         assert_eq!(resolve_numstat_new_path("old => new"), "new");
+    }
+
+    #[test]
+    fn parses_unmerged_porcelain_records_as_conflicted_without_changing_legacy_states() {
+        let unmerged = parse_porcelain_v2_line(
+            "u UU N... 100644 100644 100644 100644 aaaaaaa bbbbbbb ccccccc conflicted.txt",
+        )
+        .expect("unmerged record");
+
+        assert_eq!(unmerged.index_status, VcsWorkingTreeFileStatus::Conflicted);
+        assert_eq!(
+            unmerged.worktree_status,
+            VcsWorkingTreeFileStatus::Conflicted
+        );
+        assert!(unmerged.unmerged);
+        assert_eq!(unmerged.status_code, "UU");
+        assert!(!unmerged.submodule);
+
+        let both_added = parse_porcelain_v2_line(
+            "u AA N... 100644 100644 100644 100644 aaaaaaa bbbbbbb ccccccc both-added.txt",
+        )
+        .expect("both-added unmerged record");
+        assert_eq!(
+            (both_added.index_status, both_added.worktree_status),
+            (
+                VcsWorkingTreeFileStatus::Conflicted,
+                VcsWorkingTreeFileStatus::Conflicted,
+            )
+        );
+
+        let ordinary =
+            parse_porcelain_v2_line("1 M. N... 100644 100644 100644 aaaaaaa bbbbbbb ordinary.txt")
+                .expect("ordinary record");
+        assert_eq!(ordinary.index_status, VcsWorkingTreeFileStatus::Modified);
+        assert!(!ordinary.unmerged);
     }
 }

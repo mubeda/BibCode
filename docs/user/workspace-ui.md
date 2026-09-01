@@ -203,6 +203,71 @@ persist across reloads. Closing a split pane merges its tabs into the adjacent
 layout without closing chats or terminals. Explicit tab close commands remain
 pane-local and do close their underlying panel thread or terminal session.
 
+## Git Manager
+
+Each project header in the left panel has a **Git Manager** branch icon directly
+after **New worktree**. It opens the project-scoped centre route
+`/project/<environmentId>/<projectId>/git`; opening it again navigates to the
+same route instead of creating a second manager or centre tab. The selected
+environment owns every path and Git process, so a remote project's checkout
+path remains opaque to the browser.
+
+The toolbar has three segments:
+
+1. **Worktree** selects the main checkout or one of the project's catalogued
+   worktrees. A first open or reload starts on the main checkout; a later
+   selection is remembered while the current client session remains alive.
+2. **Branch** groups local branches into Default, Recent, and Other, and offers
+   create, checkout, rename, delete, and merge actions. The same segment exposes
+   tag creation.
+3. **Sync** derives fetch, pull, push, publish-branch, and diverged
+   force-with-lease states from the current branch and upstream.
+
+The **Changes** tab filters and groups working-directory changes, keeps file
+inclusion separate from row selection, renders per-file diffs, uses whole-file
+inclusion for commits, supports line/hunk stage or unstage, and confirms discard. Its commit box
+supports summary and description, no-verify, signoff, allow-empty, co-author
+trailers, amend, and eligible undo. Binary, submodule, and oversized content use
+explicit interstitials; repository-owned image bytes can be viewed as 2-up,
+swipe, onion-skin, or difference without loading an external image.
+
+The **History** tab pages a flat commit list and shows the selected commit's
+metadata, changed files, and diff. New repository generations are spliced above
+the loaded tip-pinned snapshot; repositories beyond the pin limit show the
+less-stable paging warning. Author circles use only locally derived initials and
+color. The current project route does not mount the implemented history-rewrite
+context menu or multi-commit dialog, so History remains read-only in the shipped
+surface.
+
+Above the tabs, **Stashes** opens the full native stash list with per-entry diff
+and apply, pop, and drop actions. Choosing **Leave my changes** while switching
+branches creates a normal visible stash. **Merge…** loads a server preview and
+starts a normal or squash merge. Repositories with a merge, rebase,
+cherry-pick, or revert in progress show a continue/abort strip, and conflicted
+paths are marked in Changes. The reusable ours/theirs conflict list exists in
+the codebase but is not mounted by the current route, so resolution still needs
+an editor or terminal before Continue can succeed.
+
+**Pull requests** opens the provider pane without making a request. Pull-request
+and check data load only when **Refresh** is pressed, and the pane never starts a
+provider timer. It can also start the existing create-pull-request flow. GitHub
+checks are available; other providers currently return checks unavailable.
+
+Project view state is stored under `bibcode:git-manager-state:v1` for the two
+most recently used physical projects. Its persisted project record contains
+`activeTab`, `selectedRef`, `selectedCommitSha`, `multiCommitSelection`,
+`selectedFilePath`, `selectedStashSha`, `stashPaneOpen`, `imageDiffMode`,
+`providerPaneOpen`, `lineSelectionByPath`, `filterText`, `loadedPageCount`,
+`loadedPageCursors`, `scrollAnchor`, `commitDraft`, and the `lastUsedAt` value
+that enforces eviction. The companion toolbar record contains
+`branchFilterText` and `openDropdown`. The mounted commit box does not currently
+read the legacy `commitDraft` field; its active draft instead uses the shared
+`bibcode:source-control-panel-state:v1` store keyed by environment and checkout,
+so the right-panel Source Control surface and Git Manager do not diverge. The
+selected worktree is intentionally session-only and resets to the main checkout
+after a reload. Evicted or hidden projects retain no mounted panel or live Git
+Manager subscription.
+
 ## Right Panel
 
 The right panel hosts persistent tool surfaces for the active thread. Use its
@@ -291,8 +356,10 @@ The Source Control panel is Orca-parity for the shipped local Git workflow:
   subscriptions immediately. Periodic status polling remains a fallback for
   changes made by external tools.
 
-Stash and amend are intentionally not present; this matches the Orca reference
-behavior for this pass.
+Stash and amend are intentionally not present in this right-panel Source
+Control surface; this matches the Orca reference behavior for this pass. The
+project-scoped Git Manager is a separate centre surface and does provide stash
+operations and amend.
 
 ### Files
 
@@ -349,7 +416,14 @@ The Files surface is a full file manager for the active workspace:
 
 ## Current limitations
 
-- Staged-row diff viewing does not yet use a true `git diff --cached` source.
+- Staged-row diff viewing in the right-panel Source Control surface does not yet
+  use a true `git diff --cached` source. Git Manager diffs are a separate path.
+- Git Manager history-rewrite actions and its ours/theirs conflict-resolution
+  list are implemented as components but are not mounted by the project route.
+- The Git Manager toolbar currently exposes tag creation, but not the shipped
+  server operations for tag deletion or tag push.
+- Git Manager has no configurable keybinding command IDs yet; use its sidebar
+  entry point and the keyboard-operable controls within the panel.
 - Outside changes are detected by a periodic check, so the tree updates within
   seconds rather than instantly. Use Refresh when you want it immediately.
 - Changes to an arbitrary custom Git `core.excludesFile` require **Refresh**;

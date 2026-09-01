@@ -189,6 +189,12 @@ pub struct WorktreeCatalogService {
     inner: Arc<Inner>,
 }
 
+pub(crate) enum ProjectMutationAttempt<T> {
+    Acquired(T),
+    InFlight,
+    Cancelled,
+}
+
 struct Inner {
     projections: Arc<dyn CatalogProjectionSource>,
     inventory: Arc<dyn InventorySource>,
@@ -1588,6 +1594,79 @@ impl WorktreeCatalogService {
     {
         self.with_project_mutation_lock_until_cancelled(project_id, Some(cancellation), operation)
             .await
+    }
+
+    pub(crate) async fn try_with_project_mutation_lock_cancellation<T, F, Fut>(
+        &self,
+        project_id: &str,
+        cancellation: &CancellationToken,
+        operation: F,
+    ) -> ProjectMutationAttempt<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = T>,
+    {
+        if cancellation.is_cancelled() {
+            return ProjectMutationAttempt::Cancelled;
+        }
+        let project_lock = {
+            let mut registry = lock(&self.inner.registry);
+            registry
+                .project_mutation_locks
+                .retain(|_, mutation_lock| mutation_lock.strong_count() > 0);
+            registry
+                .project_mutation_locks
+                .get(project_id)
+                .and_then(Weak::upgrade)
+                .unwrap_or_else(|| {
+                    let mutation_lock = Arc::new(AsyncMutex::new(()));
+                    registry
+                        .project_mutation_locks
+                        .insert(project_id.to_owned(), Arc::downgrade(&mutation_lock));
+                    mutation_lock
+                })
+        };
+        let Ok(_project_guard) = project_lock.try_lock() else {
+            return ProjectMutationAttempt::InFlight;
+        };
+        let project = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return ProjectMutationAttempt::Cancelled,
+            project = self.load_project(project_id) => project,
+        };
+        let repository_key = project
+            .ok()
+            .and_then(|project| project.repository_key)
+            .or_else(|| lock(&self.inner.registry).aliases.get(project_id).cloned());
+        let repository_lock = repository_key.map(|repository_key| {
+            let mut registry = lock(&self.inner.registry);
+            registry
+                .repository_mutation_locks
+                .retain(|_, mutation_lock| mutation_lock.strong_count() > 0);
+            registry
+                .repository_mutation_locks
+                .get(&repository_key)
+                .and_then(Weak::upgrade)
+                .unwrap_or_else(|| {
+                    let mutation_lock = Arc::new(AsyncMutex::new(()));
+                    registry
+                        .repository_mutation_locks
+                        .insert(repository_key, Arc::downgrade(&mutation_lock));
+                    mutation_lock
+                })
+        });
+        let _repository_guard = if let Some(repository_lock) = repository_lock.as_ref() {
+            let Ok(guard) = repository_lock.try_lock() else {
+                return ProjectMutationAttempt::InFlight;
+            };
+            Some(guard)
+        } else {
+            None
+        };
+        if cancellation.is_cancelled() {
+            return ProjectMutationAttempt::Cancelled;
+        }
+        ProjectMutationAttempt::Acquired(operation().await)
     }
 
     async fn with_project_mutation_lock_until_cancelled<T, F, Fut>(

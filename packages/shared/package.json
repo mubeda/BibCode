@@ -183,6 +183,10 @@
     "./httpReadiness": {
       "types": "./src/httpReadiness.ts",
       "import": "./src/httpReadiness.ts"
+    },
+    "./testSupport": {
+      "types": "./src/testSupport.ts",
+      "import": "./src/testSupport.ts"
     }
   },
   "scripts": {

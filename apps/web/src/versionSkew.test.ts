@@ -1,4 +1,5 @@
 import { EnvironmentId } from "@bibcode/contracts";
+import { makeTestExecutionEnvironmentCapabilities } from "@bibcode/shared/testSupport";
 import { describe, expect, it } from "vite-plus/test";
 
 import { APP_VERSION } from "./branding";
@@ -39,14 +40,7 @@ describe("versionSkew", () => {
           remoteUpdateSupport: null,
           remoteProtocolVersion: 1,
           minCompatibleRemoteProtocol: 1,
-          capabilities: {
-            repositoryIdentity: true,
-            worktreeCatalog: false,
-            worktreeCatalogRefreshReason: false,
-            vcsStatusSummary: false,
-            activityProtocolVersion: null,
-            remoteUpdateControl: false,
-          },
+          capabilities: makeTestExecutionEnvironmentCapabilities({ repositoryIdentity: true }),
         },
       }),
     ).toMatchObject({
