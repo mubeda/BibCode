@@ -1308,6 +1308,7 @@ impl Repositories {
         idempotency_key: String,
         input_fingerprint: String,
         now: Timestamp,
+        stale_before: Timestamp,
     ) -> Result<Option<String>> {
         self.database
             .call(move |connection| {
@@ -1319,12 +1320,20 @@ impl Repositories {
                 )?;
                 let pending_pairing_id = transaction
                     .query_row(
-                        "SELECT pairing_id FROM auth_pairing_offer_idempotency
-                         WHERE principal_id = ? AND idempotency_key = ?
-                           AND input_fingerprint = ? AND pairing_id IS NOT NULL
-                           AND result_json IS NULL AND cancelled_at IS NULL
-                           AND expires_at > ?",
-                        params![principal_id, idempotency_key, input_fingerprint, now],
+                        "SELECT offer.pairing_id
+                         FROM auth_pairing_offer_idempotency AS offer
+                         JOIN auth_pairing_links AS pairing ON pairing.id = offer.pairing_id
+                         WHERE offer.principal_id = ? AND offer.idempotency_key = ?
+                           AND offer.input_fingerprint = ? AND offer.pairing_id IS NOT NULL
+                           AND offer.result_json IS NULL AND offer.cancelled_at IS NULL
+                           AND offer.expires_at > ? AND pairing.created_at <= ?",
+                        params![
+                            principal_id,
+                            idempotency_key,
+                            input_fingerprint,
+                            now,
+                            stale_before,
+                        ],
                         |row| row.get::<_, String>(0),
                     )
                     .optional()?;

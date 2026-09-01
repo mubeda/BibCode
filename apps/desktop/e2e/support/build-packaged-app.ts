@@ -2,6 +2,7 @@
 import * as NodeChildProcess from "node:child_process";
 
 import type { DesktopUiPlatform } from "./app-path.ts";
+import { requireReleaseTarget, type ReleaseArch } from "../../../../scripts/lib/release-targets.ts";
 
 const bundles: Record<DesktopUiPlatform, string> = {
   linux: "appimage",
@@ -11,6 +12,7 @@ const bundles: Record<DesktopUiPlatform, string> = {
 
 export interface PackagedDesktopUiBuildInput {
   readonly platform: DesktopUiPlatform;
+  readonly arch: ReleaseArch;
   readonly bundle?: string;
 }
 
@@ -23,13 +25,14 @@ export function planPackagedDesktopUiBuild(
   input: PackagedDesktopUiBuildInput,
 ): PackagedDesktopUiBuildPlan {
   const bundle = input.bundle ?? bundles[input.platform];
+  const rustTarget = requireReleaseTarget(input.platform, input.arch).rustTarget;
   return {
     environment: {
       VITE_BIBCODE_DESKTOP_E2E: "1",
       ...(input.platform === "linux" ? { NO_STRIP: "1" } : {}),
     },
     args: [
-      "../../scripts/run-msvc-x64.mjs",
+      "../../scripts/run-msvc.mjs",
       "pnpm",
       "exec",
       "tauri",
@@ -40,6 +43,8 @@ export function planPackagedDesktopUiBuild(
       "./src-tauri/tauri.e2e.conf.json",
       "--bundles",
       bundle,
+      "--target",
+      rustTarget,
     ],
   };
 }
@@ -56,9 +61,18 @@ function configuredPlatform(): DesktopUiPlatform {
   return process.platform === "darwin" ? "mac" : process.platform === "win32" ? "win" : "linux";
 }
 
+function configuredArch(): ReleaseArch {
+  if (process.env.BIBCODE_E2E_ARCH === "arm64" || process.env.BIBCODE_E2E_ARCH === "x64") {
+    return process.env.BIBCODE_E2E_ARCH;
+  }
+  // oxlint-disable-next-line bibcode/no-global-process-runtime -- The build CLI resolves its native architecture when CI did not provide one.
+  return process.arch === "arm64" ? "arm64" : "x64";
+}
+
 function run(): void {
   const plan = planPackagedDesktopUiBuild({
     platform: configuredPlatform(),
+    arch: configuredArch(),
     ...(process.env.BIBCODE_E2E_BUNDLE ? { bundle: process.env.BIBCODE_E2E_BUNDLE } : {}),
   });
   const result = NodeChildProcess.spawnSync(process.execPath, [...plan.args], {

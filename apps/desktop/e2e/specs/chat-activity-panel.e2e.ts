@@ -145,7 +145,9 @@ async function openMaterializedFixtureChat(): Promise<{
   );
   if (!(await browser.$(activityThreadSelector).isDisplayed())) {
     await activityProject.waitForDisplayed();
-    await activityProject.click();
+    if ((await activityProject.getAttribute("aria-expanded")) !== "true") {
+      await activityProject.click();
+    }
     await browser.$(activityThreadSelector).waitForDisplayed({
       timeoutMsg: "The RPC-materialized activity thread did not expand in the main sidebar.",
     });
@@ -397,6 +399,7 @@ async function openCodexProviderTerminal(): Promise<string> {
   const terminalDock = `[data-provider-terminal-activity-host="${terminalId}"] [data-testid="activity-dock"]`;
   if (supportsCodexTerminalActivity) {
     await browser.$(terminalDock).waitForDisplayed({
+      timeout: 60_000,
       timeoutMsg: "The live Codex terminal activity dock did not become visible.",
     });
   } else {

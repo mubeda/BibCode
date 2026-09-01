@@ -1,7 +1,7 @@
 # Release Checklist
 
-This document describes the Tauri 2 desktop release workflow. The repository
-does not package or publish Electron artifacts.
+This document describes the Tauri 2 desktop and native standalone-server release
+workflow. The repository does not package or publish Electron artifacts.
 
 ## Release Workflow
 
@@ -10,37 +10,75 @@ does not package or publish Electron artifacts.
 - stable releases from tags matching `v*.*.*`; and
 - manual stable or nightly releases through `workflow_dispatch`.
 
-The preflight job runs `vp check`, `vp run typecheck`, and `vp run test`. The
-build matrix then creates native Tauri installers on the matching operating
-system:
+For validation-only release-candidate verification from a feature branch, dispatch the workflow
+with `validate_only=true`, `publish=false`, and a unique prerelease version such
+as `0.4.2-validation.123`. This path runs the complete native desktop and server
+matrices, assembles and checksums the public asset set, and uploads it as the
+`validated-release-assets` Actions artifact. It does not create or modify a Git
+tag or GitHub Release. It runs `vp check` and `vp run typecheck` before the
+native matrices and relies on the pull-request CI workflow for the full test
+graph. `validate_only` and `publish` are mutually exclusive.
 
-| Platform | Runner           | Architecture | Installer       |
-| -------- | ---------------- | ------------ | --------------- |
-| macOS    | `macos-26`       | arm64        | DMG             |
-| macOS    | `macos-26-intel` | x64          | DMG             |
-| Linux    | `ubuntu-22.04`   | x64          | AppImage        |
-| Windows  | `windows-2025`   | x64          | NSIS executable |
+Publication-capable preflight runs `vp check`, `vp run typecheck`, and
+`vp run test`; validation-only preflight skips the duplicated full test graph
+after check and typecheck. The build matrix then creates native Tauri installers
+on the matching operating system:
+
+| Platform | Runner                  | Architecture | Installer       |
+| -------- | ----------------------- | ------------ | --------------- |
+| macOS    | `macos-26`              | arm64        | DMG             |
+| macOS    | `macos-26-intel`        | x64          | DMG             |
+| Linux    | `ubuntu-22.04-arm`      | arm64        | AppImage        |
+| Linux    | `ubuntu-22.04`          | x64          | AppImage        |
+| Windows  | `windows-11-vs2026-arm` | arm64        | NSIS executable |
+| Windows  | `windows-2025`          | x64          | NSIS executable |
 
 Each matrix job installs the frontend build toolchain and Rust, restores Cargo
 caches, and runs `scripts/build-desktop-artifact.ts`. Tauri compiles the native
 host and in-process server and embeds the built React assets. No Node runtime or
 TypeScript server is packaged.
 
+A separate native matrix builds `bibcode` plus the matching static web client for the
+same six targets. macOS and Linux receive `.tar.gz` archives; Windows receives `.zip`.
+Linux also receives direct-download `.deb` and `.rpm` packages for both architectures.
+The Linux server binary is compiled on an Ubuntu 20.04 compatibility baseline, then its
+packages are installed and exercised on Ubuntu 22.04, Ubuntu 24.04, Debian 12, Rocky
+Linux 9, and Fedora 44.
+
 Numeric stable versions are updater candidates and are marked latest only after
 manual publication approval. Stable prerelease versions and manual nightly
-releases are GitHub prereleases, are never marked latest, and remain
-installer-only.
+releases are GitHub prereleases, are never marked latest, and publish desktop
+installers plus standalone server distributions without updater metadata.
 
 ## Supported Platforms
 
 - macOS 11 or newer on Apple Silicon (`arm64`) and Intel (`x64`);
-- Windows 10 or 11 on `x64`;
-- Linux `x64` AppImages built on Ubuntu 22.04 and exercised on Ubuntu 22.04,
+- Windows 10 or 11 on `x64`, and Windows 11 on ARM64;
+- Linux x64 and ARM64 AppImages built on matching Ubuntu 22.04 runners and exercised on Ubuntu 22.04,
   Ubuntu 24.04, and Debian 12.
 
-Windows on ARM remains unsupported until `scripts/run-msvc-x64.mjs` is made
-architecture-aware. Linux release artifacts use Ubuntu 22.04 to keep the
-runtime glibc compatibility floor below the portable Ubuntu 24.04 CI jobs.
+`scripts/run-msvc.mjs` selects the requested native MSVC architecture. Linux desktop
+release artifacts use Ubuntu 22.04; standalone server builds use the older compatibility
+baseline described above.
+
+## Standalone Server Assets
+
+Each release contains `bibcode-server-v<version>-<os>-<architecture>.tar.gz` for macOS
+and Linux or `.zip` for Windows. Public OS/architecture keys are
+`darwin-{aarch64,x86_64}`, `linux-{aarch64,x86_64}`, and
+`windows-{aarch64,x86_64}`. Linux also publishes:
+
+- `bibcode-server_<version>_arm64.deb`
+- `bibcode-server_<version>_amd64.deb`
+- `bibcode-server-<version>-1.aarch64.rpm`
+- `bibcode-server-<version>-1.x86_64.rpm`
+
+The packages are direct GitHub Release downloads, not hosted APT or RPM repositories.
+Every release includes `bibcode-server-SHA256SUMS`; optional server `.minisig` files
+appear only when both dedicated server-signing secrets are configured.
+Windows server archives are written through `scripts/create-portable-zip.ps1`, which assigns
+forward-slash entry names explicitly. The artifact builder rejects a mislabeled non-ZIP payload,
+backslash entry names, duplicate entries, traversal, or paths outside the versioned root.
 
 ## Version Source
 
@@ -85,6 +123,11 @@ signed/unnotarized. Tauri updater signatures verify update payloads; they do
 not replace Apple Developer ID signing, macOS notarization, or Windows
 Authenticode.
 
+Every server artifact is covered by `bibcode-server-SHA256SUMS`. If both
+`BIBCODE_SERVER_SIGNING_PRIVATE_KEY` and `BIBCODE_SERVER_SIGNING_PUBLIC_KEY` are
+configured, release assembly also creates and verifies `.minisig` files. Server signing
+is optional and uses a key separate from the mandatory Tauri updater key.
+
 Keep a password-protected backup of the updater private key in an approved
 offline recovery location, with access restricted to release maintainers. Keep
 its passphrase in a separate approved secret store.
@@ -112,7 +155,9 @@ Every stable `latest.json` has exactly these signed manifest targets:
 
 - `darwin-aarch64`
 - `darwin-x86_64`
+- `linux-aarch64`
 - `linux-x86_64`
+- `windows-aarch64`
 - `windows-x86_64`
 
 The payload URLs inside the manifest must be tag-specific HTTPS GitHub Release
@@ -121,9 +166,9 @@ only to fetch `latest.json`. Before creating a draft, release CI verifies every
 manifest payload with the public key from the release overlay and requires each
 manifest signature to match its adjacent `.sig` asset.
 
-Stable-channel and nightly prereleases are installer-only. They never receive
-the updater signing overlay, updater signatures, descriptors, or `latest.json`,
-and never feed the app updater.
+Stable-channel and nightly prereleases never receive the updater signing overlay,
+updater signatures, descriptors, or `latest.json`, and never feed the app updater. They
+still publish the validated standalone server matrix and checksums.
 
 ### Update installation safety
 
@@ -211,21 +256,23 @@ bootstrap credentials, update-signing secrets, tokens, and database contents.
 1. Confirm the intended version and commit have passed the local verification
    commands below. Create and push the intended tag (or dispatch `stable` with
    that explicit version) with `publish` left at its default `false`.
-2. Confirm the four native build jobs complete and that the stable jobs received
+2. Confirm the six native desktop and six native server build jobs complete and
+   that the stable desktop jobs received
    the two signing secrets above. Do not inspect or print their values.
 3. Confirm the workflow's descriptor-validation and updater-signature steps
-   passed. The workflow must validate exactly four `updater-*.json` descriptors,
+   passed. The workflow must validate exactly six `updater-*.json` descriptors,
    one for each manifest target listed above, before it removes those internal
    descriptors from the public asset set.
 4. Let the workflow create the GitHub Release as a **draft**. Before allowing
    publication, inspect its uploaded assets and `latest.json`:
 
-   - `latest.json` has exactly the four manifest target entries above;
+   - `latest.json` has exactly the six manifest target entries above;
    - each target has a nonempty signature and a tag-specific HTTPS payload URL;
    - the release contains a nonempty `.sig` asset for each target;
-   - the release contains `latest.json`, the two macOS DMGs, Linux AppImage,
-     and Windows NSIS installer, plus the updater payload archives required by
-     the manifest; and
+   - the release contains `latest.json`, two macOS DMGs, two Linux AppImages,
+     and two Windows NSIS installers, plus the standalone server archives,
+     Linux `.deb`/`.rpm` packages, and updater payload archives required by the
+     manifest; and
    - no private key or passphrase is present in any asset, manifest, or log.
 
 5. Compare the draft's sorted asset names with the workflow's
@@ -263,7 +310,7 @@ infrastructure:
 ```powershell
 vp test scripts/tauri-hardening.test.ts scripts/build-desktop-artifact.test.ts scripts/build-tauri-update-manifest.test.ts scripts/ci-platform-contract.test.ts scripts/release-workflow.test.ts scripts/workflow-dependencies.test.ts
 vp test apps/web/src/components/settings/SettingsPanels.test.tsx apps/web/src/components/AppSidebarLayout.test.tsx apps/web/src/tauriDesktopBridge.test.ts apps/web/src/components/desktopUpdate.logic.test.ts apps/web/src/state/desktopUpdate.test.ts
-node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop -j 2
+node scripts/run-msvc.mjs cargo test -p bibcode-desktop -j 2
 ```
 
 Build the native artifact for the current operating system:

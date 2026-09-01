@@ -25,6 +25,10 @@ Start with the shared procedure, then use the page for the native host:
 Never describe compatibility or unavailable evidence as a native pass. A
 complete report separates all three classes.
 
+Native release reports also separate desktop-installer evidence from standalone-server
+archive/package evidence. Each architecture requires its own native result; one
+architecture never proves another.
+
 ## Living documentation and execution reports
 
 The runbooks define current procedure and supported behavior. Branch names,

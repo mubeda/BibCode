@@ -1061,16 +1061,14 @@ async fn established_capacity_is_partitioned_by_principal_and_released_on_close(
     // The fleet-sized forwarder burst admits every sequential pre-auth
     // handshake here without refill pauses; established capacity, not
     // pre-auth rate, is what this test partitions.
-    for index in 0..E2EE_MAX_ESTABLISHED_CONNECTIONS_PER_PRINCIPAL {
-        let source_ip = Ipv4Addr::new(
-            127,
-            0,
-            0,
-            2 + u8::try_from(index / 4).expect("source address index fits u8"),
-        );
-        let (socket, transport, reply) =
-            open_authenticated_bearer_socket_from(&handle, &host_key, &first_credential, source_ip)
-                .await;
+    for _ in 0..E2EE_MAX_ESTABLISHED_CONNECTIONS_PER_PRINCIPAL {
+        let (socket, transport, reply) = open_authenticated_bearer_socket_from(
+            &handle,
+            &host_key,
+            &first_credential,
+            Ipv4Addr::LOCALHOST,
+        )
+        .await;
         assert_eq!(reply, json!({ "type": "e2ee_authenticated" }));
         first_principal_sockets.push((socket, transport));
     }
@@ -1080,7 +1078,7 @@ async fn established_capacity_is_partitioned_by_principal_and_released_on_close(
         &handle,
         &host_key,
         &first_credential,
-        Ipv4Addr::new(127, 0, 0, 2),
+        Ipv4Addr::LOCALHOST,
     )
     .await;
     assert_eq!(reply, json!({ "type": "e2ee_error", "code": "protocol" }));
@@ -1090,7 +1088,7 @@ async fn established_capacity_is_partitioned_by_principal_and_released_on_close(
         &handle,
         &host_key,
         &second_credential,
-        Ipv4Addr::new(127, 0, 0, 10),
+        Ipv4Addr::LOCALHOST,
     )
     .await;
     assert_eq!(reply, json!({ "type": "e2ee_authenticated" }));
@@ -1112,7 +1110,7 @@ async fn established_capacity_is_partitioned_by_principal_and_released_on_close(
                 &handle,
                 &host_key,
                 &first_credential,
-                Ipv4Addr::new(127, 0, 0, 11),
+                Ipv4Addr::LOCALHOST,
             )
             .await;
             if reply == json!({ "type": "e2ee_authenticated" }) {

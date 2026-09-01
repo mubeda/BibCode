@@ -3,7 +3,7 @@ import Layout from "../layouts/Layout.astro";
 import { RELEASES_URL } from "../lib/releases";
 ---
 
-<Layout title="Download — BiBCode" description="Download BiBCode for macOS, Windows, or Linux.">
+<Layout title="Download — BiBCode" description="Download BiBCode desktop and server releases for macOS, Windows, or Linux.">
   <div class="download-page">
   <h1 class="heading">Download BiBCode</h1>
   <p class="subheading">
@@ -19,7 +19,7 @@ import { RELEASES_URL } from "../lib/releases";
         <h2 class="platform-name">macOS</h2>
       </div>
       <div class="download-cards">
-        <a class="download-card" data-asset="arm64.dmg" href={RELEASES_URL}>
+        <a class="download-card" data-asset="aarch64.dmg" href={RELEASES_URL}>
           <span class="card-arch">Apple Silicon (arm64)</span>
           <span class="card-format">.dmg</span>
         </a>
@@ -37,8 +37,12 @@ import { RELEASES_URL } from "../lib/releases";
         <h2 class="platform-name">Windows</h2>
       </div>
       <div class="download-cards">
-        <a class="download-card" data-asset="x64.exe" href={RELEASES_URL}>
-          <span class="card-arch">Windows 10, 11</span>
+        <a class="download-card" data-asset="arm64-setup.exe" href={RELEASES_URL}>
+          <span class="card-arch">Windows 11 ARM64</span>
+          <span class="card-format">.exe</span>
+        </a>
+        <a class="download-card" data-asset="x64-setup.exe" href={RELEASES_URL}>
+          <span class="card-arch">Windows 10/11 x64</span>
           <span class="card-format">.exe</span>
         </a>
       </div>
@@ -51,10 +55,46 @@ import { RELEASES_URL } from "../lib/releases";
         <h2 class="platform-name">Linux</h2>
       </div>
       <div class="download-cards">
-        <a class="download-card" data-asset="x86_64.AppImage" href={RELEASES_URL}>
+        <a class="download-card" data-asset="aarch64.AppImage" href={RELEASES_URL}>
+          <span class="card-arch">ARM64</span>
+          <span class="card-format">AppImage</span>
+        </a>
+        <a class="download-card" data-asset="amd64.AppImage" href={RELEASES_URL}>
           <span class="card-arch">x86_64</span>
           <span class="card-format">AppImage</span>
         </a>
+      </div>
+    </section>
+  </div>
+
+  <h2 class="section-heading">Standalone server</h2>
+  <p class="server-description">
+    Portable archives include the native server and matching web client. Linux also offers direct-download packages.
+  </p>
+  <div class="platforms server-platforms">
+    <section class="platform-section">
+      <div class="platform-header"><h3 class="platform-name">macOS server</h3></div>
+      <div class="download-cards">
+        <a class="download-card" data-asset="-darwin-aarch64.tar.gz" href={RELEASES_URL}><span class="card-arch">ARM64</span><span class="card-format">.tar.gz</span></a>
+        <a class="download-card" data-asset="-darwin-x86_64.tar.gz" href={RELEASES_URL}><span class="card-arch">x64</span><span class="card-format">.tar.gz</span></a>
+      </div>
+    </section>
+    <section class="platform-section">
+      <div class="platform-header"><h3 class="platform-name">Windows server</h3></div>
+      <div class="download-cards">
+        <a class="download-card" data-asset="-windows-aarch64.zip" href={RELEASES_URL}><span class="card-arch">ARM64</span><span class="card-format">.zip</span></a>
+        <a class="download-card" data-asset="-windows-x86_64.zip" href={RELEASES_URL}><span class="card-arch">x64</span><span class="card-format">.zip</span></a>
+      </div>
+    </section>
+    <section class="platform-section linux-server-section">
+      <div class="platform-header"><h3 class="platform-name">Linux server</h3></div>
+      <div class="download-cards server-package-cards">
+        <a class="download-card" data-asset="-linux-aarch64.tar.gz" href={RELEASES_URL}><span class="card-arch">ARM64 portable</span><span class="card-format">.tar.gz</span></a>
+        <a class="download-card" data-asset="-linux-x86_64.tar.gz" href={RELEASES_URL}><span class="card-arch">x64 portable</span><span class="card-format">.tar.gz</span></a>
+        <a class="download-card" data-asset="_arm64.deb" href={RELEASES_URL}><span class="card-arch">ARM64 Debian</span><span class="card-format">.deb</span></a>
+        <a class="download-card" data-asset="_amd64.deb" href={RELEASES_URL}><span class="card-arch">x64 Debian</span><span class="card-format">.deb</span></a>
+        <a class="download-card" data-asset="-1.aarch64.rpm" href={RELEASES_URL}><span class="card-arch">ARM64 RPM</span><span class="card-format">.rpm</span></a>
+        <a class="download-card" data-asset="-1.x86_64.rpm" href={RELEASES_URL}><span class="card-arch">x64 RPM</span><span class="card-format">.rpm</span></a>
       </div>
     </section>
   </div>
@@ -69,7 +109,7 @@ import { RELEASES_URL } from "../lib/releases";
 </Layout>
 
 <script>
-  import { fetchLatestRelease, RELEASES_URL } from "../lib/releases";
+  import { fetchLatestRelease, findReleaseAsset, RELEASES_URL } from "../lib/releases";
 
   async function init() {
     const versionLabel = document.getElementById("version-label");
@@ -92,7 +132,7 @@ import { RELEASES_URL } from "../lib/releases";
         const suffix = card.dataset.asset;
         if (!suffix) return;
 
-        const match = (release.assets ?? []).find((a) => a.name.endsWith(`-${suffix}`));
+        const match = findReleaseAsset(release.assets ?? [], suffix);
         if (match) {
           card.href = match.browser_download_url;
         } else {
@@ -169,6 +209,25 @@ import { RELEASES_URL } from "../lib/releases";
     gap: 2.5rem;
     opacity: 0;
     animation: fade-in 1s ease-out 0.2s forwards;
+  }
+
+  .section-heading {
+    margin-top: 4rem;
+    font-size: 1.5rem;
+    font-weight: 500;
+    letter-spacing: -0.025em;
+  }
+
+  .server-description {
+    max-width: 620px;
+    margin: 0.65rem 0 2.25rem;
+    color: var(--fg-dim);
+    text-align: center;
+    font-size: 0.9rem;
+  }
+
+  .server-package-cards {
+    grid-template-columns: repeat(3, 1fr);
   }
 
   .platform-section {

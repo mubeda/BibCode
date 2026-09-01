@@ -82,16 +82,28 @@ process that intentionally owns process-global state.
 - `vp run dist:desktop:dmg:x64`: macOS Intel DMG.
 - `vp run dist:desktop:linux`: Linux x64 AppImage.
 - `vp run dist:desktop:win`: Windows NSIS installer for the host architecture.
+- `vp run dist:desktop:win:arm64`: Windows ARM64 NSIS installer.
 - `vp run dist:desktop:win:x64`: Windows x64 NSIS installer.
 
-The root package contains a Windows ARM64 artifact command for development
-experiments, but Windows ARM is not a supported release target. The wrapper,
-`scripts/build-desktop-artifact.ts`, rejects cross-platform builds by default,
-invokes the canonical `@bibcode/desktop` Tauri package, and copies bundle output
+The wrapper, `scripts/build-desktop-artifact.ts`, rejects cross-platform builds by
+default, invokes the canonical `@bibcode/desktop` Tauri package, and copies bundle output
 under `release/desktop/<platform>-<arch>` unless an output directory is supplied.
 
 The desktop artifact contains the Tauri host, in-process Rust server, and built
 web assets. It does not stage Node.js, a TypeScript server, or helper sidecars.
+
+## Standalone Server Artifacts
+
+- `vp run dist:server:artifact -- ...`: generic standalone-server builder.
+- `vp run dist:server:mac:arm64` / `:x64`: macOS server archive.
+- `vp run dist:server:linux:arm64` / `:x64`: Linux archive plus `.deb` and `.rpm`.
+- `vp run dist:server:win:arm64` / `:x64`: Windows server archive.
+
+The builder stages the native `bibcode` executable, production web client,
+`docs/user/server-installation.md`, and license under one versioned root. Use
+`scripts/smoke-server-distribution.ts` against that staged root. Linux CI additionally
+uses `scripts/test-linux-server-package.ts` to install, start, remove, and verify data
+preservation in the documented native-architecture containers.
 
 ## Repository Maintenance
 

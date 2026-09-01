@@ -963,7 +963,7 @@ mod tests {
             [OsString::from("--version")],
             "validation_failed",
             "busy executable did not recover",
-            Duration::from_secs(1),
+            VALIDATION_TIMEOUT,
         )
         .await
         .expect("validation retries executable busy");

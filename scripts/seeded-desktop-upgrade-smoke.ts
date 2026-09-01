@@ -8,11 +8,14 @@ import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodeUtil from "node:util";
 
-import { MOCK_UPDATE_READY_PATH } from "./mock-update-server.ts";
+import { MOCK_UPDATE_LOOPBACK_HOST, MOCK_UPDATE_READY_PATH } from "./mock-update-server.ts";
+import { requireReleaseTarget, type TauriUpdaterTarget } from "./lib/release-targets.ts";
 
 export type SeededUpgradePlatform = "linux" | "mac" | "win";
 export type SeededUpgradeArch = "arm64" | "x64";
 export type SeededUpgradeLane = "previous-stable" | "protected-baseline";
+
+const MOCK_UPDATE_READY_TIMEOUT_MS = 60_000;
 
 export interface SeededDesktopUpgradeSmokeInput {
   readonly arch: SeededUpgradeArch;
@@ -139,11 +142,6 @@ export function parseSeededDesktopUpgradeSmokeArgs(
       `${platform} packaged upgrades require the ${expectedBundle} bundle.`,
     );
   }
-  if (platform === "win" && arch !== "x64") {
-    throw new SeededDesktopUpgradeSmokeError(
-      "The supported Windows updater target is Windows x64.",
-    );
-  }
   if (values.wsl === true && (platform !== "win" || arch !== "x64")) {
     throw new SeededDesktopUpgradeSmokeError("WSL upgrade coverage requires Windows x64.");
   }
@@ -256,12 +254,6 @@ export function buildSeededUpgradeOverlay(input: {
   };
 }
 
-export type TauriUpdaterTarget =
-  | "darwin-aarch64"
-  | "darwin-x86_64"
-  | "linux-x86_64"
-  | "windows-x86_64";
-
 export function buildLocalUpdaterManifest(input: {
   readonly artifact: string;
   readonly baseUrl: string;
@@ -312,7 +304,19 @@ import * as NodeFS from "node:fs";
 
 const input = ${serializedInput};
 
+async function waitForDesktopBridge() {
+  await browser.waitUntil(
+    async () => browser.execute(() => Boolean(window.desktopBridge)),
+    {
+      timeout: 60000,
+      interval: 100,
+      timeoutMsg: "The packaged desktop bridge did not become ready.",
+    },
+  );
+}
+
 async function observe(seed) {
+  await waitForDesktopBridge();
   return browser.execute(async (parameters, seed) => {
     const bridge = window.desktopBridge;
     if (!bridge) throw new Error("The packaged desktop bridge is unavailable.");
@@ -751,8 +755,7 @@ interface CommandResult {
   readonly stdout: string;
 }
 
-// oxlint-disable-next-line bibcode/no-global-process-runtime -- The standalone release harness selects the native host executable once.
-const vpExecutable = process.platform === "win32" ? "vp.cmd" : "vp";
+export const seededUpgradeVitePlusExecutable = "vp";
 
 const terminateChild = async (child: NodeChildProcess.ChildProcess): Promise<void> => {
   if (child.exitCode !== null || child.signalCode !== null) return;
@@ -826,6 +829,62 @@ export const runBoundedCommand = async (input: {
 
 const runCommand = runBoundedCommand;
 
+export function restartedApplicationCleanupPlan(
+  appBinaryPath: string,
+  platform: SeededUpgradePlatform,
+): { readonly args: ReadonlyArray<string>; readonly command: string } {
+  if (platform === "win") {
+    return {
+      args: ["/F", "/T", "/IM", NodePath.win32.basename(appBinaryPath)],
+      command: "taskkill.exe",
+    };
+  }
+  return {
+    args: ["-TERM", "-x", "bibcode-desktop"],
+    command: "pkill",
+  };
+}
+
+const stopRestartedApplication = async (
+  appBinaryPath: string,
+  platform: SeededUpgradePlatform,
+): Promise<void> => {
+  const plan = restartedApplicationCleanupPlan(appBinaryPath, platform);
+  let killed = false;
+  let missesAfterKill = 0;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const result = await runCommand({
+      ...plan,
+      cwd: NodePath.dirname(appBinaryPath),
+      timeoutMs: 10_000,
+    });
+    if (result.exitCode === 0) {
+      killed = true;
+      missesAfterKill = 0;
+    } else if (killed) {
+      missesAfterKill += 1;
+      if (missesAfterKill >= 2) return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+};
+
+export async function removeSeededUpgradeDependencyTree(checkout: string): Promise<void> {
+  const checkoutRoot = NodePath.resolve(checkout);
+  const dependencyTree = NodePath.join(checkoutRoot, "node_modules");
+  if (NodePath.relative(checkoutRoot, dependencyTree) !== "node_modules") {
+    throw new SeededDesktopUpgradeSmokeError(
+      `Refused unsafe seeded-upgrade dependency cleanup: ${dependencyTree}.`,
+    );
+  }
+  await NodeFS.promises.rm(dependencyTree, {
+    recursive: true,
+    force: true,
+    maxRetries: 20,
+    retryDelay: 250,
+  });
+}
+
 const requireCommandSuccess = async (input: Parameters<typeof runCommand>[0]): Promise<void> => {
   const result = await runCommand(input);
   if (result.exitCode !== 0) {
@@ -866,14 +925,15 @@ const findExactlyOne = async (
   return matches[0]!;
 };
 
-const updaterTargetFor = (
+export const updaterTargetFor = (
   platform: SeededUpgradePlatform,
   arch: SeededUpgradeArch,
-): TauriUpdaterTarget => {
-  if (platform === "win") return "windows-x86_64";
-  if (platform === "linux") return "linux-x86_64";
-  return arch === "arm64" ? "darwin-aarch64" : "darwin-x86_64";
-};
+): TauriUpdaterTarget => requireReleaseTarget(platform, arch).updaterTarget;
+
+export const seededUpgradeRustTarget = (
+  platform: SeededUpgradePlatform,
+  arch: SeededUpgradeArch,
+): string => requireReleaseTarget(platform, arch).rustTarget;
 
 const writeBuildOverlay = async (input: {
   readonly createUpdaterArtifacts: boolean;
@@ -891,6 +951,7 @@ const writeBuildOverlay = async (input: {
 };
 
 const buildPackagedApplication = async (input: {
+  readonly arch: SeededUpgradeArch;
   readonly bundle: SeededDesktopUpgradeSmokeInput["bundle"];
   readonly checkout: string;
   readonly overlayPath: string;
@@ -899,14 +960,14 @@ const buildPackagedApplication = async (input: {
   readonly targetDirectory: string;
 }): Promise<void> => {
   await requireCommandSuccess({
-    command: vpExecutable,
+    command: seededUpgradeVitePlusExecutable,
     args: ["install", "--frozen-lockfile"],
     cwd: input.checkout,
     inherit: true,
     timeoutMs: 10 * 60_000,
   });
   await requireCommandSuccess({
-    command: vpExecutable,
+    command: seededUpgradeVitePlusExecutable,
     args: [
       "run",
       "--filter",
@@ -922,6 +983,8 @@ const buildPackagedApplication = async (input: {
       input.overlayPath,
       "--bundles",
       input.platform === "mac" ? "app,dmg" : input.bundle,
+      "--target",
+      seededUpgradeRustTarget(input.platform, input.arch),
     ],
     cwd: input.checkout,
     env: { ...input.signingEnvironment, CARGO_TARGET_DIR: input.targetDirectory },
@@ -930,16 +993,21 @@ const buildPackagedApplication = async (input: {
   });
 };
 
-const bundleRoot = (targetDirectory: string): string =>
-  NodePath.join(targetDirectory, "release", "bundle");
+export const seededUpgradeBundleRoot = (
+  targetDirectory: string,
+  platform: SeededUpgradePlatform,
+  arch: SeededUpgradeArch,
+): string =>
+  NodePath.join(targetDirectory, seededUpgradeRustTarget(platform, arch), "release", "bundle");
 
 const baselinePackage = async (
   targetDirectory: string,
   platform: SeededUpgradePlatform,
+  arch: SeededUpgradeArch,
 ): Promise<string> => {
   const suffix = platform === "mac" ? ".dmg" : platform === "linux" ? ".AppImage" : ".exe";
   return findExactlyOne(
-    bundleRoot(targetDirectory),
+    seededUpgradeBundleRoot(targetDirectory, platform, arch),
     (path) => path.endsWith(suffix) && !path.endsWith(`${suffix}.sig`),
     `${platform} baseline package`,
   );
@@ -954,7 +1022,7 @@ const publishCandidateUpdater = async (input: {
   readonly updaterRoot: string;
 }): Promise<void> => {
   const signaturePath = await findExactlyOne(
-    bundleRoot(input.candidateBuildRoot),
+    seededUpgradeBundleRoot(input.candidateBuildRoot, input.platform, input.arch),
     (path) => path.endsWith(".sig"),
     "candidate updater signature",
   );
@@ -966,7 +1034,7 @@ const publishCandidateUpdater = async (input: {
   await NodeFS.promises.copyFile(signaturePath, NodePath.join(input.updaterRoot, signatureName));
   const manifest = buildLocalUpdaterManifest({
     artifact: payloadName,
-    baseUrl: `http://127.0.0.1:${input.updaterPort}/`,
+    baseUrl: `http://${MOCK_UPDATE_LOOPBACK_HOST}:${input.updaterPort}/`,
     candidateVersion: input.candidateVersion,
     signature: await NodeFS.promises.readFile(signaturePath, "utf8"),
     target: updaterTargetFor(input.platform, input.arch),
@@ -1105,7 +1173,7 @@ const runWebDriverPhase = async (input: {
     { mode: 0o600 },
   );
   const result = await runCommand({
-    command: vpExecutable,
+    command: seededUpgradeVitePlusExecutable,
     args: ["exec", "wdio", "run", configPath],
     cwd: NodePath.join(input.repositoryRoot, "apps", "desktop"),
     env: {
@@ -1185,13 +1253,15 @@ const startMockUpdateServer = async (input: {
       probe: async () => {
         if (startupError !== undefined) throw startupError;
         try {
-          const response = await fetch(`http://127.0.0.1:${input.port}${MOCK_UPDATE_READY_PATH}`);
+          const response = await fetch(
+            `http://${MOCK_UPDATE_LOOPBACK_HOST}:${input.port}${MOCK_UPDATE_READY_PATH}`,
+          );
           return response.ok;
         } catch {
           return false;
         }
       },
-      timeoutMs: 15_000,
+      timeoutMs: MOCK_UPDATE_READY_TIMEOUT_MS,
     });
     return child;
   } catch (error) {
@@ -1241,6 +1311,7 @@ const runUpgradeLane = async (input: {
     wsl: input.wsl,
   } as const;
   await runWebDriverPhase({ ...shared, phase: "seed-and-install", resultPath: beforePath });
+  await stopRestartedApplication(input.appBinaryPath, input.platform);
   await runWebDriverPhase({ ...shared, phase: "verify", resultPath: afterPath });
   const before = await readObservation<SeededUpgradeObservationBefore>(beforePath);
   const after = await readObservation<SeededUpgradeObservationAfter>(afterPath);
@@ -1360,7 +1431,7 @@ export async function runSeededDesktopUpgradeSmoke(
     mode: 0o700,
   });
 
-  const endpoint = `http://127.0.0.1:${input.updaterPort}/latest.json`;
+  const endpoint = `http://${MOCK_UPDATE_LOOPBACK_HOST}:${input.updaterPort}/latest.json`;
   const candidateOverlay = NodePath.join(runRoot, "candidate-overlay.json");
   const previousOverlay = NodePath.join(runRoot, "previous-overlay.json");
   const protectedOverlay = NodePath.join(runRoot, "protected-overlay.json");
@@ -1407,6 +1478,7 @@ export async function runSeededDesktopUpgradeSmoke(
         timeoutMs: 120_000,
       });
       cleanup.add("previous stable checkout", async () => {
+        await removeSeededUpgradeDependencyTree(layout.previousStable.checkout);
         await requireCommandSuccess({
           command: "git",
           args: ["worktree", "remove", "--force", layout.previousStable.checkout],
@@ -1433,6 +1505,7 @@ export async function runSeededDesktopUpgradeSmoke(
       timeoutMs: 120_000,
     });
     cleanup.add("protected baseline checkout", async () => {
+      await removeSeededUpgradeDependencyTree(layout.protectedBaseline.checkout);
       await requireCommandSuccess({
         command: "git",
         args: ["worktree", "remove", "--force", layout.protectedBaseline.checkout],
@@ -1442,6 +1515,7 @@ export async function runSeededDesktopUpgradeSmoke(
     });
 
     await buildPackagedApplication({
+      arch: input.arch,
       bundle: input.bundle,
       checkout: input.repositoryRoot,
       overlayPath: candidateOverlay,
@@ -1451,6 +1525,7 @@ export async function runSeededDesktopUpgradeSmoke(
     });
     if (!input.wsl) {
       await buildPackagedApplication({
+        arch: input.arch,
         bundle: input.bundle,
         checkout: layout.previousStable.checkout,
         overlayPath: previousOverlay,
@@ -1460,6 +1535,7 @@ export async function runSeededDesktopUpgradeSmoke(
       });
     }
     await buildPackagedApplication({
+      arch: input.arch,
       bundle: input.bundle,
       checkout: layout.protectedBaseline.checkout,
       overlayPath: protectedOverlay,
@@ -1488,6 +1564,7 @@ export async function runSeededDesktopUpgradeSmoke(
       const previousPackage = await baselinePackage(
         layout.previousStable.buildRoot,
         input.platform,
+        input.arch,
       );
       const previousApp = await installBaselinePackage({
         laneRoot: NodePath.dirname(layout.previousStable.dataRoot),
@@ -1512,6 +1589,7 @@ export async function runSeededDesktopUpgradeSmoke(
     const protectedPackage = await baselinePackage(
       layout.protectedBaseline.buildRoot,
       input.platform,
+      input.arch,
     );
     const protectedApp = await installBaselinePackage({
       laneRoot: NodePath.dirname(layout.protectedBaseline.dataRoot),
