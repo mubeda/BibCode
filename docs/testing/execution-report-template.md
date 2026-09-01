@@ -80,6 +80,9 @@ Delete the unused result values above. Do not leave an ambiguous status.
 | Explicit pull-request/check refresh and no idle provider refresh    |        |                                      |                                   |
 | Disconnect/reconnect and one missing-capability degradation         |        |                                      |                                   |
 | Local-only author identity and no external image source             |        |                                      |                                   |
+| Two-project selection, filter, tab, and repository-data isolation   |        |                                      |                                   |
+| Three-project visit with two-entry least-recently-used eviction     |        |                                      |                                   |
+| Manual idle third-party Network and rendered-image-source check     |        |                                      |                                   |
 
 ## Workspace and static gates
 
