@@ -33,6 +33,7 @@ interface WorkflowStep {
 
 interface WorkflowJob {
   readonly env?: Record<string, string>;
+  readonly needs?: string | ReadonlyArray<string>;
   readonly outputs?: Record<string, string>;
   readonly "runs-on"?: string;
   readonly strategy?: {
@@ -81,16 +82,14 @@ describe("cross-platform CI contract", () => {
     const releaseGuide = NodeFS.readFileSync(RELEASE_GUIDE_PATH, "utf8");
 
     expect(serverPackage.scripts.test).toBe(
-      "node ../../scripts/run-msvc-x64.mjs cargo test -p bibcode-server -j 2",
+      "node ../../scripts/run-msvc.mjs cargo test -p bibcode-server -j 2",
     );
     expect(desktopPackage.scripts.test).toBe(
-      "node ../../scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop -j 2",
+      "node ../../scripts/run-msvc.mjs cargo test -p bibcode-desktop -j 2",
     );
     expect(rustWorkspaceTestStep?.run).toBe("cargo test --workspace -j 2");
     expect(ciWorkflow).not.toContain("--test-threads=1");
-    expect(releaseGuide).toContain(
-      "node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop -j 2",
-    );
+    expect(releaseGuide).toContain("node scripts/run-msvc.mjs cargo test -p bibcode-desktop -j 2");
     expect(releaseGuide).not.toContain("cargo test -p bibcode-desktop -j 2 -- --test-threads=1");
   });
 
@@ -111,10 +110,22 @@ describe("cross-platform CI contract", () => {
     expect(matrix).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
+          runner: "ubuntu-22.04-arm",
+          platform: "linux",
+          target: "appimage",
+          arch: "arm64",
+        }),
+        expect.objectContaining({
           runner: "ubuntu-22.04",
           platform: "linux",
           target: "appimage",
           arch: "x64",
+        }),
+        expect.objectContaining({
+          runner: "windows-11-vs2026-arm",
+          platform: "win",
+          target: "nsis",
+          arch: "arm64",
         }),
         expect.objectContaining({
           runner: "windows-2025",
@@ -136,7 +147,7 @@ describe("cross-platform CI contract", () => {
         }),
       ]),
     );
-    expect(matrix.some((entry) => entry.platform === "win" && entry.arch === "arm64")).toBe(false);
+    expect(matrix).toHaveLength(6);
   });
 
   it("installs dependencies once in every CI job", () => {
@@ -201,6 +212,19 @@ describe("cross-platform CI contract", () => {
     }
     expect(commands).not.toContain("libappindicator3-dev");
   });
+
+  it("installs xdg-utils in every Linux AppImage build workflow", () => {
+    const jobs = [
+      requireJob(readWorkflow(CI_WORKFLOW_PATH).workflow, "native_desktop"),
+      requireJob(readWorkflow(RELEASE_WORKFLOW_PATH).workflow, "build_desktop"),
+      requireJob(readWorkflow(DESKTOP_UI_WORKFLOW_PATH).workflow, "desktop_ui_smoke"),
+      requireJob(readWorkflow(DESKTOP_UPGRADE_WORKFLOW_PATH).workflow, "seeded_upgrade_smoke"),
+    ];
+
+    for (const job of jobs) {
+      expect(allStepCommands(job)).toContain("xdg-utils");
+    }
+  });
 });
 
 describe("cross-platform release contract", () => {
@@ -219,9 +243,9 @@ describe("cross-platform release contract", () => {
 
   it("builds AppImage on Ubuntu 22.04 with the complete Linux prerequisites", () => {
     const { workflow } = readWorkflow(RELEASE_WORKFLOW_PATH);
-    const build = requireJob(workflow, "build");
+    const build = requireJob(workflow, "build_desktop");
     const linux = (build.strategy?.matrix?.include ?? []).find(
-      (entry) => entry.platform === "linux",
+      (entry) => entry.platform === "linux" && entry.arch === "x64",
     );
     const commands = allStepCommands(build);
 
@@ -233,7 +257,7 @@ describe("cross-platform release contract", () => {
 
   it("verifies complete ad-hoc signatures before publishing macOS DMGs", () => {
     const { workflow } = readWorkflow(RELEASE_WORKFLOW_PATH);
-    const steps = requireJob(workflow, "build").steps ?? [];
+    const steps = requireJob(workflow, "build_desktop").steps ?? [];
     const buildIndex = steps.findIndex((step) => step.name === "Build desktop artifact");
     const verifyIndex = steps.findIndex(
       (step) => step.name === "Verify macOS ad-hoc application signature",
@@ -278,7 +302,7 @@ describe("cross-platform release contract", () => {
 
   it("signs and collects updater artifacts only for updater candidates", () => {
     const { workflow } = readWorkflow(RELEASE_WORKFLOW_PATH);
-    const build = requireJob(workflow, "build");
+    const build = requireJob(workflow, "build_desktop");
     const commands = allStepCommands(build);
     const releaseAssets = build.steps?.find((step) => step.name === "Collect release assets");
     const signingCheck = build.steps?.find(
@@ -303,6 +327,100 @@ describe("cross-platform release contract", () => {
     expect(releaseAssets?.run).toMatch(/release\/\*\.sig/);
     expect(releaseAssets?.run).toMatch(/release\/updater-\*\.json/);
     expect(releaseAssets?.run).toMatch(/is_update_candidate/);
+  });
+
+  it("builds independent six-target desktop and server release matrices", () => {
+    const { workflow } = readWorkflow(RELEASE_WORKFLOW_PATH);
+    const desktop = requireJob(workflow, "build_desktop");
+    const server = requireJob(workflow, "build_server");
+    const release = requireJob(workflow, "release");
+
+    expect(desktop.strategy?.matrix?.include).toEqual([
+      { label: "macOS arm64", runner: "macos-26", platform: "mac", target: "dmg", arch: "arm64" },
+      { label: "macOS x64", runner: "macos-26-intel", platform: "mac", target: "dmg", arch: "x64" },
+      {
+        label: "Linux arm64",
+        runner: "ubuntu-22.04-arm",
+        platform: "linux",
+        target: "appimage",
+        arch: "arm64",
+      },
+      {
+        label: "Linux x64",
+        runner: "ubuntu-22.04",
+        platform: "linux",
+        target: "appimage",
+        arch: "x64",
+      },
+      {
+        label: "Windows arm64",
+        runner: "windows-11-vs2026-arm",
+        platform: "win",
+        target: "nsis",
+        arch: "arm64",
+      },
+      {
+        label: "Windows x64",
+        runner: "windows-2025",
+        platform: "win",
+        target: "nsis",
+        arch: "x64",
+      },
+    ]);
+    expect(server.strategy?.matrix?.include).toEqual([
+      {
+        label: "macOS arm64",
+        runner: "macos-26",
+        platform: "mac",
+        arch: "arm64",
+        serverOs: "darwin",
+        serverArch: "aarch64",
+      },
+      {
+        label: "macOS x64",
+        runner: "macos-26-intel",
+        platform: "mac",
+        arch: "x64",
+        serverOs: "darwin",
+        serverArch: "x86_64",
+      },
+      {
+        label: "Linux arm64",
+        runner: "ubuntu-22.04-arm",
+        platform: "linux",
+        arch: "arm64",
+        serverOs: "linux",
+        serverArch: "aarch64",
+      },
+      {
+        label: "Linux x64",
+        runner: "ubuntu-22.04",
+        platform: "linux",
+        arch: "x64",
+        serverOs: "linux",
+        serverArch: "x86_64",
+      },
+      {
+        label: "Windows arm64",
+        runner: "windows-11-vs2026-arm",
+        platform: "win",
+        arch: "arm64",
+        serverOs: "windows",
+        serverArch: "aarch64",
+      },
+      {
+        label: "Windows x64",
+        runner: "windows-2025",
+        platform: "win",
+        arch: "x64",
+        serverOs: "windows",
+        serverArch: "x86_64",
+      },
+    ]);
+    expect(allStepCommands(server)).toContain("scripts/build-server-artifact.ts");
+    expect(allStepCommands(server)).toContain('chown -R "$HOST_UID:$HOST_GID" /workspace/target');
+    expect(allStepCommands(server)).toContain("scripts/smoke-server-distribution.ts");
+    expect(release.needs).toEqual(["preflight", "build_desktop", "build_server"]);
   });
 
   it("cryptographically verifies every updater payload before creating a stable draft", () => {
@@ -349,14 +467,17 @@ describe("cross-platform release contract", () => {
     expect(preflight.outputs?.publish_requested).toBe(
       "${{ steps.release_meta.outputs.publish_requested }}",
     );
-    expect(requireDraft?.if).toBe(
+    expect(requireDraft?.if).toContain("needs.preflight.outputs.validate_only != 'true'");
+    expect(requireDraft?.if).toContain(
       "needs.preflight.outputs.release_channel == 'stable' && needs.preflight.outputs.publish_requested == 'true'",
     );
     expect(requireDraft?.run).toMatch(/gh release view[^]*isDraft/);
     for (const draftStep of [prepareDraft, createDraft, createFirstDraft, verifyDraft]) {
+      expect(draftStep?.if).toContain("needs.preflight.outputs.validate_only != 'true'");
       expect(draftStep?.if).toContain("needs.preflight.outputs.publish_requested != 'true'");
     }
-    expect(publish?.if).toBe(
+    expect(publish?.if).toContain("needs.preflight.outputs.validate_only != 'true'");
+    expect(publish?.if).toContain(
       "needs.preflight.outputs.release_channel == 'stable' && needs.preflight.outputs.publish_requested == 'true'",
     );
     expect(publish?.run).toMatch(/gh release edit[^]*--draft=false/);
@@ -393,7 +514,17 @@ describe("packaged desktop UI smoke contract", () => {
     expect(smoke.strategy?.["fail-fast"]).toBe(false);
     expect(matrix).toEqual(
       expect.arrayContaining([
+        expect.objectContaining({
+          runner: "ubuntu-22.04-arm",
+          platform: "linux",
+          arch: "arm64",
+        }),
         expect.objectContaining({ runner: "ubuntu-22.04", platform: "linux", arch: "x64" }),
+        expect.objectContaining({
+          runner: "windows-11-vs2026-arm",
+          platform: "win",
+          arch: "arm64",
+        }),
         expect.objectContaining({ runner: "windows-2025", platform: "win", arch: "x64" }),
         expect.objectContaining({ runner: "macos-26", platform: "mac", arch: "arm64" }),
         expect.objectContaining({
@@ -403,6 +534,7 @@ describe("packaged desktop UI smoke contract", () => {
         }),
       ]),
     );
+    expect(matrix).toHaveLength(6);
     expect(commands).toMatch(/vp install --frozen-lockfile/);
     expect(commands).toMatch(/test:ui:build/);
     expect(commands).toMatch(/test:ui:desktop/);
@@ -410,7 +542,7 @@ describe("packaged desktop UI smoke contract", () => {
     expect(commands).toMatch(/hdiutil attach/);
     expect(commands).toMatch(/hdiutil detach/);
     expect(commands).toContain("-name 'BiBCode.app'");
-    expect(commands).toContain('-Filter "BiBCode.exe"');
+    expect(commands).toContain('"BiBCode.exe", "bibcode-desktop.exe"');
     expect(commands).not.toMatch(/bundle\/macos.*\.app/);
     expect(commands).toMatch(/always\(\)/);
     expect(commands).toMatch(/actions\/upload-artifact/);
@@ -432,7 +564,9 @@ describe("packaged desktop UI smoke contract", () => {
     const smoke = requireJob(workflow, "desktop_ui_smoke");
     const resolveStep = smoke.steps?.find((step) => step.name === "Resolve Linux AppImage");
 
-    expect(resolveStep?.run).toContain('find "$GITHUB_WORKSPACE/target/release/bundle/appimage"');
+    expect(resolveStep?.run).toContain(
+      'find "$GITHUB_WORKSPACE/target/${{ matrix.rustTarget }}/release/bundle/appimage"',
+    );
     expect(resolveStep?.run).toContain('echo "BIBCODE_E2E_APP_PATH=$app_path"');
   });
 
@@ -470,9 +604,11 @@ describe("packaged desktop UI smoke contract", () => {
     const evidencePaths = String(evidenceStep?.with?.path);
 
     expect(packageStep?.if).toBe("always()");
-    expect(packagePaths).toContain("target/release/bundle/appimage/*.AppImage");
-    expect(packagePaths).toContain("target/release/bundle/nsis/*.exe");
-    expect(packagePaths).toContain("target/release/bundle/dmg/*.dmg");
+    expect(packagePaths).toContain(
+      "target/${{ matrix.rustTarget }}/release/bundle/appimage/*.AppImage",
+    );
+    expect(packagePaths).toContain("target/${{ matrix.rustTarget }}/release/bundle/nsis/*.exe");
+    expect(packagePaths).toContain("target/${{ matrix.rustTarget }}/release/bundle/dmg/*.dmg");
     expect(evidencePaths).toContain("/*.png");
     expect(evidencePaths).toContain("/*.log");
     expect(evidencePaths).not.toContain("/state/");
@@ -499,11 +635,25 @@ describe("seeded packaged desktop upgrade contract", () => {
     expect(smoke.strategy?.["fail-fast"]).toBe(false);
     expect(smoke.strategy?.matrix?.include).toEqual([
       {
+        label: "Linux arm64 AppImage",
+        runner: "ubuntu-22.04-arm",
+        platform: "linux",
+        arch: "arm64",
+        bundle: "appimage",
+      },
+      {
         label: "Linux x64 AppImage",
         runner: "ubuntu-22.04",
         platform: "linux",
         arch: "x64",
         bundle: "appimage",
+      },
+      {
+        label: "Windows arm64 NSIS",
+        runner: "windows-11-vs2026-arm",
+        platform: "win",
+        arch: "arm64",
+        bundle: "nsis",
       },
       {
         label: "Windows x64 NSIS",

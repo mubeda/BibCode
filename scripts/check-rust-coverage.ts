@@ -72,7 +72,7 @@ export function buildRustCoverageCommand(
   if (platform === "win32") {
     return {
       command: process.execPath,
-      args: [NodePath.join(repoRoot, "scripts", "run-msvc-x64.mjs"), "cargo", ...args],
+      args: [NodePath.join(repoRoot, "scripts", "run-msvc.mjs"), "cargo", ...args],
       cwd: repoRoot,
     };
   }

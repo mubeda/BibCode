@@ -16,6 +16,21 @@ export interface Release {
   assets: ReleaseAsset[];
 }
 
+const isInternalReleaseAsset = (name: string): boolean =>
+  name.endsWith(".sig") ||
+  name.endsWith(".minisig") ||
+  name.endsWith(".sbom.json") ||
+  name === "bibcode-server-SHA256SUMS" ||
+  name === "latest.json" ||
+  name.startsWith("updater-");
+
+export function findReleaseAsset(
+  assets: ReadonlyArray<ReleaseAsset>,
+  suffix: string,
+): ReleaseAsset | undefined {
+  return assets.find((asset) => !isInternalReleaseAsset(asset.name) && asset.name.endsWith(suffix));
+}
+
 export async function fetchLatestRelease(): Promise<Release> {
   const cached = sessionStorage.getItem(CACHE_KEY);
   if (cached) return JSON.parse(cached);

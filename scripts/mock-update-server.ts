@@ -18,6 +18,7 @@ export interface MockUpdateServerConfig {
 }
 
 export const MOCK_UPDATE_READY_PATH = "/.well-known/bibcode-updater-ready";
+export const MOCK_UPDATE_LOOPBACK_HOST = "127.0.0.1";
 
 export const makeResolveMockUpdateServerConfig = (scriptDirectory: string) =>
   Effect.gen(function* () {
@@ -363,7 +364,7 @@ export const makeMockUpdateServerLayer = (config: MockUpdateServerConfig) =>
   ).pipe(
     Layer.provideMerge(
       NodeHttpServer.layer(NodeHttp.createServer, {
-        host: "localhost",
+        host: MOCK_UPDATE_LOOPBACK_HOST,
         port: config.port,
       }),
     ),

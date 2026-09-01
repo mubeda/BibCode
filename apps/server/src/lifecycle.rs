@@ -190,6 +190,13 @@ impl ServerRuntime {
             logging::initialize_owned(&state_paths.server_log)
                 .map_err(|error| ServerError::Logging(error.to_string()))?,
         );
+        if let (Some(static_dir), Some(source)) = (&config.static_dir, config.static_dir_source) {
+            tracing::info!(
+                static_dir = %static_dir.display(),
+                source = source.as_str(),
+                "selected static web assets"
+            );
+        }
         let store_runtime_guard = StoreRuntimeGuard::acquire(&config.base_dir)
             .await
             .map_err(|error| ServerError::PersistenceInitialize(error.to_string()))?;

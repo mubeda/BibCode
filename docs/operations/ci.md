@@ -16,9 +16,9 @@ four job groups:
   version rewriting, nightly metadata, and lockfile generation without
   publishing.
 - **Native desktop** builds the web application, tests the desktop Rust host,
-  and creates an unpublished native bundle on Linux x64, Windows x64, macOS
-  arm64, and macOS x64 runners. Windows ARM is intentionally excluded while
-  `scripts/run-msvc-x64.mjs` remains x64-specific. After the Rust host tests,
+  and creates an unpublished native bundle on Linux ARM64/x64, Windows ARM64/x64,
+  and macOS ARM64/x64 runners. The shared `scripts/run-msvc.mjs` launcher selects
+  the requested MSVC architecture. After the Rust host tests,
   the Windows row alone runs
   `vp test run apps/desktop/e2e/support/test-project.test.ts`. That step is the
   supported native proof that the generated Cursor `.cmd` shim executes through
@@ -35,9 +35,13 @@ runtime or TypeScript server.
 ## Other Workflows
 
 - `.github/workflows/desktop-ui-smoke.yml` is a manual or reusable packaged-app
-  UI smoke matrix for the same four supported native targets.
+  UI smoke matrix for all six supported native targets.
+- `.github/workflows/desktop-upgrade-smoke.yml` runs real seeded updater flows on
+  all six targets; its WSL-specific lane remains Windows x64.
 - `.github/workflows/release.yml` runs the stable/nightly release pipeline. See
-  the [Release Checklist](./release.md).
+  the [Release Checklist](./release.md). Its separate server matrix builds six
+  archives, four Linux packages, and native distribution evidence before release
+  assembly can create a draft.
 - `.github/workflows/deploy-relay.yml` deploys the BiBCode Connect relay from
   `main` only when the required Cloudflare repository configuration exists.
 - `.github/workflows/issue-labels.yml`, `pr-size.yml`, and `pr-vouch.yml` enforce

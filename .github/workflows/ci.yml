@@ -49,6 +49,7 @@ jobs:
             libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
+            xdg-utils \
             patchelf
 
       - name: Check
@@ -104,6 +105,7 @@ jobs:
             libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
+            xdg-utils \
             patchelf
 
       - name: Test
@@ -138,6 +140,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - label: Linux arm64
+            runner: ubuntu-22.04-arm
+            platform: linux
+            target: appimage
+            arch: arm64
           - label: Linux x64
             runner: ubuntu-22.04
             platform: linux
@@ -148,8 +155,11 @@ jobs:
             platform: win
             target: nsis
             arch: x64
-          # Windows ARM remains disabled while scripts/run-msvc-x64.mjs is
-          # intentionally architecture-specific.
+          - label: Windows arm64
+            runner: windows-11-vs2026-arm
+            platform: win
+            target: nsis
+            arch: arm64
           - label: macOS arm64
             runner: macos-26
             platform: mac
@@ -195,6 +205,7 @@ jobs:
             libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
+            xdg-utils \
             patchelf
 
       - name: Verify toolchain versions

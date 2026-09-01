@@ -15,7 +15,14 @@ describe("packaged preferences, native integrations, and platform capabilities",
     await expect(settings).toBeDisplayed();
     await settings.click();
     const appOrigin = await browser.execute(() => window.location.origin);
-    await browser.url(`${appOrigin}/#/settings/about`);
+    const about = browser.$(
+      "//button[@data-sidebar='menu-button'][.//span[normalize-space()='About']]",
+    );
+    await expect(about).toBeDisplayed();
+    await about.click();
+    await browser.waitUntil(async () => (await browser.getUrl()).endsWith("/#/settings/about"), {
+      timeoutMsg: "About settings did not become active.",
+    });
     const checkForUpdates = browser.$("button=Check for Updates");
     await checkForUpdates.scrollIntoView();
     await expect(checkForUpdates).toBeDisplayed();
@@ -43,6 +50,14 @@ describe("packaged preferences, native integrations, and platform capabilities",
     await expect(browser.$("//*[contains(., 'fixture@example.test')]")).toBeDisplayed();
 
     await browser.url(`${appOrigin}/#/settings/connections`);
+    await browser.waitUntil(
+      async () => (await browser.getUrl()).endsWith("/#/settings/remote-servers"),
+      {
+        timeoutMsg: "Legacy Connections settings did not redirect to Remote Servers.",
+      },
+    );
+    await expect(browser.$("//*[normalize-space()='Connect to a host']")).toBeDisplayed();
+    await expect(browser.$("//*[normalize-space()='Share this host']")).toBeDisplayed();
     if (process.env.BIBCODE_E2E_PLATFORM === "win") {
       const wslState = await browser.execute(async () => {
         const bridge = Reflect.get(window, "desktopBridge") as
@@ -60,15 +75,9 @@ describe("packaged preferences, native integrations, and platform capabilities",
         throw new Error("Expected the packaged Windows desktop bridge to report WSL state.");
       }
 
+      await browser.url(`${appOrigin}/#/settings/local-environment`);
       await expect(browser.$("//*[normalize-space()='Local environment']")).toBeDisplayed();
       await expect(browser.$("//*[normalize-space()='WSL backend']")).toBeDisplayed();
-    } else {
-      await browser.waitUntil(
-        async () => (await browser.getUrl()).endsWith("/#/settings/general"),
-        {
-          timeoutMsg: "Local-only non-Windows desktop settings did not redirect to General.",
-        },
-      );
     }
 
     await expect(browser.$("//*[normalize-space()='Network access']")).not.toExist();

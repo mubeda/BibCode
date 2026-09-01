@@ -17,15 +17,50 @@ import {
   ManagedProcessRegistry,
   parseSeededDesktopUpgradeSmokeArgs,
   redactAndBoundUpgradeEvidence,
+  removeSeededUpgradeDependencyTree,
   runBoundedCommand,
+  seededUpgradeVitePlusExecutable,
+  seededUpgradeBundleRoot,
+  seededUpgradeRustTarget,
+  updaterTargetFor,
   verifySeededUpgradeOutcome,
   waitForUpgradeCondition,
+  restartedApplicationCleanupPlan,
 } from "./seeded-desktop-upgrade-smoke.ts";
 
 const absolute = (...parts: ReadonlyArray<string>): string =>
   NodePath.resolve("/tmp/bibcode-upgrade-smoke", ...parts);
 
 describe("seeded packaged desktop upgrade harness", () => {
+  it("launches the native Vite+ executable on every host", () => {
+    expect(seededUpgradeVitePlusExecutable).toBe("vp");
+  });
+
+  it("targets only the exact updater-restarted application on every host", () => {
+    expect(
+      restartedApplicationCleanupPlan(
+        String.raw`C:\Program Files\BiBCode\bibcode-desktop.exe`,
+        "win",
+      ),
+    ).toEqual({
+      args: ["/F", "/T", "/IM", "bibcode-desktop.exe"],
+      command: "taskkill.exe",
+    });
+    expect(
+      restartedApplicationCleanupPlan(
+        "/private/tmp/BiBCode (test).app/Contents/MacOS/bibcode-desktop",
+        "mac",
+      ),
+    ).toEqual({
+      args: ["-TERM", "-x", "bibcode-desktop"],
+      command: "pkill",
+    });
+    expect(restartedApplicationCleanupPlan("/tmp/installed/BiBCode.AppImage", "linux")).toEqual({
+      args: ["-TERM", "-x", "bibcode-desktop"],
+      command: "pkill",
+    });
+  });
+
   it("canonicalizes symlinked work roots before installing an updater target", async () => {
     const temporaryBase = await NodeFS.promises.mkdtemp(
       NodePath.join(NodeOS.tmpdir(), "bibcode-upgrade-canonical-owner-"),
@@ -47,6 +82,27 @@ describe("seeded packaged desktop upgrade harness", () => {
       await expect(NodeFS.promises.readdir(temporaryBase)).resolves.toEqual([]);
     } finally {
       await NodeFS.promises.rm(temporaryBase, { recursive: true, force: true });
+    }
+  });
+
+  it("removes only the generated dependency tree before worktree cleanup", async () => {
+    const checkout = await NodeFS.promises.mkdtemp(
+      NodePath.join(NodeOS.tmpdir(), "bibcode-upgrade-cleanup-"),
+    );
+    try {
+      await NodeFS.promises.mkdir(NodePath.join(checkout, "node_modules", ".pnpm", "deep"), {
+        recursive: true,
+      });
+      await NodeFS.promises.writeFile(NodePath.join(checkout, "keep.txt"), "keep");
+
+      await removeSeededUpgradeDependencyTree(checkout);
+
+      await expect(NodeFS.promises.stat(NodePath.join(checkout, "node_modules"))).rejects.toThrow();
+      await expect(
+        NodeFS.promises.readFile(NodePath.join(checkout, "keep.txt"), "utf8"),
+      ).resolves.toBe("keep");
+    } finally {
+      await NodeFS.promises.rm(checkout, { recursive: true, force: true });
     }
   });
 
@@ -131,7 +187,7 @@ describe("seeded packaged desktop upgrade harness", () => {
     ).toThrow(/WSL.*Windows x64/);
   });
 
-  it("rejects invalid target combinations, relative roots, and private-key command arguments", () => {
+  it("accepts Windows ARM64 while rejecting relative roots and private-key arguments", () => {
     const base = [
       "--platform",
       "win",
@@ -154,7 +210,7 @@ describe("seeded packaged desktop upgrade harness", () => {
       "--artifact-dir",
       absolute("evidence"),
     ];
-    expect(() => parseSeededDesktopUpgradeSmokeArgs(base, "/repo")).toThrow(/Windows x64/);
+    expect(parseSeededDesktopUpgradeSmokeArgs(base, "/repo").arch).toBe("arm64");
     expect(() =>
       parseSeededDesktopUpgradeSmokeArgs(
         base.with(3, "x64").with(base.indexOf(absolute("work")), "relative"),
@@ -167,6 +223,16 @@ describe("seeded packaged desktop upgrade harness", () => {
         "/repo",
       ),
     ).toThrow(/private-key|Unknown option/);
+  });
+
+  it("maps Linux and Windows ARM64 to their native updater and Rust targets", () => {
+    expect(updaterTargetFor("linux", "arm64")).toBe("linux-aarch64");
+    expect(updaterTargetFor("win", "arm64")).toBe("windows-aarch64");
+    expect(seededUpgradeRustTarget("linux", "arm64")).toBe("aarch64-unknown-linux-gnu");
+    expect(seededUpgradeRustTarget("win", "arm64")).toBe("aarch64-pc-windows-msvc");
+    expect(seededUpgradeBundleRoot("/tmp/build", "win", "arm64")).toBe(
+      NodePath.join("/tmp/build", "aarch64-pc-windows-msvc", "release", "bundle"),
+    );
   });
 
   it("creates disjoint roots for real previous and protected baseline lanes", () => {
@@ -470,6 +536,8 @@ describe("seeded packaged desktop upgrade harness", () => {
     });
     const combined = `${seed}\n${verify}`;
 
+    expect(combined).toContain("The packaged desktop bridge did not become ready.");
+    expect(combined).toContain("browser.waitUntil");
     expect(combined).toContain("getLocalEnvironmentBootstraps");
     expect(combined).toContain("getLocalEnvironmentBearerToken");
     expect(combined).toContain("/.well-known/bibcode/environment");

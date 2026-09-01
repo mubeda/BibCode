@@ -7,10 +7,12 @@ import {
   canonicalizeCargoTestTarget,
   defaultWindowsCargoRunner,
   discoverVcVarsAll,
+  msvcToolchain,
   quoteCmdArg,
+  resolveMsvcArchitecture,
   run,
-  runMsvcX64,
-} from "./run-msvc-x64.mjs";
+  runMsvc,
+} from "./run-msvc.mjs";
 
 const directoryAliasCapability = (() => {
   const fixtureRoot = NodeFS.mkdtempSync(
@@ -29,7 +31,51 @@ const directoryAliasCapability = (() => {
   }
 })();
 
-describe("run-msvc-x64", () => {
+describe("run-msvc", () => {
+  it("selects the ARM64 toolchain from an explicit Rust target", () => {
+    expect(
+      resolveMsvcArchitecture(["cargo", "build", "--target", "aarch64-pc-windows-msvc"], {
+        PROCESSOR_ARCHITECTURE: "AMD64",
+      }),
+    ).toBe("arm64");
+    expect(msvcToolchain("arm64")).toEqual({
+      cargoRunnerKey: "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUNNER",
+      vcvarsArgument: "arm64",
+      vsComponent: "Microsoft.VisualStudio.Component.VC.Tools.ARM64",
+    });
+  });
+
+  it("uses explicit configuration before native host architecture", () => {
+    expect(
+      resolveMsvcArchitecture([], {
+        CARGO_BUILD_TARGET: "x86_64-pc-windows-msvc",
+        PROCESSOR_ARCHITECTURE: "ARM64",
+      }),
+    ).toBe("x64");
+    expect(
+      resolveMsvcArchitecture([], {
+        PROCESSOR_ARCHITECTURE: "AMD64",
+        PROCESSOR_ARCHITEW6432: "ARM64",
+        TAURI_DESKTOP_ARCH: "x64",
+      }),
+    ).toBe("x64");
+    expect(
+      resolveMsvcArchitecture([], {
+        PROCESSOR_ARCHITECTURE: "AMD64",
+        PROCESSOR_ARCHITEW6432: "ARM64",
+      }),
+    ).toBe("arm64");
+  });
+
+  it("keeps the existing x64 toolchain contract", () => {
+    expect(resolveMsvcArchitecture([], { PROCESSOR_ARCHITECTURE: "AMD64" })).toBe("x64");
+    expect(msvcToolchain("x64")).toEqual({
+      cargoRunnerKey: "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER",
+      vcvarsArgument: "x64",
+      vsComponent: "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+    });
+  });
+
   it("quotes only command arguments that require cmd escaping", () => {
     expect(quoteCmdArg("safe/path:value-1")).toBe("safe/path:value-1");
     expect(quoteCmdArg('two words "quoted"')).toBe('"two words \\"quoted\\""');
@@ -99,12 +145,12 @@ describe("run-msvc-x64", () => {
 
   it("runs directly without Visual Studio and reports missing commands", () => {
     const consoleError = vi.fn();
-    expect(runMsvcX64([], { consoleError })).toBe(2);
+    expect(runMsvc([], { consoleError })).toBe(2);
     expect(consoleError).toHaveBeenCalledOnce();
 
     const spawnSync = vi.fn(() => ({ status: 4 }));
     expect(
-      runMsvcX64(["cargo", "test"], {
+      runMsvc(["cargo", "test"], {
         programFilesX86: "C:/missing",
         existsSync: () => false,
         spawnSync,
@@ -124,7 +170,7 @@ describe("run-msvc-x64", () => {
     const resolvedTarget = NodePath.resolve("/tmp/bibcode-task9f-target");
 
     expect(
-      runMsvcX64(["cargo", "test", "-p", "bibcode-desktop"], {
+      runMsvc(["cargo", "test", "-p", "bibcode-desktop"], {
         env: { CARGO_TARGET_DIR: "/tmp/bibcode-task9f-target" },
         programFilesX86: "",
         mkdirSync,
@@ -226,7 +272,7 @@ describe("run-msvc-x64", () => {
 
       const absentTarget = NodePath.join(physicalRoot, "absent-target");
       expect(
-        runMsvcX64(["cargo", "test"], {
+        runMsvc(["cargo", "test"], {
           env: { CARGO_TARGET_DIR: absentTarget },
           programFilesX86: "",
           spawnSync,
@@ -249,7 +295,7 @@ describe("run-msvc-x64", () => {
 
       NodeFS.mkdirSync(NodePath.join(physicalRoot, "existing-target"));
       expect(
-        runMsvcX64(["cargo", "test"], {
+        runMsvc(["cargo", "test"], {
           cwd: physicalRoot,
           env: { CARGO_TARGET_DIR: "existing-target" },
           programFilesX86: "",
@@ -286,7 +332,7 @@ describe("run-msvc-x64", () => {
         NodeFS.mkdirSync(physicalRoot);
         NodeFS.symlinkSync(physicalRoot, aliasRoot, "junction");
         expect(
-          runMsvcX64(["cargo", "test"], {
+          runMsvc(["cargo", "test"], {
             env: { CARGO_TARGET_DIR: NodePath.join(aliasRoot, "target") },
             programFilesX86: "",
             spawnSync,
@@ -318,7 +364,7 @@ describe("run-msvc-x64", () => {
       .mockReturnValueOnce({ status: 0 });
 
     expect(
-      runMsvcX64(["cargo", "test name"], {
+      runMsvc(["cargo", "test name"], {
         programFilesX86: "C:/Program Files (x86)",
         existsSync: () => true,
         spawnSync,
@@ -359,7 +405,7 @@ describe("run-msvc-x64", () => {
     try {
       process.env.ComSpec = "true";
       expect(
-        runMsvcX64(["cargo", "test"], {
+        runMsvc(["cargo", "test"], {
           programFilesX86: "C:/Program Files (x86)",
           existsSync: () => true,
           spawnSync,
@@ -368,7 +414,7 @@ describe("run-msvc-x64", () => {
 
       delete process.env.ComSpec;
       expect(
-        runMsvcX64(["cargo", "test"], {
+        runMsvc(["cargo", "test"], {
           programFilesX86: "C:/Program Files (x86)",
           existsSync: () => true,
           spawnSync,
