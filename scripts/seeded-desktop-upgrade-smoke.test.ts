@@ -17,6 +17,7 @@ import {
   ManagedProcessRegistry,
   parseSeededDesktopUpgradeSmokeArgs,
   redactAndBoundUpgradeEvidence,
+  removeSeededUpgradeDependencyTree,
   runBoundedCommand,
   seededUpgradeVitePlusExecutable,
   seededUpgradeBundleRoot,
@@ -24,7 +25,7 @@ import {
   updaterTargetFor,
   verifySeededUpgradeOutcome,
   waitForUpgradeCondition,
-  windowsRestartedApplicationCleanupPlan,
+  restartedApplicationCleanupPlan,
 } from "./seeded-desktop-upgrade-smoke.ts";
 
 const absolute = (...parts: ReadonlyArray<string>): string =>
@@ -35,9 +36,9 @@ describe("seeded packaged desktop upgrade harness", () => {
     expect(seededUpgradeVitePlusExecutable).toBe("vp");
   });
 
-  it("targets only the exact restarted Windows application image", () => {
+  it("targets only the exact updater-restarted application on every host", () => {
     expect(
-      windowsRestartedApplicationCleanupPlan(
+      restartedApplicationCleanupPlan(
         String.raw`C:\Program Files\BiBCode\bibcode-desktop.exe`,
         "win",
       ),
@@ -45,7 +46,23 @@ describe("seeded packaged desktop upgrade harness", () => {
       args: ["/F", "/T", "/IM", "bibcode-desktop.exe"],
       command: "taskkill.exe",
     });
-    expect(windowsRestartedApplicationCleanupPlan("/Applications/BiBCode.app", "mac")).toBeNull();
+    expect(
+      restartedApplicationCleanupPlan(
+        "/private/tmp/BiBCode (test).app/Contents/MacOS/bibcode-desktop",
+        "mac",
+      ),
+    ).toEqual({
+      args: [
+        "-TERM",
+        "-f",
+        String.raw`^/private/tmp/BiBCode \(test\)\.app/Contents/MacOS/bibcode-desktop([[:space:]]|$)`,
+      ],
+      command: "pkill",
+    });
+    expect(restartedApplicationCleanupPlan("/tmp/installed/BiBCode.AppImage", "linux")).toEqual({
+      args: ["-TERM", "-f", String.raw`^/tmp/installed/BiBCode\.AppImage([[:space:]]|$)`],
+      command: "pkill",
+    });
   });
 
   it("canonicalizes symlinked work roots before installing an updater target", async () => {
@@ -69,6 +86,27 @@ describe("seeded packaged desktop upgrade harness", () => {
       await expect(NodeFS.promises.readdir(temporaryBase)).resolves.toEqual([]);
     } finally {
       await NodeFS.promises.rm(temporaryBase, { recursive: true, force: true });
+    }
+  });
+
+  it("removes only the generated dependency tree before worktree cleanup", async () => {
+    const checkout = await NodeFS.promises.mkdtemp(
+      NodePath.join(NodeOS.tmpdir(), "bibcode-upgrade-cleanup-"),
+    );
+    try {
+      await NodeFS.promises.mkdir(NodePath.join(checkout, "node_modules", ".pnpm", "deep"), {
+        recursive: true,
+      });
+      await NodeFS.promises.writeFile(NodePath.join(checkout, "keep.txt"), "keep");
+
+      await removeSeededUpgradeDependencyTree(checkout);
+
+      await expect(NodeFS.promises.stat(NodePath.join(checkout, "node_modules"))).rejects.toThrow();
+      await expect(
+        NodeFS.promises.readFile(NodePath.join(checkout, "keep.txt"), "utf8"),
+      ).resolves.toBe("keep");
+    } finally {
+      await NodeFS.promises.rm(checkout, { recursive: true, force: true });
     }
   });
 

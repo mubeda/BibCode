@@ -817,23 +817,28 @@ export const runBoundedCommand = async (input: {
 
 const runCommand = runBoundedCommand;
 
-export function windowsRestartedApplicationCleanupPlan(
+export function restartedApplicationCleanupPlan(
   appBinaryPath: string,
   platform: SeededUpgradePlatform,
-): { readonly args: ReadonlyArray<string>; readonly command: string } | null {
-  if (platform !== "win") return null;
+): { readonly args: ReadonlyArray<string>; readonly command: string } {
+  if (platform === "win") {
+    return {
+      args: ["/F", "/T", "/IM", NodePath.win32.basename(appBinaryPath)],
+      command: "taskkill.exe",
+    };
+  }
+  const exactCommand = appBinaryPath.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
   return {
-    args: ["/F", "/T", "/IM", NodePath.win32.basename(appBinaryPath)],
-    command: "taskkill.exe",
+    args: ["-TERM", "-f", `^${exactCommand}([[:space:]]|$)`],
+    command: "pkill",
   };
 }
 
-const stopRestartedWindowsApplication = async (
+const stopRestartedApplication = async (
   appBinaryPath: string,
   platform: SeededUpgradePlatform,
 ): Promise<void> => {
-  const plan = windowsRestartedApplicationCleanupPlan(appBinaryPath, platform);
-  if (plan === null) return;
+  const plan = restartedApplicationCleanupPlan(appBinaryPath, platform);
   let killed = false;
   let missesAfterKill = 0;
   for (let attempt = 0; attempt < 20; attempt += 1) {
@@ -852,6 +857,22 @@ const stopRestartedWindowsApplication = async (
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
 };
+
+export async function removeSeededUpgradeDependencyTree(checkout: string): Promise<void> {
+  const checkoutRoot = NodePath.resolve(checkout);
+  const dependencyTree = NodePath.join(checkoutRoot, "node_modules");
+  if (NodePath.relative(checkoutRoot, dependencyTree) !== "node_modules") {
+    throw new SeededDesktopUpgradeSmokeError(
+      `Refused unsafe seeded-upgrade dependency cleanup: ${dependencyTree}.`,
+    );
+  }
+  await NodeFS.promises.rm(dependencyTree, {
+    recursive: true,
+    force: true,
+    maxRetries: 20,
+    retryDelay: 250,
+  });
+}
 
 const requireCommandSuccess = async (input: Parameters<typeof runCommand>[0]): Promise<void> => {
   const result = await runCommand(input);
@@ -1279,7 +1300,7 @@ const runUpgradeLane = async (input: {
     wsl: input.wsl,
   } as const;
   await runWebDriverPhase({ ...shared, phase: "seed-and-install", resultPath: beforePath });
-  await stopRestartedWindowsApplication(input.appBinaryPath, input.platform);
+  await stopRestartedApplication(input.appBinaryPath, input.platform);
   await runWebDriverPhase({ ...shared, phase: "verify", resultPath: afterPath });
   const before = await readObservation<SeededUpgradeObservationBefore>(beforePath);
   const after = await readObservation<SeededUpgradeObservationAfter>(afterPath);
@@ -1446,6 +1467,7 @@ export async function runSeededDesktopUpgradeSmoke(
         timeoutMs: 120_000,
       });
       cleanup.add("previous stable checkout", async () => {
+        await removeSeededUpgradeDependencyTree(layout.previousStable.checkout);
         await requireCommandSuccess({
           command: "git",
           args: ["worktree", "remove", "--force", layout.previousStable.checkout],
@@ -1472,6 +1494,7 @@ export async function runSeededDesktopUpgradeSmoke(
       timeoutMs: 120_000,
     });
     cleanup.add("protected baseline checkout", async () => {
+      await removeSeededUpgradeDependencyTree(layout.protectedBaseline.checkout);
       await requireCommandSuccess({
         command: "git",
         args: ["worktree", "remove", "--force", layout.protectedBaseline.checkout],
