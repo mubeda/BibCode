@@ -153,6 +153,10 @@ export interface GitManagerToolbarProps {
   readonly worktrees: ReadonlyArray<VcsWorktreeDescriptor>;
   readonly catalogPending: boolean;
   readonly catalogError: string | null;
+  readonly branchSyncDisabledReason: string | null;
+  readonly stashMergeDisabledReason: string | null;
+  readonly tagDisabledReason: string | null;
+  readonly liveSignalAvailable: boolean;
   readonly onSelectedWorktreeChange: (cwd: string) => void;
 }
 
@@ -163,6 +167,10 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
   worktrees,
   catalogPending,
   catalogError,
+  branchSyncDisabledReason,
+  stashMergeDisabledReason,
+  tagDisabledReason,
+  liveSignalAvailable,
   onSelectedWorktreeChange,
 }: GitManagerToolbarProps) {
   const registry = useContext(RegistryContext);
@@ -204,11 +212,13 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
   );
   const signalAtom = useMemo(
     () =>
-      gitManagerEnvironment.signal({
-        environmentId,
-        input: { cwd: selectedWorktreeCwd },
-      }),
-    [environmentId, selectedWorktreeCwd],
+      liveSignalAvailable
+        ? gitManagerEnvironment.signal({
+            environmentId,
+            input: { cwd: selectedWorktreeCwd },
+          })
+        : null,
+    [environmentId, liveSignalAvailable, selectedWorktreeCwd],
   );
   const refsQuery = useEnvironmentQuery(refsAtom);
   const signalQuery = useEnvironmentQuery(signalAtom);
@@ -337,6 +347,14 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
 
   const checkoutBranch = useCallback(
     async (branch: GitManagerRefEntry, strategy: "stash" | "bring" | null) => {
+      if (branchSyncDisabledReason !== null) {
+        setOperationError(branchSyncDisabledReason);
+        return false;
+      }
+      if (strategy === "stash" && stashMergeDisabledReason !== null) {
+        setOperationError(stashMergeDisabledReason);
+        return false;
+      }
       if (strategy === "stash") {
         const stashed = await executeOperation({
           _tag: "stash-push",
@@ -357,7 +375,15 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
       if (success) setSelectedRef(stableProjectRef, branch.name);
       return success;
     },
-    [executeOperation, projectId, selectedWorktreeCwd, setSelectedRef, stableProjectRef],
+    [
+      branchSyncDisabledReason,
+      executeOperation,
+      projectId,
+      selectedWorktreeCwd,
+      setSelectedRef,
+      stableProjectRef,
+      stashMergeDisabledReason,
+    ],
   );
   const selectBranch = useCallback(
     (branch: GitManagerRefEntry) => {
@@ -388,6 +414,10 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
   );
   const mergeIntoCurrent = useCallback(
     (branch: GitManagerRefEntry) => {
+      if (stashMergeDisabledReason !== null) {
+        setOperationError(stashMergeDisabledReason);
+        return;
+      }
       void executeOperation({
         _tag: "merge",
         cwd: selectedWorktreeCwd,
@@ -396,13 +426,17 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
         noVerify: false,
       });
     },
-    [executeOperation, projectId, selectedWorktreeCwd],
+    [executeOperation, projectId, selectedWorktreeCwd, stashMergeDisabledReason],
   );
   const closeBranchDialog = useCallback(() => {
     if (!isOperationRunning) setBranchDialog(null);
   }, [isOperationRunning]);
   const submitBranchDialog = useCallback(
     async (submission: GitManagerBranchDialogSubmission) => {
+      if (branchSyncDisabledReason !== null) {
+        setOperationError(branchSyncDisabledReason);
+        return;
+      }
       let request: GitManagerOperationRequest;
       switch (submission.kind) {
         case "create":
@@ -437,7 +471,7 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
       }
       if (await executeOperation(request)) setBranchDialog(null);
     },
-    [executeOperation, projectId, selectedWorktreeCwd],
+    [branchSyncDisabledReason, executeOperation, projectId, selectedWorktreeCwd],
   );
   const resolveSwitchWithChanges = useCallback(
     async ({ strategy }: { readonly strategy: "stash" | "bring" }) => {
@@ -462,6 +496,10 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
   }, []);
   const runSyncOperation = useCallback(
     (kind: SyncOperationKind) => {
+      if (branchSyncDisabledReason !== null) {
+        setOperationError(branchSyncDisabledReason);
+        return;
+      }
       if (currentBranch === null && kind !== "fetch-unborn" && kind !== "fetch") return;
       const base = { cwd: selectedWorktreeCwd, projectId };
       if (kind === "fetch-unborn" || kind === "fetch") {
@@ -485,13 +523,21 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
         remoteBranch: kind === "publish-branch" ? null : pushBase.remoteBranch,
       });
     },
-    [currentBranch, executeOperation, projectId, remote, selectedWorktreeCwd],
+    [
+      branchSyncDisabledReason,
+      currentBranch,
+      executeOperation,
+      projectId,
+      remote,
+      selectedWorktreeCwd,
+    ],
   );
   const tagScope = useMemo(
     () => ({ environmentId, cwd: selectedWorktreeCwd }),
     [environmentId, selectedWorktreeCwd],
   );
-  const tagMenuDisabledReason = refsQuery.isPending || snapshot === null ? "Loading tags." : null;
+  const tagMenuDisabledReason =
+    tagDisabledReason ?? (refsQuery.isPending || snapshot === null ? "Loading tags." : null);
   const createTagDisabledReason =
     tagMenuDisabledReason ??
     (tagTargetSha === null ? "Create a commit before creating a tag." : null);
@@ -544,7 +590,9 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
 
         <div className="flex min-w-0 flex-1 items-center border-r border-border px-2 py-1.5">
           <GitManagerBranchDropdown
+            branchDisabledReason={branchSyncDisabledReason}
             currentBranchName={currentBranchName}
+            mergeDisabledReason={stashMergeDisabledReason}
             projectRef={stableProjectRef}
             recentNames={recentNames}
             refs={localBranches}
@@ -593,8 +641,10 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
                       <TagActionMenuItem
                         action="delete"
                         disabledReason={
+                          tagDisabledReason ??
                           entry.blocked.find((reason) => reason.operation === "tag-delete")
-                            ?.message ?? null
+                            ?.message ??
+                          null
                         }
                         entry={entry}
                         key={entry.name}
@@ -619,8 +669,10 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
                       <TagActionMenuItem
                         action="push"
                         disabledReason={
+                          tagDisabledReason ??
                           entry.blocked.find((reason) => reason.operation === "tag-push")
-                            ?.message ?? null
+                            ?.message ??
+                          null
                         }
                         entry={entry}
                         key={entry.name}
@@ -661,6 +713,7 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
           <GitManagerSyncButton
             blockedReason={syncBlockedReason}
             currentBranchName={currentBranchName}
+            disabledReason={branchSyncDisabledReason}
             remote={remote}
             state={syncState}
             onOperation={runSyncOperation}
@@ -672,6 +725,7 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
       <GitManagerBranchDialogs
         busy={isOperationRunning}
         dialog={branchDialog}
+        disabledReason={branchSyncDisabledReason}
         errorMessage={operationError}
         refs={localBranches}
         onClose={closeBranchDialog}
@@ -679,6 +733,7 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
       />
       <GitManagerTagDialog
         action={tagDialog.action}
+        disabledReason={tagDisabledReason}
         existingTags={existingTags}
         open={tagDialog.open}
         projectRef={stableProjectRef}
@@ -690,9 +745,11 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
         onOpenChange={changeTagDialogOpen}
       />
       <GitManagerSwitchWithChangesDialog
+        branchDisabledReason={branchSyncDisabledReason}
         branchName={switchTarget?.name ?? "branch"}
         busy={isOperationRunning}
         open={switchTarget !== null}
+        stashDisabledReason={stashMergeDisabledReason}
         onOpenChange={changeSwitchDialogOpen}
         onResolve={resolveSwitchWithChanges}
       />

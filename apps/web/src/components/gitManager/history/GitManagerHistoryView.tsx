@@ -58,6 +58,10 @@ interface GitManagerHistoryViewProps {
   };
   readonly projectRef: ScopedProjectRef;
   readonly blockedReasons: ReadonlyArray<GitManagerBlockedReason>;
+  readonly branchSyncDisabledReason: string | null;
+  readonly rewriteDisabledReason: string | null;
+  readonly tagDisabledReason: string | null;
+  readonly liveSignalAvailable: boolean;
   readonly onAction: (action: GitManagerHistoryAction) => void;
 }
 
@@ -133,6 +137,10 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
   scope,
   projectRef,
   blockedReasons,
+  branchSyncDisabledReason,
+  rewriteDisabledReason,
+  tagDisabledReason,
+  liveSignalAvailable,
   onAction,
 }: GitManagerHistoryViewProps) {
   const { environmentId, cwd } = scope;
@@ -218,11 +226,13 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
 
   const signalAtom = useMemo(
     () =>
-      gitManagerEnvironment.signal({
-        environmentId,
-        input: { cwd },
-      }),
-    [cwd, environmentId],
+      liveSignalAvailable
+        ? gitManagerEnvironment.signal({
+            environmentId,
+            input: { cwd },
+          })
+        : null,
+    [cwd, environmentId, liveSignalAvailable],
   );
   const signalQuery = useEnvironmentQuery(signalAtom);
   const signalGeneration = signalQuery.data?.generation ?? null;
@@ -554,6 +564,9 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
         buildCommitMenuItems(selection, {
           loadedCommits: pagesRef.current.commits,
           blockedReasons,
+          branchSyncDisabledReason,
+          rewriteDisabledReason,
+          tagDisabledReason,
         }).map((menuItem) => ({
           id: menuItem.id,
           label:
@@ -572,11 +585,24 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
           setActionError("The commit action menu could not open. Try the action again.");
         });
     },
-    [blockedReasons, emitMenuAction, multiCommitSelection, projectRef, setMultiCommitSelection],
+    [
+      blockedReasons,
+      branchSyncDisabledReason,
+      emitMenuAction,
+      multiCommitSelection,
+      projectRef,
+      rewriteDisabledReason,
+      setMultiCommitSelection,
+      tagDisabledReason,
+    ],
   );
   const handleCommitDrop = useCallback(
     (resolution: GitManagerCommitDropResolution) => {
       setActionError(null);
+      if (rewriteDisabledReason !== null) {
+        setActionError(rewriteDisabledReason);
+        return;
+      }
       switch (resolution._tag) {
         case "blocked":
           setActionError(resolution.reason.message);
@@ -597,7 +623,7 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
         }
       }
     },
-    [onAction, orderedSelection, squashMessage],
+    [onAction, orderedSelection, rewriteDisabledReason, squashMessage],
   );
   const handleSelectFile = useCallback(
     (path: string) =>
@@ -717,6 +743,7 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
         <div className="grid min-h-0 flex-1 grid-cols-[minmax(220px,34%)_minmax(0,1fr)] overflow-hidden rounded-lg border border-border/70">
           <GitManagerCommitList
             commits={pages.commits}
+            rewriteDisabledReason={rewriteDisabledReason}
             selectedSha={effectiveSelectedSha}
             onSelect={handleSelectCommit}
             onReachEnd={handleReachEnd}

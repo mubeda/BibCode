@@ -125,10 +125,11 @@ export function advanceCommitKeyboardReorder(
   return nextSha === undefined ? state : { ...state, overSha: nextSha };
 }
 
-export function useGitManagerCommitDragSource(sha: string) {
+export function useGitManagerCommitDragSource(sha: string, disabled = false) {
   const sortable = useSortable({
     id: commitDndId(sha),
     data: { type: "commit", sha },
+    disabled,
   });
   return {
     attributes: sortable.attributes,
