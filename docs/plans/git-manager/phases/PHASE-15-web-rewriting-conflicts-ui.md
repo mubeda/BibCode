@@ -51,9 +51,9 @@ Invoke these skills via the `Skill` tool BEFORE doing any work. Order matters: a
 
 **Matched for this phase:**
 
-5. `Skill(skill="web-design-guidelines")` — *destructive rewrites need explicit, accessible confirmation and a non-pointer path*
-6. `Skill(skill="vercel-react-best-practices")` — *drag over a virtualized commit list must not re-render the whole list*
-7. `Skill(skill="codebase-design")` — *one state machine drives five operations; the seam has to stay shallow-surfaced*
+5. `Skill(skill="web-design-guidelines")` — _destructive rewrites need explicit, accessible confirmation and a non-pointer path_
+6. `Skill(skill="vercel-react-best-practices")` — _drag over a virtualized commit list must not re-render the whole list_
+7. `Skill(skill="codebase-design")` — _one state machine drives five operations; the seam has to stay shallow-surfaced_
 
 ## Documents to Read
 
@@ -77,102 +77,102 @@ Invoke these skills via the `Skill` tool BEFORE doing any work. Order matters: a
 
 - [ ] **Step 15.1: Locate the surface area being changed.**
 
-	```bash
-	rg -n "GitManagerOperationRequest|GitManagerOperationEvent|GitManagerConflictState|GitManagerBlockedReason" packages/contracts/src/gitManager.ts
-	rg --files apps/web/src/components/gitManager
-	rg -n "GitManagerInProgressStrip|GitManagerOperationBanner|groupBranches|summarizeMergePreview" apps/web/src/components/gitManager
-	rg -n "@dnd-kit" apps/web/src/components/CenterPanelTabs.tsx apps/web/src/components/Sidebar.tsx
-	```
+  ```bash
+  rg -n "GitManagerOperationRequest|GitManagerOperationEvent|GitManagerConflictState|GitManagerBlockedReason" packages/contracts/src/gitManager.ts
+  rg --files apps/web/src/components/gitManager
+  rg -n "GitManagerInProgressStrip|GitManagerOperationBanner|groupBranches|summarizeMergePreview" apps/web/src/components/gitManager
+  rg -n "@dnd-kit" apps/web/src/components/CenterPanelTabs.tsx apps/web/src/components/Sidebar.tsx
+  ```
 
-	`packages/contracts/src/gitManager.ts` is authoritative for every schema and variant name; the names used below are the expected ones. Confirm PHASE-13's operation variants (`rebase`, `cherry-pick`, `squash`, `reorder`, `revert`, `reset`, `continue`, `abort`, `resolve-conflict`) and the fields of `GitManagerConflictState` (`path`, `kind`, `markerCount`, `resolution`) from the working tree.
+  `packages/contracts/src/gitManager.ts` is authoritative for every schema and variant name; the names used below are the expected ones. Confirm PHASE-13's operation variants (`rebase`, `cherry-pick`, `squash`, `reorder`, `revert`, `reset`, `continue`, `abort`, `resolve-conflict`) and the fields of `GitManagerConflictState` (`path`, `kind`, `markerCount`, `resolution`) from the working tree.
 
-	**Sibling contracts to reuse, not re-create:** PHASE-10's single `<GitManagerOperationBanner>` (props `operation: GitManagerOperationEvent | null`, `onCancel: () => void`) is where live operation progress renders — the app shows one operation at a time, matching the server's `operation-in-flight` rejection. PHASE-10's `groupBranches({ refs, recentNames, filter })` in `apps/web/src/components/gitManager/toolbar/branchGrouping.ts` is the only branch-list shaping function. PHASE-12's `<GitManagerInProgressStrip>` renders the repository's persisted in-progress state. PHASE-12's `summarizeMergePreview` maps `GitManagerMergePreview`. PHASE-06's `GitManagerCommitList` already exposes `onSelect` and `onContextMenu`. Record deviations in the per-phase notes of `tasks.md`.
+  **Sibling contracts to reuse, not re-create:** PHASE-10's single `<GitManagerOperationBanner>` (props `operation: GitManagerOperationEvent | null`, `onCancel: () => void`) is where live operation progress renders — the app shows one operation at a time, matching the server's `operation-in-flight` rejection. PHASE-10's `groupBranches({ refs, recentNames, filter })` in `apps/web/src/components/gitManager/toolbar/branchGrouping.ts` is the only branch-list shaping function. PHASE-12's `<GitManagerInProgressStrip>` renders the repository's persisted in-progress state. PHASE-12's `summarizeMergePreview` maps `GitManagerMergePreview`. PHASE-06's `GitManagerCommitList` already exposes `onSelect` and `onContextMenu`. Record deviations in the per-phase notes of `tasks.md`.
 
 - [ ] **Step 15.2: Author the first failing test — the state machine.**
 
-	Path: `apps/web/src/components/gitManager/rewrite/gitManagerMultiCommitOperation.logic.test.ts`
+  Path: `apps/web/src/components/gitManager/rewrite/gitManagerMultiCommitOperation.logic.test.ts`
 
-	Import `describe, expect, it` from `"vite-plus/test"`. Pin one behaviour: `advanceMultiCommitOperation(state, event)` moves a rebase from `choose-branch` to `warn-force-push` when the chosen commits are already pushed, and straight to `show-progress` when they are not. The step set is exactly `choose-branch`, `warn-force-push`, `show-progress`, `show-conflicts`, `hide-conflicts`, `confirm-abort`, `create-branch` — the reference's seven-step framework (`research/github-desktop-analysis.md` § 1.3) minus only its two feature-flagged Copilot steps. `hide-conflicts` is load-bearing: dismissing the conflicts dialog mid-operation must not abandon the operation, it must fall back to the sticky, non-dismissable conflict banner with a "View conflicts" link (§ 2.3). The machine is pure — no atoms, no React, no timers.
+  Import `describe, expect, it` from `"vite-plus/test"`. Pin one behaviour: `advanceMultiCommitOperation(state, event)` moves a rebase from `choose-branch` to `warn-force-push` when the chosen commits are already pushed, and straight to `show-progress` when they are not. The step set is exactly `choose-branch`, `warn-force-push`, `show-progress`, `show-conflicts`, `hide-conflicts`, `confirm-abort`, `create-branch` — the reference's seven-step framework (`research/github-desktop-analysis.md` § 1.3) minus only its two feature-flagged Copilot steps. `hide-conflicts` is load-bearing: dismissing the conflicts dialog mid-operation must not abandon the operation, it must fall back to the sticky, non-dismissable conflict banner with a "View conflicts" link (§ 2.3). The machine is pure — no atoms, no React, no timers.
 
 - [ ] **Step 15.3: Run the new test; expect FAIL** (the module does not exist yet).
 
-	```bash
-	vp test run apps/web/src/components/gitManager/rewrite/gitManagerMultiCommitOperation.logic.test.ts
-	```
+  ```bash
+  vp test run apps/web/src/components/gitManager/rewrite/gitManagerMultiCommitOperation.logic.test.ts
+  ```
 
 - [ ] **Step 15.4: Implement the minimum to make Step 15.2 pass.**
 
-	Path: `apps/web/src/components/gitManager/rewrite/gitManagerMultiCommitOperation.logic.ts`
+  Path: `apps/web/src/components/gitManager/rewrite/gitManagerMultiCommitOperation.logic.ts`
 
-	Export `type GitManagerMultiCommitStep`, `type GitManagerMultiCommitKind = "merge" | "rebase" | "cherry-pick" | "squash" | "reorder"`, `interface GitManagerMultiCommitState`, and `advanceMultiCommitOperation`.
+  Export `type GitManagerMultiCommitStep`, `type GitManagerMultiCommitKind = "merge" | "rebase" | "cherry-pick" | "squash" | "reorder"`, `interface GitManagerMultiCommitState`, and `advanceMultiCommitOperation`.
 
 - [ ] **Step 15.5: Run the test; expect PASS.**
 
 - [ ] **Step 15.6: Add the remaining state-machine tests and implementation, one at a time.**
 
-	- A `failed` event carrying a conflict code moves to `show-conflicts`; the conflict list is the server's, unmodified.
-	- `show-conflicts` → `show-progress` only when every conflicted path reports `markerCount === 0` or a non-null `resolution`; otherwise Continue stays disabled with the server's reason.
-	- `show-conflicts` → `hide-conflicts` on dismiss, and back to `show-conflicts` from the banner's "View conflicts" link. Assert that `hide-conflicts` does **not** abort, does not clear the conflict list, and keeps the banner sticky and non-dismissable — the operation is still in progress in the repository, and PHASE-12's `<GitManagerInProgressStrip>` proves it independently of this machine.
-	- Abort always routes through `confirm-abort`; confirming dispatches the `abort` variant and returns to idle on `finished`.
-	- The state machine records the pre-operation tip so an undo affordance can offer to reset to it, matching the reference's `originalBranchTip` behaviour; assert the tip is captured from the server's `started` event and never recomputed.
-	- A `started` event for an operation this client did not initiate (spec § 6.6) is accepted and drives the same machine — the flow must not require local initiation.
+  - A `failed` event carrying a conflict code moves to `show-conflicts`; the conflict list is the server's, unmodified.
+  - `show-conflicts` → `show-progress` only when every conflicted path reports `markerCount === 0` or a non-null `resolution`; otherwise Continue stays disabled with the server's reason.
+  - `show-conflicts` → `hide-conflicts` on dismiss, and back to `show-conflicts` from the banner's "View conflicts" link. Assert that `hide-conflicts` does **not** abort, does not clear the conflict list, and keeps the banner sticky and non-dismissable — the operation is still in progress in the repository, and PHASE-12's `<GitManagerInProgressStrip>` proves it independently of this machine.
+  - Abort always routes through `confirm-abort`; confirming dispatches the `abort` variant and returns to idle on `finished`.
+  - The state machine records the pre-operation tip so an undo affordance can offer to reset to it, matching the reference's `originalBranchTip` behaviour; assert the tip is captured from the server's `started` event and never recomputed.
+  - A `started` event for an operation this client did not initiate (spec § 6.6) is accepted and drives the same machine — the flow must not require local initiation.
 
 - [ ] **Step 15.7: Add the conflict-list tests, then implement it.**
 
-	Path: `apps/web/src/components/gitManager/rewrite/GitManagerConflictList.logic.ts` and `GitManagerConflictList.tsx`.
+  Path: `apps/web/src/components/gitManager/rewrite/GitManagerConflictList.logic.ts` and `GitManagerConflictList.tsx`.
 
-	- `resolveConflictCount(markerCount)` returns `Math.ceil(markerCount / 3)` — the reference's "N conflicts" contract. If PHASE-13's contract already exposes a pre-divided field, use it and delete this helper rather than dividing twice; assert whichever path you take.
-	- A path with zero markers renders as resolved with a check, and offers Undo.
-	- A `binary` or `submodule` conflict renders a "Resolve ▾" menu with exactly two options, Ours and Theirs, each dispatching the `resolve-conflict` variant with `{ path, side }`. The client sends no git arguments.
-	- Component test: every row's action carries an `aria-label`; the list is keyboard-navigable; a disabled Continue exposes the server's reason via `title` and `aria-describedby`.
-	- Committing while any path still reports markers raises a warning dialog before proceeding (reference contract, `commit-conflicts-warning`).
+  - `resolveConflictCount(markerCount)` returns `Math.ceil(markerCount / 3)` — the reference's "N conflicts" contract. If PHASE-13's contract already exposes a pre-divided field, use it and delete this helper rather than dividing twice; assert whichever path you take.
+  - A path with zero markers renders as resolved with a check, and offers Undo.
+  - A `binary` or `submodule` conflict renders a "Resolve ▾" menu with exactly two options, Ours and Theirs, each dispatching the `resolve-conflict` variant with `{ path, side }`. The client sends no git arguments.
+  - Component test: every row's action carries an `aria-label`; the list is keyboard-navigable; a disabled Continue exposes the server's reason via `title` and `aria-describedby`.
+  - Committing while any path still reports markers raises a warning dialog before proceeding (reference contract, `commit-conflicts-warning`).
 
 - [ ] **Step 15.8: Add the operation-dialog tests, then implement the dialog host.**
 
-	Path: `apps/web/src/components/gitManager/rewrite/GitManagerMultiCommitOperationDialog.tsx`.
+  Path: `apps/web/src/components/gitManager/rewrite/GitManagerMultiCommitOperationDialog.tsx`.
 
-	Build on `Dialog` / `DialogPopup` / `DialogHeader` / `DialogTitle` / `DialogDescription` / `DialogFooter` from `apps/web/src/components/ui/dialog.tsx` — the house convention is a plain `Dialog`, not `AlertDialog`. Use PHASE-10's `groupBranches` for the `choose-branch` step's list and PHASE-12's `summarizeMergePreview` for its preview line. Assert:
-	- the `warn-force-push` step states that history will be rewritten and that a force push will be needed, and its confirm is `variant="destructive"`;
-	- the `show-progress` step renders "Commit i of N" from the `{ current, total }` carried on the refs snapshot's `GitManagerInProgressOperation`, which PHASE-13 fills from `.git/rebase-merge/{msgnum,end}` and the sequencer snapshot. There is **no** per-line progress stream: PHASE-07 recorded that the supervised process path has no incremental output observer, so `output` events arrive one per completed git command. Design for chunked output and add no fake percentage; the client parses no git text either way;
-	- Cancel during progress dispatches cancellation on the operation stream and reaches a terminal state rather than leaving the dialog stuck;
-	- the collapsible raw-output area renders the server's `output` payload verbatim and is collapsed by default;
-	- live operation progress renders through PHASE-10's single `<GitManagerOperationBanner>`, and the ambient repository state through PHASE-12's `<GitManagerInProgressStrip>`; render no third banner.
+  Build on `Dialog` / `DialogPopup` / `DialogHeader` / `DialogTitle` / `DialogDescription` / `DialogFooter` from `apps/web/src/components/ui/dialog.tsx` — the house convention is a plain `Dialog`, not `AlertDialog`. Use PHASE-10's `groupBranches` for the `choose-branch` step's list and PHASE-12's `summarizeMergePreview` for its preview line. Assert:
+  - the `warn-force-push` step states that history will be rewritten and that a force push will be needed, and its confirm is `variant="destructive"`;
+  - the `show-progress` step renders "Commit i of N" from the `{ current, total }` carried on the refs snapshot's `GitManagerInProgressOperation`, which PHASE-13 fills from `.git/rebase-merge/{msgnum,end}` and the sequencer snapshot. There is **no** per-line progress stream: PHASE-07 recorded that the supervised process path has no incremental output observer, so `output` events arrive one per completed git command. Design for chunked output and add no fake percentage; the client parses no git text either way;
+  - Cancel during progress dispatches cancellation on the operation stream and reaches a terminal state rather than leaving the dialog stuck;
+  - the collapsible raw-output area renders the server's `output` payload verbatim and is collapsed by default;
+  - live operation progress renders through PHASE-10's single `<GitManagerOperationBanner>`, and the ambient repository state through PHASE-12's `<GitManagerInProgressStrip>`; render no third banner.
 
-	Every operation dispatch goes through the `createRuntimeCommand` wrapper PHASE-10 established — `gitManager.runOperation` is a streaming **command** in `EnvironmentStreamCommandRpcTag` (not `EnvironmentSubscriptionRpcTag`), consumed on the existing per-`(environmentId, cwd)` lane, never via `runStream` from a component. Any force push uses PHASE-07's force-push variant, which is `--force-with-lease` server-side; the client never chooses git flags.
+  Every operation dispatch goes through the `createRuntimeCommand` wrapper PHASE-10 established — `gitManager.runOperation` is a streaming **command** in `EnvironmentStreamCommandRpcTag` (not `EnvironmentSubscriptionRpcTag`), consumed on the existing per-`(environmentId, cwd)` lane, never via `runStream` from a component. Any force push uses PHASE-07's force-push variant, which is `--force-with-lease` server-side; the client never chooses git flags.
 
 - [ ] **Step 15.9: Add the commit context-menu tests, then implement the logic module.**
 
-	Path: `apps/web/src/components/gitManager/rewrite/GitManagerCommitContextMenu.logic.ts`.
+  Path: `apps/web/src/components/gitManager/rewrite/GitManagerCommitContextMenu.logic.ts`.
 
-	Export `buildCommitMenuItems(selection, context)` returning the item set for a single-commit selection (Reset to commit, Revert, Cherry-pick, Reorder, Create branch from commit, Create tag, Copy SHA) and for a multi-commit selection (Cherry-pick N, Squash N, Reorder N). Assert, following the reference contract in `research/github-desktop-analysis.md` § 1.2:
-	- squash and reorder require a **contiguous** selection, and the contiguity check is over the loaded commit order;
-	- a merge commit blocks squash and reorder;
-	- every item that the server reports blocked is present but disabled with the server's `message` verbatim — items are never hidden to express policy;
-	- a non-contiguous multi-selection suppresses the diff and shows the explanatory blank slate rather than an arbitrary diff.
+  Export `buildCommitMenuItems(selection, context)` returning the item set for a single-commit selection (Reset to commit, Revert, Cherry-pick, Reorder, Create branch from commit, Create tag, Copy SHA) and for a multi-commit selection (Cherry-pick N, Squash N, Reorder N). Assert, following the reference contract in `research/github-desktop-analysis.md` § 1.2:
+  - squash and reorder require a **contiguous** selection, and the contiguity check is over the loaded commit order;
+  - a merge commit blocks squash and reorder;
+  - every item that the server reports blocked is present but disabled with the server's `message` verbatim — items are never hidden to express policy;
+  - a non-contiguous multi-selection suppresses the diff and shows the explanatory blank slate rather than an arbitrary diff.
 
-	Render the menu through the existing native context-menu path (`readLocalApi()?.contextMenu.show`, with the browser fallback in `apps/web/src/contextMenuFallback.ts`) used elsewhere in `apps/web/src/components/Sidebar.tsx`.
+  Render the menu through the existing native context-menu path (`readLocalApi()?.contextMenu.show`, with the browser fallback in `apps/web/src/contextMenuFallback.ts`) used elsewhere in `apps/web/src/components/Sidebar.tsx`.
 
 - [ ] **Step 15.10: Add the drag-target tests, then implement `gitManagerCommitDrag.ts`.**
 
-	Export `resolveCommitDropTarget(drag, over)` mapping a commit drag onto one of: a branch row → cherry-pick onto that branch; the "New branch" pseudo-row → cherry-pick to a new branch; another commit row → squash; a list insertion point → reorder; anything else → `null`. Use `@dnd-kit/core` (already a dependency) with the same sensor/modifier conventions as `apps/web/src/components/CenterPanelTabs.tsx`. Assert a keyboard reorder path exists (arrow keys plus Enter) so the affordance is not pointer-only, and that a drop onto a target the server reports blocked is refused with the server's reason rather than dispatched.
+  Export `resolveCommitDropTarget(drag, over)` mapping a commit drag onto one of: a branch row → cherry-pick onto that branch; the "New branch" pseudo-row → cherry-pick to a new branch; another commit row → squash; a list insertion point → reorder; anything else → `null`. Use `@dnd-kit/core` (already a dependency) with the same sensor/modifier conventions as `apps/web/src/components/CenterPanelTabs.tsx`. Assert a keyboard reorder path exists (arrow keys plus Enter) so the affordance is not pointer-only, and that a drop onto a target the server reports blocked is refused with the server's reason rather than dispatched.
 
 - [ ] **Step 15.11: Add the store slice and its test.**
 
-	Add only `multiCommitSelection: readonly string[]` to `apps/web/src/gitManagerStore.ts`, inside the existing per-project view-state record keyed by `(environmentId, projectId)`, plus its setter alongside PHASE-03's existing action set, and add it to the sanitiser. The persisted key stays `bibcode:git-manager-state:v1`. PHASE-03's note requires a new field to be requested through `tasks.md` before it is added, and **PHASE-16 shares this round and also edits this file** — coordinate both before editing. Extend PHASE-03's existing store test.
+  Add only `multiCommitSelection: readonly string[]` to `apps/web/src/gitManagerStore.ts`, inside the existing per-project view-state record keyed by `(environmentId, projectId)`, plus its setter alongside PHASE-03's existing action set, and add it to the sanitiser. The persisted key stays `bibcode:git-manager-state:v1`. PHASE-03's note requires a new field to be requested through `tasks.md` before it is added, and **PHASE-16 shares this round and also edits this file** — coordinate both before editing. Extend PHASE-03's existing store test.
 
 - [ ] **Step 15.12: Full build + test gate.**
 
-	```bash
-	vp test run apps/web/src/components/gitManager/rewrite apps/web/src/gitManagerStore.test.ts
-	vp run typecheck
-	vp check
-	```
+  ```bash
+  vp test run apps/web/src/components/gitManager/rewrite apps/web/src/gitManagerStore.test.ts
+  vp run typecheck
+  vp check
+  ```
 
-	Expected: zero warnings, zero errors, all tests green.
+  Expected: zero warnings, zero errors, all tests green.
 
 - [ ] **Step 15.13: Exercise the flow in the running app.**
 
-	`vp run dev`, and verify against **both** a local project and a remote-hosted project (attach one per `docs/user/remote-access.md`): a rebase that conflicts shows the conflict list with marker counts; resolving with Theirs and continuing completes; aborting mid-operation restores the tip; a cherry-pick of two commits onto a branch works by drag and by context menu; the force-push warning appears before rewriting pushed commits; and a conflict started with `git rebase` in a terminal drives the same flow.
+  `vp run dev`, and verify against **both** a local project and a remote-hosted project (attach one per `docs/user/remote-access.md`): a rebase that conflicts shows the conflict list with marker counts; resolving with Theirs and continuing completes; aborting mid-operation restores the tip; a cherry-pick of two commits onto a branch works by drag and by context menu; the force-push warning appears before rewriting pushed commits; and a conflict started with `git rebase` in a terminal drives the same flow.
 
 - [ ] **Step 15.14: TDD proof.** Make `advanceMultiCommitOperation` always return its input state and `resolveCommitDropTarget` always return `null`. Re-run the Step 15.12 test filter and confirm the affected tests DO fail. Restore the real implementations.
 
@@ -205,4 +205,4 @@ Invoke these skills via the `Skill` tool BEFORE doing any work. Order matters: a
 - `GitManagerMultiCommitOperationDialog` props are `{ state: GitManagerMultiCommitState; onAdvance: (event: GitManagerOperationEvent) => void; onCancel: () => void; onConfirmAbort: () => void }` — pass stable memoized callbacks.
 - `GitManagerConflictList` props are `{ conflicts: readonly GitManagerConflictState[]; onResolve: (path: string, side: "ours" | "theirs") => void; onUndoResolve: (path: string) => void; continueBlocked: GitManagerBlockedReason | null }`.
 - This phase reuses PHASE-12's `<GitManagerInProgressStrip>` and PHASE-10's `<GitManagerOperationBanner>` unchanged. If either's props turn out to be insufficient, extend them where they live and record the change in `tasks.md` — do not add a third progress surface.
-- **Divergence carried forward from PHASE-07/10:** `gitManager.runOperation` is a streaming *command*, so it lives in `EnvironmentStreamCommandRpcTag` in `packages/client-runtime/src/rpc/client.ts`, not in the subscription-tag union the brief mentions. Consume it through a `createRuntimeCommand` wrapper mirroring `packages/client-runtime/src/state/vcsAction.ts`.
+- **Divergence carried forward from PHASE-07/10:** `gitManager.runOperation` is a streaming _command_, so it lives in `EnvironmentStreamCommandRpcTag` in `packages/client-runtime/src/rpc/client.ts`, not in the subscription-tag union the brief mentions. Consume it through a `createRuntimeCommand` wrapper mirroring `packages/client-runtime/src/state/vcsAction.ts`.

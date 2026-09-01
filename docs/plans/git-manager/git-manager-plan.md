@@ -19,8 +19,8 @@ re-derives git policy. All traffic uses the existing typed WebSocket RPC; no
 
 - **Rust / Axum / Tokio** — `apps/server`: git execution, RPC handlers,
   broadcaster, guards. Build `cargo build -p bibcode-server`; test `cargo test
-  -p bibcode-server`; lint `cargo clippy -p bibcode-server --all-targets -- -D
-  warnings`; format `cargo fmt --all --check`.
+-p bibcode-server`; lint `cargo clippy -p bibcode-server --all-targets -- -D
+warnings`; format `cargo fmt --all --check`.
 - **TypeScript / Effect Schema** — `packages/contracts`: schema-only wire
   contracts, no runtime logic.
 - **React 19 / Vite+ / TanStack Router / zustand / Effect Atom** — `apps/web`.
@@ -119,15 +119,15 @@ Two things make this different from simply porting GitHub Desktop:
 
 ### Ownership
 
-| Concern | Owner |
-| --- | --- |
-| Git execution, parsing, error classification | `apps/server/src/git/` |
+| Concern                                            | Owner                                              |
+| -------------------------------------------------- | -------------------------------------------------- |
+| Git execution, parsing, error classification       | `apps/server/src/git/`                             |
 | Blocking conditions and their user-facing messages | a new pure guards module in `apps/server/src/git/` |
-| Operation serialisation | the worktree catalog's existing repository lock |
-| Live change signal | the existing `StatusBroadcaster`, extended |
-| Wire shapes and capability flags | `packages/contracts` |
-| Environment routing, retry, subscription re-attach | `packages/client-runtime` |
-| Rendering, view state, virtualisation, diffs | `apps/web` |
+| Operation serialisation                            | the worktree catalog's existing repository lock    |
+| Live change signal                                 | the existing `StatusBroadcaster`, extended         |
+| Wire shapes and capability flags                   | `packages/contracts`                               |
+| Environment routing, retry, subscription re-attach | `packages/client-runtime`                          |
+| Rendering, view state, virtualisation, diffs       | `apps/web`                                         |
 
 The client renders `{ operation, code, message }` triples verbatim and computes
 no git policy. This is the single most important structural rule in the plan:
@@ -144,7 +144,7 @@ server-side, because only the server can see the repository.
   recorded per-feature in `research/github-desktop-analysis.md` § 3 and should
   be treated as the specification for each git call.
 - **The staging model.** GitHub Desktop hides git's index: the checkbox and
-  line selection *are* the staging state, rebuilt into the index at commit
+  line selection _are_ the staging state, rebuilt into the index at commit
   time (`git reset -- .`, then stage fully-selected paths via `update-index`,
   then apply per-line patches with `git apply --cached --unidiff-zero`, then
   `git commit -F -`). BiBCode's existing panel instead stages incrementally
@@ -152,7 +152,7 @@ server-side, because only the server can see the repository.
   visible-index model** — it is simpler, matches the existing panel it shares
   state with (spec § 12, decision 12), and avoids a rebuild racing an agent's
   concurrent `git add`. Desktop's patch-application machinery is still the
-  reference for *hunk and line staging*, which has no equivalent today.
+  reference for _hunk and line staging_, which has no equivalent today.
 - **Mutation discipline.** Every git mutation passes through the status
   broadcaster's mutation fence (`begin_mutation` → guard), or it races the
   streaming status. The stage/unstage arm in
@@ -173,7 +173,7 @@ server-side, because only the server can see the repository.
   error, never raw stderr.
 - **Error classification.** A stderr-to-code table is needed for actionable
   failures: authentication, non-fast-forward, local-changes-overwritten,
-  conflicts, cancelled. This is for *error reporting only*. Occupancy and other
+  conflicts, cancelled. This is for _error reporting only_. Occupancy and other
   guard conditions are pre-computed from the worktree catalog or
   `for-each-ref --format='%(worktreepath)'`, never from stderr matching — git's
   wording is version-specific, and GitHub Desktop deleted its own stderr-regex
@@ -223,7 +223,7 @@ Design rules for the additions:
   authored server-side; `message` is rendered verbatim.
 - Both reads carry a monotonically increasing generation.
 - Per-commit diffs need a **read-scoped** method. They cannot reuse
-  `review.getDiffPreview`, which is mapped to a review *write* scope; browsing
+  `review.getDiffPreview`, which is mapped to a review _write_ scope; browsing
   history read-only must not require a write scope.
 - Every new method is gated behind a default-false capability flag so older or
   third-party servers degrade feature by feature.
@@ -231,7 +231,7 @@ Design rules for the additions:
 **Naming collision — read before naming anything.** `GitManagerError` and
 `GitManagerServiceError` already exist in `packages/contracts/src/git.ts`
 (~:419-453) and mean something else entirely: they are the generic error types
-of the server's *internal* git service, behind methods like
+of the server's _internal_ git service, behind methods like
 `vcs.refreshStatus`. They predate this feature and must not be repurposed,
 renamed, or shadowed.
 
@@ -271,9 +271,9 @@ relative to each other and must not be trusted without re-reading the files.
   project. Idempotent: it navigates to the project's Git Manager, focusing the
   existing view rather than creating a second one.
 - **View state.** A zustand store, persisted, keyed by `(environmentId,
-  projectId)` — never bare `projectId`, since ids collide across environments.
+projectId)` — never bare `projectId`, since ids collide across environments.
   It holds an LRU of the two most recently used projects' view state and the
-  commit-message draft, and evicts the third. It holds *state only*; no panel
+  commit-message draft, and evicts the third. It holds _state only_; no panel
   is kept mounted and no subscription is held for a project not being viewed.
 - **Server data.** Through the existing environment-scoped Effect Atom
   families, never raw RPC calls: query atoms refire per connect generation,
@@ -287,7 +287,7 @@ relative to each other and must not be trusted without re-reading the files.
   other. The existing action hooks already take an `{ environmentId, cwd }`
   scope and are reused rather than reimplemented.
 - **Diffs.** Reuse the existing `@pierre/diffs` worker-pool renderer and its
-  helpers. Port the reference implementation's *policy* — the size ladder,
+  helpers. Port the reference implementation's _policy_ — the size ladder,
   whitespace toggle, expandable context, intra-line highlighting, image diff
   modes, submodule and binary interstitials — not its CodeMirror engine. The
   interactive line and hunk gutter for partial staging is new work either way.
@@ -363,16 +363,16 @@ CLI, refreshed only on explicit user action.
 
 ## Risks
 
-| Risk | Mitigation |
-| --- | --- |
-| Scope: this is a large feature and every slice touches contracts, server and web | Slices are independently shippable; slice 1 is read-only and de-risks the whole surface before any mutation exists |
-| The registration and fixture-count gates fail the build in non-obvious ways | Slice 0 carries the whole contract surface so the gate is crossed once, deliberately, with both count sites re-read from the working tree |
-| Concurrent agent writes make status and history flicker or mis-page | Tip-pinned paging, generation splicing, the mutation fence, and the passive agent-active indicator |
-| Guards computed client-side would drift from server truth | Structural rule: server authors every message; client renders verbatim; guards re-validated under the lock before execution |
-| A second lock deadlocks against the worktree catalog | Reuse the catalog's lock in its existing acquisition order; introduce none |
-| A dependency or asset quietly introduces a network call, breaking the telemetry constraint | No new dependencies; explicit test asserting the feature's network surface |
-| Remote-hosted projects behave differently from local ones | Every slice is validated against a remote-hosted project; paths stay opaque and client-side path resolution is forbidden |
-| Line numbers and counts in this plan and the research documents drift | Stated explicitly above; the working tree wins and discrepancies are reported |
+| Risk                                                                                       | Mitigation                                                                                                                                |
+| ------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| Scope: this is a large feature and every slice touches contracts, server and web           | Slices are independently shippable; slice 1 is read-only and de-risks the whole surface before any mutation exists                        |
+| The registration and fixture-count gates fail the build in non-obvious ways                | Slice 0 carries the whole contract surface so the gate is crossed once, deliberately, with both count sites re-read from the working tree |
+| Concurrent agent writes make status and history flicker or mis-page                        | Tip-pinned paging, generation splicing, the mutation fence, and the passive agent-active indicator                                        |
+| Guards computed client-side would drift from server truth                                  | Structural rule: server authors every message; client renders verbatim; guards re-validated under the lock before execution               |
+| A second lock deadlocks against the worktree catalog                                       | Reuse the catalog's lock in its existing acquisition order; introduce none                                                                |
+| A dependency or asset quietly introduces a network call, breaking the telemetry constraint | No new dependencies; explicit test asserting the feature's network surface                                                                |
+| Remote-hosted projects behave differently from local ones                                  | Every slice is validated against a remote-hosted project; paths stay opaque and client-side path resolution is forbidden                  |
+| Line numbers and counts in this plan and the research documents drift                      | Stated explicitly above; the working tree wins and discrepancies are reported                                                             |
 
 ## Validation
 

@@ -354,12 +354,18 @@ refresh scheduling changes, run the current focused owners before broad gates:
 ```sh
 vp run check:contracts
 vp test run apps/web/src/components/SourceControlPanel.test.tsx apps/web/src/components/files/FileBrowserPanel.test.tsx apps/web/src/components/GitActionsControl.test.tsx apps/web/src/components/Sidebar.test.tsx apps/web/src/components/ThreadStatusIndicators.test.tsx
+vp test run packages/contracts/src/gitManager.test.ts packages/contracts/src/environment.test.ts apps/web/src/gitManagerStore.test.ts apps/web/src/components/gitManager scripts/privacy-contract.test.ts
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-server git:: -- --nocapture
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --lib git::manager:: -- --nocapture
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --lib git::broadcaster::tests::ref_poll_is_replaced_by_watcher_and_safety_status_reads -- --exact --nocapture
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --lib terminal::manager::tests::retained_process_exit_callback_does_not_hold_terminal_publication -- --exact --nocapture
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --lib production::runtime::tests::structured_terminal_process_exit_immediately_invalidates_status_under_watcher_fallback -- --exact --nocapture
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --lib production::runtime::tests::provider_lifecycle_and_delivery_events_do_not_trigger_git_status_reads -- --exact --nocapture
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test production_git_vcs_rpc -- --nocapture
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test git_manager_reads -- --nocapture
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test git_manager_commit -- --nocapture
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test production_git_manager_rpc -- --nocapture
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test git_rpc -- --nocapture
 vp test run packages/client-runtime/src/state/vcs.test.ts apps/web/src/components/GitActionsControl.test.tsx
 ```
 
@@ -380,6 +386,13 @@ For the event-driven VCS boundary, retain separate evidence for:
 - one 125 ms trailing watcher read and one immediate structured-terminal read;
 - reconnect plus hidden, reveal, focus, and Git-menu explicit catch-up; and
 - execution-host routing for native, WSL-direct, and SSH/server workspaces.
+
+For the Git Manager boundary, retain separate evidence for tip-pinned paging
+and generation splicing; the shared project-then-repository lock rejecting a
+competing Git Manager or catalog mutation with `operation-in-flight`;
+server-authored blocked copy rendered unchanged; stream cancellation reaching
+the Git child; and one explicit provider refresh after an idle interval that
+produced no provider process or browser network request.
 
 Host-independent event-shape and routing tests are compatibility evidence, not
 native evidence for another operating system or remote host. Record unavailable
@@ -604,6 +617,10 @@ sizes. Cover relevant:
 - Create Worktree exact local and remote ref selection: the exact value appears
   once, the derived name remains correct, and a remote-to-local race succeeds
   without duplicate branch creation;
+- Git Manager opened from the project header, its worktree selector, a Changes
+  list with the partial-staging gutter, History with a selected commit diff, the
+  branch dropdown, fetch/pull/push/force-with-lease sync states, the native
+  stash list, and an in-progress/conflicted repository state;
 - thread creation, switching, persistence, and streaming;
 - terminal input/output and panel switching, including reopening the global right panel after a
   sibling chat suppresses a previously active Activity surface;

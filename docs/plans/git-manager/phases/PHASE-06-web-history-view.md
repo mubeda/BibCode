@@ -54,8 +54,8 @@ Invoke these skills via the `Skill` tool BEFORE doing any work. Order matters: a
 
 **Matched for this phase:**
 
-5. `Skill(skill="vercel-react-best-practices")` — *keeping the virtualised commit list and diff renders from re-rendering per page*
-6. `Skill(skill="web-design-guidelines")` — *keyboard navigation and labels for the commit list and diff controls*
+5. `Skill(skill="vercel-react-best-practices")` — _keeping the virtualised commit list and diff renders from re-rendering per page_
+6. `Skill(skill="web-design-guidelines")` — _keyboard navigation and labels for the commit list and diff controls_
 
 ## Documents to Read
 
@@ -77,50 +77,50 @@ Invoke these skills via the `Skill` tool BEFORE doing any work. Order matters: a
 
 - [ ] **Step 06.1: Locate the surface area being changed.**
 
-	```bash
-	rg --files apps/web/src/components/gitManager
-	rg -n "GitManagerCommitPage|GitManagerCommitEntry|GitManagerDiffSource|gitManager\." packages/contracts/src/gitManager.ts
-	rg -n "export const|createEnvironmentRpcQueryAtomFamily" packages/client-runtime/src/state/gitManager.ts
-	rg -n "getRenderablePatch|resolveFileDiffPath|buildFileDiffRenderKey" apps/web/src/lib/diffRendering.ts
-	rg -n "FileDiff" apps/web/src/components/chat/MessagesTimeline.tsx
-	sed -n '1,40p' apps/web/src/lib/lruCache.ts
-	```
+  ```bash
+  rg --files apps/web/src/components/gitManager
+  rg -n "GitManagerCommitPage|GitManagerCommitEntry|GitManagerDiffSource|gitManager\." packages/contracts/src/gitManager.ts
+  rg -n "export const|createEnvironmentRpcQueryAtomFamily" packages/client-runtime/src/state/gitManager.ts
+  rg -n "getRenderablePatch|resolveFileDiffPath|buildFileDiffRenderKey" apps/web/src/lib/diffRendering.ts
+  rg -n "FileDiff" apps/web/src/components/chat/MessagesTimeline.tsx
+  sed -n '1,40p' apps/web/src/lib/lruCache.ts
+  ```
 
-	The landed `packages/contracts/src/gitManager.ts` is authoritative for the method names and field names used below (`gitManager.getCommits` and `gitManager.getDiff` are the expected names). There is **no** per-commit diff method: a commit diff is `gitManager.getDiff` carrying a `GitManagerDiffSource` of `{ _tag: "commit", sha, path }`, the same method the working-tree source (`{ _tag: "working-tree", path, staged }`) uses. Read `apps/web/src/gitManagerStore.ts` as PHASE-03 actually landed it before adding a slice. Record any deviation in the per-phase notes of `tasks.md`.
+  The landed `packages/contracts/src/gitManager.ts` is authoritative for the method names and field names used below (`gitManager.getCommits` and `gitManager.getDiff` are the expected names). There is **no** per-commit diff method: a commit diff is `gitManager.getDiff` carrying a `GitManagerDiffSource` of `{ _tag: "commit", sha, path }`, the same method the working-tree source (`{ _tag: "working-tree", path, staged }`) uses. Read `apps/web/src/gitManagerStore.ts` as PHASE-03 actually landed it before adding a slice. Record any deviation in the per-phase notes of `tasks.md`.
 
 - [ ] **Step 06.2: Author the first failing test.**
 
-	Path: `apps/web/src/components/gitManager/history/commitPaging.test.ts`
+  Path: `apps/web/src/components/gitManager/history/commitPaging.test.ts`
 
-	```ts
-	import { describe, expect, it } from "vitest";
-	import { spliceCommitGeneration } from "./commitPaging";
+  ```ts
+  import { describe, expect, it } from "vitest";
+  import { spliceCommitGeneration } from "./commitPaging";
 
-	describe("spliceCommitGeneration", () => {
-	  it("prepends new commits above the pinned pages and keeps loaded rows and their order", () => {
-	    const loaded = [{ sha: "b" }, { sha: "a" }];
-	    const result = spliceCommitGeneration({
-	      loaded,
-	      incoming: [{ sha: "c" }, { sha: "b" }],
-	      pinnedTips: ["b"],
-	    });
-	    expect(result.commits.map((commit) => commit.sha)).toEqual(["c", "b", "a"]);
-	    expect(result.requiresReset).toBe(false);
-	  });
-	});
-	```
+  describe("spliceCommitGeneration", () => {
+    it("prepends new commits above the pinned pages and keeps loaded rows and their order", () => {
+      const loaded = [{ sha: "b" }, { sha: "a" }];
+      const result = spliceCommitGeneration({
+        loaded,
+        incoming: [{ sha: "c" }, { sha: "b" }],
+        pinnedTips: ["b"],
+      });
+      expect(result.commits.map((commit) => commit.sha)).toEqual(["c", "b", "a"]);
+      expect(result.requiresReset).toBe(false);
+    });
+  });
+  ```
 
 - [ ] **Step 06.3: Run the new test; expect FAIL** (the module does not exist yet).
 
-	```bash
-	vp test apps/web/src/components/gitManager/history/commitPaging.test.ts
-	```
+  ```bash
+  vp test apps/web/src/components/gitManager/history/commitPaging.test.ts
+  ```
 
 - [ ] **Step 06.4: Implement the minimum to make Step 06.2 pass.**
 
-	Path: `apps/web/src/components/gitManager/history/commitPaging.ts`
+  Path: `apps/web/src/components/gitManager/history/commitPaging.ts`
 
-	Export `spliceCommitGeneration({ loaded, incoming, pinnedTips })` returning `{ commits, requiresReset }`. Splice by sha identity: keep every loaded commit, prepend incoming commits not already loaded, and set `requiresReset` only when none of `pinnedTips` is present in `incoming` (the pinned snapshot can no longer be resolved). Never de-duplicate by index or `--skip` offset.
+  Export `spliceCommitGeneration({ loaded, incoming, pinnedTips })` returning `{ commits, requiresReset }`. Splice by sha identity: keep every loaded commit, prepend incoming commits not already loaded, and set `requiresReset` only when none of `pinnedTips` is present in `incoming` (the pinned snapshot can no longer be resolved). Never de-duplicate by index or `--skip` offset.
 
 - [ ] **Step 06.5: Run the test; expect PASS.**
 
@@ -130,33 +130,33 @@ Invoke these skills via the `Skill` tool BEFORE doing any work. Order matters: a
 
 - [ ] **Step 06.8: Add the size-ladder test and implementation.**
 
-	Path: `apps/web/src/components/gitManager/history/diffLadder.ts` and its test. Export `classifyDiffPayload({ byteLength, longestLineLength })` returning `"unrenderable" | "large-text" | "renderable"` using the reference constants verbatim (research § 3.4): `>= 70_000_000` bytes → `unrenderable` (never parsed); `>= 4_375_000` bytes → `large-text` (rendered only after an explicit "Show diff anyway"); any line longer than `5_000` characters → `large-text`. Call this **before** `getRenderablePatch`, so an oversized payload is never handed to the parser.
+  Path: `apps/web/src/components/gitManager/history/diffLadder.ts` and its test. Export `classifyDiffPayload({ byteLength, longestLineLength })` returning `"unrenderable" | "large-text" | "renderable"` using the reference constants verbatim (research § 3.4): `>= 70_000_000` bytes → `unrenderable` (never parsed); `>= 4_375_000` bytes → `large-text` (rendered only after an explicit "Show diff anyway"); any line longer than `5_000` characters → `large-text`. Call this **before** `getRenderablePatch`, so an oversized payload is never handed to the parser.
 
 - [ ] **Step 06.9: Add the local author-identity test and implementation.**
 
-	Path: `apps/web/src/components/gitManager/history/authorIdentity.ts` and its test. Export `deriveAuthorIdentity({ name, email })` returning `{ initials, hue, title }`, computed with the existing `fnv1a32` from `apps/web/src/lib/diffRendering.ts` over the lower-cased email. Assert determinism (same input → same output), that a name-less author falls back to the email local part, and — the constraint that matters — that the module contains **no URL and no fetch**: no `avatars.`, no `gravatar`, no `https://`.
+  Path: `apps/web/src/components/gitManager/history/authorIdentity.ts` and its test. Export `deriveAuthorIdentity({ name, email })` returning `{ initials, hue, title }`, computed with the existing `fnv1a32` from `apps/web/src/lib/diffRendering.ts` over the lower-cased email. Assert determinism (same input → same output), that a name-less author falls back to the email local part, and — the constraint that matters — that the module contains **no URL and no fetch**: no `avatars.`, no `gravatar`, no `https://`.
 
 - [ ] **Step 06.10: Build the commit list component.**
 
-	Path: `apps/web/src/components/gitManager/history/GitManagerCommitList.tsx`. Use `LegendList` from `@legendapp/list/react` exactly as `apps/web/src/components/BranchToolbarBranchSelector.tsx` does (indicative: import at :7, usage at :749 — re-verify). Fixed 50px rows (spec § 8). Props: `{ commits, selectedSha, onSelect, onReachEnd, isLoadingMore }`. Every row is a `<button type="button">` with an accessible name of `${shortSha} ${subject}`; arrow keys move selection. Test in `GitManagerHistoryView.test.tsx` that reaching the tenth-from-last row calls `onReachEnd` once, not twice.
+  Path: `apps/web/src/components/gitManager/history/GitManagerCommitList.tsx`. Use `LegendList` from `@legendapp/list/react` exactly as `apps/web/src/components/BranchToolbarBranchSelector.tsx` does (indicative: import at :7, usage at :749 — re-verify). Fixed 50px rows (spec § 8). Props: `{ commits, selectedSha, onSelect, onReachEnd, isLoadingMore }`. Every row is a `<button type="button">` with an accessible name of `${shortSha} ${subject}`; arrow keys move selection. Test in `GitManagerHistoryView.test.tsx` that reaching the tenth-from-last row calls `onReachEnd` once, not twice.
 
 - [ ] **Step 06.11: Build the commit detail component.**
 
-	Path: `apps/web/src/components/gitManager/history/GitManagerCommitDetail.tsx`. Render subject, body, short sha with a copy button, ref decorations, both identities (author and committer) via `deriveAuthorIdentity`, and the changed-file list at 29px rows. Selecting a file requests `gitManager.getDiff` through the atom family with `source: { _tag: "commit", sha, path }` (the selected commit's sha and the selected file's path), runs `classifyDiffPayload`, then `getRenderablePatch(patch, "git-manager-history:" + resolvedTheme)` and renders with `FileDiff` from `@pierre/diffs/react` inside the existing `DiffWorkerPoolProvider` — do not instantiate a second worker pool. Test: a `large-text` classification renders the "Show diff anyway" affordance and does **not** call the parser until it is pressed.
+  Path: `apps/web/src/components/gitManager/history/GitManagerCommitDetail.tsx`. Render subject, body, short sha with a copy button, ref decorations, both identities (author and committer) via `deriveAuthorIdentity`, and the changed-file list at 29px rows. Selecting a file requests `gitManager.getDiff` through the atom family with `source: { _tag: "commit", sha, path }` (the selected commit's sha and the selected file's path), runs `classifyDiffPayload`, then `getRenderablePatch(patch, "git-manager-history:" + resolvedTheme)` and renders with `FileDiff` from `@pierre/diffs/react` inside the existing `DiffWorkerPoolProvider` — do not instantiate a second worker pool. Test: a `large-text` classification renders the "Show diff anyway" affordance and does **not** call the parser until it is pressed.
 
 - [ ] **Step 06.12: Wire the view to the store and the atoms.**
 
-	Path: `apps/web/src/components/gitManager/history/GitManagerHistoryView.tsx`. Read and write only the History slice of `apps/web/src/gitManagerStore.ts`, keyed by `(environmentId, projectId)`. Server data comes exclusively from the atoms in `apps/web/src/state/gitManager.ts`; a raw `request`/`runStream` call in this phase is a review rejection. Render the unavailable state PHASE-03 landed when the environment has no live session or lacks the capability flag — never dial a deliberately disconnected environment.
+  Path: `apps/web/src/components/gitManager/history/GitManagerHistoryView.tsx`. Read and write only the History slice of `apps/web/src/gitManagerStore.ts`, keyed by `(environmentId, projectId)`. Server data comes exclusively from the atoms in `apps/web/src/state/gitManager.ts`; a raw `request`/`runStream` call in this phase is a review rejection. Render the unavailable state PHASE-03 landed when the environment has no live session or lacks the capability flag — never dial a deliberately disconnected environment.
 
 - [ ] **Step 06.13: Full build + test gate.**
 
-	```bash
-	vp test apps/web/src/components/gitManager/history
-	vp check
-	vp run typecheck
-	```
+  ```bash
+  vp test apps/web/src/components/gitManager/history
+  vp check
+  vp run typecheck
+  ```
 
-	Expected: zero warnings, zero errors, all tests green.
+  Expected: zero warnings, zero errors, all tests green.
 
 - [ ] **Step 06.14: Stack-specific verification.** Launch the app, open the Git Manager on a repository with more than 200 commits, scroll the history past three pages, select a commit, select a file, and confirm the diff renders. Repeat against a remote-hosted project (spec § 10 requires both). With the browser devtools Network tab filtered to third-party hosts, confirm zero requests leave the app while the History tab is used.
 

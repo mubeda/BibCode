@@ -55,8 +55,8 @@ Invoke these skills via the `Skill` tool BEFORE doing any work. Order matters: a
 
 **Matched for this phase:**
 
-5. `Skill(skill="web-design-guidelines")` — *disabled controls must expose the server reason via tooltip and `aria-describedby`*
-6. `Skill(skill="vercel-react-best-practices")` — *keeping the virtualised branch list and the live progress banner from re-rendering the toolbar*
+5. `Skill(skill="web-design-guidelines")` — _disabled controls must expose the server reason via tooltip and `aria-describedby`_
+6. `Skill(skill="vercel-react-best-practices")` — _keeping the virtualised branch list and the live progress banner from re-rendering the toolbar_
 
 ## Documents to Read
 
@@ -78,49 +78,49 @@ Invoke these skills via the `Skill` tool BEFORE doing any work. Order matters: a
 
 - [ ] **Step 10.1: Locate the surface area being changed.**
 
-	```bash
-	rg --files apps/web/src/components/gitManager
-	rg -n "resolveBranchSelectionTarget" -A 30 apps/web/src/components/BranchToolbar.logic.ts
-	rg -n "LegendList" apps/web/src/components/BranchToolbarBranchSelector.tsx
-	rg -n "runStackedAction|runStreamInEnvironment|createRuntimeCommand" packages/client-runtime/src/state/vcsAction.ts
-	rg -n "GitManagerBlockedReason|GitManagerOperationEvent|GitManagerOperationRequest" packages/contracts/src/gitManager.ts
-	```
+  ```bash
+  rg --files apps/web/src/components/gitManager
+  rg -n "resolveBranchSelectionTarget" -A 30 apps/web/src/components/BranchToolbar.logic.ts
+  rg -n "LegendList" apps/web/src/components/BranchToolbarBranchSelector.tsx
+  rg -n "runStackedAction|runStreamInEnvironment|createRuntimeCommand" packages/client-runtime/src/state/vcsAction.ts
+  rg -n "GitManagerBlockedReason|GitManagerOperationEvent|GitManagerOperationRequest" packages/contracts/src/gitManager.ts
+  ```
 
-	The landed `packages/contracts/src/gitManager.ts` is authoritative for method and field names (`gitManager.runOperation` is the expected stream-command name). `packages/client-runtime/src/state/vcsAction.ts` (indicative :417-520) is the template for consuming a streaming command as an atom command — copy that shape, do not call `runStream` directly from a component. Note that a streaming *command* joins `EnvironmentStreamCommandRpcTag` (`packages/client-runtime/src/rpc/client.ts`, indicative :60), not the subscription union.
+  The landed `packages/contracts/src/gitManager.ts` is authoritative for method and field names (`gitManager.runOperation` is the expected stream-command name). `packages/client-runtime/src/state/vcsAction.ts` (indicative :417-520) is the template for consuming a streaming command as an atom command — copy that shape, do not call `runStream` directly from a component. Note that a streaming _command_ joins `EnvironmentStreamCommandRpcTag` (`packages/client-runtime/src/rpc/client.ts`, indicative :60), not the subscription union.
 
 - [ ] **Step 10.2: Author the first failing test.**
 
-	Path: `apps/web/src/components/gitManager/toolbar/syncButton.logic.test.ts`
+  Path: `apps/web/src/components/gitManager/toolbar/syncButton.logic.test.ts`
 
-	```ts
-	import { describe, expect, it } from "vitest";
-	import { resolveSyncState } from "./syncButton.logic";
+  ```ts
+  import { describe, expect, it } from "vitest";
+  import { resolveSyncState } from "./syncButton.logic";
 
-	describe("resolveSyncState", () => {
-	  it("offers publish-branch when the current branch has no upstream", () => {
-	    expect(
-	      resolveSyncState({
-	        isOperationRunning: false,
-	        hasRemote: true,
-	        isUnborn: false,
-	        isDetached: false,
-	        aheadBehind: null,
-	        forcePushRecommended: false,
-	      }).kind,
-	    ).toBe("publish-branch");
-	  });
-	});
-	```
+  describe("resolveSyncState", () => {
+    it("offers publish-branch when the current branch has no upstream", () => {
+      expect(
+        resolveSyncState({
+          isOperationRunning: false,
+          hasRemote: true,
+          isUnborn: false,
+          isDetached: false,
+          aheadBehind: null,
+          forcePushRecommended: false,
+        }).kind,
+      ).toBe("publish-branch");
+    });
+  });
+  ```
 
 - [ ] **Step 10.3: Run the new test; expect FAIL** (the module does not exist yet).
 
-	```bash
-	vp test apps/web/src/components/gitManager/toolbar/syncButton.logic.test.ts
-	```
+  ```bash
+  vp test apps/web/src/components/gitManager/toolbar/syncButton.logic.test.ts
+  ```
 
 - [ ] **Step 10.4: Implement the minimum to make Step 10.2 pass.**
 
-	Path: `apps/web/src/components/gitManager/toolbar/syncButton.logic.ts`. Export `resolveSyncState(input)` returning `{ kind, label, ahead, behind, disabledReason }` where `kind` is one of `"running" | "no-remote" | "fetch-unborn" | "detached" | "publish-branch" | "fetch" | "force-push" | "pull" | "push"`, evaluated in exactly that order (research § 2.2). The reference implementation's two "Publish repository" states are replaced by `"no-remote"`, a **disabled, explanatory** state — constraint 1 forbids repository lifecycle, so the button must never offer to publish or create a repository.
+  Path: `apps/web/src/components/gitManager/toolbar/syncButton.logic.ts`. Export `resolveSyncState(input)` returning `{ kind, label, ahead, behind, disabledReason }` where `kind` is one of `"running" | "no-remote" | "fetch-unborn" | "detached" | "publish-branch" | "fetch" | "force-push" | "pull" | "push"`, evaluated in exactly that order (research § 2.2). The reference implementation's two "Publish repository" states are replaced by `"no-remote"`, a **disabled, explanatory** state — constraint 1 forbids repository lifecycle, so the button must never offer to publish or create a repository.
 
 - [ ] **Step 10.5: Run the test; expect PASS.**
 
@@ -128,36 +128,36 @@ Invoke these skills via the `Skill` tool BEFORE doing any work. Order matters: a
 
 - [ ] **Step 10.7: Build the branch grouping, test first.**
 
-	Path: `apps/web/src/components/gitManager/toolbar/branchGrouping.ts`. Export `groupBranches({ refs, recentNames, filter })` returning `{ default: [...], recent: [...], other: [...] }` with the recent group capped at 5 (research § 1.3, `RecentBranchesLimit = 5`), case-insensitive substring filtering, and the current branch marked. It is a **pure re-shaping of server data** — it computes no blocked state and no policy. Tests: the cap, filter behaviour, a branch appearing in exactly one group.
+  Path: `apps/web/src/components/gitManager/toolbar/branchGrouping.ts`. Export `groupBranches({ refs, recentNames, filter })` returning `{ default: [...], recent: [...], other: [...] }` with the recent group capped at 5 (research § 1.3, `RecentBranchesLimit = 5`), case-insensitive substring filtering, and the current branch marked. It is a **pure re-shaping of server data** — it computes no blocked state and no policy. Tests: the cap, filter behaviour, a branch appearing in exactly one group.
 
 - [ ] **Step 10.8: Build the branch dropdown.**
 
-	Path: `apps/web/src/components/gitManager/toolbar/GitManagerBranchDropdown.tsx`. `LegendList` at fixed 30px rows (spec § 8), a filter box, group headers, a current-branch check mark, a "New branch" action, and a "Choose a branch to merge into <current>" action at the foot. Each row carries the server's `GitManagerBlockedReason[]`: a blocked row is disabled and exposes `message` verbatim through both a tooltip and `aria-describedby`; an **unknown code fails closed** (disabled). A row whose `worktreePath` differs from the selected checkout shows a worktree badge; activating it **switches the panel's selected worktree** and says so, rather than attempting a checkout (spec § 7.1). Tests: the redirect changes the selected worktree and issues no checkout operation; a blocked row renders the server message verbatim; an unknown code is disabled.
+  Path: `apps/web/src/components/gitManager/toolbar/GitManagerBranchDropdown.tsx`. `LegendList` at fixed 30px rows (spec § 8), a filter box, group headers, a current-branch check mark, a "New branch" action, and a "Choose a branch to merge into <current>" action at the foot. Each row carries the server's `GitManagerBlockedReason[]`: a blocked row is disabled and exposes `message` verbatim through both a tooltip and `aria-describedby`; an **unknown code fails closed** (disabled). A row whose `worktreePath` differs from the selected checkout shows a worktree badge; activating it **switches the panel's selected worktree** and says so, rather than attempting a checkout (spec § 7.1). Tests: the redirect changes the selected worktree and issues no checkout operation; a blocked row renders the server message verbatim; an unknown code is disabled.
 
 - [ ] **Step 10.9: Build the branch dialogs.**
 
-	Path: `apps/web/src/components/gitManager/dialogs/GitManagerBranchDialogs.tsx`. Create (name validation with an immediate duplicate check and a debounced ref-rules check, base = default branch or current branch); Rename (local branches only; **blocked when the branch is held by another worktree** — the server authors that message, spec § 7.2); Delete (confirmation stating it cannot be undone, with an optional "also delete on the remote" checkbox only when the branch exists upstream). Tests: the rename block renders the server message and disables submit; delete requires explicit confirmation.
+  Path: `apps/web/src/components/gitManager/dialogs/GitManagerBranchDialogs.tsx`. Create (name validation with an immediate duplicate check and a debounced ref-rules check, base = default branch or current branch); Rename (local branches only; **blocked when the branch is held by another worktree** — the server authors that message, spec § 7.2); Delete (confirmation stating it cannot be undone, with an optional "also delete on the remote" checkbox only when the branch exists upstream). Tests: the rename block renders the server message and disables submit; delete requires explicit confirmation.
 
 - [ ] **Step 10.10: Build the switch-with-changes dialog.**
 
-	Path: `apps/web/src/components/gitManager/dialogs/GitManagerSwitchWithChangesDialog.tsx`. Two options: "Leave my changes" (stash) and "Bring my changes". The stash copy must state that an ordinary, visible stash entry is created (spec § 6.3 / § 6.4) — not a hidden marker-scoped one. Test both branches produce the expected operation payload.
+  Path: `apps/web/src/components/gitManager/dialogs/GitManagerSwitchWithChangesDialog.tsx`. Two options: "Leave my changes" (stash) and "Bring my changes". The stash copy must state that an ordinary, visible stash entry is created (spec § 6.3 / § 6.4) — not a hidden marker-scoped one. Test both branches produce the expected operation payload.
 
 - [ ] **Step 10.11: Build the operation banner.**
 
-	Path: `apps/web/src/components/gitManager/toolbar/GitManagerOperationBanner.tsx`. Consumes the `gitManager.runOperation` stream through the atom command: `started` opens the banner with `role="status"`, each `output` event appends to a collapsible output area (collapsed by default), `finished` closes it, `failed` keeps it open with the server message and the stable failure code. A Cancel control aborts the stream, which cancels the child process server-side. Tests: the event sequence drives the banner states; cancel invokes the abort path; the output area is collapsed by default and expandable by keyboard.
+  Path: `apps/web/src/components/gitManager/toolbar/GitManagerOperationBanner.tsx`. Consumes the `gitManager.runOperation` stream through the atom command: `started` opens the banner with `role="status"`, each `output` event appends to a collapsible output area (collapsed by default), `finished` closes it, `failed` keeps it open with the server message and the stable failure code. A Cancel control aborts the stream, which cancels the child process server-side. Tests: the event sequence drives the banner states; cancel invokes the abort path; the output area is collapsed by default and expandable by keyboard.
 
 - [ ] **Step 10.12: Mount segments 2 and 3.** Wire the dropdown, the sync button, the dialogs and the banner into the toolbar PHASE-03 landed. Server data comes exclusively from the atoms in `apps/web/src/state/gitManager.ts`; operations run through the atom command on the existing per-`(environmentId, cwd)` lane. A raw `request`/`runStream` call from a component is a review rejection.
 
 - [ ] **Step 10.13: Full build + test gate.**
 
-	```bash
-	vp test apps/web/src/components/gitManager/toolbar
-	vp test apps/web/src/components/gitManager/dialogs
-	vp check
-	vp run typecheck
-	```
+  ```bash
+  vp test apps/web/src/components/gitManager/toolbar
+  vp test apps/web/src/components/gitManager/dialogs
+  vp check
+  vp run typecheck
+  ```
 
-	Expected: zero warnings, zero errors, all tests green.
+  Expected: zero warnings, zero errors, all tests green.
 
 - [ ] **Step 10.14: Stack-specific verification.** Launch the app against a repository with a linked worktree. Confirm: selecting an occupied branch switches the panel to that worktree and says so; the sync button walks fetch → publish-branch → push → pull as the repository state changes; a long fetch shows the banner with working cancel; a blocked delete shows the server message. Repeat against a remote-hosted project (spec § 10 requires both).
 
@@ -189,5 +189,5 @@ Invoke these skills via the `Skill` tool BEFORE doing any work. Order matters: a
 - **`<GitManagerOperationBanner>`** takes `operation: GitManagerOperationEvent | null` and `onCancel: () => void`. **PHASE-12, PHASE-13 and PHASE-15 must render their operations through this one banner** — the app shows one operation at a time, matching the server's `operation-in-flight` rejection.
 - **`<GitManagerBranchDropdown>`** props: `onSelectBranch: (ref: GitManagerRefEntry) => void`, `onSwitchWorktree: (worktreePath: string) => void`, `onCreateBranch: () => void`, `onMergeInto: (ref: GitManagerRefEntry) => void`. Pass stable, memoised callbacks; the list is virtualised.
 - **`<GitManagerSwitchWithChangesDialog>`** resolves to `{ strategy: "stash" | "bring" }`. **PHASE-12** reuses the same stash semantics: the stash it creates is an ordinary visible entry.
-- **Divergence recorded:** `gitManager.runOperation` is a streaming *command*, so it belongs in `EnvironmentStreamCommandRpcTag`, not `EnvironmentSubscriptionRpcTag`. Consume it via a `createRuntimeCommand` wrapper mirroring `packages/client-runtime/src/state/vcsAction.ts`, never `runStream` from a component.
+- **Divergence recorded:** `gitManager.runOperation` is a streaming _command_, so it belongs in `EnvironmentStreamCommandRpcTag`, not `EnvironmentSubscriptionRpcTag`. Consume it via a `createRuntimeCommand` wrapper mirroring `packages/client-runtime/src/state/vcsAction.ts`, never `runStream` from a component.
 - **Divergence recorded:** the server captures each git command's output on completion rather than streaming per-line progress, so the banner's output area fills in chunks, not continuously. Design the collapsible area for that and do not add a fake progress percentage.

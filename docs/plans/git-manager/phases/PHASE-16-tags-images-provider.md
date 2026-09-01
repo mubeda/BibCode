@@ -57,8 +57,8 @@ Invoke these skills via the `Skill` tool BEFORE doing any work. Order matters: a
 
 **Matched for this phase:**
 
-5. `Skill(skill="web-design-guidelines")` — *four image-diff modes need labelled controls and non-pointer operation*
-6. `Skill(skill="vercel-react-best-practices")` — *swipe and onion-skin modes must not re-decode images per frame*
+5. `Skill(skill="web-design-guidelines")` — _four image-diff modes need labelled controls and non-pointer operation_
+6. `Skill(skill="vercel-react-best-practices")` — _swipe and onion-skin modes must not re-decode images per frame_
 
 ## Documents to Read
 
@@ -82,128 +82,128 @@ Invoke these skills via the `Skill` tool BEFORE doing any work. Order matters: a
 
 - [ ] **Step 16.1: Locate the surface area being changed.**
 
-	```bash
-	rg -n "pub struct PullRequestService|ProviderCommandSpec|fn run_provider_os|pub async fn resolve_current|pub async fn create" apps/server/src/source_control/pull_request.rs
-	rg -n "SUMMARY_FRESHNESS|sleep_until|load_pull_request" apps/server/src/git/summary.rs
-	rg -n "GitManagerTag|GitManagerImage|GitManagerPullRequest|GitManagerCheck" packages/contracts/src/gitManager.ts
-	rg -n "fn render\(|SupervisedStreamOutput|bytes" apps/server/src/git/process.rs apps/server/src/process/supervised.rs
-	```
+  ```bash
+  rg -n "pub struct PullRequestService|ProviderCommandSpec|fn run_provider_os|pub async fn resolve_current|pub async fn create" apps/server/src/source_control/pull_request.rs
+  rg -n "SUMMARY_FRESHNESS|sleep_until|load_pull_request" apps/server/src/git/summary.rs
+  rg -n "GitManagerTag|GitManagerImage|GitManagerPullRequest|GitManagerCheck" packages/contracts/src/gitManager.ts
+  rg -n "fn render\(|SupervisedStreamOutput|bytes" apps/server/src/git/process.rs apps/server/src/process/supervised.rs
+  ```
 
-	`packages/contracts/src/gitManager.ts` is authoritative for every schema and method name. Read `apps/server/src/source_control/pull_request.rs` in full before touching it: `PullRequestService` (indicative :117) already holds `github_command`/`gitlab_command`/`azure_command` as `ProviderCommandSpec` (indicative :19) defaulting to `gh`/`glab`/`az`, and `run_provider_os` (indicative :963) is the single exec seam. Record deviations in the per-phase notes of `tasks.md`.
+  `packages/contracts/src/gitManager.ts` is authoritative for every schema and method name. Read `apps/server/src/source_control/pull_request.rs` in full before touching it: `PullRequestService` (indicative :117) already holds `github_command`/`gitlab_command`/`azure_command` as `ProviderCommandSpec` (indicative :19) defaulting to `gh`/`glab`/`az`, and `run_provider_os` (indicative :963) is the single exec seam. Record deviations in the per-phase notes of `tasks.md`.
 
 - [ ] **Step 16.2: Confirm the wire surface, and only cross the registration gate if you must.**
 
-	Confirm PHASE-00 declared the tag operation variants, the image-blob read and the pull-request/checks reads. If any is missing, add it and re-run the whole gate: `WS_METHODS` + `Rpc.make` + the exported `RpcGroup.make` in `packages/contracts/src/rpc.ts`; `pnpm --filter @bibcode/contracts generate:rust-rpc-fixtures`; `ACTIVE_RPC_METHODS` in `apps/server/src/rpc/methods.rs`; exactly one `required_scope` arm in `apps/server/src/auth/scope.rs`; and the two hard-coded count sites — `packages/contracts/scripts/export-rust-rpc-fixtures.ts` and `apps/server/tests/rpc_wire.rs` (indicative :85 `101`, :90 `18`, :92-95 `65`/`23`/`65`/`242` — **re-read them; earlier phases have moved them**). The image-blob read, the pull-request read and the checks read are **reads** and must use the read scope; note that the pre-existing `git.resolvePullRequest` is classified `mutation_unary` today, which is exactly why this feature needs its own read-scoped method rather than reusing it. No `apps/server/src/maintenance.rs` edit is needed — PHASE-07 confirmed that mutability is derived from `ACTIVE_RPC_METHODS` via `method_mutability`.
+  Confirm PHASE-00 declared the tag operation variants, the image-blob read and the pull-request/checks reads. If any is missing, add it and re-run the whole gate: `WS_METHODS` + `Rpc.make` + the exported `RpcGroup.make` in `packages/contracts/src/rpc.ts`; `pnpm --filter @bibcode/contracts generate:rust-rpc-fixtures`; `ACTIVE_RPC_METHODS` in `apps/server/src/rpc/methods.rs`; exactly one `required_scope` arm in `apps/server/src/auth/scope.rs`; and the two hard-coded count sites — `packages/contracts/scripts/export-rust-rpc-fixtures.ts` and `apps/server/tests/rpc_wire.rs` (indicative :85 `101`, :90 `18`, :92-95 `65`/`23`/`65`/`242` — **re-read them; earlier phases have moved them**). The image-blob read, the pull-request read and the checks read are **reads** and must use the read scope; note that the pre-existing `git.resolvePullRequest` is classified `mutation_unary` today, which is exactly why this feature needs its own read-scoped method rather than reusing it. No `apps/server/src/maintenance.rs` edit is needed — PHASE-07 confirmed that mutability is derived from `ACTIVE_RPC_METHODS` via `method_mutability`.
 
 - [ ] **Step 16.3: Author the first failing test — tag command shapes.**
 
-	Path: `apps/server/src/git/manager/tags.rs`, inline `#[cfg(test)] mod tests`, using `GitRepository::with_runner_for_test` with a recording runner in the style of `RecordingGitRunner` (indicative `repository.rs:5035`). Pin one behaviour: creating a tag runs exactly
+  Path: `apps/server/src/git/manager/tags.rs`, inline `#[cfg(test)] mod tests`, using `GitRepository::with_runner_for_test` with a recording runner in the style of `RecordingGitRunner` (indicative `repository.rs:5035`). Pin one behaviour: creating a tag runs exactly
 
-	```text
-	git tag -a -m '' <name> <sha>
-	```
+  ```text
+  git tag -a -m '' <name> <sha>
+  ```
 
-	with the mutation environment from `git_environment()` (indicative `repository.rs:4759`), and the tag name is validated before the process is spawned (max 245 characters, plus git's ref-name rules).
+  with the mutation environment from `git_environment()` (indicative `repository.rs:4759`), and the tag name is validated before the process is spawned (max 245 characters, plus git's ref-name rules).
 
 - [ ] **Step 16.4: Run the new test; expect FAIL, then implement `tags.rs` and re-run to PASS.**
 
-	```bash
-	cargo test -p bibcode-server git::manager::tags
-	```
+  ```bash
+  cargo test -p bibcode-server git::manager::tags
+  ```
 
-	Then add the remaining tag tests and implementation, one at a time. These are the exact command lines, from `research/github-desktop-analysis.md` § 3.9 and § 3.6:
+  Then add the remaining tag tests and implementation, one at a time. These are the exact command lines, from `research/github-desktop-analysis.md` § 3.9 and § 3.6:
 
-	```text
-	create   git tag -a -m '' <name> <sha>
-	delete   git tag -d <name>
-	list     git show-ref --tags -d          (normalise the "^{}" annotated-tag suffix)
-	push     git push <remote> refs/tags/<name>
-	```
+  ```text
+  create   git tag -a -m '' <name> <sha>
+  delete   git tag -d <name>
+  list     git show-ref --tags -d          (normalise the "^{}" annotated-tag suffix)
+  push     git push <remote> refs/tags/<name>
+  ```
 
-	Cover: deleting a non-existent tag yields a structured error, not a panic; the list normalises `^{}`; pushing a tag runs `--force-with-lease`-free (a tag push is not a force push) and never bare `--force`.
+  Cover: deleting a non-existent tag yields a structured error, not a panic; the list normalises `^{}`; pushing a tag runs `--force-with-lease`-free (a tag push is not a force push) and never bare `--force`.
 
-	**Deliberate divergence from the reference, record it in the phase notes:** GitHub Desktop tracks unpushed tags in `localStorage` and batches them as extra refspecs onto the next branch push. That is client-held git state that can desync from the repository and would need a persisted store; this phase pushes one named tag on one explicit user action instead. Remote tag deletion (`git push <remote> :refs/tags/<name>`) is **out of this pass** — it is a separate destructive confirmation surface; state that in the phase notes rather than smuggling it in.
+  **Deliberate divergence from the reference, record it in the phase notes:** GitHub Desktop tracks unpushed tags in `localStorage` and batches them as extra refspecs onto the next branch push. That is client-held git state that can desync from the repository and would need a persisted store; this phase pushes one named tag on one explicit user action instead. Remote tag deletion (`git push <remote> :refs/tags/<name>`) is **out of this pass** — it is a separate destructive confirmation surface; state that in the phase notes rather than smuggling it in.
 
 - [ ] **Step 16.5: Add the byte-preserving blob read tests, then implement it.**
 
-	The image sides come from the repository via
+  The image sides come from the repository via
 
-	```text
-	git show <commitish>:<path>
-	```
+  ```text
+  git show <commitish>:<path>
+  ```
 
-	`ProcessOutput.stdout` is a `String` and `apps/server/src/git/process.rs` lossy-converts the supervised layer's `SupervisedStreamOutput.bytes` through its private `render` helper (indicative :173) — **a binary blob read through the existing path is corrupted.** The supervised layer already carries `Vec<u8>`, so add a byte-preserving variant alongside the existing one (do not change the lossy path any existing caller depends on) and base64-encode at the RPC boundary. Cap the blob at the spec's image budget and return a structured "too large" result rather than truncating silently; a truncated image is worse than an absent one. Test with a real binary fixture that a round trip is byte-identical.
+  `ProcessOutput.stdout` is a `String` and `apps/server/src/git/process.rs` lossy-converts the supervised layer's `SupervisedStreamOutput.bytes` through its private `render` helper (indicative :173) — **a binary blob read through the existing path is corrupted.** The supervised layer already carries `Vec<u8>`, so add a byte-preserving variant alongside the existing one (do not change the lossy path any existing caller depends on) and base64-encode at the RPC boundary. Cap the blob at the spec's image budget and return a structured "too large" result rather than truncating silently; a truncated image is worse than an absent one. Test with a real binary fixture that a round trip is byte-identical.
 
-	`assets.createUrl` is **not** an alternative: its `AssetResource` union (`packages/contracts/src/assets.ts`) is keyed by `ThreadId` or attachment id and cannot address a commit blob.
+  `assets.createUrl` is **not** an alternative: its `AssetResource` union (`packages/contracts/src/assets.ts`) is keyed by `ThreadId` or attachment id and cannot address a commit blob.
 
 - [ ] **Step 16.6: Add the provider-checks tests, then implement `apps/server/src/source_control/checks.rs`.**
 
-	Extend the existing `PullRequestService` seam rather than adding a second process path: reuse `ProviderCommandSpec` and `run_provider_os` so the executable stays injectable for tests, exactly as `resolve_current` does. GitHub first:
+  Extend the existing `PullRequestService` seam rather than adding a second process path: reuse `ProviderCommandSpec` and `run_provider_os` so the executable stays injectable for tests, exactly as `resolve_current` does. GitHub first:
 
-	```text
-	gh pr checks <number> --json name,state,link,workflow
-	```
+  ```text
+  gh pr checks <number> --json name,state,link,workflow
+  ```
 
-	Verify the available `--json` field set against the `gh` on the host before pinning it, and record what you used. GitLab and Azure DevOps have no equivalent single-command check read at parity; return a structured `unavailable` result for them in this pass, mirroring how native repository publishing is already GitHub-only in `docs/integrations/source-control-providers.md`. Bitbucket has no CLI here at all and stays unavailable.
+  Verify the available `--json` field set against the `gh` on the host before pinning it, and record what you used. GitLab and Azure DevOps have no equivalent single-command check read at parity; return a structured `unavailable` result for them in this pass, mirroring how native repository publishing is already GitHub-only in `docs/integrations/source-control-providers.md`. Bitbucket has no CLI here at all and stays unavailable.
 
-	**The hard constraint of this step:** the checks read runs only when called. Assert with a test that constructing the service, and letting time pass, spawns no process. Do not add a timer, an interval, a `sleep_until` loop, or a subscription that refreshes on its own. The one existing periodic provider call in this repository is the 30-second cycle in `apps/server/src/git/summary.rs` (`SUMMARY_FRESHNESS`, indicative :20), which is subscriber-scoped, predates this feature, and must not be extended to carry checks. Also note the live tripwire in `apps/server/tests/git_rpc.rs` (indicative :36) that fails the build if `Duration::from_secs(3)` appears in `apps/server/src/production/git_vcs.rs`.
+  **The hard constraint of this step:** the checks read runs only when called. Assert with a test that constructing the service, and letting time pass, spawns no process. Do not add a timer, an interval, a `sleep_until` loop, or a subscription that refreshes on its own. The one existing periodic provider call in this repository is the 30-second cycle in `apps/server/src/git/summary.rs` (`SUMMARY_FRESHNESS`, indicative :20), which is subscriber-scoped, predates this feature, and must not be extended to carry checks. Also note the live tripwire in `apps/server/tests/git_rpc.rs` (indicative :36) that fails the build if `Duration::from_secs(3)` appears in `apps/server/src/production/git_vcs.rs`.
 
 - [ ] **Step 16.7: Wire the server handlers.**
 
-	Add the dispatch arms in `apps/server/src/production/git_manager_rpc.rs`. Tag create, delete and push are mutations and follow PHASE-07's published `run_branch_or_sync_operation` order exactly: `GitManagerOperationRegistry::try_begin` → the worktree catalog lock via `with_project_mutation_lock_cancellation` → guard re-validation under the lock → `StatusBroadcaster::begin_mutation` → execute → always `mutation.finish()`. Reuse PHASE-07's registry and its `classify_operation_failure`; add no second registry and no second stderr matcher. The blob read, the pull-request read and the checks read are reads: they use the read scope, `git_read_environment()` where they touch git, and take no lock. No log line may interpolate a tag name, ref name, absolute path, remote URL, provider output or git stderr.
+  Add the dispatch arms in `apps/server/src/production/git_manager_rpc.rs`. Tag create, delete and push are mutations and follow PHASE-07's published `run_branch_or_sync_operation` order exactly: `GitManagerOperationRegistry::try_begin` → the worktree catalog lock via `with_project_mutation_lock_cancellation` → guard re-validation under the lock → `StatusBroadcaster::begin_mutation` → execute → always `mutation.finish()`. Reuse PHASE-07's registry and its `classify_operation_failure`; add no second registry and no second stderr matcher. The blob read, the pull-request read and the checks read are reads: they use the read scope, `git_read_environment()` where they touch git, and take no lock. No log line may interpolate a tag name, ref name, absolute path, remote URL, provider output or git stderr.
 
 - [ ] **Step 16.8: Run the server gate.**
 
-	```bash
-	cargo fmt --all --check
-	cargo test -p bibcode-server git::manager::tags
-	cargo test -p bibcode-server source_control::checks
-	cargo test -p bibcode-server --test production_git_manager_rpc
-	cargo test -p bibcode-server --test git_rpc
-	cargo test -p bibcode-server --test rpc_wire
-	cargo clippy -p bibcode-server --all-targets -- -D warnings
-	```
+  ```bash
+  cargo fmt --all --check
+  cargo test -p bibcode-server git::manager::tags
+  cargo test -p bibcode-server source_control::checks
+  cargo test -p bibcode-server --test production_git_manager_rpc
+  cargo test -p bibcode-server --test git_rpc
+  cargo test -p bibcode-server --test rpc_wire
+  cargo clippy -p bibcode-server --all-targets -- -D warnings
+  ```
 
 - [ ] **Step 16.9: Author the failing web test for the tag dialog, then implement it.**
 
-	Path: `apps/web/src/components/gitManager/tags/GitManagerTagDialog.logic.test.ts` then `.logic.ts` and `.tsx`. Import `describe, expect, it` from `"vite-plus/test"`. Export `validateTagName(name, existingTags)` returning `{ valid: boolean; reason: string | null }` — duplicate check immediate, length cap 245 — and `resolveTagDeleteDialogCopy(tag)` for the destructive confirmation (spec § 6.5). Build the dialog on `Dialog` from `apps/web/src/components/ui/dialog.tsx` with nullable `pending*` state, the house convention. Every dispatch goes through the `createRuntimeCommand` wrapper PHASE-10 established (`gitManager.runOperation` is a streaming command in `EnvironmentStreamCommandRpcTag`) on the per-`(environmentId, cwd)` lane, and progress renders through PHASE-10's single `<GitManagerOperationBanner>`. The component receives `{ scope: { environmentId, cwd }, projectRef }` per PHASE-03's prop contract, and gates its capability through PHASE-03's `gitManagerAvailability.ts`.
+  Path: `apps/web/src/components/gitManager/tags/GitManagerTagDialog.logic.test.ts` then `.logic.ts` and `.tsx`. Import `describe, expect, it` from `"vite-plus/test"`. Export `validateTagName(name, existingTags)` returning `{ valid: boolean; reason: string | null }` — duplicate check immediate, length cap 245 — and `resolveTagDeleteDialogCopy(tag)` for the destructive confirmation (spec § 6.5). Build the dialog on `Dialog` from `apps/web/src/components/ui/dialog.tsx` with nullable `pending*` state, the house convention. Every dispatch goes through the `createRuntimeCommand` wrapper PHASE-10 established (`gitManager.runOperation` is a streaming command in `EnvironmentStreamCommandRpcTag`) on the per-`(environmentId, cwd)` lane, and progress renders through PHASE-10's single `<GitManagerOperationBanner>`. The component receives `{ scope: { environmentId, cwd }, projectRef }` per PHASE-03's prop contract, and gates its capability through PHASE-03's `gitManagerAvailability.ts`.
 
-	Then add the tags-to-push contribution to `resolveSyncState` in `apps/web/src/components/gitManager/toolbar/syncButton.logic.ts` — PHASE-10 reserved that seam so the count is computed in the logic module, not in the toolbar component. Cover it with a test in PHASE-10's existing `syncButton.logic.test.ts`.
+  Then add the tags-to-push contribution to `resolveSyncState` in `apps/web/src/components/gitManager/toolbar/syncButton.logic.ts` — PHASE-10 reserved that seam so the count is computed in the logic module, not in the toolbar component. Cover it with a test in PHASE-10's existing `syncButton.logic.test.ts`.
 
 - [ ] **Step 16.10: Author the failing web tests for the image diff, then implement it.**
 
-	Path: `apps/web/src/components/gitManager/diff/gitManagerImageDiff.logic.ts` then `GitManagerImageDiff.tsx`. Add the image branch to PHASE-06's `classifyDiffPayload` in `apps/web/src/components/gitManager/history/diffLadder.ts` — PHASE-06's note requires extending it rather than bypassing it — so an image is routed here and an oversized one still falls through the ladder. Support exactly the four reference modes (`research/github-desktop-analysis.md` § 1.5): **2-up**, **swipe**, **onion-skin**, **difference**. Cover the extension set `png, jpg, jpeg, gif, ico, webp, bmp, avif`. Both sides render from `data:` URIs built from the server's base64 payload — assert with a test that no rendered `img` has an `http`/`https` `src`, that no `fetch` is issued, and that a missing side (added or deleted file) renders a one-sided presentation rather than a broken image. Memoise the object URLs so swipe and onion-skin do not re-decode per pointer move. Add `// @vitest-environment happy-dom` on line 1 only for the tests that need DOM.
+  Path: `apps/web/src/components/gitManager/diff/gitManagerImageDiff.logic.ts` then `GitManagerImageDiff.tsx`. Add the image branch to PHASE-06's `classifyDiffPayload` in `apps/web/src/components/gitManager/history/diffLadder.ts` — PHASE-06's note requires extending it rather than bypassing it — so an image is routed here and an oversized one still falls through the ladder. Support exactly the four reference modes (`research/github-desktop-analysis.md` § 1.5): **2-up**, **swipe**, **onion-skin**, **difference**. Cover the extension set `png, jpg, jpeg, gif, ico, webp, bmp, avif`. Both sides render from `data:` URIs built from the server's base64 payload — assert with a test that no rendered `img` has an `http`/`https` `src`, that no `fetch` is issued, and that a missing side (added or deleted file) renders a one-sided presentation rather than a broken image. Memoise the object URLs so swipe and onion-skin do not re-decode per pointer move. Add `// @vitest-environment happy-dom` on line 1 only for the tests that need DOM.
 
 - [ ] **Step 16.11: Author the failing web tests for the provider pane, then implement it.**
 
-	Path: `apps/web/src/components/gitManager/provider/GitManagerPullRequestPanel.logic.ts` then `.tsx`. The pane shows the resolved pull request and its checks, and a Refresh button. Assert, and this is the phase's most important test:
+  Path: `apps/web/src/components/gitManager/provider/GitManagerPullRequestPanel.logic.ts` then `.tsx`. The pane shows the resolved pull request and its checks, and a Refresh button. Assert, and this is the phase's most important test:
 
-	- mounting the component issues **no** provider request — the pane starts in an explicit "not loaded" state with a Refresh affordance;
-	- advancing fake timers by an hour issues no request;
-	- exactly one request is issued per Refresh press;
-	- an `unavailable` provider result renders as an explanatory state, not an error toast;
-	- the "Create pull request" action reuses the existing stacked-action path (`git.runStackedAction` with `create_pr`) rather than adding a second creation route.
+  - mounting the component issues **no** provider request — the pane starts in an explicit "not loaded" state with a Refresh affordance;
+  - advancing fake timers by an hour issues no request;
+  - exactly one request is issued per Refresh press;
+  - an `unavailable` provider result renders as an explanatory state, not an error toast;
+  - the "Create pull request" action reuses the existing stacked-action path (`git.runStackedAction` with `create_pr`) rather than adding a second creation route.
 
-	There is no sign-in, no OAuth, no fork surface and no avatar: author identity is rendered from local commit data only (spec § 6.7).
+  There is no sign-in, no OAuth, no fork surface and no avatar: author identity is rendered from local commit data only (spec § 6.7).
 
 - [ ] **Step 16.12: Add the store fields and their test.**
 
-	Add only `imageDiffMode: "two-up" | "swipe" | "onion" | "difference"` and `providerPaneOpen: boolean` to `apps/web/src/gitManagerStore.ts`, inside the existing per-project view-state record keyed by `(environmentId, projectId)`, plus their setters alongside PHASE-03's existing action set, and add both to the sanitiser. Persisted key stays `bibcode:git-manager-state:v1`. PHASE-03's note requires a new field to be requested through `tasks.md` before it is added, and **PHASE-15 shares this round and also edits this file** — coordinate both before editing. Extend PHASE-03's existing store test.
+  Add only `imageDiffMode: "two-up" | "swipe" | "onion" | "difference"` and `providerPaneOpen: boolean` to `apps/web/src/gitManagerStore.ts`, inside the existing per-project view-state record keyed by `(environmentId, projectId)`, plus their setters alongside PHASE-03's existing action set, and add both to the sanitiser. Persisted key stays `bibcode:git-manager-state:v1`. PHASE-03's note requires a new field to be requested through `tasks.md` before it is added, and **PHASE-15 shares this round and also edits this file** — coordinate both before editing. Extend PHASE-03's existing store test.
 
 - [ ] **Step 16.13: Full build + test gate.**
 
-	```bash
-	vp test run apps/web/src/components/gitManager/tags apps/web/src/components/gitManager/diff apps/web/src/components/gitManager/provider apps/web/src/gitManagerStore.test.ts
-	vp run typecheck
-	vp check
-	vp run check:contracts
-	```
+  ```bash
+  vp test run apps/web/src/components/gitManager/tags apps/web/src/components/gitManager/diff apps/web/src/components/gitManager/provider apps/web/src/gitManagerStore.test.ts
+  vp run typecheck
+  vp check
+  vp run check:contracts
+  ```
 
-	Expected: zero warnings, zero errors, all tests green. Run `vp run check:contracts` whether or not Step 16.2 changed a contract — it also re-verifies deterministic fixture export.
+  Expected: zero warnings, zero errors, all tests green. Run `vp run check:contracts` whether or not Step 16.2 changed a contract — it also re-verifies deterministic fixture export.
 
 - [ ] **Step 16.14: Exercise the surfaces in the running app.**
 
-	`vp run dev`, and verify against **both** a local project and a remote-hosted project (attach one per `docs/user/remote-access.md`): creating, deleting and pushing a tag works and the tag appears in the refs snapshot; an image file changed in a commit renders in all four modes; the pull-request pane loads only when Refresh is pressed. With the panel open and idle for several minutes, confirm from the server log that no provider process was spawned.
+  `vp run dev`, and verify against **both** a local project and a remote-hosted project (attach one per `docs/user/remote-access.md`): creating, deleting and pushing a tag works and the tag appears in the refs snapshot; an image file changed in a commit renders in all four modes; the pull-request pane loads only when Refresh is pressed. With the panel open and idle for several minutes, confirm from the server log that no provider process was spawned.
 
 - [ ] **Step 16.15: TDD proof.** Make `validateTagName` always return valid and the checks reader return an empty list unconditionally. Re-run the Step 16.8 and Step 16.13 filters and confirm the affected tests DO fail. Restore the real implementations.
 

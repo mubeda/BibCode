@@ -13,26 +13,26 @@
 
 ## Phase status
 
-| # | Phase | Round | Owner agent | Status | Agent | Started | Finished |
-|---|---|---|---|---|---|---|---|
-| 00 | Wire contracts for the whole feature | 0 | general-purpose | pending | — | — | — |
-| 01 | Server read modules and read RPCs | 1 | general-purpose | pending | — | — | — |
-| 02 | Pure guards module | 1 | general-purpose | pending | — | — | — |
-| 03 | Web panel shell: route, button, store | 1 | general-purpose | pending | — | — | — |
-| 04 | Server staging and commit operations | 2 | general-purpose | pending | — | — | — |
-| 05 | Web changes view | 2 | general-purpose | pending | — | — | — |
-| 06 | Web history view and diffs | 2 | general-purpose | pending | — | — | — |
-| 07 | Server branch and sync operations | 3 | general-purpose | pending | — | — | — |
-| 08 | Web staging and commit UI | 3 | general-purpose | pending | — | — | — |
-| 09 | Server stash, merge, live signal | 4 | general-purpose | pending | — | — | — |
-| 10 | Web toolbar, branch dropdown, sync UI | 4 | general-purpose | pending | — | — | — |
-| 11 | Server hunk and line staging | 5 | general-purpose | pending | — | — | — |
-| 12 | Web stash and merge UI | 5 | general-purpose | pending | — | — | — |
-| 13 | Server history-rewriting operations | 6 | general-purpose | pending | — | — | — |
-| 14 | Web partial staging gutter | 6 | general-purpose | pending | — | — | — |
-| 15 | Web history rewriting and conflict UI | 7 | general-purpose | pending | — | — | — |
-| 16 | Tags, image diffs, provider surfaces | 7 | general-purpose | pending | — | — | — |
-| 17 | Docs, telemetry test, full verification | 8 | general-purpose | pending | — | — | — |
+| #   | Phase                                   | Round | Owner agent     | Status      | Agent     | Started          | Finished |
+| --- | --------------------------------------- | ----- | --------------- | ----------- | --------- | ---------------- | -------- |
+| 00  | Wire contracts for the whole feature    | 0     | general-purpose | pending     | —         | —                | —        |
+| 01  | Server read modules and read RPCs       | 1     | general-purpose | pending     | —         | —                | —        |
+| 02  | Pure guards module                      | 1     | general-purpose | pending     | —         | —                | —        |
+| 03  | Web panel shell: route, button, store   | 1     | general-purpose | pending     | —         | —                | —        |
+| 04  | Server staging and commit operations    | 2     | general-purpose | pending     | —         | —                | —        |
+| 05  | Web changes view                        | 2     | general-purpose | pending     | —         | —                | —        |
+| 06  | Web history view and diffs              | 2     | general-purpose | pending     | —         | —                | —        |
+| 07  | Server branch and sync operations       | 3     | general-purpose | pending     | —         | —                | —        |
+| 08  | Web staging and commit UI               | 3     | general-purpose | pending     | —         | —                | —        |
+| 09  | Server stash, merge, live signal        | 4     | general-purpose | pending     | —         | —                | —        |
+| 10  | Web toolbar, branch dropdown, sync UI   | 4     | general-purpose | pending     | —         | —                | —        |
+| 11  | Server hunk and line staging            | 5     | general-purpose | pending     | —         | —                | —        |
+| 12  | Web stash and merge UI                  | 5     | general-purpose | pending     | —         | —                | —        |
+| 13  | Server history-rewriting operations     | 6     | general-purpose | pending     | —         | —                | —        |
+| 14  | Web partial staging gutter              | 6     | general-purpose | pending     | —         | —                | —        |
+| 15  | Web history rewriting and conflict UI   | 7     | general-purpose | pending     | —         | —                | —        |
+| 16  | Tags, image diffs, provider surfaces    | 7     | general-purpose | pending     | —         | —                | —        |
+| 17  | Docs, telemetry test, full verification | 8     | general-purpose | in_progress | phase-17a | 2026-09-01 08:53 | —        |
 
 **Status legend:** `pending` · `in_progress` · `blocked` · `completed` · `dropped`
 
@@ -101,15 +101,15 @@ is a pure module and touches no registry, so it is safe beside Phase 01.
 
 Round 1:
 
-| File | Phase 01 | Phase 02 | Phase 03 |
-|---|---|---|---|
-| `apps/server/src/git/manager/refs.rs`, `graph.rs` | Create | — | — |
-| `apps/server/src/git/manager/guards.rs` | — | Create | — |
-| `apps/server/src/git/manager/mod.rs` | Create | Modify | — |
-| `apps/server/src/production/git_manager_rpc.rs` | Create | — | — |
-| `apps/web/src/gitManagerStore.ts` | — | — | Create |
-| `apps/web/src/components/Sidebar.tsx` | — | — | Modify |
-| `apps/web/src/routes/` (new project route) | — | — | Create |
+| File                                              | Phase 01 | Phase 02 | Phase 03 |
+| ------------------------------------------------- | -------- | -------- | -------- |
+| `apps/server/src/git/manager/refs.rs`, `graph.rs` | Create   | —        | —        |
+| `apps/server/src/git/manager/guards.rs`           | —        | Create   | —        |
+| `apps/server/src/git/manager/mod.rs`              | Create   | Modify   | —        |
+| `apps/server/src/production/git_manager_rpc.rs`   | Create   | —        | —        |
+| `apps/web/src/gitManagerStore.ts`                 | —        | —        | Create   |
+| `apps/web/src/components/Sidebar.tsx`             | —        | —        | Modify   |
+| `apps/web/src/routes/` (new project route)        | —        | —        | Create   |
 
 **Coordination rule for `apps/server/src/git/manager/mod.rs`:** Phase 01 creates
 it and declares `pub mod refs; pub mod graph;`. Phase 02 adds only the single
@@ -120,12 +120,12 @@ instead — whichever arrives second appends.
 
 Round 2:
 
-| File | Phase 04 | Phase 05 | Phase 06 |
-|---|---|---|---|
-| `apps/server/src/git/manager/operations.rs` | Create | — | — |
-| `apps/web/src/components/gitManager/changes/**` | — | Create | — |
-| `apps/web/src/components/gitManager/history/**` | — | — | Create |
-| `apps/web/src/gitManagerStore.ts` | — | Modify | Modify |
+| File                                            | Phase 04 | Phase 05 | Phase 06 |
+| ----------------------------------------------- | -------- | -------- | -------- |
+| `apps/server/src/git/manager/operations.rs`     | Create   | —        | —        |
+| `apps/web/src/components/gitManager/changes/**` | —        | Create   | —        |
+| `apps/web/src/components/gitManager/history/**` | —        | —        | Create   |
+| `apps/web/src/gitManagerStore.ts`               | —        | Modify   | Modify   |
 
 **Coordination rule for `gitManagerStore.ts` in Round 2:** Phases 05 and 06 both
 add a slice to the store created in Phase 03. Each adds only its own keys and
@@ -183,58 +183,77 @@ Append one-line entries under your Detailed Progress section as you land meaning
 ## Detailed Progress
 
 ### Phase 00 — Wire contracts for the whole feature
+
 - _(updates appended by phase-00 teammate)_
 
 ### Phase 01 — Server read modules and read RPCs
+
 - _(updates appended by phase-01 teammate)_
 
 ### Phase 02 — Pure guards module
+
 - _(updates appended by phase-02 teammate)_
 
 ### Phase 03 — Web panel shell: route, button, store
+
 - _(updates appended by phase-03 teammate)_
 
 ### Phase 04 — Server staging and commit operations
+
 - _(updates appended by phase-04 teammate)_
 
 ### Phase 05 — Web changes view
+
 - _(updates appended by phase-05 teammate)_
 
 ### Phase 06 — Web history view and diffs
+
 - _(updates appended by phase-06 teammate)_
 
 ### Phase 07 — Server branch and sync operations
+
 - _(updates appended by phase-07 teammate)_
 
 ### Phase 08 — Web staging and commit UI
+
 - _(updates appended by phase-08 teammate)_
 
 ### Phase 09 — Server stash, merge, live signal
+
 - _(updates appended by phase-09 teammate)_
 
 ### Phase 10 — Web toolbar, branch dropdown, sync UI
+
 - _(updates appended by phase-10 teammate)_
 
 ### Phase 11 — Server hunk and line staging
+
 - _(updates appended by phase-11 teammate)_
 
 ### Phase 12 — Web stash and merge UI
+
 - _(updates appended by phase-12 teammate)_
 
 ### Phase 13 — Server history-rewriting operations
+
 - _(updates appended by phase-13 teammate)_
 
 ### Phase 14 — Web partial staging gutter
+
 - _(updates appended by phase-14 teammate)_
 
 ### Phase 15 — Web history rewriting and conflict UI
+
 - _(updates appended by phase-15 teammate)_
 
 ### Phase 16 — Tags, image diffs, provider surfaces
+
 - _(updates appended by phase-16 teammate)_
 
 ### Phase 17 — Docs, telemetry test, full verification
-- _(updates appended by phase-17 teammate)_
+
+- 2026-09-01 08:53 — phase-17a picked up living-document alignment and the Markdown format gate; telemetry tests are owned by the concurrent phase-17 agent.
+- 2026-09-01 09:06 — phase-17a completed Steps 17.1–17.6: aligned the owned architecture, user, integration, and shared testing docs to source; corrected the historical supersession note; and recorded shipped deviations (no Git Manager keybinding commands, six fine-grained flags not consumed by React, and unmounted rewrite/conflict/tag-delete/tag-push UI). Platform runbooks and the remaining reviewed-only living docs remain accurate. The Phase 17 row stays in progress for the concurrent telemetry and final verification work.
 
 ---
 
@@ -275,7 +294,7 @@ Coordinator-only section. Round summaries, cross-phase decisions, file-conflict 
   numbers, and bumps them together.
 - **`apps/server/src/maintenance.rs` needs no edit.** Maintenance mutability is
   derived from the `mutability` field on `ACTIVE_RPC_METHODS`, so declaring a
-  method with `read_unary`/`read_stream` *is* its maintenance classification.
+  method with `read_unary`/`read_stream` _is_ its maintenance classification.
   There is no separate allowlist.
 - **`validate_complete` forces stubs in Phase 00.** The RPC registry validates
   that every `ACTIVE_RPC_METHODS` entry has a registered handler, and
@@ -307,7 +326,7 @@ Coordinator-only section. Round summaries, cross-phase decisions, file-conflict 
   deferred and needs a supervised-process change; raise it as a scope decision
   before attempting it inside a phase.
 - **`operation-in-flight` needs a marker, not a second lock.** The catalog lock
-  (`with_project_mutation_lock_cancellation`) *blocks* rather than failing fast,
+  (`with_project_mutation_lock_cancellation`) _blocks_ rather than failing fast,
   so a fast rejection needs an in-flight marker keyed by the canonical common
   directory alongside — not instead of — the existing lock. Serialisation still
   uses the one existing lock. This also means `GitManagerOperationRequest` must

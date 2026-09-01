@@ -12,39 +12,48 @@ This file is the **round-by-round orchestrator prompt** for the multi-agent exec
 ## Rounds in this plan
 
 ### Round 0 (sequential — 1 teammate)
+
 - `phases/PHASE-00-contracts.md` — Wire contracts for the whole feature — owner: `general-purpose`
 
 ### Round 1 (parallel — 3 teammates)
+
 - `phases/PHASE-01-server-read-rpcs.md` — Server read modules and read RPCs — owner: `general-purpose`
 - `phases/PHASE-02-guards-module.md` — Pure guards module — owner: `general-purpose`
 - `phases/PHASE-03-web-panel-shell.md` — Web panel shell: route, button, store — owner: `general-purpose`
 
 ### Round 2 (parallel — 3 teammates)
+
 - `phases/PHASE-04-server-commit-operations.md` — Server staging and commit operations — owner: `general-purpose`
 - `phases/PHASE-05-web-changes-view.md` — Web changes view — owner: `general-purpose`
 - `phases/PHASE-06-web-history-view.md` — Web history view and diffs — owner: `general-purpose`
 
 ### Round 3 (parallel — 2 teammates)
+
 - `phases/PHASE-07-server-branch-sync-operations.md` — Server branch and sync operations — owner: `general-purpose`
 - `phases/PHASE-08-web-staging-commit-ui.md` — Web staging and commit UI — owner: `general-purpose`
 
 ### Round 4 (parallel — 2 teammates)
+
 - `phases/PHASE-09-server-stash-merge-live-signal.md` — Server stash, merge, live signal — owner: `general-purpose`
 - `phases/PHASE-10-web-toolbar-branch-sync.md` — Web toolbar, branch dropdown, sync UI — owner: `general-purpose`
 
 ### Round 5 (parallel — 2 teammates)
+
 - `phases/PHASE-11-server-hunk-staging.md` — Server hunk and line staging — owner: `general-purpose`
 - `phases/PHASE-12-web-stash-merge-ui.md` — Web stash and merge UI — owner: `general-purpose`
 
 ### Round 6 (parallel — 2 teammates)
+
 - `phases/PHASE-13-server-history-rewriting.md` — Server history-rewriting operations — owner: `general-purpose`
 - `phases/PHASE-14-web-partial-staging.md` — Web partial staging gutter — owner: `general-purpose`
 
 ### Round 7 (parallel — 2 teammates)
+
 - `phases/PHASE-15-web-rewriting-conflicts-ui.md` — Web history rewriting and conflict UI — owner: `general-purpose`
 - `phases/PHASE-16-tags-images-provider.md` — Tags, image diffs, provider surfaces — owner: `general-purpose`
 
 ### Round 8 (sequential — 1 teammate)
+
 - `phases/PHASE-17-docs-telemetry-verification.md` — Docs, telemetry test, full verification — owner: `general-purpose`
 
 ---

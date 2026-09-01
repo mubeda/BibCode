@@ -12,6 +12,7 @@ machine running the BiBCode server.
 | Look up a repository by provider/name | Yes, `gh`        | Yes, `glab`      | No               | No               |
 | Publish a local repository natively   | **Yes, `gh`**    | No               | No               | No               |
 | Resolve the current PR/MR             | Yes              | Yes              | Yes              | Yes              |
+| Read checks in Git Manager            | Yes, `gh`        | No               | No               | No               |
 | Create a PR/MR                        | Yes              | Yes              | Yes              | Yes              |
 | Open or prepare a PR branch locally   | Yes              | Yes              | Yes              | Yes              |
 
@@ -66,6 +67,17 @@ same-provider PR completed in the previous producer cycle may appear for one
 cycle with its original observation time and `stale` state. It expires in the
 following cycle unless the provider refreshes it; fresh local base fields are
 not replaced by the prior whole summary.
+
+The project-scoped Git Manager has a narrower on-demand provider pane. Its
+current pull-request read supports GitHub, GitLab, and Azure DevOps; Bitbucket
+returns unavailable on this surface even though the existing Source Control
+integration can resolve and create Bitbucket pull requests elsewhere. Check
+reads use `gh pr checks` and are available only for GitHub in this pass.
+
+Git Manager pull-request and check data refresh only on explicit user action,
+never on a timer. Opening the pane or leaving it idle issues no provider call;
+choosing **Refresh** invokes the environment-scoped RPC, whose server handler
+runs the configured provider CLI when that provider is supported.
 
 ## Source Control panel
 

@@ -17,19 +17,19 @@ recommendation below is to pre-compute occupancy instead of parsing stderr.
 
 ### A.1 Operations git refuses when the branch is checked out elsewhere
 
-| Operation | Result | Exit code |
-| --- | --- | --- |
-| `git checkout <branch>` | **refused** | 128 |
-| `git switch <branch>` | **refused** | 128 |
-| `git checkout -B <branch> <ref>` (force-reset + checkout) | **refused** | 128 |
-| `git branch -d <branch>` / `git branch -D <branch>` | **refused** | 1 |
-| `git branch -f <branch> <ref>` (force-move the ref) | **refused** | 128 |
-| `git rebase <upstream> <branch>` (implicit checkout) | **refused** | 128 |
-| `git worktree add <path> <branch>` (second worktree for the same branch) | **refused** | 128 |
-| `git fetch <remote> <src>:<branch>` (ref update into occupied branch) | **refused** | 128 |
-| `git branch -m <branch> <new>` (rename) | **allowed** — the other worktree's HEAD is updated to the new name | 0 |
-| `git merge <branch>` (merging the occupied branch *into* the current one) | **allowed** — only the current branch moves | 0 |
-| `git update-ref refs/heads/<branch> <ref>` (plumbing) | **allowed, silently** — leaves the other worktree's index/working tree out of sync with its new HEAD | 0 |
+| Operation                                                                 | Result                                                                                               | Exit code |
+| ------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- | --------- |
+| `git checkout <branch>`                                                   | **refused**                                                                                          | 128       |
+| `git switch <branch>`                                                     | **refused**                                                                                          | 128       |
+| `git checkout -B <branch> <ref>` (force-reset + checkout)                 | **refused**                                                                                          | 128       |
+| `git branch -d <branch>` / `git branch -D <branch>`                       | **refused**                                                                                          | 1         |
+| `git branch -f <branch> <ref>` (force-move the ref)                       | **refused**                                                                                          | 128       |
+| `git rebase <upstream> <branch>` (implicit checkout)                      | **refused**                                                                                          | 128       |
+| `git worktree add <path> <branch>` (second worktree for the same branch)  | **refused**                                                                                          | 128       |
+| `git fetch <remote> <src>:<branch>` (ref update into occupied branch)     | **refused**                                                                                          | 128       |
+| `git branch -m <branch> <new>` (rename)                                   | **allowed** — the other worktree's HEAD is updated to the new name                                   | 0         |
+| `git merge <branch>` (merging the occupied branch _into_ the current one) | **allowed** — only the current branch moves                                                          | 0         |
+| `git update-ref refs/heads/<branch> <ref>` (plumbing)                     | **allowed, silently** — leaves the other worktree's index/working tree out of sync with its new HEAD | 0         |
 
 Verbatim stderr captured (paths abbreviated to `.../wt-feature`):
 
@@ -61,10 +61,10 @@ Verbatim stderr captured (paths abbreviated to `.../wt-feature`):
 Notes:
 
 - "Merge into an occupied branch" is not a distinct git operation — `merge`
-  only ever writes the *current* branch. The real vectors for moving an
+  only ever writes the _current_ branch. The real vectors for moving an
   occupied branch from outside its worktree are `branch -f`, `fetch <src>:<dst>`,
   and `push` into a non-bare checkout; the first two are refused as shown
-  above. A rebase *of* the occupied branch is refused because rebase implicitly
+  above. A rebase _of_ the occupied branch is refused because rebase implicitly
   checks it out.
 - **Rename is NOT protected.** `git branch -m feature feature2` succeeded and
   the linked worktree's `HEAD` followed
@@ -102,7 +102,7 @@ error: cannot delete branch 'feature' used by worktree at '.../wt-feature'
 `git worktree prune` does `git branch -D feature` succeed
 (`Deleted branch feature (was 8f7bfa1).`). A guard message for this case
 should therefore say "prune the stale worktree registration first", and the
-pre-computed occupancy check must count *registered* worktrees, including ones
+pre-computed occupancy check must count _registered_ worktrees, including ones
 whose directory is missing.
 
 ### A.4 Cheaply detecting occupancy
@@ -145,7 +145,7 @@ as belonging to one worktree.
 
 Framing: this checkout tracks `desktop/desktop@development` (clean tree), so
 the worktree feature is **unreleased upstream work**, not a fork-local patch.
-"Stock" below means *released* GitHub Desktop, i.e. the code before the
+"Stock" below means _released_ GitHub Desktop, i.e. the code before the
 worktree commits.
 
 ### B.1 Feature flag
@@ -187,9 +187,9 @@ the Add Worktree dialog pre-filled with
 ```ts
 // If the branch is checked out in another worktree, switch to that worktree
 // instead of checking out the branch in the current worktree.
-const wt = repositoryState.worktrees.find(wt => wt.branch === branch.ref)
+const wt = repositoryState.worktrees.find((wt) => wt.branch === branch.ref);
 if (wt) {
-  return this._switchWorktree(repository, wt)
+  return this._switchWorktree(repository, wt);
 }
 ```
 
@@ -235,7 +235,7 @@ appears nowhere in the repo.
 - Adding a path that turns out to be a linked worktree of a known repository
   switches to it instead of adding a duplicate repo
   (`app/src/ui/dispatcher/dispatcher.ts:2082-2094`).
-- Deleting the *current* worktree first switches back to the main worktree;
+- Deleting the _current_ worktree first switches back to the main worktree;
   failures get a dedicated `DeleteWorktreeFailed` popup
   (app-store.ts:6105-6167).
 
@@ -253,10 +253,10 @@ of the raw error in the race case.
 ## C. BibCode today (/work/workspaces/orca/BibCode/develop-2)
 
 **Precise answer to "block, warn, or raw error?": all three, in layers.**
-(a) The branch toolbar *avoids* the occupied case by design — selecting an
+(a) The branch toolbar _avoids_ the occupied case by design — selecting an
 occupied branch retargets the thread to that branch's existing worktree instead
-of running `git switch`. (b) The Create Worktree dialog *pre-computes and
-warns*, auto-suffixing a new branch name. (c) The server itself has **no
+of running `git switch`. (b) The Create Worktree dialog _pre-computes and
+warns_, auto-suffixing a new branch name. (c) The server itself has **no
 guard**: `switch_ref` is a bare `git switch`, and if it ever runs against an
 occupied branch the redacted raw git stderr is surfaced verbatim in an error
 toast. No classification of the occupied-branch error exists anywhere in the
@@ -290,7 +290,7 @@ codebase.
 - `selectBranch`
   (`apps/web/src/components/BranchToolbarBranchSelector.tsx:379-441`): for
   `reuseExistingWorktree` it calls `setThreadBranch(name, nextWorktreePath,
-  worktreeKey)` and returns **without invoking `git switch` at all**
+worktreeKey)` and returns **without invoking `git switch` at all**
   (lines 395-403) — the thread's environment moves to the worktree that already
   holds the branch. Only free branches reach the `vcs.switchRef` RPC
   (lines 412-421).
@@ -306,7 +306,7 @@ codebase.
   the main checkout" and "held by a worktree" identically.
 - The dialog's messaging (`CreateWorktreeDialog.tsx:678-686`):
   `"<name>" is already checked out. A new branch ("<name>-2" or the next
-  available name) will be created from it.` — with
+available name) will be created from it.` — with
   `suggestNextAvailableBranchName` (logic.ts:86-92) picking the suffix.
 - The server enforces the same policy independently:
   `create_worktree` (repository.rs:1786-1958) checks `worktree_map` up front
@@ -343,6 +343,7 @@ codebase.
   ```
 
   So the fallback layer is: attempt, then surface the raw git error text.
+
 - The git-manager guard surface does not exist yet: there is no
   `apps/server/src/git/guards.rs` or `graph.rs`, and
   `packages/contracts/src/git.ts` has no `VcsGraphBlockedReason` — only the
@@ -359,18 +360,18 @@ system:
   taking parsed refs, the worktree inventory, the dirty flag, the default
   branch, and running-operation state, returning a blocked list per ref.
   Example message: `Checkout is blocked: this branch is already checked out in
-  the worktree at <path>.`
+the worktree at <path>.`
 - Contract shape (master-plan.md:198-229): `VcsGraphBlockedCode` =
   `worktree-checked-out | dirty-working-tree | operation-in-flight |
-  merge-in-progress | protected-branch | current-branch | no-upstream |
-  detached-head | no-remote`, carried as
+merge-in-progress | protected-branch | current-branch | no-upstream |
+detached-head | no-remote`, carried as
   `{ operation, code, message }` triples on every branch/remote-branch/tag,
   with `message` rendered verbatim as the tooltip. Note: the code list has
   **no case for rename-of-a-held-branch** — relevant given A.1's finding that
   git itself allows the rename.
 - Client rule (PHASE-05-ref-tree.md:103-119, 145): the web `refBlockedReason`
-  helper is a pure lookup over server-supplied reasons — *no Git policy
-  computed client-side*; disabled controls expose the server message via
+  helper is a pure lookup over server-supplied reasons — _no Git policy
+  computed client-side_; disabled controls expose the server message via
   tooltip and `aria-describedby`; unknown codes fail closed
   (PHASE-05-ref-tree.md:154).
 - Execution-time re-validation: guards are re-checked server-side when the
@@ -378,8 +379,8 @@ system:
   (master-plan.md:453). Mutations serialize through the worktree catalog's
   existing repository lock, with a second operation rejected as
   `operation-in-flight`, never queued (master-plan.md:108, 452).
-- Failure classification for push/pull was planned as *exit status plus stderr
-  matching* for `authentication` / `non-fast-forward` only
+- Failure classification for push/pull was planned as _exit status plus stderr
+  matching_ for `authentication` / `non-fast-forward` only
   (master-plan.md:465) — worktree occupancy was always meant to be
   pre-computed, not stderr-matched.
 
@@ -402,19 +403,19 @@ the worktree catalog (C.1) — optionally cheapened to one
 Do **not** classify by stderr matching: the strings above are from git 2.55.0
 and have changed across versions.
 
-| Operation | Blocking condition | Class | Suggested user-facing message |
-| --- | --- | --- | --- |
-| Checkout / switch | branch has `worktreePath` ≠ this checkout | git-enforced | `Checkout is blocked: this branch is already checked out in the worktree at <path>.` Offer "Switch to that worktree" instead (the toolbar already does this, C.2). |
-| Checkout / switch | branch is the current branch here | app-policy (git no-ops) | Disable with `Already checked out.` |
-| Delete branch | branch has `worktreePath` (including a registered worktree whose directory is missing) | git-enforced | `Delete is blocked: this branch is checked out in the worktree at <path>.` For a prunable registration (catalog `directory_state` says the directory is gone): `…in a worktree registration whose directory is missing — remove/prune the worktree first.` |
-| Delete branch | branch is current / default | app-policy for default; git-enforced for current | `Delete is blocked: this is the current branch.` / `…the default branch.` |
-| Rename branch | branch has `worktreePath` owned by an **agent thread** | **app-policy** (git allows it and retargets the worktree's HEAD) | `Rename is blocked: an agent worktree at <path> has this branch checked out.` If allowed instead, the catalog/thread branch fields must be updated in the same operation. |
-| Force-move (`branch -f`), reset a branch to a commit | branch has `worktreePath` | git-enforced | `Cannot move this branch: it is checked out in the worktree at <path>.` |
-| Rebase a branch (from outside its worktree) | branch has `worktreePath` | git-enforced | Same message as checkout; offer to run inside the owning worktree. |
-| Pull / fetch with explicit `<src>:<dst>` into a local branch | destination branch has `worktreePath` ≠ cwd | git-enforced | `Cannot update <branch>: it is checked out in the worktree at <path>.` |
-| Create worktree from occupied branch | branch has `worktreePath` or is current | app-policy (git would refuse the plain add) | Keep the existing behavior: warn and auto-suffix (`"<name>" is already checked out. A new branch ("<name>-2" …) will be created from it.` — C.3). |
-| Any mutation | another git-manager operation holds the repository lock | app-policy | `Blocked: <operation> is already running.` (`operation-in-flight`, per the plan's lock design.) |
-| Checkout / merge / rebase | dirty working tree in the target checkout | git-enforced (checkout may also succeed and carry changes) | `Blocked: the working tree has uncommitted changes.` |
+| Operation                                                    | Blocking condition                                                                     | Class                                                            | Suggested user-facing message                                                                                                                                                                                                                              |
+| ------------------------------------------------------------ | -------------------------------------------------------------------------------------- | ---------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Checkout / switch                                            | branch has `worktreePath` ≠ this checkout                                              | git-enforced                                                     | `Checkout is blocked: this branch is already checked out in the worktree at <path>.` Offer "Switch to that worktree" instead (the toolbar already does this, C.2).                                                                                         |
+| Checkout / switch                                            | branch is the current branch here                                                      | app-policy (git no-ops)                                          | Disable with `Already checked out.`                                                                                                                                                                                                                        |
+| Delete branch                                                | branch has `worktreePath` (including a registered worktree whose directory is missing) | git-enforced                                                     | `Delete is blocked: this branch is checked out in the worktree at <path>.` For a prunable registration (catalog `directory_state` says the directory is gone): `…in a worktree registration whose directory is missing — remove/prune the worktree first.` |
+| Delete branch                                                | branch is current / default                                                            | app-policy for default; git-enforced for current                 | `Delete is blocked: this is the current branch.` / `…the default branch.`                                                                                                                                                                                  |
+| Rename branch                                                | branch has `worktreePath` owned by an **agent thread**                                 | **app-policy** (git allows it and retargets the worktree's HEAD) | `Rename is blocked: an agent worktree at <path> has this branch checked out.` If allowed instead, the catalog/thread branch fields must be updated in the same operation.                                                                                  |
+| Force-move (`branch -f`), reset a branch to a commit         | branch has `worktreePath`                                                              | git-enforced                                                     | `Cannot move this branch: it is checked out in the worktree at <path>.`                                                                                                                                                                                    |
+| Rebase a branch (from outside its worktree)                  | branch has `worktreePath`                                                              | git-enforced                                                     | Same message as checkout; offer to run inside the owning worktree.                                                                                                                                                                                         |
+| Pull / fetch with explicit `<src>:<dst>` into a local branch | destination branch has `worktreePath` ≠ cwd                                            | git-enforced                                                     | `Cannot update <branch>: it is checked out in the worktree at <path>.`                                                                                                                                                                                     |
+| Create worktree from occupied branch                         | branch has `worktreePath` or is current                                                | app-policy (git would refuse the plain add)                      | Keep the existing behavior: warn and auto-suffix (`"<name>" is already checked out. A new branch ("<name>-2" …) will be created from it.` — C.3).                                                                                                          |
+| Any mutation                                                 | another git-manager operation holds the repository lock                                | app-policy                                                       | `Blocked: <operation> is already running.` (`operation-in-flight`, per the plan's lock design.)                                                                                                                                                            |
+| Checkout / merge / rebase                                    | dirty working tree in the target checkout                                              | git-enforced (checkout may also succeed and carry changes)       | `Blocked: the working tree has uncommitted changes.`                                                                                                                                                                                                       |
 
 Cross-cutting requirements, all consistent with the historical plan and with
 what exists today:
@@ -435,7 +436,7 @@ what exists today:
    as the primary affordance; the Git Manager's checkout guard should offer
    the same action, not just a disabled control. GitHub Desktop also tried the
    stderr-regex route (`/fatal: '.*?' is already used by worktree at
-   '(.+?)'/`) and deleted it in favor of the pre-computed check — independent
+'(.+?)'/`) and deleted it in favor of the pre-computed check — independent
    confirmation of recommendation "pre-compute, don't parse".
 6. **Protect held branches from automated cleanup** — GitHub Desktop's branch
    pruner explicitly excludes branches checked out in linked worktrees

@@ -228,4 +228,3 @@ Before shipping UI, verify:
 
 When implementing UI, do not merely satisfy the functional requirement. Choose the design that makes the user feel in control, minimizes surprise, minimizes reading, minimizes precision work, minimizes memory burden, and best matches the conventions users already know.
 ```
-

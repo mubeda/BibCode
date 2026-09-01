@@ -54,8 +54,8 @@ Invoke these skills via the `Skill` tool BEFORE doing any work. Order matters: a
 
 **Matched for this phase:**
 
-5. `Skill(skill="web-design-guidelines")` — *destructive confirmations, labels and focus order for discard and undo*
-6. `Skill(skill="codebase-design")` — *one draft source of truth shared by two panels without duplicating policy*
+5. `Skill(skill="web-design-guidelines")` — _destructive confirmations, labels and focus order for discard and undo_
+6. `Skill(skill="codebase-design")` — _one draft source of truth shared by two panels without duplicating policy_
 
 ## Documents to Read
 
@@ -77,45 +77,45 @@ Invoke these skills via the `Skill` tool BEFORE doing any work. Order matters: a
 
 - [ ] **Step 08.1: Locate the surface area being changed.**
 
-	```bash
-	sed -n '1,70p' apps/web/src/sourceControlPanelStore.ts
-	rg -n "useSourceControlPanelStore|selectThreadSourceControlDraft" apps/web/src
-	rg -n "SourceControlActionScope|useVcsStageAction|useGitStackedAction" apps/web/src/state/sourceControlActions.ts
-	rg --files apps/web/src/components/gitManager
-	rg -n "commit|undoCommit|discard" apps/web/src/gitManagerStore.ts
-	```
+  ```bash
+  sed -n '1,70p' apps/web/src/sourceControlPanelStore.ts
+  rg -n "useSourceControlPanelStore|selectThreadSourceControlDraft" apps/web/src
+  rg -n "SourceControlActionScope|useVcsStageAction|useGitStackedAction" apps/web/src/state/sourceControlActions.ts
+  rg --files apps/web/src/components/gitManager
+  rg -n "commit|undoCommit|discard" apps/web/src/gitManagerStore.ts
+  ```
 
-	Two preconditions, each a stop-and-record item in `tasks.md` if it fails:
-	1. The landed `apps/web/src/gitManagerStore.ts` (PHASE-03) must hold **view state only**. If PHASE-03 also cached a commit-message draft in its LRU-2, that duplicate must be removed here — the draft has exactly one home, and two independent drafts for one checkout is the defect spec decision 12 forbids. Coordinate the removal through `tasks.md` before editing PHASE-03's store.
-	2. The commit / undo-commit / discard method names in the landed `packages/contracts/src/gitManager.ts` are authoritative; the names used below are the expected ones.
+  Two preconditions, each a stop-and-record item in `tasks.md` if it fails:
+  1.  The landed `apps/web/src/gitManagerStore.ts` (PHASE-03) must hold **view state only**. If PHASE-03 also cached a commit-message draft in its LRU-2, that duplicate must be removed here — the draft has exactly one home, and two independent drafts for one checkout is the defect spec decision 12 forbids. Coordinate the removal through `tasks.md` before editing PHASE-03's store.
+  2.  The commit / undo-commit / discard method names in the landed `packages/contracts/src/gitManager.ts` are authoritative; the names used below are the expected ones.
 
 - [ ] **Step 08.2: Author the first failing test.**
 
-	Path: `apps/web/src/sourceControlDraft.test.ts`
+  Path: `apps/web/src/sourceControlDraft.test.ts`
 
-	```ts
-	import { describe, expect, it } from "vitest";
-	import { sourceControlDraftKey } from "./sourceControlDraft";
+  ```ts
+  import { describe, expect, it } from "vitest";
+  import { sourceControlDraftKey } from "./sourceControlDraft";
 
-	describe("sourceControlDraftKey", () => {
-	  it("keys a draft by environment and cwd, so ids cannot collide across environments", () => {
-	    const a = sourceControlDraftKey({ environmentId: "env-a", cwd: "/repo" });
-	    const b = sourceControlDraftKey({ environmentId: "env-b", cwd: "/repo" });
-	    expect(a).not.toEqual(b);
-	    expect(sourceControlDraftKey({ environmentId: "env-a", cwd: "/repo/" })).toEqual(a);
-	  });
-	});
-	```
+  describe("sourceControlDraftKey", () => {
+    it("keys a draft by environment and cwd, so ids cannot collide across environments", () => {
+      const a = sourceControlDraftKey({ environmentId: "env-a", cwd: "/repo" });
+      const b = sourceControlDraftKey({ environmentId: "env-b", cwd: "/repo" });
+      expect(a).not.toEqual(b);
+      expect(sourceControlDraftKey({ environmentId: "env-a", cwd: "/repo/" })).toEqual(a);
+    });
+  });
+  ```
 
 - [ ] **Step 08.3: Run the new test; expect FAIL** (the module does not exist yet).
 
-	```bash
-	vp test apps/web/src/sourceControlDraft.test.ts
-	```
+  ```bash
+  vp test apps/web/src/sourceControlDraft.test.ts
+  ```
 
 - [ ] **Step 08.4: Implement the minimum to make Step 08.2 pass.**
 
-	Path: `apps/web/src/sourceControlDraft.ts`. Export `sourceControlDraftKey({ environmentId, cwd })` returning `` `${environmentId}::${normalizedCwd}` `` with a single trailing-separator normalisation. A bare `cwd` or bare `projectId` key is a review rejection — ids collide across environments.
+  Path: `apps/web/src/sourceControlDraft.ts`. Export `sourceControlDraftKey({ environmentId, cwd })` returning `` `${environmentId}::${normalizedCwd}` `` with a single trailing-separator normalisation. A bare `cwd` or bare `projectId` key is a review rejection — ids collide across environments.
 
 - [ ] **Step 08.5: Run the test; expect PASS.**
 
@@ -125,40 +125,40 @@ Invoke these skills via the `Skill` tool BEFORE doing any work. Order matters: a
 
 - [ ] **Step 08.8: Build the commit-box logic, test first.**
 
-	Path: `apps/web/src/components/gitManager/changes/commitBox.logic.ts`. Pure functions only:
-	- `isCommitEnabled({ summary, includedCount, allowEmpty, isAmending, isBusy })` — a commit needs a non-empty summary unless exactly one file is included (then the single-file placeholder summary applies) or `allowEmpty` is set;
-	- `buildPlaceholderSummary(paths)` → `Update <basename>` for a single path;
-	- `formatCoAuthorTrailers(coAuthors)` → one `Co-Authored-By: Name <email>` line per entry, de-duplicated case-insensitively by email;
-	- `buildCommitMessage({ summary, description, coAuthors })` — summary, blank line, description, blank line, trailers;
-	- `isSummaryOverIdealLength(summary)` at 50 characters (research § 1.1, `IdealSummaryLength = 50`).
+  Path: `apps/web/src/components/gitManager/changes/commitBox.logic.ts`. Pure functions only:
+  - `isCommitEnabled({ summary, includedCount, allowEmpty, isAmending, isBusy })` — a commit needs a non-empty summary unless exactly one file is included (then the single-file placeholder summary applies) or `allowEmpty` is set;
+  - `buildPlaceholderSummary(paths)` → `Update <basename>` for a single path;
+  - `formatCoAuthorTrailers(coAuthors)` → one `Co-Authored-By: Name <email>` line per entry, de-duplicated case-insensitively by email;
+  - `buildCommitMessage({ summary, description, coAuthors })` — summary, blank line, description, blank line, trailers;
+  - `isSummaryOverIdealLength(summary)` at 50 characters (research § 1.1, `IdealSummaryLength = 50`).
 
-	One failing test per function before its implementation.
+  One failing test per function before its implementation.
 
 - [ ] **Step 08.9: Build the commit box component.**
 
-	Path: `apps/web/src/components/gitManager/changes/GitManagerCommitBox.tsx`. Summary input, description textarea, a co-author input, an options popover carrying **Bypass commit hooks** (`--no-verify`), **Signed-off-by** (`--signoff`) and **Allow empty** (`--allow-empty`), and an amend mode with a visible "Stop amending" affordance that suppresses the undo strip. The commit button label is `Commit N files to <branch>`; Cmd/Ctrl+Enter commits. It runs the commit action from `apps/web/src/state/gitManager.ts` on the existing per-`(environmentId, cwd)` lane. Tests: disabled without a summary; enabled with the single-file placeholder; the over-50-character hint appears; the options flags reach the action payload; amend hides the undo strip.
+  Path: `apps/web/src/components/gitManager/changes/GitManagerCommitBox.tsx`. Summary input, description textarea, a co-author input, an options popover carrying **Bypass commit hooks** (`--no-verify`), **Signed-off-by** (`--signoff`) and **Allow empty** (`--allow-empty`), and an amend mode with a visible "Stop amending" affordance that suppresses the undo strip. The commit button label is `Commit N files to <branch>`; Cmd/Ctrl+Enter commits. It runs the commit action from `apps/web/src/state/gitManager.ts` on the existing per-`(environmentId, cwd)` lane. Tests: disabled without a summary; enabled with the single-file placeholder; the over-50-character hint appears; the options flags reach the action payload; amend hides the undo strip.
 
 - [ ] **Step 08.10: Build the undo-commit strip.**
 
-	Path: `apps/web/src/components/gitManager/changes/GitManagerUndoCommitStrip.tsx`. Shows `Committed <relative time>` with an Undo control for the most recent local commit; hidden while amending and while an operation is in flight; a dirty working tree or a merge commit routes through a confirmation stating exactly what will happen (spec § 6.5). Tests cover the hidden cases and the confirmation gate.
+  Path: `apps/web/src/components/gitManager/changes/GitManagerUndoCommitStrip.tsx`. Shows `Committed <relative time>` with an Undo control for the most recent local commit; hidden while amending and while an operation is in flight; a dirty working tree or a merge commit routes through a confirmation stating exactly what will happen (spec § 6.5). Tests cover the hidden cases and the confirmation gate.
 
 - [ ] **Step 08.11: Build the discard confirmations.**
 
-	Path: `apps/web/src/components/gitManager/changes/GitManagerDiscardDialog.tsx`. One dialog serving whole-file discard and discard-all, listing at most 10 paths and then `and N more` (research § 1.1, `MaxFilesToList = 10`). The dialog states whether the files go to the OS trash or are discarded permanently, using the outcome the **server** reports — the client derives no policy. Tests: the 10-path cap, the confirm/cancel paths, and that cancel issues no RPC.
+  Path: `apps/web/src/components/gitManager/changes/GitManagerDiscardDialog.tsx`. One dialog serving whole-file discard and discard-all, listing at most 10 paths and then `and N more` (research § 1.1, `MaxFilesToList = 10`). The dialog states whether the files go to the OS trash or are discarded permanently, using the outcome the **server** reports — the client derives no policy. Tests: the 10-path cap, the confirm/cancel paths, and that cancel issues no RPC.
 
 - [ ] **Step 08.12: Mount everything in the Changes view.** Wire the three components into the Changes view PHASE-05 landed. Do not re-implement inclusion state or the file list — extend what PHASE-05 owns.
 
 - [ ] **Step 08.13: Full build + test gate.**
 
-	```bash
-	vp test apps/web/src/components/gitManager/changes
-	vp test apps/web/src/sourceControlDraft.test.ts
-	vp test apps/web/src/components/SourceControlPanel.test.tsx
-	vp check
-	vp run typecheck
-	```
+  ```bash
+  vp test apps/web/src/components/gitManager/changes
+  vp test apps/web/src/sourceControlDraft.test.ts
+  vp test apps/web/src/components/SourceControlPanel.test.tsx
+  vp check
+  vp run typecheck
+  ```
 
-	Expected: zero warnings, zero errors, all tests green.
+  Expected: zero warnings, zero errors, all tests green.
 
 - [ ] **Step 08.14: Stack-specific verification.** Launch the app. Type a commit message in the Git Manager, open the per-thread Source Control panel for the same checkout, and confirm the same text is there — and the reverse. Commit, amend, undo, and discard a file. Repeat against a remote-hosted project (spec § 10 requires both).
 

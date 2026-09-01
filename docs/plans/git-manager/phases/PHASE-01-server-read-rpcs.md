@@ -69,84 +69,84 @@ If a file does not exist, report it back in the per-phase notes section of `task
 
 - [ ] **Step 01.1: Locate the surface area being changed.** Line numbers are indicative; re-verify.
 
-	```bash
-	rg -n 'pub async fn list_refs|async fn worktree_map|pub async fn list_commits|async fn default_ref' apps/server/src/git/repository.rs
-	rg -n 'fn git_read_environment|async fn run_read|async fn execute_read' apps/server/src/git/repository.rs
-	rg -n 'guard_git_path|handle_admitted_unary|await_git_rpc_operation' apps/server/src/production/git_vcs.rs
-	rg -n 'gitManager' apps/server/src/production/git_manager_rpc.rs
-	```
+  ```bash
+  rg -n 'pub async fn list_refs|async fn worktree_map|pub async fn list_commits|async fn default_ref' apps/server/src/git/repository.rs
+  rg -n 'fn git_read_environment|async fn run_read|async fn execute_read' apps/server/src/git/repository.rs
+  rg -n 'guard_git_path|handle_admitted_unary|await_git_rpc_operation' apps/server/src/production/git_vcs.rs
+  rg -n 'gitManager' apps/server/src/production/git_manager_rpc.rs
+  ```
 
-	Read `list_refs` (indicative repository.rs:1574-1660) and `worktree_map` (indicative :3376-3403) — they are the template. Note that `list_refs` currently uses `--format=%(refname:short)%09%(HEAD)%09%(committerdate:unix)` and gets occupancy from a **separate** `worktree list --porcelain` call. **Do not modify `list_refs`, `VcsRef` or `VcsCommit`** — existing callers depend on them.
+  Read `list_refs` (indicative repository.rs:1574-1660) and `worktree_map` (indicative :3376-3403) — they are the template. Note that `list_refs` currently uses `--format=%(refname:short)%09%(HEAD)%09%(committerdate:unix)` and gets occupancy from a **separate** `worktree list --porcelain` call. **Do not modify `list_refs`, `VcsRef` or `VcsCommit`** — existing callers depend on them.
 
 - [ ] **Step 01.2: Author the first failing test.** Path: `apps/server/src/git/manager/graph.rs` (inline `#[cfg(test)]`)
 
-	```rust
-	#[test]
-	fn parses_a_nul_delimited_log_record_into_a_commit_entry() {
-	    let record = "abc1234def\u{1f}abc1234\u{1f}Subject line\u{1f}Body\u{1f}\
-	Ann Author\u{1f}ann@example.test\u{1f}1735689600\u{1f}\
-	Cara Committer\u{1f}cara@example.test\u{1f}1735689660\u{1f}\
-	parent1 parent2\u{1f}HEAD -> main, origin/main";
-	    let entry = parse_commit_record(record).expect("record parses");
-	    assert_eq!(entry.short_sha, "abc1234");
-	    assert_eq!(entry.parents, vec!["parent1", "parent2"]);
-	    assert_eq!(entry.decorations, vec!["HEAD -> main", "origin/main"]);
-	}
-	```
+  ```rust
+  #[test]
+  fn parses_a_nul_delimited_log_record_into_a_commit_entry() {
+      let record = "abc1234def\u{1f}abc1234\u{1f}Subject line\u{1f}Body\u{1f}\
+  Ann Author\u{1f}ann@example.test\u{1f}1735689600\u{1f}\
+  Cara Committer\u{1f}cara@example.test\u{1f}1735689660\u{1f}\
+  parent1 parent2\u{1f}HEAD -> main, origin/main";
+      let entry = parse_commit_record(record).expect("record parses");
+      assert_eq!(entry.short_sha, "abc1234");
+      assert_eq!(entry.parents, vec!["parent1", "parent2"]);
+      assert_eq!(entry.decorations, vec!["HEAD -> main", "origin/main"]);
+  }
+  ```
 
 - [ ] **Step 01.3: Run the new test; expect FAIL** (`parse_commit_record` does not exist).
 
-	```bash
-	cargo test -p bibcode-server git::manager::graph
-	```
+  ```bash
+  cargo test -p bibcode-server git::manager::graph
+  ```
 
 - [ ] **Step 01.4: Implement the minimum to make Step 01.2 pass.** Path: `apps/server/src/git/manager/graph.rs`. Add `parse_commit_record(record: &str) -> Option<GitManagerCommitEntry>` splitting on `\u{1f}` with the field order above. Use an explicit record separator (`\u{1e}`) and field separator (`\u{1f}`) in the `--format` string so subjects and bodies containing newlines parse correctly.
 
 - [ ] **Step 01.5: Run the test; expect PASS.**
 
 - [ ] **Step 01.6: Add the tip-pinned paging logic and its tests.** In `graph.rs`:
-	- `resolve_tips(cwd) -> Vec<(refName, sha)>` via one `for-each-ref --format='%(refname)%09%(objectname)' refs/heads refs/remotes refs/tags`, capped (adopt a constant, e.g. `MAX_PINNED_TIPS = 512`).
-	- `page(cwd, pinned_tips, offset, limit)` issues `git log --no-show-signature --no-color -z --date=raw --skip=<offset> --max-count=<limit> <tip shas…> --` so offsets stay valid however much the repository moves.
-	- When the repository exceeds `MAX_PINNED_TIPS`, fall back to `--all` paging and set `degradedToAllPaging: true` in the page so the UI can state it rather than silently degrading.
-	- Page size is 100 commits (spec § 8).
-	- Tests: an offset past the end returns `exhausted: true`; a tip that can no longer be resolved returns a distinguishable error the handler maps to a full reset; the degraded flag is set above the cap.
+  - `resolve_tips(cwd) -> Vec<(refName, sha)>` via one `for-each-ref --format='%(refname)%09%(objectname)' refs/heads refs/remotes refs/tags`, capped (adopt a constant, e.g. `MAX_PINNED_TIPS = 512`).
+  - `page(cwd, pinned_tips, offset, limit)` issues `git log --no-show-signature --no-color -z --date=raw --skip=<offset> --max-count=<limit> <tip shas…> --` so offsets stay valid however much the repository moves.
+  - When the repository exceeds `MAX_PINNED_TIPS`, fall back to `--all` paging and set `degradedToAllPaging: true` in the page so the UI can state it rather than silently degrading.
+  - Page size is 100 commits (spec § 8).
+  - Tests: an offset past the end returns `exhausted: true`; a tip that can no longer be resolved returns a distinguishable error the handler maps to a full reset; the degraded flag is set above the cap.
 
 - [ ] **Step 01.7: Implement `refs.rs` and its tests.** Assemble a `GitManagerRefsSnapshot` from:
-	- `git for-each-ref --format='%(refname:short)%09%(objectname)%09%(upstream:short)%09%(worktreepath)%09%(HEAD)' refs/heads refs/remotes refs/tags` — one call gives occupancy directly (`%(worktreepath)`, git ≥ 2.22; verified on 2.55.0).
-	- `git worktree list --porcelain` for the worktree inventory including `locked` / `prunable` / `detached`, which `%(worktreepath)` does not supply. **Occupancy must count registered worktrees whose directory is missing** — deletion protection outlives the directory.
-	- ahead/behind per local branch with an upstream (`rev-list --left-right --count`).
-	- repository state: `HEAD` ref or detached sha, dirty flag, default branch, remotes, and the in-progress operation probed from `MERGE_HEAD`, `rebase-merge/*`, `sequencer/*`, `CHERRY_PICK_HEAD`, `SQUASH_MSG`.
-	- `blocked: vec![]` on every ref for now — PHASE-02 supplies the pure guards module that fills it, and PHASE-07 wires it in.
-	- a monotonically increasing `generation`.
-	Tests cover: an occupied branch reports its `worktreePath`; a registered-but-missing worktree still reports occupancy; a detached HEAD sets `detachedSha` and leaves `headRef` null; a merge in progress is reported.
+  - `git for-each-ref --format='%(refname:short)%09%(objectname)%09%(upstream:short)%09%(worktreepath)%09%(HEAD)' refs/heads refs/remotes refs/tags` — one call gives occupancy directly (`%(worktreepath)`, git ≥ 2.22; verified on 2.55.0).
+  - `git worktree list --porcelain` for the worktree inventory including `locked` / `prunable` / `detached`, which `%(worktreepath)` does not supply. **Occupancy must count registered worktrees whose directory is missing** — deletion protection outlives the directory.
+  - ahead/behind per local branch with an upstream (`rev-list --left-right --count`).
+  - repository state: `HEAD` ref or detached sha, dirty flag, default branch, remotes, and the in-progress operation probed from `MERGE_HEAD`, `rebase-merge/*`, `sequencer/*`, `CHERRY_PICK_HEAD`, `SQUASH_MSG`.
+  - `blocked: vec![]` on every ref for now — PHASE-02 supplies the pure guards module that fills it, and PHASE-07 wires it in.
+  - a monotonically increasing `generation`.
+    Tests cover: an occupied branch reports its `worktreePath`; a registered-but-missing worktree still reports occupancy; a detached HEAD sets `detachedSha` and leaves `headRef` null; a merge in progress is reported.
 
 - [ ] **Step 01.8: Implement `gitManager.getDiff` and replace the three stubs.** In `apps/server/src/production/git_manager_rpc.rs`, mirror the read arms of `handle_admitted_unary` in `apps/server/src/production/git_vcs.rs`: decode the input, take the workspace admission lease via `guard_git_path`, then run the operation with the child cancellation token. Diff sources:
-	- `working-tree`: `git diff --no-ext-diff --patch-with-raw -z --no-color HEAD -- <path>`, untracked via `--no-index -- /dev/null <path>`.
-	- `commit`: `git log <sha> -m -1 --first-parent --patch-with-raw --format= -z --no-color -- <path>`.
-	- `stash`: the same shape against `stash@{n}` (PHASE-09 exercises it; return the not-implemented code until then only if the stash plumbing is absent — otherwise implement it now).
-	Apply the size ladder from spec § 8: above ~70 MB do not parse at all; above ~4.375 MB return a `large-text` marker instead of content; any line longer than 5000 characters degrades the file to large-text. Enforce these as **server-side output caps**, not client policy.
+  - `working-tree`: `git diff --no-ext-diff --patch-with-raw -z --no-color HEAD -- <path>`, untracked via `--no-index -- /dev/null <path>`.
+  - `commit`: `git log <sha> -m -1 --first-parent --patch-with-raw --format= -z --no-color -- <path>`.
+  - `stash`: the same shape against `stash@{n}` (PHASE-09 exercises it; return the not-implemented code until then only if the stash plumbing is absent — otherwise implement it now).
+    Apply the size ladder from spec § 8: above ~70 MB do not parse at all; above ~4.375 MB return a `large-text` marker instead of content; any line longer than 5000 characters degrades the file to large-text. Enforce these as **server-side output caps**, not client policy.
 
 - [ ] **Step 01.9: Add integration tests.** Path: `apps/server/tests/git_manager_reads.rs`. Following `apps/server/tests/production_git_vcs_rpc.rs` for harness shape, create a temporary repository with a linked worktree and assert over the wire that: `gitManager.getRefs` reports the occupied branch's worktree path; `gitManager.getCommits` returns a stable second page after a new commit lands between pages; `gitManager.getDiff` returns a working-tree diff for a modified file; and all three succeed with only the **read** scope granted.
 
 - [ ] **Step 01.10: Full build + test gate.**
 
-	```bash
-	cargo fmt --all --check
-	cargo test -p bibcode-server
-	cargo clippy -p bibcode-server --all-targets -- -D warnings
-	vp check
-	vp run typecheck
-	```
+  ```bash
+  cargo fmt --all --check
+  cargo test -p bibcode-server
+  cargo clippy -p bibcode-server --all-targets -- -D warnings
+  vp check
+  vp run typecheck
+  ```
 
-	Expected: zero warnings, zero errors, all tests green.
+  Expected: zero warnings, zero errors, all tests green.
 
 - [ ] **Step 01.11: Log-hygiene review.** Grep your diff for interpolated branch names, ref names, absolute paths, remote URLs and git stderr in log strings:
 
-	```bash
-	git diff -- apps/server/src | rg 'tracing::(info|warn|error|debug)!' -A3
-	```
+  ```bash
+  git diff -- apps/server/src | rg 'tracing::(info|warn|error|debug)!' -A3
+  ```
 
-	Every log line must carry stable codes plus lengths and counts only — mirroring the existing `GitCommandError`, which carries `stdoutLength`/`stderrLength` and not the text.
+  Every log line must carry stable codes plus lengths and counts only — mirroring the existing `GitCommandError`, which carries `stdoutLength`/`stderrLength` and not the text.
 
 - [ ] **Step 01.12: TDD proof.** Make `parse_commit_record` return `None` unconditionally and make `refs.rs` return an empty worktree inventory. Re-run `cargo test -p bibcode-server git::manager` and the new integration test; confirm they fail. Restore.
 

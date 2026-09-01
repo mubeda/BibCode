@@ -1,9 +1,11 @@
 # Git Manager — Master Plan
 
-> **SUPERSEDED (2026-08-31).** This plan was never implemented — every phase in
-> its tracker is `pending` and none of the RPCs it designs exist in the code.
-> It has been superseded in full by `docs/plans/git-manager/`, which specifies a
-> GitHub-Desktop-shaped Git Manager including the working directory, staging,
+> **SUPERSEDED (2026-08-31).** This plan was never implemented—every phase in
+> its tracker remains `pending`, and no shipped work was executed from it. The
+> current code may contain overlapping Git Manager concepts and RPCs, but those
+> were implemented from its replacement. This plan has been superseded in full
+> by `docs/plans/git-manager/`, which specifies a GitHub-Desktop-shaped Git
+> Manager including the working directory, staging,
 > commit, stash, history rewriting and conflict resolution — all of which this
 > plan explicitly excluded. Its verified technical findings (tip-pinned history
 > paging, the status-broadcaster generation signal, reuse of the worktree
