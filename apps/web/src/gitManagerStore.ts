@@ -23,6 +23,8 @@ export interface GitManagerViewState {
   readonly selectedRef: string | null;
   readonly selectedCommitSha: string | null;
   readonly selectedFilePath: string | null;
+  readonly selectedStashSha: string | null;
+  readonly stashPaneOpen: boolean;
   readonly filterText: string;
   readonly loadedPageCount: number;
   readonly loadedPageCursors: ReadonlyArray<number>;
@@ -49,6 +51,8 @@ export const DEFAULT_GIT_MANAGER_VIEW_STATE: GitManagerViewState = Object.freeze
   selectedRef: null,
   selectedCommitSha: null,
   selectedFilePath: null,
+  selectedStashSha: null,
+  stashPaneOpen: false,
   filterText: "",
   loadedPageCount: 0,
   loadedPageCursors: Object.freeze([]),
@@ -68,6 +72,8 @@ interface GitManagerStoreState {
   readonly setSelectedRef: (ref: ScopedProjectRef, name: string | null) => void;
   readonly setSelectedCommit: (ref: ScopedProjectRef, sha: string | null) => void;
   readonly setSelectedFile: (ref: ScopedProjectRef, path: string | null) => void;
+  readonly setSelectedStash: (ref: ScopedProjectRef, sha: string | null) => void;
+  readonly setStashPaneOpen: (ref: ScopedProjectRef, open: boolean) => void;
   readonly setFilterText: (ref: ScopedProjectRef, text: string) => void;
   readonly setLoadedPageCount: (ref: ScopedProjectRef, count: number) => void;
   readonly setLoadedPageCursors: (ref: ScopedProjectRef, cursors: ReadonlyArray<number>) => void;
@@ -160,6 +166,8 @@ function sanitizeViewState(value: unknown): PersistedGitManagerViewState | null 
     selectedRef: nullableString(candidate.selectedRef),
     selectedCommitSha: nullableString(candidate.selectedCommitSha),
     selectedFilePath: nullableString(candidate.selectedFilePath),
+    selectedStashSha: nullableString(candidate.selectedStashSha),
+    stashPaneOpen: candidate.stashPaneOpen === true,
     filterText: stringOr(candidate.filterText, ""),
     loadedPageCount: nonNegativeIntegerOr(candidate.loadedPageCount, 0),
     loadedPageCursors: nonNegativeIntegerArray(candidate.loadedPageCursors),
@@ -259,6 +267,14 @@ export const useGitManagerStore = create<GitManagerStoreState>()(
       setSelectedFile: (ref, path) =>
         set((state) =>
           updateProject(state, ref, (current) => ({ ...current, selectedFilePath: path })),
+        ),
+      setSelectedStash: (ref, sha) =>
+        set((state) =>
+          updateProject(state, ref, (current) => ({ ...current, selectedStashSha: sha })),
+        ),
+      setStashPaneOpen: (ref, open) =>
+        set((state) =>
+          updateProject(state, ref, (current) => ({ ...current, stashPaneOpen: open })),
         ),
       setFilterText: (ref, text) =>
         set((state) => updateProject(state, ref, (current) => ({ ...current, filterText: text }))),

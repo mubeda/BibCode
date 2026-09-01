@@ -1,7 +1,18 @@
+import { RegistryContext } from "@effect/atom-react";
 import { projectKey } from "@bibcode/client-runtime/state/entities";
-import type { ScopedProjectRef, VcsWorktreeDescriptor } from "@bibcode/contracts";
-import { GitBranchIcon } from "lucide-react";
-import { memo, useCallback, useEffect, useMemo, useState } from "react";
+import type {
+  GitManagerInProgressOperation,
+  GitManagerOperationEvent,
+  GitManagerOperationRequest,
+  GitManagerRefEntry,
+  GitManagerRefsSnapshot,
+  GitManagerStashEntry,
+  ScopedProjectRef,
+  VcsWorktreeDescriptor,
+} from "@bibcode/contracts";
+import * as Cause from "effect/Cause";
+import { ArchiveIcon, GitBranchIcon, GitMergeIcon } from "lucide-react";
+import { memo, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   DEFAULT_GIT_MANAGER_VIEW_STATE,
@@ -10,10 +21,20 @@ import {
 } from "../../gitManagerStore";
 import { useProject, useServerConfigs } from "../../state/entities";
 import { useEnvironmentConnectionState } from "../../state/environments";
-import { gitManagerEnvironment } from "../../state/gitManager";
+import {
+  gitManagerEnvironment,
+  runGitManagerOperation,
+  type GitManagerOperationHandle,
+} from "../../state/gitManager";
 import { useEnvironmentQuery } from "../../state/query";
 import { worktreeEnvironment } from "../../state/worktrees";
+import { Button } from "../ui/button";
 import { Tabs, TabsList, TabsPanel, TabsTab } from "../ui/tabs";
+import { GitManagerInProgressStrip } from "./GitManagerInProgressStrip";
+import { GitManagerMergeDialog } from "./merge/GitManagerMergeDialog";
+import { GitManagerStashDiff } from "./stash/GitManagerStashDiff";
+import { GitManagerStashList } from "./stash/GitManagerStashList";
+import { resolveStashIndex } from "./stash/GitManagerStashList.logic";
 import {
   resolveGitManagerAvailability,
   type GitManagerAvailability,
@@ -21,8 +42,23 @@ import {
 import { GitManagerChangesView } from "./changes/GitManagerChangesView";
 import { GitManagerHistoryView } from "./history/GitManagerHistoryView";
 import { GitManagerToolbar } from "./GitManagerToolbar";
+import { GitManagerOperationBanner } from "./toolbar/GitManagerOperationBanner";
 
 const EMPTY_WORKTREES: ReadonlyArray<VcsWorktreeDescriptor> = Object.freeze([]);
+const EMPTY_REFS: ReadonlyArray<GitManagerRefEntry> = Object.freeze([]);
+const EMPTY_STASHES: ReadonlyArray<GitManagerStashEntry> = Object.freeze([]);
+const STASH_MUTATION_OPERATIONS = new Set(["stash-apply", "stash-pop", "stash-drop"]);
+
+type ResumableInProgressOperation = Omit<GitManagerInProgressOperation, "kind"> & {
+  readonly kind: "merge" | "rebase" | "cherry-pick" | "revert";
+};
+
+function asResumableOperation(
+  operation: GitManagerInProgressOperation | null,
+): ResumableInProgressOperation | null {
+  if (operation === null || operation.kind === "squash") return null;
+  return { ...operation, kind: operation.kind };
+}
 
 export interface GitManagerPanelProps {
   readonly projectRef: ScopedProjectRef;
@@ -68,6 +104,303 @@ function selectedCheckoutCwd(
   if (storedCwd === null || storedCwd === mainCheckoutCwd) return mainCheckoutCwd;
   return worktrees.some((worktree) => worktree.path === storedCwd) ? storedCwd : mainCheckoutCwd;
 }
+
+interface GitManagerRepositorySurfacesProps {
+  readonly scope: {
+    readonly environmentId: ScopedProjectRef["environmentId"];
+    readonly cwd: string;
+  };
+  readonly projectRef: ScopedProjectRef;
+  readonly signalGeneration: number | null;
+}
+
+const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces({
+  scope,
+  projectRef,
+  signalGeneration,
+}: GitManagerRepositorySurfacesProps) {
+  const registry = useContext(RegistryContext);
+  const { environmentId, cwd } = scope;
+  const { projectId } = projectRef;
+  const storeKey = projectKey(projectRef);
+  const selectSelectedStashSha = useCallback(
+    (state: ReturnType<typeof useGitManagerStore.getState>) =>
+      state.byProjectKey[storeKey]?.selectedStashSha ??
+      DEFAULT_GIT_MANAGER_VIEW_STATE.selectedStashSha,
+    [storeKey],
+  );
+  const selectStashPaneOpen = useCallback(
+    (state: ReturnType<typeof useGitManagerStore.getState>) =>
+      state.byProjectKey[storeKey]?.stashPaneOpen ?? DEFAULT_GIT_MANAGER_VIEW_STATE.stashPaneOpen,
+    [storeKey],
+  );
+  const selectSelectedFilePath = useCallback(
+    (state: ReturnType<typeof useGitManagerStore.getState>) =>
+      state.byProjectKey[storeKey]?.selectedFilePath ??
+      DEFAULT_GIT_MANAGER_VIEW_STATE.selectedFilePath,
+    [storeKey],
+  );
+  const selectRecentRef = useCallback(
+    (state: ReturnType<typeof useGitManagerStore.getState>) =>
+      state.byProjectKey[storeKey]?.selectedRef ?? DEFAULT_GIT_MANAGER_VIEW_STATE.selectedRef,
+    [storeKey],
+  );
+  const selectedStashSha = useGitManagerStore(selectSelectedStashSha);
+  const stashPaneOpen = useGitManagerStore(selectStashPaneOpen);
+  const selectedFilePath = useGitManagerStore(selectSelectedFilePath);
+  const recentRef = useGitManagerStore(selectRecentRef);
+  const setSelectedStash = useGitManagerStore((state) => state.setSelectedStash);
+  const setStashPaneOpen = useGitManagerStore((state) => state.setStashPaneOpen);
+  const setSelectedFile = useGitManagerStore((state) => state.setSelectedFile);
+
+  const refsAtom = useMemo(
+    () =>
+      gitManagerEnvironment.getRefs?.({
+        environmentId,
+        input: { cwd },
+      }) ?? null,
+    [cwd, environmentId],
+  );
+  const stashesAtom = useMemo(
+    () =>
+      !stashPaneOpen
+        ? null
+        : (gitManagerEnvironment.getStashes?.({
+            environmentId,
+            input: { cwd },
+          }) ?? null),
+    [cwd, environmentId, stashPaneOpen],
+  );
+  const refsQuery = useEnvironmentQuery(refsAtom);
+  const stashesQuery = useEnvironmentQuery(stashesAtom);
+  const refreshRefs = refsQuery.refresh;
+  const refreshStashes = stashesQuery.refresh;
+  useEffect(() => {
+    if (signalGeneration === null) return;
+    refreshRefs();
+    if (stashPaneOpen) refreshStashes();
+  }, [refreshRefs, refreshStashes, signalGeneration, stashPaneOpen]);
+
+  const snapshot: GitManagerRefsSnapshot | null = refsQuery.data ?? null;
+  const localBranches = snapshot?.localBranches ?? EMPTY_REFS;
+  const stashes = stashesQuery.data ?? EMPTY_STASHES;
+  const repositoryBlockedReasons = useMemo(
+    () => localBranches.flatMap((branch) => branch.blocked),
+    [localBranches],
+  );
+  const stashBlockedReasons = useMemo(
+    () =>
+      repositoryBlockedReasons.filter((reason) => STASH_MUTATION_OPERATIONS.has(reason.operation)),
+    [repositoryBlockedReasons],
+  );
+  const inProgressBlocked =
+    repositoryBlockedReasons.find((reason) => reason.code === "merge-in-progress") ?? null;
+  const inProgressOperation = snapshot?.inProgressOperation ?? null;
+  const resumableOperation = asResumableOperation(inProgressOperation);
+  const recentNames = useMemo(() => (recentRef === null ? [] : [recentRef]), [recentRef]);
+
+  const [mergeDialogOpen, setMergeDialogOpen] = useState(false);
+  const [operationEvent, setOperationEvent] = useState<GitManagerOperationEvent | null>(null);
+  const [operationRunning, setOperationRunning] = useState(false);
+  const activeOperationRef = useRef<GitManagerOperationHandle | null>(null);
+  useEffect(
+    () => () => {
+      activeOperationRef.current?.cancel();
+    },
+    [],
+  );
+  const refreshRepositoryReads = useCallback(() => {
+    refreshRefs();
+    if (stashPaneOpen) refreshStashes();
+  }, [refreshRefs, refreshStashes, stashPaneOpen]);
+  const executeOperation = useCallback(
+    async (input: GitManagerOperationRequest): Promise<boolean> => {
+      if (activeOperationRef.current !== null) return false;
+      setOperationRunning(true);
+      setOperationEvent({ _tag: "started", operation: input._tag });
+      const handle = runGitManagerOperation(registry, { environmentId, input }, (event) => {
+        setOperationEvent(event);
+        if (event._tag === "failed" || event._tag === "finished") {
+          setOperationRunning(false);
+        }
+      });
+      activeOperationRef.current = handle;
+      const result = await handle.result;
+      if (activeOperationRef.current === handle) activeOperationRef.current = null;
+      setOperationRunning(false);
+      refreshRepositoryReads();
+      if (result._tag === "Failure") {
+        if (Cause.hasInterruptsOnly(result.cause)) return false;
+        const error = Cause.squash(result.cause);
+        const message = error instanceof Error ? error.message : "The Git operation failed.";
+        setOperationEvent({
+          _tag: "failed",
+          operation: input._tag,
+          code: "transport-error",
+          message,
+          blocked: null,
+        });
+        return false;
+      }
+      return result.value._tag === "finished";
+    },
+    [environmentId, refreshRepositoryReads, registry],
+  );
+  const cancelOperation = useCallback(() => {
+    activeOperationRef.current?.cancel();
+    activeOperationRef.current = null;
+    setOperationRunning(false);
+  }, []);
+  const runStashMutation = useCallback(
+    async (kind: "stash-apply" | "stash-pop" | "stash-drop", sha: string) => {
+      const index = resolveStashIndex(stashes, sha);
+      if (index === null) {
+        refreshStashes();
+        return;
+      }
+      await executeOperation({ _tag: kind, cwd, projectId, index });
+    },
+    [cwd, executeOperation, projectId, refreshStashes, stashes],
+  );
+  const runStashApply = useCallback(
+    (sha: string) => runStashMutation("stash-apply", sha),
+    [runStashMutation],
+  );
+  const runStashPop = useCallback(
+    (sha: string) => runStashMutation("stash-pop", sha),
+    [runStashMutation],
+  );
+  const runStashDrop = useCallback(
+    (sha: string) => runStashMutation("stash-drop", sha),
+    [runStashMutation],
+  );
+  const selectStash = useCallback(
+    (sha: string) => setSelectedStash(projectRef, sha),
+    [projectRef, setSelectedStash],
+  );
+  const selectStashFile = useCallback(
+    (path: string) => setSelectedFile(projectRef, path),
+    [projectRef, setSelectedFile],
+  );
+  const toggleStashPane = useCallback(
+    () => setStashPaneOpen(projectRef, !stashPaneOpen),
+    [projectRef, setStashPaneOpen, stashPaneOpen],
+  );
+  const openMergeDialog = useCallback(() => setMergeDialogOpen(true), []);
+  const handleMergeFinished = useCallback(() => refreshRefs(), [refreshRefs]);
+  const continueInProgress = useCallback(() => {
+    if (resumableOperation === null) return;
+    void executeOperation({
+      _tag: "continue",
+      cwd,
+      projectId,
+      operation: resumableOperation.kind,
+    });
+  }, [cwd, executeOperation, projectId, resumableOperation]);
+  const abortInProgress = useCallback(() => {
+    if (resumableOperation === null) return;
+    void executeOperation({
+      _tag: "abort",
+      cwd,
+      projectId,
+      operation: resumableOperation.kind,
+    });
+  }, [cwd, executeOperation, projectId, resumableOperation]);
+  const mergeDisabledReason =
+    refsQuery.isPending || snapshot === null
+      ? "Loading branches."
+      : localBranches.every((branch) => branch.current)
+        ? "No source branch is available."
+        : null;
+
+  return (
+    <>
+      <GitManagerOperationBanner operation={operationEvent} onCancel={cancelOperation} />
+      {resumableOperation === null ? null : (
+        <GitManagerInProgressStrip
+          blocked={inProgressBlocked}
+          operation={resumableOperation}
+          onAbort={abortInProgress}
+          onContinue={continueInProgress}
+        />
+      )}
+      <div className="flex items-center justify-end gap-2 border-b border-border px-4 py-1.5">
+        <Button
+          aria-expanded={stashPaneOpen}
+          aria-label="Toggle repository stashes"
+          size="xs"
+          variant="ghost"
+          onClick={toggleStashPane}
+        >
+          <ArchiveIcon aria-hidden="true" />
+          Stashes{stashPaneOpen && !stashesQuery.isPending ? ` (${stashes.length})` : ""}
+        </Button>
+        <Button
+          aria-describedby={
+            mergeDisabledReason === null ? undefined : "git-manager-merge-trigger-reason"
+          }
+          disabled={mergeDisabledReason !== null}
+          size="xs"
+          title={mergeDisabledReason ?? "Merge a branch into the current branch"}
+          variant="ghost"
+          onClick={openMergeDialog}
+        >
+          <GitMergeIcon aria-hidden="true" />
+          Merge…
+        </Button>
+        {mergeDisabledReason === null ? null : (
+          <span className="sr-only" id="git-manager-merge-trigger-reason">
+            {mergeDisabledReason}
+          </span>
+        )}
+      </div>
+      {stashPaneOpen ? (
+        <section
+          aria-label="Repository stash browser"
+          className="grid h-80 min-h-0 grid-cols-[minmax(14rem,32%)_minmax(0,1fr)] border-b border-border"
+        >
+          <div className="min-h-0 border-r border-border">
+            {stashesQuery.error !== null && stashes.length === 0 ? (
+              <p className="p-3 text-xs text-destructive">{stashesQuery.error}</p>
+            ) : (
+              <GitManagerStashList
+                blockedReasons={stashBlockedReasons}
+                entries={stashes}
+                operationInFlight={operationRunning}
+                projectRef={projectRef}
+                scope={scope}
+                selectedSha={selectedStashSha}
+                onApply={runStashApply}
+                onDrop={runStashDrop}
+                onPop={runStashPop}
+                onSelectStash={selectStash}
+              />
+            )}
+          </div>
+          <GitManagerStashDiff
+            entries={stashes}
+            projectRef={projectRef}
+            scope={scope}
+            selectedPath={selectedFilePath}
+            selectedStashSha={selectedStashSha}
+            stashesPending={stashesQuery.isPending}
+            onRefreshStashes={refreshStashes}
+            onSelectPath={selectStashFile}
+          />
+        </section>
+      ) : null}
+      <GitManagerMergeDialog
+        open={mergeDialogOpen}
+        projectRef={projectRef}
+        recentNames={recentNames}
+        refs={localBranches}
+        scope={scope}
+        onFinished={handleMergeFinished}
+        onOpenChange={setMergeDialogOpen}
+      />
+    </>
+  );
+});
 
 export const GitManagerPanel = memo(function GitManagerPanel({ projectRef }: GitManagerPanelProps) {
   const { environmentId, projectId } = projectRef;
@@ -129,7 +462,8 @@ export const GitManagerPanel = memo(function GitManagerPanel({ projectRef }: Git
         : null,
     [activeCwd, availability.kind, environmentId],
   );
-  useEnvironmentQuery(signalAtom);
+  const signalQuery = useEnvironmentQuery(signalAtom);
+  const signalGeneration = signalQuery.data?.generation ?? null;
 
   const handleTabChange = useCallback(
     (value: string | number | null) => {
@@ -164,6 +498,11 @@ export const GitManagerPanel = memo(function GitManagerPanel({ projectRef }: Git
         catalogPending={catalog.isPending}
         catalogError={catalog.error}
         onSelectedWorktreeChange={handleWorktreeChange}
+      />
+      <GitManagerRepositorySurfaces
+        projectRef={stableProjectRef}
+        scope={activeScope}
+        signalGeneration={signalGeneration}
       />
       <Tabs
         className="min-h-0 flex-1 gap-0"

@@ -88,6 +88,33 @@ describe("gitManagerStore", () => {
     );
   });
 
+  it("persists stash selection by sha and the stash pane state", async () => {
+    const project = ref("env-a", "p1");
+    const store = useGitManagerStore.getState();
+    store.setSelectedStash(project, "stable-stash-sha");
+    store.setStashPaneOpen(project, true);
+
+    const serialized = persisted.get(GIT_MANAGER_STORAGE_KEY);
+    const parsed = JSON.parse(serialized!) as {
+      state: {
+        byProjectKey: Record<string, { selectedStashSha: string | null; stashPaneOpen: boolean }>;
+      };
+    };
+    expect(parsed.state.byProjectKey[projectKey(project)]).toMatchObject({
+      selectedStashSha: "stable-stash-sha",
+      stashPaneOpen: true,
+    });
+    useGitManagerStore.setState({ byProjectKey: {} });
+    persisted.set(GIT_MANAGER_STORAGE_KEY, serialized!);
+    await useGitManagerStore.persist.rehydrate();
+
+    expect(useGitManagerStore.getState().selectViewState(project)).toMatchObject({
+      selectedStashSha: "stable-stash-sha",
+      stashPaneOpen: true,
+      selectedWorktreeCwd: null,
+    });
+  });
+
   it("keeps checkout selection in memory while persisting the tab and commit draft", async () => {
     const project = ref("env-a", "p1");
     const store = useGitManagerStore.getState();
