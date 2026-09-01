@@ -25,8 +25,10 @@ use crate::{
             },
             guards::{GuardInput, evaluate_guards},
             operations::{
-                CoAuthor, CommitRequest, DiscardError, DiscardRequest, commit_arguments,
-                commit_message_body, discard_paths, parse_undo_commit_message,
+                CoAuthor, CommitRequest, DiscardError, DiscardRequest,
+                GitManagerOperationError as DomainOperationError, GitManagerOperationRequest,
+                commit_arguments, commit_message_body, discard_paths, parse_undo_commit_message,
+                run_branch_or_sync_operation,
             },
             refs::{GitManagerRefsError, GitManagerRefsSnapshot, build_refs_snapshot},
         },
@@ -41,6 +43,7 @@ use crate::{
 };
 
 static NEXT_DIFF_GENERATION: AtomicU64 = AtomicU64::new(1);
+const OPERATION_STREAM_CAPACITY: usize = 8;
 
 pub const GIT_MANAGER_UNARY_METHODS: &[&str] = &[
     "gitManager.commit",
@@ -135,6 +138,155 @@ impl ConfiguredGitManagerRpcServices {
         sender
             .try_send(Err(not_implemented_error(&request.tag)))
             .expect("new Git Manager stub stream accepts its terminal failure");
+        receiver
+    }
+
+    pub fn operation_stream(
+        &self,
+        request: RpcRequest,
+        cancellation: CancellationToken,
+    ) -> mpsc::Receiver<RpcStreamChunk> {
+        let (sender, receiver) = mpsc::channel(OPERATION_STREAM_CAPACITY);
+        let services = self.clone();
+        tokio::spawn(async move {
+            let input = match decode::<GitManagerOperationRequest>(request.payload, &request.tag) {
+                Ok(input) => input,
+                Err(error) => {
+                    let _ = sender.send(Err(error)).await;
+                    return;
+                }
+            };
+            let operation = input.operation();
+            let cwd = input.cwd().to_path_buf();
+            let project_id = input.project_id().to_owned();
+            let (Some(catalog), Some(repositories), Some(availability)) = (
+                services.catalog.clone(),
+                services.repositories.clone(),
+                services.availability.clone(),
+            ) else {
+                send_terminal_operation_error(
+                    &sender,
+                    DomainOperationError {
+                        operation: operation.to_owned(),
+                        code: "service-unavailable".to_owned(),
+                        message: "Git Manager operations are unavailable in this server runtime."
+                            .to_owned(),
+                        blocked: None,
+                        outputs: Vec::new(),
+                    },
+                )
+                .await;
+                return;
+            };
+            let resolved_project_id = match resolve_project_id(&repositories, &cwd).await {
+                Ok(resolved_project_id) if resolved_project_id == project_id => resolved_project_id,
+                Ok(_) => {
+                    send_terminal_operation_error(
+                        &sender,
+                        DomainOperationError {
+                            operation: operation.to_owned(),
+                            code: "project-mismatch".to_owned(),
+                            message:
+                                "The selected checkout does not belong to the requested project."
+                                    .to_owned(),
+                            blocked: None,
+                            outputs: Vec::new(),
+                        },
+                    )
+                    .await;
+                    return;
+                }
+                Err(code) => {
+                    send_terminal_operation_error(
+                        &sender,
+                        DomainOperationError {
+                            operation: operation.to_owned(),
+                            code: code.to_owned(),
+                            message:
+                                "The selected checkout is not owned by exactly one BiBCode project."
+                                    .to_owned(),
+                            blocked: None,
+                            outputs: Vec::new(),
+                        },
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let admission = match availability.acquire_path_admission([cwd.as_path()]).await {
+                Ok(admission) => admission,
+                Err(_) => {
+                    send_terminal_operation_error(
+                        &sender,
+                        DomainOperationError {
+                            operation: operation.to_owned(),
+                            code: "workspace-unavailable".to_owned(),
+                            message: "The selected checkout is unavailable.".to_owned(),
+                            blocked: None,
+                            outputs: Vec::new(),
+                        },
+                    )
+                    .await;
+                    return;
+                }
+            };
+            if sender
+                .send(Ok(vec![json!({
+                    "_tag": "started",
+                    "operation": operation,
+                })]))
+                .await
+                .is_err()
+            {
+                return;
+            }
+
+            debug_assert_eq!(resolved_project_id, project_id);
+            let operation_cancellation = cancellation.child_token();
+            let loss = admission.loss_cancellation();
+            let operation_future = run_branch_or_sync_operation(
+                services.repository.clone(),
+                services.broadcaster.clone(),
+                catalog,
+                input,
+                operation_cancellation.clone(),
+            );
+            tokio::pin!(operation_future);
+            let result = tokio::select! {
+                biased;
+                () = loss.cancelled() => {
+                    operation_cancellation.cancel();
+                    let _ = operation_future.await;
+                    Err(DomainOperationError {
+                        operation: operation.to_owned(),
+                        code: "workspace-unavailable".to_owned(),
+                        message: "The selected checkout became unavailable during the operation."
+                            .to_owned(),
+                        blocked: None,
+                        outputs: Vec::new(),
+                    })
+                }
+                result = &mut operation_future => result,
+            };
+            match result {
+                Ok(outcome) => {
+                    if send_operation_outputs(&sender, &outcome.operation, &outcome.outputs)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    let _ = sender
+                        .send(Ok(vec![json!({
+                            "_tag": "finished",
+                            "operation": outcome.operation,
+                            "message": outcome.message,
+                        })]))
+                        .await;
+                }
+                Err(error) => send_terminal_operation_error(&sender, error).await,
+            }
+        });
         receiver
     }
 
@@ -537,13 +689,65 @@ pub fn register_git_manager_rpc(
         });
     }
 
-    for method in GIT_MANAGER_STREAM_METHODS {
+    for method in GIT_MANAGER_STREAM_METHODS
+        .iter()
+        .filter(|method| **method != "gitManager.runOperation")
+    {
         let services = services.clone();
         registry.register_stream(*method, move |request, _cancellation| {
             let services = services.clone();
             services.not_implemented_stream(request)
         });
     }
+    let operation_services = services.clone();
+    registry.register_stream("gitManager.runOperation", move |request, cancellation| {
+        operation_services.operation_stream(request, cancellation)
+    });
+}
+
+async fn send_operation_outputs(
+    sender: &mpsc::Sender<RpcStreamChunk>,
+    operation: &str,
+    outputs: &[ProcessOutput],
+) -> Result<(), ()> {
+    for output in outputs {
+        for (stream, text) in [("stdout", &output.stdout), ("stderr", &output.stderr)] {
+            if text.is_empty() {
+                continue;
+            }
+            sender
+                .send(Ok(vec![json!({
+                    "_tag": "output",
+                    "operation": operation,
+                    "stream": stream,
+                    "text": text,
+                })]))
+                .await
+                .map_err(|_| ())?;
+        }
+    }
+    Ok(())
+}
+
+async fn send_terminal_operation_error(
+    sender: &mpsc::Sender<RpcStreamChunk>,
+    error: DomainOperationError,
+) {
+    if send_operation_outputs(sender, &error.operation, &error.outputs)
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let _ = sender
+        .send(Ok(vec![json!({
+            "_tag": "failed",
+            "operation": error.operation,
+            "code": error.code,
+            "message": error.message,
+            "blocked": error.blocked,
+        })]))
+        .await;
 }
 
 #[derive(Deserialize)]

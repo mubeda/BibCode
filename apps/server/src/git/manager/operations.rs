@@ -14,7 +14,14 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::git::{
-    GitCommandError, GitRepository, OutputPolicy, ProcessRequest, ProcessRunner, validate_pathspecs,
+    GitCommandError, GitManagerBlockedReason, GitManagerRefsSnapshot, GitRepository, OutputPolicy,
+    ProcessOutput, ProcessRequest, ProcessRunner, StatusBroadcaster, validate_pathspecs,
+};
+use crate::worktree_catalog::{ProjectMutationAttempt, WorktreeCatalogService};
+
+use super::{
+    guards::{GuardInput, evaluate_guards},
+    refs::build_refs_snapshot,
 };
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -96,6 +103,790 @@ impl FileTrash for NativeFileTrash {
 pub enum DiscardError {
     #[error(transparent)]
     Git(#[from] GitCommandError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GitManagerFailureCode {
+    Authentication,
+    NonFastForward,
+    StaleInfo,
+    LocalChangesOverwritten,
+    Conflicts,
+    NoUpstream,
+    Cancelled,
+    TimedOut,
+    Unknown,
+}
+
+impl GitManagerFailureCode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Authentication => "authentication",
+            Self::NonFastForward => "non-fast-forward",
+            Self::StaleInfo => "stale-info",
+            Self::LocalChangesOverwritten => "local-changes-overwritten",
+            Self::Conflicts => "conflicts",
+            Self::NoUpstream => "no-upstream",
+            Self::Cancelled => "cancelled",
+            Self::TimedOut => "timed-out",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[must_use]
+pub fn classify_operation_failure(_exit_code: i32, stderr: &str) -> GitManagerFailureCode {
+    let stderr = stderr.to_ascii_lowercase();
+    if stderr.contains("was interrupted") || stderr.contains("cancelled") {
+        GitManagerFailureCode::Cancelled
+    } else if stderr.contains("timed out") {
+        GitManagerFailureCode::TimedOut
+    } else if [
+        "authentication failed",
+        "could not read username",
+        "could not read password",
+        "permission denied (publickey)",
+    ]
+    .iter()
+    .any(|needle| stderr.contains(needle))
+    {
+        GitManagerFailureCode::Authentication
+    } else if stderr.contains("non-fast-forward") || stderr.contains("updates were rejected") {
+        GitManagerFailureCode::NonFastForward
+    } else if stderr.contains("stale info") {
+        GitManagerFailureCode::StaleInfo
+    } else if stderr.contains("your local changes to the following files would be overwritten") {
+        GitManagerFailureCode::LocalChangesOverwritten
+    } else if stderr.contains("conflict (") || stderr.contains("automatic merge failed") {
+        GitManagerFailureCode::Conflicts
+    } else if stderr.contains("there is no tracking information") {
+        GitManagerFailureCode::NoUpstream
+    } else {
+        GitManagerFailureCode::Unknown
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum GitManagerCheckoutStrategy {
+    Stash,
+    Bring,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(
+    tag = "_tag",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+pub enum GitManagerOperationRequest {
+    BranchCreate {
+        cwd: PathBuf,
+        project_id: String,
+        name: String,
+        start_point: Option<String>,
+        checkout: bool,
+    },
+    BranchCheckout {
+        cwd: PathBuf,
+        project_id: String,
+        name: String,
+        strategy: Option<GitManagerCheckoutStrategy>,
+    },
+    BranchRename {
+        cwd: PathBuf,
+        project_id: String,
+        name: String,
+        new_name: String,
+    },
+    BranchDelete {
+        cwd: PathBuf,
+        project_id: String,
+        name: String,
+        force: bool,
+        delete_remote: bool,
+    },
+    Fetch {
+        cwd: PathBuf,
+        project_id: String,
+        remote: String,
+    },
+    Pull {
+        cwd: PathBuf,
+        project_id: String,
+        remote: String,
+    },
+    Push {
+        cwd: PathBuf,
+        project_id: String,
+        remote: String,
+        local_branch: String,
+        remote_branch: Option<String>,
+    },
+    PublishBranch {
+        cwd: PathBuf,
+        project_id: String,
+        remote: String,
+        local_branch: String,
+        remote_branch: Option<String>,
+    },
+    ForcePush {
+        cwd: PathBuf,
+        project_id: String,
+        remote: String,
+        local_branch: String,
+        remote_branch: Option<String>,
+    },
+    StashPush {
+        cwd: PathBuf,
+        project_id: String,
+    },
+    StashApply {
+        cwd: PathBuf,
+        project_id: String,
+    },
+    StashPop {
+        cwd: PathBuf,
+        project_id: String,
+    },
+    StashDrop {
+        cwd: PathBuf,
+        project_id: String,
+    },
+    Merge {
+        cwd: PathBuf,
+        project_id: String,
+    },
+    SquashMerge {
+        cwd: PathBuf,
+        project_id: String,
+    },
+    Rebase {
+        cwd: PathBuf,
+        project_id: String,
+    },
+    CherryPick {
+        cwd: PathBuf,
+        project_id: String,
+    },
+    Squash {
+        cwd: PathBuf,
+        project_id: String,
+    },
+    Reorder {
+        cwd: PathBuf,
+        project_id: String,
+    },
+    Revert {
+        cwd: PathBuf,
+        project_id: String,
+    },
+    Reset {
+        cwd: PathBuf,
+        project_id: String,
+    },
+    Continue {
+        cwd: PathBuf,
+        project_id: String,
+    },
+    Abort {
+        cwd: PathBuf,
+        project_id: String,
+    },
+    ResolveConflict {
+        cwd: PathBuf,
+        project_id: String,
+    },
+    TagCreate {
+        cwd: PathBuf,
+        project_id: String,
+    },
+    TagDelete {
+        cwd: PathBuf,
+        project_id: String,
+    },
+    TagPush {
+        cwd: PathBuf,
+        project_id: String,
+    },
+}
+
+impl GitManagerOperationRequest {
+    #[must_use]
+    pub const fn operation(&self) -> &'static str {
+        match self {
+            Self::BranchCreate { .. } => "branch-create",
+            Self::BranchCheckout { .. } => "branch-checkout",
+            Self::BranchRename { .. } => "branch-rename",
+            Self::BranchDelete { .. } => "branch-delete",
+            Self::Fetch { .. } => "fetch",
+            Self::Pull { .. } => "pull",
+            Self::Push { .. } => "push",
+            Self::PublishBranch { .. } => "publish-branch",
+            Self::ForcePush { .. } => "force-push",
+            Self::StashPush { .. } => "stash-push",
+            Self::StashApply { .. } => "stash-apply",
+            Self::StashPop { .. } => "stash-pop",
+            Self::StashDrop { .. } => "stash-drop",
+            Self::Merge { .. } => "merge",
+            Self::SquashMerge { .. } => "squash-merge",
+            Self::Rebase { .. } => "rebase",
+            Self::CherryPick { .. } => "cherry-pick",
+            Self::Squash { .. } => "squash",
+            Self::Reorder { .. } => "reorder",
+            Self::Revert { .. } => "revert",
+            Self::Reset { .. } => "reset",
+            Self::Continue { .. } => "continue",
+            Self::Abort { .. } => "abort",
+            Self::ResolveConflict { .. } => "resolve-conflict",
+            Self::TagCreate { .. } => "tag-create",
+            Self::TagDelete { .. } => "tag-delete",
+            Self::TagPush { .. } => "tag-push",
+        }
+    }
+
+    #[must_use]
+    pub fn cwd(&self) -> &Path {
+        match self {
+            Self::BranchCreate { cwd, .. }
+            | Self::BranchCheckout { cwd, .. }
+            | Self::BranchRename { cwd, .. }
+            | Self::BranchDelete { cwd, .. }
+            | Self::Fetch { cwd, .. }
+            | Self::Pull { cwd, .. }
+            | Self::Push { cwd, .. }
+            | Self::PublishBranch { cwd, .. }
+            | Self::ForcePush { cwd, .. }
+            | Self::StashPush { cwd, .. }
+            | Self::StashApply { cwd, .. }
+            | Self::StashPop { cwd, .. }
+            | Self::StashDrop { cwd, .. }
+            | Self::Merge { cwd, .. }
+            | Self::SquashMerge { cwd, .. }
+            | Self::Rebase { cwd, .. }
+            | Self::CherryPick { cwd, .. }
+            | Self::Squash { cwd, .. }
+            | Self::Reorder { cwd, .. }
+            | Self::Revert { cwd, .. }
+            | Self::Reset { cwd, .. }
+            | Self::Continue { cwd, .. }
+            | Self::Abort { cwd, .. }
+            | Self::ResolveConflict { cwd, .. }
+            | Self::TagCreate { cwd, .. }
+            | Self::TagDelete { cwd, .. }
+            | Self::TagPush { cwd, .. } => cwd,
+        }
+    }
+
+    #[must_use]
+    pub fn project_id(&self) -> &str {
+        match self {
+            Self::BranchCreate { project_id, .. }
+            | Self::BranchCheckout { project_id, .. }
+            | Self::BranchRename { project_id, .. }
+            | Self::BranchDelete { project_id, .. }
+            | Self::Fetch { project_id, .. }
+            | Self::Pull { project_id, .. }
+            | Self::Push { project_id, .. }
+            | Self::PublishBranch { project_id, .. }
+            | Self::ForcePush { project_id, .. }
+            | Self::StashPush { project_id, .. }
+            | Self::StashApply { project_id, .. }
+            | Self::StashPop { project_id, .. }
+            | Self::StashDrop { project_id, .. }
+            | Self::Merge { project_id, .. }
+            | Self::SquashMerge { project_id, .. }
+            | Self::Rebase { project_id, .. }
+            | Self::CherryPick { project_id, .. }
+            | Self::Squash { project_id, .. }
+            | Self::Reorder { project_id, .. }
+            | Self::Revert { project_id, .. }
+            | Self::Reset { project_id, .. }
+            | Self::Continue { project_id, .. }
+            | Self::Abort { project_id, .. }
+            | Self::ResolveConflict { project_id, .. }
+            | Self::TagCreate { project_id, .. }
+            | Self::TagDelete { project_id, .. }
+            | Self::TagPush { project_id, .. } => project_id,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_implemented_in_phase_07(&self) -> bool {
+        matches!(
+            self,
+            Self::BranchCreate { .. }
+                | Self::BranchCheckout {
+                    strategy: None | Some(GitManagerCheckoutStrategy::Bring),
+                    ..
+                }
+                | Self::BranchRename { .. }
+                | Self::BranchDelete { .. }
+                | Self::Fetch { .. }
+                | Self::Pull { .. }
+                | Self::Push { .. }
+                | Self::PublishBranch { .. }
+                | Self::ForcePush { .. }
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitManagerOperationOutcome {
+    pub operation: String,
+    pub outputs: Vec<ProcessOutput>,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[error("{message}")]
+pub struct GitManagerOperationError {
+    pub operation: String,
+    pub code: String,
+    pub message: String,
+    pub blocked: Option<Box<GitManagerBlockedReason>>,
+    pub outputs: Vec<ProcessOutput>,
+}
+
+pub async fn run_branch_or_sync_operation(
+    repository: Arc<GitRepository>,
+    broadcaster: StatusBroadcaster,
+    catalog: WorktreeCatalogService,
+    request: GitManagerOperationRequest,
+    cancellation: CancellationToken,
+) -> Result<GitManagerOperationOutcome, GitManagerOperationError> {
+    let operation = request.operation();
+    if !request.is_implemented_in_phase_07() {
+        return Err(operation_error(
+            operation,
+            "not-implemented",
+            "This Git Manager operation is not implemented until a later phase.",
+        ));
+    }
+    let project_id = request.project_id().to_owned();
+    let locked_repository = Arc::clone(&repository);
+    let locked_broadcaster = broadcaster.clone();
+    let locked_request = request.clone();
+    let operation_cancellation = cancellation.clone();
+    match catalog
+        .try_with_project_mutation_lock_cancellation(&project_id, &cancellation, || async move {
+            let snapshot = build_refs_snapshot(
+                &locked_repository,
+                locked_request.cwd(),
+                &operation_cancellation,
+            )
+            .await
+            .map_err(|error| refs_snapshot_error(operation, error))?;
+            if let Some(reason) = blocked_reason_for_operation(&snapshot, &locked_request) {
+                return Err(blocked_operation_error(operation, reason));
+            }
+            if operation_cancellation.is_cancelled() {
+                return Err(cancelled_error(operation));
+            }
+            let mutation = tokio::select! {
+                biased;
+                () = operation_cancellation.cancelled() => {
+                    return Err(cancelled_error(operation));
+                }
+                mutation = locked_broadcaster.begin_mutation(locked_request.cwd()) => mutation,
+            };
+            let result = execute_branch_or_sync_operation(
+                &locked_repository,
+                &snapshot,
+                &locked_request,
+                &operation_cancellation,
+            )
+            .await;
+            mutation.finish().await;
+            result
+        })
+        .await
+    {
+        ProjectMutationAttempt::Acquired(result) => result,
+        ProjectMutationAttempt::InFlight => Err(blocked_operation_error(
+            operation,
+            GitManagerBlockedReason {
+                operation: operation.to_owned(),
+                code: "operation-in-flight".to_owned(),
+                message: "Blocked: another Git Manager operation is already running.".to_owned(),
+            },
+        )),
+        ProjectMutationAttempt::Cancelled => Err(cancelled_error(operation)),
+    }
+}
+
+fn blocked_reason_for_operation(
+    snapshot: &GitManagerRefsSnapshot,
+    request: &GitManagerOperationRequest,
+) -> Option<GitManagerBlockedReason> {
+    let blocked = evaluate_guards(&GuardInput::from_snapshot(snapshot, false));
+    let (branch, guard_operation) = match request {
+        GitManagerOperationRequest::BranchCheckout { name, .. } => {
+            (Some(name.as_str()), "checkout")
+        }
+        GitManagerOperationRequest::BranchRename { name, .. } => {
+            (Some(name.as_str()), "rename-branch")
+        }
+        GitManagerOperationRequest::BranchDelete { name, .. } => {
+            (Some(name.as_str()), "delete-branch")
+        }
+        GitManagerOperationRequest::Pull { .. } => (snapshot.head_ref.as_deref(), "pull"),
+        GitManagerOperationRequest::Push { local_branch, .. } => {
+            (Some(local_branch.as_str()), "push")
+        }
+        GitManagerOperationRequest::PublishBranch { local_branch, .. } => {
+            (Some(local_branch.as_str()), "publish-branch")
+        }
+        GitManagerOperationRequest::ForcePush { local_branch, .. } => {
+            (Some(local_branch.as_str()), "force-push")
+        }
+        GitManagerOperationRequest::Fetch { .. } => (snapshot.head_ref.as_deref(), "fetch"),
+        GitManagerOperationRequest::BranchCreate { .. } => {
+            (snapshot.head_ref.as_deref(), "branch-create")
+        }
+        _ => return None,
+    };
+    let branch_reasons = branch.and_then(|branch| blocked.get(branch));
+    branch_reasons
+        .and_then(|reasons| {
+            reasons
+                .iter()
+                .find(|reason| reason.operation == guard_operation)
+        })
+        .or_else(|| {
+            blocked.values().flatten().find(|reason| {
+                reason.operation == guard_operation
+                    && matches!(
+                        reason.code.as_str(),
+                        "merge-in-progress" | "no-remote" | "dirty-working-tree"
+                    )
+            })
+        })
+        .cloned()
+}
+
+async fn execute_branch_or_sync_operation(
+    repository: &GitRepository,
+    snapshot: &GitManagerRefsSnapshot,
+    request: &GitManagerOperationRequest,
+    cancellation: &CancellationToken,
+) -> Result<GitManagerOperationOutcome, GitManagerOperationError> {
+    let operation = request.operation();
+    let outputs = match request {
+        GitManagerOperationRequest::BranchCreate {
+            cwd,
+            name,
+            start_point,
+            checkout,
+            ..
+        } => one_output(
+            operation,
+            repository
+                .git_manager_create_branch(
+                    cwd,
+                    name,
+                    start_point.as_deref(),
+                    *checkout,
+                    cancellation,
+                )
+                .await,
+        )?,
+        GitManagerOperationRequest::BranchCheckout { cwd, name, .. } => {
+            if snapshot
+                .local_branches
+                .iter()
+                .any(|reference| reference.name == *name)
+            {
+                one_output(
+                    operation,
+                    repository
+                        .git_manager_checkout_local_branch(cwd, name, cancellation)
+                        .await,
+                )?
+            } else if let Some(remote_ref) = remote_tracking_ref(snapshot, name) {
+                let local_name = remote_ref
+                    .name
+                    .split_once('/')
+                    .map_or(remote_ref.name.as_str(), |(_, branch)| branch);
+                one_output(
+                    operation,
+                    repository
+                        .git_manager_checkout_remote_branch(
+                            cwd,
+                            local_name,
+                            &remote_ref.name,
+                            cancellation,
+                        )
+                        .await,
+                )?
+            } else {
+                one_output(
+                    operation,
+                    repository
+                        .git_manager_checkout_local_branch(cwd, name, cancellation)
+                        .await,
+                )?
+            }
+        }
+        GitManagerOperationRequest::BranchRename {
+            cwd,
+            name,
+            new_name,
+            ..
+        } => {
+            let outputs = repository
+                .git_manager_rename_branch(cwd, name, new_name, cancellation)
+                .await
+                .map_err(|error| git_command_error(operation, error, Vec::new()))?;
+            require_last_success(operation, outputs)?
+        }
+        GitManagerOperationRequest::BranchDelete {
+            cwd,
+            name,
+            force,
+            delete_remote,
+            ..
+        } => {
+            let remote_target = if *delete_remote {
+                Some(remote_delete_target(snapshot, name).ok_or_else(|| {
+                    operation_error(
+                        operation,
+                        "no-upstream",
+                        "Remote deletion is blocked because this branch has no upstream.",
+                    )
+                })?)
+            } else {
+                None
+            };
+            let mut outputs = one_output(
+                operation,
+                repository
+                    .git_manager_delete_branch(cwd, name, *force, cancellation)
+                    .await,
+            )?;
+            if let Some((remote, remote_branch)) = remote_target {
+                let remote_output = repository
+                    .git_manager_delete_remote_branch(cwd, remote, remote_branch, cancellation)
+                    .await
+                    .map_err(|error| git_command_error(operation, error, outputs.clone()))?;
+                outputs.push(remote_output);
+                outputs = require_last_success(operation, outputs)?;
+            }
+            outputs
+        }
+        GitManagerOperationRequest::Fetch { cwd, remote, .. } => one_output(
+            operation,
+            repository
+                .git_manager_fetch(cwd, remote, cancellation)
+                .await,
+        )?,
+        GitManagerOperationRequest::Pull { cwd, remote, .. } => {
+            let outputs = repository
+                .git_manager_pull(cwd, remote, cancellation)
+                .await
+                .map_err(|error| git_command_error(operation, error, Vec::new()))?;
+            require_last_success(operation, outputs)?
+        }
+        GitManagerOperationRequest::Push {
+            cwd,
+            remote,
+            local_branch,
+            remote_branch,
+            ..
+        }
+        | GitManagerOperationRequest::PublishBranch {
+            cwd,
+            remote,
+            local_branch,
+            remote_branch,
+            ..
+        }
+        | GitManagerOperationRequest::ForcePush {
+            cwd,
+            remote,
+            local_branch,
+            remote_branch,
+            ..
+        } => one_output(
+            operation,
+            repository
+                .git_manager_push(
+                    cwd,
+                    remote,
+                    local_branch,
+                    remote_branch.as_deref(),
+                    matches!(request, GitManagerOperationRequest::PublishBranch { .. }),
+                    matches!(request, GitManagerOperationRequest::ForcePush { .. }),
+                    cancellation,
+                )
+                .await,
+        )?,
+        _ => {
+            return Err(operation_error(
+                operation,
+                "not-implemented",
+                "This Git Manager operation is not implemented until a later phase.",
+            ));
+        }
+    };
+    Ok(GitManagerOperationOutcome {
+        operation: operation.to_owned(),
+        outputs,
+        message: "Git operation completed.".to_owned(),
+    })
+}
+
+fn remote_tracking_ref<'a>(
+    snapshot: &'a GitManagerRefsSnapshot,
+    requested: &str,
+) -> Option<&'a crate::git::GitManagerRefEntry> {
+    snapshot
+        .remote_branches
+        .iter()
+        .find(|reference| reference.name == requested)
+        .or_else(|| {
+            let mut matches = snapshot.remote_branches.iter().filter(|reference| {
+                reference
+                    .name
+                    .split_once('/')
+                    .is_some_and(|(_, branch)| branch == requested)
+            });
+            let first = matches.next()?;
+            matches.next().is_none().then_some(first)
+        })
+}
+
+fn remote_delete_target<'a>(
+    snapshot: &'a GitManagerRefsSnapshot,
+    branch: &str,
+) -> Option<(&'a str, &'a str)> {
+    snapshot
+        .local_branches
+        .iter()
+        .find(|reference| reference.name == branch)?
+        .upstream
+        .as_deref()?
+        .split_once('/')
+}
+
+fn one_output(
+    operation: &str,
+    output: Result<ProcessOutput, GitCommandError>,
+) -> Result<Vec<ProcessOutput>, GitManagerOperationError> {
+    let output = output.map_err(|error| git_command_error(operation, error, Vec::new()))?;
+    require_last_success(operation, vec![output])
+}
+
+fn require_last_success(
+    operation: &str,
+    outputs: Vec<ProcessOutput>,
+) -> Result<Vec<ProcessOutput>, GitManagerOperationError> {
+    let Some(output) = outputs.last() else {
+        return Ok(outputs);
+    };
+    if output.exit_code == 0 {
+        return Ok(outputs);
+    }
+    let code = classify_operation_failure(output.exit_code, &output.stderr);
+    Err(GitManagerOperationError {
+        operation: operation.to_owned(),
+        code: code.as_str().to_owned(),
+        message: failure_message(code).to_owned(),
+        blocked: None,
+        outputs,
+    })
+}
+
+fn git_command_error(
+    operation: &str,
+    error: GitCommandError,
+    outputs: Vec<ProcessOutput>,
+) -> GitManagerOperationError {
+    let exit_code = error
+        .diagnostics
+        .as_deref()
+        .and_then(|diagnostics| diagnostics.exit_code)
+        .unwrap_or(-1);
+    let code = classify_operation_failure(exit_code, &error.detail);
+    GitManagerOperationError {
+        operation: operation.to_owned(),
+        code: code.as_str().to_owned(),
+        message: failure_message(code).to_owned(),
+        blocked: None,
+        outputs,
+    }
+}
+
+fn refs_snapshot_error(
+    operation: &str,
+    error: super::refs::GitManagerRefsError,
+) -> GitManagerOperationError {
+    match error {
+        super::refs::GitManagerRefsError::Git(error) => {
+            git_command_error(operation, error, Vec::new())
+        }
+        super::refs::GitManagerRefsError::MalformedRefs
+        | super::refs::GitManagerRefsError::RepositoryState(_)
+        | super::refs::GitManagerRefsError::Worktrees(_) => operation_error(
+            operation,
+            "repository-state-unavailable",
+            "Git repository state could not be revalidated.",
+        ),
+    }
+}
+
+const fn failure_message(code: GitManagerFailureCode) -> &'static str {
+    match code {
+        GitManagerFailureCode::Authentication => {
+            "Authentication failed. Check the configured credentials and try again."
+        }
+        GitManagerFailureCode::NonFastForward => {
+            "The remote rejected this update because it is not a fast-forward."
+        }
+        GitManagerFailureCode::StaleInfo => {
+            "The remote branch changed; fetch its latest state before retrying."
+        }
+        GitManagerFailureCode::LocalChangesOverwritten => {
+            "Git stopped because local changes would be overwritten."
+        }
+        GitManagerFailureCode::Conflicts => "Git stopped because the operation produced conflicts.",
+        GitManagerFailureCode::NoUpstream => "The current branch has no configured upstream.",
+        GitManagerFailureCode::Cancelled => "The Git Manager operation was cancelled.",
+        GitManagerFailureCode::TimedOut => "The Git Manager operation timed out.",
+        GitManagerFailureCode::Unknown => "Git could not complete the requested operation.",
+    }
+}
+
+fn blocked_operation_error(
+    operation: &str,
+    reason: GitManagerBlockedReason,
+) -> GitManagerOperationError {
+    GitManagerOperationError {
+        operation: operation.to_owned(),
+        code: reason.code.clone(),
+        message: reason.message.clone(),
+        blocked: Some(Box::new(reason)),
+        outputs: Vec::new(),
+    }
+}
+
+fn cancelled_error(operation: &str) -> GitManagerOperationError {
+    operation_error(
+        operation,
+        GitManagerFailureCode::Cancelled.as_str(),
+        failure_message(GitManagerFailureCode::Cancelled),
+    )
+}
+
+fn operation_error(operation: &str, code: &str, message: &str) -> GitManagerOperationError {
+    GitManagerOperationError {
+        operation: operation.to_owned(),
+        code: code.to_owned(),
+        message: message.to_owned(),
+        blocked: None,
+        outputs: Vec::new(),
+    }
 }
 
 #[must_use]
@@ -427,6 +1218,141 @@ mod tests {
                 Ok(())
             })
         }
+    }
+
+    fn assert_failure_code(stderr: &str, expected: GitManagerFailureCode) {
+        assert_eq!(classify_operation_failure(1, stderr), expected);
+    }
+
+    #[test]
+    fn classifies_authentication_failures() {
+        for stderr in [
+            "fatal: Authentication failed",
+            "fatal: could not read Username for 'https://example.test'",
+            "fatal: could not read Password for 'https://example.test'",
+            "remote: Permission denied (publickey)",
+        ] {
+            assert_failure_code(stderr, GitManagerFailureCode::Authentication);
+        }
+    }
+
+    #[test]
+    fn classifies_non_fast_forward_failures() {
+        for stderr in [
+            "! [rejected] main -> main (non-fast-forward)",
+            "rejected because the remote contains work; updates were rejected",
+        ] {
+            assert_failure_code(stderr, GitManagerFailureCode::NonFastForward);
+        }
+    }
+
+    #[test]
+    fn classifies_stale_info_failures() {
+        assert_failure_code("rejected: stale info", GitManagerFailureCode::StaleInfo);
+    }
+
+    #[test]
+    fn classifies_local_changes_overwritten_failures() {
+        assert_failure_code(
+            "Your local changes to the following files would be overwritten by checkout",
+            GitManagerFailureCode::LocalChangesOverwritten,
+        );
+    }
+
+    #[test]
+    fn classifies_conflict_failures() {
+        for stderr in [
+            "CONFLICT (content): Merge conflict in tracked.txt",
+            "Automatic merge failed; fix conflicts and then commit the result.",
+        ] {
+            assert_failure_code(stderr, GitManagerFailureCode::Conflicts);
+        }
+    }
+
+    #[test]
+    fn classifies_no_upstream_failures() {
+        assert_failure_code(
+            "There is no tracking information for the current branch.",
+            GitManagerFailureCode::NoUpstream,
+        );
+    }
+
+    #[test]
+    fn classifies_cancelled_failures() {
+        assert_failure_code(
+            "Git command was interrupted.",
+            GitManagerFailureCode::Cancelled,
+        );
+    }
+
+    #[test]
+    fn classifies_timed_out_failures() {
+        assert_failure_code("Git command timed out.", GitManagerFailureCode::TimedOut);
+    }
+
+    #[test]
+    fn unknown_failures_use_the_fallback_code() {
+        assert_failure_code(
+            "fatal: an unfamiliar failure",
+            GitManagerFailureCode::Unknown,
+        );
+    }
+
+    #[test]
+    fn delete_guard_revalidation_returns_the_prune_first_structured_reason() {
+        let worktree_path = "/repo/missing-topic";
+        let snapshot = crate::git::GitManagerRefsSnapshot {
+            generation: 1,
+            head_ref: Some("main".into()),
+            detached_sha: None,
+            is_dirty: false,
+            default_branch: Some("main".into()),
+            remotes: vec!["origin".into()],
+            local_branches: vec![crate::git::GitManagerRefEntry {
+                name: "topic".into(),
+                tip_sha: "0123456789012345678901234567890123456789".into(),
+                upstream: Some("origin/topic".into()),
+                ahead: 0,
+                behind: 0,
+                current: false,
+                is_default: false,
+                worktree_path: Some(worktree_path.into()),
+                blocked: Vec::new(),
+            }],
+            remote_branches: Vec::new(),
+            tags: Vec::new(),
+            worktrees: vec![crate::git::GitManagerWorktreeEntry {
+                path: worktree_path.into(),
+                head_sha: "0123456789012345678901234567890123456789".into(),
+                branch: Some("topic".into()),
+                is_primary: false,
+                is_bare: false,
+                is_detached: false,
+                locked: false,
+                lock_reason: None,
+                prunable: true,
+            }],
+            in_progress_operation: None,
+            conflicted_paths: Vec::new(),
+        };
+        let request = GitManagerOperationRequest::BranchDelete {
+            cwd: PathBuf::from("/repo"),
+            project_id: "project-1".into(),
+            name: "topic".into(),
+            force: true,
+            delete_remote: false,
+        };
+
+        let reason = blocked_reason_for_operation(&snapshot, &request)
+            .expect("missing registered worktree blocks branch deletion");
+
+        assert_eq!(reason.operation, "delete-branch");
+        assert_eq!(reason.code, "worktree-checked-out");
+        assert!(
+            reason
+                .message
+                .contains("remove or prune the worktree first")
+        );
     }
 
     #[test]
