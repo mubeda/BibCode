@@ -308,6 +308,19 @@ body {
   padding: 0;
 }
 
+/* WebKitGTK renders scroll-container text grayscale-only; this compensates
+   stroke density. The design document records the measurements. */
+html[data-linux-webkit] body {
+  font-weight: 450;
+  letter-spacing: 0.01em;
+}
+
+html[data-linux-webkit] pre,
+html[data-linux-webkit] code {
+  font-weight: 400;
+  letter-spacing: normal;
+}
+
 html,
 body {
   min-height: calc(100svh + env(safe-area-inset-top));
