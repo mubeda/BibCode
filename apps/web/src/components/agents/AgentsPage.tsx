@@ -150,7 +150,7 @@ export function AgentsPage() {
           <ArrowLeftIcon className="size-4" aria-hidden />
         </Button>
         <h1 className="text-sm font-medium">agents</h1>
-        <span className="rounded-full bg-muted px-2 py-0.5 text-[10px] font-medium tabular-nums text-muted-foreground">
+        <span className="rounded-full bg-muted px-2 py-0.5 text-2xs font-medium tabular-nums text-muted-foreground">
           {unreadCount} unread
         </span>
       </header>
@@ -224,9 +224,9 @@ export function AgentsPage() {
           <div className="min-h-0 flex-1 overflow-y-auto px-2 py-1.5">
             <div className="min-w-0" data-text-surface="card">
               {rows.length === 0 ? (
-                <div className="px-2 py-3 text-xs text-muted-foreground/60">No agents yet</div>
+                <div className="px-2 py-3 text-xs text-muted-foreground">No agents yet</div>
               ) : groups.length === 0 ? (
-                <div className="px-2 py-3 text-xs text-muted-foreground/60">No agents found</div>
+                <div className="px-2 py-3 text-xs text-muted-foreground">No agents found</div>
               ) : (
                 groups.map((group) => {
                   const groupExpanded = resolveAgentsGroupExpanded(
@@ -237,7 +237,7 @@ export function AgentsPage() {
                     <div key={group.id} className="min-w-0">
                       <button
                         type="button"
-                        className="flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left text-[10px] font-medium text-muted-foreground/70 hover:bg-accent hover:text-foreground"
+                        className="flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left text-2xs font-medium text-muted-foreground hover:bg-accent hover:text-foreground"
                         data-testid={`agents-group-${group.id}`}
                         aria-expanded={groupExpanded}
                         onClick={() => setAgentsGroupExpanded(group.id, !groupExpanded)}
@@ -252,7 +252,7 @@ export function AgentsPage() {
                           />
                           <span className="truncate">{group.label}</span>
                         </span>
-                        <span className="rounded-full bg-muted px-1.5 py-0.5 text-[9px] tabular-nums text-muted-foreground/70">
+                        <span className="rounded-full bg-muted px-1.5 py-0.5 text-2xs tabular-nums text-muted-foreground">
                           {group.rows.length}
                         </span>
                       </button>

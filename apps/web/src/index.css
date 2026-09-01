@@ -48,6 +48,10 @@
     sans-serif;
   --font-mono:
     "SF Mono", "SFMono-Regular", "JetBrains Mono", Consolas, "Liberation Mono", Menlo, monospace;
+  /* Smallest text size in the app (11px). Secondary labels, badges, and
+     timestamps use it; nothing renders below it. */
+  --text-2xs: 0.6875rem;
+  --text-2xs--line-height: 1rem;
   --color-warning-foreground: var(--warning-foreground);
   --color-warning: var(--warning);
   --color-success-foreground: var(--success-foreground);
