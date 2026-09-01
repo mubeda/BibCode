@@ -139,3 +139,79 @@ the sidebar text crops' mean-ink density to rise accordingly, with
 screenshots for the user's subjective judgment. The subpixel gap inside
 scrollers is recorded as an upstream WebKitGTK limitation, not fixable
 app-side.
+
+## Revision 3 (same day) — spacing regression traced to full hinting
+
+The user's screenshot and a capture of the packaged AppImage under Xwayland
+showed uneven whole-pixel gaps inside words: “prim ary”, “s erver”, “No t
+hreads yet”, “Securi ty”, “st andards”, and “SECURIT Y”. The measured session
+was Fedora 44 on GNOME Wayland at display scale 1.0, with the non-default GNOME
+`font-hinting='full'` (GNOME defaults to `slight`) and
+`font-antialiasing='rgba'`. The reference Electron app on the same machine
+uses Geist Variable with body `letter-spacing: 0.01em` and sets no Chromium
+font-rendering switches.
+
+Revision 2's headless harness ran at GTK's default `hintmedium`: its isolated
+`settings.ini` hint style never reached GDK on X11. It therefore could not
+reproduce the user's `hintfull` session. More importantly, the user's complaint
+was spacing rather than stroke density, and Revision 2's added tracking made
+that spacing worse.
+
+WebKit source (`Source/WebCore/platform/graphics/skia/FontPlatformDataSkia.cpp`
+and `FontRenderOptionsSkia.cpp`) and Chromium source
+(`ui/gfx/font_render_params_linux.cc`) explain the measurements. At device
+scale 1.0, both engines disable subpixel glyph positioning when the session
+hint style is `full` and rasterize fully hinted glyphs at whole-pixel
+positions; with any other hint style WebKitGTK forces subpixel positioning on.
+The `0.01em` tracking adds a fractional advance of about 0.13px at 13px, which
+accumulates and periodically snaps into an extra whole-pixel gap in both
+engines. WebKitGTK's fully hinted DM Sans additionally shows gaps without
+tracking, while Chromium's does not.
+
+Oversized (≥3px) intra-word gaps per 56-character no-space line at 13px were
+deterministic across 3 runs:
+
+| Font/CSS variant                                | WebKitGTK `hintfull` | WebKitGTK `hintslight` | Chromium `hintfull` |
+| ----------------------------------------------- | -------------------: | ---------------------: | ------------------: |
+| DM Sans 400                                     |                    7 |                      0 |                   0 |
+| DM Sans 400 + `0.01em`                          |                   12 |                      0 |                   4 |
+| DM Sans 450                                     |                    7 |                      0 |                   0 |
+| DM Sans 450 + `0.01em` (shipped Revision 2 CSS) |                   12 |                      0 |                   5 |
+| Geist 400 + `0.01em`                            |                    2 |                      0 |                   2 |
+| Geist 400                                       |                    0 |                      0 |                   0 |
+| System font (Adwaita Sans)                      |                    0 |                      1 |                   0 |
+
+WebKitGTK `hintnone` also measured 0 for every DM Sans and Geist row, and
+Chromium `hintslight` and `hintnone` measured 0 for the DM Sans rows. With the
+system still at `hintfull`, an application-level GtkSettings override to
+`gtk-xft-hintstyle=hintslight` measured 0 for every DM Sans row, including when
+applied after the page loaded; WebKitGTK re-rendered on the settings change.
+Under `hintslight`, mean ink per row was 280 for DM Sans 400 and 300 for DM Sans
+450 (+7%).
+
+**Superseding decision:** combine a process-local host correction with the
+smallest CSS correction, retaining the measured stroke-density improvement:
+
+- **Application GtkSettings override — accepted.** On Linux, when the session
+  reports hinting enabled with `hintfull`, the desktop host pins its own
+  `gtk-xft-hintstyle` to `hintslight` in
+  `apps/desktop/src-tauri/src/linux_text_rendering.rs`. Application-source
+  settings outrank XSettings/GSettings, so this leaves the user's system
+  preference untouched. Remove body tracking, keep body `font-weight: 450`,
+  and keep the `pre`/`code` weight pin at 400.
+- **Switch the product typeface to Geist — rejected.** Geist at weight 400
+  without tracking fixes WebKitGTK spacing without a host change, but changing
+  cross-platform typography is outside a Linux bug fix; Geist with tracking
+  still shows 2 gaps.
+- **Remove tracking only — rejected.** This removes Revision 2's regression but
+  leaves 7 gaps in fully hinted WebKitGTK DM Sans.
+
+The known side effect is that the app's own native GTK menu bar also renders
+with `hintslight`. Whether the application-source override survives a later
+live change to the system preference was not verified and remains residual
+risk.
+
+Verification: rebuild the AppImage, capture the packaged app under Xwayland
+with the same temporary-HOME harness, and require the “prim ary” and “No t
+hreads yet” gaps to be gone and the 13px matrix to measure 0 gaps on every DM
+Sans row.

@@ -95,7 +95,10 @@ behavior when applicable.
 
 Run the shared focused tests and sequential broad/static gate set. Confirm
 Linux-only tests are not filtered unexpectedly and record any AppImage,
-WebKitGTK, X11, or Wayland diagnostic.
+WebKitGTK, X11, or Wayland diagnostic. Also record the session's GNOME
+`font-hinting` value; when it is `full`, confirm the packaged app's body text
+shows no whole-pixel letter gaps because the host pins `hintslight` for its
+webview.
 
 Do not run `vp run test` and a separate broad Cargo command concurrently. Do
 not replace the normal Rust test harness with a serial harness.

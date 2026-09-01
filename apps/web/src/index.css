@@ -308,17 +308,17 @@ body {
   padding: 0;
 }
 
-/* WebKitGTK renders scroll-container text grayscale-only; this compensates
-   stroke density. The design document records the measurements. */
+/* The Linux host pins WebKitGTK to hintslight in
+   apps/desktop/src-tauri/src/linux_text_rendering.rs. Weight 450 preserves
+   measured stroke density; never add letter-spacing here because fractional
+   per-glyph advances snap into whole-pixel gaps under hinting (design Revision 3). */
 html[data-linux-webkit] body {
   font-weight: 450;
-  letter-spacing: 0.01em;
 }
 
 html[data-linux-webkit] pre,
 html[data-linux-webkit] code {
   font-weight: 400;
-  letter-spacing: normal;
 }
 
 html,
