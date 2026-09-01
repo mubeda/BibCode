@@ -56,6 +56,7 @@ export interface ServerArtifactPlan {
   readonly archiveName: string;
   readonly archivePath: string;
   readonly archiveCommand: ServerArtifactCommand;
+  readonly archiveListCommand: ServerArtifactCommand;
   readonly binaryPath: string;
   readonly webDir: string;
   readonly guidePath: string;
@@ -149,14 +150,38 @@ export function planServerArtifact(
   const stagingParent = NodePath.join(outputDir, "staging");
   const stagingDir = NodePath.join(stagingParent, distributionRootName);
   const archivePath = NodePath.join(outputDir, archiveName);
-  const archiveArgs = [
-    target.serverArchive === "zip" ? "-a" : undefined,
-    target.serverArchive === "zip" ? "-cf" : "-czf",
-    archiveName,
-    "-C",
-    NodePath.basename(stagingParent),
-    distributionRootName,
-  ].filter((argument): argument is string => argument !== undefined);
+  const archiveCommand =
+    target.serverArchive === "zip"
+      ? {
+          command: "powershell.exe",
+          args: [
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$ErrorActionPreference = 'Stop'; Compress-Archive -LiteralPath $args[0] -DestinationPath $args[1] -CompressionLevel Optimal",
+            NodePath.win32.join(NodePath.basename(stagingParent), distributionRootName),
+            archiveName,
+          ],
+        }
+      : {
+          command: "tar",
+          args: ["-czf", archiveName, "-C", NodePath.basename(stagingParent), distributionRootName],
+        };
+  const archiveListCommand =
+    target.serverArchive === "zip"
+      ? {
+          command: "powershell.exe",
+          args: [
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$ErrorActionPreference = 'Stop'; Add-Type -AssemblyName System.IO.Compression.FileSystem; $archive = [IO.Compression.ZipFile]::OpenRead($args[0]); try { $archive.Entries | ForEach-Object { [Console]::Out.WriteLine($_.FullName) } } finally { $archive.Dispose() }",
+            archiveName,
+          ],
+        }
+      : { command: "tar", args: ["-tf", archiveName] };
   const cargoArgs = [
     "build",
     "-p",
@@ -230,7 +255,8 @@ export function planServerArtifact(
     stagingDir,
     archiveName,
     archivePath,
-    archiveCommand: { command: "tar", args: archiveArgs },
+    archiveCommand,
+    archiveListCommand,
     binaryPath,
     webDir,
     guidePath,
@@ -323,19 +349,54 @@ function runCommand(command: ServerArtifactCommand, cwd: string, verbose: boolea
   }
 }
 
+export function validateServerArchiveSignature(
+  archivePath: string,
+  archiveType: "tar.gz" | "zip",
+): void {
+  const descriptor = NodeFS.openSync(archivePath, "r");
+  try {
+    const signature = Buffer.alloc(4);
+    const bytesRead = NodeFS.readSync(descriptor, signature, 0, signature.byteLength, 0);
+    const valid =
+      archiveType === "zip"
+        ? bytesRead === signature.byteLength &&
+          signature[0] === 0x50 &&
+          signature[1] === 0x4b &&
+          ((signature[2] === 0x03 && signature[3] === 0x04) ||
+            (signature[2] === 0x05 && signature[3] === 0x06) ||
+            (signature[2] === 0x07 && signature[3] === 0x08))
+        : bytesRead >= 2 && signature[0] === 0x1f && signature[1] === 0x8b;
+    if (!valid) {
+      throw new ServerArtifactConfigurationError(
+        `${NodePath.basename(archivePath)} does not have a valid ${archiveType === "zip" ? "ZIP signature" : "gzip signature"}.`,
+      );
+    }
+  } finally {
+    NodeFS.closeSync(descriptor);
+  }
+}
+
 function validateArchive(plan: ServerArtifactPlan): void {
-  const result = NodeChildProcess.spawnSync("tar", ["-tf", plan.archiveName], {
-    cwd: plan.outputDir,
-    shell: false,
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  validateServerArchiveSignature(plan.archivePath, plan.target.serverArchive);
+  const result = NodeChildProcess.spawnSync(
+    plan.archiveListCommand.command,
+    [...plan.archiveListCommand.args],
+    {
+      cwd: plan.outputDir,
+      shell: false,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
   if (result.error) throw result.error;
   if (result.status !== 0) {
     throw new ServerArtifactConfigurationError(`Could not inspect ${plan.archiveName}.`);
   }
   const prefix = `${plan.distributionRootName}/`;
-  const entries = String(result.stdout).split(/\r?\n/).filter(Boolean);
+  const entries = String(result.stdout)
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((entry) => entry.replaceAll("\\", "/"));
   const seen = new Set<string>();
   for (const entry of entries) {
     if (
