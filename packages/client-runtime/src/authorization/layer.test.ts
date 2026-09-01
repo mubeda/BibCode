@@ -9,6 +9,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import { makeTestExecutionEnvironmentCapabilities } from "@bibcode/shared/testSupport";
 
 import * as ManagedRelay from "../relay/managedRelay.ts";
 import { remoteHttpClientLayer } from "../rpc/http.ts";
@@ -35,14 +36,7 @@ const DESCRIPTOR = {
   remoteUpdateSupport: null,
   remoteProtocolVersion: 1,
   minCompatibleRemoteProtocol: 1,
-  capabilities: {
-    repositoryIdentity: true,
-    worktreeCatalog: false,
-    worktreeCatalogRefreshReason: false,
-    vcsStatusSummary: false,
-    activityProtocolVersion: null,
-    remoteUpdateControl: false,
-  },
+  capabilities: makeTestExecutionEnvironmentCapabilities({ repositoryIdentity: true }),
 } satisfies ExecutionEnvironmentDescriptor;
 const BOOTSTRAP: RemoteEnvironmentAuthorization.RelayEnvironmentAuthorization = {
   environmentId: ENVIRONMENT_ID,

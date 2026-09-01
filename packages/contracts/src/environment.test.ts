@@ -12,6 +12,18 @@ const decodeExecutionEnvironmentDescriptor = Schema.decodeUnknownSync(
   ExecutionEnvironmentDescriptor,
 );
 
+const gitManagerCapabilities = [
+  "gitManagerReads",
+  "gitManagerCommitOperations",
+  "gitManagerBranchSyncOperations",
+  "gitManagerStashMergeOperations",
+  "gitManagerPartialStaging",
+  "gitManagerRewriteOperations",
+  "gitManagerTagOperations",
+  "gitManagerLiveSignal",
+  "gitManagerPullRequests",
+] as const;
+
 const descriptor = {
   environmentId: "local",
   label: "Local",
@@ -103,6 +115,25 @@ describe("execution environment contracts", () => {
         capabilities: { repositoryIdentity: true },
       }).capabilities.vcsStatusSummary,
     ).toBe(false);
+  });
+
+  it("defaults every Git Manager capability to false and decodes every advertised capability", () => {
+    const absent = decodeExecutionEnvironmentDescriptor({
+      ...descriptor,
+      capabilities: { repositoryIdentity: true },
+    });
+    const advertised = decodeExecutionEnvironmentDescriptor({
+      ...descriptor,
+      capabilities: {
+        repositoryIdentity: true,
+        ...Object.fromEntries(gitManagerCapabilities.map((capability) => [capability, true])),
+      },
+    });
+
+    for (const capability of gitManagerCapabilities) {
+      expect(absent.capabilities[capability]).toBe(false);
+      expect(advertised.capabilities[capability]).toBe(true);
+    }
   });
 
   it("defaults worktree catalog support to false for an old descriptor", () => {

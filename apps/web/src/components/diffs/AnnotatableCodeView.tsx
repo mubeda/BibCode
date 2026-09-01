@@ -70,7 +70,12 @@ function appendAnnotationEntry(
   );
 }
 
-interface AnnotatableCodeViewProps {
+interface AnnotatableSelectedLines {
+  readonly id: string;
+  readonly range: SelectedLineRange;
+}
+
+export interface AnnotatableCodeViewProps {
   files: ReadonlyArray<{
     fileDiff: FileDiffMetadata;
     filePath: string;
@@ -88,9 +93,14 @@ interface AnnotatableCodeViewProps {
     fileKey: string,
     collapsed: boolean,
   ) => ReactNode;
+  enableGutterUtility?: boolean;
+  enableLineSelection?: boolean;
+  selectedLines?: AnnotatableSelectedLines | null;
+  onSelectedLinesChange?: (selection: AnnotatableSelectedLines | null) => void;
+  onLineSelectionEnd?: (range: SelectedLineRange | null, context: DiffSelectionContext) => void;
 }
 
-interface DiffSelectionContext {
+export interface DiffSelectionContext {
   item: CodeViewItem<DiffCommentAnnotationGroup>;
 }
 
@@ -103,16 +113,20 @@ export function AnnotatableCodeView({
   viewerRef,
   className,
   renderHeaderPrefix,
+  enableGutterUtility,
+  enableLineSelection,
+  selectedLines: controlledSelectedLines,
+  onSelectedLinesChange,
+  onLineSelectionEnd,
 }: AnnotatableCodeViewProps) {
   const addReviewComment = useComposerDraftStore((store) => store.addReviewComment);
   const removeReviewComment = useComposerDraftStore((store) => store.removeReviewComment);
   const reviewComments = useComposerDraftStore(
     (store) => store.getComposerDraft(composerDraftTarget)?.reviewComments ?? EMPTY_REVIEW_COMMENTS,
   );
-  const [selectedLines, setSelectedLines] = useState<{
-    id: string;
-    range: SelectedLineRange;
-  } | null>(null);
+  const [localSelectedLines, setLocalSelectedLines] = useState<AnnotatableSelectedLines | null>(
+    null,
+  );
   const [draft, setDraft] = useState<{
     fileKey: string;
     annotation: DiffCommentLineAnnotation;
@@ -164,7 +178,7 @@ export function AnnotatableCodeView({
 
   const removeEntry = useCallback(
     (entryId: string) => {
-      setSelectedLines(null);
+      setLocalSelectedLines(null);
       if (draft?.annotation.metadata.entries.some((entry) => entry.id === entryId)) {
         setDraft(null);
       } else {
@@ -191,7 +205,7 @@ export function AnnotatableCodeView({
         text,
       });
       if (comment) addReviewComment(composerDraftTarget, comment);
-      setSelectedLines(null);
+      setLocalSelectedLines(null);
       setDraft(null);
     },
     [addReviewComment, composerDraftTarget, draft, filesByKey, sectionId, sectionTitle],
@@ -229,19 +243,23 @@ export function AnnotatableCodeView({
     [filesByKey, sectionId, sectionTitle],
   );
 
-  const hasOpenComment = draft !== null;
+  const commentSelectionEnabled = onLineSelectionEnd === undefined;
+  const hasOpenComment = commentSelectionEnabled && draft !== null;
+  const selectedLines =
+    controlledSelectedLines === undefined ? localSelectedLines : controlledSelectedLines;
+  const handleSelectedLinesChange = onSelectedLinesChange ?? setLocalSelectedLines;
   return (
     <CodeView<DiffCommentAnnotationGroup>
       {...(viewerRef ? { ref: viewerRef } : {})}
       {...(className ? { className } : {})}
       items={items}
       selectedLines={selectedLines}
-      onSelectedLinesChange={setSelectedLines}
+      onSelectedLinesChange={handleSelectedLinesChange}
       options={{
         ...options,
-        enableGutterUtility: !hasOpenComment,
-        enableLineSelection: !hasOpenComment,
-        onLineSelectionEnd: beginComment,
+        enableGutterUtility: enableGutterUtility ?? !hasOpenComment,
+        enableLineSelection: enableLineSelection ?? !hasOpenComment,
+        onLineSelectionEnd: onLineSelectionEnd ?? beginComment,
       }}
       renderHeaderPrefix={(item) =>
         item.type === "diff"

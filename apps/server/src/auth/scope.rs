@@ -21,6 +21,12 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
     match method {
         "assets.createUrl"
         | "filesystem.browse"
+        | "gitManager.getCommits"
+        | "gitManager.getDiff"
+        | "gitManager.getRefs"
+        | "gitManager.getStashes"
+        | "gitManager.listPullRequests"
+        | "gitManager.previewMerge"
         | "orchestration.getArchivedShellSnapshot"
         | "orchestration.getFullThreadDiff"
         | "orchestration.getTurnDiff"
@@ -41,6 +47,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "updater.status"
         | "sourceControl.lookupRepository"
         | "subscribeDiscoveredLocalServers"
+        | "subscribeGitManagerSignal"
         | "subscribePreviewEvents"
         | "subscribeProjectEntries"
         | "subscribeServerConfig"
@@ -56,6 +63,13 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         "git.preparePullRequestThread"
         | "git.resolvePullRequest"
         | "git.runStackedAction"
+        | "gitManager.commit"
+        | "gitManager.discard"
+        | "gitManager.discardPartial"
+        | "gitManager.runOperation"
+        | "gitManager.stagePartial"
+        | "gitManager.undoCommit"
+        | "gitManager.unstagePartial"
         | "activity.cancelSubtree"
         | "activity.retrySubtreeCancellation"
         | "orchestration.dispatchCommand"
@@ -194,6 +208,13 @@ mod tests {
             );
         }
         for method in [
+            "gitManager.getCommits",
+            "gitManager.getDiff",
+            "gitManager.getRefs",
+            "gitManager.getStashes",
+            "gitManager.listPullRequests",
+            "gitManager.previewMerge",
+            "subscribeGitManagerSignal",
             "subscribeVcsStatusSummary",
             "subscribeWorktreeCatalog",
             "vcs.refreshWorktreeCatalog",
@@ -213,6 +234,21 @@ mod tests {
             required_scope("worktree.adopt"),
             Some(SCOPE_ORCHESTRATION_OPERATE)
         );
+        for method in [
+            "gitManager.commit",
+            "gitManager.discard",
+            "gitManager.discardPartial",
+            "gitManager.runOperation",
+            "gitManager.stagePartial",
+            "gitManager.undoCommit",
+            "gitManager.unstagePartial",
+        ] {
+            assert_eq!(
+                required_scope(method),
+                Some(SCOPE_ORCHESTRATION_OPERATE),
+                "wrong Git Manager mutation scope for {method}"
+            );
+        }
         for method in ["worktree.remove", "worktree.removeFromBibCode"] {
             assert_eq!(required_scope(method), Some(SCOPE_ORCHESTRATION_OPERATE));
         }
