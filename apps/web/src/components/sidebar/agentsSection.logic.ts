@@ -1,9 +1,16 @@
 import { scopeThreadRef, scopedThreadKey } from "@bibcode/client-runtime/environment";
 import type { EnvironmentThreadShell } from "@bibcode/client-runtime/state/models";
 import type { EnvironmentAvailabilityStatus } from "@bibcode/client-runtime/state/shell";
-import type { OrchestrationConversationPreview, ScopedThreadRef } from "@bibcode/contracts";
+import {
+  isProviderDriverKind,
+  type OrchestrationConversationPreview,
+  PROVIDER_DISPLAY_NAMES,
+  type ProviderDriverKind,
+  type ScopedThreadRef,
+} from "@bibcode/contracts";
 
 import { selectIsUnread } from "../../sidebarWorkspaceMetaStore";
+import { formatProviderSlugLabel } from "../../providerModels";
 import { normalizeSearchText } from "../CommandPalette.logic";
 import { resolveThreadStatusPill, type ThreadStatusPill } from "../Sidebar.logic";
 
@@ -28,6 +35,8 @@ export interface AgentRow {
   readonly environmentLive: boolean;
   readonly environmentStatus: EnvironmentAvailabilityStatus | null;
   readonly projectTitle: string;
+  readonly providerDriverKind: ProviderDriverKind | null;
+  readonly providerLabel: string | null;
   readonly previewLine: string | null;
   readonly searchText: string;
 }
@@ -53,6 +62,22 @@ export function resolveAgentGroup(pill: ThreadStatusPill | null): AgentGroupId {
     default:
       return "done";
   }
+}
+
+export function resolveAgentProvider(providerName: string | null | undefined): {
+  readonly driverKind: ProviderDriverKind | null;
+  readonly label: string | null;
+} {
+  const trimmed = providerName?.trim() ?? "";
+  if (trimmed === "") return { driverKind: null, label: null };
+  // Sessions store the driver kind verbatim (for example `claudeAgent`).
+  const driverKind = isProviderDriverKind(trimmed) ? trimmed : null;
+  return {
+    driverKind,
+    label:
+      (driverKind === null ? undefined : PROVIDER_DISPLAY_NAMES[driverKind]) ??
+      formatProviderSlugLabel(trimmed),
+  };
 }
 
 export function resolveAgentPreviewLine(
@@ -82,6 +107,7 @@ export function buildAgentRows(input: {
       const environmentLabel = input.environmentLabelById.get(shell.environmentId) ?? "";
       const environmentStatus = input.availabilityByEnvironmentId.get(shell.environmentId) ?? null;
       const preview = shell.conversationPreview;
+      const provider = resolveAgentProvider(shell.session?.providerName);
 
       return {
         key: scopedThreadKey(ref),
@@ -93,6 +119,8 @@ export function buildAgentRows(input: {
         environmentLive: environmentStatus === "live",
         environmentStatus,
         projectTitle,
+        providerDriverKind: provider.driverKind,
+        providerLabel: provider.label,
         previewLine: resolveAgentPreviewLine(pill, preview),
         searchText: normalizeSearchText(
           [

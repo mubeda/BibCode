@@ -1,7 +1,13 @@
 import type { EnvironmentAvailabilityStatus } from "@bibcode/client-runtime/state/shell";
 import type { ScopedThreadRef } from "@bibcode/contracts";
 import { useRouter } from "@tanstack/react-router";
-import { ArrowLeftIcon, BellIcon, ChevronRightIcon, MoreHorizontalIcon } from "lucide-react";
+import {
+  ArrowLeftIcon,
+  BellIcon,
+  ChevronRightIcon,
+  MoreHorizontalIcon,
+  SearchIcon,
+} from "lucide-react";
 import { useCallback, useDeferredValue, useEffect, useMemo, useState } from "react";
 
 import { cn } from "../../lib/utils";
@@ -157,19 +163,25 @@ export function AgentsPage() {
 
       <div className="flex min-h-0 min-w-0 flex-1">
         <aside
-          className="flex w-[340px] shrink-0 flex-col border-r border-border bg-card"
+          className="flex w-[clamp(340px,28vw,480px)] shrink-0 flex-col border-r border-border bg-card"
           data-testid="agents-view-list"
         >
-          <div className="grid shrink-0 grid-cols-[minmax(0,1fr)_auto_auto_auto] items-center gap-1.5 border-b border-border/70 p-2">
-            <input
-              type="search"
-              className="h-7 min-w-0 rounded-md border border-border/70 bg-background px-2 text-xs outline-hidden placeholder:text-muted-foreground/50 focus-visible:ring-1 focus-visible:ring-ring"
-              aria-label="Filter agents"
-              placeholder="Filter agents…"
-              data-testid="agents-filter-input"
-              value={filter}
-              onChange={(event) => setFilter(event.currentTarget.value)}
-            />
+          <div className="flex shrink-0 items-center gap-1.5 border-b border-border/70 px-2 py-2">
+            <div className="relative min-w-0 flex-1">
+              <SearchIcon
+                className="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-muted-foreground"
+                aria-hidden
+              />
+              <input
+                type="search"
+                className="h-7 w-full min-w-0 rounded-md border border-border bg-muted/40 pr-2 pl-7 text-xs text-foreground outline-hidden placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-1 focus-visible:ring-ring"
+                aria-label="Filter agents"
+                placeholder="Filter…"
+                data-testid="agents-filter-input"
+                value={filter}
+                onChange={(event) => setFilter(event.currentTarget.value)}
+              />
+            </div>
             <Select
               value={groupBy}
               onValueChange={(value) => {
@@ -221,8 +233,8 @@ export function AgentsPage() {
             </DropdownMenu>
           </div>
 
-          <div className="min-h-0 flex-1 overflow-y-auto px-2 py-1.5">
-            <div className="min-w-0" data-text-surface="card">
+          <div className="min-h-0 flex-1 overflow-y-auto px-2 py-2">
+            <div className="min-w-0 space-y-2" data-text-surface="card">
               {rows.length === 0 ? (
                 <div className="px-2 py-3 text-xs text-muted-foreground">No agents yet</div>
               ) : groups.length === 0 ? (
@@ -237,28 +249,26 @@ export function AgentsPage() {
                     <div key={group.id} className="min-w-0">
                       <button
                         type="button"
-                        className="flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left text-xs font-medium text-muted-foreground hover:bg-accent hover:text-foreground"
+                        className="flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-xs font-semibold uppercase tracking-[0.05em] text-muted-foreground hover:bg-accent/60 hover:text-foreground"
                         data-testid={`agents-group-${group.id}`}
                         aria-expanded={groupExpanded}
                         onClick={() => setAgentsGroupExpanded(group.id, !groupExpanded)}
                       >
-                        <span className="flex min-w-0 items-center gap-1">
-                          <ChevronRightIcon
-                            className={cn(
-                              "size-3 shrink-0 transition-transform",
-                              groupExpanded && "rotate-90",
-                            )}
-                            aria-hidden
-                          />
-                          <span className="truncate">{group.label}</span>
-                        </span>
-                        <span className="rounded-full bg-muted px-1.5 py-0.5 text-xs tabular-nums text-muted-foreground">
+                        <ChevronRightIcon
+                          className={cn(
+                            "size-3 shrink-0 transition-transform",
+                            groupExpanded && "rotate-90",
+                          )}
+                          aria-hidden
+                        />
+                        <span className="truncate">{group.label}</span>
+                        <span className="ml-auto rounded-full bg-muted px-1.5 py-0.5 text-xs font-medium normal-case tracking-normal tabular-nums">
                           {group.rows.length}
                         </span>
                       </button>
 
                       {groupExpanded ? (
-                        <SidebarMenu role="list" className="gap-0.5">
+                        <SidebarMenu role="list" className="gap-0">
                           {group.rows.map((row) => (
                             <AgentsRow
                               key={row.key}

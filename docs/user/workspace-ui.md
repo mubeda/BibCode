@@ -19,12 +19,14 @@ The view's list column provides a filter, grouping by **Status** (the default),
 **Project**, or **Environment**, an unread-only bell, and a menu with **Mark all
 read**. Status groups have counts and appear in fixed **Working** → **Pending
 Approval** → **Awaiting Input** → **Done** order, with Done collapsed by
-default. Each row keeps the status pill, thread title, project · branch,
-one-line conversation preview, environment badge, and relative time. While a
-thread is working, the preview shows its current tool; otherwise it shows the
-latest assistant message or prompt. Rows from environments that are not live
-are greyed and add the environment's availability to the badge. Rows remain
-bold until visited.
+default. Each row opens with the project name, the provider icon, the status
+dot, and the relative time, then shows the branch as its main line, the thread
+title, a one-line conversation preview, and a footer with the status, the
+provider, and the environment badge. While a thread is working, the preview
+shows its current tool; otherwise it shows the latest assistant message or
+prompt. Rows from environments that are not live are greyed and add the
+environment's availability to the badge. Unread rows carry a dot and stay bold
+until visited.
 
 Selecting an agent row marks it read and shows its live session in the right
 pane while keeping the list visible. The per-row **Jump to workspace** action
