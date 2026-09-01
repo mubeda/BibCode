@@ -17,6 +17,7 @@ import {
   buildAgentRows,
   groupAgentRows,
 } from "./agentsSection.logic";
+import { useAgentsUnread } from "./useAgentsUnread";
 
 export interface AgentsSectionProps {
   readonly navigateToThread: (ref: ScopedThreadRef) => void;
@@ -144,6 +145,7 @@ export const AgentsSection = memo(function AgentsSection({ navigateToThread }: A
       }),
     [shells, projects, environments, availability],
   );
+  useAgentsUnread(rows);
 
   const agentsSectionExpanded = useUiStateStore((state) => state.agentsSectionExpanded);
   const agentsGroupExpandedById = useUiStateStore((state) => state.agentsGroupExpandedById);
