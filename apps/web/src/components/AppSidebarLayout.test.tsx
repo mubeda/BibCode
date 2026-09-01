@@ -25,8 +25,13 @@ vi.mock("./sidebar/EnvironmentRail", () => ({
 
 const sidebarProviderProps: Array<Record<string, unknown>> = [];
 
+const sidebarProps: Array<Record<string, unknown>> = [];
+
 vi.mock("./ui/sidebar", () => ({
-  Sidebar: ({ children }: { children?: ReactNode }) => <>{children}</>,
+  Sidebar: ({ children, ...props }: { children?: ReactNode } & Record<string, unknown>) => {
+    sidebarProps.push(props);
+    return <>{children}</>;
+  },
   SidebarProvider: ({ children, ...props }: { children?: ReactNode } & Record<string, unknown>) => {
     sidebarProviderProps.push(props);
     return <>{children}</>;
@@ -59,6 +64,7 @@ afterEach(async () => {
 describe("AppSidebarLayout", () => {
   it("opens the left sidebar at 320px by default so 13px titles and 12px badges fit", async () => {
     sidebarProviderProps.length = 0;
+    sidebarProps.length = 0;
     const container = document.createElement("div");
     document.body.append(container);
     const root = createRoot(container);
@@ -67,6 +73,8 @@ describe("AppSidebarLayout", () => {
     });
     const style = sidebarProviderProps[0]?.["style"] as Record<string, string> | undefined;
     expect(style?.["--sidebar-width"]).toBe("320px");
+    const resizable = sidebarProps[0]?.["resizable"] as Record<string, unknown> | undefined;
+    expect(resizable?.["defaultWidth"]).toBe(320);
     await act(async () => {
       root.unmount();
     });

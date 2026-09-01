@@ -6,6 +6,9 @@ terminals, and the right panel hosts project tools.
 
 ## Left Panel
 
+The panel opens 320px wide. Drag its right edge to resize it; the width is
+remembered, and double-clicking the edge restores the default.
+
 The **Search** row is followed by an **Agents** nav row, then Projects. Its
 unread-count badge covers agents across all connected environments. Selecting
 the row opens the full-screen Agents view; its top strip has a back arrow for
