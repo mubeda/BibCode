@@ -98,9 +98,22 @@ Delete the unused result values above. Do not leave an ambiguous status.
 
 ## Native package artifacts
 
-| Artifact | Absolute path | Version/architecture | Identity/trust verification |
-| -------- | ------------- | -------------------- | --------------------------- |
-|          |               |                      |                             |
+| Kind | Artifact | Absolute path | Version/architecture | Identity/trust verification |
+| ---- | -------- | ------------- | -------------------- | --------------------------- |
+|      |          |               |                      |                             |
+
+## Standalone server distribution evidence
+
+- Exact staged or installed executable:
+- Packaged web discovery result:
+- Environment descriptor result:
+- Pairing/token-exchange result:
+- Shutdown/exit result:
+- Checksum result:
+- Optional Minisign result or explicitly unsigned state:
+- Package install/remove result, when applicable:
+- Isolated data sentinel preserved after removal:
+- Container image and native architecture, when applicable:
 
 ## Packaged UI and visual evidence
 

@@ -1819,7 +1819,7 @@ mod tests {
             .ensure_scope(thread_scope.clone())
             .await
             .expect("thread scope persistence");
-        let fixture_at = now_iso();
+        let fixture_timestamp = now_iso();
         projection
             .apply(
                 &terminal_scope.scope_id,
@@ -1840,7 +1840,7 @@ mod tests {
                     )
                     .expect("terminal completed actor"),
                 ],
-                fixture_at.clone(),
+                fixture_timestamp.clone(),
             )
             .await
             .expect("terminal activity persistence");
@@ -1857,7 +1857,7 @@ mod tests {
                     )
                     .expect("thread active actor"),
                 ],
-                fixture_at,
+                fixture_timestamp,
             )
             .await
             .expect("thread activity persistence");

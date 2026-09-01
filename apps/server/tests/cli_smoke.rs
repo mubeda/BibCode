@@ -4,7 +4,7 @@ use std::{
 };
 
 use bibcode_server::{
-    Cli, ServerConfig, ServerRuntime,
+    Cli, ConfigError, ServerConfig, ServerRuntime,
     persistence::{BackupTrigger, StatePaths, create_verified_backup, prepare_store},
     resolve_data_root,
 };
@@ -351,6 +351,24 @@ fn start_opens_a_browser_unless_disabled_while_serve_is_always_headless() {
     assert!(!start.no_browser);
     assert!(disabled.no_browser);
     assert!(serve.no_browser);
+}
+
+#[test]
+fn explicit_static_directory_must_contain_the_web_entry_point() {
+    let root = TempDir::new().expect("temporary static root");
+    let missing = root.path().join("missing");
+
+    let error = Cli::try_parse_from([
+        "bibcode",
+        "serve",
+        "--static-dir",
+        missing.to_str().expect("UTF-8 fixture path"),
+    ])
+    .expect("parse static directory")
+    .into_server_config()
+    .expect_err("reject missing static entry point");
+
+    assert!(matches!(error, ConfigError::StaticAssets(_)));
 }
 
 #[tokio::test]

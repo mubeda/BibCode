@@ -34,7 +34,9 @@ const decodeUpdaterDescriptor = Schema.decodeUnknownSync(
   Schema.fromJsonString(
     Schema.Struct({
       target: Schema.Union([
+        Schema.Literal("windows-aarch64"),
         Schema.Literal("windows-x86_64"),
+        Schema.Literal("linux-aarch64"),
         Schema.Literal("linux-x86_64"),
         Schema.Literal("darwin-x86_64"),
         Schema.Literal("darwin-aarch64"),
@@ -148,6 +150,30 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
         "--target",
         "aarch64-apple-darwin",
       ]);
+    }),
+  );
+
+  it.effect("plans updater-enabled Linux and Windows ARM64 builds", () =>
+    Effect.gen(function* () {
+      const path = yield* Path.Path;
+      const repoRoot = path.resolve("X:/repo");
+      const linux = yield* resolveTauriBuildPlan(
+        { platform: "linux", target: "appimage", arch: "arm64", updater: true },
+        {},
+        { platform: "linux", arch: "arm64" },
+        repoRoot,
+      );
+      const windows = yield* resolveTauriBuildPlan(
+        { platform: "win", target: "nsis", arch: "arm64", updater: true },
+        {},
+        { platform: "win32", arch: "arm64" },
+        repoRoot,
+      );
+
+      assert.equal(linux.updaterManifestTarget, "linux-aarch64");
+      assert.equal(linux.rustTarget, "aarch64-unknown-linux-gnu");
+      assert.equal(windows.updaterManifestTarget, "windows-aarch64");
+      assert.equal(windows.rustTarget, "aarch64-pc-windows-msvc");
     }),
   );
 

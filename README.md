@@ -45,8 +45,13 @@ Download the latest desktop build for your platform from
 [GitHub Releases](https://github.com/mubeda/BibCode/releases):
 
 - macOS: `.dmg` (Apple Silicon `arm64` or Intel `x64`)
-- Windows: `.exe` installer (x64)
-- Linux: `.AppImage` (x64)
+- Windows: `.exe` installer (ARM64 or x64)
+- Linux: `.AppImage` (ARM64 or x64)
+
+The same GitHub Release contains standalone `bibcode` server archives for macOS,
+Windows, and Linux on both architectures. Linux also provides direct-download `.deb`
+and `.rpm` packages. See [Standalone server installation](docs/user/server-installation.md)
+for checksums, packaged web assets, listener safety, installation, and manual updates.
 
 Desktop releases are built by the Tauri 2 pipeline in `apps/desktop`.
 

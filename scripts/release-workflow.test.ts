@@ -58,9 +58,10 @@ it("publishes stable updater metadata atomically from a verified draft", () => {
   );
   assert.match(
     releaseWorkflow,
-    /if: needs\.preflight\.outputs\.release_channel == 'stable' && needs\.preflight\.outputs\.publish_requested == 'true'[\s\S]*gh release edit/,
+    /if:[^\n]*needs\.preflight\.outputs\.release_channel == 'stable' && needs\.preflight\.outputs\.publish_requested == 'true'[\s\S]*gh release edit/,
   );
-  assert.match(releaseWorkflow, /rm -f release-assets\/updater-\*\.json/);
+  assert.match(releaseWorkflow, /assemble-release-assets\.ts/);
+  assert.match(releaseWorkflow, /pattern:\s*server-\*/);
   assert.match(releaseWorkflow, /files:\s*\|\s*\n\s+release-assets\/\*/);
 });
 
@@ -110,6 +111,44 @@ it("requires explicit manual approval to publish a previously inspected stable d
     /name: Publish first stable release\s*\n\s*if:[^\n]*publish_requested != 'true'/,
   );
   assert.match(releaseDocumentation, /rerun[\s\S]*same version[\s\S]*publish[\s\S]*true/i);
+});
+
+it("assembles final assets without creating a GitHub release in validation-only runs", () => {
+  assert.match(
+    releaseWorkflow,
+    /validate_only:\s*\n\s+description:[^\n]+\n\s+required: false\n\s+default: false\n\s+type: boolean/,
+  );
+  assert.include(releaseWorkflow, "validate_only: ${{ steps.release_meta.outputs.validate_only }}");
+  assert.match(
+    releaseWorkflow,
+    /name: Upload validated release assets\s*\n\s*if: needs\.preflight\.outputs\.validate_only == 'true'[\s\S]*name: validated-release-assets[\s\S]*path:\s*release-assets\/\*/,
+  );
+  assert.match(
+    releaseWorkflow,
+    /name: Test\s*\n\s*if: steps\.release_meta\.outputs\.validate_only != 'true'\s*\n\s*run: vp run test/,
+  );
+
+  const releaseMutationStepNames = [
+    "Require inspected stable draft",
+    "Prepare stable release assets",
+    "Publish stable release",
+    "Publish first stable release",
+    "Publish nightly release",
+    "Publish first nightly release",
+    "Verify stable draft release assets",
+    "Publish approved stable release",
+  ];
+
+  for (const stepName of releaseMutationStepNames) {
+    assert.match(
+      releaseWorkflow,
+      new RegExp(`name: ${stepName}\\s*\\n\\s*if:[^\\n]*validate_only != 'true'`),
+      `${stepName} must be disabled during validation-only runs`,
+    );
+  }
+
+  assert.match(releaseWorkflow, /name: Finalize release\s*\n\s*if:[^\n]*validate_only != 'true'/);
+  assert.match(releaseDocumentation, /validation-only[\s\S]*validated-release-assets/i);
 });
 
 it("builds the stable manifest with a runner-generated UTC publication timestamp", () => {
