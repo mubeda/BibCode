@@ -7,6 +7,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 
 const h = vi.hoisted(() => ({
   listProps: null as Record<string, unknown> | null,
+  commitPage: null as {
+    generation: number;
+    pinnedTips: ReadonlyArray<string>;
+    commits: ReadonlyArray<GitManagerCommitEntry>;
+    nextOffset: number | null;
+    exhausted: boolean;
+    degradedToAllPaging: boolean;
+  } | null,
+  contextMenuShow: vi.fn(),
+  dndProps: null as Record<string, unknown> | null,
 }));
 
 vi.mock("@legendapp/list/react", () => ({
@@ -26,7 +36,44 @@ vi.mock("@legendapp/list/react", () => ({
   },
 }));
 
+vi.mock("../../../localApi", () => ({
+  readLocalApi: () => ({ contextMenu: { show: h.contextMenuShow } }),
+}));
+
+vi.mock("../../../state/gitManager", () => ({
+  gitManagerEnvironment: {
+    getCommits: vi.fn(() => ({ kind: "commits" })),
+    signal: vi.fn(() => ({ kind: "signal" })),
+  },
+}));
+
+vi.mock("../../../state/query", () => ({
+  useEnvironmentQuery: (atom: { kind: string } | null) => ({
+    data: atom?.kind === "commits" ? h.commitPage : null,
+    emission: { _tag: "Initial", waiting: false },
+    error: null,
+    isPending: false,
+    refresh: vi.fn(),
+  }),
+}));
+
+vi.mock("../rewrite/gitManagerCommitDrag", () => ({
+  GitManagerCommitDndContext: (props: Record<string, unknown>) => {
+    h.dndProps = props;
+    return <>{props.children as React.ReactNode}</>;
+  },
+  GitManagerCommitInsertionTarget: () => null,
+  useGitManagerCommitDragSource: () => ({
+    attributes: {},
+    listeners: {},
+    setNodeRef: () => undefined,
+    isDragging: false,
+    transform: undefined,
+  }),
+}));
+
 import { GitManagerCommitList } from "./GitManagerCommitList";
+import { GitManagerHistoryView } from "./GitManagerHistoryView";
 
 let container: HTMLDivElement;
 let root: Root | null;
@@ -53,6 +100,9 @@ function commit(index: number): GitManagerCommitEntry {
 beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   h.listProps = null;
+  h.commitPage = null;
+  h.contextMenuShow.mockReset();
+  h.dndProps = null;
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
@@ -123,5 +173,155 @@ describe("GitManagerCommitList", () => {
     });
 
     expect(onSelect).toHaveBeenCalledWith(commits[1]!.sha);
+  });
+});
+
+describe("GitManagerHistoryView rewrite reachability", () => {
+  it("opens the existing commit menu from the list and forwards the chosen operation", async () => {
+    const selectedCommit = commit(7);
+    h.commitPage = {
+      generation: 1,
+      pinnedTips: [selectedCommit.sha],
+      commits: [selectedCommit],
+      nextOffset: null,
+      exhausted: true,
+      degradedToAllPaging: false,
+    };
+    h.contextMenuShow.mockResolvedValue("cherry-pick");
+    const onAction = vi.fn();
+
+    await act(async () =>
+      root?.render(
+        <GitManagerHistoryView
+          blockedReasons={[
+            {
+              operation: "reset",
+              code: "operation-in-flight",
+              message: "Server says the repository mutation lane is occupied.",
+            },
+          ]}
+          projectRef={{ environmentId: "environment-1", projectId: "project-1" } as never}
+          scope={{ environmentId: "environment-1" as never, cwd: "/opaque/repository" }}
+          onAction={onAction}
+        />,
+      ),
+    );
+
+    const row = container.querySelector<HTMLButtonElement>(
+      `button[data-commit-sha="${selectedCommit.sha}"]`,
+    );
+    expect(row).not.toBeNull();
+    await act(async () => {
+      row?.dispatchEvent(
+        new MouseEvent("contextmenu", {
+          bubbles: true,
+          clientX: 17,
+          clientY: 29,
+        }),
+      );
+      await Promise.resolve();
+    });
+
+    expect(h.contextMenuShow).toHaveBeenCalledOnce();
+    const [items, position] = h.contextMenuShow.mock.calls[0] ?? [];
+    expect(position).toEqual({ x: 17, y: 29 });
+    expect(items).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: "cherry-pick", label: "Cherry-Pick", disabled: false }),
+        expect.objectContaining({
+          id: "reset",
+          disabled: true,
+          label: expect.stringContaining("Server says the repository mutation lane is occupied."),
+        }),
+      ]),
+    );
+    expect(onAction).toHaveBeenCalledWith({
+      _tag: "cherry-pick",
+      shas: [selectedCommit.sha],
+    });
+  });
+
+  it("forwards commit-list drag reorder results through the history parent", async () => {
+    const selectedCommit = commit(8);
+    h.commitPage = {
+      generation: 1,
+      pinnedTips: [selectedCommit.sha],
+      commits: [selectedCommit],
+      nextOffset: null,
+      exhausted: true,
+      degradedToAllPaging: false,
+    };
+    const onAction = vi.fn();
+
+    await act(async () =>
+      root?.render(
+        <GitManagerHistoryView
+          blockedReasons={[]}
+          projectRef={{ environmentId: "environment-1", projectId: "project-1" } as never}
+          scope={{ environmentId: "environment-1" as never, cwd: "/opaque/repository" }}
+          onAction={onAction}
+        />,
+      ),
+    );
+
+    const onCommitDrop = h.dndProps?.onCommitDrop;
+    expect(onCommitDrop).toBeTypeOf("function");
+    await act(async () =>
+      (onCommitDrop as (resolution: unknown) => void)({
+        _tag: "reorder",
+        shas: [selectedCommit.sha],
+        insertBeforeSha: null,
+      }),
+    );
+
+    expect(onAction).toHaveBeenCalledWith({
+      _tag: "reorder",
+      shas: [selectedCommit.sha],
+      insertBeforeSha: null,
+    });
+  });
+
+  it("makes contiguous multi-commit actions reachable with standard range selection", async () => {
+    const commits = [commit(10), commit(11), commit(12)];
+    h.commitPage = {
+      generation: 1,
+      pinnedTips: commits.map((entry) => entry.sha),
+      commits,
+      nextOffset: null,
+      exhausted: true,
+      degradedToAllPaging: false,
+    };
+    h.contextMenuShow.mockResolvedValue(null);
+
+    await act(async () =>
+      root?.render(
+        <GitManagerHistoryView
+          blockedReasons={[]}
+          projectRef={{ environmentId: "environment-1", projectId: "project-1" } as never}
+          scope={{ environmentId: "environment-1" as never, cwd: "/opaque/repository" }}
+          onAction={vi.fn()}
+        />,
+      ),
+    );
+    const rows = commits.map((entry) =>
+      container.querySelector<HTMLButtonElement>(`button[data-commit-sha="${entry.sha}"]`),
+    );
+    await act(async () => rows[0]?.click());
+    await act(async () =>
+      rows[2]?.dispatchEvent(new MouseEvent("click", { bubbles: true, shiftKey: true })),
+    );
+    await act(async () => {
+      rows[2]?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true }));
+      await Promise.resolve();
+    });
+
+    const [items] = h.contextMenuShow.mock.calls[0] ?? [];
+    expect(items).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: "squash", label: "Squash 3", disabled: false }),
+        expect.objectContaining({ id: "reorder", label: "Reorder 3", disabled: false }),
+      ]),
+    );
+    expect(h.dndProps?.multiCommitSelection).toEqual(commits.map((entry) => entry.sha));
   });
 });

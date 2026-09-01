@@ -1,5 +1,7 @@
 import { projectKey } from "@bibcode/client-runtime/state/entities";
 import type {
+  ContextMenuItem,
+  GitManagerBlockedReason,
   GitManagerCommitEntry,
   GitManagerCommitPage,
   ScopedProjectRef,
@@ -9,11 +11,17 @@ import * as Cause from "effect/Cause";
 import * as Schema from "effect/Schema";
 import { AsyncResult } from "effect/unstable/reactivity";
 import { RefreshCwIcon } from "lucide-react";
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 
 import { DEFAULT_GIT_MANAGER_VIEW_STATE, useGitManagerStore } from "../../../gitManagerStore";
+import { readLocalApi } from "../../../localApi";
 import { gitManagerEnvironment } from "../../../state/gitManager";
 import { useEnvironmentQuery } from "../../../state/query";
+import {
+  buildCommitMenuItems,
+  type GitManagerCommitMenuItemId,
+} from "../rewrite/GitManagerCommitContextMenu.logic";
+import type { GitManagerCommitDropResolution } from "../rewrite/gitManagerCommitDrag";
 import { createCommitLookup, spliceCommitGeneration } from "./commitPaging";
 import { GitManagerCommitDetail } from "./GitManagerCommitDetail";
 import { GitManagerCommitList } from "./GitManagerCommitList";
@@ -25,12 +33,32 @@ const EMPTY_COMMITS: ReadonlyArray<GitManagerCommitEntry> = Object.freeze([]);
 const EMPTY_TIPS: ReadonlyArray<string> = Object.freeze([]);
 const isGitManagerOperationError = Schema.is(GitManagerOperationError);
 
+export type GitManagerHistoryAction =
+  | { readonly _tag: "reset"; readonly sha: string }
+  | { readonly _tag: "revert"; readonly sha: string }
+  | { readonly _tag: "cherry-pick"; readonly shas: ReadonlyArray<string> }
+  | {
+      readonly _tag: "squash";
+      readonly shas: ReadonlyArray<string>;
+      readonly message: string;
+    }
+  | {
+      readonly _tag: "reorder";
+      readonly shas: ReadonlyArray<string>;
+      readonly insertBeforeSha: string | null;
+    }
+  | { readonly _tag: "prepare-reorder"; readonly shas: ReadonlyArray<string> }
+  | { readonly _tag: "create-branch"; readonly sha: string }
+  | { readonly _tag: "create-tag"; readonly sha: string };
+
 interface GitManagerHistoryViewProps {
   readonly scope: {
     readonly environmentId: ScopedProjectRef["environmentId"];
     readonly cwd: string;
   };
   readonly projectRef: ScopedProjectRef;
+  readonly blockedReasons: ReadonlyArray<GitManagerBlockedReason>;
+  readonly onAction: (action: GitManagerHistoryAction) => void;
 }
 
 interface HistoryPagesState {
@@ -104,6 +132,8 @@ function isTipsUnresolvableFailure(result: AsyncResult.AsyncResult<unknown, unkn
 export const GitManagerHistoryView = memo(function GitManagerHistoryView({
   scope,
   projectRef,
+  blockedReasons,
+  onAction,
 }: GitManagerHistoryViewProps) {
   const { environmentId, cwd } = scope;
   const projectEnvironmentId = projectRef.environmentId;
@@ -112,6 +142,7 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
   const [pages, setPages] = useState<HistoryPagesState>(emptyHistoryPages);
   const [loadingOffset, setLoadingOffset] = useState<number | null>(null);
   const [loadMoreError, setLoadMoreError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
   const [refreshEpoch, setRefreshEpoch] = useState(0);
   const pagesRef = useRef(pages);
   const loadingOffsetRef = useRef(loadingOffset);
@@ -141,6 +172,12 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
       DEFAULT_GIT_MANAGER_VIEW_STATE.selectedFilePath,
     [storeKey],
   );
+  const selectMultiCommitSelection = useCallback(
+    (state: ReturnType<typeof useGitManagerStore.getState>) =>
+      state.byProjectKey[storeKey]?.multiCommitSelection ??
+      DEFAULT_GIT_MANAGER_VIEW_STATE.multiCommitSelection,
+    [storeKey],
+  );
   const selectLoadedPageCursors = useCallback(
     (state: ReturnType<typeof useGitManagerStore.getState>) =>
       state.byProjectKey[storeKey]?.loadedPageCursors ??
@@ -154,10 +191,12 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
   );
   const selectedCommitSha = useGitManagerStore(selectSelectedCommitSha);
   const selectedFilePath = useGitManagerStore(selectSelectedFilePath);
+  const multiCommitSelection = useGitManagerStore(selectMultiCommitSelection);
   const loadedPageCursors = useGitManagerStore(selectLoadedPageCursors);
   const scrollAnchor = useGitManagerStore(selectScrollAnchor);
   const setSelectedCommit = useGitManagerStore((state) => state.setSelectedCommit);
   const setSelectedFile = useGitManagerStore((state) => state.setSelectedFile);
+  const setMultiCommitSelection = useGitManagerStore((state) => state.setMultiCommitSelection);
   const setLoadedPageCount = useGitManagerStore((state) => state.setLoadedPageCount);
   const setLoadedPageCursors = useGitManagerStore((state) => state.setLoadedPageCursors);
   const setScrollAnchor = useGitManagerStore((state) => state.setScrollAnchor);
@@ -389,6 +428,7 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
         projectId,
       } as ScopedProjectRef;
       setSelectedCommit(currentProjectRef, sha);
+      setMultiCommitSelection(currentProjectRef, []);
       setSelectedFile(currentProjectRef, commit?.changedFiles[0] ?? null);
       setScrollAnchor(currentProjectRef, sha);
     },
@@ -397,9 +437,167 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
       projectEnvironmentId,
       projectId,
       setScrollAnchor,
+      setMultiCommitSelection,
       setSelectedCommit,
       setSelectedFile,
     ],
+  );
+  const handleMultiSelect = useCallback(
+    (sha: string, mode: "range" | "toggle") => {
+      const currentProjectRef = {
+        environmentId: projectEnvironmentId,
+        projectId,
+      } as ScopedProjectRef;
+      let nextSelection: ReadonlyArray<string>;
+      if (mode === "toggle") {
+        nextSelection = multiCommitSelection.includes(sha)
+          ? multiCommitSelection.filter((selectedSha) => selectedSha !== sha)
+          : [...multiCommitSelection, sha];
+      } else {
+        const anchorSha = selectedCommitSha ?? pagesRef.current.commits[0]?.sha ?? sha;
+        const anchorIndex = pagesRef.current.commits.findIndex(
+          (commit) => commit.sha === anchorSha,
+        );
+        const selectedIndex = pagesRef.current.commits.findIndex((commit) => commit.sha === sha);
+        if (anchorIndex < 0 || selectedIndex < 0) {
+          nextSelection = [sha];
+        } else {
+          const start = Math.min(anchorIndex, selectedIndex);
+          const end = Math.max(anchorIndex, selectedIndex);
+          nextSelection = pagesRef.current.commits
+            .slice(start, end + 1)
+            .map((commit) => commit.sha);
+        }
+      }
+      setMultiCommitSelection(currentProjectRef, nextSelection);
+      setSelectedCommit(currentProjectRef, sha);
+      setScrollAnchor(currentProjectRef, sha);
+    },
+    [
+      multiCommitSelection,
+      projectEnvironmentId,
+      projectId,
+      selectedCommitSha,
+      setMultiCommitSelection,
+      setScrollAnchor,
+      setSelectedCommit,
+    ],
+  );
+  const orderedSelection = useCallback((shas: ReadonlyArray<string>): ReadonlyArray<string> => {
+    const selected = new Set(shas);
+    return pagesRef.current.commits.flatMap((commit) =>
+      selected.has(commit.sha) ? [commit.sha] : [],
+    );
+  }, []);
+  const squashMessage = useCallback((shas: ReadonlyArray<string>): string => {
+    const selected = new Set(shas);
+    const subjects = pagesRef.current.commits.flatMap((commit) => {
+      const subject = commit.subject.trim();
+      return selected.has(commit.sha) && subject.length > 0 ? [subject] : [];
+    });
+    return subjects.join("\n\n") || `Squash ${shas.length} commits`;
+  }, []);
+  const emitMenuAction = useCallback(
+    (id: GitManagerCommitMenuItemId, selection: ReadonlyArray<string>) => {
+      const sha = selection[0];
+      if (sha === undefined) return;
+      switch (id) {
+        case "reset":
+          onAction({ _tag: "reset", sha });
+          return;
+        case "revert":
+          onAction({ _tag: "revert", sha });
+          return;
+        case "cherry-pick":
+          onAction({ _tag: "cherry-pick", shas: selection });
+          return;
+        case "squash":
+          onAction({ _tag: "squash", shas: selection, message: squashMessage(selection) });
+          return;
+        case "reorder":
+          onAction({ _tag: "prepare-reorder", shas: selection });
+          return;
+        case "create-branch":
+          onAction({ _tag: "create-branch", sha });
+          return;
+        case "create-tag":
+          onAction({ _tag: "create-tag", sha });
+          return;
+        case "copy-sha": {
+          const clipboard = typeof navigator === "undefined" ? undefined : navigator.clipboard;
+          if (clipboard?.writeText === undefined) {
+            setActionError("Could not copy the commit SHA. Copy it from the commit details.");
+            return;
+          }
+          void clipboard.writeText(selection.join("\n")).catch(() => {
+            setActionError("Could not copy the commit SHA. Copy it from the commit details.");
+          });
+        }
+      }
+    },
+    [onAction, squashMessage],
+  );
+  const handleContextMenu = useCallback(
+    (sha: string, event: MouseEvent<HTMLButtonElement>) => {
+      event.preventDefault();
+      const selection = multiCommitSelection.includes(sha) ? multiCommitSelection : [sha];
+      if (!multiCommitSelection.includes(sha)) {
+        setMultiCommitSelection(projectRef, selection);
+      }
+      const api = readLocalApi();
+      if (api === undefined) {
+        setActionError("The commit action menu is unavailable. Try reopening Git Manager.");
+        return;
+      }
+      setActionError(null);
+      const items: ReadonlyArray<ContextMenuItem<GitManagerCommitMenuItemId>> =
+        buildCommitMenuItems(selection, {
+          loadedCommits: pagesRef.current.commits,
+          blockedReasons,
+        }).map((menuItem) => ({
+          id: menuItem.id,
+          label:
+            menuItem.disabledReason === null
+              ? menuItem.label
+              : `${menuItem.label} — ${menuItem.disabledReason}`,
+          disabled: !menuItem.enabled,
+          destructive: menuItem.id === "reset",
+        }));
+      void api.contextMenu
+        .show(items, { x: event.clientX, y: event.clientY })
+        .then((action) => {
+          if (action !== null) emitMenuAction(action, selection);
+        })
+        .catch(() => {
+          setActionError("The commit action menu could not open. Try the action again.");
+        });
+    },
+    [blockedReasons, emitMenuAction, multiCommitSelection, projectRef, setMultiCommitSelection],
+  );
+  const handleCommitDrop = useCallback(
+    (resolution: GitManagerCommitDropResolution) => {
+      setActionError(null);
+      switch (resolution._tag) {
+        case "blocked":
+          setActionError(resolution.reason.message);
+          return;
+        case "cherry-pick":
+          onAction({ _tag: "cherry-pick", shas: resolution.shas });
+          return;
+        case "reorder":
+          onAction({
+            _tag: "reorder",
+            shas: resolution.shas,
+            insertBeforeSha: resolution.insertBeforeSha,
+          });
+          return;
+        case "squash": {
+          const shas = orderedSelection([resolution.targetSha, ...resolution.shas]);
+          onAction({ _tag: "squash", shas, message: squashMessage(shas) });
+        }
+      }
+    },
+    [onAction, orderedSelection, squashMessage],
   );
   const handleSelectFile = useCallback(
     (path: string) =>
@@ -505,6 +703,14 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
           {loadMoreError}
         </p>
       ) : null}
+      {actionError === null ? null : (
+        <p
+          aria-live="polite"
+          className="shrink-0 border-b border-destructive/30 px-3 py-2 text-xs text-destructive"
+        >
+          {actionError}
+        </p>
+      )}
       {pages.commits.length === 0 ? (
         <p className="p-4 text-sm text-muted-foreground">This repository has no commits yet.</p>
       ) : (
@@ -515,6 +721,10 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
             onSelect={handleSelectCommit}
             onReachEnd={handleReachEnd}
             isLoadingMore={loadingOffset !== null}
+            multiCommitSelection={multiCommitSelection}
+            onCommitDrop={handleCommitDrop}
+            onContextMenu={handleContextMenu}
+            onMultiSelect={handleMultiSelect}
           />
           {selectedCommit === null ? (
             <p className="p-4 text-sm text-muted-foreground">Select a commit to inspect it.</p>

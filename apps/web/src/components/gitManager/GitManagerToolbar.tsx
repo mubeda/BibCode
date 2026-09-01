@@ -31,7 +31,16 @@ import { GitManagerOperationBanner } from "./toolbar/GitManagerOperationBanner";
 import { GitManagerSyncButton, type SyncOperationKind } from "./toolbar/GitManagerSyncButton";
 import { resolveSyncState, type SyncState } from "./toolbar/syncButton.logic";
 import { GitManagerTagDialog } from "./tags/GitManagerTagDialog";
-import { Button } from "../ui/button";
+import {
+  Menu,
+  MenuItem,
+  MenuPopup,
+  MenuSeparator,
+  MenuSub,
+  MenuSubPopup,
+  MenuSubTrigger,
+  MenuTrigger,
+} from "../ui/menu";
 import {
   Select,
   SelectGroup,
@@ -47,6 +56,49 @@ interface WorktreeOption {
   readonly label: string;
   readonly path: string;
 }
+
+type GitManagerTagAction = "create" | "delete" | "push";
+
+interface TagDialogState {
+  readonly open: boolean;
+  readonly action: GitManagerTagAction;
+  readonly tag: string | null;
+}
+
+interface TagActionMenuItemProps {
+  readonly action: "delete" | "push";
+  readonly entry: GitManagerRefEntry;
+  readonly disabledReason: string | null;
+  readonly onSelect: (action: "delete" | "push", tag: string) => void;
+}
+
+const TagActionMenuItem = memo(function TagActionMenuItem({
+  action,
+  entry,
+  disabledReason,
+  onSelect,
+}: TagActionMenuItemProps) {
+  const select = useCallback(() => onSelect(action, entry.name), [action, entry.name, onSelect]);
+  const verb = action === "delete" ? "Delete" : "Push";
+  return (
+    <MenuItem
+      aria-label={`${verb} tag ${entry.name}`}
+      disabled={disabledReason !== null}
+      title={disabledReason ?? `${verb} tag ${entry.name}`}
+      variant={action === "delete" ? "destructive" : "default"}
+      onClick={select}
+    >
+      <span className="flex min-w-0 flex-col">
+        <span className="truncate font-mono" translate="no">
+          {entry.name}
+        </span>
+        {disabledReason === null ? null : (
+          <span className="text-[10px] text-muted-foreground">{disabledReason}</span>
+        )}
+      </span>
+    </MenuItem>
+  );
+});
 
 const EMPTY_BRANCHES: ReadonlyArray<GitManagerRefEntry> = Object.freeze([]);
 const EMPTY_TAG_NAMES: ReadonlyArray<string> = Object.freeze([]);
@@ -219,7 +271,11 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
   );
 
   const [branchDialog, setBranchDialog] = useState<GitManagerBranchDialog | null>(null);
-  const [tagDialogOpen, setTagDialogOpen] = useState(false);
+  const [tagDialog, setTagDialog] = useState<TagDialogState>({
+    open: false,
+    action: "create",
+    tag: null,
+  });
   const [switchTarget, setSwitchTarget] = useState<GitManagerRefEntry | null>(null);
   const [operationEvent, setOperationEvent] = useState<GitManagerOperationEvent | null>(null);
   const [operationError, setOperationError] = useState<string | null>(null);
@@ -394,7 +450,16 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
   const changeSwitchDialogOpen = useCallback((open: boolean) => {
     if (!open) setSwitchTarget(null);
   }, []);
-  const openTagDialog = useCallback(() => setTagDialogOpen(true), []);
+  const openCreateTagDialog = useCallback(
+    () => setTagDialog({ open: true, action: "create", tag: null }),
+    [],
+  );
+  const openExistingTagDialog = useCallback((action: "delete" | "push", tag: string) => {
+    setTagDialog({ open: true, action, tag });
+  }, []);
+  const changeTagDialogOpen = useCallback((open: boolean) => {
+    setTagDialog((current) => ({ ...current, open }));
+  }, []);
   const runSyncOperation = useCallback(
     (kind: SyncOperationKind) => {
       if (currentBranch === null && kind !== "fetch-unborn" && kind !== "fetch") return;
@@ -426,12 +491,11 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
     () => ({ environmentId, cwd: selectedWorktreeCwd }),
     [environmentId, selectedWorktreeCwd],
   );
-  const tagDisabledReason =
-    refsQuery.isPending || snapshot === null
-      ? "Loading tags."
-      : tagTargetSha === null
-        ? "Create a commit before creating a tag."
-        : null;
+  const tagMenuDisabledReason = refsQuery.isPending || snapshot === null ? "Loading tags." : null;
+  const createTagDisabledReason =
+    tagMenuDisabledReason ??
+    (tagTargetSha === null ? "Create a commit before creating a tag." : null);
+  const tagRemote = snapshot?.remotes.includes(remote) === true ? remote : null;
 
   return (
     <div className="min-w-0 shrink-0">
@@ -492,22 +556,103 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
             onSelectBranch={selectBranch}
             onSwitchWorktree={onSelectedWorktreeChange}
           />
-          <Button
-            aria-describedby={
-              tagDisabledReason === null ? undefined : "git-manager-tag-trigger-reason"
-            }
-            disabled={tagDisabledReason !== null}
-            size="xs"
-            title={tagDisabledReason ?? "Create a tag at the current commit"}
-            variant="ghost"
-            onClick={openTagDialog}
-          >
-            <TagIcon aria-hidden="true" />
-            Create tag…
-          </Button>
-          {tagDisabledReason === null ? null : (
+          <Menu>
+            <MenuTrigger
+              aria-describedby={
+                tagMenuDisabledReason === null ? undefined : "git-manager-tag-trigger-reason"
+              }
+              className="inline-flex min-h-7 items-center gap-1.5 rounded-md px-2 text-xs text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring disabled:pointer-events-none disabled:opacity-50"
+              disabled={tagMenuDisabledReason !== null}
+              title={tagMenuDisabledReason ?? "Create, delete, or push a tag"}
+            >
+              <TagIcon aria-hidden="true" className="size-3.5" />
+              Tags…
+            </MenuTrigger>
+            <MenuPopup align="start" side="bottom" className="min-w-52">
+              <MenuItem
+                aria-label="Create tag"
+                disabled={createTagDisabledReason !== null}
+                title={createTagDisabledReason ?? "Create a tag at the current commit"}
+                onClick={openCreateTagDialog}
+              >
+                <span className="flex min-w-0 flex-col">
+                  <span>Create Tag…</span>
+                  {createTagDisabledReason === null ? null : (
+                    <span className="text-[10px] text-muted-foreground">
+                      {createTagDisabledReason}
+                    </span>
+                  )}
+                </span>
+              </MenuItem>
+              <MenuSeparator />
+              {snapshot !== null && snapshot.tags.length > 0 ? (
+                <MenuSub>
+                  <MenuSubTrigger>Delete Tag</MenuSubTrigger>
+                  <MenuSubPopup className="min-w-52">
+                    {snapshot.tags.map((entry) => (
+                      <TagActionMenuItem
+                        action="delete"
+                        disabledReason={
+                          entry.blocked.find((reason) => reason.operation === "tag-delete")
+                            ?.message ?? null
+                        }
+                        entry={entry}
+                        key={entry.name}
+                        onSelect={openExistingTagDialog}
+                      />
+                    ))}
+                  </MenuSubPopup>
+                </MenuSub>
+              ) : (
+                <MenuItem disabled title="Create a local tag before deleting one">
+                  <span className="flex flex-col">
+                    <span>Delete Tag</span>
+                    <span className="text-[10px] text-muted-foreground">No local tags.</span>
+                  </span>
+                </MenuItem>
+              )}
+              {snapshot !== null && snapshot.tags.length > 0 && tagRemote !== null ? (
+                <MenuSub>
+                  <MenuSubTrigger>Push Tag</MenuSubTrigger>
+                  <MenuSubPopup className="min-w-52">
+                    {snapshot.tags.map((entry) => (
+                      <TagActionMenuItem
+                        action="push"
+                        disabledReason={
+                          entry.blocked.find((reason) => reason.operation === "tag-push")
+                            ?.message ?? null
+                        }
+                        entry={entry}
+                        key={entry.name}
+                        onSelect={openExistingTagDialog}
+                      />
+                    ))}
+                  </MenuSubPopup>
+                </MenuSub>
+              ) : (
+                <MenuItem
+                  disabled
+                  title={
+                    snapshot !== null && snapshot.tags.length === 0
+                      ? "Create a local tag before pushing one"
+                      : "Add a remote before pushing a tag"
+                  }
+                >
+                  <span className="flex flex-col">
+                    <span>Push Tag</span>
+                    <span className="text-[10px] text-muted-foreground">
+                      {snapshot !== null && snapshot.tags.length === 0
+                        ? "No local tags."
+                        : "No remote is configured."}
+                    </span>
+                  </span>
+                </MenuItem>
+              )}
+            </MenuPopup>
+          </Menu>
+          {tagMenuDisabledReason === null ? null : (
             <span className="sr-only" id="git-manager-tag-trigger-reason">
-              {tagDisabledReason}
+              {tagMenuDisabledReason}
             </span>
           )}
         </div>
@@ -533,16 +678,16 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
         onSubmit={submitBranchDialog}
       />
       <GitManagerTagDialog
-        action="create"
+        action={tagDialog.action}
         existingTags={existingTags}
-        open={tagDialogOpen}
+        open={tagDialog.open}
         projectRef={stableProjectRef}
-        remote={remote}
+        remote={tagRemote}
         scope={tagScope}
-        tag={null}
+        tag={tagDialog.tag}
         targetSha={tagTargetSha}
         onFinished={refreshRefs}
-        onOpenChange={setTagDialogOpen}
+        onOpenChange={changeTagDialogOpen}
       />
       <GitManagerSwitchWithChangesDialog
         branchName={switchTarget?.name ?? "branch"}
