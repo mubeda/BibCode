@@ -18,19 +18,30 @@ import * as NodeUtil from "node:util";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
 import { getDefaultBuildArch, type BuildArch } from "./lib/build-target-arch.ts";
+import {
+  requireReleaseTarget,
+  type ReleaseArch,
+  type ReleasePlatform,
+  type TauriUpdaterTarget,
+} from "./lib/release-targets.ts";
 
-export type TauriBuildPlatform = "mac" | "linux" | "win";
-export type TauriBuildArch = Exclude<BuildArch, "universal">;
-export type TauriUpdaterManifestTarget =
-  | "windows-x86_64"
-  | "linux-x86_64"
-  | "darwin-x86_64"
-  | "darwin-aarch64";
+export type TauriBuildPlatform = ReleasePlatform;
+export type TauriBuildArch = Extract<BuildArch, ReleaseArch>;
+export type TauriUpdaterManifestTarget = TauriUpdaterTarget;
 
 export const TAURI_UPDATER_TARGETS = {
-  mac: { arm64: "darwin-aarch64", x64: "darwin-x86_64" },
-  linux: { x64: "linux-x86_64" },
-  win: { x64: "windows-x86_64" },
+  mac: {
+    arm64: requireReleaseTarget("mac", "arm64").updaterTarget,
+    x64: requireReleaseTarget("mac", "x64").updaterTarget,
+  },
+  linux: {
+    arm64: requireReleaseTarget("linux", "arm64").updaterTarget,
+    x64: requireReleaseTarget("linux", "x64").updaterTarget,
+  },
+  win: {
+    arm64: requireReleaseTarget("win", "arm64").updaterTarget,
+    x64: requireReleaseTarget("win", "x64").updaterTarget,
+  },
 } as const;
 
 interface TauriPlatformConfig {
@@ -119,7 +130,9 @@ export interface TauriUpdaterArtifactDescriptor {
 const TauriUpdaterArtifactDescriptorJson = Schema.fromJsonString(
   Schema.Struct({
     target: Schema.Union([
+      Schema.Literal("windows-aarch64"),
       Schema.Literal("windows-x86_64"),
+      Schema.Literal("linux-aarch64"),
       Schema.Literal("linux-x86_64"),
       Schema.Literal("darwin-x86_64"),
       Schema.Literal("darwin-aarch64"),
@@ -319,26 +332,14 @@ function normalizeTauriBundleTarget(platform: TauriBuildPlatform, target: string
 }
 
 export function resolveTauriRustTarget(platform: TauriBuildPlatform, arch: TauriBuildArch): string {
-  if (platform === "mac") {
-    return arch === "arm64" ? "aarch64-apple-darwin" : "x86_64-apple-darwin";
-  }
-  if (platform === "linux") {
-    return arch === "arm64" ? "aarch64-unknown-linux-gnu" : "x86_64-unknown-linux-gnu";
-  }
-  return arch === "arm64" ? "aarch64-pc-windows-msvc" : "x86_64-pc-windows-msvc";
+  return requireReleaseTarget(platform, arch).rustTarget;
 }
 
 function resolveTauriUpdaterManifestTarget(
   platform: TauriBuildPlatform,
   arch: TauriBuildArch,
 ): TauriUpdaterManifestTarget {
-  if (platform === "mac") return TAURI_UPDATER_TARGETS.mac[arch];
-  if (arch !== "x64") {
-    throw new TauriDesktopBuildConfigurationError(
-      `Tauri updater builds do not support ${platform}/${arch}.`,
-    );
-  }
-  return TAURI_UPDATER_TARGETS[platform].x64;
+  return requireReleaseTarget(platform, arch).updaterTarget;
 }
 
 function withHostRuntime(host: TauriBuildHost, env: Readonly<Record<string, string | undefined>>) {

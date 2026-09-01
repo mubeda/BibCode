@@ -219,6 +219,21 @@ async function setComposerValue(value: string): Promise<void> {
     selection?.addRange(range);
   });
   await browser.keys("Backspace");
+  if (value.length === 0) {
+    await browser.waitUntil(
+      async () => {
+        if ((await editor.getText()) === "") return true;
+        await editor.click();
+        await browser.keys("Backspace");
+        return (await editor.getText()) === "";
+      },
+      {
+        timeout: 3_000,
+        interval: 100,
+        timeoutMsg: "Composer chips did not clear before entering a new value.",
+      },
+    );
+  }
   if (value.length > 0) {
     await editor.addValue(value);
   }

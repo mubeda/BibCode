@@ -109,8 +109,6 @@ impl HostIdentity {
 
 #[cfg(test)]
 mod tests {
-    use base64::Engine as _;
-
     use super::*;
     use crate::auth::secret_store::SecretStore;
 

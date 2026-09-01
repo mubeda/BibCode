@@ -6,7 +6,16 @@ import type { ServerConfig } from "@bibcode/contracts";
 import { makeTestExecutionEnvironmentCapabilities } from "@bibcode/shared/testSupport";
 import { describe, expect, it } from "vite-plus/test";
 
-import { resolveGitManagerAvailability } from "./gitManagerAvailability";
+import {
+  GIT_MANAGER_BRANCH_SYNC_DISABLED_REASON,
+  GIT_MANAGER_LIVE_SIGNAL_DISABLED_REASON,
+  GIT_MANAGER_PULL_REQUESTS_DISABLED_REASON,
+  GIT_MANAGER_REWRITE_DISABLED_REASON,
+  GIT_MANAGER_STASH_MERGE_DISABLED_REASON,
+  GIT_MANAGER_TAG_DISABLED_REASON,
+  resolveGitManagerAvailability,
+  resolveGitManagerCapabilityDisabledReasons,
+} from "./gitManagerAvailability";
 
 function connection(overrides: Partial<SupervisorConnectionState>): SupervisorConnectionState {
   return { ...AVAILABLE_CONNECTION_STATE, ...overrides };
@@ -67,5 +76,43 @@ describe("resolveGitManagerAvailability", () => {
         serverConfig(true),
       ),
     ).toEqual({ kind: "ready" });
+  });
+});
+
+describe("resolveGitManagerCapabilityDisabledReasons", () => {
+  it("fails each optional surface closed when capability fields are absent", () => {
+    const configWithAbsentFields = {
+      environment: { capabilities: { gitManagerReads: true } },
+    } as ServerConfig;
+
+    expect(resolveGitManagerCapabilityDisabledReasons(configWithAbsentFields)).toEqual({
+      branchSync: GIT_MANAGER_BRANCH_SYNC_DISABLED_REASON,
+      stashMerge: GIT_MANAGER_STASH_MERGE_DISABLED_REASON,
+      rewrite: GIT_MANAGER_REWRITE_DISABLED_REASON,
+      tag: GIT_MANAGER_TAG_DISABLED_REASON,
+      pullRequests: GIT_MANAGER_PULL_REQUESTS_DISABLED_REASON,
+      liveSignal: GIT_MANAGER_LIVE_SIGNAL_DISABLED_REASON,
+    });
+  });
+
+  it("enables only explicitly advertised optional surfaces", () => {
+    const configWithCapabilities = {
+      environment: {
+        capabilities: makeTestExecutionEnvironmentCapabilities({
+          gitManagerReads: true,
+          gitManagerBranchSyncOperations: true,
+          gitManagerLiveSignal: true,
+        }),
+      },
+    } as ServerConfig;
+
+    expect(resolveGitManagerCapabilityDisabledReasons(configWithCapabilities)).toEqual({
+      branchSync: null,
+      stashMerge: GIT_MANAGER_STASH_MERGE_DISABLED_REASON,
+      rewrite: GIT_MANAGER_REWRITE_DISABLED_REASON,
+      tag: GIT_MANAGER_TAG_DISABLED_REASON,
+      pullRequests: GIT_MANAGER_PULL_REQUESTS_DISABLED_REASON,
+      liveSignal: null,
+    });
   });
 });

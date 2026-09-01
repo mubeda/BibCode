@@ -2408,6 +2408,33 @@ mod tests {
     static COMPILED_CURSOR_UPDATE_FIXTURE: OnceCell<CompiledCursorUpdateFixture> =
         OnceCell::const_new();
 
+    async fn run_compiled_cursor_update_fixture(
+        executable: &Path,
+        argument: &str,
+    ) -> std::io::Result<std::process::Output> {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                match tokio::process::Command::new(executable)
+                    .arg(argument)
+                    .output()
+                    .await
+                {
+                    Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                    result => return result,
+                }
+            }
+        })
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "compiled Cursor update fixture did not become executable",
+            )
+        })?
+    }
+
     async fn compiled_cursor_update_fixture() -> &'static CompiledCursorUpdateFixture {
         COMPILED_CURSOR_UPDATE_FIXTURE
             .get_or_init(|| async {
@@ -2450,30 +2477,46 @@ mod tests {
             .await
             .expect("write next Cursor version");
 
-        let before = tokio::process::Command::new(&executable)
-            .arg("about")
-            .output()
+        let before = run_compiled_cursor_update_fixture(&executable, "about")
             .await
             .expect("run Cursor about before update");
         assert_eq!(
             String::from_utf8_lossy(&before.stdout).trim(),
             r#"{"cliVersion":"2026.06.19-653a7fb"}"#
         );
-        let update = tokio::process::Command::new(&executable)
-            .arg("update")
-            .output()
+        let update = run_compiled_cursor_update_fixture(&executable, "update")
             .await
             .expect("run Cursor update");
         assert!(update.status.success());
-        let after = tokio::process::Command::new(&executable)
-            .arg("about")
-            .output()
+        let after = run_compiled_cursor_update_fixture(&executable, "about")
             .await
             .expect("run Cursor about after update");
         assert_eq!(
             String::from_utf8_lossy(&after.stdout).trim(),
             r#"{"cliVersion":"2026.08.04-aaa8809"}"#
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compiled_cursor_update_fixture_retries_a_busy_executable() {
+        let directory = tempfile::tempdir().expect("Cursor fixture directory");
+        let executable =
+            compile_cursor_update_fixture(directory.path(), "2026.06.19-653a7fb").await;
+        let writable = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&executable)
+            .expect("hold writable Cursor fixture");
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            drop(writable);
+        });
+
+        let output = run_compiled_cursor_update_fixture(&executable, "about")
+            .await
+            .expect("busy Cursor fixture becomes executable");
+        assert!(output.status.success());
+        release.await.expect("writable fixture release");
     }
 
     async fn control_with_cursor_update_fixture(executable: PathBuf) -> NativeServerControl {

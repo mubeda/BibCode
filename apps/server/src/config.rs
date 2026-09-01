@@ -16,6 +16,7 @@ use url::Url;
 use crate::data_root::{DataRootError, DataRootRequest, DataRootSource, ResolvedDataRoot};
 use crate::persistence::StorageInstanceId;
 use crate::remote_update::RemoteUpdateSupport;
+use crate::static_assets::{StaticDirError, StaticDirSource, resolve_static_dir};
 
 pub const DEFAULT_PORT: u16 = 3773;
 
@@ -44,6 +45,7 @@ pub struct ServerConfig {
     pub data_root_request: DataRootRequest,
     pub resolved_data_root: Option<ResolvedDataRoot>,
     pub static_dir: Option<PathBuf>,
+    pub static_dir_source: Option<StaticDirSource>,
     pub dev_url: Option<Url>,
     pub no_browser: bool,
     pub desktop_bootstrap_token: Option<String>,
@@ -77,6 +79,7 @@ impl ServerConfig {
             resolved_data_root: None,
             base_dir,
             static_dir: None,
+            static_dir_source: None,
             dev_url: None,
             no_browser: false,
             desktop_bootstrap_token: None,
@@ -119,6 +122,7 @@ impl ServerConfig {
     #[must_use]
     pub fn with_static_dir(mut self, static_dir: impl AsRef<Path>) -> Self {
         self.static_dir = Some(static_dir.as_ref().to_path_buf());
+        self.static_dir_source = Some(StaticDirSource::Explicit);
         self
     }
 
@@ -235,6 +239,27 @@ mod tests {
             config.data_root_request.requested,
             Some(PathBuf::from("/var/lib/bibcode"))
         );
+    }
+
+    #[test]
+    fn cli_discovers_packaged_web_from_the_injected_executable() {
+        let distribution = tempfile::tempdir().expect("distribution root");
+        let executable = distribution.path().join("bibcode");
+        let web = distribution.path().join("web");
+        std::fs::create_dir(&web).expect("web directory");
+        std::fs::write(&executable, b"binary").expect("binary fixture");
+        std::fs::write(web.join("index.html"), b"<main>BiBCode</main>").expect("web entry point");
+
+        let action = Cli::try_parse_from(["bibcode", "serve"])
+            .expect("parse CLI")
+            .into_action_with_executable(&executable)
+            .expect("build server action");
+        let CliAction::Run(config) = action else {
+            panic!("serve must produce a run action");
+        };
+
+        assert_eq!(config.static_dir, Some(web));
+        assert_eq!(config.static_dir_source, Some(StaticDirSource::Packaged));
     }
 
     #[test]
@@ -434,6 +459,10 @@ pub enum ConfigError {
     StorageCommandIsNotServer,
     #[error("pairing commands cannot be converted into a server configuration")]
     PairingCommandIsNotServer,
+    #[error("failed to resolve the current executable for static web discovery")]
+    CurrentExecutable(#[source] io::Error),
+    #[error(transparent)]
+    StaticAssets(#[from] StaticDirError),
     #[error(transparent)]
     DataRoot(#[from] DataRootError),
 }
@@ -471,6 +500,18 @@ impl Cli {
     }
 
     pub fn into_action(self) -> Result<CliAction, ConfigError> {
+        self.into_action_with_optional_executable(None)
+    }
+
+    #[cfg(test)]
+    fn into_action_with_executable(self, executable: &Path) -> Result<CliAction, ConfigError> {
+        self.into_action_with_optional_executable(Some(executable))
+    }
+
+    fn into_action_with_optional_executable(
+        self,
+        executable: Option<&Path>,
+    ) -> Result<CliAction, ConfigError> {
         let Self {
             command,
             root: args,
@@ -553,7 +594,16 @@ impl Cli {
         .with_bind(host, port);
         config.data_root_request = data_root_request;
         config.mode = mode;
-        config.static_dir = args.static_dir;
+        let current_executable = match executable {
+            Some(executable) => executable.to_path_buf(),
+            None => std::env::current_exe().map_err(ConfigError::CurrentExecutable)?,
+        };
+        let resolved_static_dir =
+            resolve_static_dir(args.static_dir.as_deref(), &current_executable)?;
+        config.static_dir = resolved_static_dir
+            .as_ref()
+            .map(|resolved| resolved.path.clone());
+        config.static_dir_source = resolved_static_dir.map(|resolved| resolved.source);
         config.dev_url = args.dev_url;
         config.no_browser = headless
             || args.no_browser
