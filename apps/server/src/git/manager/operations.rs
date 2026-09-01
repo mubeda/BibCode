@@ -2401,6 +2401,14 @@ mod tests {
     async fn cherry_pick_operation_arm_applies_the_requested_commit() {
         let repository = tempfile::tempdir().expect("temporary repository");
         git(repository.path(), &["init", "-q", "-b", "main"]);
+        git(
+            repository.path(),
+            &["config", "user.email", "git-manager@example.test"],
+        );
+        git(
+            repository.path(),
+            &["config", "user.name", "Git Manager Test"],
+        );
         std::fs::write(repository.path().join("base.txt"), "base\n").expect("base file");
         git(repository.path(), &["add", "base.txt"]);
         git(repository.path(), &["commit", "-q", "-m", "base"]);
