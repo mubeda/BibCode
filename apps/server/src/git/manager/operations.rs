@@ -30,6 +30,7 @@ use super::{
     refs::build_refs_snapshot,
     rewrite::{build_reorder_todo, build_squash_todo, resolve_last_retained_commit_ref},
     stash,
+    tags::{self, GitManagerTagError},
 };
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -415,14 +416,19 @@ pub enum GitManagerOperationRequest {
     TagCreate {
         cwd: PathBuf,
         project_id: String,
+        name: String,
+        sha: String,
     },
     TagDelete {
         cwd: PathBuf,
         project_id: String,
+        name: String,
     },
     TagPush {
         cwd: PathBuf,
         project_id: String,
+        name: String,
+        remote: String,
     },
 }
 
@@ -527,7 +533,7 @@ impl GitManagerOperationRequest {
     }
 
     #[must_use]
-    pub const fn is_implemented_through_phase_13(&self) -> bool {
+    pub const fn is_implemented_through_phase_16(&self) -> bool {
         matches!(
             self,
             Self::BranchCreate { .. }
@@ -557,6 +563,9 @@ impl GitManagerOperationRequest {
                 | Self::Continue { .. }
                 | Self::Abort { .. }
                 | Self::ResolveConflict { .. }
+                | Self::TagCreate { .. }
+                | Self::TagDelete { .. }
+                | Self::TagPush { .. }
         )
     }
 }
@@ -889,7 +898,7 @@ pub async fn run_branch_or_sync_operation(
     cancellation: CancellationToken,
 ) -> Result<GitManagerOperationOutcome, GitManagerOperationError> {
     let operation = request.operation();
-    if !request.is_implemented_through_phase_13() {
+    if !request.is_implemented_through_phase_16() {
         return Err(operation_error(
             operation,
             "not-implemented",
@@ -1447,12 +1456,25 @@ async fn execute_branch_or_sync_operation(
                 .map_err(|error| git_command_error(operation, error, Vec::new()))?;
             require_last_success(operation, outputs)?
         }
-        _ => {
-            return Err(operation_error(
-                operation,
-                "not-implemented",
-                "This Git Manager operation is not implemented until a later phase.",
-            ));
+        GitManagerOperationRequest::TagCreate { cwd, name, sha, .. } => {
+            let output = tags::create_tag(repository, cwd, name, sha, cancellation)
+                .await
+                .map_err(|error| tag_operation_error(operation, error))?;
+            require_last_success(operation, vec![output])?
+        }
+        GitManagerOperationRequest::TagDelete { cwd, name, .. } => {
+            let output = tags::delete_tag(repository, cwd, name, cancellation)
+                .await
+                .map_err(|error| tag_operation_error(operation, error))?;
+            require_last_success(operation, vec![output])?
+        }
+        GitManagerOperationRequest::TagPush {
+            cwd, name, remote, ..
+        } => {
+            let output = tags::push_tag(repository, cwd, remote, name, cancellation)
+                .await
+                .map_err(|error| tag_operation_error(operation, error))?;
+            require_last_success(operation, vec![output])?
         }
     };
     Ok(GitManagerOperationOutcome {
@@ -1663,6 +1685,27 @@ fn git_command_error(
     }
 }
 
+fn tag_operation_error(operation: &str, error: GitManagerTagError) -> GitManagerOperationError {
+    match error {
+        GitManagerTagError::InvalidName => operation_error(
+            operation,
+            "invalid-tag-name",
+            "The tag name or target is invalid.",
+        ),
+        GitManagerTagError::NotFound => operation_error(
+            operation,
+            "tag-not-found",
+            "The requested tag no longer exists; refresh the repository refs.",
+        ),
+        GitManagerTagError::Malformed | GitManagerTagError::CommandFailed => operation_error(
+            operation,
+            "git-command-failed",
+            "Git could not complete the requested tag operation.",
+        ),
+        GitManagerTagError::Git(error) => git_command_error(operation, error, Vec::new()),
+    }
+}
+
 fn refs_snapshot_error(
     operation: &str,
     error: super::refs::GitManagerRefsError,
@@ -1673,7 +1716,8 @@ fn refs_snapshot_error(
         }
         super::refs::GitManagerRefsError::MalformedRefs
         | super::refs::GitManagerRefsError::RepositoryState(_)
-        | super::refs::GitManagerRefsError::Worktrees(_) => operation_error(
+        | super::refs::GitManagerRefsError::Worktrees(_)
+        | super::refs::GitManagerRefsError::Tags(_) => operation_error(
             operation,
             "repository-state-unavailable",
             "Git repository state could not be revalidated.",
@@ -2258,7 +2302,7 @@ mod tests {
                 no_verify: false,
             },
         ] {
-            assert!(request.is_implemented_through_phase_13());
+            assert!(request.is_implemented_through_phase_16());
         }
     }
 
@@ -2307,6 +2351,49 @@ mod tests {
                 side: super::ConflictSide::Theirs,
                 ..
             } if path == "nested/file.txt"
+        ));
+    }
+
+    #[test]
+    fn phase_16_tag_requests_retain_every_contract_operand() {
+        let create: GitManagerOperationRequest = serde_json::from_value(serde_json::json!({
+            "_tag": "tag-create",
+            "cwd": "/repo",
+            "projectId": "project-1",
+            "name": "release/v1",
+            "sha": "0123456789abcdef0123456789abcdef01234567"
+        }))
+        .expect("tag-create request");
+        let delete: GitManagerOperationRequest = serde_json::from_value(serde_json::json!({
+            "_tag": "tag-delete",
+            "cwd": "/repo",
+            "projectId": "project-1",
+            "name": "release/v1"
+        }))
+        .expect("tag-delete request");
+        let push: GitManagerOperationRequest = serde_json::from_value(serde_json::json!({
+            "_tag": "tag-push",
+            "cwd": "/repo",
+            "projectId": "project-1",
+            "name": "release/v1",
+            "remote": "origin"
+        }))
+        .expect("tag-push request");
+
+        assert!(matches!(
+            create,
+            GitManagerOperationRequest::TagCreate { name, sha, .. }
+                if name == "release/v1"
+                    && sha == "0123456789abcdef0123456789abcdef01234567"
+        ));
+        assert!(matches!(
+            delete,
+            GitManagerOperationRequest::TagDelete { name, .. } if name == "release/v1"
+        ));
+        assert!(matches!(
+            push,
+            GitManagerOperationRequest::TagPush { name, remote, .. }
+                if name == "release/v1" && remote == "origin"
         ));
     }
 

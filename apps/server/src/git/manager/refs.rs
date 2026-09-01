@@ -2,8 +2,10 @@
 
 use std::{
     collections::HashMap,
+    ffi::OsString,
     io,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use serde::Serialize;
@@ -11,13 +13,17 @@ use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
+use crate::git::repository::git_read_environment;
 use crate::git::{
-    GitCommandError, GitRepository, GitWorktreeRecord, WorktreeParseError, parse_worktree_porcelain,
+    GitCommandError, GitRepository, GitWorktreeRecord, OutputPolicy, ProcessError, ProcessRequest,
+    ProcessRunner, WorktreeParseError, parse_worktree_porcelain,
 };
 
 use super::generation::{
     RepositoryHeadState, RepositoryStateObservation, observe_repository_state,
 };
+use super::graph::MAX_DIFF_BUFFER_SIZE;
+use super::tags::{GitManagerTagError, list_tags};
 
 const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
 
@@ -101,6 +107,70 @@ pub enum GitManagerRefsError {
     Worktrees(#[from] WorktreeParseError),
     #[error(transparent)]
     Git(#[from] GitCommandError),
+    #[error(transparent)]
+    Tags(#[from] GitManagerTagError),
+}
+
+#[derive(Debug, Error)]
+pub enum GitManagerImageBlobError {
+    #[error("the image blob exceeded {max_bytes} bytes")]
+    TooLarge {
+        max_bytes: usize,
+        observed_bytes: usize,
+    },
+    #[error(transparent)]
+    Process(#[from] ProcessError),
+}
+
+pub async fn read_image_blob(
+    cwd: &Path,
+    commitish: &str,
+    path: &str,
+    cancellation: &CancellationToken,
+) -> Result<Option<Vec<u8>>, GitManagerImageBlobError> {
+    let output = ProcessRunner
+        .run_bytes(
+            ProcessRequest {
+                operation: "GitManager.getDiff.imageBlob".to_owned(),
+                command: PathBuf::from("git"),
+                args: ["show".to_owned(), format!("{commitish}:{path}")]
+                    .into_iter()
+                    .map(OsString::from)
+                    .collect(),
+                cwd: cwd.to_path_buf(),
+                env: git_read_environment(),
+                stdin: None,
+                timeout: Duration::from_secs(30),
+                max_output_bytes: MAX_DIFF_BUFFER_SIZE,
+                output_policy: OutputPolicy::Error,
+                append_truncation_marker: false,
+                allow_non_zero_exit: true,
+            },
+            cancellation,
+        )
+        .await
+        .map_err(|error| match error {
+            ProcessError::OutputLimit {
+                stream: "stdout",
+                max_bytes,
+                observed_bytes,
+                ..
+            } => GitManagerImageBlobError::TooLarge {
+                max_bytes,
+                observed_bytes,
+            },
+            error => GitManagerImageBlobError::Process(error),
+        })?;
+    if output.exit_code != 0 {
+        return Ok(None);
+    }
+    if output.stdout_truncated {
+        return Err(GitManagerImageBlobError::TooLarge {
+            max_bytes: MAX_DIFF_BUFFER_SIZE,
+            observed_bytes: output.stdout.len().saturating_add(1),
+        });
+    }
+    Ok(Some(output.stdout))
 }
 
 #[derive(Clone, Debug)]
@@ -117,15 +187,54 @@ pub async fn build_refs_snapshot(
     cwd: &Path,
     cancellation: &CancellationToken,
 ) -> Result<GitManagerRefsSnapshot, GitManagerRefsError> {
-    let (refs, tag_names, worktrees, head_ref, status, conflicts, remotes, git_dir) = tokio::try_join!(
-        repository.git_manager_refs(cwd, cancellation),
-        repository.git_manager_tag_names(cwd, cancellation),
-        repository.git_manager_worktrees(cwd, cancellation),
-        repository.git_manager_head_ref(cwd, cancellation),
-        repository.git_manager_status(cwd, cancellation),
-        repository.git_manager_conflicted_paths(cwd, cancellation),
-        repository.git_manager_remotes(cwd, cancellation),
-        repository.git_manager_git_dir(cwd, cancellation),
+    let (refs, listed_tags, worktrees, head_ref, status, conflicts, remotes, git_dir) = tokio::try_join!(
+        async {
+            repository
+                .git_manager_refs(cwd, cancellation)
+                .await
+                .map_err(GitManagerRefsError::from)
+        },
+        async {
+            list_tags(repository, cwd, cancellation)
+                .await
+                .map_err(GitManagerRefsError::from)
+        },
+        async {
+            repository
+                .git_manager_worktrees(cwd, cancellation)
+                .await
+                .map_err(GitManagerRefsError::from)
+        },
+        async {
+            repository
+                .git_manager_head_ref(cwd, cancellation)
+                .await
+                .map_err(GitManagerRefsError::from)
+        },
+        async {
+            repository
+                .git_manager_status(cwd, cancellation)
+                .await
+                .map_err(GitManagerRefsError::from)
+        },
+        async {
+            repository
+                .git_manager_conflicted_paths(cwd, cancellation)
+                .await
+                .map_err(GitManagerRefsError::from)
+        },
+        async {
+            repository
+                .git_manager_remotes(cwd, cancellation)
+                .await
+                .map_err(GitManagerRefsError::from)
+        },
+        async {
+            repository
+                .git_manager_git_dir(cwd, cancellation)
+                .await
+                .map_err(GitManagerRefsError::from)
+        },
     )?;
 
     let worktree_records = parse_worktree_porcelain(&worktrees.stdout, false)?;
@@ -139,12 +248,14 @@ pub async fn build_refs_snapshot(
         })
         .collect::<HashMap<_, _>>();
     let raw_refs = parse_refs(&refs.stdout)?;
-    let tag_counts = tag_names
-        .stdout
-        .lines()
-        .filter(|name| !name.is_empty())
-        .fold(HashMap::<String, usize>::new(), |mut counts, name| {
-            *counts.entry(name.to_owned()).or_default() += 1;
+    let tag_targets = listed_tags
+        .iter()
+        .map(|tag| (tag.name.clone(), tag.target_sha.clone()))
+        .collect::<HashMap<_, _>>();
+    let tag_counts = listed_tags
+        .iter()
+        .fold(HashMap::<String, usize>::new(), |mut counts, tag| {
+            *counts.entry(tag.name.clone()).or_default() += 1;
             counts
         });
     let mut remaining_counts =
@@ -199,6 +310,12 @@ pub async fn build_refs_snapshot(
         *remaining = remaining.saturating_sub(1);
         if is_tag && let Some(count) = remaining_tags.get_mut(&reference.name) {
             *count = count.saturating_sub(1);
+        }
+        if is_tag {
+            reference.tip_sha = tag_targets
+                .get(&reference.name)
+                .cloned()
+                .ok_or(GitManagerRefsError::MalformedRefs)?;
         }
         let is_remote = !is_tag
             && remote_names
@@ -563,6 +680,26 @@ mod tests {
         let snapshot = snapshot(&repository).await;
         assert_eq!(snapshot.head_ref, None);
         assert_eq!(snapshot.detached_sha.as_deref(), Some(expected.as_str()));
+    }
+
+    #[tokio::test]
+    async fn annotated_tag_entries_use_the_normalized_dereferenced_target() {
+        let repository = repository_with_one_commit();
+        git(repository.path(), &["tag", "-a", "release/v1", "-m", ""]);
+        let expected =
+            String::from_utf8(git_output(repository.path(), &["rev-parse", "HEAD"]).stdout)
+                .expect("UTF-8 sha")
+                .trim()
+                .to_owned();
+
+        let snapshot = snapshot(&repository).await;
+        let tag = snapshot
+            .tags
+            .iter()
+            .find(|tag| tag.name == "release/v1")
+            .expect("annotated tag");
+
+        assert_eq!(tag.tip_sha, expected);
     }
 
     #[tokio::test]

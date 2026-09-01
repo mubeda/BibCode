@@ -11,3 +11,4 @@ pub mod patch;
 pub mod refs;
 pub mod rewrite;
 pub mod stash;
+pub mod tags;

@@ -1,3 +1,4 @@
+pub mod checks;
 mod discovery;
 mod pull_request;
 

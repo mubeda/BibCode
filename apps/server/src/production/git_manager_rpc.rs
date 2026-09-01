@@ -2,6 +2,7 @@
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -27,13 +28,20 @@ use crate::{
                 run_branch_or_sync_operation, stage_partial, unstage_partial,
             },
             patch::{diff_generation, parse_working_tree_diff},
-            refs::{GitManagerRefsError, GitManagerRefsSnapshot, build_refs_snapshot},
+            refs::{
+                GitManagerImageBlobError, GitManagerRefsError, GitManagerRefsSnapshot,
+                build_refs_snapshot, read_image_blob,
+            },
             stash::{self, GitManagerStashError},
         },
         validate_pathspecs,
     },
     persistence::Repositories,
     rpc::{RpcRegistry, RpcRequest, RpcResult, RpcStreamChunk},
+    source_control::{
+        ProviderKind as SourceControlProviderKind, PullRequestService, ResolvePullRequestInput,
+        checks::ProviderChecksResult,
+    },
     worktree_catalog::{
         CatalogRefreshTrigger, ProjectMutationAttempt, WorkspaceAdmissionLease,
         WorkspaceAvailabilityRegistry, WorktreeCatalogService,
@@ -91,6 +99,7 @@ impl GitManagerRpcServices {
             repositories: Some(repositories),
             availability: Some(availability),
             trash,
+            pull_requests: PullRequestService::default(),
         }
     }
 }
@@ -103,6 +112,7 @@ pub struct ConfiguredGitManagerRpcServices {
     repositories: Option<Repositories>,
     availability: Option<WorkspaceAvailabilityRegistry>,
     trash: Arc<dyn FileTrash>,
+    pull_requests: PullRequestService,
 }
 
 impl Default for ConfiguredGitManagerRpcServices {
@@ -115,6 +125,7 @@ impl Default for ConfiguredGitManagerRpcServices {
             repositories: None,
             availability: None,
             trash: Arc::new(NativeFileTrash::default()),
+            pull_requests: PullRequestService::default(),
         }
     }
 }
@@ -126,6 +137,12 @@ impl From<GitManagerRpcServices> for ConfiguredGitManagerRpcServices {
 }
 
 impl ConfiguredGitManagerRpcServices {
+    #[must_use]
+    pub fn with_pull_request_service(mut self, pull_requests: PullRequestService) -> Self {
+        self.pull_requests = pull_requests;
+        self
+    }
+
     async fn not_implemented_unary(&self, request: RpcRequest) -> RpcResult {
         Err(not_implemented_error(&request.tag))
     }
@@ -386,6 +403,10 @@ impl ConfiguredGitManagerRpcServices {
                         .await
                         .map_err(|error| merge_error(&request.tag, error))?;
                 Ok(merge_preview_value(preview))
+            }
+            "gitManager.listPullRequests" => {
+                let input: GitManagerCwdInput = decode(request.payload, &request.tag)?;
+                self.list_pull_requests(&input.cwd, &cancellation).await
             }
             _ => self.not_implemented_unary(request).await,
         }
@@ -836,6 +857,97 @@ impl ConfiguredGitManagerRpcServices {
         mutation.finish().await;
         result
     }
+
+    async fn list_pull_requests(
+        &self,
+        cwd: &std::path::Path,
+        cancellation: &CancellationToken,
+    ) -> RpcResult {
+        let summary = self
+            .repository
+            .summary_status(cwd, cancellation)
+            .await
+            .map_err(|error| git_error("gitManager.listPullRequests", error))?;
+        let Some(reference) = summary.ref_name else {
+            return Ok(unavailable_pull_requests());
+        };
+        let Some(provider) = summary
+            .source_control_provider
+            .map(|provider| source_control_provider_kind(provider.kind))
+        else {
+            return Ok(unavailable_pull_requests());
+        };
+        if matches!(
+            provider,
+            SourceControlProviderKind::Bitbucket | SourceControlProviderKind::Unknown
+        ) {
+            return Ok(unavailable_pull_requests());
+        }
+
+        let pull_request = self
+            .pull_requests
+            .resolve_current_optional(
+                ResolvePullRequestInput {
+                    cwd: cwd.to_path_buf(),
+                    provider,
+                    reference,
+                },
+                cancellation,
+            )
+            .await
+            .map_err(|_| {
+                operation_error(
+                    "gitManager.listPullRequests",
+                    "provider-command-failed",
+                    "The source-control provider could not load pull requests.",
+                )
+            })?;
+        let Some(pull_request) = pull_request else {
+            return Ok(json!({
+                "status": "available",
+                "pullRequests": [],
+                "checks": [],
+            }));
+        };
+        let checks = self
+            .pull_requests
+            .read_checks(provider, cwd, pull_request.number, cancellation)
+            .await
+            .map_err(|_| {
+                operation_error(
+                    "gitManager.listPullRequests",
+                    "provider-command-failed",
+                    "The source-control provider could not load pull-request checks.",
+                )
+            })?;
+        let (status, checks) = match checks {
+            ProviderChecksResult::Available(checks) => ("available", checks),
+            ProviderChecksResult::Unavailable => ("unavailable", Vec::new()),
+        };
+        Ok(json!({
+            "status": status,
+            "pullRequests": [pull_request],
+            "checks": checks,
+        }))
+    }
+}
+
+fn source_control_provider_kind(provider: crate::git::ProviderKind) -> SourceControlProviderKind {
+    match provider {
+        crate::git::ProviderKind::Github => SourceControlProviderKind::Github,
+        crate::git::ProviderKind::Gitlab => SourceControlProviderKind::Gitlab,
+        crate::git::ProviderKind::AzureDevops => SourceControlProviderKind::AzureDevops,
+        crate::git::ProviderKind::Bitbucket => SourceControlProviderKind::Bitbucket,
+        crate::git::ProviderKind::Unknown => SourceControlProviderKind::Unknown,
+    }
+}
+
+fn unavailable_pull_requests() -> Value {
+    json!({
+        "status": "unavailable",
+        "pullRequests": [],
+        "checks": [],
+    })
 }
 
 pub fn register_git_manager_rpc(
@@ -851,6 +963,7 @@ pub fn register_git_manager_rpc(
                 | "gitManager.getDiff"
                 | "gitManager.getStashes"
                 | "gitManager.previewMerge"
+                | "gitManager.listPullRequests"
                 | "gitManager.commit"
                 | "gitManager.undoCommit"
                 | "gitManager.discard"
@@ -871,6 +984,7 @@ pub fn register_git_manager_rpc(
         "gitManager.getDiff",
         "gitManager.getStashes",
         "gitManager.previewMerge",
+        "gitManager.listPullRequests",
     ] {
         let services = services.clone();
         registry.register_unary(method, move |request, cancellation| {
@@ -1232,6 +1346,30 @@ async fn get_diff(
             "The requested diff path is invalid.",
         )
     })?;
+    if let GitManagerDiffSource::Commit { sha, path } = &input.source
+        && is_image_path(path)
+    {
+        if !valid_object_id(sha) {
+            return Err(operation_error(
+                operation,
+                "invalid-commit",
+                "The requested commit identifier is invalid.",
+            ));
+        }
+        let metadata = repository
+            .git_manager_commit_diff(&input.cwd, sha, path, cancellation)
+            .await
+            .map_err(|error| git_error(operation, error))?;
+        return render_commit_image_diff(
+            input.source.clone(),
+            &input.cwd,
+            sha,
+            path,
+            metadata,
+            cancellation,
+        )
+        .await;
+    }
     let output = match &input.source {
         GitManagerDiffSource::WorkingTree { path, staged } => {
             let mut output = repository
@@ -1286,6 +1424,109 @@ async fn get_diff(
         }
     };
     Ok(render_diff(input.source, output))
+}
+
+async fn render_commit_image_diff(
+    source: GitManagerDiffSource,
+    cwd: &std::path::Path,
+    sha: &str,
+    path: &str,
+    metadata_output: ProcessOutput,
+    cancellation: &CancellationToken,
+) -> RpcResult {
+    let before_commitish = format!("{sha}^");
+    let (before, after) = tokio::join!(
+        read_image_blob(cwd, &before_commitish, path, cancellation),
+        read_image_blob(cwd, sha, path, cancellation),
+    );
+    let before = match before {
+        Ok(value) => value,
+        Err(GitManagerImageBlobError::TooLarge { .. }) => {
+            return Ok(unrenderable_image_diff(source));
+        }
+        Err(GitManagerImageBlobError::Process(_)) => {
+            return Err(operation_error(
+                "gitManager.getDiff",
+                "git-command-failed",
+                "Git could not read the requested image blob.",
+            ));
+        }
+    };
+    let after = match after {
+        Ok(value) => value,
+        Err(GitManagerImageBlobError::TooLarge { .. }) => {
+            return Ok(unrenderable_image_diff(source));
+        }
+        Err(GitManagerImageBlobError::Process(_)) => {
+            return Err(operation_error(
+                "gitManager.getDiff",
+                "git-command-failed",
+                "Git could not read the requested image blob.",
+            ));
+        }
+    };
+    let byte_length = before
+        .as_ref()
+        .map_or(0, Vec::len)
+        .checked_add(after.as_ref().map_or(0, Vec::len))
+        .unwrap_or(MAX_DIFF_BUFFER_SIZE + 1);
+    if byte_length > MAX_DIFF_BUFFER_SIZE {
+        return Ok(unrenderable_image_diff(source));
+    }
+    if before.is_none() && after.is_none() {
+        return Err(operation_error(
+            "gitManager.getDiff",
+            "image-unavailable",
+            "Neither side of the requested image diff exists.",
+        ));
+    }
+    let generation = diff_generation(&parse_working_tree_diff(&metadata_output.stdout));
+    let mime_type = mime_guess::from_path(path)
+        .first_raw()
+        .unwrap_or("application/octet-stream");
+    Ok(json!({
+        "_tag": "image",
+        "generation": generation,
+        "source": source,
+        "byteLength": byte_length,
+        "longestLineLength": 0,
+        "before": image_diff_side(before.as_deref(), mime_type),
+        "after": image_diff_side(after.as_deref(), mime_type),
+    }))
+}
+
+fn image_diff_side(bytes: Option<&[u8]>, mime_type: &str) -> Value {
+    bytes.map_or_else(
+        || json!({ "contentBase64": null, "mimeType": null }),
+        |bytes| {
+            json!({
+                "contentBase64": BASE64_STANDARD.encode(bytes),
+                "mimeType": mime_type,
+            })
+        },
+    )
+}
+
+fn unrenderable_image_diff(source: GitManagerDiffSource) -> Value {
+    json!({
+        "_tag": "unrenderable",
+        "generation": 0,
+        "source": source,
+        "byteLength": MAX_DIFF_BUFFER_SIZE + 1,
+        "longestLineLength": 0,
+    })
+}
+
+fn is_image_path(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "ico" | "webp" | "bmp" | "avif"
+            )
+        })
 }
 
 fn render_diff(source: GitManagerDiffSource, output: ProcessOutput) -> Value {
@@ -1371,7 +1612,9 @@ fn encode_result<T: Serialize>(result: Result<T, Value>) -> RpcResult {
 fn refs_error(operation: &str, error: GitManagerRefsError) -> Value {
     match error {
         GitManagerRefsError::Git(error) => git_error(operation, error),
-        GitManagerRefsError::MalformedRefs | GitManagerRefsError::Worktrees(_) => operation_error(
+        GitManagerRefsError::MalformedRefs
+        | GitManagerRefsError::Worktrees(_)
+        | GitManagerRefsError::Tags(_) => operation_error(
             operation,
             "malformed-git-output",
             "Git returned malformed repository ref state.",
@@ -1741,6 +1984,26 @@ mod tests {
                 .as_str()
                 .is_some_and(|patch| patch.contains("changed"))
         );
+    }
+
+    #[tokio::test]
+    async fn pull_request_read_without_a_supported_provider_is_structured_unavailable() {
+        let repository = repository_with_change();
+
+        let result = GitManagerRpcServices
+            .handle_read_unary(
+                request(
+                    "gitManager.listPullRequests",
+                    json!({ "cwd": repository.path() }),
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("unsupported provider is a result, not an RPC failure");
+
+        assert_eq!(result["status"], "unavailable");
+        assert_eq!(result["pullRequests"], json!([]));
+        assert_eq!(result["checks"], json!([]));
     }
 
     #[tokio::test]

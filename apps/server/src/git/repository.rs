@@ -587,22 +587,6 @@ impl GitRepository {
         .await
     }
 
-    pub(crate) async fn git_manager_tag_names(
-        &self,
-        cwd: &Path,
-        cancellation: &CancellationToken,
-    ) -> Result<ProcessOutput, GitCommandError> {
-        self.git_manager_bounded_read(
-            "GitManager.getRefs.tags",
-            cwd,
-            &strings(&["for-each-ref", "--format=%(refname:short)", "refs/tags"]),
-            false,
-            GIT_MANAGER_TIPS_OUTPUT_LIMIT,
-            cancellation,
-        )
-        .await
-    }
-
     pub(crate) async fn git_manager_worktrees(
         &self,
         cwd: &Path,
@@ -953,7 +937,7 @@ impl GitRepository {
         self.default_ref(cwd, current, cancellation).await
     }
 
-    async fn git_manager_bounded_read(
+    pub(crate) async fn git_manager_bounded_read(
         &self,
         operation: &str,
         cwd: &Path,
@@ -1301,7 +1285,7 @@ impl GitRepository {
         .await
     }
 
-    async fn run(
+    pub(crate) async fn run(
         &self,
         operation: &str,
         cwd: &Path,
@@ -6563,7 +6547,7 @@ fn git_environment() -> Vec<(OsString, OsString)> {
     .collect()
 }
 
-fn git_read_environment() -> Vec<(OsString, OsString)> {
+pub(crate) fn git_read_environment() -> Vec<(OsString, OsString)> {
     let mut environment = git_environment();
     environment.push(("GIT_OPTIONAL_LOCKS".into(), "0".into()));
     environment
