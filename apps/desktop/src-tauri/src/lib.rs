@@ -102,6 +102,8 @@ pub fn run() {
         .plugin(tauri_plugin_wdio::init())
         .plugin(tauri_plugin_wdio_webdriver::init());
     let builder = builder.setup(move |app| {
+        #[cfg(target_os = "linux")]
+        linux_text_rendering::apply_webview_hinting_override();
         shell_path_hydration.record();
         window::configure_application_menu(app.handle())?;
         window::restore_main_window_state(app.handle())?;
@@ -273,6 +275,8 @@ mod config;
 mod context_menu;
 mod data_safety;
 mod firewall;
+#[cfg(target_os = "linux")]
+mod linux_text_rendering;
 mod network_interfaces;
 mod preview;
 mod remote_update_delegate;
