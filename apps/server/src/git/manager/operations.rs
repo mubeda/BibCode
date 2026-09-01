@@ -21,7 +21,10 @@ use crate::worktree_catalog::{ProjectMutationAttempt, WorktreeCatalogService};
 
 use super::{
     guards::{GuardInput, evaluate_guards},
+    in_progress::detect_in_progress_operation,
+    merge,
     refs::build_refs_snapshot,
+    stash,
 };
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -241,26 +244,35 @@ pub enum GitManagerOperationRequest {
     StashPush {
         cwd: PathBuf,
         project_id: String,
+        message: String,
+        paths: Vec<String>,
     },
     StashApply {
         cwd: PathBuf,
         project_id: String,
+        index: u64,
     },
     StashPop {
         cwd: PathBuf,
         project_id: String,
+        index: u64,
     },
     StashDrop {
         cwd: PathBuf,
         project_id: String,
+        index: u64,
     },
     Merge {
         cwd: PathBuf,
         project_id: String,
+        source: String,
+        no_verify: bool,
     },
     SquashMerge {
         cwd: PathBuf,
         project_id: String,
+        source: String,
+        no_verify: bool,
     },
     Rebase {
         cwd: PathBuf,
@@ -413,7 +425,7 @@ impl GitManagerOperationRequest {
     }
 
     #[must_use]
-    pub const fn is_implemented_in_phase_07(&self) -> bool {
+    pub const fn is_implemented_through_phase_09(&self) -> bool {
         matches!(
             self,
             Self::BranchCreate { .. }
@@ -428,6 +440,12 @@ impl GitManagerOperationRequest {
                 | Self::Push { .. }
                 | Self::PublishBranch { .. }
                 | Self::ForcePush { .. }
+                | Self::StashPush { .. }
+                | Self::StashApply { .. }
+                | Self::StashPop { .. }
+                | Self::StashDrop { .. }
+                | Self::Merge { .. }
+                | Self::SquashMerge { .. }
         )
     }
 }
@@ -457,7 +475,7 @@ pub async fn run_branch_or_sync_operation(
     cancellation: CancellationToken,
 ) -> Result<GitManagerOperationOutcome, GitManagerOperationError> {
     let operation = request.operation();
-    if !request.is_implemented_in_phase_07() {
+    if !request.is_implemented_through_phase_09() {
         return Err(operation_error(
             operation,
             "not-implemented",
@@ -471,13 +489,26 @@ pub async fn run_branch_or_sync_operation(
     let operation_cancellation = cancellation.clone();
     match catalog
         .try_with_project_mutation_lock_cancellation(&project_id, &cancellation, || async move {
-            let snapshot = build_refs_snapshot(
+            let mut snapshot = build_refs_snapshot(
                 &locked_repository,
                 locked_request.cwd(),
                 &operation_cancellation,
             )
             .await
             .map_err(|error| refs_snapshot_error(operation, error))?;
+            snapshot.in_progress_operation = detect_in_progress_operation(
+                &locked_repository,
+                locked_request.cwd(),
+                &operation_cancellation,
+            )
+            .await
+            .map_err(|_| {
+                operation_error(
+                    operation,
+                    "repository-state-unavailable",
+                    "Git repository operation state could not be revalidated.",
+                )
+            })?;
             if let Some(reason) = blocked_reason_for_operation(&snapshot, &locked_request) {
                 return Err(blocked_operation_error(operation, reason));
             }
@@ -540,6 +571,20 @@ fn blocked_reason_for_operation(
         }
         GitManagerOperationRequest::ForcePush { local_branch, .. } => {
             (Some(local_branch.as_str()), "force-push")
+        }
+        GitManagerOperationRequest::Merge { source, .. }
+        | GitManagerOperationRequest::SquashMerge { source, .. } => {
+            (Some(source.as_str()), "merge")
+        }
+        GitManagerOperationRequest::StashPush { .. } => {
+            (snapshot.head_ref.as_deref(), "stash-push")
+        }
+        GitManagerOperationRequest::StashApply { .. } => {
+            (snapshot.head_ref.as_deref(), "stash-apply")
+        }
+        GitManagerOperationRequest::StashPop { .. } => (snapshot.head_ref.as_deref(), "stash-pop"),
+        GitManagerOperationRequest::StashDrop { .. } => {
+            (snapshot.head_ref.as_deref(), "stash-drop")
         }
         GitManagerOperationRequest::Fetch { .. } => (snapshot.head_ref.as_deref(), "fetch"),
         GitManagerOperationRequest::BranchCreate { .. } => {
@@ -722,6 +767,67 @@ async fn execute_branch_or_sync_operation(
                 )
                 .await,
         )?,
+        GitManagerOperationRequest::StashPush {
+            cwd,
+            message,
+            paths,
+            ..
+        } => {
+            if message.is_empty() || message.trim() != message {
+                return Err(operation_error(
+                    operation,
+                    "invalid-request",
+                    "The stash message must be trimmed and non-empty.",
+                ));
+            }
+            validate_pathspecs("GitManager.stashPush", cwd, paths).map_err(|_| {
+                operation_error(
+                    operation,
+                    "invalid-path",
+                    "A requested stash path is invalid.",
+                )
+            })?;
+            let outputs = stash::push(repository, cwd, message, paths, cancellation)
+                .await
+                .map_err(|error| git_command_error(operation, error, Vec::new()))?;
+            require_last_success(operation, outputs)?
+        }
+        GitManagerOperationRequest::StashApply { cwd, index, .. } => one_output(
+            operation,
+            stash::apply(repository, cwd, *index, cancellation).await,
+        )?,
+        GitManagerOperationRequest::StashPop { cwd, index, .. } => one_output(
+            operation,
+            stash::pop(repository, cwd, *index, cancellation).await,
+        )?,
+        GitManagerOperationRequest::StashDrop { cwd, index, .. } => one_output(
+            operation,
+            stash::drop_stash(repository, cwd, *index, cancellation).await,
+        )?,
+        GitManagerOperationRequest::Merge {
+            cwd,
+            source,
+            no_verify,
+            ..
+        } => {
+            validate_merge_source(operation, source)?;
+            let outputs = merge::merge(repository, cwd, source, *no_verify, cancellation)
+                .await
+                .map_err(|error| git_command_error(operation, error, Vec::new()))?;
+            require_last_success(operation, outputs)?
+        }
+        GitManagerOperationRequest::SquashMerge {
+            cwd,
+            source,
+            no_verify,
+            ..
+        } => {
+            validate_merge_source(operation, source)?;
+            let outputs = merge::squash_merge(repository, cwd, source, *no_verify, cancellation)
+                .await
+                .map_err(|error| git_command_error(operation, error, Vec::new()))?;
+            require_last_success(operation, outputs)?
+        }
         _ => {
             return Err(operation_error(
                 operation,
@@ -732,9 +838,24 @@ async fn execute_branch_or_sync_operation(
     };
     Ok(GitManagerOperationOutcome {
         operation: operation.to_owned(),
+        message: if outputs.iter().any(merge::is_already_up_to_date) {
+            "Already up to date.".to_owned()
+        } else {
+            "Git operation completed.".to_owned()
+        },
         outputs,
-        message: "Git operation completed.".to_owned(),
     })
+}
+
+fn validate_merge_source(operation: &str, source: &str) -> Result<(), GitManagerOperationError> {
+    if source.is_empty() || source.trim() != source || source.starts_with('-') {
+        return Err(operation_error(
+            operation,
+            "invalid-request",
+            "The merge source must be a trimmed non-option revision.",
+        ));
+    }
+    Ok(())
 }
 
 fn remote_tracking_ref<'a>(
@@ -788,7 +909,10 @@ fn require_last_success(
     if output.exit_code == 0 {
         return Ok(outputs);
     }
-    let code = classify_operation_failure(output.exit_code, &output.stderr);
+    let mut code = classify_operation_failure(output.exit_code, &output.stderr);
+    if code == GitManagerFailureCode::Unknown {
+        code = classify_operation_failure(output.exit_code, &output.stdout);
+    }
     Err(GitManagerOperationError {
         operation: operation.to_owned(),
         code: code.as_str().to_owned(),
@@ -1266,6 +1390,73 @@ mod tests {
             "Automatic merge failed; fix conflicts and then commit the result.",
         ] {
             assert_failure_code(stderr, GitManagerFailureCode::Conflicts);
+        }
+    }
+
+    #[test]
+    fn conflicting_pop_stdout_is_reported_as_a_conflict() {
+        let error = require_last_success(
+            "stash-pop",
+            vec![ProcessOutput {
+                exit_code: 1,
+                stdout: "CONFLICT (content): Merge conflict in tracked.txt\n".into(),
+                stderr: String::new(),
+                stdout_truncated: false,
+                stderr_truncated: false,
+            }],
+        )
+        .expect_err("conflicting pop fails");
+
+        assert_eq!(error.code, "conflicts");
+    }
+
+    #[test]
+    fn phase_09_operation_requests_decode_the_contract_fields() {
+        let stash: GitManagerOperationRequest = serde_json::from_value(serde_json::json!({
+            "_tag": "stash-push",
+            "cwd": "/repo",
+            "projectId": "project-1",
+            "message": "save all work",
+            "paths": ["untracked.txt"]
+        }))
+        .expect("stash request");
+        assert!(matches!(
+            stash,
+            GitManagerOperationRequest::StashPush { message, paths, .. }
+                if message == "save all work" && paths == ["untracked.txt"]
+        ));
+
+        let merge: GitManagerOperationRequest = serde_json::from_value(serde_json::json!({
+            "_tag": "merge",
+            "cwd": "/repo",
+            "projectId": "project-1",
+            "source": "feature",
+            "noVerify": true
+        }))
+        .expect("merge request");
+        assert!(matches!(
+            merge,
+            GitManagerOperationRequest::Merge { source, no_verify, .. }
+                if source == "feature" && no_verify
+        ));
+    }
+
+    #[test]
+    fn phase_09_operations_are_admitted_by_the_executor() {
+        for request in [
+            GitManagerOperationRequest::StashApply {
+                cwd: PathBuf::from("/repo"),
+                project_id: "project-1".into(),
+                index: 0,
+            },
+            GitManagerOperationRequest::Merge {
+                cwd: PathBuf::from("/repo"),
+                project_id: "project-1".into(),
+                source: "feature".into(),
+                no_verify: false,
+            },
+        ] {
+            assert!(request.is_implemented_through_phase_09());
         }
     }
 

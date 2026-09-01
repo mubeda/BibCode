@@ -132,6 +132,7 @@ pub(crate) struct GitWatchRoots {
 
 pub(crate) struct ObservedRemoteStatus {
     pub ref_name: Option<String>,
+    pub head_signature: String,
     pub remote: Option<VcsStatusRemoteResult>,
 }
 
@@ -730,6 +731,60 @@ impl GitRepository {
         .await
     }
 
+    pub(crate) async fn git_manager_in_progress_paths(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.getRefs.inProgressPaths",
+            cwd,
+            &strings(&[
+                "rev-parse",
+                "--git-path",
+                "MERGE_HEAD",
+                "--git-path",
+                "CHERRY_PICK_HEAD",
+                "--git-path",
+                "REVERT_HEAD",
+                "--git-path",
+                "SQUASH_MSG",
+                "--git-path",
+                "rebase-merge",
+                "--git-path",
+                "rebase-apply",
+                "--git-path",
+                "sequencer/todo",
+            ]),
+            false,
+            128 * 1024,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_signal_refs(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.signal.refs",
+            cwd,
+            &strings(&[
+                "for-each-ref",
+                "--format=%(objectname)%09%(refname)%09%(worktreepath)",
+                "refs/heads",
+                "refs/remotes",
+                "refs/tags",
+            ]),
+            false,
+            GIT_MANAGER_TIPS_OUTPUT_LIMIT,
+            cancellation,
+        )
+        .await
+    }
+
     pub(crate) async fn git_manager_default_ref(
         &self,
         cwd: &Path,
@@ -860,6 +915,151 @@ impl GitRepository {
         args.push(path.to_owned());
         self.git_manager_diff_read("GitManager.getDiff.commit", cwd, &args, false, cancellation)
             .await
+    }
+
+    pub(crate) async fn git_manager_stash_list(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.getStashes.list",
+            cwd,
+            &strings(&[
+                "log",
+                "-g",
+                "-z",
+                "--no-show-signature",
+                "--format=%gD%x1f%H%x1f%gs%x1f%ct%x1f%P",
+                "refs/stash",
+                "--",
+            ]),
+            true,
+            GIT_MANAGER_TIPS_OUTPUT_LIMIT,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_stash_file_list(
+        &self,
+        cwd: &Path,
+        selector: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.getStashes.files",
+            cwd,
+            &[
+                "stash".into(),
+                "show".into(),
+                selector.into(),
+                "--raw".into(),
+                "--numstat".into(),
+                "-z".into(),
+                "--format=format:".into(),
+                "--no-show-signature".into(),
+                "--".into(),
+            ],
+            false,
+            GIT_MANAGER_TIPS_OUTPUT_LIMIT,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_stash_diff(
+        &self,
+        cwd: &Path,
+        selector: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_diff_read(
+            "GitManager.getDiff.stash",
+            cwd,
+            &[
+                "stash".into(),
+                "show".into(),
+                "-p".into(),
+                selector.into(),
+                "--no-color".into(),
+            ],
+            false,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_resolve_merge_tip(
+        &self,
+        cwd: &Path,
+        revision: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.previewMerge.resolveTip",
+            cwd,
+            &[
+                "rev-parse".into(),
+                "--verify".into(),
+                "--end-of-options".into(),
+                format!("{revision}^{{commit}}"),
+            ],
+            true,
+            64 * 1024,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_merge_ahead_behind(
+        &self,
+        cwd: &Path,
+        ours_tip: &str,
+        theirs_tip: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.previewMerge.aheadBehind",
+            cwd,
+            &[
+                "rev-list".into(),
+                "--left-right".into(),
+                "--count".into(),
+                format!("{ours_tip}...{theirs_tip}"),
+                "--".into(),
+            ],
+            false,
+            64 * 1024,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_merge_tree(
+        &self,
+        cwd: &Path,
+        ours_tip: &str,
+        theirs_tip: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.previewMerge.mergeTree",
+            cwd,
+            &[
+                "merge-tree".into(),
+                "--write-tree".into(),
+                "--name-only".into(),
+                "--no-messages".into(),
+                "-z".into(),
+                ours_tip.into(),
+                theirs_tip.into(),
+            ],
+            true,
+            GIT_MANAGER_TIPS_OUTPUT_LIMIT,
+            cancellation,
+        )
+        .await
     }
 
     async fn git_manager_diff_read(
@@ -1762,6 +1962,7 @@ impl GitRepository {
         if !self.is_repository(cwd, cancellation).await? {
             return Ok(ObservedRemoteStatus {
                 ref_name: None,
+                head_signature: "not-repository".to_owned(),
                 remote: None,
             });
         }
@@ -1798,6 +1999,7 @@ impl GitRepository {
             .await?;
         Ok(ObservedRemoteStatus {
             ref_name: branch,
+            head_signature: parse_head_signature(&status.stdout),
             remote: Some(remote),
         })
     }
@@ -3646,6 +3848,131 @@ impl GitRepository {
         }
         self.execute("GitManager.push", cwd, &args, true, cancellation)
             .await
+    }
+
+    pub(crate) async fn git_manager_stash_push(
+        &self,
+        cwd: &Path,
+        message: &str,
+        paths: &[String],
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<ProcessOutput>, GitCommandError> {
+        let mut outputs = Vec::new();
+        if !paths.is_empty() {
+            let mut args = strings(&["add", "--"]);
+            args.extend(paths.iter().cloned());
+            outputs.push(
+                self.execute("GitManager.stashPush.stage", cwd, &args, true, cancellation)
+                    .await?,
+            );
+            if outputs.last().is_some_and(|output| output.exit_code != 0) {
+                return Ok(outputs);
+            }
+        }
+        outputs.push(
+            self.execute(
+                "GitManager.stashPush",
+                cwd,
+                &["stash".into(), "push".into(), "-m".into(), message.into()],
+                true,
+                cancellation,
+            )
+            .await?,
+        );
+        Ok(outputs)
+    }
+
+    pub(crate) async fn git_manager_stash_apply(
+        &self,
+        cwd: &Path,
+        selector: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute(
+            "GitManager.stashApply",
+            cwd,
+            &[
+                "stash".into(),
+                "apply".into(),
+                "--quiet".into(),
+                selector.into(),
+            ],
+            true,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_stash_pop(
+        &self,
+        cwd: &Path,
+        selector: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute(
+            "GitManager.stashPop",
+            cwd,
+            &[
+                "stash".into(),
+                "pop".into(),
+                "--quiet".into(),
+                selector.into(),
+            ],
+            true,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_stash_drop(
+        &self,
+        cwd: &Path,
+        selector: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute(
+            "GitManager.stashDrop",
+            cwd,
+            &["stash".into(), "drop".into(), selector.into()],
+            true,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_merge(
+        &self,
+        cwd: &Path,
+        source: &str,
+        no_verify: bool,
+        squash: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let mut args = vec!["merge".to_owned()];
+        if squash {
+            args.push("--squash".to_owned());
+        }
+        if no_verify {
+            args.push("--no-verify".to_owned());
+        }
+        args.push(source.to_owned());
+        self.execute("GitManager.merge", cwd, &args, true, cancellation)
+            .await
+    }
+
+    pub(crate) async fn git_manager_squash_merge_commit(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute(
+            "GitManager.squashMerge.commit",
+            cwd,
+            &strings(&["commit", "--no-edit"]),
+            true,
+            cancellation,
+        )
+        .await
     }
 
     pub async fn switch_ref(
@@ -7532,6 +7859,14 @@ fn parse_branch_headers(stdout: &str) -> (Option<String>, Option<String>, u64, u
         upstream = None;
     }
     (branch, upstream, ahead, behind)
+}
+
+fn parse_head_signature(stdout: &str) -> String {
+    stdout
+        .lines()
+        .filter(|line| line.starts_with("# branch.oid ") || line.starts_with("# branch.head "))
+        .collect::<Vec<_>>()
+        .join("\0")
 }
 
 fn parse_summary_identity(

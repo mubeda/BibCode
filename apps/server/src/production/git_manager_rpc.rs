@@ -24,6 +24,8 @@ use crate::{
                 MAX_REASONABLE_DIFF_SIZE, page,
             },
             guards::{GuardInput, evaluate_guards},
+            in_progress::detect_in_progress_operation,
+            merge::{self, GitManagerMergeError, GitManagerMergePreview},
             operations::{
                 CoAuthor, CommitRequest, DiscardError, DiscardRequest,
                 GitManagerOperationError as DomainOperationError, GitManagerOperationRequest,
@@ -31,6 +33,7 @@ use crate::{
                 run_branch_or_sync_operation,
             },
             refs::{GitManagerRefsError, GitManagerRefsSnapshot, build_refs_snapshot},
+            stash::{self, GitManagerStashError},
         },
         validate_pathspecs,
     },
@@ -131,14 +134,6 @@ impl From<GitManagerRpcServices> for ConfiguredGitManagerRpcServices {
 impl ConfiguredGitManagerRpcServices {
     async fn not_implemented_unary(&self, request: RpcRequest) -> RpcResult {
         Err(not_implemented_error(&request.tag))
-    }
-
-    fn not_implemented_stream(&self, request: RpcRequest) -> mpsc::Receiver<RpcStreamChunk> {
-        let (sender, receiver) = mpsc::channel(1);
-        sender
-            .try_send(Err(not_implemented_error(&request.tag)))
-            .expect("new Git Manager stub stream accepts its terminal failure");
-        receiver
     }
 
     pub fn operation_stream(
@@ -290,6 +285,58 @@ impl ConfiguredGitManagerRpcServices {
         receiver
     }
 
+    pub async fn read_unary(
+        &self,
+        request: RpcRequest,
+        cancellation: CancellationToken,
+    ) -> RpcResult {
+        self.handle_read_unary(request, cancellation).await
+    }
+
+    pub fn git_manager_signal_stream(
+        &self,
+        request: RpcRequest,
+        cancellation: CancellationToken,
+    ) -> mpsc::Receiver<RpcStreamChunk> {
+        let (sender, receiver) = mpsc::channel(OPERATION_STREAM_CAPACITY);
+        let broadcaster = self.broadcaster.clone();
+        tokio::spawn(async move {
+            let input = match decode::<GitManagerCwdInput>(request.payload, &request.tag) {
+                Ok(input) => input,
+                Err(error) => {
+                    let _ = sender.send(Err(error)).await;
+                    return;
+                }
+            };
+            let cwd = input.cwd.to_string_lossy().replace('\\', "/");
+            let mut subscription = match broadcaster
+                .subscribe_git_manager_signal(input.cwd, cancellation)
+                .await
+            {
+                Ok(subscription) => subscription,
+                Err(error) => {
+                    let _ = sender
+                        .send(Err(git_error("subscribeGitManagerSignal", error)))
+                        .await;
+                    return;
+                }
+            };
+            while let Some(generation) = subscription.recv().await {
+                if sender
+                    .send(Ok(vec![json!({
+                        "cwd": cwd,
+                        "generation": generation,
+                    })]))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        receiver
+    }
+
     async fn handle_read_unary(
         &self,
         request: RpcRequest,
@@ -299,9 +346,8 @@ impl ConfiguredGitManagerRpcServices {
             "gitManager.getRefs" => {
                 let input: GitManagerCwdInput = decode(request.payload, &request.tag)?;
                 encode_result(
-                    build_refs_snapshot(&self.repository, &input.cwd, &cancellation)
-                        .await
-                        .map_err(|error| refs_error(&request.tag, error)),
+                    self.refs_snapshot(&request.tag, &input.cwd, &cancellation)
+                        .await,
                 )
             }
             "gitManager.getCommits" => {
@@ -322,6 +368,22 @@ impl ConfiguredGitManagerRpcServices {
             "gitManager.getDiff" => {
                 let input: GitManagerGetDiffInput = decode(request.payload, &request.tag)?;
                 get_diff(&self.repository, input, &cancellation).await
+            }
+            "gitManager.getStashes" => {
+                let input: GitManagerCwdInput = decode(request.payload, &request.tag)?;
+                encode_result(
+                    stash::list_stashes(&self.repository, &input.cwd, &cancellation)
+                        .await
+                        .map_err(|error| stash_error(&request.tag, error)),
+                )
+            }
+            "gitManager.previewMerge" => {
+                let input: GitManagerPreviewMergeInput = decode(request.payload, &request.tag)?;
+                let preview =
+                    merge::preview(&self.repository, &input.cwd, &input.source, &cancellation)
+                        .await
+                        .map_err(|error| merge_error(&request.tag, error))?;
+                Ok(merge_preview_value(preview))
             }
             _ => self.not_implemented_unary(request).await,
         }
@@ -492,9 +554,20 @@ impl ConfiguredGitManagerRpcServices {
         cwd: &std::path::Path,
         cancellation: &CancellationToken,
     ) -> Result<GitManagerRefsSnapshot, Value> {
-        build_refs_snapshot(&self.repository, cwd, cancellation)
+        let mut snapshot = build_refs_snapshot(&self.repository, cwd, cancellation)
             .await
-            .map_err(|error| refs_error(operation, error))
+            .map_err(|error| refs_error(operation, error))?;
+        snapshot.in_progress_operation =
+            detect_in_progress_operation(&self.repository, cwd, cancellation)
+                .await
+                .map_err(|_| {
+                    operation_error(
+                        operation,
+                        "repository-state-unavailable",
+                        "Git repository operation state could not be inspected.",
+                    )
+                })?;
+        Ok(snapshot)
     }
 
     async fn run_mutation<F, Fut>(
@@ -655,6 +728,8 @@ pub fn register_git_manager_rpc(
             "gitManager.getRefs"
                 | "gitManager.getCommits"
                 | "gitManager.getDiff"
+                | "gitManager.getStashes"
+                | "gitManager.previewMerge"
                 | "gitManager.commit"
                 | "gitManager.undoCommit"
                 | "gitManager.discard"
@@ -670,6 +745,8 @@ pub fn register_git_manager_rpc(
         "gitManager.getRefs",
         "gitManager.getCommits",
         "gitManager.getDiff",
+        "gitManager.getStashes",
+        "gitManager.previewMerge",
     ] {
         let services = services.clone();
         registry.register_unary(method, move |request, cancellation| {
@@ -689,19 +766,12 @@ pub fn register_git_manager_rpc(
         });
     }
 
-    for method in GIT_MANAGER_STREAM_METHODS
-        .iter()
-        .filter(|method| **method != "gitManager.runOperation")
-    {
-        let services = services.clone();
-        registry.register_stream(*method, move |request, _cancellation| {
-            let services = services.clone();
-            services.not_implemented_stream(request)
-        });
-    }
     let operation_services = services.clone();
     registry.register_stream("gitManager.runOperation", move |request, cancellation| {
         operation_services.operation_stream(request, cancellation)
+    });
+    registry.register_stream("subscribeGitManagerSignal", move |request, cancellation| {
+        services.git_manager_signal_stream(request, cancellation)
     });
 }
 
@@ -807,6 +877,12 @@ impl GitManagerDiffSource {
 struct GitManagerGetDiffInput {
     cwd: PathBuf,
     source: GitManagerDiffSource,
+}
+
+#[derive(Deserialize)]
+struct GitManagerPreviewMergeInput {
+    cwd: PathBuf,
+    source: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1003,12 +1079,17 @@ async fn get_diff(
                 .await
                 .map_err(|error| git_error(operation, error))?
         }
-        GitManagerDiffSource::Stash { .. } => {
-            return Err(operation_error(
-                operation,
-                "not-implemented-yet",
-                "Stash diffs are not implemented until Git Manager PHASE-09.",
-            ));
+        GitManagerDiffSource::Stash { sha, path } => {
+            if !valid_object_id(sha) {
+                return Err(operation_error(
+                    operation,
+                    "invalid-stash",
+                    "The requested stash identifier is invalid.",
+                ));
+            }
+            stash::diff(repository, &input.cwd, sha, path, cancellation)
+                .await
+                .map_err(|error| stash_error(operation, error))?
         }
     };
     Ok(render_diff(input.source, output))
@@ -1123,6 +1204,76 @@ fn graph_error(operation: &str, error: GitManagerGraphError) -> Value {
         ),
         GitManagerGraphError::Git(error) => git_error(operation, error),
     }
+}
+
+fn stash_error(operation: &str, error: GitManagerStashError) -> Value {
+    match error {
+        GitManagerStashError::NotFound => operation_error(
+            operation,
+            "stash-not-found",
+            "The requested stash is no longer present; refresh the stash list.",
+        ),
+        GitManagerStashError::Malformed => operation_error(
+            operation,
+            "malformed-git-output",
+            "Git returned malformed stash state.",
+        ),
+        GitManagerStashError::CommandFailed | GitManagerStashError::Git(_) => operation_error(
+            operation,
+            "git-command-failed",
+            "Git could not complete the requested stash read.",
+        ),
+    }
+}
+
+fn merge_error(operation: &str, error: GitManagerMergeError) -> Value {
+    match error {
+        GitManagerMergeError::InvalidSource => operation_error(
+            operation,
+            "invalid-merge-source",
+            "The requested merge source could not be resolved.",
+        ),
+        GitManagerMergeError::CurrentUnavailable => operation_error(
+            operation,
+            "head-unavailable",
+            "The current HEAD could not be resolved for merge preview.",
+        ),
+        GitManagerMergeError::MalformedComparison => operation_error(
+            operation,
+            "malformed-git-output",
+            "Git returned malformed merge comparison state.",
+        ),
+        GitManagerMergeError::Git(_) => operation_error(
+            operation,
+            "git-command-failed",
+            "Git could not complete the merge preview.",
+        ),
+    }
+}
+
+fn merge_preview_value(preview: merge::GitManagerMergePreviewResult) -> Value {
+    let mut value = json!({
+        "source": preview.source,
+        "current": preview.current,
+        "ahead": preview.ahead,
+        "behind": preview.behind,
+    });
+    let fields = value
+        .as_object_mut()
+        .expect("merge preview metadata is an object");
+    match preview.preview {
+        GitManagerMergePreview::Clean => {
+            fields.insert("_tag".to_owned(), json!("clean"));
+        }
+        GitManagerMergePreview::Conflicted { file_count } => {
+            fields.insert("_tag".to_owned(), json!("conflicted"));
+            fields.insert("fileCount".to_owned(), json!(file_count));
+        }
+        GitManagerMergePreview::UnrelatedHistories => {
+            fields.insert("_tag".to_owned(), json!("unrelated-histories"));
+        }
+    }
+    value
 }
 
 fn git_error(operation: &str, _error: GitCommandError) -> Value {
@@ -1273,11 +1424,13 @@ mod tests {
     }
 
     #[test]
-    fn all_three_read_handlers_require_only_the_read_scope() {
+    fn all_phase_09_read_handlers_require_only_the_read_scope() {
         for method in [
             "gitManager.getRefs",
             "gitManager.getCommits",
             "gitManager.getDiff",
+            "gitManager.getStashes",
+            "gitManager.previewMerge",
         ] {
             assert_eq!(
                 crate::auth::required_scope(method),
@@ -1345,9 +1498,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stash_diff_is_a_clear_later_phase_error() {
+    async fn stash_diff_resolves_the_stable_sha() {
         let repository = repository_with_change();
-        let error = GitManagerRpcServices
+        git(repository.path(), &["stash", "push", "-q", "-m", "saved"]);
+        let sha = Command::new("git")
+            .args(["rev-parse", "refs/stash"])
+            .current_dir(repository.path())
+            .output()
+            .expect("read stash sha");
+        let sha = String::from_utf8(sha.stdout)
+            .expect("UTF-8 stash sha")
+            .trim()
+            .to_owned();
+        let diff = GitManagerRpcServices
             .handle_read_unary(
                 request(
                     "gitManager.getDiff",
@@ -1355,7 +1518,7 @@ mod tests {
                         "cwd": repository.path(),
                         "source": {
                             "_tag": "stash",
-                            "sha": "0123456789012345678901234567890123456789",
+                            "sha": sha,
                             "path": "tracked.txt"
                         }
                     }),
@@ -1363,9 +1526,13 @@ mod tests {
                 CancellationToken::new(),
             )
             .await
-            .expect_err("stash diff remains deferred");
-        assert_eq!(error["_tag"], "GitManagerOperationError");
-        assert_eq!(error["code"], "not-implemented-yet");
+            .expect("stash diff");
+        assert_eq!(diff["_tag"], "patch");
+        assert!(
+            diff["patch"]
+                .as_str()
+                .is_some_and(|patch| patch.contains("changed"))
+        );
     }
 
     #[tokio::test]
