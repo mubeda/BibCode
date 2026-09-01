@@ -69,9 +69,9 @@ the store (`sidebarWidth`).
 
 ```ts
 export function shouldShowAgentsButton(
-  settings: Pick<GlobalSettings, 'experimentalActivity'> | null | undefined
+  settings: Pick<GlobalSettings, "experimentalActivity"> | null | undefined,
 ): boolean {
-  return settings?.experimentalActivity === true
+  return settings?.experimentalActivity === true;
 }
 ```
 
@@ -96,7 +96,7 @@ The button itself (SidebarNav.tsx:232-260) renders a `Bell` icon, the label
 Gating (`sidebar/use-worktree-card-secondary-details.ts:88`):
 
 ```ts
-const showInlineAgentList = cardProps.includes('inline-agents') && (newCardStyle || !compactCards)
+const showInlineAgentList = cardProps.includes("inline-agents") && (newCardStyle || !compactCards);
 ```
 
 `'inline-agents'` is one of the worktree-card display properties the user can
@@ -123,8 +123,7 @@ filters **worktrees**, not agent rows.
 An agent is **a live coding-agent session bound to a terminal pane**, keyed by
 a stable **pane key**:
 
-> `/** Composite key: \`${tabId}:${leafId}\` where leafId is a stable UUID layout leaf. */`
-> — `src/shared/agent-status-types.ts:115-116`
+> `/** Composite key: \`${tabId}:${leafId}\` where leafId is a stable UUID layout leaf. */`—`src/shared/agent-status-types.ts:115-116`
 
 Terminal tabs (`src/shared/terminal-tab-types.ts:5-56`) belong to a worktree
 (`worktreeId`), can be split into panes (layout leaves), and may record
@@ -138,39 +137,39 @@ provider icon before the first hook event arrives
 
 ```ts
 export type AgentStatusEntry = {
-  state: AgentStatusState                 // 'working' | 'blocked' | 'waiting' | 'done'
-  workingMode?: 'monitoring'              // background work, only while working
-  prompt: string                          // user's most recent prompt (cached per turn)
-  updatedAt: number                       // ms of last status update
-  stateStartedAt: number                  // ms when current state first reported
-  agentType?: AgentType                   // 'claude' | 'codex' | ... | arbitrary string
-  model?: string
-  paneKey: string                         // `${tabId}:${leafId}`
-  terminalHandle?: string
-  worktreeId?: string                     // attribution stamped by main
-  connectionId?: string | null            // transport authority (SSH conn or local)
-  tabId?: string
-  terminalTitle?: string
-  stateHistory: AgentStateHistoryEntry[]  // rolling log, cap 20
-  toolName?: string                       // e.g. "Edit", "Bash"
-  toolInput?: string                      // short preview (file path, command)
-  interactivePrompt?: string              // full AskUserQuestion JSON, live only
-  lastAssistantMessage?: string
-  lastCompletedAssistantMessage?: string
-  interrupted?: boolean                   // done-by-cancel
-  sessionBoundary?: boolean               // done that is a session boundary, not a turn
-  orchestration?: AgentStatusOrchestrationContext  // parent/child dispatch context
-  subagents?: AgentSubagentSnapshot[]     // live in-process children (max 32)
-  providerSession?: AgentProviderSessionMetadata   // provider session id, for CLI resume
-  promptInteractionKey?: string
-  restoredUnconfirmed?: boolean           // hydrated-from-disk, no live hook yet
-}
+  state: AgentStatusState; // 'working' | 'blocked' | 'waiting' | 'done'
+  workingMode?: "monitoring"; // background work, only while working
+  prompt: string; // user's most recent prompt (cached per turn)
+  updatedAt: number; // ms of last status update
+  stateStartedAt: number; // ms when current state first reported
+  agentType?: AgentType; // 'claude' | 'codex' | ... | arbitrary string
+  model?: string;
+  paneKey: string; // `${tabId}:${leafId}`
+  terminalHandle?: string;
+  worktreeId?: string; // attribution stamped by main
+  connectionId?: string | null; // transport authority (SSH conn or local)
+  tabId?: string;
+  terminalTitle?: string;
+  stateHistory: AgentStateHistoryEntry[]; // rolling log, cap 20
+  toolName?: string; // e.g. "Edit", "Bash"
+  toolInput?: string; // short preview (file path, command)
+  interactivePrompt?: string; // full AskUserQuestion JSON, live only
+  lastAssistantMessage?: string;
+  lastCompletedAssistantMessage?: string;
+  interrupted?: boolean; // done-by-cancel
+  sessionBoundary?: boolean; // done that is a session boundary, not a turn
+  orchestration?: AgentStatusOrchestrationContext; // parent/child dispatch context
+  subagents?: AgentSubagentSnapshot[]; // live in-process children (max 32)
+  providerSession?: AgentProviderSessionMetadata; // provider session id, for CLI resume
+  promptInteractionKey?: string;
+  restoredUnconfirmed?: boolean; // hydrated-from-disk, no live hook yet
+};
 ```
 
 Key vocabulary points:
 
 - **Wire states are exactly four**: `AGENT_STATUS_STATES = ['working',
-  'blocked', 'waiting', 'done']` (agent-status-types.ts:23). **`'idle'` is
+'blocked', 'waiting', 'done']` (agent-status-types.ts:23). **`'idle'` is
   renderer-derived**, not a wire state — a fresh-but-quiet or stale entry decays
   to `'idle'` in the row builder (see §4).
 - `agentType` is open-ended: a `WellKnownAgentType` union (claude, codex,
@@ -197,17 +196,22 @@ The sidebar and the dashboard share one row shape,
 
 ```ts
 export type DashboardAgentRow = {
-  paneKey: string                       // synthetic for 'subagent' rows
-  entry: AgentStatusEntry
-  tab: TerminalTab
-  agentType: AgentType
-  rowSource?: 'live' | 'retained' | 'subagent'
-  state: AgentStatusState | 'idle'      // 'idle' = stale-decayed
-  activationPaneKey?: string            // subagent rows focus their parent's pane
-  startedAt: number                     // oldest stateHistory entry, else updatedAt
-  lineage?: { depth: 0 | 1; parentPaneKey?: string; isFirstSibling: boolean;
-              isLastSibling: boolean; childCount: number }
-}
+  paneKey: string; // synthetic for 'subagent' rows
+  entry: AgentStatusEntry;
+  tab: TerminalTab;
+  agentType: AgentType;
+  rowSource?: "live" | "retained" | "subagent";
+  state: AgentStatusState | "idle"; // 'idle' = stale-decayed
+  activationPaneKey?: string; // subagent rows focus their parent's pane
+  startedAt: number; // oldest stateHistory entry, else updatedAt
+  lineage?: {
+    depth: 0 | 1;
+    parentPaneKey?: string;
+    isFirstSibling: boolean;
+    isLastSibling: boolean;
+    childCount: number;
+  };
+};
 ```
 
 ### Retained (finished) agents — `RetainedAgentEntry`
@@ -243,7 +247,7 @@ The renderer's Zustand store (`useAppStore`) holds, among others:
 
 The comment atop `agent-status-types.ts:1-3` says explicit status "comes from
 hooks … never inferred from terminal titles", but that describes only the
-*explicit* channel. Orca in fact runs **two evidence layers**:
+_explicit_ channel. Orca in fact runs **two evidence layers**:
 
 1. **Hook status (authoritative)** — the `AgentStatusEntry` pipeline above.
 2. **Terminal-title heuristics (fallback)** — for agents with no hooks
@@ -267,11 +271,16 @@ Composition (in `useMemo`):
 ```ts
 applyAgentRowLineage(
   buildWorktreeAgentRows({
-    tabs, entries, retained,
-    runtimePaneTitlesByTabId, ptyIdsByTabId, terminalLayoutsByTabId,
-    runtimeAgentOrchestrationByPaneKey, now
-  })
-)
+    tabs,
+    entries,
+    retained,
+    runtimePaneTitlesByTabId,
+    ptyIdsByTabId,
+    terminalLayoutsByTabId,
+    runtimeAgentOrchestrationByPaneKey,
+    now,
+  }),
+);
 ```
 
 with each input pulled through **indexed per-worktree selectors**
@@ -335,7 +344,7 @@ never reshuffle the list (worktree-agent-rows.ts:326-328).
   (blocked/waiting), 2 = done recently, 3 = working, 4 = idle.
 - **In the Activity page**: threads grouped by status / project / worktree via
   `buildActivityThreadGroups` (`activity/ActivityPrototypePage.tsx:1018,
-  1058`), default `groupBy = 'status'` (line 1426).
+1058`), default `groupBy = 'status'` (line 1426).
 
 ### Row anatomy
 
@@ -367,8 +376,8 @@ Two renderers, chosen by `agentActivityDisplayMode`:
 `failed` | `done` (check icon) | `idle` (grey dot) | `permission` (question
 glyph; the title-heuristic flow's collapsed blocked+waiting). The header
 comment (lines 6-17) is a small design doc: two distinct glyphs per row — one
-for *who* (agent icon via `AgentIcon` / `agentTypeToIconAgent`,
-`lib/agent-status.ts:100-145`) and one for *what state* (the dot).
+for _who_ (agent icon via `AgentIcon` / `agentTypeToIconAgent`,
+`lib/agent-status.ts:100-145`) and one for _what state_ (the dot).
 `asDotState` maps row state + `workingMode` into it; `interrupted === true`
 overrides to the `interrupted` dot (DashboardAgentRow.tsx:172-175). The
 worktree-level rollup maps hook state to card status via
@@ -384,7 +393,7 @@ permission, done→done; `lib/agent-status.ts:167-177`).
   ("every user-initiated worktree switch must route through
   activateAndRevealWorktree — cross-repo activation + nav history") and
   `activateTabAndFocusPane(tabId, leafId, { ackPaneKeyOnSuccess: paneKey,
-  flashFocusedPane: true, scrollToBottomIfOutputSinceLastView: true })`. So a
+flashFocusedPane: true, scrollToBottomIfOutputSinceLastView: true })`. So a
   click opens that worktree, that tab, focuses that pane, flashes it, and
   marks the row acknowledged. Malformed/mismatched rows are dismissed instead
   of guessed at.
@@ -473,7 +482,7 @@ is the guts. Notable mechanics a re-implementation should copy:
   from a disconnected transport (lines 119-125); connection-ownership check
   drops events from the wrong transport authority (lines 126-138).
 - **Commit**: `store.setAgentStatus(paneKey, payload, terminalTitle, timing,
-  routing, metadata)` plus post-commit completion-notification observation and
+routing, metadata)` plus post-commit completion-notification observation and
   optional tab-title sync.
 
 ### Refresh cadence in the UI
@@ -549,7 +558,7 @@ is the guts. Notable mechanics a re-implementation should copy:
 ## 7. Implications for a BibCode implementation
 
 BibCode (React/Vite web + Rust/Axum server + Tauri desktop, WebSocket RPC)
-maps onto Orca's architecture cleanly — Orca's *paired-client* path (host
+maps onto Orca's architecture cleanly — Orca's _paired-client_ path (host
 publishes projections over a socket) is actually a closer analog than its
 Electron IPC path.
 
@@ -622,20 +631,20 @@ Electron IPC path.
 
 **Key Orca files to mine while implementing**
 
-| Concern | Path |
-| --- | --- |
-| Sidebar composition | `src/renderer/src/components/sidebar/index.tsx` |
-| Nav "Agents" entry + flags | `src/renderer/src/components/sidebar/SidebarNav.tsx` |
-| Inline agent list | `src/renderer/src/components/sidebar/WorktreeCardAgents.tsx` |
-| Row building | `src/renderer/src/components/sidebar/worktree-agent-rows.ts`, `useWorktreeAgentRows.ts`, `worktree-agent-row-selectors.ts`, `worktree-agent-row-order.ts` |
-| Row rendering | `src/renderer/src/components/dashboard/DashboardAgentRow.tsx`, `sidebar/worktree-card-compact-agent-row.tsx`, `components/AgentStateDot.tsx` |
-| Types | `src/shared/agent-status-types.ts`, `src/shared/agent-status-ipc-payload.ts`, `src/shared/terminal-tab-types.ts` |
-| Store slice | `src/renderer/src/store/slices/agent-status.ts` |
-| Event apply pipeline | `src/renderer/src/hooks/ipc-events/agent-status-event-applicator.ts`, `agent-status-ipc-bridge.ts` |
-| Main-process fanout | `src/main/index.ts:1687-1775`, `src/main/agent-hooks/server.ts`, `managed-agent-hook-registry.ts` |
-| Paired-client projection | `src/renderer/src/runtime/web-session-tabs-sync.ts` |
-| Title heuristics | `src/renderer/src/lib/agent-status.ts`, `sidebar/worktree-title-derived-agent-rows.ts`, `sidebar/smart-attention.ts` |
-| Activity page (flagged) | `src/renderer/src/components/activity/ActivityPrototypePage.tsx` |
+| Concern                    | Path                                                                                                                                                      |
+| -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Sidebar composition        | `src/renderer/src/components/sidebar/index.tsx`                                                                                                           |
+| Nav "Agents" entry + flags | `src/renderer/src/components/sidebar/SidebarNav.tsx`                                                                                                      |
+| Inline agent list          | `src/renderer/src/components/sidebar/WorktreeCardAgents.tsx`                                                                                              |
+| Row building               | `src/renderer/src/components/sidebar/worktree-agent-rows.ts`, `useWorktreeAgentRows.ts`, `worktree-agent-row-selectors.ts`, `worktree-agent-row-order.ts` |
+| Row rendering              | `src/renderer/src/components/dashboard/DashboardAgentRow.tsx`, `sidebar/worktree-card-compact-agent-row.tsx`, `components/AgentStateDot.tsx`              |
+| Types                      | `src/shared/agent-status-types.ts`, `src/shared/agent-status-ipc-payload.ts`, `src/shared/terminal-tab-types.ts`                                          |
+| Store slice                | `src/renderer/src/store/slices/agent-status.ts`                                                                                                           |
+| Event apply pipeline       | `src/renderer/src/hooks/ipc-events/agent-status-event-applicator.ts`, `agent-status-ipc-bridge.ts`                                                        |
+| Main-process fanout        | `src/main/index.ts:1687-1775`, `src/main/agent-hooks/server.ts`, `managed-agent-hook-registry.ts`                                                         |
+| Paired-client projection   | `src/renderer/src/runtime/web-session-tabs-sync.ts`                                                                                                       |
+| Title heuristics           | `src/renderer/src/lib/agent-status.ts`, `sidebar/worktree-title-derived-agent-rows.ts`, `sidebar/smart-attention.ts`                                      |
+| Activity page (flagged)    | `src/renderer/src/components/activity/ActivityPrototypePage.tsx`                                                                                          |
 
 ---
 
@@ -655,12 +664,12 @@ and its helpers, verified against the working tree.
 and `generatedTitlesEnabled` (`settings.tabAutoGenerateTitle`). It additionally
 subscribes to `agentStatusEpoch` as a pure invalidation dep — "so the memo
 recomputes when freshness boundaries expire even without new PTY data" (line
-1467-1468) — and reads `Date.now()` *inside* the memo body, not as a dep
+1467-1468) — and reads `Date.now()` _inside_ the memo body, not as a dep
 (1480-1481). No polling, no interval.
 
 **Two-stage derivation**, both plain exported functions (unit-tested):
 
-*Stage 1 — `buildActivityEvents` (lines 621-779)* produces:
+_Stage 1 — `buildActivityEvents` (lines 621-779)_ produces:
 
 - `events: ActivityEvent[]` — an **append-only notification feed** of
   `done | blocked | waiting` occurrences (`ActivityEventState`, line 90).
@@ -692,10 +701,10 @@ recomputes when freshness boundaries expire even without new PTY data" (line
 
   **Caps**: events are sorted newest-first, then capped to **80 events
   globally** with **5 per pane** (`EVENTS_PER_PANE_CAP`, line 531), and each
-  pane's newest event is reserved *before* the global cap fills "so … a pane
+  pane's newest event is reserved _before_ the global cap fills "so … a pane
   [can't be pushed] out of the window and hid[den]" (749-761).
 
-*Stage 2 — `buildAgentPaneThreads` (lines 781-870)* folds events + live map
+_Stage 2 — `buildAgentPaneThreads` (lines 781-870)_ folds events + live map
 into `AgentPaneThread[]`. **A thread's identity is the pane key** — "keyed per
 agent pane (tab + leaf id), not per workspace, so the list shows one row per
 agent; paneKey is `${tabId}:${leafId}`" (line 125). Thread shape (126-141):
@@ -750,7 +759,7 @@ right template.)
 **Counts**: the sticky group header (`ActivityStatusGroupHeader`, 1200-1216)
 renders an optional state dot (only when `group.state` is set), the uppercase
 label, and a pill with `group.threads.length`. **Empty groups never render** —
-groups are built only from existing threads. An empty *list* renders "No agent
+groups are built only from existing threads. An empty _list_ renders "No agent
 activity matches these filters." (1908-1915).
 
 ### 8.3 Row anatomy (`ThreadRow`, lines 1235-1422)
@@ -846,7 +855,7 @@ Ack state lives in the **UI store slice**:
 to" timestamp (`store/slices/ui.ts:1227-1286`).
 
 - `acknowledgeAgents(paneKeys)` stamps `max(Date.now(),
-  latestAgentTurnTimestamp(entry))` — the clock-skew guard: "a remote/SSH
+latestAgentTurnTimestamp(entry))` — the clock-skew guard: "a remote/SSH
   execution host can stamp a turn ahead of this clock, and every unread rule
   is `ackAt < turnTimestamp`" (ui.ts:1241-1244). It only writes when the ack
   actually advances (`prev < stamp`, not `!==`, ui.ts:1236) and also
@@ -880,7 +889,7 @@ Session-boundary dones are never unread (68-73). Recompute is driven by
    remote host stamps turns ahead of the local clock.
 2. **Jump to workspace** marks the thread read before navigating (1767).
 3. **Mark all read** acknowledges every unread thread's paneKey (1773-1779).
-4. Clicking an agent row in the *sidebar* acks via
+4. Clicking an agent row in the _sidebar_ acks via
    `activateTabAndFocusPane({ ackPaneKeyOnSuccess })` (§3) — same map.
 
 **"0 unread" header badge**: when the Activity page is open, the titlebar
@@ -898,7 +907,7 @@ does two things: `setSelectedPaneKey(paneKey)` and
 `activateThreadTerminal(thread)` (1695-1720), which — only if the thread's tab
 is still live — switches the app's active repo/worktree/tab-type and calls
 `activateTabAndFocusPane(tabId, leafId, { scrollToBottomIfOutputSinceLastView:
-true })`. So clicking a row *also* re-points the app's global active
+true })`. So clicking a row _also_ re-points the app's global active
 workspace; the "Jump to workspace" button additionally leaves the Activity
 page via `activateAndRevealWorktree` (1762-1769).
 
@@ -911,7 +920,7 @@ detail slot:
 
 - A module-level external store (`activity-terminal-portal.ts`) holds portal
   descriptors `{slotId, requestToken, target, worktreeId, tabId, paneKey,
-  forceUnavailable, active}`; the page publishes them with
+forceUnavailable, active}`; the page publishes them with
   `setActivityTerminalPortals` in a `useLayoutEffect` "before paint so
   Terminal's portal subscriber rerenders in the same commit" (1659-1664).
   Descriptors carry their own worktree/tab routing because deriving from
@@ -922,7 +931,7 @@ detail slot:
   `createPortal` (Terminal.tsx:417, 2504).
 - **Double-buffered swap**: two portal slots (`'primary'`/`'secondary'`,
   1434-1437, 1991-2012, stacked absolutely with opacity/z-index switching).
-  The newly selected thread is *staged* in the inactive slot; a
+  The newly selected thread is _staged_ in the inactive slot; a
   `MutationObserver`-driven readiness probe
   (`useActivityTerminalPortalStatus`, 294-406) checks the portaled DOM for
   the right `data-terminal-tab-id`/`data-leaf-id`, a PTY binding and an
@@ -998,7 +1007,7 @@ Direct carry-overs from the Activity page:
 1. **Thread = stable session identity** joining live status + finished
    snapshot + bounded history. BibCode's join key is its thread/session id
    (server-owned) instead of `tabId:leafId`; keep Orca's rule that the live
-   turn overwrites row title/target while a *stable task title* survives
+   turn overwrites row title/target while a _stable task title_ survives
    terse follow-ups (`getActivityThreadTaskTitle`'s chain: user title →
    orchestration label → generated title → substantive prompt → history →
    default). The terse-follow-up filter (≤24-char yes/ok/proceed) is cheap
@@ -1027,7 +1036,7 @@ Direct carry-overs from the Activity page:
    manual "mark unread" deletes the ack; "mark all read" batches. Unread UI =
    bold title + left bar (+ optional bell), and a badge counting
    unacknowledged events.
-5. **Selection**: clicking a row selects it *and* re-points the active
+5. **Selection**: clicking a row selects it _and_ re-points the active
    environment/session (Orca: repo + worktree + tab + pane focus; BibCode:
    switch rail env + open thread in center). Clear selection when the thread
    disappears. Keep row-click guards for nested interactive elements.
@@ -1058,7 +1067,7 @@ Deliberate divergences (and what they release BibCode from):
   surfaces to avoid double PTY ownership, with double-buffered slots,
   MutationObserver readiness probing and swap reconciliation (§8.6). BibCode
   opens the thread in the center pane through its normal session-view
-  routing, so none of that machinery is needed — but the *reason* it exists
+  routing, so none of that machinery is needed — but the _reason_ it exists
   (never render two live owners of one terminal; never flash the wrong
   session while switching) is a requirement BibCode must satisfy through its
   own view lifecycle.

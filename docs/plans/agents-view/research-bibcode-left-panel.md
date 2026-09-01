@@ -24,7 +24,7 @@ synced in this worktree before research.
   live WebSocket per catalog entry simultaneously (spec decision D3 "soft
   switch" — `docs/plans/remote-servers/remote-servers-spec.md:50`;
   `docs/architecture/connection-runtime.md:359-368`). Rail selection scopes
-  *presentation only* via `activeEnvironmentIdAtom`; connections to other
+  _presentation only_ via `activeEnvironmentIdAtom`; connections to other
   environments stay live and streaming.
 - The entity closest to an "agent" is the **thread shell**
   (`OrchestrationThreadShell`, `packages/contracts/src/orchestration.ts:497-534`)
@@ -36,7 +36,7 @@ synced in this worktree before research.
   `threadShellsAtom` concatenates every catalog environment's scoped thread
   shells (`packages/client-runtime/src/state/threadShell.ts:149-173`), exposed
   as `useThreadShells()` (`apps/web/src/state/entities.ts:112-114`) — the
-  sidebar consumes it today and then *narrows* it by rail selection
+  sidebar consumes it today and then _narrows_ it by rail selection
   (`Sidebar.tsx:4051-4059`). An Agents view over all connected environments
   needs **no new RPC**, only a new presentation section — and one product
   decision about whether it deliberately bypasses the rail-scoping invariant.
@@ -62,18 +62,18 @@ synced in this worktree before research.
 Main return of `Sidebar()` at `Sidebar.tsx:4705-4812` (dialogs/portals
 omitted):
 
-| Order | Element | Renderer | Lines |
-| --- | --- | --- | --- |
-| 1 | Header bar (mobile trigger + brand link + stage pill) | `SidebarChromeHeader` / `SidebarBrand` | Sidebar.tsx:3636-3657, 3669-3688 |
-| 2 | Environment context card (remote env only) | `SidebarEnvironmentContextCard` → `EnvironmentContextCard` | Sidebar.tsx:279-312, 4755 |
-| 3 | **"Search" row** (opens command palette) | `SidebarGroup` → `SidebarMenu` → `CommandDialogTrigger` inside `SidebarProjectsContent` | Sidebar.tsx:3842-3864 |
-| 4 | ARM64/Intel build warning (conditional) | `SidebarProjectsContent` | Sidebar.tsx:3865-3887 |
-| 5 | Local secondary backend status alerts | `LocalSecondaryStatus` | Sidebar.tsx:3888, 3366-3443 |
-| 6 | **"Projects" section header** (uppercase label + sort menu + add-project `+`) | `SidebarProjectsContent` | Sidebar.tsx:3889-3922 |
-| 7 | Project list (DnD variant when sort is `manual`, else plain) | `SidebarProjectItem` / `SidebarProjectListRow` | Sidebar.tsx:3924-3995 |
-| 8 | Availability/empty state ("No projects yet", degraded, recovery) | `SidebarProjectAvailability` | Sidebar.tsx:3997-4006; `components/sidebar/SidebarProjectAvailability.tsx:37` |
-| 9 | Separator | `SidebarSeparator` | Sidebar.tsx:4807 |
-| 10 | Footer: provider-update pill, app-update pill, Settings | `SidebarChromeFooter` | Sidebar.tsx:3690-3718 |
+| Order | Element                                                                       | Renderer                                                                                | Lines                                                                         |
+| ----- | ----------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| 1     | Header bar (mobile trigger + brand link + stage pill)                         | `SidebarChromeHeader` / `SidebarBrand`                                                  | Sidebar.tsx:3636-3657, 3669-3688                                              |
+| 2     | Environment context card (remote env only)                                    | `SidebarEnvironmentContextCard` → `EnvironmentContextCard`                              | Sidebar.tsx:279-312, 4755                                                     |
+| 3     | **"Search" row** (opens command palette)                                      | `SidebarGroup` → `SidebarMenu` → `CommandDialogTrigger` inside `SidebarProjectsContent` | Sidebar.tsx:3842-3864                                                         |
+| 4     | ARM64/Intel build warning (conditional)                                       | `SidebarProjectsContent`                                                                | Sidebar.tsx:3865-3887                                                         |
+| 5     | Local secondary backend status alerts                                         | `LocalSecondaryStatus`                                                                  | Sidebar.tsx:3888, 3366-3443                                                   |
+| 6     | **"Projects" section header** (uppercase label + sort menu + add-project `+`) | `SidebarProjectsContent`                                                                | Sidebar.tsx:3889-3922                                                         |
+| 7     | Project list (DnD variant when sort is `manual`, else plain)                  | `SidebarProjectItem` / `SidebarProjectListRow`                                          | Sidebar.tsx:3924-3995                                                         |
+| 8     | Availability/empty state ("No projects yet", degraded, recovery)              | `SidebarProjectAvailability`                                                            | Sidebar.tsx:3997-4006; `components/sidebar/SidebarProjectAvailability.tsx:37` |
+| 9     | Separator                                                                     | `SidebarSeparator`                                                                      | Sidebar.tsx:4807                                                              |
+| 10    | Footer: provider-update pill, app-update pill, Settings                       | `SidebarChromeFooter`                                                                   | Sidebar.tsx:3690-3718                                                         |
 
 Important structural facts:
 
@@ -123,7 +123,7 @@ component. The minimal template is the search row group (:3842-3864).
 3. **Pin/unread (persisted)** — `sidebarWorkspaceMetaStore.ts` (zustand
    `persist`, name `bibcode:sidebar-workspace-meta:v1` (:15), selectors
    `selectIsPinned`/`selectIsUnread` (:85, :89), keyed by `scopedThreadKey`).
-4. **Sort/group prefs** are *client settings*, not UI store:
+4. **Sort/group prefs** are _client settings_, not UI store:
    `sidebarThreadSortOrder`, `sidebarProjectSortOrder`,
    `sidebarProjectGroupingMode`, `sidebarThreadPreviewCount` via
    `useClientSettings` (Sidebar.tsx:4071-4076; contracts in
@@ -160,7 +160,7 @@ Palette search mechanics:
 - Query state: local `useState` + `useDeferredValue` in
   `apps/web/src/components/CommandPalette.tsx:211-212`; applied at :447-453.
 - Filter helper: `filterCommandPaletteGroups(input: { activeGroups, query,
-  isInSubmenu, projectSearchItems, threadSearchItems })` at
+isInSubmenu, projectSearchItems, threadSearchItems })` at
   `apps/web/src/components/CommandPalette.logic.ts:215`, behavior at
   :222-279. Leading `>` restricts to actions; empty query returns active
   groups; otherwise synthetic `projects-search`/`threads-search` groups are
@@ -195,7 +195,7 @@ supervisor per environment). Composition root:
   `hostKey`), `RelayConnectionTarget` (BiBCode Connect), `SshConnectionTarget`
   (desktop SSH gateway), `UnavailableConnectionTarget`.
 - Supervisor phases: `available | offline | connecting | backoff | connected |
-  blocked`, with 1/2/4/8/16s transient backoff
+blocked`, with 1/2/4/8/16s transient backoff
   (connection-runtime.md:289-305).
 - `environmentId` is the logical routing identity; `storageInstanceId` gates
   synchronization against a swapped persistent store
@@ -273,8 +273,8 @@ data with a per-environment availability status."
   `useEnvironmentConnectionState(environmentId)` (:110-112).
 - Per-environment availability for data rendering: `EnvironmentShellState`
   with `EnvironmentAvailabilityStatus = starting | synchronizing | live |
-  degraded | storage-changed | recovery-required | unavailable |
-  configuration-error` (`packages/client-runtime/src/state/shell.ts:33-47`).
+degraded | storage-changed | recovery-required | unavailable |
+configuration-error` (`packages/client-runtime/src/state/shell.ts:33-47`).
 
 ---
 
@@ -295,10 +295,10 @@ Three layers (all verified in contracts):
    `EnvironmentThreadShell extends OrchestrationThreadShell { environmentId }`
    (`packages/client-runtime/src/state/models.ts:15-17`, via
    `scopeThreadShell` :32-37). Refs: `ScopedThreadRef = { environmentId,
-   threadId }` (`packages/contracts/src/environment.ts:96-100`).
+threadId }` (`packages/contracts/src/environment.ts:96-100`).
 2. **Session — the live runtime of the agent.** `OrchestrationSession`
    (`orchestration.ts:345-372`): `status` (`OrchestrationSessionStatus =
-   idle | starting | running | ready | interrupted | stopped | error`,
+idle | starting | running | ready | interrupted | stopped | error`,
    :345-353), `providerName`, `providerInstanceId`, `runtimeMode`,
    `activeTurnId`, `lastError`(+class), `updatedAt`. Embedded in the shell,
    so **live agent status arrives on the shell stream without opening the
@@ -345,7 +345,7 @@ function.
   `packages/contracts/src/orchestration.ts:27-35` (`subscribeShell`,
   `subscribeThread`, `dispatchCommand`, …). Wire shapes:
   `OrchestrationShellSnapshot { snapshotSequence, projects, threads,
-  updatedAt }` (:536-542) then sequenced `OrchestrationShellStreamEvent`s
+updatedAt }` (:536-542) then sequenced `OrchestrationShellStreamEvent`s
   (`project-upserted | project-removed | thread-upserted | thread-removed`,
   :544-566).
 - Client sync: `packages/client-runtime/src/state/shell.ts:255-305`
@@ -362,7 +362,7 @@ function.
 - Web wiring: `apps/web/src/state/shell.ts` (environment snapshot atom) and
   `apps/web/src/state/threads.ts:23-26`
   (`environmentThreadShells = createEnvironmentThreadShellAtoms({
-  catalogValueAtom, snapshotAtom })`).
+catalogValueAtom, snapshotAtom })`).
 
 ### The existing cross-environment aggregate
 
