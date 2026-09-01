@@ -9,7 +9,6 @@ import {
   buildAgentRows,
   buildAgentViewGroups,
   countUnreadAgentRows,
-  groupAgentRows,
   resolveAgentGroup,
   resolveAgentPreviewLine,
 } from "./agentsSection.logic";
@@ -216,90 +215,6 @@ describe("buildAgentRows", () => {
     ]) {
       expect(searchText).toContain(part);
     }
-  });
-});
-
-describe("groupAgentRows", () => {
-  it("orders groups working → blocked → waiting → done and elides empty groups", () => {
-    const rows = buildRows([
-      makeShell({ id: ThreadId.make("thread-done") }),
-      makeShell({ id: ThreadId.make("thread-waiting"), hasPendingUserInput: true }),
-      makeShell({ id: ThreadId.make("thread-blocked"), hasPendingApprovals: true }),
-      makeShell({
-        id: ThreadId.make("thread-working"),
-        session: makeSession({ status: "running" }),
-      }),
-    ]);
-
-    expect(groupAgentRows(rows, "").map((group) => ({ id: group.id, label: group.label }))).toEqual(
-      [
-        { id: "working", label: "Working" },
-        { id: "blocked", label: "Pending Approval" },
-        { id: "waiting", label: "Awaiting Input" },
-        { id: "done", label: "Done" },
-      ],
-    );
-    expect(
-      groupAgentRows(
-        rows.filter((row) => row.group !== "blocked"),
-        "",
-      ).map((group) => group.id),
-    ).toEqual(["working", "waiting", "done"]);
-  });
-
-  it("sorts rows by updatedAt desc with key tie-break", () => {
-    const rows = buildRows([
-      makeShell({
-        id: ThreadId.make("thread-tie-b"),
-        updatedAt: "2026-08-31T13:00:00.000Z",
-      }),
-      makeShell({
-        id: ThreadId.make("thread-oldest"),
-        updatedAt: "2026-08-31T11:00:00.000Z",
-      }),
-      makeShell({
-        id: ThreadId.make("thread-newest"),
-        updatedAt: "2026-08-31T14:00:00.000Z",
-      }),
-      makeShell({
-        id: ThreadId.make("thread-tie-a"),
-        updatedAt: "2026-08-31T13:00:00.000Z",
-      }),
-    ]);
-
-    expect(groupAgentRows(rows, "")[0]?.rows.map((row) => row.shell.id)).toEqual([
-      ThreadId.make("thread-newest"),
-      ThreadId.make("thread-tie-a"),
-      ThreadId.make("thread-tie-b"),
-      ThreadId.make("thread-oldest"),
-    ]);
-  });
-
-  it("filters by normalized substring and fails closed past 2048 bytes", () => {
-    const rows = buildRows([
-      makeShell({
-        id: ThreadId.make("thread-match"),
-        conversationPreview: {
-          prompt: "Initial prompt",
-          tool: null,
-          assistantMessage: "Assistant Reply",
-        },
-      }),
-      makeShell({ id: ThreadId.make("thread-other"), title: "Unrelated work" }),
-    ]);
-
-    expect(
-      groupAgentRows(rows, "  ASSISTANT   REPLY ").flatMap((group) =>
-        group.rows.map((row) => row.shell.id),
-      ),
-    ).toEqual([ThreadId.make("thread-match")]);
-    expect(groupAgentRows(rows, "x".repeat(3000))).toEqual([]);
-
-    const atByteLimit = "é".repeat(1024);
-    const pastByteLimit = `${atByteLimit}é`;
-    const longSearchRow = { ...rows[0]!, searchText: pastByteLimit };
-    expect(groupAgentRows([longSearchRow], atByteLimit)[0]?.rows).toEqual([longSearchRow]);
-    expect(groupAgentRows([longSearchRow], pastByteLimit)).toEqual([]);
   });
 });
 

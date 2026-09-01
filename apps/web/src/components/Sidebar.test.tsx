@@ -1338,6 +1338,12 @@ staticDescribe("Sidebar full render", () => {
     // Search entry + shortcut label.
     expect(markup).toContain("Search");
     expect(markup).toContain("Mod+K");
+    const searchIndex = markup.indexOf("Search");
+    const agentsNavIndex = markup.indexOf('data-testid="agents-nav-row"');
+    const projectsIndex = markup.indexOf("Projects");
+    expect(agentsNavIndex).toBeGreaterThan(searchIndex);
+    expect(agentsNavIndex).toBeLessThan(projectsIndex);
+    expect(markup).not.toContain("agents-section-header");
   });
 
   it("uses the passive summary for the primary project row", () => {
