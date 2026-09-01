@@ -108,13 +108,29 @@ function read(path: string): string {
   return NodeFS.readFileSync(NodePath.join(root, path), "utf8");
 }
 
+function cargoDependencyNames(source: string): Array<string> {
+  const dependencies = source.match(/^\[dependencies\]\r?\n(?<body>[\s\S]*?)(?=^\[)/m)?.groups
+    ?.body;
+  if (dependencies === undefined) return [];
+
+  return dependencies
+    .split(/\r?\n/)
+    .flatMap((line) => {
+      const match = /^([A-Za-z0-9_-]+)(?:\.[A-Za-z0-9_-]+)?\s*=/.exec(line);
+      return match?.[1] === undefined ? [] : [match[1]];
+    })
+    .sort();
+}
+
 function telemetryViolations(
   files: ReadonlyArray<string>,
   relativeTo: string = root,
+  forbiddenMarkers: ReadonlyArray<string> = forbiddenTelemetryMarkers,
+  transformSource: (source: string) => string = (source) => source,
 ): Array<string> {
   return files.flatMap((file) => {
-    const source = NodeFS.readFileSync(file, "utf8");
-    return forbiddenTelemetryMarkers
+    const source = transformSource(NodeFS.readFileSync(file, "utf8"));
+    return forbiddenMarkers
       .filter((marker) => source.includes(marker))
       .map((marker) => `${NodePath.relative(relativeTo, file)}: ${marker}`);
   });
@@ -131,6 +147,150 @@ function workflowJob(path: string, name: string): string {
 }
 
 describe("zero-telemetry privacy contract", () => {
+  it("adds no dependency for the Git Manager", () => {
+    const webPackage = JSON.parse(read("apps/web/package.json")) as {
+      dependencies: Record<string, string>;
+      devDependencies: Record<string, string>;
+    };
+    const webDependencyNames = [
+      ...Object.keys(webPackage.dependencies),
+      ...Object.keys(webPackage.devDependencies),
+    ].sort();
+    const serverDependencyNames = cargoDependencyNames(read("apps/server/Cargo.toml"));
+
+    expect(webDependencyNames).toEqual([
+      "@base-ui/react",
+      "@bibcode/client-runtime",
+      "@bibcode/contracts",
+      "@bibcode/shared",
+      "@clerk/react",
+      "@dnd-kit/core",
+      "@dnd-kit/modifiers",
+      "@dnd-kit/sortable",
+      "@dnd-kit/utilities",
+      "@effect/atom-react",
+      "@effect/platform-node",
+      "@effect/vitest",
+      "@fontsource-variable/dm-sans",
+      "@fontsource/jetbrains-mono",
+      "@formkit/auto-animate",
+      "@legendapp/list",
+      "@lexical/react",
+      "@pierre/diffs",
+      "@pierre/trees",
+      "@rolldown/plugin-babel",
+      "@tailwindcss/vite",
+      "@tanstack/react-pacer",
+      "@tanstack/react-router",
+      "@tanstack/router-plugin",
+      "@tauri-apps/api",
+      "@types/babel__core",
+      "@types/react",
+      "@types/react-dom",
+      "@vercel/config",
+      "@vitejs/plugin-react",
+      "@wdio/tauri-plugin",
+      "@xterm/addon-fit",
+      "@xterm/addon-webgl",
+      "@xterm/xterm",
+      "babel-plugin-react-compiler",
+      "class-variance-authority",
+      "effect",
+      "fake-indexeddb",
+      "fontkitten",
+      "happy-dom",
+      "jose",
+      "lexical",
+      "lucide-react",
+      "msw",
+      "react",
+      "react-dom",
+      "react-markdown",
+      "rehype-raw",
+      "rehype-sanitize",
+      "remark-breaks",
+      "remark-gfm",
+      "tailwind-merge",
+      "tailwindcss",
+      "vite",
+      "vite-plus",
+      "zustand",
+    ]);
+    expect(serverDependencyNames).toEqual([
+      "axum",
+      "base64",
+      "clap",
+      "dirs",
+      "ed25519-dalek",
+      "futures-util",
+      "getrandom",
+      "hmac",
+      "httpdate",
+      "mime_guess",
+      "notify",
+      "open",
+      "p256",
+      "percent-encoding",
+      "portable-pty",
+      "process-wrap",
+      "reqwest",
+      "rusqlite",
+      "semver",
+      "serde",
+      "serde_json",
+      "sha2",
+      "snow",
+      "subtle",
+      "sysinfo",
+      "thiserror",
+      "time",
+      "tokio",
+      "tokio-tungstenite",
+      "tokio-util",
+      "tower-http",
+      "tracing",
+      "tracing-subscriber",
+      "url",
+      "uuid",
+      "zip",
+    ]);
+  });
+
+  it("contacts no third-party host from Git Manager code", () => {
+    const gitManagerFiles = [
+      ...sourceFiles(NodePath.join(root, "apps/web/src/components/gitManager")),
+      NodePath.join(root, "apps/web/src/gitManagerStore.ts"),
+      NodePath.join(root, "packages/client-runtime/src/state/gitManager.ts"),
+      ...sourceFiles(NodePath.join(root, "apps/server/src/git/manager")),
+      NodePath.join(root, "apps/server/src/source_control/checks.rs"),
+    ];
+    const productionSource = (source: string): string =>
+      source.split("\n#[cfg(test)]\nmod tests {")[0] ?? source;
+    const violations = telemetryViolations(
+      gitManagerFiles,
+      root,
+      [
+        "http://",
+        "https://",
+        "sendBeacon",
+        "navigator.connection",
+        "gravatar",
+        "avatars.githubusercontent.com",
+      ],
+      productionSource,
+    );
+    const networkClientImport =
+      /(?:\bfrom\s*|\bimport\s*(?:\(\s*)?|\brequire\s*\()\s*["'](?:axios|cross-fetch|got|ky|node-fetch|ofetch|superagent|undici|wretch)(?:[/"'])|\b(?:extern\s+crate\s+|use\s+)reqwest(?:::|;|\b)/u;
+    const networkClientImportViolations = gitManagerFiles.flatMap((file) => {
+      const source = productionSource(NodeFS.readFileSync(file, "utf8"));
+      return networkClientImport.test(source)
+        ? [`${NodePath.relative(root, file)}: network client import`]
+        : [];
+    });
+
+    expect([...violations, ...networkClientImportViolations]).toEqual([]);
+  });
+
   it("scans executable web, manifest, shell, and environment files", () => {
     const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "bibcode-privacy-"));
     const fixtures = [
