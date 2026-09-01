@@ -134,8 +134,8 @@ where
         deadline.unwrap_or_else(|| tokio::time::Instant::now() + execution.timeout);
     #[cfg(windows)]
     let mut child = {
-        let spawn = tokio::task::spawn_blocking(move || spawn_wrapped(&mut command));
-        match tokio::time::timeout_at(overall_deadline, spawn).await {
+        let mut spawn = tokio::task::spawn_blocking(move || spawn_wrapped(&mut command));
+        match tokio::time::timeout_at(overall_deadline, &mut spawn).await {
             Ok(joined) => joined
                 .map_err(|error| {
                     SupervisedRunError::Spawn(io::Error::other(format!(
