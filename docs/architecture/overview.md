@@ -602,7 +602,10 @@ WKWebView on macOS, WebKitGTK on Linux, and WebView2 on Windows. Browser API
 support therefore varies between desktop hosts, and between desktop and browser
 mode. The frontend feature-detects optional APIs and supplies its own fallback
 rather than assuming the Chromium behavior that browser mode and Windows
-happen to share.
+happen to share. On Linux the desktop host pins its own GtkSettings text hinting
+to `hintslight` when the session requests full hinting because WebKitGTK renders
+DM Sans body text with uneven whole-pixel letter gaps under full hinting. The
+override is process-local, so the user's system preference is unchanged.
 
 Center chat-panel creation reserves and activates its client surface before the
 server command settles. A confirmed command failure removes that reservation;
