@@ -81,11 +81,12 @@ describe("GitManagerToolbar", () => {
     expect(onSelectedWorktreeChange).toHaveBeenCalledWith("/opaque/feature");
   });
 
-  it("renders accessible disabled placeholders for branch and sync segments", () => {
+  it("renders the branch selector and an accessible sync loading state", () => {
     const markup = renderToolbar();
 
-    expect(markup).toContain('aria-label="Branch Selector Coming in Phase 10"');
-    expect(markup).toContain('aria-label="Sync Controls Coming in Phase 10"');
-    expect(markup.match(/disabled=""/g)).toHaveLength(2);
+    expect(markup).toContain('aria-label="Choose branch"');
+    expect(markup).toContain("Loading repository state…");
+    expect(markup).toContain('title="Loading repository state."');
+    expect(markup.match(/disabled=""/g)).toHaveLength(1);
   });
 });
