@@ -69,7 +69,13 @@ impl Fixture {
             .await
             .expect("project projection");
         let repository = Arc::new(GitRepository::default());
-        let broadcaster = StatusBroadcaster::new(repository.clone(), Duration::from_secs(3_600), 8);
+        let (remote_refresh_interval, _) = tokio::sync::watch::channel(Duration::from_millis(50));
+        let broadcaster = StatusBroadcaster::with_automatic_remote_refresh_interval(
+            repository.clone(),
+            Duration::from_secs(3_600),
+            remote_refresh_interval,
+            8,
+        );
         let availability = WorkspaceAvailabilityRegistry::new();
         let catalog = WorktreeCatalogService::new_with_availability_registry(
             Arc::new(repositories.clone()),
@@ -78,7 +84,7 @@ impl Fixture {
         );
         let services = GitManagerRpcServices::with_dependencies(
             repository,
-            broadcaster,
+            broadcaster.clone(),
             catalog,
             repositories,
             availability,
@@ -106,6 +112,169 @@ impl Fixture {
             CancellationToken::new(),
         )
     }
+
+    async fn read(&self, id: &str, tag: &str, payload: Value) -> Result<Value, Value> {
+        self.services
+            .read_unary(rpc_request(id, tag, payload), CancellationToken::new())
+            .await
+    }
+}
+
+#[tokio::test]
+async fn stash_listing_and_diff_use_the_full_native_list_and_stable_sha() {
+    let fixture = Fixture::new().await;
+    let linked = fixture._root.path().join("stash-linked");
+    git(
+        &fixture.repository_path,
+        &["worktree", "add", "-q", "-b", "stash-linked", path(&linked)],
+    );
+    fs::write(linked.join("tracked.txt"), "first stash\n").expect("first stash content");
+    git(
+        &linked,
+        &["stash", "push", "-q", "-m", "agent-created stash"],
+    );
+    let first_sha = String::from_utf8(
+        git_output(&fixture.repository_path, &["rev-parse", "refs/stash"]).stdout,
+    )
+    .expect("UTF-8 stash sha")
+    .trim()
+    .to_owned();
+    fs::write(linked.join("tracked.txt"), "second stash\n").expect("second stash content");
+    git(
+        &linked,
+        &["stash", "push", "-q", "-m", "user-created stash"],
+    );
+
+    let stashes = fixture
+        .read(
+            "30",
+            "gitManager.getStashes",
+            json!({ "cwd": fixture.repository_path }),
+        )
+        .await
+        .expect("stash list");
+
+    let stashes = stashes.as_array().expect("stash array");
+    assert_eq!(stashes.len(), 2);
+    assert_eq!(stashes[0]["message"], "On stash-linked: user-created stash");
+    assert!(stashes.iter().any(|stash| stash["sha"] == first_sha));
+    assert!(stashes.iter().all(|stash| stash["files"].is_array()));
+
+    let diff = fixture
+        .read(
+            "31",
+            "gitManager.getDiff",
+            json!({
+                "cwd": fixture.repository_path,
+                "source": { "_tag": "stash", "sha": first_sha, "path": "tracked.txt" }
+            }),
+        )
+        .await
+        .expect("stable-SHA stash diff");
+    assert_eq!(diff["_tag"], "patch");
+    assert!(
+        diff["patch"]
+            .as_str()
+            .is_some_and(|patch| patch.contains("first stash"))
+    );
+
+    git(&fixture.repository_path, &["stash", "drop", "stash@{1}"]);
+    let missing = fixture
+        .read(
+            "32",
+            "gitManager.getDiff",
+            json!({
+                "cwd": fixture.repository_path,
+                "source": { "_tag": "stash", "sha": first_sha, "path": "tracked.txt" }
+            }),
+        )
+        .await
+        .expect_err("dropped stash fails structurally");
+    assert_eq!(missing["code"], "stash-not-found");
+}
+
+#[tokio::test]
+async fn merge_preview_reports_clean_ahead_and_behind_state() {
+    let fixture = Fixture::new().await;
+    git(&fixture.repository_path, &["switch", "-q", "-c", "feature"]);
+    fs::write(fixture.repository_path.join("feature.txt"), "feature\n").expect("feature file");
+    git(&fixture.repository_path, &["add", "feature.txt"]);
+    git(&fixture.repository_path, &["commit", "-q", "-m", "feature"]);
+    git(&fixture.repository_path, &["switch", "-q", "main"]);
+
+    let preview = fixture
+        .read(
+            "33",
+            "gitManager.previewMerge",
+            json!({ "cwd": fixture.repository_path, "source": "feature" }),
+        )
+        .await
+        .expect("merge preview");
+
+    assert_eq!(preview["_tag"], "clean");
+    assert_eq!(preview["source"], "feature");
+    assert_eq!(preview["current"], "main");
+    assert_eq!(preview["ahead"], 1);
+    assert_eq!(preview["behind"], 0);
+}
+
+#[tokio::test]
+async fn refs_detect_an_external_merge_inside_a_linked_worktree() {
+    let fixture = Fixture::new().await;
+    let linked = fixture._root.path().join("linked");
+    git(&fixture.repository_path, &["switch", "-q", "-c", "feature"]);
+    fs::write(fixture.repository_path.join("tracked.txt"), "feature\n").expect("feature content");
+    git(&fixture.repository_path, &["commit", "-qam", "feature"]);
+    git(&fixture.repository_path, &["switch", "-q", "main"]);
+    git(&fixture.repository_path, &["branch", "linked"]);
+    git(
+        &fixture.repository_path,
+        &["worktree", "add", "-q", path(&linked), "linked"],
+    );
+    configure_identity(&linked);
+    fs::write(linked.join("tracked.txt"), "linked\n").expect("linked content");
+    git(&linked, &["commit", "-qam", "linked"]);
+    assert!(!git_output(&linked, &["merge", "feature"]).status.success());
+
+    let refs = fixture
+        .read("35", "gitManager.getRefs", json!({ "cwd": linked }))
+        .await
+        .expect("refs snapshot");
+
+    assert_eq!(refs["inProgressOperation"]["kind"], "merge");
+}
+
+#[tokio::test]
+async fn git_manager_signal_generation_bumps_after_an_external_commit() {
+    let fixture = Fixture::new().await;
+    let linked = fixture._root.path().join("signal-linked");
+    git(
+        &fixture.repository_path,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "signal-linked",
+            path(&linked),
+        ],
+    );
+    configure_identity(&linked);
+    let cancellation = CancellationToken::new();
+    let mut stream = fixture.services.git_manager_signal_stream(
+        rpc_request("34", "subscribeGitManagerSignal", json!({ "cwd": linked })),
+        cancellation.clone(),
+    );
+    let initial = next_event(&mut stream).await;
+    let first = next_generation_after(&mut stream, initial["generation"].as_u64().unwrap()).await;
+
+    fs::write(linked.join("external.txt"), "external\n").expect("external file");
+    git(&linked, &["add", "external.txt"]);
+    git(&linked, &["commit", "-q", "-m", "external"]);
+    let second = next_generation_after(&mut stream, first).await;
+
+    assert!(second > first);
+    cancellation.cancel();
 }
 
 #[tokio::test]
@@ -306,6 +475,136 @@ async fn branch_and_sync_operations_execute_through_the_streaming_adapter() {
     );
 }
 
+#[tokio::test]
+async fn stash_and_merge_operations_execute_through_the_existing_mutation_path() {
+    let fixture = Fixture::new().await;
+    let cwd = fixture.repository_path.clone();
+    fs::write(cwd.join("tracked.txt"), "saved change\n").expect("stash content");
+    fs::write(cwd.join("untracked.txt"), "untracked\n").expect("untracked content");
+
+    let pushed = collect_events(fixture.operation(
+        "40",
+        json!({
+            "_tag": "stash-push", "cwd": cwd, "projectId": "project-1",
+            "message": "save visible work", "paths": ["untracked.txt"]
+        }),
+    ))
+    .await;
+    assert_eq!(
+        pushed.last().and_then(|event| event["_tag"].as_str()),
+        Some("finished")
+    );
+    assert!(!cwd.join("untracked.txt").exists());
+
+    let applied = collect_events(fixture.operation(
+        "41",
+        json!({
+            "_tag": "stash-apply", "cwd": cwd, "projectId": "project-1", "index": 0
+        }),
+    ))
+    .await;
+    assert_eq!(
+        applied.last().and_then(|event| event["_tag"].as_str()),
+        Some("finished")
+    );
+    assert_eq!(
+        fs::read_to_string(cwd.join("tracked.txt")).expect("applied tracked content"),
+        "saved change\n"
+    );
+    git(&cwd, &["reset", "--hard", "-q", "HEAD"]);
+    let _ = fs::remove_file(cwd.join("untracked.txt"));
+    let dropped = collect_events(fixture.operation(
+        "42",
+        json!({
+            "_tag": "stash-drop", "cwd": cwd, "projectId": "project-1", "index": 0
+        }),
+    ))
+    .await;
+    assert_eq!(
+        dropped.last().and_then(|event| event["_tag"].as_str()),
+        Some("finished")
+    );
+
+    git(&cwd, &["switch", "-q", "-c", "feature"]);
+    fs::write(cwd.join("feature.txt"), "feature\n").expect("feature file");
+    git(&cwd, &["add", "feature.txt"]);
+    git(&cwd, &["commit", "-q", "-m", "feature"]);
+    git(&cwd, &["switch", "-q", "main"]);
+    let merged = collect_events(fixture.operation(
+        "43",
+        json!({
+            "_tag": "merge", "cwd": cwd, "projectId": "project-1",
+            "source": "feature", "noVerify": false
+        }),
+    ))
+    .await;
+    assert_eq!(
+        merged.last().and_then(|event| event["_tag"].as_str()),
+        Some("finished")
+    );
+    assert!(cwd.join("feature.txt").exists());
+
+    git(&cwd, &["switch", "-q", "-c", "squash-source"]);
+    fs::write(cwd.join("squash.txt"), "squash\n").expect("squash file");
+    git(&cwd, &["add", "squash.txt"]);
+    git(&cwd, &["commit", "-q", "-m", "squash source"]);
+    git(&cwd, &["switch", "-q", "main"]);
+    let squashed = collect_events(fixture.operation(
+        "44",
+        json!({
+            "_tag": "squash-merge", "cwd": cwd, "projectId": "project-1",
+            "source": "squash-source", "noVerify": false
+        }),
+    ))
+    .await;
+    assert_eq!(
+        squashed.last().and_then(|event| event["_tag"].as_str()),
+        Some("finished")
+    );
+    assert!(cwd.join("squash.txt").exists());
+
+    fs::write(cwd.join("dirty.txt"), "dirty\n").expect("dirty file");
+    let blocked = collect_events(fixture.operation(
+        "45",
+        json!({
+            "_tag": "merge", "cwd": cwd, "projectId": "project-1",
+            "source": "feature", "noVerify": false
+        }),
+    ))
+    .await;
+    assert_eq!(event_kinds(&blocked), ["started", "failed"]);
+    assert_eq!(blocked[1]["code"], "dirty-working-tree");
+}
+
+#[tokio::test]
+async fn conflicting_merge_reports_conflicts_and_leaves_the_operation_in_progress() {
+    let fixture = Fixture::new().await;
+    let cwd = fixture.repository_path.clone();
+    git(&cwd, &["switch", "-q", "-c", "feature"]);
+    fs::write(cwd.join("tracked.txt"), "feature\n").expect("feature content");
+    git(&cwd, &["commit", "-qam", "feature"]);
+    git(&cwd, &["switch", "-q", "main"]);
+    fs::write(cwd.join("tracked.txt"), "main\n").expect("main content");
+    git(&cwd, &["commit", "-qam", "main"]);
+
+    let events = collect_events(fixture.operation(
+        "46",
+        json!({
+            "_tag": "merge", "cwd": cwd, "projectId": "project-1",
+            "source": "feature", "noVerify": false
+        }),
+    ))
+    .await;
+
+    assert_eq!(event_kinds(&events).first(), Some(&"started"));
+    assert_eq!(event_kinds(&events).last(), Some(&"failed"));
+    assert_eq!(events.last().expect("failed event")["code"], "conflicts");
+    let merge_head =
+        String::from_utf8(git_output(&cwd, &["rev-parse", "--git-path", "MERGE_HEAD"]).stdout)
+            .expect("UTF-8 merge path");
+    assert!(cwd.join(merge_head.trim()).exists() || Path::new(merge_head.trim()).exists());
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn concurrent_operation_is_rejected_and_cancellation_terminates_the_child() {
@@ -397,14 +696,31 @@ async fn concurrent_operation_is_rejected_and_cancellation_terminates_the_child(
 }
 
 fn operation_request(id: &str, payload: Value) -> RpcRequest {
+    rpc_request(id, "gitManager.runOperation", payload)
+}
+
+fn rpc_request(id: &str, tag: &str, payload: Value) -> RpcRequest {
     RpcRequest {
         id: RequestId::try_from(id).expect("request id"),
-        tag: "gitManager.runOperation".to_owned(),
+        tag: tag.to_owned(),
         payload,
         headers: Vec::new(),
         trace_id: None,
         span_id: None,
         sampled: None,
+    }
+}
+
+async fn next_generation_after(
+    receiver: &mut mpsc::Receiver<Result<Vec<Value>, Value>>,
+    generation: u64,
+) -> u64 {
+    loop {
+        let event = next_event(receiver).await;
+        let observed = event["generation"].as_u64().expect("signal generation");
+        if observed > generation {
+            return observed;
+        }
     }
 }
 
