@@ -1,8 +1,27 @@
+// @vitest-environment happy-dom
+
 import type { OrchestrationLatestTurnState } from "@bibcode/contracts";
-import { describe, expect, it } from "vite-plus/test";
+import { act, createElement } from "react";
+import { createRoot } from "react-dom/client";
+import { describe, expect, it, vi } from "vite-plus/test";
+
+const h = vi.hoisted(() => ({
+  markUnread: vi.fn(),
+  router: { navigate: vi.fn() },
+}));
+
+vi.mock("@tanstack/react-router", () => ({
+  useRouter: () => h.router,
+}));
+
+vi.mock("../../sidebarWorkspaceMetaStore", () => ({
+  useSidebarWorkspaceMetaStore: (
+    selector: (state: { markUnread: typeof h.markUnread }) => unknown,
+  ) => selector({ markUnread: h.markUnread }),
+}));
 
 import type { AgentRow } from "./agentsSection.logic";
-import { detectUnreadTransitions } from "./useAgentsUnread";
+import { detectUnreadTransitions, useAgentsUnread } from "./useAgentsUnread";
 
 function rowWithTurn(key: string, turnId: string, state: OrchestrationLatestTurnState): AgentRow {
   return {
@@ -84,5 +103,34 @@ describe("detectUnreadTransitions", () => {
         ["running", "turn-3:running"],
       ]),
     );
+  });
+});
+
+describe("useAgentsUnread", () => {
+  it("tracks unread transitions when the router omits state and subscription APIs", async () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    h.markUnread.mockReset();
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const Probe = ({ rows }: { readonly rows: ReadonlyArray<AgentRow> }) => {
+      useAgentsUnread(rows);
+      return null;
+    };
+
+    try {
+      await act(async () =>
+        root.render(createElement(Probe, { rows: [rowWithTurn("k1", "turn-1", "running")] })),
+      );
+      await act(async () =>
+        root.render(createElement(Probe, { rows: [rowWithTurn("k1", "turn-1", "completed")] })),
+      );
+
+      expect(h.markUnread).toHaveBeenCalledWith("k1");
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
+    }
   });
 });

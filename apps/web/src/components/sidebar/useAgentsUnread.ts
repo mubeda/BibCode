@@ -48,11 +48,13 @@ export function useAgentsUnread(rows: ReadonlyArray<AgentRow>): void {
   const router = useRouter({ warn: false }) as ReturnType<typeof useRouter> | null;
   const subscribeToRoute = useCallback(
     (onStoreChange: () => void) =>
-      router === null ? () => undefined : router.subscribe("onResolved", onStoreChange),
+      typeof router?.subscribe === "function"
+        ? router.subscribe("onResolved", onStoreChange)
+        : () => undefined,
     [router],
   );
   const getOpenThreadKey = useCallback(() => {
-    const matches = router?.state.matches;
+    const matches = router?.state?.matches;
     const params = matches?.[matches.length - 1]?.params ?? {};
     const routeThreadRef = resolveThreadRouteRef(params);
     return routeThreadRef === null ? null : scopedThreadKey(routeThreadRef);
