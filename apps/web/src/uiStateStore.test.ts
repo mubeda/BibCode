@@ -39,8 +39,11 @@ describe("agents section expansion", () => {
   it("defaults the section expanded and the done group collapsed", () => {
     expect(initialUiState.agentsSectionExpanded).toBe(true);
     expect(resolveAgentsGroupExpanded({}, "done")).toBe(false);
+    expect(resolveAgentsGroupExpanded({}, "status:done")).toBe(false);
     expect(resolveAgentsGroupExpanded({}, "working")).toBe(true);
+    expect(resolveAgentsGroupExpanded({}, "project:Done")).toBe(true);
     expect(resolveAgentsGroupExpanded({ done: true }, "done")).toBe(true);
+    expect(resolveAgentsGroupExpanded({ "status:done": true }, "status:done")).toBe(true);
   });
 
   it("updates immutably and no-ops on same value", () => {

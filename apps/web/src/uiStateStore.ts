@@ -357,7 +357,7 @@ export function resolveAgentsGroupExpanded(
   agentsGroupExpandedById: Readonly<Record<string, boolean>>,
   groupId: string,
 ): boolean {
-  return agentsGroupExpandedById[groupId] ?? groupId !== "done";
+  return agentsGroupExpandedById[groupId] ?? (groupId !== "done" && groupId !== "status:done");
 }
 
 export function setAgentsSectionExpanded(state: UiState, expanded: boolean): UiState {
