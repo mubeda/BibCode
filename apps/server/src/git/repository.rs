@@ -848,6 +848,63 @@ impl GitRepository {
         .await
     }
 
+    pub(crate) async fn git_manager_intent_to_add(
+        &self,
+        cwd: &Path,
+        path: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let mut args = strings(&["add", "--intent-to-add", "--"]);
+        args.push(path.to_owned());
+        self.execute(
+            "GitManager.partial.intentToAdd",
+            cwd,
+            &args,
+            false,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_clear_intent_to_add(
+        &self,
+        cwd: &Path,
+        path: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let mut args = strings(&["reset", "--"]);
+        args.push(path.to_owned());
+        self.execute(
+            "GitManager.partial.clearIntentToAdd",
+            cwd,
+            &args,
+            false,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_apply_partial_patch(
+        &self,
+        operation: &str,
+        cwd: &Path,
+        patch: Vec<u8>,
+        cached: bool,
+        reverse: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let mut args = vec!["apply".to_owned()];
+        if cached {
+            args.push("--cached".to_owned());
+        }
+        if reverse {
+            args.push("--reverse".to_owned());
+        }
+        args.extend(strings(&["--unidiff-zero", "--whitespace=nowarn", "-"]));
+        self.execute_with_stdin(operation, cwd, &args, patch, false, cancellation)
+            .await
+    }
+
     pub(crate) async fn git_manager_untracked_paths(
         &self,
         cwd: &Path,
@@ -6683,6 +6740,83 @@ mod tests {
                 .iter()
                 .any(|arg| arg == "reset" || arg == "add")
         }));
+    }
+
+    #[tokio::test]
+    async fn git_manager_partial_apply_modes_keep_index_and_worktree_targets_distinct() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([
+                ("GitManager.stagePartial.apply".into(), process_output("")),
+                ("GitManager.unstagePartial.apply".into(), process_output("")),
+                ("GitManager.discardPartial.apply".into(), process_output("")),
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+        let patch = b"diff payload\n".to_vec();
+        let cancellation = CancellationToken::new();
+
+        for (operation, cached, reverse) in [
+            ("GitManager.stagePartial.apply", true, false),
+            ("GitManager.unstagePartial.apply", true, true),
+            ("GitManager.discardPartial.apply", false, true),
+        ] {
+            repository
+                .git_manager_apply_partial_patch(
+                    operation,
+                    Path::new("/repo"),
+                    patch.clone(),
+                    cached,
+                    reverse,
+                    &cancellation,
+                )
+                .await
+                .expect("partial apply");
+        }
+
+        let requests = runner.requests();
+        let args = requests
+            .iter()
+            .map(|request| {
+                request
+                    .args
+                    .iter()
+                    .map(|argument| argument.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                vec![
+                    "apply",
+                    "--cached",
+                    "--unidiff-zero",
+                    "--whitespace=nowarn",
+                    "-"
+                ],
+                vec![
+                    "apply",
+                    "--cached",
+                    "--reverse",
+                    "--unidiff-zero",
+                    "--whitespace=nowarn",
+                    "-"
+                ],
+                vec![
+                    "apply",
+                    "--reverse",
+                    "--unidiff-zero",
+                    "--whitespace=nowarn",
+                    "-"
+                ],
+            ]
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.stdin.as_deref() == Some(patch.as_slice()))
+        );
     }
 
     #[tokio::test]
