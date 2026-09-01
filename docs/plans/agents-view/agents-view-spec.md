@@ -1,9 +1,10 @@
 # Agents View — Design Specification
 
-Status: awaiting approval. This document is the AGENTS.md-required design
-record for the feature: alternatives and trade-offs were settled in an
-interview with the user on 2026-08-31 (decision log below). Implementation
-must not start until this spec is approved.
+Status: approved and implemented (v1 approved 2026-08-31 and shipped on
+`mubeda/develop-3`; the §7 v2 revision was confirmed by the user on
+2026-09-01). This document is the AGENTS.md-required design record for the
+feature: alternatives and trade-offs were settled in user interviews (decision
+logs below).
 
 Research grounding (same directory):
 
@@ -242,3 +243,66 @@ the same one-sentence exception.
 - `docs/testing/` runbooks: review the packaged-UI-flow runbooks; if native
   visual validation flows enumerate sidebar sections, add the Agents section,
   else state "reviewed and remain accurate".
+
+## 7. V2 revision — full Agents view (2026-09-01, approved)
+
+After using v1, the user requested the reference product's actual
+click-through experience (screenshots on file): a slim entry that opens a
+**full-takeover Agents view** with a back arrow, list column, and an embedded
+live detail pane. Confirmed in a follow-up interview on 2026-09-01. This
+section supersedes parts of D1, D6, and D11; everything else above stands.
+
+### 7.1 V2 decision log
+
+| #   | Decision                                                                                                                                                                                                                                                                             | Supersedes     |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------- |
+| D16 | The in-panel Agents section (rows/groups/filter) is removed. A slim **Agents nav row** sits below the Search row: icon, label, unread-count badge. Clicking navigates to `/agents`.                                                                                                  | D1 (surface)   |
+| D17 | `/agents` is a full-takeover route: `AppSidebarLayout` renders no sidebar/rail/sidebar-control on it (the reference hides its worktree sidebar the same way). The page owns a top strip — back arrow, lowercase title "agents", "N unread" badge — a list column, and a detail pane. | D1 (surface)   |
+| D18 | List-column toolbar: the filter input, a **group-by select** (Status default / Project / Environment), an **unread-only bell toggle**, and a kebab menu with **Mark all read**.                                                                                                      | D6 (dropdown)  |
+| D19 | Clicking a row **selects in place**: the detail pane mounts the thread's live `ChatView` (`routeKind: "server"`) while the list stays. Empty state: "Select an agent to view its activity". Selection is page-local, cleared when the row leaves the list.                           | —              |
+| D20 | A per-row hover "jump to workspace" affordance exits the view with v1's click behavior: mark read → `setActiveEnvironmentId` → `navigateToThread`. The back arrow exits via `router.history.back()` with `/` fallback.                                                               | D8 (relocated) |
+| D21 | Unread count (rows whose key is in `unreadThreadKeys`) renders on the nav-row badge and the view's top strip. Selecting a row marks it read (viewing = read). The unread-only toggle keeps the currently selected row visible even after it flips to read.                           | D11 (badge)    |
+| D22 | Group-by modes: `status` keeps the fixed v1 order; `project` groups by project title and `environment` by environment label, groups ordered by their newest member (recency), rows recency-sorted within.                                                                            | D6             |
+
+### 7.2 V2 pinned contracts
+
+- **Route**: TanStack file route `apps/web/src/routes/agents.tsx`
+  (`createFileRoute("/agents")`), deep-linkable; reload lands with no
+  selection. `AppSidebarLayout` checks the pathname (`useLocation`) and, for
+  `/agents`, renders `children` full-bleed without the `Sidebar`,
+  `EnvironmentRail`, or `SidebarControl`.
+- **Single-owner rule**: the embedded detail `ChatView` and the normal thread
+  route are never mounted simultaneously — guaranteed structurally because
+  `/agents` replaces the chat route; no portal machinery is needed or
+  permitted.
+- **Unread trigger placement**: `useAgentsUnread` moves out of the removed
+  section into the always-mounted **nav row component**, still fed by the full
+  `buildAgentRows` output, so transitions mark unread while the user is
+  anywhere in the app. The nav row also derives the badge count.
+- **Logic module**: `agentsSection.logic.ts` gains
+  `AgentsGroupByMode = "status" | "project" | "environment"` and
+  `buildAgentViewGroups(rows, { query, groupBy, unreadOnly, unreadThreadKeys, selectedKey })`
+  → `ReadonlyArray<AgentViewGroup>` (`{ id, label, rows }`), implementing
+  D18/D21/D22 as pure policy; `groupAgentRows` remains for compatibility until
+  the section is removed, then is deleted with it.
+- **Persistence**: group-by mode and unread-only toggle are page-local
+  ephemeral state in v2 (the reference keeps them per-window); the v1
+  `agentsSectionExpanded` / `agentsGroupExpandedById` uiState keys become the
+  view's group-collapse store — section-expansion semantics retire with the
+  section, and group collapse keeps Done-collapsed-by-default via
+  `resolveAgentsGroupExpanded`, now keyed per group-by mode as
+  `"<mode>:<groupId>"` (only `status:done` defaults collapsed).
+- **Copy**: nav row label "Agents"; top strip title "agents"; badge
+  `"{n} unread"`; detail empty state "Select an agent to view its activity".
+
+### 7.3 V2 validation obligations
+
+Same gates as §6, plus: route tests for `/agents` (takeover layout, back
+navigation, selection → embedded ChatView, deep link), nav-row badge tests,
+and a live Playwright pass matching the reference screenshots (list + detail,
+back arrow round-trip). Docs updated in the same patch: `user/workspace-ui.md`
+and `reference/encyclopedia.md` (v1 section wording → nav row + full view),
+`architecture/connection-runtime.md` and
+`plans/remote-servers/remote-servers-spec.md` exception sentences (the
+cross-environment surface is now the Agents view + its nav badge), and
+`testing/cross-platform-validation.md` enumeration.

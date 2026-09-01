@@ -886,3 +886,88 @@ and residual risk (spec §6).
 - Line numbers cited (`Sidebar.tsx:3864`, `orchestration_rpc.rs:1011` etc.) are
   anchors verified on 2026-08-31 against `mubeda/develop-3`; re-locate by symbol name
   if the file has drifted.
+
+---
+
+## V2 tasks — full Agents view (spec §7, confirmed 2026-09-01)
+
+Execute in order; each follows the same TDD steps, review checklist, and
+per-task gates as Tasks 1–7. Verified anchors: `ChatView` props
+`{ environmentId, threadId, routeKind: "server" }`
+(`apps/web/src/routes/_chat.$environmentId.$threadId.tsx:69-73`);
+`AppSidebarLayout` (`apps/web/src/components/AppSidebarLayout.tsx:55-104`)
+currently renders the sidebar unconditionally; route files live in
+`apps/web/src/routes/` (`createFileRoute` file-route convention).
+
+### Task 8: Logic — group-by modes, unread filter, view groups
+
+**Files:** modify `apps/web/src/components/sidebar/agentsSection.logic.ts`;
+test `agentsSection.logic.test.ts`.
+**Produces:** `AgentsGroupByMode = "status" | "project" | "environment"`;
+`interface AgentViewGroup { id: string; label: string; rows: ReadonlyArray<AgentRow> }`;
+`buildAgentViewGroups(rows, options: { query: string; groupBy: AgentsGroupByMode; unreadOnly: boolean; unreadThreadKeys: ReadonlyArray<string>; selectedKey: string | null }): ReadonlyArray<AgentViewGroup>`;
+`countUnreadAgentRows(rows, unreadThreadKeys): number`.
+Semantics (spec D18/D21/D22): filter query exactly as `groupAgentRows`
+(byte-cap fails closed); `unreadOnly` keeps rows that are unread **or** match
+`selectedKey`; `status` mode = fixed v1 order with `status:`-prefixed ids;
+`project` / `environment` modes bucket by `projectTitle` / `environmentLabel`
+(fallback label "Unknown"), groups ordered by newest member `updatedAt`, ids
+`project:<title>` / `environment:<label>`; rows recency-sorted in every mode.
+TDD: cover each mode, the unread-only + selected-row exception, and the
+empty-group elision. Keep `groupAgentRows` untouched (deleted in Task 10).
+
+### Task 9: The `/agents` route and page
+
+**Files:** create `apps/web/src/routes/agents.tsx`,
+`apps/web/src/components/agents/AgentsPage.tsx`,
+`apps/web/src/components/agents/AgentsPage.test.tsx`; modify
+`apps/web/src/components/AppSidebarLayout.tsx` (pathname check via
+`useLocation`: on `/agents` render `children` inside `SidebarProvider`
+without `Sidebar`/`EnvironmentRail`/`SidebarControl`); modify
+`apps/web/src/uiStateStore.ts` only if the mode-scoped collapse key helper
+needs adjusting (`resolveAgentsGroupExpanded(map, `"${mode}:${groupId}"`)` —
+only `status:done` defaults collapsed).
+**Page contract (spec §7.2):** top strip: back button (`aria-label "Back"`,
+`router.history.back()`, fallback `navigate({ to: "/" })` when history is
+empty), title "agents", `"{n} unread"` badge from `countUnreadAgentRows`.
+Left column (fixed width ~340px, `data-testid="agents-view-list"`): toolbar
+(filter input reused semantics, group-by `Select` default `status`,
+unread-only bell `Toggle`, kebab `DropdownMenu` with "Mark all read" calling
+`markRead` for every unread row key), then collapsible groups from
+`buildAgentViewGroups`, rows reusing the v1 row anatomy (extract the row
+renderer from `AgentsSection.tsx` into
+`apps/web/src/components/agents/AgentsRow.tsx` so Task 10 can delete the
+section without losing it). Row click: select (page state) + `markRead`;
+hover "jump to workspace" button: `markRead` + `setActiveEnvironmentId` +
+`navigateToThread`. Detail pane: selected row → `<ChatView
+environmentId=… threadId=… routeKind="server" />`; none → centered "Select an
+agent to view its activity"; selection cleared when its key leaves the row
+set. Tests: takeover layout (no sidebar), back navigation, selection mounts
+ChatView (mock it), unread badge, mark-all-read, group-by switch.
+
+### Task 10: Sidebar swap — nav row replaces the section
+
+**Files:** create `apps/web/src/components/sidebar/AgentsNavRow.tsx` (+ test);
+modify `apps/web/src/components/Sidebar.tsx` (mount nav row where
+`<AgentsSection …>` sat; drop the `navigateToThread` prop plumbing if now
+unused); delete `AgentsSection.tsx` + `AgentsSection.test.tsx`; move
+`useAgentsUnread(rows)` into `AgentsNavRow` (full `buildAgentRows` output,
+unconditional — spec §7.2 trigger placement); delete `groupAgentRows` and its
+tests from the logic module (Task 8's `buildAgentViewGroups` replaces it).
+Nav row: `SidebarMenuButton` with label "Agents", unread-count badge
+(`countUnreadAgentRows`), `data-testid="agents-nav-row"`, click →
+`navigate({ to: "/agents" })`, `aria-current` when the route is active.
+Tests: badge count, navigation, unread trigger still marks while on normal
+routes; `Sidebar.test.tsx` updated for the removed section.
+
+### Task 11: Docs + full battery + live verification
+
+Update `docs/user/workspace-ui.md` and `docs/reference/encyclopedia.md`
+(section wording → nav row + full view per spec §7.3), the exception
+sentences in `docs/architecture/connection-runtime.md` and
+`docs/plans/remote-servers/remote-servers-spec.md` §4.8 (cross-environment
+surface = the Agents view and its nav badge), and
+`docs/testing/cross-platform-validation.md`. Then the supervisor runs the
+full battery (Tasks 7 gate) and a Playwright pass matching the reference
+screenshots: nav row → view opens (list + "Select an agent…"), row select →
+embedded live session, back arrow → normal view.
