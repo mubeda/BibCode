@@ -73,6 +73,19 @@ pub(crate) trait GitProcessRunner: Send + Sync {
     ) -> BoxGitProcessFuture<'a>;
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitManagerCommitOutcome {
+    pub sha: Option<String>,
+    pub empty: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitManagerHeadCommit {
+    pub sha: String,
+    pub parents: Vec<String>,
+    pub message: String,
+}
+
 impl GitProcessRunner for ProcessRunner {
     fn run<'a>(
         &'a self,
@@ -326,6 +339,33 @@ impl GitRepository {
             args,
             options,
             git_environment(),
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_with_stdin(
+        &self,
+        operation: &str,
+        cwd: &Path,
+        args: &[String],
+        stdin: Vec<u8>,
+        allow_non_zero_exit: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute_with_environment_and_stdin(
+            operation,
+            cwd,
+            args,
+            GitExecutionOptions {
+                allow_non_zero_exit,
+                max_output_bytes: DEFAULT_OUTPUT_LIMIT,
+                output_policy: OutputPolicy::Truncate,
+            },
+            GitExecutionInput {
+                environment: git_environment(),
+                stdin: Some(stdin),
+            },
             cancellation,
         )
         .await
@@ -2039,6 +2079,46 @@ impl GitRepository {
         Ok(())
     }
 
+    pub async fn git_manager_tracked_paths(
+        &self,
+        cwd: &Path,
+        paths: &[String],
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<String>, GitCommandError> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        validate_pathspecs("GitManager.discard", cwd, paths)?;
+        let mut args = strings(&["-c", "core.quotePath=false", "ls-files", "-z", "--"]);
+        args.extend(paths.iter().cloned());
+        let tracked = self
+            .run_read("GitManager.discard.tracked", cwd, &args, cancellation)
+            .await?;
+        Ok(tracked
+            .stdout
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned)
+            .collect())
+    }
+
+    pub async fn git_manager_restore_tracked_paths(
+        &self,
+        cwd: &Path,
+        paths: &[String],
+        cancellation: &CancellationToken,
+    ) -> Result<(), GitCommandError> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        validate_pathspecs("GitManager.discard", cwd, paths)?;
+        let mut args = strings(&["checkout", "HEAD", "--"]);
+        args.extend(paths.iter().cloned());
+        self.run("GitManager.discard.restore", cwd, &args, cancellation)
+            .await?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn list_refs(
         &self,
@@ -3641,6 +3721,161 @@ impl GitRepository {
             )
             .await?;
         Ok(Some(sha.stdout.trim().to_owned()))
+    }
+
+    pub async fn commit_with_options(
+        &self,
+        cwd: &Path,
+        args: &[String],
+        message: &[u8],
+        allow_empty: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<GitManagerCommitOutcome, GitCommandError> {
+        let status_args = strings(&[
+            "-c",
+            "core.quotePath=false",
+            "status",
+            "--porcelain=2",
+            "-z",
+            "--untracked-files=all",
+        ]);
+        let status = self
+            .execute_read(
+                "GitManager.commit.status",
+                cwd,
+                &status_args,
+                false,
+                cancellation,
+            )
+            .await?;
+        let has_staged_changes = status
+            .stdout
+            .split('\0')
+            .filter_map(parse_porcelain_v2_line)
+            .any(|record| record.index_changed);
+        let amending = args.iter().any(|argument| argument == "--amend");
+        if !has_staged_changes && !allow_empty && !amending {
+            return Ok(GitManagerCommitOutcome {
+                sha: None,
+                empty: true,
+            });
+        }
+
+        self.execute_with_stdin(
+            "GitManager.commit",
+            cwd,
+            args,
+            message.to_vec(),
+            false,
+            cancellation,
+        )
+        .await?;
+        let sha = self
+            .run(
+                "GitManager.commit.sha",
+                cwd,
+                &strings(&["rev-parse", "HEAD"]),
+                cancellation,
+            )
+            .await?;
+        Ok(GitManagerCommitOutcome {
+            sha: Some(sha.stdout.trim().to_owned()),
+            empty: false,
+        })
+    }
+
+    pub async fn undo_head_commit(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<GitManagerHeadCommit, GitCommandError> {
+        let head = self
+            .run(
+                "GitManager.undoCommit.head",
+                cwd,
+                &strings(&[
+                    "show",
+                    "-s",
+                    "--no-show-signature",
+                    "--format=%H%x00%P%x00%B",
+                    "HEAD",
+                ]),
+                cancellation,
+            )
+            .await?;
+        let head = parse_git_manager_head_commit(cwd, &head.stdout)?;
+        if let Some(parent) = head.parents.first() {
+            self.run(
+                "GitManager.undoCommit.reset",
+                cwd,
+                &["reset".into(), "--mixed".into(), parent.clone()],
+                cancellation,
+            )
+            .await?;
+            return Ok(head);
+        }
+
+        let deleted = self
+            .run(
+                "GitManager.undoCommit.initial.deleted",
+                cwd,
+                &strings(&["diff", "--name-only", "--diff-filter=D", "-z", "HEAD", "--"]),
+                cancellation,
+            )
+            .await?;
+        let deleted_paths = deleted
+            .stdout
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if !deleted_paths.is_empty() {
+            let mut args = strings(&["checkout", "HEAD", "--"]);
+            args.extend(deleted_paths);
+            self.run(
+                "GitManager.undoCommit.initial.restoreDeleted",
+                cwd,
+                &args,
+                cancellation,
+            )
+            .await?;
+        }
+        self.run(
+            "GitManager.undoCommit.initial.deleteHead",
+            cwd,
+            &strings(&["update-ref", "-d", "HEAD"]),
+            cancellation,
+        )
+        .await?;
+        self.run(
+            "GitManager.undoCommit.initial.unstage",
+            cwd,
+            &strings(&["reset", "--", "."]),
+            cancellation,
+        )
+        .await?;
+        Ok(head)
+    }
+
+    pub async fn git_manager_head_tags(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<String>, GitCommandError> {
+        let tags = self
+            .run_read(
+                "GitManager.undoCommit.tags",
+                cwd,
+                &strings(&["tag", "--points-at", "HEAD"]),
+                cancellation,
+            )
+            .await?;
+        Ok(tags
+            .stdout
+            .lines()
+            .filter(|tag| !tag.is_empty())
+            .map(str::to_owned)
+            .collect())
     }
 
     pub async fn push_current_branch(
@@ -5312,8 +5547,8 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        GitProcessRunner, GitRepository, OutputPolicy, ProcessError, ProcessOutput, ProcessRequest,
-        git_read_environment, normalize_path_lexically,
+        GitManagerCommitOutcome, GitProcessRunner, GitRepository, OutputPolicy, ProcessError,
+        ProcessOutput, ProcessRequest, git_read_environment, normalize_path_lexically,
     };
     use crate::test_support::TestSandbox;
 
@@ -5557,6 +5792,198 @@ mod tests {
                 .env
                 .iter()
                 .any(|(key, value)| key == "GIT_OPTIONAL_LOCKS" && value == "0")
+        );
+    }
+
+    #[tokio::test]
+    async fn git_manager_commit_uses_stdin_and_preserves_the_visible_index() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([
+                (
+                    "GitManager.commit.status".into(),
+                    process_output("1 M. N... 100644 100644 100644 aaaaaaa bbbbbbb tracked.txt\0"),
+                ),
+                ("GitManager.commit".into(), process_output("")),
+                (
+                    "GitManager.commit.sha".into(),
+                    process_output("0123456789012345678901234567890123456789\n"),
+                ),
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+        let message = b"summary\n\ndescription\n";
+
+        let result = repository
+            .commit_with_options(
+                Path::new("/repo"),
+                &[
+                    "commit".into(),
+                    "--no-verify".into(),
+                    "-F".into(),
+                    "-".into(),
+                ],
+                message,
+                false,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("commit succeeds");
+
+        assert_eq!(
+            result,
+            GitManagerCommitOutcome {
+                sha: Some("0123456789012345678901234567890123456789".into()),
+                empty: false,
+            }
+        );
+        let requests = runner.requests();
+        assert_eq!(requests[1].stdin.as_deref(), Some(message.as_slice()));
+        assert_eq!(
+            requests[1].args,
+            ["commit", "--no-verify", "-F", "-"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+        assert!(requests.iter().all(|request| {
+            !request
+                .args
+                .iter()
+                .any(|arg| arg == "reset" || arg == "add")
+        }));
+    }
+
+    #[tokio::test]
+    async fn git_manager_undo_uses_a_mixed_reset_to_the_first_parent() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([
+                (
+                    "GitManager.undoCommit.head".into(),
+                    process_output(
+                        "2222222222222222222222222222222222222222\0\
+                         1111111111111111111111111111111111111111\0\
+                         subject\n\nbody\n",
+                    ),
+                ),
+                ("GitManager.undoCommit.reset".into(), process_output("")),
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+
+        let undone = repository
+            .undo_head_commit(Path::new("/repo"), &CancellationToken::new())
+            .await
+            .expect("undo succeeds");
+
+        assert_eq!(undone.sha, "2222222222222222222222222222222222222222");
+        assert_eq!(undone.message, "subject\n\nbody\n");
+        assert_eq!(
+            runner.requests()[1].args,
+            [
+                "reset",
+                "--mixed",
+                "1111111111111111111111111111111111111111"
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn git_manager_discard_resolves_tracked_paths_without_mutating() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([(
+                "GitManager.discard.tracked".into(),
+                process_output("dir/tracked.txt\0root.txt\0"),
+            )]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+
+        let tracked = repository
+            .git_manager_tracked_paths(
+                Path::new("/repo"),
+                &["dir".into(), "root.txt".into()],
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("tracked paths resolve");
+
+        assert_eq!(tracked, ["dir/tracked.txt", "root.txt"]);
+        assert_eq!(
+            runner.requests()[0].args,
+            [
+                "-c",
+                "core.quotePath=false",
+                "ls-files",
+                "-z",
+                "--",
+                "dir",
+                "root.txt"
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn git_manager_undo_restores_deleted_files_from_an_initial_commit() {
+        fn git(cwd: &Path, args: &[&str]) -> std::process::Output {
+            Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "Git Manager Test")
+                .env("GIT_AUTHOR_EMAIL", "git-manager@example.test")
+                .env("GIT_COMMITTER_NAME", "Git Manager Test")
+                .env("GIT_COMMITTER_EMAIL", "git-manager@example.test")
+                .output()
+                .expect("git fixture starts")
+        }
+
+        let fixture = tempfile::tempdir().expect("temporary repository");
+        assert!(
+            git(fixture.path(), &["init", "-q", "-b", "main"])
+                .status
+                .success()
+        );
+        fs::write(fixture.path().join("tracked.txt"), "initial\n").expect("tracked fixture");
+        assert!(
+            git(fixture.path(), &["add", "tracked.txt"])
+                .status
+                .success()
+        );
+        assert!(
+            git(fixture.path(), &["commit", "-q", "-m", "Initial subject"])
+                .status
+                .success()
+        );
+        fs::remove_file(fixture.path().join("tracked.txt")).expect("delete tracked fixture");
+
+        let undone = GitRepository::default()
+            .undo_head_commit(fixture.path(), &CancellationToken::new())
+            .await
+            .expect("initial commit undo succeeds");
+
+        assert!(undone.parents.is_empty());
+        assert!(undone.message.starts_with("Initial subject"));
+        assert_eq!(
+            fs::read_to_string(fixture.path().join("tracked.txt")).expect("restored file"),
+            "initial\n"
+        );
+        assert!(
+            !git(fixture.path(), &["rev-parse", "--verify", "HEAD"])
+                .status
+                .success()
+        );
+        assert_eq!(
+            String::from_utf8(git(fixture.path(), &["status", "--porcelain=v1"]).stdout)
+                .expect("UTF-8 status"),
+            "?? tracked.txt\n"
         );
     }
 
@@ -6655,6 +7082,28 @@ fn area_order(area: Option<VcsStagingArea>) -> u8 {
         Some(VcsStagingArea::Untracked) => 2,
         None => 3,
     }
+}
+
+fn parse_git_manager_head_commit(
+    cwd: &Path,
+    output: &str,
+) -> Result<GitManagerHeadCommit, GitCommandError> {
+    let mut fields = output.splitn(3, '\0');
+    let sha = fields.next().unwrap_or_default().trim();
+    let parents = fields.next().unwrap_or_default();
+    let message = fields.next();
+    if sha.is_empty() || message.is_none() {
+        return Err(simple_error(
+            "GitManager.undoCommit.head",
+            cwd,
+            "Git returned malformed HEAD commit data.",
+        ));
+    }
+    Ok(GitManagerHeadCommit {
+        sha: sha.to_owned(),
+        parents: parents.split_whitespace().map(str::to_owned).collect(),
+        message: message.unwrap_or_default().to_owned(),
+    })
 }
 
 pub(crate) fn validate_pathspecs(

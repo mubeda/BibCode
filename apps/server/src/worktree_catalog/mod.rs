@@ -7,6 +7,7 @@ pub use availability::*;
 pub use model::*;
 pub(crate) use service::{
     CatalogFuture, CatalogHealthySnapshotObserver, CatalogWorkspaceLossObserver,
+    ProjectMutationAttempt,
 };
 pub use service::{CatalogSubscription, WorktreeCatalogService};
 

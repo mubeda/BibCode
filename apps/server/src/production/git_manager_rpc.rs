@@ -2,7 +2,11 @@
 
 use std::{
     path::PathBuf,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -12,17 +16,28 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     git::{
-        GitCommandError, GitRepository, ProcessOutput,
+        FileTrash, GitCommandError, GitManagerBlockedReason, GitRepository, NativeFileTrash,
+        ProcessOutput, StatusBroadcaster, canonical_worktree_path_key,
         manager::{
             graph::{
                 GitManagerGraphError, MAX_DIFF_BUFFER_SIZE, MAX_DIFF_LINE_CHARACTERS,
                 MAX_REASONABLE_DIFF_SIZE, page,
             },
-            refs::{GitManagerRefsError, build_refs_snapshot},
+            guards::{GuardInput, evaluate_guards},
+            operations::{
+                CoAuthor, CommitRequest, DiscardError, DiscardRequest, commit_arguments,
+                commit_message_body, discard_paths, parse_undo_commit_message,
+            },
+            refs::{GitManagerRefsError, GitManagerRefsSnapshot, build_refs_snapshot},
         },
         validate_pathspecs,
     },
+    persistence::Repositories,
     rpc::{RpcRegistry, RpcRequest, RpcResult, RpcStreamChunk},
+    worktree_catalog::{
+        CatalogRefreshTrigger, ProjectMutationAttempt, WorkspaceAdmissionLease,
+        WorkspaceAvailabilityRegistry, WorktreeCatalogService,
+    },
 };
 
 static NEXT_DIFF_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -49,11 +64,73 @@ pub const GIT_MANAGER_STREAM_METHODS: &[&str] =
 pub struct GitManagerRpcServices;
 
 impl GitManagerRpcServices {
-    async fn not_implemented_unary(self, request: RpcRequest) -> RpcResult {
+    #[cfg(test)]
+    async fn handle_read_unary(
+        self,
+        request: RpcRequest,
+        cancellation: CancellationToken,
+    ) -> RpcResult {
+        ConfiguredGitManagerRpcServices::default()
+            .handle_read_unary(request, cancellation)
+            .await
+    }
+
+    #[must_use]
+    pub fn with_dependencies(
+        repository: Arc<GitRepository>,
+        broadcaster: StatusBroadcaster,
+        catalog: WorktreeCatalogService,
+        repositories: Repositories,
+        availability: WorkspaceAvailabilityRegistry,
+        trash: Arc<dyn FileTrash>,
+    ) -> ConfiguredGitManagerRpcServices {
+        ConfiguredGitManagerRpcServices {
+            repository,
+            broadcaster,
+            catalog: Some(catalog),
+            repositories: Some(repositories),
+            availability: Some(availability),
+            trash,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ConfiguredGitManagerRpcServices {
+    repository: Arc<GitRepository>,
+    broadcaster: StatusBroadcaster,
+    catalog: Option<WorktreeCatalogService>,
+    repositories: Option<Repositories>,
+    availability: Option<WorkspaceAvailabilityRegistry>,
+    trash: Arc<dyn FileTrash>,
+}
+
+impl Default for ConfiguredGitManagerRpcServices {
+    fn default() -> Self {
+        let repository = Arc::new(GitRepository::default());
+        Self {
+            broadcaster: StatusBroadcaster::new(repository.clone(), Duration::from_secs(3_600), 8),
+            repository,
+            catalog: None,
+            repositories: None,
+            availability: None,
+            trash: Arc::new(NativeFileTrash::default()),
+        }
+    }
+}
+
+impl From<GitManagerRpcServices> for ConfiguredGitManagerRpcServices {
+    fn from(_services: GitManagerRpcServices) -> Self {
+        Self::default()
+    }
+}
+
+impl ConfiguredGitManagerRpcServices {
+    async fn not_implemented_unary(&self, request: RpcRequest) -> RpcResult {
         Err(not_implemented_error(&request.tag))
     }
 
-    fn not_implemented_stream(self, request: RpcRequest) -> mpsc::Receiver<RpcStreamChunk> {
+    fn not_implemented_stream(&self, request: RpcRequest) -> mpsc::Receiver<RpcStreamChunk> {
         let (sender, receiver) = mpsc::channel(1);
         sender
             .try_send(Err(not_implemented_error(&request.tag)))
@@ -62,16 +139,15 @@ impl GitManagerRpcServices {
     }
 
     async fn handle_read_unary(
-        self,
+        &self,
         request: RpcRequest,
         cancellation: CancellationToken,
     ) -> RpcResult {
-        let repository = GitRepository::default();
         match request.tag.as_str() {
             "gitManager.getRefs" => {
                 let input: GitManagerCwdInput = decode(request.payload, &request.tag)?;
                 encode_result(
-                    build_refs_snapshot(&repository, &input.cwd, &cancellation)
+                    build_refs_snapshot(&self.repository, &input.cwd, &cancellation)
                         .await
                         .map_err(|error| refs_error(&request.tag, error)),
                 )
@@ -80,7 +156,7 @@ impl GitManagerRpcServices {
                 let input: GitManagerGetCommitsInput = decode(request.payload, &request.tag)?;
                 encode_result(
                     page(
-                        &repository,
+                        &self.repository,
                         &input.cwd,
                         input.pinned_tips.as_deref(),
                         input.offset.unwrap_or(0),
@@ -93,22 +169,349 @@ impl GitManagerRpcServices {
             }
             "gitManager.getDiff" => {
                 let input: GitManagerGetDiffInput = decode(request.payload, &request.tag)?;
-                get_diff(&repository, input, &cancellation).await
+                get_diff(&self.repository, input, &cancellation).await
             }
             _ => self.not_implemented_unary(request).await,
         }
     }
+
+    async fn handle_mutation_unary(
+        &self,
+        request: RpcRequest,
+        cancellation: CancellationToken,
+    ) -> RpcResult {
+        match request.tag.as_str() {
+            "gitManager.commit" => {
+                let input: GitManagerCommitInput = decode(request.payload, &request.tag)?;
+                validate_commit_input(&input)?;
+                let commit = CommitRequest {
+                    summary: input.summary,
+                    description: Some(input.description),
+                    amend: input.amend,
+                    no_verify: input.no_verify,
+                    signoff: input.signoff,
+                    allow_empty: input.allow_empty,
+                    co_authors: input.co_authors,
+                };
+                let args = commit_arguments(&commit);
+                let message = commit_message_body(&commit).into_bytes();
+                let allow_empty = commit.allow_empty;
+                self.run_mutation(
+                    "gitManager.commit",
+                    input.cwd,
+                    cancellation,
+                    move |services, cwd, token| async move {
+                        let snapshot = services
+                            .refs_snapshot("gitManager.commit", &cwd, &token)
+                            .await?;
+                        if let Some(reason) = operation_blocked(&snapshot, "commit") {
+                            return Err(blocked_error("gitManager.commit", reason));
+                        }
+                        let outcome = services
+                            .repository
+                            .commit_with_options(&cwd, &args, &message, allow_empty, &token)
+                            .await
+                            .map_err(|error| mutation_git_error("gitManager.commit", error))?;
+                        Ok(json!({ "sha": outcome.sha, "empty": outcome.empty }))
+                    },
+                )
+                .await
+            }
+            "gitManager.undoCommit" => {
+                let input: GitManagerCwdInput = decode(request.payload, &request.tag)?;
+                self.run_mutation(
+                    "gitManager.undoCommit",
+                    input.cwd,
+                    cancellation,
+                    move |services, cwd, token| async move {
+                        let snapshot = services
+                            .refs_snapshot("gitManager.undoCommit", &cwd, &token)
+                            .await?;
+                        if let Some(reason) = operation_blocked(&snapshot, "undo-commit") {
+                            return Err(blocked_error("gitManager.undoCommit", reason));
+                        }
+                        let current = snapshot
+                            .local_branches
+                            .iter()
+                            .find(|reference| reference.current)
+                            .ok_or_else(|| {
+                                operation_error(
+                                    "gitManager.undoCommit",
+                                    "commit-not-local",
+                                    "Undo is blocked: HEAD is not a local branch commit.",
+                                )
+                            })?;
+                        if current.upstream.is_some() && current.ahead == 0 {
+                            return Err(operation_error(
+                                "gitManager.undoCommit",
+                                "commit-not-local",
+                                "Undo is blocked: the HEAD commit is not local.",
+                            ));
+                        }
+                        if !services
+                            .repository
+                            .git_manager_head_tags(&cwd, &token)
+                            .await
+                            .map_err(|error| mutation_git_error("gitManager.undoCommit", error))?
+                            .is_empty()
+                        {
+                            return Err(operation_error(
+                                "gitManager.undoCommit",
+                                "tagged-commit",
+                                "Undo is blocked: the HEAD commit has a tag.",
+                            ));
+                        }
+                        let undone = services
+                            .repository
+                            .undo_head_commit(&cwd, &token)
+                            .await
+                            .map_err(|error| mutation_git_error("gitManager.undoCommit", error))?;
+                        let mut draft = parse_undo_commit_message(&undone.message);
+                        if draft.summary.trim().is_empty() {
+                            draft.summary = "(no commit message)".to_owned();
+                        }
+                        Ok(json!({
+                            "summary": draft.summary,
+                            "description": draft.description,
+                            "coAuthors": draft.co_authors,
+                        }))
+                    },
+                )
+                .await
+            }
+            "gitManager.discard" => {
+                let input: GitManagerDiscardInput = decode(request.payload, &request.tag)?;
+                if input.paths.is_empty() {
+                    return Err(operation_error(
+                        "gitManager.discard",
+                        "invalid-request",
+                        "At least one discard path is required.",
+                    ));
+                }
+                validate_pathspecs("GitManager.discard", &input.cwd, &input.paths).map_err(
+                    |_| {
+                        operation_error(
+                            "gitManager.discard",
+                            "invalid-path",
+                            "A requested discard path is invalid.",
+                        )
+                    },
+                )?;
+                let trash = self.trash.clone();
+                self.run_mutation(
+                    "gitManager.discard",
+                    input.cwd.clone(),
+                    cancellation,
+                    move |services, cwd, token| async move {
+                        let snapshot = services
+                            .refs_snapshot("gitManager.discard", &cwd, &token)
+                            .await?;
+                        if let Some(reason) = operation_blocked(&snapshot, "discard") {
+                            return Err(blocked_error("gitManager.discard", reason));
+                        }
+                        let outcome = discard_paths(
+                            &services.repository,
+                            trash,
+                            DiscardRequest {
+                                cwd,
+                                paths: input.paths,
+                                permit_permanent: input.permit_permanent,
+                            },
+                            &token,
+                        )
+                        .await
+                        .map_err(|error| discard_error("gitManager.discard", error))?;
+                        Ok(json!({
+                            "trashed": outcome.trashed,
+                            "permanentlyDiscarded": outcome.permanently_discarded,
+                            "trashUnavailable": outcome.trash_unavailable,
+                        }))
+                    },
+                )
+                .await
+            }
+            _ => self.not_implemented_unary(request).await,
+        }
+    }
+
+    async fn refs_snapshot(
+        &self,
+        operation: &str,
+        cwd: &std::path::Path,
+        cancellation: &CancellationToken,
+    ) -> Result<GitManagerRefsSnapshot, Value> {
+        build_refs_snapshot(&self.repository, cwd, cancellation)
+            .await
+            .map_err(|error| refs_error(operation, error))
+    }
+
+    async fn run_mutation<F, Fut>(
+        &self,
+        operation: &'static str,
+        cwd: PathBuf,
+        cancellation: CancellationToken,
+        action: F,
+    ) -> RpcResult
+    where
+        F: FnOnce(Self, PathBuf, CancellationToken) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = RpcResult> + Send + 'static,
+    {
+        let services = self.clone();
+        await_server_owned_mutation(async move {
+            let (Some(catalog), Some(repositories), Some(availability)) = (
+                services.catalog.clone(),
+                services.repositories.clone(),
+                services.availability.clone(),
+            ) else {
+                return Err(operation_error(
+                    operation,
+                    "service-unavailable",
+                    "Git Manager commit operations are unavailable in this server runtime.",
+                ));
+            };
+            let project_id = resolve_project_id(&repositories, &cwd)
+                .await
+                .map_err(|code| {
+                    operation_error(
+                        operation,
+                        code,
+                        "The selected checkout is not owned by exactly one BiBCode project.",
+                    )
+                })?;
+            catalog
+                .refresh(&project_id, CatalogRefreshTrigger::Explicit)
+                .await
+                .map_err(|_| {
+                    operation_error(
+                        operation,
+                        "repository-unavailable",
+                        "The selected repository could not be revalidated.",
+                    )
+                })?;
+            let admission = availability
+                .acquire_path_admission([cwd.as_path()])
+                .await
+                .map_err(|_| {
+                    operation_error(
+                        operation,
+                        "workspace-unavailable",
+                        "The selected checkout is unavailable.",
+                    )
+                })?;
+            let lock_cancellation = cancellation.child_token();
+            let operation_cancellation = lock_cancellation.clone();
+            let locked_services = services.clone();
+            let locked_cwd = cwd.clone();
+            match catalog
+                .try_with_project_mutation_lock_cancellation(
+                    &project_id,
+                    &lock_cancellation,
+                    || async move {
+                        locked_services
+                            .run_fenced_mutation(
+                                operation,
+                                locked_cwd,
+                                admission,
+                                operation_cancellation,
+                                action,
+                            )
+                            .await
+                    },
+                )
+                .await
+            {
+                ProjectMutationAttempt::Acquired(result) => result,
+                ProjectMutationAttempt::InFlight => Err(blocked_error(
+                    operation,
+                    GitManagerBlockedReason {
+                        operation: operation_guard_name(operation).to_owned(),
+                        code: "operation-in-flight".to_owned(),
+                        message: "Blocked: another Git Manager operation is already running."
+                            .to_owned(),
+                    },
+                )),
+                ProjectMutationAttempt::Cancelled => Err(operation_error(
+                    operation,
+                    "cancelled",
+                    "The Git Manager operation was cancelled before admission.",
+                )),
+            }
+        })
+        .await
+    }
+
+    async fn run_fenced_mutation<F, Fut>(
+        self,
+        operation: &'static str,
+        cwd: PathBuf,
+        admission: WorkspaceAdmissionLease,
+        cancellation: CancellationToken,
+        action: F,
+    ) -> RpcResult
+    where
+        F: FnOnce(Self, PathBuf, CancellationToken) -> Fut,
+        Fut: std::future::Future<Output = RpcResult>,
+    {
+        let loss = admission.loss_cancellation();
+        let mutation = tokio::select! {
+            biased;
+            () = loss.cancelled() => {
+                cancellation.cancel();
+                return Err(operation_error(
+                    operation,
+                    "workspace-unavailable",
+                    "The selected checkout became unavailable before mutation.",
+                ));
+            }
+            () = cancellation.cancelled() => {
+                return Err(operation_error(
+                    operation,
+                    "cancelled",
+                    "The Git Manager operation was cancelled before mutation.",
+                ));
+            }
+            mutation = self.broadcaster.begin_mutation(&cwd) => mutation,
+        };
+        let operation_future = action(self, cwd, cancellation.clone());
+        tokio::pin!(operation_future);
+        let result = tokio::select! {
+            biased;
+            () = loss.cancelled() => {
+                cancellation.cancel();
+                let _ = operation_future.await;
+                Err(operation_error(
+                    operation,
+                    "workspace-unavailable",
+                    "The selected checkout became unavailable during mutation.",
+                ))
+            }
+            result = &mut operation_future => result,
+        };
+        mutation.finish().await;
+        result
+    }
 }
 
-pub fn register_git_manager_rpc(registry: &mut RpcRegistry, services: GitManagerRpcServices) {
+pub fn register_git_manager_rpc(
+    registry: &mut RpcRegistry,
+    services: impl Into<ConfiguredGitManagerRpcServices>,
+) {
+    let services = services.into();
     for method in GIT_MANAGER_UNARY_METHODS.iter().filter(|method| {
         !matches!(
             **method,
-            "gitManager.getRefs" | "gitManager.getCommits" | "gitManager.getDiff"
+            "gitManager.getRefs"
+                | "gitManager.getCommits"
+                | "gitManager.getDiff"
+                | "gitManager.commit"
+                | "gitManager.undoCommit"
+                | "gitManager.discard"
         )
     }) {
+        let services = services.clone();
         registry.register_unary(*method, move |request, _cancellation| {
-            services.not_implemented_unary(request)
+            let services = services.clone();
+            async move { services.not_implemented_unary(request).await }
         });
     }
     for method in [
@@ -116,13 +519,28 @@ pub fn register_git_manager_rpc(registry: &mut RpcRegistry, services: GitManager
         "gitManager.getCommits",
         "gitManager.getDiff",
     ] {
+        let services = services.clone();
         registry.register_unary(method, move |request, cancellation| {
-            services.handle_read_unary(request, cancellation)
+            let services = services.clone();
+            async move { services.handle_read_unary(request, cancellation).await }
+        });
+    }
+    for method in [
+        "gitManager.commit",
+        "gitManager.undoCommit",
+        "gitManager.discard",
+    ] {
+        let services = services.clone();
+        registry.register_unary(method, move |request, cancellation| {
+            let services = services.clone();
+            async move { services.handle_mutation_unary(request, cancellation).await }
         });
     }
 
     for method in GIT_MANAGER_STREAM_METHODS {
+        let services = services.clone();
         registry.register_stream(*method, move |request, _cancellation| {
+            let services = services.clone();
             services.not_implemented_stream(request)
         });
     }
@@ -131,6 +549,27 @@ pub fn register_git_manager_rpc(registry: &mut RpcRegistry, services: GitManager
 #[derive(Deserialize)]
 struct GitManagerCwdInput {
     cwd: PathBuf,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitManagerCommitInput {
+    cwd: PathBuf,
+    summary: String,
+    description: String,
+    amend: bool,
+    no_verify: bool,
+    signoff: bool,
+    allow_empty: bool,
+    co_authors: Vec<CoAuthor>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitManagerDiscardInput {
+    cwd: PathBuf,
+    paths: Vec<String>,
+    permit_permanent: bool,
 }
 
 #[derive(Deserialize)]
@@ -171,6 +610,135 @@ enum DiffSizeClass {
     Patch,
     LargeText,
     Unrenderable,
+}
+
+fn validate_commit_input(input: &GitManagerCommitInput) -> Result<(), Value> {
+    if input.summary.trim().is_empty() || input.summary.trim() != input.summary {
+        return Err(operation_error(
+            "gitManager.commit",
+            "invalid-request",
+            "The commit summary must be trimmed and non-empty.",
+        ));
+    }
+    if input.co_authors.iter().any(|author| {
+        author.name.trim().is_empty()
+            || author.name.trim() != author.name
+            || author.email.trim().is_empty()
+            || author.email.trim() != author.email
+    }) {
+        return Err(operation_error(
+            "gitManager.commit",
+            "invalid-request",
+            "Every co-author must have a trimmed non-empty name and email.",
+        ));
+    }
+    Ok(())
+}
+
+async fn resolve_project_id(
+    repositories: &Repositories,
+    cwd: &std::path::Path,
+) -> Result<String, &'static str> {
+    let requested_key = canonical_worktree_path_key(cwd)
+        .await
+        .map_err(|_| "project-resolution-failed")?;
+    let projects = repositories
+        .list_projects()
+        .await
+        .map_err(|_| "project-resolution-failed")?;
+    let mut matched = None;
+    for project in projects
+        .into_iter()
+        .filter(|project| project.deleted_at.is_none())
+    {
+        let root_matches =
+            canonical_worktree_path_key(std::path::Path::new(&project.workspace_root))
+                .await
+                .is_ok_and(|key| key == requested_key);
+        let mut thread_matches = false;
+        if !root_matches {
+            for path in repositories
+                .list_threads_by_project(project.project_id.clone())
+                .await
+                .map_err(|_| "project-resolution-failed")?
+                .into_iter()
+                .filter(|thread| thread.deleted_at.is_none())
+                .filter_map(|thread| thread.worktree_path)
+            {
+                if canonical_worktree_path_key(std::path::Path::new(&path))
+                    .await
+                    .is_ok_and(|key| key == requested_key)
+                {
+                    thread_matches = true;
+                    break;
+                }
+            }
+        }
+        if root_matches || thread_matches {
+            if matched.is_some() {
+                return Err("project-ambiguous");
+            }
+            matched = Some(project.project_id);
+        }
+    }
+    matched.ok_or("project-not-found")
+}
+
+fn operation_blocked(
+    snapshot: &GitManagerRefsSnapshot,
+    operation: &str,
+) -> Option<GitManagerBlockedReason> {
+    evaluate_guards(&GuardInput::from_snapshot(snapshot, false))
+        .into_values()
+        .flatten()
+        .find(|reason| reason.operation == operation)
+}
+
+fn operation_guard_name(operation: &str) -> &'static str {
+    match operation {
+        "gitManager.commit" => "commit",
+        "gitManager.undoCommit" => "undo-commit",
+        "gitManager.discard" => "discard",
+        _ => "git-manager-mutation",
+    }
+}
+
+fn blocked_error(operation: &str, reason: GitManagerBlockedReason) -> Value {
+    json!({
+        "_tag": "GitManagerOperationError",
+        "operation": operation,
+        "code": reason.code,
+        "message": reason.message,
+        "blocked": reason,
+    })
+}
+
+fn mutation_git_error(operation: &str, _error: GitCommandError) -> Value {
+    operation_error(
+        operation,
+        "git-command-failed",
+        "Git could not complete the requested mutation.",
+    )
+}
+
+fn discard_error(operation: &str, error: DiscardError) -> Value {
+    match error {
+        DiscardError::Git(error) => mutation_git_error(operation, error),
+    }
+}
+
+async fn await_server_owned_mutation(
+    operation: impl std::future::Future<Output = RpcResult> + Send + 'static,
+) -> RpcResult {
+    match tokio::spawn(operation).await {
+        Ok(result) => result,
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(_) => Err(operation_error(
+            "gitManager.mutation",
+            "operation-ended",
+            "The server-owned Git Manager operation ended without a result.",
+        )),
+    }
 }
 
 async fn get_diff(
@@ -383,12 +951,17 @@ fn not_implemented_error(operation: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path, process::Command};
+    use std::{fs, path::Path, process::Command, sync::Arc, time::Duration};
 
     use tempfile::TempDir;
+    use tokio::sync::{Semaphore, oneshot};
 
     use super::*;
-    use crate::rpc::{ACTIVE_RPC_METHODS, MethodMode, RequestId};
+    use crate::{
+        persistence::{Database, ProjectionProject, Repositories, run_migrations},
+        rpc::{ACTIVE_RPC_METHODS, MethodMode, RequestId},
+        worktree_catalog::{WorkspaceAvailabilityRegistry, WorktreeCatalogService},
+    };
 
     fn git(cwd: &Path, args: &[&str]) {
         let output = Command::new("git")
@@ -589,5 +1162,177 @@ mod tests {
             .expect_err("stash diff remains deferred");
         assert_eq!(error["_tag"], "GitManagerOperationError");
         assert_eq!(error["code"], "not-implemented-yet");
+    }
+
+    #[tokio::test]
+    async fn configured_commit_handler_commits_the_visible_index_without_a_socket() {
+        let repository_fixture = repository_with_change();
+        git(repository_fixture.path(), &["add", "tracked.txt"]);
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let repositories = Repositories::new(database);
+        repositories
+            .upsert_project(ProjectionProject {
+                project_id: "project-commit".to_owned(),
+                title: "Commit".to_owned(),
+                workspace_root: repository_fixture.path().to_string_lossy().into_owned(),
+                default_model_selection: None,
+                scripts: json!([]),
+                worktree_discovery: json!({}),
+                worktree_repository_key: None,
+                created_at: "2026-08-31T00:00:00Z".to_owned(),
+                updated_at: "2026-08-31T00:00:00Z".to_owned(),
+                deleted_at: None,
+            })
+            .await
+            .expect("project projection");
+        let repository = Arc::new(GitRepository::default());
+        let broadcaster = StatusBroadcaster::new(repository.clone(), Duration::from_secs(3_600), 8);
+        let availability = WorkspaceAvailabilityRegistry::new();
+        let catalog = WorktreeCatalogService::new_with_availability_registry(
+            Arc::new(repositories.clone()),
+            repository.clone(),
+            availability.clone(),
+        );
+        let services = GitManagerRpcServices::with_dependencies(
+            repository,
+            broadcaster,
+            catalog.clone(),
+            repositories,
+            availability,
+            Arc::new(NativeFileTrash::default()),
+        );
+
+        let result = services
+            .handle_mutation_unary(
+                request(
+                    "gitManager.commit",
+                    json!({
+                        "cwd": repository_fixture.path(),
+                        "summary": "Visible index commit",
+                        "description": "through stdin",
+                        "amend": false,
+                        "noVerify": false,
+                        "signoff": false,
+                        "allowEmpty": false,
+                        "coAuthors": []
+                    }),
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("configured commit succeeds");
+
+        assert_eq!(result["empty"], false);
+        assert!(result["sha"].as_str().is_some_and(|sha| !sha.is_empty()));
+        let message = Command::new("git")
+            .args(["log", "-1", "--format=%B"])
+            .current_dir(repository_fixture.path())
+            .output()
+            .expect("read committed message");
+        assert_eq!(
+            String::from_utf8(message.stdout).expect("UTF-8 commit message"),
+            "Visible index commit\n\nthrough stdin\n\n"
+        );
+
+        let empty_discard = services
+            .handle_mutation_unary(
+                request(
+                    "gitManager.discard",
+                    json!({
+                        "cwd": repository_fixture.path(),
+                        "paths": [],
+                        "permitPermanent": false
+                    }),
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("discard paths are non-empty on the wire");
+        assert_eq!(empty_discard["code"], "invalid-request");
+
+        git(
+            repository_fixture.path(),
+            &["tag", "-a", "protected", "-m", "protected"],
+        );
+        let tagged_head = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repository_fixture.path())
+            .output()
+            .expect("read tagged head");
+        let tagged_head = String::from_utf8(tagged_head.stdout)
+            .expect("UTF-8 tagged head")
+            .trim()
+            .to_owned();
+        let tagged = services
+            .handle_mutation_unary(
+                request(
+                    "gitManager.undoCommit",
+                    json!({ "cwd": repository_fixture.path() }),
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("annotated tags block undo");
+        assert_eq!(tagged["code"], "tagged-commit");
+        let current_head = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repository_fixture.path())
+            .output()
+            .expect("read current head");
+        assert_eq!(
+            String::from_utf8(current_head.stdout)
+                .expect("UTF-8 current head")
+                .trim(),
+            tagged_head
+        );
+        git(repository_fixture.path(), &["tag", "-d", "protected"]);
+
+        let (entered, entered_rx) = oneshot::channel();
+        let release = Arc::new(Semaphore::new(0));
+        let held_catalog = catalog.clone();
+        let held_release = release.clone();
+        let held = tokio::spawn(async move {
+            held_catalog
+                .with_project_mutation_lock("project-commit", || async move {
+                    let _ = entered.send(());
+                    held_release
+                        .acquire()
+                        .await
+                        .expect("lock release remains open")
+                        .forget();
+                })
+                .await;
+        });
+        entered_rx.await.expect("catalog mutation lock acquired");
+        let rejected = services
+            .handle_mutation_unary(
+                request(
+                    "gitManager.commit",
+                    json!({
+                        "cwd": repository_fixture.path(),
+                        "summary": "Concurrent commit",
+                        "description": "",
+                        "amend": false,
+                        "noVerify": false,
+                        "signoff": false,
+                        "allowEmpty": false,
+                        "coAuthors": []
+                    }),
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("a held catalog lock rejects the second mutation");
+        assert_eq!(rejected["code"], "operation-in-flight");
+        assert_eq!(rejected["blocked"]["code"], "operation-in-flight");
+        release.add_permits(1);
+        held.await.expect("held catalog mutation joins");
     }
 }
