@@ -1,10 +1,29 @@
 # Workspace UI
 
-BiBCode is split into left, center, and right work areas. The left panel chooses
-the project/worktree thread, the center panel runs chats and terminals, and the
-right panel hosts project tools.
+BiBCode is split into left, center, and right work areas. The left panel
+navigates agents and project/worktree threads, the center panel runs chats and
+terminals, and the right panel hosts project tools.
 
 ## Left Panel
+
+The **Search** row is followed by an **Agents** section, then Projects. Agents
+lists one row for every non-archived thread with a session across all connected
+environments. It is the left panel's single exception to environment-rail
+scoping: it ignores the selected environment by design.
+
+Each agent row shows a status pill, thread title, project · branch, one-line
+conversation preview, environment badge, and relative time. While a thread is
+working, the preview shows its current tool; otherwise it shows the latest
+assistant message or prompt. Rows from environments that are not live are
+greyed and add the environment's availability to the badge. Rows remain bold
+until visited.
+
+Rows appear in fixed **Working** → **Pending Approval** → **Awaiting Input** →
+**Done** groups with counts. Done is collapsed by default, and each group shows
+five rows before offering **Show more**. The inline filter matches rows across
+all environments. The section header and each status group can be collapsed,
+and both kinds of collapse state persist. Clicking a row opens its thread in
+the center panel and re-points the environment rail to that row's environment.
 
 Projects are shown as groups of workspace rows:
 

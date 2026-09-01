@@ -48,8 +48,18 @@ transcript. They appear as center-panel tabs, not left-panel rows.
 
 ### Left Panel
 
-The project/worktree navigator. It shows project groups, primary rows, worktree
-rows, pin/unread state, context menus, and running agent sub-rows.
+The navigator for Search, the cross-environment Agents section, and
+environment-scoped project/worktree rows. It shows project groups, primary
+rows, worktree rows, pin/unread state, context menus, and running agent
+sub-rows.
+
+### Agents Section
+
+The cross-environment thread navigator in the left panel. It shows one row per
+non-archived thread with a session, with a status pill and capped one-line
+conversation preview; rows remain bold and unread until visited. It is the
+sanctioned exception to environment-rail scoping. Clicking a row opens its
+thread and re-points the rail selection to that row's environment.
 
 ### Center Panel
 
