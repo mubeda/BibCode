@@ -121,7 +121,8 @@ vi.mock("../sidebar/EnvironmentRail", () => ({
   EnvironmentRail: () => <nav data-testid="environment-rail-mock" />,
 }));
 
-vi.mock("../ui/sidebar", () => ({
+vi.mock("../ui/sidebar", async (importOriginal) => ({
+  SidebarInset: (await importOriginal<typeof import("../ui/sidebar")>()).SidebarInset,
   Sidebar: ({
     children,
     resizable: _resizable,
@@ -474,6 +475,17 @@ describe("AgentsPage", () => {
     expect(chatView?.dataset.environmentId).toBe("environment-remote");
     expect(chatView?.dataset.threadId).toBe("thread-remote");
     expect(chatView?.dataset.routeKind).toBe("server");
+    const chatInset = chatView?.closest<HTMLElement>('[data-slot="sidebar-inset"]');
+    expect(chatInset?.className.split(/\s+/)).toEqual(
+      expect.arrayContaining([
+        "flex",
+        "h-full",
+        "min-h-0",
+        "flex-1",
+        "flex-col",
+        "overflow-hidden",
+      ]),
+    );
     expect(h.markRead).toHaveBeenCalledExactlyOnceWith("environment-remote:thread-remote");
   });
 

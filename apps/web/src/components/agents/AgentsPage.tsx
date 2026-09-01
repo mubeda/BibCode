@@ -5,6 +5,7 @@ import { ArrowLeftIcon, BellIcon, ChevronRightIcon, MoreHorizontalIcon } from "l
 import { useCallback, useDeferredValue, useEffect, useMemo, useState } from "react";
 
 import { cn } from "../../lib/utils";
+import { ChatRouteInset } from "../../routes/-ChatRouteInset";
 import { selectIsUnread, useSidebarWorkspaceMetaStore } from "../../sidebarWorkspaceMetaStore";
 import { setActiveEnvironmentId, useProjects, useThreadShells } from "../../state/entities";
 import { useEnvironments } from "../../state/environments";
@@ -278,13 +279,13 @@ export function AgentsPage() {
               Select an agent to view its activity
             </div>
           ) : (
-            <div className="min-h-0 min-w-0 flex-1">
+            <ChatRouteInset>
               <ChatView
                 environmentId={selectedRow.ref.environmentId}
                 threadId={selectedRow.ref.threadId}
                 routeKind="server"
               />
-            </div>
+            </ChatRouteInset>
           )}
         </section>
       </div>
