@@ -827,9 +827,8 @@ export function restartedApplicationCleanupPlan(
       command: "taskkill.exe",
     };
   }
-  const exactCommand = appBinaryPath.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
   return {
-    args: ["-TERM", "-f", `^${exactCommand}([[:space:]]|$)`],
+    args: ["-TERM", "-x", "bibcode-desktop"],
     command: "pkill",
   };
 }
