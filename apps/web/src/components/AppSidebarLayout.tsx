@@ -9,7 +9,8 @@ import { EnvironmentRail } from "./sidebar/EnvironmentRail";
 import { Sidebar, SidebarProvider, SidebarRail, SidebarTrigger, useSidebar } from "./ui/sidebar";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
 
-const THREAD_SIDEBAR_WIDTH_STORAGE_KEY = "chat_thread_sidebar_width";
+// v2: widths stored under the retired key belong to the 256px default era.
+const THREAD_SIDEBAR_WIDTH_STORAGE_KEY = "bibcode:sidebar-width:v2";
 const ENVIRONMENT_RAIL_WIDTH = 52;
 const THREAD_SIDEBAR_MIN_WIDTH = 13 * 16 + ENVIRONMENT_RAIL_WIDTH;
 // Wider than the shared primitive's 16rem default: 13px titles and 12px badges
