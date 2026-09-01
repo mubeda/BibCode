@@ -26,6 +26,34 @@ struct Fixture {
     services: ConfiguredGitManagerRpcServices,
 }
 
+#[test]
+fn phase_13_history_rewrite_sources_do_not_log_repository_operands() {
+    let operations = include_str!("../src/git/manager/operations.rs");
+    let operation_section = operations
+        .split_once("pub async fn run_branch_or_sync_operation")
+        .expect("operation section starts")
+        .1
+        .split_once("fn validate_merge_source")
+        .expect("operation section ends")
+        .0;
+    let repository = include_str!("../src/git/repository.rs");
+    let repository_section = repository
+        .split_once("pub(crate) async fn git_manager_rebase")
+        .expect("rewrite repository section starts")
+        .1
+        .split_once("pub async fn switch_ref")
+        .expect("rewrite repository section ends")
+        .0;
+    for source in [
+        include_str!("../src/git/manager/rewrite.rs"),
+        include_str!("../src/git/manager/conflicts.rs"),
+        operation_section,
+        repository_section,
+    ] {
+        assert!(!source.contains("tracing::"));
+    }
+}
+
 impl Fixture {
     async fn new() -> Self {
         let root = TempDir::new().expect("temporary Git Manager fixture");
@@ -1042,6 +1070,277 @@ async fn conflicting_merge_reports_conflicts_and_leaves_the_operation_in_progres
     assert!(cwd.join(merge_head.trim()).exists() || Path::new(merge_head.trim()).exists());
 }
 
+#[tokio::test]
+async fn cherry_pick_conflict_lifecycle_detects_resolves_continues_and_aborts() {
+    let fixture = Fixture::new().await;
+    let cwd = fixture.repository_path.clone();
+    git(&cwd, &["switch", "-q", "-c", "conflict-source"]);
+    fs::write(cwd.join("tracked.txt"), "theirs first\n").expect("source content");
+    git(&cwd, &["commit", "-qam", "source conflict"]);
+    let source_sha = git_stdout(&cwd, &["rev-parse", "HEAD"]);
+    git(&cwd, &["switch", "-q", "main"]);
+    fs::write(cwd.join("tracked.txt"), "ours first\n").expect("main content");
+    git(&cwd, &["commit", "-qam", "main conflict"]);
+
+    let started = collect_events(fixture.operation(
+        "60",
+        json!({
+            "_tag": "cherry-pick", "cwd": cwd, "projectId": "project-1",
+            "shas": [source_sha]
+        }),
+    ))
+    .await;
+    assert_eq!(event_kinds(&started).first(), Some(&"started"));
+    assert_eq!(event_kinds(&started).last(), Some(&"failed"));
+    assert_eq!(
+        started.last().expect("conflict failure")["code"],
+        "conflicts-encountered"
+    );
+
+    let conflicts = GitRepository::default()
+        .git_manager_conflict_states(&cwd, &CancellationToken::new())
+        .await
+        .expect("conflict state");
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].path, "tracked.txt");
+    assert_eq!(conflicts[0].marker_count, 3);
+
+    let theirs = collect_events(fixture.operation(
+        "61",
+        json!({
+            "_tag": "resolve-conflict", "cwd": cwd, "projectId": "project-1",
+            "path": "tracked.txt", "side": "theirs"
+        }),
+    ))
+    .await;
+    assert_eq!(event_kinds(&theirs).last(), Some(&"finished"));
+    assert_eq!(
+        fs::read_to_string(cwd.join("tracked.txt")).expect("theirs resolution"),
+        "theirs first\n"
+    );
+
+    let continued = collect_events(fixture.operation(
+        "62",
+        json!({
+            "_tag": "continue", "cwd": cwd, "projectId": "project-1",
+            "operation": "cherry-pick"
+        }),
+    ))
+    .await;
+    assert_eq!(event_kinds(&continued).last(), Some(&"finished"));
+    let continued_tip = git_stdout(&cwd, &["rev-parse", "HEAD"]);
+
+    git(&cwd, &["switch", "-q", "-c", "abort-source"]);
+    fs::write(cwd.join("tracked.txt"), "theirs second\n").expect("second source content");
+    git(&cwd, &["commit", "-qam", "second source conflict"]);
+    let abort_source_sha = git_stdout(&cwd, &["rev-parse", "HEAD"]);
+    git(&cwd, &["switch", "-q", "main"]);
+    assert_eq!(git_stdout(&cwd, &["rev-parse", "HEAD"]), continued_tip);
+    fs::write(cwd.join("tracked.txt"), "ours second\n").expect("second main content");
+    git(&cwd, &["commit", "-qam", "second main conflict"]);
+    let pre_abort_tip = git_stdout(&cwd, &["rev-parse", "HEAD"]);
+
+    let second = collect_events(fixture.operation(
+        "63",
+        json!({
+            "_tag": "cherry-pick", "cwd": cwd, "projectId": "project-1",
+            "shas": [abort_source_sha]
+        }),
+    ))
+    .await;
+    assert_eq!(event_kinds(&second).last(), Some(&"failed"));
+
+    let ours = collect_events(fixture.operation(
+        "64",
+        json!({
+            "_tag": "resolve-conflict", "cwd": cwd, "projectId": "project-1",
+            "path": "tracked.txt", "side": "ours"
+        }),
+    ))
+    .await;
+    assert_eq!(event_kinds(&ours).last(), Some(&"finished"));
+    assert_eq!(
+        fs::read_to_string(cwd.join("tracked.txt")).expect("ours resolution"),
+        "ours second\n"
+    );
+
+    let aborted = collect_events(fixture.operation(
+        "65",
+        json!({
+            "_tag": "abort", "cwd": cwd, "projectId": "project-1",
+            "operation": "cherry-pick"
+        }),
+    ))
+    .await;
+    assert_eq!(event_kinds(&aborted).last(), Some(&"finished"));
+    assert_eq!(git_stdout(&cwd, &["rev-parse", "HEAD"]), pre_abort_tip);
+    assert_eq!(
+        fs::read_to_string(cwd.join("tracked.txt")).expect("abort restoration"),
+        "ours second\n"
+    );
+    assert!(
+        GitRepository::default()
+            .git_manager_conflict_states(&cwd, &CancellationToken::new())
+            .await
+            .expect("clean conflict state")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn squash_can_rewrite_through_the_initial_commit_with_root() {
+    let fixture = Fixture::new().await;
+    let cwd = fixture.repository_path.clone();
+    let initial = git_stdout(&cwd, &["rev-parse", "HEAD"]);
+    fs::write(cwd.join("second.txt"), "second\n").expect("second file");
+    git(&cwd, &["add", "second.txt"]);
+    git(&cwd, &["commit", "-q", "-m", "second"]);
+    let second = git_stdout(&cwd, &["rev-parse", "HEAD"]);
+    fs::write(cwd.join("third.txt"), "third\n").expect("third file");
+    git(&cwd, &["add", "third.txt"]);
+    git(&cwd, &["commit", "-q", "-m", "third"]);
+    let third = git_stdout(&cwd, &["rev-parse", "HEAD"]);
+
+    let events = collect_events(fixture.operation(
+        "66",
+        json!({
+            "_tag": "squash", "cwd": cwd, "projectId": "project-1",
+            "shas": [third, second, initial], "message": "combined root history"
+        }),
+    ))
+    .await;
+
+    assert_eq!(event_kinds(&events).last(), Some(&"finished"));
+    assert_eq!(git_stdout(&cwd, &["rev-list", "--count", "HEAD"]), "1");
+    assert_eq!(
+        git_stdout(&cwd, &["show", "-s", "--format=%s", "HEAD"]),
+        "combined root history"
+    );
+    assert!(cwd.join("tracked.txt").exists());
+    assert!(cwd.join("second.txt").exists());
+    assert!(cwd.join("third.txt").exists());
+}
+
+#[tokio::test]
+async fn reorder_replays_the_touched_range_in_the_requested_order() {
+    let fixture = Fixture::new().await;
+    let cwd = fixture.repository_path.clone();
+    fs::write(cwd.join("a.txt"), "a\n").expect("a file");
+    git(&cwd, &["add", "a.txt"]);
+    git(&cwd, &["commit", "-q", "-m", "commit A"]);
+    let commit_a = git_stdout(&cwd, &["rev-parse", "HEAD"]);
+    fs::write(cwd.join("b.txt"), "b\n").expect("b file");
+    git(&cwd, &["add", "b.txt"]);
+    git(&cwd, &["commit", "-q", "-m", "commit B"]);
+    let commit_b = git_stdout(&cwd, &["rev-parse", "HEAD"]);
+
+    let events = collect_events(fixture.operation(
+        "67",
+        json!({
+            "_tag": "reorder", "cwd": cwd, "projectId": "project-1",
+            "shas": [commit_a], "insertBeforeSha": commit_b
+        }),
+    ))
+    .await;
+
+    assert_eq!(event_kinds(&events).last(), Some(&"finished"));
+    assert_eq!(
+        git_stdout(&cwd, &["log", "-3", "--format=%s"]),
+        "commit A\ncommit B\nbase"
+    );
+}
+
+#[tokio::test]
+async fn rebase_revert_and_all_reset_modes_execute_through_the_stream() {
+    let fixture = Fixture::new().await;
+    let cwd = fixture.repository_path.clone();
+    git(&cwd, &["switch", "-q", "-c", "topic"]);
+    fs::write(cwd.join("topic.txt"), "topic\n").expect("topic file");
+    git(&cwd, &["add", "topic.txt"]);
+    git(&cwd, &["commit", "-q", "-m", "topic"]);
+    git(&cwd, &["switch", "-q", "main"]);
+    fs::write(cwd.join("main.txt"), "main\n").expect("main file");
+    git(&cwd, &["add", "main.txt"]);
+    git(&cwd, &["commit", "-q", "-m", "main"]);
+
+    let rebased = collect_events(fixture.operation(
+        "68",
+        json!({
+            "_tag": "rebase", "cwd": cwd, "projectId": "project-1",
+            "base": "main", "target": "topic"
+        }),
+    ))
+    .await;
+    assert_eq!(event_kinds(&rebased).last(), Some(&"finished"));
+    assert_eq!(git_stdout(&cwd, &["branch", "--show-current"]), "topic");
+    git(&cwd, &["merge-base", "--is-ancestor", "main", "topic"]);
+    git(&cwd, &["switch", "-q", "main"]);
+
+    fs::write(cwd.join("revert-me.txt"), "revert\n").expect("revert file");
+    git(&cwd, &["add", "revert-me.txt"]);
+    git(&cwd, &["commit", "-q", "-m", "revert target"]);
+    let revert_sha = git_stdout(&cwd, &["rev-parse", "HEAD"]);
+    let reverted = collect_events(fixture.operation(
+        "69",
+        json!({
+            "_tag": "revert", "cwd": cwd, "projectId": "project-1", "sha": revert_sha
+        }),
+    ))
+    .await;
+    assert_eq!(event_kinds(&reverted).last(), Some(&"finished"));
+    assert!(!cwd.join("revert-me.txt").exists());
+
+    let hard_target = git_stdout(&cwd, &["rev-parse", "HEAD"]);
+    fs::write(cwd.join("hard.txt"), "hard\n").expect("hard file");
+    git(&cwd, &["add", "hard.txt"]);
+    git(&cwd, &["commit", "-q", "-m", "hard reset target"]);
+    let hard = collect_events(fixture.operation(
+        "70",
+        json!({
+            "_tag": "reset", "cwd": cwd, "projectId": "project-1",
+            "sha": hard_target, "mode": "hard"
+        }),
+    ))
+    .await;
+    assert_eq!(event_kinds(&hard).last(), Some(&"finished"));
+    assert!(!cwd.join("hard.txt").exists());
+
+    fs::write(cwd.join("soft.txt"), "soft\n").expect("soft file");
+    git(&cwd, &["add", "soft.txt"]);
+    git(&cwd, &["commit", "-q", "-m", "soft reset target"]);
+    let soft_parent = git_stdout(&cwd, &["rev-parse", "HEAD^"]);
+    let soft = collect_events(fixture.operation(
+        "71",
+        json!({
+            "_tag": "reset", "cwd": cwd, "projectId": "project-1",
+            "sha": soft_parent, "mode": "soft"
+        }),
+    ))
+    .await;
+    assert_eq!(event_kinds(&soft).last(), Some(&"finished"));
+    assert_eq!(
+        git_stdout(&cwd, &["diff", "--cached", "--name-only"]),
+        "soft.txt"
+    );
+    git(&cwd, &["reset", "--hard", "-q", "HEAD"]);
+
+    fs::write(cwd.join("mixed.txt"), "mixed\n").expect("mixed file");
+    git(&cwd, &["add", "mixed.txt"]);
+    git(&cwd, &["commit", "-q", "-m", "mixed reset target"]);
+    let mixed_parent = git_stdout(&cwd, &["rev-parse", "HEAD^"]);
+    let mixed = collect_events(fixture.operation(
+        "72",
+        json!({
+            "_tag": "reset", "cwd": cwd, "projectId": "project-1",
+            "sha": mixed_parent, "mode": "mixed"
+        }),
+    ))
+    .await;
+    assert_eq!(event_kinds(&mixed).last(), Some(&"finished"));
+    assert!(cwd.join("mixed.txt").exists());
+    assert!(git_stdout(&cwd, &["diff", "--cached", "--name-only"]).is_empty());
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn concurrent_operation_is_rejected_and_cancellation_terminates_the_child() {
@@ -1250,6 +1549,16 @@ fn git(cwd: &Path, args: &[&str]) {
         "git fixture failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn git_stdout(cwd: &Path, args: &[&str]) -> String {
+    let output = git_output(cwd, args);
+    assert!(
+        output.status.success(),
+        "git fixture command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
 fn path(path: &Path) -> &str {
