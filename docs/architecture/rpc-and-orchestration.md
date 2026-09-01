@@ -208,6 +208,15 @@ and publishes its own branch-specific remote result. The default interval is
 180 seconds. Live interval changes, bounded failure backoff, and `0 = disabled`
 remain supported, and the last attachment cancels the owner.
 
+The same subscriber-owned broadcaster lifecycle carries the Git Manager's
+repository-change signal; it does not start another poller or watcher. On the
+existing remote/ref reconciliation tick, the server hashes the bounded
+`for-each-ref` output for heads, remotes, and tags—including each branch's
+`worktreepath`—together with the porcelain-v2 `branch.oid` and `branch.head`
+identity. A changed refs/HEAD/worktree signature increments the repository's
+Git Manager generation. `subscribeGitManagerSignal` receives that generation,
+and a completed in-app mutation requests the existing immediate refresh path.
+
 The client runtime keeps mutations on the serial `(environmentId, cwd)` lane.
 Only `vcs.refreshStatus` uses a separate `latest` lane with the same key: callers
 share the active refresh and signals during it retain one newest trailing
@@ -217,6 +226,45 @@ Successful pull, stage, unstage, discard, stacked action, and repository
 publication still trigger their subscription refresh. A post-mutation signal
 therefore cannot be satisfied by an older active read, while the server epoch
 remains the correctness boundary across clients.
+
+## Git Manager flow
+
+The Git Manager uses the same authenticated Effect RPC session as every other
+application surface. Its unary methods are:
+
+| Methods                                                                             | Scope                   | Responsibility                                                                                                                                      |
+| ----------------------------------------------------------------------------------- | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `gitManager.getRefs`, `gitManager.getCommits`, `gitManager.getDiff`                 | `orchestration:read`    | Read refs and worktree occupancy, page history, and load working-tree, commit, stash, text, binary, or image diffs.                                 |
+| `gitManager.getStashes`, `gitManager.previewMerge`, `gitManager.listPullRequests`   | `orchestration:read`    | Read the native stash list, compute a merge preview, or explicitly ask the configured provider integration for the current pull request and checks. |
+| `gitManager.commit`, `gitManager.undoCommit`, `gitManager.discard`                  | `orchestration:operate` | Commit or amend selected paths, undo the latest eligible local commit, or discard whole-file changes.                                               |
+| `gitManager.stagePartial`, `gitManager.unstagePartial`, `gitManager.discardPartial` | `orchestration:operate` | Apply a generation-checked patch to the index or working tree.                                                                                      |
+
+`subscribeGitManagerSignal` is the read-scoped generation stream described in
+the VCS section above. `gitManager.runOperation` is the one operate-scoped
+streaming command for branch lifecycle, fetch/pull/push, stash, merge, history
+rewrite, conflict continuation or resolution, and tag operations. It emits one
+`started` event, zero or more `output` events—one capped chunk per completed Git
+command in the current supervised-process implementation—and exactly one
+`finished` or `failed` event. Client interrupt and socket cancellation reach the
+supervised child process.
+
+Every Git Manager mutation revalidates the selected checkout after admission;
+operations with server-authored blocked conditions recompute those reasons
+there as well. Mutations then reuse
+`WorktreeCatalogService`'s existing project lock followed by its optional
+physical-repository lock. The non-waiting acquisition returns the structured
+`operation-in-flight` blocked reason when either lock is occupied; there is no
+second Git Manager lock and no silently queued competing operation. The client
+uses each returned `GitManagerBlockedReason.message` verbatim in disabled-state
+and failure presentation instead of recreating Git or worktree policy.
+
+History paging is pinned to repository tips. The first page resolves at most
+512 unique head, remote, and tag tips and returns their SHAs; later pages echo
+those SHAs so offsets remain stable. When the generation changes, the client
+deduplicates and splices newly observed commits above the loaded snapshot. An
+explicit refresh or an unresolvable pinned tip resets the pages. Repositories
+over the cap fall back to `--all` paging with `degradedToAllPaging: true`, and
+the History view warns that new commits may shift the list.
 
 ## Worktree catalog flow
 
@@ -1026,6 +1074,13 @@ replacement that now occupies the old path.
   wait is canceled.
 - Cancellation flows from client interrupt or socket closure into registered
   handlers and supervised processes.
+- Git Manager mutations use the worktree catalog's project-then-repository lock
+  order and fail a competing operation with `operation-in-flight`; they do not
+  introduce an independent repository lock.
+- Git Manager guard text is authored by the server and rendered verbatim by the
+  client. A stale client decision never authorizes a mutation.
+- Git Manager provider data is requested only by an explicit user refresh; its
+  live repository signal performs Git reads only and never polls a provider.
 - Worktree removal holds one server terminal-admission fence from terminal
   shutdown through filesystem and Git settlement; client-side teardown alone
   is never the deletion safety boundary.

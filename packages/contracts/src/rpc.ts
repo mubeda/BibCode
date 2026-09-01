@@ -61,6 +61,29 @@ import {
   VcsUnstageFilesInput,
 } from "./git.ts";
 import {
+  GitManagerCommitInput,
+  GitManagerCommitPage,
+  GitManagerCommitResult,
+  GitManagerCwdInput,
+  GitManagerDiff,
+  GitManagerDiscardInput,
+  GitManagerDiscardResult,
+  GitManagerGetCommitsInput,
+  GitManagerGetDiffInput,
+  GitManagerMergePreview,
+  GitManagerOperationError,
+  GitManagerOperationEvent,
+  GitManagerOperationRequest,
+  GitManagerPartialSelectionInput,
+  GitManagerPartialSelectionResult,
+  GitManagerPreviewMergeInput,
+  GitManagerPullRequestsResult,
+  GitManagerRefsSnapshot,
+  GitManagerSignalEvent,
+  GitManagerStashEntry,
+  GitManagerUndoCommitResult,
+} from "./gitManager.ts";
+import {
   ReviewDiffPreviewError,
   ReviewDiffPreviewInput,
   ReviewDiffPreviewResult,
@@ -355,6 +378,21 @@ export const WS_METHODS = {
   worktreeRemoveFromBibCode: "worktree.removeFromBibCode",
   worktreeRemove: "worktree.remove",
 
+  // Git Manager methods
+  gitManagerGetRefs: "gitManager.getRefs",
+  gitManagerGetCommits: "gitManager.getCommits",
+  gitManagerGetDiff: "gitManager.getDiff",
+  gitManagerGetStashes: "gitManager.getStashes",
+  gitManagerPreviewMerge: "gitManager.previewMerge",
+  gitManagerListPullRequests: "gitManager.listPullRequests",
+  gitManagerCommit: "gitManager.commit",
+  gitManagerUndoCommit: "gitManager.undoCommit",
+  gitManagerDiscard: "gitManager.discard",
+  gitManagerStagePartial: "gitManager.stagePartial",
+  gitManagerUnstagePartial: "gitManager.unstagePartial",
+  gitManagerDiscardPartial: "gitManager.discardPartial",
+  gitManagerRunOperation: "gitManager.runOperation",
+
   // Git workflow methods
   gitRunStackedAction: "git.runStackedAction",
   gitResolvePullRequest: "git.resolvePullRequest",
@@ -434,6 +472,7 @@ export const WS_METHODS = {
   subscribeAuthAccess: "subscribeAuthAccess",
   subscribeActivity: "subscribeActivity",
   subscribeWorktreeCatalog: "subscribeWorktreeCatalog",
+  subscribeGitManagerSignal: "subscribeGitManagerSignal",
 } as const;
 
 const AuthConfirmPairingEmpty = Schema.Record(Schema.String, Schema.Never);
@@ -1010,6 +1049,92 @@ export const WsWorktreeRemoveRpc = Rpc.make(WS_METHODS.worktreeRemove, {
   ]),
 });
 
+export const WsGitManagerGetRefsRpc = Rpc.make(WS_METHODS.gitManagerGetRefs, {
+  payload: GitManagerCwdInput,
+  success: GitManagerRefsSnapshot,
+  error: GitManagerOperationError,
+});
+
+export const WsGitManagerGetCommitsRpc = Rpc.make(WS_METHODS.gitManagerGetCommits, {
+  payload: GitManagerGetCommitsInput,
+  success: GitManagerCommitPage,
+  error: GitManagerOperationError,
+});
+
+export const WsGitManagerGetDiffRpc = Rpc.make(WS_METHODS.gitManagerGetDiff, {
+  payload: GitManagerGetDiffInput,
+  success: GitManagerDiff,
+  error: GitManagerOperationError,
+});
+
+export const WsGitManagerGetStashesRpc = Rpc.make(WS_METHODS.gitManagerGetStashes, {
+  payload: GitManagerCwdInput,
+  success: Schema.Array(GitManagerStashEntry),
+  error: GitManagerOperationError,
+});
+
+export const WsGitManagerPreviewMergeRpc = Rpc.make(WS_METHODS.gitManagerPreviewMerge, {
+  payload: GitManagerPreviewMergeInput,
+  success: GitManagerMergePreview,
+  error: GitManagerOperationError,
+});
+
+export const WsGitManagerListPullRequestsRpc = Rpc.make(WS_METHODS.gitManagerListPullRequests, {
+  payload: GitManagerCwdInput,
+  success: GitManagerPullRequestsResult,
+  error: GitManagerOperationError,
+});
+
+export const WsGitManagerCommitRpc = Rpc.make(WS_METHODS.gitManagerCommit, {
+  payload: GitManagerCommitInput,
+  success: GitManagerCommitResult,
+  error: GitManagerOperationError,
+});
+
+export const WsGitManagerUndoCommitRpc = Rpc.make(WS_METHODS.gitManagerUndoCommit, {
+  payload: GitManagerCwdInput,
+  success: GitManagerUndoCommitResult,
+  error: GitManagerOperationError,
+});
+
+export const WsGitManagerDiscardRpc = Rpc.make(WS_METHODS.gitManagerDiscard, {
+  payload: GitManagerDiscardInput,
+  success: GitManagerDiscardResult,
+  error: GitManagerOperationError,
+});
+
+export const WsGitManagerStagePartialRpc = Rpc.make(WS_METHODS.gitManagerStagePartial, {
+  payload: GitManagerPartialSelectionInput,
+  success: GitManagerPartialSelectionResult,
+  error: GitManagerOperationError,
+});
+
+export const WsGitManagerUnstagePartialRpc = Rpc.make(WS_METHODS.gitManagerUnstagePartial, {
+  payload: GitManagerPartialSelectionInput,
+  success: GitManagerPartialSelectionResult,
+  error: GitManagerOperationError,
+});
+
+export const WsGitManagerDiscardPartialRpc = Rpc.make(WS_METHODS.gitManagerDiscardPartial, {
+  payload: GitManagerPartialSelectionInput,
+  success: GitManagerPartialSelectionResult,
+  error: GitManagerOperationError,
+});
+
+export const WsGitManagerRunOperationRpc = Rpc.make(WS_METHODS.gitManagerRunOperation, {
+  payload: GitManagerOperationRequest,
+  success: GitManagerOperationEvent,
+  error: GitManagerOperationError,
+  stream: true,
+});
+
+export const WsSubscribeGitManagerSignalRpc = Rpc.make(WS_METHODS.subscribeGitManagerSignal, {
+  payload: GitManagerCwdInput,
+  success: GitManagerSignalEvent,
+  error: GitManagerOperationError,
+  stream: true,
+});
+
 /**
  * Ephemeral live diff preview for compact/mobile surfaces.
  * Not the persisted BiBCode Review model. Future review sessions should use
@@ -1358,6 +1483,20 @@ export const WsRpcGroup = RpcGroup.make(
   WsWorktreeGetRemovalPlanRpc,
   WsWorktreeRemoveFromBibCodeRpc,
   WsWorktreeRemoveRpc,
+  WsGitManagerGetRefsRpc,
+  WsGitManagerGetCommitsRpc,
+  WsGitManagerGetDiffRpc,
+  WsGitManagerGetStashesRpc,
+  WsGitManagerPreviewMergeRpc,
+  WsGitManagerListPullRequestsRpc,
+  WsGitManagerCommitRpc,
+  WsGitManagerUndoCommitRpc,
+  WsGitManagerDiscardRpc,
+  WsGitManagerStagePartialRpc,
+  WsGitManagerUnstagePartialRpc,
+  WsGitManagerDiscardPartialRpc,
+  WsGitManagerRunOperationRpc,
+  WsSubscribeGitManagerSignalRpc,
   WsReviewGetDiffPreviewRpc,
   WsTerminalOpenRpc,
   WsTerminalAttachRpc,

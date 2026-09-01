@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 use crate::diagnostics::redact_sensitive_text;
 
+use super::manager::graph::MAX_DIFF_BUFFER_SIZE;
 use super::worktree::{WorktreePruneDryRunRecord, parse_worktree_prune_dry_run};
 use super::{
     ChangeRequest, CreateWorktreeInput, GitCommandDiagnostics, GitCommandError,
@@ -35,6 +36,8 @@ const DEFAULT_OUTPUT_LIMIT: usize = 1_000_000;
 const SUMMARY_STATUS_OUTPUT_LIMIT: usize = 64 * 1024;
 const WATCH_ROOTS_OUTPUT_LIMIT: usize = 16 * 1024;
 const WORKTREE_INVENTORY_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
+const GIT_MANAGER_HISTORY_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
+const GIT_MANAGER_TIPS_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 const WORKTREE_REMOVAL_STATUS_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 const WORKTREE_PRUNE_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 const WORKTREE_PRUNE_GITDIR_LIMIT: u64 = 64 * 1024;
@@ -54,6 +57,27 @@ struct GitExecutionOptions {
     output_policy: OutputPolicy,
 }
 
+struct GitExecutionInput {
+    environment: Vec<(OsString, OsString)>,
+    stdin: Option<Vec<u8>>,
+}
+
+struct RewriteTempFiles {
+    directory: PathBuf,
+    todo: PathBuf,
+    message: Option<PathBuf>,
+}
+
+impl Drop for RewriteTempFiles {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.todo);
+        if let Some(message) = self.message.as_ref() {
+            let _ = fs::remove_file(message);
+        }
+        let _ = fs::remove_dir(&self.directory);
+    }
+}
+
 pub(crate) type BoxGitProcessFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ProcessOutput, ProcessError>> + Send + 'a>>;
 
@@ -63,6 +87,19 @@ pub(crate) trait GitProcessRunner: Send + Sync {
         request: ProcessRequest,
         cancellation: &'a CancellationToken,
     ) -> BoxGitProcessFuture<'a>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitManagerCommitOutcome {
+    pub sha: Option<String>,
+    pub empty: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitManagerHeadCommit {
+    pub sha: String,
+    pub parents: Vec<String>,
+    pub message: String,
 }
 
 impl GitProcessRunner for ProcessRunner {
@@ -111,6 +148,7 @@ pub(crate) struct GitWatchRoots {
 
 pub(crate) struct ObservedRemoteStatus {
     pub ref_name: Option<String>,
+    pub head_signature: String,
     pub remote: Option<VcsStatusRemoteResult>,
 }
 
@@ -323,6 +361,33 @@ impl GitRepository {
         .await
     }
 
+    pub(crate) async fn execute_with_stdin(
+        &self,
+        operation: &str,
+        cwd: &Path,
+        args: &[String],
+        stdin: Vec<u8>,
+        allow_non_zero_exit: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute_with_environment_and_stdin(
+            operation,
+            cwd,
+            args,
+            GitExecutionOptions {
+                allow_non_zero_exit,
+                max_output_bytes: DEFAULT_OUTPUT_LIMIT,
+                output_policy: OutputPolicy::Truncate,
+            },
+            GitExecutionInput {
+                environment: git_environment(),
+                stdin: Some(stdin),
+            },
+            cancellation,
+        )
+        .await
+    }
+
     async fn execute_read(
         &self,
         operation: &str,
@@ -355,6 +420,29 @@ impl GitRepository {
         environment: Vec<(OsString, OsString)>,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute_with_environment_and_stdin(
+            operation,
+            cwd,
+            args,
+            options,
+            GitExecutionInput {
+                environment,
+                stdin: None,
+            },
+            cancellation,
+        )
+        .await
+    }
+
+    async fn execute_with_environment_and_stdin(
+        &self,
+        operation: &str,
+        cwd: &Path,
+        args: &[String],
+        options: GitExecutionOptions,
+        input: GitExecutionInput,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
         self.runner
             .run(
                 ProcessRequest {
@@ -362,8 +450,8 @@ impl GitRepository {
                     command: PathBuf::from("git"),
                     args: args.iter().map(OsString::from).collect(),
                     cwd: cwd.to_path_buf(),
-                    env: environment,
-                    stdin: None,
+                    env: input.environment,
+                    stdin: input.stdin,
                     timeout: DEFAULT_TIMEOUT,
                     max_output_bytes: options.max_output_bytes,
                     output_policy: options.output_policy,
@@ -376,7 +464,828 @@ impl GitRepository {
             .map_err(|error| git_error(operation, cwd, args.len(), error))
     }
 
-    async fn run(
+    pub(crate) async fn git_manager_resolve_tips(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let args = strings(&[
+            "for-each-ref",
+            "--format=%(refname)%09%(objectname)",
+            "refs/heads",
+            "refs/remotes",
+            "refs/tags",
+        ]);
+        self.execute_with_environment(
+            "GitManager.resolveTips",
+            cwd,
+            &args,
+            GitExecutionOptions {
+                allow_non_zero_exit: false,
+                max_output_bytes: GIT_MANAGER_TIPS_OUTPUT_LIMIT,
+                output_policy: OutputPolicy::Error,
+            },
+            git_read_environment(),
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_validate_tips(
+        &self,
+        cwd: &Path,
+        tips: &[String],
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let mut stdin = Vec::new();
+        for tip in tips {
+            stdin.extend_from_slice(tip.as_bytes());
+            stdin.extend_from_slice(b"^{commit}\n");
+        }
+        self.execute_with_environment_and_stdin(
+            "GitManager.validateTips",
+            cwd,
+            &strings(&["cat-file", "--batch-check=%(objectname) %(objecttype)"]),
+            GitExecutionOptions {
+                allow_non_zero_exit: false,
+                max_output_bytes: GIT_MANAGER_TIPS_OUTPUT_LIMIT,
+                output_policy: OutputPolicy::Error,
+            },
+            GitExecutionInput {
+                environment: git_read_environment(),
+                stdin: Some(stdin),
+            },
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_log_page(
+        &self,
+        cwd: &Path,
+        tips: &[String],
+        degraded_to_all_paging: bool,
+        offset: usize,
+        limit: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let format = concat!(
+            "--format=%x1e%H%x1f%h%x1f%s%x1f%b%x1f%an%x1f%ae%x1f%at%x1f",
+            "%cn%x1f%ce%x1f%ct%x1f%P%x1f%D"
+        );
+        let mut args = vec![
+            "log".to_owned(),
+            "--no-show-signature".to_owned(),
+            "--no-color".to_owned(),
+            "-z".to_owned(),
+            "--date=raw".to_owned(),
+            "--name-only".to_owned(),
+            format!("--skip={offset}"),
+            format!("--max-count={limit}"),
+            format.to_owned(),
+        ];
+        if degraded_to_all_paging {
+            args.push("--all".to_owned());
+        } else {
+            args.extend(tips.iter().cloned());
+        }
+        args.push("--".to_owned());
+        self.execute_with_environment(
+            "GitManager.getCommits",
+            cwd,
+            &args,
+            GitExecutionOptions {
+                allow_non_zero_exit: false,
+                max_output_bytes: GIT_MANAGER_HISTORY_OUTPUT_LIMIT,
+                output_policy: OutputPolicy::Error,
+            },
+            git_read_environment(),
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_refs(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.getRefs.refs",
+            cwd,
+            &strings(&[
+                "for-each-ref",
+                "--format=%(refname:short)%09%(objectname)%09%(upstream:short)%09%(worktreepath)%09%(HEAD)",
+                "refs/heads",
+                "refs/remotes",
+                "refs/tags",
+            ]),
+            false,
+            GIT_MANAGER_TIPS_OUTPUT_LIMIT,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_worktrees(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.getRefs.worktrees",
+            cwd,
+            &strings(&["worktree", "list", "--porcelain"]),
+            false,
+            WORKTREE_INVENTORY_OUTPUT_LIMIT,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_ahead_behind(
+        &self,
+        cwd: &Path,
+        local: &str,
+        upstream: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let range = format!("refs/heads/{local}...{upstream}");
+        self.git_manager_bounded_read(
+            "GitManager.getRefs.aheadBehind",
+            cwd,
+            &[
+                "rev-list".into(),
+                "--left-right".into(),
+                "--count".into(),
+                range,
+                "--".into(),
+            ],
+            false,
+            64 * 1024,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_head_ref(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.getRefs.headRef",
+            cwd,
+            &strings(&["symbolic-ref", "--quiet", "--short", "HEAD"]),
+            true,
+            64 * 1024,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_head_sha(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.getRefs.headSha",
+            cwd,
+            &strings(&["rev-parse", "--verify", "HEAD"]),
+            true,
+            64 * 1024,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_status(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.getRefs.status",
+            cwd,
+            &strings(&[
+                "-c",
+                "core.quotePath=false",
+                "status",
+                "--porcelain=2",
+                "-z",
+                "--untracked-files=all",
+            ]),
+            false,
+            WORKTREE_REMOVAL_STATUS_OUTPUT_LIMIT,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_conflicted_paths(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.getRefs.conflicts",
+            cwd,
+            &strings(&["diff", "--name-only", "--diff-filter=U", "-z", "--"]),
+            false,
+            WORKTREE_REMOVAL_STATUS_OUTPUT_LIMIT,
+            cancellation,
+        )
+        .await
+    }
+
+    pub async fn git_manager_conflict_states(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<super::manager::conflicts::GitManagerConflictState>, GitCommandError> {
+        let status = self
+            .execute(
+                "GitManager.conflicts.status",
+                cwd,
+                &strings(&[
+                    "-c",
+                    "core.quotePath=false",
+                    "status",
+                    "--porcelain=2",
+                    "-z",
+                    "--untracked-files=all",
+                ]),
+                true,
+                cancellation,
+            )
+            .await?;
+        let records = status
+            .stdout
+            .split('\0')
+            .flat_map(str::lines)
+            .filter_map(parse_porcelain_v2_line)
+            .collect::<Vec<_>>();
+        let entries = super::manager::conflicts::unmerged_entries(&records);
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let markers = self
+            .execute(
+                "GitManager.conflicts.markers",
+                cwd,
+                &strings(&["diff", "--check"]),
+                true,
+                cancellation,
+            )
+            .await?;
+        let numstat = self
+            .execute(
+                "GitManager.conflicts.numstat",
+                cwd,
+                &strings(&["diff", "--numstat", "-z"]),
+                true,
+                cancellation,
+            )
+            .await?;
+        let mut attribute_input = entries
+            .iter()
+            .flat_map(|entry| entry.path.bytes().chain(std::iter::once(0)))
+            .collect::<Vec<_>>();
+        if attribute_input.last() != Some(&0) {
+            attribute_input.push(0);
+        }
+        let attributes = self
+            .execute_with_stdin(
+                "GitManager.conflicts.attributes",
+                cwd,
+                &strings(&["check-attr", "--stdin", "-z", "merge"]),
+                attribute_input,
+                false,
+                cancellation,
+            )
+            .await?;
+        let marker_output = format!("{}\n{}", markers.stdout, markers.stderr);
+        let marker_counts = super::manager::conflicts::count_conflict_markers(&marker_output);
+        let binary_paths =
+            super::manager::conflicts::binary_conflict_paths(&numstat.stdout, &attributes.stdout);
+        Ok(super::manager::conflicts::build_conflict_states(
+            &entries,
+            &binary_paths,
+            &marker_counts,
+        ))
+    }
+
+    pub(crate) async fn git_manager_conflict_side_deleted(
+        &self,
+        cwd: &Path,
+        path: &str,
+        side: super::manager::conflicts::ConflictSide,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<bool>, GitCommandError> {
+        let status = self
+            .execute(
+                "GitManager.resolveConflict.status",
+                cwd,
+                &strings(&[
+                    "-c",
+                    "core.quotePath=false",
+                    "status",
+                    "--porcelain=2",
+                    "-z",
+                    "--untracked-files=all",
+                ]),
+                true,
+                cancellation,
+            )
+            .await?;
+        let records = status
+            .stdout
+            .split('\0')
+            .flat_map(str::lines)
+            .filter_map(parse_porcelain_v2_line)
+            .collect::<Vec<_>>();
+        Ok(super::manager::conflicts::unmerged_entries(&records)
+            .into_iter()
+            .find(|entry| entry.path == path)
+            .map(|entry| entry.side_deleted(side)))
+    }
+
+    pub(crate) async fn git_manager_remotes(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.getRefs.remotes",
+            cwd,
+            &strings(&["remote"]),
+            false,
+            DEFAULT_OUTPUT_LIMIT,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_git_dir(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.getRefs.gitDir",
+            cwd,
+            &strings(&["rev-parse", "--git-dir"]),
+            false,
+            64 * 1024,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_in_progress_paths(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.getRefs.inProgressPaths",
+            cwd,
+            &strings(&[
+                "rev-parse",
+                "--git-path",
+                "MERGE_HEAD",
+                "--git-path",
+                "CHERRY_PICK_HEAD",
+                "--git-path",
+                "REVERT_HEAD",
+                "--git-path",
+                "SQUASH_MSG",
+                "--git-path",
+                "rebase-merge",
+                "--git-path",
+                "rebase-apply",
+                "--git-path",
+                "rebase-merge/msgnum",
+                "--git-path",
+                "rebase-merge/end",
+                "--git-path",
+                "sequencer/abort-safety",
+                "--git-path",
+                "sequencer/head",
+                "--git-path",
+                "sequencer/todo",
+            ]),
+            false,
+            128 * 1024,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_count_commit_range(
+        &self,
+        cwd: &Path,
+        from: &str,
+        to: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.getRefs.inProgressCount",
+            cwd,
+            &[
+                "rev-list".to_owned(),
+                "--count".to_owned(),
+                format!("{from}..{to}"),
+                "--".to_owned(),
+            ],
+            false,
+            64 * 1024,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_signal_refs(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.signal.refs",
+            cwd,
+            &strings(&[
+                "for-each-ref",
+                "--format=%(objectname)%09%(refname)%09%(worktreepath)",
+                "refs/heads",
+                "refs/remotes",
+                "refs/tags",
+            ]),
+            false,
+            GIT_MANAGER_TIPS_OUTPUT_LIMIT,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_default_ref(
+        &self,
+        cwd: &Path,
+        current: Option<&str>,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<String>, GitCommandError> {
+        self.default_ref(cwd, current, cancellation).await
+    }
+
+    pub(crate) async fn git_manager_bounded_read(
+        &self,
+        operation: &str,
+        cwd: &Path,
+        args: &[String],
+        allow_non_zero_exit: bool,
+        max_output_bytes: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute_with_environment(
+            operation,
+            cwd,
+            args,
+            GitExecutionOptions {
+                allow_non_zero_exit,
+                max_output_bytes,
+                output_policy: OutputPolicy::Error,
+            },
+            git_read_environment(),
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_working_tree_diff(
+        &self,
+        cwd: &Path,
+        path: &str,
+        staged: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let mut args = vec!["diff".to_owned()];
+        if staged {
+            args.push("--cached".to_owned());
+        }
+        args.extend(strings(&[
+            "--no-ext-diff",
+            "--patch-with-raw",
+            "-z",
+            "--no-color",
+            "HEAD",
+            "--",
+        ]));
+        args.push(path.to_owned());
+        self.git_manager_diff_read(
+            "GitManager.getDiff.workingTree",
+            cwd,
+            &args,
+            false,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_intent_to_add(
+        &self,
+        cwd: &Path,
+        path: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let mut args = strings(&["add", "--intent-to-add", "--"]);
+        args.push(path.to_owned());
+        self.execute(
+            "GitManager.partial.intentToAdd",
+            cwd,
+            &args,
+            false,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_clear_intent_to_add(
+        &self,
+        cwd: &Path,
+        path: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let mut args = strings(&["reset", "--"]);
+        args.push(path.to_owned());
+        self.execute(
+            "GitManager.partial.clearIntentToAdd",
+            cwd,
+            &args,
+            false,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_apply_partial_patch(
+        &self,
+        operation: &str,
+        cwd: &Path,
+        patch: Vec<u8>,
+        cached: bool,
+        reverse: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let mut args = vec!["apply".to_owned()];
+        if cached {
+            args.push("--cached".to_owned());
+        }
+        if reverse {
+            args.push("--reverse".to_owned());
+        }
+        args.extend(strings(&["--unidiff-zero", "--whitespace=nowarn", "-"]));
+        self.execute_with_stdin(operation, cwd, &args, patch, false, cancellation)
+            .await
+    }
+
+    pub(crate) async fn git_manager_untracked_paths(
+        &self,
+        cwd: &Path,
+        path: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let mut args = strings(&["ls-files", "--others", "--exclude-standard", "-z", "--"]);
+        args.push(path.to_owned());
+        self.git_manager_bounded_read(
+            "GitManager.getDiff.untrackedPaths",
+            cwd,
+            &args,
+            false,
+            DEFAULT_OUTPUT_LIMIT,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_untracked_diff(
+        &self,
+        cwd: &Path,
+        path: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let mut args = strings(&[
+            "diff",
+            "--no-ext-diff",
+            "--patch-with-raw",
+            "-z",
+            "--no-color",
+            "--no-index",
+            "--",
+            "/dev/null",
+        ]);
+        args.push(path.to_owned());
+        self.git_manager_diff_read(
+            "GitManager.getDiff.untracked",
+            cwd,
+            &args,
+            true,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_commit_diff(
+        &self,
+        cwd: &Path,
+        sha: &str,
+        path: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let mut args = vec!["log".to_owned(), sha.to_owned()];
+        args.extend(strings(&[
+            "-m",
+            "-1",
+            "--first-parent",
+            "--patch-with-raw",
+            "--format=",
+            "-z",
+            "--no-color",
+            "--",
+        ]));
+        args.push(path.to_owned());
+        self.git_manager_diff_read("GitManager.getDiff.commit", cwd, &args, false, cancellation)
+            .await
+    }
+
+    pub(crate) async fn git_manager_stash_list(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.getStashes.list",
+            cwd,
+            &strings(&[
+                "log",
+                "-g",
+                "-z",
+                "--no-show-signature",
+                "--format=%gD%x1f%H%x1f%gs%x1f%ct%x1f%P",
+                "refs/stash",
+                "--",
+            ]),
+            true,
+            GIT_MANAGER_TIPS_OUTPUT_LIMIT,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_stash_file_list(
+        &self,
+        cwd: &Path,
+        selector: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.getStashes.files",
+            cwd,
+            &[
+                "stash".into(),
+                "show".into(),
+                selector.into(),
+                "--raw".into(),
+                "--numstat".into(),
+                "-z".into(),
+                "--format=format:".into(),
+                "--no-show-signature".into(),
+                "--".into(),
+            ],
+            false,
+            GIT_MANAGER_TIPS_OUTPUT_LIMIT,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_stash_diff(
+        &self,
+        cwd: &Path,
+        selector: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_diff_read(
+            "GitManager.getDiff.stash",
+            cwd,
+            &[
+                "stash".into(),
+                "show".into(),
+                "-p".into(),
+                selector.into(),
+                "--no-color".into(),
+            ],
+            false,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_resolve_merge_tip(
+        &self,
+        cwd: &Path,
+        revision: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.previewMerge.resolveTip",
+            cwd,
+            &[
+                "rev-parse".into(),
+                "--verify".into(),
+                "--end-of-options".into(),
+                format!("{revision}^{{commit}}"),
+            ],
+            true,
+            64 * 1024,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_merge_ahead_behind(
+        &self,
+        cwd: &Path,
+        ours_tip: &str,
+        theirs_tip: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.previewMerge.aheadBehind",
+            cwd,
+            &[
+                "rev-list".into(),
+                "--left-right".into(),
+                "--count".into(),
+                format!("{ours_tip}...{theirs_tip}"),
+                "--".into(),
+            ],
+            false,
+            64 * 1024,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_merge_tree(
+        &self,
+        cwd: &Path,
+        ours_tip: &str,
+        theirs_tip: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.previewMerge.mergeTree",
+            cwd,
+            &[
+                "merge-tree".into(),
+                "--write-tree".into(),
+                "--name-only".into(),
+                "--no-messages".into(),
+                "-z".into(),
+                ours_tip.into(),
+                theirs_tip.into(),
+            ],
+            true,
+            GIT_MANAGER_TIPS_OUTPUT_LIMIT,
+            cancellation,
+        )
+        .await
+    }
+
+    async fn git_manager_diff_read(
+        &self,
+        operation: &str,
+        cwd: &Path,
+        args: &[String],
+        allow_non_zero_exit: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute_with_environment(
+            operation,
+            cwd,
+            args,
+            GitExecutionOptions {
+                allow_non_zero_exit,
+                max_output_bytes: MAX_DIFF_BUFFER_SIZE + 1,
+                output_policy: OutputPolicy::Truncate,
+            },
+            git_read_environment(),
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn run(
         &self,
         operation: &str,
         cwd: &Path,
@@ -1253,6 +2162,7 @@ impl GitRepository {
         if !self.is_repository(cwd, cancellation).await? {
             return Ok(ObservedRemoteStatus {
                 ref_name: None,
+                head_signature: "not-repository".to_owned(),
                 remote: None,
             });
         }
@@ -1289,6 +2199,7 @@ impl GitRepository {
             .await?;
         Ok(ObservedRemoteStatus {
             ref_name: branch,
+            head_signature: parse_head_signature(&status.stdout),
             remote: Some(remote),
         })
     }
@@ -1567,6 +2478,46 @@ impl GitRepository {
             )
             .await?;
         }
+        Ok(())
+    }
+
+    pub async fn git_manager_tracked_paths(
+        &self,
+        cwd: &Path,
+        paths: &[String],
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<String>, GitCommandError> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        validate_pathspecs("GitManager.discard", cwd, paths)?;
+        let mut args = strings(&["-c", "core.quotePath=false", "ls-files", "-z", "--"]);
+        args.extend(paths.iter().cloned());
+        let tracked = self
+            .run_read("GitManager.discard.tracked", cwd, &args, cancellation)
+            .await?;
+        Ok(tracked
+            .stdout
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned)
+            .collect())
+    }
+
+    pub async fn git_manager_restore_tracked_paths(
+        &self,
+        cwd: &Path,
+        paths: &[String],
+        cancellation: &CancellationToken,
+    ) -> Result<(), GitCommandError> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        validate_pathspecs("GitManager.discard", cwd, paths)?;
+        let mut args = strings(&["checkout", "HEAD", "--"]);
+        args.extend(paths.iter().cloned());
+        self.run("GitManager.discard.restore", cwd, &args, cancellation)
+            .await?;
         Ok(())
     }
 
@@ -2874,6 +3825,675 @@ impl GitRepository {
         Ok(ref_name.to_owned())
     }
 
+    pub(crate) async fn git_manager_create_branch(
+        &self,
+        cwd: &Path,
+        name: &str,
+        start_point: Option<&str>,
+        checkout: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let mut args = if checkout {
+            vec!["switch".into(), "-c".into(), name.into()]
+        } else {
+            vec!["branch".into(), name.into()]
+        };
+        if let Some(start_point) = start_point {
+            args.push(start_point.into());
+        }
+        if !checkout {
+            args.push("--no-track".into());
+        }
+        self.execute("GitManager.branchCreate", cwd, &args, true, cancellation)
+            .await
+    }
+
+    pub(crate) async fn git_manager_checkout_local_branch(
+        &self,
+        cwd: &Path,
+        name: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute(
+            "GitManager.branchCheckout.local",
+            cwd,
+            &["switch".into(), name.into()],
+            true,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_checkout_remote_branch(
+        &self,
+        cwd: &Path,
+        local_name: &str,
+        remote_ref: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute(
+            "GitManager.branchCheckout.remote",
+            cwd,
+            &[
+                "switch".into(),
+                "-c".into(),
+                local_name.into(),
+                "--track".into(),
+                remote_ref.into(),
+            ],
+            true,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_rename_branch(
+        &self,
+        cwd: &Path,
+        old_name: &str,
+        new_name: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<ProcessOutput>, GitCommandError> {
+        let first = self
+            .execute(
+                "GitManager.branchRename",
+                cwd,
+                &[
+                    "branch".into(),
+                    "-m".into(),
+                    old_name.into(),
+                    new_name.into(),
+                ],
+                true,
+                cancellation,
+            )
+            .await?;
+        let retry_case_only =
+            first.exit_code != 0 && old_name != new_name && old_name.eq_ignore_ascii_case(new_name);
+        if !retry_case_only {
+            return Ok(vec![first]);
+        }
+        let retry = self
+            .execute(
+                "GitManager.branchRename.forceCase",
+                cwd,
+                &[
+                    "branch".into(),
+                    "-M".into(),
+                    old_name.into(),
+                    new_name.into(),
+                ],
+                true,
+                cancellation,
+            )
+            .await?;
+        Ok(vec![first, retry])
+    }
+
+    pub(crate) async fn git_manager_delete_branch(
+        &self,
+        cwd: &Path,
+        name: &str,
+        force: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute(
+            "GitManager.branchDelete",
+            cwd,
+            &[
+                "branch".into(),
+                if force { "-D" } else { "-d" }.into(),
+                name.into(),
+            ],
+            true,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_delete_remote_branch(
+        &self,
+        cwd: &Path,
+        remote: &str,
+        name: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute(
+            "GitManager.remoteBranchDelete",
+            cwd,
+            &["push".into(), remote.into(), format!(":{name}")],
+            true,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_fetch(
+        &self,
+        cwd: &Path,
+        remote: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute(
+            "GitManager.fetch",
+            cwd,
+            &[
+                "fetch".into(),
+                "--prune".into(),
+                "--recurse-submodules=on-demand".into(),
+                remote.into(),
+            ],
+            true,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_pull(
+        &self,
+        cwd: &Path,
+        remote: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<ProcessOutput>, GitCommandError> {
+        let pull_ff = self
+            .execute(
+                "GitManager.pull.pullFf",
+                cwd,
+                &strings(&["config", "--get", "pull.ff"]),
+                true,
+                cancellation,
+            )
+            .await?;
+        let pull_rebase = self
+            .execute(
+                "GitManager.pull.pullRebase",
+                cwd,
+                &strings(&["config", "--get", "pull.rebase"]),
+                true,
+                cancellation,
+            )
+            .await?;
+        let mut args = strings(&["-c", "rebase.backend=merge", "pull"]);
+        if pull_ff.exit_code != 0 && pull_rebase.exit_code != 0 {
+            args.push("--ff".into());
+        }
+        args.extend(strings(&["--recurse-submodules", remote]));
+        let pull = self
+            .execute("GitManager.pull", cwd, &args, true, cancellation)
+            .await?;
+        Ok(vec![pull_ff, pull_rebase, pull])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn git_manager_push(
+        &self,
+        cwd: &Path,
+        remote: &str,
+        local_branch: &str,
+        remote_branch: Option<&str>,
+        set_upstream: bool,
+        force_with_lease: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let refspec = remote_branch.map_or_else(
+            || local_branch.to_owned(),
+            |remote_branch| format!("{local_branch}:{remote_branch}"),
+        );
+        let mut args = vec!["push".into(), remote.into(), refspec];
+        if set_upstream {
+            args.push("--set-upstream".into());
+        }
+        if force_with_lease {
+            args.push("--force-with-lease".into());
+        }
+        self.execute("GitManager.push", cwd, &args, true, cancellation)
+            .await
+    }
+
+    pub(crate) async fn git_manager_stash_push(
+        &self,
+        cwd: &Path,
+        message: &str,
+        paths: &[String],
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<ProcessOutput>, GitCommandError> {
+        let mut outputs = Vec::new();
+        if !paths.is_empty() {
+            let mut args = strings(&["add", "--"]);
+            args.extend(paths.iter().cloned());
+            outputs.push(
+                self.execute("GitManager.stashPush.stage", cwd, &args, true, cancellation)
+                    .await?,
+            );
+            if outputs.last().is_some_and(|output| output.exit_code != 0) {
+                return Ok(outputs);
+            }
+        }
+        outputs.push(
+            self.execute(
+                "GitManager.stashPush",
+                cwd,
+                &["stash".into(), "push".into(), "-m".into(), message.into()],
+                true,
+                cancellation,
+            )
+            .await?,
+        );
+        Ok(outputs)
+    }
+
+    pub(crate) async fn git_manager_stash_apply(
+        &self,
+        cwd: &Path,
+        selector: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute(
+            "GitManager.stashApply",
+            cwd,
+            &[
+                "stash".into(),
+                "apply".into(),
+                "--quiet".into(),
+                selector.into(),
+            ],
+            true,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_stash_pop(
+        &self,
+        cwd: &Path,
+        selector: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute(
+            "GitManager.stashPop",
+            cwd,
+            &[
+                "stash".into(),
+                "pop".into(),
+                "--quiet".into(),
+                selector.into(),
+            ],
+            true,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_stash_drop(
+        &self,
+        cwd: &Path,
+        selector: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute(
+            "GitManager.stashDrop",
+            cwd,
+            &["stash".into(), "drop".into(), selector.into()],
+            true,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_merge(
+        &self,
+        cwd: &Path,
+        source: &str,
+        no_verify: bool,
+        squash: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let mut args = vec!["merge".to_owned()];
+        if squash {
+            args.push("--squash".to_owned());
+        }
+        if no_verify {
+            args.push("--no-verify".to_owned());
+        }
+        args.push(source.to_owned());
+        self.execute("GitManager.merge", cwd, &args, true, cancellation)
+            .await
+    }
+
+    pub(crate) async fn git_manager_squash_merge_commit(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute(
+            "GitManager.squashMerge.commit",
+            cwd,
+            &strings(&["commit", "--no-edit"]),
+            true,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_rebase(
+        &self,
+        cwd: &Path,
+        base: &str,
+        target: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute(
+            "GitManager.rebase",
+            cwd,
+            &[
+                "-c".to_owned(),
+                "rebase.backend=merge".to_owned(),
+                "rebase".to_owned(),
+                base.to_owned(),
+                target.to_owned(),
+            ],
+            true,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_interactive_rebase(
+        &self,
+        cwd: &Path,
+        todo: &str,
+        message: Option<&str>,
+        last_retained_commit_ref: Option<&str>,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let operation = if message.is_some() {
+            "GitManager.squash"
+        } else {
+            "GitManager.reorder"
+        };
+        let files = create_rewrite_temp_files(operation, cwd, todo, message).await?;
+        let sequence_editor = editor_redirect_command(&files.todo);
+        let mut environment = git_environment();
+        environment.push((
+            "GIT_EDITOR".into(),
+            files.message.as_ref().map_or_else(
+                || OsString::from(":"),
+                |path| editor_redirect_command(path).into(),
+            ),
+        ));
+        let mut args = strings(&[
+            "-c",
+            "rebase.backend=merge",
+            "-c",
+            &format!("sequence.editor={sequence_editor}"),
+            "rebase",
+            "-i",
+        ]);
+        args.push(last_retained_commit_ref.map_or_else(|| "--root".to_owned(), str::to_owned));
+        self.execute_with_environment(
+            operation,
+            cwd,
+            &args,
+            GitExecutionOptions {
+                allow_non_zero_exit: true,
+                max_output_bytes: DEFAULT_OUTPUT_LIMIT,
+                output_policy: OutputPolicy::Truncate,
+            },
+            environment,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_cherry_pick(
+        &self,
+        cwd: &Path,
+        shas: &[String],
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let mut args = strings(&["cherry-pick", "--empty=keep", "-m", "1"]);
+        args.extend(shas.iter().cloned());
+        self.execute("GitManager.cherryPick", cwd, &args, true, cancellation)
+            .await
+    }
+
+    pub(crate) async fn git_manager_revert(
+        &self,
+        cwd: &Path,
+        sha: &str,
+        merge_commit: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let mut args = vec!["revert".to_owned()];
+        if merge_commit {
+            args.extend(strings(&["-m", "1"]));
+        }
+        args.push(sha.to_owned());
+        self.execute("GitManager.revert", cwd, &args, true, cancellation)
+            .await
+    }
+
+    pub(crate) async fn git_manager_reset(
+        &self,
+        cwd: &Path,
+        sha: &str,
+        mode: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute(
+            "GitManager.reset",
+            cwd,
+            &["reset".to_owned(), format!("--{mode}"), sha.to_owned()],
+            true,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_rewrite_log_order(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<String>, GitCommandError> {
+        let output = self
+            .execute(
+                "GitManager.rewrite.logOrder",
+                cwd,
+                &strings(&["rev-list", "--first-parent", "HEAD", "--"]),
+                false,
+                cancellation,
+            )
+            .await?;
+        Ok(output
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|sha| !sha.is_empty())
+            .map(str::to_owned)
+            .collect())
+    }
+
+    pub(crate) async fn git_manager_commit_parent(
+        &self,
+        cwd: &Path,
+        sha: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<String>, GitCommandError> {
+        let output = self
+            .execute(
+                "GitManager.rewrite.parent",
+                cwd,
+                &[
+                    "rev-list".to_owned(),
+                    "--parents".to_owned(),
+                    "-n".to_owned(),
+                    "1".to_owned(),
+                    sha.to_owned(),
+                    "--".to_owned(),
+                ],
+                false,
+                cancellation,
+            )
+            .await?;
+        let mut fields = output.stdout.split_whitespace();
+        if fields.next() != Some(sha) {
+            return Err(simple_error(
+                "GitManager.rewrite.parent",
+                cwd,
+                "Git returned malformed rewrite parent data.",
+            ));
+        }
+        Ok(fields.next().map(str::to_owned))
+    }
+
+    pub(crate) async fn git_manager_is_merge_commit(
+        &self,
+        cwd: &Path,
+        sha: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, GitCommandError> {
+        let output = self
+            .execute(
+                "GitManager.revert.parents",
+                cwd,
+                &[
+                    "show".to_owned(),
+                    "-s".to_owned(),
+                    "--format=%P".to_owned(),
+                    sha.to_owned(),
+                    "--".to_owned(),
+                ],
+                false,
+                cancellation,
+            )
+            .await?;
+        Ok(output.stdout.split_whitespace().nth(1).is_some())
+    }
+
+    pub(crate) async fn git_manager_index_is_empty(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, GitCommandError> {
+        let output = self
+            .execute(
+                "GitManager.continue.staged",
+                cwd,
+                &strings(&["diff", "--cached", "--quiet", "--"]),
+                true,
+                cancellation,
+            )
+            .await?;
+        match output.exit_code {
+            0 => Ok(true),
+            1 => Ok(false),
+            _ => Err(simple_error(
+                "GitManager.continue.staged",
+                cwd,
+                "Git could not inspect the staged conflict resolution.",
+            )),
+        }
+    }
+
+    pub(crate) async fn git_manager_continue(
+        &self,
+        cwd: &Path,
+        operation: &str,
+        skip_empty: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let args = match operation {
+            "rebase" => vec![
+                "-c".to_owned(),
+                "rebase.backend=merge".to_owned(),
+                "rebase".to_owned(),
+                if skip_empty { "--skip" } else { "--continue" }.to_owned(),
+            ],
+            "cherry-pick" => strings(&["cherry-pick", "--continue"]),
+            "revert" => strings(&["revert", "--continue"]),
+            "merge" => strings(&["commit", "--no-edit", "--cleanup=strip"]),
+            _ => {
+                return Err(simple_error(
+                    "GitManager.continue",
+                    cwd,
+                    "Git Manager received an unsupported continue operation.",
+                ));
+            }
+        };
+        let mut environment = git_environment();
+        environment.push(("GIT_EDITOR".into(), ":".into()));
+        self.execute_with_environment(
+            "GitManager.continue",
+            cwd,
+            &args,
+            GitExecutionOptions {
+                allow_non_zero_exit: true,
+                max_output_bytes: DEFAULT_OUTPUT_LIMIT,
+                output_policy: OutputPolicy::Truncate,
+            },
+            environment,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_abort(
+        &self,
+        cwd: &Path,
+        operation: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let args = match operation {
+            "rebase" => strings(&["-c", "rebase.backend=merge", "rebase", "--abort"]),
+            "cherry-pick" => strings(&["cherry-pick", "--abort"]),
+            "revert" => strings(&["revert", "--abort"]),
+            "merge" => strings(&["merge", "--abort"]),
+            _ => {
+                return Err(simple_error(
+                    "GitManager.abort",
+                    cwd,
+                    "Git Manager received an unsupported abort operation.",
+                ));
+            }
+        };
+        self.execute("GitManager.abort", cwd, &args, true, cancellation)
+            .await
+    }
+
+    pub(crate) async fn git_manager_resolve_conflict(
+        &self,
+        cwd: &Path,
+        path: &str,
+        side: super::manager::conflicts::ConflictSide,
+        selected_side_deleted: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<ProcessOutput>, GitCommandError> {
+        let plan =
+            super::manager::conflicts::plan_manual_resolution(path, side, selected_side_deleted);
+        let checkout = self
+            .execute(
+                "GitManager.resolveConflict.checkout",
+                cwd,
+                &plan[0],
+                true,
+                cancellation,
+            )
+            .await?;
+        if checkout.exit_code != 0 && !selected_side_deleted {
+            return Ok(vec![checkout]);
+        }
+        let stage = self
+            .execute(
+                "GitManager.resolveConflict.stage",
+                cwd,
+                &plan[1],
+                true,
+                cancellation,
+            )
+            .await?;
+        Ok(vec![checkout, stage])
+    }
+
     pub async fn switch_ref(
         &self,
         cwd: &Path,
@@ -3172,6 +4792,161 @@ impl GitRepository {
             )
             .await?;
         Ok(Some(sha.stdout.trim().to_owned()))
+    }
+
+    pub async fn commit_with_options(
+        &self,
+        cwd: &Path,
+        args: &[String],
+        message: &[u8],
+        allow_empty: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<GitManagerCommitOutcome, GitCommandError> {
+        let status_args = strings(&[
+            "-c",
+            "core.quotePath=false",
+            "status",
+            "--porcelain=2",
+            "-z",
+            "--untracked-files=all",
+        ]);
+        let status = self
+            .execute_read(
+                "GitManager.commit.status",
+                cwd,
+                &status_args,
+                false,
+                cancellation,
+            )
+            .await?;
+        let has_staged_changes = status
+            .stdout
+            .split('\0')
+            .filter_map(parse_porcelain_v2_line)
+            .any(|record| record.index_changed);
+        let amending = args.iter().any(|argument| argument == "--amend");
+        if !has_staged_changes && !allow_empty && !amending {
+            return Ok(GitManagerCommitOutcome {
+                sha: None,
+                empty: true,
+            });
+        }
+
+        self.execute_with_stdin(
+            "GitManager.commit",
+            cwd,
+            args,
+            message.to_vec(),
+            false,
+            cancellation,
+        )
+        .await?;
+        let sha = self
+            .run(
+                "GitManager.commit.sha",
+                cwd,
+                &strings(&["rev-parse", "HEAD"]),
+                cancellation,
+            )
+            .await?;
+        Ok(GitManagerCommitOutcome {
+            sha: Some(sha.stdout.trim().to_owned()),
+            empty: false,
+        })
+    }
+
+    pub async fn undo_head_commit(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<GitManagerHeadCommit, GitCommandError> {
+        let head = self
+            .run(
+                "GitManager.undoCommit.head",
+                cwd,
+                &strings(&[
+                    "show",
+                    "-s",
+                    "--no-show-signature",
+                    "--format=%H%x00%P%x00%B",
+                    "HEAD",
+                ]),
+                cancellation,
+            )
+            .await?;
+        let head = parse_git_manager_head_commit(cwd, &head.stdout)?;
+        if let Some(parent) = head.parents.first() {
+            self.run(
+                "GitManager.undoCommit.reset",
+                cwd,
+                &["reset".into(), "--mixed".into(), parent.clone()],
+                cancellation,
+            )
+            .await?;
+            return Ok(head);
+        }
+
+        let deleted = self
+            .run(
+                "GitManager.undoCommit.initial.deleted",
+                cwd,
+                &strings(&["diff", "--name-only", "--diff-filter=D", "-z", "HEAD", "--"]),
+                cancellation,
+            )
+            .await?;
+        let deleted_paths = deleted
+            .stdout
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if !deleted_paths.is_empty() {
+            let mut args = strings(&["checkout", "HEAD", "--"]);
+            args.extend(deleted_paths);
+            self.run(
+                "GitManager.undoCommit.initial.restoreDeleted",
+                cwd,
+                &args,
+                cancellation,
+            )
+            .await?;
+        }
+        self.run(
+            "GitManager.undoCommit.initial.deleteHead",
+            cwd,
+            &strings(&["update-ref", "-d", "HEAD"]),
+            cancellation,
+        )
+        .await?;
+        self.run(
+            "GitManager.undoCommit.initial.unstage",
+            cwd,
+            &strings(&["reset", "--", "."]),
+            cancellation,
+        )
+        .await?;
+        Ok(head)
+    }
+
+    pub async fn git_manager_head_tags(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<String>, GitCommandError> {
+        let tags = self
+            .run_read(
+                "GitManager.undoCommit.tags",
+                cwd,
+                &strings(&["tag", "--points-at", "HEAD"]),
+                cancellation,
+            )
+            .await?;
+        Ok(tags
+            .stdout
+            .lines()
+            .filter(|tag| !tag.is_empty())
+            .map(str::to_owned)
+            .collect())
     }
 
     pub async fn push_current_branch(
@@ -4772,7 +6547,7 @@ fn git_environment() -> Vec<(OsString, OsString)> {
     .collect()
 }
 
-fn git_read_environment() -> Vec<(OsString, OsString)> {
+pub(crate) fn git_read_environment() -> Vec<(OsString, OsString)> {
     let mut environment = git_environment();
     environment.push(("GIT_OPTIONAL_LOCKS".into(), "0".into()));
     environment
@@ -4829,6 +6604,89 @@ fn same_worktree_path(registered: &str, path: &Path) -> bool {
     }
 }
 
+async fn create_rewrite_temp_files(
+    operation: &str,
+    cwd: &Path,
+    todo_contents: &str,
+    message_contents: Option<&str>,
+) -> Result<RewriteTempFiles, GitCommandError> {
+    let mut directory = None;
+    for _ in 0..8 {
+        let candidate =
+            std::env::temp_dir().join(format!("bibcode-git-manager-rewrite-{}", Uuid::new_v4()));
+        match tokio::fs::create_dir(&candidate).await {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+
+                    if tokio::fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700))
+                        .await
+                        .is_err()
+                    {
+                        let _ = tokio::fs::remove_dir(&candidate).await;
+                        return Err(simple_error(
+                            operation,
+                            cwd,
+                            "Git Manager could not protect its temporary rewrite directory.",
+                        ));
+                    }
+                }
+                directory = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(_) => {
+                return Err(simple_error(
+                    operation,
+                    cwd,
+                    "Git Manager could not create its temporary rewrite directory.",
+                ));
+            }
+        }
+    }
+    let directory = directory.ok_or_else(|| {
+        simple_error(
+            operation,
+            cwd,
+            "Git Manager could not reserve a temporary rewrite directory.",
+        )
+    })?;
+    let todo = directory.join("todo");
+    let message = message_contents.map(|_| directory.join("message"));
+    let files = RewriteTempFiles {
+        directory,
+        todo,
+        message,
+    };
+    if tokio::fs::write(&files.todo, todo_contents).await.is_err() {
+        return Err(simple_error(
+            operation,
+            cwd,
+            "Git Manager could not write its temporary rewrite todo.",
+        ));
+    }
+    if let (Some(path), Some(contents)) = (files.message.as_ref(), message_contents)
+        && tokio::fs::write(path, contents).await.is_err()
+    {
+        return Err(simple_error(
+            operation,
+            cwd,
+            "Git Manager could not write its temporary squash message.",
+        ));
+    }
+    Ok(files)
+}
+
+fn editor_redirect_command(path: &Path) -> String {
+    let path = display_path(path)
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('$', "\\$")
+        .replace('`', "\\`");
+    format!("cat \"{path}\" >")
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -4843,8 +6701,8 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        GitProcessRunner, GitRepository, OutputPolicy, ProcessError, ProcessOutput, ProcessRequest,
-        git_read_environment, normalize_path_lexically,
+        GitManagerCommitOutcome, GitProcessRunner, GitRepository, OutputPolicy, ProcessError,
+        ProcessOutput, ProcessRequest, git_read_environment, normalize_path_lexically,
     };
     use crate::test_support::TestSandbox;
 
@@ -5088,6 +6946,955 @@ mod tests {
                 .env
                 .iter()
                 .any(|(key, value)| key == "GIT_OPTIONAL_LOCKS" && value == "0")
+        );
+    }
+
+    #[tokio::test]
+    async fn git_manager_branch_create_uses_the_requested_start_and_tracking_policy() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([(
+                "GitManager.branchCreate".into(),
+                process_output("created\n"),
+            )]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+
+        repository
+            .git_manager_create_branch(
+                Path::new("/repo"),
+                "feature/topic",
+                Some("main"),
+                false,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("branch creation succeeds");
+
+        assert_eq!(
+            runner.requests()[0].args,
+            ["branch", "feature/topic", "main", "--no-track"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn git_manager_branch_checkout_supports_local_and_remote_tracking_refs() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([
+                (
+                    "GitManager.branchCheckout.local".into(),
+                    process_output("local\n"),
+                ),
+                (
+                    "GitManager.branchCheckout.remote".into(),
+                    process_output("remote\n"),
+                ),
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+
+        repository
+            .git_manager_checkout_local_branch(
+                Path::new("/repo"),
+                "topic",
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("local checkout succeeds");
+        repository
+            .git_manager_checkout_remote_branch(
+                Path::new("/repo"),
+                "topic-remote",
+                "origin/topic",
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("remote checkout succeeds");
+
+        let requests = runner.requests();
+        assert_eq!(
+            requests[0].args,
+            ["switch", "topic"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            requests[1].args,
+            ["switch", "-c", "topic-remote", "--track", "origin/topic"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn git_manager_case_only_branch_rename_retries_with_capital_m() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([
+                (
+                    "GitManager.branchRename".into(),
+                    process_result(1, "", "case collision"),
+                ),
+                (
+                    "GitManager.branchRename.forceCase".into(),
+                    process_output("renamed\n"),
+                ),
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+
+        let outputs = repository
+            .git_manager_rename_branch(
+                Path::new("/repo"),
+                "Feature",
+                "feature",
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("case-only rename succeeds on retry");
+
+        assert_eq!(outputs.len(), 2);
+        let requests = runner.requests();
+        assert_eq!(requests[0].args[1], "-m");
+        assert_eq!(requests[1].args[1], "-M");
+    }
+
+    #[tokio::test]
+    async fn git_manager_branch_delete_keeps_force_and_remote_deletion_explicit() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([
+                (
+                    "GitManager.branchDelete".into(),
+                    process_output("deleted\n"),
+                ),
+                (
+                    "GitManager.remoteBranchDelete".into(),
+                    process_output("remote deleted\n"),
+                ),
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+
+        repository
+            .git_manager_delete_branch(Path::new("/repo"), "topic", true, &CancellationToken::new())
+            .await
+            .expect("local delete succeeds");
+        repository
+            .git_manager_delete_remote_branch(
+                Path::new("/repo"),
+                "origin",
+                "topic",
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("remote delete succeeds");
+
+        let requests = runner.requests();
+        assert_eq!(
+            requests[0].args,
+            ["branch", "-D", "topic"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            requests[1].args,
+            ["push", "origin", ":topic"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn git_manager_fetch_uses_prune_submodules_and_noninteractive_environment() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([("GitManager.fetch".into(), process_output("fetched\n"))]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+
+        repository
+            .git_manager_fetch(Path::new("/repo"), "origin", &CancellationToken::new())
+            .await
+            .expect("fetch succeeds");
+
+        let request = &runner.requests()[0];
+        assert_eq!(
+            request.args,
+            [
+                "fetch",
+                "--prune",
+                "--recurse-submodules=on-demand",
+                "origin"
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+        );
+        for (key, expected) in [
+            ("GIT_TERMINAL_PROMPT", "0"),
+            ("GIT_ASKPASS", ""),
+            ("SSH_ASKPASS_REQUIRE", "never"),
+        ] {
+            assert!(
+                request
+                    .env
+                    .iter()
+                    .any(|(actual_key, value)| actual_key == key && value == expected)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn git_manager_pull_adds_ff_only_when_both_pull_settings_are_unset() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([
+                ("GitManager.pull.pullFf".into(), process_result(1, "", "")),
+                (
+                    "GitManager.pull.pullRebase".into(),
+                    process_result(1, "", ""),
+                ),
+                ("GitManager.pull".into(), process_output("pulled\n")),
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+
+        let outputs = repository
+            .git_manager_pull(Path::new("/repo"), "origin", &CancellationToken::new())
+            .await
+            .expect("pull succeeds");
+
+        assert_eq!(outputs.len(), 3);
+        assert_eq!(
+            runner.requests()[2].args,
+            [
+                "-c",
+                "rebase.backend=merge",
+                "pull",
+                "--ff",
+                "--recurse-submodules",
+                "origin"
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn git_manager_push_modes_build_explicit_refspecs_and_lease_only_force() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([("GitManager.push".into(), process_output("pushed\n"))]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+
+        repository
+            .git_manager_push(
+                Path::new("/repo"),
+                "origin",
+                "topic",
+                Some("review/topic"),
+                true,
+                true,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("push succeeds");
+
+        let args = &runner.requests()[0].args;
+        assert_eq!(
+            args,
+            &[
+                "push",
+                "origin",
+                "topic:review/topic",
+                "--set-upstream",
+                "--force-with-lease"
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+        );
+        assert!(!args.iter().any(|argument| argument == "--force"));
+    }
+
+    #[tokio::test]
+    async fn git_manager_history_rewrite_commands_match_the_command_contract() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([
+                ("GitManager.rebase".into(), process_output("")),
+                ("GitManager.cherryPick".into(), process_output("")),
+                ("GitManager.revert".into(), process_output("")),
+                ("GitManager.reset".into(), process_output("")),
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+        let cwd = Path::new("/repo");
+        let cancellation = CancellationToken::new();
+
+        repository
+            .git_manager_rebase(cwd, "main", "topic", &cancellation)
+            .await
+            .expect("rebase command");
+        repository
+            .git_manager_cherry_pick(cwd, &["aaaaaaa".into(), "bbbbbbb".into()], &cancellation)
+            .await
+            .expect("cherry-pick command");
+        repository
+            .git_manager_revert(cwd, "ccccccc", false, &cancellation)
+            .await
+            .expect("non-merge revert command");
+        repository
+            .git_manager_revert(cwd, "ddddddd", true, &cancellation)
+            .await
+            .expect("merge revert command");
+        for mode in ["hard", "soft", "mixed"] {
+            repository
+                .git_manager_reset(cwd, "eeeeeee", mode, &cancellation)
+                .await
+                .expect("reset command");
+        }
+
+        let args = runner
+            .requests()
+            .into_iter()
+            .map(|request| request.args)
+            .collect::<Vec<_>>();
+        let expected = [
+            vec!["-c", "rebase.backend=merge", "rebase", "main", "topic"],
+            vec![
+                "cherry-pick",
+                "--empty=keep",
+                "-m",
+                "1",
+                "aaaaaaa",
+                "bbbbbbb",
+            ],
+            vec!["revert", "ccccccc"],
+            vec!["revert", "-m", "1", "ddddddd"],
+            vec!["reset", "--hard", "eeeeeee"],
+            vec!["reset", "--soft", "eeeeeee"],
+            vec!["reset", "--mixed", "eeeeeee"],
+        ]
+        .into_iter()
+        .map(|args| args.into_iter().map(OsString::from).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+        assert_eq!(args, expected);
+        assert!(runner.requests().iter().all(|request| {
+            request
+                .env
+                .iter()
+                .any(|(key, value)| key == "GIT_TERMINAL_PROMPT" && value == "0")
+                && !request
+                    .env
+                    .iter()
+                    .any(|(key, _)| key == "GIT_OPTIONAL_LOCKS")
+        }));
+    }
+
+    #[tokio::test]
+    async fn interactive_rebase_uses_temporary_todo_and_editor_files_then_cleans_them() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([
+                ("GitManager.squash".into(), process_output("")),
+                ("GitManager.reorder".into(), process_output("")),
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+        let cancellation = CancellationToken::new();
+
+        repository
+            .git_manager_interactive_rebase(
+                Path::new("/repo"),
+                "pick aaaaaaa\nsquash bbbbbbb\n",
+                Some("combined message\n"),
+                Some("aaaaaaa^"),
+                &cancellation,
+            )
+            .await
+            .expect("squash rebase command");
+        repository
+            .git_manager_interactive_rebase(
+                Path::new("/repo"),
+                "pick bbbbbbb\npick aaaaaaa\n",
+                None,
+                None,
+                &cancellation,
+            )
+            .await
+            .expect("root reorder command");
+
+        let requests = runner.requests();
+        assert_eq!(requests.len(), 2);
+        for (index, request) in requests.iter().enumerate() {
+            assert_eq!(request.args[0], "-c");
+            assert_eq!(request.args[1], "rebase.backend=merge");
+            assert_eq!(request.args[2], "-c");
+            let sequence_editor = request.args[3].to_string_lossy();
+            let todo_path = editor_file_path(&sequence_editor, "sequence.editor=")
+                .expect("sequence editor file path");
+            assert!(!todo_path.exists(), "todo file is removed after execution");
+            assert_eq!(request.args[4], "rebase");
+            assert_eq!(request.args[5], "-i");
+            assert_eq!(
+                request.args[6],
+                if index == 0 { "aaaaaaa^" } else { "--root" }
+            );
+            assert!(request.stdin.is_none());
+        }
+        let squash_editor = requests[0]
+            .env
+            .iter()
+            .find(|(key, _)| key == "GIT_EDITOR")
+            .map(|(_, value)| value.to_string_lossy().into_owned())
+            .expect("squash editor");
+        let message_path =
+            editor_file_path(&squash_editor, "").expect("squash message editor file path");
+        assert!(
+            !message_path.exists(),
+            "message file is removed after execution"
+        );
+        assert!(
+            requests[1]
+                .env
+                .iter()
+                .any(|(key, value)| key == "GIT_EDITOR" && value == ":")
+        );
+    }
+
+    fn editor_file_path(editor: &str, prefix: &str) -> Option<PathBuf> {
+        editor
+            .strip_prefix(prefix)?
+            .strip_prefix("cat \"")?
+            .strip_suffix("\" >")
+            .map(PathBuf::from)
+    }
+
+    #[tokio::test]
+    async fn recovery_commands_set_the_editor_and_preserve_command_order() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([
+                ("GitManager.continue".into(), process_output("")),
+                ("GitManager.abort".into(), process_output("")),
+                (
+                    "GitManager.resolveConflict.checkout".into(),
+                    process_output(""),
+                ),
+                (
+                    "GitManager.resolveConflict.stage".into(),
+                    process_output(""),
+                ),
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+        let cwd = Path::new("/repo");
+        let cancellation = CancellationToken::new();
+
+        for (operation, skip) in [
+            ("rebase", false),
+            ("rebase", true),
+            ("cherry-pick", false),
+            ("revert", false),
+            ("merge", false),
+        ] {
+            repository
+                .git_manager_continue(cwd, operation, skip, &cancellation)
+                .await
+                .expect("continue command");
+        }
+        for operation in ["rebase", "cherry-pick", "revert", "merge"] {
+            repository
+                .git_manager_abort(cwd, operation, &cancellation)
+                .await
+                .expect("abort command");
+        }
+        repository
+            .git_manager_resolve_conflict(
+                cwd,
+                "nested/file.txt",
+                crate::git::manager::conflicts::ConflictSide::Ours,
+                false,
+                &cancellation,
+            )
+            .await
+            .expect("ours resolution");
+        repository
+            .git_manager_resolve_conflict(
+                cwd,
+                "deleted.txt",
+                crate::git::manager::conflicts::ConflictSide::Theirs,
+                true,
+                &cancellation,
+            )
+            .await
+            .expect("deleted-side resolution");
+
+        let requests = runner.requests();
+        let args = requests
+            .iter()
+            .map(|request| {
+                request
+                    .args
+                    .iter()
+                    .map(|argument| argument.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                vec!["-c", "rebase.backend=merge", "rebase", "--continue"],
+                vec!["-c", "rebase.backend=merge", "rebase", "--skip"],
+                vec!["cherry-pick", "--continue"],
+                vec!["revert", "--continue"],
+                vec!["commit", "--no-edit", "--cleanup=strip"],
+                vec!["-c", "rebase.backend=merge", "rebase", "--abort"],
+                vec!["cherry-pick", "--abort"],
+                vec!["revert", "--abort"],
+                vec!["merge", "--abort"],
+                vec!["checkout", "--ours", "--", "nested/file.txt"],
+                vec!["add", "--", "nested/file.txt"],
+                vec!["checkout", "--theirs", "--", "deleted.txt"],
+                vec!["rm", "--", "deleted.txt"],
+            ]
+        );
+        assert!(requests[..5].iter().all(|request| {
+            request
+                .env
+                .iter()
+                .any(|(key, value)| key == "GIT_EDITOR" && value == ":")
+        }));
+    }
+
+    #[tokio::test]
+    async fn conflict_state_uses_porcelain_markers_numstat_and_binary_attributes() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([
+                (
+                    "GitManager.conflicts.status".into(),
+                    process_output(
+                        "u UU N... 100644 100644 100644 100644 aaaaaaa bbbbbbb ccccccc text.txt\0\
+                         u AA N... 100644 100644 100644 100644 aaaaaaa bbbbbbb ccccccc image.dat\0",
+                    ),
+                ),
+                (
+                    "GitManager.conflicts.markers".into(),
+                    process_result(
+                        2,
+                        "",
+                        "text.txt:1: leftover conflict marker\n\
+                         text.txt:3: leftover conflict marker\n\
+                         text.txt:5: leftover conflict marker\n",
+                    ),
+                ),
+                (
+                    "GitManager.conflicts.numstat".into(),
+                    process_output("-\t-\timage.dat\0"),
+                ),
+                (
+                    "GitManager.conflicts.attributes".into(),
+                    process_output("image.dat\0merge\0binary\0"),
+                ),
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+
+        let states = repository
+            .git_manager_conflict_states(Path::new("/repo"), &CancellationToken::new())
+            .await
+            .expect("conflict state");
+
+        assert_eq!(states.len(), 2);
+        assert_eq!(states[0].path, "text.txt");
+        assert_eq!(states[0].marker_count, 3);
+        assert_eq!(
+            states[1].kind,
+            crate::git::manager::conflicts::ConflictKind::Binary
+        );
+        let requests = runner.requests();
+        let args = requests
+            .iter()
+            .map(|request| request.args.clone())
+            .collect::<Vec<_>>();
+        let expected = [
+            vec![
+                "-c",
+                "core.quotePath=false",
+                "status",
+                "--porcelain=2",
+                "-z",
+                "--untracked-files=all",
+            ],
+            vec!["diff", "--check"],
+            vec!["diff", "--numstat", "-z"],
+            vec!["check-attr", "--stdin", "-z", "merge"],
+        ]
+        .into_iter()
+        .map(|args| args.into_iter().map(OsString::from).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+        assert_eq!(args, expected);
+        assert_eq!(
+            requests[3].stdin.as_deref(),
+            Some(b"text.txt\0image.dat\0".as_slice())
+        );
+        assert!(requests.iter().all(|request| {
+            !request
+                .env
+                .iter()
+                .any(|(key, _)| key == "GIT_OPTIONAL_LOCKS")
+        }));
+    }
+
+    #[tokio::test]
+    async fn rewrite_inspection_reads_history_parents_and_staged_emptiness() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([
+                (
+                    "GitManager.rewrite.logOrder".into(),
+                    process_output("bbbbbbb\naaaaaaa\n"),
+                ),
+                (
+                    "GitManager.rewrite.parent".into(),
+                    process_output("aaaaaaa 0000000\n"),
+                ),
+                (
+                    "GitManager.revert.parents".into(),
+                    process_output("1111111 2222222\n"),
+                ),
+                (
+                    "GitManager.continue.staged".into(),
+                    process_result(1, "", ""),
+                ),
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+        let cancellation = CancellationToken::new();
+
+        assert_eq!(
+            repository
+                .git_manager_rewrite_log_order(Path::new("/repo"), &cancellation)
+                .await
+                .expect("history order"),
+            ["bbbbbbb", "aaaaaaa"]
+        );
+        assert_eq!(
+            repository
+                .git_manager_commit_parent(Path::new("/repo"), "aaaaaaa", &cancellation)
+                .await
+                .expect("parent probe"),
+            Some("0000000".to_owned())
+        );
+        assert!(
+            repository
+                .git_manager_is_merge_commit(Path::new("/repo"), "ccccccc", &cancellation)
+                .await
+                .expect("merge-parent probe")
+        );
+        assert!(
+            !repository
+                .git_manager_index_is_empty(Path::new("/repo"), &cancellation)
+                .await
+                .expect("staged probe")
+        );
+
+        let args = runner
+            .requests()
+            .into_iter()
+            .map(|request| request.args)
+            .collect::<Vec<_>>();
+        let expected = [
+            vec!["rev-list", "--first-parent", "HEAD", "--"],
+            vec!["rev-list", "--parents", "-n", "1", "aaaaaaa", "--"],
+            vec!["show", "-s", "--format=%P", "ccccccc", "--"],
+            vec!["diff", "--cached", "--quiet", "--"],
+        ]
+        .into_iter()
+        .map(|args| args.into_iter().map(OsString::from).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+        assert_eq!(args, expected);
+    }
+
+    #[tokio::test]
+    async fn git_manager_commit_uses_stdin_and_preserves_the_visible_index() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([
+                (
+                    "GitManager.commit.status".into(),
+                    process_output("1 M. N... 100644 100644 100644 aaaaaaa bbbbbbb tracked.txt\0"),
+                ),
+                ("GitManager.commit".into(), process_output("")),
+                (
+                    "GitManager.commit.sha".into(),
+                    process_output("0123456789012345678901234567890123456789\n"),
+                ),
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+        let message = b"summary\n\ndescription\n";
+
+        let result = repository
+            .commit_with_options(
+                Path::new("/repo"),
+                &[
+                    "commit".into(),
+                    "--no-verify".into(),
+                    "-F".into(),
+                    "-".into(),
+                ],
+                message,
+                false,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("commit succeeds");
+
+        assert_eq!(
+            result,
+            GitManagerCommitOutcome {
+                sha: Some("0123456789012345678901234567890123456789".into()),
+                empty: false,
+            }
+        );
+        let requests = runner.requests();
+        assert_eq!(requests[1].stdin.as_deref(), Some(message.as_slice()));
+        assert_eq!(
+            requests[1].args,
+            ["commit", "--no-verify", "-F", "-"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+        assert!(requests.iter().all(|request| {
+            !request
+                .args
+                .iter()
+                .any(|arg| arg == "reset" || arg == "add")
+        }));
+    }
+
+    #[tokio::test]
+    async fn git_manager_partial_apply_modes_keep_index_and_worktree_targets_distinct() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([
+                ("GitManager.stagePartial.apply".into(), process_output("")),
+                ("GitManager.unstagePartial.apply".into(), process_output("")),
+                ("GitManager.discardPartial.apply".into(), process_output("")),
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+        let patch = b"diff payload\n".to_vec();
+        let cancellation = CancellationToken::new();
+
+        for (operation, cached, reverse) in [
+            ("GitManager.stagePartial.apply", true, false),
+            ("GitManager.unstagePartial.apply", true, true),
+            ("GitManager.discardPartial.apply", false, true),
+        ] {
+            repository
+                .git_manager_apply_partial_patch(
+                    operation,
+                    Path::new("/repo"),
+                    patch.clone(),
+                    cached,
+                    reverse,
+                    &cancellation,
+                )
+                .await
+                .expect("partial apply");
+        }
+
+        let requests = runner.requests();
+        let args = requests
+            .iter()
+            .map(|request| {
+                request
+                    .args
+                    .iter()
+                    .map(|argument| argument.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                vec![
+                    "apply",
+                    "--cached",
+                    "--unidiff-zero",
+                    "--whitespace=nowarn",
+                    "-"
+                ],
+                vec![
+                    "apply",
+                    "--cached",
+                    "--reverse",
+                    "--unidiff-zero",
+                    "--whitespace=nowarn",
+                    "-"
+                ],
+                vec![
+                    "apply",
+                    "--reverse",
+                    "--unidiff-zero",
+                    "--whitespace=nowarn",
+                    "-"
+                ],
+            ]
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.stdin.as_deref() == Some(patch.as_slice()))
+        );
+    }
+
+    #[tokio::test]
+    async fn git_manager_undo_uses_a_mixed_reset_to_the_first_parent() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([
+                (
+                    "GitManager.undoCommit.head".into(),
+                    process_output(
+                        "2222222222222222222222222222222222222222\0\
+                         1111111111111111111111111111111111111111\0\
+                         subject\n\nbody\n",
+                    ),
+                ),
+                ("GitManager.undoCommit.reset".into(), process_output("")),
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+
+        let undone = repository
+            .undo_head_commit(Path::new("/repo"), &CancellationToken::new())
+            .await
+            .expect("undo succeeds");
+
+        assert_eq!(undone.sha, "2222222222222222222222222222222222222222");
+        assert_eq!(undone.message, "subject\n\nbody\n");
+        assert_eq!(
+            runner.requests()[1].args,
+            [
+                "reset",
+                "--mixed",
+                "1111111111111111111111111111111111111111"
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn git_manager_discard_resolves_tracked_paths_without_mutating() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([(
+                "GitManager.discard.tracked".into(),
+                process_output("dir/tracked.txt\0root.txt\0"),
+            )]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+
+        let tracked = repository
+            .git_manager_tracked_paths(
+                Path::new("/repo"),
+                &["dir".into(), "root.txt".into()],
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("tracked paths resolve");
+
+        assert_eq!(tracked, ["dir/tracked.txt", "root.txt"]);
+        assert_eq!(
+            runner.requests()[0].args,
+            [
+                "-c",
+                "core.quotePath=false",
+                "ls-files",
+                "-z",
+                "--",
+                "dir",
+                "root.txt"
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn git_manager_undo_restores_deleted_files_from_an_initial_commit() {
+        fn git(cwd: &Path, args: &[&str]) -> std::process::Output {
+            Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "Git Manager Test")
+                .env("GIT_AUTHOR_EMAIL", "git-manager@example.test")
+                .env("GIT_COMMITTER_NAME", "Git Manager Test")
+                .env("GIT_COMMITTER_EMAIL", "git-manager@example.test")
+                .output()
+                .expect("git fixture starts")
+        }
+
+        let fixture = tempfile::tempdir().expect("temporary repository");
+        assert!(
+            git(fixture.path(), &["init", "-q", "-b", "main"])
+                .status
+                .success()
+        );
+        fs::write(fixture.path().join("tracked.txt"), "initial\n").expect("tracked fixture");
+        assert!(
+            git(fixture.path(), &["add", "tracked.txt"])
+                .status
+                .success()
+        );
+        assert!(
+            git(fixture.path(), &["commit", "-q", "-m", "Initial subject"])
+                .status
+                .success()
+        );
+        fs::remove_file(fixture.path().join("tracked.txt")).expect("delete tracked fixture");
+
+        let undone = GitRepository::default()
+            .undo_head_commit(fixture.path(), &CancellationToken::new())
+            .await
+            .expect("initial commit undo succeeds");
+
+        assert!(undone.parents.is_empty());
+        assert!(undone.message.starts_with("Initial subject"));
+        assert_eq!(
+            fs::read_to_string(fixture.path().join("tracked.txt")).expect("restored file"),
+            "initial\n"
+        );
+        assert!(
+            !git(fixture.path(), &["rev-parse", "--verify", "HEAD"])
+                .status
+                .success()
+        );
+        assert_eq!(
+            String::from_utf8(git(fixture.path(), &["status", "--porcelain=v1"]).stdout)
+                .expect("UTF-8 status"),
+            "?? tracked.txt\n"
         );
     }
 
@@ -6134,6 +8941,14 @@ fn parse_branch_headers(stdout: &str) -> (Option<String>, Option<String>, u64, u
     (branch, upstream, ahead, behind)
 }
 
+fn parse_head_signature(stdout: &str) -> String {
+    stdout
+        .lines()
+        .filter(|line| line.starts_with("# branch.oid ") || line.starts_with("# branch.head "))
+        .collect::<Vec<_>>()
+        .join("\0")
+}
+
 fn parse_summary_identity(
     cwd: &Path,
     stdout: &str,
@@ -6186,6 +9001,28 @@ fn area_order(area: Option<VcsStagingArea>) -> u8 {
         Some(VcsStagingArea::Untracked) => 2,
         None => 3,
     }
+}
+
+fn parse_git_manager_head_commit(
+    cwd: &Path,
+    output: &str,
+) -> Result<GitManagerHeadCommit, GitCommandError> {
+    let mut fields = output.splitn(3, '\0');
+    let sha = fields.next().unwrap_or_default().trim();
+    let parents = fields.next().unwrap_or_default();
+    let message = fields.next();
+    if sha.is_empty() || message.is_none() {
+        return Err(simple_error(
+            "GitManager.undoCommit.head",
+            cwd,
+            "Git returned malformed HEAD commit data.",
+        ));
+    }
+    Ok(GitManagerHeadCommit {
+        sha: sha.to_owned(),
+        parents: parents.split_whitespace().map(str::to_owned).collect(),
+        message: message.unwrap_or_default().to_owned(),
+    })
 }
 
 pub(crate) fn validate_pathspecs(

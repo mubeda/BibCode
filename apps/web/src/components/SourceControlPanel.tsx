@@ -1,3 +1,4 @@
+import { scopedThreadKey } from "@bibcode/client-runtime/environment";
 import type {
   GitStackedAction,
   ScopedThreadRef,
@@ -51,10 +52,7 @@ import { cn, randomUUID } from "~/lib/utils";
 import { readLocalApi } from "~/localApi";
 import { useRightPanelStore } from "~/rightPanelStore";
 import { getSourceControlPresentation } from "~/sourceControlPresentation";
-import {
-  selectThreadSourceControlDraft,
-  useSourceControlPanelStore,
-} from "~/sourceControlPanelStore";
+import { useSourceControlDraft } from "~/sourceControlDraft";
 import { usePrimaryEnvironmentId } from "~/state/environments";
 import { useEnvironmentQuery } from "~/state/query";
 import { primaryServerAvailableEditorsAtom } from "~/state/server";
@@ -157,11 +155,11 @@ export default function SourceControlPanel({
   );
   const status: VcsStatusResult | null = statusQuery.data ?? null;
 
-  const draft = useSourceControlPanelStore((store) =>
-    selectThreadSourceControlDraft(store.byThreadKey, threadRef),
-  );
-  const setMessage = useSourceControlPanelStore((store) => store.setMessage);
-  const clearDraft = useSourceControlPanelStore((store) => store.clearDraft);
+  const draft = useSourceControlDraft({
+    environmentId,
+    cwd: gitCwd ?? "",
+    legacyThreadKey: scopedThreadKey(threadRef),
+  });
 
   const runAction = useGitStackedAction(scope);
   const pullAction = useVcsPullAction(scope);
@@ -353,7 +351,7 @@ export default function SourceControlPanel({
       }
       // Commit succeeded: clear the drafted message.
       if (actionCanCommit) {
-        clearDraft(threadRef);
+        draft.clear();
       }
       // Refresh the commits list (and the relative-time clock) after any success.
       setCommitSignal((value) => value + 1);
@@ -365,17 +363,7 @@ export default function SourceControlPanel({
         data: { ...threadToastData, dismissAfterVisibleMs: 10_000 },
       });
     },
-    [
-      clearDraft,
-      draft.message,
-      files,
-      hasAreas,
-      isDefaultRef,
-      runAction,
-      status,
-      threadRef,
-      threadToastData,
-    ],
+    [draft.message, draft.clear, files, hasAreas, isDefaultRef, runAction, status, threadToastData],
   );
 
   const runPull = useCallback(async () => {
@@ -622,9 +610,9 @@ export default function SourceControlPanel({
       return;
     }
     if (result.value.message.trim().length > 0) {
-      setMessage(threadRef, result.value.message);
+      draft.setMessage(result.value.message);
     }
-  }, [generateAction, generateFilePaths, setMessage, threadRef, threadToastData]);
+  }, [draft.setMessage, generateAction, generateFilePaths, threadToastData]);
 
   const cancelGenerate = useCallback(() => {
     // There is no clean client-side interrupt path for this RPC: unlike
@@ -836,7 +824,7 @@ export default function SourceControlPanel({
         <div className="relative">
           <Textarea
             value={draft.message}
-            onChange={(event) => setMessage(threadRef, event.target.value)}
+            onChange={(event) => draft.setMessage(event.target.value)}
             placeholder="Message (leave empty to auto-generate)"
             size="sm"
             aria-label="Commit message"

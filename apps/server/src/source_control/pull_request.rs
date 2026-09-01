@@ -21,6 +21,15 @@ pub(crate) struct ProviderCommandSpec {
     prefix_args: Vec<OsString>,
 }
 
+pub(crate) struct ProviderCommandInvocation<'a> {
+    pub provider: ProviderKind,
+    pub cwd: &'a std::path::Path,
+    pub operation: &'a str,
+    pub command: &'a ProviderCommandSpec,
+    pub args: Vec<OsString>,
+    pub allowed_non_zero_exit_codes: &'a [i32],
+}
+
 impl ProviderCommandSpec {
     pub(crate) fn new(
         executable: impl Into<PathBuf>,
@@ -309,7 +318,10 @@ impl PullRequestService {
         })
     }
 
-    fn current_provider_command(&self, provider: ProviderKind) -> Option<&ProviderCommandSpec> {
+    pub(crate) fn current_provider_command(
+        &self,
+        provider: ProviderKind,
+    ) -> Option<&ProviderCommandSpec> {
         match provider {
             ProviderKind::Github => Some(&self.github_command),
             ProviderKind::Gitlab => Some(&self.gitlab_command),
@@ -969,7 +981,35 @@ impl PullRequestService {
         args: Vec<OsString>,
         cancellation: &CancellationToken,
     ) -> Result<crate::git::ProcessOutput, SourceControlProviderError> {
-        self.runner
+        self.run_provider_os_with_allowed_exit_codes(
+            ProviderCommandInvocation {
+                provider,
+                cwd,
+                operation,
+                command,
+                args,
+                allowed_non_zero_exit_codes: &[],
+            },
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn run_provider_os_with_allowed_exit_codes(
+        &self,
+        invocation: ProviderCommandInvocation<'_>,
+        cancellation: &CancellationToken,
+    ) -> Result<crate::git::ProcessOutput, SourceControlProviderError> {
+        let ProviderCommandInvocation {
+            provider,
+            cwd,
+            operation,
+            command,
+            args,
+            allowed_non_zero_exit_codes,
+        } = invocation;
+        let output = self
+            .runner
             .run(
                 ProcessRequest {
                     operation: format!("source-control.{operation}"),
@@ -982,7 +1022,7 @@ impl PullRequestService {
                     max_output_bytes: 128_000,
                     output_policy: OutputPolicy::Error,
                     append_truncation_marker: false,
-                    allow_non_zero_exit: false,
+                    allow_non_zero_exit: true,
                 },
                 cancellation,
             )
@@ -996,7 +1036,19 @@ impl PullRequestService {
                     None,
                     &error.to_string(),
                 )
-            })
+            })?;
+        if output.exit_code == 0 || allowed_non_zero_exit_codes.contains(&output.exit_code) {
+            Ok(output)
+        } else {
+            Err(operation_error(
+                provider,
+                cwd,
+                operation,
+                Some(command.label()),
+                None,
+                "Provider CLI returned a non-success exit status.",
+            ))
+        }
     }
 }
 
