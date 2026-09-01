@@ -76,6 +76,9 @@ and Linux or `.zip` for Windows. Public OS/architecture keys are
 The packages are direct GitHub Release downloads, not hosted APT or RPM repositories.
 Every release includes `bibcode-server-SHA256SUMS`; optional server `.minisig` files
 appear only when both dedicated server-signing secrets are configured.
+Windows server archives are written through `scripts/create-portable-zip.ps1`, which assigns
+forward-slash entry names explicitly. The artifact builder rejects a mislabeled non-ZIP payload,
+backslash entry names, duplicate entries, traversal, or paths outside the versioned root.
 
 ## Version Source
 

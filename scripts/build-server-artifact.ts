@@ -158,16 +158,13 @@ export function planServerArtifact(
             "-NoLogo",
             "-NoProfile",
             "-NonInteractive",
-            "-Command",
-            "$ErrorActionPreference = 'Stop'; Add-Type -AssemblyName System.IO.Compression.FileSystem; [IO.Compression.ZipFile]::CreateFromDirectory([IO.Path]::GetFullPath($env:BIBCODE_SERVER_ARCHIVE_SOURCE), [IO.Path]::GetFullPath($env:BIBCODE_SERVER_ARCHIVE_DESTINATION), [IO.Compression.CompressionLevel]::Optimal, $true)",
+            "-File",
+            NodePath.join(repositoryRoot, "scripts/create-portable-zip.ps1"),
+            "-Source",
+            NodePath.win32.join(NodePath.basename(stagingParent), distributionRootName),
+            "-Destination",
+            archiveName,
           ],
-          env: {
-            BIBCODE_SERVER_ARCHIVE_SOURCE: NodePath.win32.join(
-              NodePath.basename(stagingParent),
-              distributionRootName,
-            ),
-            BIBCODE_SERVER_ARCHIVE_DESTINATION: archiveName,
-          },
         }
       : {
           command: "tar",

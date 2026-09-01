@@ -112,13 +112,13 @@ describe("server artifact builder", () => {
         "-NoLogo",
         "-NoProfile",
         "-NonInteractive",
-        "-Command",
-        expect.stringContaining("CreateFromDirectory"),
+        "-File",
+        NodePath.join(root, "scripts/create-portable-zip.ps1"),
+        "-Source",
+        "staging\\bibcode-server-v0.4.3-windows-x86_64",
+        "-Destination",
+        "bibcode-server-v0.4.3-windows-x86_64.zip",
       ],
-      env: {
-        BIBCODE_SERVER_ARCHIVE_DESTINATION: "bibcode-server-v0.4.3-windows-x86_64.zip",
-        BIBCODE_SERVER_ARCHIVE_SOURCE: "staging\\bibcode-server-v0.4.3-windows-x86_64",
-      },
     });
     expect(plan.archiveListCommand.command).toBe("powershell.exe");
     expect(plan.archiveListCommand.env).toEqual({
