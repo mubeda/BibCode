@@ -2,6 +2,7 @@ import { RegistryContext } from "@effect/atom-react";
 import { projectKey } from "@bibcode/client-runtime/state/entities";
 import type {
   GitManagerInProgressOperation,
+  GitManagerConflictState,
   GitManagerOperationEvent,
   GitManagerOperationRequest,
   GitManagerRefEntry,
@@ -11,7 +12,13 @@ import type {
   VcsWorktreeDescriptor,
 } from "@bibcode/contracts";
 import * as Cause from "effect/Cause";
-import { ArchiveIcon, GitBranchIcon, GitMergeIcon, GitPullRequestIcon } from "lucide-react";
+import {
+  ArchiveIcon,
+  GitBranchIcon,
+  GitCompareArrowsIcon,
+  GitMergeIcon,
+  GitPullRequestIcon,
+} from "lucide-react";
 import { memo, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 
 import {
@@ -31,6 +38,11 @@ import { worktreeEnvironment } from "../../state/worktrees";
 import { Button } from "../ui/button";
 import { Tabs, TabsList, TabsPanel, TabsTab } from "../ui/tabs";
 import { GitManagerInProgressStrip } from "./GitManagerInProgressStrip";
+import {
+  GitManagerBranchDialogs,
+  type GitManagerBranchDialog,
+  type GitManagerBranchDialogSubmission,
+} from "./dialogs/GitManagerBranchDialogs";
 import { GitManagerMergeDialog } from "./merge/GitManagerMergeDialog";
 import { GitManagerStashDiff } from "./stash/GitManagerStashDiff";
 import { GitManagerStashList } from "./stash/GitManagerStashList";
@@ -41,14 +53,28 @@ import {
 } from "./gitManagerAvailability";
 import { GitManagerChangesView } from "./changes/GitManagerChangesView";
 import { GitManagerImageDiffModeProvider } from "./diff/GitManagerImageDiffModeContext";
-import { GitManagerHistoryView } from "./history/GitManagerHistoryView";
+import {
+  GitManagerHistoryView,
+  type GitManagerHistoryAction,
+} from "./history/GitManagerHistoryView";
 import { GitManagerPullRequestPanel } from "./provider/GitManagerPullRequestPanel";
 import { GitManagerToolbar } from "./GitManagerToolbar";
+import { GitManagerMultiCommitOperationDialog } from "./rewrite/GitManagerMultiCommitOperationDialog";
+import { GitManagerResetDialog, type GitManagerResetMode } from "./rewrite/GitManagerResetDialog";
+import {
+  advanceMultiCommitOperation,
+  type GitManagerMultiCommitEvent,
+  type GitManagerMultiCommitKind,
+  type GitManagerMultiCommitState,
+} from "./rewrite/gitManagerMultiCommitOperation.logic";
+import { GitManagerTagDialog } from "./tags/GitManagerTagDialog";
 import { GitManagerOperationBanner } from "./toolbar/GitManagerOperationBanner";
 
 const EMPTY_WORKTREES: ReadonlyArray<VcsWorktreeDescriptor> = Object.freeze([]);
 const EMPTY_REFS: ReadonlyArray<GitManagerRefEntry> = Object.freeze([]);
 const EMPTY_STASHES: ReadonlyArray<GitManagerStashEntry> = Object.freeze([]);
+const EMPTY_CONFLICT_PATHS: ReadonlyArray<string> = Object.freeze([]);
+const EMPTY_TAG_NAMES: ReadonlyArray<string> = Object.freeze([]);
 const STASH_MUTATION_OPERATIONS = new Set(["stash-apply", "stash-pop", "stash-drop"]);
 
 type ResumableInProgressOperation = Omit<GitManagerInProgressOperation, "kind"> & {
@@ -60,6 +86,32 @@ function asResumableOperation(
 ): ResumableInProgressOperation | null {
   if (operation === null || operation.kind === "squash") return null;
   return { ...operation, kind: operation.kind };
+}
+
+function asMultiCommitKind(
+  operation: GitManagerInProgressOperation | null,
+): GitManagerMultiCommitKind | null {
+  if (operation === null || operation.kind === "revert") return null;
+  return operation.kind;
+}
+
+function createMultiCommitState(
+  kind: GitManagerMultiCommitKind,
+  step: GitManagerMultiCommitState["step"],
+  selectedShas: ReadonlyArray<string>,
+): GitManagerMultiCommitState {
+  return {
+    step,
+    kind,
+    selectedShas,
+    selectedBranch: null,
+    conflicts: [],
+    continueBlocked: null,
+    originalBranchTip: null,
+    operationEvent: null,
+    operationStartedExternally: false,
+    abortRequested: false,
+  };
 }
 
 export interface GitManagerPanelProps {
@@ -114,12 +166,16 @@ interface GitManagerRepositorySurfacesProps {
   };
   readonly projectRef: ScopedProjectRef;
   readonly signalGeneration: number | null;
+  readonly activeTab: GitManagerTab;
+  readonly onTabChange: (value: string | number | null) => void;
 }
 
 const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces({
   scope,
   projectRef,
   signalGeneration,
+  activeTab,
+  onTabChange,
 }: GitManagerRepositorySurfacesProps) {
   const registry = useContext(RegistryContext);
   const { environmentId, cwd } = scope;
@@ -193,6 +249,8 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
 
   const snapshot: GitManagerRefsSnapshot | null = refsQuery.data ?? null;
   const localBranches = snapshot?.localBranches ?? EMPTY_REFS;
+  const currentBranch = localBranches.find((branch) => branch.current) ?? null;
+  const currentBranchName = currentBranch?.name ?? null;
   const stashes = stashesQuery.data ?? EMPTY_STASHES;
   const repositoryBlockedReasons = useMemo(
     () => localBranches.flatMap((branch) => branch.blocked),
@@ -205,11 +263,30 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
   );
   const inProgressBlocked =
     repositoryBlockedReasons.find((reason) => reason.code === "merge-in-progress") ?? null;
+  const continueBlocked =
+    repositoryBlockedReasons.find((reason) => reason.operation === "continue") ?? null;
   const inProgressOperation = snapshot?.inProgressOperation ?? null;
   const resumableOperation = asResumableOperation(inProgressOperation);
+  const externalMultiCommitKind = asMultiCommitKind(inProgressOperation);
+  const conflictedPaths = snapshot?.conflictedPaths ?? EMPTY_CONFLICT_PATHS;
+  const conflicts: ReadonlyArray<GitManagerConflictState> = conflictedPaths.map((path) => ({
+    path,
+    kind: "binary",
+    markerCount: 1,
+    resolution: null,
+  }));
   const recentNames = useMemo(() => (recentRef === null ? [] : [recentRef]), [recentRef]);
 
   const [mergeDialogOpen, setMergeDialogOpen] = useState(false);
+  const [multiCommitState, setMultiCommitState] = useState<GitManagerMultiCommitState | null>(null);
+  const [historyBranchDialog, setHistoryBranchDialog] = useState<GitManagerBranchDialog | null>(
+    null,
+  );
+  const [historyTagTargetSha, setHistoryTagTargetSha] = useState<string | null>(null);
+  const [resetTargetSha, setResetTargetSha] = useState<string | null>(null);
+  const [historyActionMessage, setHistoryActionMessage] = useState<string | null>(null);
+  const [pendingRewriteRequest, setPendingRewriteRequest] =
+    useState<GitManagerOperationRequest | null>(null);
   const [operationEvent, setOperationEvent] = useState<GitManagerOperationEvent | null>(null);
   const [operationRunning, setOperationRunning] = useState(false);
   const activeOperationRef = useRef<GitManagerOperationHandle | null>(null);
@@ -224,12 +301,18 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
     if (stashPaneOpen) refreshStashes();
   }, [refreshRefs, refreshStashes, stashPaneOpen]);
   const executeOperation = useCallback(
-    async (input: GitManagerOperationRequest): Promise<boolean> => {
+    async (
+      input: GitManagerOperationRequest,
+      onEvent?: (event: GitManagerOperationEvent) => void,
+    ): Promise<boolean> => {
       if (activeOperationRef.current !== null) return false;
       setOperationRunning(true);
-      setOperationEvent({ _tag: "started", operation: input._tag });
+      const startedEvent = { _tag: "started", operation: input._tag } as const;
+      setOperationEvent(startedEvent);
+      onEvent?.(startedEvent);
       const handle = runGitManagerOperation(registry, { environmentId, input }, (event) => {
         setOperationEvent(event);
+        onEvent?.(event);
         if (event._tag === "failed" || event._tag === "finished") {
           setOperationRunning(false);
         }
@@ -250,6 +333,13 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
           message,
           blocked: null,
         });
+        onEvent?.({
+          _tag: "failed",
+          operation: input._tag,
+          code: "transport-error",
+          message,
+          blocked: null,
+        });
         return false;
       }
       return result.value._tag === "finished";
@@ -261,6 +351,222 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
     activeOperationRef.current = null;
     setOperationRunning(false);
   }, []);
+  const externalMultiCommitState =
+    externalMultiCommitKind === null || conflicts.length === 0
+      ? null
+      : {
+          ...createMultiCommitState(externalMultiCommitKind, "show-conflicts", []),
+          operationStartedExternally: true,
+        };
+  const baseMultiCommitState = multiCommitState ?? externalMultiCommitState;
+  const presentedMultiCommitState =
+    baseMultiCommitState === null
+      ? null
+      : {
+          ...baseMultiCommitState,
+          conflicts,
+          continueBlocked,
+          inProgressOperation,
+          refs: localBranches,
+          recentNames,
+        };
+  const presentedMultiCommitStateRef = useRef(presentedMultiCommitState);
+  const pendingRewriteRequestRef = useRef(pendingRewriteRequest);
+  presentedMultiCommitStateRef.current = presentedMultiCommitState;
+  pendingRewriteRequestRef.current = pendingRewriteRequest;
+  const observeMultiCommitEvent = useCallback((event: GitManagerOperationEvent) => {
+    setMultiCommitState((current) => {
+      if (current === null) return null;
+      const next = advanceMultiCommitOperation(current, event);
+      return next.step === null ? null : next;
+    });
+  }, []);
+  const runMultiCommitOperation = useCallback(
+    (state: GitManagerMultiCommitState, input: GitManagerOperationRequest) => {
+      setHistoryActionMessage(null);
+      setPendingRewriteRequest(null);
+      setMultiCommitState(state);
+      void executeOperation(input, observeMultiCommitEvent);
+    },
+    [executeOperation, observeMultiCommitEvent],
+  );
+  const rewriteNeedsForceWarning =
+    currentBranch?.upstream !== null && currentBranch?.upstream !== undefined;
+  const startHistoryRewrite = useCallback(
+    (
+      kind: "squash" | "reorder",
+      shas: ReadonlyArray<string>,
+      request: GitManagerOperationRequest,
+    ) => {
+      const state = {
+        ...createMultiCommitState(
+          kind,
+          rewriteNeedsForceWarning ? "warn-force-push" : "show-progress",
+          shas,
+        ),
+        commitsArePushed: rewriteNeedsForceWarning,
+      };
+      if (rewriteNeedsForceWarning) {
+        setPendingRewriteRequest(request);
+        setMultiCommitState(state);
+        return;
+      }
+      runMultiCommitOperation(state, request);
+    },
+    [rewriteNeedsForceWarning, runMultiCommitOperation],
+  );
+  const handleHistoryAction = useCallback(
+    (action: GitManagerHistoryAction) => {
+      const operationBase = { cwd, projectId };
+      switch (action._tag) {
+        case "reset":
+          setResetTargetSha(action.sha);
+          return;
+        case "revert":
+          setHistoryActionMessage(null);
+          void executeOperation({ _tag: "revert", ...operationBase, sha: action.sha });
+          return;
+        case "cherry-pick":
+          runMultiCommitOperation(
+            createMultiCommitState("cherry-pick", "show-progress", action.shas),
+            { _tag: "cherry-pick", ...operationBase, shas: action.shas as [string, ...string[]] },
+          );
+          return;
+        case "squash":
+          if (action.shas.length < 2) {
+            setHistoryActionMessage("Select at least two commits to squash.");
+            return;
+          }
+          startHistoryRewrite("squash", action.shas, {
+            _tag: "squash",
+            ...operationBase,
+            shas: action.shas as [string, ...string[]],
+            message: action.message,
+          });
+          return;
+        case "reorder":
+          startHistoryRewrite("reorder", action.shas, {
+            _tag: "reorder",
+            ...operationBase,
+            shas: action.shas as [string, ...string[]],
+            insertBeforeSha: action.insertBeforeSha,
+          });
+          return;
+        case "prepare-reorder":
+          setHistoryActionMessage(
+            "Drag the selected commit to an insertion line, then drop it to reorder history.",
+          );
+          return;
+        case "create-branch":
+          setHistoryBranchDialog({ kind: "create", baseBranch: action.sha });
+          return;
+        case "create-tag":
+          setHistoryTagTargetSha(action.sha);
+      }
+    },
+    [cwd, executeOperation, projectId, runMultiCommitOperation, startHistoryRewrite],
+  );
+  const openRebaseDialog = useCallback(() => {
+    setHistoryActionMessage(null);
+    setPendingRewriteRequest(null);
+    setMultiCommitState({
+      ...createMultiCommitState("rebase", "choose-branch", []),
+      commitsArePushed: currentBranch?.upstream !== null && currentBranch?.upstream !== undefined,
+    });
+  }, [currentBranch?.upstream]);
+  const cancelMultiCommitOperation = useCallback(() => {
+    cancelOperation();
+    setPendingRewriteRequest(null);
+    setMultiCommitState((current) =>
+      current === null ? null : advanceMultiCommitOperation(current, { _tag: "cancelled" }),
+    );
+  }, [cancelOperation]);
+  const runRebase = useCallback(
+    (state: GitManagerMultiCommitState) => {
+      if (state.selectedBranch === null || currentBranchName === null) return;
+      runMultiCommitOperation(state, {
+        _tag: "rebase",
+        cwd,
+        projectId,
+        base: state.selectedBranch,
+        target: currentBranchName,
+      });
+    },
+    [currentBranchName, cwd, projectId, runMultiCommitOperation],
+  );
+  const advanceMultiCommit = useCallback(
+    (event: GitManagerMultiCommitEvent) => {
+      const current = presentedMultiCommitStateRef.current;
+      if (current === null) return;
+      switch (event._tag) {
+        case "branch-chosen": {
+          const next = advanceMultiCommitOperation(current, event);
+          setMultiCommitState(next);
+          if (next.step === "show-progress") runRebase(next);
+          return;
+        }
+        case "force-push-confirmed": {
+          const next = advanceMultiCommitOperation(current, event);
+          setMultiCommitState(next);
+          const pendingRequest = pendingRewriteRequestRef.current;
+          if (pendingRequest === null) {
+            runRebase(next);
+          } else {
+            runMultiCommitOperation(next, pendingRequest);
+          }
+          return;
+        }
+        case "continue-requested": {
+          const next = advanceMultiCommitOperation(current, event);
+          if (next === current) return;
+          setMultiCommitState(next);
+          const operation =
+            current.kind === "merge" || current.kind === "rebase" || current.kind === "cherry-pick"
+              ? current.kind
+              : null;
+          if (operation !== null) {
+            runMultiCommitOperation(next, {
+              _tag: "continue",
+              cwd,
+              projectId,
+              operation,
+            });
+          }
+          return;
+        }
+        case "resolve-conflict-requested":
+          void executeOperation({
+            _tag: "resolve-conflict",
+            cwd,
+            projectId,
+            path: event.path,
+            side: event.side,
+          });
+          return;
+        case "undo-conflict-resolution-requested":
+          setHistoryActionMessage(
+            `Edit ${event.path} again to change its resolution before continuing.`,
+          );
+          return;
+        default:
+          setMultiCommitState(advanceMultiCommitOperation(current, event));
+      }
+    },
+    [cwd, executeOperation, projectId, runMultiCommitOperation, runRebase],
+  );
+  const confirmMultiCommitAbort = useCallback(() => {
+    const current = presentedMultiCommitStateRef.current;
+    if (current === null) return;
+    const next = advanceMultiCommitOperation(current, { _tag: "abort-confirmed" });
+    setMultiCommitState(next);
+    const operation =
+      current.kind === "merge" || current.kind === "rebase" || current.kind === "cherry-pick"
+        ? current.kind
+        : null;
+    if (operation !== null) {
+      runMultiCommitOperation(next, { _tag: "abort", cwd, projectId, operation });
+    }
+  }, [cwd, projectId, runMultiCommitOperation]);
   const runStashMutation = useCallback(
     async (kind: "stash-apply" | "stash-pop" | "stash-drop", sha: string) => {
       const index = resolveStashIndex(stashes, sha);
@@ -302,6 +608,40 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
   );
   const openMergeDialog = useCallback(() => setMergeDialogOpen(true), []);
   const handleMergeFinished = useCallback(() => refreshRefs(), [refreshRefs]);
+  const closeHistoryBranchDialog = useCallback(() => {
+    if (!operationRunning) setHistoryBranchDialog(null);
+  }, [operationRunning]);
+  const submitHistoryBranchDialog = useCallback(
+    async (submission: GitManagerBranchDialogSubmission) => {
+      if (submission.kind !== "create") return;
+      if (
+        await executeOperation({
+          _tag: "branch-create",
+          cwd,
+          projectId,
+          name: submission.name,
+          startPoint: submission.startPoint,
+          checkout: true,
+        })
+      ) {
+        setHistoryBranchDialog(null);
+      }
+    },
+    [cwd, executeOperation, projectId],
+  );
+  const closeHistoryTagDialog = useCallback((open: boolean) => {
+    if (!open) setHistoryTagTargetSha(null);
+  }, []);
+  const closeResetDialog = useCallback(() => setResetTargetSha(null), []);
+  const confirmReset = useCallback(
+    (mode: GitManagerResetMode) => {
+      const sha = resetTargetSha;
+      if (sha === null) return;
+      setResetTargetSha(null);
+      void executeOperation({ _tag: "reset", cwd, projectId, sha, mode });
+    },
+    [cwd, executeOperation, projectId, resetTargetSha],
+  );
   const continueInProgress = useCallback(() => {
     if (resumableOperation === null) return;
     void executeOperation({
@@ -326,10 +666,29 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
       : localBranches.every((branch) => branch.current)
         ? "No source branch is available."
         : null;
+  const rebaseBlockedReason =
+    currentBranch?.blocked.find((reason) => reason.operation === "rebase") ?? null;
+  const rebaseDisabledReason =
+    refsQuery.isPending || snapshot === null
+      ? "Loading branches."
+      : currentBranch === null
+        ? "Check out a branch before rebasing."
+        : localBranches.every((branch) => branch.current)
+          ? "No base branch is available."
+          : (rebaseBlockedReason?.message ?? null);
+  const historyOperationError =
+    operationEvent?._tag === "failed"
+      ? (operationEvent.blocked?.message ?? operationEvent.message)
+      : null;
+  const historyTagScope = useMemo(() => ({ environmentId, cwd }), [cwd, environmentId]);
+  const historyTagNames = snapshot?.tags.map((tag) => tag.name) ?? EMPTY_TAG_NAMES;
+  const historyTagRemote = snapshot?.remotes[0] ?? null;
 
   return (
     <>
-      <GitManagerOperationBanner operation={operationEvent} onCancel={cancelOperation} />
+      {presentedMultiCommitState === null ? (
+        <GitManagerOperationBanner operation={operationEvent} onCancel={cancelOperation} />
+      ) : null}
       {resumableOperation === null ? null : (
         <GitManagerInProgressStrip
           blocked={inProgressBlocked}
@@ -377,7 +736,33 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
             {mergeDisabledReason}
           </span>
         )}
+        <Button
+          aria-describedby={
+            rebaseDisabledReason === null ? undefined : "git-manager-rebase-trigger-reason"
+          }
+          disabled={rebaseDisabledReason !== null}
+          size="xs"
+          title={rebaseDisabledReason ?? "Rebase the current branch onto another branch"}
+          variant="ghost"
+          onClick={openRebaseDialog}
+        >
+          <GitCompareArrowsIcon aria-hidden="true" />
+          Rebase…
+        </Button>
+        {rebaseDisabledReason === null ? null : (
+          <span className="sr-only" id="git-manager-rebase-trigger-reason">
+            {rebaseDisabledReason}
+          </span>
+        )}
       </div>
+      {historyActionMessage === null ? null : (
+        <p
+          aria-live="polite"
+          className="border-b border-border px-3 py-2 text-xs text-muted-foreground"
+        >
+          {historyActionMessage}
+        </p>
+      )}
       {providerPaneOpen ? (
         <div className="h-80 min-h-0 overflow-auto border-b border-border">
           <GitManagerPullRequestPanel scope={scope} onRefresh={refreshRefs} />
@@ -418,6 +803,70 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
           />
         </section>
       ) : null}
+      <Tabs className="min-h-0 flex-1 gap-0" value={activeTab} onValueChange={onTabChange}>
+        <div className="border-b border-border px-4 pt-2">
+          <TabsList className="w-fit rounded-none border-0 bg-transparent p-0">
+            <TabsTab
+              className="rounded-none border-b-2 border-transparent px-3 py-2 data-selected:border-foreground data-selected:bg-transparent data-selected:shadow-none"
+              value="changes"
+            >
+              Changes
+            </TabsTab>
+            <TabsTab
+              className="rounded-none border-b-2 border-transparent px-3 py-2 data-selected:border-foreground data-selected:bg-transparent data-selected:shadow-none"
+              value="history"
+            >
+              History
+            </TabsTab>
+          </TabsList>
+        </div>
+        <TabsPanel className="min-h-0 flex-1 gap-0 p-4" value="changes">
+          <GitManagerChangesView scope={scope} projectRef={projectRef} />
+        </TabsPanel>
+        <TabsPanel className="min-h-0 flex-1 gap-0 p-4" value="history">
+          {activeTab === "history" ? (
+            <GitManagerHistoryView
+              blockedReasons={repositoryBlockedReasons}
+              projectRef={projectRef}
+              scope={scope}
+              onAction={handleHistoryAction}
+            />
+          ) : null}
+        </TabsPanel>
+      </Tabs>
+      {presentedMultiCommitState === null ? null : (
+        <GitManagerMultiCommitOperationDialog
+          state={presentedMultiCommitState}
+          onAdvance={advanceMultiCommit}
+          onCancel={cancelMultiCommitOperation}
+          onConfirmAbort={confirmMultiCommitAbort}
+        />
+      )}
+      <GitManagerBranchDialogs
+        busy={operationRunning}
+        dialog={historyBranchDialog}
+        errorMessage={historyOperationError}
+        refs={localBranches}
+        onClose={closeHistoryBranchDialog}
+        onSubmit={submitHistoryBranchDialog}
+      />
+      <GitManagerTagDialog
+        action="create"
+        existingTags={historyTagNames}
+        open={historyTagTargetSha !== null}
+        projectRef={projectRef}
+        remote={historyTagRemote}
+        scope={historyTagScope}
+        tag={null}
+        targetSha={historyTagTargetSha}
+        onFinished={refreshRefs}
+        onOpenChange={closeHistoryTagDialog}
+      />
+      <GitManagerResetDialog
+        sha={resetTargetSha}
+        onClose={closeResetDialog}
+        onConfirm={confirmReset}
+      />
       <GitManagerMergeDialog
         open={mergeDialogOpen}
         projectRef={projectRef}
@@ -530,40 +979,12 @@ export const GitManagerPanel = memo(function GitManagerPanel({ projectRef }: Git
           onSelectedWorktreeChange={handleWorktreeChange}
         />
         <GitManagerRepositorySurfaces
+          activeTab={viewState.activeTab}
           projectRef={stableProjectRef}
           scope={activeScope}
           signalGeneration={signalGeneration}
+          onTabChange={handleTabChange}
         />
-        <Tabs
-          className="min-h-0 flex-1 gap-0"
-          value={viewState.activeTab}
-          onValueChange={handleTabChange}
-        >
-          <div className="border-b border-border px-4 pt-2">
-            <TabsList className="w-fit rounded-none border-0 bg-transparent p-0">
-              <TabsTab
-                className="rounded-none border-b-2 border-transparent px-3 py-2 data-selected:border-foreground data-selected:bg-transparent data-selected:shadow-none"
-                value="changes"
-              >
-                Changes
-              </TabsTab>
-              <TabsTab
-                className="rounded-none border-b-2 border-transparent px-3 py-2 data-selected:border-foreground data-selected:bg-transparent data-selected:shadow-none"
-                value="history"
-              >
-                History
-              </TabsTab>
-            </TabsList>
-          </div>
-          <TabsPanel className="min-h-0 flex-1 gap-0 p-4" value="changes">
-            <GitManagerChangesView scope={activeScope} projectRef={stableProjectRef} />
-          </TabsPanel>
-          <TabsPanel className="min-h-0 flex-1 gap-0 p-4" value="history">
-            {viewState.activeTab === "history" ? (
-              <GitManagerHistoryView scope={activeScope} projectRef={stableProjectRef} />
-            ) : null}
-          </TabsPanel>
-        </Tabs>
       </div>
     </GitManagerImageDiffModeProvider>
   );

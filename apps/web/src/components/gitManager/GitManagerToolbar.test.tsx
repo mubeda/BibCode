@@ -18,6 +18,7 @@ const h = vi.hoisted(() => ({
   snapshot: null as GitManagerRefsSnapshot | null,
   refreshRefs: vi.fn(),
   tagDialogProps: [] as Array<Record<string, unknown>>,
+  menuItemProps: [] as Array<Record<string, unknown>>,
 }));
 
 vi.mock("../../state/gitManager", () => ({
@@ -56,10 +57,36 @@ vi.mock("../ui/select", () => ({
   },
 }));
 
+vi.mock("../ui/menu", () => ({
+  Menu: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  MenuTrigger: ({ children, ...props }: Record<string, unknown>) => (
+    <button {...props}>{children as React.ReactNode}</button>
+  ),
+  MenuPopup: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  MenuItem: (props: Record<string, unknown>) => {
+    h.menuItemProps.push(props);
+    return (
+      <button
+        aria-label={props["aria-label"] as string | undefined}
+        disabled={props.disabled as boolean}
+        onClick={props.onClick as React.MouseEventHandler<HTMLButtonElement>}
+      >
+        {props.children as React.ReactNode}
+      </button>
+    );
+  },
+  MenuSeparator: () => <hr />,
+  MenuSub: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  MenuSubTrigger: ({ children, ...props }: Record<string, unknown>) => (
+    <button disabled={props.disabled as boolean}>{children as React.ReactNode}</button>
+  ),
+  MenuSubPopup: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+}));
+
 vi.mock("./tags/GitManagerTagDialog", () => ({
   GitManagerTagDialog: (props: Record<string, unknown>) => {
     h.tagDialogProps.push(props);
-    return props.open === true ? <div role="dialog">Create tag dialog</div> : null;
+    return props.open === true ? <div role="dialog">{String(props.action)} tag dialog</div> : null;
   },
 }));
 
@@ -127,6 +154,7 @@ beforeEach(() => {
   h.snapshot = null;
   h.refreshRefs.mockClear();
   h.tagDialogProps.length = 0;
+  h.menuItemProps.length = 0;
   useGitManagerStore.setState({ byProjectKey: {} });
 });
 
@@ -157,10 +185,10 @@ describe("GitManagerToolbar", () => {
     expect(markup).toContain("Loading repository state…");
     expect(markup).toContain('title="Loading repository state."');
     expect(markup).toContain('title="Loading tags."');
-    expect(markup.match(/disabled=""/g)).toHaveLength(2);
+    expect(markup).toContain('aria-describedby="git-manager-tag-trigger-reason"');
   });
 
-  it("opens the create-tag dialog from the toolbar at the current commit", async () => {
+  it("opens create, delete, and push tag dialogs from the toolbar", async () => {
     (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
     h.snapshot = refsSnapshot([ref("release/v1")]);
     const container = document.createElement("div");
@@ -181,18 +209,36 @@ describe("GitManagerToolbar", () => {
           />,
         ),
       );
-      const trigger = [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) =>
-        button.textContent?.includes("Create tag"),
-      );
-      expect(trigger).toBeDefined();
+      const clickAction = async (label: string) => {
+        const action = container.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`);
+        expect(action).not.toBeNull();
+        await act(async () => action?.click());
+      };
 
-      await act(async () => trigger?.click());
-
-      expect(container.querySelector('[role="dialog"]')?.textContent).toBe("Create tag dialog");
+      await clickAction("Create tag");
+      expect(container.querySelector('[role="dialog"]')?.textContent).toBe("create tag dialog");
       expect(h.tagDialogProps.at(-1)).toMatchObject({
         action: "create",
         existingTags: ["release/v1"],
         targetSha: "a".repeat(40),
+      });
+
+      const closeCreate = h.tagDialogProps.at(-1)?.onOpenChange;
+      expect(closeCreate).toBeTypeOf("function");
+      await act(async () => (closeCreate as (open: boolean) => void)(false));
+      await clickAction("Delete tag release/v1");
+      expect(container.querySelector('[role="dialog"]')?.textContent).toBe("delete tag dialog");
+      expect(h.tagDialogProps.at(-1)).toMatchObject({ action: "delete", tag: "release/v1" });
+
+      const closeDelete = h.tagDialogProps.at(-1)?.onOpenChange;
+      expect(closeDelete).toBeTypeOf("function");
+      await act(async () => (closeDelete as (open: boolean) => void)(false));
+      await clickAction("Push tag release/v1");
+      expect(container.querySelector('[role="dialog"]')?.textContent).toBe("push tag dialog");
+      expect(h.tagDialogProps.at(-1)).toMatchObject({
+        action: "push",
+        remote: "origin",
+        tag: "release/v1",
       });
     } finally {
       await act(async () => root.unmount());

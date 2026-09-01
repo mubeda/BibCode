@@ -28,6 +28,7 @@ export interface GitManagerCommitListProps {
   readonly isLoadingMore: boolean;
   readonly onContextMenu?: (sha: string, event: MouseEvent<HTMLButtonElement>) => void;
   readonly multiCommitSelection?: ReadonlyArray<string>;
+  readonly onMultiSelect?: (sha: string, mode: "range" | "toggle") => void;
   readonly onCommitDrop?: (resolution: GitManagerCommitDropResolution) => void;
 }
 
@@ -37,6 +38,7 @@ interface GitManagerCommitRowProps {
   readonly tabbable: boolean;
   readonly onSelect: (sha: string) => void;
   readonly onContextMenu?: (sha: string, event: MouseEvent<HTMLButtonElement>) => void;
+  readonly onMultiSelect?: (sha: string, mode: "range" | "toggle") => void;
 }
 
 function commitRowPropsEqual(
@@ -54,7 +56,8 @@ function commitRowPropsEqual(
     previous.selected === next.selected &&
     previous.tabbable === next.tabbable &&
     previous.onSelect === next.onSelect &&
-    previous.onContextMenu === next.onContextMenu
+    previous.onContextMenu === next.onContextMenu &&
+    previous.onMultiSelect === next.onMultiSelect
   );
 }
 
@@ -64,9 +67,24 @@ const GitManagerCommitRow = memo(function GitManagerCommitRow({
   tabbable,
   onSelect,
   onContextMenu,
+  onMultiSelect,
 }: GitManagerCommitRowProps) {
   const author = deriveAuthorIdentity({ name: commit.authorName, email: commit.authorEmail });
   const drag = useGitManagerCommitDragSource(commit.sha);
+  const select = useCallback(
+    (event: MouseEvent<HTMLButtonElement>) => {
+      if (event.shiftKey && onMultiSelect !== undefined) {
+        onMultiSelect(commit.sha, "range");
+        return;
+      }
+      if ((event.metaKey || event.ctrlKey) && onMultiSelect !== undefined) {
+        onMultiSelect(commit.sha, "toggle");
+        return;
+      }
+      onSelect(commit.sha);
+    },
+    [commit.sha, onMultiSelect, onSelect],
+  );
   return (
     <button
       ref={drag.setNodeRef}
@@ -85,7 +103,7 @@ const GitManagerCommitRow = memo(function GitManagerCommitRow({
       role="option"
       style={{ transform: drag.transform }}
       tabIndex={tabbable ? 0 : -1}
-      onClick={() => onSelect(commit.sha)}
+      onClick={select}
       onContextMenu={(event) => onContextMenu?.(commit.sha, event)}
     >
       <span
@@ -127,6 +145,7 @@ export const GitManagerCommitList = memo(function GitManagerCommitList({
   isLoadingMore,
   onContextMenu,
   multiCommitSelection,
+  onMultiSelect,
   onCommitDrop,
 }: GitManagerCommitListProps) {
   const listRef = useRef<LegendListRef | null>(null);
@@ -148,14 +167,15 @@ export const GitManagerCommitList = memo(function GitManagerCommitList({
         <GitManagerCommitInsertionTarget beforeSha={item.sha} />
         <GitManagerCommitRow
           commit={item}
-          selected={item.sha === selectedSha}
+          selected={item.sha === selectedSha || multiCommitSelection?.includes(item.sha) === true}
           tabbable={item.sha === selectedSha || (selectedSha === null && index === 0)}
           onSelect={onSelect}
           {...(onContextMenu === undefined ? {} : { onContextMenu })}
+          {...(onMultiSelect === undefined ? {} : { onMultiSelect })}
         />
       </div>
     ),
-    [onContextMenu, onSelect, selectedSha],
+    [multiCommitSelection, onContextMenu, onMultiSelect, onSelect, selectedSha],
   );
   const initialScrollIndex = Math.max(
     0,
@@ -220,6 +240,7 @@ export const GitManagerCommitList = memo(function GitManagerCommitList({
     <div
       ref={containerRef}
       aria-label="Commit history"
+      aria-multiselectable={onMultiSelect === undefined ? undefined : true}
       role="listbox"
       className="flex min-h-0 flex-1 flex-col overflow-hidden"
       onKeyDown={handleKeyDown}

@@ -4,7 +4,7 @@ import {
   AVAILABLE_CONNECTION_STATE,
   type SupervisorConnectionState,
 } from "@bibcode/client-runtime/connection";
-import type { ServerConfig } from "@bibcode/contracts";
+import type { GitManagerRefsSnapshot, ServerConfig } from "@bibcode/contracts";
 import { makeTestExecutionEnvironmentCapabilities } from "@bibcode/shared/testSupport";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
@@ -47,6 +47,14 @@ const h = vi.hoisted(() => ({
     cwd: args.input.cwd,
   })),
   toolbarProps: [] as Array<Record<string, unknown>>,
+  historyProps: [] as Array<Record<string, unknown>>,
+  refsSnapshot: null as GitManagerRefsSnapshot | null,
+  runOperation: vi.fn((_registry: unknown, _target: unknown, _onEvent: unknown) => ({
+    result: new Promise(() => undefined),
+    cancel: vi.fn(),
+  })),
+  branchDialogProps: [] as Array<Record<string, unknown>>,
+  historyTagDialogProps: [] as Array<Record<string, unknown>>,
 }));
 
 vi.mock("react", async (importOriginal) => ({
@@ -76,7 +84,7 @@ vi.mock("../../state/query", () => ({
       });
     }
     return {
-      data: atom?.kind === "catalog" ? h.catalog : null,
+      data: atom?.kind === "catalog" ? h.catalog : atom?.kind === "refs" ? h.refsSnapshot : null,
       error: null,
       isPending: false,
       refresh: () => undefined,
@@ -98,6 +106,7 @@ vi.mock("../../state/gitManager", () => ({
     undoCommit: { label: "test:undo-commit" },
     discard: { label: "test:discard" },
   },
+  runGitManagerOperation: h.runOperation,
 }));
 
 vi.mock("../../state/sourceControlActions", () => ({
@@ -119,6 +128,27 @@ vi.mock("./GitManagerToolbar", () => ({
   GitManagerToolbar: (props: Record<string, unknown>) => {
     h.toolbarProps.push(props);
     return <div data-testid="git-manager-toolbar" />;
+  },
+}));
+
+vi.mock("./history/GitManagerHistoryView", () => ({
+  GitManagerHistoryView: (props: Record<string, unknown>) => {
+    h.historyProps.push(props);
+    return <div data-testid="git-manager-history" />;
+  },
+}));
+
+vi.mock("./dialogs/GitManagerBranchDialogs", () => ({
+  GitManagerBranchDialogs: (props: Record<string, unknown>) => {
+    h.branchDialogProps.push(props);
+    return props.dialog === null ? null : <div role="dialog">History branch dialog</div>;
+  },
+}));
+
+vi.mock("./tags/GitManagerTagDialog", () => ({
+  GitManagerTagDialog: (props: Record<string, unknown>) => {
+    h.historyTagDialogProps.push(props);
+    return props.open === true ? <div role="dialog">History tag dialog</div> : null;
   },
 }));
 
@@ -145,7 +175,49 @@ function renderPanel(): string {
   h.effects.length = 0;
   h.queryAtoms.length = 0;
   h.toolbarProps.length = 0;
+  h.historyProps.length = 0;
   return renderToStaticMarkup(<GitManagerPanel projectRef={projectRef} />);
+}
+
+function refsSnapshot(overrides: Partial<GitManagerRefsSnapshot> = {}): GitManagerRefsSnapshot {
+  return {
+    generation: 1,
+    headRef: "main",
+    detachedSha: null,
+    isDirty: false,
+    defaultBranch: "main",
+    remotes: ["origin"],
+    localBranches: [
+      {
+        name: "main",
+        tipSha: "a".repeat(40),
+        upstream: "origin/main",
+        ahead: 1,
+        behind: 0,
+        current: true,
+        isDefault: true,
+        worktreePath: "/opaque/main",
+        blocked: [],
+      },
+      {
+        name: "feature/base",
+        tipSha: "f".repeat(40),
+        upstream: null,
+        ahead: 0,
+        behind: 0,
+        current: false,
+        isDefault: false,
+        worktreePath: null,
+        blocked: [],
+      },
+    ],
+    remoteBranches: [],
+    tags: [],
+    worktrees: [],
+    inProgressOperation: null,
+    conflictedPaths: [],
+    ...overrides,
+  };
 }
 
 beforeEach(() => {
@@ -168,11 +240,16 @@ beforeEach(() => {
     ],
   };
   h.activeSubscriptions = 0;
+  h.refsSnapshot = refsSnapshot();
   h.catalogAtom.mockClear();
   h.signalAtom.mockClear();
   h.refsAtom.mockClear();
   h.stashesAtom.mockClear();
   h.listPullRequests.mockClear();
+  h.runOperation.mockClear();
+  h.historyProps.length = 0;
+  h.branchDialogProps.length = 0;
+  h.historyTagDialogProps.length = 0;
   useGitManagerStore.setState({ byProjectKey: {} });
 });
 
@@ -255,6 +332,282 @@ describe("GitManagerPanel", () => {
       await act(async () => refresh?.click());
 
       expect(h.listPullRequests).toHaveBeenCalledOnce();
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
+    }
+  });
+
+  it("opens the multi-commit dialog when History chooses an operation", async () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    useGitManagerStore.getState().setActiveTab(projectRef, "history");
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+
+    try {
+      await act(async () => root.render(<GitManagerPanel projectRef={projectRef} />));
+      const historyProps = h.historyProps.at(-1);
+      expect(historyProps).toBeDefined();
+      const onAction = historyProps?.onAction;
+      expect(onAction).toBeTypeOf("function");
+
+      await act(async () =>
+        (onAction as (action: unknown) => void)({
+          _tag: "cherry-pick",
+          shas: ["b".repeat(40)],
+        }),
+      );
+
+      expect(document.body.textContent).toContain("Cherry-Pick in Progress");
+      expect(h.runOperation).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          input: expect.objectContaining({ _tag: "cherry-pick", shas: ["b".repeat(40)] }),
+        }),
+        expect.any(Function),
+      );
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
+    }
+  });
+
+  it("mounts the conflict list for an externally conflicted history operation", async () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    h.refsSnapshot = refsSnapshot({
+      inProgressOperation: { kind: "cherry-pick", current: 1, total: 2 },
+      conflictedPaths: ["src/conflicted.bin"],
+    });
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+
+    try {
+      await act(async () => root.render(<GitManagerPanel projectRef={projectRef} />));
+
+      expect(document.body.querySelector('section[aria-label="Conflicted files"]')).not.toBeNull();
+      expect(document.body.textContent).toContain("src/conflicted.bin");
+      const resolve = document.body.querySelector<HTMLButtonElement>(
+        '[aria-label="Resolve src/conflicted.bin with theirs"]',
+      );
+      expect(resolve).not.toBeNull();
+      await act(async () => resolve?.click());
+      expect(h.runOperation).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          input: expect.objectContaining({
+            _tag: "resolve-conflict",
+            path: "src/conflicted.bin",
+            side: "theirs",
+          }),
+        }),
+        expect.any(Function),
+      );
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
+    }
+  });
+
+  it("leaves an external non-conflicted operation in the existing resumable strip", async () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    h.refsSnapshot = refsSnapshot({
+      inProgressOperation: { kind: "rebase", current: 1, total: 2 },
+      conflictedPaths: [],
+    });
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+
+    try {
+      await act(async () => root.render(<GitManagerPanel projectRef={projectRef} />));
+
+      expect(document.body.textContent).toContain("Rebase underway");
+      expect(document.body.textContent).not.toContain("Rebase in Progress");
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
+    }
+  });
+
+  it("keeps reset behind a destructive confirmation before dispatching", async () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    useGitManagerStore.getState().setActiveTab(projectRef, "history");
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const sha = "c".repeat(40);
+
+    try {
+      await act(async () => root.render(<GitManagerPanel projectRef={projectRef} />));
+      const onAction = h.historyProps.at(-1)?.onAction;
+      expect(onAction).toBeTypeOf("function");
+      await act(async () => (onAction as (action: unknown) => void)({ _tag: "reset", sha }));
+
+      expect(document.body.textContent).toContain("Reset to ccccccc?");
+      expect(h.runOperation).not.toHaveBeenCalled();
+      const hardReset = [...document.body.querySelectorAll<HTMLButtonElement>("button")].find(
+        (button) => button.textContent === "Discard Changes and Reset",
+      );
+      expect(hardReset?.className).toContain("destructive");
+
+      await act(async () => hardReset?.click());
+      expect(h.runOperation).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          input: expect.objectContaining({ _tag: "reset", mode: "hard", sha }),
+        }),
+        expect.any(Function),
+      );
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
+    }
+  });
+
+  it("routes revert, create-branch, and create-tag intents through existing parent owners", async () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    useGitManagerStore.getState().setActiveTab(projectRef, "history");
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const sha = "d".repeat(40);
+
+    try {
+      await act(async () => root.render(<GitManagerPanel projectRef={projectRef} />));
+      const onAction = h.historyProps.at(-1)?.onAction as (action: unknown) => void;
+
+      await act(async () => onAction({ _tag: "revert", sha }));
+      expect(h.runOperation).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ input: expect.objectContaining({ _tag: "revert", sha }) }),
+        expect.any(Function),
+      );
+
+      await act(async () => onAction({ _tag: "create-branch", sha }));
+      expect(h.branchDialogProps.at(-1)?.dialog).toEqual({ kind: "create", baseBranch: sha });
+
+      await act(async () => onAction({ _tag: "create-tag", sha }));
+      expect(h.historyTagDialogProps.at(-1)).toMatchObject({
+        action: "create",
+        open: true,
+        targetSha: sha,
+      });
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
+    }
+  });
+
+  it("opens the existing multi-commit chooser from the Rebase control", async () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+
+    try {
+      await act(async () => root.render(<GitManagerPanel projectRef={projectRef} />));
+      const rebase = [...container.querySelectorAll<HTMLButtonElement>("button")].find(
+        (button) => button.textContent === "Rebase…",
+      );
+      expect(rebase).toBeDefined();
+
+      await act(async () => rebase?.click());
+      expect(document.body.textContent).toContain("Choose a Branch to Rebase");
+      const baseBranch = document.body.querySelector<HTMLButtonElement>(
+        '[aria-label="Choose branch feature/base"]',
+      );
+      expect(baseBranch).not.toBeNull();
+      await act(async () => baseBranch?.click());
+      const confirmRewrite = [...document.body.querySelectorAll<HTMLButtonElement>("button")].find(
+        (button) => button.textContent === "Rewrite History",
+      );
+      expect(confirmRewrite).toBeDefined();
+      await act(async () => confirmRewrite?.click());
+      expect(h.runOperation).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          input: expect.objectContaining({
+            _tag: "rebase",
+            base: "feature/base",
+            target: "main",
+          }),
+        }),
+        expect.any(Function),
+      );
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
+    }
+  });
+
+  it("dispatches squash and drag reorder intents through the multi-commit dialog owner", async () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    useGitManagerStore.getState().setActiveTab(projectRef, "history");
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const first = "1".repeat(40);
+    const second = "2".repeat(40);
+
+    try {
+      h.runOperation.mockImplementationOnce(() => ({
+        result: Promise.resolve({
+          _tag: "Success",
+          value: { _tag: "finished", operation: "squash", message: "Squashed." },
+        }),
+        cancel: vi.fn(),
+      }));
+      await act(async () => root.render(<GitManagerPanel projectRef={projectRef} />));
+      const onAction = h.historyProps.at(-1)?.onAction as (action: unknown) => void;
+
+      await act(async () =>
+        onAction({ _tag: "squash", shas: [first, second], message: "Combined change" }),
+      );
+      expect(document.body.textContent).toContain("Rewrite Squash History?");
+      expect(h.runOperation).not.toHaveBeenCalled();
+      const confirmSquash = [...document.body.querySelectorAll<HTMLButtonElement>("button")].find(
+        (button) => button.textContent === "Rewrite History",
+      );
+      await act(async () => confirmSquash?.click());
+      expect(document.body.textContent).toContain("Squash in Progress");
+      expect(h.runOperation).toHaveBeenLastCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          input: expect.objectContaining({
+            _tag: "squash",
+            shas: [first, second],
+            message: "Combined change",
+          }),
+        }),
+        expect.any(Function),
+      );
+      await act(async () => onAction({ _tag: "reorder", shas: [second], insertBeforeSha: first }));
+      expect(document.body.textContent).toContain("Rewrite Reorder History?");
+      const confirmReorder = [...document.body.querySelectorAll<HTMLButtonElement>("button")].find(
+        (button) => button.textContent === "Rewrite History",
+      );
+      await act(async () => confirmReorder?.click());
+      expect(document.body.textContent).toContain("Reorder in Progress");
+      expect(h.runOperation).toHaveBeenLastCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          input: expect.objectContaining({
+            _tag: "reorder",
+            shas: [second],
+            insertBeforeSha: first,
+          }),
+        }),
+        expect.any(Function),
+      );
     } finally {
       await act(async () => root.unmount());
       container.remove();
