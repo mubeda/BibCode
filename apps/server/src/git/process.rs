@@ -41,6 +41,15 @@ pub struct ProcessOutput {
     pub stderr_truncated: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessBytesOutput {
+    pub exit_code: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+}
+
 #[derive(Debug, Error)]
 pub enum ProcessError {
     #[error("failed to spawn {command} for {operation}")]
@@ -112,6 +121,68 @@ impl ProcessRunner {
     ) -> Result<ProcessOutput, ProcessError> {
         self.run_with_environment(request, cancellation, false)
             .await
+    }
+
+    pub async fn run_bytes(
+        &self,
+        request: ProcessRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessBytesOutput, ProcessError> {
+        let command_label = request.command.to_string_lossy().into_owned();
+        let mut command = Command::new(&request.command);
+        command
+            .args(&request.args)
+            .current_dir(&request.cwd)
+            .envs(request.env.iter().cloned())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = run_supervised(
+            SupervisedRunRequest {
+                command,
+                stdin: request.stdin.clone(),
+                timeout: request.timeout,
+                cleanup_timeout: Duration::from_secs(2),
+                max_output_bytes: request.max_output_bytes,
+                overflow: match request.output_policy {
+                    OutputPolicy::Truncate => SupervisedOverflow::Truncate,
+                    OutputPolicy::Error => SupervisedOverflow::Error,
+                },
+            },
+            cancellation,
+        )
+        .await
+        .map_err(|error| map_supervised_error(error, &request, command_label))?;
+
+        let exit_code = output
+            .status
+            .code()
+            .ok_or_else(|| ProcessError::MissingExitCode {
+                operation: request.operation.clone(),
+            })?;
+        let stdout_length = output.stdout.observed_bytes;
+        let stderr_length = output.stderr.observed_bytes;
+        let stdout_truncated = output.stdout.truncated();
+        let stderr_truncated = output.stderr.truncated();
+        let stdout = render_bytes(output.stdout, request.append_truncation_marker);
+        let stderr = render_bytes(output.stderr, request.append_truncation_marker);
+        if exit_code != 0 && !request.allow_non_zero_exit {
+            return Err(ProcessError::NonZeroExit {
+                operation: request.operation,
+                exit_code,
+                stdout_length,
+                stderr_length,
+                stdout: String::from_utf8_lossy(&stdout).into_owned().into(),
+                stderr: String::from_utf8_lossy(&stderr).into_owned().into(),
+            });
+        }
+        Ok(ProcessBytesOutput {
+            exit_code,
+            stdout,
+            stderr,
+            stdout_truncated,
+            stderr_truncated,
+        })
     }
 
     #[cfg(test)]
@@ -237,6 +308,15 @@ fn render(output: SupervisedStreamOutput, append_marker: bool) -> String {
         rendered.push_str(TRUNCATION_MARKER);
     }
     rendered
+}
+
+fn render_bytes(output: SupervisedStreamOutput, append_marker: bool) -> Vec<u8> {
+    let truncated = output.truncated();
+    let mut bytes = output.bytes;
+    if truncated && append_marker {
+        bytes.extend_from_slice(TRUNCATION_MARKER.as_bytes());
+    }
+    bytes
 }
 
 #[cfg(test)]

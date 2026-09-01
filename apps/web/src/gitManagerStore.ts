@@ -11,6 +11,7 @@ const GIT_MANAGER_VIEW_STATE_LIMIT = 2;
 
 export type GitManagerTab = "changes" | "history";
 export type GitManagerOpenDropdown = "branch" | "sync" | null;
+export type GitManagerImageDiffMode = "two-up" | "swipe" | "onion" | "difference";
 
 export interface SerializedGitManagerLineSelection {
   readonly type: "all" | "partial" | "none";
@@ -35,6 +36,8 @@ export interface GitManagerViewState {
   readonly selectedFilePath: string | null;
   readonly selectedStashSha: string | null;
   readonly stashPaneOpen: boolean;
+  readonly imageDiffMode: GitManagerImageDiffMode;
+  readonly providerPaneOpen: boolean;
   readonly lineSelectionByPath: Record<string, SerializedGitManagerLineSelection>;
   readonly filterText: string;
   readonly loadedPageCount: number;
@@ -65,6 +68,8 @@ export const DEFAULT_GIT_MANAGER_VIEW_STATE: GitManagerViewState = Object.freeze
   selectedFilePath: null,
   selectedStashSha: null,
   stashPaneOpen: false,
+  imageDiffMode: "two-up",
+  providerPaneOpen: false,
   lineSelectionByPath: Object.freeze({}),
   filterText: "",
   loadedPageCount: 0,
@@ -88,6 +93,8 @@ interface GitManagerStoreState {
   readonly setSelectedFile: (ref: ScopedProjectRef, path: string | null) => void;
   readonly setSelectedStash: (ref: ScopedProjectRef, sha: string | null) => void;
   readonly setStashPaneOpen: (ref: ScopedProjectRef, open: boolean) => void;
+  readonly setImageDiffMode: (ref: ScopedProjectRef, mode: GitManagerImageDiffMode) => void;
+  readonly setProviderPaneOpen: (ref: ScopedProjectRef, open: boolean) => void;
   readonly setLineSelection: (
     ref: ScopedProjectRef,
     path: string,
@@ -237,6 +244,13 @@ function sanitizeViewState(value: unknown): PersistedGitManagerViewState | null 
     selectedFilePath: nullableString(candidate.selectedFilePath),
     selectedStashSha: nullableString(candidate.selectedStashSha),
     stashPaneOpen: candidate.stashPaneOpen === true,
+    imageDiffMode:
+      candidate.imageDiffMode === "swipe" ||
+      candidate.imageDiffMode === "onion" ||
+      candidate.imageDiffMode === "difference"
+        ? candidate.imageDiffMode
+        : "two-up",
+    providerPaneOpen: candidate.providerPaneOpen === true,
     lineSelectionByPath: sanitizeLineSelectionByPath(candidate.lineSelectionByPath),
     filterText: stringOr(candidate.filterText, ""),
     loadedPageCount: nonNegativeIntegerOr(candidate.loadedPageCount, 0),
@@ -352,6 +366,14 @@ export const useGitManagerStore = create<GitManagerStoreState>()(
       setStashPaneOpen: (ref, open) =>
         set((state) =>
           updateProject(state, ref, (current) => ({ ...current, stashPaneOpen: open })),
+        ),
+      setImageDiffMode: (ref, mode) =>
+        set((state) =>
+          updateProject(state, ref, (current) => ({ ...current, imageDiffMode: mode })),
+        ),
+      setProviderPaneOpen: (ref, open) =>
+        set((state) =>
+          updateProject(state, ref, (current) => ({ ...current, providerPaneOpen: open })),
         ),
       setLineSelection: (ref, path, selection) =>
         set((state) =>

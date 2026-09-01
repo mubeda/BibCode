@@ -130,4 +130,18 @@ describe("resolveSyncState", () => {
       }),
     ).toMatchObject({ kind: "push", label: "Push origin", ahead: 4, behind: 0 });
   });
+
+  it("adds explicitly pending tag pushes to the visible ahead count", () => {
+    expect(
+      resolveSyncState({
+        isOperationRunning: false,
+        hasRemote: true,
+        isUnborn: false,
+        isDetached: false,
+        aheadBehind: { ahead: 0, behind: 0 },
+        forcePushRecommended: false,
+        tagsToPush: 2,
+      }),
+    ).toMatchObject({ kind: "fetch", ahead: 2, behind: 0 });
+  });
 });

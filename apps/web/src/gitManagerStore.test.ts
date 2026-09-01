@@ -255,4 +255,33 @@ describe("gitManagerStore", () => {
       multiCommitSelection: ["commit-b", "commit-a"],
     });
   });
+
+  it("persists only the requested image mode and provider-pane fields with project view state", async () => {
+    const project = ref("env-a", "p1");
+    const store = useGitManagerStore.getState();
+    store.setSelectedWorktree(project, "/opaque/worktree");
+    store.setImageDiffMode(project, "onion");
+    store.setProviderPaneOpen(project, true);
+
+    const serialized = persisted.get(GIT_MANAGER_STORAGE_KEY);
+    const parsed = JSON.parse(serialized!) as {
+      state: { byProjectKey: Record<string, Record<string, unknown>> };
+    };
+    expect(parsed.state.byProjectKey[projectKey(project)]).toMatchObject({
+      imageDiffMode: "onion",
+      providerPaneOpen: true,
+    });
+    expect(parsed.state.byProjectKey[projectKey(project)]).not.toHaveProperty(
+      "selectedWorktreeCwd",
+    );
+
+    useGitManagerStore.setState({ byProjectKey: {} });
+    persisted.set(GIT_MANAGER_STORAGE_KEY, serialized!);
+    await useGitManagerStore.persist.rehydrate();
+    expect(useGitManagerStore.getState().selectViewState(project)).toMatchObject({
+      selectedWorktreeCwd: null,
+      imageDiffMode: "onion",
+      providerPaneOpen: true,
+    });
+  });
 });

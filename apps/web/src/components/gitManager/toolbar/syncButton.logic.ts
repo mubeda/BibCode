@@ -16,6 +16,7 @@ export interface SyncStateInput {
   readonly isDetached: boolean;
   readonly aheadBehind: { readonly ahead: number; readonly behind: number } | null;
   readonly forcePushRecommended: boolean;
+  readonly tagsToPush?: number;
   readonly remote?: string;
 }
 
@@ -29,11 +30,18 @@ export interface SyncState {
 
 export function resolveSyncState(input: SyncStateInput): SyncState {
   const remote = input.remote ?? "origin";
+  const tagsToPush =
+    typeof input.tagsToPush === "number" &&
+    Number.isSafeInteger(input.tagsToPush) &&
+    input.tagsToPush > 0
+      ? input.tagsToPush
+      : 0;
+  const visibleAhead = (input.aheadBehind?.ahead ?? 0) + tagsToPush;
   if (input.isOperationRunning) {
     return {
       kind: "running",
       label: "Syncing…",
-      ahead: input.aheadBehind?.ahead ?? 0,
+      ahead: visibleAhead,
       behind: input.aheadBehind?.behind ?? 0,
       disabledReason: "A Git Manager operation is already running.",
     };
@@ -42,7 +50,7 @@ export function resolveSyncState(input: SyncStateInput): SyncState {
     return {
       kind: "no-remote",
       label: "No remote configured",
-      ahead: input.aheadBehind?.ahead ?? 0,
+      ahead: visibleAhead,
       behind: input.aheadBehind?.behind ?? 0,
       disabledReason: "This repository has no configured remote.",
     };
@@ -69,14 +77,15 @@ export function resolveSyncState(input: SyncStateInput): SyncState {
     return {
       kind: "publish-branch",
       label: `Publish branch to ${remote}`,
-      ahead: 0,
+      ahead: tagsToPush,
       behind: 0,
       disabledReason: null,
     };
   }
 
-  const { ahead, behind } = input.aheadBehind;
-  if (ahead === 0 && behind === 0) {
+  const { ahead: branchAhead, behind } = input.aheadBehind;
+  const ahead = branchAhead + tagsToPush;
+  if (branchAhead === 0 && behind === 0) {
     return {
       kind: "fetch",
       label: `Fetch ${remote}`,

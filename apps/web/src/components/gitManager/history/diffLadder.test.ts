@@ -25,4 +25,21 @@ describe("classifyDiffPayload", () => {
     expect(classifyDiffPayload({ byteLength: 100, longestLineLength: 5_000 })).toBe("renderable");
     expect(classifyDiffPayload({ byteLength: 100, longestLineLength: 5_001 })).toBe("large-text");
   });
+
+  it("routes bounded image payloads through the ladder and still rejects oversized images", () => {
+    expect(
+      classifyDiffPayload({
+        byteLength: 6_000_000,
+        longestLineLength: 0,
+        kind: "image",
+      }),
+    ).toBe("image");
+    expect(
+      classifyDiffPayload({
+        byteLength: 70_000_000,
+        longestLineLength: 0,
+        kind: "image",
+      }),
+    ).toBe("unrenderable");
+  });
 });

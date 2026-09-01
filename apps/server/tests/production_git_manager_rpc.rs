@@ -6,11 +6,13 @@ use std::{
     time::Duration,
 };
 
+use base64::Engine;
 use bibcode_server::{
     RequestId, RpcRequest,
-    git::{GitRepository, NativeFileTrash, StatusBroadcaster},
+    git::{GitRepository, MAX_DIFF_BUFFER_SIZE, NativeFileTrash, StatusBroadcaster},
     persistence::{Database, ProjectionProject, Repositories, run_migrations},
     production::git_manager_rpc::{ConfiguredGitManagerRpcServices, GitManagerRpcServices},
+    source_control::PullRequestService,
     worktree_catalog::{WorkspaceAvailabilityRegistry, WorktreeCatalogService},
 };
 use serde_json::{Value, json};
@@ -152,6 +154,246 @@ impl Fixture {
             .mutation_unary(rpc_request(id, tag, payload), CancellationToken::new())
             .await
     }
+}
+
+#[tokio::test]
+async fn commit_image_diff_round_trips_both_binary_blobs_byte_for_byte() {
+    let fixture = Fixture::new().await;
+    let cwd = fixture.repository_path.clone();
+    let before = b"\x89PNG\r\n\x1a\n\0\xff\xfe\x80before".to_vec();
+    let after = b"\x89PNG\r\n\x1a\n\0\xff\xfe\x80after".to_vec();
+    fs::write(cwd.join("image.png"), &before).expect("before image");
+    git(&cwd, &["add", "image.png"]);
+    git(&cwd, &["commit", "-q", "-m", "image before"]);
+    fs::write(cwd.join("image.png"), &after).expect("after image");
+    git(&cwd, &["commit", "-qam", "image after"]);
+    let sha = git_stdout(&cwd, &["rev-parse", "HEAD"]);
+
+    let diff = fixture
+        .read(
+            "90",
+            "gitManager.getDiff",
+            json!({
+                "cwd": cwd,
+                "source": { "_tag": "commit", "sha": sha, "path": "image.png" }
+            }),
+        )
+        .await
+        .expect("image diff");
+
+    assert_eq!(diff["_tag"], "image");
+    assert_eq!(diff["before"]["mimeType"], "image/png");
+    assert_eq!(diff["after"]["mimeType"], "image/png");
+    let decode = |value: &Value| {
+        base64::engine::general_purpose::STANDARD
+            .decode(value.as_str().expect("base64 image side"))
+            .expect("valid base64 image side")
+    };
+    assert_eq!(decode(&diff["before"]["contentBase64"]), before);
+    assert_eq!(decode(&diff["after"]["contentBase64"]), after);
+}
+
+#[tokio::test]
+async fn added_image_diff_has_one_side_and_an_oversized_blob_is_unrenderable() {
+    let fixture = Fixture::new().await;
+    let cwd = fixture.repository_path.clone();
+    let added = b"\x89PNG\r\n\x1a\nadded".to_vec();
+    fs::write(cwd.join("added.png"), &added).expect("added image");
+    git(&cwd, &["add", "added.png"]);
+    git(&cwd, &["commit", "-q", "-m", "add image"]);
+    let sha = git_stdout(&cwd, &["rev-parse", "HEAD"]);
+
+    let diff = fixture
+        .read(
+            "91",
+            "gitManager.getDiff",
+            json!({
+                "cwd": cwd,
+                "source": { "_tag": "commit", "sha": sha, "path": "added.png" }
+            }),
+        )
+        .await
+        .expect("added image diff");
+    assert_eq!(diff["_tag"], "image");
+    assert!(diff["before"]["contentBase64"].is_null());
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(
+                diff["after"]["contentBase64"]
+                    .as_str()
+                    .expect("after image")
+            )
+            .expect("base64 after image"),
+        added
+    );
+
+    fs::write(
+        cwd.join("oversized.png"),
+        vec![0xa5; MAX_DIFF_BUFFER_SIZE + 1],
+    )
+    .expect("oversized image");
+    git(&cwd, &["add", "oversized.png"]);
+    git(&cwd, &["commit", "-q", "-m", "oversized image"]);
+    let oversized_sha = git_stdout(&cwd, &["rev-parse", "HEAD"]);
+    let oversized = fixture
+        .read(
+            "92",
+            "gitManager.getDiff",
+            json!({
+                "cwd": cwd,
+                "source": {
+                    "_tag": "commit",
+                    "sha": oversized_sha,
+                    "path": "oversized.png"
+                }
+            }),
+        )
+        .await
+        .expect("oversized image result");
+    assert_eq!(oversized["_tag"], "unrenderable");
+    assert_eq!(oversized["byteLength"], MAX_DIFF_BUFFER_SIZE + 1);
+}
+
+#[tokio::test]
+async fn tag_create_push_and_delete_share_the_streaming_mutation_fence() {
+    let fixture = Fixture::new().await;
+    let cwd = fixture.repository_path.clone();
+    let sha = git_stdout(&cwd, &["rev-parse", "HEAD"]);
+
+    let created = collect_events(fixture.operation(
+        "93",
+        json!({
+            "_tag": "tag-create",
+            "cwd": cwd,
+            "projectId": "project-1",
+            "name": "release/v1",
+            "sha": sha
+        }),
+    ))
+    .await;
+    assert_eq!(event_kinds(&created).last(), Some(&"finished"));
+    let refs = fixture
+        .read("94", "gitManager.getRefs", json!({ "cwd": cwd }))
+        .await
+        .expect("refs after tag create");
+    assert!(
+        refs["tags"]
+            .as_array()
+            .is_some_and(|tags| tags.iter().any(|tag| tag["name"] == "release/v1"))
+    );
+
+    let pushed = collect_events(fixture.operation(
+        "95",
+        json!({
+            "_tag": "tag-push",
+            "cwd": cwd,
+            "projectId": "project-1",
+            "name": "release/v1",
+            "remote": "origin"
+        }),
+    ))
+    .await;
+    assert_eq!(event_kinds(&pushed).last(), Some(&"finished"));
+    assert!(
+        git_output(
+            &cwd,
+            &["ls-remote", "--exit-code", "origin", "refs/tags/release/v1"]
+        )
+        .status
+        .success()
+    );
+
+    let deleted = collect_events(fixture.operation(
+        "96",
+        json!({
+            "_tag": "tag-delete",
+            "cwd": cwd,
+            "projectId": "project-1",
+            "name": "release/v1"
+        }),
+    ))
+    .await;
+    assert_eq!(event_kinds(&deleted).last(), Some(&"finished"));
+    assert!(
+        !git_output(&cwd, &["show-ref", "--verify", "refs/tags/release/v1"])
+            .status
+            .success()
+    );
+    assert!(
+        git_output(
+            &cwd,
+            &["ls-remote", "--exit-code", "origin", "refs/tags/release/v1"]
+        )
+        .status
+        .success(),
+        "local deletion must not delete the remote tag"
+    );
+
+    let missing = collect_events(fixture.operation(
+        "97",
+        json!({
+            "_tag": "tag-delete",
+            "cwd": cwd,
+            "projectId": "project-1",
+            "name": "release/v1"
+        }),
+    ))
+    .await;
+    assert_eq!(event_kinds(&missing), ["started", "failed"]);
+    assert_eq!(missing[1]["code"], "tag-not-found");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn explicit_pull_request_read_invokes_the_provider_once_for_prs_and_once_for_checks() {
+    let fixture = Fixture::new().await;
+    let cwd = fixture.repository_path.clone();
+    git(
+        &cwd,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/example/repository.git",
+        ],
+    );
+    let calls = fixture._root.path().join("provider-calls");
+    let command = fixture._root.path().join("provider-gh");
+    fs::write(
+        &command,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$1:$2\" in\n  pr:list) printf '%s\\n' '[{{\"number\":42,\"title\":\"Explicit PR\",\"url\":\"https://github.test/42\",\"baseRefName\":\"main\",\"headRefName\":\"main\",\"state\":\"OPEN\"}}]' ;;\n  pr:checks) printf '%s\\n' '[{{\"name\":\"build\",\"state\":\"SUCCESS\",\"link\":\"https://github.test/check/1\",\"workflow\":\"CI\"}}]' ;;\n  *) exit 64 ;;\nesac\n",
+            calls.to_string_lossy()
+        ),
+    )
+    .expect("provider fixture");
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&command, fs::Permissions::from_mode(0o755))
+        .expect("provider fixture executable");
+    let services = fixture.services.clone().with_pull_request_service(
+        PullRequestService::with_provider_commands(
+            command.to_string_lossy(),
+            "unused-glab",
+            "unused-az",
+        ),
+    );
+
+    let result = services
+        .read_unary(
+            rpc_request("98", "gitManager.listPullRequests", json!({ "cwd": cwd })),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("explicit provider read");
+
+    assert_eq!(result["status"], "available");
+    assert_eq!(result["pullRequests"][0]["number"], 42);
+    assert_eq!(result["checks"][0]["name"], "build");
+    let calls = fs::read_to_string(calls).expect("provider calls");
+    assert_eq!(calls.lines().count(), 2);
+    assert!(calls.contains("pr list --head main --state open --limit 1 --json"));
+    assert!(calls.contains("pr checks 42 --json name,state,link,workflow"));
+    assert!(!calls.contains("--watch"));
 }
 
 #[tokio::test]
