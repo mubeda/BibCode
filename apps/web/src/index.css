@@ -48,8 +48,9 @@
     sans-serif;
   --font-mono:
     "SF Mono", "SFMono-Regular", "JetBrains Mono", Consolas, "Liberation Mono", Menlo, monospace;
-  /* Smallest text size in the app (11px). Secondary labels, badges, and
-     timestamps use it; nothing renders below it. */
+  /* Declared text-size floor (11px). Secondary labels, badges, and timestamps
+     use it; new UI never goes below it and older screens are being swept to it
+     (UI.md, Typography). */
   --text-2xs: 0.6875rem;
   --text-2xs--line-height: 1rem;
   --color-warning-foreground: var(--warning-foreground);

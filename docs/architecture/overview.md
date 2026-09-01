@@ -35,7 +35,8 @@ flowchart TB
 - **React app (`apps/web`)** owns the user interface and client-side state. It
   uses hash history in desktop mode and browser history on the web. Preview
   content is hosted in Tauri child webviews; preview automation is brokered by
-  the Rust server and consumed by the React host.
+  the Rust server and consumed by the React host. Typography and text-contrast
+  rules live in [`UI.md`](../../UI.md).
 - **Desktop adapter (`apps/web/src/tauriDesktopBridge.ts`)** installs
   `window.desktopBridge` only when Tauri globals are present. Tauri commands and
   events implement privileged operations; browser fallbacks are limited to
@@ -597,19 +598,15 @@ independently bounded to 30 seconds. The client deadline includes supervisor
 acquisition, readiness, and RPC execution; timeout interrupts the whole lazy
 operation and releases one of the two update-check workers.
 
+### WebView engines
+
 The WebView engine is the operating system's, so it differs per platform:
 WKWebView on macOS, WebKitGTK on Linux, and WebView2 on Windows. Browser API
 support therefore varies between desktop hosts, and between desktop and browser
 mode. The frontend feature-detects optional APIs and supplies its own fallback
 rather than assuming the Chromium behavior that browser mode and Windows
-happen to share. On Linux the desktop host pins its own GtkSettings text hinting
-to `hintslight` when the session requests full hinting because WebKitGTK renders
-DM Sans body text with uneven whole-pixel letter gaps under full hinting. The
-override is process-local, so the user's system preference is unchanged. The
-same webview paints text inside composited scroll containers grayscale unless
-an ancestor inside the scroller paints a background, so the main reading
-surfaces mark their content wrapper with `data-text-surface` and the Linux
-webview CSS paints the matching theme token on it to keep LCD subpixel text.
+happen to share. Linux text rendering has its own rules; see
+[Linux webview text rendering](#linux-webview-text-rendering).
 
 Center chat-panel creation reserves and activates its client surface before the
 server command settles. A confirmed command failure removes that reservation;
@@ -642,6 +639,48 @@ terminal identity. Teardown detaches the transcript and disposes xterm and
 WebGL without abandoning input already accepted by the scheduler. A later
 renderer retargets error presentation, while the retained writer cannot keep
 the departed renderer or its terminal buffers reachable.
+
+### Linux webview text rendering
+
+The Linux host and the web UI share responsibility for text quality in
+WebKitGTK. The web side applies its Linux rules only when a desktop bridge is
+installed and the user agent reports Linux:
+[`linuxWebkitTypography.ts`](../../apps/web/src/linuxWebkitTypography.ts) sets
+`data-linux-webkit` on the root element before the first render, so browser
+mode on Linux and the macOS and Windows hosts are unaffected.
+
+**Hinting.** WebKitGTK disables subpixel glyph positioning and fully hints
+glyphs when GTK reports `gtk-xft-hinting` enabled with `gtk-xft-hintstyle`
+`hintfull`, which renders DM Sans body text with uneven whole-pixel letter
+gaps. During setup the host reads those GTK values and, only in that state,
+sets its own process-local `gtk-xft-hintstyle` to `hintslight`
+([`linux_text_rendering.rs`](../../apps/desktop/src-tauri/src/linux_text_rendering.rs)).
+The trigger is the GTK value, whichever desktop produced it; the user's system
+preference is unchanged, and the host's native menu and dialogs use the same
+pinned hinting. The override runs after Tauri has created the main window and
+reaches the webview because WebKitGTK propagates GtkSettings changes to its web
+processes; it is not re-evaluated if the session setting changes while the app
+is running.
+
+**Density.** Under the pinned hinting the Linux CSS in
+[`index.css`](../../apps/web/src/index.css) renders body text at weight 450 and
+`pre` and `code` at 400 to keep stroke density, and never adds letter-spacing,
+because fractional per-glyph advances snap into whole-pixel gaps under hinting.
+
+**LCD text in scrollers.** WebKitGTK paints text inside a composited scroll
+container with grayscale antialiasing unless an ancestor inside that scroller
+paints an opaque background. The scroller's own background does not count, a
+nested scroller starts over, and alpha theme tokens such as `--muted` and
+`--accent` never count. A `mask-image` on the scrolled content or an ancestor
+with `opacity` below 1 forces grayscale even with a painted ancestor. Reading
+surfaces therefore mark the content wrapper inside their scroller with
+`data-text-surface="background|card|sidebar"`, which the Linux CSS paints with
+the matching opaque token, and the Linux CSS removes the `ScrollArea`
+scroll-fade mask, so Linux has no scroll fade. Coverage today is the sidebar
+content, the chat timeline rows, the settings column, and the Agents list;
+every other scroller, including menus, dialogs, popovers, the git manager
+lists, and file preview, renders grayscale text on Linux until it adopts a
+wrapper. Any new scrollable reading surface must add one.
 
 ## Request and event flow
 
