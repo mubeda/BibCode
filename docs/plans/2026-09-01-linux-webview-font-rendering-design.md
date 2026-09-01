@@ -275,3 +275,24 @@ temporary-HOME harness, and require the sidebar text crop's fringe ratio to
 rise from 0.000 to at least 0.85 while the static title stays LCD. The chat
 timeline is verified by analog (per-row painted wrapper equals harness
 variants 8 and 24) because the throwaway HOME has no thread to render.
+
+## Revision 5 (same day) — sidebar typography floor and contrast
+
+With LCD text restored, the remaining gap against the reference Electron app in
+the user's side-by-side screenshot was typographic, not rendering: its sidebar
+navigation rows are 13px medium on a near-black foreground at 60% alpha, while
+BiBCode's were 12px regular on the muted foreground at 70% alpha (two
+reductions stacked), and badges such as `primary` were 9px. Published minimums
+agree: Apple's macOS guidance accepts 11pt as the smallest text, and both
+Apple and Material put comfortable body text well above that.
+
+**Decision:** add a theme token `--text-2xs` (11px, 1rem line height) as the
+smallest size in the app and use it for every 8/9/10px label in the sidebar,
+the Agents view, and timeline metadata; set navigation rows and project and
+thread titles to 13px medium on `foreground/80`; never alpha-reduce
+`muted-foreground` for text (badges, subtitles, and empty states use the solid
+token). The `primary` badge gains a border at 11px. Remaining `text-[9px]` and
+`text-[10px]` uses outside those surfaces (settings diagnostics, worktree
+discovery, status bar, git manager) are a follow-up sweep to the same token.
+If 11px still reads small on the user's display, raise the token to 12px
+rather than adjusting individual labels.

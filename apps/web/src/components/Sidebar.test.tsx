@@ -1613,7 +1613,7 @@ staticDescribe("Sidebar full render", () => {
         props["data-thread-selection-safe"] !== undefined &&
         props["size"] === "sm" &&
         props["className"] !== undefined &&
-        String(props["className"]).includes("text-[10px]"),
+        String(props["className"]).includes("text-2xs"),
       "show more button",
     );
     invoke(showMore, "onClick", mouseEvent());

@@ -51,14 +51,14 @@ export function AgentsNavRow() {
           <SidebarMenuButton
             size="sm"
             isActive={pathname === "/agents"}
-            className="gap-2 px-2 py-1.5 text-muted-foreground/70 hover:bg-accent hover:text-foreground"
+            className="gap-2 px-2 py-1.5 text-foreground/80 hover:bg-accent hover:text-foreground"
             data-testid="agents-nav-row"
             aria-current={pathname === "/agents" ? "page" : undefined}
             onClick={handleClick}
           >
-            <BotIcon className="size-3.5" aria-hidden />
-            <span className="flex-1 truncate text-left text-xs">Agents</span>
-            <span className="rounded-full bg-muted px-1.5 py-0.5 text-[9px] font-medium tabular-nums text-muted-foreground/70">
+            <BotIcon className="size-4 text-foreground/60" aria-hidden />
+            <span className="flex-1 truncate text-left text-[13px] font-medium">Agents</span>
+            <span className="rounded-full bg-muted px-1.5 py-0.5 text-2xs font-medium tabular-nums text-muted-foreground">
               {unreadCount}
             </span>
           </SidebarMenuButton>
