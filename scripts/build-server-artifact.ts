@@ -159,7 +159,7 @@ export function planServerArtifact(
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "$ErrorActionPreference = 'Stop'; Compress-Archive -LiteralPath $env:BIBCODE_SERVER_ARCHIVE_SOURCE -DestinationPath $env:BIBCODE_SERVER_ARCHIVE_DESTINATION -CompressionLevel Optimal",
+            "$ErrorActionPreference = 'Stop'; Add-Type -AssemblyName System.IO.Compression.FileSystem; [IO.Compression.ZipFile]::CreateFromDirectory([IO.Path]::GetFullPath($env:BIBCODE_SERVER_ARCHIVE_SOURCE), [IO.Path]::GetFullPath($env:BIBCODE_SERVER_ARCHIVE_DESTINATION), [IO.Compression.CompressionLevel]::Optimal, $true)",
           ],
           env: {
             BIBCODE_SERVER_ARCHIVE_SOURCE: NodePath.win32.join(
@@ -398,17 +398,22 @@ function validateArchive(plan: ServerArtifactPlan): void {
   if (result.status !== 0) {
     throw new ServerArtifactConfigurationError(`Could not inspect ${plan.archiveName}.`);
   }
-  const prefix = `${plan.distributionRootName}/`;
-  const entries = String(result.stdout)
-    .split(/\r?\n/)
-    .filter(Boolean)
-    .map((entry) => entry.replaceAll("\\", "/"));
+  const entries = String(result.stdout).split(/\r?\n/).filter(Boolean);
+  validateServerArchiveEntries(entries, plan.distributionRootName);
+}
+
+export function validateServerArchiveEntries(
+  entries: ReadonlyArray<string>,
+  distributionRootName: string,
+): void {
+  const prefix = `${distributionRootName}/`;
   const seen = new Set<string>();
   for (const entry of entries) {
     if (
+      entry.includes("\\") ||
       NodePath.posix.isAbsolute(entry) ||
       entry.split("/").includes("..") ||
-      (entry !== plan.distributionRootName && !entry.startsWith(prefix)) ||
+      (entry !== distributionRootName && !entry.startsWith(prefix)) ||
       seen.has(entry)
     ) {
       throw new ServerArtifactConfigurationError(`Unsafe archive entry ${entry}.`);
