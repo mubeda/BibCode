@@ -16,7 +16,6 @@ export const AGENT_GROUP_ORDER = [
   { id: "done", label: "Done" },
 ] as const satisfies ReadonlyArray<{ id: AgentGroupId; label: string }>;
 
-export const AGENTS_GROUP_PREVIEW_COUNT = 5;
 export const AGENTS_FILTER_MAX_BYTES = 2048;
 
 export interface AgentRow {
@@ -31,12 +30,6 @@ export interface AgentRow {
   readonly projectTitle: string;
   readonly previewLine: string | null;
   readonly searchText: string;
-}
-
-export interface AgentGroup {
-  readonly id: AgentGroupId;
-  readonly label: string;
-  readonly rows: ReadonlyArray<AgentRow>;
 }
 
 export type AgentsGroupByMode = "status" | "project" | "environment";
@@ -128,37 +121,6 @@ function compareAgentRows(left: AgentRow, right: AgentRow): number {
   return 0;
 }
 
-export function groupAgentRows(
-  rows: ReadonlyArray<AgentRow>,
-  query: string,
-): ReadonlyArray<AgentGroup> {
-  if (new TextEncoder().encode(query).length > AGENTS_FILTER_MAX_BYTES) {
-    return [];
-  }
-
-  const normalizedQuery = normalizeSearchText(query);
-  const rowsByGroup = new Map<AgentGroupId, AgentRow[]>();
-  for (const row of rows) {
-    if (!row.searchText.includes(normalizedQuery)) {
-      continue;
-    }
-    const groupRows = rowsByGroup.get(row.group);
-    if (groupRows === undefined) {
-      rowsByGroup.set(row.group, [row]);
-    } else {
-      groupRows.push(row);
-    }
-  }
-
-  return AGENT_GROUP_ORDER.flatMap(({ id, label }) => {
-    const groupRows = rowsByGroup.get(id);
-    if (groupRows === undefined || groupRows.length === 0) {
-      return [];
-    }
-    return [{ id, label, rows: groupRows.sort(compareAgentRows) }];
-  });
-}
-
 export function buildAgentViewGroups(
   rows: ReadonlyArray<AgentRow>,
   options: {
@@ -169,7 +131,31 @@ export function buildAgentViewGroups(
     readonly selectedKey: string | null;
   },
 ): ReadonlyArray<AgentViewGroup> {
-  const filteredGroups = groupAgentRows(rows, options.query);
+  if (new TextEncoder().encode(options.query).length > AGENTS_FILTER_MAX_BYTES) {
+    return [];
+  }
+
+  const normalizedQuery = normalizeSearchText(options.query);
+  const rowsByStatus = new Map<AgentGroupId, AgentRow[]>();
+  for (const row of rows) {
+    if (!row.searchText.includes(normalizedQuery)) {
+      continue;
+    }
+    const statusRows = rowsByStatus.get(row.group);
+    if (statusRows === undefined) {
+      rowsByStatus.set(row.group, [row]);
+    } else {
+      statusRows.push(row);
+    }
+  }
+
+  const filteredGroups = AGENT_GROUP_ORDER.flatMap(({ id, label }) => {
+    const statusRows = rowsByStatus.get(id);
+    if (statusRows === undefined || statusRows.length === 0) {
+      return [];
+    }
+    return [{ id, label, rows: statusRows.sort(compareAgentRows) }];
+  });
   const visibleGroups = options.unreadOnly
     ? filteredGroups.flatMap((group) => {
         const visibleRows = group.rows.filter(
