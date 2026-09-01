@@ -7,6 +7,55 @@ export type GitManagerAvailability =
   | { readonly kind: "disconnected"; readonly reason: string }
   | { readonly kind: "unsupported"; readonly missingCapability: "gitManagerReads" };
 
+export const GIT_MANAGER_BRANCH_SYNC_DISABLED_REASON =
+  "This environment does not support Git Manager branch and sync operations.";
+export const GIT_MANAGER_STASH_MERGE_DISABLED_REASON =
+  "This environment does not support Git Manager stash and merge operations.";
+export const GIT_MANAGER_REWRITE_DISABLED_REASON =
+  "This environment does not support Git Manager rewrite operations.";
+export const GIT_MANAGER_TAG_DISABLED_REASON =
+  "This environment does not support Git Manager tag operations.";
+export const GIT_MANAGER_PULL_REQUESTS_DISABLED_REASON =
+  "This environment does not support Git Manager pull request operations.";
+export const GIT_MANAGER_LIVE_SIGNAL_DISABLED_REASON =
+  "This environment does not support Git Manager live updates. Use Refresh to load new repository data.";
+
+export interface GitManagerCapabilityDisabledReasons {
+  readonly branchSync: string | null;
+  readonly stashMerge: string | null;
+  readonly rewrite: string | null;
+  readonly tag: string | null;
+  readonly pullRequests: string | null;
+  readonly liveSignal: string | null;
+}
+
+export function resolveGitManagerCapabilityDisabledReasons(
+  serverConfig: ServerConfig | null,
+): GitManagerCapabilityDisabledReasons {
+  const capabilities = serverConfig?.environment?.capabilities;
+  return {
+    branchSync:
+      capabilities?.gitManagerBranchSyncOperations === true
+        ? null
+        : GIT_MANAGER_BRANCH_SYNC_DISABLED_REASON,
+    stashMerge:
+      capabilities?.gitManagerStashMergeOperations === true
+        ? null
+        : GIT_MANAGER_STASH_MERGE_DISABLED_REASON,
+    rewrite:
+      capabilities?.gitManagerRewriteOperations === true
+        ? null
+        : GIT_MANAGER_REWRITE_DISABLED_REASON,
+    tag: capabilities?.gitManagerTagOperations === true ? null : GIT_MANAGER_TAG_DISABLED_REASON,
+    pullRequests:
+      capabilities?.gitManagerPullRequests === true
+        ? null
+        : GIT_MANAGER_PULL_REQUESTS_DISABLED_REASON,
+    liveSignal:
+      capabilities?.gitManagerLiveSignal === true ? null : GIT_MANAGER_LIVE_SIGNAL_DISABLED_REASON,
+  };
+}
+
 function disconnectedReason(connectionState: SupervisorConnectionState): string {
   switch (connectionState.phase) {
     case "available":

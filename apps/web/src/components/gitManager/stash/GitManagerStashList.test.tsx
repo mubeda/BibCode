@@ -186,6 +186,27 @@ describe("GitManagerStashList", () => {
     }
     expect(markup).toContain(blocked.message);
   });
+
+  it("disables every stash mutation with the capability reason while stash browsing still works", () => {
+    const reason = "This environment does not support Git Manager stash and merge operations.";
+    const { markup, onSelectStash } = renderList({
+      blockedReasons: [],
+      disabledReason: reason,
+      operationInFlight: false,
+    });
+
+    for (const label of ["Apply stash@{0}", "Pop stash@{0}", "Drop stash@{0}"]) {
+      expect(h.buttons.find((props) => props["aria-label"] === label)).toMatchObject({
+        disabled: true,
+        title: reason,
+      });
+    }
+    expect(markup).toContain(reason);
+    const select = h.buttons.find((props) => props["aria-label"] === "Select stash stash@{0}");
+    expect(select?.disabled).not.toBe(true);
+    (select?.onClick as (() => void) | undefined)?.();
+    expect(onSelectStash).toHaveBeenCalledWith("stash-sha");
+  });
 });
 
 describe("GitManagerStashDiff", () => {

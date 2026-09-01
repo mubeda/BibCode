@@ -15,17 +15,17 @@ describe("run Tauri build", () => {
   });
 
   it("runs the locked Tauri CLI through the platform toolchain adapter", () => {
-    const runMsvcX64 = vi.fn(() => 17);
+    const runMsvc = vi.fn(() => 17);
 
     expect(
       runTauriBuild({
         platform: "linux",
         env: { SENTINEL: "kept" },
         args: ["--features", "desktop-e2e"],
-        runMsvcX64,
+        runMsvc,
       }),
     ).toBe(17);
-    expect(runMsvcX64).toHaveBeenCalledWith(
+    expect(runMsvc).toHaveBeenCalledWith(
       ["pnpm", "exec", "tauri", "build", "--features", "desktop-e2e"],
       {
         env: { SENTINEL: "kept", NO_STRIP: "1" },

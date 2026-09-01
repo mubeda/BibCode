@@ -5,6 +5,47 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
 
+const targetArgument = (args) => {
+  const index = args.indexOf("--target");
+  if (index >= 0) return args[index + 1];
+  return args.find((argument) => argument.startsWith("--target="))?.slice("--target=".length);
+};
+
+const normalizeArchitecture = (value) => {
+  const normalized = value?.trim().toLowerCase();
+  if (!normalized) return undefined;
+  if (normalized.includes("aarch64") || normalized.includes("arm64")) return "arm64";
+  if (normalized.includes("x86_64") || normalized.includes("amd64") || normalized === "x64") {
+    return "x64";
+  }
+  return undefined;
+};
+
+export function resolveMsvcArchitecture(args, env) {
+  return (
+    normalizeArchitecture(targetArgument(args)) ??
+    normalizeArchitecture(env.CARGO_BUILD_TARGET) ??
+    normalizeArchitecture(env.TAURI_DESKTOP_ARCH) ??
+    normalizeArchitecture(env.PROCESSOR_ARCHITEW6432) ??
+    normalizeArchitecture(env.PROCESSOR_ARCHITECTURE) ??
+    "x64"
+  );
+}
+
+export function msvcToolchain(architecture) {
+  return architecture === "arm64"
+    ? {
+        cargoRunnerKey: "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUNNER",
+        vcvarsArgument: "arm64",
+        vsComponent: "Microsoft.VisualStudio.Component.VC.Tools.ARM64",
+      }
+    : {
+        cargoRunnerKey: "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER",
+        vcvarsArgument: "x64",
+        vsComponent: "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+      };
+}
+
 export function run(command, commandArgs, options = {}, spawnSync = NodeChildProcess.spawnSync) {
   return (
     spawnSync(command, commandArgs, {
@@ -16,6 +57,8 @@ export function run(command, commandArgs, options = {}, spawnSync = NodeChildPro
 }
 
 export function discoverVcVarsAll(options = {}) {
+  const architecture = options.architecture ?? "x64";
+  const toolchain = msvcToolchain(architecture);
   const programFilesX86 = options.programFilesX86 ?? process.env["ProgramFiles(x86)"];
   const existsSync = options.existsSync ?? NodeFS.existsSync;
   const spawnSync = options.spawnSync ?? NodeChildProcess.spawnSync;
@@ -37,7 +80,7 @@ export function discoverVcVarsAll(options = {}) {
         "-products",
         "*",
         "-requires",
-        "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+        toolchain.vsComponent,
         "-property",
         "installationPath",
       ],
@@ -106,27 +149,28 @@ export function canonicalizeCargoTestTarget(args, env, options = {}) {
   };
 }
 
-export function runMsvcX64(args, options = {}) {
+export function runMsvc(args, options = {}) {
   const consoleError = options.consoleError ?? console.error;
   const spawnSync = options.spawnSync ?? NodeChildProcess.spawnSync;
   if (args.length === 0) {
-    consoleError("Usage: node scripts/run-msvc-x64.mjs <command> [...args]");
+    consoleError("Usage: node scripts/run-msvc.mjs <command> <arguments>");
     return 2;
   }
 
-  const cargoRunnerKey = "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER";
+  const configuredInputEnv = { ...process.env, ...options.env };
+  const architecture = resolveMsvcArchitecture(args, configuredInputEnv);
+  const toolchain = msvcToolchain(architecture);
   const configuredEnv = {
     ...process.env,
-    [cargoRunnerKey]:
-      options.env?.[cargoRunnerKey] ??
-      process.env[cargoRunnerKey] ??
-      defaultWindowsCargoRunner({
-        repoRoot: options.repoRoot,
-      }),
+    [toolchain.cargoRunnerKey]:
+      options.env?.[toolchain.cargoRunnerKey] ??
+      process.env[toolchain.cargoRunnerKey] ??
+      defaultWindowsCargoRunner({ repoRoot: options.repoRoot }),
     ...options.env,
   };
   const env = canonicalizeCargoTestTarget(args, configuredEnv, options);
   const vcvarsall = discoverVcVarsAll({
+    architecture,
     programFilesX86: options.programFilesX86,
     existsSync: options.existsSync,
     spawnSync,
@@ -138,7 +182,7 @@ export function runMsvcX64(args, options = {}) {
   const comspec = options.comspec ?? process.env.ComSpec ?? "cmd.exe";
   const scriptPath = NodePath.join(
     options.tmpdir ?? NodeOS.tmpdir(),
-    `bibcode-msvc-x64-${options.pid ?? process.pid}-${options.now?.() ?? Date.now()}.cmd`,
+    `bibcode-msvc-${architecture}-${options.pid ?? process.pid}-${options.now?.() ?? Date.now()}.cmd`,
   );
   const writeFileSync = options.writeFileSync ?? NodeFS.writeFileSync;
   const rmSync = options.rmSync ?? NodeFS.rmSync;
@@ -146,7 +190,7 @@ export function runMsvcX64(args, options = {}) {
     scriptPath,
     [
       "@echo off",
-      `call "${vcvarsall}" x64`,
+      `call "${vcvarsall}" ${toolchain.vcvarsArgument}`,
       "if errorlevel 1 exit /b %errorlevel%",
       args.map(quoteCmdArg).join(" "),
       "exit /b %errorlevel%",
@@ -165,5 +209,5 @@ if (
   process.argv[1] !== undefined &&
   import.meta.url === NodeURL.pathToFileURL(process.argv[1]).href
 ) {
-  process.exit(runMsvcX64(process.argv.slice(2)));
+  process.exit(runMsvc(process.argv.slice(2)));
 }

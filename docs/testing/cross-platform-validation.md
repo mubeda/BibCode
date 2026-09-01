@@ -99,6 +99,30 @@ A focused suite must cover the changed success behavior and its material
 failure, cancellation, retry, restart, and cleanup seams. For cross-platform
 logic, include host-independent fixtures for every affected platform.
 
+### Native release distribution evidence
+
+For every desktop target, build and install the native artifact, inspect the installed
+executable architecture, run the packaged UI suite, retain bounded screenshots/logs, and
+exercise a seeded update. The required matrix is macOS ARM64/x64, Linux ARM64/x64, and
+Windows ARM64/x64. A cross-compiled or emulated executable is compatibility evidence, not
+a native pass.
+
+For every standalone server target, inspect the native executable, run `bibcode
+--version`, start the staged distribution without `--static-dir`, fetch `/`, read the
+environment descriptor, issue and exchange pairing material, then terminate and prove
+cleanup. Linux additionally installs and removes both package formats in native
+containers:
+
+| Format | Required systems                      |
+| ------ | ------------------------------------- |
+| `.deb` | Ubuntu 22.04, Ubuntu 24.04, Debian 12 |
+| `.rpm` | Rocky Linux 9, Fedora 44              |
+
+Package removal must delete `/usr/bin/bibcode` and package-owned documentation/web
+assets while preserving a test sentinel in the isolated BiBCode data root. Record the
+archive/package name, reported architecture, version, startup result, pairing result,
+shutdown result, and evidence artifact location in the execution report.
+
 ### Grant-driven remote sharing
 
 When pairing-offer generation, grant reach metadata, desktop exposure, or
@@ -200,6 +224,7 @@ cargo test -p bibcode-server rpc::session::tests::byte_and_queue_admission_share
 cargo test -p bibcode-server auth::service::tests::completed_pairing_offer_replays_and_cancels_after_restart --lib -- --exact
 cargo test -p bibcode-server auth::service::tests::pending_pairing_offer_can_be_cancelled_after_restart --lib -- --exact
 cargo test -p bibcode-server auth::service::tests::pending_pairing_offer_recovers_for_retry_after_restart --lib -- --exact
+cargo test -p bibcode-server auth::service::tests::live_service_does_not_recover_another_services_young_pending_offer --lib -- --exact
 cargo test -p bibcode-server auth::service::tests::remote_offer_cancellation_converges_dormant_share_state_and_access_events --lib -- --exact
 cargo test -p bibcode-server auth::service::tests::cancelled_guard_registration_releases_bookkeeping_while_persistence_is_queued --lib -- --exact
 cargo test -p bibcode-server auth::service::tests::cancelled_pending_session_issuance_revokes_durable_commit_before_state_publication --lib -- --exact
@@ -208,6 +233,7 @@ cargo test -p bibcode-server --lib keeps_one_service_watcher -- --nocapture
 cargo test -p bibcode-server auth::service::tests::cross_service_authentication_starts_watcher_for_the_cached_session --lib -- --exact
 cargo test -p bibcode-server --test repositories pairing_offer_reservations_enforce_the_shared_ -- --nocapture
 cargo test -p bibcode-server --test auth_http pairing_offer_authority_is_shared_across_simultaneously_live_servers -- --exact
+cargo test -p bibcode-server --test auth_http concurrent_pairing_offer_retries_across_live_servers_return_one_result -- --exact
 cargo test -p bibcode-server --test auth_http remote_revocation_closes_an_acked_live_stream_before_later_events -- --exact
 cargo test -p bibcode-server --test repositories pending_auth_sessions_confirm_by_id_and_startup_cleanup_is_selective -- --exact
 cargo test -p bibcode-desktop firewall::tests --lib -- --nocapture
@@ -355,17 +381,17 @@ refresh scheduling changes, run the current focused owners before broad gates:
 vp run check:contracts
 vp test run apps/web/src/components/SourceControlPanel.test.tsx apps/web/src/components/files/FileBrowserPanel.test.tsx apps/web/src/components/GitActionsControl.test.tsx apps/web/src/components/Sidebar.test.tsx apps/web/src/components/ThreadStatusIndicators.test.tsx
 vp test run packages/contracts/src/gitManager.test.ts packages/contracts/src/environment.test.ts apps/web/src/gitManagerStore.test.ts apps/web/src/components/gitManager scripts/privacy-contract.test.ts
-node scripts/run-msvc-x64.mjs cargo test -p bibcode-server git:: -- --nocapture
-node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --lib git::manager:: -- --nocapture
-node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --lib git::broadcaster::tests::ref_poll_is_replaced_by_watcher_and_safety_status_reads -- --exact --nocapture
-node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --lib terminal::manager::tests::retained_process_exit_callback_does_not_hold_terminal_publication -- --exact --nocapture
-node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --lib production::runtime::tests::structured_terminal_process_exit_immediately_invalidates_status_under_watcher_fallback -- --exact --nocapture
-node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --lib production::runtime::tests::provider_lifecycle_and_delivery_events_do_not_trigger_git_status_reads -- --exact --nocapture
-node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test production_git_vcs_rpc -- --nocapture
-node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test git_manager_reads -- --nocapture
-node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test git_manager_commit -- --nocapture
-node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test production_git_manager_rpc -- --nocapture
-node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test git_rpc -- --nocapture
+node scripts/run-msvc.mjs cargo test -p bibcode-server git:: -- --nocapture
+node scripts/run-msvc.mjs cargo test -p bibcode-server --lib git::manager:: -- --nocapture
+node scripts/run-msvc.mjs cargo test -p bibcode-server --lib git::broadcaster::tests::ref_poll_is_replaced_by_watcher_and_safety_status_reads -- --exact --nocapture
+node scripts/run-msvc.mjs cargo test -p bibcode-server --lib terminal::manager::tests::retained_process_exit_callback_does_not_hold_terminal_publication -- --exact --nocapture
+node scripts/run-msvc.mjs cargo test -p bibcode-server --lib production::runtime::tests::structured_terminal_process_exit_immediately_invalidates_status_under_watcher_fallback -- --exact --nocapture
+node scripts/run-msvc.mjs cargo test -p bibcode-server --lib production::runtime::tests::provider_lifecycle_and_delivery_events_do_not_trigger_git_status_reads -- --exact --nocapture
+node scripts/run-msvc.mjs cargo test -p bibcode-server --test production_git_vcs_rpc -- --nocapture
+node scripts/run-msvc.mjs cargo test -p bibcode-server --test git_manager_reads -- --nocapture
+node scripts/run-msvc.mjs cargo test -p bibcode-server --test git_manager_commit -- --nocapture
+node scripts/run-msvc.mjs cargo test -p bibcode-server --test production_git_manager_rpc -- --nocapture
+node scripts/run-msvc.mjs cargo test -p bibcode-server --test git_rpc -- --nocapture
 vp test run packages/client-runtime/src/state/vcs.test.ts apps/web/src/components/GitActionsControl.test.tsx
 ```
 
@@ -455,7 +481,7 @@ When catalog fingerprint inputs, reuse timing, or inventory invalidation change,
 run the ignored native fleet test explicitly:
 
 ```powershell
-node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --lib worktree_catalog::tests::fingerprint_focus_fleet_reconciles_every_five_minutes_for_thirty_minutes -- --ignored --exact --nocapture
+node scripts/run-msvc.mjs cargo test -p bibcode-server --lib worktree_catalog::tests::fingerprint_focus_fleet_reconciles_every_five_minutes_for_thirty_minutes -- --ignored --exact --nocapture
 ```
 
 The test uses ten disposable real Git repositories, the production filesystem
@@ -475,7 +501,7 @@ cold builds and 30 immediate warm hits:
 
 ```powershell
 Remove-Item Env:BIBCODE_FILE_INDEX_BENCHMARK_SAMPLES -ErrorAction SilentlyContinue
-node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --lib workspace::rpc::tests::benchmark_file_manager_index_phases -- --ignored --exact --nocapture
+node scripts/run-msvc.mjs cargo test -p bibcode-server --lib workspace::rpc::tests::benchmark_file_manager_index_phases -- --ignored --exact --nocapture
 ```
 
 The ignored test creates one unique disposable real-Git repository and completes
@@ -515,7 +541,7 @@ output limits, sibling settlement, and bounded filesystem fallback. Verify a
 slow successful pair inside the bound and timeout fallback beyond it with:
 
 ```powershell
-node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --lib workspace::search::tests::git_snapshot_accepts_slow_success_inside_bound_and_falls_back_beyond_it -- --exact --nocapture
+node scripts/run-msvc.mjs cargo test -p bibcode-server --lib workspace::search::tests::git_snapshot_accepts_slow_success_inside_bound_and_falls_back_beyond_it -- --exact --nocapture
 ```
 
 Then run `workspace_rpc` twice at its default harness width. Isolate the known

@@ -183,6 +183,9 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
   const [mutationError, setMutationError] = useState<string | null>(null);
   const [pendingDiscard, setPendingDiscard] = useState<PendingDiscard | null>(null);
   const readsAvailable = typeof gitManagerEnvironment.getRefs === "function";
+  const project = useProject(stableProjectRef);
+  const serverConfig = useServerConfigs().get(environmentId) ?? null;
+  const liveSignalAvailable = serverConfig?.environment?.capabilities.gitManagerLiveSignal === true;
 
   const statusAtom = useMemo(
     () => (readsAvailable ? vcsEnvironment.status({ environmentId, input: { cwd } }) : null),
@@ -193,8 +196,11 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
     return typeof getRefs === "function" ? getRefs({ environmentId, input: { cwd } }) : null;
   }, [cwd, environmentId]);
   const signalAtom = useMemo(
-    () => (readsAvailable ? gitManagerEnvironment.signal({ environmentId, input: { cwd } }) : null),
-    [cwd, environmentId, readsAvailable],
+    () =>
+      readsAvailable && liveSignalAvailable
+        ? gitManagerEnvironment.signal({ environmentId, input: { cwd } })
+        : null,
+    [cwd, environmentId, liveSignalAvailable, readsAvailable],
   );
   const latestCommitAtom = useMemo(() => {
     const getCommits = gitManagerEnvironment.getCommits;
@@ -213,8 +219,6 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
     if (signalGeneration !== null) refreshRefs();
   }, [refreshRefs, signalGeneration]);
 
-  const project = useProject(stableProjectRef);
-  const serverConfig = useServerConfigs().get(environmentId) ?? null;
   const availableEditors = serverConfig?.availableEditors ?? EMPTY_EDITORS;
   const openInPreferredEditor = useOpenInPreferredEditor(environmentId, availableEditors);
   const revealInFileManager = useAtomCommand(shellEnvironment.openInEditor, {

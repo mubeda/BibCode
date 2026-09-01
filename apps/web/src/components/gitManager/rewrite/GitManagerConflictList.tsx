@@ -23,12 +23,14 @@ export interface GitManagerConflictListProps {
   readonly onResolve: (path: string, side: "ours" | "theirs") => void;
   readonly onUndoResolve: (path: string) => void;
   readonly continueBlocked: GitManagerBlockedReason | null;
+  readonly disabledReason?: string | null;
   readonly onContinue?: () => void;
   readonly onCommit?: () => void;
 }
 
 interface GitManagerConflictRowProps {
   readonly conflict: GitManagerConflictState;
+  readonly disabledReason: string | null;
   readonly onResolve: (path: string, side: "ours" | "theirs") => void;
   readonly onUndoResolve: (path: string) => void;
 }
@@ -42,6 +44,7 @@ function conflictRowPropsEqual(
     previous.conflict.kind === next.conflict.kind &&
     previous.conflict.markerCount === next.conflict.markerCount &&
     previous.conflict.resolution === next.conflict.resolution &&
+    previous.disabledReason === next.disabledReason &&
     previous.onResolve === next.onResolve &&
     previous.onUndoResolve === next.onUndoResolve
   );
@@ -49,6 +52,7 @@ function conflictRowPropsEqual(
 
 const GitManagerConflictRow = memo(function GitManagerConflictRow({
   conflict,
+  disabledReason,
   onResolve,
   onUndoResolve,
 }: GitManagerConflictRowProps) {
@@ -63,6 +67,10 @@ const GitManagerConflictRow = memo(function GitManagerConflictRow({
     [conflict.path, onResolve],
   );
   const undo = useCallback(() => onUndoResolve(conflict.path), [conflict.path, onUndoResolve]);
+  const disabledReasonId =
+    disabledReason === null
+      ? undefined
+      : `git-manager-conflict-${encodeURIComponent(conflict.path)}-disabled-reason`;
 
   return (
     <li className="flex min-w-0 items-center gap-2 border-b border-border/60 px-3 py-2 text-xs">
@@ -81,8 +89,11 @@ const GitManagerConflictRow = memo(function GitManagerConflictRow({
       </span>
       {resolved ? (
         <Button
+          aria-describedby={disabledReasonId}
           aria-label={`Undo resolution for ${conflict.path}`}
+          disabled={disabledReason !== null}
           size="xs"
+          title={disabledReason ?? undefined}
           variant="ghost"
           onClick={undo}
         >
@@ -92,26 +103,34 @@ const GitManagerConflictRow = memo(function GitManagerConflictRow({
       ) : conflict.kind === "binary" || conflict.kind === "submodule" ? (
         <details className="relative">
           <summary
+            aria-describedby={disabledReasonId}
             aria-label={`Resolve ${conflict.path}`}
             className="inline-flex min-h-7 cursor-pointer list-none items-center gap-1 rounded-md border border-border px-2 hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring"
+            title={disabledReason ?? undefined}
           >
             Resolve
             <ChevronDownIcon aria-hidden="true" className="size-3" />
           </summary>
           <div className="absolute end-0 z-20 mt-1 min-w-28 rounded-md border border-border bg-popover p-1 shadow-lg">
             <Button
+              aria-describedby={disabledReasonId}
               aria-label={`Resolve ${conflict.path} with ours`}
               className="w-full justify-start"
+              disabled={disabledReason !== null}
               size="xs"
+              title={disabledReason ?? undefined}
               variant="ghost"
               onClick={resolveOurs}
             >
               Ours
             </Button>
             <Button
+              aria-describedby={disabledReasonId}
               aria-label={`Resolve ${conflict.path} with theirs`}
               className="w-full justify-start"
+              disabled={disabledReason !== null}
               size="xs"
+              title={disabledReason ?? undefined}
               variant="ghost"
               onClick={resolveTheirs}
             >
@@ -120,6 +139,11 @@ const GitManagerConflictRow = memo(function GitManagerConflictRow({
           </div>
         </details>
       ) : null}
+      {disabledReason === null ? null : (
+        <span className="sr-only" id={disabledReasonId}>
+          {disabledReason}
+        </span>
+      )}
     </li>
   );
 }, conflictRowPropsEqual);
@@ -129,6 +153,7 @@ export const GitManagerConflictList = memo(function GitManagerConflictList({
   onResolve,
   onUndoResolve,
   continueBlocked,
+  disabledReason = null,
   onContinue,
   onCommit,
 }: GitManagerConflictListProps) {
@@ -145,8 +170,9 @@ export const GitManagerConflictList = memo(function GitManagerConflictList({
     onCommit?.();
   }, [onCommit]);
   const closeCommitWarning = useCallback(() => setCommitWarningOpen(false), []);
+  const effectiveContinueReason = disabledReason ?? continueBlocked?.message ?? null;
   const continueReasonId =
-    continueBlocked === null ? undefined : "git-manager-conflicts-continue-reason";
+    effectiveContinueReason === null ? undefined : "git-manager-conflicts-continue-reason";
 
   return (
     <section aria-label="Conflicted files" className="min-h-0">
@@ -154,6 +180,7 @@ export const GitManagerConflictList = memo(function GitManagerConflictList({
         {conflicts.map((conflict) => (
           <GitManagerConflictRow
             conflict={conflict}
+            disabledReason={disabledReason}
             key={conflict.path}
             onResolve={onResolve}
             onUndoResolve={onUndoResolve}
@@ -169,15 +196,15 @@ export const GitManagerConflictList = memo(function GitManagerConflictList({
         <Button
           aria-describedby={continueReasonId}
           aria-label="Continue operation"
-          disabled={continueBlocked !== null}
-          title={continueBlocked?.message}
+          disabled={effectiveContinueReason !== null}
+          title={effectiveContinueReason ?? undefined}
           onClick={onContinue}
         >
           Continue
         </Button>
-        {continueBlocked === null ? null : (
+        {effectiveContinueReason === null ? null : (
           <span className="sr-only" id={continueReasonId}>
-            {continueBlocked.message}
+            {effectiveContinueReason}
           </span>
         )}
       </div>

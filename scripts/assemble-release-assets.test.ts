@@ -1,0 +1,134 @@
+// @effect-diagnostics nodeBuiltinImport:off - This assembler test uses real temporary release fixtures.
+import * as NodeCrypto from "node:crypto";
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
+
+import { afterEach, describe, expect, it } from "vite-plus/test";
+
+import {
+  ReleaseAssetAssemblyError,
+  assembleReleaseAssets,
+  expectedServerAssetNames,
+  serverSigningPlan,
+} from "./assemble-release-assets.ts";
+
+const temporaryRoots: string[] = [];
+
+function temporaryRoot(): string {
+  const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "bibcode-release-assets-"));
+  temporaryRoots.push(root);
+  return root;
+}
+
+afterEach(() => {
+  for (const root of temporaryRoots.splice(0)) {
+    NodeFS.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+function writeCompleteFixture(root: string, version: string, updater: boolean): void {
+  const desktop = [
+    `BiBCode_${version}_aarch64.dmg`,
+    `BiBCode_${version}_x64.dmg`,
+    `BiBCode_${version}_aarch64.AppImage`,
+    `BiBCode_${version}_amd64.AppImage`,
+    `BiBCode_${version}_arm64-setup.exe`,
+    `BiBCode_${version}_x64-setup.exe`,
+  ];
+  for (const name of [...desktop, ...expectedServerAssetNames(version)]) {
+    NodeFS.writeFileSync(NodePath.join(root, name), name);
+  }
+  if (updater) {
+    NodeFS.writeFileSync(NodePath.join(root, "latest.json"), "{}\n");
+    for (const target of [
+      "darwin-aarch64",
+      "darwin-x86_64",
+      "linux-aarch64",
+      "linux-x86_64",
+      "windows-aarch64",
+      "windows-x86_64",
+    ]) {
+      const artifact = target.startsWith("darwin-")
+        ? `bibcode-update-${target}.app.tar.gz`
+        : target === "linux-aarch64"
+          ? `BiBCode_${version}_aarch64.AppImage`
+          : target === "linux-x86_64"
+            ? `BiBCode_${version}_amd64.AppImage`
+            : target === "windows-aarch64"
+              ? `BiBCode_${version}_arm64-setup.exe`
+              : `BiBCode_${version}_x64-setup.exe`;
+      NodeFS.writeFileSync(
+        NodePath.join(root, `updater-${target}.json`),
+        `${JSON.stringify({ target, artifact, signature: `${artifact}.sig` })}\n`,
+      );
+      NodeFS.writeFileSync(NodePath.join(root, artifact), artifact);
+      NodeFS.writeFileSync(NodePath.join(root, `${artifact}.sig`), "signature");
+    }
+  }
+}
+
+describe("release asset assembly", () => {
+  it("requires six archives and four Linux packages", () => {
+    expect(expectedServerAssetNames("0.4.3")).toEqual([
+      "bibcode-server-v0.4.3-darwin-aarch64.tar.gz",
+      "bibcode-server-v0.4.3-darwin-x86_64.tar.gz",
+      "bibcode-server-v0.4.3-linux-aarch64.tar.gz",
+      "bibcode-server-v0.4.3-linux-x86_64.tar.gz",
+      "bibcode-server-v0.4.3-windows-aarch64.zip",
+      "bibcode-server-v0.4.3-windows-x86_64.zip",
+      "bibcode-server_0.4.3_amd64.deb",
+      "bibcode-server_0.4.3_arm64.deb",
+      "bibcode-server-0.4.3-1.aarch64.rpm",
+      "bibcode-server-0.4.3-1.x86_64.rpm",
+    ]);
+  });
+
+  it("writes sorted checksums and removes only internal updater descriptors", async () => {
+    const root = temporaryRoot();
+    writeCompleteFixture(root, "0.4.3", true);
+
+    const result = await assembleReleaseAssets({
+      assetsDir: root,
+      version: "0.4.3",
+      updater: true,
+    });
+
+    const checksumPath = NodePath.join(root, "bibcode-server-SHA256SUMS");
+    const checksumLines = NodeFS.readFileSync(checksumPath, "utf8").trim().split("\n");
+    expect(checksumLines).toHaveLength(10);
+    const checksumNames = checksumLines.map((line) => line.slice(66));
+    expect(checksumNames).toEqual(checksumNames.toSorted());
+    const firstName = "bibcode-server-0.4.3-1.aarch64.rpm";
+    const expectedHash = NodeCrypto.createHash("sha256").update(firstName).digest("hex");
+    expect(checksumLines[0]).toBe(`${expectedHash}  ${firstName}`);
+    expect(result.signed).toBe(false);
+    expect(NodeFS.existsSync(NodePath.join(root, "latest.json"))).toBe(true);
+    expect(NodeFS.readdirSync(root).some((name) => name.startsWith("updater-"))).toBe(false);
+  });
+
+  it("rejects missing server targets, unexpected files, and partial signing config", async () => {
+    const root = temporaryRoot();
+    writeCompleteFixture(root, "0.4.3", false);
+    NodeFS.rmSync(NodePath.join(root, "bibcode-server-v0.4.3-linux-aarch64.tar.gz"));
+    await expect(
+      assembleReleaseAssets({ assetsDir: root, version: "0.4.3", updater: false }),
+    ).rejects.toBeInstanceOf(ReleaseAssetAssemblyError);
+
+    writeCompleteFixture(root, "0.4.3", false);
+    NodeFS.writeFileSync(NodePath.join(root, "stale-debug.txt"), "unexpected");
+    await expect(
+      assembleReleaseAssets({ assetsDir: root, version: "0.4.3", updater: false }),
+    ).rejects.toThrow("Unexpected release asset stale-debug.txt");
+
+    NodeFS.rmSync(NodePath.join(root, "stale-debug.txt"));
+    NodeFS.writeFileSync(NodePath.join(root, "stale.sig"), "unexpected signature");
+    await expect(
+      assembleReleaseAssets({ assetsDir: root, version: "0.4.3", updater: false }),
+    ).rejects.toThrow("Unexpected release asset stale.sig");
+
+    expect(() => serverSigningPlan({ privateKey: "/tmp/private", publicKey: undefined })).toThrow(
+      "both private and public keys",
+    );
+  });
+});

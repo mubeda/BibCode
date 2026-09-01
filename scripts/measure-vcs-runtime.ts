@@ -742,7 +742,7 @@ export async function measureVcsRuntime(
   const cargoOutput = NodeChildProcess.execFileSync(
     process.execPath,
     [
-      "scripts/run-msvc-x64.mjs",
+      "scripts/run-msvc.mjs",
       "cargo",
       "build",
       "-p",

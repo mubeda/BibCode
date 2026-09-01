@@ -25,13 +25,23 @@ function commit(sha: string, parents: ReadonlyArray<string> = ["parent"]): GitMa
 }
 
 const loadedCommits = [commit("a"), commit("b"), commit("c"), commit("d")];
+const availableCapabilities = {
+  branchSyncDisabledReason: null,
+  rewriteDisabledReason: null,
+  tagDisabledReason: null,
+} as const;
 
 describe("buildCommitMenuItems", () => {
   it("builds the reference single- and multi-commit action sets", () => {
-    const single = buildCommitMenuItems(["b"], { loadedCommits, blockedReasons: [] });
+    const single = buildCommitMenuItems(["b"], {
+      loadedCommits,
+      blockedReasons: [],
+      ...availableCapabilities,
+    });
     const multiple = buildCommitMenuItems(["b", "c"], {
       loadedCommits,
       blockedReasons: [],
+      ...availableCapabilities,
     });
 
     expect(single.map((item) => item.label)).toEqual([
@@ -50,10 +60,12 @@ describe("buildCommitMenuItems", () => {
     const nonContiguous = buildCommitMenuItems(["b", "d"], {
       loadedCommits,
       blockedReasons: [],
+      ...availableCapabilities,
     });
     const withMerge = buildCommitMenuItems(["b", "c"], {
       loadedCommits: [commit("a"), commit("b", ["left", "right"]), commit("c"), commit("d")],
       blockedReasons: [],
+      ...availableCapabilities,
     });
 
     for (const items of [nonContiguous, withMerge]) {
@@ -76,6 +88,7 @@ describe("buildCommitMenuItems", () => {
       blockedReasons: [
         { operation: "squash", code: "operation-in-flight", message: serverMessage },
       ],
+      ...availableCapabilities,
     });
 
     expect(items.find((item) => item.id === "squash")).toEqual({
@@ -96,6 +109,38 @@ describe("buildCommitMenuItems", () => {
       kind: "range",
       suppressDiff: false,
       message: null,
+    });
+  });
+
+  it("applies each capability reason only to its own commit-menu actions", () => {
+    const rewriteReason = "Rewrite unavailable.";
+    const branchReason = "Branch unavailable.";
+    const tagReason = "Tag unavailable.";
+    const items = buildCommitMenuItems(["b"], {
+      loadedCommits,
+      blockedReasons: [],
+      rewriteDisabledReason: rewriteReason,
+      branchSyncDisabledReason: branchReason,
+      tagDisabledReason: tagReason,
+    });
+
+    for (const id of ["reset", "revert", "cherry-pick", "reorder"] as const) {
+      expect(items.find((item) => item.id === id)).toMatchObject({
+        enabled: false,
+        disabledReason: rewriteReason,
+      });
+    }
+    expect(items.find((item) => item.id === "create-branch")).toMatchObject({
+      enabled: false,
+      disabledReason: branchReason,
+    });
+    expect(items.find((item) => item.id === "create-tag")).toMatchObject({
+      enabled: false,
+      disabledReason: tagReason,
+    });
+    expect(items.find((item) => item.id === "copy-sha")).toMatchObject({
+      enabled: true,
+      disabledReason: null,
     });
   });
 });

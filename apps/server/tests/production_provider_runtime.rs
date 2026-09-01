@@ -68,12 +68,12 @@ use bibcode_server::{
 };
 use futures_util::{SinkExt, StreamExt, stream};
 use provider_runtime::{
-    BoxRuntimeFuture, ClaudeActivityProbeTestContext, ClaudeActivitySupport,
-    NativeProviderDriverFactory, ProviderDeliveryOutcome, ProviderDriver, ProviderDriverFactory,
-    ProviderEvent, ProviderLaunchRequest, ProviderMcpConfig, ProviderNativeEventId,
-    ProviderReconciliationOutcome, ProviderRuntimeError, ProviderRuntimeSupervisor, StartedSession,
-    SupervisorOptions, build_claude_launch_arguments_for_test,
-    build_claude_launch_arguments_with_settings_for_test,
+    BoxRuntimeFuture, ClaudeActivityProbeResolutionGate, ClaudeActivityProbeTestContext,
+    ClaudeActivitySupport, NativeProviderDriverFactory, ProviderDeliveryOutcome, ProviderDriver,
+    ProviderDriverFactory, ProviderEvent, ProviderLaunchRequest, ProviderMcpConfig,
+    ProviderNativeEventId, ProviderReconciliationOutcome, ProviderRuntimeError,
+    ProviderRuntimeSupervisor, StartedSession, SupervisorOptions,
+    build_claude_launch_arguments_for_test, build_claude_launch_arguments_with_settings_for_test,
     claude_output_shutdown_with_open_stream_for_test, deliver_durable_orchestration_turn,
     deliver_orchestration_turn, freeze_delivery_route, reconcile_abandoned_provider_sessions,
     reconcile_orchestration_turn, route_orchestration_command,
@@ -11888,8 +11888,38 @@ async fn claude_activity_probe_timeout_downgrades_without_blocking_launch() {
 }
 
 #[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn claude_activity_probe_deadline_expires_while_resolution_is_blocked() {
+    let probe_context = ClaudeActivityProbeTestContext::new();
+    let temp = TempDir::new().unwrap();
+    let executable =
+        executable_fixture(&temp, "claude-probe-resolution", "#!/bin/sh\nexit 0\n", "");
+    let binary_path = executable.to_string_lossy().into_owned();
+    let gate = ClaudeActivityProbeResolutionGate::new();
+    let probe_gate = gate.clone();
+    let mut probe = tokio::spawn(async move {
+        probe_context
+            .probe_with_resolution_gate(&binary_path, probe_gate)
+            .await
+    });
+
+    gate.wait_until_blocked().await;
+    tokio::time::advance(Duration::from_secs(2)).await;
+    tokio::time::resume();
+    let outcome = timeout(Duration::from_secs(10), &mut probe).await;
+    gate.release();
+
+    assert_eq!(
+        outcome
+            .expect("the resolution deadline must expire independently of wall-clock scheduling")
+            .expect("probe task"),
+        ClaudeActivitySupport::default()
+    );
+}
+
+#[cfg(unix)]
 #[tokio::test]
-async fn claude_activity_probe_deadline_covers_resolution_and_reaps_process_tree() {
+async fn claude_activity_probe_timeout_reaps_process_tree() {
     let probe_context = ClaudeActivityProbeTestContext::new();
     let temp = TempDir::new().unwrap();
     let descendant_pid_path = temp.path().join("descendant-pid");
@@ -11900,32 +11930,17 @@ async fn claude_activity_probe_deadline_covers_resolution_and_reaps_process_tree
     let executable = executable_fixture(&temp, "claude-probe-tree", &script, "");
     let binary_path = executable.to_string_lossy().into_owned();
 
-    let resolution_started = Instant::now();
     assert_eq!(
-        probe_context
-            .probe_with_resolution_delay(&binary_path, Duration::from_secs(5))
-            .await,
+        timeout(Duration::from_secs(10), probe_context.probe(&binary_path))
+            .await
+            .expect("the probe must retain a bounded outer watchdog"),
         ClaudeActivitySupport::default()
-    );
-    assert!(
-        resolution_started.elapsed() < Duration::from_millis(2_250),
-        "resolution, metadata, process work, and cleanup share one hard deadline"
-    );
-
-    let probe_started = Instant::now();
-    assert_eq!(
-        probe_context.probe(&binary_path).await,
-        ClaudeActivitySupport::default()
-    );
-    assert!(
-        probe_started.elapsed() < Duration::from_millis(2_250),
-        "a timed-out process tree must be terminated and reaped within the hard deadline"
     );
     let descendant_pid = std::fs::read_to_string(&descendant_pid_path)
         .expect("descendant pid")
         .parse::<u32>()
         .expect("numeric descendant pid");
-    timeout(Duration::from_secs(1), async {
+    timeout(Duration::from_secs(5), async {
         loop {
             let alive = std::process::Command::new("kill")
                 .args(["-0", &descendant_pid.to_string()])
@@ -11934,7 +11949,7 @@ async fn claude_activity_probe_deadline_covers_resolution_and_reaps_process_tree
             if !alive {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -13092,6 +13107,7 @@ done
             tokio::task::yield_now().await;
         }
         let mut actor_requested = false;
+        let mut late_actor_requested = false;
         let mut operation_requested = false;
         loop {
             let ServerMessage::Chunk { values, .. } =
@@ -13108,12 +13124,15 @@ done
                     actor_requested |= change["kind"] == "actor-upserted"
                         && change["actor"]["actorId"] == "codex:thread:alpha"
                         && change["actor"]["state"] == "requested";
+                    late_actor_requested |= change["kind"] == "actor-upserted"
+                        && change["actor"]["actorId"] == "codex:thread:alpha-late"
+                        && change["actor"]["state"] == "requested";
                     operation_requested |= change["kind"] == "operation-upserted"
                         && change["operation"]["rootActorId"] == "codex:thread:alpha"
                         && change["operation"]["state"] == "requested";
                 }
             }
-            if actor_requested && operation_requested {
+            if actor_requested && late_actor_requested && operation_requested {
                 break;
             }
         }

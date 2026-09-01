@@ -27,27 +27,32 @@ const EMPTY_RECENT_NAMES: ReadonlyArray<string> = Object.freeze([]);
 interface BranchChoiceProps {
   readonly branch: GitManagerRefEntry;
   readonly operation: string;
+  readonly disabledReason: string | null;
   readonly onChoose: (branch: string) => void;
 }
 
 const BranchChoice = memo(function BranchChoice({
   branch,
   operation,
+  disabledReason,
   onChoose,
 }: BranchChoiceProps) {
   const choose = useCallback(() => onChoose(branch.name), [branch.name, onChoose]);
   const blocked = branch.blocked.find((reason) => reason.operation === operation) ?? null;
+  const effectiveDisabledReason = disabledReason ?? blocked?.message ?? null;
   const reasonId =
-    blocked === null ? undefined : `git-manager-branch-choice-${branch.tipSha}-reason`;
+    effectiveDisabledReason === null
+      ? undefined
+      : `git-manager-branch-choice-${branch.tipSha}-reason`;
   return (
     <>
       <Button
         aria-describedby={reasonId}
         aria-label={`Choose branch ${branch.name}`}
         className="w-full min-w-0 justify-start font-mono"
-        disabled={blocked !== null}
+        disabled={effectiveDisabledReason !== null}
         size="sm"
-        title={blocked?.message}
+        title={effectiveDisabledReason ?? undefined}
         variant="ghost"
         onClick={choose}
       >
@@ -55,9 +60,9 @@ const BranchChoice = memo(function BranchChoice({
           {branch.name}
         </span>
       </Button>
-      {blocked === null ? null : (
+      {effectiveDisabledReason === null ? null : (
         <span className="sr-only" id={reasonId}>
-          {blocked.message}
+          {effectiveDisabledReason}
         </span>
       )}
     </>
@@ -68,6 +73,7 @@ interface BranchChoiceGroupProps {
   readonly label: string;
   readonly branches: ReadonlyArray<GitManagerRefEntry>;
   readonly operation: string;
+  readonly disabledReason: string | null;
   readonly onChoose: (branch: string) => void;
 }
 
@@ -75,6 +81,7 @@ const BranchChoiceGroup = memo(function BranchChoiceGroup({
   label,
   branches,
   operation,
+  disabledReason,
   onChoose,
 }: BranchChoiceGroupProps) {
   if (branches.length === 0) return null;
@@ -84,7 +91,13 @@ const BranchChoiceGroup = memo(function BranchChoiceGroup({
         {label}
       </h3>
       {branches.map((branch) => (
-        <BranchChoice branch={branch} key={branch.name} operation={operation} onChoose={onChoose} />
+        <BranchChoice
+          branch={branch}
+          disabledReason={disabledReason}
+          key={branch.name}
+          operation={operation}
+          onChoose={onChoose}
+        />
       ))}
     </section>
   );
@@ -92,6 +105,7 @@ const BranchChoiceGroup = memo(function BranchChoiceGroup({
 
 export interface GitManagerMultiCommitOperationDialogProps {
   readonly state: GitManagerMultiCommitState;
+  readonly disabledReason?: string | null;
   readonly onAdvance: (event: GitManagerMultiCommitEvent) => void;
   readonly onCancel: () => void;
   readonly onConfirmAbort: () => void;
@@ -124,22 +138,24 @@ function operationTitle(state: GitManagerMultiCommitState): string {
 export const GitManagerMultiCommitOperationDialog = memo(
   function GitManagerMultiCommitOperationDialog({
     state,
+    disabledReason = null,
     onAdvance,
     onCancel,
     onConfirmAbort,
   }: GitManagerMultiCommitOperationDialogProps) {
-    const confirmForcePush = useCallback(
-      () => onAdvance({ _tag: "force-push-confirmed" }),
-      [onAdvance],
-    );
+    const confirmForcePush = useCallback(() => {
+      if (disabledReason === null) onAdvance({ _tag: "force-push-confirmed" });
+    }, [disabledReason, onAdvance]);
     const chooseBranch = useCallback(
-      (branch: string) =>
+      (branch: string) => {
+        if (disabledReason !== null) return;
         onAdvance({
           _tag: "branch-chosen",
           branch,
           commitsArePushed: state.commitsArePushed === true,
-        }),
-      [onAdvance, state.commitsArePushed],
+        });
+      },
+      [disabledReason, onAdvance, state.commitsArePushed],
     );
     const resolveConflict = useCallback(
       (path: string, side: "ours" | "theirs") =>
@@ -186,6 +202,8 @@ export const GitManagerMultiCommitOperationDialog = memo(
       progress?.current === null || progress?.current === undefined || progress.total === null
         ? null
         : `Commit ${progress.current} of ${progress.total}`;
+    const disabledReasonId =
+      disabledReason === null ? undefined : "git-manager-multi-commit-disabled-reason";
 
     if (state.step === null) return null;
     if (state.step === "hide-conflicts") {
@@ -218,6 +236,11 @@ export const GitManagerMultiCommitOperationDialog = memo(
             </DialogDescription>
           </DialogHeader>
           <div className="min-h-0 space-y-3 px-6 pb-4">
+            {disabledReason === null ? null : (
+              <p className="text-xs text-muted-foreground" id={disabledReasonId}>
+                {disabledReason}
+              </p>
+            )}
             {state.step === "warn-force-push" ? (
               <div className="flex items-start gap-2 rounded-md border border-destructive/35 bg-destructive/5 p-3 text-sm">
                 <AlertTriangleIcon aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
@@ -243,18 +266,21 @@ export const GitManagerMultiCommitOperationDialog = memo(
                 >
                   <BranchChoiceGroup
                     branches={groupedBranches.default}
+                    disabledReason={disabledReason}
                     label="Default"
                     operation={state.kind}
                     onChoose={chooseBranch}
                   />
                   <BranchChoiceGroup
                     branches={groupedBranches.recent}
+                    disabledReason={disabledReason}
                     label="Recent"
                     operation={state.kind}
                     onChoose={chooseBranch}
                   />
                   <BranchChoiceGroup
                     branches={groupedBranches.other}
+                    disabledReason={disabledReason}
                     label="Other"
                     operation={state.kind}
                     onChoose={chooseBranch}
@@ -274,6 +300,7 @@ export const GitManagerMultiCommitOperationDialog = memo(
               <GitManagerConflictList
                 conflicts={state.conflicts}
                 continueBlocked={state.continueBlocked}
+                disabledReason={disabledReason}
                 onContinue={continueOperation}
                 onResolve={resolveConflict}
                 onUndoResolve={undoConflictResolution}
@@ -286,7 +313,13 @@ export const GitManagerMultiCommitOperationDialog = memo(
                 <Button variant="outline" onClick={onCancel}>
                   Cancel
                 </Button>
-                <Button variant="destructive" onClick={confirmForcePush}>
+                <Button
+                  aria-describedby={disabledReasonId}
+                  disabled={disabledReason !== null}
+                  title={disabledReason ?? undefined}
+                  variant="destructive"
+                  onClick={confirmForcePush}
+                >
                   Rewrite History
                 </Button>
               </>
@@ -295,7 +328,13 @@ export const GitManagerMultiCommitOperationDialog = memo(
                 <Button variant="outline" onClick={onCancel}>
                   Keep Working
                 </Button>
-                <Button variant="destructive" onClick={onConfirmAbort}>
+                <Button
+                  aria-describedby={disabledReasonId}
+                  disabled={disabledReason !== null}
+                  title={disabledReason ?? undefined}
+                  variant="destructive"
+                  onClick={onConfirmAbort}
+                >
                   Abort{" "}
                   {state.kind === "cherry-pick"
                     ? "Cherry-Pick"

@@ -37,6 +37,7 @@ describe("GitManagerMultiCommitOperationDialog", () => {
       onCancel?: () => void;
       onConfirmAbort?: () => void;
     } = {},
+    disabledReason: string | null = null,
   ) {
     const onAdvance = callbacks.onAdvance ?? vi.fn();
     const onCancel = callbacks.onCancel ?? vi.fn();
@@ -44,6 +45,7 @@ describe("GitManagerMultiCommitOperationDialog", () => {
     await act(async () =>
       root.render(
         <GitManagerMultiCommitOperationDialog
+          disabledReason={disabledReason}
           state={operationState}
           onAdvance={onAdvance}
           onCancel={onCancel}
@@ -75,6 +77,24 @@ describe("GitManagerMultiCommitOperationDialog", () => {
       (button) => button.textContent === "Rewrite History",
     );
     expect(confirm?.className).toContain("border-destructive");
+  });
+
+  it("disables rewrite confirmation with its reason while cancellation remains available", async () => {
+    const reason = "This environment does not support Git Manager rewrite operations.";
+    const onCancel = vi.fn();
+    await renderDialog(state({ step: "warn-force-push" }), { onCancel }, reason);
+
+    const confirm = [...document.body.querySelectorAll<HTMLButtonElement>("button")].find(
+      (button) => button.textContent === "Rewrite History",
+    );
+    const cancel = [...document.body.querySelectorAll<HTMLButtonElement>("button")].find(
+      (button) => button.textContent === "Cancel",
+    );
+    expect(confirm).toMatchObject({ disabled: true, title: reason });
+    expect(document.body.textContent).toContain(reason);
+    expect(cancel?.disabled).toBe(false);
+    await act(async () => cancel?.click());
+    expect(onCancel).toHaveBeenCalledOnce();
   });
 
   it("shows structured commit progress and collapsed verbatim command output", async () => {

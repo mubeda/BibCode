@@ -30,11 +30,9 @@ import {
 import { Input } from "~/components/ui/input";
 import { runGitManagerOperation, type GitManagerOperationHandle } from "~/state/gitManager";
 
-import type { GitManagerAvailability } from "../gitManagerAvailability";
 import { GitManagerOperationBanner } from "../toolbar/GitManagerOperationBanner";
 import { resolveTagDeleteDialogCopy, validateTagName } from "./GitManagerTagDialog.logic";
 
-const READY_AVAILABILITY: GitManagerAvailability = Object.freeze({ kind: "ready" });
 const noop = () => undefined;
 
 export interface GitManagerTagDialogProps {
@@ -46,9 +44,9 @@ export interface GitManagerTagDialogProps {
   readonly targetSha: string | null;
   readonly tag: string | null;
   readonly remote: string | null;
+  readonly disabledReason?: string | null;
   readonly onOpenChange: (open: boolean) => void;
   readonly onFinished?: () => void;
-  readonly availability?: GitManagerAvailability;
 }
 
 export const GitManagerTagDialog = memo(function GitManagerTagDialog({
@@ -60,9 +58,9 @@ export const GitManagerTagDialog = memo(function GitManagerTagDialog({
   targetSha,
   tag,
   remote,
+  disabledReason: capabilityDisabledReason = null,
   onOpenChange,
   onFinished = noop,
-  availability = READY_AVAILABILITY,
 }: GitManagerTagDialogProps) {
   const registry = useContext(RegistryContext);
   const [name, setName] = useState("");
@@ -79,12 +77,6 @@ export const GitManagerTagDialog = memo(function GitManagerTagDialog({
 
   const selectedTag = action === "create" ? name : (tag ?? "");
   const validation = validateTagName(selectedTag, action === "create" ? existingTags : []);
-  const availabilityReason =
-    availability.kind === "ready"
-      ? null
-      : availability.kind === "unsupported"
-        ? `This environment does not support ${availability.missingCapability}.`
-        : availability.reason;
   const missingOperand =
     action === "create" && targetSha === null
       ? "Choose a commit for the new tag."
@@ -94,7 +86,7 @@ export const GitManagerTagDialog = memo(function GitManagerTagDialog({
           ? "Choose a tag."
           : null;
   const disabledReason =
-    availabilityReason ??
+    capabilityDisabledReason ??
     (pendingTagName === null ? null : `The ${pendingTagName} tag operation is running.`) ??
     missingOperand ??
     validation.reason;
@@ -266,6 +258,7 @@ export const GitManagerTagDialog = memo(function GitManagerTagDialog({
           <Button
             aria-describedby={disabledReason === null ? undefined : "git-manager-tag-name-reason"}
             disabled={disabledReason !== null}
+            title={disabledReason ?? undefined}
             variant={action === "delete" ? "destructive" : "default"}
             onClick={confirm}
           >

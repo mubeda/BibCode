@@ -288,7 +288,7 @@ mod tests {
             macos[..macos.len() - 1]
                 .iter()
                 .chain(&linux[..linux.len() - 1])
-                .all(|candidate| candidate.is_absolute())
+                .all(|candidate| candidate.to_string_lossy().starts_with('/'))
         );
     }
 

@@ -2434,7 +2434,7 @@ mod tests {
         let worktrees = fixture.primary.join(".git").join("worktrees");
         std::fs::create_dir(&worktrees).expect("worktrees directory");
         for index in 0..=MAX_CATALOG_WORKTREES {
-            std::fs::create_dir(worktrees.join(index.to_string())).expect("admin entry");
+            std::fs::create_dir_all(worktrees.join(index.to_string())).expect("admin entry");
         }
         assert!(
             matches!(
