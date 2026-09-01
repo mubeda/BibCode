@@ -11,6 +11,7 @@ import {
   countUnreadAgentRows,
   resolveAgentGroup,
   resolveAgentPreviewLine,
+  resolveAgentProvider,
 } from "./agentsSection.logic";
 
 const ENVIRONMENT_A = EnvironmentId.make("environment-a");
@@ -128,7 +129,37 @@ describe("resolveAgentPreviewLine", () => {
   });
 });
 
+describe("resolveAgentProvider", () => {
+  it("maps a session provider name to a driver kind and display label", () => {
+    expect(resolveAgentProvider("claudeAgent")).toEqual({
+      driverKind: "claudeAgent",
+      label: "Claude",
+    });
+    expect(resolveAgentProvider("codex")).toEqual({ driverKind: "codex", label: "Codex" });
+    expect(resolveAgentProvider("unknownProvider").label).toBe("Unknown Provider");
+    expect(resolveAgentProvider("  ")).toEqual({ driverKind: null, label: null });
+    expect(resolveAgentProvider(null)).toEqual({ driverKind: null, label: null });
+  });
+});
+
 describe("buildAgentRows", () => {
+  it("carries the session provider onto the row", () => {
+    const base = makeShell({ id: ThreadId.make("thread-provider") });
+    const rows = buildRows([
+      { ...base, session: { ...base.session!, providerName: "claudeAgent" } },
+      {
+        ...base,
+        id: ThreadId.make("thread-unknown"),
+        session: { ...base.session!, providerName: null },
+      },
+    ]);
+
+    expect(rows.map((row) => [row.providerDriverKind, row.providerLabel])).toEqual([
+      ["claudeAgent", "Claude"],
+      [null, null],
+    ]);
+  });
+
   it("includes only non-archived shells with a session", () => {
     const included = makeShell({ id: ThreadId.make("thread-included") });
     const archived = makeShell({

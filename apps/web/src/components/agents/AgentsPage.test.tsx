@@ -489,6 +489,29 @@ describe("AgentsPage", () => {
     expect(h.markRead).toHaveBeenCalledExactlyOnceWith("environment-remote:thread-remote");
   });
 
+  it("lays out a row as project eyebrow, branch, title, preview, and status footer", async () => {
+    h.shells = [
+      workingShell({
+        id: ThreadId.make("thread-layout"),
+        title: "Layout agent",
+        branch: "feature/layout",
+      }),
+    ];
+    const { container } = await mount(<AgentsPage />);
+
+    const row = queryAgentRow(container, "Layout agent");
+    expect(row).not.toBeNull();
+    const lines = Array.from(row!.querySelectorAll<HTMLElement>("div.truncate")).map(
+      (element) => element.textContent,
+    );
+    expect(lines.slice(0, 2)).toEqual(["feature/layout", "Layout agent"]);
+    expect(row!.textContent).toContain("Project Alpha");
+    expect(row!.textContent).toContain("Codex");
+    expect(row!.textContent).toContain("Working");
+    expect(row!.textContent).toContain("Local");
+    expect(row!.className).not.toContain("opacity-");
+  });
+
   it("switches grouping from Status to Project", async () => {
     h.shells = [
       workingShell({ id: ThreadId.make("thread-alpha"), title: "Alpha agent" }),
