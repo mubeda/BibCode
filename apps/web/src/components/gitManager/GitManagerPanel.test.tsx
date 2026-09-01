@@ -1,9 +1,13 @@
+// @vitest-environment happy-dom
+
 import {
   AVAILABLE_CONNECTION_STATE,
   type SupervisorConnectionState,
 } from "@bibcode/client-runtime/connection";
 import type { ServerConfig } from "@bibcode/contracts";
 import { makeTestExecutionEnvironmentCapabilities } from "@bibcode/shared/testSupport";
+import { act } from "react";
+import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
@@ -28,6 +32,18 @@ const h = vi.hoisted(() => ({
   })),
   signalAtom: vi.fn((args: { input: { cwd: string } }) => ({
     kind: "signal",
+    cwd: args.input.cwd,
+  })),
+  refsAtom: vi.fn((args: { input: { cwd: string } }) => ({
+    kind: "refs",
+    cwd: args.input.cwd,
+  })),
+  stashesAtom: vi.fn((args: { input: { cwd: string } }) => ({
+    kind: "stashes",
+    cwd: args.input.cwd,
+  })),
+  listPullRequests: vi.fn((args: { input: { cwd: string } }) => ({
+    kind: "provider",
     cwd: args.input.cwd,
   })),
   toolbarProps: [] as Array<Record<string, unknown>>,
@@ -75,10 +91,21 @@ vi.mock("../../state/worktrees", () => ({
 vi.mock("../../state/gitManager", () => ({
   gitManagerEnvironment: {
     signal: h.signalAtom,
+    getRefs: h.refsAtom,
+    getStashes: h.stashesAtom,
+    listPullRequests: h.listPullRequests,
     commit: { label: "test:commit" },
     undoCommit: { label: "test:undo-commit" },
     discard: { label: "test:discard" },
   },
+}));
+
+vi.mock("../../state/sourceControlActions", () => ({
+  useGitStackedAction: () => ({
+    run: vi.fn(),
+    isPending: false,
+    error: null,
+  }),
 }));
 
 vi.mock("../ui/tabs", () => ({
@@ -143,6 +170,9 @@ beforeEach(() => {
   h.activeSubscriptions = 0;
   h.catalogAtom.mockClear();
   h.signalAtom.mockClear();
+  h.refsAtom.mockClear();
+  h.stashesAtom.mockClear();
+  h.listPullRequests.mockClear();
   useGitManagerStore.setState({ byProjectKey: {} });
 });
 
@@ -191,10 +221,44 @@ describe("GitManagerPanel", () => {
 
   it("releases every server subscription when the panel unmounts", () => {
     renderPanel();
+    const expectedSubscriptions = h.queryAtoms.filter((atom) => atom !== null).length;
     const cleanups = h.effects.map((effect) => effect()).filter((value) => value !== undefined);
 
-    expect(h.activeSubscriptions).toBe(2);
+    expect(h.activeSubscriptions).toBe(expectedSubscriptions);
     for (const cleanup of cleanups) cleanup?.();
     expect(h.activeSubscriptions).toBe(0);
+  });
+
+  it("does not mount the provider pane while it is disabled", () => {
+    expect(renderPanel()).not.toContain("Pull requests and checks");
+    expect(h.listPullRequests).not.toHaveBeenCalled();
+  });
+
+  it("mounts the enabled provider pane without requesting provider data", async () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    useGitManagerStore.getState().setProviderPaneOpen(projectRef, true);
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+
+    try {
+      await act(async () => root.render(<GitManagerPanel projectRef={projectRef} />));
+
+      expect(container.textContent).toContain("Pull requests and checks");
+      expect(container.textContent).toContain("load only when you choose Refresh");
+      expect(h.listPullRequests).not.toHaveBeenCalled();
+
+      const refresh = [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) =>
+        button.textContent?.includes("Refresh"),
+      );
+      expect(refresh).toBeDefined();
+      await act(async () => refresh?.click());
+
+      expect(h.listPullRequests).toHaveBeenCalledOnce();
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
+    }
   });
 });

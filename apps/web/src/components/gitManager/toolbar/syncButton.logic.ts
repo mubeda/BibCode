@@ -16,7 +16,6 @@ export interface SyncStateInput {
   readonly isDetached: boolean;
   readonly aheadBehind: { readonly ahead: number; readonly behind: number } | null;
   readonly forcePushRecommended: boolean;
-  readonly tagsToPush?: number;
   readonly remote?: string;
 }
 
@@ -30,13 +29,7 @@ export interface SyncState {
 
 export function resolveSyncState(input: SyncStateInput): SyncState {
   const remote = input.remote ?? "origin";
-  const tagsToPush =
-    typeof input.tagsToPush === "number" &&
-    Number.isSafeInteger(input.tagsToPush) &&
-    input.tagsToPush > 0
-      ? input.tagsToPush
-      : 0;
-  const visibleAhead = (input.aheadBehind?.ahead ?? 0) + tagsToPush;
+  const visibleAhead = input.aheadBehind?.ahead ?? 0;
   if (input.isOperationRunning) {
     return {
       kind: "running",
@@ -77,14 +70,14 @@ export function resolveSyncState(input: SyncStateInput): SyncState {
     return {
       kind: "publish-branch",
       label: `Publish branch to ${remote}`,
-      ahead: tagsToPush,
+      ahead: 0,
       behind: 0,
       disabledReason: null,
     };
   }
 
   const { ahead: branchAhead, behind } = input.aheadBehind;
-  const ahead = branchAhead + tagsToPush;
+  const ahead = branchAhead;
   if (branchAhead === 0 && behind === 0) {
     return {
       kind: "fetch",

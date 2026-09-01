@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, expectTypeOf, it } from "vite-plus/test";
 
-import { resolveSyncState } from "./syncButton.logic";
+import { resolveSyncState, type SyncStateInput } from "./syncButton.logic";
 
 describe("resolveSyncState", () => {
   it("disables sync while an operation is running", () => {
@@ -131,17 +131,7 @@ describe("resolveSyncState", () => {
     ).toMatchObject({ kind: "push", label: "Push origin", ahead: 4, behind: 0 });
   });
 
-  it("adds explicitly pending tag pushes to the visible ahead count", () => {
-    expect(
-      resolveSyncState({
-        isOperationRunning: false,
-        hasRemote: true,
-        isUnborn: false,
-        isDetached: false,
-        aheadBehind: { ahead: 0, behind: 0 },
-        forcePushRecommended: false,
-        tagsToPush: 2,
-      }),
-    ).toMatchObject({ kind: "fetch", ahead: 2, behind: 0 });
+  it("does not expose speculative pending-tag input without remote tag state", () => {
+    expectTypeOf<SyncStateInput>().not.toHaveProperty("tagsToPush");
   });
 });

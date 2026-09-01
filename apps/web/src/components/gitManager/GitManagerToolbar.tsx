@@ -10,7 +10,7 @@ import type {
   VcsWorktreeDescriptor,
 } from "@bibcode/contracts";
 import * as Cause from "effect/Cause";
-import { FolderGit2Icon } from "lucide-react";
+import { FolderGit2Icon, TagIcon } from "lucide-react";
 import { memo, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 
 import { DEFAULT_GIT_MANAGER_VIEW_STATE, useGitManagerStore } from "../../gitManagerStore";
@@ -30,6 +30,8 @@ import { GitManagerBranchDropdown } from "./toolbar/GitManagerBranchDropdown";
 import { GitManagerOperationBanner } from "./toolbar/GitManagerOperationBanner";
 import { GitManagerSyncButton, type SyncOperationKind } from "./toolbar/GitManagerSyncButton";
 import { resolveSyncState, type SyncState } from "./toolbar/syncButton.logic";
+import { GitManagerTagDialog } from "./tags/GitManagerTagDialog";
+import { Button } from "../ui/button";
 import {
   Select,
   SelectGroup,
@@ -47,6 +49,7 @@ interface WorktreeOption {
 }
 
 const EMPTY_BRANCHES: ReadonlyArray<GitManagerRefEntry> = Object.freeze([]);
+const EMPTY_TAG_NAMES: ReadonlyArray<string> = Object.freeze([]);
 const LOADING_SYNC_STATE: SyncState = Object.freeze({
   kind: "running",
   label: "Loading repository state…",
@@ -170,6 +173,8 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
     [localBranches],
   );
   const currentBranchName = snapshot?.headRef ?? currentBranch?.name ?? null;
+  const existingTags = snapshot?.tags.map((tag) => tag.name) ?? EMPTY_TAG_NAMES;
+  const tagTargetSha = currentBranch?.tipSha ?? snapshot?.detachedSha ?? null;
   const remote = remoteForBranch(currentBranch, snapshot?.remotes ?? []);
   const isUnborn =
     snapshot !== null &&
@@ -214,6 +219,7 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
   );
 
   const [branchDialog, setBranchDialog] = useState<GitManagerBranchDialog | null>(null);
+  const [tagDialogOpen, setTagDialogOpen] = useState(false);
   const [switchTarget, setSwitchTarget] = useState<GitManagerRefEntry | null>(null);
   const [operationEvent, setOperationEvent] = useState<GitManagerOperationEvent | null>(null);
   const [operationError, setOperationError] = useState<string | null>(null);
@@ -388,6 +394,7 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
   const changeSwitchDialogOpen = useCallback((open: boolean) => {
     if (!open) setSwitchTarget(null);
   }, []);
+  const openTagDialog = useCallback(() => setTagDialogOpen(true), []);
   const runSyncOperation = useCallback(
     (kind: SyncOperationKind) => {
       if (currentBranch === null && kind !== "fetch-unborn" && kind !== "fetch") return;
@@ -415,6 +422,16 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
     },
     [currentBranch, executeOperation, projectId, remote, selectedWorktreeCwd],
   );
+  const tagScope = useMemo(
+    () => ({ environmentId, cwd: selectedWorktreeCwd }),
+    [environmentId, selectedWorktreeCwd],
+  );
+  const tagDisabledReason =
+    refsQuery.isPending || snapshot === null
+      ? "Loading tags."
+      : tagTargetSha === null
+        ? "Create a commit before creating a tag."
+        : null;
 
   return (
     <div className="min-w-0 shrink-0">
@@ -475,6 +492,24 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
             onSelectBranch={selectBranch}
             onSwitchWorktree={onSelectedWorktreeChange}
           />
+          <Button
+            aria-describedby={
+              tagDisabledReason === null ? undefined : "git-manager-tag-trigger-reason"
+            }
+            disabled={tagDisabledReason !== null}
+            size="xs"
+            title={tagDisabledReason ?? "Create a tag at the current commit"}
+            variant="ghost"
+            onClick={openTagDialog}
+          >
+            <TagIcon aria-hidden="true" />
+            Create tag…
+          </Button>
+          {tagDisabledReason === null ? null : (
+            <span className="sr-only" id="git-manager-tag-trigger-reason">
+              {tagDisabledReason}
+            </span>
+          )}
         </div>
 
         <div className="flex min-w-0 flex-1 items-center px-2 py-1.5">
@@ -496,6 +531,18 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
         refs={localBranches}
         onClose={closeBranchDialog}
         onSubmit={submitBranchDialog}
+      />
+      <GitManagerTagDialog
+        action="create"
+        existingTags={existingTags}
+        open={tagDialogOpen}
+        projectRef={stableProjectRef}
+        remote={remote}
+        scope={tagScope}
+        tag={null}
+        targetSha={tagTargetSha}
+        onFinished={refreshRefs}
+        onOpenChange={setTagDialogOpen}
       />
       <GitManagerSwitchWithChangesDialog
         branchName={switchTarget?.name ?? "branch"}

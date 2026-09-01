@@ -22,6 +22,8 @@ import {
 import { cn } from "../../../lib/utils";
 import { gitManagerEnvironment } from "../../../state/gitManager";
 import { useEnvironmentQuery } from "../../../state/query";
+import { GitManagerStoredImageDiff } from "../diff/GitManagerImageDiffModeContext";
+import { buildImageDataUri } from "../diff/gitManagerImageDiff.logic";
 import { deriveAuthorIdentity } from "./authorIdentity";
 import { classifyDiffPayload } from "./diffLadder";
 
@@ -260,6 +262,7 @@ export const GitManagerCommitDetail = memo(function GitManagerCommitDetail({
       : classifyDiffPayload({
           byteLength: diffByteLength,
           longestLineLength: diffLongestLineLength,
+          ...(diffTag === "image" ? { kind: "image" as const } : {}),
         });
   const currentDiffKey =
     selectedFilePath === null || diffGeneration === null
@@ -403,10 +406,11 @@ export const GitManagerCommitDetail = memo(function GitManagerCommitDetail({
             <p className="p-3 text-xs text-muted-foreground">
               This diff is too large to transfer for rendering.
             </p>
-          ) : diffTag === "image" ? (
-            <p className="p-3 text-xs text-muted-foreground">
-              Image diff rendering is not available yet.
-            </p>
+          ) : diffClassification === "image" && diff?._tag === "image" ? (
+            <GitManagerStoredImageDiff
+              after={buildImageDataUri(diff.after)}
+              before={buildImageDataUri(diff.before)}
+            />
           ) : renderablePatch?.kind === "files" ? (
             <Suspense fallback={DIFF_PREPARING_FALLBACK}>
               <DiffWorkerPoolProvider>

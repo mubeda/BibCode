@@ -266,6 +266,28 @@ describe("GitManagerStagingGutter", () => {
     expect(markup).not.toContain("data-line-index");
   });
 
+  it("renders an image payload with the image diff renderer", () => {
+    const markup = renderToStaticMarkup(
+      <GitManagerStagingGutter
+        disabledReason={null}
+        fileDiff={fileDiff()}
+        payload={{
+          byteLength: 128,
+          longestLineLength: 0,
+          kind: "image",
+          before: { contentBase64: "YmVmb3Jl", mimeType: "image/png" },
+          after: { contentBase64: "YWZ0ZXI=", mimeType: "image/png" },
+        }}
+        selection={createLineSelection("none", selectable)}
+        onSelectionChange={vi.fn()}
+      />,
+    );
+
+    expect(markup).toContain('aria-label="Image diff"');
+    expect(markup.match(/<img/g)).toHaveLength(2);
+    expect(markup).not.toContain("data-line-index");
+  });
+
   it("renders the whole-file fallback reason for a renamed path", () => {
     const renamed = { ...fileDiff(), prevName: "old.ts", type: "rename-changed" as const };
     const markup = renderToStaticMarkup(

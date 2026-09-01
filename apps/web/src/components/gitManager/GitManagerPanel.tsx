@@ -11,7 +11,7 @@ import type {
   VcsWorktreeDescriptor,
 } from "@bibcode/contracts";
 import * as Cause from "effect/Cause";
-import { ArchiveIcon, GitBranchIcon, GitMergeIcon } from "lucide-react";
+import { ArchiveIcon, GitBranchIcon, GitMergeIcon, GitPullRequestIcon } from "lucide-react";
 import { memo, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 
 import {
@@ -40,7 +40,9 @@ import {
   type GitManagerAvailability,
 } from "./gitManagerAvailability";
 import { GitManagerChangesView } from "./changes/GitManagerChangesView";
+import { GitManagerImageDiffModeProvider } from "./diff/GitManagerImageDiffModeContext";
 import { GitManagerHistoryView } from "./history/GitManagerHistoryView";
+import { GitManagerPullRequestPanel } from "./provider/GitManagerPullRequestPanel";
 import { GitManagerToolbar } from "./GitManagerToolbar";
 import { GitManagerOperationBanner } from "./toolbar/GitManagerOperationBanner";
 
@@ -140,6 +142,12 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
       DEFAULT_GIT_MANAGER_VIEW_STATE.selectedFilePath,
     [storeKey],
   );
+  const selectProviderPaneOpen = useCallback(
+    (state: ReturnType<typeof useGitManagerStore.getState>) =>
+      state.byProjectKey[storeKey]?.providerPaneOpen ??
+      DEFAULT_GIT_MANAGER_VIEW_STATE.providerPaneOpen,
+    [storeKey],
+  );
   const selectRecentRef = useCallback(
     (state: ReturnType<typeof useGitManagerStore.getState>) =>
       state.byProjectKey[storeKey]?.selectedRef ?? DEFAULT_GIT_MANAGER_VIEW_STATE.selectedRef,
@@ -148,10 +156,12 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
   const selectedStashSha = useGitManagerStore(selectSelectedStashSha);
   const stashPaneOpen = useGitManagerStore(selectStashPaneOpen);
   const selectedFilePath = useGitManagerStore(selectSelectedFilePath);
+  const providerPaneOpen = useGitManagerStore(selectProviderPaneOpen);
   const recentRef = useGitManagerStore(selectRecentRef);
   const setSelectedStash = useGitManagerStore((state) => state.setSelectedStash);
   const setStashPaneOpen = useGitManagerStore((state) => state.setStashPaneOpen);
   const setSelectedFile = useGitManagerStore((state) => state.setSelectedFile);
+  const setProviderPaneOpen = useGitManagerStore((state) => state.setProviderPaneOpen);
 
   const refsAtom = useMemo(
     () =>
@@ -286,6 +296,10 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
     () => setStashPaneOpen(projectRef, !stashPaneOpen),
     [projectRef, setStashPaneOpen, stashPaneOpen],
   );
+  const toggleProviderPane = useCallback(
+    () => setProviderPaneOpen(projectRef, !providerPaneOpen),
+    [projectRef, providerPaneOpen, setProviderPaneOpen],
+  );
   const openMergeDialog = useCallback(() => setMergeDialogOpen(true), []);
   const handleMergeFinished = useCallback(() => refreshRefs(), [refreshRefs]);
   const continueInProgress = useCallback(() => {
@@ -326,6 +340,16 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
       )}
       <div className="flex items-center justify-end gap-2 border-b border-border px-4 py-1.5">
         <Button
+          aria-expanded={providerPaneOpen}
+          aria-label={`${providerPaneOpen ? "Hide" : "Show"} pull requests and checks`}
+          size="xs"
+          variant="ghost"
+          onClick={toggleProviderPane}
+        >
+          <GitPullRequestIcon aria-hidden="true" />
+          {providerPaneOpen ? "Hide pull requests" : "Show pull requests"}
+        </Button>
+        <Button
           aria-expanded={stashPaneOpen}
           aria-label="Toggle repository stashes"
           size="xs"
@@ -354,6 +378,11 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
           </span>
         )}
       </div>
+      {providerPaneOpen ? (
+        <div className="h-80 min-h-0 overflow-auto border-b border-border">
+          <GitManagerPullRequestPanel scope={scope} onRefresh={refreshRefs} />
+        </div>
+      ) : null}
       {stashPaneOpen ? (
         <section
           aria-label="Repository stash browser"
@@ -489,51 +518,53 @@ export const GitManagerPanel = memo(function GitManagerPanel({ projectRef }: Git
   }
 
   return (
-    <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col bg-background">
-      <GitManagerToolbar
-        projectRef={stableProjectRef}
-        mainCheckoutCwd={mainCheckoutCwd}
-        selectedWorktreeCwd={activeCwd}
-        worktrees={worktrees}
-        catalogPending={catalog.isPending}
-        catalogError={catalog.error}
-        onSelectedWorktreeChange={handleWorktreeChange}
-      />
-      <GitManagerRepositorySurfaces
-        projectRef={stableProjectRef}
-        scope={activeScope}
-        signalGeneration={signalGeneration}
-      />
-      <Tabs
-        className="min-h-0 flex-1 gap-0"
-        value={viewState.activeTab}
-        onValueChange={handleTabChange}
-      >
-        <div className="border-b border-border px-4 pt-2">
-          <TabsList className="w-fit rounded-none border-0 bg-transparent p-0">
-            <TabsTab
-              className="rounded-none border-b-2 border-transparent px-3 py-2 data-selected:border-foreground data-selected:bg-transparent data-selected:shadow-none"
-              value="changes"
-            >
-              Changes
-            </TabsTab>
-            <TabsTab
-              className="rounded-none border-b-2 border-transparent px-3 py-2 data-selected:border-foreground data-selected:bg-transparent data-selected:shadow-none"
-              value="history"
-            >
-              History
-            </TabsTab>
-          </TabsList>
-        </div>
-        <TabsPanel className="min-h-0 flex-1 gap-0 p-4" value="changes">
-          <GitManagerChangesView scope={activeScope} projectRef={stableProjectRef} />
-        </TabsPanel>
-        <TabsPanel className="min-h-0 flex-1 gap-0 p-4" value="history">
-          {viewState.activeTab === "history" ? (
-            <GitManagerHistoryView scope={activeScope} projectRef={stableProjectRef} />
-          ) : null}
-        </TabsPanel>
-      </Tabs>
-    </div>
+    <GitManagerImageDiffModeProvider projectRef={stableProjectRef}>
+      <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col bg-background">
+        <GitManagerToolbar
+          projectRef={stableProjectRef}
+          mainCheckoutCwd={mainCheckoutCwd}
+          selectedWorktreeCwd={activeCwd}
+          worktrees={worktrees}
+          catalogPending={catalog.isPending}
+          catalogError={catalog.error}
+          onSelectedWorktreeChange={handleWorktreeChange}
+        />
+        <GitManagerRepositorySurfaces
+          projectRef={stableProjectRef}
+          scope={activeScope}
+          signalGeneration={signalGeneration}
+        />
+        <Tabs
+          className="min-h-0 flex-1 gap-0"
+          value={viewState.activeTab}
+          onValueChange={handleTabChange}
+        >
+          <div className="border-b border-border px-4 pt-2">
+            <TabsList className="w-fit rounded-none border-0 bg-transparent p-0">
+              <TabsTab
+                className="rounded-none border-b-2 border-transparent px-3 py-2 data-selected:border-foreground data-selected:bg-transparent data-selected:shadow-none"
+                value="changes"
+              >
+                Changes
+              </TabsTab>
+              <TabsTab
+                className="rounded-none border-b-2 border-transparent px-3 py-2 data-selected:border-foreground data-selected:bg-transparent data-selected:shadow-none"
+                value="history"
+              >
+                History
+              </TabsTab>
+            </TabsList>
+          </div>
+          <TabsPanel className="min-h-0 flex-1 gap-0 p-4" value="changes">
+            <GitManagerChangesView scope={activeScope} projectRef={stableProjectRef} />
+          </TabsPanel>
+          <TabsPanel className="min-h-0 flex-1 gap-0 p-4" value="history">
+            {viewState.activeTab === "history" ? (
+              <GitManagerHistoryView scope={activeScope} projectRef={stableProjectRef} />
+            ) : null}
+          </TabsPanel>
+        </Tabs>
+      </div>
+    </GitManagerImageDiffModeProvider>
   );
 });

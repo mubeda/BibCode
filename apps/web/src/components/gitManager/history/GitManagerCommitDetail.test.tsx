@@ -127,4 +127,34 @@ describe("GitManagerCommitDetail", () => {
       "git-manager-history:dark",
     );
   });
+
+  it("renders the selected image payload without issuing an external request", async () => {
+    const fetchSpy = vi.fn();
+    vi.stubGlobal("fetch", fetchSpy);
+    h.diff = {
+      _tag: "image",
+      generation: 2,
+      source: { _tag: "commit", sha: commit.sha, path: "src/large.ts" },
+      byteLength: 128,
+      longestLineLength: 0,
+      before: { contentBase64: "YmVmb3Jl", mimeType: "image/png" },
+      after: { contentBase64: "YWZ0ZXI=", mimeType: "image/png" },
+    };
+
+    await act(async () =>
+      root?.render(
+        <GitManagerCommitDetail
+          environmentId={"env-a" as EnvironmentId}
+          cwd="/repo"
+          commit={commit}
+          selectedFilePath="src/large.ts"
+          onSelectFile={() => undefined}
+        />,
+      ),
+    );
+
+    expect(container.querySelector('[aria-label="Image diff"]')).not.toBeNull();
+    expect(container.querySelectorAll("img")).toHaveLength(2);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
 });
