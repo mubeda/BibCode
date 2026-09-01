@@ -10,6 +10,7 @@ import {
   parseServerArtifactArguments,
   planServerArtifact,
   stageServerDistribution,
+  validateServerArchiveEntries,
   validateServerArchiveSignature,
 } from "./build-server-artifact.ts";
 
@@ -112,7 +113,7 @@ describe("server artifact builder", () => {
         "-NoProfile",
         "-NonInteractive",
         "-Command",
-        expect.stringContaining("Compress-Archive"),
+        expect.stringContaining("CreateFromDirectory"),
       ],
       env: {
         BIBCODE_SERVER_ARCHIVE_DESTINATION: "bibcode-server-v0.4.3-windows-x86_64.zip",
@@ -133,6 +134,16 @@ describe("server artifact builder", () => {
 
     NodeFS.writeFileSync(archive, Buffer.from([0x50, 0x4b, 0x03, 0x04]));
     expect(() => validateServerArchiveSignature(archive, "zip")).not.toThrow();
+  });
+
+  it("rejects non-portable Windows separators inside ZIP entries", () => {
+    const root = "bibcode-server-v0.4.3-windows-x86_64";
+    expect(() => validateServerArchiveEntries([`${root}\\bibcode.exe`], root)).toThrow(
+      "Unsafe archive entry",
+    );
+    expect(() =>
+      validateServerArchiveEntries([`${root}/bibcode.exe`, `${root}/web/index.html`], root),
+    ).not.toThrow();
   });
 
   it("stages the executable, web client, guide, and license under one versioned root", async () => {
