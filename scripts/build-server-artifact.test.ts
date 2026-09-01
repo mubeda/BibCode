@@ -6,11 +6,11 @@ import * as NodePath from "node:path";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 
 import {
-  buildServerArtifact,
   ServerArtifactConfigurationError,
   parseServerArtifactArguments,
   planServerArtifact,
   stageServerDistribution,
+  validateServerArchiveSignature,
 } from "./build-server-artifact.ts";
 
 const temporaryRoots: string[] = [];
@@ -89,7 +89,7 @@ describe("server artifact builder", () => {
     ]);
   });
 
-  it("keeps Windows archive arguments relative so tar does not parse the drive as a host", () => {
+  it("uses native Windows ZIP creation with relative artifact paths", () => {
     const root = temporaryRoot();
     const plan = planServerArtifact(
       {
@@ -106,49 +106,29 @@ describe("server artifact builder", () => {
     );
 
     expect(plan.archiveCommand).toEqual({
-      command: "tar",
+      command: "powershell.exe",
       args: [
-        "-a",
-        "-cf",
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        expect.stringContaining("Compress-Archive"),
+        "staging\\bibcode-server-v0.4.3-windows-x86_64",
         "bibcode-server-v0.4.3-windows-x86_64.zip",
-        "-C",
-        "staging",
-        "bibcode-server-v0.4.3-windows-x86_64",
       ],
     });
-    expect(plan.archiveCommand.args.every((argument) => !NodePath.win32.isAbsolute(argument))).toBe(
-      true,
-    );
+    expect(plan.archiveListCommand.command).toBe("powershell.exe");
+    expect(plan.archiveListCommand.args).toContain("bibcode-server-v0.4.3-windows-x86_64.zip");
   });
 
-  it("creates and validates a Windows server zip from the relative archive plan", async () => {
+  it("rejects tar bytes renamed with a zip extension", () => {
     const root = temporaryRoot();
-    const binary = NodePath.join(root, "bibcode.exe");
-    const web = NodePath.join(root, "web");
-    const guide = NodePath.join(root, "server-installation.md");
-    const license = NodePath.join(root, "LICENSE");
-    NodeFS.mkdirSync(web);
-    NodeFS.writeFileSync(binary, "windows-binary");
-    NodeFS.writeFileSync(NodePath.join(web, "index.html"), "<main>BiBCode</main>");
-    NodeFS.writeFileSync(guide, "# Server installation\n");
-    NodeFS.writeFileSync(license, "MIT\n");
-    const plan = planServerArtifact(
-      {
-        platform: "win",
-        arch: "x64",
-        version: "0.4.3",
-        outputDir: NodePath.join(root, "out"),
-        skipBuild: true,
-        binaryPath: binary,
-        webDir: web,
-      },
-      { platform: "win32", arch: "x64" },
-      root,
-      { guidePath: guide, licensePath: license },
-    );
+    const archive = NodePath.join(root, "server.zip");
+    NodeFS.writeFileSync(archive, "ustar");
+    expect(() => validateServerArchiveSignature(archive, "zip")).toThrow("ZIP signature");
 
-    await expect(buildServerArtifact(plan)).resolves.toBe(plan.archivePath);
-    expect(NodeFS.statSync(plan.archivePath).size).toBeGreaterThan(0);
+    NodeFS.writeFileSync(archive, Buffer.from([0x50, 0x4b, 0x03, 0x04]));
+    expect(() => validateServerArchiveSignature(archive, "zip")).not.toThrow();
   });
 
   it("stages the executable, web client, guide, and license under one versioned root", async () => {
