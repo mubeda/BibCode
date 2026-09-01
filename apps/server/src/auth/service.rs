@@ -3453,42 +3453,30 @@ mod tests {
             .await
             .expect("all migrations apply");
         let repositories = Repositories::new(database.clone());
-        let secrets = tempfile::tempdir().expect("secret store directory");
-        let secret_store = SecretStore::new(secrets.path())
-            .await
-            .expect("secret store opens");
-        let config = ServerConfig::new(".")
-            .with_bind("127.0.0.1", 3773)
-            .with_desktop("desktop-test-seed")
-            .expect("desktop config");
-        let auth = AuthService::new_with_persistence(
-            &config,
-            vec![7_u8; 32],
-            secret_store,
-            repositories.clone(),
-        )
-        .await
-        .expect("persistent auth service starts");
-        let offer = auth
-            .issue_share_pairing(
-                owned_scopes(STANDARD_SCOPES),
-                None,
-                "another-device".to_owned(),
-                true,
-            )
-            .await
-            .expect("off-host share pairing");
-        let (issued, _) = auth
-            .exchange_pairing_bootstrap(&offer.credential, ClientMetadata::default())
-            .await
-            .expect("pending session issues");
-        let session_id = issued.principal.session_id.clone();
-        // The service owns an immediate background sweep. Drop its final
-        // strong state owner before exercising repository cutoffs directly so
-        // the background task cannot race the two deterministic assertions.
-        drop(auth);
-        tokio::task::yield_now().await;
         let now = now_ms();
+        let session_id = Uuid::new_v4().to_string();
+        repositories
+            .create_auth_session(NewAuthSession {
+                session_id: session_id.clone(),
+                subject: "pairing-sweep-test".to_owned(),
+                scopes: serde_json::json!(owned_scopes(STANDARD_SCOPES)),
+                method: "bearer-access-token".to_owned(),
+                client: PersistedAuthSessionClient {
+                    label: Some("Pairing sweep test".to_owned()),
+                    ip_address: None,
+                    user_agent: None,
+                    device_type: "desktop".to_owned(),
+                    os: None,
+                    browser: None,
+                },
+                issued_at: format_iso(now),
+                expires_at: format_iso(now + SESSION_TTL_MS),
+                reach: Some(PAIRING_REACH_ANOTHER_DEVICE.to_owned()),
+                off_host: Some(true),
+                delivery_state: AuthSessionDeliveryState::PendingPairing,
+            })
+            .await
+            .expect("pending session persists");
 
         // A sweep whose cutoff predates the mint leaves the fresh pending
         // session alone — a restart cannot revoke an in-flight pairing.
