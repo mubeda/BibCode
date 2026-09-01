@@ -219,7 +219,7 @@ The toolbar has three segments:
    selection is remembered while the current client session remains alive.
 2. **Branch** groups local branches into Default, Recent, and Other, and offers
    create, checkout, rename, delete, and merge actions. The same segment exposes
-   tag creation.
+   tag creation, deletion, and push actions.
 3. **Sync** derives fetch, pull, push, publish-branch, and diverged
    force-with-lease states from the current branch and upstream.
 
@@ -235,18 +235,20 @@ The **History** tab pages a flat commit list and shows the selected commit's
 metadata, changed files, and diff. New repository generations are spliced above
 the loaded tip-pinned snapshot; repositories beyond the pin limit show the
 less-stable paging warning. Author circles use only locally derived initials and
-color. The current project route does not mount the implemented history-rewrite
-context menu or multi-commit dialog, so History remains read-only in the shipped
-surface.
+color. Right-click a commit to access reset, revert, cherry-pick, reorder,
+branch or tag creation, and SHA-copy actions. Contiguous multi-commit selections
+also offer cherry-pick, squash, and reorder. History actions use the panel's
+mounted confirmation and multi-commit dialogs.
 
 Above the tabs, **Stashes** opens the full native stash list with per-entry diff
 and apply, pop, and drop actions. Choosing **Leave my changes** while switching
 branches creates a normal visible stash. **Merge…** loads a server preview and
-starts a normal or squash merge. Repositories with a merge, rebase,
-cherry-pick, or revert in progress show a continue/abort strip, and conflicted
-paths are marked in Changes. The reusable ours/theirs conflict list exists in
-the codebase but is not mounted by the current route, so resolution still needs
-an editor or terminal before Continue can succeed.
+starts a normal or squash merge. **Rebase…** opens a branch chooser and warns
+when the rewrite will require updating an upstream with force-with-lease.
+Repositories with a merge, rebase, cherry-pick, or revert in progress show a
+continue/abort strip, and conflicted paths are marked in Changes. For supported
+conflicted operations, resolve each listed path with Ours or Theirs in the
+panel's conflict list, then choose Continue once it is enabled.
 
 **Pull requests** opens the provider pane without making a request. Pull-request
 and check data load only when **Refresh** is pressed, and the pane never starts a
@@ -418,10 +420,6 @@ The Files surface is a full file manager for the active workspace:
 
 - Staged-row diff viewing in the right-panel Source Control surface does not yet
   use a true `git diff --cached` source. Git Manager diffs are a separate path.
-- Git Manager history-rewrite actions and its ours/theirs conflict-resolution
-  list are implemented as components but are not mounted by the project route.
-- The Git Manager toolbar currently exposes tag creation, but not the shipped
-  server operations for tag deletion or tag push.
 - Git Manager has no configurable keybinding command IDs yet; use its sidebar
   entry point and the keyboard-operable controls within the panel.
 - Outside changes are detected by a periodic check, so the tree updates within
