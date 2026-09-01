@@ -476,8 +476,7 @@ export const useUiStateStore = create<UiStateStore>((set) => ({
     set((state) => setThreadChangedFilesExpanded(state, threadId, turnId, expanded)),
   setDefaultAdvertisedEndpointKey: (key) =>
     set((state) => setDefaultAdvertisedEndpointKey(state, key)),
-  setAgentsSectionExpanded: (expanded) =>
-    set((state) => setAgentsSectionExpanded(state, expanded)),
+  setAgentsSectionExpanded: (expanded) => set((state) => setAgentsSectionExpanded(state, expanded)),
   setAgentsGroupExpanded: (groupId, expanded) =>
     set((state) => setAgentsGroupExpanded(state, groupId, expanded)),
   setProjectExpanded: (projectIds, expanded) =>

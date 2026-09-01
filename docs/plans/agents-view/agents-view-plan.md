@@ -48,6 +48,7 @@ contracts §3 are normative; this plan implements them and nothing more. Researc
 ### Task 1: Contracts — `OrchestrationConversationPreview`
 
 **Files:**
+
 - Modify: `packages/contracts/src/orchestration.ts` (insert before
   `OrchestrationThreadShell` at ~:497; add field to the shell struct after
   `unresolvedDelivery` at ~:532)
@@ -56,13 +57,14 @@ contracts §3 are normative; this plan implements them and nothing more. Researc
   (schema fingerprints)
 
 **Interfaces:**
+
 - Produces: `OrchestrationConversationPreview` (schema + type) and
   `OrchestrationThreadShell.conversationPreview?: OrchestrationConversationPreview | null | undefined`,
   imported by Tasks 3 and 5 from `@bibcode/contracts`.
 
 - [ ] **Step 1: Write the failing test** — append to
-  `packages/contracts/src/orchestration.test.ts`, matching the file's existing
-  `describe`/`it` + `Schema.decodeUnknownSync` style:
+      `packages/contracts/src/orchestration.test.ts`, matching the file's existing
+      `describe`/`it` + `Schema.decodeUnknownSync` style:
 
 ```ts
 describe("OrchestrationConversationPreview", () => {
@@ -116,7 +118,7 @@ Run: `vp test packages/contracts/src/orchestration.test.ts`
 Expected: FAIL — `OrchestrationConversationPreview` / `conversationPreview` unknown.
 
 - [ ] **Step 3: Implement the schema** in `packages/contracts/src/orchestration.ts`,
-  immediately above `OrchestrationThreadShell`:
+      immediately above `OrchestrationThreadShell`:
 
 ```ts
 export const OrchestrationConversationPreview = Schema.Struct({
@@ -164,24 +166,26 @@ git commit -m "feat(contracts): add conversationPreview to the thread shell"
 ### Task 2: Server — populate `conversationPreview` in the shell builder
 
 **Files:**
+
 - Modify: `apps/server/src/production/orchestration_rpc.rs` — `thread_shell` (:1011),
   its two call sites (`shell_snapshot` :869, thread detail :899), and the inline
   `mod tests` (:1153)
 
 **Interfaces:**
+
 - Consumes: `Snapshot { messages: Vec<ProjectionThreadMessage>, activities:
-  Vec<ProjectionThreadActivity>, turns: Vec<ProjectionTurn>, .. }`
+Vec<ProjectionThreadActivity>, turns: Vec<ProjectionTurn>, .. }`
   (`apps/server/src/orchestration/engine.rs:6302`), `ProjectionThreadMessage { thread_id,
-  role, text, created_at, .. }`, `ProjectionThreadActivity { thread_id, turn_id, tone,
-  summary, created_at, .. }` (`apps/server/src/persistence/repositories.rs:1849-1874`).
+role, text, created_at, .. }`, `ProjectionThreadActivity { thread_id, turn_id, tone,
+summary, created_at, .. }` (`apps/server/src/persistence/repositories.rs:1849-1874`).
 - Produces: JSON key `conversationPreview` on every thread object in the
   `orchestration.subscribeShell` snapshot — shape exactly per Task 1's schema. The
   thread-detail path passes no preview and emits no key (wire change is shell-only,
   spec §3.1).
 
 - [ ] **Step 1: Write the failing tests** in the existing `mod tests` of
-  `orchestration_rpc.rs`, following its fixture style (plain synchronous `#[test]` fns
-  are fine — the functions under test are pure):
+      `orchestration_rpc.rs`, following its fixture style (plain synchronous `#[test]` fns
+      are fine — the functions under test are pure):
 
 ```rust
 #[test]
@@ -411,10 +415,12 @@ git commit -m "feat(server): push conversation previews on the shell stream"
 ### Task 3: Client policy — `agentsSection.logic.ts`
 
 **Files:**
+
 - Create: `apps/web/src/components/sidebar/agentsSection.logic.ts`
 - Test: `apps/web/src/components/sidebar/agentsSection.logic.test.ts`
 
 **Interfaces:**
+
 - Consumes: `EnvironmentThreadShell` (`@bibcode/client-runtime` — shell +
   `environmentId`), `resolveThreadStatusPill` and `ThreadStatusPill` from
   `../Sidebar.logic.ts`, `normalizeSearchText` from `../CommandPalette.logic.ts`,
@@ -464,9 +470,9 @@ export function groupAgentRows(
 ```
 
 - [ ] **Step 1: Write the failing tests** in `agentsSection.logic.test.ts` (Vitest,
-  same import style as `environmentRail.logic.test.ts`). Cover, with hand-built shell
-  fixtures (helper `makeShell(overrides)` returning a minimal
-  `EnvironmentThreadShell`):
+      same import style as `environmentRail.logic.test.ts`). Cover, with hand-built shell
+      fixtures (helper `makeShell(overrides)` returning a minimal
+      `EnvironmentThreadShell`):
 
 ```ts
 describe("resolveAgentGroup", () => {
@@ -486,15 +492,21 @@ describe("resolveAgentPreviewLine", () => {
     const preview = { prompt: "p", tool: "Bash: ls", assistantMessage: "a" };
     expect(resolveAgentPreviewLine(workingPill, preview)).toBe("Bash: ls");
     expect(resolveAgentPreviewLine(completedPill, preview)).toBe("a");
-    expect(resolveAgentPreviewLine(completedPill, { ...preview, assistantMessage: null })).toBe("p");
+    expect(resolveAgentPreviewLine(completedPill, { ...preview, assistantMessage: null })).toBe(
+      "p",
+    );
     expect(resolveAgentPreviewLine(completedPill, null)).toBeNull();
     expect(resolveAgentPreviewLine(completedPill, undefined)).toBeNull();
   });
 });
 
 describe("buildAgentRows", () => {
-  it("includes only non-archived shells with a session", () => { /* archived + sessionless excluded */ });
-  it("marks rows stale when availability is not 'live'", () => { /* environmentLive false, status carried */ });
+  it("includes only non-archived shells with a session", () => {
+    /* archived + sessionless excluded */
+  });
+  it("marks rows stale when availability is not 'live'", () => {
+    /* environmentLive false, status carried */
+  });
   it("builds a lowercase haystack containing title, project, branch, env label, provider, pill label, previews", () => {});
 });
 
@@ -577,11 +589,13 @@ git commit -m "feat(web): agents section row/group/filter policy"
 ### Task 4: Persisted expansion state in `uiStateStore`
 
 **Files:**
+
 - Modify: `apps/web/src/uiStateStore.ts` (add keys beside `projectExpandedById`, pure
   helpers beside `resolveProjectExpanded`/`setProjectExpanded` :331-362)
 - Test: `apps/web/src/uiStateStore.test.ts` (append)
 
 **Interfaces:**
+
 - Produces (Task 5 imports): `UiState.agentsSectionExpanded: boolean` (default `true`),
   `UiState.agentsGroupExpandedById: Record<string, boolean>`, and pure updaters
   `setAgentsSectionExpanded(state: UiState, expanded: boolean): UiState`,
@@ -592,7 +606,7 @@ git commit -m "feat(web): agents section row/group/filter policy"
   default).
 
 - [ ] **Step 1: Write the failing tests** (follow the file's existing test style for
-  `setProjectExpanded`):
+      `setProjectExpanded`):
 
 ```ts
 describe("agents section expansion", () => {
@@ -619,11 +633,11 @@ sanitized on load, extend that sanitizer for the two new keys the same way the e
 keys are handled.)
 
 - [ ] **Step 2: Run tests to verify they fail** —
-  `vp test apps/web/src/uiStateStore.test.ts` → FAIL.
+      `vp test apps/web/src/uiStateStore.test.ts` → FAIL.
 
 - [ ] **Step 3: Implement** the two state keys (defaults `true` / `{}`), the two
-  no-op-preserving updaters (mirror `setProjectExpanded`'s early-return shape), and the
-  resolver.
+      no-op-preserving updaters (mirror `setProjectExpanded`'s early-return shape), and the
+      resolver.
 
 - [ ] **Step 4: Run tests to verify they pass** — same command, PASS.
 
@@ -639,6 +653,7 @@ git commit -m "feat(web): persist agents section and group expansion"
 ### Task 5: The `AgentsSection` component
 
 **Files:**
+
 - Create: `apps/web/src/components/sidebar/AgentsSection.tsx`
 - Test: `apps/web/src/components/sidebar/AgentsSection.test.tsx`
 - Modify: `apps/web/src/components/Sidebar.tsx` (mount inside
@@ -647,6 +662,7 @@ git commit -m "feat(web): persist agents section and group expansion"
   reaches `SidebarProjectsContent` callers, follow how `handleNewThread` is plumbed)
 
 **Interfaces:**
+
 - Consumes: `useThreadShells`, `useProjects`, `setActiveEnvironmentId`
   (`apps/web/src/state/entities.ts`), `useEnvironments`
   (`apps/web/src/state/environments.ts`), `useEnvironmentShellSummary`
@@ -663,7 +679,7 @@ Component contract (all policy comes from Task 3 — the component only renders)
 - Header row: chevron + uppercase `Agents` label + total-row-count pill; clicking
   toggles `agentsSectionExpanded`. `data-testid="agents-section-header"`.
 - When expanded: filter `<input placeholder="Filter agents…"
-  data-testid="agents-filter-input">` (local `useState`, passed through
+data-testid="agents-filter-input">` (local `useState`, passed through
   `useDeferredValue` before `groupAgentRows`), then groups.
 - Group header: label + count pill, toggles `agentsGroupExpandedById[group.id]`,
   `data-testid={"agents-group-" + group.id}`.
@@ -687,19 +703,19 @@ Component contract (all policy comes from Task 3 — the component only renders)
   component so one shell update re-renders one row.
 
 - [ ] **Step 1: Write the failing component tests** (Testing Library, follow
-  `EnvironmentRail.test.tsx` for render/mocking conventions — mock the state hooks the
-  same way that file mocks its atoms). Cover: (1) groups render in pinned order with
-  counts and DONE collapsed by default; (2) filter text narrows rows and >2048-byte
-  query renders no rows; (3) row click calls `markRead`, `setActiveEnvironmentId`, and
-  `navigateToThread` with the row's ref; (4) stale environment row is greyed and shows
-  the availability status; (5) section header toggle collapses the body; (6) unread key
-  bolds the title; (7) empty state renders.
+      `EnvironmentRail.test.tsx` for render/mocking conventions — mock the state hooks the
+      same way that file mocks its atoms). Cover: (1) groups render in pinned order with
+      counts and DONE collapsed by default; (2) filter text narrows rows and >2048-byte
+      query renders no rows; (3) row click calls `markRead`, `setActiveEnvironmentId`, and
+      `navigateToThread` with the row's ref; (4) stale environment row is greyed and shows
+      the availability status; (5) section header toggle collapses the body; (6) unread key
+      bolds the title; (7) empty state renders.
 
 - [ ] **Step 2: Run tests to verify they fail** —
-  `vp test apps/web/src/components/sidebar/AgentsSection.test.tsx` → FAIL.
+      `vp test apps/web/src/components/sidebar/AgentsSection.test.tsx` → FAIL.
 
 - [ ] **Step 3: Implement the component**, then mount it in
-  `SidebarProjectsContent`:
+      `SidebarProjectsContent`:
 
 ```tsx
 </SidebarGroup>
@@ -712,11 +728,11 @@ Component contract (all policy comes from Task 3 — the component only renders)
 (:2273) is in scope.)
 
 - [ ] **Step 4: Run tests to verify they pass** — component tests plus
-  `vp test apps/web/src/components/Sidebar.test.tsx` (existing sidebar tests must stay
-  green; update snapshots/queries only where the new section legitimately appears).
+      `vp test apps/web/src/components/Sidebar.test.tsx` (existing sidebar tests must stay
+      green; update snapshots/queries only where the new section legitimately appears).
 
 - [ ] **Step 5: React quality gate** — verify the new/changed `apps/web` code against
-  the `vercel-react-best-practices` skill; fix findings.
+      the `vercel-react-best-practices` skill; fix findings.
 
 - [ ] **Step 6: Commit**
 
@@ -730,11 +746,13 @@ git commit -m "feat(web): agents section in the left panel"
 ### Task 6: Unread rising-edge trigger
 
 **Files:**
+
 - Create: `apps/web/src/components/sidebar/useAgentsUnread.ts`
 - Test: `apps/web/src/components/sidebar/useAgentsUnread.test.ts`
 - Modify: `apps/web/src/components/sidebar/AgentsSection.tsx` (mount the hook)
 
 **Interfaces:**
+
 - Consumes: `EnvironmentThreadShell.latestTurn` (`turnId`, `state`), the open route's
   thread (read via TanStack Router `useParams` on `/$environmentId/$threadId` —
   copy how `Sidebar.tsx` derives `routeThreadKey`), `markUnread` from
@@ -775,15 +793,15 @@ it("treats interrupted and error like completed, and running/null as not-settled
 - [ ] **Step 2: Run tests to verify they fail** — module not found.
 
 - [ ] **Step 3: Implement.** `detectUnreadTransitions`: settled =
-  `state === "completed" || state === "interrupted" || state === "error"`; for each row
-  with a `latestTurn`, signature `` `${turnId}:${state}` ``; mark when the previous map
-  **has** the key, the signature changed, the new state is settled, and
-  `row.key !== openThreadKey`; always record the new signature. `useAgentsUnread`
-  keeps the map in a `useRef`, runs the detector in `useEffect` on `rows`, and calls
-  `markUnread` for each returned key.
+      `state === "completed" || state === "interrupted" || state === "error"`; for each row
+      with a `latestTurn`, signature `` `${turnId}:${state}` ``; mark when the previous map
+      **has** the key, the signature changed, the new state is settled, and
+      `row.key !== openThreadKey`; always record the new signature. `useAgentsUnread`
+      keeps the map in a `useRef`, runs the detector in `useEffect` on `rows`, and calls
+      `markUnread` for each returned key.
 
 - [ ] **Step 4: Run tests to verify they pass**, then mount `useAgentsUnread(rows)`
-  inside `AgentsSection` and re-run the Task 5 component tests.
+      inside `AgentsSection` and re-run the Task 5 component tests.
 
   **Which rows (pinned):** the hook receives the **full `buildAgentRows` output** —
   before `groupAgentRows`, before filtering, before the per-group cap — and both the
@@ -807,6 +825,7 @@ git commit -m "feat(web): bold agents rows until visited"
 ### Task 7: Documentation amendments and final gate
 
 **Files:**
+
 - Modify: `docs/plans/remote-servers/remote-servers-spec.md` (§4.8 — add the
   Agents-section exception sentence pinned in the spec §3.6)
 - Modify: `docs/architecture/connection-runtime.md` (presentation-scoping paragraph —
@@ -816,15 +835,15 @@ git commit -m "feat(web): bold agents rows until visited"
 - Review: `docs/testing/` runbooks (packaged-UI-flow rule)
 
 - [ ] **Step 1: Amend the three living documents** with exactly the scope above — the
-  exception sentence: *"Exception: the Agents section in the left panel is the single
-  cross-environment surface; it ignores rail selection by design, and clicking one of
-  its rows re-points rail selection to the row's environment so every other surface
-  remains scoped."*
+      exception sentence: _"Exception: the Agents section in the left panel is the single
+      cross-environment surface; it ignores rail selection by design, and clicking one of
+      its rows re-points rail selection to the row's environment so every other surface
+      remains scoped."_
 
 - [ ] **Step 2: Review `docs/testing/` runbooks.** If a native visual-validation
-  runbook enumerates sidebar sections or packaged UI flows, add the Agents section to
-  that enumeration; otherwise record in the final report that the runbooks were
-  **reviewed and remain accurate**.
+      runbook enumerates sidebar sections or packaged UI flows, add the Agents section to
+      that enumeration; otherwise record in the final report that the runbooks were
+      **reviewed and remain accurate**.
 
 - [ ] **Step 3: Full validation gate**
 

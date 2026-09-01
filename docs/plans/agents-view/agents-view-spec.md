@@ -34,23 +34,23 @@ reuses the existing client-side `threadShellsAtom`.
 
 ## 2. Decision log
 
-| #   | Decision                                                                                                                                                                                                    | Why / alternative rejected                                                                                                                                                                              |
-| --- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| D1  | Always-visible section in the left panel between the Search row and the Projects header.                                                                                                                     | User decision. A toggleable panel mode (Orca's full-window Activity page) was offered and declined.                                                                                                       |
-| D2  | Cross-environment: the section ignores rail selection and renders rows from every catalog environment.                                                                                                       | The point of the feature. This is a deliberate, recorded exception to the Remote Servers rail-scoping invariant (§3.6).                                                                                   |
-| D3  | Row set: every thread with `archivedAt === null` and `session !== null`, including finished/idle sessions.                                                                                                   | User decision ("all threads with a live session"); matches the reference Activity page's DONE group. Attention-only was offered and declined.                                                             |
-| D4  | Row content: Orca-parity previews — latest prompt, current tool line, last assistant message — plus status pill, project/branch, environment badge, relative time.                                            | User decision ("Orca way").                                                                                                                                                                               |
-| D5  | Preview transport: the server pushes capped preview fields on the existing shell stream (the reference's paired-client projection pattern). No per-thread activity subscriptions, no managed CLI hooks.       | One stream, bounded by design; reliability-first. The server already supervises the provider processes, so hook installation (the reference's Electron-local mechanism) is unnecessary.                    |
-| D6  | Grouping v1: fixed status groups in pinned order WORKING → PENDING APPROVAL → AWAITING INPUT → DONE, counts in headers, empty groups elided. No group-by dropdown.                                            | User decision; dropdown (status/project/environment) is an explicit fast-follow, out of scope.                                                                                                             |
-| D7  | Rows from a non-live environment render greyed with that environment's availability badge; cached data is never presented as live.                                                                            | User decision (option "shown, visibly stale"); shell-projection-authority rule in `docs/architecture/connection-runtime.md`. Explicitly-disconnected environments are also shown greyed (not hidden).      |
-| D8  | Clicking a row opens the thread in the center panel **and** moves `activeEnvironmentIdAtom` to the row's environment.                                                                                        | User decision; otherwise the rail/Projects section and the center panel disagree about the active environment. Verified: route navigation does not currently sync rail selection.                          |
-| D9  | Inline filter input at the top of the section, matching over a precomputed lowercase haystack across all environments, reusing `normalizeSearchText` from `CommandPalette.logic.ts`. 2 KiB byte cap fails closed. | User decision; first inline input in the sidebar, deliberate. One matching policy, not two.                                                                                                                |
-| D10 | Volume bounds: groups collapsible, DONE collapsed by default, per-group cap of 5 rows with "Show more", whole section collapsible via its header (persisted).                                                | User accepted recommendation; keeps the no-virtualization sidebar viable.                                                                                                                                  |
-| D11 | Unread: rows render bold until visited, reusing `sidebarWorkspaceMetaStore` (`unreadThreadKeys`, keyed by `scopedThreadKey`). No unread-count badge in v1.                                                    | User decision. New trigger required: nothing marks threads unread today (verified — `markUnread` has no production callers).                                                                               |
-| D12 | Aggregation stays client-side in existing atoms.                                                                                                                                                             | Settled architecture: one server = one environment (`remote-servers-spec.md`); `threadShellsAtom` already concatenates all environments and is already mounted by the sidebar.                             |
-| D13 | Status policy has one source: the row's group derives from `resolveThreadStatusPill` (`Sidebar.logic.ts:445`), not a second status policy.                                                                    | Duplicate policy is a maintenance defect; the sidebar's pill and the Agents group can never disagree.                                                                                                     |
-| D14 | No stable-task-title machinery (the reference's terse-follow-up filter).                                                                                                                                     | BiBCode threads have server-owned titles; the reference needed title synthesis because its rows are terminal panes. YAGNI.                                                                                 |
-| D15 | Copy and identifiers: section label "Agents", components `AgentsSection`/`agentsSection.logic`. The existing `settings.agents.tsx` (default-agent settings) and activity-protocol "actors" are unrelated.     | Naming-collision note from research; identifiers chosen to not collide.                                                                                                                                   |
+| #   | Decision                                                                                                                                                                                                          | Why / alternative rejected                                                                                                                                                                            |
+| --- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| D1  | Always-visible section in the left panel between the Search row and the Projects header.                                                                                                                          | User decision. A toggleable panel mode (Orca's full-window Activity page) was offered and declined.                                                                                                   |
+| D2  | Cross-environment: the section ignores rail selection and renders rows from every catalog environment.                                                                                                            | The point of the feature. This is a deliberate, recorded exception to the Remote Servers rail-scoping invariant (§3.6).                                                                               |
+| D3  | Row set: every thread with `archivedAt === null` and `session !== null`, including finished/idle sessions.                                                                                                        | User decision ("all threads with a live session"); matches the reference Activity page's DONE group. Attention-only was offered and declined.                                                         |
+| D4  | Row content: Orca-parity previews — latest prompt, current tool line, last assistant message — plus status pill, project/branch, environment badge, relative time.                                                | User decision ("Orca way").                                                                                                                                                                           |
+| D5  | Preview transport: the server pushes capped preview fields on the existing shell stream (the reference's paired-client projection pattern). No per-thread activity subscriptions, no managed CLI hooks.           | One stream, bounded by design; reliability-first. The server already supervises the provider processes, so hook installation (the reference's Electron-local mechanism) is unnecessary.               |
+| D6  | Grouping v1: fixed status groups in pinned order WORKING → PENDING APPROVAL → AWAITING INPUT → DONE, counts in headers, empty groups elided. No group-by dropdown.                                                | User decision; dropdown (status/project/environment) is an explicit fast-follow, out of scope.                                                                                                        |
+| D7  | Rows from a non-live environment render greyed with that environment's availability badge; cached data is never presented as live.                                                                                | User decision (option "shown, visibly stale"); shell-projection-authority rule in `docs/architecture/connection-runtime.md`. Explicitly-disconnected environments are also shown greyed (not hidden). |
+| D8  | Clicking a row opens the thread in the center panel **and** moves `activeEnvironmentIdAtom` to the row's environment.                                                                                             | User decision; otherwise the rail/Projects section and the center panel disagree about the active environment. Verified: route navigation does not currently sync rail selection.                     |
+| D9  | Inline filter input at the top of the section, matching over a precomputed lowercase haystack across all environments, reusing `normalizeSearchText` from `CommandPalette.logic.ts`. 2 KiB byte cap fails closed. | User decision; first inline input in the sidebar, deliberate. One matching policy, not two.                                                                                                           |
+| D10 | Volume bounds: groups collapsible, DONE collapsed by default, per-group cap of 5 rows with "Show more", whole section collapsible via its header (persisted).                                                     | User accepted recommendation; keeps the no-virtualization sidebar viable.                                                                                                                             |
+| D11 | Unread: rows render bold until visited, reusing `sidebarWorkspaceMetaStore` (`unreadThreadKeys`, keyed by `scopedThreadKey`). No unread-count badge in v1.                                                        | User decision. New trigger required: nothing marks threads unread today (verified — `markUnread` has no production callers).                                                                          |
+| D12 | Aggregation stays client-side in existing atoms.                                                                                                                                                                  | Settled architecture: one server = one environment (`remote-servers-spec.md`); `threadShellsAtom` already concatenates all environments and is already mounted by the sidebar.                        |
+| D13 | Status policy has one source: the row's group derives from `resolveThreadStatusPill` (`Sidebar.logic.ts:445`), not a second status policy.                                                                        | Duplicate policy is a maintenance defect; the sidebar's pill and the Agents group can never disagree.                                                                                                 |
+| D14 | No stable-task-title machinery (the reference's terse-follow-up filter).                                                                                                                                          | BiBCode threads have server-owned titles; the reference needed title synthesis because its rows are terminal panes. YAGNI.                                                                            |
+| D15 | Copy and identifiers: section label "Agents", components `AgentsSection`/`agentsSection.logic`. The existing `settings.agents.tsx` (default-agent settings) and activity-protocol "actors" are unrelated.         | Naming-collision note from research; identifiers chosen to not collide.                                                                                                                               |
 
 ## 3. Pinned contracts
 
@@ -122,13 +122,13 @@ exported, colocated tests) is the single home of Agents-view policy:
 - **Group** (type `AgentGroupId = "working" | "blocked" | "waiting" | "done"`)
   derives from `resolveThreadStatusPill({ thread: shell })`:
 
-  | Pill label                | Group     |
-  | ------------------------- | --------- |
-  | `Working` / `Connecting`  | `working` |
-  | `Pending Approval`        | `blocked` |
-  | `Awaiting Input`          | `waiting` |
-  | `Plan Ready`              | `waiting` |
-  | `Completed` / `null`      | `done`    |
+  | Pill label               | Group     |
+  | ------------------------ | --------- |
+  | `Working` / `Connecting` | `working` |
+  | `Pending Approval`       | `blocked` |
+  | `Awaiting Input`         | `waiting` |
+  | `Plan Ready`             | `waiting` |
+  | `Completed` / `null`     | `done`    |
 
 - **Group order and labels** (empty groups elided):
   `working` "Working" → `blocked` "Pending Approval" → `waiting`
@@ -161,7 +161,7 @@ exported, colocated tests) is the single home of Agents-view policy:
   collapsible; expansion persists in `uiStateStore`
   (`agentsGroupExpandedById: Record<string, boolean>`), defaults: `done` →
   `false`, others → `true`. Per-group preview cap `AGENTS_GROUP_PREVIEW_COUNT
-  = 5` with a "Show more"/"Show less" row (ephemeral state, Projects-overflow
+= 5` with a "Show more"/"Show less" row (ephemeral state, Projects-overflow
   pattern).
 - **Row anatomy** (top line → bottom): status dot + pill (reuse
   `ThreadStatusPill` colors/pulse), thread title (bold while unread),
@@ -181,20 +181,20 @@ exported, colocated tests) is the single home of Agents-view policy:
 
 ### 3.5 Persistence keys
 
-| Store                      | Key                        | Shape                              |
-| -------------------------- | -------------------------- | ---------------------------------- |
-| `uiStateStore`             | `agentsSectionExpanded`    | `boolean`, default `true`          |
-| `uiStateStore`             | `agentsGroupExpandedById`  | `Record<string, boolean>`          |
-| `sidebarWorkspaceMetaStore`| `unreadThreadKeys` (reuse) | existing `string[]` of scoped keys |
+| Store                       | Key                        | Shape                              |
+| --------------------------- | -------------------------- | ---------------------------------- |
+| `uiStateStore`              | `agentsSectionExpanded`    | `boolean`, default `true`          |
+| `uiStateStore`              | `agentsGroupExpandedById`  | `Record<string, boolean>`          |
+| `sidebarWorkspaceMetaStore` | `unreadThreadKeys` (reuse) | existing `string[]` of scoped keys |
 
 ### 3.6 Rail-scoping exception (Remote Servers spec amendment)
 
 `docs/plans/remote-servers/remote-servers-spec.md` §4.8 pins "no selection
 must never render as 'show everything'". This feature adds, in the same
-patch, an explicit exception clause: *the Agents section is the single
+patch, an explicit exception clause: _the Agents section is the single
 cross-environment surface in the panel; it ignores rail selection by design,
 and its row click re-points rail selection to the row's environment so every
-other surface remains scoped.* The living doc
+other surface remains scoped._ The living doc
 `docs/architecture/connection-runtime.md` presentation-scoping paragraph gets
 the same one-sentence exception.
 
