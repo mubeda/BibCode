@@ -855,10 +855,7 @@ The following are packaged-surface acceptance steps. Do not substitute a raw
 RPC or command-line Git operation when a named Git Manager control is missing;
 record that step as **FAIL**. The companion-shell commands below are exceptions
 used only to create repository states that cannot be held while the application
-starts. The current living UI documentation identifies history-rewrite and
-conflict-resolution components plus tag delete/push as not mounted by the
-project route, so their absence must remain visible as a product failure rather
-than being reported as unavailable evidence.
+starts.
 
 1. Hover the primary fixture project's header and choose its **Git Manager**
    branch-icon button. Confirm the centre route is the project-scoped `/git`
