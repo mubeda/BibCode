@@ -6,7 +6,7 @@ use std::{
     pin::Pin,
     process::Stdio,
     sync::{
-        Arc, Mutex as StdMutex, OnceLock,
+        Arc, Condvar, Mutex as StdMutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime},
@@ -7922,6 +7922,71 @@ impl ClaudeActivityProbeCache {
     }
 }
 
+#[derive(Debug, Default)]
+struct ClaudeActivityProbeResolutionGateState {
+    blocked: AtomicBool,
+    blocked_changed: tokio::sync::Notify,
+    released: StdMutex<bool>,
+    release_changed: Condvar,
+}
+
+/// Deterministically blocks executable resolution for integration tests.
+#[doc(hidden)]
+#[derive(Clone, Debug, Default)]
+pub struct ClaudeActivityProbeResolutionGate {
+    state: Arc<ClaudeActivityProbeResolutionGateState>,
+}
+
+impl ClaudeActivityProbeResolutionGate {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn wait_until_blocked(&self) {
+        loop {
+            let blocked_changed = self.state.blocked_changed.notified();
+            if self.state.blocked.load(Ordering::Acquire) {
+                return;
+            }
+            blocked_changed.await;
+        }
+    }
+
+    pub fn release(&self) {
+        let mut released = self
+            .state
+            .released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *released = true;
+        self.state.release_changed.notify_all();
+    }
+
+    fn block(&self) {
+        self.state.blocked.store(true, Ordering::Release);
+        self.state.blocked_changed.notify_waiters();
+        let mut released = self
+            .state
+            .released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !*released {
+            released = self
+                .state
+                .release_changed
+                .wait(released)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+}
+
+impl Drop for ClaudeActivityProbeResolutionGate {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 enum ClaudeProbeLaunchPolicy {
     #[default]
@@ -7947,7 +8012,7 @@ fn production_claude_probe_cache() -> ClaudeActivityProbeCache {
 async fn probe_claude_activity_support_with_environment<'a>(
     binary_path: &str,
     environment: impl IntoIterator<Item = (&'a OsStr, &'a OsStr)>,
-    resolution_delay: Duration,
+    resolution_gate: Option<ClaudeActivityProbeResolutionGate>,
     cache: ClaudeActivityProbeCache,
     launch_policy: ClaudeProbeLaunchPolicy,
 ) -> ClaudeActivitySupport {
@@ -7958,8 +8023,8 @@ async fn probe_claude_activity_support_with_environment<'a>(
         let resolution = tokio::time::timeout_at(
             deadline,
             tokio::task::spawn_blocking(move || {
-                if !resolution_delay.is_zero() {
-                    std::thread::sleep(resolution_delay);
+                if let Some(resolution_gate) = resolution_gate {
+                    resolution_gate.block();
                 }
                 let resolved =
                     resolve_provider_executable_in_path(&binary_path, search_path.as_deref())?;
@@ -8394,22 +8459,22 @@ impl ClaudeActivityProbeTestContext {
         probe_claude_activity_support_with_environment(
             binary_path,
             std::iter::empty(),
-            Duration::ZERO,
+            None,
             self.cache.clone(),
             test_claude_probe_launch_policy(),
         )
         .await
     }
 
-    pub async fn probe_with_resolution_delay(
+    pub async fn probe_with_resolution_gate(
         &self,
         binary_path: &str,
-        resolution_delay: Duration,
+        resolution_gate: ClaudeActivityProbeResolutionGate,
     ) -> ClaudeActivitySupport {
         probe_claude_activity_support_with_environment(
             binary_path,
             std::iter::empty(),
-            resolution_delay,
+            Some(resolution_gate),
             self.cache.clone(),
             test_claude_probe_launch_policy(),
         )
@@ -8493,7 +8558,7 @@ impl ClaudeDriver {
                 .environment
                 .iter()
                 .map(|(name, value)| (OsStr::new(name), OsStr::new(value))),
-            Duration::ZERO,
+            None,
             probe_cache,
             probe_launch_policy,
         )
