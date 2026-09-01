@@ -9,6 +9,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
+import { makeTestExecutionEnvironmentCapabilities } from "@bibcode/shared/testSupport";
 
 import * as ManagedRelay from "../relay/managedRelay.ts";
 import { remoteHttpClientLayer } from "../rpc/http.ts";
@@ -53,14 +54,7 @@ const DESCRIPTOR = {
   remoteUpdateSupport: null,
   remoteProtocolVersion: 1,
   minCompatibleRemoteProtocol: 1,
-  capabilities: {
-    repositoryIdentity: true,
-    worktreeCatalog: false,
-    worktreeCatalogRefreshReason: false,
-    vcsStatusSummary: false,
-    activityProtocolVersion: null,
-    remoteUpdateControl: false,
-  },
+  capabilities: makeTestExecutionEnvironmentCapabilities({ repositoryIdentity: true }),
 } satisfies ExecutionEnvironmentDescriptor;
 const SSH_TARGET: DesktopSshEnvironmentTarget = {
   alias: "development",

@@ -18,6 +18,7 @@ import * as Ref from "effect/Ref";
 import * as Result from "effect/Result";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
+import { makeTestExecutionEnvironmentCapabilities } from "@bibcode/shared/testSupport";
 
 import * as ClientCapabilities from "../platform/capabilities.ts";
 import * as TokenStore from "../authorization/tokenStore.ts";
@@ -82,14 +83,7 @@ const PREPARED: PreparedConnection = {
     remoteUpdateSupport: null,
     remoteProtocolVersion: 1,
     minCompatibleRemoteProtocol: 1,
-    capabilities: {
-      repositoryIdentity: true,
-      worktreeCatalog: false,
-      worktreeCatalogRefreshReason: false,
-      vcsStatusSummary: false,
-      activityProtocolVersion: null,
-      remoteUpdateControl: false,
-    },
+    capabilities: makeTestExecutionEnvironmentCapabilities({ repositoryIdentity: true }),
   },
   httpBaseUrl: TARGET.httpBaseUrl,
   socketUrl: "wss://environment.example.test/ws",

@@ -56,6 +56,34 @@ Delete the unused result values above. Do not leave an ambiguous status.
 | Overflow/setup unavailable         |               |                             |                    |                |
 | Reconnect/hidden/reveal/focus/menu |               |                             |                    |                |
 
+## Git Manager evidence
+
+- Project/environment and selected checkout:
+- Environment kind: Local | WSL direct | SSH/server | Other remote | Unavailable
+- Advertised Git Manager capabilities:
+- Repository shape: ordinary | linked worktrees | unborn | detached | conflicted
+- Idle interval provider/browser request evidence:
+- Streaming operation event sequence and cancellation result:
+- Competing catalog/Git Manager mutation and `operation-in-flight` result:
+
+| Scenario                                                            | Result | Screenshot, command, or log evidence | Findings and unavailable behavior |
+| ------------------------------------------------------------------- | ------ | ------------------------------------ | --------------------------------- |
+| Open from the project-header button and route persistence           |        |                                      |                                   |
+| Main checkout and linked-worktree selection                         |        |                                      |                                   |
+| Changes, file diff, partial-stage gutter, commit/amend/undo/discard |        |                                      |                                   |
+| History paging, selected commit, and commit diff                    |        |                                      |                                   |
+| Branch create/checkout/rename/delete and occupied-branch redirect   |        |                                      |                                   |
+| Fetch/pull/push/publish/force-with-lease states                     |        |                                      |                                   |
+| Native stash list, entry diff, apply/pop/drop, and merge preview    |        |                                      |                                   |
+| In-progress and conflicted repository presentation                  |        |                                      |                                   |
+| Tag create/delete/push and all four image-diff modes                |        |                                      |                                   |
+| Explicit pull-request/check refresh and no idle provider refresh    |        |                                      |                                   |
+| Disconnect/reconnect and one missing-capability degradation         |        |                                      |                                   |
+| Local-only author identity and no external image source             |        |                                      |                                   |
+| Two-project selection, filter, tab, and repository-data isolation   |        |                                      |                                   |
+| Three-project visit with two-entry least-recently-used eviction     |        |                                      |                                   |
+| Manual idle third-party Network and rendered-image-source check     |        |                                      |                                   |
+
 ## Workspace and static gates
 
 | Command                                                                           | Result/exit code | Duration | Test totals or warning summary |
