@@ -99,3 +99,43 @@ defect.
 - Live verification (the diagnosis feedback loop): rebuild the AppImage,
   launch on the real display, screenshot, and require text fringe ratio > 0.3
   where the pre-fix measurement was 0.0.
+
+## Revision 2 (same day) — original decision superseded by measurement
+
+Instrumenting the real AppImage headlessly (Xvfb + isolated HOME + GTK
+`settings.ini`, root-window capture, per-region subpixel-fringe metrics)
+falsified the original mechanism before implementation landed:
+
+- With the session preference reaching GTK, the app's **static chrome already
+  renders subpixel** (menu bar 0.888, top bar 0.713, toast 0.885 fringe
+  ratio) — the GtkSettings→web-process plumbing works without our help.
+- Text inside **scrollable containers renders grayscale in every mode**
+  (sidebar list 0.000; by extension the chat transcript and terminal — the
+  surfaces users actually read). `WEBKIT_DISABLE_COMPOSITING_MODE`,
+  `WEBKIT_DISABLE_DMABUF_RENDERER`, and `WEBKIT_SKIA_ENABLE_CPU_RENDERING`
+  change nothing. This per-scroll-layer grayscale is engine behavior with no
+  public knob; Chromium keeps LCD text on such layers, which is the visible
+  BiBCode-vs-Electron delta.
+- The fontconfig mirror is additionally unreachable: the web process runs in
+  WebKit's bubblewrap sandbox, which cannot see a process-private
+  `FONTCONFIG_FILE` path (verified: forcing one changes nothing in the app
+  while changing an unsandboxed harness).
+
+**Superseding decision:** compensate typography on the surfaces the engine
+insists on rendering grayscale, scoped to the Linux desktop webview only:
+
+- When the desktop bridge is present and the platform is Linux, the web app
+  stamps `data-linux-webkit` on `<html>` (pure, unit-tested gate).
+- CSS under that attribute sets body `font-weight: 450` (DM Sans Variable
+  instances the axis; measured stroke density mean-ink 116.9 → 120.1,
+  dark-stem ratio 0.236 → 0.267, visually fuller without reading as bold)
+  and `letter-spacing: 0.01em` (the same global tracking the reference app
+  uses); `pre`/`code` pin `font-weight: 400` so the mono stack does not jump
+  to its 500 face.
+- Chromium browser mode and macOS/Windows webviews are untouched.
+
+Verification: rebuild the AppImage and re-run the headless capture; require
+the sidebar text crops' mean-ink density to rise accordingly, with
+screenshots for the user's subjective judgment. The subpixel gap inside
+scrollers is recorded as an upstream WebKitGTK limitation, not fixable
+app-side.
