@@ -113,12 +113,16 @@ describe("server artifact builder", () => {
         "-NonInteractive",
         "-Command",
         expect.stringContaining("Compress-Archive"),
-        "staging\\bibcode-server-v0.4.3-windows-x86_64",
-        "bibcode-server-v0.4.3-windows-x86_64.zip",
       ],
+      env: {
+        BIBCODE_SERVER_ARCHIVE_DESTINATION: "bibcode-server-v0.4.3-windows-x86_64.zip",
+        BIBCODE_SERVER_ARCHIVE_SOURCE: "staging\\bibcode-server-v0.4.3-windows-x86_64",
+      },
     });
     expect(plan.archiveListCommand.command).toBe("powershell.exe");
-    expect(plan.archiveListCommand.args).toContain("bibcode-server-v0.4.3-windows-x86_64.zip");
+    expect(plan.archiveListCommand.env).toEqual({
+      BIBCODE_SERVER_ARCHIVE_DESTINATION: "bibcode-server-v0.4.3-windows-x86_64.zip",
+    });
   });
 
   it("rejects tar bytes renamed with a zip extension", () => {
