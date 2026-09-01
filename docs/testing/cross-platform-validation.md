@@ -599,8 +599,11 @@ sizes. Cover relevant:
   context card with its ⋯ menu when a remote environment is selected—verifying
   that switching rail selection filters the projects panel without interrupting
   running sessions on other environments—and the cross-environment **Agents**
-  section between Search and Projects, whose row selection re-points the rail to
-  that row's environment;
+  nav row below Search, whose unread badge aggregates across environments;
+  verify that it opens the full Agents view, selecting a row shows its live
+  session in the right pane, the back arrow returns to the normal view, and the
+  per-row jump-to-workspace action returns to the normal view and re-points the
+  rail to that row's environment;
 - provider settings and provider/terminal action menus;
 - discovered and adopted external worktrees;
 - Create Worktree exact local and remote ref selection: the exact value appears

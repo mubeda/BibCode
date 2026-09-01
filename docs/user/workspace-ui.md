@@ -6,24 +6,27 @@ terminals, and the right panel hosts project tools.
 
 ## Left Panel
 
-The **Search** row is followed by an **Agents** section, then Projects. Agents
-lists one row for every non-archived thread with a session across all connected
-environments. It is the left panel's single exception to environment-rail
-scoping: it ignores the selected environment by design.
+The **Search** row is followed by an **Agents** nav row, then Projects. Its
+unread-count badge covers agents across all connected environments. Selecting
+the row opens the full-screen Agents view; its top strip has a back arrow for
+returning to the normal workspace, the title **agents**, and an **N unread**
+badge.
 
-Each agent row shows a status pill, thread title, project · branch, one-line
-conversation preview, environment badge, and relative time. While a thread is
-working, the preview shows its current tool; otherwise it shows the latest
-assistant message or prompt. Rows from environments that are not live are
-greyed and add the environment's availability to the badge. Rows remain bold
-until visited.
+The view's list column provides a filter, grouping by **Status** (the default),
+**Project**, or **Environment**, an unread-only bell, and a menu with **Mark all
+read**. Status groups have counts and appear in fixed **Working** → **Pending
+Approval** → **Awaiting Input** → **Done** order, with Done collapsed by
+default. Each row keeps the status pill, thread title, project · branch,
+one-line conversation preview, environment badge, and relative time. While a
+thread is working, the preview shows its current tool; otherwise it shows the
+latest assistant message or prompt. Rows from environments that are not live
+are greyed and add the environment's availability to the badge. Rows remain
+bold until visited.
 
-Rows appear in fixed **Working** → **Pending Approval** → **Awaiting Input** →
-**Done** groups with counts. Done is collapsed by default, and each group shows
-five rows before offering **Show more**. The inline filter matches rows across
-all environments. The section header and each status group can be collapsed,
-and both kinds of collapse state persist. Clicking a row opens its thread in
-the center panel and re-points the environment rail to that row's environment.
+Selecting an agent row marks it read and shows its live session in the right
+pane while keeping the list visible. The per-row **Jump to workspace** action
+exits to the normal workspace view and re-points the environment rail to that
+row's environment.
 
 Projects are shown as groups of workspace rows:
 
