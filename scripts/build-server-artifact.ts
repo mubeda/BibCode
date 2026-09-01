@@ -159,10 +159,15 @@ export function planServerArtifact(
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "$ErrorActionPreference = 'Stop'; Compress-Archive -LiteralPath $args[0] -DestinationPath $args[1] -CompressionLevel Optimal",
-            NodePath.win32.join(NodePath.basename(stagingParent), distributionRootName),
-            archiveName,
+            "$ErrorActionPreference = 'Stop'; Compress-Archive -LiteralPath $env:BIBCODE_SERVER_ARCHIVE_SOURCE -DestinationPath $env:BIBCODE_SERVER_ARCHIVE_DESTINATION -CompressionLevel Optimal",
           ],
+          env: {
+            BIBCODE_SERVER_ARCHIVE_SOURCE: NodePath.win32.join(
+              NodePath.basename(stagingParent),
+              distributionRootName,
+            ),
+            BIBCODE_SERVER_ARCHIVE_DESTINATION: archiveName,
+          },
         }
       : {
           command: "tar",
@@ -177,9 +182,9 @@ export function planServerArtifact(
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "$ErrorActionPreference = 'Stop'; Add-Type -AssemblyName System.IO.Compression.FileSystem; $archive = [IO.Compression.ZipFile]::OpenRead($args[0]); try { $archive.Entries | ForEach-Object { [Console]::Out.WriteLine($_.FullName) } } finally { $archive.Dispose() }",
-            archiveName,
+            "$ErrorActionPreference = 'Stop'; Add-Type -AssemblyName System.IO.Compression.FileSystem; $archive = [IO.Compression.ZipFile]::OpenRead($env:BIBCODE_SERVER_ARCHIVE_DESTINATION); try { $archive.Entries | ForEach-Object { [Console]::Out.WriteLine($_.FullName) } } finally { $archive.Dispose() }",
           ],
+          env: { BIBCODE_SERVER_ARCHIVE_DESTINATION: archiveName },
         }
       : { command: "tar", args: ["-tf", archiveName] };
   const cargoArgs = [
@@ -383,6 +388,7 @@ function validateArchive(plan: ServerArtifactPlan): void {
     [...plan.archiveListCommand.args],
     {
       cwd: plan.outputDir,
+      env: { ...process.env, ...plan.archiveListCommand.env },
       shell: false,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
