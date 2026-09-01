@@ -3423,6 +3423,231 @@ impl GitRepository {
         Ok(ref_name.to_owned())
     }
 
+    pub(crate) async fn git_manager_create_branch(
+        &self,
+        cwd: &Path,
+        name: &str,
+        start_point: Option<&str>,
+        checkout: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let mut args = if checkout {
+            vec!["switch".into(), "-c".into(), name.into()]
+        } else {
+            vec!["branch".into(), name.into()]
+        };
+        if let Some(start_point) = start_point {
+            args.push(start_point.into());
+        }
+        if !checkout {
+            args.push("--no-track".into());
+        }
+        self.execute("GitManager.branchCreate", cwd, &args, true, cancellation)
+            .await
+    }
+
+    pub(crate) async fn git_manager_checkout_local_branch(
+        &self,
+        cwd: &Path,
+        name: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute(
+            "GitManager.branchCheckout.local",
+            cwd,
+            &["switch".into(), name.into()],
+            true,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_checkout_remote_branch(
+        &self,
+        cwd: &Path,
+        local_name: &str,
+        remote_ref: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute(
+            "GitManager.branchCheckout.remote",
+            cwd,
+            &[
+                "switch".into(),
+                "-c".into(),
+                local_name.into(),
+                "--track".into(),
+                remote_ref.into(),
+            ],
+            true,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_rename_branch(
+        &self,
+        cwd: &Path,
+        old_name: &str,
+        new_name: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<ProcessOutput>, GitCommandError> {
+        let first = self
+            .execute(
+                "GitManager.branchRename",
+                cwd,
+                &[
+                    "branch".into(),
+                    "-m".into(),
+                    old_name.into(),
+                    new_name.into(),
+                ],
+                true,
+                cancellation,
+            )
+            .await?;
+        let retry_case_only =
+            first.exit_code != 0 && old_name != new_name && old_name.eq_ignore_ascii_case(new_name);
+        if !retry_case_only {
+            return Ok(vec![first]);
+        }
+        let retry = self
+            .execute(
+                "GitManager.branchRename.forceCase",
+                cwd,
+                &[
+                    "branch".into(),
+                    "-M".into(),
+                    old_name.into(),
+                    new_name.into(),
+                ],
+                true,
+                cancellation,
+            )
+            .await?;
+        Ok(vec![first, retry])
+    }
+
+    pub(crate) async fn git_manager_delete_branch(
+        &self,
+        cwd: &Path,
+        name: &str,
+        force: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute(
+            "GitManager.branchDelete",
+            cwd,
+            &[
+                "branch".into(),
+                if force { "-D" } else { "-d" }.into(),
+                name.into(),
+            ],
+            true,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_delete_remote_branch(
+        &self,
+        cwd: &Path,
+        remote: &str,
+        name: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute(
+            "GitManager.remoteBranchDelete",
+            cwd,
+            &["push".into(), remote.into(), format!(":{name}")],
+            true,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_fetch(
+        &self,
+        cwd: &Path,
+        remote: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute(
+            "GitManager.fetch",
+            cwd,
+            &[
+                "fetch".into(),
+                "--prune".into(),
+                "--recurse-submodules=on-demand".into(),
+                remote.into(),
+            ],
+            true,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_pull(
+        &self,
+        cwd: &Path,
+        remote: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<ProcessOutput>, GitCommandError> {
+        let pull_ff = self
+            .execute(
+                "GitManager.pull.pullFf",
+                cwd,
+                &strings(&["config", "--get", "pull.ff"]),
+                true,
+                cancellation,
+            )
+            .await?;
+        let pull_rebase = self
+            .execute(
+                "GitManager.pull.pullRebase",
+                cwd,
+                &strings(&["config", "--get", "pull.rebase"]),
+                true,
+                cancellation,
+            )
+            .await?;
+        let mut args = strings(&["-c", "rebase.backend=merge", "pull"]);
+        if pull_ff.exit_code != 0 && pull_rebase.exit_code != 0 {
+            args.push("--ff".into());
+        }
+        args.extend(strings(&["--recurse-submodules", remote]));
+        let pull = self
+            .execute("GitManager.pull", cwd, &args, true, cancellation)
+            .await?;
+        Ok(vec![pull_ff, pull_rebase, pull])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn git_manager_push(
+        &self,
+        cwd: &Path,
+        remote: &str,
+        local_branch: &str,
+        remote_branch: Option<&str>,
+        set_upstream: bool,
+        force_with_lease: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let refspec = remote_branch.map_or_else(
+            || local_branch.to_owned(),
+            |remote_branch| format!("{local_branch}:{remote_branch}"),
+        );
+        let mut args = vec!["push".into(), remote.into(), refspec];
+        if set_upstream {
+            args.push("--set-upstream".into());
+        }
+        if force_with_lease {
+            args.push("--force-with-lease".into());
+        }
+        self.execute("GitManager.push", cwd, &args, true, cancellation)
+            .await
+    }
+
     pub async fn switch_ref(
         &self,
         cwd: &Path,
@@ -5793,6 +6018,285 @@ mod tests {
                 .iter()
                 .any(|(key, value)| key == "GIT_OPTIONAL_LOCKS" && value == "0")
         );
+    }
+
+    #[tokio::test]
+    async fn git_manager_branch_create_uses_the_requested_start_and_tracking_policy() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([(
+                "GitManager.branchCreate".into(),
+                process_output("created\n"),
+            )]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+
+        repository
+            .git_manager_create_branch(
+                Path::new("/repo"),
+                "feature/topic",
+                Some("main"),
+                false,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("branch creation succeeds");
+
+        assert_eq!(
+            runner.requests()[0].args,
+            ["branch", "feature/topic", "main", "--no-track"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn git_manager_branch_checkout_supports_local_and_remote_tracking_refs() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([
+                (
+                    "GitManager.branchCheckout.local".into(),
+                    process_output("local\n"),
+                ),
+                (
+                    "GitManager.branchCheckout.remote".into(),
+                    process_output("remote\n"),
+                ),
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+
+        repository
+            .git_manager_checkout_local_branch(
+                Path::new("/repo"),
+                "topic",
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("local checkout succeeds");
+        repository
+            .git_manager_checkout_remote_branch(
+                Path::new("/repo"),
+                "topic-remote",
+                "origin/topic",
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("remote checkout succeeds");
+
+        let requests = runner.requests();
+        assert_eq!(
+            requests[0].args,
+            ["switch", "topic"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            requests[1].args,
+            ["switch", "-c", "topic-remote", "--track", "origin/topic"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn git_manager_case_only_branch_rename_retries_with_capital_m() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([
+                (
+                    "GitManager.branchRename".into(),
+                    process_result(1, "", "case collision"),
+                ),
+                (
+                    "GitManager.branchRename.forceCase".into(),
+                    process_output("renamed\n"),
+                ),
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+
+        let outputs = repository
+            .git_manager_rename_branch(
+                Path::new("/repo"),
+                "Feature",
+                "feature",
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("case-only rename succeeds on retry");
+
+        assert_eq!(outputs.len(), 2);
+        let requests = runner.requests();
+        assert_eq!(requests[0].args[1], "-m");
+        assert_eq!(requests[1].args[1], "-M");
+    }
+
+    #[tokio::test]
+    async fn git_manager_branch_delete_keeps_force_and_remote_deletion_explicit() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([
+                (
+                    "GitManager.branchDelete".into(),
+                    process_output("deleted\n"),
+                ),
+                (
+                    "GitManager.remoteBranchDelete".into(),
+                    process_output("remote deleted\n"),
+                ),
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+
+        repository
+            .git_manager_delete_branch(Path::new("/repo"), "topic", true, &CancellationToken::new())
+            .await
+            .expect("local delete succeeds");
+        repository
+            .git_manager_delete_remote_branch(
+                Path::new("/repo"),
+                "origin",
+                "topic",
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("remote delete succeeds");
+
+        let requests = runner.requests();
+        assert_eq!(
+            requests[0].args,
+            ["branch", "-D", "topic"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            requests[1].args,
+            ["push", "origin", ":topic"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn git_manager_fetch_uses_prune_submodules_and_noninteractive_environment() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([("GitManager.fetch".into(), process_output("fetched\n"))]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+
+        repository
+            .git_manager_fetch(Path::new("/repo"), "origin", &CancellationToken::new())
+            .await
+            .expect("fetch succeeds");
+
+        let request = &runner.requests()[0];
+        assert_eq!(
+            request.args,
+            [
+                "fetch",
+                "--prune",
+                "--recurse-submodules=on-demand",
+                "origin"
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+        );
+        for (key, expected) in [
+            ("GIT_TERMINAL_PROMPT", "0"),
+            ("GIT_ASKPASS", ""),
+            ("SSH_ASKPASS_REQUIRE", "never"),
+        ] {
+            assert!(
+                request
+                    .env
+                    .iter()
+                    .any(|(actual_key, value)| actual_key == key && value == expected)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn git_manager_pull_adds_ff_only_when_both_pull_settings_are_unset() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([
+                ("GitManager.pull.pullFf".into(), process_result(1, "", "")),
+                (
+                    "GitManager.pull.pullRebase".into(),
+                    process_result(1, "", ""),
+                ),
+                ("GitManager.pull".into(), process_output("pulled\n")),
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+
+        let outputs = repository
+            .git_manager_pull(Path::new("/repo"), "origin", &CancellationToken::new())
+            .await
+            .expect("pull succeeds");
+
+        assert_eq!(outputs.len(), 3);
+        assert_eq!(
+            runner.requests()[2].args,
+            [
+                "-c",
+                "rebase.backend=merge",
+                "pull",
+                "--ff",
+                "--recurse-submodules",
+                "origin"
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn git_manager_push_modes_build_explicit_refspecs_and_lease_only_force() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([("GitManager.push".into(), process_output("pushed\n"))]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+
+        repository
+            .git_manager_push(
+                Path::new("/repo"),
+                "origin",
+                "topic",
+                Some("review/topic"),
+                true,
+                true,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("push succeeds");
+
+        let args = &runner.requests()[0].args;
+        assert_eq!(
+            args,
+            &[
+                "push",
+                "origin",
+                "topic:review/topic",
+                "--set-upstream",
+                "--force-with-lease"
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+        );
+        assert!(!args.iter().any(|argument| argument == "--force"));
     }
 
     #[tokio::test]
