@@ -1,10 +1,37 @@
 # Workspace UI
 
-BiBCode is split into left, center, and right work areas. The left panel chooses
-the project/worktree thread, the center panel runs chats and terminals, and the
-right panel hosts project tools.
+BiBCode is split into left, center, and right work areas. The left panel
+navigates agents and project/worktree threads, the center panel runs chats and
+terminals, and the right panel hosts project tools.
 
 ## Left Panel
+
+The panel opens 320px wide. Drag its right edge to resize it; the width is
+remembered, and double-clicking the edge restores the default.
+
+The **Search** row is followed by an **Agents** nav row, then Projects. Its
+unread-count badge covers agents across all connected environments. Selecting
+the row opens the full-screen Agents view; its top strip has a back arrow for
+returning to the normal workspace, the title **agents**, and an **N unread**
+badge.
+
+The view's list column provides a filter, grouping by **Status** (the default),
+**Project**, or **Environment**, an unread-only bell, and a menu with **Mark all
+read**. Status groups have counts and appear in fixed **Working** → **Pending
+Approval** → **Awaiting Input** → **Done** order, with Done collapsed by
+default. Each row opens with the project name, the provider icon, the status
+dot, and the relative time, then shows the branch as its main line, the thread
+title, a one-line conversation preview, and a footer with the status, the
+provider, and the environment badge. While a thread is working, the preview
+shows its current tool; otherwise it shows the latest assistant message or
+prompt. Rows from environments that are not live are greyed and add the
+environment's availability to the badge. Unread rows carry a dot and stay bold
+until visited.
+
+Selecting an agent row marks it read and shows its live session in the right
+pane while keeping the list visible. The per-row **Jump to workspace** action
+exits to the normal workspace view and re-points the environment rail to that
+row's environment.
 
 Projects are shown as groups of workspace rows:
 
@@ -222,6 +249,10 @@ The toolbar has three segments:
    tag creation, deletion, and push actions.
 3. **Sync** derives fetch, pull, push, publish-branch, and diverged
    force-with-lease states from the current branch and upstream.
+
+The manager opens on **History**. It opens on **Changes** only while a merge is
+in progress, since that merge is finished there, and returns to History once the
+merge is committed or aborted; the tab is not remembered between openings.
 
 The **Changes** tab filters and groups working-directory changes, keeps file
 inclusion separate from row selection, renders per-file diffs, uses whole-file

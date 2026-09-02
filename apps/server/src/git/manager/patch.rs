@@ -102,8 +102,13 @@ pub fn diff_generation(diff: &ParsedFileDiff) -> u64 {
     let bytes: [u8; 8] = digest.finalize()[..8]
         .try_into()
         .expect("SHA-256 prefix has a fixed length");
-    u64::from_be_bytes(bytes)
+    // The generation travels as a JSON number and must round-trip through
+    // JavaScript, whose safe integers stop at 2^53 - 1.
+    u64::from_be_bytes(bytes) & GENERATION_MASK
 }
+
+/// Largest value the client contract (`NonNegativeInt`) accepts without loss.
+const GENERATION_MASK: u64 = (1 << 53) - 1;
 
 pub fn format_selection_patch(diff: &ParsedFileDiff, selected_lines: &[usize]) -> Option<String> {
     let selected = selected_lines.iter().copied().collect::<BTreeSet<_>>();
@@ -421,6 +426,22 @@ mod tests {
             format_selection_patch(&parse_working_tree_diff(diff), &[0, 1, 2, 3]).as_deref(),
             Some(diff)
         );
+    }
+
+    #[test]
+    fn diff_generation_fits_a_javascript_safe_integer() {
+        let diffs = [
+            "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n",
+            "diff --git a/b.txt b/b.txt\n--- a/b.txt\n+++ b/b.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+three\n",
+            "diff --git a/c.txt b/c.txt\n--- a/c.txt\n+++ b/c.txt\n@@ -3 +3,2 @@\n ctx\n+added\n",
+        ];
+        for diff in diffs {
+            let generation = diff_generation(&parse_working_tree_diff(diff));
+            assert!(
+                generation < (1u64 << 53),
+                "generation {generation} exceeds 2^53 - 1"
+            );
+        }
     }
 
     #[test]

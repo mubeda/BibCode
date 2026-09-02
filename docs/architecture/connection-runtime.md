@@ -363,6 +363,10 @@ grouped per the `DESKTOP_LOCAL_CONNECTION_ID_PREFIX` convention) and one entry
 per saved remote environment. Selection writes `activeEnvironmentIdAtom` and
 scopes _presentation only_: the panel filters which environments' projects and
 threads it shows, and **Add project** targets the selected environment.
+Exception: the Agents view (opened from the Agents nav row, whose unread badge
+also aggregates across environments) is the single cross-environment surface;
+it ignores rail selection by design, and its jump-to-workspace action re-points
+rail selection to the row's environment so every other surface remains scoped.
 Selection never changes supervisor desired state—connections to other
 environments stay live and streaming—and operations on an entity always route
 to the entity's own `environmentId` regardless of selection. When a remote

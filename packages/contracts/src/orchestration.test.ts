@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import { describe, expect } from "vite-plus/test";
 
 import {
   DEFAULT_PROVIDER_INTERACTION_MODE,
@@ -14,6 +15,7 @@ import {
   OrchestrationMessage,
   OrchestrationProject,
   OrchestrationProjectShell,
+  OrchestrationThreadShell,
   OrchestrationGetFullThreadDiffInput,
   OrchestrationGetTurnDiffInput,
   OrchestrationLatestTurn,
@@ -50,6 +52,61 @@ const decodeOrchestrationProjectShell = Schema.decodeUnknownEffect(Orchestration
 const encodeThreadCreatedPayload = Schema.encodeEffect(ThreadCreatedPayload);
 const decodeOrchestrationMessageSync = Schema.decodeUnknownSync(OrchestrationMessage);
 const decodeOrchestrationCommandSync = Schema.decodeUnknownSync(OrchestrationCommand);
+
+const baseShellFixture = {
+  id: "thread-1",
+  projectId: "project-1",
+  title: "Thread",
+  modelSelection: { provider: "codex", model: "gpt-5" },
+  runtimeMode: "full-access",
+  branch: null,
+  worktreePath: null,
+  latestTurn: null,
+  createdAt: "2026-08-01T00:00:00Z",
+  updatedAt: "2026-08-01T00:00:01Z",
+  session: null,
+  latestUserMessageAt: null,
+  hasPendingApprovals: false,
+  hasPendingUserInput: false,
+  hasActionableProposedPlan: false,
+} as const;
+
+describe("OrchestrationConversationPreview", () => {
+  const decodeShell = Schema.decodeUnknownSync(OrchestrationThreadShell);
+
+  it("decodes a shell without the field (older server)", () => {
+    const shell = decodeShell(baseShellFixture);
+    expect(shell.conversationPreview).toBeUndefined();
+  });
+
+  it("decodes a populated preview", () => {
+    const shell = decodeShell({
+      ...baseShellFixture,
+      conversationPreview: {
+        prompt: "fix the flaky test",
+        tool: "Bash: vp test apps/web",
+        assistantMessage: "The test is flaky because…",
+      },
+    });
+    expect(shell.conversationPreview).toEqual({
+      prompt: "fix the flaky test",
+      tool: "Bash: vp test apps/web",
+      assistantMessage: "The test is flaky because…",
+    });
+  });
+
+  it("decodes null members and a null preview", () => {
+    expect(
+      decodeShell({ ...baseShellFixture, conversationPreview: null }).conversationPreview,
+    ).toBeNull();
+    expect(
+      decodeShell({
+        ...baseShellFixture,
+        conversationPreview: { prompt: null, tool: null, assistantMessage: null },
+      }).conversationPreview,
+    ).toEqual({ prompt: null, tool: null, assistantMessage: null });
+  });
+});
 
 it("decodes message delivery and delivery resolution command", () => {
   const message = decodeOrchestrationMessageSync({

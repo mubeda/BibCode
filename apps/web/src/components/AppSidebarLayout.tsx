@@ -1,6 +1,6 @@
 import { useAtomValue } from "@effect/atom-react";
-import { useEffect, type ReactNode } from "react";
-import { useNavigate } from "@tanstack/react-router";
+import { useEffect, type CSSProperties, type ReactNode } from "react";
+import * as TanStackRouter from "@tanstack/react-router";
 
 import { resolveShortcutCommand, shortcutLabelForCommand } from "../keybindings";
 import { primaryServerKeybindingsAtom } from "../state/server";
@@ -9,10 +9,23 @@ import { EnvironmentRail } from "./sidebar/EnvironmentRail";
 import { Sidebar, SidebarProvider, SidebarRail, SidebarTrigger, useSidebar } from "./ui/sidebar";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
 
-const THREAD_SIDEBAR_WIDTH_STORAGE_KEY = "chat_thread_sidebar_width";
+// v2: widths stored under the retired key belong to the 256px default era.
+const THREAD_SIDEBAR_WIDTH_STORAGE_KEY = "bibcode:sidebar-width:v2";
 const ENVIRONMENT_RAIL_WIDTH = 52;
 const THREAD_SIDEBAR_MIN_WIDTH = 13 * 16 + ENVIRONMENT_RAIL_WIDTH;
+// Wider than the shared primitive's 16rem default: 13px titles and 12px badges
+// truncate in a 204px content column, and 268px matches the reference app's rows.
+// A width the user has dragged to is stored under the storage key and wins.
+const THREAD_SIDEBAR_DEFAULT_WIDTH = 268 + ENVIRONMENT_RAIL_WIDTH;
+const THREAD_SIDEBAR_PROVIDER_STYLE = {
+  "--sidebar-width": `${THREAD_SIDEBAR_DEFAULT_WIDTH}px`,
+} as CSSProperties;
 const THREAD_MAIN_CONTENT_MIN_WIDTH = 40 * 16;
+
+const useAppPathname =
+  "useLocation" in TanStackRouter
+    ? () => TanStackRouter.useLocation({ select: (location) => location.pathname })
+    : () => "/";
 
 function SidebarControl() {
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
@@ -53,7 +66,8 @@ function SidebarControl() {
 }
 
 export function AppSidebarLayout({ children }: { children: ReactNode }) {
-  const navigate = useNavigate();
+  const navigate = TanStackRouter.useNavigate();
+  const pathname = useAppPathname();
   useEffect(() => {
     const onMenuAction = window.desktopBridge?.onMenuAction;
     if (typeof onMenuAction !== "function") {
@@ -76,13 +90,22 @@ export function AppSidebarLayout({ children }: { children: ReactNode }) {
     };
   }, [navigate]);
 
+  if (pathname === "/agents") {
+    return (
+      <SidebarProvider className="h-dvh! min-h-0!" defaultOpen>
+        {children}
+      </SidebarProvider>
+    );
+  }
+
   return (
-    <SidebarProvider className="h-dvh! min-h-0!" defaultOpen>
+    <SidebarProvider className="h-dvh! min-h-0!" defaultOpen style={THREAD_SIDEBAR_PROVIDER_STYLE}>
       <Sidebar
         side="left"
         collapsible="offcanvas"
         className="border-r border-border bg-card text-foreground"
         resizable={{
+          defaultWidth: THREAD_SIDEBAR_DEFAULT_WIDTH,
           minWidth: THREAD_SIDEBAR_MIN_WIDTH,
           shouldAcceptWidth: ({ nextWidth, wrapper }) =>
             wrapper.clientWidth - nextWidth >= THREAD_MAIN_CONTENT_MIN_WIDTH,

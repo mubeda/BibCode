@@ -24,6 +24,8 @@ uname -a
 uname -m
 printf 'desktop=%s\nsession=%s\nwayland=%s\ndisplay=%s\n' \
   "$XDG_CURRENT_DESKTOP" "$XDG_SESSION_TYPE" "$WAYLAND_DISPLAY" "$DISPLAY"
+gsettings get org.gnome.desktop.interface font-hinting
+gsettings get org.gnome.desktop.interface font-antialiasing
 git --version
 gh --version
 rustc -Vv
@@ -32,6 +34,10 @@ rustup show
 node --version
 vp --version
 ```
+
+On a non-GNOME desktop record the equivalent hinting and antialiasing settings
+instead. The host keys its hinting pin off the GTK `gtk-xft-hintstyle` value,
+so any desktop that produces `hintfull` exercises it.
 
 Check WebKitGTK, Tauri/AppImage, FUSE, graphics, and display dependencies
 against current CI and release workflows. Use Xvfb for packaged E2E when the
@@ -207,6 +213,13 @@ verify:
   the code prefilled;
 - provider settings and action menus show Claude, Codex, Cursor, and OpenCode
   without Early Access labels and omit Grok/Grok Terminal;
+- text rendering: body text in the sidebar and transcript shows no uneven
+  whole-pixel letter gaps, including when the session hinting is `full` (the
+  host pins `hintslight`); in a screenshot crop enlarged to 300%, text in the
+  sidebar, transcript, settings column, and Agents list shows colored fringes
+  at glyph edges like the window title (LCD subpixel text) rather than
+  gray-only edges; and the sidebar and timeline have no top or bottom scroll
+  fade, which is expected on Linux only;
 - AppImage window identity, icon, launcher, and taskbar grouping are correct;
 - external worktree grouping, paths, actions, physical identity, and restart
   are correct;
@@ -234,7 +247,8 @@ deleting them.
 ## Windows and macOS compatibility audit
 
 Audit that Linux fixes do not leak `/proc`, POSIX signals, Unix permissions,
-shell syntax, or Linux-only paths into unguarded Windows/macOS code. Confirm
+shell syntax, or Linux-only paths into unguarded Windows/macOS code, and that
+Linux-only CSS stays inside the `html[data-linux-webkit]` scope. Confirm
 Windows native identity/Jobs/WSL contracts and macOS bundle/path/process-group
 contracts remain present in host-independent tests. Report the result as
 compatibility evidence only.

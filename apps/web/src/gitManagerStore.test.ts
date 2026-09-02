@@ -39,9 +39,9 @@ describe("gitManagerStore", () => {
 
   it("keys by environment and project, not by bare project id", () => {
     const store = useGitManagerStore.getState();
-    store.setActiveTab(ref("env-a", "p1"), "history");
+    store.setActiveTab(ref("env-a", "p1"), "changes");
 
-    expect(store.selectViewState(ref("env-b", "p1")).activeTab).toBe("changes");
+    expect(store.selectViewState(ref("env-b", "p1")).activeTab).toBe("history");
   });
 
   it("rehydrates only the two most recently used projects", async () => {
@@ -49,7 +49,7 @@ describe("gitManagerStore", () => {
     store.touchProject(ref("env-a", "p1"));
     store.touchProject(ref("env-a", "p2"));
     store.touchProject(ref("env-a", "p3"));
-    store.setActiveTab(ref("env-a", "p2"), "history");
+    store.setActiveTab(ref("env-a", "p2"), "changes");
     const serialized = persisted.get(GIT_MANAGER_STORAGE_KEY);
     expect(serialized).toBeDefined();
 
@@ -59,9 +59,10 @@ describe("gitManagerStore", () => {
 
     expect(Object.keys(useGitManagerStore.getState().byProjectKey)).toHaveLength(2);
     expect(useGitManagerStore.getState().selectViewState(ref("env-a", "p1"))).toMatchObject({
-      activeTab: "changes",
+      activeTab: "history",
       lastUsedAt: 0,
     });
+    // The active tab is session-only: a rehydrated project opens on History.
     expect(useGitManagerStore.getState().selectViewState(ref("env-a", "p2")).activeTab).toBe(
       "history",
     );
@@ -171,11 +172,11 @@ describe("gitManagerStore", () => {
     );
   });
 
-  it("keeps checkout selection in memory while persisting the tab and commit draft", async () => {
+  it("keeps checkout selection and the tab in memory while persisting the commit draft", async () => {
     const project = ref("env-a", "p1");
     const store = useGitManagerStore.getState();
     store.setSelectedWorktree(project, "/opaque/feature");
-    store.setActiveTab(project, "history");
+    store.setActiveTab(project, "changes");
     store.setCommitDraft(project, "Keep this draft");
 
     const serialized = persisted.get(GIT_MANAGER_STORAGE_KEY);
@@ -184,10 +185,8 @@ describe("gitManagerStore", () => {
     };
     const persistedViewState = parsed.state.byProjectKey[projectKey(project)];
     expect(persistedViewState).not.toHaveProperty("selectedWorktreeCwd");
-    expect(persistedViewState).toMatchObject({
-      activeTab: "history",
-      commitDraft: "Keep this draft",
-    });
+    expect(persistedViewState).not.toHaveProperty("activeTab");
+    expect(persistedViewState).toMatchObject({ commitDraft: "Keep this draft" });
 
     useGitManagerStore.setState({ byProjectKey: {} });
     persisted.set(GIT_MANAGER_STORAGE_KEY, serialized!);
@@ -224,7 +223,7 @@ describe("gitManagerStore", () => {
       projectKey(ref("env-a", "p2")),
     ]);
     expect(state.selectViewState(ref("env-a", "p1"))).toEqual(
-      expect.objectContaining({ activeTab: "changes", lastUsedAt: 0 }),
+      expect.objectContaining({ activeTab: "history", lastUsedAt: 0 }),
     );
   });
 

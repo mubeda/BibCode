@@ -17,6 +17,7 @@ const harness = vi.hoisted(() => {
     storedWidth: null as number | null,
     localStorageSets: [] as Array<{ key: string; value: unknown }>,
     localStorageGets: [] as string[],
+    localStorageRemoves: [] as string[],
     triggers: [] as Array<{ render: unknown; props: Record<string, unknown> }>,
     effects: [] as Array<() => void | (() => void)>,
     refs: [] as Array<{ current: unknown }>,
@@ -28,6 +29,7 @@ const harness = vi.hoisted(() => {
       state.setStateCalls.length = 0;
       state.localStorageSets.length = 0;
       state.localStorageGets.length = 0;
+      state.localStorageRemoves.length = 0;
     },
   };
   return state;
@@ -77,6 +79,9 @@ vi.mock("~/hooks/useLocalStorage", () => ({
   },
   setLocalStorageItem: (key: string, value: unknown) => {
     harness.localStorageSets.push({ key, value });
+  },
+  removeLocalStorageItem: (key: string) => {
+    harness.localStorageRemoves.push(key);
   },
 }));
 
@@ -247,10 +252,12 @@ type RailProps = Record<string, unknown> & {
   onPointerUp?: (event: unknown) => void;
   onPointerCancel?: (event: unknown) => void;
   onClick?: (event: unknown) => void;
+  onDoubleClick?: (event: unknown) => void;
   "aria-label"?: string;
 };
 
 interface ResizableOptions {
+  defaultWidth?: number;
   minWidth?: number;
   maxWidth?: number;
   storageKey?: string;
@@ -426,6 +433,45 @@ describe("SidebarRail resize drag flow", () => {
     // The still-pending frame is cancelled during stopResize.
     expect(cancelledFrames).toEqual([1]);
     expect(harness.localStorageSets).toContainEqual({ key: "sb", value: expect.any(Number) });
+  });
+
+  it("double-click restores the default width and clears the stored width", () => {
+    const dom = fakeDom(613);
+    const onResize = vi.fn();
+    const { rail, markup } = renderRail({
+      defaultWidth: 320,
+      minWidth: 200,
+      maxWidth: 400,
+      storageKey: "sb",
+      onResize,
+    });
+    expect(markup).toContain("double-click to reset");
+
+    const dbl = pointerEvent(dom.rail);
+    rail.onDoubleClick?.(dbl);
+    expect(dbl.prevented).toBe(true);
+    expect(dom.wrapperStyle.set).toContainEqual(["--sidebar-width", "320px"]);
+    expect(harness.localStorageRemoves).toEqual(["sb"]);
+    expect(onResize).toHaveBeenCalledWith(320);
+  });
+
+  it("double-click is inert without a default width", () => {
+    const dom = fakeDom(613);
+    const onResize = vi.fn();
+    const { rail, markup } = renderRail({
+      minWidth: 200,
+      maxWidth: 400,
+      storageKey: "sb",
+      onResize,
+    });
+    expect(markup).not.toContain("double-click to reset");
+
+    const dbl = pointerEvent(dom.rail);
+    rail.onDoubleClick?.(dbl);
+    expect(dbl.prevented).toBe(false);
+    expect(dom.wrapperStyle.set).toHaveLength(0);
+    expect(harness.localStorageRemoves).toHaveLength(0);
+    expect(onResize).not.toHaveBeenCalled();
   });
 
   it("does not persist when no storage key is configured", () => {
