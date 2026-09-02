@@ -10,7 +10,7 @@ use std::{
     collections::BTreeMap,
     fmt, fs,
     io::{self, Read, Write},
-    net::{IpAddr, Ipv4Addr, TcpListener, TcpStream, ToSocketAddrs},
+    net::{IpAddr, Ipv4Addr, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -2808,8 +2808,34 @@ fn select_desktop_backend_port_excluding(excluded: &[u16]) -> Option<u16> {
     })
 }
 
+/// Probes whether `port` can still be claimed on `host` without opening a listening socket.
+///
+/// Port selection checks the loopback and both wildcard addresses so a later
+/// share-widening rebind keeps the same port. Binding alone detects the
+/// address-in-use conflict; calling `listen` is what makes Windows Defender
+/// Firewall treat the executable as a network server and raise its inbound
+/// prompt (or silently create Block rules) on the first launch, so the probe
+/// deliberately never listens. Unix keeps `SO_REUSEADDR` to match the
+/// semantics of the listener the server creates afterwards.
 fn can_listen_on_host(port: u16, host: &str) -> bool {
-    TcpListener::bind((host, port)).is_ok()
+    let Ok(mut addresses) = (host, port).to_socket_addrs() else {
+        return false;
+    };
+    let Some(address) = addresses.next() else {
+        return false;
+    };
+    let Ok(socket) = socket2::Socket::new(
+        socket2::Domain::for_address(address),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    ) else {
+        return false;
+    };
+    #[cfg(unix)]
+    if socket.set_reuse_address(true).is_err() {
+        return false;
+    }
+    socket.bind(&socket2::SockAddr::from(address)).is_ok()
 }
 
 fn normalize_tailscale_serve_port(value: Option<u64>) -> u16 {
@@ -6258,6 +6284,28 @@ $client.Dispose()
                 .await
                 .expect_err("closed endpoint should reject shutdown request");
         assert!(error.contains("Could not request desktop backend shutdown"));
+    }
+
+    #[test]
+    fn port_probe_reports_occupied_ports_without_a_listening_socket() {
+        let occupied = TcpListener::bind(("127.0.0.1", 0)).expect("test listener should bind");
+        let port = occupied.local_addr().expect("listener address").port();
+
+        assert!(!can_listen_on_host(port, "127.0.0.1"));
+        assert!(can_listen_on_host(0, "127.0.0.1"));
+        assert!(can_listen_on_host(0, "0.0.0.0"));
+
+        drop(occupied);
+        // A probe must never leave a listener behind: nothing accepts on the
+        // probed port once the probe returns.
+        assert!(can_listen_on_host(port, "127.0.0.1"));
+        assert!(
+            TcpStream::connect_timeout(
+                &(Ipv4Addr::LOCALHOST, port).into(),
+                Duration::from_millis(250),
+            )
+            .is_err()
+        );
     }
 
     #[test]

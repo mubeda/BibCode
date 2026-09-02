@@ -34,7 +34,7 @@ const TauriConfiguration = Schema.fromJsonString(
 const CapabilityConfiguration = Schema.fromJsonString(
   Schema.Struct({ permissions: Schema.Array(Schema.String) }),
 );
-const LinuxTauriConfiguration = Schema.fromJsonString(
+const PlatformToolsTauriConfiguration = Schema.fromJsonString(
   Schema.Struct({ bundle: Schema.Struct({ useLocalToolsDir: Schema.Boolean }) }),
 );
 const DesktopPackageConfiguration = Schema.fromJsonString(
@@ -60,7 +60,9 @@ const ReleaseUpdaterConfiguration = Schema.fromJsonString(
   }),
 );
 const decodeTauriConfiguration = Schema.decodeUnknownEffect(TauriConfiguration);
-const decodeLinuxTauriConfiguration = Schema.decodeUnknownEffect(LinuxTauriConfiguration);
+const decodePlatformToolsTauriConfiguration = Schema.decodeUnknownEffect(
+  PlatformToolsTauriConfiguration,
+);
 const decodeCapabilityConfiguration = Schema.decodeUnknownEffect(CapabilityConfiguration);
 const decodeDesktopPackageConfiguration = Schema.decodeUnknownEffect(DesktopPackageConfiguration);
 const decodeBaseUpdaterConfiguration = Schema.decodeUnknownEffect(BaseUpdaterConfiguration);
@@ -153,7 +155,7 @@ it.layer(NodeServices.layer)("Tauri production hardening", (it) => {
     }),
   );
 
-  it.effect("prepares repository-local AppImage tools only for Linux bundle builds", () =>
+  it.effect("caches bundler tools inside the repository target for Linux and Windows builds", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
@@ -161,14 +163,23 @@ it.layer(NodeServices.layer)("Tauri production hardening", (it) => {
       const tauri = yield* decodeTauriConfiguration(
         yield* fs.readFileString(path.join(repoRoot, "apps/desktop/src-tauri/tauri.conf.json")),
       );
-      const linux = yield* decodeLinuxTauriConfiguration(
+      const linux = yield* decodePlatformToolsTauriConfiguration(
         yield* fs.readFileString(
           path.join(repoRoot, "apps/desktop/src-tauri/tauri.linux.conf.json"),
+        ),
+      );
+      const windows = yield* decodePlatformToolsTauriConfiguration(
+        yield* fs.readFileString(
+          path.join(repoRoot, "apps/desktop/src-tauri/tauri.windows.conf.json"),
         ),
       );
 
       assert.equal(tauri.bundle.useLocalToolsDir, undefined);
       assert.equal(linux.bundle.useLocalToolsDir, true);
+      // Windows keeps NSIS under target/.tauri instead of %LOCALAPPDATA%, so an
+      // ARM64 build never depends on a per-account cache that x86 filesystem
+      // redirection can make unreachable for the NSIS bootstrapper.
+      assert.equal(windows.bundle.useLocalToolsDir, true);
       assert.equal(
         tauri.build.beforeBuildCommand,
         "node ../../scripts/prepare-tauri-appimage-tools.ts && vp run --filter @bibcode/web build && node ../../scripts/apply-web-brand-assets.ts production apps/web/dist",

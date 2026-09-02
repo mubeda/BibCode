@@ -103,7 +103,7 @@ beforeEach(() => {
   h.commitPage = null;
   h.contextMenuShow.mockReset();
   h.dndProps = null;
-  h.refreshCommits.mockClear();
+  h.refreshCommits.mockReset();
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
@@ -500,5 +500,114 @@ describe("GitManagerHistoryView repository generation tracking", () => {
 
     await renderHistory(3);
     expect(h.refreshCommits).toHaveBeenCalledOnce();
+  });
+
+  it("shows the committed tip after remount without an explicit refresh click", async () => {
+    // History was loaded at generation 1, the user committed from Changes while
+    // History was unmounted, and the panel's refs snapshot now reports 2.
+    const preCommit = [commit(31), commit(30)];
+    h.commitPage = {
+      generation: 1,
+      pinnedTips: [preCommit[0]!.sha],
+      commits: preCommit,
+      nextOffset: null,
+      exhausted: true,
+      degradedToAllPaging: false,
+    };
+    h.refreshCommits.mockImplementation(() => {
+      const committed = commit(32);
+      h.commitPage = {
+        generation: 2,
+        pinnedTips: [committed.sha],
+        commits: [committed, ...preCommit],
+        nextOffset: null,
+        exhausted: true,
+        degradedToAllPaging: false,
+      };
+    });
+
+    await renderHistory(2);
+    expect(h.refreshCommits).toHaveBeenCalledOnce();
+    await renderHistory(2);
+
+    const rows = [...container.querySelectorAll<HTMLButtonElement>("button[data-commit-sha]")].map(
+      (row) => row.dataset.commitSha,
+    );
+    expect(rows).toEqual([commit(32).sha, ...preCommit.map((entry) => entry.sha)]);
+    expect(container.textContent).toContain("3 commits loaded");
+    expect(h.refreshCommits).toHaveBeenCalledOnce();
+  });
+
+  it("ignores a stale first page that resolves behind the loaded generation", async () => {
+    const newTip = commit(44);
+    const older = [commit(43), commit(42)];
+    h.commitPage = {
+      generation: 6,
+      pinnedTips: [newTip.sha],
+      commits: [newTip, ...older],
+      nextOffset: null,
+      exhausted: true,
+      degradedToAllPaging: false,
+    };
+    await renderHistory(6);
+    expect(container.textContent).toContain("3 commits loaded");
+
+    // An older in-flight read completing late must not restore pre-commit history
+    // or trigger another refresh cycle.
+    h.commitPage = {
+      generation: 5,
+      pinnedTips: [older[0]!.sha],
+      commits: older,
+      nextOffset: null,
+      exhausted: true,
+      degradedToAllPaging: false,
+    };
+    await renderHistory(6);
+
+    const rows = [...container.querySelectorAll<HTMLButtonElement>("button[data-commit-sha]")].map(
+      (row) => row.dataset.commitSha,
+    );
+    expect(rows).toEqual([newTip.sha, ...older.map((entry) => entry.sha)]);
+    expect(container.textContent).toContain("3 commits loaded");
+    expect(h.refreshCommits).not.toHaveBeenCalled();
+  });
+
+  it("requests history only for the scoped repository", async () => {
+    const getCommits = vi.mocked(
+      (await import("../../../state/gitManager")).gitManagerEnvironment.getCommits,
+    );
+    getCommits.mockClear();
+    h.commitPage = {
+      generation: 1,
+      pinnedTips: [],
+      commits: [],
+      nextOffset: null,
+      exhausted: true,
+      degradedToAllPaging: false,
+    };
+
+    await act(async () =>
+      root?.render(
+        <GitManagerHistoryView
+          branchSyncDisabledReason={null}
+          blockedReasons={[]}
+          repositoryGeneration={1}
+          projectRef={{ environmentId: "environment-1", projectId: "project-a" } as never}
+          rewriteDisabledReason={null}
+          scope={{ environmentId: "environment-1" as never, cwd: "/repositories/a" }}
+          tagDisabledReason={null}
+          onAction={vi.fn()}
+        />,
+      ),
+    );
+
+    const requestedTargets = getCommits.mock.calls.map(
+      (call) => call[0] as { environmentId: string; input: { cwd: string } },
+    );
+    expect(requestedTargets.length).toBeGreaterThan(0);
+    for (const target of requestedTargets) {
+      expect(target.environmentId).toBe("environment-1");
+      expect(target.input.cwd).toBe("/repositories/a");
+    }
   });
 });

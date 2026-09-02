@@ -188,6 +188,7 @@ mod tests {
     use super::*;
     use crate::test_support::TestSandbox;
 
+    #[cfg(unix)]
     const ROLLUP_COMMAND: &str = "pr view 42 --json statusCheckRollup";
 
     #[cfg(unix)]

@@ -68,6 +68,15 @@ Use `vp test` for the built-in Vite+ test command. Use `vp run test` when the
 workspace package-script graph is specifically required. The graph keeps
 package test tasks concurrent, while server and desktop Rust test commands use
 the default parallel harness threads with Cargo compilation bounded by `-j 2`.
+On Windows the launcher runs every Cargo test target through
+`scripts/run-windows-cargo-target.mjs`, which writes a sidecar manifest next to
+the binary declaring the Common Controls v6 dependency and
+`requestedExecutionLevel asInvoker`, then touches the binary so Windows
+re-reads the manifest. Rust test binaries have no embedded manifest, so without
+the `asInvoker` declaration UAC installer detection refuses to start any target
+whose name contains `install`, `setup`, `update`, or `patch` (for example the
+`remote_update_rpc` and `bibcode-updater-verifier` tests) with
+"The requested operation requires elevation", which Node reports as `EACCES`.
 When an explicit `CARGO_TARGET_DIR` is supplied to a Cargo test command, the
 shared Cargo launcher resolves it from the launch directory, creates it, and
 passes its native canonical filesystem path to Cargo. This gives each platform
@@ -76,6 +85,17 @@ lookup valid when an isolated target was requested through an alias such as
 macOS `/tmp`; non-test commands and implicit Cargo targets are unchanged.
 Exact subprocess tests may use `--test-threads=1` only inside an isolated child
 process that intentionally owns process-global state.
+
+`node scripts/run-local-vp.mjs <vp arguments>` runs the checkout-local Vite+
+installation from `node_modules/vite-plus` with the current Node, ignoring any
+globally installed `vp`. Use it wherever a global `vp` might shadow the
+workspace copy (native Windows validation, Parallels `prlctl exec
+--current-user`), because a second Vitest runtime fails with `Vitest failed to
+find the runner` before collecting tests. The launcher exits with code 3 and an
+install instruction when workspace dependencies are missing, and otherwise
+forwards the child exit code unchanged. Every package `test` script,
+`check:contracts`, and `test:coverage:ts` invoke Vitest through this launcher
+for the same reason, so `vp run test` stays correct wherever it runs.
 
 ## Desktop Artifacts
 
@@ -87,6 +107,23 @@ process that intentionally owns process-global state.
 - `vp run dist:desktop:win`: Windows NSIS installer for the host architecture.
 - `vp run dist:desktop:win:arm64`: Windows ARM64 NSIS installer.
 - `vp run dist:desktop:win:x64`: Windows x64 NSIS installer.
+
+On Windows the shared `scripts/run-msvc.mjs` launcher refuses `tauri build`
+before any compilation when the process runs under the SYSTEM profile
+(`USERNAME` is a machine or service account, or `LOCALAPPDATA`, `APPDATA`, or
+`USERPROFILE` resolves under `C:WindowsSystem32configsystemprofile`). It
+exits with code 3 and names the detected variables; run the build as the
+logged-in interactive user instead. `apps/desktop/src-tauri/tauri.windows.conf.json`
+additionally sets `bundle.useLocalToolsDir`, so Tauri caches the NSIS toolset in
+`target/.tauri` rather than a per-account cache directory.
+
+`node scripts/remove-test-firewall-rules.ts --executable <path> [--dry-run]`
+removes the Windows Defender Firewall rules that Windows generates for one exact
+repository-built test executable after a "Windows Security Alert" prompt, then
+re-queries and fails unless zero matching rules remain. It refuses installed
+locations (Program Files, per-user Programs, the Windows directory) and never
+removes the app-managed `BiBCode Remote Access` rule. Run it from an elevated
+PowerShell; on other platforms it exits 0 without doing anything.
 
 The wrapper, `scripts/build-desktop-artifact.ts`, rejects cross-platform builds by
 default, invokes the canonical `@bibcode/desktop` Tauri package, and copies bundle output

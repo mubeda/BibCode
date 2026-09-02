@@ -29,6 +29,7 @@ const h = vi.hoisted(() => ({
   commitsAtom: vi.fn((target: unknown) => ({ kind: "commits", target })),
   signalAtom: vi.fn((target: unknown) => ({ kind: "signal", target })),
   refreshRefs: vi.fn(),
+  refreshCommits: vi.fn(),
   contextMenuShow: vi.fn(
     (
       _items: ReadonlyArray<{ label: string }>,
@@ -87,7 +88,8 @@ vi.mock("../../../state/query", () => ({
           : { _tag: data === null ? "Initial" : "Success", waiting: data === null },
       error: kind === "status" ? h.statusError : null,
       isPending: data === null,
-      refresh: kind === "refs" ? h.refreshRefs : () => undefined,
+      refresh:
+        kind === "refs" ? h.refreshRefs : kind === "commits" ? h.refreshCommits : () => undefined,
     };
   },
 }));
@@ -241,6 +243,7 @@ beforeEach(() => {
   h.commitsAtom.mockClear();
   h.signalAtom.mockClear();
   h.refreshRefs.mockClear();
+  h.refreshCommits.mockClear();
   h.contextMenuShow.mockClear();
   h.openInEditor.mockClear();
   h.refreshStatus.mockReset();
@@ -516,6 +519,50 @@ describe("GitManagerChangesView", () => {
     await act(async () => buttonWithText("Commit 1 files to main").click());
 
     await vi.waitFor(() => expect(container.textContent).toContain(reason));
+  });
+
+  it("refreshes refs and the latest commit only after the commit succeeds", async () => {
+    h.status = statusWith("src/selected.ts");
+    h.freshStatus = h.status;
+    await renderView();
+    h.refreshRefs.mockClear();
+    h.refreshCommits.mockClear();
+
+    await act(async () => buttonWithText("Commit 1 files to main").click());
+
+    await vi.waitFor(() => expect(h.commit).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(h.refreshRefs).toHaveBeenCalledOnce());
+    expect(h.refreshCommits).toHaveBeenCalledOnce();
+    expect(h.refreshRefs.mock.invocationCallOrder[0]).toBeGreaterThan(
+      h.commit.mock.invocationCallOrder[0]!,
+    );
+  });
+
+  it("does not refresh refs or history reads when the commit fails", async () => {
+    const reason = "pre-commit hook rejected the change";
+    h.status = statusWith("src/selected.ts");
+    h.freshStatus = h.status;
+    h.commit.mockResolvedValueOnce(
+      AsyncResult.failure(
+        Cause.fail(
+          new GitManagerOperationError({
+            operation: "gitManager.commit",
+            code: "git-command-failed",
+            message: reason,
+            blocked: null,
+          }),
+        ),
+      ),
+    );
+    await renderView();
+    h.refreshRefs.mockClear();
+    h.refreshCommits.mockClear();
+
+    await act(async () => buttonWithText("Commit 1 files to main").click());
+
+    await vi.waitFor(() => expect(container.textContent).toContain(reason));
+    expect(h.refreshRefs).not.toHaveBeenCalled();
+    expect(h.refreshCommits).not.toHaveBeenCalled();
   });
 
   it("does not discard from the context menu until the confirmation is accepted", async () => {

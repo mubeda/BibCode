@@ -84,7 +84,7 @@
   "inventorySummary": {
     "javascriptDirect": 81,
     "javascriptLedger": 80,
-    "rustRegistry": 82,
+    "rustRegistry": 83,
     "rustPath": 1,
     "actions": 9,
     "toolchains": 9
@@ -1751,6 +1751,17 @@
       "target": "0.10",
       "channel": "stable",
       "source": "https://crates.io/crates/snow",
+      "cohort": "rust-current",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current"
+    },
+    {
+      "key": "rust:workspace:socket2",
+      "name": "socket2",
+      "current": "0.6.5",
+      "target": "0.6.5",
+      "channel": "stable",
+      "source": "https://crates.io/crates/socket2",
       "cohort": "rust-current",
       "platforms": ["linux", "macos", "windows"],
       "status": "current"

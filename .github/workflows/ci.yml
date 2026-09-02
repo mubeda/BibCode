@@ -227,6 +227,10 @@ jobs:
         if: matrix.platform == 'win'
         run: vp test run apps/desktop/e2e/support/test-project.test.ts
 
+      - name: Check Windows server test targets compile
+        if: matrix.platform == 'win'
+        run: node scripts/run-msvc.mjs cargo check -p bibcode-server --all-targets
+
       - name: Build native bundle without publishing
         run: >
           node scripts/build-desktop-artifact.ts

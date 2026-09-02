@@ -5,7 +5,7 @@
   "scripts": {
     "check:dependency-ledger": "node check-dependency-upgrade-ledger.ts",
     "typecheck": "tsc --noEmit",
-    "test": "vp test run"
+    "test": "node run-local-vp.mjs test run"
   },
   "dependencies": {
     "@bibcode/contracts": "workspace:*",

@@ -81,12 +81,18 @@ describe("RPC wire fixture exporter", () => {
     const manifest = readManifest();
     expect(io.removals).toEqual([outputDirectory]);
     expect(io.directories).toContain(outputDirectory);
+    const repositoryRoot = NodePath.resolve(import.meta.dirname, "../../..");
     expect(io.formatCalls).toEqual([
       {
-        command: "vp",
-        args: ["fmt", "--write", outputDirectory],
+        command: process.execPath,
+        args: [
+          NodePath.join(repositoryRoot, "scripts", "run-local-vp.mjs"),
+          "fmt",
+          "--write",
+          outputDirectory,
+        ],
         options: {
-          cwd: NodePath.resolve(import.meta.dirname, "../../.."),
+          cwd: repositoryRoot,
           stdio: "inherit",
         },
       },

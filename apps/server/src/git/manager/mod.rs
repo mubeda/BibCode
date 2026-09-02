@@ -30,7 +30,7 @@ mod telemetry {
             GitProcessRunner, GitRepository, ProcessOutput, ProcessRequest,
             repository::BoxGitProcessFuture,
         },
-        source_control::{ProviderKind, PullRequestService, checks::ProviderChecksResult},
+        source_control::PullRequestService,
         test_support::TestSandbox,
     };
 
@@ -469,6 +469,8 @@ mod telemetry {
     #[cfg(unix)]
     #[tokio::test]
     async fn explicit_checks_handler_is_the_only_non_git_process_surface() {
+        use crate::source_control::{ProviderKind, checks::ProviderChecksResult};
+
         let sandbox = TestSandbox::new("git-manager-explicit-checks");
         let provider_cli = sandbox.executable_script(
             "gh",

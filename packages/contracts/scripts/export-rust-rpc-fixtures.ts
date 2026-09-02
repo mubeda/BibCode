@@ -800,10 +800,21 @@ await NodeFSP.writeFile(
   )}\n`,
 );
 
-const formatResult = NodeChildProcess.spawnSync("vp", ["fmt", "--write", outputDirectory], {
-  cwd: NodePath.resolve(import.meta.dirname, "../../.."),
-  stdio: "inherit",
-});
+// Format through the checkout-local Vite+ launcher: a bare `vp` cannot be
+// spawned without a shell on Windows (`vp.CMD`), and a global `vp` would load
+// a second runtime.
+const repositoryRoot = NodePath.resolve(import.meta.dirname, "../../..");
+const formatResult = NodeChildProcess.spawnSync(
+  process.execPath,
+  [NodePath.join(repositoryRoot, "scripts", "run-local-vp.mjs"), "fmt", "--write", outputDirectory],
+  {
+    cwd: repositoryRoot,
+    stdio: "inherit",
+  },
+);
+if (formatResult.error !== undefined) {
+  throw new Error(`Failed to start the RPC fixture formatter: ${formatResult.error.message}`);
+}
 if (formatResult.status !== 0) {
   throw new Error(`Failed to format RPC fixtures (exit ${formatResult.status ?? "unknown"}).`);
 }

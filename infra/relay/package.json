@@ -5,7 +5,7 @@
   "scripts": {
     "deploy": "node --require ../../scripts/disable-telemetry.cjs -- scripts/deploy.ts",
     "destroy": "node --require ../../scripts/disable-telemetry.cjs ./node_modules/alchemy/bin/cli.js destroy",
-    "test": "vp test run",
+    "test": "node ../../scripts/run-local-vp.mjs test run",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

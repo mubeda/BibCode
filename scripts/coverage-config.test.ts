@@ -363,7 +363,7 @@ describe("root coverage policy", () => {
 
     expect(packageJson.scripts).toMatchObject({
       "test:coverage": "vp run test:coverage:ts && vp run test:coverage:rust",
-      "test:coverage:ts": "vp test --coverage",
+      "test:coverage:ts": "node scripts/run-local-vp.mjs test --coverage",
       "test:coverage:rust": "node scripts/check-rust-coverage.ts",
     });
   });

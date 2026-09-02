@@ -278,6 +278,12 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
       next = historyFromFirstPage(page, firstPageSignature);
       resetCursors = true;
       preserveStoredCursors = current.generation === null && !explicitRefreshRef.current;
+    } else if (page.generation < current.generation) {
+      // A first page that resolved behind the loaded generation is a stale
+      // in-flight response (an older read completing after a newer one).
+      // Record it as seen without letting it regress the tip or the counter;
+      // the newer page already holds the post-mutation history.
+      next = { ...current, processedFirstPageSignature: firstPageSignature };
     } else if (page.generation !== current.generation) {
       const spliced = spliceCommitGeneration({
         loaded: current.commits,

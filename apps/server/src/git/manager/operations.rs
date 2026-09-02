@@ -2401,6 +2401,7 @@ mod tests {
     async fn cherry_pick_operation_arm_applies_the_requested_commit() {
         let repository = tempfile::tempdir().expect("temporary repository");
         git(repository.path(), &["init", "-q", "-b", "main"]);
+        git(repository.path(), &["config", "core.autocrlf", "false"]);
         git(
             repository.path(),
             &["config", "user.email", "git-manager@example.test"],
@@ -2774,6 +2775,7 @@ mod tests {
         let fixture = tempfile::tempdir().expect("temporary repository");
         let trash_directory = tempfile::tempdir().expect("temporary trash");
         git(fixture.path(), &["init", "-q", "-b", "main"]);
+        git(fixture.path(), &["config", "core.autocrlf", "false"]);
         std::fs::write(fixture.path().join("tracked.txt"), "base\n").expect("base file");
         git(fixture.path(), &["add", "tracked.txt"]);
         git(fixture.path(), &["commit", "-q", "-m", "base"]);
@@ -2827,6 +2829,7 @@ mod tests {
 
         let fixture = tempfile::tempdir().expect("temporary repository");
         git(fixture.path(), &["init", "-q", "-b", "main"]);
+        git(fixture.path(), &["config", "core.autocrlf", "false"]);
         std::fs::write(fixture.path().join("tracked.txt"), "base\n").expect("base file");
         git(fixture.path(), &["add", "tracked.txt"]);
         git(
@@ -2894,6 +2897,7 @@ mod tests {
 
         let fixture = tempfile::tempdir().expect("temporary repository");
         git(fixture.path(), &["init", "-q", "-b", "main"]);
+        git(fixture.path(), &["config", "core.autocrlf", "false"]);
         std::fs::write(fixture.path().join("tracked.txt"), "base\n").expect("base file");
         git(fixture.path(), &["add", "tracked.txt"]);
         git(

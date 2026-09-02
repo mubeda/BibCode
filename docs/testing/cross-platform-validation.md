@@ -91,9 +91,14 @@ test names. When concurrency matters, run the affected owner at its default
 harness width and at the repository's relevant explicit parallel widths.
 
 Use `vp test` for the built-in Vite+ test command. Use `vp run test` only when
-the workspace package-script graph is required. Exact subprocess tests may
-select a single thread only when the subprocess intentionally owns isolated
-process-global state, as documented in the repository scripts reference.
+the workspace package-script graph is required. When a globally installed `vp`
+could shadow the checkout's `node_modules/vite-plus` (native Windows hosts and
+Parallels guest execution), run `node scripts/run-local-vp.mjs test ...` with
+the same arguments; it executes the workspace copy so exactly one Vitest runtime
+loads, and it fails with an install instruction when dependencies are missing.
+Exact subprocess tests may select a single thread only when the subprocess
+intentionally owns isolated process-global state, as documented in the
+repository scripts reference.
 
 A focused suite must cover the changed success behavior and its material
 failure, cancellation, retry, restart, and cleanup seams. For cross-platform
@@ -431,8 +436,12 @@ For the event-driven VCS boundary, retain separate evidence for:
 - execution-host routing for native, WSL-direct, and SSH/server workspaces.
 
 For the Git Manager boundary, retain separate evidence for tip-pinned paging
-and generation splicing; the shared project-then-repository lock rejecting a
-competing Git Manager or catalog mutation with `operation-in-flight`;
+and generation splicing; a commit made from Changes appearing at the History
+tip after switching tabs without pressing **Refresh** (the panel's refs
+generation moves past the loaded page and History refetches and splices, while
+a stale first page that resolves behind the loaded generation is ignored); the
+shared project-then-repository lock rejecting a competing Git Manager or
+catalog mutation with `operation-in-flight`;
 server-authored blocked copy rendered unchanged; stream cancellation reaching
 the Git child; and one explicit provider refresh after an idle interval that
 produced no provider process or browser network request.
