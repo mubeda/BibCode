@@ -37,6 +37,7 @@ import { useEnvironmentQuery } from "../../state/query";
 import { worktreeEnvironment } from "../../state/worktrees";
 import { Button } from "../ui/button";
 import { Tabs, TabsList, TabsPanel, TabsTab } from "../ui/tabs";
+import { resolveGitManagerDefaultTab } from "./gitManagerDefaultTab";
 import { GitManagerInProgressStrip } from "./GitManagerInProgressStrip";
 import {
   GitManagerBranchDialogs,
@@ -279,6 +280,12 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
   const continueBlocked =
     repositoryBlockedReasons.find((reason) => reason.operation === "continue") ?? null;
   const inProgressOperation = snapshot?.inProgressOperation ?? null;
+  const defaultTab = resolveGitManagerDefaultTab(inProgressOperation);
+  // Opening the manager lands on History; a pending merge moves it to Changes
+  // and finishing that merge moves it back. Manual tab picks survive in between.
+  useEffect(() => {
+    onTabChange(defaultTab);
+  }, [defaultTab, onTabChange]);
   const resumableOperation = asResumableOperation(inProgressOperation);
   const resumableOperationDisabledReason =
     resumableOperation?.kind === "merge" ? stashMergeDisabledReason : rewriteDisabledReason;
