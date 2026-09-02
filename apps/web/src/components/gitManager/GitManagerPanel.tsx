@@ -802,7 +802,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
           onContinue={continueInProgress}
         />
       )}
-      <div className="flex items-center justify-end gap-2 border-b border-border px-4 py-1.5">
+      <div className="flex items-center justify-end gap-2 border-b border-panel-separator px-4 py-1.5">
         <Button
           aria-describedby={
             pullRequestsDisabledReason === null
@@ -891,7 +891,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
         </p>
       )}
       {providerPaneOpen ? (
-        <div className="h-80 min-h-0 overflow-auto border-b border-border">
+        <div className="h-80 min-h-0 overflow-auto border-b border-panel-separator">
           <GitManagerPullRequestPanel
             disabledReason={pullRequestsDisabledReason}
             scope={scope}
@@ -902,7 +902,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
       {stashPaneOpen ? (
         <section
           aria-label="Repository stash browser"
-          className="grid h-80 min-h-0 grid-cols-[minmax(14rem,32%)_minmax(0,1fr)] border-b border-border"
+          className="grid h-80 min-h-0 grid-cols-[minmax(14rem,32%)_minmax(0,1fr)] border-b border-panel-separator"
         >
           {stashMergeDisabledReason !== null ? (
             <p className="col-span-2 p-3 text-xs text-muted-foreground">
@@ -910,7 +910,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
             </p>
           ) : (
             <>
-              <div className="min-h-0 border-r border-border">
+              <div className="min-h-0 border-r border-panel-separator">
                 {stashesQuery.error !== null && stashes.length === 0 ? (
                   <p className="p-3 text-xs text-destructive">{stashesQuery.error}</p>
                 ) : (
@@ -944,7 +944,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
         </section>
       ) : null}
       <Tabs className="min-h-0 flex-1 gap-0" value={activeTab} onValueChange={onTabChange}>
-        <div className="border-b border-border px-4 pt-2">
+        <div className="border-b border-panel-separator px-4 pt-2">
           <TabsList className="w-fit rounded-none border-0 bg-transparent p-0">
             <TabsTab
               className="rounded-none border-b-2 border-transparent px-3 py-2 data-selected:border-foreground data-selected:bg-transparent data-selected:shadow-none"

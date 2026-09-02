@@ -323,7 +323,7 @@ export const GitManagerDiffPane = memo(function GitManagerDiffPane({
   return (
     <section
       aria-label={`Diff for ${path}`}
-      className="flex h-[45%] min-h-48 shrink-0 flex-col border-t border-border"
+      className="flex h-[45%] min-h-48 shrink-0 flex-col border-t border-panel-separator"
     >
       <div className="flex h-8 shrink-0 items-center gap-1 border-b border-border px-2">
         <span className="min-w-0 flex-1 truncate font-mono text-xs">{path}</span>

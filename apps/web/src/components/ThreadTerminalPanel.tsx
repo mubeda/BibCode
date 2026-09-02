@@ -2301,7 +2301,7 @@ export default function ThreadTerminalPanel({
               {hasTerminalToolbarActions ? (
                 <div
                   data-terminal-toolbar="sidebar"
-                  className="flex h-[22px] items-stretch justify-end border-b border-border/70"
+                  className="flex h-[22px] items-stretch justify-end border-b border-panel-separator"
                 >
                   <div className="inline-flex h-full items-stretch">
                     {onSplitTerminal ? (

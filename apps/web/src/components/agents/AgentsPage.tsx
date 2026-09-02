@@ -151,7 +151,7 @@ export function AgentsPage() {
 
   return (
     <main className="flex h-full min-h-0 min-w-0 flex-1 flex-col bg-background text-foreground">
-      <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-3">
+      <header className="flex h-12 shrink-0 items-center gap-2 border-b border-panel-separator px-3">
         <Button variant="ghost" size="icon-sm" aria-label="Back" onClick={handleBack}>
           <ArrowLeftIcon className="size-4" aria-hidden />
         </Button>
@@ -163,7 +163,7 @@ export function AgentsPage() {
 
       <div className="flex min-h-0 min-w-0 flex-1">
         <aside
-          className="flex w-[clamp(340px,28vw,480px)] shrink-0 flex-col border-r border-border bg-card"
+          className="flex w-[clamp(340px,28vw,480px)] shrink-0 flex-col border-r border-panel-separator bg-card"
           data-testid="agents-view-list"
         >
           <div className="flex shrink-0 items-center gap-1.5 border-b border-border/70 px-2 py-2">

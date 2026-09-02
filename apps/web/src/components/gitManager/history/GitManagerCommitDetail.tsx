@@ -209,7 +209,7 @@ const ChangedFileList = memo(function ChangedFileList({
     <div
       ref={containerRef}
       aria-label="Changed files"
-      className="min-h-0 overflow-hidden border-r border-border"
+      className="min-h-0 overflow-hidden border-r border-panel-separator"
       role="listbox"
       onKeyDown={handleKeyDown}
     >
@@ -369,7 +369,7 @@ export const GitManagerCommitDetail = memo(function GitManagerCommitDetail({
             onSelect={onSelectFile}
           />
         ) : (
-          <div className="border-r border-border">
+          <div className="border-r border-panel-separator">
             <p className="p-3 text-xs text-muted-foreground">No changed files.</p>
           </div>
         )}

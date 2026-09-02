@@ -276,7 +276,7 @@ const GitManagerTextStagingGutter = memo(function GitManagerTextStagingGutter({
   return (
     <aside
       aria-label="Partial staging selection gutter"
-      className="w-32 shrink-0 overflow-y-auto border-r border-border bg-background"
+      className="w-32 shrink-0 overflow-y-auto border-r border-panel-separator bg-background"
       data-staging-gutter="true"
       onPointerLeave={endDrag}
       onPointerUp={endDrag}
