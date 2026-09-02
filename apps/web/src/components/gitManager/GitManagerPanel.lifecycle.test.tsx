@@ -51,6 +51,7 @@ vi.mock("../../state/environments", () => ({
 vi.mock("../../state/query", () => ({
   useEnvironmentQuery: (atom: { kind: string } | null) => ({
     data: atom?.kind === "catalog" ? h.catalog : null,
+    emission: { _tag: "Initial" },
     error: null,
     isPending: false,
     refresh: () => undefined,
@@ -64,6 +65,7 @@ vi.mock("../../state/worktrees", () => ({
 vi.mock("../../state/gitManager", () => ({
   gitManagerEnvironment: {
     signal: h.signalAtom,
+    getCommits: () => ({ kind: "commits" }),
     commit: { label: "test:commit" },
     undoCommit: { label: "test:undo-commit" },
     discard: { label: "test:discard" },

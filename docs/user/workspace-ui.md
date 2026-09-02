@@ -250,6 +250,10 @@ The toolbar has three segments:
 3. **Sync** derives fetch, pull, push, publish-branch, and diverged
    force-with-lease states from the current branch and upstream.
 
+The manager opens on **History**. It opens on **Changes** only while a merge is
+in progress, since that merge is finished there, and returns to History once the
+merge is committed or aborted; the tab is not remembered between openings.
+
 The **Changes** tab filters and groups working-directory changes, keeps file
 inclusion separate from row selection, renders per-file diffs, uses whole-file
 inclusion for commits, supports line/hunk stage or unstage, and confirms discard. Its commit box

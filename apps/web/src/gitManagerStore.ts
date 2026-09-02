@@ -47,7 +47,9 @@ export interface GitManagerViewState {
   readonly lastUsedAt: number;
 }
 
-type PersistedGitManagerViewState = Omit<GitManagerViewState, "selectedWorktreeCwd">;
+// The active tab is deliberately not persisted: the manager opens on History
+// (or on Changes while a merge is pending) every time.
+type PersistedGitManagerViewState = Omit<GitManagerViewState, "selectedWorktreeCwd" | "activeTab">;
 
 interface PersistedGitManagerState {
   readonly byProjectKey: Record<string, PersistedGitManagerViewState>;
@@ -61,7 +63,7 @@ export const DEFAULT_GIT_MANAGER_TOOLBAR_VIEW_STATE: GitManagerToolbarViewState 
 
 export const DEFAULT_GIT_MANAGER_VIEW_STATE: GitManagerViewState = Object.freeze({
   selectedWorktreeCwd: null,
-  activeTab: "changes",
+  activeTab: "history",
   selectedRef: null,
   selectedCommitSha: null,
   multiCommitSelection: Object.freeze([]),
@@ -237,7 +239,6 @@ function sanitizeViewState(value: unknown): PersistedGitManagerViewState | null 
   if (value === null || typeof value !== "object") return null;
   const candidate = value as Record<string, unknown>;
   return {
-    activeTab: candidate.activeTab === "history" ? "history" : "changes",
     selectedRef: nullableString(candidate.selectedRef),
     selectedCommitSha: nullableString(candidate.selectedCommitSha),
     multiCommitSelection: nonEmptyUniqueStringArray(candidate.multiCommitSelection),
@@ -319,7 +320,7 @@ function restoreGitManagerState(
     byProjectKey: Object.fromEntries(
       Object.entries(persisted.byProjectKey).map(([key, viewState]) => [
         key,
-        { ...viewState, selectedWorktreeCwd: null },
+        { ...viewState, selectedWorktreeCwd: null, activeTab: "history" },
       ]),
     ),
     toolbarByProjectKey: persisted.toolbarByProjectKey,
