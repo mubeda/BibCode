@@ -189,7 +189,7 @@ export const AuthAccessTokenResult = Schema.Struct({
   access_token: TrimmedNonEmptyString,
   issued_token_type: Schema.Literal(AuthAccessTokenType),
   token_type: Schema.Literals(["Bearer", "DPoP"]),
-  expires_in: Schema.Number,
+  expires_in: Schema.Finite,
   scope: TrimmedNonEmptyString,
 });
 export type AuthAccessTokenResult = typeof AuthAccessTokenResult.Type;
@@ -220,8 +220,8 @@ export type AuthPairingOfferResult = typeof AuthPairingOfferResult.Type;
 
 export const AuthShareStateResult = Schema.Struct({
   desiredExposure: Schema.Literals(["wide", "loopback"]),
-  offHostGrantCount: Schema.Number,
-  legacyGrantCount: Schema.Number,
+  offHostGrantCount: Schema.Finite,
+  legacyGrantCount: Schema.Finite,
 });
 export type AuthShareStateResult = typeof AuthShareStateResult.Type;
 
@@ -270,7 +270,7 @@ export type AuthAccessSnapshot = typeof AuthAccessSnapshot.Type;
 
 export const AuthAccessStreamSnapshotEvent = Schema.Struct({
   version: Schema.Literal(1),
-  revision: Schema.Number,
+  revision: Schema.Finite,
   type: Schema.Literal("snapshot"),
   payload: AuthAccessSnapshot,
 });
@@ -278,7 +278,7 @@ export type AuthAccessStreamSnapshotEvent = typeof AuthAccessStreamSnapshotEvent
 
 export const AuthAccessStreamPairingLinkUpsertedEvent = Schema.Struct({
   version: Schema.Literal(1),
-  revision: Schema.Number,
+  revision: Schema.Finite,
   type: Schema.Literal("pairingLinkUpserted"),
   payload: AuthPairingLink,
 });
@@ -287,7 +287,7 @@ export type AuthAccessStreamPairingLinkUpsertedEvent =
 
 export const AuthAccessStreamPairingLinkRemovedEvent = Schema.Struct({
   version: Schema.Literal(1),
-  revision: Schema.Number,
+  revision: Schema.Finite,
   type: Schema.Literal("pairingLinkRemoved"),
   payload: Schema.Struct({
     id: TrimmedNonEmptyString,
@@ -325,7 +325,7 @@ export const EnvironmentRpcError = Schema.Union([
 
 export const AuthAccessStreamClientUpsertedEvent = Schema.Struct({
   version: Schema.Literal(1),
-  revision: Schema.Number,
+  revision: Schema.Finite,
   type: Schema.Literal("clientUpserted"),
   payload: AuthClientSession,
 });
@@ -333,7 +333,7 @@ export type AuthAccessStreamClientUpsertedEvent = typeof AuthAccessStreamClientU
 
 export const AuthAccessStreamClientRemovedEvent = Schema.Struct({
   version: Schema.Literal(1),
-  revision: Schema.Number,
+  revision: Schema.Finite,
   type: Schema.Literal("clientRemoved"),
   payload: Schema.Struct({
     sessionId: AuthSessionId,

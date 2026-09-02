@@ -31,8 +31,8 @@ export class RotatingFileSinkConfigurationError extends Schema.TaggedErrorClass<
   "RotatingFileSinkConfigurationError",
   {
     option: Schema.Literals(["maxBytes", "maxFiles"]),
-    received: Schema.Number,
-    minimum: Schema.Number,
+    received: Schema.Finite,
+    minimum: Schema.Finite,
   },
 ) {
   override get message(): string {

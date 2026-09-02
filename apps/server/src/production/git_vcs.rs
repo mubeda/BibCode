@@ -1932,6 +1932,8 @@ struct StackedActionInput {
     file_paths: Option<Vec<String>>,
     feature_branch: Option<bool>,
     commit_staged_index_as_is: Option<bool>,
+    pull_request_title: Option<String>,
+    pull_request_body: Option<String>,
 }
 #[derive(Deserialize)]
 struct LookupRepositoryInput {
@@ -1984,6 +1986,14 @@ fn validate_stacked_action_input(input: &StackedActionInput) -> Result<(), Value
         return Err(request_error(
             "git.runStackedAction",
             "Feature-branch checkout is only supported for commit actions.",
+        ));
+    }
+    if (input.pull_request_title.is_some() || input.pull_request_body.is_some())
+        && !matches!(input.action.as_str(), "create_pr" | "commit_push_pr")
+    {
+        return Err(request_error(
+            "git.runStackedAction",
+            "A pull request title or body applies only to pull request actions.",
         ));
     }
     Ok(())
@@ -2125,13 +2135,21 @@ async fn run_stacked_action(
         {
             resolved_pull_request_step("opened_existing", &existing)
         } else {
-            let title = match resolved_message
+            let reviewed_title = input
+                .pull_request_title
                 .as_deref()
-                .and_then(|message| message.lines().next())
                 .map(str::trim)
                 .filter(|title| !title.is_empty())
-            {
-                Some(title) => title.to_owned(),
+                .map(str::to_owned);
+            let title = match reviewed_title.or_else(|| {
+                resolved_message
+                    .as_deref()
+                    .and_then(|message| message.lines().next())
+                    .map(str::trim)
+                    .filter(|title| !title.is_empty())
+                    .map(str::to_owned)
+            }) {
+                Some(title) => title,
                 None => repository
                     .list_commits(&input.cwd, 1, 0, cancellation)
                     .await
@@ -2153,7 +2171,7 @@ async fn run_stacked_action(
                         base_branch,
                         head_branch: head_branch.to_owned(),
                         title,
-                        body: String::new(),
+                        body: input.pull_request_body.clone().unwrap_or_default(),
                     },
                     cancellation,
                 )
@@ -4408,6 +4426,8 @@ esac
             file_paths: None,
             feature_branch: None,
             commit_staged_index_as_is: None,
+            pull_request_title: None,
+            pull_request_body: None,
         };
         assert!(
             run_stacked_action(
@@ -4440,6 +4460,196 @@ esac
         assert!(request_error("method", "detail").is_object());
         assert!(vcs_error("operation", &repository, "detail").is_object());
         assert!(source_control_error("unknown", "lookup", "detail").is_object());
+    }
+
+    /// A reviewed pull request: the fixture repository tracks a local bare
+    /// remote for pushes while its fetch URL names GitHub so provider detection
+    /// resolves, and the `gh` stub records every argument it receives.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_pr_uses_the_reviewed_title_and_body_and_never_duplicates() {
+        let sandbox = crate::test_support::TestSandbox::new("git-vcs-reviewed-pr");
+        let repository = sandbox.root().join("repository");
+        tokio::fs::create_dir_all(&repository)
+            .await
+            .expect("repository directory");
+        let bare_remote = sandbox.root().join("remote.git");
+        tokio::fs::create_dir_all(&bare_remote)
+            .await
+            .expect("bare remote directory");
+        git(&sandbox, &bare_remote, &["init", "--bare", "-b", "main"]).await;
+        git(&sandbox, &repository, &["init", "-q", "-b", "main"]).await;
+        git(
+            &sandbox,
+            &repository,
+            &["config", "user.email", "fixture@example.test"],
+        )
+        .await;
+        git(&sandbox, &repository, &["config", "user.name", "Fixture"]).await;
+        tokio::fs::write(repository.join("base.txt"), "base\n")
+            .await
+            .expect("base file");
+        git(&sandbox, &repository, &["add", "base.txt"]).await;
+        git(&sandbox, &repository, &["commit", "-q", "-m", "base"]).await;
+        let bare_remote_text = bare_remote.to_string_lossy().into_owned();
+        git(
+            &sandbox,
+            &repository,
+            &["remote", "add", "origin", bare_remote_text.as_str()],
+        )
+        .await;
+        git(
+            &sandbox,
+            &repository,
+            &["push", "-q", "-u", "origin", "main"],
+        )
+        .await;
+        git(
+            &sandbox,
+            &repository,
+            &["switch", "-q", "-c", "feature/reviewed"],
+        )
+        .await;
+        tokio::fs::write(repository.join("feature.txt"), "feature\n")
+            .await
+            .expect("feature file");
+        git(&sandbox, &repository, &["add", "feature.txt"]).await;
+        git(
+            &sandbox,
+            &repository,
+            &["commit", "-q", "-m", "commit subject"],
+        )
+        .await;
+        git(
+            &sandbox,
+            &repository,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/owner/name.git",
+            ],
+        )
+        .await;
+        git(
+            &sandbox,
+            &repository,
+            &[
+                "remote",
+                "set-url",
+                "--push",
+                "origin",
+                bare_remote_text.as_str(),
+            ],
+        )
+        .await;
+
+        let calls = sandbox.root().join("gh-calls");
+        let calls_text = calls.to_string_lossy().into_owned();
+        let gh = sandbox.executable_script(
+            "gh",
+            &format!(
+                "printf '%s\\037' \"$@\" >> '{calls_text}'\nprintf '\\036' >> '{calls_text}'\ncase \"$1:$2\" in\n  pr:list) if [ -f '{calls_text}.existing' ]; then printf '%s\\n' '[{{\"number\":9,\"title\":\"Existing\",\"url\":\"https://github.com/owner/name/pull/9\",\"baseRefName\":\"main\",\"headRefName\":\"feature/reviewed\",\"state\":\"OPEN\"}}]'; else printf '[]\\n'; fi ;;\n  pr:create) printf '%s\\n' 'https://github.com/owner/name/pull/7' ;;\n  *) exit 64 ;;\nesac\n"
+            ),
+            "",
+        );
+        let pull_requests = PullRequestService::with_provider_commands(
+            gh.to_string_lossy(),
+            "unused-glab",
+            "unused-az",
+        );
+        let git_repository = GitRepository::default();
+        let reviewed = StackedActionInput {
+            action_id: "action-reviewed".to_owned(),
+            cwd: repository.clone(),
+            action: "create_pr".to_owned(),
+            commit_message: None,
+            file_paths: None,
+            feature_branch: None,
+            commit_staged_index_as_is: None,
+            pull_request_title: Some("  Reviewed title  ".to_owned()),
+            pull_request_body: Some("Reviewed body\n\nwith detail".to_owned()),
+        };
+
+        let result = run_stacked_action(
+            &git_repository,
+            &pull_requests,
+            &reviewed,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("reviewed pull request creates");
+
+        assert_eq!(result["push"]["status"], "pushed");
+        assert_eq!(result["pr"]["status"], "created");
+        assert_eq!(result["pr"]["number"], 7);
+        assert_eq!(result["pr"]["title"], "Reviewed title");
+        assert_eq!(result["pr"]["baseBranch"], "main");
+        assert_eq!(result["pr"]["headBranch"], "feature/reviewed");
+        let recorded = tokio::fs::read_to_string(&calls).await.expect("gh calls");
+        let invocations = recorded
+            .split('\u{1e}')
+            .filter(|call| !call.is_empty())
+            .map(|call| {
+                call.split('\u{1f}')
+                    .filter(|argument| !argument.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(invocations.len(), 2, "{recorded}");
+        assert_eq!(invocations[0][..2], ["pr", "list"]);
+        assert_eq!(
+            invocations[1],
+            [
+                "pr",
+                "create",
+                "--base",
+                "main",
+                "--head",
+                "feature/reviewed",
+                "--title",
+                "Reviewed title",
+                "--body",
+                "Reviewed body\n\nwith detail",
+            ]
+        );
+
+        // A retry after the pull request exists must not create a duplicate.
+        tokio::fs::write(format!("{calls_text}.existing"), "1")
+            .await
+            .expect("existing marker");
+        tokio::fs::write(&calls, "").await.expect("reset gh calls");
+        let retried = run_stacked_action(
+            &git_repository,
+            &pull_requests,
+            &reviewed,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("retry resolves the existing pull request");
+        assert_eq!(retried["push"]["status"], "skipped_not_requested");
+        assert_eq!(retried["pr"]["status"], "opened_existing");
+        assert_eq!(retried["pr"]["number"], 9);
+        let recorded = tokio::fs::read_to_string(&calls).await.expect("gh calls");
+        assert!(!recorded.contains("create"), "{recorded}");
+
+        let misplaced = StackedActionInput {
+            action: "commit".to_owned(),
+            pull_request_body: None,
+            ..reviewed
+        };
+        let error = run_stacked_action(
+            &git_repository,
+            &pull_requests,
+            &misplaced,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("a title outside a pull request action is rejected");
+        assert_eq!(
+            error["detail"],
+            "A pull request title or body applies only to pull request actions."
+        );
     }
 
     #[tokio::test]

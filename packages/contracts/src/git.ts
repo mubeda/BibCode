@@ -138,6 +138,10 @@ export const GitRunStackedActionInput = Schema.Struct({
     Schema.Array(TrimmedNonEmptyStringSchema).check(Schema.isMinLength(1)),
   ),
   commitStagedIndexAsIs: Schema.optional(Schema.Boolean),
+  /** Reviewed pull-request title; only meaningful for `create_pr` and `commit_push_pr`. */
+  pullRequestTitle: Schema.optional(TrimmedNonEmptyStringSchema.check(Schema.isMaxLength(256))),
+  /** Reviewed pull-request body; only meaningful for `create_pr` and `commit_push_pr`. */
+  pullRequestBody: Schema.optional(Schema.String.check(Schema.isMaxLength(65_536))),
 });
 export type GitRunStackedActionInput = typeof GitRunStackedActionInput.Type;
 
@@ -390,11 +394,11 @@ export class GitCommandError extends Schema.TaggedErrorClass<GitCommandError>()(
   operation: Schema.String,
   command: Schema.String,
   cwd: Schema.String,
-  argumentCount: Schema.optional(Schema.Number),
-  exitCode: Schema.optional(Schema.Number),
-  stdoutLength: Schema.optional(Schema.Number),
-  stderrLength: Schema.optional(Schema.Number),
-  outputLength: Schema.optional(Schema.Number),
+  argumentCount: Schema.optional(Schema.Finite),
+  exitCode: Schema.optional(Schema.Finite),
+  stdoutLength: Schema.optional(Schema.Finite),
+  stderrLength: Schema.optional(Schema.Finite),
+  outputLength: Schema.optional(Schema.Finite),
   detail: Schema.String,
   cause: Schema.optional(Schema.Defect()),
 }) {

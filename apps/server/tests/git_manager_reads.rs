@@ -227,9 +227,27 @@ async fn read_scoped_git_manager_rpcs_preserve_worktree_history_and_diff_state()
         .iter()
         .find(|branch| branch["name"] == "feature")
         .expect("feature branch");
+    // The snapshot keeps Git's own display spelling, which on macOS resolves the
+    // temporary root's `/var` alias to `/private/var`; identity is compared
+    // through the server's canonical key rather than the fixture's spelling.
+    let reported_worktree_path = feature["worktreePath"]
+        .as_str()
+        .expect("occupied branch reports its worktree path");
     assert_eq!(
-        feature["worktreePath"],
-        linked_worktree.to_string_lossy().as_ref()
+        bibcode_server::git::canonical_worktree_path_key(std::path::Path::new(
+            reported_worktree_path
+        ))
+        .await
+        .expect("reported worktree key"),
+        bibcode_server::git::canonical_worktree_path_key(&linked_worktree)
+            .await
+            .expect("fixture worktree key")
+    );
+    assert!(
+        git_stdout(&repository, &["worktree", "list", "--porcelain"])
+            .lines()
+            .any(|line| line == format!("worktree {reported_worktree_path}")),
+        "the reported spelling must be Git's own worktree spelling"
     );
 
     request(

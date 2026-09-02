@@ -17,7 +17,7 @@ const h = vi.hoisted(() => ({
   } | null,
   contextMenuShow: vi.fn(),
   dndProps: null as Record<string, unknown> | null,
-  signalAtom: vi.fn(() => ({ kind: "signal" })),
+  refreshCommits: vi.fn(),
 }));
 
 vi.mock("@legendapp/list/react", () => ({
@@ -44,7 +44,6 @@ vi.mock("../../../localApi", () => ({
 vi.mock("../../../state/gitManager", () => ({
   gitManagerEnvironment: {
     getCommits: vi.fn(() => ({ kind: "commits" })),
-    signal: h.signalAtom,
   },
 }));
 
@@ -54,7 +53,7 @@ vi.mock("../../../state/query", () => ({
     emission: { _tag: "Initial", waiting: false },
     error: null,
     isPending: false,
-    refresh: vi.fn(),
+    refresh: atom?.kind === "commits" ? h.refreshCommits : vi.fn(),
   }),
 }));
 
@@ -104,7 +103,7 @@ beforeEach(() => {
   h.commitPage = null;
   h.contextMenuShow.mockReset();
   h.dndProps = null;
-  h.signalAtom.mockClear();
+  h.refreshCommits.mockClear();
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
@@ -203,7 +202,7 @@ describe("GitManagerHistoryView rewrite reachability", () => {
               message: "Server says the repository mutation lane is occupied.",
             },
           ]}
-          liveSignalAvailable
+          repositoryGeneration={null}
           projectRef={{ environmentId: "environment-1", projectId: "project-1" } as never}
           rewriteDisabledReason={null}
           scope={{ environmentId: "environment-1" as never, cwd: "/opaque/repository" }}
@@ -264,7 +263,7 @@ describe("GitManagerHistoryView rewrite reachability", () => {
         <GitManagerHistoryView
           branchSyncDisabledReason={null}
           blockedReasons={[]}
-          liveSignalAvailable
+          repositoryGeneration={null}
           projectRef={{ environmentId: "environment-1", projectId: "project-1" } as never}
           rewriteDisabledReason={null}
           scope={{ environmentId: "environment-1" as never, cwd: "/opaque/repository" }}
@@ -308,7 +307,7 @@ describe("GitManagerHistoryView rewrite reachability", () => {
         <GitManagerHistoryView
           branchSyncDisabledReason={null}
           blockedReasons={[]}
-          liveSignalAvailable
+          repositoryGeneration={null}
           projectRef={{ environmentId: "environment-1", projectId: "project-1" } as never}
           rewriteDisabledReason={null}
           scope={{ environmentId: "environment-1" as never, cwd: "/opaque/repository" }}
@@ -357,7 +356,7 @@ describe("GitManagerHistoryView rewrite reachability", () => {
         <GitManagerHistoryView
           branchSyncDisabledReason={null}
           blockedReasons={[]}
-          liveSignalAvailable
+          repositoryGeneration={null}
           projectRef={{ environmentId: "environment-1", projectId: "project-1" } as never}
           rewriteDisabledReason={reason}
           scope={{ environmentId: "environment-1" as never, cwd: "/opaque/repository" }}
@@ -394,7 +393,7 @@ describe("GitManagerHistoryView rewrite reachability", () => {
     expect(container.textContent).toContain(reason);
   });
 
-  it("opens no live subscription and keeps explicit history refresh available", async () => {
+  it("keeps explicit history refresh available without a repository generation", async () => {
     const selectedCommit = commit(14);
     h.commitPage = {
       generation: 1,
@@ -410,7 +409,7 @@ describe("GitManagerHistoryView rewrite reachability", () => {
         <GitManagerHistoryView
           branchSyncDisabledReason={null}
           blockedReasons={[]}
-          liveSignalAvailable={false}
+          repositoryGeneration={null}
           projectRef={{ environmentId: "environment-1", projectId: "project-1" } as never}
           rewriteDisabledReason={null}
           scope={{ environmentId: "environment-1" as never, cwd: "/opaque/repository" }}
@@ -420,10 +419,86 @@ describe("GitManagerHistoryView rewrite reachability", () => {
       ),
     );
 
-    expect(h.signalAtom).not.toHaveBeenCalled();
+    expect(h.refreshCommits).not.toHaveBeenCalled();
     expect(container.textContent).toContain("Commit 14");
     expect(
       container.querySelector<HTMLButtonElement>('[aria-label="Refresh history"]'),
     ).not.toBeNull();
+  });
+});
+
+describe("GitManagerHistoryView repository generation tracking", () => {
+  function renderHistory(repositoryGeneration: number | null) {
+    return act(async () =>
+      root?.render(
+        <GitManagerHistoryView
+          branchSyncDisabledReason={null}
+          blockedReasons={[]}
+          repositoryGeneration={repositoryGeneration}
+          projectRef={{ environmentId: "environment-1", projectId: "project-1" } as never}
+          rewriteDisabledReason={null}
+          scope={{ environmentId: "environment-1" as never, cwd: "/opaque/repository" }}
+          tagDisabledReason={null}
+          onAction={vi.fn()}
+        />,
+      ),
+    );
+  }
+
+  it("refreshes a cached page that is behind the repository generation on mount", async () => {
+    const tip = commit(20);
+    h.commitPage = {
+      generation: 1,
+      pinnedTips: [tip.sha],
+      commits: [tip, commit(19), commit(18), commit(17)],
+      nextOffset: null,
+      exhausted: true,
+      degradedToAllPaging: false,
+    };
+
+    await renderHistory(2);
+
+    expect(h.refreshCommits).toHaveBeenCalledOnce();
+    expect(container.textContent).toContain("Commit 20");
+  });
+
+  it("refreshes once per newer generation and splices the new tip without losing rows", async () => {
+    const commits = [commit(23), commit(22), commit(21)];
+    h.commitPage = {
+      generation: 4,
+      pinnedTips: [commits[0]!.sha],
+      commits,
+      nextOffset: null,
+      exhausted: true,
+      degradedToAllPaging: false,
+    };
+
+    await renderHistory(4);
+    expect(h.refreshCommits).not.toHaveBeenCalled();
+
+    await renderHistory(5);
+    expect(h.refreshCommits).toHaveBeenCalledOnce();
+    await renderHistory(5);
+    expect(h.refreshCommits).toHaveBeenCalledOnce();
+
+    const newTip = commit(24);
+    h.commitPage = {
+      generation: 5,
+      pinnedTips: [newTip.sha],
+      commits: [newTip, ...commits],
+      nextOffset: null,
+      exhausted: true,
+      degradedToAllPaging: false,
+    };
+    await renderHistory(5);
+
+    expect(h.refreshCommits).toHaveBeenCalledOnce();
+    const rows = [...container.querySelectorAll<HTMLButtonElement>("button[data-commit-sha]")].map(
+      (row) => row.dataset.commitSha,
+    );
+    expect(rows).toEqual([newTip.sha, ...commits.map((entry) => entry.sha)]);
+
+    await renderHistory(3);
+    expect(h.refreshCommits).toHaveBeenCalledOnce();
   });
 });

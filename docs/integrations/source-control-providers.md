@@ -72,12 +72,32 @@ The project-scoped Git Manager has a narrower on-demand provider pane. Its
 current pull-request read supports GitHub, GitLab, and Azure DevOps; Bitbucket
 returns unavailable on this surface even though the existing Source Control
 integration can resolve and create Bitbucket pull requests elsewhere. Check
-reads use `gh pr checks` and are available only for GitHub in this pass.
+reads use `gh pr view <number> --json statusCheckRollup` and are available only
+for GitHub in this pass. That command reports an open pull request without
+checks as an empty collection with a zero exit, so the pane renders the pull
+request with no check rows; `gh pr checks` cannot distinguish that case from a
+missing pull request or rejected credentials, which all exit 1 with empty
+output. Rollup entries fold the way `gh pr checks` folds them: newest run per
+check-run name and workflow or per status context, with the state taken from
+the context state, else the completed conclusion, else the run status.
 
 Git Manager pull-request and check data refresh only on explicit user action,
 never on a timer. Opening the pane or leaving it idle issues no provider call;
 choosing **Refresh** invokes the environment-scoped RPC, whose server handler
 runs the configured provider CLI when that provider is supported.
+
+**Create pull request** in the Git Manager pane opens a review dialog that
+reads local status only: it shows the detected provider, base and head
+branches, whether the branch must be published first, and a title and
+description seeded from the latest commit. Nothing is pushed or created until
+the dialog's primary action runs the existing `git.runStackedAction`
+`create_pr` route with the reviewed `pullRequestTitle` and `pullRequestBody`.
+The dialog reports publishing and creation as separate phases, keeps a
+published branch visible when creation fails, and offers Retry; a retry never
+duplicates a pull request because the server resolves an existing open pull
+request for the branch (`opened_existing`) before creating one. The Source
+Control right-panel menu still creates a pull request directly from its
+existing action path.
 
 ## Source Control panel
 

@@ -52,6 +52,7 @@ const decodeOrchestrationProjectShell = Schema.decodeUnknownEffect(Orchestration
 const encodeThreadCreatedPayload = Schema.encodeEffect(ThreadCreatedPayload);
 const decodeOrchestrationMessageSync = Schema.decodeUnknownSync(OrchestrationMessage);
 const decodeOrchestrationCommandSync = Schema.decodeUnknownSync(OrchestrationCommand);
+const decodeShell = Schema.decodeUnknownSync(OrchestrationThreadShell);
 
 const baseShellFixture = {
   id: "thread-1",
@@ -72,8 +73,6 @@ const baseShellFixture = {
 } as const;
 
 describe("OrchestrationConversationPreview", () => {
-  const decodeShell = Schema.decodeUnknownSync(OrchestrationThreadShell);
-
   it("decodes a shell without the field (older server)", () => {
     const shell = decodeShell(baseShellFixture);
     expect(shell.conversationPreview).toBeUndefined();

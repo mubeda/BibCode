@@ -36,15 +36,18 @@ const forbiddenSchema = Schema.String.pipe(
 );
 const decodeForbidden = Schema.decodeUnknownExit(forbiddenSchema);
 const decodeOneOf = Schema.decodeUnknownExit(
+  // @effect-diagnostics-next-line schemaNumber:off -- Exercises the generic number schema, not a finite domain field.
   Schema.Union([Schema.Struct({ a: Schema.String }), Schema.Struct({ b: Schema.Number })], {
     mode: "oneOf",
   }),
 );
 const decodeFiniteFromString = Schema.decodeUnknownExit(Schema.FiniteFromString);
 const decodeNestedNumbers = Schema.decodeUnknownExit(
+  // @effect-diagnostics-next-line schemaNumber:off -- Exercises the generic number schema, not a finite domain field.
   Schema.Struct({ items: Schema.Array(Schema.Number) }),
 );
 const decodeComposite = Schema.decodeUnknownExit(
+  // @effect-diagnostics-next-line schemaNumber:off -- Exercises the generic number schema, not a finite domain field.
   Schema.Struct({ count: Schema.Number, name: Schema.String }),
   { errors: "all" },
 );
@@ -57,9 +60,11 @@ const decodeConstrainedUnion = Schema.decodeUnknownExit(
 );
 const decodeEmptyUnion = Schema.decodeUnknownExit(Schema.Union([]));
 
+// @effect-diagnostics-next-line schemaNumber:off -- Exercises the generic number schema, not a finite domain field.
 const issueLimitFields: Record<string, typeof Schema.Number> = {};
 const issueLimitInput: Record<string, unknown> = {};
 for (let index = 0; index < 10; index += 1) {
+  // @effect-diagnostics-next-line schemaNumber:off -- Exercises the generic number schema, not a finite domain field.
   issueLimitFields[`field-${index}`] = Schema.Number;
   issueLimitInput[`field-${index}`] = `credential=secret-value-${index}`;
 }
@@ -140,6 +145,7 @@ Done.`),
   });
 
   it("formats schema failures with paths without exposing invalid values", () => {
+    // @effect-diagnostics-next-line schemaNumber:off -- Exercises the generic number schema, not a finite domain field.
     const decodeCredential = decodeJsonResult(Schema.Struct({ token: Schema.Number }));
     const decoded = decodeCredential('{"token":"credential=secret-value"}');
 
@@ -150,7 +156,9 @@ Done.`),
   });
 
   it("decodes known and unknown JSON inputs as Results", () => {
+    // @effect-diagnostics-next-line schemaNumber:off -- Exercises the generic number schema, not a finite domain field.
     const decodeKnown = decodeJsonResult(Schema.Struct({ count: Schema.Number }));
+    // @effect-diagnostics-next-line schemaNumber:off -- Exercises the generic number schema, not a finite domain field.
     const decodeUnknown = decodeUnknownJsonResult(Schema.Struct({ count: Schema.Number }));
 
     expect(decodeKnown('{"count":1}')).toEqual(Result.succeed({ count: 1 }));

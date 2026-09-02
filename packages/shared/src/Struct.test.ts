@@ -10,6 +10,7 @@ const Settings = Schema.Struct({
     enabled: Schema.Boolean,
     label: Schema.optional(Schema.String),
   }),
+  // @effect-diagnostics-next-line schemaNumber:off -- Exercises the generic number schema, not a finite domain field.
   retries: Schema.Number.pipe(Schema.withDecodingDefault(Effect.succeed(3))),
   tags: Schema.Array(Schema.String),
 });
@@ -21,6 +22,7 @@ const SettingsPatch = Schema.Struct({
       label: Schema.optionalKey(Schema.String),
     }),
   ),
+  // @effect-diagnostics-next-line schemaNumber:off -- Exercises the generic number schema, not a finite domain field.
   retries: Schema.optionalKey(Schema.Number),
   tags: Schema.optionalKey(Schema.Array(Schema.String)),
 });

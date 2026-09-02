@@ -25,7 +25,7 @@ export type AssetCreateUrlInput = typeof AssetCreateUrlInput.Type;
 
 export const AssetCreateUrlResult = Schema.Struct({
   relativeUrl: TrimmedNonEmptyString.check(Schema.isMaxLength(4096)),
-  expiresAt: Schema.Number,
+  expiresAt: Schema.Finite,
 });
 export type AssetCreateUrlResult = typeof AssetCreateUrlResult.Type;
 

@@ -61,7 +61,13 @@ interface GitManagerHistoryViewProps {
   readonly branchSyncDisabledReason: string | null;
   readonly rewriteDisabledReason: string | null;
   readonly tagDisabledReason: string | null;
-  readonly liveSignalAvailable: boolean;
+  /**
+   * The repository generation the panel's refs snapshot last observed. The
+   * history page shares that counter, so a generation ahead of the loaded page
+   * means a commit landed (app-authored or external) and the first page must be
+   * refreshed and spliced.
+   */
+  readonly repositoryGeneration: number | null;
   readonly onAction: (action: GitManagerHistoryAction) => void;
 }
 
@@ -140,7 +146,7 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
   branchSyncDisabledReason,
   rewriteDisabledReason,
   tagDisabledReason,
-  liveSignalAvailable,
+  repositoryGeneration,
   onAction,
 }: GitManagerHistoryViewProps) {
   const { environmentId, cwd } = scope;
@@ -158,7 +164,7 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
   const nextPageRef = useRef<GitManagerCommitPage | null>(null);
   const processedNextPageSignatureRef = useRef<string | null>(null);
   const explicitRefreshRef = useRef(false);
-  const lastSignalGenerationRef = useRef<number | null>(null);
+  const requestedGenerationRef = useRef<number | null>(null);
   const [commitLookup] = useState(() =>
     createCommitLookup<GitManagerCommitEntry>(
       COMMIT_LOOKUP_MAX_ENTRIES,
@@ -224,19 +230,6 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
   firstPageRef.current = firstPageQuery.data;
   const firstPageSignature = pageSignature(firstPageQuery.data);
 
-  const signalAtom = useMemo(
-    () =>
-      liveSignalAvailable
-        ? gitManagerEnvironment.signal({
-            environmentId,
-            input: { cwd },
-          })
-        : null,
-    [cwd, environmentId, liveSignalAvailable],
-  );
-  const signalQuery = useEnvironmentQuery(signalAtom);
-  const signalGeneration = signalQuery.data?.generation ?? null;
-
   const nextPageAtom = useMemo(() => {
     if (loadingOffset === null) return null;
     const pinnedTips = pages.pinnedTips;
@@ -255,17 +248,19 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
   const nextPageSignature = pageSignature(nextPageQuery.data, loadingOffset ?? 0);
   const nextPageTipsUnresolvable = isTipsUnresolvableFailure(nextPageQuery.emission);
 
+  const loadedGeneration = pages.generation;
   useEffect(() => {
-    if (signalGeneration === null) return;
-    if (lastSignalGenerationRef.current === null) {
-      lastSignalGenerationRef.current = signalGeneration;
+    if (
+      repositoryGeneration === null ||
+      loadedGeneration === null ||
+      repositoryGeneration <= loadedGeneration ||
+      requestedGenerationRef.current === repositoryGeneration
+    ) {
       return;
     }
-    if (lastSignalGenerationRef.current !== signalGeneration) {
-      lastSignalGenerationRef.current = signalGeneration;
-      firstPageQuery.refresh();
-    }
-  }, [firstPageQuery.refresh, signalGeneration]);
+    requestedGenerationRef.current = repositoryGeneration;
+    firstPageQuery.refresh();
+  }, [firstPageQuery.refresh, loadedGeneration, repositoryGeneration]);
 
   useEffect(() => {
     const page = firstPageRef.current;
@@ -699,7 +694,7 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
       <div className="flex shrink-0 items-center justify-between gap-2 border-b border-border px-3 py-2">
         <div>
           <h1 className="text-balance text-xs font-semibold">History</h1>
-          <p className="text-[10px] text-muted-foreground tabular-nums">
+          <p className="text-xs text-muted-foreground tabular-nums">
             {pages.commits.length} commit{pages.commits.length === 1 ? "" : "s"} loaded
           </p>
         </div>

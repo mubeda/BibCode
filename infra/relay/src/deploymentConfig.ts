@@ -11,7 +11,7 @@ export class RelayPublicDomainLabelTooLongError extends Schema.TaggedErrorClass<
   {
     stage: Schema.String,
     label: Schema.String,
-    maxLength: Schema.Number,
+    maxLength: Schema.Finite,
   },
 ) {
   override get message(): string {

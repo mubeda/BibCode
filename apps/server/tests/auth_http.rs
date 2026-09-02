@@ -842,7 +842,38 @@ async fn remote_revocation_closes_an_acked_live_stream_before_later_events() {
         .and_then(|session| session["sessionId"].as_str())
         .expect("first administrator session")
         .to_owned();
-    let second_administrator = exchange_token(&client, &second, DESKTOP_BOOTSTRAP, None).await;
+    // The desktop bootstrap represents the host's single WebView and each
+    // exchange supersedes earlier desktop sessions on the shared root, so the
+    // second process authenticates through a one-time pairing the first
+    // administrator issues; both servers share the persisted pairing state.
+    let second_pairing = get_json(
+        client
+            .post(http_url(&first, "/api/auth/pairing-token"))
+            .bearer_auth(first_token)
+            .json(&json!({
+                "label": "Second administrator",
+                "scopes": [
+                    "orchestration:read",
+                    "orchestration:operate",
+                    "terminal:operate",
+                    "review:write",
+                    "relay:read",
+                    "access:read",
+                    "access:write",
+                    "relay:write"
+                ]
+            }))
+            .send()
+            .await
+            .expect("second administrator pairing request"),
+        StatusCode::OK,
+    )
+    .await;
+    let second_credential = second_pairing["credential"]
+        .as_str()
+        .expect("second administrator pairing credential")
+        .to_owned();
+    let second_administrator = exchange_token(&client, &second, &second_credential, None).await;
     let second_token = access_token(&second_administrator);
 
     let ticket = websocket_ticket(&client, &first, first_token).await;
@@ -2006,24 +2037,6 @@ async fn dpop_tokens_validate_proof_binding_time_and_replay() {
     assert_eq!(issued["token_type"], "DPoP");
     let access_token = access_token(&issued);
 
-    let proxied_proof = dpop_proof(
-        &signing_key,
-        "POST",
-        &token_url.replacen("http://", "https://", 1),
-        "proxied-token-proof",
-        unix_seconds(),
-        None,
-    );
-    let proxied = client
-        .post(&token_url)
-        .header("x-forwarded-proto", "https")
-        .header("dpop", proxied_proof)
-        .form(&token_form(DESKTOP_BOOTSTRAP, None))
-        .send()
-        .await
-        .expect("reverse-proxied DPoP token exchange");
-    assert_eq!(proxied.status(), StatusCode::OK);
-
     let ticket_url = http_url(&handle, "/api/auth/websocket-ticket");
     let request_proof = dpop_proof(
         &signing_key,
@@ -2134,6 +2147,27 @@ async fn dpop_tokens_validate_proof_binding_time_and_replay() {
         stale_response.headers().get(header::WWW_AUTHENTICATE),
         Some(&header::HeaderValue::from_static("DPoP"))
     );
+
+    // A second desktop bootstrap exchange supersedes the first session, so the
+    // reverse-proxied exchange runs only after every proof check bound to the
+    // first access token has completed.
+    let proxied_proof = dpop_proof(
+        &signing_key,
+        "POST",
+        &token_url.replacen("http://", "https://", 1),
+        "proxied-token-proof",
+        unix_seconds(),
+        None,
+    );
+    let proxied = client
+        .post(&token_url)
+        .header("x-forwarded-proto", "https")
+        .header("dpop", proxied_proof)
+        .form(&token_form(DESKTOP_BOOTSTRAP, None))
+        .send()
+        .await
+        .expect("reverse-proxied DPoP token exchange");
+    assert_eq!(proxied.status(), StatusCode::OK);
 
     shutdown(handle).await;
 }

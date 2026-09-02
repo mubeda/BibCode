@@ -16,7 +16,7 @@ export const ServerProviderUsageStatus = Schema.Literals([
 export type ServerProviderUsageStatus = typeof ServerProviderUsageStatus.Type;
 
 export const ServerProviderUsageWindow = Schema.Struct({
-  usedPercent: Schema.Number,
+  usedPercent: Schema.Finite,
   windowMinutes: NonNegativeInt,
   resetsAt: Schema.NullOr(Schema.DateTimeUtc),
   resetDescription: Schema.NullOr(Schema.String),

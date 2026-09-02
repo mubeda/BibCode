@@ -79,6 +79,8 @@ export interface RunVcsStackedActionInput {
   readonly featureBranch?: boolean;
   readonly filePaths?: ReadonlyArray<string>;
   readonly commitStagedIndexAsIs?: boolean;
+  readonly pullRequestTitle?: string;
+  readonly pullRequestBody?: string;
   readonly onProgress?: (event: GitActionProgressEvent) => void;
 }
 
@@ -104,7 +106,7 @@ export class VcsActionRemoteFailureError extends Schema.TaggedErrorClass<VcsActi
     environmentId: EnvironmentId,
     cwd: Schema.String,
     phase: Schema.NullOr(GitActionProgressPhase),
-    remoteMessageLength: Schema.Number,
+    remoteMessageLength: Schema.Finite,
   },
 ) {
   override get message(): string {
@@ -131,7 +133,7 @@ export class VcsActionMissingTerminalEventError extends Schema.TaggedErrorClass<
 export class VcsActionTargetKeyParseError extends Schema.TaggedErrorClass<VcsActionTargetKeyParseError>()(
   "VcsActionTargetKeyParseError",
   {
-    keyLength: Schema.Number,
+    keyLength: Schema.Finite,
     cause: Schema.Defect(),
   },
 ) {
@@ -469,6 +471,10 @@ export function createVcsActionManager<R, E>(
           ...(input.featureBranch ? { featureBranch: true } : {}),
           ...(input.filePaths?.length ? { filePaths: [...input.filePaths] } : {}),
           ...(input.commitStagedIndexAsIs ? { commitStagedIndexAsIs: true } : {}),
+          ...(input.pullRequestTitle ? { pullRequestTitle: input.pullRequestTitle } : {}),
+          ...(input.pullRequestBody !== undefined
+            ? { pullRequestBody: input.pullRequestBody }
+            : {}),
         };
         return consumeVcsActionProgress(
           runStreamInEnvironment(

@@ -207,6 +207,31 @@ describe("ComposerCommandMenu empty states", () => {
     const mounted = await mount(renderMenu({ isLoading: true }));
 
     expect(mounted.container.textContent).toContain("Searching workspace files...");
+    expect(
+      mounted.container
+        .querySelector('[data-composer-menu="true"]')
+        ?.getAttribute("data-composer-menu-loading"),
+    ).toBe("true");
+  });
+
+  it("keeps loaded items mounted and marks the menu busy while a refreshed search is pending", async () => {
+    const mounted = await mount(renderMenu({ items: [fileItem()], isLoading: true }));
+    const menu = mounted.container.querySelector('[data-composer-menu="true"]');
+    const item = mounted.container.querySelector('[data-composer-item-id="file-1"]');
+
+    expect(menu?.getAttribute("data-composer-menu-loading")).toBe("true");
+    expect(menu?.getAttribute("aria-busy")).toBe("true");
+    expect(item).not.toBeNull();
+    expect(mounted.container.textContent).toContain("Searching workspace files...");
+
+    await act(async () =>
+      mounted.root.render(renderMenu({ items: [fileItem()], isLoading: false })),
+    );
+
+    expect(menu?.getAttribute("data-composer-menu-loading")).toBe("false");
+    expect(menu?.getAttribute("aria-busy")).toBe("false");
+    expect(mounted.container.querySelector('[data-composer-item-id="file-1"]')).toBe(item);
+    expect(mounted.container.textContent).not.toContain("Searching workspace files...");
   });
 });
 
