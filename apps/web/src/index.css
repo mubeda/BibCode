@@ -258,9 +258,9 @@
   --input: --alpha(var(--color-black) / 10%);
   --ring: #d8610e;
   /* Panel edges and panel-level toolbars; row and section dividers keep --border.
-     The interaction orange at half opacity: visible on both themes, and it
-     blends with whichever surface the edge crosses. */
-  --panel-separator: --alpha(var(--ring) / 50%);
+     The interaction orange at a quarter opacity: a subtle line that is still
+     visible on both themes and blends with whichever surface the edge crosses. */
+  --panel-separator: --alpha(var(--ring) / 25%);
   --destructive-foreground: var(--color-red-700);
   --link: var(--color-blue-700);
   --info: var(--color-blue-500);
