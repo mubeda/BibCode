@@ -92,18 +92,22 @@ export function AppSidebarLayout({ children }: { children: ReactNode }) {
 
   if (pathname === "/agents") {
     return (
-      <SidebarProvider className="h-dvh! min-h-0!" defaultOpen>
+      <SidebarProvider className="h-dvh! min-h-0! border-t border-panel-separator" defaultOpen>
         {children}
       </SidebarProvider>
     );
   }
 
   return (
-    <SidebarProvider className="h-dvh! min-h-0!" defaultOpen style={THREAD_SIDEBAR_PROVIDER_STYLE}>
+    <SidebarProvider
+      className="h-dvh! min-h-0! border-t border-panel-separator"
+      defaultOpen
+      style={THREAD_SIDEBAR_PROVIDER_STYLE}
+    >
       <Sidebar
         side="left"
         collapsible="offcanvas"
-        className="border-r border-panel-separator bg-card text-foreground"
+        className="border-t border-r border-panel-separator bg-card text-foreground"
         resizable={{
           defaultWidth: THREAD_SIDEBAR_DEFAULT_WIDTH,
           minWidth: THREAD_SIDEBAR_MIN_WIDTH,
