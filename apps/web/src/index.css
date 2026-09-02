@@ -50,6 +50,7 @@
     "SF Mono", "SFMono-Regular", "JetBrains Mono", Consolas, "Liberation Mono", Menlo, monospace;
   /* text-xs (12px) is the declared text-size floor: new UI never goes below it
      and older screens are being swept to it (UI.md, Typography). */
+  --color-panel-separator: var(--panel-separator);
   --color-warning-foreground: var(--warning-foreground);
   --color-warning: var(--warning);
   --color-success-foreground: var(--success-foreground);
@@ -256,6 +257,10 @@
   --border: --alpha(var(--color-black) / 8%);
   --input: --alpha(var(--color-black) / 10%);
   --ring: #d8610e;
+  /* Panel edges and panel-level toolbars; row and section dividers keep --border.
+     The interaction orange at a quarter opacity: a subtle line that is still
+     visible on both themes and blends with whichever surface the edge crosses. */
+  --panel-separator: --alpha(var(--ring) / 25%);
   --destructive-foreground: var(--color-red-700);
   --link: var(--color-blue-700);
   --info: var(--color-blue-500);

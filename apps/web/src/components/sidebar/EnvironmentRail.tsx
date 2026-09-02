@@ -201,7 +201,7 @@ export function EnvironmentRail() {
   return (
     <div
       data-testid="environment-rail"
-      className="flex h-full w-[52px] shrink-0 flex-col items-center gap-2 border-r border-border bg-sidebar py-2"
+      className="flex h-full w-[52px] shrink-0 flex-col items-center gap-2 border-r border-panel-separator bg-sidebar py-2"
     >
       <div
         role="radiogroup"

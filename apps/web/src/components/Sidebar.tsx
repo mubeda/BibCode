@@ -3673,7 +3673,7 @@ function SortableProjectItem({
 
 const SidebarChromeHeader = memo(function SidebarChromeHeader() {
   return (
-    <SidebarHeader className="@container/sidebar-header h-[var(--workspace-topbar-height)] shrink-0 flex-row items-center px-3 py-0 md:px-0">
+    <SidebarHeader className="@container/sidebar-header h-[var(--workspace-topbar-height)] shrink-0 flex-row items-center border-b border-panel-separator px-3 py-0 md:px-0">
       <SidebarTrigger className="md:hidden" />
       <SidebarBrand />
     </SidebarHeader>

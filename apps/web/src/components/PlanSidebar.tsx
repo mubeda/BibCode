@@ -140,12 +140,12 @@ const PlanSidebar = memo(function PlanSidebar({
       className={cn(
         "flex min-h-0 flex-col bg-card/50",
         mode === "sidebar"
-          ? "h-full w-[340px] shrink-0 border-l border-border/70"
+          ? "h-full w-[340px] shrink-0 border-l border-panel-separator"
           : "h-full w-full",
       )}
     >
       {/* Header */}
-      <div className="flex h-12 shrink-0 items-center justify-between border-b border-border/60 px-3">
+      <div className="flex h-[var(--workspace-topbar-height)] shrink-0 items-center justify-between border-b border-panel-separator px-3">
         <div className="flex items-center gap-2">
           <Badge
             variant="info"

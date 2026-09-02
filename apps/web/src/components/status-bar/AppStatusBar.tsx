@@ -241,7 +241,7 @@ export function AppStatusBarView({
   const providers = presentationCache.current.providers;
   return (
     <div
-      className="relative z-20 flex h-6 min-h-6 shrink-0 items-center justify-between gap-3 border-t border-border bg-background px-3 text-xs"
+      className="relative z-20 flex h-6 min-h-6 shrink-0 items-center justify-between gap-3 border-t border-panel-separator bg-background px-3 text-xs"
       data-testid="app-status-bar"
     >
       <div className="flex min-w-0 flex-1 items-center gap-1 overflow-hidden">

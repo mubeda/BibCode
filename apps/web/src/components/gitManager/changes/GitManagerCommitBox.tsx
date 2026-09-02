@@ -217,7 +217,7 @@ export const GitManagerCommitBox = memo(function GitManagerCommitBox({
     <>
       <form
         aria-label="Commit Changes"
-        className="shrink-0 space-y-2 border-t border-border bg-card/20 p-3"
+        className="shrink-0 space-y-2 border-t border-panel-separator bg-card/20 p-3"
         onKeyDown={handleKeyDown}
         onSubmit={handleSubmit}
       >

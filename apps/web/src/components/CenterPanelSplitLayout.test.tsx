@@ -219,7 +219,7 @@ describe("CenterPanelSplitLayout", () => {
 
     for (const path of ["root", "second"]) {
       const line = separatorAt(path).querySelector<HTMLElement>(":scope > [aria-hidden='true']");
-      expect(line?.classList.contains("bg-ring")).toBe(true);
+      expect(line?.classList.contains("bg-panel-separator")).toBe(true);
     }
   });
 

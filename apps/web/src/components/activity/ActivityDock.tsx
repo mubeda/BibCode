@@ -410,7 +410,7 @@ export function ActivityDock({
           {toggleContent}
         </Button>
         {expanded ? (
-          <div className="border-t border-border p-1">
+          <div className="border-t border-panel-separator p-1">
             {visibility.showSubagents ? (
               <Button
                 aria-label={`Open Subagents: ${subagentActive} active, ${subagentDone} done${
