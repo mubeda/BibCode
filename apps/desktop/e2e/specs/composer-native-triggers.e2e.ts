@@ -159,14 +159,58 @@ async function waitForComposerItem(id: string): Promise<void> {
   });
 }
 
+const composerMenuSelector = '[data-composer-menu="true"]';
+
+/**
+ * Waits until the visible composer menu has settled its workspace search for the
+ * current query. While a refreshed search is pending the menu keeps its loaded
+ * rows mounted and reports `data-composer-menu-loading="true"`; clicking before
+ * it settles would target a row the incoming result may still replace.
+ */
+async function waitForComposerMenuSettled(): Promise<void> {
+  const menu = composerForm().$(composerMenuSelector);
+  await menu.waitForExist({ timeoutMsg: "The composer menu did not open inside the composer." });
+  await browser.waitUntil(
+    async () => (await menu.getAttribute("data-composer-menu-loading")) === "false",
+    { timeoutMsg: "The composer menu did not settle its workspace search." },
+  );
+}
+
 async function clickVisibleComposerItem(id: string): Promise<void> {
-  const selector = `[data-composer-item-id="${id}"]`;
   await waitForComposerItem(id);
-  const candidate = browser.$(selector);
+  await waitForComposerMenuSettled();
+  const candidate = composerForm().$(`${composerMenuSelector} [data-composer-item-id="${id}"]`);
   await candidate.waitForExist({ timeoutMsg: `The composer item disappeared: ${id}` });
   await candidate.waitForDisplayed({ timeoutMsg: `The composer item remained hidden: ${id}` });
   await candidate.waitForEnabled({ timeoutMsg: `The composer item remained disabled: ${id}` });
-  await candidate.click();
+  // Resolve the element once so the ownership script and the click share the
+  // same element reference. WebdriverIO only serializes resolved elements into
+  // WebDriver element references; an unresolved chainable would reach the
+  // page as a plain object.
+  const element = await candidate;
+  const ownership = await browser.execute(
+    (element: HTMLElement, itemId: string) => {
+      const menu = element.closest<HTMLElement>('[data-composer-menu="true"]');
+      const host = element.closest<HTMLElement>("[data-center-surface-host]");
+      return {
+        connected: element.isConnected,
+        itemId: element.dataset.composerItemId ?? null,
+        menuLoading: menu?.dataset.composerMenuLoading ?? null,
+        hostVisible: host?.dataset.visible ?? null,
+        expectedItemId: itemId,
+      };
+    },
+    element,
+    id,
+  );
+  expect(ownership).toEqual({
+    connected: true,
+    itemId: id,
+    menuLoading: "false",
+    hostVisible: "true",
+    expectedItemId: id,
+  });
+  await element.click();
 }
 
 async function waitForComposerItemsToClose(): Promise<void> {

@@ -173,7 +173,7 @@ export class VcsProcessExitError extends Schema.TaggedErrorClass<VcsProcessExitE
     command: Schema.String,
     cwd: Schema.String,
     argumentCount: Schema.optional(NonNegativeInt),
-    exitCode: Schema.Number,
+    exitCode: Schema.Finite,
     detail: Schema.String,
     failureKind: Schema.optional(VcsProcessExitFailureKind),
     stderrLength: Schema.optional(NonNegativeInt),
@@ -218,7 +218,7 @@ export class VcsProcessTimeoutError extends Schema.TaggedErrorClass<VcsProcessTi
     command: Schema.String,
     cwd: Schema.String,
     argumentCount: Schema.optional(NonNegativeInt),
-    timeoutMs: Schema.Number,
+    timeoutMs: Schema.Finite,
   },
 ) {
   override get message(): string {

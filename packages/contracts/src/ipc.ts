@@ -265,8 +265,8 @@ export const DesktopProjectDataBackupSchema = Schema.Struct({
   createdAt: Schema.String,
   trigger: Schema.Literals(["pre-migration", "pre-update"]),
   appVersion: Schema.String,
-  schemaVersion: Schema.Number,
-  sizeBytes: Schema.Number,
+  schemaVersion: Schema.Finite,
+  sizeBytes: Schema.Finite,
 });
 
 export interface DesktopProjectDataEnvironmentStatus {
@@ -355,7 +355,7 @@ export interface DesktopBridgeHostMetadata {
 
 export const DesktopBridgeHostMetadataSchema = Schema.Struct({
   host: DesktopBridgeHostSchema,
-  bridgeVersion: Schema.Number,
+  bridgeVersion: Schema.Finite,
   features: DesktopBridgeFeatureFlagsSchema,
 });
 
@@ -410,7 +410,7 @@ export const DesktopUpdateStateSchema = Schema.Struct({
   runningUnderArm64Translation: Schema.Boolean,
   availableVersion: Schema.NullOr(Schema.String),
   downloadedVersion: Schema.NullOr(Schema.String),
-  downloadPercent: Schema.NullOr(Schema.Number),
+  downloadPercent: Schema.NullOr(Schema.Finite),
   checkedAt: Schema.NullOr(Schema.String),
   message: Schema.NullOr(Schema.String),
   errorContext: Schema.NullOr(Schema.Literals(["check", "download", "install"])),
@@ -514,7 +514,7 @@ export const DesktopSshEnvironmentTargetSchema = Schema.Struct({
   alias: Schema.String,
   hostname: Schema.String,
   username: Schema.NullOr(Schema.String),
-  port: Schema.NullOr(Schema.Number),
+  port: Schema.NullOr(Schema.Finite),
 });
 export type DesktopSshEnvironmentTarget = typeof DesktopSshEnvironmentTargetSchema.Type;
 
@@ -529,7 +529,7 @@ export const DesktopDiscoveredSshHostSchema = Schema.Struct({
   alias: Schema.String,
   hostname: Schema.String,
   username: Schema.NullOr(Schema.String),
-  port: Schema.NullOr(Schema.Number),
+  port: Schema.NullOr(Schema.Finite),
   source: DesktopSshHostSourceSchema,
 });
 
@@ -547,7 +547,7 @@ export const DesktopSshEnvironmentBootstrapSchema = Schema.Struct({
   httpBaseUrl: Schema.String,
   wsBaseUrl: Schema.String,
   pairingToken: Schema.NullOr(Schema.String),
-  remotePort: Schema.optionalKey(Schema.Number),
+  remotePort: Schema.optionalKey(Schema.Finite),
   remoteServerKind: Schema.optionalKey(Schema.Literals(["external", "managed"])),
 });
 
@@ -649,7 +649,7 @@ export const DesktopServerExposureStateSchema = Schema.Struct({
   endpointUrl: Schema.NullOr(Schema.String),
   advertisedHost: Schema.NullOr(Schema.String),
   tailscaleServeEnabled: Schema.Boolean,
-  tailscaleServePort: Schema.Number,
+  tailscaleServePort: Schema.Finite,
 });
 
 export interface PickFolderOptions {
@@ -756,7 +756,7 @@ export const DesktopPreviewNavStatusSchema = Schema.Union([
     kind: Schema.Literal("LoadFailed"),
     url: Schema.String,
     title: Schema.String,
-    code: Schema.Number,
+    code: Schema.Finite,
     description: Schema.String,
   }),
 ]);
@@ -767,7 +767,7 @@ export const DesktopPreviewTabStateSchema: Schema.Codec<DesktopPreviewTabState> 
   navStatus: DesktopPreviewNavStatusSchema,
   canGoBack: Schema.Boolean,
   canGoForward: Schema.Boolean,
-  zoomFactor: Schema.Number,
+  zoomFactor: Schema.Finite,
   controller: Schema.Literals(["human", "agent", "none"]),
   updatedAt: Schema.String,
 });
@@ -785,8 +785,8 @@ export const DesktopPreviewPointerEventSchema: Schema.Codec<DesktopPreviewPointe
   Schema.Struct({
     tabId: DesktopPreviewTabIdSchema,
     phase: Schema.Literals(["move", "click"]),
-    x: Schema.Number,
-    y: Schema.Number,
+    x: Schema.Finite,
+    y: Schema.Finite,
     sequence: Schema.Int,
     createdAt: Schema.String,
   });
@@ -804,10 +804,10 @@ export interface DesktopPreviewBounds {
 }
 
 export const DesktopPreviewBoundsSchema: Schema.Codec<DesktopPreviewBounds> = Schema.Struct({
-  x: Schema.Number,
-  y: Schema.Number,
-  width: Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
-  height: Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
+  x: Schema.Finite,
+  y: Schema.Finite,
+  width: Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0)),
+  height: Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0)),
 });
 
 /**
@@ -893,8 +893,8 @@ export const DesktopPreviewRecordingFrameSchema: Schema.Codec<DesktopPreviewReco
   Schema.Struct({
     tabId: DesktopPreviewTabIdSchema,
     data: Schema.String,
-    width: Schema.Number,
-    height: Schema.Number,
+    width: Schema.Finite,
+    height: Schema.Finite,
     receivedAt: Schema.String,
   });
 
@@ -951,8 +951,8 @@ export interface PickedElementStackFrame {
 export const PickedElementStackFrameSchema: Schema.Codec<PickedElementStackFrame> = Schema.Struct({
   functionName: Schema.NullOr(Schema.String),
   fileName: Schema.NullOr(Schema.String),
-  lineNumber: Schema.NullOr(Schema.Number),
-  columnNumber: Schema.NullOr(Schema.Number),
+  lineNumber: Schema.NullOr(Schema.Finite),
+  columnNumber: Schema.NullOr(Schema.Finite),
 });
 
 /**
@@ -1005,10 +1005,10 @@ export interface PreviewAnnotationRect {
 }
 
 export const PreviewAnnotationRectSchema: Schema.Codec<PreviewAnnotationRect> = Schema.Struct({
-  x: Schema.Number,
-  y: Schema.Number,
-  width: Schema.Number,
-  height: Schema.Number,
+  x: Schema.Finite,
+  y: Schema.Finite,
+  width: Schema.Finite,
+  height: Schema.Finite,
 });
 
 export interface PreviewAnnotationPoint {
@@ -1017,8 +1017,8 @@ export interface PreviewAnnotationPoint {
 }
 
 export const PreviewAnnotationPointSchema: Schema.Codec<PreviewAnnotationPoint> = Schema.Struct({
-  x: Schema.Number,
-  y: Schema.Number,
+  x: Schema.Finite,
+  y: Schema.Finite,
 });
 
 export interface PreviewAnnotationElementTarget {
@@ -1057,7 +1057,7 @@ export const PreviewAnnotationStrokeTargetSchema: Schema.Codec<PreviewAnnotation
   Schema.Struct({
     id: Schema.String,
     color: Schema.String,
-    width: Schema.Number,
+    width: Schema.Finite,
     points: Schema.Array(PreviewAnnotationPointSchema),
     bounds: PreviewAnnotationRectSchema,
   });
@@ -1089,8 +1089,8 @@ export interface PreviewAnnotationScreenshot {
 export const PreviewAnnotationScreenshotSchema: Schema.Codec<PreviewAnnotationScreenshot> =
   Schema.Struct({
     dataUrl: Schema.String,
-    width: Schema.Number,
-    height: Schema.Number,
+    width: Schema.Finite,
+    height: Schema.Finite,
     cropRect: PreviewAnnotationRectSchema,
   });
 

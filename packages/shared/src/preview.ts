@@ -50,7 +50,7 @@ export function isPreviewableUrl(rawUrl: string): boolean {
 export class PreviewUrlNormalizationError extends Schema.TaggedErrorClass<PreviewUrlNormalizationError>()(
   "PreviewUrlNormalizationError",
   {
-    inputLength: Schema.Number,
+    inputLength: Schema.Finite,
     reason: Schema.Literals(["empty", "parse", "unsupported-protocol"]),
     protocol: Schema.optional(Schema.String),
     cause: Schema.optional(Schema.Defect()),

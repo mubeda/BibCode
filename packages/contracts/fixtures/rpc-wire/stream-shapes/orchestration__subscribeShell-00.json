@@ -672,76 +672,94 @@
             "hasActionableProposedPlan": false
           },
           {
-            "id": ".8@>",
-            "projectId": "pu1UNNN",
-            "title": "rb96b",
+            "id": "@>a",
+            "projectId": "u1UNNN]r",
+            "title": "96byTgH3?",
             "modelSelection": {
-              "instanceId": "q-W2I_5324U",
-              "model": "hK?{)T\\asrL",
+              "instanceId": "y853",
+              "model": "J'[?",
               "options": [
                 {
-                  "id": "/r`MNWwp$1X",
+                  "id": "?{)T\\asr",
+                  "value": "4"
+                },
+                {
+                  "id": "8/r",
+                  "value": "NWwp$1Xg"
+                },
+                {
+                  "id": "d",
+                  "value": false
+                },
+                {
+                  "id": ".JD",
+                  "value": "|6ZXU"
+                },
+                {
+                  "id": "BLeLa",
+                  "value": "<QQUK>#$F"
+                },
+                {
+                  "id": "wm6AThE",
                   "value": true
                 },
                 {
-                  "id": "k]L5.JDf!",
+                  "id": ")",
                   "value": true
                 },
                 {
-                  "id": "Uo)",
-                  "value": true
+                  "id": "7",
+                  "value": false
                 },
                 {
-                  "id": "aVB<QQUK>",
-                  "value": "F1zwm6A"
+                  "id": "$a<'4aV&C",
+                  "value": ">mV1A*g"
                 },
                 {
-                  "id": "EJ^7",
-                  "value": "tU5{7Z8|q$"
-                },
-                {
-                  "id": "'4aV&C(\\>",
-                  "value": "1A*gwAN?"
-                },
-                {
-                  "id": "i791?/Rma|",
-                  "value": "NbI"
-                },
-                {
-                  "id": "1",
-                  "value": true
-                },
-                {
-                  "id": "@Rw7",
-                  "value": "0/z5y%'&>A'q"
+                  "id": "N?z@i791?/R",
+                  "value": false
                 }
               ]
             },
-            "runtimeMode": "auto-accept-edits",
-            "interactionMode": "default",
-            "branch": "?kyCg0bY",
-            "worktreePath": null,
-            "latestTurn": null,
-            "createdAt": ";Wf@J+?m",
-            "updatedAt": "XU23'>\"",
-            "archivedAt": "P-N5z>#Yd ",
-            "session": {
-              "threadId": "|a}G03",
-              "status": "starting",
-              "providerName": "8tzq}7",
-              "providerInstanceId": "J-AL_-09",
-              "runtimeMode": "auto-accept-edits",
-              "activeTurnId": null,
-              "lastError": null,
-              "updatedAt": "8T4"
+            "runtimeMode": "full-access",
+            "interactionMode": "plan",
+            "kind": "panel",
+            "branch": "CyIn@Rw7",
+            "worktreePath": "0/z5y%'&>A'q",
+            "latestTurn": {
+              "turnId": "tyNw|.?kyC",
+              "state": "interrupted",
+              "requestedAt": "bYoy",
+              "startedAt": "Wf@J+?m5XU",
+              "completedAt": null,
+              "assistantMessageId": null,
+              "sourceProposedPlan": {
+                "threadId": "BZP",
+                "planId": "N5z>#Yd"
+              }
             },
-            "latestUserMessageAt": "c~4&_V",
+            "createdAt": "|",
+            "updatedAt": "}G03Xw",
+            "archivedAt": null,
+            "session": {
+              "threadId": "zq",
+              "status": "stopped",
+              "providerName": "7\\A{J3?wD",
+              "providerInstanceId": "Y-9TG-5",
+              "runtimeMode": "full-access",
+              "activeTurnId": "c~4",
+              "lastError": null,
+              "lastErrorClass": null,
+              "updatedAt": "E\\e"
+            },
+            "latestUserMessageAt": "am{W*,",
             "hasPendingApprovals": true,
-            "hasPendingUserInput": true,
-            "hasActionableProposedPlan": false
+            "hasPendingUserInput": false,
+            "hasActionableProposedPlan": true,
+            "conversationPreview": null
           }
         ],
-        "updatedAt": "\"-}"
+        "updatedAt": "_,V|vDZm"
       }
     }
   ]

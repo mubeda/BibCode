@@ -472,7 +472,7 @@ mod telemetry {
         let sandbox = TestSandbox::new("git-manager-explicit-checks");
         let provider_cli = sandbox.executable_script(
             "gh",
-            "printf '%s\\n' '[{\"name\":\"build\",\"state\":\"SUCCESS\",\"link\":null,\"workflow\":\"CI\"}]'",
+            "printf '%s\\n' '{\"statusCheckRollup\":[{\"__typename\":\"CheckRun\",\"name\":\"build\",\"status\":\"COMPLETED\",\"conclusion\":\"SUCCESS\",\"detailsUrl\":null,\"workflowName\":\"CI\"}]}'",
             "",
         );
         let service = PullRequestService::with_provider_commands(

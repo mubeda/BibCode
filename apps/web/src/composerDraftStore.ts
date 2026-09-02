@@ -109,16 +109,16 @@ const PersistedTerminalContextDraft = Schema.Struct({
   createdAt: Schema.String,
   terminalId: Schema.String,
   terminalLabel: Schema.String,
-  lineStart: Schema.Number,
-  lineEnd: Schema.Number,
+  lineStart: Schema.Finite,
+  lineEnd: Schema.Finite,
 });
 type PersistedTerminalContextDraft = typeof PersistedTerminalContextDraft.Type;
 
 const PersistedElementContextStackFrame = Schema.Struct({
   functionName: Schema.NullOr(Schema.String),
   fileName: Schema.NullOr(Schema.String),
-  lineNumber: Schema.NullOr(Schema.Number),
-  columnNumber: Schema.NullOr(Schema.Number),
+  lineNumber: Schema.NullOr(Schema.Finite),
+  columnNumber: Schema.NullOr(Schema.Finite),
 });
 
 const PersistedElementContextDraft = Schema.Struct({
@@ -250,7 +250,7 @@ const PersistedComposerDraftStoreState = Schema.Struct({
 type PersistedComposerDraftStoreState = typeof PersistedComposerDraftStoreState.Type;
 
 const PersistedComposerDraftStoreStorage = Schema.Struct({
-  version: Schema.Number,
+  version: Schema.Finite,
   state: PersistedComposerDraftStoreState,
 });
 

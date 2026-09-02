@@ -76,7 +76,7 @@
           "status": 200,
           "contentType": "application/json",
           "schema": "Objects",
-          "fingerprint": "7859bef3973de94e6918d64a1c4fc6bf22f89007f1f9315182c51c32ff972451"
+          "fingerprint": "3db33c54a80ebf36469669c4558d4a000441bf839c4debc0098656cb2986f979"
         }
       ],
       "errors": [
@@ -281,7 +281,7 @@
           "status": 200,
           "contentType": "application/json",
           "schema": "Objects",
-          "fingerprint": "86409758dd6d22436d0f435ff304646ba15a33dff7f4e9bb363ebc8171204272"
+          "fingerprint": "cc185e3dd26263e680c92ff718c22e38072fed479c53382099c526f77f3431e5"
         }
       ],
       "errors": [
@@ -474,7 +474,7 @@
           "status": 200,
           "contentType": "application/json",
           "schema": "Objects",
-          "fingerprint": "c6fd0e86c5c33ae271e0f54dc6a41648a35cd7da45ed0a27615ad037f75b63be"
+          "fingerprint": "5c8e12709c12b1392d85c6bc70ebc4a2a2d3ec27d4bdcb485834573ad01dafd0"
         }
       ],
       "errors": [
@@ -614,7 +614,7 @@
     }
   },
   "schemaFingerprints": {
-    "AuthAccessTokenResult": "cea8aabefb044f9daf941efa9e83f1d17d3817247c3e32a153f5765fca0891ad",
+    "AuthAccessTokenResult": "3db33c54a80ebf36469669c4558d4a000441bf839c4debc0098656cb2986f979",
     "AuthBrowserSessionRequest": "ce857515bdf6a6328a36c6df7692846f6fbc386271da6973f6a03df39c933e44",
     "AuthBrowserSessionResult": "39abbe3526341131c33f73525739e84b4949ae9dba0abb1293359bec43dc5e90",
     "AuthCancelPairingOfferInput": "01c5b2929a2d618087a1aeb429dd116735a50933ba2670b03dc61de05c764433",
@@ -625,7 +625,7 @@
     "AuthCreatePairingOfferInput": "5d0dd91b07382261ca45335d7497774cae8ddf48667729f20fa285498dd76042",
     "AuthEnvironmentScope": "0075f3b8e58d5c596cb62b1fab337228db16942bc03be9685fafa11f5aa8b08d",
     "AuthEnvironmentScopes": "c80c09a9ed11b43aa331fd500b6a7bba484dd93cfef92c7a014bb9812f3b4989",
-    "AuthOtherClientSessionsRevokeResult": "09a01af283c067546b42a825ad343e48941492ad5c319c211e5f6b75f51d4af1",
+    "AuthOtherClientSessionsRevokeResult": "5c8e12709c12b1392d85c6bc70ebc4a2a2d3ec27d4bdcb485834573ad01dafd0",
     "AuthPairingCredentialResult": "57232db62fd57bd4c2dd35776b84fe2d264254d50ec46efd65ebe10436b4f8e0",
     "AuthPairingLink": "b1fbdcb84a2cb5fe669e0b40925a9148b307f83785d103899ef4c9bbbace560f",
     "AuthPairingLinkList": "8d97c692592cb80e7e4953113ae60b0290636657d54fde778c5b01461a00050a",
@@ -635,7 +635,7 @@
     "AuthRevokeClientSessionInput": "df394b76d7c613720315f6e8ebae96fcda7d7f702a15b058c4417f234b142e58",
     "AuthRevokePairingLinkInput": "f3962c1644924035c8cd2db9628c43ebd93c08ad5bdfdba4dac4d242fe9c2968",
     "AuthSessionState": "7c7433c4e7469f73ff94c1f8e9ae52ad2441eeed5fe96ecbe3bee1651b2c3a7e",
-    "AuthShareStateResult": "132b7f179d50762e7e945a124bdd19b9ee99cb6bd424976802032009233f76ba",
+    "AuthShareStateResult": "cc185e3dd26263e680c92ff718c22e38072fed479c53382099c526f77f3431e5",
     "AuthTokenExchangeRequest": "746432a74986642eee5a4f4c32fbab9d666642bf3247b3f4955610e9683d4de7",
     "AuthWebSocketTicketResult": "4d4b514499bf6373a0812f5defaf5b880acb5d42ce3e057da68f5ab9c5c36a84",
     "EnvironmentAuthInvalidError": "fb39b2fefb6cc89c7a61b6888eaf5188dcbd5f8a9192746e6edf302f321f7eff",

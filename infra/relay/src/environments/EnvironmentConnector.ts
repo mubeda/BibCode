@@ -110,7 +110,7 @@ export class EnvironmentMintRequestTimedOut extends Schema.TaggedErrorClass<Envi
   "EnvironmentMintRequestTimedOut",
   {
     environmentId: Schema.String,
-    timeoutMs: Schema.Number,
+    timeoutMs: Schema.Finite,
   },
 ) {
   override get message(): string {

@@ -26,8 +26,10 @@ describe("desktop UI motion stabilization", () => {
   it("keeps the WDIO motion guard from overriding open or closed portal styles", () => {
     const configuration = NodeFS.readFileSync(new URL("../wdio.conf.ts", import.meta.url), "utf8");
 
-    expect(configuration).not.toContain('document.createElement("style")');
-    expect(configuration).toContain("sheet.insertRule");
+    // The guard is one marked stylesheet installed once per document; it never
+    // sets inline styles or observes and rewrites portal lifecycle attributes.
+    expect(configuration).toContain("style[data-bibcode-desktop-ui-automation]");
+    expect(configuration).toContain("style.dataset.bibcodeDesktopUiAutomation");
     expect(configuration).toContain(
       'document.documentElement.dataset.bibcodeDesktopUiMotion = "disabled"',
     );
@@ -89,11 +91,31 @@ describe("packaged composer acceptance contract", () => {
     expect(source).toContain("element.checkVisibility({");
     expect(source).toContain("opacityProperty: true");
     expect(source).toContain("visibilityProperty: true");
-    expect(source).toContain("const candidate = browser.$(selector)");
+    // The click target is resolved inside the visible composer form only after
+    // the menu has settled its workspace search, and its ownership is asserted
+    // right before the click; there is no global lookup, retry, or sleep.
+    expect(source).toContain("await waitForComposerMenuSettled();");
+    expect(source).toContain('(await menu.getAttribute("data-composer-menu-loading")) === "false"');
+    expect(source).toContain(
+      'const candidate = composerForm().$(`${composerMenuSelector} [data-composer-item-id="${id}"]`)',
+    );
     expect(source).toContain("await candidate.waitForExist({");
     expect(source).toContain("await candidate.waitForDisplayed({");
     expect(source).toContain("await candidate.waitForEnabled({");
+    // The ownership script receives the resolved element, never the chainable
+    // wrapper, and the click reuses that same resolved reference.
+    expect(source).toContain("const element = await candidate;");
+    expect(source).toMatch(
+      /browser\.execute\(\s*\(element: HTMLElement, itemId: string\) => \{[\s\S]*?\},\s*element,\s*id,\s*\);/,
+    );
+    expect(source).toMatch(
+      /expect\(ownership\)\.toEqual\(\{[\s\S]*?\}\);\s*await element\.click\(\);/,
+    );
+    expect(source).toContain("connected: element.isConnected");
+    expect(source).toContain('hostVisible: "true"');
+    expect(source).not.toContain("const candidate = browser.$(selector)");
     expect(source).not.toContain("for (const candidate of await browser.$$(selector))");
+    expect(source).not.toMatch(/browser\.pause\(|setTimeout\(resolve/);
   });
 
   it("restarts the packaged session and compares the complete native provider payload sequence", () => {

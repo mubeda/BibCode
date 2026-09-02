@@ -19,9 +19,25 @@ import {
   GitManagerWorktreeEntry,
 } from "./gitManager.ts";
 
+const decodeGitManagerBlockedReason = Schema.decodeUnknownSync(GitManagerBlockedReason);
+const decodeGitManagerWorktreeEntry = Schema.decodeUnknownSync(GitManagerWorktreeEntry);
+const decodeGitManagerRefEntry = Schema.decodeUnknownSync(GitManagerRefEntry);
+const decodeGitManagerRefsSnapshot = Schema.decodeUnknownSync(GitManagerRefsSnapshot);
+const decodeGitManagerCommitEntry = Schema.decodeUnknownSync(GitManagerCommitEntry);
+const decodeGitManagerCommitPage = Schema.decodeUnknownSync(GitManagerCommitPage);
+const decodeGitManagerDiffSource = Schema.decodeUnknownSync(GitManagerDiffSource);
+const decodeGitManagerDiff = Schema.decodeUnknownSync(GitManagerDiff);
+const decodeGitManagerStashEntry = Schema.decodeUnknownSync(GitManagerStashEntry);
+const decodeGitManagerConflictState = Schema.decodeUnknownSync(GitManagerConflictState);
+const decodeGitManagerMergePreview = Schema.decodeUnknownSync(GitManagerMergePreview);
+const decodeGitManagerOperationRequest = Schema.decodeUnknownSync(GitManagerOperationRequest);
+const decodeGitManagerOperationEvent = Schema.decodeUnknownSync(GitManagerOperationEvent);
+const decodeGitManagerSignalEvent = Schema.decodeUnknownSync(GitManagerSignalEvent);
+const decodeGitManagerOperationError = Schema.decodeUnknownSync(GitManagerOperationError);
+
 describe("GitManagerBlockedReason", () => {
   it("round-trips a server-authored blocked reason verbatim", () => {
-    const decoded = Schema.decodeUnknownSync(GitManagerBlockedReason)({
+    const decoded = decodeGitManagerBlockedReason({
       operation: "checkout",
       code: "worktree-checked-out",
       message: "Checkout is blocked: this branch is already checked out in another worktree.",
@@ -34,7 +50,7 @@ describe("GitManagerBlockedReason", () => {
 
 describe("Git Manager wire schemas", () => {
   it("decodes a registered worktree including a missing directory", () => {
-    const decoded = Schema.decodeUnknownSync(GitManagerWorktreeEntry)({
+    const decoded = decodeGitManagerWorktreeEntry({
       path: "/repo-worktrees/topic",
       headSha: "abc123",
       branch: "topic",
@@ -49,7 +65,7 @@ describe("Git Manager wire schemas", () => {
   });
 
   it("keeps server-authored blocked reasons on refs", () => {
-    const decoded = Schema.decodeUnknownSync(GitManagerRefEntry)({
+    const decoded = decodeGitManagerRefEntry({
       name: "topic",
       tipSha: "abc123",
       upstream: "origin/topic",
@@ -72,7 +88,7 @@ describe("Git Manager wire schemas", () => {
   });
 
   it("decodes the complete repository refs snapshot", () => {
-    const decoded = Schema.decodeUnknownSync(GitManagerRefsSnapshot)({
+    const decoded = decodeGitManagerRefsSnapshot({
       generation: 7,
       headRef: "main",
       detachedSha: null,
@@ -90,7 +106,7 @@ describe("Git Manager wire schemas", () => {
   });
 
   it("preserves commit author and committer identities independently", () => {
-    const decoded = Schema.decodeUnknownSync(GitManagerCommitEntry)({
+    const decoded = decodeGitManagerCommitEntry({
       sha: "abcdef123456",
       shortSha: "abcdef1",
       parents: ["parent1", "parent2"],
@@ -110,7 +126,7 @@ describe("Git Manager wire schemas", () => {
   });
 
   it("keeps pinned tips and degraded paging explicit", () => {
-    const decoded = Schema.decodeUnknownSync(GitManagerCommitPage)({
+    const decoded = decodeGitManagerCommitPage({
       generation: 8,
       pinnedTips: ["abcdef123456"],
       commits: [],
@@ -123,7 +139,7 @@ describe("Git Manager wire schemas", () => {
   });
 
   it("uses a stash sha rather than a shifting index as a diff identity", () => {
-    const decoded = Schema.decodeUnknownSync(GitManagerDiffSource)({
+    const decoded = decodeGitManagerDiffSource({
       _tag: "stash",
       sha: "stash-sha",
       path: "src/file.ts",
@@ -133,7 +149,7 @@ describe("Git Manager wire schemas", () => {
   });
 
   it("decodes an explicit large-text diff marker without patch content", () => {
-    const decoded = Schema.decodeUnknownSync(GitManagerDiff)({
+    const decoded = decodeGitManagerDiff({
       _tag: "large-text",
       generation: 9,
       source: { _tag: "commit", sha: "abcdef123456", path: "src/file.ts" },
@@ -144,7 +160,7 @@ describe("Git Manager wire schemas", () => {
   });
 
   it("keeps a stash sha stable while its list index remains presentation data", () => {
-    const decoded = Schema.decodeUnknownSync(GitManagerStashEntry)({
+    const decoded = decodeGitManagerStashEntry({
       index: 0,
       sha: "stash-sha",
       message: "WIP on main",
@@ -157,7 +173,7 @@ describe("Git Manager wire schemas", () => {
   });
 
   it("decodes conflict kind, marker count, and nullable resolution", () => {
-    const decoded = Schema.decodeUnknownSync(GitManagerConflictState)({
+    const decoded = decodeGitManagerConflictState({
       path: "src/conflicted.ts",
       kind: "text",
       markerCount: 3,
@@ -167,7 +183,7 @@ describe("Git Manager wire schemas", () => {
   });
 
   it("keeps merge conflict counts server-authored", () => {
-    const decoded = Schema.decodeUnknownSync(GitManagerMergePreview)({
+    const decoded = decodeGitManagerMergePreview({
       _tag: "conflicted",
       source: "topic",
       current: "main",
@@ -180,7 +196,7 @@ describe("Git Manager wire schemas", () => {
   });
 
   it("decodes branch, sync, stash, merge, rewrite, conflict, and tag operations", () => {
-    const decode = Schema.decodeUnknownSync(GitManagerOperationRequest);
+    const decode = decodeGitManagerOperationRequest;
     const base = { cwd: "/repo", projectId: "project-1" };
     const operations = [
       { ...base, _tag: "branch-create", name: "topic", startPoint: null, checkout: true },
@@ -205,7 +221,7 @@ describe("Git Manager wire schemas", () => {
   });
 
   it("decodes the four operation stream event kinds", () => {
-    const decode = Schema.decodeUnknownSync(GitManagerOperationEvent);
+    const decode = decodeGitManagerOperationEvent;
     expect(
       [
         { _tag: "started", operation: "fetch" },
@@ -223,13 +239,14 @@ describe("Git Manager wire schemas", () => {
   });
 
   it("decodes the live repository generation signal", () => {
-    expect(
-      Schema.decodeUnknownSync(GitManagerSignalEvent)({ cwd: "/repo", generation: 10 }),
-    ).toEqual({ cwd: "/repo", generation: 10 });
+    expect(decodeGitManagerSignalEvent({ cwd: "/repo", generation: 10 })).toEqual({
+      cwd: "/repo",
+      generation: 10,
+    });
   });
 
   it("preserves operation error messages and nullable blocked reasons", () => {
-    const decoded = Schema.decodeUnknownSync(GitManagerOperationError)({
+    const decoded = decodeGitManagerOperationError({
       _tag: "GitManagerOperationError",
       operation: "checkout",
       code: "not-implemented",
