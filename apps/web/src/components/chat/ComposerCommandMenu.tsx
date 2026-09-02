@@ -86,37 +86,50 @@ export const ComposerCommandMenu = memo(function ComposerCommandMenu(props: {
     >
       <div
         ref={listRef}
+        aria-busy={props.isLoading ? "true" : "false"}
+        data-composer-menu="true"
+        data-composer-menu-loading={props.isLoading ? "true" : "false"}
         className="relative w-full overflow-hidden rounded-[20px] border border-border/80 bg-popover/96 shadow-lg/8 backdrop-blur-xs"
       >
         {props.items.length > 0 ? (
-          <CommandList className="max-h-72">
-            {groups.map((group, groupIndex) => (
-              <div key={group.id} data-composer-group={group.id}>
-                {groupIndex > 0 ? <CommandSeparator className="my-0.5" /> : null}
-                <CommandGroup>
-                  <CommandGroupLabel
-                    data-composer-group-label={group.id}
-                    className="px-3 pt-2 pb-1 text-[10px] font-semibold uppercase tracking-[0.08em] text-muted-foreground/55"
-                  >
-                    {group.label}
-                  </CommandGroupLabel>
-                  {group.items.map((item) => (
-                    <ComposerCommandMenuItem
-                      key={item.id}
-                      item={item}
-                      resolvedTheme={props.resolvedTheme}
-                      isActive={props.activeItemId === item.id}
-                      onHighlight={props.onHighlightedItemChange}
-                      onSelect={props.onSelect}
-                    />
-                  ))}
-                </CommandGroup>
-              </div>
-            ))}
-          </CommandList>
+          <>
+            <CommandList className="max-h-72">
+              {groups.map((group, groupIndex) => (
+                <div key={group.id} data-composer-group={group.id}>
+                  {groupIndex > 0 ? <CommandSeparator className="my-0.5" /> : null}
+                  <CommandGroup>
+                    <CommandGroupLabel
+                      data-composer-group-label={group.id}
+                      className="px-3 pt-2 pb-1 text-xs font-semibold uppercase text-muted-foreground"
+                    >
+                      {group.label}
+                    </CommandGroupLabel>
+                    {group.items.map((item) => (
+                      <ComposerCommandMenuItem
+                        key={item.id}
+                        item={item}
+                        resolvedTheme={props.resolvedTheme}
+                        isActive={props.activeItemId === item.id}
+                        onHighlight={props.onHighlightedItemChange}
+                        onSelect={props.onSelect}
+                      />
+                    ))}
+                  </CommandGroup>
+                </div>
+              ))}
+            </CommandList>
+            {props.isLoading ? (
+              <p
+                role="status"
+                className="border-t border-border/60 px-3 py-1.5 text-xs text-muted-foreground"
+              >
+                Searching workspace files...
+              </p>
+            ) : null}
+          </>
         ) : (
           <div className="px-5 py-3.5">
-            <p className="text-muted-foreground/70 text-xs">
+            <p className="text-muted-foreground text-xs">
               {props.isLoading
                 ? "Searching workspace files..."
                 : (props.emptyStateText ?? "No matching command.")}
@@ -184,12 +197,12 @@ const ComposerCommandMenuItem = memo(function ComposerCommandMenuItem(props: {
       ) : null}
       <span className="flex min-w-0 flex-1 items-center gap-2">
         <span className="shrink-0">{props.item.label}</span>
-        <span className="min-w-0 flex-1 truncate text-muted-foreground/70 text-xs">
+        <span className="min-w-0 flex-1 truncate text-muted-foreground text-xs">
           {props.item.description}
         </span>
       </span>
       {skillSourceLabel ? (
-        <span className="shrink-0 pl-2 text-muted-foreground/70 text-xs">{skillSourceLabel}</span>
+        <span className="shrink-0 pl-2 text-muted-foreground text-xs">{skillSourceLabel}</span>
       ) : null}
     </CommandItem>
   );

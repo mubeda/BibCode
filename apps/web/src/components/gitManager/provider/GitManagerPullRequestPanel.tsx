@@ -7,15 +7,11 @@ import type {
 import { CheckCircle2Icon, GitPullRequestIcon, RefreshCwIcon } from "lucide-react";
 import { memo, useCallback, useMemo, useState } from "react";
 
-import { randomUUID } from "../../../lib/utils";
 import { gitManagerEnvironment } from "../../../state/gitManager";
 import { useEnvironmentQuery } from "../../../state/query";
-import { useGitStackedAction } from "../../../state/sourceControlActions";
 import { Button } from "../../ui/button";
-import {
-  createPullRequestAction,
-  resolveProviderPanePresentation,
-} from "./GitManagerPullRequestPanel.logic";
+import { GitManagerCreatePullRequestDialog } from "./GitManagerCreatePullRequestDialog";
+import { resolveProviderPanePresentation } from "./GitManagerPullRequestPanel.logic";
 
 const EMPTY_PULL_REQUESTS: ReadonlyArray<GitManagerPullRequestEntry> = Object.freeze([]);
 const EMPTY_CHECKS: ReadonlyArray<GitManagerCheckEntry> = Object.freeze([]);
@@ -52,7 +48,7 @@ const PullRequestRow = memo(function PullRequestRow({ pullRequest }: PullRequest
               {pullRequest.title}
             </a>
           )}
-          <p className="mt-1 text-[11px] text-muted-foreground">
+          <p className="mt-1 text-xs text-muted-foreground">
             #{pullRequest.number} · {pullRequest.headBranch} → {pullRequest.baseBranch} ·{` `}
             {pullRequest.state}
           </p>
@@ -75,7 +71,7 @@ const CheckRow = memo(function CheckRow({ check }: CheckRowProps) {
       {check.workflow === null ? null : (
         <span className="truncate text-muted-foreground">{check.workflow}</span>
       )}
-      <span className="font-mono text-[10px]">{check.state}</span>
+      <span className="font-mono text-xs">{check.state}</span>
     </>
   );
   return (
@@ -128,9 +124,7 @@ export const GitManagerPullRequestPanel = memo(function GitManagerPullRequestPan
   });
   const pullRequests = result?.pullRequests ?? EMPTY_PULL_REQUESTS;
   const checks = result?.checks ?? EMPTY_CHECKS;
-  const createPullRequest = useGitStackedAction(scope);
-  const createPullRequestRun = createPullRequest.run;
-  const createPullRequestPending = createPullRequest.isPending;
+  const [createDialogOpen, setCreateDialogOpen] = useState(false);
 
   const refresh = useCallback(() => {
     if (disabledReason !== null) return;
@@ -141,10 +135,11 @@ export const GitManagerPullRequestPanel = memo(function GitManagerPullRequestPan
       setRequested(true);
     }
   }, [disabledReason, onRefresh, query.refresh, requested]);
+  // Opening the review surface publishes nothing; the dialog owns the action.
   const create = useCallback(() => {
     if (disabledReason !== null) return;
-    void createPullRequestRun(createPullRequestAction(randomUUID()));
-  }, [createPullRequestRun, disabledReason]);
+    setCreateDialogOpen(true);
+  }, [disabledReason]);
   const disabledReasonId =
     disabledReason === null ? undefined : "git-manager-pull-request-panel-disabled-reason";
 
@@ -153,14 +148,13 @@ export const GitManagerPullRequestPanel = memo(function GitManagerPullRequestPan
       <header className="flex items-center justify-between gap-3">
         <div>
           <h2 className="text-sm font-semibold">Pull requests and checks</h2>
-          <p className="text-[11px] text-muted-foreground">
-            Provider data refreshes only on demand.
-          </p>
+          <p className="text-xs text-muted-foreground">Provider data refreshes only on demand.</p>
         </div>
         <div className="flex gap-2">
           <Button
             aria-describedby={disabledReasonId}
-            disabled={disabledReason !== null || createPullRequestPending}
+            aria-haspopup="dialog"
+            disabled={disabledReason !== null}
             size="xs"
             title={disabledReason ?? undefined}
             variant="outline"
@@ -213,6 +207,14 @@ export const GitManagerPullRequestPanel = memo(function GitManagerPullRequestPan
             ))}
           </ul>
         </div>
+      ) : null}
+      {createDialogOpen ? (
+        <GitManagerCreatePullRequestDialog
+          open
+          scope={scope}
+          onOpenChange={setCreateDialogOpen}
+          onSettled={refresh}
+        />
       ) : null}
     </section>
   );

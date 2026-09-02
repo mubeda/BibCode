@@ -11,10 +11,10 @@
           "operation": "",
           "command": "1_0T_(mM)X",
           "cwd": "f5 ;nx",
-          "argumentCount": 94162.1484375,
+          "argumentCount": 94162.15625,
           "exitCode": -1.401298464324817e-45,
-          "stdoutLength": 24.25819206237793,
-          "stderrLength": -3.4028234663852886e38,
+          "stdoutLength": 24.258193969726562,
+          "stderrLength": -3.4028232635611926e38,
           "detail": "toString",
           "cause": {
             "9))w2\"": [

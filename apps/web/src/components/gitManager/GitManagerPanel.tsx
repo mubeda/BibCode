@@ -968,7 +968,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
             <GitManagerHistoryView
               blockedReasons={repositoryBlockedReasons}
               branchSyncDisabledReason={branchSyncDisabledReason}
-              liveSignalAvailable={liveSignalDisabledReason === null}
+              repositoryGeneration={snapshot?.generation ?? null}
               projectRef={projectRef}
               rewriteDisabledReason={rewriteDisabledReason}
               scope={scope}

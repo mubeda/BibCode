@@ -98,7 +98,13 @@ fixture worktrees.
 Run the shared focused and sequential broad/static gate set. Record macOS
 linker, compact-unwind, process-signal, WebKit, signing, and DMG diagnostics
 with their affected test or artifact. Do not suppress a warning without
-classifying it.
+classifying it. The known `ld: __eh_frame section too large (max 16MB) to
+encode dwarf unwind offsets in compact unwind table` message on the
+`bibcode-server` library test binary is benign: the unoptimized test binary
+exceeds the compact-unwind encoding limit, so the linker keeps DWARF unwind
+tables for it and only exception-unwinding performance of that test binary is
+affected. It is not emitted for shipped release artifacts; report it with the
+affected test target rather than suppressing the `linker_messages` lint.
 
 For update validation, use an isolated `BIBCODE_HOME` and disposable project.
 Keep a read subscription open while installing an available test update and

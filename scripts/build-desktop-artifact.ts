@@ -473,10 +473,150 @@ export const resolveTauriBuildPlan = Effect.fn("resolveTauriBuildPlan")(function
         updater && platform === "mac" && target === "dmg" ? "app,dmg" : target,
         "--target",
         rustTarget,
+        // tauri-bundler logs the generated bundle_dmg.sh (create-dmg, hdiutil,
+        // AppleScript) output only at debug level, so a DMG build without
+        // --verbose reports a failed attempt as an opaque "failed to run
+        // bundle_dmg.sh". Verbose logging keeps the first failure diagnosable.
+        ...(platform === "mac" && target === "dmg" ? ["--verbose"] : []),
       ],
       cwd: repoRoot,
     },
   };
+});
+
+export const TAURI_BUILD_ATTEMPTS = 3;
+
+export interface DetachedDmgImage {
+  readonly imagePath: string;
+  readonly device: string;
+}
+
+export interface DmgMountCleanupReport {
+  readonly detached: ReadonlyArray<DetachedDmgImage>;
+  readonly failures: ReadonlyArray<{ readonly imagePath: string; readonly detail: string }>;
+}
+
+const EMPTY_DMG_MOUNT_CLEANUP: DmgMountCleanupReport = { detached: [], failures: [] };
+
+interface HdiutilImage {
+  readonly imagePath: string;
+  readonly devices: ReadonlyArray<string>;
+}
+
+/**
+ * Reads the images `hdiutil info -plist` reports. The XML lists each image's
+ * `image-path` before its `system-entities`, so a linear scan of key/string
+ * pairs attributes every `dev-entry` to the most recent image.
+ */
+export function parseHdiutilImages(plist: string): ReadonlyArray<HdiutilImage> {
+  const images: Array<{ imagePath: string; devices: string[] }> = [];
+  const pairs = plist.matchAll(/<key>([^<]*)<\/key>\s*<string>([^<]*)<\/string>/g);
+  for (const [, key, value] of pairs) {
+    if (key === "image-path") {
+      images.push({ imagePath: decodePlistText(value ?? ""), devices: [] });
+    } else if (key === "dev-entry" && images.length > 0) {
+      images[images.length - 1]!.devices.push(decodePlistText(value ?? ""));
+    }
+  }
+  return images;
+}
+
+function decodePlistText(value: string): string {
+  return value
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&quot;", '"')
+    .replaceAll("&apos;", "'")
+    .replaceAll("&amp;", "&");
+}
+
+/**
+ * The intermediate read/write image the generated `bundle_dmg.sh` attaches is
+ * `rw.<name>.dmg` inside the bundle's dmg directory. Only an image at exactly
+ * that location belongs to this build; anything else on the host (a user's
+ * mounted release DMG with the same volume name, another worktree's build)
+ * is never touched.
+ */
+export function isRunOwnedIntermediateDmg(
+  path: Path.Path,
+  bundleDir: string,
+  imagePath: string,
+): boolean {
+  const parent = path.dirname(imagePath);
+  const name = path.basename(imagePath);
+  return (
+    path.resolve(parent) === path.resolve(bundleDir) &&
+    name.startsWith("rw.") &&
+    name.endsWith(".dmg")
+  );
+}
+
+const captureStdout = Effect.fn("captureSpawnStdout")(function* (
+  command: string,
+  args: ReadonlyArray<string>,
+  env: NodeJS.ProcessEnv,
+) {
+  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const child = yield* spawner.spawn(
+    ChildProcess.make(command, args, { env, stdout: "pipe", stderr: "inherit" }),
+  );
+  const stdout = yield* child.stdout.pipe(Stream.decodeText(), Stream.mkString);
+  const exitCode = yield* child.exitCode;
+  return { exitCode: Number(exitCode), stdout };
+});
+
+/**
+ * Detaches the intermediate images a failed DMG attempt left mounted so the
+ * next attempt starts from a clean host. Cleanup is scoped to this build's
+ * bundle directory and never relies on the retry itself; every detach outcome
+ * is reported so a leaked mount is visible even when the retry succeeds.
+ */
+export const detachRunOwnedDmgMounts = Effect.fn("detachRunOwnedDmgMounts")(function* (
+  plan: Pick<TauriBuildPlan, "platform" | "target" | "bundleDir">,
+  env: NodeJS.ProcessEnv,
+) {
+  if (plan.platform !== "mac" || plan.target !== "dmg") {
+    return EMPTY_DMG_MOUNT_CLEANUP;
+  }
+  const path = yield* Path.Path;
+  const info = yield* captureStdout("hdiutil", ["info", "-plist"], env).pipe(
+    Effect.catchCause((cause) =>
+      Effect.succeed({ exitCode: -1, stdout: "", detail: String(cause) as string | undefined }),
+    ),
+  );
+  if (info.exitCode !== 0) {
+    return {
+      detached: [],
+      failures: [
+        {
+          imagePath: plan.bundleDir,
+          detail: `hdiutil info exited with code ${String(info.exitCode)}; mounted images could not be inspected.`,
+        },
+      ],
+    } satisfies DmgMountCleanupReport;
+  }
+  const detached: DetachedDmgImage[] = [];
+  const failures: Array<{ readonly imagePath: string; readonly detail: string }> = [];
+  for (const image of parseHdiutilImages(info.stdout)) {
+    if (!isRunOwnedIntermediateDmg(path, plan.bundleDir, image.imagePath)) continue;
+    const device = image.devices[0];
+    if (device === undefined) {
+      failures.push({ imagePath: image.imagePath, detail: "no device entry was reported" });
+      continue;
+    }
+    const result = yield* captureStdout("hdiutil", ["detach", device, "-force"], env).pipe(
+      Effect.catchCause((cause) => Effect.succeed({ exitCode: -1, stdout: String(cause) })),
+    );
+    if (result.exitCode === 0) {
+      detached.push({ imagePath: image.imagePath, device });
+    } else {
+      failures.push({
+        imagePath: image.imagePath,
+        detail: `hdiutil detach ${device} exited with code ${String(result.exitCode)}`,
+      });
+    }
+  }
+  return { detached, failures } satisfies DmgMountCleanupReport;
 });
 
 export function parseTauriArtifactCliArgs(argv: ReadonlyArray<string>): TauriBuildCliInput {
@@ -1113,6 +1253,46 @@ export const copyTauriBundleArtifacts = Effect.fn("copyTauriBundleArtifacts")(fu
   );
 });
 
+/**
+ * Runs the Tauri build with bounded attempts. Every failed attempt is reported
+ * with its exit code, this build's leaked intermediate DMG mounts are detached
+ * and reported before the next attempt, and the final error preserves the
+ * first failure instead of only the last one.
+ */
+const runBuildAttempts = Effect.fn("runTauriBuildAttempts")(function* (
+  plan: Pick<TauriBuildPlan, "buildCommand" | "platform" | "target" | "bundleDir">,
+  env: NodeJS.ProcessEnv,
+  write: (text: string) => void,
+) {
+  const failures: string[] = [];
+  for (let attempt = 1; attempt <= TAURI_BUILD_ATTEMPTS; attempt += 1) {
+    const outcome = yield* runSpawnPlan(plan.buildCommand, env).pipe(Effect.result);
+    if (outcome._tag === "Success") {
+      return;
+    }
+    failures.push(outcome.failure.message);
+    write(
+      `[desktop-artifact] Build attempt ${String(attempt)} of ${String(TAURI_BUILD_ATTEMPTS)} failed: ${outcome.failure.message}\n`,
+    );
+    const cleanup = yield* detachRunOwnedDmgMounts(plan, env);
+    for (const image of cleanup.detached) {
+      write(
+        `[desktop-artifact] Detached this build's intermediate image ${image.imagePath} (${image.device}) left mounted by the failed attempt.\n`,
+      );
+    }
+    for (const failure of cleanup.failures) {
+      write(
+        `[desktop-artifact] Could not detach ${failure.imagePath}: ${failure.detail}. Detach it manually before relying on the result.\n`,
+      );
+    }
+  }
+  return yield* Effect.fail(
+    new TauriDesktopBuildConfigurationError(
+      `Tauri build failed after ${String(TAURI_BUILD_ATTEMPTS)} attempts. First failure: ${failures[0] ?? "unknown"}. Last failure: ${failures.at(-1) ?? "unknown"}.`,
+    ),
+  );
+});
+
 export const buildTauriDesktopArtifact = Effect.fn("buildTauriDesktopArtifact")(function* (
   input: TauriBuildCliInput,
   env: NodeJS.ProcessEnv = process.env,
@@ -1128,7 +1308,7 @@ export const buildTauriDesktopArtifact = Effect.fn("buildTauriDesktopArtifact")(
     write(
       `[desktop-artifact] Building ${plan.platform}/${plan.target} (${plan.arch}, ${plan.rustTarget})...\n`,
     );
-    yield* runSpawnPlan(plan.buildCommand, env).pipe(Effect.retry({ times: 2 }));
+    yield* runBuildAttempts(plan, env, write);
   }
 
   const artifacts = yield* copyTauriBundleArtifacts(plan);

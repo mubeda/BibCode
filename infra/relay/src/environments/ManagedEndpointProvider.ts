@@ -101,7 +101,7 @@ export class ManagedEndpointOriginNotAllowed extends Schema.TaggedErrorClass<Man
     userId: Schema.String,
     environmentId: Schema.String,
     host: Schema.String,
-    port: Schema.Number,
+    port: Schema.Finite,
   },
 ) {
   override get message(): string {
@@ -111,7 +111,7 @@ export class ManagedEndpointOriginNotAllowed extends Schema.TaggedErrorClass<Man
 
 export class ManagedEndpointProviderCallTimedOut extends Schema.TaggedErrorClass<ManagedEndpointProviderCallTimedOut>()(
   "ManagedEndpointProviderCallTimedOut",
-  { timeoutMillis: Schema.Number },
+  { timeoutMillis: Schema.Finite },
 ) {
   override get message(): string {
     return `Managed endpoint provider call exceeded ${this.timeoutMillis}ms`;

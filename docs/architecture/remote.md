@@ -20,6 +20,17 @@ environment identity.
 - Remote clients use the same HTTP and Effect RPC APIs as local clients.
 - Credentials are exchanged for bounded sessions; raw bootstrap credentials do
   not remain in WebSocket URLs.
+- The desktop bootstrap credential stands for the host's own WebView, which
+  exchanges it on every load and after every backend restart, once for its
+  bearer access token and once for its browser-session cookie. Each exchange
+  supersedes (durably revokes, closing live connections) every earlier active
+  session minted from the desktop bootstrap with the same session method on
+  that data root, so the host holds exactly one bearer and one cookie session
+  and the paired-client list shows one row per method for it. One-time pairing
+  exchanges are never superseded. Two desktop-mode servers
+  sharing one data root would therefore supersede each other; the Tauri host
+  starts one desktop backend per root, and headless servers have no desktop
+  bootstrap.
 
 ## Client targets
 

@@ -48,6 +48,8 @@ const PENDING_PAIRING_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const PAIRING_TTL_MS: i64 = 5 * 60 * 1_000;
 const CLOUD_PAIRING_TTL_MS: i64 = 2 * 60 * 1_000;
 const DESKTOP_BOOTSTRAP_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
+/// Subject of every session minted from the desktop bootstrap credential.
+const DESKTOP_BOOTSTRAP_SUBJECT: &str = "desktop-bootstrap";
 const PAIRING_ALPHABET: &[u8] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
 const PAIRING_LENGTH: usize = 12;
 const PAIRING_REJECTION_LIMIT: u8 =
@@ -261,6 +263,8 @@ fn ensure_pairing_offer_capacity(
 
 #[derive(Default)]
 struct AuthGrantMetadata {
+    /// Whether the session comes from the reusable desktop bootstrap credential.
+    desktop_bootstrap: bool,
     proof_key_thumbprint: Option<String>,
     reach: Option<String>,
     off_host: Option<bool>,
@@ -344,6 +348,10 @@ struct Grant {
     label: Option<String>,
     reach: Option<String>,
     off_host: Option<bool>,
+    /// The reusable desktop bootstrap credential of this backend process. The
+    /// host's own WebView exchanges it on every load and after every backend
+    /// restart, so a new exchange supersedes the sessions it minted before.
+    desktop_bootstrap: bool,
 }
 
 pub struct IssuedSession {
@@ -722,6 +730,7 @@ impl AuthService {
             transport,
             AuthSessionIssuanceMetadata {
                 grant: AuthGrantMetadata {
+                    desktop_bootstrap: grant.desktop_bootstrap,
                     reach: grant.reach,
                     off_host: grant.off_host,
                     ..AuthGrantMetadata::default()
@@ -834,6 +843,7 @@ impl AuthService {
             transport,
             AuthSessionIssuanceMetadata {
                 grant: AuthGrantMetadata {
+                    desktop_bootstrap: grant.desktop_bootstrap,
                     proof_key_thumbprint,
                     reach: grant.reach,
                     off_host: grant.off_host,
@@ -1099,6 +1109,7 @@ impl AuthService {
                 "one-time-token",
                 PAIRING_TTL_MS,
                 AuthGrantMetadata {
+                    desktop_bootstrap: false,
                     proof_key_thumbprint: Some(proof_key_thumbprint),
                     ..AuthGrantMetadata::default()
                 },
@@ -1122,6 +1133,7 @@ impl AuthService {
                 "cloud-connect",
                 CLOUD_PAIRING_TTL_MS,
                 AuthGrantMetadata {
+                    desktop_bootstrap: false,
                     proof_key_thumbprint: Some(proof_key_thumbprint),
                     ..AuthGrantMetadata::default()
                 },
@@ -1162,6 +1174,7 @@ impl AuthService {
                 "one-time-token",
                 PAIRING_TTL_MS,
                 AuthGrantMetadata {
+                    desktop_bootstrap: false,
                     reach: Some(reach),
                     off_host: Some(off_host),
                     ..AuthGrantMetadata::default()
@@ -1191,6 +1204,7 @@ impl AuthService {
                 "one-time-token",
                 PAIRING_TTL_MS,
                 AuthGrantMetadata {
+                    desktop_bootstrap: false,
                     reach: Some(reach),
                     off_host: Some(off_host),
                     ..AuthGrantMetadata::default()
@@ -1216,6 +1230,7 @@ impl AuthService {
         offer_reservation: Option<PairingOfferReservation>,
     ) -> Result<PairingIssuance, AuthError> {
         let AuthGrantMetadata {
+            desktop_bootstrap: _,
             proof_key_thumbprint,
             reach,
             off_host,
@@ -1778,6 +1793,63 @@ impl AuthService {
         Ok(true)
     }
 
+    /// Revokes every active session the desktop bootstrap credential minted
+    /// before a new exchange. The host has one WebView, and each of its loads
+    /// or backend restarts exchanges the same reusable credential; without this
+    /// every launch would leave another "current host" row in the paired-client
+    /// list. Runs under the issuance lock after the replacement session is
+    /// durable, so concurrent exchanges serialize and a crash in between leaves
+    /// sessions the next exchange supersedes. With persistence the database is
+    /// the authority (the authority watcher converges memory to it), so the
+    /// candidates come from the persisted active rows and revocation goes
+    /// through the persisted path; the watcher cannot resurrect a superseded
+    /// session. The WebView holds one session per session method (its bearer
+    /// access token and its browser-session cookie), so only sessions issued
+    /// with the same `method` are superseded. `replacement_session_id` is the
+    /// session being issued and is never revoked.
+    async fn supersede_desktop_bootstrap_sessions(
+        &self,
+        replacement_session_id: &str,
+        method: &str,
+    ) -> Result<usize, AuthError> {
+        let now = now_ms();
+        let mut superseded = if let Some(repositories) = &self.repositories {
+            repositories
+                .list_active_auth_sessions(format_iso(now))
+                .await
+                .map_err(|error| AuthError::Internal(error.to_string()))?
+                .into_iter()
+                .filter(|session| {
+                    session.subject == DESKTOP_BOOTSTRAP_SUBJECT && session.method == method
+                })
+                .map(|session| session.session_id)
+                .collect::<Vec<_>>()
+        } else {
+            let state = self.state.lock().await;
+            state
+                .sessions
+                .values()
+                .filter(|session| {
+                    session.subject == DESKTOP_BOOTSTRAP_SUBJECT
+                        && session.method == method
+                        && session.revoked_at_ms.is_none()
+                        && session.expires_at_ms > now
+                })
+                .map(|session| session.session_id.clone())
+                .collect::<Vec<_>>()
+        };
+        superseded.retain(|session_id| session_id != replacement_session_id);
+        superseded.sort_unstable();
+        superseded.dedup();
+        let mut revoked = 0;
+        for session_id in superseded {
+            if self.revoke_session(&session_id).await? {
+                revoked += 1;
+            }
+        }
+        Ok(revoked)
+    }
+
     async fn revoke_session(&self, target_session_id: &str) -> Result<bool, AuthError> {
         let revoked_at = now_ms();
         if let Some(repositories) = &self.repositories {
@@ -1961,6 +2033,7 @@ impl AuthService {
         let AuthSessionIssuanceMetadata {
             grant:
                 AuthGrantMetadata {
+                    desktop_bootstrap,
                     proof_key_thumbprint,
                     reach,
                     off_host,
@@ -2014,7 +2087,20 @@ impl AuthService {
             state.sessions.retain(|_, session| {
                 session.revoked_at_ms.is_none() && session.expires_at_ms > issued_at
             });
-            if state.sessions.len() >= MAX_ACTIVE_SESSIONS {
+            // Sessions the desktop bootstrap is about to supersede do not hold
+            // capacity against the session that replaces them.
+            let occupied = if desktop_bootstrap {
+                state
+                    .sessions
+                    .values()
+                    .filter(|session| {
+                        session.subject != DESKTOP_BOOTSTRAP_SUBJECT || session.method != method
+                    })
+                    .count()
+            } else {
+                state.sessions.len()
+            };
+            if occupied >= MAX_ACTIVE_SESSIONS {
                 return Err(AuthError::Internal(
                     "active session capacity exceeded".to_owned(),
                 ));
@@ -2029,6 +2115,10 @@ impl AuthService {
                 .create_auth_session(persisted_auth_session(&record))
                 .await
                 .map_err(|error| AuthError::Internal(error.to_string()))?;
+        }
+        if desktop_bootstrap {
+            self.supersede_desktop_bootstrap_sessions(&session_id, method)
+                .await?;
         }
         let mut state = self.state.lock().await;
         state.sessions.insert(session_id.clone(), record);
@@ -2064,10 +2154,11 @@ impl AuthService {
             return if desktop.expires_at_ms > now {
                 Ok(Grant {
                     scopes: owned_scopes(ADMINISTRATIVE_SCOPES),
-                    subject: "desktop-bootstrap".to_owned(),
+                    subject: DESKTOP_BOOTSTRAP_SUBJECT.to_owned(),
                     label: None,
                     reach: None,
                     off_host: None,
+                    desktop_bootstrap: true,
                 })
             } else {
                 Err(AuthError::InvalidCredential)
@@ -2099,6 +2190,7 @@ impl AuthService {
                 label: pairing.label,
                 reach: pairing.reach,
                 off_host: pairing.off_host,
+                desktop_bootstrap: false,
             });
         }
 
@@ -2126,6 +2218,7 @@ impl AuthService {
             label: pairing.label.clone(),
             reach: pairing.reach.clone(),
             off_host: pairing.off_host,
+            desktop_bootstrap: false,
         };
         drop(state);
         self.emit_access_change(AuthAccessChange::PairingLinkRemoved { id: pairing_id });
@@ -2758,6 +2851,265 @@ mod tests {
         assert!(!context.is_currently_authorized("orchestration:read").await);
     }
 
+    fn desktop_client() -> ClientMetadata {
+        ClientMetadata {
+            label: Some("BiBCode Tauri Desktop".to_owned()),
+            device_type: "desktop".to_owned(),
+            os: Some("macOS".to_owned()),
+            ..ClientMetadata::default()
+        }
+    }
+
+    async fn exchange_desktop_bootstrap(service: &AuthService) -> IssuedSession {
+        service
+            .exchange_bootstrap(
+                "desktop-test-seed",
+                None,
+                desktop_client(),
+                None,
+                SessionTransport::Plain,
+            )
+            .await
+            .expect("desktop bootstrap exchanges")
+    }
+
+    /// Issues and exchanges a one-time pairing so a test owns an independent
+    /// client session; the desktop bootstrap credential supersedes its own
+    /// earlier sessions, so it cannot mint several coexisting ones.
+    async fn paired_session(service: &AuthService, label: &str) -> IssuedSession {
+        let pairing = service
+            .issue_pairing(owned_scopes(STANDARD_SCOPES), Some(label.to_owned()))
+            .await
+            .expect("pairing issues");
+        service
+            .exchange_bootstrap(
+                &pairing.credential,
+                None,
+                ClientMetadata {
+                    label: Some(label.to_owned()),
+                    device_type: "mobile".to_owned(),
+                    ..ClientMetadata::default()
+                },
+                None,
+                SessionTransport::Plain,
+            )
+            .await
+            .expect("pairing exchanges")
+    }
+
+    #[tokio::test]
+    async fn desktop_bootstrap_exchange_supersedes_the_previous_desktop_session() {
+        let service = service();
+        let first = exchange_desktop_bootstrap(&service).await;
+        let second_load = exchange_desktop_bootstrap(&service).await;
+        let mut events = service.subscribe_access();
+        let third_load = exchange_desktop_bootstrap(&service).await;
+
+        let (_, _, clients) = service
+            .access_snapshot(&third_load.principal.session_id)
+            .await;
+        assert_eq!(
+            clients
+                .iter()
+                .map(|client| client.session_id.as_str())
+                .collect::<Vec<_>>(),
+            [third_load.principal.session_id.as_str()],
+            "the host's WebView holds exactly one session"
+        );
+        assert!(clients[0].current);
+        assert_eq!(
+            clients[0].client.label.as_deref(),
+            Some("BiBCode Tauri Desktop")
+        );
+
+        let removed = events.recv().await.expect("superseded session removal");
+        assert!(matches!(
+            removed.change,
+            AuthAccessChange::ClientRemoved { ref session_id }
+                if *session_id == second_load.principal.session_id
+        ));
+        let upserted = events.recv().await.expect("new session announcement");
+        assert!(matches!(
+            upserted.change,
+            AuthAccessChange::ClientUpserted(ref view)
+                if view.session_id == third_load.principal.session_id
+        ));
+
+        for stale in [&first, &second_load] {
+            let context =
+                RpcSessionContext::authenticated(stale.principal.clone(), service.clone());
+            assert!(
+                !context.is_currently_authorized("orchestration:read").await,
+                "a superseded desktop session no longer authorizes"
+            );
+        }
+        let current =
+            RpcSessionContext::authenticated(third_load.principal.clone(), service.clone());
+        assert!(current.is_currently_authorized("orchestration:read").await);
+    }
+
+    #[tokio::test]
+    async fn superseding_a_desktop_session_closes_its_live_connections() {
+        let service = service();
+        let first = exchange_desktop_bootstrap(&service).await;
+        let shutdown = CancellationToken::new();
+        service
+            .mark_connected(&first.principal.session_id, shutdown.clone())
+            .await
+            .expect("first session connects");
+        assert!(!shutdown.is_cancelled());
+
+        let second = exchange_desktop_bootstrap(&service).await;
+
+        assert!(
+            shutdown.is_cancelled(),
+            "the superseded session's connection is closed"
+        );
+        let (_, _, clients) = service.access_snapshot(&second.principal.session_id).await;
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].session_id, second.principal.session_id);
+        assert!(!clients[0].connected);
+    }
+
+    #[tokio::test]
+    async fn desktop_bootstrap_keeps_one_bearer_and_one_browser_cookie_session_side_by_side() {
+        let service = service();
+        let bearer = exchange_desktop_bootstrap(&service).await;
+        let cookie = service
+            .create_browser_session(
+                "desktop-test-seed",
+                desktop_client(),
+                SessionTransport::Plain,
+            )
+            .await
+            .expect("browser session issues");
+        let bearer_again = exchange_desktop_bootstrap(&service).await;
+        let cookie_again = service
+            .create_browser_session(
+                "desktop-test-seed",
+                desktop_client(),
+                SessionTransport::Plain,
+            )
+            .await
+            .expect("browser session re-issues");
+
+        let (_, _, clients) = service
+            .access_snapshot(&bearer_again.principal.session_id)
+            .await;
+        let mut remaining = clients
+            .iter()
+            .map(|client| (client.method.as_str(), client.session_id.as_str()))
+            .collect::<Vec<_>>();
+        remaining.sort_unstable();
+        let mut expected = vec![
+            (
+                "bearer-access-token",
+                bearer_again.principal.session_id.as_str(),
+            ),
+            (
+                "browser-session-cookie",
+                cookie_again.principal.session_id.as_str(),
+            ),
+        ];
+        expected.sort_unstable();
+        assert_eq!(
+            remaining, expected,
+            "each method keeps exactly its latest desktop session"
+        );
+        for stale in [&bearer, &cookie] {
+            let context =
+                RpcSessionContext::authenticated(stale.principal.clone(), service.clone());
+            assert!(!context.is_currently_authorized("orchestration:read").await);
+        }
+    }
+
+    #[tokio::test]
+    async fn pairing_exchanges_never_supersede_each_other_or_the_desktop_session() {
+        let service = service();
+        let desktop = exchange_desktop_bootstrap(&service).await;
+        let mut paired = Vec::new();
+        for label in ["Phone", "Tablet"] {
+            paired.push(paired_session(&service, label).await.principal.session_id);
+        }
+
+        let (_, _, clients) = service.access_snapshot(&desktop.principal.session_id).await;
+        let mut session_ids = clients
+            .iter()
+            .map(|client| client.session_id.clone())
+            .collect::<Vec<_>>();
+        session_ids.sort();
+        let mut expected = paired.clone();
+        expected.push(desktop.principal.session_id.clone());
+        expected.sort();
+        assert_eq!(session_ids, expected);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn desktop_supersession_persists_and_survives_authority_convergence() {
+        let database = crate::persistence::Database::open_in_memory()
+            .await
+            .expect("in-memory database opens");
+        database
+            .call(|connection| {
+                crate::persistence::run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("all migrations apply");
+        let repositories = Repositories::new(database);
+        let secrets = tempfile::tempdir().expect("secret store directory");
+        let secret_store = SecretStore::new(secrets.path())
+            .await
+            .expect("secret store opens");
+        let config = ServerConfig::new(".")
+            .with_bind("127.0.0.1", 3773)
+            .with_desktop("desktop-test-seed")
+            .expect("desktop config");
+        let service = AuthService::new_with_persistence(
+            &config,
+            vec![7_u8; 32],
+            secret_store,
+            repositories.clone(),
+        )
+        .await
+        .expect("persisted service starts");
+
+        let first = exchange_desktop_bootstrap(&service).await;
+        let _events = service.subscribe_access();
+        let second = exchange_desktop_bootstrap(&service).await;
+
+        let persisted_first = repositories
+            .get_auth_session(first.principal.session_id.clone())
+            .await
+            .expect("persisted session reads")
+            .expect("superseded session row remains for audit");
+        assert!(
+            persisted_first.revoked_at.is_some(),
+            "supersession is durable, not memory-only"
+        );
+        let active = repositories
+            .list_active_auth_sessions(format_iso(now_ms()))
+            .await
+            .expect("active sessions read");
+        assert_eq!(
+            active
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>(),
+            [second.principal.session_id.as_str()]
+        );
+
+        // The authority watcher reconciles memory with the database every 250 ms;
+        // the superseded session must not come back.
+        for _ in 0..4 {
+            tokio::time::advance(AUTHORITY_CONVERGENCE_INTERVAL).await;
+            tokio::task::yield_now().await;
+        }
+        let (_, _, clients) = service.access_snapshot(&second.principal.session_id).await;
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].session_id, second.principal.session_id);
+    }
+
     #[tokio::test]
     async fn revoking_other_clients_cancels_every_registered_connection() {
         let auth = service();
@@ -2771,26 +3123,8 @@ mod tests {
             )
             .await
             .expect("current session");
-        let first = auth
-            .exchange_bootstrap(
-                "desktop-test-seed",
-                None,
-                ClientMetadata::default(),
-                None,
-                SessionTransport::Plain,
-            )
-            .await
-            .expect("first other session");
-        let second = auth
-            .exchange_bootstrap(
-                "desktop-test-seed",
-                None,
-                ClientMetadata::default(),
-                None,
-                SessionTransport::Plain,
-            )
-            .await
-            .expect("second other session");
+        let first = paired_session(&auth, "first other").await;
+        let second = paired_session(&auth, "second other").await;
 
         let current_shutdown = CancellationToken::new();
         let first_shutdown_a = CancellationToken::new();
@@ -4003,16 +4337,7 @@ mod tests {
             )
             .await
             .expect("current session should issue");
-        let other = service
-            .exchange_bootstrap(
-                "desktop-test-seed",
-                None,
-                ClientMetadata::default(),
-                None,
-                SessionTransport::Plain,
-            )
-            .await
-            .expect("other session should issue");
+        let other = paired_session(&service, "other").await;
         let connection_id = service
             .mark_connected(&current.principal.session_id, CancellationToken::new())
             .await

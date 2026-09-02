@@ -11,8 +11,8 @@
           "operation": "bind",
           "command": "1",
           "cwd": "a[`M",
-          "stdoutLength": -889788891136,
-          "stderrLength": -15828464,
+          "stdoutLength": -889788825600,
+          "stderrLength": -15828463,
           "detail": "G G",
           "cause": "undefined"
         }

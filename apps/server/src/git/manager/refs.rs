@@ -558,7 +558,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::git::GitRepository;
+    use crate::git::{GitRepository, canonical_worktree_path_key};
 
     fn git_output(cwd: &Path, args: &[&str]) -> Output {
         Command::new("git")
@@ -578,7 +578,10 @@ mod tests {
     }
 
     fn repository_with_one_commit() -> TempDir {
-        let repository = TempDir::new().expect("temporary repository");
+        repository_with_one_commit_in(TempDir::new().expect("temporary repository"))
+    }
+
+    fn repository_with_one_commit_in(repository: TempDir) -> TempDir {
         git(repository.path(), &["init", "-q", "-b", "main"]);
         git(
             repository.path(),
@@ -604,12 +607,38 @@ mod tests {
         .expect("refs snapshot")
     }
 
-    #[tokio::test]
-    async fn occupied_branch_reports_its_worktree_path() {
-        let repository = repository_with_one_commit();
-        let worktree = repository.path().join("linked");
+    /// The server-owned physical identity of a path: symlinked ancestors such as
+    /// macOS `/var` → `/private/var` collapse onto one key, and Windows case or
+    /// verbatim-prefix spellings normalize the same way production does.
+    async fn physical_key(path: &Path) -> String {
+        canonical_worktree_path_key(path)
+            .await
+            .unwrap_or_else(|error| panic!("canonical key for {}: {error}", path.display()))
+    }
+
+    /// Git's own spelling of the fixture worktree from `git worktree list
+    /// --porcelain`, selected by physical identity so an aliased fixture path still
+    /// finds its entry. Backslashes are normalized the way the snapshot displays them.
+    async fn git_reported_spelling(repository: &Path, worktree: &Path) -> String {
+        let expected_key = physical_key(worktree).await;
+        let output = git_output(repository, &["worktree", "list", "--porcelain"]);
+        let listing = String::from_utf8(output.stdout).expect("UTF-8 worktree list");
+        for line in listing.lines() {
+            if let Some(path) = line.strip_prefix("worktree ")
+                && physical_key(Path::new(path)).await == expected_key
+            {
+                return path.replace('\\', "/");
+            }
+        }
+        panic!(
+            "git worktree list did not report the fixture worktree {}",
+            worktree.display()
+        );
+    }
+
+    fn add_feature_worktree(repository: &Path, worktree: &Path) {
         git(
-            repository.path(),
+            repository,
             &[
                 "worktree",
                 "add",
@@ -619,52 +648,128 @@ mod tests {
                 worktree.to_str().expect("UTF-8 fixture path"),
             ],
         );
+    }
 
-        let snapshot = snapshot(&repository).await;
-        let branch = snapshot
+    fn feature_worktree_path(snapshot: &GitManagerRefsSnapshot) -> String {
+        snapshot
             .local_branches
             .iter()
             .find(|branch| branch.name == "feature")
-            .expect("feature branch");
+            .expect("feature branch")
+            .worktree_path
+            .clone()
+            .expect("occupied branch reports its worktree path")
+    }
+
+    async fn assert_worktree_identity_and_spelling(
+        repository: &TempDir,
+        fixture_worktree: &Path,
+        reported: &str,
+    ) {
         assert_eq!(
-            branch.worktree_path.as_deref(),
-            Some(worktree.to_str().expect("UTF-8 fixture path"))
+            physical_key(Path::new(reported)).await,
+            physical_key(fixture_worktree).await,
+            "the reported worktree path must be the fixture worktree's physical identity"
         );
+        assert_eq!(
+            reported,
+            git_reported_spelling(repository.path(), fixture_worktree).await,
+            "the reported worktree path must keep Git's own display spelling"
+        );
+    }
+
+    #[tokio::test]
+    async fn occupied_branch_reports_its_worktree_path() {
+        let repository = repository_with_one_commit();
+        let worktree = repository.path().join("linked");
+        add_feature_worktree(repository.path(), &worktree);
+
+        let snapshot = snapshot(&repository).await;
+        let reported = feature_worktree_path(&snapshot);
+        assert_worktree_identity_and_spelling(&repository, &worktree, &reported).await;
     }
 
     #[tokio::test]
     async fn registered_but_missing_worktree_still_occupies_its_branch() {
         let repository = repository_with_one_commit();
         let worktree = repository.path().join("linked");
-        git(
-            repository.path(),
-            &[
-                "worktree",
-                "add",
-                "-q",
-                "-b",
-                "feature",
-                worktree.to_str().expect("UTF-8 fixture path"),
-            ],
-        );
+        add_feature_worktree(repository.path(), &worktree);
         fs::remove_dir_all(&worktree).expect("remove temporary linked worktree");
 
         let snapshot = snapshot(&repository).await;
-        let branch = snapshot
-            .local_branches
-            .iter()
-            .find(|branch| branch.name == "feature")
-            .expect("feature branch");
-        assert_eq!(
-            branch.worktree_path.as_deref(),
-            Some(worktree.to_str().expect("UTF-8 fixture path"))
-        );
+        let reported = feature_worktree_path(&snapshot);
+        assert_worktree_identity_and_spelling(&repository, &worktree, &reported).await;
         assert!(
             snapshot
                 .worktrees
                 .iter()
-                .any(|entry| entry.path == worktree.to_string_lossy() && entry.prunable)
+                .any(|entry| entry.path == reported && entry.prunable),
+            "the prunable worktree entry keeps the same reported spelling"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worktree_added_through_a_symlinked_alias_keeps_one_identity_and_git_spelling() {
+        let repository = repository_with_one_commit();
+        let real_root = repository.path().join("real");
+        fs::create_dir_all(&real_root).expect("real worktree root");
+        let alias_root = repository.path().join("alias");
+        std::os::unix::fs::symlink(&real_root, &alias_root).expect("symlinked alias root");
+        let aliased_worktree = alias_root.join("linked");
+        add_feature_worktree(repository.path(), &aliased_worktree);
+
+        let snapshot = snapshot(&repository).await;
+        let reported = feature_worktree_path(&snapshot);
+        assert_worktree_identity_and_spelling(&repository, &aliased_worktree, &reported).await;
+        assert_eq!(
+            physical_key(Path::new(&reported)).await,
+            physical_key(&real_root.join("linked")).await,
+            "the alias and the real path are one worktree identity"
+        );
+        let mut matching = 0;
+        for entry in &snapshot.worktrees {
+            if physical_key(Path::new(&entry.path)).await == physical_key(&aliased_worktree).await {
+                matching += 1;
+            }
+        }
+        assert_eq!(
+            matching, 1,
+            "one physical worktree yields exactly one entry"
+        );
+    }
+
+    /// macOS spells its temporary roots through `/tmp` → `/private/tmp` and
+    /// `/var` → `/private/var`. Git reports the physical spelling; the snapshot
+    /// keeps it, and identity comparisons collapse both spellings onto one key.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_private_aliases_keep_git_spelling_and_one_identity() {
+        for (alias_root, physical_prefix) in
+            [("/tmp", "/private/tmp/"), ("/var/tmp", "/private/var/tmp/")]
+        {
+            let repository = repository_with_one_commit_in(
+                tempfile::Builder::new()
+                    .prefix("bibcode-refs-alias")
+                    .tempdir_in(alias_root)
+                    .expect("temporary repository under the alias root"),
+            );
+            let worktree = repository.path().join("linked");
+            assert!(
+                worktree.starts_with(alias_root),
+                "fixture is spelled through the alias: {}",
+                worktree.display()
+            );
+            add_feature_worktree(repository.path(), &worktree);
+
+            let snapshot = snapshot(&repository).await;
+            let reported = feature_worktree_path(&snapshot);
+            assert!(
+                reported.starts_with(physical_prefix),
+                "Git reports the physical spelling for {alias_root}: {reported}"
+            );
+            assert_worktree_identity_and_spelling(&repository, &worktree, &reported).await;
+        }
     }
 
     #[tokio::test]

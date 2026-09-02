@@ -37,8 +37,8 @@ export class BrowserRecordingCanvasUnavailableError extends Schema.TaggedErrorCl
   "BrowserRecordingCanvasUnavailableError",
   {
     tabId: Schema.String,
-    width: Schema.Number,
-    height: Schema.Number,
+    width: Schema.Finite,
+    height: Schema.Finite,
   },
 ) {
   override get message(): string {

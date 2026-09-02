@@ -281,10 +281,22 @@ so ordinary `vp test` does not depend on a prebuilt binary.
 
 When remote authentication, pairing, E2EE, share-state derivation, revocation,
 or remote updates change, run the opt-in smoke test with the server and client
-in distinct Linux containers. Build the current server first, verify Docker is
-available, and use test-owned names so cleanup can be proven:
+in distinct Linux containers. The recipe bind-mounts the host-built
+`target/debug/bibcode` into a Linux container, so it requires a Linux host with
+Docker networking: a macOS or Windows host builds a native executable the
+container cannot run, and Apple Container or a Docker Desktop proxy that
+cannot route between containers or publish ports yields no valid client/server
+pair. Detect the host first and record the gate as **unavailable evidence**
+with the exact blocker when it is not a Linux host; do not change application
+networking or fall back to a loopback host server to compensate. Build the
+current server, verify Docker is available, and use test-owned names so
+cleanup can be proven:
 
 ```sh
+case "$(uname -s)" in
+  Linux) ;;
+  *) echo "cross-container gate unavailable: requires a Linux host binary and Docker networking ($(uname -s))" >&2; exit 2 ;;
+esac
 cargo build -p bibcode-server
 docker version
 
@@ -394,6 +406,11 @@ node scripts/run-msvc.mjs cargo test -p bibcode-server --test production_git_man
 node scripts/run-msvc.mjs cargo test -p bibcode-server --test git_rpc -- --nocapture
 vp test run packages/client-runtime/src/state/vcs.test.ts apps/web/src/components/GitActionsControl.test.tsx
 ```
+
+`vp run check:contracts` regenerates the RPC wire fixtures and ends by failing
+when the regenerated tree differs from the committed one, so a contract change
+must land together with its regenerated fixtures; a report records the exact
+fixture files that changed rather than restoring them by hand.
 
 On non-Windows hosts, replace the MSVC launcher with the equivalent direct
 Cargo invocation. Run the production RPC file once with its default harness and
@@ -992,7 +1009,14 @@ starts.
     and checks subcommands on the server; a missing CLI, credentials, or the
     fixture's intentionally nonexistent forge repository must produce the
     provider pane's explicit error or unavailable presentation without retrying
-    in the background.
+    in the background. Then choose **Create pull request**: the review dialog
+    must open with the detected provider, base and head branches, whether the
+    branch will be published first, and a title and description seeded from
+    the latest commit, while no push, provider process, or pull request is
+    created. Cancel it and confirm the branch, its upstream, and the forge are
+    unchanged; only the dialog's explicit primary action may publish or create,
+    and its failure states must distinguish a failed publish from a published
+    branch whose pull request could not be created.
 12. Validate the two-project view isolation before the cache limit. Give `main`
     and `project-two` different Changes filters, selected files, and active tabs,
     then alternate between their project-header buttons. Each project must

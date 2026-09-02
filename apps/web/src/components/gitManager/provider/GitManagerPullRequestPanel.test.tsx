@@ -12,6 +12,7 @@ const h = vi.hoisted(() => ({
   listRequests: vi.fn(() => ({ kind: "provider-query" })),
   refreshRequests: vi.fn(),
   createPr: vi.fn(async () => ({ _tag: "Success" })),
+  dialogProps: [] as Array<Record<string, unknown>>,
 }));
 
 vi.mock("../../../state/gitManager", () => ({
@@ -31,10 +32,12 @@ vi.mock("../../../state/sourceControlActions", () => ({
   useGitStackedAction: () => ({ run: h.createPr, isPending: false, error: null }),
 }));
 
-vi.mock("../../../lib/utils", async (importOriginal) => {
-  const actual = await importOriginal<Record<string, unknown>>();
-  return { ...actual, randomUUID: () => "action-1" };
-});
+vi.mock("./GitManagerCreatePullRequestDialog", () => ({
+  GitManagerCreatePullRequestDialog: (props: Record<string, unknown>) => {
+    h.dialogProps.push(props);
+    return <div data-testid="create-pr-dialog" role="dialog" />;
+  },
+}));
 
 import { GitManagerPullRequestPanel } from "./GitManagerPullRequestPanel";
 
@@ -73,6 +76,7 @@ beforeEach(() => {
   h.listRequests.mockClear();
   h.refreshRequests.mockClear();
   h.createPr.mockClear();
+  h.dialogProps = [];
   vi.useFakeTimers();
 });
 
@@ -144,9 +148,32 @@ describe("GitManagerPullRequestPanel", () => {
     expect(container.querySelector("img")).toBeNull();
   });
 
-  it("creates a pull request through the existing stacked action", async () => {
-    await renderPanel();
+  it("opens the review surface without publishing or creating anything", async () => {
+    const onRefresh = await renderPanel();
+    expect(container.querySelector('[data-testid="create-pr-dialog"]')).toBeNull();
+
     await act(async () => button("Create pull request").click());
-    expect(h.createPr).toHaveBeenCalledWith({ actionId: "action-1", action: "create_pr" });
+
+    expect(container.querySelector('[data-testid="create-pr-dialog"]')).not.toBeNull();
+    expect(h.createPr).not.toHaveBeenCalled();
+    expect(h.listRequests).not.toHaveBeenCalled();
+    expect(onRefresh).not.toHaveBeenCalled();
+    const dialog = h.dialogProps.at(-1);
+    if (dialog === undefined) throw new Error("The review dialog did not render.");
+    expect(dialog).toMatchObject({
+      open: true,
+      scope: { environmentId: "env-a", cwd: "/repo" },
+    });
+    const onSettled = dialog.onSettled as () => void;
+    const onOpenChange = dialog.onOpenChange as (open: boolean) => void;
+
+    // A settled pull request refreshes the pane the same way Refresh does.
+    await act(async () => onSettled());
+    expect(onRefresh).toHaveBeenCalledOnce();
+    expect(h.listRequests).toHaveBeenCalledOnce();
+
+    await act(async () => onOpenChange(false));
+    expect(container.querySelector('[data-testid="create-pr-dialog"]')).toBeNull();
+    expect(h.createPr).not.toHaveBeenCalled();
   });
 });
