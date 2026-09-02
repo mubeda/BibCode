@@ -55,7 +55,7 @@ export function DiffPanelLoadingState(props: { label: string }) {
         aria-live="polite"
         aria-label={props.label}
       >
-        <div className="flex items-center gap-2 border-b border-panel-separator px-3 py-2">
+        <div className="flex h-[var(--workspace-topbar-height)] shrink-0 items-center gap-2 border-b border-panel-separator px-3">
           <Skeleton className="h-4 w-32 rounded-full" />
           <Skeleton className="ml-auto h-4 w-20 rounded-full" />
         </div>
