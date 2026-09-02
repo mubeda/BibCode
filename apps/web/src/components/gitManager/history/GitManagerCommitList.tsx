@@ -259,7 +259,7 @@ export const GitManagerCommitList = memo(function GitManagerCommitList({
       aria-label="Commit history"
       aria-multiselectable={onMultiSelect === undefined ? undefined : true}
       role="listbox"
-      className="flex min-h-0 flex-1 flex-col overflow-hidden"
+      className="flex min-h-0 flex-1 flex-col overflow-hidden border-r border-panel-separator"
       onKeyDown={handleKeyDown}
     >
       <GitManagerCommitDndContext

@@ -134,7 +134,7 @@ export function FileEditorToolbar({
 
   return (
     <div
-      className="flex h-9 min-h-9 shrink-0 items-center gap-1 border-b border-border/60 bg-background px-3"
+      className="flex h-9 min-h-9 shrink-0 items-center gap-1 border-b border-panel-separator bg-background px-3"
       data-file-editor-toolbar
     >
       <ToolbarAction

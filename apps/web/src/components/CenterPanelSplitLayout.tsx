@@ -230,7 +230,7 @@ function GroupLeaf(
         data-touches-left-edge={props.touchesLeftEdge}
         data-touches-right-edge={props.touchesRightEdge}
         className={cn(
-          "@container/header-actions relative z-30 flex min-w-0 shrink-0 items-center border-b border-border/60 bg-background",
+          "@container/header-actions relative z-30 flex min-w-0 shrink-0 items-center border-b border-panel-separator bg-background",
           props.touchesTopEdge ? "workspace-topbar" : "h-8",
           props.touchesTopEdge &&
             props.touchesLeftEdge &&
@@ -536,7 +536,7 @@ function SplitNode(
         <span
           aria-hidden="true"
           className={cn(
-            "pointer-events-none absolute bg-ring transition-colors group-hover/separator:bg-ring group-focus-visible/separator:bg-ring",
+            "pointer-events-none absolute bg-panel-separator transition-colors group-hover/separator:bg-ring group-focus-visible/separator:bg-ring",
             horizontal
               ? "inset-y-0 left-1/2 w-px -translate-x-1/2"
               : "inset-x-0 top-1/2 h-px -translate-y-1/2",

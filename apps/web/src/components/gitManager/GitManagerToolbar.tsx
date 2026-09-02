@@ -546,11 +546,11 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
   return (
     <div className="min-w-0 shrink-0">
       <header
-        className="flex min-w-0 items-stretch border-b border-border bg-card/20"
+        className="flex h-[var(--workspace-topbar-height)] min-w-0 shrink-0 items-stretch border-b border-panel-separator bg-card/20"
         data-environment-id={environmentId}
         data-project-id={projectId}
       >
-        <div className="flex min-w-0 flex-1 items-center border-r border-border px-2 py-1.5">
+        <div className="flex min-w-0 flex-1 items-center border-r border-panel-separator px-2 py-1.5">
           <Select
             items={worktreeOptions}
             modal={false}
@@ -588,7 +588,7 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
           )}
         </div>
 
-        <div className="flex min-w-0 flex-1 items-center border-r border-border px-2 py-1.5">
+        <div className="flex min-w-0 flex-1 items-center border-r border-panel-separator px-2 py-1.5">
           <GitManagerBranchDropdown
             branchDisabledReason={branchSyncDisabledReason}
             currentBranchName={currentBranchName}
