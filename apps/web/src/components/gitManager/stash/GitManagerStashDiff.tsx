@@ -223,7 +223,10 @@ export const GitManagerStashDiff = memo(function GitManagerStashDiff({
 
   return (
     <section aria-label={`Stash ${selectedEntry.index} diff`} className="flex min-h-0 flex-1">
-      <div className="min-h-0 w-[min(18rem,35%)] shrink-0 border-r border-border" role="listbox">
+      <div
+        className="min-h-0 w-[min(18rem,35%)] shrink-0 border-r border-panel-separator"
+        role="listbox"
+      >
         {selectedEntry.files.length === 0 ? (
           <p className="p-3 text-xs text-muted-foreground">No changed files in this stash.</p>
         ) : (

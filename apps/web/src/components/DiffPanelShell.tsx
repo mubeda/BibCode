@@ -20,7 +20,7 @@ export function DiffPanelShell(props: {
       className={cn(
         "flex h-full min-w-0 flex-col bg-background",
         props.mode === "inline"
-          ? "w-[42vw] min-w-[360px] max-w-[560px] shrink-0 border-l border-border"
+          ? "w-[42vw] min-w-[360px] max-w-[560px] shrink-0 border-l border-panel-separator"
           : "w-full",
       )}
     >
@@ -55,7 +55,7 @@ export function DiffPanelLoadingState(props: { label: string }) {
         aria-live="polite"
         aria-label={props.label}
       >
-        <div className="flex items-center gap-2 border-b border-border/50 px-3 py-2">
+        <div className="flex items-center gap-2 border-b border-panel-separator px-3 py-2">
           <Skeleton className="h-4 w-32 rounded-full" />
           <Skeleton className="ml-auto h-4 w-20 rounded-full" />
         </div>

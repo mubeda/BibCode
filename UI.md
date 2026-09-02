@@ -209,6 +209,7 @@ Optimize for user control, predictability, and task completion. Every surprise, 
 - The interface should use contrast (darkness and lightness), independent of color, to distinguish different types of information.
 - The UI should look good and be readable in black and white.
 - Interfaces should automatically adapt to the dark and light modes of the platform.
+- Panel edges and panel-level toolbars use the `panel-separator` token (the interaction orange, `#d8610e`, in both themes) so panels stay distinguishable on every display; dividers between rows, sections, cards, and dialog parts keep the muted `border` token.
 
 ## Usability Review Checklist
 
