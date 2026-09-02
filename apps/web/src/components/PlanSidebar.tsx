@@ -145,7 +145,7 @@ const PlanSidebar = memo(function PlanSidebar({
       )}
     >
       {/* Header */}
-      <div className="flex h-12 shrink-0 items-center justify-between border-b border-panel-separator px-3">
+      <div className="flex h-[var(--workspace-topbar-height)] shrink-0 items-center justify-between border-b border-panel-separator px-3">
         <div className="flex items-center gap-2">
           <Badge
             variant="info"

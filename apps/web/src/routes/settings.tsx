@@ -66,11 +66,11 @@ function SettingsContentLayout() {
       <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-background text-foreground">
         <header
           className={cn(
-            "border-b border-panel-separator px-3 py-2 transition-[padding-left] duration-200 ease-linear motion-reduce:transition-none sm:px-5",
+            "flex h-[var(--workspace-topbar-height)] shrink-0 items-center border-b border-panel-separator px-3 transition-[padding-left] duration-200 ease-linear motion-reduce:transition-none sm:px-5",
             COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS,
           )}
         >
-          <div className="flex min-h-7 items-center gap-2 sm:min-h-6">
+          <div className="flex min-h-7 min-w-0 flex-1 items-center gap-2 sm:min-h-6">
             <span className="text-sm font-medium text-foreground">Settings</span>
             {showRestoreDefaults ? (
               <div className="ms-auto flex items-center gap-2">

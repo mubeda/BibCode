@@ -151,7 +151,7 @@ export function AgentsPage() {
 
   return (
     <main className="flex h-full min-h-0 min-w-0 flex-1 flex-col bg-background text-foreground">
-      <header className="flex h-12 shrink-0 items-center gap-2 border-b border-panel-separator px-3">
+      <header className="flex h-[var(--workspace-topbar-height)] shrink-0 items-center gap-2 border-b border-panel-separator px-3">
         <Button variant="ghost" size="icon-sm" aria-label="Back" onClick={handleBack}>
           <ArrowLeftIcon className="size-4" aria-hidden />
         </Button>
