@@ -50,7 +50,7 @@ export class PrimaryEnvironmentRequestTimeoutError extends Schema.TaggedErrorCla
   "PrimaryEnvironmentRequestTimeoutError",
   {
     operation: PrimaryEnvironmentRequestOperation,
-    timeoutMs: Schema.Number,
+    timeoutMs: Schema.Finite,
   },
 ) {
   override get message(): string {
@@ -81,7 +81,7 @@ export class PrimaryEnvironmentRequestError extends Schema.TaggedErrorClass<Prim
   "PrimaryEnvironmentRequestError",
   {
     operation: PrimaryEnvironmentRequestOperation,
-    status: Schema.Number,
+    status: Schema.Finite,
     pairingLinkId: Schema.optional(Schema.String),
     sessionId: Schema.optional(Schema.String),
     cause: Schema.Defect(),
@@ -115,7 +115,7 @@ export const isPrimaryEnvironmentRequestError = Schema.is(PrimaryEnvironmentRequ
 export class PrimaryEnvironmentPairingCredentialRejectedError extends Schema.TaggedErrorClass<PrimaryEnvironmentPairingCredentialRejectedError>()(
   "PrimaryEnvironmentPairingCredentialRejectedError",
   {
-    providedLength: Schema.Number,
+    providedLength: Schema.Finite,
     cause: Schema.Defect(),
   },
 ) {
@@ -131,8 +131,8 @@ export const isPrimaryEnvironmentPairingCredentialRejectedError = Schema.is(
 export class PrimaryEnvironmentAuthSessionTimeoutError extends Schema.TaggedErrorClass<PrimaryEnvironmentAuthSessionTimeoutError>()(
   "PrimaryEnvironmentAuthSessionTimeoutError",
   {
-    timeoutMs: Schema.Number,
-    elapsedMs: Schema.Number,
+    timeoutMs: Schema.Finite,
+    elapsedMs: Schema.Finite,
   },
 ) {
   override get message(): string {
@@ -147,7 +147,7 @@ export const isPrimaryEnvironmentAuthSessionTimeoutError = Schema.is(
 export class PrimaryEnvironmentPairingCredentialRequiredError extends Schema.TaggedErrorClass<PrimaryEnvironmentPairingCredentialRequiredError>()(
   "PrimaryEnvironmentPairingCredentialRequiredError",
   {
-    providedLength: Schema.Number,
+    providedLength: Schema.Finite,
   },
 ) {
   override get message(): string {

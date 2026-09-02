@@ -381,7 +381,7 @@ const TurnCompletedPayload = Schema.Struct({
   stopReason: Schema.optional(Schema.NullOr(TrimmedNonEmptyStringSchema)),
   usage: Schema.optional(Schema.Unknown),
   modelUsage: Schema.optional(UnknownRecordSchema),
-  totalCostUsd: Schema.optional(Schema.Number),
+  totalCostUsd: Schema.optional(Schema.Finite),
   errorMessage: Schema.optional(TrimmedNonEmptyStringSchema),
   /** Which side reported the failure. See `RuntimeErrorClass`. */
   errorClass: Schema.optional(RuntimeErrorClass),
@@ -531,7 +531,7 @@ const ToolProgressPayload = Schema.Struct({
   toolUseId: Schema.optional(TrimmedNonEmptyStringSchema),
   toolName: Schema.optional(TrimmedNonEmptyStringSchema),
   summary: Schema.optional(TrimmedNonEmptyStringSchema),
-  elapsedSeconds: Schema.optional(Schema.Number),
+  elapsedSeconds: Schema.optional(Schema.Finite),
 });
 export type ToolProgressPayload = typeof ToolProgressPayload.Type;
 

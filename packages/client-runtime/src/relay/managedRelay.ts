@@ -98,7 +98,7 @@ export class ManagedRelayRequestTimeoutError extends Schema.TaggedErrorClass<Man
   "ManagedRelayRequestTimeoutError",
   {
     activity: ManagedRelayRequestActivity,
-    timeoutMs: Schema.Number,
+    timeoutMs: Schema.Finite,
   },
 ) {
   override get message(): string {

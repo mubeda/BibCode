@@ -8,7 +8,7 @@
         "_tag": "Fail",
         "error": {
           "_tag": "PreviewInvalidUrlError",
-          "inputLength": 0,
+          "inputLength": -3.4028234663852886e38,
           "reason": "unsupported-protocol",
           "cause": []
         }

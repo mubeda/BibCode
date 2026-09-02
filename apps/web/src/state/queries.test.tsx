@@ -61,6 +61,14 @@ const hooks = vi.hoisted(() => {
       };
       return [stateSlots.get(index) as T, setValue];
     },
+    useRef<T>(initialValue: T): { current: T } {
+      const index = cursor;
+      cursor += 1;
+      if (!stateSlots.has(index)) {
+        stateSlots.set(index, { current: initialValue });
+      }
+      return stateSlots.get(index) as { current: T };
+    },
   };
 });
 
@@ -107,6 +115,7 @@ vi.mock("react", async (importOriginal) => {
     useCallback: hooks.useCallback,
     useEffect: hooks.useEffect,
     useMemo: hooks.useMemo,
+    useRef: hooks.useRef,
     useState: hooks.useState,
   };
 });
@@ -573,6 +582,86 @@ describe("useComposerPathSearch", () => {
       kind: "searchEntries",
       args: { input: { query: "second" } },
     });
+  });
+
+  it("retains the loaded entries for the same target while a refreshed search is pending", () => {
+    vi.useFakeTimers();
+    const readme = { path: "README.md", kind: "file" as const };
+    testState.queryViews.set("searchEntries", {
+      data: { entries: [readme] },
+      error: null,
+      isPending: false,
+      refresh: vi.fn(),
+    });
+    const loaded = renderHook(() => useComposerPathSearch(searchTarget({ query: "READ" })));
+    runEffects();
+    expect(loaded.entries).toEqual([readme]);
+
+    renderHook(() => useComposerPathSearch(searchTarget({ query: "README" })));
+    runEffects();
+    testState.queryViews.set("searchEntries", {
+      data: null,
+      error: null,
+      isPending: true,
+      refresh: vi.fn(),
+    });
+    vi.advanceTimersByTime(120);
+    const refreshing = renderHook(() => useComposerPathSearch(searchTarget({ query: "README" })));
+
+    expect(testState.queryDescriptors.at(-1)).toMatchObject({
+      kind: "searchEntries",
+      args: { input: { query: "README" } },
+    });
+    expect(refreshing.isPending).toBe(true);
+    expect(refreshing.entries).toEqual([readme]);
+
+    const narrowed = { path: "docs/README.md", kind: "file" as const };
+    testState.queryViews.set("searchEntries", {
+      data: { entries: [narrowed] },
+      error: null,
+      isPending: false,
+      refresh: vi.fn(),
+    });
+    const settled = renderHook(() => useComposerPathSearch(searchTarget({ query: "README" })));
+    expect(settled.isPending).toBe(false);
+    expect(settled.entries).toEqual([narrowed]);
+  });
+
+  it("drops retained entries when the search target changes or searching stops", () => {
+    vi.useFakeTimers();
+    const readme = { path: "README.md", kind: "file" as const };
+    testState.queryViews.set("searchEntries", {
+      data: { entries: [readme] },
+      error: null,
+      isPending: false,
+      refresh: vi.fn(),
+    });
+    renderHook(() => useComposerPathSearch(searchTarget({ query: "READ" })));
+    runEffects();
+
+    testState.queryViews.set("searchEntries", {
+      data: null,
+      error: null,
+      isPending: true,
+      refresh: vi.fn(),
+    });
+    renderHook(() => useComposerPathSearch(searchTarget({ cwd: "/other", query: "READ" })));
+    runEffects();
+    vi.advanceTimersByTime(120);
+    const retargeted = renderHook(() =>
+      useComposerPathSearch(searchTarget({ cwd: "/other", query: "READ" })),
+    );
+    expect(retargeted.isPending).toBe(true);
+    expect(retargeted.entries).toEqual([]);
+
+    renderHook(() => useComposerPathSearch(searchTarget({ cwd: null, query: "READ" })));
+    runEffects();
+    vi.advanceTimersByTime(120);
+    const disabled = renderHook(() =>
+      useComposerPathSearch(searchTarget({ cwd: null, query: "READ" })),
+    );
+    expect(disabled.isPending).toBe(false);
+    expect(disabled.entries).toEqual([]);
   });
 
   it("disables searching when the environment or cwd is absent", () => {

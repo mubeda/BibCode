@@ -158,6 +158,27 @@ describe("GitRunStackedActionInput", () => {
     expect(parsed.actionId).toBe("action-1");
     expect(parsed.action).toBe("create_pr");
   });
+
+  it("carries a reviewed pull-request title and body and rejects a blank title", () => {
+    const parsed = decodeRunStackedActionInput({
+      actionId: "action-2",
+      cwd: "/repo",
+      action: "create_pr",
+      pullRequestTitle: "  Reviewed title  ",
+      pullRequestBody: "",
+    });
+
+    expect(parsed.pullRequestTitle).toBe("Reviewed title");
+    expect(parsed.pullRequestBody).toBe("");
+    expect(() =>
+      decodeRunStackedActionInput({
+        actionId: "action-3",
+        cwd: "/repo",
+        action: "create_pr",
+        pullRequestTitle: "   ",
+      }),
+    ).toThrow();
+  });
 });
 
 describe("GitRunStackedActionResult", () => {

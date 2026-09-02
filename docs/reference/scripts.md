@@ -41,9 +41,12 @@ state kind.
   environment unchanged.
 - `vp run build:marketing`: build the Astro marketing site.
 - `vp run check:contracts`: typecheck the schema-only contracts package, verify
-  deterministic RPC fixture export, regenerate the fixtures, and run the
-  TypeScript/Rust RPC parity and Rust fixture round-trip checks. It does not
-  create a distributable contracts build.
+  deterministic RPC fixture export, regenerate the fixtures, run the
+  TypeScript/Rust RPC parity and Rust fixture round-trip checks, and finally
+  fail if the regenerated fixtures differ from the committed tree
+  (`git diff --exit-code --stat -- packages/contracts/fixtures`). A contract
+  change must therefore commit its regenerated fixtures. It does not create a
+  distributable contracts build.
 - `vp check`: run the Vite+ formatting and lint checks.
 - `vp run fmt` / `vp run fmt:check`: write or verify Vite+ formatting.
 - `vp run lint`: run Vite+ linting with unused-disable reporting.
@@ -88,6 +91,14 @@ process that intentionally owns process-global state.
 The wrapper, `scripts/build-desktop-artifact.ts`, rejects cross-platform builds by
 default, invokes the canonical `@bibcode/desktop` Tauri package, and copies bundle output
 under `release/desktop/<platform>-<arch>` unless an output directory is supplied.
+It runs the Tauri build with at most three attempts. Every failed attempt is
+reported with its exit code, and before retrying a macOS DMG build the wrapper
+reads `hdiutil info -plist` and detaches only the intermediate `rw.*.dmg` image
+inside that build's bundle `dmg` directory, reporting each detach or its
+failure; other mounted images are never touched. The final error names the
+first failure, not only the last. macOS DMG builds pass `--verbose` to the
+Tauri CLI because the bundler logs the generated `bundle_dmg.sh` output
+(`create-dmg`, `hdiutil`, AppleScript) only at debug level.
 
 The desktop artifact contains the Tauri host, in-process Rust server, and built
 web assets. It does not stage Node.js, a TypeScript server, or helper sidecars.

@@ -343,57 +343,171 @@ async fn tag_create_push_and_delete_share_the_streaming_mutation_fence() {
     assert_eq!(missing[1]["code"], "tag-not-found");
 }
 
+/// A GitHub CLI stub that resolves pull request 42 for `pr list` and answers the
+/// rollup read with `checks_stdout` (or fails it with `checks_exit`), recording
+/// every argv line into `calls`.
+#[cfg(unix)]
+struct GitHubProviderStub {
+    calls: PathBuf,
+    services: ConfiguredGitManagerRpcServices,
+}
+
+#[cfg(unix)]
+impl GitHubProviderStub {
+    fn install(fixture: &Fixture, checks_stdout: &str, checks_exit: u8) -> Self {
+        git(
+            &fixture.repository_path,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/example/repository.git",
+            ],
+        );
+        let calls = fixture._root.path().join("provider-calls");
+        let command = fixture._root.path().join("provider-gh");
+        fs::write(
+            &command,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$1:$2\" in\n  pr:list) printf '%s\\n' '[{{\"number\":42,\"title\":\"Explicit PR\",\"url\":\"https://github.test/42\",\"baseRefName\":\"main\",\"headRefName\":\"main\",\"state\":\"OPEN\"}}]' ;;\n  pr:view) printf '%s\\n' '{checks_stdout}'; exit {checks_exit} ;;\n  *) exit 64 ;;\nesac\n",
+                calls.to_string_lossy()
+            ),
+        )
+        .expect("provider fixture");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&command, fs::Permissions::from_mode(0o755))
+            .expect("provider fixture executable");
+        let services = fixture.services.clone().with_pull_request_service(
+            PullRequestService::with_provider_commands(
+                command.to_string_lossy(),
+                "unused-glab",
+                "unused-az",
+            ),
+        );
+        Self { calls, services }
+    }
+
+    async fn list_pull_requests(&self, cwd: &Path) -> Result<Value, Value> {
+        self.services
+            .read_unary(
+                rpc_request("98", "gitManager.listPullRequests", json!({ "cwd": cwd })),
+                CancellationToken::new(),
+            )
+            .await
+    }
+
+    fn calls(&self) -> String {
+        fs::read_to_string(&self.calls).expect("provider calls")
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn explicit_pull_request_read_invokes_the_provider_once_for_prs_and_once_for_checks() {
     let fixture = Fixture::new().await;
     let cwd = fixture.repository_path.clone();
-    git(
-        &cwd,
-        &[
-            "remote",
-            "set-url",
-            "origin",
-            "https://github.com/example/repository.git",
-        ],
-    );
-    let calls = fixture._root.path().join("provider-calls");
-    let command = fixture._root.path().join("provider-gh");
-    fs::write(
-        &command,
-        format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$1:$2\" in\n  pr:list) printf '%s\\n' '[{{\"number\":42,\"title\":\"Explicit PR\",\"url\":\"https://github.test/42\",\"baseRefName\":\"main\",\"headRefName\":\"main\",\"state\":\"OPEN\"}}]' ;;\n  pr:checks) printf '%s\\n' '[{{\"name\":\"build\",\"state\":\"SUCCESS\",\"link\":\"https://github.test/check/1\",\"workflow\":\"CI\"}}]' ;;\n  *) exit 64 ;;\nesac\n",
-            calls.to_string_lossy()
-        ),
-    )
-    .expect("provider fixture");
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(&command, fs::Permissions::from_mode(0o755))
-        .expect("provider fixture executable");
-    let services = fixture.services.clone().with_pull_request_service(
-        PullRequestService::with_provider_commands(
-            command.to_string_lossy(),
-            "unused-glab",
-            "unused-az",
-        ),
+    let stub = GitHubProviderStub::install(
+        &fixture,
+        r#"{"statusCheckRollup":[{"__typename":"CheckRun","completedAt":"2026-09-02T13:09:09Z","conclusion":"SUCCESS","detailsUrl":"https://github.test/check/1","name":"build","startedAt":"2026-09-02T12:52:36Z","status":"COMPLETED","workflowName":"CI"}]}"#,
+        0,
     );
 
-    let result = services
-        .read_unary(
-            rpc_request("98", "gitManager.listPullRequests", json!({ "cwd": cwd })),
-            CancellationToken::new(),
-        )
+    let result = stub
+        .list_pull_requests(&cwd)
         .await
         .expect("explicit provider read");
 
     assert_eq!(result["status"], "available");
     assert_eq!(result["pullRequests"][0]["number"], 42);
-    assert_eq!(result["checks"][0]["name"], "build");
-    let calls = fs::read_to_string(calls).expect("provider calls");
+    assert_eq!(
+        result["checks"],
+        json!([{
+            "name": "build",
+            "state": "SUCCESS",
+            "link": "https://github.test/check/1",
+            "workflow": "CI",
+        }])
+    );
+    let calls = stub.calls();
     assert_eq!(calls.lines().count(), 2);
     assert!(calls.contains("pr list --head main --state open --limit 1 --json"));
-    assert!(calls.contains("pr checks 42 --json name,state,link,workflow"));
+    assert!(calls.contains("pr view 42 --json statusCheckRollup"));
+    assert!(!calls.contains("pr checks"));
     assert!(!calls.contains("--watch"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn explicit_pull_request_read_renders_an_open_pull_request_that_has_no_checks() {
+    let fixture = Fixture::new().await;
+    let cwd = fixture.repository_path.clone();
+    let stub = GitHubProviderStub::install(&fixture, r#"{"statusCheckRollup":[]}"#, 0);
+
+    let result = stub
+        .list_pull_requests(&cwd)
+        .await
+        .expect("a pull request without checks is not a provider failure");
+
+    assert_eq!(result["status"], "available");
+    assert_eq!(result["pullRequests"][0]["number"], 42);
+    assert_eq!(result["checks"], json!([]));
+    assert_eq!(stub.calls().lines().count(), 2);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn explicit_pull_request_read_keeps_pending_checks_available() {
+    let fixture = Fixture::new().await;
+    let cwd = fixture.repository_path.clone();
+    let stub = GitHubProviderStub::install(
+        &fixture,
+        r#"{"statusCheckRollup":[{"__typename":"CheckRun","conclusion":null,"detailsUrl":"https://github.test/check/2","name":"build","startedAt":"2026-09-02T12:52:36Z","status":"IN_PROGRESS","workflowName":"CI"},{"__typename":"StatusContext","context":"ci/external","state":"PENDING","targetUrl":"https://external.test/1"}]}"#,
+        0,
+    );
+
+    let result = stub
+        .list_pull_requests(&cwd)
+        .await
+        .expect("pending checks remain readable");
+
+    assert_eq!(result["status"], "available");
+    assert_eq!(
+        result["checks"],
+        json!([
+            {
+                "name": "build",
+                "state": "IN_PROGRESS",
+                "link": "https://github.test/check/2",
+                "workflow": "CI",
+            },
+            {
+                "name": "ci/external",
+                "state": "PENDING",
+                "link": "https://external.test/1",
+                "workflow": null,
+            },
+        ])
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn explicit_pull_request_read_reports_a_genuine_check_command_failure() {
+    let fixture = Fixture::new().await;
+    let cwd = fixture.repository_path.clone();
+    let stub = GitHubProviderStub::install(&fixture, "HTTP 401: Bad credentials", 1);
+
+    let error = stub
+        .list_pull_requests(&cwd)
+        .await
+        .expect_err("a failing provider command is surfaced, not rendered as no checks");
+
+    assert_eq!(error["code"], "provider-command-failed");
+    assert_eq!(
+        error["message"],
+        "The source-control provider could not load pull-request checks."
+    );
+    assert_eq!(stub.calls().lines().count(), 2);
 }
 
 #[tokio::test]

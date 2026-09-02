@@ -16,7 +16,7 @@ export class DpopProofReplayPersistenceError extends Schema.TaggedErrorClass<Dpo
     operation: Schema.Literals(["consume", "prune-expired"]),
     thumbprint: Schema.optionalKey(Schema.String),
     jti: Schema.optionalKey(Schema.String),
-    iat: Schema.optionalKey(Schema.Number),
+    iat: Schema.optionalKey(Schema.Finite),
     expiresBefore: Schema.optionalKey(Schema.String),
     cause: Schema.Literal("database-error"),
   },

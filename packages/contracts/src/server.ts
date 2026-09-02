@@ -29,7 +29,7 @@ const KeybindingsMalformedConfigIssue = Schema.Struct({
 const KeybindingsInvalidEntryIssue = Schema.Struct({
   kind: Schema.Literal("keybindings.invalid-entry"),
   message: TrimmedNonEmptyString,
-  index: Schema.Number,
+  index: Schema.Finite,
 });
 
 export const ServerConfigIssue = Schema.Union([
@@ -241,9 +241,9 @@ export const ServerTraceDiagnosticsSpanSummary = Schema.Struct({
   name: TrimmedNonEmptyString,
   count: NonNegativeInt,
   failureCount: NonNegativeInt,
-  totalDurationMs: Schema.Number,
-  averageDurationMs: Schema.Number,
-  maxDurationMs: Schema.Number,
+  totalDurationMs: Schema.Finite,
+  averageDurationMs: Schema.Finite,
+  maxDurationMs: Schema.Finite,
 });
 export type ServerTraceDiagnosticsSpanSummary = typeof ServerTraceDiagnosticsSpanSummary.Type;
 
@@ -260,7 +260,7 @@ export type ServerTraceDiagnosticsFailureSummary = typeof ServerTraceDiagnostics
 export const ServerTraceDiagnosticsRecentFailure = Schema.Struct({
   name: TrimmedNonEmptyString,
   cause: TrimmedNonEmptyString,
-  durationMs: Schema.Number,
+  durationMs: Schema.Finite,
   endedAt: Schema.DateTimeUtc,
   traceId: TrimmedNonEmptyString,
   spanId: TrimmedNonEmptyString,
@@ -269,7 +269,7 @@ export type ServerTraceDiagnosticsRecentFailure = typeof ServerTraceDiagnosticsR
 
 export const ServerTraceDiagnosticsSpanOccurrence = Schema.Struct({
   name: TrimmedNonEmptyString,
-  durationMs: Schema.Number,
+  durationMs: Schema.Finite,
   endedAt: Schema.DateTimeUtc,
   traceId: TrimmedNonEmptyString,
   spanId: TrimmedNonEmptyString,
@@ -358,9 +358,9 @@ export const ServerProcessUiCoverage = Schema.Struct({
 export type ServerProcessUiCoverage = typeof ServerProcessUiCoverage.Type;
 
 const ServerProcessCpuSplitMetric = Schema.Struct({
-  combined: Schema.Number,
-  core: Schema.Number,
-  external: Schema.Number,
+  combined: Schema.Finite,
+  core: Schema.Finite,
+  external: Schema.Finite,
 });
 
 const ServerProcessCountSplitMetric = Schema.Struct({
@@ -435,10 +435,10 @@ export const ServerProcessResourceHistorySummary = Schema.Struct({
   confidence: ServerProcessAttributionConfidence,
   firstSeenAt: Schema.DateTimeUtc,
   lastSeenAt: Schema.DateTimeUtc,
-  currentCpuPercent: Schema.Number,
-  avgCpuPercent: Schema.Number,
-  maxCpuPercent: Schema.Number,
-  cpuSecondsApprox: Schema.Number,
+  currentCpuPercent: Schema.Finite,
+  avgCpuPercent: Schema.Finite,
+  maxCpuPercent: Schema.Finite,
+  cpuSecondsApprox: Schema.Finite,
   currentRssBytes: NonNegativeInt,
   maxRssBytes: NonNegativeInt,
   sampleCount: NonNegativeInt,

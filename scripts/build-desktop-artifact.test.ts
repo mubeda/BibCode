@@ -17,11 +17,15 @@ import { vi } from "vite-plus/test";
 import {
   copyTauriBundleArtifacts,
   buildTauriDesktopArtifact,
+  detachRunOwnedDmgMounts,
   detectHostTauriBuildPlatform,
+  isRunOwnedIntermediateDmg,
+  parseHdiutilImages,
   parseTauriArtifactCliArgs,
   resolveTauriBuildPlan,
   resolveTauriRustTarget,
   runBuildTauriDesktopArtifactMain,
+  TAURI_BUILD_ATTEMPTS,
   TauriDesktopBuildConfigurationError,
   TauriDesktopBuildDirectoryMissingError,
   TauriDesktopBuildHostMismatchError,
@@ -47,7 +51,7 @@ const decodeUpdaterDescriptor = Schema.decodeUnknownSync(
   ),
 );
 
-const processHandle = (exitCode: number) =>
+const processHandle = (exitCode: number, stdout = "") =>
   ChildProcessSpawner.makeHandle({
     pid: ChildProcessSpawner.ProcessId(7),
     exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(exitCode)),
@@ -55,12 +59,22 @@ const processHandle = (exitCode: number) =>
     kill: () => Effect.void,
     unref: Effect.succeed(Effect.void),
     stdin: Sink.drain,
-    stdout: Stream.empty,
+    stdout: stdout.length === 0 ? Stream.empty : Stream.make(new TextEncoder().encode(stdout)),
     stderr: Stream.empty,
     all: Stream.empty,
     getInputFd: () => Sink.drain,
     getOutputFd: () => Stream.empty,
   });
+
+const hdiutilInfoPlist = (images: ReadonlyArray<{ path: string; device: string }>) =>
+  `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>framework</key><string>480.60.1</string><key>images</key><array>${images
+    .map(
+      (image) =>
+        `<dict><key>blockcount</key><integer>1</integer><key>hdid-pid</key><integer>1</integer><key>image-alias</key><data>AA==</data><key>image-path</key><string>${image.path}</string><key>image-type</key><string>UDIF read/write image</string><key>system-entities</key><array><dict><key>content-hint</key><string>GUID_partition_scheme</string><key>dev-entry</key><string>${image.device}</string></dict><dict><key>content-hint</key><string>Apple_APFS</string><key>dev-entry</key><string>${image.device}s1</string><key>mount-point</key><string>/private/tmp/dmg.random</string></dict></array></dict>`,
+    )
+    .join("")}</array><key>revision</key><string>10.13</string></dict></plist>
+`;
 
 it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
   it("detects the supported Tauri build platform for the host OS", () => {
@@ -149,6 +163,7 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
         "app,dmg",
         "--target",
         "aarch64-apple-darwin",
+        "--verbose",
       ]);
     }),
   );
@@ -198,6 +213,7 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
         "dmg",
         "--target",
         "x86_64-apple-darwin",
+        "--verbose",
       ]);
     }),
   );
@@ -1903,22 +1919,189 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
         }),
       );
 
+      const writes: string[] = [];
       const error = yield* buildTauriDesktopArtifact(
         { platform: "win", arch: "x64", target: "nsis" },
         {},
-        { write: () => undefined, host: { platform: "win32", arch: "x64" }, repoRoot },
+        { write: (text) => writes.push(text), host: { platform: "win32", arch: "x64" }, repoRoot },
       ).pipe(Effect.provide(failingSpawner), Effect.flip);
       assert.instanceOf(error, TauriDesktopBuildConfigurationError);
-      assert.include(error.message, "code 9");
+      assert.include(error.message, `after ${String(TAURI_BUILD_ATTEMPTS)} attempts`);
+      assert.include(error.message, "First failure: Tauri build command exited with code 9");
+      assert.equal(
+        writes.filter((text) => text.includes("Build attempt")).length,
+        TAURI_BUILD_ATTEMPTS,
+      );
+      assert.include(
+        writes.join(""),
+        "Build attempt 1 of 3 failed: Tauri build command exited with code 9",
+      );
 
       const artifacts = yield* buildTauriDesktopArtifact(
         { platform: "win", arch: "x64", target: "nsis", skipBuild: true },
         {},
         { write: () => undefined, host: { platform: "win32", arch: "x64" }, repoRoot },
       ).pipe(Effect.provide(failingSpawner));
-      assert.equal(spawnCount, 3);
+      // A non-DMG build never inspects host mounts, so only the build attempts spawn.
+      assert.equal(spawnCount, TAURI_BUILD_ATTEMPTS);
       assert.equal(artifacts.length, 1);
     }),
+  );
+
+  it.effect("keeps a macOS DMG build verbose so bundle_dmg.sh diagnostics are captured", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const repoRoot = yield* fs.makeTempDirectoryScoped({ prefix: "bibcode-build-dmg-plan-" });
+      const dmg = yield* resolveTauriBuildPlan(
+        { platform: "mac", arch: "arm64", target: "dmg" },
+        {},
+        { platform: "darwin", arch: "arm64" },
+        repoRoot,
+      );
+      assert.include(dmg.buildCommand.args, "--verbose");
+      const app = yield* resolveTauriBuildPlan(
+        { platform: "mac", arch: "arm64", target: "app" },
+        {},
+        { platform: "darwin", arch: "arm64" },
+        repoRoot,
+      );
+      assert.notInclude(app.buildCommand.args, "--verbose");
+    }),
+  );
+
+  it("parses hdiutil image reports and recognizes only this build's intermediate image", () => {
+    const images = parseHdiutilImages(
+      hdiutilInfoPlist([
+        {
+          path: "/repo/target/aarch64-apple-darwin/release/bundle/dmg/rw.BiBCode_0.4.2_aarch64.dmg",
+          device: "/dev/disk9",
+        },
+        { path: "/Users/someone/Downloads/BiBCode_0.4.1_aarch64.dmg", device: "/dev/disk4" },
+      ]),
+    );
+    assert.deepStrictEqual(
+      images.map((image) => ({ imagePath: image.imagePath, device: image.devices[0] })),
+      [
+        {
+          imagePath:
+            "/repo/target/aarch64-apple-darwin/release/bundle/dmg/rw.BiBCode_0.4.2_aarch64.dmg",
+          device: "/dev/disk9",
+        },
+        { imagePath: "/Users/someone/Downloads/BiBCode_0.4.1_aarch64.dmg", device: "/dev/disk4" },
+      ],
+    );
+    assert.deepStrictEqual(parseHdiutilImages("not a plist"), []);
+  });
+
+  it.effect(
+    "detaches only this build's leaked intermediate image after a failed DMG attempt and retries",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const repoRoot = yield* fs.makeTempDirectoryScoped({ prefix: "bibcode-build-dmg-leak-" });
+        const plan = yield* resolveTauriBuildPlan(
+          { platform: "mac", arch: "arm64", target: "dmg" },
+          {},
+          { platform: "darwin", arch: "arm64" },
+          repoRoot,
+        );
+        yield* fs.makeDirectory(plan.bundleDir, { recursive: true });
+        yield* fs.writeFileString(path.join(plan.bundleDir, "BiBCode_0.4.2_aarch64.dmg"), "image");
+        const ownIntermediate = path.join(plan.bundleDir, "rw.BiBCode_0.4.2_aarch64.dmg");
+        const foreignIntermediate = path.join(
+          repoRoot,
+          "other-worktree",
+          "target",
+          "aarch64-apple-darwin",
+          "release",
+          "bundle",
+          "dmg",
+          "rw.BiBCode_0.4.2_aarch64.dmg",
+        );
+        assert.isTrue(isRunOwnedIntermediateDmg(path, plan.bundleDir, ownIntermediate));
+        assert.isFalse(isRunOwnedIntermediateDmg(path, plan.bundleDir, foreignIntermediate));
+        assert.isFalse(
+          isRunOwnedIntermediateDmg(
+            path,
+            plan.bundleDir,
+            path.join(plan.bundleDir, "BiBCode_0.4.2_aarch64.dmg"),
+          ),
+        );
+
+        const spawned: Array<{ command: string; args: ReadonlyArray<string> }> = [];
+        let buildAttempts = 0;
+        const spawnerLayer = Layer.succeed(
+          ChildProcessSpawner.ChildProcessSpawner,
+          ChildProcessSpawner.make((command) => {
+            if (command._tag !== "StandardCommand") {
+              throw new Error("The artifact wrapper never pipes commands.");
+            }
+            spawned.push({ command: command.command, args: command.args });
+            if (command.command === "hdiutil" && command.args[0] === "info") {
+              return Effect.succeed(
+                processHandle(
+                  0,
+                  hdiutilInfoPlist([
+                    { path: "/Volumes/Downloads/BiBCode_0.4.1_aarch64.dmg", device: "/dev/disk4" },
+                    { path: ownIntermediate, device: "/dev/disk9" },
+                    { path: foreignIntermediate, device: "/dev/disk11" },
+                  ]),
+                ),
+              );
+            }
+            if (command.command === "hdiutil") {
+              return Effect.succeed(processHandle(0));
+            }
+            buildAttempts += 1;
+            return Effect.succeed(processHandle(buildAttempts === 1 ? 1 : 0));
+          }),
+        );
+        const writes: string[] = [];
+
+        const artifacts = yield* buildTauriDesktopArtifact(
+          { platform: "mac", arch: "arm64", target: "dmg", outputDir: "out" },
+          {},
+          {
+            write: (text) => writes.push(text),
+            host: { platform: "darwin", arch: "arm64" },
+            repoRoot,
+          },
+        ).pipe(Effect.provide(spawnerLayer));
+
+        assert.equal(buildAttempts, 2);
+        const detaches = spawned.filter(
+          (entry) => entry.command === "hdiutil" && entry.args[0] === "detach",
+        );
+        assert.deepStrictEqual(
+          detaches.map((entry) => entry.args),
+          [["detach", "/dev/disk9", "-force"]],
+        );
+        assert.include(
+          writes.join(""),
+          "Build attempt 1 of 3 failed: Tauri build command exited with code 1",
+        );
+        assert.include(
+          writes.join(""),
+          `Detached this build's intermediate image ${ownIntermediate} (/dev/disk9)`,
+        );
+        assert.notInclude(writes.join(""), "/dev/disk4");
+        assert.notInclude(writes.join(""), "/dev/disk11");
+        assert.equal(artifacts.length, 1);
+
+        // An inspection failure is reported, never silently ignored.
+        const report = yield* detachRunOwnedDmgMounts(plan, {}).pipe(
+          Effect.provide(
+            Layer.succeed(
+              ChildProcessSpawner.ChildProcessSpawner,
+              ChildProcessSpawner.make(() => Effect.succeed(processHandle(3))),
+            ),
+          ),
+        );
+        assert.deepStrictEqual(report.detached, []);
+        assert.equal(report.failures.length, 1);
+        assert.include(report.failures[0]?.detail, "hdiutil info exited with code 3");
+      }),
   );
 
   it("launches only when used as the CLI entrypoint", () => {
