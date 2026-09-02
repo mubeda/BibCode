@@ -463,7 +463,11 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   // from TimelineRowCtx, which propagates through LegendList's memo.
   const renderItem = useCallback(
     ({ item }: { item: MessagesTimelineRow }) => (
-      <div className="mx-auto w-full min-w-0 max-w-3xl overflow-x-clip" data-timeline-root="true">
+      <div
+        className="mx-auto w-full min-w-0 max-w-3xl overflow-x-clip"
+        data-timeline-root="true"
+        data-text-surface="background"
+      >
         <TimelineRowContent row={item} />
       </div>
     ),
@@ -921,7 +925,7 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
               >
                 <FileIcon className="size-4 shrink-0 text-muted-foreground" />
                 <span className="min-w-0 truncate text-xs">{file.name}</span>
-                <span className="shrink-0 text-[10px] text-muted-foreground">
+                <span className="shrink-0 text-xs text-muted-foreground">
                   {formatBytes(file.sizeBytes)}
                 </span>
               </div>
@@ -1331,7 +1335,7 @@ function AssistantChangedFilesSectionInner({
   return (
     <div className="mt-2 rounded-lg border border-border/80 bg-card/45 p-2.5">
       <div className="sticky top-2 z-10 mb-1.5 flex items-center justify-between gap-2 bg-[color-mix(in_srgb,var(--card)_45%,var(--background))] before:absolute before:inset-x-0 before:-top-2 before:h-2 before:bg-[color-mix(in_srgb,var(--card)_45%,var(--background))] before:content-['']">
-        <p className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground/65">
+        <p className="text-xs uppercase tracking-[0.12em] text-muted-foreground">
           <span>Changed files ({changedFileCountLabel})</span>
           {hasNonZeroStat(summaryStat) && (
             <>
@@ -1443,7 +1447,7 @@ function UserMessagePreviewAnnotationCard(props: {
         ) : null}
         <div
           className={cn(
-            "flex items-center gap-2 text-[10px] text-muted-foreground",
+            "flex items-center gap-2 text-xs text-muted-foreground",
             props.annotation.comment && "mt-1",
           )}
         >

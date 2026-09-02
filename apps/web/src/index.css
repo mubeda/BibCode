@@ -48,6 +48,8 @@
     sans-serif;
   --font-mono:
     "SF Mono", "SFMono-Regular", "JetBrains Mono", Consolas, "Liberation Mono", Menlo, monospace;
+  /* text-xs (12px) is the declared text-size floor: new UI never goes below it
+     and older screens are being swept to it (UI.md, Typography). */
   --color-warning-foreground: var(--warning-foreground);
   --color-warning: var(--warning);
   --color-success-foreground: var(--success-foreground);
@@ -306,6 +308,46 @@ body {
     sans-serif;
   margin: 0;
   padding: 0;
+}
+
+/* The Linux host pins WebKitGTK to hintslight in
+   apps/desktop/src-tauri/src/linux_text_rendering.rs. Weight 450 preserves
+   measured stroke density; never add letter-spacing here because fractional
+   per-glyph advances snap into whole-pixel gaps under hinting (design Revision 3). */
+html[data-linux-webkit] body {
+  font-weight: 450;
+}
+
+html[data-linux-webkit] pre,
+html[data-linux-webkit] code {
+  font-weight: 400;
+}
+
+/* WebKitGTK paints text inside a composited scroll container with grayscale
+   antialiasing unless an ancestor *inside* the scroller paints a background
+   under it; the scroller's own background does not count (measured across 30
+   harness variants on WebKitGTK 2.52, design Revision 4). Reading surfaces mark
+   their content wrapper with data-text-surface so they get LCD subpixel text. */
+html[data-linux-webkit] [data-text-surface="background"] {
+  background-color: var(--background);
+}
+
+html[data-linux-webkit] [data-text-surface="card"] {
+  background-color: var(--card);
+}
+
+html[data-linux-webkit] [data-text-surface="sidebar"] {
+  background-color: var(--sidebar, var(--background));
+}
+
+/* The scroll-fade mask on ScrollArea viewports routes the scrolled contents
+   through a transparent mask layer, which forces grayscale text regardless of
+   the painted wrapper (measured: sidebar 0.000 → 0.667 fringe ratio with the
+   mask removed). Element opacity below 1 has the same effect. Linux loses the
+   cosmetic fade; every other platform keeps it. */
+html[data-linux-webkit] [data-slot="scroll-area-viewport"] {
+  mask-image: none;
+  -webkit-mask-image: none;
 }
 
 html,

@@ -48,8 +48,26 @@ transcript. They appear as center-panel tabs, not left-panel rows.
 
 ### Left Panel
 
-The project/worktree navigator. It shows project groups, primary rows, worktree
-rows, pin/unread state, context menus, and running agent sub-rows.
+The navigator for Search, the cross-environment Agents nav row, and
+environment-scoped project/worktree rows. The Agents row's unread badge
+aggregates across environments, and selecting it opens the full-screen Agents
+view. The panel also shows project groups, primary rows, worktree rows,
+pin/unread state, context menus, and running agent sub-rows.
+
+### Agents View
+
+The full-takeover cross-environment thread navigator opened from the Agents nav
+row. Its top strip has a back arrow and **N unread** badge. Its list column has
+a filter, grouping by Status, Project, or Environment, an unread-only bell, and
+a **Mark all read** menu. Status groups show counts, with Done collapsed by
+default. Rows show status, title, project · branch, conversation preview,
+environment, and relative time; non-live environments are greyed, and rows
+remain bold and unread until visited. Selecting a row marks it read and shows
+its live session in the right pane while the list remains visible.
+
+The view and the nav row's unread badge are the sanctioned exception to
+environment-rail scoping. The per-row **Jump to workspace** action exits the
+view and re-points rail selection to the row's environment.
 
 ### Center Panel
 

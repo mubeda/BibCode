@@ -83,11 +83,14 @@ vi.mock("../../state/query", () => ({
         };
       });
     }
+    const data =
+      atom?.kind === "catalog" ? h.catalog : atom?.kind === "refs" ? h.refsSnapshot : null;
     return {
-      data: atom?.kind === "catalog" ? h.catalog : atom?.kind === "refs" ? h.refsSnapshot : null,
+      data,
       error: null,
       isPending: false,
       refresh: () => undefined,
+      emission: data === null ? { _tag: "Initial" } : { _tag: "Success", value: data },
     };
   },
 }));
@@ -101,6 +104,7 @@ vi.mock("../../state/gitManager", () => ({
     signal: h.signalAtom,
     getRefs: h.refsAtom,
     getStashes: h.stashesAtom,
+    getCommits: () => ({ kind: "commits" }),
     listPullRequests: h.listPullRequests,
     commit: { label: "test:commit" },
     undoCommit: { label: "test:undo-commit" },
@@ -442,6 +446,43 @@ describe("GitManagerPanel", () => {
     } finally {
       await act(async () => root.unmount());
       container.remove();
+      (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
+    }
+  });
+
+  it("opens on History, or on Changes while a merge is pending", async () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    // The React mock collects effects; flush the ones a mount registered.
+    const openManager = async () => {
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      await act(async () => root.render(<GitManagerPanel projectRef={projectRef} />));
+      await act(async () => {
+        for (const effect of h.effects.splice(0)) effect();
+      });
+      const tab = useGitManagerStore.getState().selectViewState(projectRef).activeTab;
+      await act(async () => root.unmount());
+      container.remove();
+      return tab;
+    };
+
+    try {
+      // A tab picked last time does not carry over: the manager opens on History.
+      useGitManagerStore.getState().setActiveTab(projectRef, "changes");
+      expect(await openManager()).toBe("history");
+
+      h.refsSnapshot = refsSnapshot({
+        inProgressOperation: { kind: "merge", current: null, total: null },
+        conflictedPaths: ["src/conflicted.bin"],
+      });
+      expect(await openManager()).toBe("changes");
+
+      h.refsSnapshot = refsSnapshot({
+        inProgressOperation: { kind: "rebase", current: 1, total: 2 },
+      });
+      expect(await openManager()).toBe("history");
+    } finally {
       (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
     }
   });

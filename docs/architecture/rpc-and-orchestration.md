@@ -804,6 +804,13 @@ depending on connection-local push caches. `subscribeThread` and
 initial snapshot, so a commit concurrent with that read is queued and then
 projected instead of being lost between snapshot and live delivery.
 
+The `subscribeShell` thread-shell contract has an additive optional
+`conversationPreview` field with `prompt`, `tool`, and `assistantMessage`
+members capped at 200, 160, and 320 characters respectively. The server trims
+the values and truncates them at character boundaries; `tool` is populated only
+while the latest turn is running. The field is omitted when there is no preview
+content, and older servers omit it.
+
 A turn whose delivery was refused, or whose fate the provider never confirmed,
 is reported in the open thread by the delivery notice and, independently, as an
 unresolved-delivery field on the thread shell. `OrchestrationEngine` derives that

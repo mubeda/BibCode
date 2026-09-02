@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     path::PathBuf,
     sync::{
         Arc,
@@ -862,11 +863,12 @@ pub async fn shell_snapshot(engine: &OrchestrationEngine, archived: bool) -> Rpc
             })
         })
         .collect::<Vec<_>>();
+    let previews = build_conversation_previews(&snapshot);
     let threads = snapshot
         .threads
         .iter()
         .filter(|thread| thread.deleted_at.is_none() && (thread.archived_at.is_some()) == archived)
-        .map(|thread| thread_shell(thread, &snapshot))
+        .map(|thread| thread_shell(thread, &snapshot, previews.get(thread.thread_id.as_str())))
         .collect::<Vec<_>>();
     Ok(json!({
         "snapshotSequence": sequence,
@@ -896,7 +898,7 @@ async fn thread_snapshot(engine: &OrchestrationEngine, thread_id: &str) -> RpcRe
         .map(|state| state.last_applied_sequence)
         .max()
         .unwrap_or(0);
-    let mut detail = thread_shell(thread, &snapshot);
+    let mut detail = thread_shell(thread, &snapshot, None);
     let object = detail.as_object_mut().expect("thread shell is an object");
     object.insert("deletedAt".to_owned(), json!(thread.deleted_at));
     object.insert(
@@ -1008,7 +1010,121 @@ fn thread_activity_tone(tone: &str) -> &str {
     }
 }
 
-fn thread_shell(thread: &ProjectionThread, snapshot: &crate::orchestration::Snapshot) -> Value {
+const PREVIEW_PROMPT_MAX_CHARS: usize = 200;
+const PREVIEW_TOOL_MAX_CHARS: usize = 160;
+const PREVIEW_ASSISTANT_MAX_CHARS: usize = 320;
+
+#[derive(Debug, Default)]
+struct ConversationPreview {
+    prompt: Option<String>,
+    tool: Option<String>,
+    assistant_message: Option<String>,
+}
+
+fn truncate_preview(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
+/// One pass over messages and activities so shell building stays
+/// O(messages + activities + threads) even though every engine event
+/// re-sends the full shell snapshot.
+fn build_conversation_previews(
+    snapshot: &crate::orchestration::Snapshot,
+) -> HashMap<&str, ConversationPreview> {
+    let mut previews: HashMap<&str, ConversationPreview> = HashMap::new();
+    let mut newest_user: HashMap<&str, &crate::persistence::ProjectionThreadMessage> =
+        HashMap::new();
+    let mut newest_assistant: HashMap<&str, &crate::persistence::ProjectionThreadMessage> =
+        HashMap::new();
+    for message in &snapshot.messages {
+        let bucket = match message.role.as_str() {
+            "user" => &mut newest_user,
+            "assistant" => &mut newest_assistant,
+            _ => continue,
+        };
+        match bucket.get(message.thread_id.as_str()) {
+            Some(existing) if existing.created_at > message.created_at => {}
+            _ => {
+                bucket.insert(message.thread_id.as_str(), message);
+            }
+        }
+    }
+    let turn_states: HashMap<(&str, &str), &str> = snapshot
+        .turns
+        .iter()
+        .filter_map(|turn| {
+            Some((
+                (turn.thread_id.as_str(), turn.turn_id.as_deref()?),
+                turn.state.as_str(),
+            ))
+        })
+        .collect();
+    let running_latest_turn: HashMap<&str, &str> = snapshot
+        .threads
+        .iter()
+        .filter_map(|thread| {
+            let latest_id = thread.latest_turn_id.as_deref()?;
+            (turn_states.get(&(thread.thread_id.as_str(), latest_id)) == Some(&"running"))
+                .then_some((thread.thread_id.as_str(), latest_id))
+        })
+        .collect();
+    let mut newest_tool: HashMap<&str, &crate::persistence::ProjectionThreadActivity> =
+        HashMap::new();
+    for activity in &snapshot.activities {
+        if activity.tone != "tool" {
+            continue;
+        }
+        let Some(latest_id) = running_latest_turn.get(activity.thread_id.as_str()) else {
+            continue;
+        };
+        if activity.turn_id.as_deref() != Some(latest_id) {
+            continue;
+        }
+        match newest_tool.get(activity.thread_id.as_str()) {
+            Some(existing) if existing.created_at > activity.created_at => {}
+            _ => {
+                newest_tool.insert(activity.thread_id.as_str(), activity);
+            }
+        }
+    }
+    for (thread_id, message) in newest_user {
+        let text = message.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        previews.entry(thread_id).or_default().prompt =
+            Some(truncate_preview(text, PREVIEW_PROMPT_MAX_CHARS));
+    }
+    for (thread_id, message) in newest_assistant {
+        let text = message.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        previews.entry(thread_id).or_default().assistant_message =
+            Some(truncate_preview(text, PREVIEW_ASSISTANT_MAX_CHARS));
+    }
+    for (thread_id, activity) in newest_tool {
+        let summary = activity.summary.trim();
+        if summary.is_empty() {
+            continue;
+        }
+        previews.entry(thread_id).or_default().tool =
+            Some(truncate_preview(summary, PREVIEW_TOOL_MAX_CHARS));
+    }
+    previews
+}
+
+fn thread_shell(
+    thread: &ProjectionThread,
+    snapshot: &crate::orchestration::Snapshot,
+    preview: Option<&ConversationPreview>,
+) -> Value {
     let latest_turn = thread.latest_turn_id.as_ref().and_then(|latest_id| {
         snapshot
             .turns
@@ -1044,7 +1160,7 @@ fn thread_shell(thread: &ProjectionThread, snapshot: &crate::orchestration::Snap
                 "updatedAt": session.updated_at,
             })
         });
-    json!({
+    let mut shell = json!({
         "id": thread.thread_id,
         "projectId": thread.project_id,
         "title": thread.title,
@@ -1066,7 +1182,15 @@ fn thread_shell(thread: &ProjectionThread, snapshot: &crate::orchestration::Snap
         "unresolvedDelivery": thread.unresolved_delivery_state.as_ref().map(|state| {
             json!({ "state": state, "detail": thread.unresolved_delivery_detail })
         }),
-    })
+    });
+    if let Some(preview) = preview {
+        shell["conversationPreview"] = json!({
+            "prompt": preview.prompt,
+            "tool": preview.tool,
+            "assistantMessage": preview.assistant_message,
+        });
+    }
+    shell
 }
 
 pub fn wire_event(row: &OrchestrationEvent) -> Value {
@@ -1156,11 +1280,14 @@ mod tests {
         RequestId, RpcExit, ServerConfig, ServerMessage, ServerRuntime,
         activity::{ActivityProjection, ActivityRepository},
         orchestration::{
-            AttachmentReference, NewProviderTurnDelivery, TurnDeliveryState,
+            AttachmentReference, NewProviderTurnDelivery, Snapshot, TurnDeliveryState,
             TurnDeliveryTransition,
             engine::{EngineOptions, TestHooks},
         },
-        persistence::{Database, run_migrations},
+        persistence::{
+            Database, ProjectionThreadActivity, ProjectionThreadMessage, ProjectionTurn,
+            run_migrations,
+        },
         production::{
             provider_runtime::{
                 BoxRuntimeFuture, ProviderDriver, ProviderDriverFactory, ProviderEvent,
@@ -1178,6 +1305,191 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
 
     const CREATED_AT: &str = "2026-07-11T00:00:00.000Z";
+
+    fn preview_snapshot_fixture(latest_turn_state: &str) -> Snapshot {
+        Snapshot {
+            projects: Vec::new(),
+            threads: vec![ProjectionThread {
+                thread_id: "thread-1".to_owned(),
+                project_id: "project-1".to_owned(),
+                title: "Preview thread".to_owned(),
+                kind: "default".to_owned(),
+                model_selection: json!({"instanceId": "codex", "model": "gpt-5"}),
+                runtime_mode: "full-access".to_owned(),
+                interaction_mode: "default".to_owned(),
+                branch: None,
+                worktree_path: None,
+                latest_turn_id: Some("turn-2".to_owned()),
+                created_at: "2026-07-11T00:00:00.000Z".to_owned(),
+                updated_at: "2026-07-11T00:00:00.007Z".to_owned(),
+                archived_at: None,
+                latest_user_message_at: Some("2026-07-11T00:00:00.004Z".to_owned()),
+                pending_approval_count: 0,
+                pending_user_input_count: 0,
+                has_actionable_proposed_plan: 0,
+                unresolved_delivery_state: None,
+                unresolved_delivery_detail: None,
+                deleted_at: None,
+            }],
+            messages: vec![
+                ProjectionThreadMessage {
+                    message_id: "message-user-older".to_owned(),
+                    thread_id: "thread-1".to_owned(),
+                    turn_id: Some("turn-1".to_owned()),
+                    role: "user".to_owned(),
+                    text: "older prompt".to_owned(),
+                    attachments: None,
+                    is_streaming: false,
+                    delivery_state: None,
+                    delivery_provider: None,
+                    delivery_detail: None,
+                    created_at: "2026-07-11T00:00:00.000Z".to_owned(),
+                    updated_at: "2026-07-11T00:00:00.000Z".to_owned(),
+                },
+                ProjectionThreadMessage {
+                    message_id: "message-assistant-older".to_owned(),
+                    thread_id: "thread-1".to_owned(),
+                    turn_id: Some("turn-1".to_owned()),
+                    role: "assistant".to_owned(),
+                    text: "older assistant".to_owned(),
+                    attachments: None,
+                    is_streaming: false,
+                    delivery_state: None,
+                    delivery_provider: None,
+                    delivery_detail: None,
+                    created_at: "2026-07-11T00:00:00.001Z".to_owned(),
+                    updated_at: "2026-07-11T00:00:00.001Z".to_owned(),
+                },
+                ProjectionThreadMessage {
+                    message_id: "message-user-newer".to_owned(),
+                    thread_id: "thread-1".to_owned(),
+                    turn_id: Some("turn-2".to_owned()),
+                    role: "user".to_owned(),
+                    text: "newest user prompt".to_owned(),
+                    attachments: None,
+                    is_streaming: false,
+                    delivery_state: None,
+                    delivery_provider: None,
+                    delivery_detail: None,
+                    created_at: "2026-07-11T00:00:00.002Z".to_owned(),
+                    updated_at: "2026-07-11T00:00:00.002Z".to_owned(),
+                },
+                ProjectionThreadMessage {
+                    message_id: "message-assistant-newer".to_owned(),
+                    thread_id: "thread-1".to_owned(),
+                    turn_id: Some("turn-2".to_owned()),
+                    role: "assistant".to_owned(),
+                    text: "newest assistant text".to_owned(),
+                    attachments: None,
+                    is_streaming: false,
+                    delivery_state: None,
+                    delivery_provider: None,
+                    delivery_detail: None,
+                    created_at: "2026-07-11T00:00:00.003Z".to_owned(),
+                    updated_at: "2026-07-11T00:00:00.003Z".to_owned(),
+                },
+                ProjectionThreadMessage {
+                    message_id: "message-user-newest".to_owned(),
+                    thread_id: "thread-1".to_owned(),
+                    turn_id: Some("turn-2".to_owned()),
+                    role: "user".to_owned(),
+                    text: "  padded prompt \n".to_owned(),
+                    attachments: None,
+                    is_streaming: false,
+                    delivery_state: None,
+                    delivery_provider: None,
+                    delivery_detail: None,
+                    created_at: "2026-07-11T00:00:00.004Z".to_owned(),
+                    updated_at: "2026-07-11T00:00:00.004Z".to_owned(),
+                },
+                ProjectionThreadMessage {
+                    message_id: "message-assistant-newest".to_owned(),
+                    thread_id: "thread-1".to_owned(),
+                    turn_id: Some("turn-2".to_owned()),
+                    role: "assistant".to_owned(),
+                    text: " \n\t".to_owned(),
+                    attachments: None,
+                    is_streaming: true,
+                    delivery_state: None,
+                    delivery_provider: None,
+                    delivery_detail: None,
+                    created_at: "2026-07-11T00:00:00.005Z".to_owned(),
+                    updated_at: "2026-07-11T00:00:00.005Z".to_owned(),
+                },
+            ],
+            activities: vec![ProjectionThreadActivity {
+                activity_id: "activity-tool".to_owned(),
+                thread_id: "thread-1".to_owned(),
+                turn_id: Some("turn-2".to_owned()),
+                tone: "tool".to_owned(),
+                kind: "tool".to_owned(),
+                summary: "Edit: src/main.rs".to_owned(),
+                payload: json!({}),
+                sequence: Some(1),
+                created_at: "2026-07-11T00:00:00.006Z".to_owned(),
+            }],
+            sessions: Vec::new(),
+            approvals: Vec::new(),
+            proposed_plans: Vec::new(),
+            turns: vec![ProjectionTurn {
+                thread_id: "thread-1".to_owned(),
+                turn_id: Some("turn-2".to_owned()),
+                pending_message_id: None,
+                source_proposed_plan_thread_id: None,
+                source_proposed_plan_id: None,
+                assistant_message_id: None,
+                state: latest_turn_state.to_owned(),
+                requested_at: "2026-07-11T00:00:00.002Z".to_owned(),
+                started_at: Some("2026-07-11T00:00:00.003Z".to_owned()),
+                completed_at: None,
+                checkpoint_turn_count: None,
+                checkpoint_ref: None,
+                checkpoint_status: None,
+                checkpoint_files: json!([]),
+            }],
+            checkpoints: Vec::new(),
+            states: Vec::new(),
+            receipts: Vec::new(),
+            diffs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn conversation_preview_truncates_on_char_boundary() {
+        let text = "é".repeat(300);
+        let truncated = truncate_preview(&text, 200);
+        assert_eq!(truncated.chars().count(), 201);
+        assert!(truncated.ends_with('…'));
+        assert_eq!(truncate_preview("short", 200), "short");
+    }
+
+    #[test]
+    fn conversation_preview_picks_newest_rows_and_gates_tool_on_running_turn() {
+        let snapshot = preview_snapshot_fixture("running");
+        let previews = build_conversation_previews(&snapshot);
+        let preview = previews.get("thread-1").expect("preview for thread-1");
+        assert_eq!(preview.prompt.as_deref(), Some("padded prompt"));
+        assert_eq!(preview.assistant_message, None);
+        assert_eq!(preview.tool.as_deref(), Some("Edit: src/main.rs"));
+
+        let done = preview_snapshot_fixture("completed");
+        let previews = build_conversation_previews(&done);
+        assert_eq!(previews.get("thread-1").expect("preview").tool, None);
+    }
+
+    #[test]
+    fn thread_shell_embeds_preview_and_detail_omits_it() {
+        let snapshot = preview_snapshot_fixture("running");
+        let previews = build_conversation_previews(&snapshot);
+        let thread = &snapshot.threads[0];
+        let with = thread_shell(thread, &snapshot, previews.get(thread.thread_id.as_str()));
+        assert_eq!(
+            with["conversationPreview"]["prompt"],
+            serde_json::json!("padded prompt")
+        );
+        let without = thread_shell(thread, &snapshot, None);
+        assert!(without.get("conversationPreview").is_none());
+    }
 
     struct NeverFactory;
 

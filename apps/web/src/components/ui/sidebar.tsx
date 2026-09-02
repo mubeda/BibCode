@@ -18,7 +18,11 @@ import {
 import { Skeleton } from "~/components/ui/skeleton";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
 import { useIsMobile } from "~/hooks/useMediaQuery";
-import { getLocalStorageItem, setLocalStorageItem } from "~/hooks/useLocalStorage";
+import {
+  getLocalStorageItem,
+  removeLocalStorageItem,
+  setLocalStorageItem,
+} from "~/hooks/useLocalStorage";
 import { resolveSidebarState, type ResponsiveSidebarState } from "./sidebarState";
 import * as Schema from "effect/Schema";
 
@@ -40,6 +44,8 @@ type SidebarContextProps = {
 };
 
 type SidebarResizableOptions = {
+  /** Width restored by double-clicking the rail; also clears the stored width. */
+  defaultWidth?: number;
   maxWidth?: number;
   minWidth?: number;
   onResize?: (width: number) => void;
@@ -55,6 +61,7 @@ type SidebarResizableOptions = {
 };
 
 type SidebarResolvedResizableOptions = {
+  defaultWidth: number | null;
   maxWidth: number;
   minWidth: number;
   onResize?: (width: number) => void;
@@ -199,6 +206,7 @@ function Sidebar({
 
     const options = typeof resizable === "boolean" ? {} : resizable;
     return {
+      defaultWidth: options.defaultWidth ?? null,
       maxWidth: options.maxWidth ?? Number.POSITIVE_INFINITY,
       minWidth: options.minWidth ?? SIDEBAR_RESIZE_DEFAULT_MIN_WIDTH,
       storageKey: options.storageKey ?? null,
@@ -347,6 +355,7 @@ function clampSidebarWidth(width: number, options: SidebarResolvedResizableOptio
 function SidebarRail({
   className,
   onClick,
+  onDoubleClick,
   onPointerCancel,
   onPointerDown,
   onPointerMove,
@@ -374,7 +383,12 @@ function SidebarRail({
   const resolvedResizable = sidebarInstance?.resizable ?? null;
   const canResize = resolvedResizable !== null && open;
   const railLabel = canResize ? "Resize Sidebar" : "Toggle Sidebar";
-  const railTitle = canResize ? "Drag to resize sidebar" : "Toggle Sidebar";
+  const canReset = canResize && resolvedResizable?.defaultWidth !== null;
+  const railTitle = canReset
+    ? "Drag to resize sidebar; double-click to reset"
+    : canResize
+      ? "Drag to resize sidebar"
+      : "Toggle Sidebar";
 
   const stopResize = React.useCallback(
     (pointerId: number) => {
@@ -552,6 +566,25 @@ function SidebarRail({
     [onClick, open, resolvedResizable, toggleSidebar],
   );
 
+  const handleDoubleClick = React.useCallback(
+    (event: React.MouseEvent<HTMLButtonElement>) => {
+      onDoubleClick?.(event);
+      if (event.defaultPrevented) return;
+      if (!resolvedResizable || resolvedResizable.defaultWidth === null || !open) return;
+      const wrapper = event.currentTarget.closest<HTMLElement>("[data-slot='sidebar-wrapper']");
+      if (!wrapper) return;
+
+      event.preventDefault();
+      const width = clampSidebarWidth(resolvedResizable.defaultWidth, resolvedResizable);
+      wrapper.style.setProperty("--sidebar-width", `${width}px`);
+      if (resolvedResizable.storageKey && typeof window !== "undefined") {
+        removeLocalStorageItem(resolvedResizable.storageKey);
+      }
+      resolvedResizable.onResize?.(width);
+    },
+    [onDoubleClick, open, resolvedResizable],
+  );
+
   React.useEffect(() => {
     if (!resolvedResizable?.storageKey || typeof window === "undefined") return;
     const rail = railRef.current;
@@ -599,6 +632,7 @@ function SidebarRail({
             data-sidebar="rail"
             data-slot="sidebar-rail"
             onClick={handleClick}
+            onDoubleClick={handleDoubleClick}
             onPointerCancel={handlePointerCancel}
             onPointerDown={handlePointerDown}
             onPointerMove={handlePointerMove}
@@ -683,6 +717,7 @@ function SidebarContent({ className, ...props }: React.ComponentProps<"div">) {
         )}
         data-sidebar="content"
         data-slot="sidebar-content"
+        data-text-surface="sidebar"
         {...props}
       />
     </ScrollArea>

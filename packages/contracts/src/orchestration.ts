@@ -494,6 +494,16 @@ export const OrchestrationProjectShell = Schema.Struct({
 });
 export type OrchestrationProjectShell = typeof OrchestrationProjectShell.Type;
 
+export const OrchestrationConversationPreview = Schema.Struct({
+  /** Newest user message text, truncated server-side to ≤ 200 chars. */
+  prompt: Schema.NullOr(TrimmedNonEmptyString),
+  /** Newest tool activity summary of the running latest turn, ≤ 160 chars. */
+  tool: Schema.NullOr(TrimmedNonEmptyString),
+  /** Newest assistant message text, truncated server-side to ≤ 320 chars. */
+  assistantMessage: Schema.NullOr(TrimmedNonEmptyString),
+});
+export type OrchestrationConversationPreview = typeof OrchestrationConversationPreview.Type;
+
 export const OrchestrationThreadShell = Schema.Struct({
   id: ThreadId,
   projectId: ProjectId,
@@ -530,6 +540,7 @@ export const OrchestrationThreadShell = Schema.Struct({
       }),
     ),
   ),
+  conversationPreview: Schema.optional(Schema.NullOr(OrchestrationConversationPreview)),
 });
 export type OrchestrationThreadShell = typeof OrchestrationThreadShell.Type;
 

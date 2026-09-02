@@ -7,6 +7,7 @@ import { runClientStateMigrationsV1 } from "./clientStateMigrations";
 import { installDesktopCloseShortcutRouter } from "./desktopCloseShortcut";
 import { isTauri } from "./env";
 import { resolveStorage } from "./lib/storage";
+import { applyLinuxWebkitTypography } from "./linuxWebkitTypography";
 
 async function main(): Promise<void> {
   try {
@@ -22,7 +23,12 @@ async function main(): Promise<void> {
   if (isTauri) {
     await installDesktopCloseShortcutRouter().catch(() => undefined);
   }
-  const { renderApplication } = await import("./bootstrap");
+  const [{ renderApplication }, { tauriDesktopBridgeReady }] = await Promise.all([
+    import("./bootstrap"),
+    import("./tauriDesktopBridge"),
+  ]);
+  await tauriDesktopBridgeReady.catch(() => undefined);
+  applyLinuxWebkitTypography(document);
   await renderApplication();
 }
 
