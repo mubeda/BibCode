@@ -435,6 +435,7 @@ async fn commit_amend_undo_discard_scope_and_concurrency_follow_the_wire_contrac
 
 fn initialize_repository(repository: &Path) {
     git(repository, &["init", "-q", "-b", "main"]);
+    git(repository, &["config", "core.autocrlf", "false"]);
     git(repository, &["config", "user.name", "Git Manager Test"]);
     git(
         repository,

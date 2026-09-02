@@ -129,6 +129,62 @@ export function defaultWindowsCargoRunner(options = {}) {
     .join(" ");
 }
 
+export const WINDOWS_PACKAGING_PREFLIGHT_EXIT_CODE = 3;
+
+const SYSTEM_PROFILE_SEGMENT = /[\\/]config[\\/]systemprofile(?:[\\/]|$)/i;
+
+export function isTauriBuildCommand(args) {
+  const tauriIndex = args.indexOf("tauri");
+  return tauriIndex >= 0 && args[tauriIndex + 1] === "build";
+}
+
+/**
+ * Detects Windows packaging runs that cannot complete. Tauri downloads the NSIS
+ * toolset into the account cache, and the SYSTEM profile
+ * (`C:\Windows\System32\config\systemprofile`) is subject to x86 filesystem
+ * redirection on ARM64, so the x86 NSIS bootstrapper fails with "Unable to
+ * start child process, error 0x2" only after the Rust release build has already
+ * finished. Parallels `prlctl exec` without `--current-user` and scheduled
+ * tasks are the usual sources. The check reads only the environment so it can
+ * fail before any compilation starts.
+ *
+ * @returns {string | null} an actionable diagnostic, or null when packaging may proceed.
+ */
+export function windowsPackagingPreflight(
+  args,
+  env,
+  // oxlint-disable-next-line bibcode/no-global-process-runtime -- The standalone launcher samples the host platform once and still accepts an injected platform in tests.
+  platform = NodeOS.platform(),
+) {
+  if (platform !== "win32" || !isTauriBuildCommand(args)) {
+    return null;
+  }
+  const username = (env.USERNAME ?? "").trim();
+  const reasons = [];
+  if (username.length > 0 && (username.endsWith("$") || username.toUpperCase() === "SYSTEM")) {
+    reasons.push(`USERNAME is \`${username}\`, a machine or service account`);
+  }
+  for (const name of ["LOCALAPPDATA", "APPDATA", "USERPROFILE"]) {
+    const value = env[name];
+    if (typeof value === "string" && SYSTEM_PROFILE_SEGMENT.test(value)) {
+      reasons.push(`${name} resolves under the system profile (${value})`);
+    }
+  }
+  if (reasons.length === 0) {
+    return null;
+  }
+  return [
+    "Windows packaging is running under the SYSTEM profile, so Tauri would cache the NSIS",
+    "toolset where x86 filesystem redirection makes it unusable for the NSIS bootstrapper",
+    '("Unable to start child process, error 0x2").',
+    `Detected: ${reasons.join("; ")}.`,
+    "Run the build as the logged-in interactive user instead, for example",
+    "`prlctl exec 'Windows 11' --current-user ...` from a Parallels host, and install",
+    "workspace dependencies with that same account so pnpm hard links stay readable.",
+    "No Rust build was started.",
+  ].join(" ");
+}
+
 export function canonicalizeCargoTestTarget(args, env, options = {}) {
   if (args[0] !== "cargo" || args[1] !== "test") {
     return env;
@@ -169,6 +225,11 @@ export function runMsvc(args, options = {}) {
     ...options.env,
   };
   const env = canonicalizeCargoTestTarget(args, configuredEnv, options);
+  const preflightFailure = windowsPackagingPreflight(args, env, options.platform);
+  if (preflightFailure !== null) {
+    consoleError(`[run-msvc] ${preflightFailure}`);
+    return WINDOWS_PACKAGING_PREFLIGHT_EXIT_CODE;
+  }
   const vcvarsall = discoverVcVarsAll({
     architecture,
     programFilesX86: options.programFilesX86,

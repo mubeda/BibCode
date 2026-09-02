@@ -20,6 +20,27 @@ function readText(path: string): string {
 }
 
 describe("repository toolchain contract", () => {
+  it("routes every Vitest package script through the checkout-local launcher", () => {
+    // A globally installed vp can load a second Vitest runtime and fail with
+    // "Vitest failed to find the runner"; scripts must resolve node_modules/vite-plus.
+    const rootScripts = readJson("package.json").scripts as Record<string, string>;
+    expect(rootScripts["test:coverage:ts"]).toBe("node scripts/run-local-vp.mjs test --coverage");
+    expect(rootScripts["check:contracts"]).not.toMatch(/(^|&& )vp test /);
+    expect(rootScripts["check:contracts"]).toContain("node scripts/run-local-vp.mjs test run ");
+    for (const [manifest, launcher] of [
+      ["apps/web/package.json", "node ../../scripts/run-local-vp.mjs test run"],
+      ["infra/relay/package.json", "node ../../scripts/run-local-vp.mjs test run"],
+      ["packages/client-runtime/package.json", "node ../../scripts/run-local-vp.mjs test run"],
+      ["packages/contracts/package.json", "node ../../scripts/run-local-vp.mjs test run"],
+      ["packages/shared/package.json", "node ../../scripts/run-local-vp.mjs test run"],
+      ["oxlint-plugin-bibcode/package.json", "node ../scripts/run-local-vp.mjs test run"],
+      ["scripts/package.json", "node run-local-vp.mjs test run"],
+    ] as const) {
+      const scripts = readJson(manifest).scripts as Record<string, string>;
+      expect(scripts.test?.startsWith(launcher), `${manifest}: ${scripts.test}`).toBe(true);
+    }
+  });
+
   it("uses the BiBCode workspace package scope", () => {
     expect(readJson("package.json").name).toBe("@bibcode/monorepo");
     expect(readJson("apps/web/package.json").name).toBe("@bibcode/web");

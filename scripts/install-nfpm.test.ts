@@ -30,7 +30,7 @@ describe("nFPM installer", () => {
         version: "2.47.0",
         asset: "nfpm_2.47.0_Linux_x86_64.tar.gz",
         sha256: "0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783",
-        executablePath: "/repo/target/tools/nfpm/2.47.0/x64/nfpm",
+        executablePath: NodePath.join("/repo", "target", "tools", "nfpm", "2.47.0", "x64", "nfpm"),
       }),
     );
     expect(planNfpmInstall("linux", "arm64", "/repo")).toEqual(
@@ -38,7 +38,15 @@ describe("nFPM installer", () => {
         version: "2.47.0",
         asset: "nfpm_2.47.0_Linux_arm64.tar.gz",
         sha256: "1c0f5f2999b9a974bfb04fdb0cc3306096de530ac5dbb25d739cc5f5219c919c",
-        executablePath: "/repo/target/tools/nfpm/2.47.0/arm64/nfpm",
+        executablePath: NodePath.join(
+          "/repo",
+          "target",
+          "tools",
+          "nfpm",
+          "2.47.0",
+          "arm64",
+          "nfpm",
+        ),
       }),
     );
   });

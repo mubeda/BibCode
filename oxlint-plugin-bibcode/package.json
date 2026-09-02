@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "vp test run"
+    "test": "node ../scripts/run-local-vp.mjs test run"
   },
   "dependencies": {
     "@effect/platform-node": "catalog:",

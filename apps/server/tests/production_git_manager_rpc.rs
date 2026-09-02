@@ -1,7 +1,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
+    process::{Command, Output},
     sync::Arc,
     time::Duration,
 };
@@ -12,13 +12,12 @@ use bibcode_server::{
     git::{GitRepository, MAX_DIFF_BUFFER_SIZE, NativeFileTrash, StatusBroadcaster},
     persistence::{Database, ProjectionProject, Repositories, run_migrations},
     production::git_manager_rpc::{ConfiguredGitManagerRpcServices, GitManagerRpcServices},
-    source_control::PullRequestService,
     worktree_catalog::{WorkspaceAvailabilityRegistry, WorktreeCatalogService},
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::sync::mpsc;
-use tokio::time::{Instant, sleep, timeout};
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 struct Fixture {
@@ -64,6 +63,7 @@ impl Fixture {
         fs::create_dir(&repository_path).expect("main checkout directory");
         git(root.path(), &["init", "-q", "--bare", path(&remote_path)]);
         git(&repository_path, &["init", "-q", "-b", "main"]);
+        git(&repository_path, &["config", "core.autocrlf", "false"]);
         configure_identity(&repository_path);
         fs::write(repository_path.join("tracked.txt"), "base\n").expect("base file");
         git(&repository_path, &["add", "tracked.txt"]);
@@ -355,6 +355,8 @@ struct GitHubProviderStub {
 #[cfg(unix)]
 impl GitHubProviderStub {
     fn install(fixture: &Fixture, checks_stdout: &str, checks_exit: u8) -> Self {
+        use bibcode_server::source_control::PullRequestService;
+
         git(
             &fixture.repository_path,
             &[
@@ -1701,6 +1703,8 @@ async fn rebase_revert_and_all_reset_modes_execute_through_the_stream() {
 #[tokio::test]
 async fn concurrent_operation_is_rejected_and_cancellation_terminates_the_child() {
     use std::os::unix::fs::PermissionsExt;
+    use std::process::Stdio;
+    use tokio::time::sleep;
 
     let fixture = Fixture::new().await;
     let marker = fixture._root.path().join("slow-fetch.pid");
@@ -1787,6 +1791,7 @@ async fn concurrent_operation_is_rejected_and_cancellation_terminates_the_child(
     assert!(stopped.is_ok(), "cancelled Git child remained alive");
 }
 
+#[cfg(unix)]
 fn operation_request(id: &str, payload: Value) -> RpcRequest {
     rpc_request(id, "gitManager.runOperation", payload)
 }
@@ -1846,7 +1851,10 @@ fn event_kinds(events: &[Value]) -> Vec<&str> {
         .collect()
 }
 
+#[cfg(unix)]
 async fn wait_for_file(path: &Path) {
+    use tokio::time::{Instant, sleep};
+
     let deadline = Instant::now() + Duration::from_secs(10);
     while !path.exists() {
         assert!(

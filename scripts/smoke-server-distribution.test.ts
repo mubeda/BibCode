@@ -26,16 +26,24 @@ it("accepts only the Windows termination exit used by Node child cleanup", () =>
   expect(isExpectedServerShutdownExit("darwin", 1)).toBe(false);
 });
 
-it("proves packaged web, descriptor, pairing exchange, and clean shutdown", async () => {
-  const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "bibcode-server-smoke-"));
-  temporaryRoots.push(root);
-  const binary = NodePath.join(root, "bibcode");
-  const web = NodePath.join(root, "web");
-  NodeFS.mkdirSync(web);
-  NodeFS.writeFileSync(NodePath.join(web, "index.html"), "<main>Packaged BiBCode</main>");
-  NodeFS.writeFileSync(
-    binary,
-    `#!/usr/bin/env node
+// The fixture stands in for a POSIX `bibcode` binary through a shebang script,
+// which Windows cannot execute directly; the Windows server distribution is
+// smoked against the real `bibcode.exe` by the release smoke instead.
+// oxlint-disable-next-line bibcode/no-global-process-runtime -- The host-only guard samples the platform once for this fixture.
+const isNativeWindowsHost = process.platform === "win32";
+
+it.skipIf(isNativeWindowsHost)(
+  "proves packaged web, descriptor, pairing exchange, and clean shutdown",
+  async () => {
+    const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "bibcode-server-smoke-"));
+    temporaryRoots.push(root);
+    const binary = NodePath.join(root, "bibcode");
+    const web = NodePath.join(root, "web");
+    NodeFS.mkdirSync(web);
+    NodeFS.writeFileSync(NodePath.join(web, "index.html"), "<main>Packaged BiBCode</main>");
+    NodeFS.writeFileSync(
+      binary,
+      `#!/usr/bin/env node
 const http = require("node:http");
 const args = process.argv.slice(2);
 if (args.includes("--version")) {
@@ -71,27 +79,29 @@ const server = http.createServer((request, response) => {
     return;
   }
   response.writeHead(404).end();
-});
+  },
+);
 server.listen(0, "127.0.0.1", () => {
   const address = server.address();
   process.stdout.write(JSON.stringify({ httpBaseUrl: "http://127.0.0.1:" + address.port }) + "\\n");
 });
 process.on("SIGTERM", () => server.close(() => process.exit(0)));
 `,
-    { mode: 0o755 },
-  );
+      { mode: 0o755 },
+    );
 
-  const result = await smokeServerDistribution({
-    binary,
-    expectedVersion: "0.4.3",
-    timeoutMs: 10_000,
-  });
+    const result = await smokeServerDistribution({
+      binary,
+      expectedVersion: "0.4.3",
+      timeoutMs: 10_000,
+    });
 
-  expect(result).toEqual({
-    version: "0.4.3",
-    environmentId: "fixture-environment",
-    tokenType: "DPoP",
-    webContainsBiBCode: true,
-    exitCode: 0,
-  });
-});
+    expect(result).toEqual({
+      version: "0.4.3",
+      environmentId: "fixture-environment",
+      tokenType: "DPoP",
+      webContainsBiBCode: true,
+      exitCode: 0,
+    });
+  },
+);

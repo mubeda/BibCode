@@ -7862,6 +7862,11 @@ mod tests {
                 .status
                 .success()
         );
+        assert!(
+            git(fixture.path(), &["config", "core.autocrlf", "false"])
+                .status
+                .success()
+        );
         fs::write(fixture.path().join("tracked.txt"), "initial\n").expect("tracked fixture");
         assert!(
             git(fixture.path(), &["add", "tracked.txt"])

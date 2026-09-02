@@ -4,14 +4,17 @@ import * as NodePath from "node:path";
 import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
+  WINDOWS_PACKAGING_PREFLIGHT_EXIT_CODE,
   canonicalizeCargoTestTarget,
   defaultWindowsCargoRunner,
   discoverVcVarsAll,
+  isTauriBuildCommand,
   msvcToolchain,
   quoteCmdArg,
   resolveMsvcArchitecture,
   run,
   runMsvc,
+  windowsPackagingPreflight,
 } from "./run-msvc.mjs";
 
 const directoryAliasCapability = (() => {
@@ -365,6 +368,9 @@ describe("run-msvc", () => {
 
     expect(
       runMsvc(["cargo", "test name"], {
+        // Pin the toolchain so the expected wrapper name does not depend on the
+        // host architecture (ARM64 hosts otherwise resolve the arm64 toolchain).
+        env: { CARGO_BUILD_TARGET: "x86_64-pc-windows-msvc" },
         programFilesX86: "C:/Program Files (x86)",
         existsSync: () => true,
         spawnSync,
@@ -427,5 +433,91 @@ describe("run-msvc", () => {
         process.env.ComSpec = originalComspec;
       }
     }
+  });
+
+  it("refuses Windows Tauri packaging under the SYSTEM profile before spawning anything", () => {
+    const systemProfile = String.raw`C:\Windows\System32\config\systemprofile\AppData\Local`;
+    const diagnostic = windowsPackagingPreflight(
+      ["pnpm", "exec", "tauri", "build", "--bundles", "nsis"],
+      { USERNAME: "WIN11$", LOCALAPPDATA: systemProfile },
+      "win32",
+    );
+    expect(diagnostic).toContain("USERNAME is `WIN11$`");
+    expect(diagnostic).toContain(
+      `LOCALAPPDATA resolves under the system profile (${systemProfile})`,
+    );
+    expect(diagnostic).toContain("error 0x2");
+    expect(diagnostic).toContain("prlctl exec 'Windows 11' --current-user");
+    expect(diagnostic).toContain("No Rust build was started.");
+    expect(
+      windowsPackagingPreflight(
+        ["tauri", "build"],
+        { USERNAME: "system", USERPROFILE: "C:/Users/system" },
+        "win32",
+      ),
+    ).toContain("USERNAME is `system`");
+    expect(
+      windowsPackagingPreflight(
+        ["tauri", "build"],
+        { USERNAME: "admin", USERPROFILE: "C:/Windows/System32/config/systemprofile" },
+        "win32",
+      ),
+    ).toContain("USERPROFILE resolves under the system profile");
+
+    const consoleError = vi.fn();
+    const spawnSync = vi.fn(() => ({ status: 0 }));
+    expect(
+      runMsvc(["pnpm", "exec", "tauri", "build"], {
+        env: { USERNAME: "WIN11$" },
+        platform: "win32",
+        programFilesX86: "",
+        consoleError,
+        spawnSync,
+      }),
+    ).toBe(WINDOWS_PACKAGING_PREFLIGHT_EXIT_CODE);
+    expect(spawnSync).not.toHaveBeenCalled();
+    expect(consoleError).toHaveBeenCalledOnce();
+    expect(consoleError.mock.calls[0][0]).toContain("[run-msvc]");
+  });
+
+  it("lets interactive-account packaging and non-packaging commands proceed", () => {
+    const interactive = {
+      USERNAME: "admin",
+      LOCALAPPDATA: String.raw`C:\Users\admin\AppData\Local`,
+      USERPROFILE: String.raw`C:\Users\admin`,
+    };
+    expect(
+      windowsPackagingPreflight(["pnpm", "exec", "tauri", "build"], interactive, "win32"),
+    ).toBe(null);
+    expect(
+      windowsPackagingPreflight(["pnpm", "exec", "tauri", "dev"], { USERNAME: "SYSTEM" }, "win32"),
+    ).toBe(null);
+    expect(
+      windowsPackagingPreflight(
+        ["cargo", "check", "--all-targets"],
+        { USERNAME: "WIN11$" },
+        "win32",
+      ),
+    ).toBe(null);
+    expect(
+      windowsPackagingPreflight(
+        ["pnpm", "exec", "tauri", "build"],
+        { USERNAME: "SYSTEM" },
+        "darwin",
+      ),
+    ).toBe(null);
+    expect(isTauriBuildCommand(["pnpm", "exec", "tauri", "build"])).toBe(true);
+    expect(isTauriBuildCommand(["tauri", "info", "build"])).toBe(false);
+
+    const spawnSync = vi.fn(() => ({ status: 0 }));
+    expect(
+      runMsvc(["pnpm", "exec", "tauri", "build"], {
+        env: interactive,
+        platform: "win32",
+        programFilesX86: "",
+        spawnSync,
+      }),
+    ).toBe(0);
+    expect(spawnSync).toHaveBeenCalledOnce();
   });
 });

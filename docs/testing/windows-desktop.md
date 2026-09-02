@@ -47,6 +47,57 @@ already route Rust/Tauri commands through `scripts/run-msvc.mjs`; use the
 documented scripts rather than constructing an unverified Visual Studio
 environment.
 
+## Parallels guest execution preflight
+
+When the Windows host is a Parallels virtual machine driven from macOS, complete
+this preflight before dependency installation, packaging, packaged E2E, or
+Computer Use capture:
+
+- The VM is running and not paused or suspended.
+- Every guest command runs as the logged-in interactive Windows account:
+
+  ```sh
+  prlctl exec 'Windows 11' --current-user -- pwsh -NoProfile -Command '...'
+  ```
+
+  Without `--current-user`, `prlctl exec` runs as `NT AUTHORITY\SYSTEM`. Tauri
+  then caches the NSIS toolset under
+  `C:\Windows\System32\config\systemprofile\AppData\Local`, where x86
+  filesystem redirection on ARM64 makes the x86 NSIS bootstrapper fail with
+  `Unable to start child process, error 0x2` after the Rust release build has
+  already completed. `scripts/run-msvc.mjs` refuses `tauri build` under the
+  SYSTEM profile before compiling and names the offending environment
+  variables; record that exit code 3 as a harness misconfiguration, switch to
+  `--current-user`, and rerun. Confirm the account with `whoami` and
+  `$env:LOCALAPPDATA` before the first expensive command.
+
+- Install workspace dependencies with that same account, from the checkout
+  root, so pnpm's hard-linked store stays readable to the account that runs the
+  tests and builds.
+- Invoke Vite+ through the checkout-local launcher instead of a global `vp`
+  whenever the command is `vp test ...`; a global installation can load a second
+  Vitest runtime and fail with `Vitest failed to find the runner`:
+
+  ```powershell
+  node scripts/run-local-vp.mjs test run packages/client-runtime/src/state/vcs.test.ts
+  ```
+
+  Package `test` scripts, `check:contracts`, and `test:coverage:ts` already
+  route their Vitest invocations through this launcher, so `vp run test` and
+  `vp run check:contracts` stay correct under a global `vp`; record which
+  launcher each directly typed `vp test` command used.
+
+- Use an isolated `BIBCODE_HOME` for every launch and keep the production
+  installer output (`release/desktop`) and the E2E build
+  (`target/<triple>/release/bibcode-desktop.exe` from `test:ui:desktop:build`)
+  in distinct, recorded paths.
+- Before Codex Computer Use captures the guest, return Parallels to **Windowed**
+  (not Full Screen or Coherence) mode; ScreenCaptureKit cannot capture the
+  full-screen Parallels surface. Switching back is a host-tool limitation, not
+  an application defect, so record it without changing app code.
+- Plan the exact process and firewall cleanup checks from
+  [Process and Job cleanup](#process-and-job-cleanup) before launching anything.
+
 ## Focused Windows contracts
 
 Select focused tests from affected source and verify at least:
@@ -85,7 +136,7 @@ node scripts/run-msvc.mjs cargo test -p bibcode-server --lib git::broadcaster::t
 node scripts/run-msvc.mjs cargo test -p bibcode-server --lib git::watcher -- --nocapture
 node scripts/run-msvc.mjs cargo test -p bibcode-server --lib production::runtime::tests::structured_terminal_process_exit_immediately_invalidates_status_under_watcher_fallback -- --exact --nocapture
 node scripts/run-msvc.mjs cargo test -p bibcode-server --test production_git_vcs_rpc native_watcher_publishes_external_worktree_and_head_changes_to_status_subscribers -- --exact --nocapture
-vp test run packages/client-runtime/src/state/vcs.test.ts apps/web/src/components/GitActionsControl.test.tsx
+node scripts/run-local-vp.mjs test run packages/client-runtime/src/state/vcs.test.ts apps/web/src/components/GitActionsControl.test.tsx
 ```
 
 Record the idle 59/60-second boundary, native content/index/`HEAD`/refs events,
@@ -260,15 +311,45 @@ the package-specific MSVC launcher. When a direct native Rust command needs the
 same environment, use:
 
 ```powershell
+node scripts/run-msvc.mjs cargo check -p bibcode-server --all-targets
 node scripts/run-msvc.mjs cargo test --workspace -j 2 -- --test-threads=2
 node scripts/run-msvc.mjs cargo clean -p bibcode-server -p bibcode-desktop -p bibcode-updater-verifier
 node scripts/run-msvc.mjs cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Run the desktop E2E support contract natively on Windows:
+Run the `--all-targets` check first. Unix-only test helpers and imports must sit
+behind the same `cfg(unix)` as their consumers; an unused import in a Windows
+test target fails the whole `bibcode-server` test build under `-D warnings` and
+blocks every focused server test below. CI's Windows native rows run the same
+command.
+
+A test target that fails with `Failed to launch Windows Cargo target ... EACCES`
+while the same binary runs from a neutral file name is UAC installer detection
+(names containing `install`, `setup`, `update`, or `patch`). The shared runner's
+sidecar manifest declares `asInvoker` and touches the binary to bypass the
+manifest cache; report the launch error rather than elevating the shell or
+renaming targets.
+
+Check free space before the broad Rust gates: on ARM64 MSVC the `target\debug`
+test binaries and their PDBs grow to tens of gigabytes across the server
+integration targets, and a full disk surfaces as `LNK1104: cannot open file`
+or `LNK1140: limit exceeded for program database` rather than a disk error.
+Delete only the checkout's own `target\debug` to recover; never the retained
+validation tree.
+
+Git for Windows installs with `core.autocrlf=true` in the system and global
+configuration. Test fixtures that assert on checked-out file bytes pin
+`core.autocrlf=false` on the repository they create right after `git init`;
+a `"base\r\n"` versus `"base\n"` assertion failure means a fixture is missing
+that pin, not that the product rewrote line endings. Do not change the host
+Git configuration to make a suite pass.
+
+Run the desktop E2E support contract and the launcher contracts natively on
+Windows:
 
 ```powershell
-vp test run apps/desktop/e2e/support/test-project.test.ts
+node scripts/run-local-vp.mjs test run apps/desktop/e2e/support/test-project.test.ts
+node scripts/run-local-vp.mjs test run scripts/run-msvc.test.mjs scripts/run-local-vp.test.mjs scripts/remove-test-firewall-rules.test.ts scripts/tauri-hardening.test.ts
 ```
 
 The `native_desktop` Windows CI row runs this exact command after the desktop
@@ -282,13 +363,34 @@ Keep `vp run test`, `vp check`, `vp run typecheck`, `cargo fmt --all --check`,
 and `git diff --check` in the recorded gate set. Do not run separate broad
 Cargo commands concurrently.
 
-## NSIS package build and inspection
-
-Build the supported artifact:
+On Windows ARM64 the relay package cannot execute its Vitest suites: Cloudflare's
+`workerd` ships no `win32 arm64` binary, so every relay test file fails at load
+and `vp run` then cancels the still-running Rust suites. Run the broad gate
+there with the same path filters the root `build` script uses, which selects
+every workspace package except `infra/relay`:
 
 ```powershell
-vp run dist:desktop:win:x64
+vp run --filter './apps/*' --filter './packages/*' --filter './oxlint-plugin-bibcode' --filter './scripts' test
 ```
+
+Record the relay package as unavailable evidence and leave its coverage to the
+Linux and macOS rows. Do not exclude any other package.
+
+## NSIS package build and inspection
+
+Build the supported artifact for the host architecture as the interactive
+account (see the Parallels preflight above):
+
+```powershell
+vp run dist:desktop:win:x64     # x64 hosts
+vp run dist:desktop:win:arm64   # Windows 11 ARM64 hosts
+```
+
+`tauri.windows.conf.json` sets `bundle.useLocalToolsDir`, so the NSIS toolset
+is cached under the checkout's `target/.tauri` directory rather than
+`%LOCALAPPDATA%`; retain it with the Cargo cache. If `run-msvc.mjs` exits with
+code 3 before compiling, the account is wrong: do not copy tools into Windows
+system directories, change ACLs, or modify the installed toolchain.
 
 Discover the produced installer and executable from the command output and
 `release/desktop`, then record absolute paths. Inspect PE version metadata and
@@ -317,6 +419,18 @@ Use a unique test profile supported by the E2E harness. Do not launch an
 installed BiBCode executable or overwrite `%APPDATA%`/`%LOCALAPPDATA%` user
 data. `BIBCODE_E2E_APP_PATH` deliberately selects the executable produced by
 the E2E build in the current worktree, not an installed production copy.
+
+The embedded test WebDriver server (`tauri-plugin-wdio-webdriver`) binds
+`127.0.0.1` only and never opens UDP, so it does not by itself raise a Windows
+Defender Firewall prompt. Desktop port selection used to listen briefly on
+`0.0.0.0` and `[::]`, which made Windows treat any freshly built executable as
+a network server and, when the prompt was cancelled, create program-scoped
+Public inbound Block rules (one TCP, one UDP). The probe now binds without
+listening. If a prompt still appears for a test executable, do not approve it;
+cancel it, finish the run, and remove the generated rules with the helper in
+[Process and Job cleanup](#process-and-job-cleanup). Changing firewall exposure,
+approving a prompt, or generating an **Another device** pairing offer requires
+explicit operator approval recorded in the report.
 
 ## Packaged UI scenarios
 
@@ -444,6 +558,24 @@ the run.
 Remove the junction before its target, then remove only the exact fixture and
 profile roots created by this run. Never delete a pre-existing `%TEMP%`, build,
 or user directory.
+
+After the last packaged launch, confirm no BiBCode, WebDriver, or Tauri process
+from the run survives, then remove any firewall rules Windows generated for the
+exact test executable and prove none remain. From an elevated PowerShell:
+
+```powershell
+Get-Process | Where-Object { $_.Path -and ($_.Path -ieq $env:BIBCODE_E2E_APP_PATH) }
+node scripts/remove-test-firewall-rules.ts --executable $env:BIBCODE_E2E_APP_PATH --dry-run
+node scripts/remove-test-firewall-rules.ts --executable $env:BIBCODE_E2E_APP_PATH
+Get-NetFirewallApplicationFilter |
+  Where-Object { $_.Program -ieq $env:BIBCODE_E2E_APP_PATH } |
+  Get-NetFirewallRule
+```
+
+The helper selects rules by that exact program path, refuses installed
+locations, never removes `BiBCode Remote Access`, and exits non-zero unless the
+final query returns zero matching rules; the last command must print nothing.
+Record the rule names removed and the empty verification in the report.
 
 ## Linux and macOS compatibility audit
 

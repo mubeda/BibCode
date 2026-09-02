@@ -52,6 +52,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11.0"
 snow = "0.10"
+socket2 = "0.6.5"
 sysinfo = "0.39.6"
 subtle = "2.6.1"
 bibcode-server = { path = "apps/server" }

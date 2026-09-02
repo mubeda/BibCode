@@ -25,6 +25,11 @@ four job groups:
   the Windows command processor and writes its exact action record. Simulated
   target fixture assertions on other hosts are compatibility evidence, not a
   native Windows pass.
+  The Windows rows then run
+  `node scripts/run-msvc.mjs cargo check -p bibcode-server --all-targets` so
+  Unix-only test helpers or imports that are unused on Windows fail there under
+  `-D warnings` instead of surfacing only during native validation; Clippy's
+  `--all-targets` pass otherwise runs on Linux alone.
 
 The Check and Test jobs install the Linux libraries required by Tauri. The
 native matrix installs them only on Linux and otherwise uses each platform's

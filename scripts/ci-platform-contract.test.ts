@@ -191,6 +191,22 @@ describe("cross-platform CI contract", () => {
     expect(windowsE2eStep?.run).toBe("vp test run apps/desktop/e2e/support/test-project.test.ts");
   });
 
+  it("compiles every bibcode-server test target on the Windows native rows", () => {
+    // Clippy with --all-targets runs on Linux only, so Unix-only test helpers
+    // and imports can leave the Windows server test binaries uncompilable
+    // under -D warnings without this gate.
+    const { workflow } = readWorkflow(CI_WORKFLOW_PATH);
+    const nativeSteps = requireJob(workflow, "native_desktop").steps ?? [];
+    const windowsCompileStep = nativeSteps.find(
+      (step) => step.name === "Check Windows server test targets compile",
+    );
+
+    expect(windowsCompileStep?.if).toBe("matrix.platform == 'win'");
+    expect(windowsCompileStep?.run).toBe(
+      "node scripts/run-msvc.mjs cargo check -p bibcode-server --all-targets",
+    );
+  });
+
   it("installs the full official Linux Tauri prerequisite set", () => {
     const { workflow } = readWorkflow(CI_WORKFLOW_PATH);
     const commands = allStepCommands(requireJob(workflow, "native_desktop"));

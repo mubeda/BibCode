@@ -14,22 +14,40 @@ describe("run-windows-cargo-target", () => {
     expect(consoleError).toHaveBeenCalledOnce();
   });
 
+  it("declares asInvoker so installer-detection names such as *update* launch unelevated", () => {
+    expect(COMMON_CONTROLS_V6_MANIFEST).toContain(
+      '<requestedExecutionLevel level="asInvoker" uiAccess="false" />',
+    );
+    expect(COMMON_CONTROLS_V6_MANIFEST).toContain('name="Microsoft.Windows.Common-Controls"');
+  });
+
   it("runs a target with a temporary Common Controls v6 sidecar manifest", () => {
     const writeFileSync = vi.fn();
     const rmSync = vi.fn();
     const spawnSync = vi.fn(() => ({ status: 7 }));
+    const utimesSync = vi.fn();
+    const stamp = new Date("2026-09-02T12:00:00Z");
 
     expect(
       runWindowsCargoTarget(["C:/target/test.exe", "--exact", "unit"], {
         writeFileSync,
         rmSync,
         spawnSync,
+        utimesSync,
+        now: () => stamp,
       }),
     ).toBe(7);
     expect(writeFileSync).toHaveBeenCalledWith(
       "C:/target/test.exe.manifest",
       COMMON_CONTROLS_V6_MANIFEST,
       "utf8",
+    );
+    expect(utimesSync).toHaveBeenCalledWith("C:/target/test.exe", stamp, stamp);
+    expect(utimesSync.mock.invocationCallOrder[0]).toBeGreaterThan(
+      writeFileSync.mock.invocationCallOrder[0],
+    );
+    expect(utimesSync.mock.invocationCallOrder[0]).toBeLessThan(
+      spawnSync.mock.invocationCallOrder[0],
     );
     expect(spawnSync).toHaveBeenCalledWith("C:/target/test.exe", ["--exact", "unit"], {
       stdio: "inherit",
