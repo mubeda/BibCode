@@ -256,6 +256,12 @@ bootstrap credentials, update-signing secrets, tokens, and database contents.
 1. Confirm the intended version and commit have passed the local verification
    commands below. Create and push the intended tag (or dispatch `stable` with
    that explicit version) with `publish` left at its default `false`.
+   If a tag-triggered run exposes a release-controller defect after the native
+   artifacts have built, fix and verify the controller on `main`, then start a
+   manual repair run for the same version with `publish=false`. The manual
+   repair run uses current release tooling only for assembly and verification;
+   every desktop and server artifact remains built from the immutable tagged
+   commit resolved by preflight.
 2. Confirm the six native desktop and six native server build jobs complete and
    that the stable desktop jobs received
    the two signing secrets above. Do not inspect or print their values.
