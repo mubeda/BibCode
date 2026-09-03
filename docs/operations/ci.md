@@ -8,10 +8,12 @@ four job groups:
   desktop build pipeline on Ubuntu 24.04.
 - **Test** runs every workspace package `test` script concurrently with
   `vp run test`, then runs `cargo test --workspace -j 2` explicitly on Ubuntu
-  24.04. The `-j 2` bound limits concurrent Cargo compilation jobs; Rust test
-  binaries use the default parallel harness threads. Exact subprocess tests may
-  still select `--test-threads=1` inside an isolated child process that
-  intentionally owns process-global state.
+  24.04. Its 45-minute job watchdog accommodates an uncached Rust workspace
+  build plus the complete integration suite without changing any test-owned
+  deadline. The `-j 2` bound limits concurrent Cargo compilation jobs; Rust
+  test binaries use the default parallel harness threads. Exact subprocess
+  tests may still select `--test-threads=1` inside an isolated child process
+  that intentionally owns process-global state.
 - **Release Smoke** runs `scripts/release-smoke.ts` to exercise release-only
   version rewriting, nightly metadata, and lockfile generation without
   publishing.

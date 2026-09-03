@@ -36,6 +36,7 @@ interface WorkflowJob {
   readonly needs?: string | ReadonlyArray<string>;
   readonly outputs?: Record<string, string>;
   readonly "runs-on"?: string;
+  readonly "timeout-minutes"?: number;
   readonly strategy?: {
     readonly "fail-fast"?: boolean;
     readonly matrix?: {
@@ -99,6 +100,12 @@ describe("cross-platform CI contract", () => {
     for (const name of ["check", "test", "release_smoke"]) {
       expect(requireJob(workflow, name)["runs-on"]).toBe("ubuntu-24.04");
     }
+  });
+
+  it("allows the full test job to finish a cold Rust workspace build", () => {
+    const { workflow } = readWorkflow(CI_WORKFLOW_PATH);
+
+    expect(requireJob(workflow, "test")["timeout-minutes"]).toBeGreaterThanOrEqual(45);
   });
 
   it("builds native desktop bundles on every supported runner and architecture", () => {
