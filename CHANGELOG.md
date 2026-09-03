@@ -1,5 +1,25 @@
 # Changelog
 
+## [v0.5.2] - 2026-09-03
+
+BiBCode v0.5.2 is a macOS-only fix on top of v0.5.1: the desktop app can now
+reach plain-HTTP remote servers on a LAN or tailnet, which App Transport
+Security had been refusing before any packet left the machine.
+
+### Connection fixes
+
+- The macOS bundle now merges an `Info.plist` that relaxes App Transport
+  Security for web content only (`NSAllowsArbitraryLoadsInWebContent` and
+  `NSAllowsLocalNetworking`) and declares the Local Network usage description,
+  so **Add Server → Pairing code** works against `http://` servers. Native
+  code keeps the default policy, and the hardening test rejects the blanket
+  `NSAllowsArbitraryLoads`.
+
+### Documentation
+
+- The remote architecture and release documents record the macOS gate beside
+  the webview connect policy introduced in v0.5.1.
+
 ## [v0.5.1] - 2026-09-03
 
 BiBCode v0.5.1 makes headless servers pairable from the desktop app without a
