@@ -6251,9 +6251,10 @@ $client.Dispose()
 
         stop_managed_backend(
             backend,
-            BackendShutdownConfig {
-                timeout: Duration::from_millis(250),
-            },
+            // Windows process termination is asynchronous. Exercise the
+            // production shutdown contract instead of coupling this lifecycle
+            // assertion to a subsecond CI scheduler window.
+            BackendShutdownConfig::default(),
         )
         .await
         .expect("unresponsive child should be force-killed");

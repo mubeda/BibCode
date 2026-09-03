@@ -104,7 +104,8 @@ features.
 - Stabilized release gates by target-gating macOS-only test imports, giving
   uncached Rust workspace jobs an explicit workflow budget, and replacing a
   scheduler-sensitive Git broadcaster teardown timer with canonical lifecycle
-  retirement.
+  retirement. Windows forced-shutdown coverage now exercises the production
+  timeout instead of a scheduler-sensitive 250 ms fixture window.
 - Removed an accidental literal NUL from tracked TypeScript source and added a
   repository-wide guard so text-source corruption fails tests immediately.
 
