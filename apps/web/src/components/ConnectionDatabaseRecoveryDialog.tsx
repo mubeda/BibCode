@@ -103,9 +103,7 @@ export function ConnectionDatabaseRecoveryDialog({
                 : "Connection storage is unavailable"}
           </DialogTitle>
           <DialogDescription role={health.status === "unavailable" ? "alert" : undefined}>
-            {health.status === "incompatible"
-              ? "This browser cannot open connection data written by a newer BiBCode version."
-              : health.message}
+            {health.message}
           </DialogDescription>
         </DialogHeader>
         <DialogPanel className="space-y-4 text-sm">

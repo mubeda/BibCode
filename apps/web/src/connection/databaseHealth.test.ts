@@ -53,7 +53,10 @@ describe("connection database health", () => {
     incompatible.error = new DOMException("newer database", "VersionError");
     monitorConnectionDatabaseOpenRequest(incompatible);
     incompatible.fire("error");
-    expect(getConnectionDatabaseHealth().status).toBe("incompatible");
+    expect(getConnectionDatabaseHealth()).toEqual({
+      status: "incompatible",
+      message: "This browser cannot open connection data written by a newer BiBCode version.",
+    });
 
     const unavailable = new FakeRequest();
     unavailable.error = new DOMException("permission denied", "UnknownError");
@@ -62,6 +65,19 @@ describe("connection database health", () => {
     expect(getConnectionDatabaseHealth()).toMatchObject({ status: "unavailable" });
     expect(snapshots).toEqual(["blocked", "ready", "incompatible", "unavailable"]);
     unsubscribe();
+  });
+
+  it("classifies WebKit's permanent database-file failure as incompatible", () => {
+    const incompatible = new FakeRequest();
+    incompatible.error = new DOMException("Unable to establish IDB database file", "UnknownError");
+    monitorConnectionDatabaseOpenRequest(incompatible);
+    incompatible.fire("error");
+
+    expect(getConnectionDatabaseHealth()).toEqual({
+      status: "incompatible",
+      message:
+        "This BiBCode build uses an older browser engine than the one that last wrote its connection data, so the connection database cannot be opened.",
+    });
   });
 
   it("keeps a blocked deletion pending until that request succeeds", async () => {

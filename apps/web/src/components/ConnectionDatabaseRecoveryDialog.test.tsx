@@ -91,6 +91,37 @@ afterEach(async () => {
 });
 
 describe("ConnectionDatabaseRecoveryDialog", () => {
+  it("offers the acknowledged reset for WebKit's permanent database-file failure", async () => {
+    publishOpenEvent(
+      "error",
+      new DOMException("Unable to establish IDB database file", "UnknownError"),
+    );
+    const deleteDatabase = vi.fn(async () => "deleted" as const);
+    const reloadPage = vi.fn();
+    await act(async () => {
+      root.render(
+        <ConnectionDatabaseRecoveryDialog
+          deleteDatabase={deleteDatabase}
+          reloadPage={reloadPage}
+        />,
+      );
+    });
+
+    expect(container.textContent).toContain("Connection database needs reset");
+    expect(container.textContent).toContain(
+      "This BiBCode build uses an older browser engine than the one that last wrote its connection data, so the connection database cannot be opened.",
+    );
+    await act(async () => button("Reset saved connection data").click());
+    expect(deleteDatabase).not.toHaveBeenCalled();
+    expect(button("Delete saved connection data").disabled).toBe(true);
+
+    await act(async () => acknowledgementCheckbox().click());
+    expect(button("Delete saved connection data").disabled).toBe(false);
+    await act(async () => button("Delete saved connection data").click());
+    expect(deleteDatabase).toHaveBeenCalledOnce();
+    expect(reloadPage).toHaveBeenCalledOnce();
+  });
+
   it("requires a separate acknowledged confirmation that a double-click cannot trigger", async () => {
     publishOpenEvent("error", new DOMException("newer database", "VersionError"));
     const deleteDatabase = vi.fn(async () => "deleted" as const);

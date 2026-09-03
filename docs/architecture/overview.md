@@ -720,13 +720,15 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
   sources and leaves catalog operations fail-closed. Unprotected legacy
   migration preserves an existing valid IndexedDB winner and uses exact CAS
   before replacing corrupt IndexedDB bytes with the only valid legacy catalog.
-  A connection-database `VersionError` is handled before the connection runtime
-  starts: the shell offers a non-destructive reload plus a separately
-  acknowledged destructive reset that a double-click cannot confirm. A blocked
-  deletion remains visibly queued on its original request until success or
-  error; the shell reloads automatically only after actual deletion success.
-  Otherwise unavailable databases remain non-destructive and show actionable
-  health instead of looping at boot.
+  A connection-database `VersionError` and WebKit's permanent open failure,
+  `Unable to establish IDB database file`, are handled before the connection
+  runtime starts. The WebKit failure is produced when an older bundled WebKitGTK
+  opens a database migrated by a newer one. The shell offers a non-destructive
+  reload plus a separately acknowledged destructive reset that a double-click
+  cannot confirm. A blocked deletion remains visibly queued on its original
+  request until success or error; the shell reloads automatically only after
+  actual deletion success. Otherwise unavailable databases remain
+  non-destructive and show actionable health instead of looping at boot.
   Outside that migration, a corrupt authoritative catalog is never rewritten
   as empty: it is quarantined when supported, publishes redacted
   recovery-required health, blocks mutation, and requires an explicit

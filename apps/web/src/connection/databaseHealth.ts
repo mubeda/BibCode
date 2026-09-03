@@ -45,7 +45,20 @@ export function monitorConnectionDatabaseOpenRequest(request: IDBOpenDBRequest):
     if (errorName(error) === "VersionError") {
       publishOpenHealth({
         status: "incompatible",
-        message: "This browser has a newer, incompatible BiBCode connection database.",
+        message: "This browser cannot open connection data written by a newer BiBCode version.",
+      });
+      return;
+    }
+    // This WebKit message is the only IndexedDB API signal for this permanent
+    // on-disk condition, and is verbatim in WebKitGTK 2.50 and 2.52.
+    if (
+      errorName(error) === "UnknownError" &&
+      error?.message.includes("Unable to establish IDB database file")
+    ) {
+      publishOpenHealth({
+        status: "incompatible",
+        message:
+          "This BiBCode build uses an older browser engine than the one that last wrote its connection data, so the connection database cannot be opened.",
       });
       return;
     }
