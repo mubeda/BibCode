@@ -1,6 +1,6 @@
 # Changelog
 
-## [v0.5.0] - 2026-09-02
+## [v0.5.0] - 2026-09-03
 
 BiBCode v0.5.0 adds first-class remote environments, a complete project-level
 Git Manager, and a dedicated Agents view. It also expands native desktop and
