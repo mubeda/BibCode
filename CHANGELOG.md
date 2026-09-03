@@ -1,5 +1,30 @@
 # Changelog
 
+## [v0.5.3] - 2026-09-03
+
+BiBCode v0.5.3 fixes the encrypted pairing channel in every desktop app: with
+the v0.5.1 connect policy and the v0.5.2 macOS transport exception in place,
+pairing still ended as "Server unreachable" because the client rejected the
+server's handshake reply.
+
+### Connection fixes
+
+- The end-to-end-encrypted channel now reads WebSocket frames delivered as
+  `ArrayBuffer`, which is what every real browser hands over once the socket
+  is switched to `binaryType "arraybuffer"`. The client previously treated
+  such frames as non-binary, failed the Noise handshake as a protocol error
+  right after receiving the server's reply, and closed the socket without
+  sending its pairing message. Verified end to end inside a WebKit page
+  carrying the app's policy against a live server: the handshake completes,
+  the pairing token is consumed, and the session is minted. A regression test
+  drives the handshake through a socket that delivers `ArrayBuffer` frames.
+
+### Test reliability
+
+- The blocked-remote cancellation test in the Git status broadcaster awaits
+  the cancellation before releasing the blocking permit, removing a race that
+  failed a release preflight under CI load.
+
 ## [v0.5.2] - 2026-09-03
 
 BiBCode v0.5.2 is a macOS-only fix on top of v0.5.1: the desktop app can now
