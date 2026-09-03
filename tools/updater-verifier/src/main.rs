@@ -11,10 +11,12 @@ use std::{
 };
 use url::Url;
 
-const UPDATE_TARGETS: [&str; 4] = [
+const UPDATE_TARGETS: [&str; 6] = [
     "darwin-aarch64",
     "darwin-x86_64",
+    "linux-aarch64",
     "linux-x86_64",
+    "windows-aarch64",
     "windows-x86_64",
 ];
 
@@ -238,7 +240,9 @@ mod tests {
         let platforms = [
             ("darwin-aarch64", "payload-a-one", b"payload-a".as_slice(), TEST_SIGNATURE_A),
             ("darwin-x86_64", "payload-b-one", b"payload-b".as_slice(), TEST_SIGNATURE_B),
+            ("linux-aarch64", "payload-a-three", b"payload-a".as_slice(), TEST_SIGNATURE_A),
             ("linux-x86_64", "payload-a-two", b"payload-a".as_slice(), TEST_SIGNATURE_A),
+            ("windows-aarch64", "payload-b-three", b"payload-b".as_slice(), TEST_SIGNATURE_B),
             ("windows-x86_64", "payload-b-two", b"payload-b".as_slice(), TEST_SIGNATURE_B),
         ]
         .into_iter()
@@ -293,7 +297,7 @@ mod tests {
                 Path::new(&fixture.assets_dir),
             )
             .expect("valid release signatures"),
-            4
+            6
         );
     }
 
