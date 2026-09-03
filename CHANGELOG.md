@@ -101,6 +101,10 @@ features.
   cross-platform runbooks. The macOS Git Manager flow was exercised against a
   real private GitHub repository through branch, diff, staging, commit, history,
   push, pull-request, checks, tag, fetch, and checkout behavior.
+- Stabilized release gates by target-gating macOS-only test imports, giving
+  uncached Rust workspace jobs an explicit workflow budget, and replacing a
+  scheduler-sensitive Git broadcaster teardown timer with canonical lifecycle
+  retirement.
 - Removed an accidental literal NUL from tracked TypeScript source and added a
   repository-wide guard so text-source corruption fails tests immediately.
 

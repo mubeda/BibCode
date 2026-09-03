@@ -2329,14 +2329,15 @@ mod tests {
                 if request.operation == "GitVcsDriver.statusDetailsRemote.status" {
                     let _ = self.remote_started.send(());
                     tokio::select! {
-                        permit = self.release_remote.acquire() => {
-                            permit.expect("remote release owner remains alive").forget();
-                        }
+                        biased;
                         () = cancellation.cancelled() => {
                             let _ = self.remote_cancelled.send(());
                             return Err(ProcessError::Cancelled {
                                 operation: request.operation,
                             });
+                        }
+                        permit = self.release_remote.acquire() => {
+                            permit.expect("remote release owner remains alive").forget();
                         }
                     }
                 }
@@ -3585,6 +3586,8 @@ mod tests {
         let command = sandbox.executable_on_path("git");
         let (expected_git_config, environment) = isolated_git_environment(&sandbox);
         let repository = initialize_test_repository(&sandbox, &command, &environment);
+        let canonical_repository =
+            fs::canonicalize(&repository).expect("canonical repository fixture");
         let (remote_started, mut remote_started_rx) = mpsc::unbounded_channel();
         let (remote_cancelled, mut remote_cancelled_rx) = mpsc::unbounded_channel();
         let (local_status_started, mut local_status_started_rx) = mpsc::unbounded_channel();
@@ -3641,10 +3644,13 @@ mod tests {
 
         drop(subscription);
         assert_eq!(broadcaster.active_poller_count(), 0);
-        tokio::time::timeout(Duration::from_secs(5), remote_cancelled_rx.recv())
-            .await
-            .expect("final subscriber drop cancels the blocked remote owner")
-            .expect("remote cancellation checkpoint owner remains alive");
+        release_remote.add_permits(1);
+        broadcaster
+            .await_retired_lifecycle(&canonical_repository)
+            .await;
+        remote_cancelled_rx
+            .try_recv()
+            .expect("final subscriber drop cancels the blocked remote owner");
     }
 
     #[tokio::test(start_paused = true)]
