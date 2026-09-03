@@ -5346,7 +5346,14 @@ mod tests {
             .await
             .expect("all migrations apply");
         let repositories = Repositories::new(database);
-        let expires_at = now_ms().saturating_add(200);
+        let secrets = tempfile::tempdir().expect("secret store directory");
+        let secret_store = SecretStore::new(secrets.path())
+            .await
+            .expect("secret store");
+        let config = ServerConfig::new(".").with_bind("127.0.0.1", 3773);
+        let expiry_lead_ms = i64::try_from((AUTHORITY_CONVERGENCE_INTERVAL * 8).as_millis())
+            .expect("authority expiry lead fits i64");
+        let expires_at = now_ms().saturating_add(expiry_lead_ms);
         repositories
             .create_auth_pairing_link(PersistedPairingLink {
                 id: "expiring-grant".to_owned(),
@@ -5365,14 +5372,10 @@ mod tests {
             })
             .await
             .expect("expiring authority row");
-        let secrets = tempfile::tempdir().expect("secret store directory");
-        let config = ServerConfig::new(".").with_bind("127.0.0.1", 3773);
         let service = AuthService::new_with_persistence(
             &config,
             vec![7_u8; 32],
-            SecretStore::new(secrets.path())
-                .await
-                .expect("secret store"),
+            secret_store,
             repositories.clone(),
         )
         .await
@@ -5384,7 +5387,7 @@ mod tests {
             .await
             .expect("authority revision");
 
-        let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let event = tokio::time::timeout(AUTHORITY_CONVERGENCE_INTERVAL * 16, async {
             loop {
                 let event = access_events
                     .recv()

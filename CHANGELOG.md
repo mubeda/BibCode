@@ -107,7 +107,8 @@ features.
   retirement. Windows forced-shutdown coverage now exercises the production
   timeout instead of a scheduler-sensitive 250 ms fixture window, and
   cross-process auth revocation coverage distinguishes queued prior revisions
-  from the forbidden post-revocation event.
+  from the forbidden post-revocation event. Authority-expiry coverage starts
+  its short-lived grant only after nonessential fixture setup is complete.
 - Removed an accidental literal NUL from tracked TypeScript source and added a
   repository-wide guard so text-source corruption fails tests immediately.
 
