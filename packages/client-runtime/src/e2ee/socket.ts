@@ -134,8 +134,15 @@ export const makeE2eeSocket = (inner: Socket.Socket, options: E2eeSocketOptions)
           const innerWrite = yield* Scope.provide(inner.writer, scope);
 
           const innerHandler = (
-            data: string | Uint8Array,
+            delivered: string | Uint8Array,
           ): void | Effect.Effect<A | void, Socket.SocketError | E, R> => {
+            // A browser WebSocket switched to binaryType "arraybuffer" delivers
+            // ArrayBuffer frames, and the raw socket path hands them over
+            // unchanged; they are binary and must be read as bytes.
+            const data: string | Uint8Array =
+              (delivered as unknown) instanceof ArrayBuffer
+                ? new Uint8Array(delivered as unknown as ArrayBuffer)
+                : delivered;
             if (typeof data === "string") {
               return fail("protocol", "peer sent a plaintext text frame on the E2EE channel");
             }

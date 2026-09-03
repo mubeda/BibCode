@@ -56,8 +56,19 @@ const makeScriptedInnerSocket = (
     close: (code?: number) => void,
   ) => void,
   beforeWrite?: (frame: Uint8Array) => Effect.Effect<void>,
+  options?: { readonly frameType?: "uint8array" | "arraybuffer" },
 ): Socket.Socket => {
   let deliver: ((frame: Uint8Array) => void) | null = null;
+  // Effect's WebSocket socket passes a browser frame through `runRaw`
+  // untouched, so under binaryType "arraybuffer" the handler receives an
+  // ArrayBuffer rather than a Uint8Array.
+  const asDelivered = (frame: Uint8Array): Uint8Array =>
+    options?.frameType === "arraybuffer"
+      ? (frame.buffer.slice(
+          frame.byteOffset,
+          frame.byteOffset + frame.byteLength,
+        ) as unknown as Uint8Array)
+      : frame;
   let finish: ((code?: number) => void) | null = null;
   const pending: Array<Uint8Array> = [];
   let closed: { code?: number } | null = null;
@@ -83,7 +94,7 @@ const makeScriptedInnerSocket = (
         );
         const run = yield* FiberSet.runtime(fiberSet)<R>();
         deliver = (frame) => {
-          const result = handler(frame);
+          const result = handler(asDelivered(frame));
           if (Effect.isEffect(result)) run(result);
         };
         finish = (code) =>
@@ -275,6 +286,48 @@ describe("makeE2eeSocket", () => {
       yield* Deferred.await(opened);
       yield* Fiber.interrupt(fiber);
       expect(received[0]).toBe(encodeJson({ type: "e2ee_auth", bearer: "stored-1" }));
+    }),
+  );
+
+  it.live("handshakes when the browser transport delivers ArrayBuffer frames", () =>
+    Effect.gen(function* () {
+      // Real WebSockets switched to binaryType "arraybuffer" deliver
+      // ArrayBuffer frames, and Effect's raw path hands them over as-is. The
+      // channel must treat them as binary, not fail closed as a non-binary
+      // frame; that failure surfaced as "Server unreachable" on every desktop.
+      const { hostKey, script, received } = responderScript();
+      const socket = makeE2eeSocket(
+        makeScriptedInnerSocket(script, undefined, { frameType: "arraybuffer" }),
+        {
+          hostKey: Buffer.from(hostKey).toString("base64url"),
+          auth: { kind: "pairing", token: "one-time-2" },
+        },
+      );
+      const delivered: Array<string> = [];
+      const opened = yield* Deferred.make<void>();
+      const fiber = yield* Effect.forkChild(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const write = yield* socket.writer;
+            yield* Effect.forkChild(
+              socket.runString(
+                (text) => {
+                  delivered.push(text);
+                },
+                { onOpen: Deferred.succeed(opened, undefined).pipe(Effect.asVoid) },
+              ),
+            );
+            yield* Deferred.await(opened);
+            yield* write(encodeJson({ hello: true }));
+            yield* Effect.sleep("50 millis");
+          }),
+        ),
+      );
+      yield* Effect.sleep("200 millis");
+      yield* Fiber.interrupt(fiber);
+      expect(received[0]).toBe(encodeJson({ type: "e2ee_auth", pairing: "one-time-2" }));
+      expect(received[1]).toBe(encodeJson({ hello: true }));
+      expect(delivered).toEqual([encodeJson({ echoed: received[1]?.length })]);
     }),
   );
 
