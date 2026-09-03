@@ -355,8 +355,9 @@ node scripts/build-desktop-artifact.ts --platform win --target nsis --arch x64 -
 Equivalent root shortcuts are `dist:desktop:dmg`,
 `dist:desktop:dmg:arm64`, `dist:desktop:dmg:x64`,
 `dist:desktop:linux`, `dist:desktop:win`, and `dist:desktop:win:x64`. The root
-package retains an ARM64 Windows artifact command for development experiments,
-but Windows ARM is not a supported release target.
+package also exposes `dist:desktop:win:arm64`; Windows 11 ARM64 and Windows
+10/11 x64 are both supported release targets and require their matching native
+release runners.
 
 ## References
 

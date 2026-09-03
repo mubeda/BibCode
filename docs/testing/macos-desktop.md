@@ -48,6 +48,10 @@ Select focused tests from affected source and verify at least:
 - Unix process-group ownership survives cancellation and natural leader exit,
   reaps late descendants, does not signal peer-runtime roots, and remains
   independent of the Windows-only Job implementation;
+- desktop login-shell PATH hydration accepts a complete delimited result
+  without waiting for shell exit or pipe EOF, then terminates and reaps the
+  probe group before startup continues, and remains usable when the desktop
+  process inherits a controlling terminal;
 - Local desktop presentation omits WSL controls while saved remote environments
   remain selectable in the environment rail without bypassing desktop-owned
   connection controls;
