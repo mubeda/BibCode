@@ -15,6 +15,7 @@ import {
   DialogDescription,
   DialogFooter,
   DialogHeader,
+  DialogPanel,
   DialogPopup,
   DialogTitle,
 } from "~/components/ui/dialog";
@@ -215,102 +216,136 @@ export const GitManagerCreatePullRequestDialog = memo(function GitManagerCreateP
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogPopup aria-busy={busy ? "true" : "false"} data-testid="git-manager-create-pr-dialog">
-        <DialogHeader>
+      <DialogPopup
+        aria-busy={busy ? "true" : "false"}
+        className="max-w-xl"
+        data-testid="git-manager-create-pr-dialog"
+      >
+        <DialogHeader className="pb-4">
           <DialogTitle>Create pull request</DialogTitle>
           <DialogDescription>
             Review the pull request before anything is published.
           </DialogDescription>
         </DialogHeader>
-        <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-xs">
-          <dt className="text-muted-foreground">Repository</dt>
-          <dd className="truncate" data-testid="create-pr-repository">
-            {review?.provider === null || review?.provider === undefined
-              ? "Not detected"
-              : `${review.provider.name} · ${review.provider.baseUrl}`}
-          </dd>
-          <dt className="text-muted-foreground">Base</dt>
-          <dd className="truncate font-mono" data-testid="create-pr-base">
-            {review?.base ?? "…"}
-          </dd>
-          <dt className="text-muted-foreground">Head</dt>
-          <dd className="truncate font-mono" data-testid="create-pr-head">
-            {review?.head ?? "No branch checked out"}
-          </dd>
-          <dt className="text-muted-foreground">Publish</dt>
-          <dd data-testid="create-pr-publish">
-            {review === null
-              ? "…"
-              : review.publishRequired
-                ? `${review.head ?? "The branch"} is not on the remote yet and will be published first.`
-                : "The branch is already published."}
-          </dd>
-        </dl>
-        {review?.existingPullRequest === null ||
-        review?.existingPullRequest === undefined ? null : (
-          <p className="text-xs" data-testid="create-pr-existing">
-            Pull request #{review.existingPullRequest.number} already exists for this branch:{" "}
-            {outcomeUrl === null ? (
-              review.existingPullRequest.title
-            ) : (
-              <a
-                className="underline-offset-2 hover:underline"
-                href={outcomeUrl}
-                rel="noreferrer"
-                target="_blank"
-              >
-                {review.existingPullRequest.title}
-              </a>
-            )}
-          </p>
-        )}
-        <div className="flex flex-col gap-1">
-          <Label htmlFor="git-manager-create-pr-title">Title</Label>
-          <Input
-            aria-invalid={trimmedTitle.length === 0 && review !== null ? "true" : undefined}
-            disabled={fieldsDisabled}
-            id="git-manager-create-pr-title"
-            value={title}
-            onChange={changeTitle}
-          />
-        </div>
-        <div className="flex flex-col gap-1">
-          <Label htmlFor="git-manager-create-pr-body">Description</Label>
-          <Textarea
-            disabled={fieldsDisabled}
-            id="git-manager-create-pr-body"
-            rows={5}
-            value={body}
-            onChange={changeBody}
-          />
-        </div>
-        {statusText === null && review?.blockedReason === null ? null : (
-          <p
-            aria-live="polite"
-            className={
-              presentation?.tone === "error"
-                ? "text-xs text-destructive"
-                : "text-xs text-muted-foreground"
-            }
-            data-testid="create-pr-status"
-            role="status"
+        <DialogPanel className="space-y-5">
+          <section
+            aria-label="Pull request details"
+            className="rounded-xl border border-border/70 bg-muted/24 px-4"
+            data-testid="create-pr-summary"
           >
-            {statusText ?? review?.blockedReason}
-            {outcomeUrl !== null && settled ? (
-              <>
-                {" "}
+            <dl className="divide-y divide-border/70 text-sm">
+              <div className="grid grid-cols-[6rem_minmax(0,1fr)] items-start gap-4 py-2.5">
+                <dt className="whitespace-nowrap text-muted-foreground">Repository</dt>
+                <dd className="min-w-0 break-all text-right" data-testid="create-pr-repository">
+                  {review?.provider === null || review?.provider === undefined
+                    ? "Not detected"
+                    : `${review.provider.name} · ${review.provider.baseUrl}`}
+                </dd>
+              </div>
+              <div className="grid grid-cols-[6rem_minmax(0,1fr)] items-center gap-4 py-2.5">
+                <dt className="whitespace-nowrap text-muted-foreground">Base branch</dt>
+                <dd
+                  className="min-w-0 justify-self-end break-all rounded-md bg-background px-2 py-1 font-mono text-xs"
+                  data-testid="create-pr-base"
+                >
+                  {review?.base ?? "…"}
+                </dd>
+              </div>
+              <div className="grid grid-cols-[6rem_minmax(0,1fr)] items-center gap-4 py-2.5">
+                <dt className="whitespace-nowrap text-muted-foreground">Head branch</dt>
+                <dd
+                  className="min-w-0 justify-self-end break-all rounded-md bg-background px-2 py-1 text-right font-mono text-xs"
+                  data-testid="create-pr-head"
+                >
+                  {review?.head ?? "No branch checked out"}
+                </dd>
+              </div>
+            </dl>
+          </section>
+          <div
+            className="rounded-lg border border-border/70 px-3 py-2.5 text-xs"
+            data-testid="create-pr-publish"
+          >
+            <p className="font-medium text-foreground">Branch publication</p>
+            <p className="mt-1 text-muted-foreground">
+              {review === null
+                ? "Reading branch status…"
+                : review.publishRequired
+                  ? `${review.head ?? "The branch"} is not on the remote yet and will be published first.`
+                  : "The branch is already published."}
+            </p>
+          </div>
+          {review?.existingPullRequest === null ||
+          review?.existingPullRequest === undefined ? null : (
+            <p
+              className="rounded-lg border border-border/70 px-3 py-2.5 text-xs"
+              data-testid="create-pr-existing"
+            >
+              Pull request #{review.existingPullRequest.number} already exists for this branch:{" "}
+              {outcomeUrl === null ? (
+                review.existingPullRequest.title
+              ) : (
                 <a
                   className="underline-offset-2 hover:underline"
                   href={outcomeUrl}
                   rel="noreferrer"
                   target="_blank"
                 >
-                  Open pull request
+                  {review.existingPullRequest.title}
                 </a>
-              </>
-            ) : null}
-          </p>
-        )}
+              )}
+            </p>
+          )}
+          <section aria-label="Pull request content" className="space-y-4">
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="git-manager-create-pr-title">Title</Label>
+              <Input
+                aria-invalid={trimmedTitle.length === 0 && review !== null ? "true" : undefined}
+                disabled={fieldsDisabled}
+                id="git-manager-create-pr-title"
+                value={title}
+                onChange={changeTitle}
+              />
+            </div>
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="git-manager-create-pr-body">Description</Label>
+              <Textarea
+                disabled={fieldsDisabled}
+                id="git-manager-create-pr-body"
+                rows={4}
+                value={body}
+                onChange={changeBody}
+              />
+            </div>
+          </section>
+          {statusText === null && review?.blockedReason === null ? null : (
+            <p
+              aria-live="polite"
+              className={
+                presentation?.tone === "error"
+                  ? "text-xs text-destructive"
+                  : "text-xs text-muted-foreground"
+              }
+              data-testid="create-pr-status"
+              role="status"
+            >
+              {statusText ?? review?.blockedReason}
+              {outcomeUrl !== null && settled ? (
+                <>
+                  {" "}
+                  <a
+                    className="underline-offset-2 hover:underline"
+                    href={outcomeUrl}
+                    rel="noreferrer"
+                    target="_blank"
+                  >
+                    Open pull request
+                  </a>
+                </>
+              ) : null}
+            </p>
+          )}
+        </DialogPanel>
         <DialogFooter>
           <Button
             disabled={busy}

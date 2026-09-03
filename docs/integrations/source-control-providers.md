@@ -188,6 +188,9 @@ credentials are absent.
 
 - Confirm `git` and the relevant provider CLI are on the BiBCode server's
   `PATH`, not only on the browser machine.
+- A newly configured upstream may precede its local remote-tracking ref, notably
+  in a single-branch clone. Git Manager keeps local branches usable in that
+  state; use **Fetch** to materialize the tracking ref and ahead/behind counts.
 - Rescan **Settings → Source Control** after installing or authenticating `gh`,
   `glab`, or `az`.
 - Check whether the remote uses SSH or HTTPS and whether that transport's Git

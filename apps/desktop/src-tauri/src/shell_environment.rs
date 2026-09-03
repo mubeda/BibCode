@@ -225,6 +225,18 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 #[cfg(unix)]
+fn has_complete_path_capture(output: &[u8]) -> bool {
+    let Some(start) = find_subslice(output, PATH_CAPTURE_START) else {
+        return false;
+    };
+    find_subslice(
+        &output[start + PATH_CAPTURE_START.len()..],
+        PATH_CAPTURE_END,
+    )
+    .is_some()
+}
+
+#[cfg(unix)]
 fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
     let start = bytes
         .iter()
@@ -302,6 +314,7 @@ fn drain_stdout(
     mut stdout: ChildStdout,
     limit: usize,
     stop: Arc<AtomicBool>,
+    capture_complete: Arc<AtomicBool>,
 ) -> io::Result<CapturedOutput> {
     set_nonblocking(&stdout)?;
     let mut bytes = Vec::with_capacity(limit.min(8192));
@@ -324,6 +337,9 @@ fn drain_stdout(
             let retained = remaining.min(read);
             bytes.extend_from_slice(&buffer[..retained]);
             exceeded_limit |= retained < read;
+            if has_complete_path_capture(&bytes) {
+                capture_complete.store(true, Ordering::Release);
+            }
         }
     }
 
@@ -407,7 +423,18 @@ fn run_shell_probe(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    command.process_group(0);
+    // SAFETY: after `fork` and before `exec`, the closure invokes only the
+    // async-signal-safe `setsid` syscall. The child cannot already be a process
+    // group leader, so this both detaches any inherited controlling terminal
+    // and creates the PID-scoped process group used by bounded cleanup below.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     let mut child = command
         .spawn()
         .map_err(|_| PathHydrationFailure::SpawnFailed)?;
@@ -421,15 +448,23 @@ fn run_shell_probe(
     };
     let stop = Arc::new(AtomicBool::new(false));
     let reader_stop = Arc::clone(&stop);
-    let reader = std::thread::spawn(move || drain_stdout(stdout, output_limit, reader_stop));
+    let capture_complete = Arc::new(AtomicBool::new(false));
+    let reader_capture_complete = Arc::clone(&capture_complete);
+    let reader = std::thread::spawn(move || {
+        drain_stdout(stdout, output_limit, reader_stop, reader_capture_complete)
+    });
     let deadline = Instant::now() + timeout;
 
-    while !reader.is_finished() && Instant::now() < deadline {
+    while !reader.is_finished()
+        && !capture_complete.load(Ordering::Acquire)
+        && Instant::now() < deadline
+    {
         std::thread::sleep(
             Duration::from_millis(5).min(deadline.saturating_duration_since(Instant::now())),
         );
     }
-    let reached_deadline = !reader.is_finished();
+    let capture_completed_before_termination = capture_complete.load(Ordering::Acquire);
+    let reached_deadline = !reader.is_finished() && !capture_complete.load(Ordering::Acquire);
 
     // Keep the group leader unreaped until after signalling the process group.
     // Reaping it first leaves only a numeric process-group ID, which the OS may
@@ -461,6 +496,9 @@ fn run_shell_probe(
         .map_err(|_| PathHydrationFailure::OutputReadFailed)?;
     if captured.exceeded_limit {
         return Err(PathHydrationFailure::OutputTooLarge);
+    }
+    if capture_completed_before_termination {
+        return parse_captured_path(&captured.bytes, false);
     }
     if reached_deadline && status.signal() == Some(libc::SIGKILL) {
         return Err(PathHydrationFailure::TimedOut);
@@ -521,7 +559,7 @@ mod tests {
     use super::{DesktopPlatform, PlatformAction, PosixPlatform, platform_action};
     #[cfg(unix)]
     use super::{
-        PathHydrationFailure, merge_path_values, parse_captured_path,
+        PathHydrationFailure, merge_path_values, parse_captured_path, probe_shell_path,
         probe_shell_path_with_command, probe_shell_path_with_command_and_pid, select_shell,
     };
 
@@ -806,6 +844,107 @@ printf '__BIBCODE_PATH_START__/user/bin:/usr/bin__BIBCODE_PATH_END__'",
         assert!(
             wait_for_process_disappearance(pid, Duration::from_secs(1)),
             "background shell descendant remained alive"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn complete_path_capture_does_not_wait_for_the_login_shell_to_exit() {
+        let started = Instant::now();
+        let (result, pid) = probe_shell_path_with_command_and_pid(
+            Path::new("/bin/sh"),
+            "printf '__BIBCODE_PATH_START__/user/bin:/usr/bin__BIBCODE_PATH_END__'; \
+             exec /bin/sleep 30",
+            Duration::from_secs(5),
+            4096,
+        );
+
+        assert_eq!(result, Ok(OsString::from("/user/bin:/usr/bin")));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a complete PATH capture waited for the login shell timeout"
+        );
+        assert_ne!(pid, 0, "probe did not record the spawned shell PID");
+        assert!(
+            wait_for_process_disappearance(pid, Duration::from_secs(1)),
+            "shell remained alive after its complete PATH capture"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn complete_path_capture_remains_authoritative_after_stdout_closes() {
+        let started = Instant::now();
+        let (result, pid) = probe_shell_path_with_command_and_pid(
+            Path::new("/bin/sh"),
+            "printf '__BIBCODE_PATH_START__/user/bin:/usr/bin__BIBCODE_PATH_END__'; \
+             exec 1>&-; exec /bin/sleep 30",
+            Duration::from_secs(5),
+            4096,
+        );
+
+        assert_eq!(result, Ok(OsString::from("/user/bin:/usr/bin")));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a complete PATH capture lost authority after stdout closed"
+        );
+        assert_ne!(pid, 0, "probe did not record the spawned shell PID");
+        assert!(
+            wait_for_process_disappearance(pid, Duration::from_secs(1)),
+            "shell remained alive after its complete PATH capture"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stray_end_marker_does_not_preempt_a_later_complete_path_capture() {
+        let (result, pid) = probe_shell_path_with_command_and_pid(
+            Path::new("/bin/sh"),
+            "printf '__BIBCODE_PATH_END__'; /bin/sleep 1; \
+             printf '__BIBCODE_PATH_START__/user/bin:/usr/bin__BIBCODE_PATH_END__'; \
+             exec /bin/sleep 30",
+            Duration::from_secs(5),
+            4096,
+        );
+
+        assert_eq!(result, Ok(OsString::from("/user/bin:/usr/bin")));
+        assert_ne!(pid, 0, "probe did not record the spawned shell PID");
+        assert!(
+            wait_for_process_disappearance(pid, Duration::from_secs(1)),
+            "shell remained alive after the later complete PATH capture"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn login_shell_probe_survives_a_controlling_terminal() {
+        const FIXTURE_ENV: &str = "BIBCODE_PATH_CONTROLLING_TERMINAL_FIXTURE";
+        if std::env::var_os(FIXTURE_ENV).is_some() {
+            assert!(
+                probe_shell_path(Path::new("/bin/zsh"), Duration::from_secs(2), 4096,).is_ok(),
+                "interactive login-shell probe should complete while the app owns a controlling terminal"
+            );
+            return;
+        }
+
+        let executable = std::env::current_exe().expect("test executable should resolve");
+        let zsh_config = tempfile::TempDir::new().expect("isolated zsh config should be created");
+        let status = Command::new("/usr/bin/script")
+            .args(["-q", "/dev/null"])
+            .arg(executable)
+            .args([
+                "--exact",
+                "shell_environment::tests::login_shell_probe_survives_a_controlling_terminal",
+                "--nocapture",
+            ])
+            .env(FIXTURE_ENV, "1")
+            .env("ZDOTDIR", zsh_config.path())
+            .status()
+            .expect("controlling-terminal fixture should launch");
+
+        assert!(
+            status.success(),
+            "controlling-terminal probe failed: {status}"
         );
     }
 

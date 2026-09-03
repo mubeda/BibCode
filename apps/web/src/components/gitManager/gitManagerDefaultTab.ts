@@ -3,12 +3,14 @@ import type { GitManagerInProgressOperation } from "@bibcode/contracts";
 import type { GitManagerTab } from "../../gitManagerStore";
 
 /**
- * History is the tab the manager opens on. Changes opens instead only while a
- * merge is in progress, because that merge can only be finished (conflicts
- * resolved, merge commit made) from the Changes tab.
+ * A pending merge must remain on Changes so it can be finished there. Once the
+ * working tree is known to be clean, History becomes the useful default. Dirty
+ * or still-loading status preserves the tab the user already selected.
  */
 export function resolveGitManagerDefaultTab(
   inProgressOperation: GitManagerInProgressOperation | null | undefined,
-): GitManagerTab {
-  return inProgressOperation?.kind === "merge" ? "changes" : "history";
+  hasWorkingTreeChanges: boolean | undefined,
+): GitManagerTab | null {
+  if (inProgressOperation?.kind === "merge") return "changes";
+  return hasWorkingTreeChanges === false ? "history" : null;
 }

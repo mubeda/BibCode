@@ -246,13 +246,21 @@ The toolbar has three segments:
    selection is remembered while the current client session remains alive.
 2. **Branch** groups local branches into Default, Recent, and Other, and offers
    create, checkout, rename, delete, and merge actions. The same segment exposes
-   tag creation, deletion, and push actions.
+   tag creation, deletion, and push actions. Symbolic remote default pointers
+   such as `origin/HEAD` are not branch rows, while an actual local branch named
+   `origin` remains available.
 3. **Sync** derives fetch, pull, push, publish-branch, and diverged
-   force-with-lease states from the current branch and upstream.
+   force-with-lease states from the current branch and upstream. A configured
+   upstream whose remote-tracking ref has not been fetched keeps the local
+   repository usable; ahead/behind remain unknown at zero until Fetch obtains
+   that ref instead of making the complete Git Manager unavailable.
 
-The manager opens on **History**. It opens on **Changes** only while a merge is
-in progress, since that merge is finished there, and returns to History once the
-merge is committed or aborted; the tab is not remembered between openings.
+The manager opens on **History**. When a checkout with pending changes becomes
+clean after a commit, discard, or recovery, it returns to History. Dirty or
+still-loading checkouts preserve the tab the user chose. An in-progress merge
+always selects **Changes**, since that merge is finished there, and returns to
+History once the merge is committed or aborted; the tab is not remembered
+between openings.
 
 The **Changes** tab filters and groups working-directory changes, keeps file
 inclusion separate from row selection, renders per-file diffs, uses whole-file
@@ -283,12 +291,15 @@ panel's conflict list, then choose Continue once it is enabled.
 
 **Pull requests** opens the provider pane without making a request. Pull-request
 and check data load only when **Refresh** is pressed, and the pane never starts a
-provider timer. It can also start the existing create-pull-request flow. GitHub
-checks are available; other providers currently return checks unavailable.
+provider timer. Its create-pull-request review dialog groups repository, base,
+and head details separately from branch-publication status, then keeps the
+editable title and description in one padded form above the fixed action footer.
+GitHub checks are available; other providers currently return checks
+unavailable.
 
 Project view state is stored under `bibcode:git-manager-state:v1` for the two
 most recently used physical projects. Its persisted project record contains
-`activeTab`, `selectedRef`, `selectedCommitSha`, `multiCommitSelection`,
+`selectedRef`, `selectedCommitSha`, `multiCommitSelection`,
 `selectedFilePath`, `selectedStashSha`, `stashPaneOpen`, `imageDiffMode`,
 `providerPaneOpen`, `lineSelectionByPath`, `filterText`, `loadedPageCount`,
 `loadedPageCursors`, `scrollAnchor`, `commitDraft`, and the `lastUsedAt` value
