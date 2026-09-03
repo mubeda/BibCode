@@ -95,7 +95,7 @@ it("requires explicit manual approval to publish a previously inspected stable d
   );
   assert.match(
     releaseWorkflow,
-    /name: Require inspected stable draft[\s\S]*--json targetCommitish[\s\S]*git rev-parse HEAD/,
+    /name: Require inspected stable draft[\s\S]*RELEASE_REF: \$\{\{ needs\.preflight\.outputs\.ref \}\}[\s\S]*--json targetCommitish[\s\S]*"\$RELEASE_REF"/,
   );
   assert.equal(/git rev-list -n 1 "\$RELEASE_TAG"/.test(releaseWorkflow), false);
   assert.match(
@@ -111,6 +111,25 @@ it("requires explicit manual approval to publish a previously inspected stable d
     /name: Publish first stable release\s*\n\s*if:[^\n]*publish_requested != 'true'/,
   );
   assert.match(releaseDocumentation, /rerun[\s\S]*same version[\s\S]*publish[\s\S]*true/i);
+});
+
+it("uses current release tooling for manual repairs while preserving the tagged product ref", () => {
+  assert.match(
+    releaseWorkflow,
+    /name: Publish GitHub Release[\s\S]*ref: \$\{\{ github\.event_name == 'workflow_dispatch' && github\.sha \|\| needs\.preflight\.outputs\.ref \}\}/,
+  );
+  assert.match(
+    releaseWorkflow,
+    /name: Build \$\{\{ matrix\.label \}\}[\s\S]*ref: \$\{\{ needs\.preflight\.outputs\.ref \}\}/,
+  );
+  assert.match(
+    releaseWorkflow,
+    /name: Build server \$\{\{ matrix\.label \}\}[\s\S]*ref: \$\{\{ needs\.preflight\.outputs\.ref \}\}/,
+  );
+  assert.match(
+    releaseDocumentation,
+    /manual repair run[\s\S]*current release tooling[\s\S]*tagged commit/i,
+  );
 });
 
 it("assembles final assets without creating a GitHub release in validation-only runs", () => {
