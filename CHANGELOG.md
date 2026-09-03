@@ -1,5 +1,126 @@
 # Changelog
 
+## [v0.5.0] - 2026-09-02
+
+BiBCode v0.5.0 adds first-class remote environments, a complete project-level
+Git Manager, and a dedicated Agents view. It also expands native desktop and
+standalone-server releases to six OS/architecture targets and hardens the
+connection, process, packaging, and test boundaries exercised by those
+features.
+
+### Remote servers and secure connectivity
+
+- Added **Remote Servers** settings, pairing-code and `bibcode://` deep-link
+  flows, manual and SSH-assisted connection setup, saved-server lifecycle
+  controls, compatibility/version status, remote update actions, and an
+  environment rail that scopes projects and actions to the selected machine.
+- Added authenticated Noise NK transport with bounded record fragmentation,
+  no-downgrade credentials, pinned host identity, transport-scoped sessions,
+  and explicit protocol-compatibility negotiation for off-host connections.
+- Added grant-derived sharing state and verified exposure transitions. Windows
+  remote access uses a program-scoped firewall rule and rolls back firewall,
+  listener, and persisted state when widening or narrowing cannot complete.
+- Hardened pairing and session authority across cancellation, reconnects,
+  concurrent server processes, stale delivery, duplicate requests, revocation,
+  forwarded loopback peers, and bounded per-principal byte/message capacity.
+  Remote failures remain typed and retryable without silently substituting a
+  local or WSL backend.
+- Added remote server update discovery and installation through the existing
+  desktop-owned updater boundary, including status badges and bounded
+  multi-server checks.
+
+### Project-level Git Manager
+
+- Added a GitHub Desktop-shaped centre panel for each project, covering working
+  tree and staged changes, per-line and per-hunk selection, commit/amend/undo,
+  safe discard, paged history and diffs, branches, tags, fetch/pull/push,
+  publication and force-with-lease, stashes, merge previews, rebase,
+  cherry-pick, squash, reorder, revert, reset, conflict recovery, and image
+  diffs.
+- Added an on-demand pull-request and checks pane with GitHub, GitLab, and Azure
+  provider resolution. Pull-request creation now opens a non-mutating review
+  dialog and only publishes the branch and creates the PR after final
+  confirmation; retries reuse an existing pull request.
+- Kept Git Manager activity server-owned, bounded, non-interactive, and free of
+  background telemetry. Repository generations fence stale reads, concurrent
+  mutations share one owner, capabilities degrade independently, and remote
+  environments retain the same typed RPC boundary.
+- Improved the final packaged behavior found during macOS and Windows native
+  validation: clean checkouts select **History**, dirty/loading selections are
+  preserved, merge recovery stays on **Changes**, history rejects stale pages,
+  symbolic remote `*/HEAD` pointers are not shown as branches, and a temporarily
+  missing upstream tracking ref no longer makes the manager unavailable.
+- Redesigned the pull-request review dialog for readable repository/base/head
+  metadata, clear branch-publication guidance, stable padding, and a fixed
+  action footer.
+
+### Agents view and interface polish
+
+- Added a full-height **Agents** view with environment/project/status grouping,
+  filtering, unread state, provider identity, branch and conversation previews,
+  live detail, and capped server-pushed shell summaries.
+- Raised the sidebar and navigation text floor, increased the default sidebar
+  width with double-click reset, and improved Linux WebKitGTK font hinting and
+  subpixel rendering without changing other applications' GTK settings.
+- Added a shared orange panel-separator token and aligned the environment rail,
+  sidebar, content headers, Git Manager, diff/file/preview panels, terminal,
+  status bar, and top frame in both themes.
+- Corrected route, capability, stale-status, dialog, and layout edge cases found
+  during packaged macOS, Linux, and Windows interaction testing.
+
+### Native releases and standalone server packages
+
+- Expanded the release matrix to macOS, Linux, and Windows on both ARM64 and
+  x64. Desktop downloads now include two DMGs, two AppImages, and two NSIS
+  installers; the signed updater manifest contains all six matching targets.
+- Added standalone `bibcode` server archives for all six targets plus native
+  ARM64/x64 Debian and RPM packages, install-and-run container tests, a sorted
+  SHA-256 manifest, and optional minisign signatures.
+- Hardened Windows ARM64 and x64 builds with architecture-aware MSVC setup,
+  drive-safe portable ZIP creation, checkout-local Vite+ execution, cached NSIS
+  tooling, explicit sidecar execution manifests, bind-only port probes that do
+  not trigger firewall prompts, and targeted cleanup for test-generated rules.
+- Hardened Linux packaging around an Ubuntu 20.04 server compatibility build,
+  native package smoke matrices, AppImage portability, minimal RPM curl
+  dependencies, and ownership restoration after container builds.
+- Hardened macOS/Linux startup PATH hydration so login-shell probes detach from
+  inherited controlling terminals, accept a complete framed result without
+  waiting for lingering descendants, and reap their process group before
+  desktop startup continues.
+
+### Data, compatibility, and validation
+
+- Database migrations 46–49 add pairing reach metadata, a durable pairing-offer
+  idempotency ledger, shared authentication-authority revision state, and active
+  pairing-delivery state. Existing stores continue through the verified
+  pre-migration backup path.
+- Remote transport, Git Manager, Agents-view, provider-check, and update
+  contracts are additive; no intentional breaking API change is documented.
+- Expanded native CI, release-candidate validation, packaged desktop UI and
+  upgrade smoke tests, remote Docker validation, source-control fixtures, and
+  cross-platform runbooks. The macOS Git Manager flow was exercised against a
+  real private GitHub repository through branch, diff, staging, commit, history,
+  push, pull-request, checks, tag, fetch, and checkout behavior.
+- Removed an accidental literal NUL from tracked TypeScript source and added a
+  repository-wide guard so text-source corruption fails tests immediately.
+
+### Supported downloads and trust
+
+- macOS 11+ Apple Silicon (`arm64`) DMG
+- macOS 11+ Intel (`x64`) DMG
+- Linux ARM64 AppImage
+- Linux x64 AppImage
+- Windows 11 ARM64 NSIS installer
+- Windows 10/11 x64 NSIS installer
+- Standalone server archives for all six targets, plus Linux ARM64/x64 `.deb`
+  and `.rpm` packages and `bibcode-server-SHA256SUMS`
+
+macOS builds remain ad-hoc signed and unnotarized, and Windows installers remain
+without Authenticode. Tauri updater payloads are independently signed and
+verified by BiBCode before publication.
+
+**Full changelog:** [v0.4.2...v0.5.0](https://github.com/mubeda/BibCode/compare/v0.4.2...v0.5.0)
+
 ## [v0.4.2] - 2026-08-25
 
 BiBCode v0.4.2 makes desktop updates easier to understand and recover from,
@@ -237,3 +358,4 @@ flow.
 [v0.4.0]: https://github.com/mubeda/BibCode/releases/tag/v0.4.0
 [v0.4.1]: https://github.com/mubeda/BibCode/releases/tag/v0.4.1
 [v0.4.2]: https://github.com/mubeda/BibCode/releases/tag/v0.4.2
+[v0.5.0]: https://github.com/mubeda/BibCode/releases/tag/v0.5.0
