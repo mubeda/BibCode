@@ -387,6 +387,17 @@ it.layer(NodeServices.layer)("Tauri production hardening", (it) => {
       assert.match(tauri.app.security.csp ?? "", /object-src 'none'/);
       assert.match(tauri.app.security.csp ?? "", /frame-ancestors 'none'/);
       assert.notEqual(tauri.app.security.devCsp, null);
+      // Remote servers are user-chosen plain-HTTP endpoints on a LAN or
+      // tailnet, reached from the webview with fetch and a ws:// encrypted
+      // channel. A connect-src that admits only loopback and https/wss makes
+      // every Add Server attempt fail as "Server unreachable" before a packet
+      // leaves the machine.
+      for (const policy of [tauri.app.security.csp, tauri.app.security.devCsp]) {
+        const connectSource = /connect-src ([^;]*)/.exec(policy ?? "")?.[1] ?? "";
+        assert.match(connectSource, /(^|\s)http:(\s|$)/, "connect-src must allow off-host http:");
+        assert.match(connectSource, /(^|\s)ws:(\s|$)/, "connect-src must allow off-host ws:");
+      }
+      assert.match(tauri.app.security.csp ?? "", /script-src 'self';/);
       assert.deepEqual(capability.permissions, [
         "allow-desktop-bridge",
         "allow-desktop-preview",
