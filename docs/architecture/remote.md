@@ -115,6 +115,15 @@ the encrypted channel; a policy limited to loopback and TLS makes every
 Add Server attempt fail as "Server unreachable" before any packet leaves the
 machine. `scripts/tauri-hardening.test.ts` pins both halves of that policy.
 
+On macOS a second gate applies: App Transport Security refuses plain-HTTP
+loads from web content unless the bundle declares an exception, and it does so
+before any packet leaves the machine. `apps/desktop/src-tauri/Info.plist`,
+merged into the bundle by Tauri, sets `NSAllowsArbitraryLoadsInWebContent` and
+`NSAllowsLocalNetworking` for the webview only (native code keeps the default
+policy) and carries the `NSLocalNetworkUsageDescription` shown by the macOS
+Local Network prompt. The hardening test pins those keys and rejects the
+broader `NSAllowsArbitraryLoads`.
+
 ### Direct-connection E2EE
 
 New direct pairings pin a server identity and carry RPC over an encrypted
