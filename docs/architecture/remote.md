@@ -681,6 +681,31 @@ the server consumes pairing links from the database and the store runtime lock
 is shared, the command works beside the already-running remote server without
 a restart.
 
+`bibcode pairing offer` uses the same database-as-authority pattern for
+encrypted offers: it writes a share-shaped grant (`one-time-token` subject,
+standard scopes, reach and off-host recorded) into `auth_pairing_links`, reads
+the persisted host identity key without generating one, reads the storage
+identity marker, and encodes the same `RemotePairingCodePayload` the Share tab
+mints. Endpoint and reach rules are shared with `POST /api/auth/pairing-offer`
+through `auth::pairing_offer::validate_pairing_offer_input`. The command fails
+closed when the data store or host key does not exist yet.
+
+An authenticated web-mode `bibcode serve` bound to a concrete, non-loopback
+address also mints one share-shaped offer through the live auth service. The
+single startup JSON object includes its full `bibcode://pair?code=…` link as
+`pairingCode`; this is separate from the administrative startup credential in
+`pairingUrl`. Loopback and unspecified binds omit `pairingCode`, and operators
+can disable startup minting with `--no-startup-pairing-offer` when stdout is
+retained by a service manager or another log owner.
+
+`bibcode service install` writes a per-user service definition (systemd user
+unit, LaunchAgent, or logon scheduled task) that runs the absolute current
+executable with `serve` and the captured `PATH`, and drives the platform's
+user-level service manager. It never installs a system service or ships in the
+Linux packages, because provider CLIs resolve from the process `PATH` and read
+credentials from the user's home. The rendering and command sequence are
+covered by unit tests through an injected command runner.
+
 SSH is a desktop capability. Browser clients cannot assume a local SSH binary,
 process supervision, or access to the user's SSH configuration.
 

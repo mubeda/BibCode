@@ -673,6 +673,60 @@ async fn confirmed_pairing_session_survives_disconnect_and_restart_cleanup() {
 }
 
 #[tokio::test]
+async fn cli_minted_offer_pairs_and_the_session_survives_a_restart() {
+    let _permit = TEST_PERMIT.acquire().await.expect("test permit");
+    let temp = TempDir::new().expect("temporary base directory");
+    let handle = start_server(&temp).await;
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bibcode"))
+        .args(["pairing", "offer", "--base-dir"])
+        .arg(temp.path())
+        .args(["--endpoint", "http://192.168.1.20:3773", "--json"])
+        .output()
+        .expect("run pairing offer");
+    assert!(
+        output.status.success(),
+        "pairing offer failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let offer: Value = serde_json::from_slice(&output.stdout).expect("offer JSON");
+    let payload = bibcode_server::auth_pairing_code::decode_pairing_code(
+        offer["code"].as_str().expect("code"),
+    )
+    .expect("pairing code decodes");
+    assert_eq!(
+        payload.host_key,
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(read_host_public_key(temp.path()))
+    );
+
+    let (mut socket, mut transport, reply) =
+        pair_inside_channel(&handle, temp.path(), &payload.token).await;
+    assert_eq!(
+        reply["pairingConfirmationRequired"],
+        Value::Bool(true),
+        "{reply}"
+    );
+    let credential = reply["credential"]
+        .as_str()
+        .expect("minted credential")
+        .to_owned();
+    confirm_pairing(&mut socket, &mut transport, "2").await;
+    socket.close(None).await.expect("close confirmed socket");
+    handle.shutdown();
+    timeout(Duration::from_secs(2), handle.join())
+        .await
+        .expect("server shutdown timeout")
+        .expect("server joins");
+
+    let restarted = start_server(&temp).await;
+    let host_key = read_host_public_key(temp.path());
+    let (mut reconnect, mut reconnect_transport, reconnect_reply) =
+        open_authenticated_bearer_socket(&restarted, &host_key, &credential).await;
+    assert_eq!(reconnect_reply, json!({ "type": "e2ee_authenticated" }));
+    assert_get_config(&mut reconnect, &mut reconnect_transport).await;
+}
+
+#[tokio::test]
 async fn no_downgrade_e2ee_credential_is_rejected_on_plain_surfaces() {
     let _permit = TEST_PERMIT.acquire().await.expect("test permit");
     let temp = TempDir::new().expect("temporary base directory");

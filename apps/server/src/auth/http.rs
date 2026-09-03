@@ -21,10 +21,10 @@ use super::{
         REMOTE_PAIRING_CODE_VERSION, RemotePairingCodePayload, RemotePairingReach,
         encode_pairing_code,
     },
+    pairing_offer::validate_pairing_offer_input,
     service::{
-        AuthError, AuthService, PAIRING_REACH_VALUES, PairingOfferIssuance, PairingOfferReplay,
-        PairingOfferReservation, default_standard_scopes, format_iso, is_loopback_host,
-        is_unspecified_host, now_ms, parse_scopes,
+        AuthError, AuthService, PairingOfferIssuance, PairingOfferReplay, PairingOfferReservation,
+        default_standard_scopes, format_iso, now_ms, parse_scopes,
     },
 };
 use crate::http::AppState;
@@ -340,30 +340,18 @@ async fn create_pairing_offer(
         }
     }
 
-    let endpoint_raw = payload.endpoint.trim();
-    let endpoint = match url::Url::parse(endpoint_raw) {
-        Ok(url) if matches!(url.scheme(), "http" | "https") => url,
-        _ => return invalid_pairing_offer_response("endpoint must be an http(s) URL"),
+    let validated = match validate_pairing_offer_input(
+        &payload.name,
+        &payload.endpoint,
+        &payload.reach,
+        payload.label.as_deref(),
+    ) {
+        Ok(validated) => validated,
+        Err(error) => return invalid_pairing_offer_response(&error.to_string()),
     };
-    let host = endpoint.host_str().unwrap_or_default();
-    if host.is_empty() || is_unspecified_host(host) || endpoint.port() == Some(0) {
-        return invalid_pairing_offer_response(
-            "endpoint must be a connectable address (no wildcard host, no port 0)",
-        );
-    }
-    let endpoint_is_loopback = is_loopback_host(host);
-    if !PAIRING_REACH_VALUES.contains(&payload.reach.as_str()) {
-        return invalid_pairing_offer_response("reach does not match the offered endpoint");
-    }
-    let reach_ok = match payload.reach.as_str() {
-        "this-computer" => endpoint_is_loopback,
-        "another-device" => !endpoint_is_loopback,
-        _ => true,
-    };
-    let name = payload.name.trim().to_owned();
-    if !reach_ok || name.is_empty() {
-        return invalid_pairing_offer_response("reach does not match the offered endpoint");
-    }
+    let name = validated.name.clone();
+    let label = validated.label.clone();
+    let off_host = validated.off_host;
     let scopes = payload.scopes.unwrap_or_else(default_standard_scopes);
     if scopes.is_empty()
         || scopes
@@ -386,18 +374,6 @@ async fn create_pairing_offer(
             &headers,
             "pairing_offer_issuance_failed",
         );
-    };
-    let label = payload
-        .label
-        .as_deref()
-        .map(str::trim)
-        .filter(|label| !label.is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| name.clone());
-    let off_host = match payload.reach.as_str() {
-        "another-device" => true,
-        "this-computer" => false,
-        _ => !endpoint_is_loopback,
     };
     let issued = if let Some(key) = &idempotency_key {
         match state
@@ -452,7 +428,7 @@ async fn create_pairing_offer(
     };
     let code_payload = RemotePairingCodePayload {
         v: REMOTE_PAIRING_CODE_VERSION,
-        endpoint: endpoint_raw.trim_end_matches('/').to_owned(),
+        endpoint: validated.endpoint.clone(),
         name: name.clone(),
         token: issued.credential.clone(),
         host_key: state.auth.host_identity().public_key_base64url(),

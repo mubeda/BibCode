@@ -51,8 +51,10 @@ from retargeting or tearing down another runtime's logging without accumulating
 completed entries. `BIBCODE_LOG` controls the filter and falls back to the
 standard `RUST_LOG` behavior, then `info`.
 
-In headless mode, run the native server from a terminal or service manager to
-retain an additional stderr stream:
+In headless mode, run the native server from a terminal, or install the
+per-user service (`bibcode service install`) whose stdout and stderr go to the
+service manager's log (the journal on Linux, `~/Library/Logs/bibcode-server.log`
+on macOS):
 
 ```bash
 bibcode serve

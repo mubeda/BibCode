@@ -447,6 +447,18 @@ minimum-size, and relevant Windows DPI states. Verify:
   grant-driven sharing appears because the desktop bridge is present.
   remote targeting is driven by the environment rail rather than mixing saved
   servers into the Local WSL picker;
+- Headless pairing: on a second machine or VM run `bibcode serve --host
+<routable address>`, confirm the startup line contains `pairingCode`, mint a
+  second offer with `bibcode pairing offer --endpoint http://<address>:3773`,
+  add each through **Add Server → Pairing code**, then restart the headless
+  server and confirm the saved server reconnects without re-pairing.
+- Headless service: on the second machine run `bibcode service install --host
+<routable address>`, confirm `bibcode service status` reports `active`,
+  reboot that machine, and confirm the desktop's saved server reconnects
+  without re-pairing. On Linux confirm `loginctl show-user $USER` reports
+  `Linger=yes`; on macOS confirm automatic login is enabled; on Windows confirm
+  the `BiBCode Server` task shows `Running` after logon. Finish with
+  `bibcode service uninstall` and confirm the definition is gone.
 - Remote server updates: with a second BiBCode server saved (headless
   `bibcode serve` is sufficient), open Remote Servers settings, run **Check for
   Server Updates**, and confirm each saved server row shows an update badge

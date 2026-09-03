@@ -30,6 +30,7 @@ pub mod remote_update;
 pub mod review;
 mod rpc;
 pub mod server_settings;
+mod service_manager;
 pub mod source_control;
 mod static_assets;
 pub mod terminal;
@@ -48,7 +49,8 @@ use thiserror::Error;
 
 pub use auth::pairing_code as auth_pairing_code;
 pub use config::{
-    Cli, CliAction, ConfigError, PairingCommand, ServerConfig, ServerMode, StorageCommand,
+    Cli, CliAction, ConfigError, PairingCommand, ServerConfig, ServerMode, ServiceCommand,
+    StorageCommand,
 };
 pub use data_root::{
     DataRootError, DataRootRequest, DataRootSource, ResolvedDataRoot, resolve_data_root,
@@ -73,6 +75,7 @@ pub use rpc::{
     ACTIVE_RPC_METHODS, CauseItem, ClientMessage, InvalidRequestId, MethodMode, RequestId, RpcExit,
     RpcMethodSpec, RpcRegistry, RpcRequest, RpcResult, RpcStreamChunk, ServerMessage, WireMessage,
 };
+pub use service_manager::ServiceSpec;
 pub use static_assets::{ResolvedStaticDir, StaticDirError, StaticDirSource, resolve_static_dir};
 
 #[derive(Debug, Error)]
@@ -95,6 +98,10 @@ pub enum RunError {
     PairingIssue(String),
     #[error("failed to encode pairing command output")]
     PairingOutput(#[source] serde_json::Error),
+    #[error(transparent)]
+    Service(#[from] service_manager::ServiceError),
+    #[error("failed to encode service command output")]
+    ServiceOutput(#[source] serde_json::Error),
 }
 
 pub async fn run_cli() -> Result<(), RunError> {
@@ -102,6 +109,7 @@ pub async fn run_cli() -> Result<(), RunError> {
         CliAction::Run(config) => run_server(*config).await,
         CliAction::Storage(command) => run_storage_command(command).await,
         CliAction::Pairing(command) => run_pairing_command(command).await,
+        CliAction::Service(command) => run_service_command(command),
     }
 }
 
@@ -122,6 +130,9 @@ async fn run_server(config: ServerConfig) -> Result<(), RunError> {
     {
         output.insert("token".to_owned(), json!(access.credential));
         output.insert("pairingUrl".to_owned(), json!(access.pairing_url));
+        if let Some(link) = &access.pairing_link {
+            output.insert("pairingCode".to_owned(), json!(link));
+        }
     }
     println!("{startup_output}");
     if open_browser {
@@ -208,17 +219,31 @@ struct PairingIssueOutput {
     expires_at: String,
 }
 
-/// Issues a one-time administrative pairing credential against a data root.
-///
-/// Coexists with a running server on the same root: it takes the shared store
-/// runtime lock (blocking only offline recovery) and writes through the WAL
-/// database, and the server consumes pairing links from the database. Prints
-/// exactly one JSON line to stdout in `--json` mode — the desktop SSH launcher
-/// parses the last non-empty stdout line — and never initializes logging or
-/// other stdout writers.
-async fn run_pairing_command(command: PairingCommand) -> Result<(), RunError> {
-    let PairingCommand::Issue { root, label, json } = command;
-    let _runtime_guard = persistence::StoreRuntimeGuard::acquire(&root.effective)
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PairingOfferOutput {
+    id: String,
+    code: String,
+    link: String,
+    reach: String,
+    endpoint: String,
+    name: String,
+    expires_at: String,
+}
+
+/// Opens an existing data root beside a running server: shared runtime lock,
+/// existing database only, never `prepare_store`.
+async fn open_existing_data_root(
+    root: &ResolvedDataRoot,
+) -> Result<
+    (
+        persistence::StoreRuntimeGuard,
+        persistence::StatePaths,
+        persistence::Database,
+    ),
+    RunError,
+> {
+    let runtime_guard = persistence::StoreRuntimeGuard::acquire(&root.effective)
         .await
         .map_err(|error| RunError::PairingIssue(error.to_string()))?;
     let paths = persistence::StatePaths::from_config(&ServerConfig::new(&root.effective));
@@ -231,28 +256,140 @@ async fn run_pairing_command(command: PairingCommand) -> Result<(), RunError> {
     let database = persistence::Database::open_existing(&paths.database)
         .await
         .map_err(|error| RunError::PairingIssue(error.to_string()))?;
-    let repositories = persistence::Repositories::new(database.clone());
-    let issued = auth::issue_administrative_pairing_link(&repositories, label)
-        .await
-        .map_err(|error| RunError::PairingIssue(format!("{error:?}")));
-    database.close().await;
-    let issued = issued?;
-    let output = PairingIssueOutput {
-        id: issued.id,
-        credential: issued.credential,
-        label: issued.label,
-        expires_at: issued.expires_at,
+    Ok((runtime_guard, paths, database))
+}
+
+/// Issues pairing credentials against a data root.
+///
+/// Coexists with a running server on the same root: it takes the shared store
+/// runtime lock (blocking only offline recovery) and writes through the WAL
+/// database, and the server consumes pairing links from the database. Prints
+/// exactly one JSON line to stdout in `--json` mode — the desktop SSH launcher
+/// parses the last non-empty stdout line — and never initializes logging or
+/// other stdout writers.
+async fn run_pairing_command(command: PairingCommand) -> Result<(), RunError> {
+    match command {
+        PairingCommand::Issue { root, label, json } => {
+            let (_runtime_guard, _paths, database) = open_existing_data_root(&root).await?;
+            let repositories = persistence::Repositories::new(database.clone());
+            let issued = auth::issue_administrative_pairing_link(&repositories, label)
+                .await
+                .map_err(|error| RunError::PairingIssue(format!("{error:?}")));
+            database.close().await;
+            let issued = issued?;
+            let output = PairingIssueOutput {
+                id: issued.id,
+                credential: issued.credential,
+                label: issued.label,
+                expires_at: issued.expires_at,
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&output).map_err(RunError::PairingOutput)?
+                );
+            } else {
+                println!("Pairing credential: {}", output.credential);
+                println!("Expires at: {}", output.expires_at);
+            }
+            Ok(())
+        }
+        PairingCommand::Offer {
+            root,
+            endpoint,
+            reach,
+            name,
+            label,
+            json,
+        } => {
+            let name = name.unwrap_or_else(default_pairing_offer_name);
+            let input =
+                auth::validate_pairing_offer_input(&name, &endpoint, &reach, label.as_deref())
+                    .map_err(|error| RunError::PairingIssue(error.to_string()))?;
+            let (_runtime_guard, paths, database) = open_existing_data_root(&root).await?;
+            let storage_instance_id = persistence::read_storage_instance_id(&paths)
+                .map_err(|error| RunError::PairingIssue(error.to_string()))?;
+            let secret_store = auth::SecretStore::new(paths.secrets_dir.clone())
+                .await
+                .map_err(|error| RunError::PairingIssue(error.to_string()))?;
+            let repositories = persistence::Repositories::new(database.clone());
+            let minted = auth::mint_offline_pairing_offer(
+                &repositories,
+                &secret_store,
+                storage_instance_id,
+                input,
+            )
+            .await
+            .map_err(|error| RunError::PairingIssue(error.to_string()));
+            database.close().await;
+            let minted = minted?;
+            let output = PairingOfferOutput {
+                id: minted.id,
+                code: minted.code,
+                link: minted.link,
+                reach: minted.reach,
+                endpoint: minted.endpoint,
+                name: minted.name,
+                expires_at: minted.expires_at,
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&output).map_err(RunError::PairingOutput)?
+                );
+            } else {
+                println!("Pairing link: {}", output.link);
+                println!("Expires at: {}", output.expires_at);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Installs, removes, or inspects the per-user background service. Runs the
+/// platform's user-level service manager as the current user and prints one
+/// report; nothing is printed on stdout when a step fails.
+fn run_service_command(command: ServiceCommand) -> Result<(), RunError> {
+    let platform = service_manager::ServicePlatform::current()
+        .ok_or(service_manager::ServiceError::UnsupportedPlatform)?;
+    let locations = service_manager::ServiceLocations::detect(platform)?;
+    let runner = service_manager::ProcessCommandRunner;
+    let (report, json) = match command {
+        ServiceCommand::Install { spec, json } => (
+            service_manager::install(&spec, platform, &locations, &runner)?,
+            json,
+        ),
+        ServiceCommand::Uninstall { json } => (
+            service_manager::uninstall(platform, &locations, &runner)?,
+            json,
+        ),
+        ServiceCommand::Status { json } => (
+            service_manager::status(platform, &locations, &runner)?,
+            json,
+        ),
     };
     if json {
         println!(
             "{}",
-            serde_json::to_string(&output).map_err(RunError::PairingOutput)?
+            serde_json::to_string(&report).map_err(RunError::ServiceOutput)?
         );
     } else {
-        println!("Pairing credential: {}", output.credential);
-        println!("Expires at: {}", output.expires_at);
+        let state = serde_json::to_value(report.state).map_err(RunError::ServiceOutput)?;
+        println!("Service: {}", report.definition);
+        println!("State: {}", state.as_str().unwrap_or("unknown"));
+        for note in &report.notes {
+            println!("Note: {note}");
+        }
     }
     Ok(())
+}
+
+/// Display name embedded in offers when the caller gives none.
+pub(crate) fn default_pairing_offer_name() -> String {
+    sysinfo::System::host_name()
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "BiBCode server".to_owned())
 }
 
 #[cfg(unix)]

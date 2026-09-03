@@ -76,7 +76,7 @@ impl HostIdentity {
         Ok(Self { private, public })
     }
 
-    fn from_record(record: &[u8]) -> Result<Self, HostIdentityError> {
+    pub(crate) fn from_record(record: &[u8]) -> Result<Self, HostIdentityError> {
         if record.len() != 64 {
             return Err(HostIdentityError::Corrupt {
                 name: HOST_IDENTITY_SECRET_NAME,
