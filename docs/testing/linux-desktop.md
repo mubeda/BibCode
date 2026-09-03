@@ -44,6 +44,15 @@ against current CI and release workflows. Use Xvfb for packaged E2E when the
 host has no suitable interactive display. Do not install system packages
 without permission.
 
+Linux AppImages bundle WebKitGTK from their build host. Isolate XDG config,
+cache, and data roots when running locally built AppImages on a newer
+distribution (for example Fedora with WebKitGTK 2.52); otherwise they can
+migrate IndexedDB metadata that a CI AppImage built on Ubuntu 22.04 with
+WebKitGTK 2.50 cannot reopen. If an older build reuses that data root, expect
+the connection-database reset dialog. On Linux the connection catalog lives in
+IndexedDB, so that reset also deletes saved servers and credentials; isolate
+the data root before the first launch rather than resetting afterwards.
+
 ## Focused Linux contracts
 
 Select focused tests from affected source and verify at least:
