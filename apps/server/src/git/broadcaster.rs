@@ -3644,13 +3644,18 @@ mod tests {
 
         drop(subscription);
         assert_eq!(broadcaster.active_poller_count(), 0);
+        // Await the cancellation before releasing the blocking permit: a
+        // permit offered first lets the runner leave through its release
+        // branch instead of cancellation, and a non-blocking read can observe
+        // the channel before the cancelled owner has published to it.
+        tokio::time::timeout(Duration::from_secs(5), remote_cancelled_rx.recv())
+            .await
+            .expect("final subscriber drop cancels the blocked remote owner")
+            .expect("remote cancellation checkpoint owner remains alive");
         release_remote.add_permits(1);
         broadcaster
             .await_retired_lifecycle(&canonical_repository)
             .await;
-        remote_cancelled_rx
-            .try_recv()
-            .expect("final subscriber drop cancels the blocked remote owner");
     }
 
     #[tokio::test(start_paused = true)]
