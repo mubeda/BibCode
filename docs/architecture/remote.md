@@ -104,6 +104,17 @@ Pairing links may carry a bootstrap in the URL fragment. Fragments are not sent
 to the hosting web server. Compatibility parsing accepts older query-form links,
 but newly generated links use the fragment form.
 
+### Desktop webview connect policy
+
+The desktop webview's Content Security Policy keeps `default-src` and
+`script-src` at `'self'`, but `connect-src` deliberately admits `http:` and
+`ws:` in addition to loopback, `https:`, and `wss:`. Remote servers are
+user-chosen plain-HTTP endpoints on a LAN or tailnet, and the client reaches
+them from the webview with `fetch` for the descriptor and a `ws://` socket for
+the encrypted channel; a policy limited to loopback and TLS makes every
+Add Server attempt fail as "Server unreachable" before any packet leaves the
+machine. `scripts/tauri-hardening.test.ts` pins both halves of that policy.
+
 ### Direct-connection E2EE
 
 New direct pairings pin a server identity and carry RPC over an encrypted
