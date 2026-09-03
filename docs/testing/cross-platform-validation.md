@@ -959,12 +959,17 @@ starts.
 5. From **Main Checkout**, create and check out a disposable branch, rename it,
    return to `main`, and delete the disposable branch through its confirmation.
    Confirm the dropdown's Default, Recent, and Other groups, current marker, and
-   filtering stay current after each operation. Repeat the occupied-branch
-   redirect from step 2 after these mutations to prove its owner was not lost.
+   filtering stay current after each operation. Confirm a symbolic remote
+   default such as `origin/HEAD` never appears as a branch row, including when a
+   real local branch is named `origin`. Repeat the occupied-branch redirect from
+   step 2 after these mutations to prove its owner was not lost.
 6. On `main`, choose **Fetch origin** and confirm the remote-only main commit is
    discovered; choose **Pull origin** and confirm it arrives locally. Check out
    `push-ready` and choose **Push origin**; check out `publish-ready` and choose
    **Publish branch to origin**, confirming an upstream is established. Check
+   that an upstream configured before its remote-tracking ref exists does not
+   make refs or unrelated local checkouts unavailable; Fetch must hydrate the
+   missing tracking ref and restore ahead/behind reporting. Check
    out `force-lease` after the fetch and confirm its divergent state offers
    **Force push origin**. The confirmation must state `--force-with-lease` and
    the operation must stop if the lease is stale; no bare force-push path is

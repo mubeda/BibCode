@@ -123,6 +123,21 @@ function firstMatch(value: string): string | null {
 }
 
 describe("BiBCode identity", () => {
+  it("keeps tracked source files free of literal NUL bytes", () => {
+    const findings: string[] = [];
+    for (const path of projectFiles()) {
+      const extension = NodePath.extname(path).toLowerCase();
+      if (!TEXT_EXTENSIONS.has(extension)) continue;
+      const content = NodeFS.readFileSync(NodePath.join(REPOSITORY_ROOT, path));
+      const nulOffset = content.indexOf(0);
+      if (nulOffset >= 0) {
+        findings.push(`${path}: byte ${String(nulOffset)}`);
+      }
+    }
+
+    expect(findings, findings.join("\n")).toEqual([]);
+  });
+
   it("contains no removed predecessor identity outside compatibility files", () => {
     const findings: string[] = [];
     for (const path of projectFiles()) {

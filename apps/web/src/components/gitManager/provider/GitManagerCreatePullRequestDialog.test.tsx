@@ -10,7 +10,7 @@ import { AsyncResult } from "effect/unstable/reactivity";
 import * as Cause from "effect/Cause";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 type RunInput = {
   actionId: string;
@@ -91,6 +91,11 @@ import { GitManagerCreatePullRequestDialog } from "./GitManagerCreatePullRequest
 
 let container: HTMLDivElement;
 let root: Root;
+const suiteGetAnimationsDescriptor = Object.getOwnPropertyDescriptor(
+  Element.prototype,
+  "getAnimations",
+);
+let originalGetAnimationsDescriptor: PropertyDescriptor | undefined;
 
 function status(overrides: Partial<VcsStatusResult> = {}): VcsStatusResult {
   return {
@@ -197,6 +202,14 @@ async function setValue(id: string, value: string) {
 
 beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  originalGetAnimationsDescriptor = Object.getOwnPropertyDescriptor(
+    Element.prototype,
+    "getAnimations",
+  );
+  Object.defineProperty(Element.prototype, "getAnimations", {
+    configurable: true,
+    value: () => [],
+  });
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
@@ -210,10 +223,45 @@ afterEach(async () => {
   await act(async () => root.unmount());
   container.remove();
   document.body.replaceChildren();
+  if (originalGetAnimationsDescriptor) {
+    Object.defineProperty(Element.prototype, "getAnimations", originalGetAnimationsDescriptor);
+  } else {
+    Reflect.deleteProperty(Element.prototype, "getAnimations");
+  }
+  originalGetAnimationsDescriptor = undefined;
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
 });
 
+afterAll(() => {
+  expect(Object.getOwnPropertyDescriptor(Element.prototype, "getAnimations")).toEqual(
+    suiteGetAnimationsDescriptor,
+  );
+});
+
 describe("GitManagerCreatePullRequestDialog", () => {
+  it("keeps the review content in one padded panel with a separate publish callout", async () => {
+    await renderDialog();
+
+    const popup = document.querySelector('[data-testid="git-manager-create-pr-dialog"]');
+    const panel = popup?.querySelector('[data-slot="dialog-panel"]');
+    const summary = panel?.querySelector('[data-testid="create-pr-summary"]');
+    const publish = panel?.querySelector('[data-testid="create-pr-publish"]');
+
+    expect(popup?.className).toContain("max-w-xl");
+    expect(panel).not.toBeNull();
+    expect(summary?.getAttribute("aria-label")).toBe("Pull request details");
+    expect(summary?.textContent).toContain("GitHub · https://github.com");
+    expect(summary?.textContent).toContain("feature/reviewed");
+    expect(
+      [...summary!.querySelectorAll("dt")].map((label) =>
+        label.classList.contains("whitespace-nowrap"),
+      ),
+    ).toEqual([true, true, true]);
+    expect(publish?.parentElement).toBe(panel);
+    expect(panel?.contains(input("git-manager-create-pr-title"))).toBe(true);
+    expect(panel?.contains(input("git-manager-create-pr-body"))).toBe(true);
+  });
+
   it("reviews repository, base, head, publish requirement, and commit defaults without running", async () => {
     await renderDialog();
 

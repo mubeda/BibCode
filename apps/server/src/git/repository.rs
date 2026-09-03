@@ -575,7 +575,7 @@ impl GitRepository {
             cwd,
             &strings(&[
                 "for-each-ref",
-                "--format=%(refname:short)%09%(objectname)%09%(upstream:short)%09%(worktreepath)%09%(HEAD)",
+                "--format=%(refname)%09%(objectname)%09%(upstream)%09%(worktreepath)%09%(HEAD)",
                 "refs/heads",
                 "refs/remotes",
                 "refs/tags",
