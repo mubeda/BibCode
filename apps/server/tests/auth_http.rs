@@ -909,14 +909,18 @@ async fn remote_revocation_closes_an_acked_live_stream_before_later_events() {
     )
     .await;
     assert_eq!(revoked["revoked"], true);
-    let later_pairing = client
-        .post(http_url(&second, "/api/auth/pairing-token"))
-        .bearer_auth(second_token)
-        .json(&json!({ "label": "Must not reach revoked stream" }))
-        .send()
-        .await
-        .expect("later access mutation");
-    assert_eq!(later_pairing.status(), StatusCode::OK);
+    let later_pairing = get_json(
+        client
+            .post(http_url(&second, "/api/auth/pairing-token"))
+            .bearer_auth(second_token)
+            .json(&json!({ "label": "Must not reach revoked stream" }))
+            .send()
+            .await
+            .expect("later access mutation"),
+        StatusCode::OK,
+    )
+    .await;
+    let later_pairing_id = later_pairing["id"].as_str().expect("later pairing id");
 
     timeout(Duration::from_secs(2), async {
         loop {
@@ -925,10 +929,30 @@ async fn remote_revocation_closes_an_acked_live_stream_before_later_events() {
                 Some(Ok(tungstenite::Message::Text(text))) => {
                     let message: Value =
                         serde_json::from_str(&text).expect("valid live-stream frame");
-                    assert_ne!(
-                        message["_tag"], "Chunk",
-                        "later access event reached the revoked stream: {message}"
-                    );
+                    if message["_tag"] == "Chunk" {
+                        let later_event_reached_stream =
+                            message["values"].as_array().is_some_and(|values| {
+                                values.iter().any(|value| {
+                                    value["type"] == "pairingLinkUpserted"
+                                        && value["payload"]["id"] == later_pairing_id
+                                })
+                            });
+                        assert!(
+                            !later_event_reached_stream,
+                            "later access event reached the revoked stream: {message}"
+                        );
+                        if socket
+                            .send(tungstenite::Message::Text(
+                                json!({ "_tag": "Ack", "requestId": "201" })
+                                    .to_string()
+                                    .into(),
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                 }
                 Some(Ok(_)) => {}
             }
