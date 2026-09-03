@@ -1,5 +1,65 @@
 # Changelog
 
+## [v0.5.1] - 2026-09-03
+
+BiBCode v0.5.1 makes headless servers pairable from the desktop app without a
+browser detour, keeps them running across reboots as a per-user service, and
+fixes two connection blockers found in real use: the desktop webview refused
+plain-HTTP remote servers, and a WebKit downgrade left the Linux desktop unable
+to open its connection database.
+
+### Headless server pairing
+
+- Added `bibcode pairing offer`, which mints an encrypted `bibcode://pair?code=…`
+  offer directly against the data root, beside a running server, for pasting
+  into **Add Server → Pairing code**. Endpoint and reach rules are shared with
+  the Share tab, and the command fails closed until the server has started on
+  that data root once.
+- `bibcode serve` now prints a ready-to-paste `pairingCode` in its startup line
+  when bound to a routable address. `--no-startup-pairing-offer` (or
+  `BIBCODE_NO_STARTUP_PAIRING_OFFER=1`) keeps that credential out of service
+  logs; loopback and wildcard binds print none.
+- The Add Server dialog names the CLI as a source of pairing codes alongside the
+  Share tab.
+
+### Per-user background service
+
+- Added `bibcode service install | uninstall | status`, which installs a systemd
+  user unit on Linux (enabling lingering so it starts at boot), a LaunchAgent on
+  macOS, or a logon scheduled task on Windows, running `bibcode serve` as the
+  invoking user with that shell's `PATH` so provider CLIs keep finding their
+  credentials. Nothing ships inside the Linux packages; the definition is
+  written on request.
+
+### Connection fixes
+
+- Fixed the desktop webview policy that made every Add Server attempt against
+  a LAN or tailnet server fail with "Server unreachable" before a packet left
+  the machine, on all desktop platforms. `connect-src` now admits `http:` and
+  `ws:` in addition to loopback and TLS, while scripts and default sources stay
+  same-origin; a hardening test pins the policy.
+- The Linux desktop now offers its acknowledged reset when WebKit reports
+  "Unable to establish IDB database file", which happens when an AppImage
+  bundling an older WebKitGTK opens a connection database migrated by a newer
+  one. The dialog explains each cause, and the runbook documents the data-root
+  isolation that avoids it.
+- Server bind failures now report the address and the operating-system error
+  instead of a bare "failed to bind the server listener".
+
+### Release reliability
+
+- The updater signature verifier covers all six supported desktop targets,
+  including Linux ARM64 and Windows ARM64, and manual release repair runs stay
+  pinned to the immutable tag while using current release tooling.
+
+### Documentation
+
+- Remote access and standalone server guides cover the CLI pairing offer, the
+  startup pairing code, and running the server as a per-user service. The
+  remote architecture document records the offline offer path, the startup
+  offer, the service installer, and the webview connect policy. The three OS
+  runbooks add headless pairing, restart, and service validation steps.
+
 ## [v0.5.0] - 2026-09-03
 
 BiBCode v0.5.0 adds first-class remote environments, a complete project-level
