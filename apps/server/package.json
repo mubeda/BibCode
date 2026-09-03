@@ -1,6 +1,6 @@
 {
   "name": "bibcode",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "private": true,
   "scripts": {
     "build": "node ../../scripts/run-msvc.mjs cargo build -p bibcode-server",
