@@ -677,7 +677,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ needs.preflight.outputs.ref }}
+          # Manual repair/publication runs use the current release controller while every
+          # product build remains pinned to the immutable tag resolved by preflight.
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.sha || needs.preflight.outputs.ref }}
           fetch-depth: 0
 
       - name: Setup Rust
@@ -789,11 +791,12 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_REF: ${{ needs.preflight.outputs.ref }}
           RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
         run: |
           set -euo pipefail
           test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = "true"
-          test "$(gh release view "$RELEASE_TAG" --json targetCommitish --jq .targetCommitish)" = "$(git rev-parse HEAD)"
+          test "$(gh release view "$RELEASE_TAG" --json targetCommitish --jq .targetCommitish)" = "$RELEASE_REF"
 
       - name: Prepare stable release assets
         if: needs.preflight.outputs.validate_only != 'true' && needs.preflight.outputs.release_channel == 'stable' && needs.preflight.outputs.publish_requested != 'true'
