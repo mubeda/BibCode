@@ -75,12 +75,25 @@ this shape:
   "address": "100.64.0.10:3773",
   "httpBaseUrl": "http://100.64.0.10:3773",
   "token": "one-time-pairing-credential",
-  "pairingUrl": "http://100.64.0.10:3773/pair#token=one-time-pairing-credential"
+  "pairingUrl": "http://100.64.0.10:3773/pair#token=one-time-pairing-credential",
+  "pairingCode": "bibcode://pair?code=…"
 }
 ```
 
-The CLI does not print a QR code. It also has no `auth` or `project` subcommands,
-no positional working-directory argument, and no `--tailscale-serve` flags. Use
+`pairingCode` is a five-minute encrypted offer for the desktop app's
+**Add Server** dialog; it is present only when the bound address is routable
+(not loopback, not `0.0.0.0`). Pass `--no-startup-pairing-offer` (or set
+`BIBCODE_NO_STARTUP_PAIRING_OFFER=1`) when stdout goes to a log, and mint
+offers on demand with `bibcode pairing offer` instead. `pairingUrl` remains the
+one-time owner bootstrap for a browser.
+
+To keep the server running across reboots, install it as a per-user service
+with `bibcode service install --host <address>`; see
+[Standalone server installation](./server-installation.md#run-as-a-per-user-service).
+
+The CLI does not print a QR code and has no `project` subcommand. Pairing
+credentials come from `bibcode pairing offer` (encrypted offers for the desktop
+app) and `bibcode pairing issue` (the desktop SSH bootstrap). Use
 `bibcode serve --help` for the implemented options.
 
 `--static-dir` explicitly overrides packaged web discovery and must contain
@@ -111,9 +124,21 @@ The hosted app saves the backend address, but it does not proxy traffic. The
 browser still connects directly to the backend, which must therefore be
 reachable over HTTPS/WSS from that browser.
 
-Create and revoke additional access from **Settings → Remote Servers**. There is no
-general CLI access-management surface; the focused `bibcode pairing issue` command
-exists for desktop-managed SSH bootstrap.
+Create and revoke additional access from **Settings → Remote Servers**. On a
+headless server, mint an encrypted offer for the desktop app from the CLI:
+
+```sh
+bibcode pairing offer --endpoint http://100.64.0.10:3773
+```
+
+It prints a `bibcode://pair?code=…` link that expires after five minutes. Paste
+it into **Settings → Remote Servers → Connect → Add Server** on the other
+device. `--reach this-computer` requires a loopback endpoint and is for tunnels;
+`--name` sets the display name (default: this machine's hostname); `--json`
+prints one JSON line. The command works while the server is running on the same
+data root and refuses to run before the server has ever started there. Revoke
+the resulting device from the Share tab like any other client. The focused
+`bibcode pairing issue` command remains for desktop-managed SSH bootstrap.
 
 ## Desktop-managed SSH
 

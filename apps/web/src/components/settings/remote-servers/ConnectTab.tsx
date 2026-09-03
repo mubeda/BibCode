@@ -1370,7 +1370,8 @@ export function ConnectTab({
               <li>
                 <span className="font-medium text-foreground">Still stuck?</span> Confirm both
                 devices are on the same network or connected through a tunnel, then generate a fresh
-                pairing code on the server&apos;s Share tab.
+                pairing code on the server&apos;s Share tab or with{" "}
+                <code>bibcode pairing offer</code> on the server.
               </li>
             </ul>
           </CollapsibleContent>
@@ -1540,7 +1541,8 @@ export function ConnectTab({
                       {renderConnectionModeCard({
                         mode: "pairing-code",
                         title: "Pairing code",
-                        description: "Paste a pairing code from the server's Share tab.",
+                        description:
+                          "Paste a pairing code from the server's Share tab or its bibcode pairing offer command.",
                         icon: <QrCodeIcon aria-hidden className="size-4" />,
                       })}
                       {desktopBridge

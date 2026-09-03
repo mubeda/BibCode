@@ -796,11 +796,13 @@ async fn occupied_listener_address_returns_typed_bind_error() {
         }
         Err(error) => error,
     };
-    assert_eq!(error.to_string(), "failed to bind the server listener");
+    let message = error.to_string();
     match error {
-        ServerError::Bind(source) => {
+        ServerError::Bind { address, source } => {
+            assert_eq!(address, occupied_addr.to_string());
             assert_eq!(source.kind(), ErrorKind::AddrInUse);
             assert!(!source.to_string().trim().is_empty());
+            assert!(message.contains(&source.to_string()), "{message}");
         }
         other => panic!("expected Bind, got {other:?}"),
     }

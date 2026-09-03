@@ -5,7 +5,13 @@ use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    auth::{AuthService, SecretStore},
+    auth::{
+        AuthService, SecretStore,
+        pairing_code::{
+            REMOTE_PAIRING_CODE_VERSION, RemotePairingCodePayload, RemotePairingReach,
+            encode_pairing_code, pairing_deep_link,
+        },
+    },
     config::{ServerConfig, ServerMode},
     data_root::{DataRootError, ResolvedDataRoot, resolve_data_root},
     diagnostics::{
@@ -14,7 +20,9 @@ use crate::{
     },
     http, logging,
     maintenance::{UpdateMaintenance, maintenance_routes_enabled},
-    persistence::{Database, Repositories, StatePaths, StoreRuntimeGuard, prepare_store},
+    persistence::{
+        Database, Repositories, StatePaths, StorageInstanceId, StoreRuntimeGuard, prepare_store,
+    },
     production::http_routes::{HttpRouteError, HttpRoutesState},
     production::runtime::ProductionRuntime,
     production::{
@@ -69,6 +77,9 @@ pub struct StartupAccess {
     pub connection_string: String,
     pub credential: String,
     pub pairing_url: String,
+    /// Full `bibcode://pair?code=…` link for the desktop Add Server dialog,
+    /// present only when the bind address is routable from other devices.
+    pub pairing_link: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -81,8 +92,12 @@ pub enum ServerError {
     StateFiles(String),
     #[error("failed to initialize native server logging: {0}")]
     Logging(String),
-    #[error("failed to bind the server listener")]
-    Bind(#[source] std::io::Error),
+    #[error("failed to bind the server listener on {address}: {source}")]
+    Bind {
+        address: String,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("failed to initialize environment authentication: {0}")]
     AuthInitialize(String),
     #[error("failed to initialize SQLite persistence: {0}")]
@@ -207,10 +222,17 @@ impl ServerRuntime {
         let storage_instance_id = prepared_store.storage_instance_id;
         let store_classification = prepared_store.classification;
         let database = prepared_store.database;
+        let bind_address = format!("{}:{}", config.host, config.port);
         let listener = TcpListener::bind((config.host.as_str(), config.port))
             .await
-            .map_err(ServerError::Bind)?;
-        let local_addr = listener.local_addr().map_err(ServerError::Bind)?;
+            .map_err(|source| ServerError::Bind {
+                address: bind_address.clone(),
+                source,
+            })?;
+        let local_addr = listener.local_addr().map_err(|source| ServerError::Bind {
+            address: bind_address,
+            source,
+        })?;
         let state_directory = config.base_dir.join(if config.dev_url.is_some() {
             "dev"
         } else {
@@ -235,16 +257,24 @@ impl ServerRuntime {
         )
         .await
         .map_err(|error| ServerError::AuthInitialize(format!("{error:?}")))?;
-        let startup_access =
-            if config.mode == crate::config::ServerMode::Web && !config.unsafe_no_auth {
-                let issued = auth
-                    .issue_startup_pairing()
-                    .await
-                    .map_err(|error| ServerError::AuthInitialize(format!("{error:?}")))?;
-                Some(build_startup_access(local_addr, issued.credential)?)
-            } else {
-                None
-            };
+        let startup_access = if config.mode == crate::config::ServerMode::Web
+            && !config.unsafe_no_auth
+        {
+            let issued = auth
+                .issue_startup_pairing()
+                .await
+                .map_err(|error| ServerError::AuthInitialize(format!("{error:?}")))?;
+            let mut access = build_startup_access(local_addr, issued.credential)?;
+            if config.startup_pairing_offer
+                && let Some(endpoint) = startup_offer_endpoint(local_addr)
+            {
+                access.pairing_link =
+                    Some(mint_startup_pairing_link(&auth, storage_instance_id, endpoint).await?);
+            }
+            Some(access)
+        } else {
+            None
+        };
         let (rpc_registry, http_routes, production_runtime) = match custom_registry {
             Some(mut registry) => {
                 crate::auth::register_rpc_handlers(&mut registry, auth.clone());
@@ -578,7 +608,50 @@ fn build_startup_access(
         connection_string,
         credential,
         pairing_url: pairing_url.to_string(),
+        pairing_link: None,
     })
+}
+
+/// Endpoint other devices can reach, derived from the bound socket address.
+/// Loopback and unspecified binds have no usable advertised endpoint.
+pub(crate) fn startup_offer_endpoint(local_addr: SocketAddr) -> Option<String> {
+    let ip = local_addr.ip();
+    if ip.is_loopback() || ip.is_unspecified() {
+        return None;
+    }
+    Some(format!("http://{local_addr}"))
+}
+
+/// Mints one share-shaped off-host offer through the live auth service. This
+/// is a second grant beside the startup token: the startup token is an
+/// administrative bootstrap without reach and must never be embedded in a code.
+async fn mint_startup_pairing_link(
+    auth: &AuthService,
+    storage_instance_id: StorageInstanceId,
+    endpoint: String,
+) -> Result<String, ServerError> {
+    let name = crate::default_pairing_offer_name();
+    let issued = auth
+        .issue_share_pairing(
+            crate::auth::default_standard_scopes(),
+            Some(name.clone()),
+            "another-device".to_owned(),
+            true,
+        )
+        .await
+        .map_err(|error| ServerError::AuthInitialize(format!("{error:?}")))?;
+    let payload = RemotePairingCodePayload {
+        v: REMOTE_PAIRING_CODE_VERSION,
+        endpoint,
+        name,
+        token: issued.credential,
+        host_key: auth.host_identity().public_key_base64url(),
+        reach: RemotePairingReach::AnotherDevice,
+        storage_instance_id: storage_instance_id.to_string(),
+    };
+    let code = encode_pairing_code(&payload)
+        .map_err(|error| ServerError::AuthInitialize(error.to_string()))?;
+    Ok(pairing_deep_link(&code))
 }
 
 impl Drop for ServerHandle {
@@ -593,6 +666,103 @@ impl Drop for ServerHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_offer_endpoint_requires_a_routable_bind() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+        assert_eq!(
+            startup_offer_endpoint(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3773)),
+            None
+        );
+        assert_eq!(
+            startup_offer_endpoint(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 3773)),
+            None
+        );
+        assert_eq!(
+            startup_offer_endpoint(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 3773)),
+            None
+        );
+        assert_eq!(
+            startup_offer_endpoint(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(100, 105, 196, 60)),
+                3773
+            )),
+            Some("http://100.105.196.60:3773".to_owned())
+        );
+        assert_eq!(
+            startup_offer_endpoint(SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 5)),
+                3773
+            )),
+            Some("http://[fd00::5]:3773".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_serve_has_no_startup_pairing_link() {
+        let temp = tempfile::tempdir().expect("temporary base directory");
+        let handle = ServerRuntime::start(ServerConfig::new(temp.path()).with_bind("127.0.0.1", 0))
+            .await
+            .expect("server starts");
+        let access = handle.startup_access().expect("web mode startup access");
+        assert_eq!(access.pairing_link, None);
+        handle.shutdown();
+        handle.join().await.expect("server joins");
+    }
+
+    /// Uses the host's outbound interface address (no packets are sent by a
+    /// connected UDP socket). Skips on hosts with no routable address.
+    #[tokio::test]
+    async fn routable_serve_prints_a_share_shaped_startup_offer() {
+        let probe = std::net::UdpSocket::bind("0.0.0.0:0").expect("udp probe");
+        let Ok(()) = probe.connect("192.0.2.1:9") else {
+            return;
+        };
+        let ip = probe.local_addr().expect("probe address").ip();
+        if ip.is_loopback() || ip.is_unspecified() {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("temporary base directory");
+        let handle =
+            ServerRuntime::start(ServerConfig::new(temp.path()).with_bind(ip.to_string(), 0))
+                .await
+                .expect("server starts on the routable address");
+        let access = handle.startup_access().expect("web mode startup access");
+        let link = access
+            .pairing_link
+            .as_deref()
+            .expect("routable bind mints a startup offer");
+        let code = link
+            .strip_prefix("bibcode://pair?code=")
+            .expect("deep link shape");
+        let payload = crate::auth::pairing_code::decode_pairing_code(code).expect("decodes");
+        assert_eq!(payload.endpoint, format!("http://{}", handle.local_addr()));
+        assert_eq!(
+            payload.reach,
+            crate::auth::pairing_code::RemotePairingReach::AnotherDevice
+        );
+        assert_ne!(
+            payload.token, access.credential,
+            "the startup token is never embedded"
+        );
+
+        let second = tempfile::tempdir().expect("second root");
+        let disabled = {
+            let mut config = ServerConfig::new(second.path()).with_bind(ip.to_string(), 0);
+            config.startup_pairing_offer = false;
+            ServerRuntime::start(config)
+                .await
+                .expect("server starts without an offer")
+        };
+        assert_eq!(
+            disabled.startup_access().expect("access").pairing_link,
+            None
+        );
+        disabled.shutdown();
+        disabled.join().await.expect("second server joins");
+        handle.shutdown();
+        handle.join().await.expect("server joins");
+    }
 
     #[test]
     fn connect_descriptor_advertises_remote_update_support() {

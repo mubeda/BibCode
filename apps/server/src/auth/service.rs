@@ -2698,6 +2698,58 @@ pub(crate) async fn issue_administrative_pairing_link(
     })
 }
 
+/// Issues a one-time share pairing grant directly against a data root's
+/// repositories, without a full [`AuthService`]. Used by `bibcode pairing offer`
+/// beside a running server: consumption reads `auth_pairing_links` from the
+/// database, so the running server honors grants inserted here. Mirrors
+/// `issue_share_pairing` (standard scopes, `one-time-token` subject, reach and
+/// off-host recorded, five-minute TTL) rather than the administrative shape,
+/// so the off-host confirmation guard and exposure accounting see it.
+pub(crate) async fn issue_offline_share_pairing(
+    repositories: &Repositories,
+    label: Option<String>,
+    reach: String,
+    off_host: bool,
+) -> Result<PairingCredentialResult, AuthError> {
+    if !is_valid_pairing_reach(&reach) {
+        return Err(AuthError::InvalidCredential);
+    }
+    let now = now_ms();
+    let active = repositories
+        .list_active_auth_pairing_links(format_iso(now))
+        .await
+        .map_err(|error| AuthError::Internal(error.to_string()))?;
+    if active.len() >= MAX_ACTIVE_PAIRINGS {
+        return Err(AuthError::Internal(
+            "active pairing capacity exceeded".to_owned(),
+        ));
+    }
+    let record = PairingRecord {
+        id: Uuid::new_v4().to_string(),
+        credential: generate_pairing_credential()?,
+        scopes: owned_scopes(STANDARD_SCOPES),
+        subject: "one-time-token".to_owned(),
+        label: label.clone(),
+        proof_key_thumbprint: None,
+        created_at_ms: now,
+        expires_at_ms: now.saturating_add(PAIRING_TTL_MS),
+        consumed_at_ms: None,
+        revoked_at_ms: None,
+        reach: Some(reach),
+        off_host: Some(off_host),
+    };
+    repositories
+        .create_auth_pairing_link(persisted_pairing_link(&record))
+        .await
+        .map_err(|error| AuthError::Internal(error.to_string()))?;
+    Ok(PairingCredentialResult {
+        id: record.id,
+        credential: record.credential,
+        label,
+        expires_at: format_iso(record.expires_at_ms),
+    })
+}
+
 #[must_use]
 pub fn default_standard_scopes() -> Vec<String> {
     owned_scopes(STANDARD_SCOPES)

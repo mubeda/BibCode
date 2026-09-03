@@ -18,6 +18,38 @@ use tokio::{
     time::timeout,
 };
 
+async fn exchange_startup_admin(handle: &bibcode_server::ServerHandle) -> String {
+    let startup = handle.startup_access().expect("startup pairing");
+    let exchange = reqwest::Client::new()
+        .post(format!("http://{}/oauth/token", handle.local_addr()))
+        .form(&[
+            (
+                "grant_type",
+                "urn:ietf:params:oauth:grant-type:token-exchange",
+            ),
+            ("subject_token", startup.credential.as_str()),
+            (
+                "subject_token_type",
+                "urn:bibcode:params:oauth:token-type:environment-bootstrap",
+            ),
+            (
+                "requested_token_type",
+                "urn:ietf:params:oauth:token-type:access_token",
+            ),
+            ("client_label", "CLI offer smoke"),
+            ("client_device_type", "desktop"),
+        ])
+        .send()
+        .await
+        .expect("startup token exchange");
+    assert_eq!(exchange.status(), reqwest::StatusCode::OK);
+    let token: Value = exchange.json().await.expect("token exchange JSON");
+    token["access_token"]
+        .as_str()
+        .expect("access token")
+        .to_owned()
+}
+
 #[test]
 fn headless_binary_exposes_the_compatible_serve_flags() {
     let output = Command::new(env!("CARGO_BIN_EXE_bibcode"))
@@ -528,4 +560,177 @@ async fn headless_binary_reads_desktop_bootstrap_and_shuts_down_over_http() {
         .expect("server exit timeout")
         .expect("server exit status");
     assert!(status.success(), "server exited with {status}");
+}
+
+#[tokio::test]
+async fn pairing_offer_prints_a_code_the_running_server_redeems() {
+    let root = TempDir::new().expect("temporary storage root");
+    let handle = ServerRuntime::start(ServerConfig::new(root.path()).with_bind("127.0.0.1", 0))
+        .await
+        .expect("start pairing storage owner");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bibcode"))
+        .args(["pairing", "offer", "--base-dir"])
+        .arg(root.path())
+        .args([
+            "--endpoint",
+            "http://192.168.1.20:3773",
+            "--name",
+            "ai-server",
+            "--label",
+            "laptop",
+            "--json",
+        ])
+        .output()
+        .expect("run pairing offer");
+    assert!(
+        output.status.success(),
+        "pairing offer failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 offer output");
+    assert_eq!(
+        stdout.trim().lines().count(),
+        1,
+        "exactly one JSON line: {stdout}"
+    );
+    let value: Value = serde_json::from_str(stdout.trim()).expect("offer JSON document");
+    let code = value["code"].as_str().expect("code string");
+    assert_eq!(value["link"], format!("bibcode://pair?code={code}"));
+    assert_eq!(value["reach"], "another-device");
+    assert_eq!(value["endpoint"], "http://192.168.1.20:3773");
+    assert_eq!(value["name"], "ai-server");
+    assert!(value["expiresAt"].as_str().is_some());
+    let payload =
+        bibcode_server::auth_pairing_code::decode_pairing_code(code).expect("pairing code decodes");
+    assert_eq!(payload.name, "ai-server");
+
+    // The running server lists pairings from a cached view that its authority
+    // watcher reconciles from the database on a short interval, so an offer
+    // inserted by another process becomes visible shortly after, not instantly.
+    let admin = exchange_startup_admin(&handle).await;
+    let client = reqwest::Client::new();
+    let mut listed = None;
+    for _ in 0..40 {
+        let links = client
+            .get(format!(
+                "http://{}/api/auth/pairing-links",
+                handle.local_addr()
+            ))
+            .bearer_auth(&admin)
+            .send()
+            .await
+            .expect("pairing list request");
+        assert_eq!(links.status(), reqwest::StatusCode::OK);
+        let links: Value = links.json().await.expect("pairing list JSON");
+        listed = links
+            .as_array()
+            .expect("pairing list")
+            .iter()
+            .find(|link| link["id"] == value["id"])
+            .cloned();
+        if listed.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let listed = listed.expect("offline offer becomes visible to the running server");
+    assert_eq!(listed["label"], "laptop");
+
+    handle.shutdown();
+    handle.join().await.expect("stop pairing storage owner");
+}
+
+#[test]
+fn pairing_offer_fails_closed_without_a_data_store() {
+    let root = TempDir::new().expect("temporary empty root");
+    let output = Command::new(env!("CARGO_BIN_EXE_bibcode"))
+        .args(["pairing", "offer", "--base-dir"])
+        .arg(root.path())
+        .args(["--endpoint", "http://192.168.1.20:3773", "--json"])
+        .output()
+        .expect("run pairing offer without a store");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("start the server on this data root first"),
+        "{stderr}"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "no code may be printed on failure"
+    );
+}
+
+#[tokio::test]
+async fn pairing_offer_rejects_a_loopback_endpoint_for_another_device() {
+    let root = TempDir::new().expect("temporary storage root");
+    let handle = ServerRuntime::start(ServerConfig::new(root.path()).with_bind("127.0.0.1", 0))
+        .await
+        .expect("start pairing storage owner");
+    let output = Command::new(env!("CARGO_BIN_EXE_bibcode"))
+        .args(["pairing", "offer", "--base-dir"])
+        .arg(root.path())
+        .args(["--endpoint", "http://127.0.0.1:3773"])
+        .output()
+        .expect("run pairing offer with a loopback endpoint");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("reach does not match the offered endpoint"),
+        "{stderr}"
+    );
+    assert!(output.stdout.is_empty());
+    handle.shutdown();
+    handle.join().await.expect("stop pairing storage owner");
+}
+
+#[tokio::test]
+async fn serve_on_loopback_prints_no_startup_pairing_code() {
+    let temp = TempDir::new().expect("temporary base directory");
+    let mut child = TokioCommand::new(env!("CARGO_BIN_EXE_bibcode"))
+        .args(["serve", "--host", "127.0.0.1", "--port", "0", "--base-dir"])
+        .arg(temp.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bibcode server");
+
+    let stdout = child.stdout.take().expect("child stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    let ready_line = match timeout(Duration::from_secs(30), lines.next_line()).await {
+        Ok(result) => result
+            .expect("read readiness line")
+            .expect("server readiness line"),
+        Err(error) => {
+            child.kill().await.expect("terminate unready server");
+            panic!("server readiness timeout: {error}");
+        }
+    };
+    let ready: Value = serde_json::from_str(&ready_line).expect("readiness JSON");
+    assert!(ready.get("pairingCode").is_none());
+    assert!(ready["pairingUrl"].as_str().is_some());
+
+    child.kill().await.expect("terminate server");
+}
+
+#[test]
+fn service_help_lists_install_uninstall_and_status() {
+    let output = Command::new(env!("CARGO_BIN_EXE_bibcode"))
+        .args(["service", "--help"])
+        .output()
+        .expect("run service help");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for expected in ["install", "uninstall", "status"] {
+        assert!(stdout.contains(expected), "missing {expected}: {stdout}");
+    }
+    let install = Command::new(env!("CARGO_BIN_EXE_bibcode"))
+        .args(["service", "install", "--help"])
+        .output()
+        .expect("run service install help");
+    let stdout = String::from_utf8_lossy(&install.stdout);
+    for expected in ["--host", "--port", "--base-dir", "--static-dir", "--json"] {
+        assert!(stdout.contains(expected), "missing {expected}: {stdout}");
+    }
 }

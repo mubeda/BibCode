@@ -20,4 +20,5 @@ pub use state_files::{
 };
 pub use store::{
     PreparedStore, StorageInstanceId, StoreClassification, StoreStartupError, prepare_store,
+    read_storage_instance_id,
 };

@@ -214,6 +214,14 @@ fn read_marker(path: &std::path::Path) -> Result<StorageInstanceId, StoreStartup
     Ok(StorageInstanceId(value))
 }
 
+/// Reads the persisted storage identity of an existing store without preparing
+/// or migrating it. Used by CLI commands that run beside a live server.
+pub fn read_storage_instance_id(
+    paths: &StatePaths,
+) -> Result<StorageInstanceId, StoreStartupError> {
+    read_marker(&paths.environment_id)
+}
+
 async fn prepare_first_run(paths: StatePaths) -> Result<PreparedStore, StoreStartupError> {
     let database = Database::create_new(&paths.database)
         .await

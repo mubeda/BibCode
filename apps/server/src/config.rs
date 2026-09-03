@@ -48,6 +48,7 @@ pub struct ServerConfig {
     pub static_dir_source: Option<StaticDirSource>,
     pub dev_url: Option<Url>,
     pub no_browser: bool,
+    pub startup_pairing_offer: bool,
     pub desktop_bootstrap_token: Option<String>,
     /// True only for a desktop-owned server launched through the WSL bootstrap transport.
     #[doc(hidden)]
@@ -82,6 +83,7 @@ impl ServerConfig {
             static_dir_source: None,
             dev_url: None,
             no_browser: false,
+            startup_pairing_offer: true,
             desktop_bootstrap_token: None,
             desktop_wsl_transport: false,
             unsafe_no_auth: false,
@@ -206,6 +208,21 @@ mod tests {
     }
 
     #[test]
+    fn startup_pairing_offer_defaults_on_and_global_disable_flag_turns_it_off() {
+        let default = Cli::try_parse_from(["bibcode", "serve"])
+            .expect("parse default serve CLI")
+            .into_server_config()
+            .expect("build default server config");
+        assert!(default.startup_pairing_offer);
+
+        let disabled = Cli::try_parse_from(["bibcode", "serve", "--no-startup-pairing-offer"])
+            .expect("parse disabled startup offer CLI")
+            .into_server_config()
+            .expect("build disabled startup offer config");
+        assert!(!disabled.startup_pairing_offer);
+    }
+
+    #[test]
     fn desktop_bootstrap_wsl_transport_is_explicit_and_defaults_closed() {
         let base = serde_json::json!({
             "mode": "desktop",
@@ -312,6 +329,123 @@ mod tests {
         .expect_err("pairing issue is not a server command");
         assert!(matches!(error, ConfigError::PairingCommandIsNotServer));
     }
+
+    #[test]
+    fn service_install_builds_a_spec_from_the_global_server_flags_only() {
+        let executable = PathBuf::from("/usr/bin/bibcode");
+        let action = Cli::try_parse_from([
+            "bibcode",
+            "service",
+            "install",
+            "--host",
+            "100.105.196.60",
+            "--port",
+            "4000",
+            "--base-dir",
+            "/srv/bibcode",
+            "--bootstrap-fd",
+            "7",
+            "--json",
+        ])
+        .expect("parse service install CLI")
+        .into_action_with_executable(&executable)
+        .expect("build service action");
+        let CliAction::Service(ServiceCommand::Install { spec, json }) = action else {
+            panic!("service install must produce a service action");
+        };
+        assert_eq!(spec.executable, executable);
+        assert_eq!(spec.host, "100.105.196.60");
+        assert_eq!(spec.port, 4000);
+        assert_eq!(spec.base_dir, Some(PathBuf::from("/srv/bibcode")));
+        assert_eq!(spec.static_dir, None);
+        assert_eq!(spec.path_env, std::env::var_os("PATH"));
+        assert!(json);
+        assert!(
+            !spec
+                .serve_arguments()
+                .iter()
+                .any(|argument| argument == "--bootstrap-fd")
+        );
+
+        let action = Cli::try_parse_from(["bibcode", "service", "status"])
+            .expect("parse service status")
+            .into_action_with_executable(&executable)
+            .expect("build status action");
+        assert!(matches!(
+            action,
+            CliAction::Service(ServiceCommand::Status { json: false })
+        ));
+
+        let error = Cli::try_parse_from(["bibcode", "service", "uninstall"])
+            .expect("parse service uninstall")
+            .into_server_config()
+            .expect_err("service commands are not server commands");
+        assert!(matches!(error, ConfigError::ServiceCommandIsNotServer));
+    }
+
+    #[test]
+    fn pairing_offer_resolves_the_data_root_and_defaults_reach_to_another_device() {
+        let temp = tempfile::tempdir().expect("temporary base directory");
+        let base_dir = temp.path().to_string_lossy().into_owned();
+
+        let action = Cli::try_parse_from([
+            "bibcode",
+            "pairing",
+            "offer",
+            "--base-dir",
+            base_dir.as_str(),
+            "--endpoint",
+            "http://100.105.196.60:3773",
+            "--label",
+            "laptop",
+            "--json",
+        ])
+        .expect("parse pairing offer CLI")
+        .into_action()
+        .expect("build pairing action");
+        let CliAction::Pairing(PairingCommand::Offer {
+            root,
+            endpoint,
+            reach,
+            name,
+            label,
+            json,
+        }) = action
+        else {
+            panic!("pairing offer must produce an offer action");
+        };
+        assert_eq!(root.requested, PathBuf::from(base_dir.as_str()));
+        assert_eq!(endpoint, "http://100.105.196.60:3773");
+        assert_eq!(reach, "another-device");
+        assert_eq!(name, None);
+        assert_eq!(label.as_deref(), Some("laptop"));
+        assert!(json);
+
+        assert!(
+            Cli::try_parse_from([
+                "bibcode",
+                "pairing",
+                "offer",
+                "--base-dir",
+                base_dir.as_str()
+            ])
+            .is_err(),
+            "--endpoint is required"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "bibcode",
+                "pairing",
+                "offer",
+                "--endpoint",
+                "http://10.0.0.5:3773",
+                "--reach",
+                "everywhere",
+            ])
+            .is_err(),
+            "reach is an enumerated value"
+        );
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -334,6 +468,10 @@ enum CliCommand {
     Storage(StorageArgs),
     #[command(about = "Manage one-time pairing credentials for a data root.")]
     Pairing(PairingArgs),
+    #[command(
+        about = "Install, remove, or inspect the per-user background service that keeps `bibcode serve` running."
+    )]
+    Service(ServiceArgs),
 }
 
 #[derive(Debug, Args)]
@@ -372,6 +510,23 @@ struct PairingArgs {
     command: PairingSubcommand,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum PairingReachArg {
+    AnotherDevice,
+    ThisComputer,
+    Custom,
+}
+
+impl PairingReachArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AnotherDevice => "another-device",
+            Self::ThisComputer => "this-computer",
+            Self::Custom => "custom",
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum PairingSubcommand {
     #[command(about = "Create a five-minute administrative pairing credential for this data root.")]
@@ -381,6 +536,64 @@ enum PairingSubcommand {
         #[arg(long)]
         json: bool,
     },
+    #[command(
+        about = "Create a five-minute encrypted pairing offer (bibcode://pair?code=…) for another BiBCode client."
+    )]
+    Offer {
+        /// The http(s) address the other device will connect to.
+        #[arg(long)]
+        endpoint: String,
+        #[arg(long, value_enum, default_value_t = PairingReachArg::AnotherDevice)]
+        reach: PairingReachArg,
+        /// Display name shown on the other device; defaults to this machine's hostname.
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Args)]
+struct ServiceArgs {
+    #[command(subcommand)]
+    command: ServiceSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceSubcommand {
+    #[command(
+        about = "Install and start a per-user service running `bibcode serve` with the given --host, --port, --base-dir, and --static-dir."
+    )]
+    Install {
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Stop and remove the per-user service.")]
+    Uninstall {
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Report whether the per-user service is installed and running.")]
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub enum ServiceCommand {
+    Install {
+        spec: crate::service_manager::ServiceSpec,
+        json: bool,
+    },
+    Uninstall {
+        json: bool,
+    },
+    Status {
+        json: bool,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -388,12 +601,21 @@ pub enum CliAction {
     Run(Box<ServerConfig>),
     Storage(StorageCommand),
     Pairing(PairingCommand),
+    Service(ServiceCommand),
 }
 
 #[derive(Clone, Debug)]
 pub enum PairingCommand {
     Issue {
         root: ResolvedDataRoot,
+        label: Option<String>,
+        json: bool,
+    },
+    Offer {
+        root: ResolvedDataRoot,
+        endpoint: String,
+        reach: String,
+        name: Option<String>,
         label: Option<String>,
         json: bool,
     },
@@ -439,6 +661,10 @@ struct ServerArgs {
     #[arg(long, env = "BIBCODE_NO_BROWSER", global = true)]
     no_browser: bool,
 
+    /// Do not mint the five-minute pairing offer printed as `pairingCode` at startup.
+    #[arg(long, env = "BIBCODE_NO_STARTUP_PAIRING_OFFER", global = true)]
+    no_startup_pairing_offer: bool,
+
     #[arg(long, env = "BIBCODE_BOOTSTRAP_FD", global = true)]
     bootstrap_fd: Option<i32>,
 }
@@ -459,6 +685,8 @@ pub enum ConfigError {
     StorageCommandIsNotServer,
     #[error("pairing commands cannot be converted into a server configuration")]
     PairingCommandIsNotServer,
+    #[error("service commands cannot be converted into a server configuration")]
+    ServiceCommandIsNotServer,
     #[error("failed to resolve the current executable for static web discovery")]
     CurrentExecutable(#[source] io::Error),
     #[error(transparent)]
@@ -496,6 +724,7 @@ impl Cli {
             CliAction::Run(config) => Ok(*config),
             CliAction::Storage(_) => Err(ConfigError::StorageCommandIsNotServer),
             CliAction::Pairing(_) => Err(ConfigError::PairingCommandIsNotServer),
+            CliAction::Service(_) => Err(ConfigError::ServiceCommandIsNotServer),
         }
     }
 
@@ -547,11 +776,49 @@ impl Cli {
                     home_dir,
                 );
                 let root = crate::data_root::resolve_data_root(request)?;
-                let PairingSubcommand::Issue { label, json } = pairing.command;
-                return Ok(CliAction::Pairing(PairingCommand::Issue {
-                    root,
-                    label,
-                    json,
+                return Ok(CliAction::Pairing(match pairing.command {
+                    PairingSubcommand::Issue { label, json } => {
+                        PairingCommand::Issue { root, label, json }
+                    }
+                    PairingSubcommand::Offer {
+                        endpoint,
+                        reach,
+                        name,
+                        label,
+                        json,
+                    } => PairingCommand::Offer {
+                        root,
+                        endpoint,
+                        reach: reach.as_str().to_owned(),
+                        name,
+                        label,
+                        json,
+                    },
+                }));
+            }
+            Some(CliCommand::Service(service)) => {
+                return Ok(CliAction::Service(match service.command {
+                    ServiceSubcommand::Install { json } => {
+                        let current_executable = match executable {
+                            Some(executable) => executable.to_path_buf(),
+                            None => {
+                                std::env::current_exe().map_err(ConfigError::CurrentExecutable)?
+                            }
+                        };
+                        ServiceCommand::Install {
+                            spec: crate::service_manager::ServiceSpec {
+                                executable: current_executable,
+                                host: args.host.unwrap_or_else(|| "127.0.0.1".to_owned()),
+                                port: args.port.unwrap_or(DEFAULT_PORT),
+                                base_dir: args.base_dir,
+                                static_dir: args.static_dir,
+                                path_env: std::env::var_os("PATH"),
+                            },
+                            json,
+                        }
+                    }
+                    ServiceSubcommand::Uninstall { json } => ServiceCommand::Uninstall { json },
+                    ServiceSubcommand::Status { json } => ServiceCommand::Status { json },
                 }));
             }
             command => command,
@@ -609,6 +876,7 @@ impl Cli {
             || args.no_browser
             || bootstrap.as_ref().is_some_and(|value| value.no_browser)
             || mode == ServerMode::Desktop;
+        config.startup_pairing_offer = !args.no_startup_pairing_offer;
         let desktop_bootstrap_token = bootstrap
             .as_ref()
             .map(|value| value.desktop_bootstrap_token.clone());
