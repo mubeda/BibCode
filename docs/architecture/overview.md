@@ -436,6 +436,15 @@ Vite development URL. Separately, the Tauri host starts the primary backend
 through `BackendSupervisor` and publishes its ready descriptor to the renderer.
 The renderer then establishes the normal HTTP/WebSocket connection.
 
+Before Tauri starts on macOS and Linux, the desktop host captures `PATH` from
+the user's login shell inside one bounded session and process group, preventing
+an inherited controlling terminal from suspending the interactive shell. A
+complete delimited PATH frame is authoritative even when shell shutdown or a
+descendant keeps the stdout pipe open: the host terminates and reaps that group,
+joins the reader, then installs the merged PATH while startup is still
+single-threaded. Missing, malformed, oversized, or incomplete frames leave the
+inherited PATH unchanged.
+
 ```mermaid
 sequenceDiagram
   participant Host as Tauri host

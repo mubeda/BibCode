@@ -1,7 +1,7 @@
 //! Git Manager ref and worktree snapshot construction.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::OsString,
     io,
     path::{Path, PathBuf},
@@ -173,8 +173,16 @@ pub async fn read_image_blob(
     Ok(Some(output.stdout))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RawRefKind {
+    LocalBranch,
+    RemoteBranch,
+    Tag,
+}
+
 #[derive(Clone, Debug)]
 struct RawRef {
+    kind: RawRefKind,
     name: String,
     tip_sha: String,
     upstream: Option<String>,
@@ -252,20 +260,11 @@ pub async fn build_refs_snapshot(
         .iter()
         .map(|tag| (tag.name.clone(), tag.target_sha.clone()))
         .collect::<HashMap<_, _>>();
-    let tag_counts = listed_tags
+    let available_ref_names = raw_refs
         .iter()
-        .fold(HashMap::<String, usize>::new(), |mut counts, tag| {
-            *counts.entry(tag.name.clone()).or_default() += 1;
-            counts
-        });
-    let mut remaining_counts =
-        raw_refs
-            .iter()
-            .fold(HashMap::<String, usize>::new(), |mut counts, reference| {
-                *counts.entry(reference.name.clone()).or_default() += 1;
-                counts
-            });
-    let mut remaining_tags = tag_counts;
+        .filter(|reference| reference.kind != RawRefKind::Tag)
+        .map(|reference| reference.name.clone())
+        .collect::<HashSet<_>>();
 
     let head_ref_value = (head_ref.exit_code == 0)
         .then(|| head_ref.stdout.trim().to_owned())
@@ -302,25 +301,14 @@ pub async fn build_refs_snapshot(
     let mut remote_branches = Vec::new();
     let mut tags = Vec::new();
     for mut reference in raw_refs {
-        let remaining = remaining_counts
-            .get_mut(&reference.name)
-            .ok_or(GitManagerRefsError::MalformedRefs)?;
-        let tags_left = remaining_tags.get(&reference.name).copied().unwrap_or(0);
-        let is_tag = tags_left != 0 && *remaining <= tags_left;
-        *remaining = remaining.saturating_sub(1);
-        if is_tag && let Some(count) = remaining_tags.get_mut(&reference.name) {
-            *count = count.saturating_sub(1);
-        }
+        let is_tag = reference.kind == RawRefKind::Tag;
+        let is_remote = reference.kind == RawRefKind::RemoteBranch;
         if is_tag {
             reference.tip_sha = tag_targets
                 .get(&reference.name)
                 .cloned()
                 .ok_or(GitManagerRefsError::MalformedRefs)?;
         }
-        let is_remote = !is_tag
-            && remote_names
-                .iter()
-                .any(|remote| reference.name.starts_with(&format!("{remote}/")));
         if !is_tag && !is_remote && reference.worktree_path.is_none() {
             reference.worktree_path = worktree_occupancy.get(&reference.name).cloned();
         }
@@ -341,7 +329,9 @@ pub async fn build_refs_snapshot(
                 .flatten(),
             blocked: Vec::new(),
         };
-        if let Some(upstream) = entry.upstream.as_deref() {
+        if let Some(upstream) = entry.upstream.as_deref()
+            && available_ref_names.contains(upstream)
+        {
             let counts = repository
                 .git_manager_ahead_behind(cwd, &entry.name, upstream, cancellation)
                 .await?;
@@ -398,19 +388,40 @@ fn parse_refs(output: &str) -> Result<Vec<RawRef>, GitManagerRefsError> {
             let [name, tip_sha, upstream, worktree_path, head] = fields.as_slice() else {
                 return Err(GitManagerRefsError::MalformedRefs);
             };
-            if name.is_empty() || !valid_object_id(tip_sha) {
+            let (kind, name) = parse_ref_name(name).ok_or(GitManagerRefsError::MalformedRefs)?;
+            if !valid_object_id(tip_sha) {
                 return Err(GitManagerRefsError::MalformedRefs);
             }
             Ok(RawRef {
-                name: (*name).to_owned(),
+                kind,
+                name: name.to_owned(),
                 tip_sha: (*tip_sha).to_owned(),
-                upstream: (!upstream.is_empty()).then(|| (*upstream).to_owned()),
+                upstream: (!upstream.is_empty()).then(|| short_ref_name(upstream).to_owned()),
                 worktree_path: (!worktree_path.is_empty())
                     .then(|| display_path(Path::new(worktree_path))),
                 current: head.trim() == "*",
             })
         })
         .collect()
+}
+
+fn parse_ref_name(value: &str) -> Option<(RawRefKind, &str)> {
+    let (kind, name) = if let Some(name) = value.strip_prefix("refs/heads/") {
+        (RawRefKind::LocalBranch, name)
+    } else if let Some(name) = value.strip_prefix("refs/remotes/") {
+        (RawRefKind::RemoteBranch, name)
+    } else {
+        (RawRefKind::Tag, value.strip_prefix("refs/tags/")?)
+    };
+    (!name.is_empty()).then_some((kind, name))
+}
+
+fn short_ref_name(value: &str) -> &str {
+    value
+        .strip_prefix("refs/heads/")
+        .or_else(|| value.strip_prefix("refs/remotes/"))
+        .or_else(|| value.strip_prefix("refs/tags/"))
+        .unwrap_or(value)
 }
 
 fn parse_ahead_behind(output: &str) -> Result<(u64, u64), GitManagerRefsError> {
@@ -706,6 +717,92 @@ mod tests {
                 .any(|entry| entry.path == reported && entry.prunable),
             "the prunable worktree entry keeps the same reported spelling"
         );
+    }
+
+    #[tokio::test]
+    async fn symbolic_remote_head_is_excluded_without_hiding_a_same_named_local_branch() {
+        let repository = repository_with_one_commit();
+        let repository_path = repository
+            .path()
+            .to_str()
+            .expect("fixture path should be UTF-8");
+        git(repository.path(), &["branch", "origin"]);
+        git(
+            repository.path(),
+            &["remote", "add", "origin", repository_path],
+        );
+        let head = String::from_utf8(git_output(repository.path(), &["rev-parse", "HEAD"]).stdout)
+            .expect("UTF-8 HEAD")
+            .trim()
+            .to_owned();
+        git(
+            repository.path(),
+            &["update-ref", "refs/remotes/origin/main", &head],
+        );
+        git(
+            repository.path(),
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+
+        let snapshot = snapshot(&repository).await;
+        let local_names = snapshot
+            .local_branches
+            .iter()
+            .map(|branch| branch.name.as_str())
+            .collect::<Vec<_>>();
+        let remote_names = snapshot
+            .remote_branches
+            .iter()
+            .map(|branch| branch.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(local_names, ["main", "origin"]);
+        assert_eq!(remote_names, ["origin/main"]);
+    }
+
+    #[tokio::test]
+    async fn missing_remote_tracking_ref_does_not_make_the_snapshot_unavailable() {
+        let repository = repository_with_one_commit();
+        let repository_path = repository
+            .path()
+            .to_str()
+            .expect("fixture path should be UTF-8");
+        git(
+            repository.path(),
+            &["remote", "add", "origin", repository_path],
+        );
+        git(
+            repository.path(),
+            &[
+                "config",
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/remotes/origin/*",
+            ],
+        );
+        git(repository.path(), &["switch", "-q", "-c", "topic"]);
+        git(
+            repository.path(),
+            &["config", "branch.topic.remote", "origin"],
+        );
+        git(
+            repository.path(),
+            &["config", "branch.topic.merge", "refs/heads/topic"],
+        );
+
+        let snapshot = snapshot(&repository).await;
+        let topic = snapshot
+            .local_branches
+            .iter()
+            .find(|branch| branch.name == "topic")
+            .expect("topic branch");
+
+        assert_eq!(topic.upstream.as_deref(), Some("origin/topic"));
+        assert_eq!((topic.ahead, topic.behind), (0, 0));
+        assert!(snapshot.remote_branches.is_empty());
     }
 
     #[cfg(unix)]

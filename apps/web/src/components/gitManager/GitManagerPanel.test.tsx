@@ -4,7 +4,7 @@ import {
   AVAILABLE_CONNECTION_STATE,
   type SupervisorConnectionState,
 } from "@bibcode/client-runtime/connection";
-import type { GitManagerRefsSnapshot, ServerConfig } from "@bibcode/contracts";
+import type { GitManagerRefsSnapshot, ServerConfig, VcsStatusResult } from "@bibcode/contracts";
 import { makeTestExecutionEnvironmentCapabilities } from "@bibcode/shared/testSupport";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
@@ -42,6 +42,10 @@ const h = vi.hoisted(() => ({
     kind: "stashes",
     cwd: args.input.cwd,
   })),
+  statusAtom: vi.fn((args: { input: { cwd: string } }) => ({
+    kind: "status",
+    cwd: args.input.cwd,
+  })),
   listPullRequests: vi.fn((args: { input: { cwd: string } }) => ({
     kind: "provider",
     cwd: args.input.cwd,
@@ -49,6 +53,8 @@ const h = vi.hoisted(() => ({
   toolbarProps: [] as Array<Record<string, unknown>>,
   historyProps: [] as Array<Record<string, unknown>>,
   refsSnapshot: null as GitManagerRefsSnapshot | null,
+  status: null as VcsStatusResult | null,
+  signalGeneration: 1,
   runOperation: vi.fn((_registry: unknown, _target: unknown, _onEvent: unknown) => ({
     result: new Promise(() => undefined),
     cancel: vi.fn(),
@@ -66,6 +72,7 @@ vi.mock("../../state/entities", () => ({
   useProject: () => h.project,
   useServerConfigs: () =>
     new Map(h.serverConfig === null ? [] : [["environment-1", h.serverConfig]]),
+  useThreadShellsForProjectRefs: () => [],
 }));
 
 vi.mock("../../state/environments", () => ({
@@ -84,7 +91,15 @@ vi.mock("../../state/query", () => ({
       });
     }
     const data =
-      atom?.kind === "catalog" ? h.catalog : atom?.kind === "refs" ? h.refsSnapshot : null;
+      atom?.kind === "catalog"
+        ? h.catalog
+        : atom?.kind === "refs"
+          ? h.refsSnapshot
+          : atom?.kind === "status"
+            ? h.status
+            : atom?.kind === "signal"
+              ? { generation: h.signalGeneration }
+              : null;
     return {
       data,
       error: null,
@@ -97,6 +112,15 @@ vi.mock("../../state/query", () => ({
 
 vi.mock("../../state/worktrees", () => ({
   worktreeEnvironment: { catalog: h.catalogAtom },
+}));
+
+vi.mock("../../state/vcs", () => ({
+  vcsEnvironment: {
+    status: h.statusAtom,
+    refreshStatus: { label: "test:refresh-status" },
+    stageFiles: { label: "test:stage-files" },
+    unstageFiles: { label: "test:unstage-files" },
+  },
 }));
 
 vi.mock("../../state/gitManager", () => ({
@@ -242,6 +266,23 @@ function refsSnapshot(overrides: Partial<GitManagerRefsSnapshot> = {}): GitManag
   };
 }
 
+function vcsStatus(hasWorkingTreeChanges: boolean): VcsStatusResult {
+  return {
+    isRepo: true,
+    sourceControlProvider: { kind: "github", name: "GitHub", baseUrl: "https://github.com" },
+    hasPrimaryRemote: true,
+    isDefaultRef: true,
+    refName: "main",
+    defaultRefName: "main",
+    hasWorkingTreeChanges,
+    workingTree: { files: [], insertions: 0, deletions: 0 },
+    hasUpstream: true,
+    aheadCount: 0,
+    behindCount: 0,
+    pr: null,
+  } as VcsStatusResult;
+}
+
 beforeEach(() => {
   h.connectionState = connection({
     desired: true,
@@ -263,10 +304,13 @@ beforeEach(() => {
   };
   h.activeSubscriptions = 0;
   h.refsSnapshot = refsSnapshot();
+  h.status = vcsStatus(false);
+  h.signalGeneration = 1;
   h.catalogAtom.mockClear();
   h.signalAtom.mockClear();
   h.refsAtom.mockClear();
   h.stashesAtom.mockClear();
+  h.statusAtom.mockClear();
   h.listPullRequests.mockClear();
   h.runOperation.mockClear();
   h.historyProps.length = 0;
@@ -483,6 +527,43 @@ describe("GitManagerPanel", () => {
       });
       expect(await openManager()).toBe("history");
     } finally {
+      (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
+    }
+  });
+
+  it("moves from Changes to History when the checkout becomes clean", async () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    h.effects.length = 0;
+    h.status = vcsStatus(true);
+    useGitManagerStore.getState().setActiveTab(projectRef, "changes");
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+
+    try {
+      await act(async () => root.render(<GitManagerPanel projectRef={projectRef} />));
+      await act(async () => {
+        for (const effect of h.effects.splice(0)) effect();
+      });
+      expect(useGitManagerStore.getState().selectViewState(projectRef).activeTab).toBe("changes");
+
+      h.status = vcsStatus(false);
+      h.signalGeneration = 2;
+      await act(async () =>
+        root.render(
+          <GitManagerPanel
+            projectRef={{ environmentId: "environment-1", projectId: "project-1" } as never}
+          />,
+        ),
+      );
+      await act(async () => {
+        for (const effect of h.effects.splice(0)) effect();
+      });
+
+      expect(useGitManagerStore.getState().selectViewState(projectRef).activeTab).toBe("history");
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
       (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
     }
   });

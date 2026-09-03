@@ -34,6 +34,7 @@ import {
   type GitManagerOperationHandle,
 } from "../../state/gitManager";
 import { useEnvironmentQuery } from "../../state/query";
+import { vcsEnvironment } from "../../state/vcs";
 import { worktreeEnvironment } from "../../state/worktrees";
 import { Button } from "../ui/button";
 import { Tabs, TabsList, TabsPanel, TabsTab } from "../ui/tabs";
@@ -241,6 +242,10 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
       }) ?? null,
     [cwd, environmentId],
   );
+  const statusAtom = useMemo(
+    () => vcsEnvironment.status({ environmentId, input: { cwd } }),
+    [cwd, environmentId],
+  );
   const stashesAtom = useMemo(
     () =>
       !stashPaneOpen || stashMergeDisabledReason !== null
@@ -252,6 +257,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
     [cwd, environmentId, stashMergeDisabledReason, stashPaneOpen],
   );
   const refsQuery = useEnvironmentQuery(refsAtom);
+  const statusQuery = useEnvironmentQuery(statusAtom);
   const stashesQuery = useEnvironmentQuery(stashesAtom);
   const refreshRefs = refsQuery.refresh;
   const refreshStashes = stashesQuery.refresh;
@@ -280,11 +286,14 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
   const continueBlocked =
     repositoryBlockedReasons.find((reason) => reason.operation === "continue") ?? null;
   const inProgressOperation = snapshot?.inProgressOperation ?? null;
-  const defaultTab = resolveGitManagerDefaultTab(inProgressOperation);
-  // Opening the manager lands on History; a pending merge moves it to Changes
-  // and finishing that merge moves it back. Manual tab picks survive in between.
+  const defaultTab = resolveGitManagerDefaultTab(
+    inProgressOperation,
+    statusQuery.data?.hasWorkingTreeChanges,
+  );
+  // A clean transition after commit, discard, or recovery moves to History. A
+  // merge still owns Changes; otherwise manual tab picks remain untouched.
   useEffect(() => {
-    onTabChange(defaultTab);
+    if (defaultTab !== null) onTabChange(defaultTab);
   }, [defaultTab, onTabChange]);
   const resumableOperation = asResumableOperation(inProgressOperation);
   const resumableOperationDisabledReason =
