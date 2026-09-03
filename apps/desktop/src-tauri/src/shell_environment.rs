@@ -556,10 +556,12 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    #[cfg(target_os = "macos")]
+    use super::probe_shell_path;
     use super::{DesktopPlatform, PlatformAction, PosixPlatform, platform_action};
     #[cfg(unix)]
     use super::{
-        PathHydrationFailure, merge_path_values, parse_captured_path, probe_shell_path,
+        PathHydrationFailure, merge_path_values, parse_captured_path,
         probe_shell_path_with_command, probe_shell_path_with_command_and_pid, select_shell,
     };
 
