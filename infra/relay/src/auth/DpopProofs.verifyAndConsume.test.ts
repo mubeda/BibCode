@@ -33,10 +33,9 @@ interface DpopProofInsertValues {
 
 interface StoredDpopProof extends DpopProofInsertValues {}
 
-class ControlledSqlError extends Schema.TaggedErrorClass<ControlledSqlError>()(
-  "ControlledSqlError",
-  { cause: Schema.Defect() },
-) {}
+class ControlledSqlError extends Schema.TaggedError<ControlledSqlError>()("ControlledSqlError", {
+  cause: Schema.Defect(),
+}) {}
 
 const encodePersistenceError = Schema.encodeSync(DpopProofs.DpopProofReplayPersistenceError);
 const isPersistenceError = Schema.is(DpopProofs.DpopProofReplayPersistenceError);
@@ -170,10 +169,12 @@ function makeDpopProof(input: {
       ...(input.accessToken ? { ath: computeDpopAccessTokenHash(input.accessToken) } : {}),
     }),
   ).toString("base64url");
-  const signature = NodeCrypto.sign("sha256", Buffer.from(`${header}.${payload}`), {
-    key: privateKey,
-    dsaEncoding: "ieee-p1363",
-  }).toString("base64url");
+  const signature = Buffer.from(
+    NodeCrypto.sign("sha256", Buffer.from(`${header}.${payload}`), {
+      key: privateKey,
+      dsaEncoding: "ieee-p1363",
+    }),
+  ).toString("base64url");
   return {
     proof: `${header}.${payload}.${signature}`,
     thumbprint: computeDpopJwkThumbprint(publicJwk),

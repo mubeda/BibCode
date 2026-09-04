@@ -14,7 +14,7 @@
           "argumentCount": 1.681692581209412e25,
           "stdoutLength": -7.661531071789796e-7,
           "detail": "u",
-          "cause": "undefined"
+          "cause": null
         }
       }
     ]

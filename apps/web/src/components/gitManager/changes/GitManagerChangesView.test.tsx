@@ -202,13 +202,12 @@ function buttonWithText(text: string): HTMLButtonElement {
   return button;
 }
 
-function checkboxWithLabel(text: string): HTMLElement {
+function checkboxLabelWithText(text: string): HTMLLabelElement {
   const label = [...document.querySelectorAll("label")].find((candidate) =>
     candidate.textContent?.includes(text),
   );
-  const checkbox = label?.querySelector<HTMLElement>("[role='checkbox']");
-  if (checkbox === null || checkbox === undefined) throw new Error(`Missing checkbox: ${text}`);
-  return checkbox;
+  if (!(label instanceof HTMLLabelElement)) throw new Error(`Missing checkbox label: ${text}`);
+  return label;
 }
 
 async function changeInput(input: HTMLInputElement, value: string): Promise<void> {
@@ -464,16 +463,7 @@ describe("GitManagerChangesView", () => {
     await act(async () => buttonWithText("Amend Last Commit").click());
     await act(async () => buttonWithText("Commit Options").click());
     for (const label of ["Bypass Commit Hooks", "Signed-off-by", "Allow Empty"]) {
-      const checkbox = checkboxWithLabel(label);
-      await act(async () => {
-        checkbox.focus();
-        checkbox.dispatchEvent(
-          new KeyboardEvent("keydown", { bubbles: true, cancelable: true, key: " " }),
-        );
-        checkbox.dispatchEvent(
-          new KeyboardEvent("keyup", { bubbles: true, cancelable: true, key: " " }),
-        );
-      });
+      await act(async () => checkboxLabelWithText(label).click());
     }
 
     await act(async () => buttonWithText("Commit 1 files to main").click());

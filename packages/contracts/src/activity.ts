@@ -345,7 +345,7 @@ export const ActivitySubtreeCancellationResult = Schema.Struct({
 });
 export type ActivitySubtreeCancellationResult = typeof ActivitySubtreeCancellationResult.Type;
 
-export class ActivityError extends Schema.TaggedErrorClass<ActivityError>()("ActivityError", {
+export class ActivityError extends Schema.TaggedError<ActivityError>()("ActivityError", {
   message: ActivitySummaryText,
   reason: Schema.Literals([
     "notFound",

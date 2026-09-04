@@ -41,7 +41,7 @@ export type RemoteUpdateSnapshot = typeof RemoteUpdateSnapshot.Type;
 
 export const REMOTE_UPDATE_MANUAL_REQUIRED = "remote_update_manual_required" as const;
 
-export class RemoteUpdateInstallError extends Schema.TaggedErrorClass<RemoteUpdateInstallError>()(
+export class RemoteUpdateInstallError extends Schema.TaggedError<RemoteUpdateInstallError>()(
   "RemoteUpdateInstallError",
   {
     code: Schema.Literal(REMOTE_UPDATE_MANUAL_REQUIRED),

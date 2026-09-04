@@ -1,53 +1,51 @@
 {
   "schemaVersion": 1,
-  "auditDate": "2026-07-17",
+  "auditDate": "2026-09-03",
   "baseline": {
-    "originMainSha": "b606a2309e021f2c315d87203054d9b92049d4a3",
-    "implementationHead": "0aeaaf743d71cb0d32c5765c68bf4b6497d8c805",
-    "baselineRepairCommit": "216b7bf232f4af68967c3e29472b346de7ace5c7",
+    "originMainSha": "610a65be4ae5269c9a3848c898725a29035b4341",
+    "implementationHead": "610a65be4ae5269c9a3848c898725a29035b4341",
+    "evidenceSource": "Task 0 report at the supported-convergence migration base; execution-specific historical durations are intentionally not carried forward.",
     "tools": {
-      "node": "v24.18.0",
-      "pnpm": "10.24.0",
-      "rust": "rustc 1.97.0 (Homebrew)",
-      "vitePlus": "0.2.1"
+      "node": "v26.8.1",
+      "pnpm": "11.15.0",
+      "rust": "rustc 1.98.0",
+      "vitePlus": "0.2.5"
     },
     "commands": [
       {
         "command": "vp check",
-        "durationSeconds": 3,
         "result": "passed"
       },
       {
         "command": "vp run typecheck",
-        "durationSeconds": 6,
         "result": "passed"
       },
       {
         "command": "vp test",
-        "durationSeconds": 39,
-        "result": "passed"
+        "result": "passed",
+        "note": "Historical aggregate Task 0 report result; the contradictory Punycode case was reproduced and repaired in Task 13, whose fresh green evidence is recorded under validationFoundation."
       },
       {
         "command": "vp run test",
-        "durationSeconds": 170,
-        "result": "passed"
+        "result": "passed",
+        "note": "Historical aggregate Task 0 report result; the contradictory Punycode case was reproduced and repaired in Task 13, whose fresh green evidence is recorded under validationFoundation."
       },
       {
         "command": "cargo test --workspace --all-targets -j 2",
-        "durationSeconds": 173,
-        "result": "passed"
+        "result": "passed",
+        "note": "Passed in Task 0 fix round 2 from the normal worktree target after the external /var symlink identity failure was classified."
       }
     ],
-    "warnings": [
-      "Frozen pnpm install reported intentionally ignored build scripts for bufferutil, utf-8-validate, and workerd; installation completed successfully."
-    ]
+    "warnings": []
   },
   "validationFoundation": {
     "crossPlatformWorkflowContract": {
       "status": "green",
       "portableRunner": "ubuntu-24.04",
       "nativeRunners": [
+        "ubuntu-22.04 arm64",
         "ubuntu-22.04 x64",
+        "windows-11-vs2026-arm arm64",
         "windows-2025 x64",
         "macos-26 arm64",
         "macos-26-intel x64"
@@ -60,32 +58,261 @@
         "vp check"
       ]
     },
+    "supportedConvergence": {
+      "targetAuditDate": "2026-09-03",
+      "verificationDate": "2026-09-04",
+      "status": "partial",
+      "ledgerClosure": {
+        "rows": 221,
+        "statuses": {
+          "green": 112,
+          "current": 63,
+          "blocked": 42,
+          "removed": 4
+        }
+      },
+      "commands": [
+        {
+          "command": "vp run check:dependency-ledger",
+          "result": "passed",
+          "evidenceClass": "local-final-fix"
+        },
+        {
+          "command": "node scripts/run-local-vp.mjs test run scripts/check-dependency-upgrade-ledger.test.ts",
+          "result": "passed",
+          "evidenceClass": "local-final-fix"
+        },
+        {
+          "command": "vp check",
+          "result": "passed-with-442-non-fatal-warnings",
+          "evidenceClass": "local-final-fix"
+        },
+        {
+          "command": "vp run typecheck",
+          "result": "passed",
+          "evidenceClass": "local-final-fix"
+        },
+        {
+          "command": "cargo test --workspace --all-targets -j 2",
+          "result": "passed",
+          "evidenceClass": "native-macos-arm64-task-13"
+        },
+        {
+          "command": "cargo test --manifest-path apps/server/tests/fixtures/task8-harness/Cargo.toml",
+          "result": "accepted-signature-equivalent-baseline-compile-failure",
+          "evidenceClass": "local-task-13"
+        },
+        {
+          "command": "cargo test --manifest-path apps/server/tests/fixtures/task9-harness/Cargo.toml",
+          "result": "accepted-signature-equivalent-baseline-compile-failure",
+          "evidenceClass": "local-task-13"
+        },
+        {
+          "command": "vp test",
+          "result": "passed-680-files-9093-tests-3-files-and-33-tests-skipped",
+          "evidenceClass": "local-final-fix"
+        },
+        {
+          "command": "vp run test",
+          "result": "passed",
+          "evidenceClass": "local-final-fix"
+        },
+        {
+          "command": "vp run build",
+          "result": "passed",
+          "evidenceClass": "local-final-fix"
+        },
+        {
+          "command": "vp run release:smoke",
+          "result": "passed",
+          "evidenceClass": "local-task-13"
+        },
+        {
+          "command": "cargo fmt --all --check / cargo clippy --workspace --all-targets -- -D warnings",
+          "result": "passed",
+          "evidenceClass": "native-macos-arm64-task-13"
+        },
+        {
+          "command": "detached private-tree vp install --frozen-lockfile",
+          "result": "passed-1242-packages-five-manifests-and-locks-byte-identical",
+          "evidenceClass": "local-final-fix"
+        }
+      ],
+      "tools": {
+        "node": "v26.8.1",
+        "pnpm": "11.25.0",
+        "rust": "rustc 1.98.0",
+        "vitePlus": "0.3.0"
+      },
+      "warnings": [
+        "The xn--a.clerk.accounts.dev baseline-report inconsistency was repaired test-first by rejecting every xn-- A-label before URL construction; this conservative cross-runtime rule intentionally leaves valid IDN custom Clerk Frontend API domains unsupported.",
+        "The isolated Task 8 and Task 9 harnesses retain their accepted signature-equivalent baseline compile failures; root Rust gates are green.",
+        "Vite+ 0.3 surfaces 442 non-fatal Oxlint warnings that remain tracked application debt.",
+        "The final-fix package is ad-hoc signed and unnotarized; release signing remains remote release evidence.",
+        "Lexical 0.50 manual native typing, IME, multiline paste, token, undo/redo, and submission checks remain unexecuted; automated composer and packaged trigger coverage does not replace that interaction pass.",
+        "The vercel-react-best-practices skill was unavailable, so the required React component review was not run.",
+        "The seeded updater was not rerun after the final-fix typography-only FilePreviewPanel change because updater and runtime lifecycle behavior did not change; the earlier Task 13 updater result remains historical evidence.",
+        "origin/main is 10 commits ahead of the migration base and overlaps six candidate paths; integration remains a residual merge/rebase responsibility and was not performed.",
+        "Remote CI and the macOS x64, Linux arm64/x64, Windows arm64/x64, WSL x64, server-package, and release-assembly matrices were not dispatched because push and remote workflow authorization were unavailable."
+      ]
+    },
     "packagedDesktopUiAutomation": {
-      "status": "green",
+      "status": "partial",
       "driver": "@wdio/tauri-service 1.2.0 with test-only embedded WebDriver",
-      "platforms": ["linux-x64", "windows-x64", "macos-arm64", "macos-x64"],
-      "stateIsolation": "BIBCODE_HOME and provider PATH shims are test-owned",
       "workflow": ".github/workflows/desktop-ui-smoke.yml",
-      "localValidation": {
-        "platform": "macos-arm64",
-        "packagedSpecs": 3,
-        "supportAndContractTests": 108,
-        "desktopRustTests": 167,
-        "commands": [
-          "vp test run apps/desktop/e2e/support/*.test.ts apps/web/src/tauriInvokeRouting.test.ts apps/web/src/components/settings/SettingsPanels.test.tsx apps/web/src/components/ThreadTerminalDrawer.test.ts scripts/ci-platform-contract.test.ts",
-          "vp run --filter @bibcode/desktop typecheck",
-          "cargo check -p bibcode-desktop --features desktop-e2e",
-          "cargo test -p bibcode-desktop -j 2",
-          "pnpm --filter @bibcode/desktop test:ui"
-        ]
-      }
+      "evidence": [
+        {
+          "platform": "macos-arm64",
+          "evidenceClass": "native-final-tree",
+          "status": "green",
+          "note": "The retained 1.2/9.29 cohort passed all 7 maintained packaged scenarios in 44.8 seconds from the final-fix candidate under short launcher-owned root /tmp/ffr.TWMaAh with no teardown warning. The inspected ad-hoc-signed arm64 DMG was 17,190,281 bytes with SHA-256 d9371d252738756b567ee09b6f786fdca45296c47f8bc31325744fe31e013309; 23 screenshots and the launcher, WebDriver, server, trace, provider, and terminal artifacts under /tmp/ffa.cJeNhq were inspected. The exact run mount was detached, port 4445 was free, the run root was removed, and the run-owned Cursor process group was terminated without touching the two user-owned /Volumes/BiBCode mounts."
+        },
+        {
+          "platform": "macos-x64",
+          "evidenceClass": "unavailable",
+          "status": "unavailable",
+          "note": "Not executed for the supported-convergence migration; remains a native workflow responsibility."
+        },
+        {
+          "platform": "linux-arm64",
+          "evidenceClass": "unavailable",
+          "status": "unavailable",
+          "note": "Not executed for the supported-convergence migration; remains a native workflow responsibility."
+        },
+        {
+          "platform": "linux-x64",
+          "evidenceClass": "unavailable",
+          "status": "unavailable",
+          "note": "Not executed for the supported-convergence migration; remains a native workflow responsibility."
+        },
+        {
+          "platform": "windows-arm64",
+          "evidenceClass": "unavailable",
+          "status": "unavailable",
+          "note": "Not executed for the supported-convergence migration; remains a native workflow responsibility."
+        },
+        {
+          "platform": "windows-x64",
+          "evidenceClass": "unavailable",
+          "status": "unavailable",
+          "note": "Not executed for the supported-convergence migration; remains a native workflow responsibility."
+        }
+      ]
+    },
+    "nativeRustValidation": {
+      "status": "partial",
+      "evidence": [
+        {
+          "platform": "macos-arm64",
+          "evidenceClass": "native-task-13",
+          "status": "green",
+          "note": "Formatting, clean warnings-denied workspace Clippy, and workspace all-target tests passed from the Task 13 final candidate on macOS arm64."
+        },
+        {
+          "platform": "macos-x64",
+          "evidenceClass": "unavailable",
+          "status": "unavailable"
+        },
+        {
+          "platform": "linux-arm64",
+          "evidenceClass": "unavailable",
+          "status": "unavailable"
+        },
+        {
+          "platform": "linux-x64",
+          "evidenceClass": "unavailable",
+          "status": "unavailable"
+        },
+        {
+          "platform": "windows-arm64",
+          "evidenceClass": "unavailable",
+          "status": "unavailable"
+        },
+        {
+          "platform": "windows-x64",
+          "evidenceClass": "unavailable",
+          "status": "unavailable"
+        }
+      ]
+    },
+    "seededDesktopUpgradeValidation": {
+      "status": "partial",
+      "evidence": [
+        {
+          "platform": "macos-arm64",
+          "evidenceClass": "native-final-tree",
+          "status": "green",
+          "note": "The documented seeded upgrade gate passed for both previous-stable v0.5.4 and protected migration-base 0.5.4 paths into the Task 13 candidate 0.5.5-upgrade.task13.1; project state, storage identity, and pre-update backup were retained."
+        },
+        {
+          "platform": "macos-x64",
+          "evidenceClass": "unavailable",
+          "status": "unavailable",
+          "note": "Not executed locally and remote workflows were not dispatched without push authorization."
+        },
+        {
+          "platform": "linux-arm64",
+          "evidenceClass": "unavailable",
+          "status": "unavailable",
+          "note": "Not executed locally and remote workflows were not dispatched without push authorization."
+        },
+        {
+          "platform": "linux-x64",
+          "evidenceClass": "unavailable",
+          "status": "unavailable",
+          "note": "Not executed locally and remote workflows were not dispatched without push authorization."
+        },
+        {
+          "platform": "windows-arm64",
+          "evidenceClass": "unavailable",
+          "status": "unavailable",
+          "note": "Not executed locally and remote workflows were not dispatched without push authorization."
+        },
+        {
+          "platform": "windows-x64",
+          "evidenceClass": "unavailable",
+          "status": "unavailable",
+          "note": "Not executed locally and remote workflows were not dispatched without push authorization."
+        }
+      ]
+    },
+    "remoteValidation": {
+      "status": "unavailable",
+      "reason": "No push, pull-request, or remote-workflow authorization was provided for Task 13; no remote result is represented as passed.",
+      "matrices": [
+        {
+          "name": "portable-check-test-release-smoke",
+          "status": "unavailable"
+        },
+        {
+          "name": "native-desktop-and-server-six-target",
+          "status": "unavailable"
+        },
+        {
+          "name": "packaged-desktop-ui-six-target",
+          "status": "unavailable"
+        },
+        {
+          "name": "seeded-desktop-upgrade-six-target",
+          "status": "unavailable"
+        },
+        {
+          "name": "windows-wsl-x64",
+          "status": "unavailable"
+        },
+        {
+          "name": "release-assembly-validate-only",
+          "status": "unavailable"
+        }
+      ]
     }
   },
   "inventorySummary": {
     "javascriptDirect": 81,
-    "javascriptLedger": 80,
-    "rustRegistry": 83,
-    "rustPath": 1,
+    "javascriptLedger": 83,
+    "rustRegistry": 112,
+    "rustPath": 3,
+    "rustGit": 1,
     "actions": 9,
     "toolchains": 9
   },
@@ -94,109 +321,117 @@
       "key": "js:apps/desktop:@wdio/cli",
       "name": "@wdio/cli",
       "current": "9.29.1",
-      "target": "9.29.1",
+      "target": "9.31.5",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/@wdio/cli",
       "cohort": "packaged-desktop-ui-testing",
       "platforms": ["linux", "macos", "windows"],
-      "status": "current"
+      "status": "blocked",
+      "notes": "Retain the installed 1.2/9.29 cohort until an upstream @wdio/tauri-service release fixes afterSession teardown ordering and aligns @wdio/globals/expect-webdriverio with the selected direct WebdriverIO cohort; 1.3 still warns on coherent 9.30.1 and 9.31 splits expect state."
     },
     {
       "key": "js:apps/desktop:@wdio/globals",
       "name": "@wdio/globals",
       "current": "9.29.1",
-      "target": "9.29.1",
+      "target": "9.31.3",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/@wdio/globals",
       "cohort": "packaged-desktop-ui-testing",
       "platforms": ["linux", "macos", "windows"],
-      "status": "current"
+      "status": "blocked",
+      "notes": "Retain the installed 1.2/9.29 cohort until an upstream @wdio/tauri-service release fixes afterSession teardown ordering and aligns @wdio/globals/expect-webdriverio with the selected direct WebdriverIO cohort; 1.3 still warns on coherent 9.30.1 and 9.31 splits expect state."
     },
     {
       "key": "js:apps/desktop:@wdio/local-runner",
       "name": "@wdio/local-runner",
       "current": "9.29.1",
-      "target": "9.29.1",
+      "target": "9.31.5",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/@wdio/local-runner",
       "cohort": "packaged-desktop-ui-testing",
       "platforms": ["linux", "macos", "windows"],
-      "status": "current"
+      "status": "blocked",
+      "notes": "Retain the installed 1.2/9.29 cohort until an upstream @wdio/tauri-service release fixes afterSession teardown ordering and aligns @wdio/globals/expect-webdriverio with the selected direct WebdriverIO cohort; 1.3 still warns on coherent 9.30.1 and 9.31 splits expect state."
     },
     {
       "key": "js:apps/desktop:@wdio/mocha-framework",
       "name": "@wdio/mocha-framework",
       "current": "9.29.1",
-      "target": "9.29.1",
+      "target": "9.31.5",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/@wdio/mocha-framework",
       "cohort": "packaged-desktop-ui-testing",
       "platforms": ["linux", "macos", "windows"],
-      "status": "current"
+      "status": "blocked",
+      "notes": "Retain the installed 1.2/9.29 cohort until an upstream @wdio/tauri-service release fixes afterSession teardown ordering and aligns @wdio/globals/expect-webdriverio with the selected direct WebdriverIO cohort; 1.3 still warns on coherent 9.30.1 and 9.31 splits expect state."
     },
     {
       "key": "js:apps/desktop:@wdio/native-utils",
       "name": "@wdio/native-utils",
       "current": "2.5.0",
-      "target": "2.5.0",
+      "target": "2.6.0",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/@wdio/native-utils",
       "cohort": "packaged-desktop-ui-testing",
       "platforms": ["linux", "macos", "windows"],
-      "status": "green"
+      "status": "blocked",
+      "notes": "Retain the installed 1.2/9.29 cohort until an upstream @wdio/tauri-service release fixes afterSession teardown ordering and aligns @wdio/globals/expect-webdriverio with the selected direct WebdriverIO cohort; 1.3 still warns on coherent 9.30.1 and 9.31 splits expect state."
     },
     {
       "key": "js:apps/desktop:@wdio/spec-reporter",
       "name": "@wdio/spec-reporter",
       "current": "9.29.1",
-      "target": "9.29.1",
+      "target": "9.31.2",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/@wdio/spec-reporter",
       "cohort": "packaged-desktop-ui-testing",
       "platforms": ["linux", "macos", "windows"],
-      "status": "current"
+      "status": "blocked",
+      "notes": "Retain the installed 1.2/9.29 cohort until an upstream @wdio/tauri-service release fixes afterSession teardown ordering and aligns @wdio/globals/expect-webdriverio with the selected direct WebdriverIO cohort; 1.3 still warns on coherent 9.30.1 and 9.31 splits expect state."
     },
     {
       "key": "js:apps/desktop:@wdio/tauri-service",
       "name": "@wdio/tauri-service",
       "current": "1.2.0",
-      "target": "1.2.0",
+      "target": "1.3.0",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/@wdio/tauri-service",
       "cohort": "packaged-desktop-ui-testing",
       "platforms": ["linux", "macos", "windows"],
-      "status": "current"
+      "status": "blocked",
+      "notes": "Retain the installed 1.2/9.29 cohort until an upstream @wdio/tauri-service release fixes afterSession teardown ordering and aligns @wdio/globals/expect-webdriverio with the selected direct WebdriverIO cohort; 1.3 still warns on coherent 9.30.1 and 9.31 splits expect state."
     },
     {
       "key": "js:apps/desktop:webdriverio",
       "name": "webdriverio",
       "current": "9.29.1",
-      "target": "9.29.1",
+      "target": "9.31.5",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/webdriverio",
       "cohort": "packaged-desktop-ui-testing",
       "platforms": ["linux", "macos", "windows"],
-      "status": "current"
+      "status": "blocked",
+      "notes": "Retain the installed 1.2/9.29 cohort until an upstream @wdio/tauri-service release fixes afterSession teardown ordering and aligns @wdio/globals/expect-webdriverio with the selected direct WebdriverIO cohort; 1.3 still warns on coherent 9.30.1 and 9.31 splits expect state."
     },
     {
       "key": "js:apps/web:@wdio/tauri-plugin",
       "name": "@wdio/tauri-plugin",
       "current": "1.2.0",
-      "target": "1.2.0",
+      "target": "1.3.0",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/@wdio/tauri-plugin",
       "cohort": "packaged-desktop-ui-testing",
       "platforms": ["linux", "macos", "windows"],
-      "status": "green",
-      "notes": "Compile-time gated to packaged desktop UI automation builds."
+      "status": "blocked",
+      "notes": "Compile-time gated to packaged desktop UI automation builds. Retain plugin 1.2.0 and its generic-type patch until an upstream @wdio/tauri-service release fixes afterSession teardown ordering and aligns @wdio/globals/expect-webdriverio with the selected direct WebdriverIO cohort; 1.3 still warns on coherent 9.30.1 and 9.31 splits expect state."
     },
     {
       "key": "action:actions/checkout",
       "name": "actions/checkout",
-      "current": "9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
-      "target": "7.0.0",
-      "tag": "v7.0.0",
-      "sha": "9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+      "current": "3d3c42e5aac5ba805825da76410c181273ba90b1",
+      "target": "7.0.1",
+      "tag": "v7.0.1",
+      "sha": "3d3c42e5aac5ba805825da76410c181273ba90b1",
       "channel": "stable",
       "source": "https://github.com/actions/checkout",
       "cohort": "github-actions",
@@ -245,10 +480,10 @@
     {
       "key": "action:dtolnay/rust-toolchain",
       "name": "dtolnay/rust-toolchain",
-      "current": "46511b1c83438f0dd37c02d843619ece5a4abb5b",
-      "target": "1.97.1",
-      "tag": "1.97.1",
-      "sha": "46511b1c83438f0dd37c02d843619ece5a4abb5b",
+      "current": "62ae3a85dbdd2bedbb5819da8ce45635129289a1",
+      "target": "1.98.0",
+      "tag": "1.98.0",
+      "sha": "62ae3a85dbdd2bedbb5819da8ce45635129289a1",
       "channel": "stable",
       "source": "https://github.com/dtolnay/rust-toolchain",
       "cohort": "github-actions",
@@ -271,10 +506,10 @@
     {
       "key": "action:softprops/action-gh-release",
       "name": "softprops/action-gh-release",
-      "current": "3d0d9888cb7fd7b750713d6e236d1fcb99157228",
-      "target": "3.0.2",
-      "tag": "v3.0.2",
-      "sha": "3d0d9888cb7fd7b750713d6e236d1fcb99157228",
+      "current": "efb35369e0ad2afab669f228072c1b0d510eae64",
+      "target": "3.0.3",
+      "tag": "v3.0.3",
+      "sha": "efb35369e0ad2afab669f228072c1b0d510eae64",
       "channel": "stable",
       "source": "https://github.com/softprops/action-gh-release",
       "cohort": "github-actions",
@@ -284,10 +519,10 @@
     {
       "key": "action:Swatinem/rust-cache",
       "name": "Swatinem/rust-cache",
-      "current": "c19371144df3bb44fab255c43d04cbc2ab54d1c4",
-      "target": "2.9.1",
-      "tag": "v2.9.1",
-      "sha": "c19371144df3bb44fab255c43d04cbc2ab54d1c4",
+      "current": "6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
+      "target": "2.9.2",
+      "tag": "v2.9.2",
+      "sha": "6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
       "channel": "stable",
       "source": "https://github.com/Swatinem/rust-cache",
       "cohort": "github-actions",
@@ -297,10 +532,10 @@
     {
       "key": "action:voidzero-dev/setup-vp",
       "name": "voidzero-dev/setup-vp",
-      "current": "250f29ce396baf5e8f24498e17c0dfdebabc26eb",
-      "target": "1.15.0",
-      "tag": "v1.15.0",
-      "sha": "250f29ce396baf5e8f24498e17c0dfdebabc26eb",
+      "current": "1b32467adbe183473499fd9d5d372c3ed9641754",
+      "target": "1.18.0",
+      "tag": "v1.18.0",
+      "sha": "1b32467adbe183473499fd9d5d372c3ed9641754",
       "channel": "stable",
       "source": "https://github.com/voidzero-dev/setup-vp",
       "cohort": "github-actions",
@@ -310,20 +545,20 @@
     {
       "key": "js:apps/marketing:@astrojs/check",
       "name": "@astrojs/check",
-      "current": "^0.9.9",
-      "target": "0.9.9",
+      "current": "^0.9.10",
+      "target": "0.9.10",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/@astrojs/check",
       "cohort": "typescript-7",
       "platforms": ["linux", "macos", "windows"],
       "status": "green",
-      "notes": "Latest Astro checker retained on its supported TypeScript 6 API boundary while the repository compiler uses TypeScript 7."
+      "notes": "Marketing TypeScript remains 6.0.3 because TypeScript 7.0 lacks the programmatic API required by Astro's embedded-language checker. Move only after an official compatible checker exists and astro check passes without an alias/fork."
     },
     {
       "key": "js:apps/marketing:@vercel/config",
       "name": "@vercel/config",
-      "current": "^0.5.5",
-      "target": "0.5.5",
+      "current": "^0.7.0",
+      "target": "0.7.0",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/@vercel/config",
       "cohort": "stable-javascript-tooling",
@@ -333,8 +568,8 @@
     {
       "key": "js:apps/marketing:astro",
       "name": "astro",
-      "current": "^7.1.1",
-      "target": "7.1.1",
+      "current": "^7.3.0",
+      "target": "7.3.0",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/astro",
       "cohort": "stable-javascript-tooling",
@@ -344,8 +579,8 @@
     {
       "key": "js:apps/web:@base-ui/react",
       "name": "@base-ui/react",
-      "current": "^1.6.0",
-      "target": "1.6.0",
+      "current": "^1.7.0",
+      "target": "1.7.0",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/@base-ui/react",
       "cohort": "react-ui",
@@ -399,24 +634,24 @@
     {
       "key": "js:apps/web:@fontsource-variable/dm-sans",
       "name": "@fontsource-variable/dm-sans",
-      "current": "^5.2.8",
-      "target": "^5.2.8",
+      "current": "^5.3.0",
+      "target": "5.3.0",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/@fontsource-variable/dm-sans",
-      "cohort": "javascript-current",
+      "cohort": "react-ui",
       "platforms": ["linux", "macos", "windows"],
-      "status": "current"
+      "status": "green"
     },
     {
       "key": "js:apps/web:@fontsource/jetbrains-mono",
       "name": "@fontsource/jetbrains-mono",
-      "current": "^5.2.8",
-      "target": "^5.2.8",
+      "current": "^5.3.0",
+      "target": "5.3.0",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/@fontsource/jetbrains-mono",
-      "cohort": "javascript-current",
+      "cohort": "react-ui",
       "platforms": ["linux", "macos", "windows"],
-      "status": "current"
+      "status": "green"
     },
     {
       "key": "js:apps/web:@formkit/auto-animate",
@@ -432,8 +667,8 @@
     {
       "key": "js:apps/web:@legendapp/list",
       "name": "@legendapp/list",
-      "current": "3.3.3",
-      "target": "3.3.3",
+      "current": "3.3.10",
+      "target": "3.3.10",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/@legendapp/list",
       "cohort": "react-ui",
@@ -443,8 +678,8 @@
     {
       "key": "js:apps/web:@lexical/react",
       "name": "@lexical/react",
-      "current": "^0.48.0",
-      "target": "0.48.0",
+      "current": "^0.50.0",
+      "target": "0.50.0",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/@lexical/react",
       "cohort": "react-ui",
@@ -454,8 +689,8 @@
     {
       "key": "js:apps/web:@pierre/trees",
       "name": "@pierre/trees",
-      "current": "1.0.0-beta.5",
-      "target": "1.0.0-beta.5",
+      "current": "1.0.0-beta.6",
+      "target": "1.0.0-beta.6",
       "channel": "preview",
       "source": "https://www.npmjs.com/package/@pierre/trees",
       "cohort": "pierre",
@@ -487,8 +722,8 @@
     {
       "key": "js:apps/web:@tanstack/react-pacer",
       "name": "@tanstack/react-pacer",
-      "current": "^0.22.1",
-      "target": "0.22.1",
+      "current": "^0.23.0",
+      "target": "0.23.0",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/@tanstack/react-pacer",
       "cohort": "react-ui",
@@ -498,8 +733,8 @@
     {
       "key": "js:apps/web:@tanstack/react-router",
       "name": "@tanstack/react-router",
-      "current": "^1.170.18",
-      "target": "1.170.18",
+      "current": "^1.170.32",
+      "target": "1.170.32",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/@tanstack/react-router",
       "cohort": "react-ui",
@@ -509,8 +744,8 @@
     {
       "key": "js:apps/web:@tanstack/router-plugin",
       "name": "@tanstack/router-plugin",
-      "current": "^1.168.22",
-      "target": "1.168.22",
+      "current": "^1.168.35",
+      "target": "1.168.35",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/@tanstack/router-plugin",
       "cohort": "react-ui",
@@ -531,8 +766,8 @@
     {
       "key": "js:apps/web:@types/react",
       "name": "@types/react",
-      "current": "~19.2.17",
-      "target": "19.2.17",
+      "current": "~19.2.18",
+      "target": "19.2.18",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/@types/react",
       "cohort": "react-ui",
@@ -542,19 +777,19 @@
     {
       "key": "js:apps/web:@types/react-dom",
       "name": "@types/react-dom",
-      "current": "~19.2.3",
-      "target": "~19.2.3",
+      "current": "~19.2.6",
+      "target": "19.2.6",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/@types/react-dom",
-      "cohort": "javascript-current",
+      "cohort": "react-ui",
       "platforms": ["linux", "macos", "windows"],
-      "status": "current"
+      "status": "green"
     },
     {
       "key": "js:apps/web:@vitejs/plugin-react",
       "name": "@vitejs/plugin-react",
-      "current": "^6.0.3",
-      "target": "6.0.3",
+      "current": "^6.1.1",
+      "target": "6.1.1",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/@vitejs/plugin-react",
       "cohort": "stable-javascript-tooling",
@@ -643,19 +878,19 @@
     {
       "key": "js:apps/web:happy-dom",
       "name": "happy-dom",
-      "current": "^20.10.6",
-      "target": "^20.10.6",
+      "current": "^20.13.2",
+      "target": "20.13.2",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/happy-dom",
-      "cohort": "javascript-current",
+      "cohort": "stable-javascript-tooling",
       "platforms": ["linux", "macos", "windows"],
-      "status": "current"
+      "status": "green"
     },
     {
       "key": "js:apps/web:lexical",
       "name": "lexical",
-      "current": "^0.48.0",
-      "target": "0.48.0",
+      "current": "^0.50.0",
+      "target": "0.50.0",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/lexical",
       "cohort": "react-ui",
@@ -665,8 +900,8 @@
     {
       "key": "js:apps/web:lucide-react",
       "name": "lucide-react",
-      "current": "^1.25.0",
-      "target": "1.25.0",
+      "current": "^1.40.0",
+      "target": "1.40.0",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/lucide-react",
       "cohort": "react-ui",
@@ -687,8 +922,8 @@
     {
       "key": "js:apps/web:react",
       "name": "react",
-      "current": "19.2.7",
-      "target": "19.2.7",
+      "current": "19.2.8",
+      "target": "19.2.8",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/react",
       "cohort": "react-ui",
@@ -698,8 +933,8 @@
     {
       "key": "js:apps/web:react-dom",
       "name": "react-dom",
-      "current": "19.2.7",
-      "target": "19.2.7",
+      "current": "19.2.8",
+      "target": "19.2.8",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/react-dom",
       "cohort": "react-ui",
@@ -786,19 +1021,19 @@
     {
       "key": "js:apps/web:zustand",
       "name": "zustand",
-      "current": "^5.0.11",
-      "target": "^5.0.11",
+      "current": "^5.0.15",
+      "target": "5.0.15",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/zustand",
-      "cohort": "javascript-current",
+      "cohort": "react-ui",
       "platforms": ["linux", "macos", "windows"],
-      "status": "current"
+      "status": "green"
     },
     {
       "key": "js:catalog:@clerk/backend",
       "name": "@clerk/backend",
-      "current": "3.11.7",
-      "target": "3.11.7",
+      "current": "3.17.1",
+      "target": "3.17.1",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/@clerk/backend",
       "cohort": "clerk",
@@ -808,8 +1043,8 @@
     {
       "key": "js:catalog:@clerk/clerk-js",
       "name": "@clerk/clerk-js",
-      "current": "6.25.5",
-      "target": "6.25.5",
+      "current": "6.31.0",
+      "target": "6.31.0",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/@clerk/clerk-js",
       "cohort": "clerk",
@@ -819,8 +1054,8 @@
     {
       "key": "js:catalog:@clerk/react",
       "name": "@clerk/react",
-      "current": "6.12.5",
-      "target": "6.12.5",
+      "current": "6.15.0",
+      "target": "6.15.0",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/@clerk/react",
       "cohort": "clerk",
@@ -830,8 +1065,8 @@
     {
       "key": "js:catalog:@clerk/shared",
       "name": "@clerk/shared",
-      "current": "4.25.5",
-      "target": "4.25.5",
+      "current": "4.31.0",
+      "target": "4.31.0",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/@clerk/shared",
       "cohort": "clerk",
@@ -841,8 +1076,8 @@
     {
       "key": "js:catalog:@effect/atom-react",
       "name": "@effect/atom-react",
-      "current": "4.0.0-beta.99",
-      "target": "4.0.0-beta.99",
+      "current": "4.0.0-beta.107",
+      "target": "4.0.0-beta.107",
       "channel": "preview",
       "source": "https://www.npmjs.com/package/@effect/atom-react",
       "cohort": "effect",
@@ -852,8 +1087,8 @@
     {
       "key": "js:catalog:@effect/platform-node",
       "name": "@effect/platform-node",
-      "current": "4.0.0-beta.99",
-      "target": "4.0.0-beta.99",
+      "current": "4.0.0-beta.107",
+      "target": "4.0.0-beta.107",
       "channel": "preview",
       "source": "https://www.npmjs.com/package/@effect/platform-node",
       "cohort": "effect",
@@ -861,10 +1096,34 @@
       "status": "green"
     },
     {
+      "key": "js:catalog:@effect/platform-node-shared",
+      "name": "@effect/platform-node-shared",
+      "current": "4.0.0-beta.107",
+      "target": "4.0.0-beta.107",
+      "channel": "preview",
+      "source": "https://www.npmjs.com/package/@effect/platform-node-shared",
+      "cohort": "effect",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "green",
+      "notes": "Exact catalog and override ownership prevents @effect/platform-node from resolving an RC.112 companion beside the beta.107 cohort."
+    },
+    {
+      "key": "js:catalog:@effect/sql-d1",
+      "name": "@effect/sql-d1",
+      "current": "4.0.0-beta.107",
+      "target": "4.0.0-beta.107",
+      "channel": "preview",
+      "source": "https://www.npmjs.com/package/@effect/sql-d1",
+      "cohort": "effect",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "green",
+      "notes": "Exact catalog and override ownership keeps Drizzle optional peer resolution on the approved Effect beta.107 cohort."
+    },
+    {
       "key": "js:catalog:@effect/sql-pg",
       "name": "@effect/sql-pg",
-      "current": "4.0.0-beta.99",
-      "target": "4.0.0-beta.99",
+      "current": "4.0.0-beta.107",
+      "target": "4.0.0-beta.107",
       "channel": "preview",
       "source": "https://www.npmjs.com/package/@effect/sql-pg",
       "cohort": "effect",
@@ -872,10 +1131,22 @@
       "status": "green"
     },
     {
+      "key": "js:catalog:@effect/sql-sqlite-do",
+      "name": "@effect/sql-sqlite-do",
+      "current": "4.0.0-beta.107",
+      "target": "4.0.0-beta.107",
+      "channel": "preview",
+      "source": "https://www.npmjs.com/package/@effect/sql-sqlite-do",
+      "cohort": "effect",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "green",
+      "notes": "Exact catalog and override ownership keeps Drizzle optional peer resolution on the approved Effect beta.107 cohort."
+    },
+    {
       "key": "js:catalog:@effect/tsgo",
       "name": "@effect/tsgo",
-      "current": "0.24.1",
-      "target": "0.24.1",
+      "current": "0.40.0",
+      "target": "0.40.0",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/@effect/tsgo",
       "cohort": "stable-javascript-tooling",
@@ -885,8 +1156,8 @@
     {
       "key": "js:catalog:@effect/vitest",
       "name": "@effect/vitest",
-      "current": "4.0.0-beta.99",
-      "target": "4.0.0-beta.99",
+      "current": "4.0.0-beta.107",
+      "target": "4.0.0-beta.107",
       "channel": "preview",
       "source": "https://www.npmjs.com/package/@effect/vitest",
       "cohort": "effect",
@@ -907,8 +1178,8 @@
     {
       "key": "js:catalog:@noble/curves",
       "name": "@noble/curves",
-      "current": "2.2.0",
-      "target": "2.2.0",
+      "current": "2.4.0",
+      "target": "2.4.0",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/@noble/curves",
       "cohort": "noble-cryptography",
@@ -918,8 +1189,8 @@
     {
       "key": "js:catalog:@noble/hashes",
       "name": "@noble/hashes",
-      "current": "2.2.0",
-      "target": "2.2.0",
+      "current": "2.4.0",
+      "target": "2.4.0",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/@noble/hashes",
       "cohort": "noble-cryptography",
@@ -929,8 +1200,8 @@
     {
       "key": "js:catalog:@pierre/diffs",
       "name": "@pierre/diffs",
-      "current": "1.3.0-beta.10",
-      "target": "1.3.0-beta.10",
+      "current": "1.3.6",
+      "target": "1.3.6",
       "channel": "preview",
       "source": "https://www.npmjs.com/package/@pierre/diffs",
       "cohort": "pierre",
@@ -951,8 +1222,8 @@
     {
       "key": "js:catalog:@types/node",
       "name": "@types/node",
-      "current": "26.1.1",
-      "target": "26.1.1",
+      "current": "26.4.1",
+      "target": "26.4.1",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/@types/node",
       "cohort": "javascript-compatible",
@@ -974,8 +1245,8 @@
     {
       "key": "js:catalog:effect",
       "name": "effect",
-      "current": "4.0.0-beta.99",
-      "target": "4.0.0-beta.99",
+      "current": "4.0.0-beta.107",
+      "target": "4.0.0-beta.107",
       "channel": "preview",
       "source": "https://www.npmjs.com/package/effect",
       "cohort": "effect",
@@ -985,8 +1256,8 @@
     {
       "key": "js:catalog:jose",
       "name": "jose",
-      "current": "6.2.3",
-      "target": "6.2.3",
+      "current": "6.2.10",
+      "target": "6.2.10",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/jose",
       "cohort": "stable-javascript-tooling",
@@ -1002,8 +1273,8 @@
       "source": "https://www.npmjs.com/package/typescript",
       "cohort": "typescript-7",
       "platforms": ["linux", "macos", "windows"],
-      "status": "green",
-      "notes": "The workspace compiler is stable TypeScript 7.0.2 with @effect/tsgo 0.24.1. apps/marketing alone pins the latest TypeScript 6 release because @astrojs/check 0.9.9 explicitly supports only TypeScript 5/6 and its language server requires the legacy typescript.sys JS API removed from TypeScript 7."
+      "status": "blocked",
+      "notes": "Marketing TypeScript remains 6.0.3 because TypeScript 7.0 lacks the programmatic API required by Astro's embedded-language checker. Move only after an official compatible checker exists and astro check passes without an alias/fork."
     },
     {
       "key": "js:catalog:yaml",
@@ -1019,8 +1290,8 @@
     {
       "key": "js:infra/relay:@cloudflare/workers-types",
       "name": "@cloudflare/workers-types",
-      "current": "^5.20260718.1",
-      "target": "5.20260718.1",
+      "current": "^5.20260903.1",
+      "target": "5.20260903.1",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/@cloudflare/workers-types",
       "cohort": "stable-javascript-tooling",
@@ -1030,42 +1301,44 @@
     {
       "key": "js:infra/relay:alchemy",
       "name": "alchemy",
-      "current": "2.0.0-beta.63",
-      "target": "2.0.0-beta.63",
+      "current": "2.0.0-beta.72",
+      "target": "2.0.0-beta.72",
       "channel": "preview",
       "source": "https://www.npmjs.com/package/alchemy",
       "cohort": "relay-preview",
       "platforms": ["linux", "macos", "windows"],
       "status": "green",
-      "notes": "Use the published npm artifact for the audited beta.63 build; its release tag resolves to the same cde008ab6b77783d3edbf5dc82750fbdfd279347 source revision."
+      "notes": "Use beta.72, the newest published Alchemy preview whose peer range supports the approved Effect beta.107 boundary. Newer beta.76 requires the separately excluded Effect RC.112 cohort."
     },
     {
       "key": "js:infra/relay:drizzle-kit",
       "name": "drizzle-kit",
-      "current": "1.0.0-rc.4",
-      "target": "1.0.0-rc.4",
+      "current": "1.0.0-rc.5-ab785fc",
+      "target": "1.0.0-rc.5-ab785fc",
       "channel": "preview",
       "source": "https://www.npmjs.com/package/drizzle-kit",
       "cohort": "relay-preview",
       "platforms": ["linux", "macos", "windows"],
-      "status": "green"
+      "status": "green",
+      "notes": "Move with Alchemy beta.72 to its exact published peer build; RC.4 still evaluates the removed Schema.TaggedErrorClass API under Effect beta.107."
     },
     {
       "key": "js:infra/relay:drizzle-orm",
       "name": "drizzle-orm",
-      "current": "1.0.0-rc.4",
-      "target": "1.0.0-rc.4",
+      "current": "1.0.0-rc.5-ab785fc",
+      "target": "1.0.0-rc.5-ab785fc",
       "channel": "preview",
       "source": "https://www.npmjs.com/package/drizzle-orm",
       "cohort": "relay-preview",
       "platforms": ["linux", "macos", "windows"],
-      "status": "green"
+      "status": "green",
+      "notes": "Move with Alchemy beta.72 to its exact published peer build, whose Effect integration uses Schema.TaggedError and supports Effect beta.107."
     },
     {
       "key": "js:oxlint-plugin-bibcode:@oxlint/plugins",
       "name": "@oxlint/plugins",
-      "current": "^1.74.0",
-      "target": "1.74.0",
+      "current": "1.79.0",
+      "target": "1.79.0",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/@oxlint/plugins",
       "cohort": "stable-javascript-tooling",
@@ -1082,18 +1355,18 @@
       "cohort": "stable-javascript-tooling",
       "platforms": ["linux", "macos", "windows"],
       "status": "green",
-      "notes": "Pinned by a workspace override within Effect beta.78's ^4.8.0 range so private Arbitrary state never crosses duplicate fast-check instances."
+      "notes": "Pinned by a workspace override within Effect beta.107's ^4.9.0 range so private Arbitrary state never crosses duplicate fast-check instances."
     },
     {
       "key": "js:scripts:smol-toml",
       "name": "smol-toml",
-      "current": "1.7.0",
-      "target": "1.7.0",
+      "current": "1.8.0",
+      "target": "1.8.0",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/smol-toml",
       "cohort": "javascript-current",
       "platforms": ["linux", "macos", "windows"],
-      "status": "current"
+      "status": "green"
     },
     {
       "key": "js:workspace:@babel/plugin-transform-react-jsx",
@@ -1110,8 +1383,8 @@
     {
       "key": "js:workspace:@vitest/coverage-v8",
       "name": "@vitest/coverage-v8",
-      "current": "4.1.10",
-      "target": "4.1.10",
+      "current": "4.1.11",
+      "target": "4.1.11",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/@vitest/coverage-v8",
       "cohort": "stable-javascript-tooling",
@@ -1130,6 +1403,18 @@
       "status": "current"
     },
     {
+      "key": "rust:patch:tao",
+      "name": "tao",
+      "current": "git:https://github.com/tauri-apps/tao#c704261c519c58cfdd0bc2d58ba24e06a0b71c92",
+      "target": "c704261c519c58cfdd0bc2d58ba24e06a0b71c92",
+      "channel": "git",
+      "source": "https://github.com/tauri-apps/tao",
+      "cohort": "retained-rust-boundaries",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "blocked",
+      "notes": "Retain until Tauri consumes an upstream equivalent to the Windows reentrant keyboard/IME fix."
+    },
+    {
       "key": "rust:third_party/portable-pty:anyhow",
       "name": "anyhow",
       "current": "1.0",
@@ -1138,7 +1423,7 @@
       "source": "https://crates.io/crates/anyhow",
       "cohort": "vendored-portable-pty",
       "platforms": ["linux", "macos", "windows"],
-      "status": "pending",
+      "status": "blocked",
       "notes": "Owned by third_party/portable-pty/Cargo.toml; update only with the vendored portable-pty release by following third_party/portable-pty/UPSTREAM.md."
     },
     {
@@ -1150,7 +1435,7 @@
       "source": "https://crates.io/crates/bitflags",
       "cohort": "vendored-portable-pty",
       "platforms": ["windows"],
-      "status": "pending",
+      "status": "blocked",
       "notes": "Owned by third_party/portable-pty/Cargo.toml; update only with the vendored portable-pty release by following third_party/portable-pty/UPSTREAM.md."
     },
     {
@@ -1162,7 +1447,7 @@
       "source": "https://crates.io/crates/downcast-rs",
       "cohort": "vendored-portable-pty",
       "platforms": ["linux", "macos", "windows"],
-      "status": "pending",
+      "status": "blocked",
       "notes": "Owned by third_party/portable-pty/Cargo.toml; update only with the vendored portable-pty release by following third_party/portable-pty/UPSTREAM.md."
     },
     {
@@ -1174,7 +1459,7 @@
       "source": "https://crates.io/crates/filedescriptor",
       "cohort": "vendored-portable-pty",
       "platforms": ["linux", "macos", "windows"],
-      "status": "pending",
+      "status": "blocked",
       "notes": "Owned by third_party/portable-pty/Cargo.toml; update only with the vendored portable-pty release by following third_party/portable-pty/UPSTREAM.md."
     },
     {
@@ -1186,7 +1471,7 @@
       "source": "https://crates.io/crates/futures",
       "cohort": "vendored-portable-pty",
       "platforms": ["linux", "macos", "windows"],
-      "status": "pending",
+      "status": "blocked",
       "notes": "Development dependency owned by third_party/portable-pty/Cargo.toml; update only with the vendored portable-pty release by following third_party/portable-pty/UPSTREAM.md."
     },
     {
@@ -1198,7 +1483,7 @@
       "source": "https://crates.io/crates/lazy_static",
       "cohort": "vendored-portable-pty",
       "platforms": ["windows"],
-      "status": "pending",
+      "status": "blocked",
       "notes": "Owned by third_party/portable-pty/Cargo.toml; update only with the vendored portable-pty release by following third_party/portable-pty/UPSTREAM.md."
     },
     {
@@ -1210,7 +1495,7 @@
       "source": "https://crates.io/crates/log",
       "cohort": "vendored-portable-pty",
       "platforms": ["linux", "macos", "windows"],
-      "status": "pending",
+      "status": "blocked",
       "notes": "Owned by third_party/portable-pty/Cargo.toml; update only with the vendored portable-pty release by following third_party/portable-pty/UPSTREAM.md."
     },
     {
@@ -1221,8 +1506,8 @@
       "channel": "stable",
       "source": "https://crates.io/crates/nix",
       "cohort": "vendored-portable-pty",
-      "platforms": ["linux", "macos"],
-      "status": "pending",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "blocked",
       "notes": "Unix dependency owned by third_party/portable-pty/Cargo.toml; update only with the vendored portable-pty release by following third_party/portable-pty/UPSTREAM.md."
     },
     {
@@ -1234,7 +1519,7 @@
       "source": "https://crates.io/crates/serde_derive",
       "cohort": "vendored-portable-pty",
       "platforms": ["linux", "macos", "windows"],
-      "status": "pending",
+      "status": "blocked",
       "notes": "Optional dependency owned by third_party/portable-pty/Cargo.toml; update only with the vendored portable-pty release by following third_party/portable-pty/UPSTREAM.md."
     },
     {
@@ -1246,7 +1531,7 @@
       "source": "https://crates.io/crates/serial2",
       "cohort": "vendored-portable-pty",
       "platforms": ["linux", "macos", "windows"],
-      "status": "pending",
+      "status": "blocked",
       "notes": "Owned by third_party/portable-pty/Cargo.toml; update only with the vendored portable-pty release by following third_party/portable-pty/UPSTREAM.md."
     },
     {
@@ -1258,7 +1543,7 @@
       "source": "https://crates.io/crates/shared_library",
       "cohort": "vendored-portable-pty",
       "platforms": ["windows"],
-      "status": "pending",
+      "status": "blocked",
       "notes": "Owned by third_party/portable-pty/Cargo.toml; update only with the vendored portable-pty release by following third_party/portable-pty/UPSTREAM.md."
     },
     {
@@ -1270,7 +1555,7 @@
       "source": "https://crates.io/crates/shell-words",
       "cohort": "vendored-portable-pty",
       "platforms": ["linux", "macos", "windows"],
-      "status": "pending",
+      "status": "blocked",
       "notes": "Owned by third_party/portable-pty/Cargo.toml; update only with the vendored portable-pty release by following third_party/portable-pty/UPSTREAM.md."
     },
     {
@@ -1282,7 +1567,7 @@
       "source": "https://crates.io/crates/smol",
       "cohort": "vendored-portable-pty",
       "platforms": ["linux", "macos", "windows"],
-      "status": "pending",
+      "status": "blocked",
       "notes": "Development dependency owned by third_party/portable-pty/Cargo.toml; update only with the vendored portable-pty release by following third_party/portable-pty/UPSTREAM.md."
     },
     {
@@ -1294,7 +1579,7 @@
       "source": "https://crates.io/crates/winapi",
       "cohort": "vendored-portable-pty",
       "platforms": ["windows"],
-      "status": "pending",
+      "status": "blocked",
       "notes": "Owned by third_party/portable-pty/Cargo.toml; update only with the vendored portable-pty release by following third_party/portable-pty/UPSTREAM.md."
     },
     {
@@ -1306,32 +1591,32 @@
       "source": "https://crates.io/crates/winreg",
       "cohort": "vendored-portable-pty",
       "platforms": ["windows"],
-      "status": "pending",
+      "status": "blocked",
       "notes": "Owned by third_party/portable-pty/Cargo.toml; update only with the vendored portable-pty release by following third_party/portable-pty/UPSTREAM.md."
     },
     {
       "key": "rust:workspace:tauri-plugin-wdio-webdriver",
       "name": "tauri-plugin-wdio-webdriver",
       "current": "=1.2.0",
-      "target": "1.2.0",
+      "target": "1.3.0",
       "channel": "stable",
       "source": "https://crates.io/crates/tauri-plugin-wdio-webdriver",
       "cohort": "packaged-desktop-ui-testing",
       "platforms": ["linux", "macos", "windows"],
-      "status": "current",
-      "notes": "Optional Cargo feature; excluded from production bundles."
+      "status": "blocked",
+      "notes": "Optional Cargo feature; excluded from production bundles. Retain exact 1.2.0 with the JavaScript Tauri Wdio cohort until an upstream @wdio/tauri-service release fixes afterSession teardown ordering and aligns @wdio/globals/expect-webdriverio with the selected direct WebdriverIO cohort."
     },
     {
       "key": "rust:workspace:tauri-plugin-wdio",
       "name": "tauri-plugin-wdio",
       "current": "=1.2.0",
-      "target": "1.2.0",
+      "target": "1.3.0",
       "channel": "stable",
       "source": "https://crates.io/crates/tauri-plugin-wdio",
       "cohort": "packaged-desktop-ui-testing",
       "platforms": ["linux", "macos", "windows"],
-      "status": "green",
-      "notes": "Optional Cargo feature; excluded from production bundles."
+      "status": "blocked",
+      "notes": "Optional Cargo feature; excluded from production bundles. Retain exact 1.2.0 with the JavaScript Tauri Wdio cohort until an upstream @wdio/tauri-service release fixes afterSession teardown ordering and aligns @wdio/globals/expect-webdriverio with the selected direct WebdriverIO cohort."
     },
     {
       "key": "rust:workspace:axum",
@@ -1353,7 +1638,8 @@
       "source": "https://crates.io/crates/base64",
       "cohort": "rust-current",
       "platforms": ["linux", "macos", "windows"],
-      "status": "current"
+      "status": "blocked",
+      "notes": "0.23 is a pre-1.0 breaking line and needs protocol/serialization review."
     },
     {
       "key": "rust:workspace:block2",
@@ -1375,7 +1661,8 @@
       "source": "https://crates.io/crates/cairo-rs",
       "cohort": "embedded-browser-preview",
       "platforms": ["linux"],
-      "status": "current"
+      "status": "blocked",
+      "notes": "Migrate with WebKit and Linux system-library support as one platform project."
     },
     {
       "key": "rust:workspace:gtk",
@@ -1386,7 +1673,8 @@
       "source": "https://crates.io/crates/gtk",
       "cohort": "embedded-browser-preview",
       "platforms": ["linux"],
-      "status": "current"
+      "status": "blocked",
+      "notes": "Migrate with WebKit and Linux system-library support as one platform project."
     },
     {
       "key": "rust:workspace:objc2",
@@ -1441,7 +1729,8 @@
       "source": "https://crates.io/crates/webkit2gtk",
       "cohort": "embedded-browser-preview",
       "platforms": ["linux"],
-      "status": "current"
+      "status": "blocked",
+      "notes": "Migrate with WebKit and Linux system-library support as one platform project."
     },
     {
       "key": "rust:workspace:webview2-com",
@@ -1452,13 +1741,14 @@
       "source": "https://crates.io/crates/webview2-com",
       "cohort": "embedded-browser-preview",
       "platforms": ["windows"],
-      "status": "current"
+      "status": "blocked",
+      "notes": "0.39 is a pre-1.0 Windows FFI migration."
     },
     {
       "key": "rust:workspace:clap",
       "name": "clap",
-      "current": "4.6.2",
-      "target": "4.6.2",
+      "current": "4.6.6",
+      "target": "4.6.6",
       "channel": "stable",
       "source": "https://crates.io/crates/clap",
       "cohort": "rust-compatible",
@@ -1490,8 +1780,8 @@
     {
       "key": "rust:workspace:futures-util",
       "name": "futures-util",
-      "current": "0.3.33",
-      "target": "0.3.33",
+      "current": "0.3.34",
+      "target": "0.3.34",
       "channel": "stable",
       "source": "https://crates.io/crates/futures-util",
       "cohort": "final-rust-patches",
@@ -1559,12 +1849,12 @@
       "key": "rust:workspace:libc",
       "name": "libc",
       "current": "0.2",
-      "target": "0.2",
+      "target": "0.2.189",
       "channel": "stable",
       "source": "https://crates.io/crates/libc",
       "cohort": "rust-current",
       "platforms": ["linux", "macos", "windows"],
-      "status": "current"
+      "status": "green"
     },
     {
       "key": "rust:workspace:mime_guess",
@@ -1586,8 +1876,8 @@
       "source": "https://crates.io/crates/minisign-verify",
       "cohort": "rust-cryptography",
       "platforms": ["linux", "macos", "windows"],
-      "status": "green",
-      "notes": "Pinned verifier for stable updater release signatures."
+      "status": "blocked",
+      "notes": "Updater-signature trust boundary is already current and exact."
     },
     {
       "key": "rust:workspace:notify",
@@ -1603,8 +1893,8 @@
     {
       "key": "rust:workspace:open",
       "name": "open",
-      "current": "5.4.0",
-      "target": "5.4.0",
+      "current": "5.4.3",
+      "target": "5.4.3",
       "channel": "stable",
       "source": "https://crates.io/crates/open",
       "cohort": "rust-compatible",
@@ -1642,7 +1932,8 @@
       "source": "https://crates.io/crates/portable-pty",
       "cohort": "rust-current",
       "platforms": ["linux", "macos", "windows"],
-      "status": "current"
+      "status": "blocked",
+      "notes": "Version intent remains 0.9.0 while rust:patch:portable-pty makes third_party/portable-pty the effective local source. Retain until a registry release contains the required at-creation Job Object and termination-result fixes."
     },
     {
       "key": "rust:workspace:portpicker",
@@ -1664,7 +1955,8 @@
       "source": "https://crates.io/crates/process-wrap",
       "cohort": "rust-current",
       "platforms": ["linux", "macos", "windows"],
-      "status": "current"
+      "status": "blocked",
+      "notes": "Version 10 is a dedicated process-supervision migration covering admission, ownership, cancellation, shutdown, reaping, and Windows descendant containment."
     },
     {
       "key": "rust:workspace:reqwest",
@@ -1680,8 +1972,8 @@
     {
       "key": "rust:workspace:rusqlite",
       "name": "rusqlite",
-      "current": "0.40.1",
-      "target": "0.40.1",
+      "current": "0.40.2",
+      "target": "0.40.2",
       "channel": "stable",
       "source": "https://crates.io/crates/rusqlite",
       "cohort": "rust-storage-protocol",
@@ -1726,12 +2018,12 @@
       "key": "rust:workspace:serde_json",
       "name": "serde_json",
       "current": "1",
-      "target": "1",
+      "target": "1.0.151",
       "channel": "stable",
       "source": "https://crates.io/crates/serde_json",
       "cohort": "rust-current",
       "platforms": ["linux", "macos", "windows"],
-      "status": "current"
+      "status": "green"
     },
     {
       "key": "rust:workspace:sha2",
@@ -1824,19 +2116,19 @@
     {
       "key": "rust:workspace:tauri-plugin-deep-link",
       "name": "tauri-plugin-deep-link",
-      "current": "2",
-      "target": "2",
+      "current": "2.4.10",
+      "target": "2.4.10",
       "channel": "stable",
       "source": "https://crates.io/crates/tauri-plugin-deep-link",
       "cohort": "rust-current",
       "platforms": ["linux", "macos", "windows"],
-      "status": "current"
+      "status": "green"
     },
     {
       "key": "rust:workspace:tauri-plugin-dialog",
       "name": "tauri-plugin-dialog",
-      "current": "2.7.2",
-      "target": "2.7.2",
+      "current": "2.7.3",
+      "target": "2.7.3",
       "channel": "stable",
       "source": "https://crates.io/crates/tauri-plugin-dialog",
       "cohort": "final-rust-patches",
@@ -1846,35 +2138,35 @@
     {
       "key": "rust:workspace:tauri-plugin-opener",
       "name": "tauri-plugin-opener",
-      "current": "2.5.4",
-      "target": "2.5.4",
+      "current": "2.5.5",
+      "target": "2.5.5",
       "channel": "stable",
       "source": "https://crates.io/crates/tauri-plugin-opener",
       "cohort": "rust-current",
       "platforms": ["linux", "macos", "windows"],
-      "status": "current"
+      "status": "green"
     },
     {
       "key": "rust:workspace:tauri-plugin-shell",
       "name": "tauri-plugin-shell",
-      "current": "2.3.5",
-      "target": "2.3.5",
+      "current": "2.3.6",
+      "target": "2.3.6",
       "channel": "stable",
       "source": "https://crates.io/crates/tauri-plugin-shell",
       "cohort": "rust-current",
       "platforms": ["linux", "macos", "windows"],
-      "status": "current"
+      "status": "green"
     },
     {
       "key": "rust:workspace:tauri-plugin-single-instance",
       "name": "tauri-plugin-single-instance",
-      "current": "2",
-      "target": "2",
+      "current": "2.4.4",
+      "target": "2.4.4",
       "channel": "stable",
       "source": "https://crates.io/crates/tauri-plugin-single-instance",
       "cohort": "rust-current",
       "platforms": ["linux", "macos", "windows"],
-      "status": "current"
+      "status": "green"
     },
     {
       "key": "rust:workspace:tauri-plugin-store",
@@ -1890,13 +2182,13 @@
     {
       "key": "rust:workspace:tauri-plugin-updater",
       "name": "tauri-plugin-updater",
-      "current": "2.10.1",
-      "target": "2.10.1",
+      "current": "2.11.0",
+      "target": "2.11.0",
       "channel": "stable",
       "source": "https://crates.io/crates/tauri-plugin-updater",
       "cohort": "rust-current",
       "platforms": ["linux", "macos", "windows"],
-      "status": "current"
+      "status": "green"
     },
     {
       "key": "rust:workspace:tempfile",
@@ -1913,29 +2205,29 @@
       "key": "rust:workspace:thiserror",
       "name": "thiserror",
       "current": "2",
-      "target": "2",
+      "target": "2.0.20",
       "channel": "stable",
       "source": "https://crates.io/crates/thiserror",
       "cohort": "rust-current",
       "platforms": ["linux", "macos", "windows"],
-      "status": "current"
+      "status": "green"
     },
     {
       "key": "rust:workspace:time",
       "name": "time",
       "current": "0.3",
-      "target": "0.3",
+      "target": "0.3.55",
       "channel": "stable",
       "source": "https://crates.io/crates/time",
       "cohort": "rust-current",
       "platforms": ["linux", "macos", "windows"],
-      "status": "current"
+      "status": "green"
     },
     {
       "key": "rust:workspace:tokio",
       "name": "tokio",
-      "current": "1.53.0",
-      "target": "1.53.0",
+      "current": "1.53.1",
+      "target": "1.53.1",
       "channel": "stable",
       "source": "https://crates.io/crates/tokio",
       "cohort": "rust-compatible",
@@ -1956,25 +2248,25 @@
     {
       "key": "rust:workspace:tokio-util",
       "name": "tokio-util",
-      "current": "0.7.18",
-      "target": "0.7.18",
+      "current": "0.7.19",
+      "target": "0.7.19",
       "channel": "stable",
       "source": "https://crates.io/crates/tokio-util",
       "cohort": "rust-current",
       "platforms": ["linux", "macos", "windows"],
-      "status": "current"
+      "status": "green"
     },
     {
       "key": "rust:workspace:toml",
       "name": "toml",
-      "current": "1.1.3",
-      "target": "1.1.3",
+      "current": "1.1.5",
+      "target": "1.1.5",
       "channel": "stable",
       "source": "https://crates.io/crates/toml",
       "cohort": "rust-storage-protocol",
       "platforms": ["linux", "macos", "windows"],
       "status": "green",
-      "notes": "Target crate 1.1.3 must retain TOML specification 1.1.0 behavior."
+      "notes": "Target crate 1.1.5 retains TOML specification 1.1.0 behavior."
     },
     {
       "key": "rust:workspace:tower",
@@ -1990,8 +2282,8 @@
     {
       "key": "rust:workspace:tower-http",
       "name": "tower-http",
-      "current": "0.7.0",
-      "target": "0.7.0",
+      "current": "0.7.1",
+      "target": "0.7.1",
       "channel": "stable",
       "source": "https://crates.io/crates/tower-http",
       "cohort": "rust-storage-protocol",
@@ -2034,8 +2326,8 @@
     {
       "key": "rust:workspace:uuid",
       "name": "uuid",
-      "current": "1.24.0",
-      "target": "1.24.0",
+      "current": "1.26.0",
+      "target": "1.26.0",
       "channel": "stable",
       "source": "https://crates.io/crates/uuid",
       "cohort": "rust-compatible",
@@ -2050,8 +2342,9 @@
       "channel": "stable",
       "source": "https://crates.io/crates/windows",
       "cohort": "rust-current",
-      "platforms": ["linux", "macos", "windows"],
-      "status": "current"
+      "platforms": ["windows"],
+      "status": "blocked",
+      "notes": "0.x FFI line changes require Tauri/WebView compatibility and native Windows validation."
     },
     {
       "key": "rust:workspace:windows-sys",
@@ -2061,8 +2354,9 @@
       "channel": "stable",
       "source": "https://crates.io/crates/windows-sys",
       "cohort": "rust-current",
-      "platforms": ["linux", "macos", "windows"],
-      "status": "current"
+      "platforms": ["windows"],
+      "status": "blocked",
+      "notes": "0.x FFI line changes require Tauri/WebView compatibility and native Windows validation."
     },
     {
       "key": "rust:workspace:zip",
@@ -2102,8 +2396,8 @@
     {
       "key": "toolchain:devcontainer:node",
       "name": "devcontainer node",
-      "current": "26.5.0",
-      "target": "26.5.0",
+      "current": "26.8.1",
+      "target": "26.8.1",
       "channel": "stable",
       "source": "https://containers.dev/features",
       "cohort": "toolchains",
@@ -2124,8 +2418,8 @@
     {
       "key": "toolchain:node",
       "name": "Node.js",
-      "current": "26.5.0",
-      "target": "26.5.0",
+      "current": "26.8.1",
+      "target": "26.8.1",
       "channel": "stable",
       "source": "https://nodejs.org/en/about/previous-releases",
       "cohort": "toolchains",
@@ -2135,8 +2429,8 @@
     {
       "key": "toolchain:pnpm",
       "name": "pnpm",
-      "current": "11.15.0",
-      "target": "11.15.0",
+      "current": "11.25.0",
+      "target": "11.25.0",
       "channel": "stable",
       "source": "https://github.com/pnpm/pnpm/releases",
       "cohort": "toolchains",
@@ -2146,8 +2440,8 @@
     {
       "key": "toolchain:rust",
       "name": "Rust",
-      "current": "1.97.1",
-      "target": "1.97.1",
+      "current": "1.98.0",
+      "target": "1.98.0",
       "channel": "stable",
       "source": "https://releases.rs/",
       "cohort": "toolchains",
@@ -2158,19 +2452,19 @@
       "key": "toolchain:tauri-cli",
       "name": "@tauri-apps/cli",
       "current": "2.11.4",
-      "target": "2.11.4 (locked workspace dependency)",
+      "target": "2.11.4",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/@tauri-apps/cli",
       "cohort": "toolchains",
       "platforms": ["linux", "macos", "windows"],
-      "status": "green",
-      "notes": "Version is already current; replace pnpm dlx with a locked workspace dependency."
+      "status": "current",
+      "notes": "Version is current and supplied by the locked workspace dependency; do not replace it with pnpm dlx."
     },
     {
       "key": "toolchain:vite-core",
       "name": "@voidzero-dev/vite-plus-core",
-      "current": "npm:@voidzero-dev/vite-plus-core@0.2.5",
-      "target": "npm:@voidzero-dev/vite-plus-core@0.2.5",
+      "current": "npm:@voidzero-dev/vite-plus-core@0.3.0",
+      "target": "npm:@voidzero-dev/vite-plus-core@0.3.0",
       "channel": "preview",
       "source": "https://www.npmjs.com/package/@voidzero-dev/vite-plus-core",
       "cohort": "toolchains",
@@ -2181,13 +2475,385 @@
     {
       "key": "toolchain:vite-plus",
       "name": "vite-plus",
-      "current": "0.2.5",
-      "target": "0.2.5",
+      "current": "0.3.0",
+      "target": "0.3.0",
       "channel": "stable",
       "source": "https://www.npmjs.com/package/vite-plus",
       "cohort": "toolchains",
       "platforms": ["linux", "macos", "windows"],
       "status": "green"
+    },
+    {
+      "key": "rust:apps/server/tests/fixtures/task8-harness:base64",
+      "name": "base64",
+      "current": "0.22.1",
+      "target": "0.22.1",
+      "channel": "stable",
+      "source": "https://crates.io/crates/base64",
+      "cohort": "rust-fixture-compatibility",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "The baseline and Rust 1.98-refreshed fixture locks both resolve base64 0.22.1; the unchanged standalone declaration is current. Harness compile status is tracked separately in validation metadata."
+    },
+    {
+      "key": "rust:apps/server/tests/fixtures/task8-harness:portable-pty",
+      "name": "portable-pty",
+      "current": "path:../../../../../third_party/portable-pty",
+      "target": "path:../../../../../third_party/portable-pty",
+      "channel": "path",
+      "source": "third_party/portable-pty/Cargo.toml",
+      "cohort": "rust-fixture-compatibility",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "blocked",
+      "notes": "The standalone harness resolves the repository local portable-pty fork. Retain it with rust:patch:portable-pty and third_party/portable-pty until an upstream release contains the required fixes; follow third_party/portable-pty/UPSTREAM.md."
+    },
+    {
+      "key": "rust:apps/server/tests/fixtures/task8-harness:process-wrap",
+      "name": "process-wrap",
+      "current": "9.1.0",
+      "target": "9.1.0",
+      "channel": "stable",
+      "source": "https://crates.io/crates/process-wrap",
+      "cohort": "rust-fixture-compatibility",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "The baseline and Rust 1.98-refreshed fixture locks both resolve process-wrap 9.1.0; the unchanged standalone declaration is current. Harness compile status is tracked separately in validation metadata."
+    },
+    {
+      "key": "rust:apps/server/tests/fixtures/task8-harness:rusqlite",
+      "name": "rusqlite",
+      "current": "0.40.1",
+      "target": "0.40.2",
+      "channel": "stable",
+      "source": "https://crates.io/crates/rusqlite",
+      "cohort": "rust-fixture-compatibility",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "The baseline and Rust 1.98-refreshed fixture locks both resolve rusqlite 0.40.2; the unchanged standalone declaration is current. Harness compile status is tracked separately in validation metadata."
+    },
+    {
+      "key": "rust:apps/server/tests/fixtures/task8-harness:serde",
+      "name": "serde",
+      "current": "1",
+      "target": "1.0.229",
+      "channel": "stable",
+      "source": "https://crates.io/crates/serde",
+      "cohort": "rust-fixture-compatibility",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "green",
+      "notes": "Task 10 refreshed the unchanged standalone manifest from serde 1.0.228 to the audited compatible 1.0.229 lock resolution. Harness compile status is tracked separately in validation metadata."
+    },
+    {
+      "key": "rust:apps/server/tests/fixtures/task8-harness:serde_json",
+      "name": "serde_json",
+      "current": "1",
+      "target": "1.0.151",
+      "channel": "stable",
+      "source": "https://crates.io/crates/serde_json",
+      "cohort": "rust-fixture-compatibility",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "green",
+      "notes": "Task 10 refreshed the unchanged standalone manifest from serde_json 1.0.150 to the audited compatible 1.0.151 lock resolution. Harness compile status is tracked separately in validation metadata."
+    },
+    {
+      "key": "rust:apps/server/tests/fixtures/task8-harness:sha2",
+      "name": "sha2",
+      "current": "0.10",
+      "target": "0.10.9",
+      "channel": "stable",
+      "source": "https://crates.io/crates/sha2",
+      "cohort": "rust-fixture-compatibility",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "The baseline and Rust 1.98-refreshed fixture locks both resolve sha2 0.10.9; the unchanged standalone declaration is current. Harness compile status is tracked separately in validation metadata."
+    },
+    {
+      "key": "rust:apps/server/tests/fixtures/task8-harness:sysinfo",
+      "name": "sysinfo",
+      "current": "0.37",
+      "target": "0.37.2",
+      "channel": "stable",
+      "source": "https://crates.io/crates/sysinfo",
+      "cohort": "rust-fixture-compatibility",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "The baseline and Rust 1.98-refreshed fixture locks both resolve sysinfo 0.37.2; the unchanged standalone declaration is current. Harness compile status is tracked separately in validation metadata."
+    },
+    {
+      "key": "rust:apps/server/tests/fixtures/task8-harness:tempfile",
+      "name": "tempfile",
+      "current": "3.27.0",
+      "target": "3.27.0",
+      "channel": "stable",
+      "source": "https://crates.io/crates/tempfile",
+      "cohort": "rust-fixture-compatibility",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "The baseline and Rust 1.98-refreshed fixture locks both resolve tempfile 3.27.0; the unchanged standalone declaration is current. Harness compile status is tracked separately in validation metadata."
+    },
+    {
+      "key": "rust:apps/server/tests/fixtures/task8-harness:thiserror",
+      "name": "thiserror",
+      "current": "2",
+      "target": "2.0.20",
+      "channel": "stable",
+      "source": "https://crates.io/crates/thiserror",
+      "cohort": "rust-fixture-compatibility",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "green",
+      "notes": "Task 10 refreshed the unchanged standalone manifest from thiserror 2.0.18 to the audited compatible 2.0.20 lock resolution. Harness compile status is tracked separately in validation metadata."
+    },
+    {
+      "key": "rust:apps/server/tests/fixtures/task8-harness:time",
+      "name": "time",
+      "current": "0.3",
+      "target": "0.3.55",
+      "channel": "stable",
+      "source": "https://crates.io/crates/time",
+      "cohort": "rust-fixture-compatibility",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "green",
+      "notes": "Task 10 refreshed the unchanged standalone manifest from time 0.3.53 to the audited compatible 0.3.55 lock resolution. Harness compile status is tracked separately in validation metadata."
+    },
+    {
+      "key": "rust:apps/server/tests/fixtures/task8-harness:tokio",
+      "name": "tokio",
+      "current": "1",
+      "target": "1.53.1",
+      "channel": "stable",
+      "source": "https://crates.io/crates/tokio",
+      "cohort": "rust-fixture-compatibility",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "green",
+      "notes": "Task 10 refreshed the unchanged standalone manifest from tokio 1.52.3 to the audited compatible 1.53.1 lock resolution. Harness compile status is tracked separately in validation metadata."
+    },
+    {
+      "key": "rust:apps/server/tests/fixtures/task8-harness:tokio-util",
+      "name": "tokio-util",
+      "current": "0.7.18",
+      "target": "0.7.19",
+      "channel": "stable",
+      "source": "https://crates.io/crates/tokio-util",
+      "cohort": "rust-fixture-compatibility",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "green",
+      "notes": "Task 10 refreshed the unchanged standalone manifest from tokio-util 0.7.18 to the audited compatible 0.7.19 lock resolution. Harness compile status is tracked separately in validation metadata."
+    },
+    {
+      "key": "rust:apps/server/tests/fixtures/task8-harness:tracing",
+      "name": "tracing",
+      "current": "0.1",
+      "target": "0.1.44",
+      "channel": "stable",
+      "source": "https://crates.io/crates/tracing",
+      "cohort": "rust-fixture-compatibility",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "The baseline and Rust 1.98-refreshed fixture locks both resolve tracing 0.1.44; the unchanged standalone declaration is current. Harness compile status is tracked separately in validation metadata."
+    },
+    {
+      "key": "rust:apps/server/tests/fixtures/task8-harness:url",
+      "name": "url",
+      "current": "2",
+      "target": "2.5.8",
+      "channel": "stable",
+      "source": "https://crates.io/crates/url",
+      "cohort": "rust-fixture-compatibility",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "The baseline and Rust 1.98-refreshed fixture locks both resolve url 2.5.8; the unchanged standalone declaration is current. Harness compile status is tracked separately in validation metadata."
+    },
+    {
+      "key": "rust:apps/server/tests/fixtures/task8-harness:uuid",
+      "name": "uuid",
+      "current": "1",
+      "target": "1.26.0",
+      "channel": "stable",
+      "source": "https://crates.io/crates/uuid",
+      "cohort": "rust-fixture-compatibility",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "green",
+      "notes": "Task 10 refreshed the unchanged standalone manifest from uuid 1.23.4 to the audited compatible 1.26.0 lock resolution. Harness compile status is tracked separately in validation metadata."
+    },
+    {
+      "key": "rust:apps/server/tests/fixtures/task8-harness:windows",
+      "name": "windows",
+      "current": "0.62.2",
+      "target": "0.62.2",
+      "channel": "stable",
+      "source": "https://crates.io/crates/windows",
+      "cohort": "rust-fixture-compatibility",
+      "platforms": ["windows"],
+      "status": "current",
+      "notes": "The baseline and Rust 1.98-refreshed fixture locks both resolve windows 0.62.2; the unchanged standalone declaration is current. Harness compile status is tracked separately in validation metadata."
+    },
+    {
+      "key": "rust:apps/server/tests/fixtures/task8-harness:windows-sys",
+      "name": "windows-sys",
+      "current": "0.61.2",
+      "target": "0.61.2",
+      "channel": "stable",
+      "source": "https://crates.io/crates/windows-sys",
+      "cohort": "rust-fixture-compatibility",
+      "platforms": ["windows"],
+      "status": "current",
+      "notes": "The baseline and Rust 1.98-refreshed fixture locks both resolve windows-sys 0.61.2; the unchanged standalone declaration is current. Harness compile status is tracked separately in validation metadata."
+    },
+    {
+      "key": "rust:apps/server/tests/fixtures/task9-harness:rusqlite",
+      "name": "rusqlite",
+      "current": "0.40.1",
+      "target": "0.40.2",
+      "channel": "stable",
+      "source": "https://crates.io/crates/rusqlite",
+      "cohort": "rust-fixture-compatibility",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "green",
+      "notes": "Task 10 refreshed the unchanged standalone manifest from rusqlite 0.40.1 to the audited compatible 0.40.2 lock resolution. Harness compile status is tracked separately in validation metadata."
+    },
+    {
+      "key": "rust:apps/server/tests/fixtures/task9-harness:serde",
+      "name": "serde",
+      "current": "1.0",
+      "target": "1.0.229",
+      "channel": "stable",
+      "source": "https://crates.io/crates/serde",
+      "cohort": "rust-fixture-compatibility",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "green",
+      "notes": "Task 10 refreshed the unchanged standalone manifest from serde 1.0.228 to the audited compatible 1.0.229 lock resolution. Harness compile status is tracked separately in validation metadata."
+    },
+    {
+      "key": "rust:apps/server/tests/fixtures/task9-harness:serde_json",
+      "name": "serde_json",
+      "current": "1.0",
+      "target": "1.0.151",
+      "channel": "stable",
+      "source": "https://crates.io/crates/serde_json",
+      "cohort": "rust-fixture-compatibility",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "green",
+      "notes": "Task 10 refreshed the unchanged standalone manifest from serde_json 1.0.150 to the audited compatible 1.0.151 lock resolution. Harness compile status is tracked separately in validation metadata."
+    },
+    {
+      "key": "rust:apps/server/tests/fixtures/task9-harness:tempfile",
+      "name": "tempfile",
+      "current": "3.23",
+      "target": "3.27.0",
+      "channel": "stable",
+      "source": "https://crates.io/crates/tempfile",
+      "cohort": "rust-fixture-compatibility",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "The baseline and Rust 1.98-refreshed fixture locks both resolve tempfile 3.27.0; the unchanged standalone declaration is current. Harness compile status is tracked separately in validation metadata."
+    },
+    {
+      "key": "rust:apps/server/tests/fixtures/task9-harness:thiserror",
+      "name": "thiserror",
+      "current": "2.0",
+      "target": "2.0.20",
+      "channel": "stable",
+      "source": "https://crates.io/crates/thiserror",
+      "cohort": "rust-fixture-compatibility",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "green",
+      "notes": "Task 10 refreshed the unchanged standalone manifest from thiserror 2.0.18 to the audited compatible 2.0.20 lock resolution. Harness compile status is tracked separately in validation metadata."
+    },
+    {
+      "key": "rust:apps/server/tests/fixtures/task9-harness:tokio",
+      "name": "tokio",
+      "current": "1.48.0",
+      "target": "1.53.1",
+      "channel": "stable",
+      "source": "https://crates.io/crates/tokio",
+      "cohort": "rust-fixture-compatibility",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "green",
+      "notes": "Task 10 refreshed the unchanged standalone manifest from tokio 1.52.3 to the audited compatible 1.53.1 lock resolution. Harness compile status is tracked separately in validation metadata."
+    },
+    {
+      "key": "rust:apps/server/tests/fixtures/task9-harness:tokio-util",
+      "name": "tokio-util",
+      "current": "0.7",
+      "target": "0.7.19",
+      "channel": "stable",
+      "source": "https://crates.io/crates/tokio-util",
+      "cohort": "rust-fixture-compatibility",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "green",
+      "notes": "Task 10 refreshed the unchanged standalone manifest from tokio-util 0.7.18 to the audited compatible 0.7.19 lock resolution. Harness compile status is tracked separately in validation metadata."
+    },
+    {
+      "key": "rust:apps/server/tests/fixtures/task9-harness:url",
+      "name": "url",
+      "current": "2.5",
+      "target": "2.5.8",
+      "channel": "stable",
+      "source": "https://crates.io/crates/url",
+      "cohort": "rust-fixture-compatibility",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "The baseline and Rust 1.98-refreshed fixture locks both resolve url 2.5.8; the unchanged standalone declaration is current. Harness compile status is tracked separately in validation metadata."
+    },
+    {
+      "key": "rust:apps/server/tests/fixtures/task9-harness:uuid",
+      "name": "uuid",
+      "current": "1.18",
+      "target": "1.26.0",
+      "channel": "stable",
+      "source": "https://crates.io/crates/uuid",
+      "cohort": "rust-fixture-compatibility",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "green",
+      "notes": "Task 10 refreshed the unchanged standalone manifest from uuid 1.23.4 to the audited compatible 1.26.0 lock resolution. Harness compile status is tracked separately in validation metadata."
+    },
+    {
+      "key": "rust:apps/server/tests/fixtures/task9-harness:windows-sys",
+      "name": "windows-sys",
+      "current": "0.61.2",
+      "target": "0.61.2",
+      "channel": "stable",
+      "source": "https://crates.io/crates/windows-sys",
+      "cohort": "rust-fixture-compatibility",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "The baseline and Rust 1.98-refreshed fixture locks both resolve windows-sys 0.61.2; the unchanged standalone declaration is current. Harness compile status is tracked separately in validation metadata."
+    },
+    {
+      "key": "rust:patch:portable-pty",
+      "name": "portable-pty",
+      "current": "path:third_party/portable-pty",
+      "target": "path:third_party/portable-pty",
+      "channel": "path",
+      "source": "third_party/portable-pty/UPSTREAM.md",
+      "cohort": "retained-rust-boundaries",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "blocked",
+      "notes": "This crates.io path patch is the effective root source for portable-pty 0.9.0. Retain it until an upstream registry release contains the required at-creation Job Object and termination-result fixes."
+    },
+    {
+      "key": "rust:third_party/portable-pty:libc",
+      "name": "libc",
+      "current": "0.2",
+      "target": "0.2",
+      "channel": "stable",
+      "source": "https://crates.io/crates/libc",
+      "cohort": "vendored-portable-pty",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "blocked",
+      "notes": "Owned by third_party/portable-pty/Cargo.toml; update only with the vendored portable-pty release by following third_party/portable-pty/UPSTREAM.md."
+    },
+    {
+      "key": "rust:third_party/portable-pty:serde",
+      "name": "serde",
+      "current": "1.0",
+      "target": "1.0",
+      "channel": "stable",
+      "source": "https://crates.io/crates/serde",
+      "cohort": "vendored-portable-pty",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "blocked",
+      "notes": "Owned by third_party/portable-pty/Cargo.toml; update only with the vendored portable-pty release by following third_party/portable-pty/UPSTREAM.md."
     }
   ]
 }

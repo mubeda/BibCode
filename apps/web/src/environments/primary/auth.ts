@@ -46,7 +46,7 @@ type PrimaryEnvironmentRequestOperation = typeof PrimaryEnvironmentRequestOperat
 
 export const PRIMARY_PAIRING_OFFER_REQUEST_TIMEOUT_MS = 5_000;
 
-export class PrimaryEnvironmentRequestTimeoutError extends Schema.TaggedErrorClass<PrimaryEnvironmentRequestTimeoutError>()(
+export class PrimaryEnvironmentRequestTimeoutError extends Schema.TaggedError<PrimaryEnvironmentRequestTimeoutError>()(
   "PrimaryEnvironmentRequestTimeoutError",
   {
     operation: PrimaryEnvironmentRequestOperation,
@@ -77,7 +77,7 @@ function withPrimaryRequestTimeout<A, E, R>(
   );
 }
 
-export class PrimaryEnvironmentRequestError extends Schema.TaggedErrorClass<PrimaryEnvironmentRequestError>()(
+export class PrimaryEnvironmentRequestError extends Schema.TaggedError<PrimaryEnvironmentRequestError>()(
   "PrimaryEnvironmentRequestError",
   {
     operation: PrimaryEnvironmentRequestOperation,
@@ -112,7 +112,7 @@ export class PrimaryEnvironmentRequestError extends Schema.TaggedErrorClass<Prim
 
 export const isPrimaryEnvironmentRequestError = Schema.is(PrimaryEnvironmentRequestError);
 
-export class PrimaryEnvironmentPairingCredentialRejectedError extends Schema.TaggedErrorClass<PrimaryEnvironmentPairingCredentialRejectedError>()(
+export class PrimaryEnvironmentPairingCredentialRejectedError extends Schema.TaggedError<PrimaryEnvironmentPairingCredentialRejectedError>()(
   "PrimaryEnvironmentPairingCredentialRejectedError",
   {
     providedLength: Schema.Finite,
@@ -128,7 +128,7 @@ export const isPrimaryEnvironmentPairingCredentialRejectedError = Schema.is(
   PrimaryEnvironmentPairingCredentialRejectedError,
 );
 
-export class PrimaryEnvironmentAuthSessionTimeoutError extends Schema.TaggedErrorClass<PrimaryEnvironmentAuthSessionTimeoutError>()(
+export class PrimaryEnvironmentAuthSessionTimeoutError extends Schema.TaggedError<PrimaryEnvironmentAuthSessionTimeoutError>()(
   "PrimaryEnvironmentAuthSessionTimeoutError",
   {
     timeoutMs: Schema.Finite,
@@ -144,7 +144,7 @@ export const isPrimaryEnvironmentAuthSessionTimeoutError = Schema.is(
   PrimaryEnvironmentAuthSessionTimeoutError,
 );
 
-export class PrimaryEnvironmentPairingCredentialRequiredError extends Schema.TaggedErrorClass<PrimaryEnvironmentPairingCredentialRequiredError>()(
+export class PrimaryEnvironmentPairingCredentialRequiredError extends Schema.TaggedError<PrimaryEnvironmentPairingCredentialRequiredError>()(
   "PrimaryEnvironmentPairingCredentialRequiredError",
   {
     providedLength: Schema.Finite,

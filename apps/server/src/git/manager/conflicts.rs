@@ -119,7 +119,7 @@ pub fn binary_conflict_paths(numstat: &str, merge_attributes: &str) -> BTreeSet<
         })
         .collect::<BTreeSet<_>>();
     let fields = merge_attributes.split('\0').collect::<Vec<_>>();
-    for record in fields.chunks_exact(3) {
+    for record in fields.as_chunks::<3>().0 {
         if !record[0].is_empty() && record[1] == "merge" && record[2] == "binary" {
             paths.insert(record[0].to_owned());
         }

@@ -21,7 +21,7 @@ describe("run-local-vp", () => {
   it("resolves the vp bin declared by the checkout-local vite-plus package", () => {
     const fs = fakeFs({
       [packagePath]: JSON.stringify({
-        version: "0.2.5",
+        version: "0.3.0",
         bin: { vp: "bin/vp.js", vpx: "bin/vpx.js" },
       }),
       [binPath]: "",
@@ -31,13 +31,13 @@ describe("run-local-vp", () => {
       kind: "resolved",
       binPath,
       packagePath,
-      version: "0.2.5",
+      version: "0.3.0",
     });
   });
 
   it("accepts a string bin entry", () => {
     const fs = fakeFs({
-      [packagePath]: JSON.stringify({ version: "0.2.5", bin: "bin/vp.js" }),
+      [packagePath]: JSON.stringify({ version: "0.3.0", bin: "bin/vp.js" }),
       [binPath]: "",
     });
 
@@ -56,14 +56,14 @@ describe("run-local-vp", () => {
   it("fails clearly when the package exists without a vp entry", () => {
     const withoutBin = resolveLocalVitePlus({
       repoRoot,
-      ...fakeFs({ [packagePath]: JSON.stringify({ version: "0.2.5" }) }),
+      ...fakeFs({ [packagePath]: JSON.stringify({ version: "0.3.0" }) }),
     });
     expect(withoutBin.kind).toBe("missing");
     expect(withoutBin.message).toContain("does not declare a `vp` bin entry");
 
     const danglingBin = resolveLocalVitePlus({
       repoRoot,
-      ...fakeFs({ [packagePath]: JSON.stringify({ version: "0.2.5", bin: { vp: "bin/vp.js" } }) }),
+      ...fakeFs({ [packagePath]: JSON.stringify({ version: "0.3.0", bin: { vp: "bin/vp.js" } }) }),
     });
     expect(danglingBin.kind).toBe("missing");
     expect(danglingBin.message).toContain(binPath);
@@ -71,7 +71,7 @@ describe("run-local-vp", () => {
 
   it("executes the local entry with the current Node and forwards arguments and exit codes", () => {
     const fs = fakeFs({
-      [packagePath]: JSON.stringify({ version: "0.2.5", bin: { vp: "bin/vp.js" } }),
+      [packagePath]: JSON.stringify({ version: "0.3.0", bin: { vp: "bin/vp.js" } }),
       [binPath]: "",
     });
     const spawnSync = vi.fn(() => ({ status: 7 }));
@@ -110,7 +110,7 @@ describe("run-local-vp", () => {
     const consoleError = vi.fn();
     const spawnSync = vi.fn(() => ({ status: null, error: new Error("EACCES") }));
     const fs = fakeFs({
-      [packagePath]: JSON.stringify({ version: "0.2.5", bin: { vp: "bin/vp.js" } }),
+      [packagePath]: JSON.stringify({ version: "0.3.0", bin: { vp: "bin/vp.js" } }),
       [binPath]: "",
     });
 

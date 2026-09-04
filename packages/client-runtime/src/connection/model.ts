@@ -96,7 +96,7 @@ export const ConnectionBlockedReason = Schema.Literals([
 ]);
 export type ConnectionBlockedReason = typeof ConnectionBlockedReason.Type;
 
-export class ConnectionTransientError extends Schema.TaggedErrorClass<ConnectionTransientError>()(
+export class ConnectionTransientError extends Schema.TaggedError<ConnectionTransientError>()(
   "ConnectionTransientError",
   {
     reason: ConnectionTransientReason,
@@ -109,7 +109,7 @@ export class ConnectionTransientError extends Schema.TaggedErrorClass<Connection
   }
 }
 
-export class ConnectionBlockedError extends Schema.TaggedErrorClass<ConnectionBlockedError>()(
+export class ConnectionBlockedError extends Schema.TaggedError<ConnectionBlockedError>()(
   "ConnectionBlockedError",
   {
     reason: ConnectionBlockedReason,
@@ -122,7 +122,7 @@ export class ConnectionBlockedError extends Schema.TaggedErrorClass<ConnectionBl
   }
 }
 
-export class ConnectionStorageChangedError extends Schema.TaggedErrorClass<ConnectionStorageChangedError>()(
+export class ConnectionStorageChangedError extends Schema.TaggedError<ConnectionStorageChangedError>()(
   "ConnectionStorageChangedError",
   {
     reason: Schema.Literal("storage-changed"),

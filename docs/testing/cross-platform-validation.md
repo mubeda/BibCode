@@ -1163,6 +1163,20 @@ session, resets client connection state before every test, and disables
 WebDriver command retries. Treat reporter hook errors, retries, and timeouts as
 test failures even when the individual scenarios are reported as passing.
 
+The maintained Pierre acceptance scenario
+(`apps/desktop/e2e/specs/pierre-diffs.e2e.ts`) uses that same isolated launcher
+and disposable application state. It creates its own committed editor fixture
+and three independent working-tree hunks, then verifies the packaged app's
+unified and split renderers, line hover utility, line selection, conversation
+diff card, partial stage and unstage controls, editable-file input, and undo
+history after switching to another right-panel tab and back. It is part of the
+default suite. To rerun only this scenario against the exact package selected
+by the native platform page, set
+`BIBCODE_E2E_SPEC=./specs/pierre-diffs.e2e.ts` for the
+`vp run test:ui:desktop` invocation. Retain its named `pierre-*.png` screenshots
+with the other bounded UI artifacts; do not put fixture state or screenshots in
+the repository.
+
 At final packaged shutdown, inspect the raw worker and server logs. Provider and
 terminal owners, operational logs, orchestration, and the SQLite worker must all
 close without a retry, timeout, or dependency on stale cloned handles.

@@ -16,7 +16,8 @@ export interface DependencyInventoryEntry {
   readonly name: string;
   readonly current: string;
   readonly locations: ReadonlyArray<string>;
-  readonly dependencyKind?: "registry" | "path";
+  readonly dependencyKind?: "registry" | "path" | "git";
+  readonly platforms?: ReadonlyArray<string> | undefined;
 }
 
 export interface DependencyInventorySummary {
@@ -24,6 +25,7 @@ export interface DependencyInventorySummary {
   readonly javascriptLedger: number;
   readonly rustRegistry: number;
   readonly rustPath: number;
+  readonly rustGit: number;
   readonly actions: number;
   readonly toolchains: number;
 }
@@ -55,6 +57,7 @@ export interface DependencyLedger {
     readonly originMainSha: string;
     readonly implementationHead: string;
     readonly baselineRepairCommit?: string;
+    readonly evidenceSource?: string;
     readonly tools: {
       readonly node: string;
       readonly pnpm: string;
@@ -63,8 +66,9 @@ export interface DependencyLedger {
     };
     readonly commands: Array<{
       readonly command: string;
-      readonly durationSeconds: number;
+      readonly durationSeconds?: number;
       result: string;
+      readonly note?: string;
     }>;
     readonly warnings: ReadonlyArray<string>;
   };
@@ -82,6 +86,7 @@ const INVENTORY_SUMMARY_FIELDS = [
   "javascriptLedger",
   "rustRegistry",
   "rustPath",
+  "rustGit",
   "actions",
   "toolchains",
 ] as const satisfies ReadonlyArray<keyof DependencyInventorySummary>;
@@ -123,7 +128,20 @@ interface RustCandidate {
   readonly name: string;
   readonly current: string;
   readonly dependencyKind: "registry" | "path";
+  readonly platforms?: ReadonlyArray<string> | undefined;
 }
+
+interface CargoDependencyTable {
+  readonly dependencies: Record<string, unknown>;
+  readonly platforms?: ReadonlyArray<string> | undefined;
+}
+
+interface PlatformAccumulator {
+  readonly values: Set<string>;
+  authoritative: boolean;
+}
+
+const SUPPORTED_PLATFORMS = ["linux", "macos", "windows"] as const;
 
 function repositoryPath(root: string, absolutePath: string): string {
   return NodePath.relative(root, absolutePath).split(NodePath.sep).join("/");
@@ -261,14 +279,60 @@ function cargoDependencyValue(value: unknown): {
   return null;
 }
 
-function dependencyTables(value: unknown): Array<Record<string, unknown>> {
+function targetPlatforms(selector: string): ReadonlyArray<string> | undefined {
+  const normalized = selector.replaceAll(/\s/g, "");
+  switch (normalized) {
+    case "cfg(windows)":
+    case 'cfg(target_os="windows")':
+      return ["windows"];
+    case 'cfg(target_os="linux")':
+      return ["linux"];
+    case 'cfg(target_os="macos")':
+      return ["macos"];
+    case "cfg(unix)":
+      return ["linux", "macos"];
+    default:
+      return undefined;
+  }
+}
+
+function dependencyTables(value: unknown): Array<CargoDependencyTable> {
   if (!isRecord(value)) return [];
-  const tables: Array<Record<string, unknown>> = [];
-  for (const [key, child] of Object.entries(value)) {
-    if (CARGO_DEPENDENCY_TABLES.has(key) && isRecord(child)) tables.push(child);
-    tables.push(...dependencyTables(child));
+  const tables: Array<CargoDependencyTable> = [];
+  for (const key of CARGO_DEPENDENCY_TABLES) {
+    const dependencies = value[key];
+    if (isRecord(dependencies)) {
+      tables.push({ dependencies, platforms: SUPPORTED_PLATFORMS });
+    }
+  }
+  const targets = value.target;
+  if (!isRecord(targets)) return tables;
+  for (const [selector, target] of Object.entries(targets)) {
+    if (!isRecord(target)) continue;
+    const platforms = targetPlatforms(selector);
+    for (const key of CARGO_DEPENDENCY_TABLES) {
+      const dependencies = target[key];
+      if (isRecord(dependencies)) tables.push({ dependencies, platforms });
+    }
   }
   return tables;
+}
+
+function recordPlatforms(
+  accumulators: Map<string, PlatformAccumulator>,
+  name: string,
+  platforms: ReadonlyArray<string> | undefined,
+): void {
+  const accumulator = accumulators.get(name) ?? {
+    values: new Set<string>(),
+    authoritative: true,
+  };
+  if (platforms === undefined) {
+    accumulator.authoritative = false;
+  } else {
+    for (const platform of platforms) accumulator.values.add(platform);
+  }
+  accumulators.set(name, accumulator);
 }
 
 function collectRustInventory(root: string): Array<DependencyInventoryEntry> {
@@ -281,8 +345,6 @@ function collectRustInventory(root: string): Array<DependencyInventoryEntry> {
     ? workspaceRoot.dependencies
     : {};
   const entries: Array<DependencyInventoryEntry> = [];
-  const workspaceNames = new Set(Object.keys(workspaceDependencies));
-
   for (const [name, value] of Object.entries(workspaceDependencies).toSorted(([left], [right]) =>
     left.localeCompare(right),
   )) {
@@ -295,33 +357,85 @@ function collectRustInventory(root: string): Array<DependencyInventoryEntry> {
       current: dependency.current,
       locations: ["Cargo.toml"],
       dependencyKind: dependency.dependencyKind,
+      platforms: SUPPORTED_PLATFORMS,
     });
   }
 
+  const patches = isRecord(workspaceManifest.patch) ? workspaceManifest.patch : {};
+  const cratesIoPatches = isRecord(patches["crates-io"]) ? patches["crates-io"] : {};
+  for (const [name, value] of Object.entries(cratesIoPatches).toSorted(([left], [right]) =>
+    left.localeCompare(right),
+  )) {
+    if (!isRecord(value)) continue;
+    if (typeof value.path === "string") {
+      entries.push({
+        key: `rust:patch:${name}`,
+        category: "rust",
+        name,
+        current: `path:${value.path}`,
+        locations: ["Cargo.toml"],
+        dependencyKind: "path",
+        platforms: SUPPORTED_PLATFORMS,
+      });
+      continue;
+    }
+    if (
+      typeof value.git === "string" &&
+      typeof value.rev === "string" &&
+      /^[0-9a-f]{40}$/.test(value.rev)
+    ) {
+      entries.push({
+        key: `rust:patch:${name}`,
+        category: "rust",
+        name,
+        current: `git:${value.git}#${value.rev}`,
+        locations: ["Cargo.toml"],
+        dependencyKind: "git",
+        platforms: SUPPORTED_PLATFORMS,
+      });
+    }
+  }
+
   const externalCandidates = new Map<string, Array<RustCandidate>>();
+  const workspacePlatforms = new Map<string, PlatformAccumulator>();
   for (const manifest of manifests) {
     if (manifest === "Cargo.toml") continue;
     const parsed = parseToml(
       NodeFS.readFileSync(NodePath.join(root, manifest), "utf8"),
     ) as TomlTable;
     for (const table of dependencyTables(parsed)) {
-      for (const [name, value] of Object.entries(table)) {
-        if (workspaceNames.has(name)) continue;
+      for (const [name, value] of Object.entries(table.dependencies)) {
         const dependency = cargoDependencyValue(value);
-        if (dependency === null || dependency.workspace) continue;
-        const candidates = externalCandidates.get(name) ?? [];
+        if (dependency === null) continue;
+        if (dependency.workspace) {
+          recordPlatforms(workspacePlatforms, name, table.platforms);
+          continue;
+        }
+        const candidateKey = `${manifest}\0${name}`;
+        const candidates = externalCandidates.get(candidateKey) ?? [];
         candidates.push({
           manifest,
           name,
           current: dependency.current,
           dependencyKind: dependency.dependencyKind,
+          platforms: table.platforms,
         });
-        externalCandidates.set(name, candidates);
+        externalCandidates.set(candidateKey, candidates);
       }
     }
   }
 
-  for (const [name, candidates] of [...externalCandidates].toSorted(([left], [right]) =>
+  for (const [index, entry] of entries.entries()) {
+    if (!entry.key.startsWith("rust:workspace:")) continue;
+    const usage = workspacePlatforms.get(entry.name);
+    if (usage === undefined) continue;
+    entries[index] = {
+      ...entry,
+      platforms: usage.authoritative ? [...usage.values].toSorted() : undefined,
+    };
+  }
+
+  for (const [, candidates] of [...externalCandidates].toSorted(([left], [right]) =>
     left.localeCompare(right),
   )) {
     const ordered = candidates.toSorted((left, right) =>
@@ -329,17 +443,20 @@ function collectRustInventory(root: string): Array<DependencyInventoryEntry> {
     );
     const firstCandidate = ordered[0];
     if (firstCandidate === undefined) {
-      throw new Error(`Rust dependency ${name} has no declaration source`);
+      throw new Error("Rust dependency has no declaration source");
     }
     entries.push({
-      key: `rust:${manifestScope(firstCandidate.manifest)}:${name}`,
+      key: `rust:${manifestScope(firstCandidate.manifest)}:${firstCandidate.name}`,
       category: "rust",
-      name,
+      name: firstCandidate.name,
       current: [...new Set(ordered.map((candidate) => candidate.current))].toSorted().join(" | "),
       locations: [...new Set(ordered.map((candidate) => candidate.manifest))].toSorted(),
       dependencyKind: ordered.some((candidate) => candidate.dependencyKind === "path")
         ? "path"
         : "registry",
+      platforms: ordered.every((candidate) => candidate.platforms !== undefined)
+        ? [...new Set(ordered.flatMap((candidate) => candidate.platforms ?? []))].toSorted()
+        : undefined,
     });
   }
   return entries;
@@ -504,6 +621,19 @@ export function discoverDependencyInventory(root: string): DependencyInventory {
   const entries = [...javascript.entries, ...rust, ...actions, ...toolchains].toSorted(
     (left, right) => left.key.localeCompare(right.key),
   );
+  const entriesByKey = new Map<string, DependencyInventoryEntry>();
+  for (const entry of entries) {
+    const existing = entriesByKey.get(entry.key);
+    if (existing !== undefined) {
+      throw new Error(
+        `duplicate dependency inventory key ${entry.key}: ${[
+          ...existing.locations,
+          ...entry.locations,
+        ].join(", ")}`,
+      );
+    }
+    entriesByKey.set(entry.key, entry);
+  }
   return {
     entries,
     summary: {
@@ -511,15 +641,27 @@ export function discoverDependencyInventory(root: string): DependencyInventory {
       javascriptLedger: javascript.entries.length,
       rustRegistry: rust.filter((entry) => entry.dependencyKind === "registry").length,
       rustPath: rust.filter((entry) => entry.dependencyKind === "path").length,
+      rustGit: rust.filter((entry) => entry.dependencyKind === "git").length,
       actions: actions.length,
       toolchains: toolchains.length,
     },
   };
 }
 
+function pluralizedCount(count: number, singular: string, plural = `${singular}s`): string {
+  return `${count} ${count === 1 ? singular : plural}`;
+}
+
 function missingString(entry: DependencyLedgerEntry, field: keyof DependencyLedgerEntry): boolean {
   return typeof entry[field] !== "string" || entry[field].trim().length === 0;
 }
+
+function normalizedPlatforms(platforms: ReadonlyArray<string>): string {
+  return [...new Set(platforms)].toSorted().join(",");
+}
+
+const MAX_BASELINE_COMMAND_DURATION_SECONDS = 86_400;
+const MAX_BASELINE_COMMAND_NOTE_LENGTH = 2_000;
 
 export function validateDependencyLedger(
   inventory: DependencyInventory,
@@ -551,6 +693,39 @@ export function validateDependencyLedger(
     }
   }
 
+  const baselineCommands: ReadonlyArray<unknown> = Array.isArray(ledger.baseline?.commands)
+    ? ledger.baseline.commands
+    : [];
+  for (const [index, value] of baselineCommands.entries()) {
+    if (!isRecord(value)) {
+      errors.push(`baseline command at index ${index} is invalid`);
+      continue;
+    }
+    if (typeof value.command !== "string" || value.command.trim().length === 0) {
+      errors.push(`baseline command at index ${index} has invalid command`);
+    }
+    if (typeof value.result !== "string" || value.result.trim().length === 0) {
+      errors.push(`baseline command at index ${index} has invalid result`);
+    }
+    if (
+      value.durationSeconds !== undefined &&
+      (typeof value.durationSeconds !== "number" ||
+        !Number.isInteger(value.durationSeconds) ||
+        value.durationSeconds < 0 ||
+        value.durationSeconds > MAX_BASELINE_COMMAND_DURATION_SECONDS)
+    ) {
+      errors.push(`baseline command at index ${index} has invalid durationSeconds`);
+    }
+    if (
+      value.note !== undefined &&
+      (typeof value.note !== "string" ||
+        value.note.trim().length === 0 ||
+        value.note.length > MAX_BASELINE_COMMAND_NOTE_LENGTH)
+    ) {
+      errors.push(`baseline command at index ${index} has invalid note`);
+    }
+  }
+
   const inventoryByKey = new Map(inventory.entries.map((entry) => [entry.key, entry]));
   for (const entry of inventory.entries) {
     const ledgerEntry = ledgerByKey.get(entry.key);
@@ -563,6 +738,15 @@ export function validateDependencyLedger(
         `${entry.key} current value does not match declarations: ${ledgerEntry.current} != ${entry.current}`,
       );
     }
+    if (
+      entry.platforms !== undefined &&
+      Array.isArray(ledgerEntry.platforms) &&
+      normalizedPlatforms(ledgerEntry.platforms) !== normalizedPlatforms(entry.platforms)
+    ) {
+      errors.push(
+        `${entry.key} platforms do not match declarations: ${normalizedPlatforms(ledgerEntry.platforms)} != ${normalizedPlatforms(entry.platforms)}`,
+      );
+    }
   }
   for (const entry of ledger.dependencies) {
     if (!inventoryByKey.has(entry.key) && entry.status !== "removed") {
@@ -573,8 +757,10 @@ export function validateDependencyLedger(
   const hasProgress = ledger.dependencies.some((entry) => PROGRESS_STATUSES.has(entry.status));
   if (hasProgress) {
     for (const command of REQUIRED_BASELINE_COMMANDS) {
-      const evidence = ledger.baseline.commands.find((entry) => entry.command === command);
-      if (evidence?.result !== "passed") {
+      const evidence = baselineCommands.find(
+        (entry) => isRecord(entry) && entry.command === command,
+      );
+      if (!isRecord(evidence) || evidence.result !== "passed") {
         errors.push(`baseline command ${command} did not pass before dependency progress`);
       }
     }
@@ -598,7 +784,8 @@ function run(): void {
       "Dependency ledger is complete",
       `${inventory.summary.javascriptDirect} direct JavaScript dependencies`,
       `${inventory.summary.rustRegistry} registry Rust crates`,
-      `${inventory.summary.rustPath} local Rust crate`,
+      `${inventory.summary.rustPath} path Rust declarations`,
+      pluralizedCount(inventory.summary.rustGit, "Git Rust revision"),
       `${inventory.summary.actions} GitHub Actions`,
       `${inventory.summary.toolchains} toolchain pins`,
       "0 unaccounted entries",

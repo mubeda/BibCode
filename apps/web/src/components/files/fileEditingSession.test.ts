@@ -21,7 +21,7 @@ const pierre = vi.hoisted(() => {
   return { Editor, instances };
 });
 
-vi.mock("@pierre/diffs/editor", () => ({ Editor: pierre.Editor }));
+vi.mock("@pierre/diffs/edit", () => ({ Editor: pierre.Editor }));
 
 import { FileEditingSession } from "./fileEditingSession";
 import { FileEditingSessionRegistry } from "./fileEditingSessionRegistry";

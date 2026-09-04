@@ -295,7 +295,7 @@ vi.mock("@pierre/diffs", () => ({
   VirtualizedFile: pierre.VirtualizedFile,
 }));
 
-vi.mock("@pierre/diffs/editor", () => ({
+vi.mock("@pierre/diffs/edit", () => ({
   Editor: class {
     readonly options: {
       onAttach?: () => void;
@@ -791,7 +791,7 @@ describe("panel layout states", () => {
     expect(options.overflow).toBe("wrap");
     expect(options.theme).toBe(resolveDiffThemeName("dark"));
     expect(options.themeType).toBe("dark");
-    expect(file.contentEditable).toBe(true);
+    expect(file.edit).toBe(true);
     expect(ui.find("FileEditorToolbar").markdownView).toBeUndefined();
   });
 
@@ -808,7 +808,7 @@ describe("panel layout states", () => {
     expect(markup).toContain("Preview limited to the first 1 MB of a");
     expect(markup).toContain("byte file.");
     const file = ui.find("File");
-    expect(file.contentEditable).toBeUndefined();
+    expect(file.edit).toBeUndefined();
     expect(file.selectedLines).toBeUndefined();
   });
 
@@ -1231,7 +1231,7 @@ describe("editable file surface", () => {
 
     expect(testState.sessionCreations.filter((path) => path === "src/a.ts")).toHaveLength(1);
     expect(testState.session).toBe(sessionA);
-    expect(ui.find("EditProvider").editor).toBe(editorA);
+    expect((ui.find("EditProvider").createEditor as () => unknown)()).toBe(editorA);
     const toolbar = ui.find("FileEditorToolbar");
     expect(toolbar.canUndo).toBe(true);
     (toolbar.onUndo as () => void)();

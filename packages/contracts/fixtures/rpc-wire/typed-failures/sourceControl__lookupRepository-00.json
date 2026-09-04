@@ -11,7 +11,7 @@
           "provider": "azure-devops",
           "operation": "ref",
           "detail": ">uyYj",
-          "cause": "undefined"
+          "cause": null
         }
       }
     ]

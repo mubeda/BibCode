@@ -54,25 +54,32 @@ const HUBS: Record<string, { href: string; blurb: string }> = {
     href: "/cloudflare",
     blurb: "Workers, Durable Objects, D1, R2, Queues, Hyperdrive",
   },
-  AWS: { href: "/aws", blurb: "Lambda, ECS, EC2, DynamoDB, S3, SQS, Kinesis" },
+  AWS: {
+    href: "/aws",
+    blurb: "Lambda, ECS, EKS, EC2, DynamoDB, S3, SQS, Kinesis",
+  },
   Planetscale: {
     href: "/planetscale",
     blurb: "Serverless MySQL & Postgres with branching workflows",
   },
   Neon: { href: "/neon", blurb: "Serverless Postgres with branches per PR" },
   Axiom: { href: "/axiom", blurb: "Logs, traces, dashboards, and monitors" },
+  BetterAuth: {
+    href: "/better-auth",
+    blurb: "Typed Better Auth with a database layer per platform",
+  },
   GitHub: { href: "/github", blurb: "Repos, secrets, and webhook events" },
   Docker: {
     href: "/docker",
     blurb: "Images, containers, networks, and volumes via the Docker CLI",
   },
-  Kubernetes: {
-    href: "/kubernetes",
-    blurb: "Kubernetes objects applied to EKS clusters from your Stack",
-  },
   Drizzle: {
-    href: "/drizzle",
+    href: "/sql",
     blurb: "Schemas and migrations as deploy-graph resources",
+  },
+  SQL: {
+    href: "/sql",
+    blurb: "Low-level effect-sql clients — tagged-template SQL as Effects",
   },
   Command: {
     href: "/command",
@@ -82,7 +89,10 @@ const HUBS: Record<string, { href: string; blurb: string }> = {
 
 const BLURBS: Record<string, string> = {};
 
-const DISPLAY_LABELS: Record<string, string> = { Planetscale: "PlanetScale" };
+const DISPLAY_LABELS: Record<string, string> = {
+  Planetscale: "PlanetScale",
+  BetterAuth: "Better Auth",
+};
 
 const providers = generatedSidebar() ?? [];
 const cards = providers.map((p) => {

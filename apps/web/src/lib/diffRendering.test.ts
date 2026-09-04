@@ -75,6 +75,108 @@ describe("getRenderablePatch", () => {
     );
   });
 
+  it("parses an ordinary modification after Git raw -z metadata as a change", () => {
+    const patch = [
+      ":100644 100644 1111111 2222222 M\0example.ts\0\0diff --git a/example.ts b/example.ts",
+      "index 1111111..2222222 100644",
+      "--- a/example.ts",
+      "+++ b/example.ts",
+      "@@ -1 +1 @@",
+      "-before",
+      "+after",
+    ].join("\n");
+
+    const parsed = getRenderablePatch(patch, "git-manager-staging", {
+      compactPartialHunkOffsets: true,
+    });
+    expect(parsed?.kind).toBe("files");
+    if (parsed?.kind !== "files") return;
+    expect(parsed.files[0]?.type).toBe("change");
+    expect(resolveFileDiffPath(parsed.files[0]!)).toBe("example.ts");
+  });
+
+  it("consumes every leading raw record before the patch section", () => {
+    const patch = [
+      ":100644 100644 1111111 2222222 M\0first.ts\0:100644 100644 3333333 4444444 M\0second.ts\0\0diff --git a/first.ts b/first.ts",
+      "index 1111111..2222222 100644",
+      "--- a/first.ts",
+      "+++ b/first.ts",
+      "@@ -1 +1 @@",
+      "-before first",
+      "+after first",
+      "diff --git a/second.ts b/second.ts",
+      "index 3333333..4444444 100644",
+      "--- a/second.ts",
+      "+++ b/second.ts",
+      "@@ -1 +1 @@",
+      "-before second",
+      "+after second",
+    ].join("\n");
+
+    const parsed = getRenderablePatch(patch, "git-manager-staging");
+    expect(parsed?.kind).toBe("files");
+    if (parsed?.kind !== "files") return;
+    expect(parsed.files.map(resolveFileDiffPath)).toEqual(["first.ts", "second.ts"]);
+  });
+
+  it("does not treat an embedded NUL patch marker as a raw-prefix boundary", () => {
+    const patch = [
+      "diff --git a/checkpoint.ts b/checkpoint.ts",
+      "index 1111111..2222222 100644",
+      "--- a/checkpoint.ts",
+      "+++ b/checkpoint.ts",
+      "@@ -1 +1 @@",
+      "-before",
+      "+after\0diff --git a/decoy.ts b/decoy.ts",
+    ].join("\n");
+
+    const parsed = getRenderablePatch(patch, "checkpoint");
+    expect(parsed?.kind).toBe("files");
+    if (parsed?.kind !== "files") return;
+    expect(parsed.files).toHaveLength(1);
+    expect(resolveFileDiffPath(parsed.files[0]!)).toBe("checkpoint.ts");
+  });
+
+  it("skips a raw filename that begins with the patch-header marker", () => {
+    const fileName = [
+      "diff --git a/decoy.ts b/decoy.ts",
+      "index 3333333..4444444 100644",
+      "--- a/decoy.ts",
+      "+++ b/decoy.ts",
+      "@@ -1 +1 @@",
+      "-before",
+      "+decoy",
+    ].join("\n");
+    const patch = [
+      `:100644 100644 1111111 2222222 R100\0old.ts\0${fileName}\0\0diff --git a/example.ts b/example.ts`,
+      "index 1111111..2222222 100644",
+      "--- a/example.ts",
+      "+++ b/example.ts",
+      "@@ -1 +1 @@",
+      "-before",
+      "+after",
+    ].join("\n");
+
+    const parsed = getRenderablePatch(patch, "git-manager-staging");
+    expect(parsed?.kind).toBe("files");
+    if (parsed?.kind !== "files") return;
+    expect(parsed.files).toHaveLength(1);
+    expect(resolveFileDiffPath(parsed.files[0]!)).toBe("example.ts");
+  });
+
+  it.each([
+    ["invalid raw header", ":not-a-raw-record\0file.ts\0\0diff --git incomplete"],
+    [
+      "invalid raw terminator",
+      ":100644 100644 1111111 2222222 M\0file.ts\0not-a-boundary\0diff --git incomplete",
+    ],
+  ])("leaves %s input unchanged", (_description, patch) => {
+    const parsed = getRenderablePatch(patch);
+    expect(parsed?.kind).toBe("raw");
+    if (parsed?.kind !== "raw") return;
+    expect(parsed.text).toBe(patch);
+  });
+
   it("retains source-file offsets for checkpoint diffs", () => {
     const patch = [
       "diff --git a/example.ts b/example.ts",

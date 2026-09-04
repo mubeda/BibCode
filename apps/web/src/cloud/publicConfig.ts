@@ -2,7 +2,7 @@ import { relayClerkTokenOptions } from "@bibcode/shared/relayAuth";
 import { normalizeSecureRelayUrl } from "@bibcode/shared/relayUrl";
 import * as Schema from "effect/Schema";
 
-export class CloudPublicConfigMissingError extends Schema.TaggedErrorClass<CloudPublicConfigMissingError>()(
+export class CloudPublicConfigMissingError extends Schema.TaggedError<CloudPublicConfigMissingError>()(
   "CloudPublicConfigMissingError",
   {
     key: Schema.Literal("BIBCODE_CLERK_JWT_TEMPLATE"),

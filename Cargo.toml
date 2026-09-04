@@ -4,17 +4,17 @@ resolver = "3"
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.97.1"
+rust-version = "1.98.0"
 
 [workspace.dependencies]
 axum = { version = "0.8.9", features = ["form", "http1", "json", "tokio", "ws"] }
 base64 = "0.22.1"
 block2 = "0.6"
 cairo-rs = { version = "0.18", features = ["png"] }
-clap = { version = "4.6.2", features = ["derive", "env"] }
+clap = { version = "4.6.6", features = ["derive", "env"] }
 dirs = "6.0.0"
 ed25519-dalek = { version = "3.0.0", features = ["pem", "pkcs8"] }
-futures-util = { version = "0.3.33", features = ["sink"] }
+futures-util = { version = "0.3.34", features = ["sink"] }
 getrandom = "0.4.3"
 gtk = "0.18"
 hmac = "0.13.0"
@@ -34,7 +34,7 @@ objc2-web-kit = { version = "0.3", features = [
   "WKWebsiteDataStore",
   "WKBackForwardList",
 ] }
-open = "5.4.0"
+open = "5.4.3"
 percent-encoding = "2.3.2"
 p256 = { version = "0.14.0", features = ["ecdsa"] }
 portpicker = "0.1.1"
@@ -46,7 +46,7 @@ reqwest = { version = "0.13.4", default-features = false, features = [
   "rustls",
   "stream",
 ] }
-rusqlite = { version = "0.40.1", features = ["backup", "bundled", "hooks"] }
+rusqlite = { version = "0.40.2", features = ["backup", "bundled", "hooks"] }
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -58,18 +58,18 @@ subtle = "2.6.1"
 bibcode-server = { path = "apps/server" }
 tauri = { version = "2.11.5", features = ["unstable", "devtools", "image-png"] }
 tauri-build = { version = "2.6.3", features = [] }
-tauri-plugin-deep-link = "2"
-tauri-plugin-dialog = "2.7.2"
-tauri-plugin-opener = "2.5.4"
-tauri-plugin-shell = "2.3.5"
-tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
+tauri-plugin-deep-link = "2.4.10"
+tauri-plugin-dialog = "2.7.3"
+tauri-plugin-opener = "2.5.5"
+tauri-plugin-shell = "2.3.6"
+tauri-plugin-single-instance = { version = "2.4.4", features = ["deep-link"] }
 tauri-plugin-store = "2.4.4"
-tauri-plugin-updater = "2.10.1"
+tauri-plugin-updater = "2.11.0"
 tauri-plugin-wdio = "=1.2.0"
 tauri-plugin-wdio-webdriver = "=1.2.0"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "parsing"] }
-tokio = { version = "1.53.0", features = [
+tokio = { version = "1.53.1", features = [
   "fs",
   "io-util",
   "macros",
@@ -80,15 +80,15 @@ tokio = { version = "1.53.0", features = [
   "sync",
   "time",
 ] }
-tokio-util = { version = "0.7.18", features = ["io", "rt"] }
+tokio-util = { version = "0.7.19", features = ["io", "rt"] }
 tokio-tungstenite = "0.30.0"
-toml = "1.1.3"
-tower-http = { version = "0.7.0", features = ["cors"] }
+toml = "1.1.5"
+tower-http = { version = "0.7.1", features = ["cors"] }
 tower = { version = "0.5.3", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
-uuid = { version = "1.24.0", features = ["v4"] }
+uuid = { version = "1.26.0", features = ["v4"] }
 webkit2gtk = { version = "2.0", features = ["v2_40"] }
 webview2-com = "0.38"
 windows-sys = "0.61.2"
