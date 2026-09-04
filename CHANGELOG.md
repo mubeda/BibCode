@@ -1,5 +1,27 @@
 # Changelog
 
+## [v0.5.4] - 2026-09-04
+
+BiBCode v0.5.4 fixes the desktop workspace sidebar: the floating **Toggle main
+sidebar** control sat on top of the environment rail's first entry, so aiming
+at **Local** collapsed the sidebar instead of selecting the environment.
+
+### Interface fixes
+
+- The environment rail now reserves the same topbar strip the thread sidebar
+  header reserves, so the first environment entry starts below the fixed
+  toggle instead of underneath it. The rail's separator line is continued
+  across the reserved strip, keeping the header edge unbroken between rail and
+  sidebar. On a native macOS titlebar the control resolves to the top-left
+  52px column, which is exactly the rail's width, so the two overlapped
+  completely; a WebKit geometry harness built from the shipped stylesheet
+  reported 672 px^2 of overlap and a hit-test at Local's centre landing on the
+  toggle, and reports no overlap with Local receiving the hit after the fix.
+  The thread sidebar brand drops its control-clearance margin because the
+  control no longer overlays that header, while the collapsed-sidebar centre
+  panel header keeps using the shared offset variable. A regression assertion
+  pins the reserved strip ahead of the environments group.
+
 ## [v0.5.3] - 2026-09-03
 
 BiBCode v0.5.3 fixes the encrypted pairing channel in every desktop app: with
