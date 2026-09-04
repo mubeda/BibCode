@@ -14,6 +14,111 @@
   snapshots. Native Linux, Windows, and final-state packaged matrices remain
   release-validation work; no cross-platform pass is claimed here.
 
+## [v0.5.5] - 2026-09-04
+
+BiBCode v0.5.5 fixes desktop pairing: **Add Server** refused every pairing code
+with "Server already saved" even when no server was saved at all.
+
+### Pairing fixes
+
+- A saved remote server is now identified by the host's storage instance id
+  rather than by the environment id the host declares about itself. Every
+  BiBCode server declares the same id — `local` — including the server the
+  desktop app runs in process, so the app's own **Local** environment and every
+  remote host claimed one key in the client's environment registry. Pairing saw
+  that key already taken and refused the code; removing the saved server could
+  not help, because the entry it collided with was Local, which cannot be
+  removed. Two different remote servers would have overwritten each other the
+  same way. Reproduced in the desktop app on a data root that had never seen the
+  remote host, and verified afterwards against an independent second server:
+  both hosts declare `local` with different storage ids, the remote pairs
+  end-to-end encrypted, and it now appears in the environment rail alongside
+  Local instead of replacing it.
+- The host's declared id is kept beside the client's own key, and the connection
+  resolver checks the endpoint against that stored value on every connect, so
+  the identity assertion is preserved rather than dropped. Servers saved before
+  this release carry the declared id in their existing field and resolve through
+  it unchanged — no re-pairing and no migration.
+- The manual endpoint-and-token path identifies a server the same way, keeping
+  the declared id for hosts that report no storage id.
+- "Server already saved" now names the entry that was collided with instead of
+  printing one generic sentence, so the dialog says which saved server to
+  reconnect to or adopt.
+
+### Documentation
+
+- The remote architecture document records how a saved remote is identified and
+  why a host's declared id cannot key it. The Linux, macOS, and Windows desktop
+  runbooks check that a paired server appears alongside Local and that a second
+  offer from the same host is refused by name.
+
+## [v0.5.4] - 2026-09-04
+
+BiBCode v0.5.4 fixes the desktop workspace sidebar: the floating **Toggle main
+sidebar** control sat on top of the environment rail's first entry, so aiming
+at **Local** collapsed the sidebar instead of selecting the environment.
+
+### Interface fixes
+
+- The environment rail now reserves the same topbar strip the thread sidebar
+  header reserves, so the first environment entry starts below the fixed
+  toggle instead of underneath it. The rail's separator line is continued
+  across the reserved strip, keeping the header edge unbroken between rail and
+  sidebar. On a native macOS titlebar the control resolves to the top-left
+  52px column, which is exactly the rail's width, so the two overlapped
+  completely; a WebKit geometry harness built from the shipped stylesheet
+  reported 672 px^2 of overlap and a hit-test at Local's centre landing on the
+  toggle, and reports no overlap with Local receiving the hit after the fix.
+  The thread sidebar brand drops its control-clearance margin because the
+  control no longer overlays that header, while the collapsed-sidebar centre
+  panel header keeps using the shared offset variable. A regression assertion
+  pins the reserved strip ahead of the environments group.
+
+## [v0.5.3] - 2026-09-03
+
+BiBCode v0.5.3 fixes the encrypted pairing channel in every desktop app: with
+the v0.5.1 connect policy and the v0.5.2 macOS transport exception in place,
+pairing still ended as "Server unreachable" because the client rejected the
+server's handshake reply.
+
+### Connection fixes
+
+- The end-to-end-encrypted channel now reads WebSocket frames delivered as
+  `ArrayBuffer`, which is what every real browser hands over once the socket
+  is switched to `binaryType "arraybuffer"`. The client previously treated
+  such frames as non-binary, failed the Noise handshake as a protocol error
+  right after receiving the server's reply, and closed the socket without
+  sending its pairing message. Verified end to end inside a WebKit page
+  carrying the app's policy against a live server: the handshake completes,
+  the pairing token is consumed, and the session is minted. A regression test
+  drives the handshake through a socket that delivers `ArrayBuffer` frames.
+
+### Test reliability
+
+- The blocked-remote cancellation test in the Git status broadcaster awaits
+  the cancellation before releasing the blocking permit, removing a race that
+  failed a release preflight under CI load.
+
+## [v0.5.2] - 2026-09-03
+
+BiBCode v0.5.2 is a macOS-only fix on top of v0.5.1: the desktop app can now
+reach plain-HTTP remote servers on a LAN or tailnet, which App Transport
+Security had been refusing before any packet left the machine.
+
+### Connection fixes
+
+- The macOS bundle now merges an `Info.plist` that relaxes App Transport
+  Security for web content only (`NSAllowsArbitraryLoadsInWebContent` and
+  `NSAllowsLocalNetworking`) and declares the Local Network usage description,
+  so **Add Server → Pairing code** works against `http://` servers. Native
+  code keeps the default policy, and the hardening test rejects the blanket
+  `NSAllowsArbitraryLoads`.
+
+### Documentation
+
+- The remote architecture and release documents record the macOS gate beside
+  the webview connect policy introduced in v0.5.1.
+
 ## [v0.5.1] - 2026-09-03
 
 BiBCode v0.5.1 makes headless servers pairable from the desktop app without a

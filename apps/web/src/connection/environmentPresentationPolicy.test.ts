@@ -26,6 +26,7 @@ const wslTarget = new BearerConnectionTarget({
   connectionId: desktopLocalConnectionId("wsl:Ubuntu"),
   environmentId: EnvironmentId.make("wsl"),
   label: "WSL: Ubuntu",
+  serverEnvironmentId: null,
 });
 
 const unavailableWslTarget = new UnavailableConnectionTarget({
@@ -51,6 +52,7 @@ const remoteBearerTarget = new BearerConnectionTarget({
   connectionId: "remote:server",
   environmentId: EnvironmentId.make("bearer"),
   label: "Remote server",
+  serverEnvironmentId: null,
 });
 
 const allTargetKinds: readonly ConnectionTarget[] = [

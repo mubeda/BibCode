@@ -233,10 +233,14 @@ minimum sizes verify:
   management remains explicitly operator-owned. The local-machine flow still
   has no Host selector; remote targeting is driven by the environment rail;
 - Headless pairing: on a second machine or VM run `bibcode serve --host
-<routable address>`, confirm the startup line contains `pairingCode`, mint a
-  second offer with `bibcode pairing offer --endpoint http://<address>:3773`,
-  add each through **Add Server → Pairing code**, then restart the headless
-  server and confirm the saved server reconnects without re-pairing.
+<routable address>`, confirm the startup line contains `pairingCode`, and add it
+  through **Add Server → Pairing code**. Confirm the saved server appears
+  alongside — not in place of — the app's own **Local** environment, since both
+  hosts declare the environment id `local`. Mint a second offer with `bibcode
+pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
+  it by name ("<label> is already saved."): two offers describe one environment.
+  Then restart the headless server and confirm the saved server reconnects
+  without re-pairing.
 - Headless service: on the second machine run `bibcode service install --host
 <routable address>`, confirm `bibcode service status` reports `active`,
   reboot that machine, and confirm the desktop's saved server reconnects
