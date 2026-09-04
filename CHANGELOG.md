@@ -51,7 +51,10 @@ runtime and the existing browser/desktop RPC boundary.
   cross-runtime IDNA validator.
 - Updated immutable GitHub Actions pins, release/test contracts, native port
   probing, process-watchdog coverage, raw Git parsing, and repository identity
-  checks used by the cross-platform build and packaged-test paths.
+  checks used by the cross-platform build and packaged-test paths. The Git
+  broadcaster cancellation regression now proves synchronous lifecycle
+  cancellation and joined cleanup without depending on a five-second scheduler
+  race.
 
 ### Supported release assets
 
