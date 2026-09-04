@@ -294,6 +294,7 @@ function sensitivePrepared(storageInstanceId: string | null): PreparedConnection
     environmentId,
     label: "Sensitive remote",
     connectionId: "sensitive-connection",
+    serverEnvironmentId: null,
   });
   return {
     environmentId,

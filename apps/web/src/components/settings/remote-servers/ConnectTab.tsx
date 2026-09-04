@@ -115,6 +115,7 @@ import {
   formatServerVersionLabel,
   isLoopbackAcknowledgementRequired,
   normalizePairingCodeInput,
+  resolvePairingAddFailureDetail,
   resolvePairingAddFailureReason,
   resolveTransportBadge,
 } from "./connectPresentation";
@@ -820,7 +821,10 @@ export function ConnectTab({
   const [pairingCodeInput, setPairingCodeInput] = useState("");
   const [tunnelAcknowledged, setTunnelAcknowledged] = useState(false);
   const [flowDemandsAcknowledgement, setFlowDemandsAcknowledgement] = useState(false);
-  const [addServerFailure, setAddServerFailure] = useState<PairingAddFailureReason | null>(null);
+  const [addServerFailure, setAddServerFailure] = useState<{
+    readonly reason: PairingAddFailureReason;
+    readonly detail: string | null;
+  } | null>(null);
   const [savedBackendHost, setSavedBackendHost] = useState("");
   const [savedBackendPairingCode, setSavedBackendPairingCode] = useState("");
   const [savedBackendSshHost, setSavedBackendSshHost] = useState("");
@@ -961,7 +965,7 @@ export function ConnectTab({
       }
       const reason = resolvePairingAddFailureReason(error);
       if (reason !== null) {
-        setAddServerFailure(reason);
+        setAddServerFailure({ reason, detail: resolvePairingAddFailureDetail(error) });
       } else {
         setSavedBackendError(error instanceof Error ? error.message : "Failed to add the server.");
       }
@@ -1298,7 +1302,9 @@ export function ConnectTab({
   );
   const renderPairingCodeModeBody = () => {
     const describedFailure =
-      addServerFailure === null ? null : describeAddServerFailure(addServerFailure);
+      addServerFailure === null
+        ? null
+        : describeAddServerFailure(addServerFailure.reason, addServerFailure.detail);
     return (
       <div className="space-y-4">
         <label className="block">

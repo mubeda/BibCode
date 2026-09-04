@@ -78,6 +78,19 @@ export function resolvePairingAddFailureReason(error: unknown): PairingAddFailur
     : null;
 }
 
+/**
+ * The failure's own sentence, which names the entry or endpoint it is about.
+ * Only reasons whose copy is written for a reader use it.
+ */
+export function resolvePairingAddFailureDetail(error: unknown): string | null {
+  if (error === null || typeof error !== "object") return null;
+  if ((error as { _tag?: unknown })._tag !== "PairingAddError") return null;
+  const detail = (error as { detail?: unknown }).detail;
+  if (typeof detail !== "string") return null;
+  const trimmed = detail.trim();
+  return trimmed.length === 0 ? null : trimmed;
+}
+
 export function isLoopbackAcknowledgementRequired(error: unknown): boolean {
   return (
     error !== null &&
@@ -86,7 +99,10 @@ export function isLoopbackAcknowledgementRequired(error: unknown): boolean {
   );
 }
 
-export function describeAddServerFailure(reason: PairingAddFailureReason): {
+export function describeAddServerFailure(
+  reason: PairingAddFailureReason,
+  detail: string | null = null,
+): {
   readonly title: string;
   readonly detail: string;
 } {
@@ -116,10 +132,14 @@ export function describeAddServerFailure(reason: PairingAddFailureReason): {
           "This app and the server cannot talk to each other. Update the older side, then retry.",
       };
     case "duplicate-storage-identity":
+      // Name the entry that collided: "which one?" is the only question a
+      // reader has here, and it decides whether they reconnect or rename.
       return {
         title: "Server already saved",
         detail:
-          "A saved server already uses this server's storage identity. Reconnect or adopt the existing entry instead of adding a duplicate.",
+          detail === null
+            ? "A saved server already uses this server's storage identity. Reconnect or adopt the existing entry instead of adding a duplicate."
+            : `${detail} Reconnect or adopt the existing entry instead of adding a duplicate.`,
       };
     case "local-persistence-failed":
       return {

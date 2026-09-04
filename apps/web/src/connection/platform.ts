@@ -353,6 +353,9 @@ const loadSecondaryConnectionRegistration = Effect.fn(
         environmentId: descriptor.environmentId,
         label,
         connectionId,
+        // Desktop-local backends are keyed by the host topology, not by what
+        // the backend declares, so the two ids stay the same value here.
+        serverEnvironmentId: null,
       }),
       profile: new BearerConnectionProfile({
         connectionId,

@@ -175,6 +175,7 @@ describe("connection onboarding", () => {
             environmentId,
             label: "Old label",
             connectionId: "bearer:environment-paired",
+            serverEnvironmentId: null,
           }),
           profile: Option.some(
             new BearerConnectionProfile({
