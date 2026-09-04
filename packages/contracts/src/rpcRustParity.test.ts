@@ -8,6 +8,7 @@ import * as DateTime from "effect/DateTime";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import type * as SchemaAST from "effect/SchemaAST";
+import * as FastCheck from "fast-check";
 
 import { OrchestrationEvent, ORCHESTRATION_WS_METHODS } from "./orchestration.ts";
 import { WS_METHODS, WsRpcGroup } from "./rpc.ts";
@@ -343,7 +344,7 @@ describe("Rust RPC fixture parity", () => {
 
       for (const [index, member] of schemaMembers(rpc.errorSchema.ast).entries()) {
         try {
-          Schema.toArbitrary(Schema.make(member));
+          Schema.toArbitrary(Schema.make(member))(FastCheck);
         } catch (cause) {
           if (cause instanceof Error && cause.message.includes("Unsupported AST Never")) continue;
           throw cause;

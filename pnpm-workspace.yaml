@@ -10,32 +10,33 @@ packages:
 # so future releases still wait for the default quarantine period.
 minimumReleaseAgeExclude:
   - geckodriver@6.1.1
-  - "@cloudflare/workers-types@5.20260718.1"
-  - "@tanstack/router-generator@1.167.21"
-  - "@tanstack/router-plugin@1.168.22"
+  - "@cloudflare/workers-types@5.20260903.1"
   - "@noble/ciphers@2.4.0"
 
 catalog:
-  "@clerk/backend": 3.11.7
-  "@clerk/clerk-js": 6.25.5
-  "@clerk/react": 6.12.5
-  "@clerk/shared": 4.25.5
+  "@clerk/backend": 3.17.1
+  "@clerk/clerk-js": 6.31.0
+  "@clerk/react": 6.15.0
+  "@clerk/shared": 4.31.0
   "@tauri-apps/api": 2.11.1
-  "@effect/atom-react": 4.0.0-beta.99
-  "@effect/platform-node": 4.0.0-beta.99
-  "@effect/sql-pg": 4.0.0-beta.99
-  "@effect/tsgo": 0.24.1
-  "@effect/vitest": 4.0.0-beta.99
+  "@effect/atom-react": 4.0.0-beta.107
+  "@effect/platform-node": 4.0.0-beta.107
+  "@effect/platform-node-shared": 4.0.0-beta.107
+  "@effect/sql-d1": 4.0.0-beta.107
+  "@effect/sql-pg": 4.0.0-beta.107
+  "@effect/sql-sqlite-do": 4.0.0-beta.107
+  "@effect/tsgo": 0.40.0
+  "@effect/vitest": 4.0.0-beta.107
   "@noble/ciphers": 2.4.0
-  "@noble/curves": 2.2.0
-  "@noble/hashes": 2.2.0
-  "@pierre/diffs": 1.3.0-beta.10
-  "@types/node": 26.1.1
-  effect: 4.0.0-beta.99
-  jose: 6.2.3
+  "@noble/curves": 2.4.0
+  "@noble/hashes": 2.4.0
+  "@pierre/diffs": 1.3.6
+  "@types/node": 26.4.1
+  effect: 4.0.0-beta.107
+  jose: 6.2.10
   typescript: 7.0.2
-  vite: npm:@voidzero-dev/vite-plus-core@0.2.5
-  vite-plus: 0.2.5
+  vite: npm:@voidzero-dev/vite-plus-core@0.3.0
+  vite-plus: 0.3.0
   yaml: ^2.9.0
 
 allowBuilds:
@@ -50,7 +51,7 @@ allowBuilds:
   "workerd@1.20260704.1": false
 
 overrides:
-  # Effect beta.78 accepts fast-check ^4.8.0. Keep its transitive copy aligned
+  # Effect beta.107 accepts fast-check ^4.9.0. Keep its transitive copy aligned
   # with the workspace generator dependency because Arbitrary carries private
   # nominal state and cannot safely cross between duplicate package instances.
   fast-check: 4.9.0
@@ -70,7 +71,10 @@ overrides:
   "@clerk/clerk-js>@wallet-standard/core": "-"
   "@effect/atom-react": "catalog:"
   "@effect/platform-node": "catalog:"
+  "@effect/platform-node-shared": "catalog:"
+  "@effect/sql-d1": "catalog:"
   "@effect/sql-pg": "catalog:"
+  "@effect/sql-sqlite-do": "catalog:"
   "@effect/vitest": "catalog:"
   # @effect/vitest is patched to use vite-plus/test; do not auto-install its
   # upstream Vitest peer and create a second Vite/Vitest toolchain.
@@ -96,8 +100,7 @@ packageExtensions:
       vite: "catalog:"
 
 patchedDependencies:
-  "@effect/vitest@4.0.0-beta.99": patches/@effect__vitest@4.0.0-beta.99.patch
-  "@pierre/diffs@1.3.0-beta.10": patches/@pierre__diffs@1.3.0-beta.10.patch
+  "@effect/vitest@4.0.0-beta.107": patches/@effect__vitest@4.0.0-beta.107.patch
   "@wdio/tauri-plugin@1.2.0": patches/@wdio__tauri-plugin@1.2.0.patch
 
 peerDependencyRules:

@@ -10,11 +10,11 @@
     "typecheck": "node --require ../../scripts/disable-telemetry.cjs ./node_modules/astro/bin/astro.mjs check"
   },
   "dependencies": {
-    "astro": "^7.1.1"
+    "astro": "^7.3.0"
   },
   "devDependencies": {
-    "@astrojs/check": "^0.9.9",
-    "@vercel/config": "^0.5.5",
+    "@astrojs/check": "^0.9.10",
+    "@vercel/config": "^0.7.0",
     "typescript": "6.0.3"
   }
 }

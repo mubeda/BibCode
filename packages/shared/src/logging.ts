@@ -27,7 +27,7 @@ export interface RotatingFileSinkFileSystem {
 
 const defaultRotatingFileSinkFileSystem: RotatingFileSinkFileSystem = NodeFS;
 
-export class RotatingFileSinkConfigurationError extends Schema.TaggedErrorClass<RotatingFileSinkConfigurationError>()(
+export class RotatingFileSinkConfigurationError extends Schema.TaggedError<RotatingFileSinkConfigurationError>()(
   "RotatingFileSinkConfigurationError",
   {
     option: Schema.Literals(["maxBytes", "maxFiles"]),
@@ -40,7 +40,7 @@ export class RotatingFileSinkConfigurationError extends Schema.TaggedErrorClass<
   }
 }
 
-export class RotatingFileSinkError extends Schema.TaggedErrorClass<RotatingFileSinkError>()(
+export class RotatingFileSinkError extends Schema.TaggedError<RotatingFileSinkError>()(
   "RotatingFileSinkError",
   {
     operation: Schema.Literals(["initialize", "read", "write", "rotate", "prune"]),
@@ -53,7 +53,7 @@ export class RotatingFileSinkError extends Schema.TaggedErrorClass<RotatingFileS
   }
 }
 
-export class RotatingFileSinkRollbackError extends Schema.TaggedErrorClass<RotatingFileSinkRollbackError>()(
+export class RotatingFileSinkRollbackError extends Schema.TaggedError<RotatingFileSinkRollbackError>()(
   "RotatingFileSinkRollbackError",
   {
     filePath: Schema.String,
@@ -66,7 +66,7 @@ export class RotatingFileSinkRollbackError extends Schema.TaggedErrorClass<Rotat
   }
 }
 
-export class RotatingFileSinkCloseError extends Schema.TaggedErrorClass<RotatingFileSinkCloseError>()(
+export class RotatingFileSinkCloseError extends Schema.TaggedError<RotatingFileSinkCloseError>()(
   "RotatingFileSinkCloseError",
   {
     filePath: Schema.String,

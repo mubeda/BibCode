@@ -14,7 +14,7 @@ import * as Schema from "effect/Schema";
 import { Argument, Command, Flag } from "effect/unstable/cli";
 import { fromJsonStringPretty } from "@bibcode/shared/schemaJson";
 
-export class ReleasePackageManifestError extends Schema.TaggedErrorClass<ReleasePackageManifestError>()(
+export class ReleasePackageManifestError extends Schema.TaggedError<ReleasePackageManifestError>()(
   "ReleasePackageManifestError",
   {
     operation: Schema.Literals(["read", "decode", "encode", "write", "replace", "cleanup"]),
@@ -34,7 +34,7 @@ export class ReleasePackageManifestError extends Schema.TaggedErrorClass<Release
   }
 }
 
-export class ReleaseGitHubOutputConfigurationError extends Schema.TaggedErrorClass<ReleaseGitHubOutputConfigurationError>()(
+export class ReleaseGitHubOutputConfigurationError extends Schema.TaggedError<ReleaseGitHubOutputConfigurationError>()(
   "ReleaseGitHubOutputConfigurationError",
   { cause: Schema.Defect() },
 ) {
@@ -43,7 +43,7 @@ export class ReleaseGitHubOutputConfigurationError extends Schema.TaggedErrorCla
   }
 }
 
-export class ReleaseGitHubOutputWriteError extends Schema.TaggedErrorClass<ReleaseGitHubOutputWriteError>()(
+export class ReleaseGitHubOutputWriteError extends Schema.TaggedError<ReleaseGitHubOutputWriteError>()(
   "ReleaseGitHubOutputWriteError",
   {
     filePath: Schema.String,
@@ -409,13 +409,11 @@ export const updateReleasePackageVersions = Effect.fn("updateReleasePackageVersi
   });
 
   return yield* Effect.acquireUseRelease(
-    Effect.sync(
-      (): ReleasePackageTransactionState => ({
-        committed: false,
-        finalized: false,
-        rollbackFailures: [],
-      }),
-    ),
+    Effect.sync((): ReleasePackageTransactionState => ({
+      committed: false,
+      finalized: false,
+      rollbackFailures: [],
+    })),
     (state) =>
       Effect.gen(function* () {
         const failAfterFinalization = (

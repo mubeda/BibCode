@@ -220,7 +220,8 @@ must retain the selected project-data root.
 
 [`desktop-upgrade-smoke.yml`](../../.github/workflows/desktop-upgrade-smoke.yml)
 runs real packaged previous-stable-to-candidate and protected-baseline upgrades
-for Windows x64 NSIS, macOS arm64 DMG, macOS x64 DMG, and Linux x64 AppImage.
+for Linux ARM64/x64 AppImages, Windows ARM64/x64 NSIS installers, and macOS
+ARM64/x64 DMGs.
 The protected lane verifies the same storage UUID, seeded project, and a
 verified `pre-update` backup after restart. A separate Windows job exercises a
 WSL primary when the runner declares WSL plus an installed distribution; an

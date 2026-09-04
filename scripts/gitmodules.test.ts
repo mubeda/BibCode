@@ -15,7 +15,7 @@ function gitOutput(args: readonly string[]): string {
 
 describe("Git submodule metadata", () => {
   it("matches every indexed gitlink with the root .gitmodules file", () => {
-    const gitlinkPaths = gitOutput(["ls-files", "--stage"])
+    const gitlinkPaths = gitOutput(["ls-files", "--stage", "--", ".", ":(exclude).repos/**"])
       .split(/\r?\n/u)
       .filter((line) => line.startsWith("160000 "))
       .map((line) => line.split("\t", 2)[1])

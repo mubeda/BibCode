@@ -227,7 +227,7 @@ export const WorktreeCatalogErrorReason = Schema.Literals([
 ]);
 export type WorktreeCatalogErrorReason = typeof WorktreeCatalogErrorReason.Type;
 
-export class WorktreeCatalogError extends Schema.TaggedErrorClass<WorktreeCatalogError>()(
+export class WorktreeCatalogError extends Schema.TaggedError<WorktreeCatalogError>()(
   "WorktreeCatalogError",
   {
     reason: WorktreeCatalogErrorReason,
@@ -241,7 +241,7 @@ export const WorktreeOperationErrorReason = Schema.Literals([
 ]);
 export type WorktreeOperationErrorReason = typeof WorktreeOperationErrorReason.Type;
 
-export class WorktreeOperationError extends Schema.TaggedErrorClass<WorktreeOperationError>()(
+export class WorktreeOperationError extends Schema.TaggedError<WorktreeOperationError>()(
   "WorktreeOperationError",
   {
     reason: WorktreeOperationErrorReason,
@@ -264,7 +264,7 @@ export const WorktreeAdoptionErrorReason = Schema.Literals([
 ]);
 export type WorktreeAdoptionErrorReason = typeof WorktreeAdoptionErrorReason.Type;
 
-export class WorktreeAdoptionError extends Schema.TaggedErrorClass<WorktreeAdoptionError>()(
+export class WorktreeAdoptionError extends Schema.TaggedError<WorktreeAdoptionError>()(
   "WorktreeAdoptionError",
   {
     reason: WorktreeAdoptionErrorReason,
@@ -293,7 +293,7 @@ export const WorktreeRemovalErrorReason = Schema.Literals([
 ]);
 export type WorktreeRemovalErrorReason = typeof WorktreeRemovalErrorReason.Type;
 
-export class WorktreeRemovalError extends Schema.TaggedErrorClass<WorktreeRemovalError>()(
+export class WorktreeRemovalError extends Schema.TaggedError<WorktreeRemovalError>()(
   "WorktreeRemovalError",
   {
     reason: WorktreeRemovalErrorReason,
@@ -305,7 +305,7 @@ export class WorktreeRemovalError extends Schema.TaggedErrorClass<WorktreeRemova
 export const WorkspaceUnavailableErrorReason = Schema.Literal("workspace-unavailable");
 export type WorkspaceUnavailableErrorReason = typeof WorkspaceUnavailableErrorReason.Type;
 
-export class WorkspaceUnavailableError extends Schema.TaggedErrorClass<WorkspaceUnavailableError>()(
+export class WorkspaceUnavailableError extends Schema.TaggedError<WorkspaceUnavailableError>()(
   "WorkspaceUnavailableError",
   {
     reason: WorkspaceUnavailableErrorReason,
@@ -319,7 +319,7 @@ export class WorkspaceUnavailableError extends Schema.TaggedErrorClass<Workspace
 export const WorkspaceIdentityErrorReason = Schema.Literal("workspace-identity-unavailable");
 export type WorkspaceIdentityErrorReason = typeof WorkspaceIdentityErrorReason.Type;
 
-export class WorkspaceIdentityError extends Schema.TaggedErrorClass<WorkspaceIdentityError>()(
+export class WorkspaceIdentityError extends Schema.TaggedError<WorkspaceIdentityError>()(
   "WorkspaceIdentityError",
   {
     reason: WorkspaceIdentityErrorReason,

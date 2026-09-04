@@ -1,6 +1,6 @@
 import type { AtomCommandResult } from "@bibcode/client-runtime/state/runtime";
-import type { DiffLineAnnotation, FileContents } from "@pierre/diffs";
-import { Editor, type EditorOptions } from "@pierre/diffs/editor";
+import type { DiffLineAnnotation, FileContents, LineAnnotation } from "@pierre/diffs";
+import { Editor, type EditorOptions } from "@pierre/diffs/edit";
 
 import {
   FileSaveCoordinator,
@@ -11,7 +11,7 @@ import {
 
 export type FileEditorChangeHandler<LAnnotation> = (
   file: FileContents,
-  lineAnnotations?: DiffLineAnnotation<LAnnotation>[],
+  lineAnnotations?: LineAnnotation<LAnnotation>[] | DiffLineAnnotation<LAnnotation>[],
 ) => void;
 
 export interface FileEditingSessionSnapshot {

@@ -260,7 +260,7 @@ describe("cross-platform release contract", () => {
     expect(setupRustIndex).toBeGreaterThan(-1);
     expect(typecheckIndex).toBeGreaterThan(setupRustIndex);
     expect(steps[setupRustIndex]?.uses).toBe(
-      "dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b",
+      "dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1",
     );
   });
 

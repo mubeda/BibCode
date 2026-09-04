@@ -9,7 +9,7 @@
         "error": {
           "_tag": "OrchestrationGetFullThreadDiffError",
           "message": "$O\"f",
-          "cause": "undefined"
+          "cause": null
         }
       }
     ]

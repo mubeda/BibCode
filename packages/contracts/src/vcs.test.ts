@@ -314,7 +314,7 @@ describe("VCS repository schemas", () => {
   });
 
   it("generates only decodable passive summary fixtures", () => {
-    const samples = FastCheck.sample(Schema.toArbitrary(VcsStatusSummary), {
+    const samples = FastCheck.sample(Schema.toArbitrary(VcsStatusSummary)(FastCheck), {
       numRuns: 100,
       seed: 20260820,
     });

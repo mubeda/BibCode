@@ -61,6 +61,48 @@ interface RenderablePatchOptions {
   compactPartialHunkOffsets?: boolean;
 }
 
+const GIT_RAW_HEADER_PATTERN = /^:[0-7]{6} [0-7]{6} [0-9a-f]+ [0-9a-f]+ ([ACDMRTUX])(\d{1,3})?$/;
+
+function stripNulDelimitedGitRawPrefix(patch: string): string {
+  if (!patch.startsWith(":")) return patch;
+
+  let cursor = 0;
+  let recordCount = 0;
+  while (patch.startsWith(":", cursor)) {
+    const headerEnd = patch.indexOf("\0", cursor);
+    if (headerEnd < 0) return patch;
+
+    const header = GIT_RAW_HEADER_PATTERN.exec(patch.slice(cursor, headerEnd));
+    if (header === null) return patch;
+    const status = header[1]!;
+    const score = header[2];
+    const hasValidScore =
+      status === "C" || status === "R"
+        ? score !== undefined && Number(score) <= 100
+        : status === "M"
+          ? score === undefined || Number(score) <= 100
+          : score === undefined;
+    if (!hasValidScore) return patch;
+
+    cursor = headerEnd + 1;
+    const sourcePathEnd = patch.indexOf("\0", cursor);
+    if (sourcePathEnd <= cursor) return patch;
+    cursor = sourcePathEnd + 1;
+
+    if (status === "C" || status === "R") {
+      const destinationPathEnd = patch.indexOf("\0", cursor);
+      if (destinationPathEnd <= cursor) return patch;
+      cursor = destinationPathEnd + 1;
+    }
+
+    recordCount += 1;
+  }
+
+  return recordCount > 0 && patch.startsWith("\0diff --git ", cursor)
+    ? patch.slice(cursor + 1)
+    : patch;
+}
+
 export function compactPartialHunkOffsets(file: FileDiffMetadata): FileDiffMetadata {
   if (!file.isPartial) return file;
 
@@ -92,7 +134,7 @@ export function getRenderablePatch(
   options: RenderablePatchOptions = {},
 ): RenderablePatch | null {
   if (!patch) return null;
-  const normalizedPatch = patch.trim();
+  const normalizedPatch = stripNulDelimitedGitRawPrefix(patch.trim());
   if (normalizedPatch.length === 0) return null;
 
   try {

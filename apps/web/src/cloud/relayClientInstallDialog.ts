@@ -5,7 +5,7 @@ import {
 } from "@bibcode/contracts";
 import * as Schema from "effect/Schema";
 
-export class RelayClientInstallConfirmationConflictError extends Schema.TaggedErrorClass<RelayClientInstallConfirmationConflictError>()(
+export class RelayClientInstallConfirmationConflictError extends Schema.TaggedError<RelayClientInstallConfirmationConflictError>()(
   "RelayClientInstallConfirmationConflictError",
   {
     requestedVersion: Schema.String,

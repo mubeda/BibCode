@@ -39,6 +39,16 @@ native toolchain. Node.js and Vite+ are development/build dependencies; release
 artifacts contain the Tauri/Rust application and built web assets, not a Node
 runtime or TypeScript server.
 
+All workflows use the repository's declared Node.js 26.8.1, pnpm 11.25.0,
+Vite+ 0.3.0, and Rust 1.98.0 toolchains. External setup actions are immutable
+SHA-pinned with audited tag comments: Checkout 7.0.1
+(`3d3c42e5aac5ba805825da76410c181273ba90b1`), Rust Cache 2.9.2
+(`6323deb102c322ba6fcbdcafc7e3dddab59af2b6`), setup-vp 1.18.0
+(`1b32467adbe183473499fd9d5d372c3ed9641754`), action-gh-release 3.0.3
+(`efb35369e0ad2afab669f228072c1b0d510eae64`), and Rust toolchain 1.98.0
+(`62ae3a85dbdd2bedbb5819da8ce45635129289a1`). Reverify a tag before changing
+its immutable SHA.
+
 ## Other Workflows
 
 - `.github/workflows/desktop-ui-smoke.yml` is a manual or reusable packaged-app

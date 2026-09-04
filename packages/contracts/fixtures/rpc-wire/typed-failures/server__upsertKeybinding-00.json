@@ -10,7 +10,7 @@
           "_tag": "KeybindingsConfigParseError",
           "configPath": "",
           "detail": "A~ vz",
-          "cause": "undefined"
+          "cause": null
         }
       }
     ]
