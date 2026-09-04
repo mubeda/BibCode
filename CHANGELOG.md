@@ -1,5 +1,19 @@
 # Changelog
 
+## [Unreleased]
+
+### Dependency and toolchain convergence
+
+- Converged development on Node.js 26.8.1, pnpm 11.25.0, Vite+ 0.3.0 with one
+  Vitest 4.1.11 runtime, TypeScript 7.0.2, React 19.2.8, Effect
+  4.0.0-beta.107, and Rust 1.98.0 while retaining the marketing TypeScript 6
+  compatibility island and the reviewed native/process/platform boundaries.
+- Moved Pierre Diffs to stable 1.3.6 and removed its patch, rebased the Effect
+  Vite+ patch, retained the Wdio 1.2/9.29 compatibility hold and patch, and
+  refreshed immutable workflow pins and exact Effect/Alchemy reference
+  snapshots. Native Linux, Windows, and final-state packaged matrices remain
+  release-validation work; no cross-platform pass is claimed here.
+
 ## [v0.5.1] - 2026-09-03
 
 BiBCode v0.5.1 makes headless servers pairable from the desktop app without a

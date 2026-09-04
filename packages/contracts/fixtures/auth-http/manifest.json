@@ -12,7 +12,7 @@
           "status": 200,
           "contentType": "application/json",
           "schema": "Objects",
-          "fingerprint": "88537975f59cc9c7e9fee7fd668bb24c18551200d6235106226d1c47e60c0d42"
+          "fingerprint": "04229a3967bb2d62c8c8800b1267e8584a991121f7819e7ac95c2cfd0b285ddb"
         }
       ],
       "errors": [
@@ -20,7 +20,7 @@
           "status": 500,
           "contentType": "application/json",
           "schema": "EnvironmentInternalError",
-          "fingerprint": "2907e4e2d5e721642dc38d6343fd9ba2a421922880f03d0531715900ef4b8b28"
+          "fingerprint": "34acb16b174e2da13f6082cf3afe41a45e80e41816f7fe6eb7a1173ee015ea53"
         }
       ]
     },
@@ -33,7 +33,7 @@
         {
           "contentType": "application/json",
           "schema": "Objects",
-          "fingerprint": "ce857515bdf6a6328a36c6df7692846f6fbc386271da6973f6a03df39c933e44"
+          "fingerprint": "5fa222e7d1f96f69cd3cb8bcd0a68556c268c62a7ccfa0e15527be2498d4f139"
         }
       ],
       "successes": [
@@ -41,7 +41,7 @@
           "status": 200,
           "contentType": "application/json",
           "schema": "Objects",
-          "fingerprint": "b6fb70ee066e227ddaf9d753e3c933e45ea4d552a9f42e8b6c9ff9914f69322f"
+          "fingerprint": "a291c95cd873ddefcfa8de15c4f497b09f42ded5279547a6f8b49aa70104dfcc"
         }
       ],
       "errors": [
@@ -49,13 +49,13 @@
           "status": 401,
           "contentType": "application/json",
           "schema": "EnvironmentAuthInvalidError",
-          "fingerprint": "fb39b2fefb6cc89c7a61b6888eaf5188dcbd5f8a9192746e6edf302f321f7eff"
+          "fingerprint": "c039e5b3393bc4ce03005ce34ceffb1518a878ae4d3d2b6af25cb52e5cfd1ca4"
         },
         {
           "status": 500,
           "contentType": "application/json",
           "schema": "EnvironmentInternalError",
-          "fingerprint": "2907e4e2d5e721642dc38d6343fd9ba2a421922880f03d0531715900ef4b8b28"
+          "fingerprint": "34acb16b174e2da13f6082cf3afe41a45e80e41816f7fe6eb7a1173ee015ea53"
         }
       ]
     },
@@ -68,7 +68,7 @@
         {
           "contentType": "application/x-www-form-urlencoded",
           "schema": "Objects",
-          "fingerprint": "746432a74986642eee5a4f4c32fbab9d666642bf3247b3f4955610e9683d4de7"
+          "fingerprint": "31ab72982e61a1d0431787d3a833b2ca932358f65a45822629a3ec1663321633"
         }
       ],
       "successes": [
@@ -76,7 +76,7 @@
           "status": 200,
           "contentType": "application/json",
           "schema": "Objects",
-          "fingerprint": "3db33c54a80ebf36469669c4558d4a000441bf839c4debc0098656cb2986f979"
+          "fingerprint": "5613fc9bb53361b3d2cb102a1eb07e1b3ef343a928fc2fcf1a1df5a8ef7d6305"
         }
       ],
       "errors": [
@@ -84,19 +84,19 @@
           "status": 400,
           "contentType": "application/json",
           "schema": "EnvironmentRequestInvalidError",
-          "fingerprint": "5e70b4b5f968528645fd25c426988023641a5266ab976d12672d25f9d4ce11a5"
+          "fingerprint": "c17879c795c3f9e092ced6a9ac3fa2f0ea85c4370d062c84d68ec03c1bd2e3c3"
         },
         {
           "status": 401,
           "contentType": "application/json",
           "schema": "EnvironmentAuthInvalidError",
-          "fingerprint": "fb39b2fefb6cc89c7a61b6888eaf5188dcbd5f8a9192746e6edf302f321f7eff"
+          "fingerprint": "c039e5b3393bc4ce03005ce34ceffb1518a878ae4d3d2b6af25cb52e5cfd1ca4"
         },
         {
           "status": 500,
           "contentType": "application/json",
           "schema": "EnvironmentInternalError",
-          "fingerprint": "2907e4e2d5e721642dc38d6343fd9ba2a421922880f03d0531715900ef4b8b28"
+          "fingerprint": "34acb16b174e2da13f6082cf3afe41a45e80e41816f7fe6eb7a1173ee015ea53"
         }
       ]
     },
@@ -111,7 +111,7 @@
           "status": 200,
           "contentType": "application/json",
           "schema": "Objects",
-          "fingerprint": "6071b275cecdd26a6486654e88fd9d717a46a4dac4eb903a59c10e3d3750fcd2"
+          "fingerprint": "92ba85649f9aa8283065bd532631fe22204f264bf0b951bb780f301fe8a8f6af"
         }
       ],
       "errors": [
@@ -119,13 +119,13 @@
           "status": 401,
           "contentType": "application/json",
           "schema": "EnvironmentAuthInvalidError",
-          "fingerprint": "fb39b2fefb6cc89c7a61b6888eaf5188dcbd5f8a9192746e6edf302f321f7eff"
+          "fingerprint": "c039e5b3393bc4ce03005ce34ceffb1518a878ae4d3d2b6af25cb52e5cfd1ca4"
         },
         {
           "status": 500,
           "contentType": "application/json",
           "schema": "EnvironmentInternalError",
-          "fingerprint": "2907e4e2d5e721642dc38d6343fd9ba2a421922880f03d0531715900ef4b8b28"
+          "fingerprint": "34acb16b174e2da13f6082cf3afe41a45e80e41816f7fe6eb7a1173ee015ea53"
         }
       ]
     },
@@ -138,7 +138,7 @@
         {
           "contentType": "application/json",
           "schema": "Objects",
-          "fingerprint": "f939406bebaf0bfbca1c2f7a5b7e8f89ce375161b077434e05327d1913e1647a"
+          "fingerprint": "4e4f32f9a4ce5796dc5f70b2572d51186a2ffdd506280e8bef7bda70f06b28aa"
         }
       ],
       "successes": [
@@ -146,7 +146,7 @@
           "status": 200,
           "contentType": "application/json",
           "schema": "Objects",
-          "fingerprint": "b41ee0a5731a9b9f361faafc82bbc30eb9bbbda1430e639efc7ed15e75d62697"
+          "fingerprint": "64b188f6aee3624e9347dedb7989ed5cb6fb1f4e3ee00b47062c042a9d46cfd3"
         }
       ],
       "errors": [
@@ -154,25 +154,25 @@
           "status": 400,
           "contentType": "application/json",
           "schema": "EnvironmentRequestInvalidError",
-          "fingerprint": "5e70b4b5f968528645fd25c426988023641a5266ab976d12672d25f9d4ce11a5"
+          "fingerprint": "c17879c795c3f9e092ced6a9ac3fa2f0ea85c4370d062c84d68ec03c1bd2e3c3"
         },
         {
           "status": 401,
           "contentType": "application/json",
           "schema": "EnvironmentAuthInvalidError",
-          "fingerprint": "fb39b2fefb6cc89c7a61b6888eaf5188dcbd5f8a9192746e6edf302f321f7eff"
+          "fingerprint": "c039e5b3393bc4ce03005ce34ceffb1518a878ae4d3d2b6af25cb52e5cfd1ca4"
         },
         {
           "status": 403,
           "contentType": "application/json",
           "schema": "EnvironmentScopeRequiredError",
-          "fingerprint": "602b9ab896e06ff4bcdac4df75d694e1c6e8e45c0a1a66df4fe21f2617c7b396"
+          "fingerprint": "68a57af6244a95a76a7c1f21cfd8dc0de362a3926986dd3ac5461465e1c78e99"
         },
         {
           "status": 500,
           "contentType": "application/json",
           "schema": "EnvironmentInternalError",
-          "fingerprint": "2907e4e2d5e721642dc38d6343fd9ba2a421922880f03d0531715900ef4b8b28"
+          "fingerprint": "34acb16b174e2da13f6082cf3afe41a45e80e41816f7fe6eb7a1173ee015ea53"
         }
       ]
     },
@@ -185,7 +185,7 @@
         {
           "contentType": "application/json",
           "schema": "Objects",
-          "fingerprint": "5d0dd91b07382261ca45335d7497774cae8ddf48667729f20fa285498dd76042"
+          "fingerprint": "c56fa580bb2ba4e10d460d227a9374a2e65a6524d03cd31f79b899508cc8b910"
         }
       ],
       "successes": [
@@ -193,7 +193,7 @@
           "status": 200,
           "contentType": "application/json",
           "schema": "Objects",
-          "fingerprint": "d89af8546cd3802e4f5da2a8672690f73564e1a7d6aa84485b0e778733e099e8"
+          "fingerprint": "f3cb4491cdb0d4a8947890a8334faaa478af7e18f2e661061c6190f81976651c"
         }
       ],
       "errors": [
@@ -201,25 +201,25 @@
           "status": 400,
           "contentType": "application/json",
           "schema": "EnvironmentRequestInvalidError",
-          "fingerprint": "5e70b4b5f968528645fd25c426988023641a5266ab976d12672d25f9d4ce11a5"
+          "fingerprint": "c17879c795c3f9e092ced6a9ac3fa2f0ea85c4370d062c84d68ec03c1bd2e3c3"
         },
         {
           "status": 401,
           "contentType": "application/json",
           "schema": "EnvironmentAuthInvalidError",
-          "fingerprint": "fb39b2fefb6cc89c7a61b6888eaf5188dcbd5f8a9192746e6edf302f321f7eff"
+          "fingerprint": "c039e5b3393bc4ce03005ce34ceffb1518a878ae4d3d2b6af25cb52e5cfd1ca4"
         },
         {
           "status": 403,
           "contentType": "application/json",
           "schema": "EnvironmentScopeRequiredError",
-          "fingerprint": "602b9ab896e06ff4bcdac4df75d694e1c6e8e45c0a1a66df4fe21f2617c7b396"
+          "fingerprint": "68a57af6244a95a76a7c1f21cfd8dc0de362a3926986dd3ac5461465e1c78e99"
         },
         {
           "status": 500,
           "contentType": "application/json",
           "schema": "EnvironmentInternalError",
-          "fingerprint": "2907e4e2d5e721642dc38d6343fd9ba2a421922880f03d0531715900ef4b8b28"
+          "fingerprint": "34acb16b174e2da13f6082cf3afe41a45e80e41816f7fe6eb7a1173ee015ea53"
         }
       ]
     },
@@ -232,7 +232,7 @@
         {
           "contentType": "application/json",
           "schema": "Objects",
-          "fingerprint": "01c5b2929a2d618087a1aeb429dd116735a50933ba2670b03dc61de05c764433"
+          "fingerprint": "4e2b3830f8e23e5dcace204bf1a8246491b404ee5a7693973b1ec145e2218d5b"
         }
       ],
       "successes": [
@@ -248,25 +248,25 @@
           "status": 400,
           "contentType": "application/json",
           "schema": "EnvironmentRequestInvalidError",
-          "fingerprint": "5e70b4b5f968528645fd25c426988023641a5266ab976d12672d25f9d4ce11a5"
+          "fingerprint": "c17879c795c3f9e092ced6a9ac3fa2f0ea85c4370d062c84d68ec03c1bd2e3c3"
         },
         {
           "status": 401,
           "contentType": "application/json",
           "schema": "EnvironmentAuthInvalidError",
-          "fingerprint": "fb39b2fefb6cc89c7a61b6888eaf5188dcbd5f8a9192746e6edf302f321f7eff"
+          "fingerprint": "c039e5b3393bc4ce03005ce34ceffb1518a878ae4d3d2b6af25cb52e5cfd1ca4"
         },
         {
           "status": 403,
           "contentType": "application/json",
           "schema": "EnvironmentScopeRequiredError",
-          "fingerprint": "602b9ab896e06ff4bcdac4df75d694e1c6e8e45c0a1a66df4fe21f2617c7b396"
+          "fingerprint": "68a57af6244a95a76a7c1f21cfd8dc0de362a3926986dd3ac5461465e1c78e99"
         },
         {
           "status": 500,
           "contentType": "application/json",
           "schema": "EnvironmentInternalError",
-          "fingerprint": "2907e4e2d5e721642dc38d6343fd9ba2a421922880f03d0531715900ef4b8b28"
+          "fingerprint": "34acb16b174e2da13f6082cf3afe41a45e80e41816f7fe6eb7a1173ee015ea53"
         }
       ]
     },
@@ -281,7 +281,7 @@
           "status": 200,
           "contentType": "application/json",
           "schema": "Objects",
-          "fingerprint": "cc185e3dd26263e680c92ff718c22e38072fed479c53382099c526f77f3431e5"
+          "fingerprint": "e645f10d7f5d7cf0c5fb1904a7803fe517309d18ef83926efd10e76273d679c9"
         }
       ],
       "errors": [
@@ -289,19 +289,19 @@
           "status": 401,
           "contentType": "application/json",
           "schema": "EnvironmentAuthInvalidError",
-          "fingerprint": "fb39b2fefb6cc89c7a61b6888eaf5188dcbd5f8a9192746e6edf302f321f7eff"
+          "fingerprint": "c039e5b3393bc4ce03005ce34ceffb1518a878ae4d3d2b6af25cb52e5cfd1ca4"
         },
         {
           "status": 403,
           "contentType": "application/json",
           "schema": "EnvironmentScopeRequiredError",
-          "fingerprint": "602b9ab896e06ff4bcdac4df75d694e1c6e8e45c0a1a66df4fe21f2617c7b396"
+          "fingerprint": "68a57af6244a95a76a7c1f21cfd8dc0de362a3926986dd3ac5461465e1c78e99"
         },
         {
           "status": 500,
           "contentType": "application/json",
           "schema": "EnvironmentInternalError",
-          "fingerprint": "2907e4e2d5e721642dc38d6343fd9ba2a421922880f03d0531715900ef4b8b28"
+          "fingerprint": "34acb16b174e2da13f6082cf3afe41a45e80e41816f7fe6eb7a1173ee015ea53"
         }
       ]
     },
@@ -316,7 +316,7 @@
           "status": 200,
           "contentType": "application/json",
           "schema": "Arrays",
-          "fingerprint": "603cd20e1e98c4258df0c451b4f02703c817a139c3c36d182247fb2a19763e95"
+          "fingerprint": "37695452ec82dc803c171ec8f042dd48ee438e821d25ec7f5a370d7bfdf70ab1"
         }
       ],
       "errors": [
@@ -324,19 +324,19 @@
           "status": 401,
           "contentType": "application/json",
           "schema": "EnvironmentAuthInvalidError",
-          "fingerprint": "fb39b2fefb6cc89c7a61b6888eaf5188dcbd5f8a9192746e6edf302f321f7eff"
+          "fingerprint": "c039e5b3393bc4ce03005ce34ceffb1518a878ae4d3d2b6af25cb52e5cfd1ca4"
         },
         {
           "status": 403,
           "contentType": "application/json",
           "schema": "EnvironmentScopeRequiredError",
-          "fingerprint": "602b9ab896e06ff4bcdac4df75d694e1c6e8e45c0a1a66df4fe21f2617c7b396"
+          "fingerprint": "68a57af6244a95a76a7c1f21cfd8dc0de362a3926986dd3ac5461465e1c78e99"
         },
         {
           "status": 500,
           "contentType": "application/json",
           "schema": "EnvironmentInternalError",
-          "fingerprint": "2907e4e2d5e721642dc38d6343fd9ba2a421922880f03d0531715900ef4b8b28"
+          "fingerprint": "34acb16b174e2da13f6082cf3afe41a45e80e41816f7fe6eb7a1173ee015ea53"
         }
       ]
     },
@@ -349,7 +349,7 @@
         {
           "contentType": "application/json",
           "schema": "Objects",
-          "fingerprint": "f3962c1644924035c8cd2db9628c43ebd93c08ad5bdfdba4dac4d242fe9c2968"
+          "fingerprint": "a8354ab7d72a4621971144df33ba2068730f7c235e19b12934f787f407f28bfc"
         }
       ],
       "successes": [
@@ -365,19 +365,19 @@
           "status": 401,
           "contentType": "application/json",
           "schema": "EnvironmentAuthInvalidError",
-          "fingerprint": "fb39b2fefb6cc89c7a61b6888eaf5188dcbd5f8a9192746e6edf302f321f7eff"
+          "fingerprint": "c039e5b3393bc4ce03005ce34ceffb1518a878ae4d3d2b6af25cb52e5cfd1ca4"
         },
         {
           "status": 403,
           "contentType": "application/json",
           "schema": "EnvironmentScopeRequiredError",
-          "fingerprint": "602b9ab896e06ff4bcdac4df75d694e1c6e8e45c0a1a66df4fe21f2617c7b396"
+          "fingerprint": "68a57af6244a95a76a7c1f21cfd8dc0de362a3926986dd3ac5461465e1c78e99"
         },
         {
           "status": 500,
           "contentType": "application/json",
           "schema": "EnvironmentInternalError",
-          "fingerprint": "2907e4e2d5e721642dc38d6343fd9ba2a421922880f03d0531715900ef4b8b28"
+          "fingerprint": "34acb16b174e2da13f6082cf3afe41a45e80e41816f7fe6eb7a1173ee015ea53"
         }
       ]
     },
@@ -392,7 +392,7 @@
           "status": 200,
           "contentType": "application/json",
           "schema": "Arrays",
-          "fingerprint": "2651973cc372be687bb3c0ba3c46eae4c32719a0a9f04e86e2828bdac2662023"
+          "fingerprint": "e24acfdbfeda1240bcf9e43fff90feba1c7b2ecee4049c8787fd2db68e9349af"
         }
       ],
       "errors": [
@@ -400,19 +400,19 @@
           "status": 401,
           "contentType": "application/json",
           "schema": "EnvironmentAuthInvalidError",
-          "fingerprint": "fb39b2fefb6cc89c7a61b6888eaf5188dcbd5f8a9192746e6edf302f321f7eff"
+          "fingerprint": "c039e5b3393bc4ce03005ce34ceffb1518a878ae4d3d2b6af25cb52e5cfd1ca4"
         },
         {
           "status": 403,
           "contentType": "application/json",
           "schema": "EnvironmentScopeRequiredError",
-          "fingerprint": "602b9ab896e06ff4bcdac4df75d694e1c6e8e45c0a1a66df4fe21f2617c7b396"
+          "fingerprint": "68a57af6244a95a76a7c1f21cfd8dc0de362a3926986dd3ac5461465e1c78e99"
         },
         {
           "status": 500,
           "contentType": "application/json",
           "schema": "EnvironmentInternalError",
-          "fingerprint": "2907e4e2d5e721642dc38d6343fd9ba2a421922880f03d0531715900ef4b8b28"
+          "fingerprint": "34acb16b174e2da13f6082cf3afe41a45e80e41816f7fe6eb7a1173ee015ea53"
         }
       ]
     },
@@ -425,7 +425,7 @@
         {
           "contentType": "application/json",
           "schema": "Objects",
-          "fingerprint": "df394b76d7c613720315f6e8ebae96fcda7d7f702a15b058c4417f234b142e58"
+          "fingerprint": "cb68e46e5954dec265e583f98a3bedbcdd9b19e81599793a98d8d6a6f6659a97"
         }
       ],
       "successes": [
@@ -441,25 +441,25 @@
           "status": 401,
           "contentType": "application/json",
           "schema": "EnvironmentAuthInvalidError",
-          "fingerprint": "fb39b2fefb6cc89c7a61b6888eaf5188dcbd5f8a9192746e6edf302f321f7eff"
+          "fingerprint": "c039e5b3393bc4ce03005ce34ceffb1518a878ae4d3d2b6af25cb52e5cfd1ca4"
         },
         {
           "status": 403,
           "contentType": "application/json",
           "schema": "EnvironmentOperationForbiddenError",
-          "fingerprint": "e8b11e33d2cdcac5fc486fe450a0b64ae216f125f5f8130d6b11799fdc2dfef2"
+          "fingerprint": "6b958e53586d02b5c106f20748b3083bb5395e186ee5519bfcbe94283190ec11"
         },
         {
           "status": 403,
           "contentType": "application/json",
           "schema": "EnvironmentScopeRequiredError",
-          "fingerprint": "602b9ab896e06ff4bcdac4df75d694e1c6e8e45c0a1a66df4fe21f2617c7b396"
+          "fingerprint": "68a57af6244a95a76a7c1f21cfd8dc0de362a3926986dd3ac5461465e1c78e99"
         },
         {
           "status": 500,
           "contentType": "application/json",
           "schema": "EnvironmentInternalError",
-          "fingerprint": "2907e4e2d5e721642dc38d6343fd9ba2a421922880f03d0531715900ef4b8b28"
+          "fingerprint": "34acb16b174e2da13f6082cf3afe41a45e80e41816f7fe6eb7a1173ee015ea53"
         }
       ]
     },
@@ -474,7 +474,7 @@
           "status": 200,
           "contentType": "application/json",
           "schema": "Objects",
-          "fingerprint": "5c8e12709c12b1392d85c6bc70ebc4a2a2d3ec27d4bdcb485834573ad01dafd0"
+          "fingerprint": "44ab35c4f14cc27baaa50602f785cab876b05485e2a593a850432a77fd62840f"
         }
       ],
       "errors": [
@@ -482,19 +482,19 @@
           "status": 401,
           "contentType": "application/json",
           "schema": "EnvironmentAuthInvalidError",
-          "fingerprint": "fb39b2fefb6cc89c7a61b6888eaf5188dcbd5f8a9192746e6edf302f321f7eff"
+          "fingerprint": "c039e5b3393bc4ce03005ce34ceffb1518a878ae4d3d2b6af25cb52e5cfd1ca4"
         },
         {
           "status": 403,
           "contentType": "application/json",
           "schema": "EnvironmentScopeRequiredError",
-          "fingerprint": "602b9ab896e06ff4bcdac4df75d694e1c6e8e45c0a1a66df4fe21f2617c7b396"
+          "fingerprint": "68a57af6244a95a76a7c1f21cfd8dc0de362a3926986dd3ac5461465e1c78e99"
         },
         {
           "status": 500,
           "contentType": "application/json",
           "schema": "EnvironmentInternalError",
-          "fingerprint": "2907e4e2d5e721642dc38d6343fd9ba2a421922880f03d0531715900ef4b8b28"
+          "fingerprint": "34acb16b174e2da13f6082cf3afe41a45e80e41816f7fe6eb7a1173ee015ea53"
         }
       ]
     }
@@ -504,35 +504,35 @@
       "schema": "EnvironmentRequestInvalidError",
       "status": 400,
       "contentType": "application/json",
-      "fingerprint": "5e70b4b5f968528645fd25c426988023641a5266ab976d12672d25f9d4ce11a5",
+      "fingerprint": "c17879c795c3f9e092ced6a9ac3fa2f0ea85c4370d062c84d68ec03c1bd2e3c3",
       "fixture": "errors/request-invalid.json"
     },
     {
       "schema": "EnvironmentAuthInvalidError",
       "status": 401,
       "contentType": "application/json",
-      "fingerprint": "fb39b2fefb6cc89c7a61b6888eaf5188dcbd5f8a9192746e6edf302f321f7eff",
+      "fingerprint": "c039e5b3393bc4ce03005ce34ceffb1518a878ae4d3d2b6af25cb52e5cfd1ca4",
       "fixture": "errors/auth-invalid.json"
     },
     {
       "schema": "EnvironmentScopeRequiredError",
       "status": 403,
       "contentType": "application/json",
-      "fingerprint": "602b9ab896e06ff4bcdac4df75d694e1c6e8e45c0a1a66df4fe21f2617c7b396",
+      "fingerprint": "68a57af6244a95a76a7c1f21cfd8dc0de362a3926986dd3ac5461465e1c78e99",
       "fixture": "errors/scope-required.json"
     },
     {
       "schema": "EnvironmentOperationForbiddenError",
       "status": 403,
       "contentType": "application/json",
-      "fingerprint": "e8b11e33d2cdcac5fc486fe450a0b64ae216f125f5f8130d6b11799fdc2dfef2",
+      "fingerprint": "6b958e53586d02b5c106f20748b3083bb5395e186ee5519bfcbe94283190ec11",
       "fixture": "errors/operation-forbidden.json"
     },
     {
       "schema": "EnvironmentInternalError",
       "status": 500,
       "contentType": "application/json",
-      "fingerprint": "2907e4e2d5e721642dc38d6343fd9ba2a421922880f03d0531715900ef4b8b28",
+      "fingerprint": "34acb16b174e2da13f6082cf3afe41a45e80e41816f7fe6eb7a1173ee015ea53",
       "fixture": "errors/internal.json"
     }
   ],
@@ -614,35 +614,35 @@
     }
   },
   "schemaFingerprints": {
-    "AuthAccessTokenResult": "3db33c54a80ebf36469669c4558d4a000441bf839c4debc0098656cb2986f979",
-    "AuthBrowserSessionRequest": "ce857515bdf6a6328a36c6df7692846f6fbc386271da6973f6a03df39c933e44",
-    "AuthBrowserSessionResult": "39abbe3526341131c33f73525739e84b4949ae9dba0abb1293359bec43dc5e90",
-    "AuthCancelPairingOfferInput": "01c5b2929a2d618087a1aeb429dd116735a50933ba2670b03dc61de05c764433",
-    "AuthClientSession": "e2402f16655d3c72d1f22aabfd0bbf7b85143ac0d0b9f0b4894aaaa13dfcc023",
-    "AuthClientSessionList": "4a5baec8f9d5a5f9492f76418765dadeb800268c26ce2f2cf0ea0f7d0a944b51",
+    "AuthAccessTokenResult": "5613fc9bb53361b3d2cb102a1eb07e1b3ef343a928fc2fcf1a1df5a8ef7d6305",
+    "AuthBrowserSessionRequest": "5fa222e7d1f96f69cd3cb8bcd0a68556c268c62a7ccfa0e15527be2498d4f139",
+    "AuthBrowserSessionResult": "7d9e322c9e633e94fe223d3772ed0db418c5386e022fd96016bd68e1415ba0ea",
+    "AuthCancelPairingOfferInput": "4e2b3830f8e23e5dcace204bf1a8246491b404ee5a7693973b1ec145e2218d5b",
+    "AuthClientSession": "50b80381fde740b5e53190602f9d541bdb99f5507d38ef86b7cdc7b60e9629a1",
+    "AuthClientSessionList": "4c5d12ae25bd121328f6d1c49e5ace5d7da0b7e16435947eab399ee6299a778e",
     "AuthClientSessionRevokeResult": "05d17a2888c1709c4f6b9e770d007efd2cbc584ddbe7e5a9278d99854b045a18",
-    "AuthCreatePairingCredentialInput": "f939406bebaf0bfbca1c2f7a5b7e8f89ce375161b077434e05327d1913e1647a",
-    "AuthCreatePairingOfferInput": "5d0dd91b07382261ca45335d7497774cae8ddf48667729f20fa285498dd76042",
+    "AuthCreatePairingCredentialInput": "4e4f32f9a4ce5796dc5f70b2572d51186a2ffdd506280e8bef7bda70f06b28aa",
+    "AuthCreatePairingOfferInput": "c56fa580bb2ba4e10d460d227a9374a2e65a6524d03cd31f79b899508cc8b910",
     "AuthEnvironmentScope": "0075f3b8e58d5c596cb62b1fab337228db16942bc03be9685fafa11f5aa8b08d",
     "AuthEnvironmentScopes": "c80c09a9ed11b43aa331fd500b6a7bba484dd93cfef92c7a014bb9812f3b4989",
-    "AuthOtherClientSessionsRevokeResult": "5c8e12709c12b1392d85c6bc70ebc4a2a2d3ec27d4bdcb485834573ad01dafd0",
-    "AuthPairingCredentialResult": "57232db62fd57bd4c2dd35776b84fe2d264254d50ec46efd65ebe10436b4f8e0",
-    "AuthPairingLink": "b1fbdcb84a2cb5fe669e0b40925a9148b307f83785d103899ef4c9bbbace560f",
-    "AuthPairingLinkList": "8d97c692592cb80e7e4953113ae60b0290636657d54fde778c5b01461a00050a",
+    "AuthOtherClientSessionsRevokeResult": "44ab35c4f14cc27baaa50602f785cab876b05485e2a593a850432a77fd62840f",
+    "AuthPairingCredentialResult": "3cdb01d7a8383a8091e5e6829a5c83d0a64f250e2a06ab6f5f03de8746c9a44b",
+    "AuthPairingLink": "d5bc462d56c95591013083fa03e57f7f8396da8e86cba03e479a9d9cd67ae0b9",
+    "AuthPairingLinkList": "d2edc5770c2397cb2f21b894b84365771c47bbb3740a4922688e77f0012dc36b",
     "AuthPairingLinkRevokeResult": "05d17a2888c1709c4f6b9e770d007efd2cbc584ddbe7e5a9278d99854b045a18",
     "AuthPairingOfferCancellationResult": "a44ddf882651be30f045f99197fab6f26c0440e5725a12246fb1116b85d71e51",
-    "AuthPairingOfferResult": "c7167a19d245abb4c09550e140f3043f8d95fd56ceaf81c9c3ec4070056ca27e",
-    "AuthRevokeClientSessionInput": "df394b76d7c613720315f6e8ebae96fcda7d7f702a15b058c4417f234b142e58",
-    "AuthRevokePairingLinkInput": "f3962c1644924035c8cd2db9628c43ebd93c08ad5bdfdba4dac4d242fe9c2968",
-    "AuthSessionState": "7c7433c4e7469f73ff94c1f8e9ae52ad2441eeed5fe96ecbe3bee1651b2c3a7e",
-    "AuthShareStateResult": "cc185e3dd26263e680c92ff718c22e38072fed479c53382099c526f77f3431e5",
-    "AuthTokenExchangeRequest": "746432a74986642eee5a4f4c32fbab9d666642bf3247b3f4955610e9683d4de7",
-    "AuthWebSocketTicketResult": "4d4b514499bf6373a0812f5defaf5b880acb5d42ce3e057da68f5ab9c5c36a84",
-    "EnvironmentAuthInvalidError": "fb39b2fefb6cc89c7a61b6888eaf5188dcbd5f8a9192746e6edf302f321f7eff",
-    "EnvironmentInternalError": "2907e4e2d5e721642dc38d6343fd9ba2a421922880f03d0531715900ef4b8b28",
-    "EnvironmentOperationForbiddenError": "e8b11e33d2cdcac5fc486fe450a0b64ae216f125f5f8130d6b11799fdc2dfef2",
-    "EnvironmentRequestInvalidError": "5e70b4b5f968528645fd25c426988023641a5266ab976d12672d25f9d4ce11a5",
-    "EnvironmentScopeRequiredError": "602b9ab896e06ff4bcdac4df75d694e1c6e8e45c0a1a66df4fe21f2617c7b396"
+    "AuthPairingOfferResult": "204a09ae4135e9931a3d83bf86e250680ca36fd5aae1fdde3a461896322a0bbe",
+    "AuthRevokeClientSessionInput": "cb68e46e5954dec265e583f98a3bedbcdd9b19e81599793a98d8d6a6f6659a97",
+    "AuthRevokePairingLinkInput": "a8354ab7d72a4621971144df33ba2068730f7c235e19b12934f787f407f28bfc",
+    "AuthSessionState": "d680396017d336a258767b26c86473b60657ed781e0c41ab42273296ad5c080a",
+    "AuthShareStateResult": "e645f10d7f5d7cf0c5fb1904a7803fe517309d18ef83926efd10e76273d679c9",
+    "AuthTokenExchangeRequest": "31ab72982e61a1d0431787d3a833b2ca932358f65a45822629a3ec1663321633",
+    "AuthWebSocketTicketResult": "bdaf306908553902221f7e52e7febb43db6827353c40ff572ce058ba88ec1127",
+    "EnvironmentAuthInvalidError": "c039e5b3393bc4ce03005ce34ceffb1518a878ae4d3d2b6af25cb52e5cfd1ca4",
+    "EnvironmentInternalError": "34acb16b174e2da13f6082cf3afe41a45e80e41816f7fe6eb7a1173ee015ea53",
+    "EnvironmentOperationForbiddenError": "6b958e53586d02b5c106f20748b3083bb5395e186ee5519bfcbe94283190ec11",
+    "EnvironmentRequestInvalidError": "c17879c795c3f9e092ced6a9ac3fa2f0ea85c4370d062c84d68ec03c1bd2e3c3",
+    "EnvironmentScopeRequiredError": "68a57af6244a95a76a7c1f21cfd8dc0de362a3926986dd3ac5461465e1c78e99"
   },
   "fixtures": [
     "errors/auth-invalid.json",

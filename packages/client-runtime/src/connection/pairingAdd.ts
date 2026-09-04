@@ -43,7 +43,7 @@ export type PairingAddFailureReason =
   | "duplicate-storage-identity"
   | "local-persistence-failed";
 
-export class PairingAddError extends Schema.TaggedErrorClass<PairingAddError>()("PairingAddError", {
+export class PairingAddError extends Schema.TaggedError<PairingAddError>()("PairingAddError", {
   reason: Schema.Literals([
     "unreachable",
     "host-identity-mismatch",
@@ -59,7 +59,7 @@ export class PairingAddError extends Schema.TaggedErrorClass<PairingAddError>()(
   }
 }
 
-export class PairingLoopbackAcknowledgementRequiredError extends Schema.TaggedErrorClass<PairingLoopbackAcknowledgementRequiredError>()(
+export class PairingLoopbackAcknowledgementRequiredError extends Schema.TaggedError<PairingLoopbackAcknowledgementRequiredError>()(
   "PairingLoopbackAcknowledgementRequiredError",
   { endpoint: Schema.String },
 ) {
@@ -149,11 +149,8 @@ const pairingBearerProof = (
     }),
     Stream.runHead,
     Effect.timeoutOption(Duration.millis(PAIRING_BEARER_PROOF_TIMEOUT_MS)),
-    Effect.map(
-      (outcome): PairingBearerProof =>
-        Option.isSome(outcome) && Option.isSome(outcome.value)
-          ? outcome.value.value
-          : "inconclusive",
+    Effect.map((outcome): PairingBearerProof =>
+      Option.isSome(outcome) && Option.isSome(outcome.value) ? outcome.value.value : "inconclusive",
     ),
     Effect.orElseSucceed((): PairingBearerProof => "inconclusive"),
   );

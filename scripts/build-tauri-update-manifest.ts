@@ -35,7 +35,7 @@ export interface TauriUpdateManifest {
   >;
 }
 
-export class TauriUpdateManifestLayoutError extends Schema.TaggedErrorClass<TauriUpdateManifestLayoutError>()(
+export class TauriUpdateManifestLayoutError extends Schema.TaggedError<TauriUpdateManifestLayoutError>()(
   "TauriUpdateManifestLayoutError",
   { message: Schema.String },
 ) {}

@@ -42,6 +42,7 @@ const outputDirectory = NodePath.resolve(import.meta.dirname, "../fixtures/rpc-w
 const manifestPath = NodePath.join(outputDirectory, "manifest.json");
 
 interface RpcManifest {
+  readonly protocolVersion: string;
   readonly methods: ReadonlyArray<{ readonly name: string; readonly mode: string }>;
   readonly streamMethodCount: number;
   readonly expectedTopLevelStreamShapes: number;
@@ -98,6 +99,7 @@ describe("RPC wire fixture exporter", () => {
       },
     ]);
     expect(manifest.methods).toHaveLength(115);
+    expect(manifest.protocolVersion).toBe("effect-4.0.0-beta.107");
     expect(manifest.methods.filter(({ mode }) => mode === "stream")).toHaveLength(20);
     expect(manifest.streamMethodCount).toBe(20);
     expect(manifest.expectedTopLevelStreamShapes).toBe(70);

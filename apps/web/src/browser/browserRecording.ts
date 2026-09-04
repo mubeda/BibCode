@@ -10,7 +10,7 @@ import { previewBridge } from "~/components/preview/previewBridge";
 import { appAtomRegistry } from "~/rpc/atomRegistry";
 import { useBrowserSurfaceStore } from "./browserSurfaceStore";
 
-export class BrowserRecordingUnavailableError extends Schema.TaggedErrorClass<BrowserRecordingUnavailableError>()(
+export class BrowserRecordingUnavailableError extends Schema.TaggedError<BrowserRecordingUnavailableError>()(
   "BrowserRecordingUnavailableError",
   {
     tabId: Schema.String,
@@ -21,7 +21,7 @@ export class BrowserRecordingUnavailableError extends Schema.TaggedErrorClass<Br
   }
 }
 
-export class BrowserRecordingConflictError extends Schema.TaggedErrorClass<BrowserRecordingConflictError>()(
+export class BrowserRecordingConflictError extends Schema.TaggedError<BrowserRecordingConflictError>()(
   "BrowserRecordingConflictError",
   {
     requestedTabId: Schema.String,
@@ -33,7 +33,7 @@ export class BrowserRecordingConflictError extends Schema.TaggedErrorClass<Brows
   }
 }
 
-export class BrowserRecordingCanvasUnavailableError extends Schema.TaggedErrorClass<BrowserRecordingCanvasUnavailableError>()(
+export class BrowserRecordingCanvasUnavailableError extends Schema.TaggedError<BrowserRecordingCanvasUnavailableError>()(
   "BrowserRecordingCanvasUnavailableError",
   {
     tabId: Schema.String,
@@ -46,7 +46,7 @@ export class BrowserRecordingCanvasUnavailableError extends Schema.TaggedErrorCl
   }
 }
 
-export class BrowserRecordingRequiresVisibleTabError extends Schema.TaggedErrorClass<BrowserRecordingRequiresVisibleTabError>()(
+export class BrowserRecordingRequiresVisibleTabError extends Schema.TaggedError<BrowserRecordingRequiresVisibleTabError>()(
   "BrowserRecordingRequiresVisibleTabError",
   {
     tabId: Schema.String,
@@ -57,7 +57,7 @@ export class BrowserRecordingRequiresVisibleTabError extends Schema.TaggedErrorC
   }
 }
 
-export class BrowserRecordingOperationError extends Schema.TaggedErrorClass<BrowserRecordingOperationError>()(
+export class BrowserRecordingOperationError extends Schema.TaggedError<BrowserRecordingOperationError>()(
   "BrowserRecordingOperationError",
   {
     operation: Schema.Literals([
