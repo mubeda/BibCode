@@ -5407,11 +5407,13 @@ describe("ChatView banners and dialogs", () => {
       connectionId: "remote:server",
       environmentId,
       label: "Remote server",
+      serverEnvironmentId: null,
     });
     const wslTarget = new BearerConnectionTarget({
       connectionId: desktopLocalConnectionId("wsl:Ubuntu"),
       environmentId,
       label: "WSL: Ubuntu",
+      serverEnvironmentId: null,
     });
 
     const macRemoteBanner = unavailableBannerActions({

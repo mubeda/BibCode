@@ -14,6 +14,17 @@ environment identity.
 - `environmentId` is the stable logical routing identity. URLs, tunnel
   hostnames, SSH ports, and labels may change without creating a new logical
   environment, but this ID alone does not identify its persistent store.
+- A server's _declared_ environment id is not unique across hosts: every server
+  declares `"local"` unless configured otherwise. A client therefore keys a
+  saved remote by that host's `storageInstanceId` — `remote:<uuid>` — so a
+  paired server can never collide with the client's own local environment or
+  with another saved remote. `BearerConnectionTarget.serverEnvironmentId`
+  keeps the host's declared id beside it, and the resolver checks the endpoint
+  still reports that value on every connect. Entries saved before the two were
+  separated carry the declared id in `environmentId` and read `null` here, so
+  the fallback resolves them unchanged. SSH and desktop-local targets keep
+  taking their ids from the desktop bridge. See
+  `docs/plans/remote-servers/2026-09-04-paired-remote-environment-identity.md`.
 - Current servers expose the persistent store UUID as `storageInstanceId` on
   direct and BiBCode Connect descriptors. New clients decode an omitted field
   from an older or third-party server as `null`.

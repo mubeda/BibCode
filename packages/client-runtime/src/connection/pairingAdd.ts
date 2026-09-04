@@ -33,6 +33,7 @@ import {
   type PreparedConnection,
 } from "./model.ts";
 import * as EnvironmentRegistry from "./registry.ts";
+import { remoteEnvironmentId } from "./remoteIdentity.ts";
 import { storageIdentityTargetKey } from "./storageIdentity.ts";
 
 export type PairingAddFailureReason =
@@ -213,6 +214,10 @@ export const verifyAndAddPairingCode = Effect.fn(
   const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
   const identities = yield* Persistence.AcceptedStorageIdentityStore;
   const entries = yield* SubscriptionRef.get(registry.entries);
+  // Keyed by the host's storage instance id, never by the environment id it
+  // declares: every server calls itself "local", so that id collides with the
+  // client's own Local environment and with every other saved remote.
+  const environmentId = remoteEnvironmentId(payload.storageInstanceId);
   for (const entry of entries.values()) {
     const accepted = yield* identities.get(storageIdentityTargetKey(entry.target));
     if (Option.isSome(accepted) && accepted.value === payload.storageInstanceId) {
@@ -238,10 +243,11 @@ export const verifyAndAddPairingCode = Effect.fn(
     }),
   );
 
-  if (entries.has(descriptor.environmentId)) {
+  const saved = entries.get(environmentId);
+  if (saved !== undefined) {
     return yield* new PairingAddError({
       reason: "duplicate-storage-identity",
-      detail: `${descriptor.label} is already saved.`,
+      detail: `${saved.target.label} is already saved.`,
     });
   }
 
@@ -257,14 +263,15 @@ export const verifyAndAddPairingCode = Effect.fn(
   }
 
   const sessions = yield* RpcSession.RpcSessionFactory;
-  const connectionId = `bearer:${descriptor.environmentId}`;
+  const connectionId = `bearer:${environmentId}`;
   const target = new BearerConnectionTarget({
-    environmentId: descriptor.environmentId,
+    environmentId,
     label: payload.name,
     connectionId,
+    serverEnvironmentId: descriptor.environmentId,
   });
   const prepared: PreparedConnection = {
-    environmentId: descriptor.environmentId,
+    environmentId,
     label: payload.name,
     descriptor,
     httpBaseUrl,
@@ -309,7 +316,7 @@ export const verifyAndAddPairingCode = Effect.fn(
       }
       const verified = {
         credential: authenticated.credential,
-        environmentId: descriptor.environmentId,
+        environmentId,
         storageInstanceId: authenticated.storageInstanceId,
       };
       const registration = new BearerConnectionRegistration({

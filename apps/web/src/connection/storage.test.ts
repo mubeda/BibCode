@@ -280,6 +280,7 @@ function bearerRegistration(): BearerConnectionRegistration {
       environmentId,
       label: "Bearer backend",
       connectionId,
+      serverEnvironmentId: null,
     }),
     profile: new BearerConnectionProfile({
       connectionId,
@@ -1877,6 +1878,7 @@ describe("connectionStorageLayer", () => {
         environmentId,
         label: "Replacement backend",
         connectionId,
+        serverEnvironmentId: null,
       }),
       profile: new BearerConnectionProfile({
         connectionId,
