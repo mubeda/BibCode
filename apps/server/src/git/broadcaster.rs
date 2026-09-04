@@ -3622,6 +3622,14 @@ mod tests {
             .await
             .expect("initial remote status scan starts")
             .expect("remote status checkpoint owner remains alive");
+        let remote_owner_cancellation = broadcaster
+            .lock_state()
+            .repositories
+            .get(&canonical_repository)
+            .expect("active repository lifecycle remains registered")
+            .poller_cancellation
+            .clone();
+        assert!(!remote_owner_cancellation.is_cancelled());
 
         fs::write(repository.join("tracked.txt"), "changed in editor\n")
             .expect("mutate tracked fixture file");
@@ -3644,18 +3652,21 @@ mod tests {
 
         drop(subscription);
         assert_eq!(broadcaster.active_poller_count(), 0);
-        // Await the cancellation before releasing the blocking permit: a
-        // permit offered first lets the runner leave through its release
-        // branch instead of cancellation, and a non-blocking read can observe
-        // the channel before the cancelled owner has published to it.
-        tokio::time::timeout(Duration::from_secs(5), remote_cancelled_rx.recv())
-            .await
-            .expect("final subscriber drop cancels the blocked remote owner")
-            .expect("remote cancellation checkpoint owner remains alive");
+        assert!(
+            remote_owner_cancellation.is_cancelled(),
+            "final subscriber drop cancels the remote lifecycle synchronously"
+        );
+        // Make the runner's release branch ready only after the production
+        // owner has cancelled its lifecycle. Its biased select must still
+        // observe cancellation first, and the retirement wait joins that
+        // owner before the assertion inspects the checkpoint channel.
         release_remote.add_permits(1);
         broadcaster
             .await_retired_lifecycle(&canonical_repository)
             .await;
+        remote_cancelled_rx
+            .try_recv()
+            .expect("final subscriber drop cancels the blocked remote owner");
     }
 
     #[tokio::test(start_paused = true)]
