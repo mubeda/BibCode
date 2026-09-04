@@ -544,7 +544,7 @@ export const ServerSettingsOperation = Schema.Literals([
 ]);
 export type ServerSettingsOperation = typeof ServerSettingsOperation.Type;
 
-export class ServerSettingsError extends Schema.TaggedErrorClass<ServerSettingsError>()(
+export class ServerSettingsError extends Schema.TaggedError<ServerSettingsError>()(
   "ServerSettingsError",
   {
     settingsPath: Schema.String,
@@ -573,7 +573,7 @@ export const WorktreeWorkspaceFailure = Schema.Literals([
 ]);
 export type WorktreeWorkspaceFailure = typeof WorktreeWorkspaceFailure.Type;
 
-export class WorktreeWorkspaceError extends Schema.TaggedErrorClass<WorktreeWorkspaceError>()(
+export class WorktreeWorkspaceError extends Schema.TaggedError<WorktreeWorkspaceError>()(
   "WorktreeWorkspaceError",
   {
     path: Schema.String,

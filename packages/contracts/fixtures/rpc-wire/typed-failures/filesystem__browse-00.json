@@ -10,7 +10,7 @@
           "_tag": "FilesystemBrowseError",
           "platform": "__defi",
           "message": "x\"",
-          "cause": "undefined"
+          "cause": null
         }
       }
     ]

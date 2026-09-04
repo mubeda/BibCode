@@ -27,6 +27,14 @@ These three values are public build-time configuration, not secrets. Web and
 desktop builds omit Connect UI unless all three are valid. A built desktop
 artifact does not need an environment file at runtime.
 
+The publishable-key parser accepts only canonical lowercase ASCII DNS names
+for Clerk's Frontend API. It rejects Unicode input, URL-normalized spellings,
+and every `xn--` A-label before constructing a URL so browser and operating-
+system WebView IDNA differences cannot widen the trusted host. This conservative
+rule means IDN custom Clerk Frontend API domains, including valid Punycode
+spellings, are unsupported until BiBCode has one deterministic cross-runtime
+IDNA validator.
+
 Never expose `CLERK_SECRET_KEY` in a client environment, desktop artifact, or
 repository file.
 

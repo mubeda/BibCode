@@ -104,7 +104,16 @@ const documentedPredecessorPattern = new RegExp(
 function projectFiles(): string[] {
   return NodeChildProcess.execFileSync(
     "git",
-    ["ls-files", "--cached", "--others", "--exclude-standard"],
+    [
+      "ls-files",
+      "--cached",
+      "--others",
+      "--exclude-standard",
+      "--",
+      ".",
+      ":(exclude).repos/**",
+      ":(exclude).tmp/**",
+    ],
     { cwd: REPOSITORY_ROOT, encoding: "utf8" },
   )
     .split(/\r?\n/u)

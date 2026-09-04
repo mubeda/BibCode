@@ -1,5 +1,70 @@
 # Changelog
 
+## [v0.5.6] - 2026-09-04
+
+BiBCode v0.5.6 is a supported dependency and toolchain convergence release. It
+moves the web, desktop, server, relay, and repository tooling onto one reviewed
+set of current compatible versions while preserving the native Rust/Tauri
+runtime and the existing browser/desktop RPC boundary.
+
+### Toolchains and frontend foundations
+
+- Standardized development on Node.js 26.8.1, pnpm 11.25.0, Rust/Cargo 1.98.0,
+  Vite+ 0.3.0, Vite 8.2.2, and the single Vitest 4.1.11 runtime supplied by
+  Vite+. The main workspace now uses TypeScript 7.0.2; the Astro marketing app
+  remains on TypeScript 6.0.3 until its public checker supports TypeScript 7.
+- Updated React and React DOM to 19.2.8 with matching types, and refreshed the
+  Base UI, Lexical, TanStack, fonts, icons, DOM test runtime, and other
+  maintained frontend dependencies as compatible cohorts.
+- Moved Pierre Diffs to stable 1.3.6 and its public editing API, removed the
+  retired Pierre prerelease patch, and retained diff review, partial staging,
+  editor history, undo, and conversation rendering behavior.
+
+### Runtime and dependency compatibility
+
+- Converged Effect core and its selected v4 companions on
+  `4.0.0-beta.107`. Alchemy remains on the newest compatible beta.72 release,
+  paired with the exact Drizzle ORM and Kit RC5 build required by that train,
+  avoiding the incompatible Effect RC.112 split.
+- Updated the supported Rust and Tauri dependency floors under Rust 1.98,
+  including the source compatibility repairs required by the new compiler and
+  libraries. The application remains a native Rust/Tauri desktop and server
+  runtime; no production Node.js service or Electron host was introduced.
+- Retained WebdriverIO 9.29 and the Tauri automation service/plugin 1.2 cohort.
+  The 1.3 line remains blocked until upstream fixes teardown ordering and aligns
+  its globals/expect dependency train.
+
+### Reliability, security, and maintenance
+
+- Reworked vendored-reference synchronization into an exact,
+  history-independent snapshot transaction. Linked worktrees share one writer
+  lock; literal Git paths, pruning, casing, and file modes are preserved; and
+  typed failures, defects, interruption, and timed rollback all quiesce their
+  child processes before recovery advances. An unverifiable recovery keeps the
+  lock for explicit repair instead of exposing partial state.
+- Refreshed the exact Effect and Alchemy reference snapshots and made the
+  dependency ledger declaration-complete: 221 audited entries, no pending row,
+  and no unaccounted direct dependency or toolchain declaration.
+- Hardened Clerk frontend-domain validation by rejecting malformed or
+  unsupported Punycode labels before URL construction. Valid IDN custom Clerk
+  domains remain unsupported until BiBCode owns one deterministic
+  cross-runtime IDNA validator.
+- Updated immutable GitHub Actions pins, release/test contracts, native port
+  probing, process-watchdog coverage, raw Git parsing, and repository identity
+  checks used by the cross-platform build and packaged-test paths.
+
+### Supported release assets
+
+- Desktop installers for macOS 11+ on Apple Silicon and Intel, Linux on ARM64
+  and x64, and Windows 11 ARM64 plus Windows 10/11 x64.
+- Standalone server archives for all six OS/architecture targets, plus ARM64
+  and x64 Debian and RPM packages and `bibcode-server-SHA256SUMS`.
+- Signed updater payloads and a six-target `latest.json` manifest for the
+  stable in-app update channel. macOS applications remain ad-hoc signed and
+  unnotarized, and Windows installers remain without Authenticode.
+
+**Full Changelog**: https://github.com/mubeda/BibCode/compare/v0.5.5...v0.5.6
+
 ## [v0.5.5] - 2026-09-04
 
 BiBCode v0.5.5 fixes desktop pairing: **Add Server** refused every pairing code

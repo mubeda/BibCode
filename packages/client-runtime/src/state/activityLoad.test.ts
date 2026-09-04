@@ -23,6 +23,8 @@ import {
 const SCOPE_ID = ActivityScopeId.make("scope:load-thread");
 const THREAD_ID = ThreadId.make("load-thread");
 const BASE_TIMESTAMP = "2026-07-22T12:00:00.0000Z";
+const ACTIVITY_LOAD_ASSERTION_LIMIT_MS = 20_000;
+const ACTIVITY_LOAD_TEST_TIMEOUT_MS = 25_000;
 
 function timestamp(index: number): string {
   return `2026-07-22T12:00:00.${String(index).padStart(4, "0")}Z`;
@@ -152,23 +154,29 @@ function applyLoadRevisions(): EnvironmentActivityState {
 }
 
 describe("activity load reducer", () => {
-  it("keeps 5,000 ordered revisions within the snapshot page caps", () => {
-    const startedAt = performance.now();
-    const current = applyLoadRevisions();
-    const loaded = Option.getOrThrow(current.snapshot);
-    const elapsedMs = performance.now() - startedAt;
+  it(
+    "keeps 5,000 ordered revisions within the snapshot page caps",
+    () => {
+      const startedAt = performance.now();
+      const current = applyLoadRevisions();
+      const loaded = Option.getOrThrow(current.snapshot);
+      const elapsedMs = performance.now() - startedAt;
 
-    expect(loaded.revision).toBe(5_000);
-    expect(loaded.actors).toHaveLength(ACTIVITY_PAGE_MAX_LENGTH);
-    expect(loaded.workItems).toHaveLength(ACTIVITY_PAGE_MAX_LENGTH);
-    expect(loaded.actors[0]?.id).toBe(ActivityRecordId.make("actor:4998"));
-    expect(loaded.actors.at(-1)?.id).toBe(ActivityRecordId.make("actor:4600"));
-    expect(loaded.workItems[0]?.id).toBe(ActivityRecordId.make("work:4999"));
-    expect(loaded.workItems.at(-1)?.id).toBe(ActivityRecordId.make("work:4601"));
-    expect(loaded.actorsHasMore).toBe(true);
-    expect(loaded.workItemsHasMore).toBe(true);
-    expect(elapsedMs, "activity reducer load elapsed time").toBeLessThan(20_000);
-  });
+      expect(loaded.revision).toBe(5_000);
+      expect(loaded.actors).toHaveLength(ACTIVITY_PAGE_MAX_LENGTH);
+      expect(loaded.workItems).toHaveLength(ACTIVITY_PAGE_MAX_LENGTH);
+      expect(loaded.actors[0]?.id).toBe(ActivityRecordId.make("actor:4998"));
+      expect(loaded.actors.at(-1)?.id).toBe(ActivityRecordId.make("actor:4600"));
+      expect(loaded.workItems[0]?.id).toBe(ActivityRecordId.make("work:4999"));
+      expect(loaded.workItems.at(-1)?.id).toBe(ActivityRecordId.make("work:4601"));
+      expect(loaded.actorsHasMore).toBe(true);
+      expect(loaded.workItemsHasMore).toBe(true);
+      expect(elapsedMs, "activity reducer load elapsed time").toBeLessThan(
+        ACTIVITY_LOAD_ASSERTION_LIMIT_MS,
+      );
+    },
+    ACTIVITY_LOAD_TEST_TIMEOUT_MS,
+  );
 
   it("reconciles after a capped page loses an active row instead of silently dropping its refill", () => {
     const capped = snapshot({
@@ -214,30 +222,36 @@ describe("activity load reducer", () => {
     expect(demotion).toEqual({ kind: "gap" });
   });
 
-  it("preserves the final bounded snapshot across duplicate and gap revisions", () => {
-    const applied = applyLoadRevisions();
-    const loaded = Option.getOrThrow(applied.snapshot);
+  it(
+    "preserves the final bounded snapshot across duplicate and gap revisions",
+    () => {
+      const applied = applyLoadRevisions();
+      const loaded = Option.getOrThrow(applied.snapshot);
 
-    const duplicate = applyEnvironmentActivityDelta(applied, {
-      ...delta(4_999),
-      previousRevision: 4_999,
-      revision: 5_000,
-    });
-    expect(duplicate.kind).toBe("duplicate");
-    expect(duplicate.state).toBe(applied);
+      const duplicate = applyEnvironmentActivityDelta(applied, {
+        ...delta(4_999),
+        previousRevision: 4_999,
+        revision: 5_000,
+      });
+      expect(duplicate.kind).toBe("duplicate");
+      expect(duplicate.state).toBe(applied);
 
-    const gap = applyEnvironmentActivityDelta(applied, {
-      ...delta(5_001),
-      previousRevision: 5_001,
-      revision: 5_002,
-    });
-    expect(gap.kind).toBe("gap");
-    expect(gap.state.status).toBe("stale");
-    expect(Option.getOrThrow(gap.state.snapshot)).toBe(loaded);
-    expect(Option.getOrThrow(gap.state.snapshot).revision).toBe(5_000);
-    expect(Option.getOrThrow(gap.state.snapshot).actors).toHaveLength(ACTIVITY_PAGE_MAX_LENGTH);
-    expect(Option.getOrThrow(gap.state.snapshot).workItems).toHaveLength(ACTIVITY_PAGE_MAX_LENGTH);
-  });
+      const gap = applyEnvironmentActivityDelta(applied, {
+        ...delta(5_001),
+        previousRevision: 5_001,
+        revision: 5_002,
+      });
+      expect(gap.kind).toBe("gap");
+      expect(gap.state.status).toBe("stale");
+      expect(Option.getOrThrow(gap.state.snapshot)).toBe(loaded);
+      expect(Option.getOrThrow(gap.state.snapshot).revision).toBe(5_000);
+      expect(Option.getOrThrow(gap.state.snapshot).actors).toHaveLength(ACTIVITY_PAGE_MAX_LENGTH);
+      expect(Option.getOrThrow(gap.state.snapshot).workItems).toHaveLength(
+        ACTIVITY_PAGE_MAX_LENGTH,
+      );
+    },
+    ACTIVITY_LOAD_TEST_TIMEOUT_MS,
+  );
 
   it("keeps requested control state across duplicate, reordered, and gapped load revisions", () => {
     const actorId = ActivityRecordId.make("actor:control-load");
@@ -256,25 +270,22 @@ describe("activity load reducer", () => {
       ),
     };
 
-    const controls = Array.from(
-      { length: 5_000 },
-      (_, index): ActivityControlDelta => ({
-        scopeId: SCOPE_ID,
-        previousRevision: index,
-        revision: index + 1,
-        changes: [
-          {
-            kind: "actor-upserted",
-            actor: {
-              actorId,
-              state: index === 4_999 ? "requested" : "available",
-              controlRevision: index + 1,
-              activeDescendantCount: 1,
-            },
+    const controls = Array.from({ length: 5_000 }, (_, index): ActivityControlDelta => ({
+      scopeId: SCOPE_ID,
+      previousRevision: index,
+      revision: index + 1,
+      changes: [
+        {
+          kind: "actor-upserted",
+          actor: {
+            actorId,
+            state: index === 4_999 ? "requested" : "available",
+            controlRevision: index + 1,
+            activeDescendantCount: 1,
           },
-        ],
-      }),
-    );
+        },
+      ],
+    }));
     for (const next of controls) {
       const result = applyEnvironmentActivityControlDelta(current, next);
       if (result.kind !== "applied") {

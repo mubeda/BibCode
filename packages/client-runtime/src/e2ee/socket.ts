@@ -25,8 +25,8 @@ export const E2EE_HOST_IDENTITY_CLOSE_CODE = 4403;
 const EMPTY = new Uint8Array(0);
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
-const decodeJson = Schema.decodeUnknownSync(Schema.UnknownFromJsonString);
-const encodeJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
+const decodeJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
+const encodeJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
 export type E2eeFailureReason = "host-identity-mismatch" | "unauthorized" | "protocol" | "timeout";
 

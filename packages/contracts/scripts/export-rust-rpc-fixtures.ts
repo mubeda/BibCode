@@ -526,7 +526,7 @@ const encodeSchemaSample = (
   if (manualValue !== undefined) {
     return encodeAndValidate(manualValue);
   }
-  const arbitrary = Schema.toArbitrary(codec);
+  const arbitrary = Schema.toArbitrary(codec)(FastCheck);
   let lastError: unknown;
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const [sample] = FastCheck.sample(arbitrary, {
@@ -781,7 +781,7 @@ await NodeFSP.writeFile(
   manifestPath,
   `${JSON.stringify(
     {
-      protocolVersion: "effect-4.0.0-beta.78",
+      protocolVersion: "effect-4.0.0-beta.107",
       methods,
       streamMethodCount,
       expectedTopLevelStreamShapes: topLevelStreamShapeCount,

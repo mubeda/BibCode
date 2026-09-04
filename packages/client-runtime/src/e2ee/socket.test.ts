@@ -46,8 +46,8 @@ vi.mock("./noise.ts", async (importOriginal) => {
   };
 });
 
-const decodeJson = Schema.decodeUnknownSync(Schema.UnknownFromJsonString);
-const encodeJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
+const decodeJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
+const encodeJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
 const makeScriptedInnerSocket = (
   onFrame: (

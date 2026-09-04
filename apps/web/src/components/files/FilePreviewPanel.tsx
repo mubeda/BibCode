@@ -539,7 +539,7 @@ function EditableFileSurface({
   );
 
   return (
-    <EditProvider editor={session.editor}>
+    <EditProvider createEditor={() => session.editor}>
       <div ref={surfaceRef} className="flex min-h-0 flex-1">
         <Virtualizer
           className="file-preview-virtualizer min-h-0 flex-1 overflow-auto"
@@ -585,7 +585,7 @@ function EditableFileSurface({
               </div>
             )}
             className="min-h-full"
-            contentEditable
+            edit
           />
         </Virtualizer>
       </div>
@@ -865,7 +865,7 @@ export default function FilePreviewPanel({
         />
       ) : null}
       {relativePath && file.data?.truncated ? (
-        <div className="shrink-0 border-b border-amber-500/20 bg-amber-500/8 px-3 py-1.5 text-[11px] text-amber-700 dark:text-amber-300">
+        <div className="shrink-0 border-b border-amber-500/20 bg-amber-500/8 px-3 py-1.5 text-xs text-amber-700 dark:text-amber-300">
           Preview limited to the first 1 MB of a {file.data.byteLength.toLocaleString()} byte file.
         </div>
       ) : null}

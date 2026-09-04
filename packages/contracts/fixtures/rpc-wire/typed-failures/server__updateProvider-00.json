@@ -10,7 +10,7 @@
           "_tag": "ServerProviderUpdateError",
           "provider": "TO0_63",
           "reason": "call",
-          "cause": "undefined"
+          "cause": null
         }
       }
     ]
