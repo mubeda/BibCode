@@ -316,12 +316,26 @@ async fn dedicated_create_panel_and_retarget_resolve_workspace_authority_server_
                 .as_str()
         )
     );
-    let retargeted = fixture
-        .repositories
-        .get_thread("managed-thread".to_owned())
-        .await
-        .expect("retargeted owner read")
-        .expect("retargeted owner exists");
+    // The accepted receipt does not mean the owner row already carries the
+    // retargeted checkout: the catalog refreshes the branch on its own pass, so
+    // a generation bump can arrive before that write. Wait for the row to
+    // converge instead of sampling it once.
+    let retargeted = timeout(Duration::from_secs(10), async {
+        loop {
+            let thread = fixture
+                .repositories
+                .get_thread("managed-thread".to_owned())
+                .await
+                .expect("retargeted owner read")
+                .expect("retargeted owner exists");
+            if thread.branch.as_deref() == Some("feature/retarget-target") {
+                return thread;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("owner row records the retargeted branch");
     assert_eq!(
         retargeted.worktree_path.as_deref(),
         Some(target_path.as_str())
