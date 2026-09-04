@@ -111,7 +111,10 @@ desktop release. The workflow intentionally does not publish the upstream
 
 ## Signing And OS Trust
 
-macOS application bundles are signed with Tauri's ad-hoc `-` identity. This
+macOS bundles merge `apps/desktop/src-tauri/Info.plist`, which relaxes App
+Transport Security for web content only so the desktop can reach plain-HTTP
+remote servers on a LAN or tailnet, and declares the Local Network usage
+description. macOS application bundles are signed with Tauri's ad-hoc `-` identity. This
 seals the complete bundle so Gatekeeper can verify that it is intact, but it
 does not associate the app with an Apple Developer team or notarize it. Users
 must approve a browser-downloaded build through Settings > Privacy & Security.

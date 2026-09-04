@@ -8,6 +8,7 @@ import {
   ADD_SERVER_FAILURE_REASONS,
   countRunningThreadsForEnvironment,
   describeAddServerFailure,
+  resolvePairingAddFailureDetail,
   describeCompatBadge,
   formatServerVersionLabel,
   isLoopbackAcknowledgementRequired,
@@ -121,6 +122,36 @@ describe("add-server failure copy", () => {
     expect(describeAddServerFailure("host-identity-mismatch").detail).toContain(
       "revoke the incomplete attempt",
     );
+  });
+
+  it("names the saved entry a duplicate pairing collided with", () => {
+    expect(
+      describeAddServerFailure("duplicate-storage-identity", "ai-server is already saved.").detail,
+    ).toBe(
+      "ai-server is already saved. Reconnect or adopt the existing entry instead of adding a duplicate.",
+    );
+    expect(describeAddServerFailure("duplicate-storage-identity").detail).toContain(
+      "already uses this server's storage identity",
+    );
+  });
+
+  it("reads the detail off a PairingAddError and rejects everything else", () => {
+    expect(
+      resolvePairingAddFailureDetail({
+        _tag: "PairingAddError",
+        reason: "duplicate-storage-identity",
+        detail: "  ai-server is already saved.  ",
+      }),
+    ).toBe("ai-server is already saved.");
+    expect(
+      resolvePairingAddFailureDetail({
+        _tag: "PairingAddError",
+        reason: "duplicate-storage-identity",
+        detail: "   ",
+      }),
+    ).toBeNull();
+    expect(resolvePairingAddFailureDetail({ _tag: "SomethingElse", detail: "nope" })).toBeNull();
+    expect(resolvePairingAddFailureDetail(null)).toBeNull();
   });
 
   it("reads the reason off a PairingAddError and rejects everything else", () => {

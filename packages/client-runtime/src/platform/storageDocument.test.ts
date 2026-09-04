@@ -31,6 +31,7 @@ const BEARER_TARGET = new BearerConnectionTarget({
   environmentId: ENVIRONMENT_ID,
   label: "Remote",
   connectionId: "bearer-1",
+  serverEnvironmentId: null,
 });
 const BEARER_PROFILE = new BearerConnectionProfile({
   connectionId: BEARER_TARGET.connectionId,
@@ -192,6 +193,7 @@ describe("ConnectionCatalogDocument", () => {
       target: new BearerConnectionTarget({
         ...BEARER_TARGET,
         label: "Replacement",
+        serverEnvironmentId: null,
       }),
       profile: new BearerConnectionProfile({
         ...BEARER_PROFILE,

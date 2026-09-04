@@ -14,6 +14,17 @@ environment identity.
 - `environmentId` is the stable logical routing identity. URLs, tunnel
   hostnames, SSH ports, and labels may change without creating a new logical
   environment, but this ID alone does not identify its persistent store.
+- A server's _declared_ environment id is not unique across hosts: every server
+  declares `"local"` unless configured otherwise. A client therefore keys a
+  saved remote by that host's `storageInstanceId` — `remote:<uuid>` — so a
+  paired server can never collide with the client's own local environment or
+  with another saved remote. `BearerConnectionTarget.serverEnvironmentId`
+  keeps the host's declared id beside it, and the resolver checks the endpoint
+  still reports that value on every connect. Entries saved before the two were
+  separated carry the declared id in `environmentId` and read `null` here, so
+  the fallback resolves them unchanged. SSH and desktop-local targets keep
+  taking their ids from the desktop bridge. See
+  `docs/plans/remote-servers/2026-09-04-paired-remote-environment-identity.md`.
 - Current servers expose the persistent store UUID as `storageInstanceId` on
   direct and BiBCode Connect descriptors. New clients decode an omitted field
   from an older or third-party server as `null`.
@@ -114,6 +125,15 @@ them from the webview with `fetch` for the descriptor and a `ws://` socket for
 the encrypted channel; a policy limited to loopback and TLS makes every
 Add Server attempt fail as "Server unreachable" before any packet leaves the
 machine. `scripts/tauri-hardening.test.ts` pins both halves of that policy.
+
+On macOS a second gate applies: App Transport Security refuses plain-HTTP
+loads from web content unless the bundle declares an exception, and it does so
+before any packet leaves the machine. `apps/desktop/src-tauri/Info.plist`,
+merged into the bundle by Tauri, sets `NSAllowsArbitraryLoadsInWebContent` and
+`NSAllowsLocalNetworking` for the webview only (native code keeps the default
+policy) and carries the `NSLocalNetworkUsageDescription` shown by the macOS
+Local Network prompt. The hardening test pins those keys and rejects the
+broader `NSAllowsArbitraryLoads`.
 
 ### Direct-connection E2EE
 
