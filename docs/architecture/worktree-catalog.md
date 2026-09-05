@@ -60,6 +60,13 @@ the persisted display path. Adoption and ordinary thread mutations preserve the
 exact server-resolved checkout path and its separator/casing spelling for the
 workspace record and UI.
 
+Catalog joins reserve every workspace thread that has a current direct
+projection-to-inventory path match before considering retained-snapshot
+fallbacks. A retained fallback may preserve ownership only when that thread has
+no current direct match. Retargeting therefore cannot attach one workspace
+owner to both its previous checkout and its new checkout, and branch
+reconciliation follows the current durable path.
+
 The first authoritative scan through the configured primary checkout is the
 only operation that may establish the durable repository pin. Once pinned, a
 fallback anchor is accepted only when it resolves to that same identity. Anchor
