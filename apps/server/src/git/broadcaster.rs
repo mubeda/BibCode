@@ -1907,11 +1907,18 @@ mod tests {
         expected_git_config: PathBuf,
         remote_started: mpsc::UnboundedSender<()>,
         remote_cancelled: mpsc::UnboundedSender<()>,
+        remote_outcome: Option<mpsc::UnboundedSender<BlockingRemoteOutcome>>,
         local_status_started: mpsc::UnboundedSender<()>,
         watch_root_calls: AtomicUsize,
         local_status_calls: AtomicUsize,
         release_local_status: Option<Arc<Semaphore>>,
         release_remote: Arc<Semaphore>,
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    enum BlockingRemoteOutcome {
+        Cancelled,
+        Released,
     }
 
     struct EpochGitRunner {
@@ -2332,12 +2339,18 @@ mod tests {
                         biased;
                         () = cancellation.cancelled() => {
                             let _ = self.remote_cancelled.send(());
+                            if let Some(outcome) = &self.remote_outcome {
+                                let _ = outcome.send(BlockingRemoteOutcome::Cancelled);
+                            }
                             return Err(ProcessError::Cancelled {
                                 operation: request.operation,
                             });
                         }
                         permit = self.release_remote.acquire() => {
                             permit.expect("remote release owner remains alive").forget();
+                            if let Some(outcome) = &self.remote_outcome {
+                                let _ = outcome.send(BlockingRemoteOutcome::Released);
+                            }
                         }
                     }
                 }
@@ -2683,6 +2696,7 @@ mod tests {
             expected_git_config,
             remote_started,
             remote_cancelled,
+            remote_outcome: None,
             local_status_started,
             watch_root_calls: AtomicUsize::new(0),
             local_status_calls: AtomicUsize::new(0),
@@ -2821,6 +2835,7 @@ mod tests {
             expected_git_config,
             remote_started,
             remote_cancelled,
+            remote_outcome: None,
             local_status_started,
             watch_root_calls: AtomicUsize::new(0),
             local_status_calls: AtomicUsize::new(0),
@@ -2883,6 +2898,7 @@ mod tests {
             expected_git_config,
             remote_started,
             remote_cancelled,
+            remote_outcome: None,
             local_status_started,
             watch_root_calls: AtomicUsize::new(0),
             local_status_calls: AtomicUsize::new(0),
@@ -2999,6 +3015,7 @@ mod tests {
             expected_git_config,
             remote_started,
             remote_cancelled,
+            remote_outcome: None,
             local_status_started,
             watch_root_calls: AtomicUsize::new(0),
             local_status_calls: AtomicUsize::new(0),
@@ -3589,7 +3606,8 @@ mod tests {
         let canonical_repository =
             fs::canonicalize(&repository).expect("canonical repository fixture");
         let (remote_started, mut remote_started_rx) = mpsc::unbounded_channel();
-        let (remote_cancelled, mut remote_cancelled_rx) = mpsc::unbounded_channel();
+        let (remote_cancelled, _) = mpsc::unbounded_channel();
+        let (remote_outcome, mut remote_outcome_rx) = mpsc::unbounded_channel();
         let (local_status_started, mut local_status_started_rx) = mpsc::unbounded_channel();
         let release_remote = Arc::new(Semaphore::new(0));
         let git = GitRepository::with_runner_for_test(Arc::new(BlockingRemoteGitRunner {
@@ -3598,6 +3616,7 @@ mod tests {
             expected_git_config,
             remote_started,
             remote_cancelled,
+            remote_outcome: Some(remote_outcome),
             local_status_started,
             watch_root_calls: AtomicUsize::new(0),
             local_status_calls: AtomicUsize::new(0),
@@ -3658,15 +3677,20 @@ mod tests {
         );
         // Make the runner's release branch ready only after the production
         // owner has cancelled its lifecycle. Its biased select must still
-        // observe cancellation first, and the retirement wait joins that
-        // owner before the assertion inspects the checkpoint channel.
+        // observe cancellation first. Awaiting the runner's explicit terminal
+        // branch avoids sampling a nested callback before it has published.
         release_remote.add_permits(1);
+        assert_eq!(
+            remote_outcome_rx
+                .recv()
+                .await
+                .expect("blocked remote runner reports its terminal branch"),
+            BlockingRemoteOutcome::Cancelled,
+            "final subscriber cancellation wins over the ready release permit"
+        );
         broadcaster
             .await_retired_lifecycle(&canonical_repository)
             .await;
-        remote_cancelled_rx
-            .try_recv()
-            .expect("final subscriber drop cancels the blocked remote owner");
     }
 
     #[tokio::test(start_paused = true)]

@@ -54,9 +54,11 @@ runtime and the existing browser/desktop RPC boundary.
   checks used by the cross-platform build and packaged-test paths. The Git
   broadcaster cancellation regression now proves synchronous lifecycle
   cancellation and joined cleanup without depending on a five-second scheduler
-  race. Catalog joins now reserve a workspace's current direct path before any
-  retained-snapshot fallback, preventing duplicate old/new ownership after a
-  retarget; its integration coverage uses an owned healthy-refresh boundary.
+  race, and Claude hook-plumbing coverage uses an isolated probe context under
+  parallel load. Catalog joins now reserve a workspace's current direct path
+  before any retained-snapshot fallback, preventing duplicate old/new ownership
+  after a retarget; its integration coverage uses an owned healthy-refresh
+  boundary.
 
 ### Supported release assets
 
