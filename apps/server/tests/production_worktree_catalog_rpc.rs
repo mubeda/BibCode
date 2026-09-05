@@ -317,25 +317,30 @@ async fn dedicated_create_panel_and_retarget_resolve_workspace_authority_server_
         )
     );
     // The accepted receipt does not mean the owner row already carries the
-    // retargeted checkout: the catalog refreshes the branch on its own pass, so
-    // a generation bump can arrive before that write. Wait for the row to
-    // converge instead of sampling it once.
-    let retargeted = timeout(Duration::from_secs(10), async {
-        loop {
-            let thread = fixture
-                .repositories
-                .get_thread("managed-thread".to_owned())
-                .await
-                .expect("retargeted owner read")
-                .expect("retargeted owner exists");
-            if thread.branch.as_deref() == Some("feature/retarget-target") {
-                return thread;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("owner row records the retargeted branch");
+    // retargeted checkout: a generation bump can arrive before the healthy
+    // snapshot observer writes the branch, and a Focus refresh may reuse a
+    // retained fingerprinted snapshot. Force one real refresh and await its
+    // observer instead of polling background reconciliation on a timer.
+    request(
+        fixture.socket(),
+        "9905",
+        "vcs.refreshWorktreeCatalog",
+        json!({"projectId":"project-1"}),
+    )
+    .await;
+    let reconciled = success_value(fixture.socket(), "9905").await;
+    assert!(
+        reconciled["generation"]
+            .as_u64()
+            .expect("reconciled generation")
+            >= retargeted_catalog.generation
+    );
+    let retargeted = fixture
+        .repositories
+        .get_thread("managed-thread".to_owned())
+        .await
+        .expect("retargeted owner read")
+        .expect("retargeted owner exists");
     assert_eq!(
         retargeted.worktree_path.as_deref(),
         Some(target_path.as_str())
@@ -346,14 +351,17 @@ async fn dedicated_create_panel_and_retarget_resolve_workspace_authority_server_
     );
     request(
         fixture.socket(),
-        "9905",
+        "9906",
         "vcs.refreshWorktreeCatalog",
         json!({"projectId":"project-1", "reason":"focus"}),
     )
     .await;
-    let focused = success_value(fixture.socket(), "9905").await;
+    let focused = success_value(fixture.socket(), "9906").await;
     assert!(
-        focused["generation"].as_u64().expect("focus generation") >= retargeted_catalog.generation
+        focused["generation"].as_u64().expect("focus generation")
+            >= reconciled["generation"]
+                .as_u64()
+                .expect("reconciled generation")
     );
     let focused_worktrees = focused["worktrees"].as_array().expect("focused worktrees");
     let focused_managed = focused_worktrees
