@@ -28,6 +28,7 @@ describe("storageIdentityTargetKey", () => {
       environmentId: ENVIRONMENT_ID,
       label: "Bearer secret label",
       connectionId: "bearer-connection-1",
+      serverEnvironmentId: null,
     });
 
     expect(storageIdentityTargetKey(target)).toBe("bearer:bearer-connection-1");

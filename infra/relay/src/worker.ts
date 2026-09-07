@@ -1,6 +1,6 @@
 import * as Alchemy from "alchemy";
 import * as Cloudflare from "alchemy/Cloudflare";
-import * as Drizzle from "alchemy/Drizzle";
+import * as DrizzlePostgres from "alchemy/Drizzle/Postgres";
 import * as Config from "effect/Config";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -51,6 +51,11 @@ const webcryptoLayer = Layer.succeed(
 );
 
 const httpPlatformNotSupportedLayer = Layer.succeed(HttpPlatform.HttpPlatform, {
+  platform: "web",
+  compression: {
+    algorithms: new Set<HttpPlatform.CompressionAlgorithm>(),
+    compressResponse: () => Effect.die("Relay API does not support response compression"),
+  },
   fileResponse: () => Effect.die("Relay API does not serve filesystem responses"),
   fileWebResponse: () => Effect.die("Relay API does not serve file responses"),
 });
@@ -91,7 +96,7 @@ export default Api.make(
     const cloudMintPrivateKey = yield* cloudMintKeyPair.privateKey;
     const cloudMintPublicKey = yield* cloudMintKeyPair.publicKey;
     const hyperdrive = yield* Cloudflare.Hyperdrive.Connect(yield* RelayDb.RelayHyperdrive);
-    const db = yield* Drizzle.postgres(hyperdrive.connectionString);
+    const db = yield* DrizzlePostgres.Postgres(hyperdrive.connectionString);
 
     const managedEndpointTunnelBinding = yield* Cloudflare.Tunnel.ReadWriteTunnel();
     // Keep Worker custom-domain reconciliation ordered after API zone provisioning.

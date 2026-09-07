@@ -70,6 +70,7 @@ export interface AwsResolvedCredentials {
     accessKeyId: Redacted.Redacted<string>;
     secretAccessKey: Redacted.Redacted<string>;
     sessionToken: Redacted.Redacted<string> | undefined;
+    region: string;
   }>;
   region: string;
   source: {
@@ -77,6 +78,21 @@ export interface AwsResolvedCredentials {
     details?: string;
   };
 }
+
+/**
+ * An explicitly-set `AWS_REGION` env var wins over the region recorded in an
+ * SSO profile (`~/.aws/config`) or in stored credentials. `AWS_DEFAULT_REGION`
+ * deliberately does NOT override — it is a *default* for when no region is
+ * configured anywhere, and the profile's region is explicit configuration.
+ */
+export const applyEnvRegionOverride = <C extends { region: string }>(
+  creds: C,
+): Effect.Effect<C> =>
+  getEnv("AWS_REGION").pipe(
+    Effect.map((envRegion) =>
+      envRegion ? { ...creds, region: envRegion } : creds,
+    ),
+  );
 
 /**
  * Layer that registers the AWS {@link AuthProvider} into the
@@ -111,6 +127,7 @@ export const AwsAuth = AuthProviderLayer<
                 accessKeyId,
                 secretAccessKey,
                 sessionToken,
+                region,
               }),
             ),
             // Provide Region directly from the resolved inputs. Relying on the
@@ -259,6 +276,7 @@ export const AwsAuth = AuthProviderLayer<
                   accessKeyId,
                   secretAccessKey,
                   sessionToken,
+                  region,
                 }),
                 region,
                 source: { type: "env" as const },
@@ -283,6 +301,7 @@ export const AwsAuth = AuthProviderLayer<
                         sessionToken: creds.sessionToken
                           ? Redacted.make(creds.sessionToken)
                           : undefined,
+                        region: creds.region,
                       }),
                       region: creds.region,
                       source: { type: "stored" as const },
@@ -365,6 +384,7 @@ export const AwsAuth = AuthProviderLayer<
           Effect.mapError(
             (e) => new AuthError({ message: "login failed", cause: e }),
           ),
+          Effect.flatMap(applyEnvRegionOverride),
         );
 
     const prettyPrint = (profileName: string, config: AwsAuthConfig) =>

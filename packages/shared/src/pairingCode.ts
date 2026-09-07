@@ -1,7 +1,7 @@
 import { REMOTE_PAIRING_CODE_VERSION, RemotePairingCodePayload } from "@bibcode/contracts";
 import * as Schema from "effect/Schema";
 
-export class PairingCodeParseError extends Schema.TaggedErrorClass<PairingCodeParseError>()(
+export class PairingCodeParseError extends Schema.TaggedError<PairingCodeParseError>()(
   "PairingCodeParseError",
   { detail: Schema.String },
 ) {
@@ -10,7 +10,7 @@ export class PairingCodeParseError extends Schema.TaggedErrorClass<PairingCodePa
   }
 }
 
-export class PairingCodeUnsupportedVersionError extends Schema.TaggedErrorClass<PairingCodeUnsupportedVersionError>()(
+export class PairingCodeUnsupportedVersionError extends Schema.TaggedError<PairingCodeUnsupportedVersionError>()(
   "PairingCodeUnsupportedVersionError",
   { version: Schema.Finite },
 ) {

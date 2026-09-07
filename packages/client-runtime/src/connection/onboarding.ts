@@ -33,6 +33,7 @@ import {
   SshConnectionTarget,
   type ConnectionAttemptError,
 } from "./model.ts";
+import { remoteEnvironmentId } from "./remoteIdentity.ts";
 import * as Persistence from "../platform/persistence.ts";
 import * as EnvironmentRegistry from "./registry.ts";
 import {
@@ -119,17 +120,25 @@ export const preparePairingRegistration = Effect.fn(
     scopes: presentation.scopes,
     clientMetadata: presentation.metadata,
   }).pipe(Effect.mapError(mapRemoteEnvironmentError));
-  const connectionId = `bearer:${descriptor.environmentId}`;
+  // Same rule as the pairing-code flow: key the saved entry by the host's
+  // storage instance id, since every server declares itself as "local". A host
+  // that reports no storage id keeps the id it declares, as before.
+  const environmentId =
+    descriptor.storageInstanceId === null
+      ? descriptor.environmentId
+      : remoteEnvironmentId(descriptor.storageInstanceId);
+  const connectionId = `bearer:${environmentId}`;
 
   return new BearerConnectionRegistration({
     target: new BearerConnectionTarget({
-      environmentId: descriptor.environmentId,
+      environmentId,
       label: descriptor.label,
       connectionId,
+      serverEnvironmentId: descriptor.environmentId,
     }),
     profile: new BearerConnectionProfile({
       connectionId,
-      environmentId: descriptor.environmentId,
+      environmentId,
       label: descriptor.label,
       httpBaseUrl: target.httpBaseUrl,
       wsBaseUrl: target.wsBaseUrl,
@@ -221,6 +230,10 @@ export const prepareBearerConnectionUpdate = Effect.fn(
       environmentId: options.input.environmentId,
       label,
       connectionId,
+      // Editing a saved environment changes its label and endpoint, never what
+      // the host declared about itself.
+      serverEnvironmentId:
+        entry.target._tag === "BearerConnectionTarget" ? entry.target.serverEnvironmentId : null,
     }),
     profile: new BearerConnectionProfile({
       connectionId,

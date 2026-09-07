@@ -23,7 +23,7 @@ const TEST_LEGACY_MINISIGN_SIGNATURE =
   "trusted comment: timestamp:1555779966\tfile:test\n" +
   "QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfNQUaOAA==\n";
 const TEST_LEGACY_SIGNATURE = Buffer.from(TEST_LEGACY_MINISIGN_SIGNATURE).toString("base64");
-const encodeJson = Schema.encodeSync(Schema.UnknownFromJsonString);
+const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
 const artifacts = {
   "darwin-aarch64": "bibcode-update-darwin-aarch64.app.tar.gz",

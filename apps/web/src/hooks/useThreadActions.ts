@@ -36,7 +36,7 @@ import { useClientSettings } from "./useSettings";
 import { useAtomCommand } from "../state/use-atom-command";
 import type { WorktreeRemovalTarget } from "../components/WorktreeRemovalDialog";
 
-export class ThreadArchiveBlockedError extends Schema.TaggedErrorClass<ThreadArchiveBlockedError>()(
+export class ThreadArchiveBlockedError extends Schema.TaggedError<ThreadArchiveBlockedError>()(
   "ThreadArchiveBlockedError",
   {
     environmentId: EnvironmentId,

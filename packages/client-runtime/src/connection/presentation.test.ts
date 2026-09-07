@@ -31,6 +31,7 @@ const TARGET = new BearerConnectionTarget({
   environmentId: EnvironmentId.make("environment-1"),
   label: "Remote environment",
   connectionId: "connection-1",
+  serverEnvironmentId: null,
 });
 const decodeBearerConnectionProfile = Schema.decodeUnknownSync(BearerConnectionProfile);
 
@@ -119,6 +120,7 @@ describe("connection presentation", () => {
             environmentId: TARGET.environmentId,
             label: "Desktop WSL",
             connectionId: "local:wsl:Ubuntu",
+            serverEnvironmentId: null,
           }),
         ),
       ),
