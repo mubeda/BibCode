@@ -818,6 +818,7 @@ export function ConnectTab({
     "pairing-code",
   );
   const [pairingCodeInput, setPairingCodeInput] = useState("");
+  const [serverAlias, setServerAlias] = useState("");
   const [tunnelAcknowledged, setTunnelAcknowledged] = useState(false);
   const [flowDemandsAcknowledgement, setFlowDemandsAcknowledgement] = useState(false);
   const [addServerFailure, setAddServerFailure] = useState<PairingAddFailureReason | null>(null);
@@ -950,6 +951,7 @@ export function ConnectTab({
     const result = await connectRemoteServer({
       code: normalizedPairingCode,
       allowLoopbackTunnel: tunnelAcknowledged,
+      ...(serverAlias.trim() ? { label: serverAlias.trim() } : {}),
     });
     setIsAddingSavedBackend(false);
     if (result._tag === "Failure") {
@@ -968,6 +970,7 @@ export function ConnectTab({
       return;
     }
     setPairingCodeInput("");
+    setServerAlias("");
     setTunnelAcknowledged(false);
     setFlowDemandsAcknowledgement(false);
     setAddBackendDialogOpen(false);
@@ -982,6 +985,7 @@ export function ConnectTab({
     consumeInitialPairingCode,
     normalizedPairingCode,
     requiresTunnelAcknowledgement,
+    serverAlias,
     tunnelAcknowledged,
   ]);
   const handleAddSavedBackend = useCallback(async () => {
@@ -1301,6 +1305,20 @@ export function ConnectTab({
       addServerFailure === null ? null : describeAddServerFailure(addServerFailure);
     return (
       <div className="space-y-4">
+        <label className="block">
+          <span className="mb-1.5 block text-xs font-medium text-foreground">
+            Server alias (optional)
+          </span>
+          <Input
+            value={serverAlias}
+            onChange={(event) => setServerAlias(event.target.value)}
+            placeholder="e.g. Linux workstation"
+            disabled={isAddingSavedBackend}
+          />
+          <span className="mt-1 block text-xs text-muted-foreground">
+            Shown on this device. Leave blank to use the server’s name.
+          </span>
+        </label>
         <label className="block">
           <span className="mb-1.5 block text-xs font-medium text-foreground">Pairing code</span>
           <Textarea

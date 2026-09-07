@@ -53,6 +53,13 @@ persisted as saved connections.
 Profiles and credentials remain separate so catalog metadata can be listed
 without exposing secrets.
 
+Pairing-code onboarding accepts an optional client-local display label. It
+trims that alias and falls back to the pairing payload's name when blank,
+then saves the result in the existing bearer target and profile `label` fields.
+The environment rail and saved-server list use the catalog target label, which
+survives catalog hydration and reconnects. The alias does not change the remote
+descriptor, environment identity, pairing credential, or server-side name.
+
 ## Pinned direct profiles and sessions
 
 `BearerConnectionProfile` additively stores `hostKey` in the existing schema-v1

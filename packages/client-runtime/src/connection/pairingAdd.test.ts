@@ -350,10 +350,11 @@ const makeHarness = Effect.fn("TestPairingAdd.makeHarness")(function* (
     releaseRegistration: Deferred.succeed(releaseRegistration, undefined),
     identityCommitted: Deferred.await(identityCommitted),
     releaseIdentity: Deferred.succeed(releaseIdentity, undefined),
-    run: (payload: RemotePairingCodePayload, allowLoopbackTunnel?: boolean) =>
+    run: (payload: RemotePairingCodePayload, allowLoopbackTunnel?: boolean, label?: string) =>
       verifyAndAddPairingCode({
         code: encodePairingCode(payload),
         ...(allowLoopbackTunnel === undefined ? {} : { allowLoopbackTunnel }),
+        ...(label === undefined ? {} : { label }),
       }).pipe(Effect.provide(layer)),
   };
 });
@@ -391,6 +392,29 @@ const supervisorState = (
 });
 
 describe("verifyAndAddPairingCode", () => {
+  for (const [alias, label] of [
+    ["  Linux workstation  ", "Linux workstation"],
+    ["   ", "Local"],
+  ] as const) {
+    it.effect(`saves the display label ${label} for alias ${JSON.stringify(alias)}`, () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness();
+        expect(yield* harness.run(validPayload({ name: "Local" }), false, alias)).toBe(
+          ENVIRONMENT_ID,
+        );
+        expect(harness.registrations[0]).toMatchObject({
+          target: { label, environmentId: ENVIRONMENT_ID },
+          profile: { label, environmentId: ENVIRONMENT_ID },
+        });
+        expect(harness.preparedConnections[0]).toMatchObject({
+          label,
+          target: { label },
+          descriptor: { label: "Paired environment" },
+        });
+      }),
+    );
+  }
+
   it.effect("requires explicit acknowledgement before dialing loopback codes", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness();

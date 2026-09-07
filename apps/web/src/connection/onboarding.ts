@@ -1,4 +1,7 @@
-import { ConnectionOnboarding } from "@bibcode/client-runtime/connection";
+import {
+  ConnectionOnboarding,
+  type VerifyPairingCodeInput,
+} from "@bibcode/client-runtime/connection";
 import {
   createAtomCommandScheduler,
   createRuntimeCommand,
@@ -31,10 +34,10 @@ export const connectRemoteServer = createRuntimeCommand(connectionAtomRuntime, {
   scheduler: onboardingScheduler,
   concurrency: {
     mode: "singleFlight",
-    key: (input: { readonly code: string; readonly allowLoopbackTunnel?: boolean }) =>
-      `${input.allowLoopbackTunnel === true ? "ack" : "raw"}:${input.code}`,
+    key: (input: VerifyPairingCodeInput) =>
+      JSON.stringify([input.code, input.allowLoopbackTunnel === true, input.label?.trim() || null]),
   },
-  execute: (input: { readonly code: string; readonly allowLoopbackTunnel?: boolean }) =>
+  execute: (input: VerifyPairingCodeInput) =>
     ConnectionOnboarding.pipe(
       Effect.flatMap((onboarding) => onboarding.verifyAndAddPairingCode(input)),
     ),

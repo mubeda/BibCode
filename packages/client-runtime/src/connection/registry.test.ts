@@ -616,7 +616,18 @@ function awaitConnectionState(
 describe("EnvironmentRegistry", () => {
   it.effect("hydrates connection profiles into catalog entries", () =>
     Effect.gen(function* () {
-      const harness = yield* makeHarness([SSH_CONNECTION], [SSH_PROFILE]);
+      const aliasedTarget = new BearerConnectionTarget({
+        ...BEARER_TARGET,
+        label: "Linux workstation",
+      });
+      const aliasedProfile = new BearerConnectionProfile({
+        ...BEARER_PROFILE,
+        label: "Linux workstation",
+      });
+      const harness = yield* makeHarness(
+        [SSH_CONNECTION, aliasedTarget],
+        [SSH_PROFILE, aliasedProfile],
+      );
 
       yield* Effect.gen(function* () {
         const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
@@ -626,6 +637,13 @@ describe("EnvironmentRegistry", () => {
 
         expect(entry?.target).toEqual(SSH_CONNECTION);
         expect(Option.getOrThrow(entry?.profile ?? Option.none())).toEqual(SSH_PROFILE);
+        const aliasedEntry = (yield* SubscriptionRef.get(registry.entries)).get(
+          BEARER_TARGET.environmentId,
+        );
+        expect(aliasedEntry?.target.label).toBe("Linux workstation");
+        expect(Option.getOrThrow(aliasedEntry?.profile ?? Option.none()).label).toBe(
+          "Linux workstation",
+        );
       }).pipe(Effect.provide(harness.layer), Effect.scoped);
     }),
   );

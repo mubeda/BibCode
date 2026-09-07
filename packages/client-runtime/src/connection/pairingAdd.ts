@@ -70,6 +70,7 @@ export class PairingLoopbackAcknowledgementRequiredError extends Schema.TaggedEr
 
 export interface VerifyPairingCodeInput {
   readonly code: string;
+  readonly label?: string;
   readonly allowLoopbackTunnel?: boolean;
 }
 
@@ -191,6 +192,7 @@ export const verifyAndAddPairingCode = Effect.fn(
   "clientRuntime.connection.pairingAdd.verifyAndAddPairingCode",
 )(function* (input: VerifyPairingCodeInput) {
   const payload = yield* parsePayload(input.code);
+  const label = input.label?.trim() || payload.name;
 
   switch (classifyPairingEndpoint(payload.endpoint)) {
     case "unconnectable":
@@ -260,12 +262,12 @@ export const verifyAndAddPairingCode = Effect.fn(
   const connectionId = `bearer:${descriptor.environmentId}`;
   const target = new BearerConnectionTarget({
     environmentId: descriptor.environmentId,
-    label: payload.name,
+    label,
     connectionId,
   });
   const prepared: PreparedConnection = {
     environmentId: descriptor.environmentId,
-    label: payload.name,
+    label,
     descriptor,
     httpBaseUrl,
     socketUrl: e2eeSocketUrl(deriveWsBaseUrl(httpBaseUrl)),
@@ -317,7 +319,7 @@ export const verifyAndAddPairingCode = Effect.fn(
         profile: new BearerConnectionProfile({
           connectionId,
           environmentId: verified.environmentId,
-          label: payload.name,
+          label,
           httpBaseUrl,
           wsBaseUrl: deriveWsBaseUrl(httpBaseUrl),
           hostKey: payload.hostKey,

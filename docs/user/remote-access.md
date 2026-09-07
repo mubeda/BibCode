@@ -12,6 +12,14 @@ terminals, provider CLIs, credentials, and agent sessions.
 Use a trusted private network such as a LAN or tailnet. Do not expose a plain
 BiBCode HTTP endpoint directly to the public internet.
 
+## Name a saved server
+
+In **Settings → Remote Servers → Connect to a host → Add Server**, enter a
+**Server alias (optional)** along with the pairing code. This name appears in
+the saved-server list and environment rail on this device and persists across
+restarts. Leave it blank to use the name supplied by the server. An alias does
+not rename the server for other clients.
+
 ## Desktop and browser network access
 
 Use the Share controls to create an address-specific pairing offer:
@@ -24,7 +32,8 @@ Use the Share controls to create an address-specific pairing offer:
 3. Choose **Custom address** for an SSH tunnel, reverse proxy, public hostname,
    or separately launched server. Custom addresses are externally managed and
    never change the desktop listener or firewall.
-4. Inspect the selected endpoint and generate the pairing offer.
+4. Select an IP address in **Address**, or leave **Automatic (LAN)** selected.
+   Hostname-based endpoints show their hostname. Generate the pairing offer.
 
 Native interface observations are visible to the Share flow before widening,
 but report unavailable while the listener is loopback-only. Public-only and
