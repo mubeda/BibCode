@@ -208,6 +208,9 @@ minimum sizes verify:
   list and environment rail show that alias after reconnecting and restarting
   the app. Blank aliases use the pairing code's server name; failed pairing
   preserves the alias for retry. The remote server's own name remains unchanged;
+- Pair a loopback offer through a local connection or tunnel and confirm the
+  already-active standard credential remains saved without administrative
+  confirmation scope. Pending and off-host scope denials must still fail;
 - Settings shows **Remote Servers** with **Connect to a host** and **Share this
   host** tabs; `/settings/connections` redirects there. SSH discovery and
   grant-driven sharing appears because the desktop bridge is present. Generate
@@ -295,6 +298,12 @@ Capture PID, PPID, process group, start time, executable, and command line for
 scoped app, server, provider, terminal, WebDriver, mount, and fixture roots.
 Confirm bounded terminate/wait/reap, late-descendant cleanup after natural root
 exit, peer-runtime isolation, and zero run-owned survivors.
+
+Run a terminal command that exits immediately, then close its terminal after
+observing completion. Also close while the command is finishing. Both paths
+must complete without an exit-wait timeout or a surviving process. The native
+PTY regression covers exit before any subscriber exists and verifies that a
+late subscriber receives the retained completion.
 
 Detach only the exact DMG mount. Remove only exact fixture, profile, artifact,
 and evidence directories created by the run. Leave pre-existing targets and

@@ -446,6 +446,9 @@ minimum-size, and relevant Windows DPI states. Verify:
   list and environment rail show that alias after reconnecting and restarting
   the app. Blank aliases use the pairing code's server name; failed pairing
   preserves the alias for retry. The remote server's own name remains unchanged;
+- Pair a loopback offer through a local connection or tunnel and confirm the
+  already-active standard credential remains saved without administrative
+  confirmation scope. Pending and off-host scope denials must still fail;
 - Settings shows **Remote Servers** with **Connect to a host** and **Share this
   host** tabs; `/settings/connections` redirects there. SSH discovery and
   grant-driven sharing appears because the desktop bridge is present.
@@ -576,6 +579,12 @@ Use exact identity before terminating anything. Confirm Job-owned descendants
 and canceled children are waited before ownership is released, independent app
 instances remain alive, and the final snapshot contains no process launched by
 the run.
+
+Run a terminal command that exits immediately, then close its terminal after
+observing completion. Also close while the command is finishing. Both paths
+must complete without an exit-wait timeout or a surviving process. The native
+PTY regression covers exit before any subscriber exists and verifies that a
+late subscriber receives the retained completion.
 
 Remove the junction before its target, then remove only the exact fixture and
 profile roots created by this run. Never delete a pre-existing `%TEMP%`, build,

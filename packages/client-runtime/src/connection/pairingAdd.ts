@@ -1,4 +1,9 @@
-import { type EnvironmentId, type RemotePairingCodePayload, WS_METHODS } from "@bibcode/contracts";
+import {
+  EnvironmentAuthorizationError,
+  type EnvironmentId,
+  type RemotePairingCodePayload,
+  WS_METHODS,
+} from "@bibcode/contracts";
 import { classifyPairingEndpoint } from "@bibcode/shared/advertisedEndpoint";
 import {
   PairingCodeParseError,
@@ -86,6 +91,7 @@ const isPairingCodeParseError = Schema.is(PairingCodeParseError);
 const isPairingCodeUnsupportedVersionError = Schema.is(PairingCodeUnsupportedVersionError);
 const isPairingAddError = Schema.is(PairingAddError);
 const isRpcClientError = Schema.is(RpcClientError.RpcClientError);
+const isEnvironmentAuthorizationError = Schema.is(EnvironmentAuthorizationError);
 const LEGACY_CONFIRMATION_UNSUPPORTED_DEFECT = `Unknown request tag: ${WS_METHODS.authConfirmPairing}`;
 
 type PairingConfirmationFailureDisposition = "rollback" | "verify-authority";
@@ -93,11 +99,23 @@ type PairingConfirmationFailureDisposition = "rollback" | "verify-authority";
 const classifyPairingConfirmationFailure = (
   cause: Cause.Cause<unknown>,
   pairingConfirmationRequired: boolean,
+  loopbackEndpoint: boolean,
 ): PairingConfirmationFailureDisposition => {
   if (cause.reasons.length !== 1) return "verify-authority";
   const reason = cause.reasons[0]!;
   if (Cause.isInterruptReason(reason)) return "verify-authority";
   if (Cause.isFailReason(reason)) {
+    // On-host grants are already active and carry no pending-confirmation
+    // capability. A scope denial does not invalidate that delivered credential;
+    // verify it through the supervisor without broadening server permissions.
+    if (
+      loopbackEndpoint &&
+      !pairingConfirmationRequired &&
+      isEnvironmentAuthorizationError(reason.error) &&
+      reason.error.requiredScope === "access:write"
+    ) {
+      return "verify-authority";
+    }
     return isRpcClientError(reason.error) ? "verify-authority" : "rollback";
   }
   if (Cause.isDieReason(reason) && reason.defect === LEGACY_CONFIRMATION_UNSUPPORTED_DEFECT) {
@@ -400,6 +418,7 @@ export const verifyAndAddPairingCode = Effect.fn(
               const disposition = classifyPairingConfirmationFailure(
                 confirmation.cause,
                 authenticated.pairingConfirmationRequired === true,
+                classifyPairingEndpoint(payload.endpoint) === "loopback",
               );
               if (disposition === "rollback") {
                 return yield* pairingConfirmationFailure(confirmation.cause);
@@ -436,7 +455,7 @@ export const verifyAndAddPairingCode = Effect.fn(
               detail: `The server rejected the paired credential before confirmation completed; the one-time code was consumed, so generate a new pairing code and pair again.${cleanupDetail}`,
             });
           }
-          // "authenticated" proves the confirmation committed;
+          // "authenticated" proves the saved credential is active;
           // "inconclusive" keeps the saved entry and leaves recovery to the
           // supervisor, exactly like a lost confirmation reply.
         }
