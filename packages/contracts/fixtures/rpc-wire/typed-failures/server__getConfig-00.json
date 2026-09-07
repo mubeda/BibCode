@@ -10,7 +10,7 @@
           "_tag": "KeybindingsConfigParseError",
           "configPath": "DH^U?c\\8",
           "detail": "pr",
-          "cause": "undefined"
+          "cause": null
         }
       }
     ]

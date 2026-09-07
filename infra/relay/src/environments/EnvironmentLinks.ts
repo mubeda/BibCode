@@ -19,7 +19,7 @@ export interface RelayLinkedEnvironmentRecord extends RelayClientEnvironmentReco
   readonly managedTunnelsEnabled: boolean;
 }
 
-export class EnvironmentLinkUpsertPersistenceError extends Schema.TaggedErrorClass<EnvironmentLinkUpsertPersistenceError>()(
+export class EnvironmentLinkUpsertPersistenceError extends Schema.TaggedError<EnvironmentLinkUpsertPersistenceError>()(
   "EnvironmentLinkUpsertPersistenceError",
   {
     userId: Schema.String,
@@ -32,7 +32,7 @@ export class EnvironmentLinkUpsertPersistenceError extends Schema.TaggedErrorCla
   }
 }
 
-export class EnvironmentLinkUserListPersistenceError extends Schema.TaggedErrorClass<EnvironmentLinkUserListPersistenceError>()(
+export class EnvironmentLinkUserListPersistenceError extends Schema.TaggedError<EnvironmentLinkUserListPersistenceError>()(
   "EnvironmentLinkUserListPersistenceError",
   {
     operation: Schema.Literal("list-users"),
@@ -45,7 +45,7 @@ export class EnvironmentLinkUserListPersistenceError extends Schema.TaggedErrorC
   }
 }
 
-export class EnvironmentPublicKeyListPersistenceError extends Schema.TaggedErrorClass<EnvironmentPublicKeyListPersistenceError>()(
+export class EnvironmentPublicKeyListPersistenceError extends Schema.TaggedError<EnvironmentPublicKeyListPersistenceError>()(
   "EnvironmentPublicKeyListPersistenceError",
   {
     environmentId: Schema.String,
@@ -57,7 +57,7 @@ export class EnvironmentPublicKeyListPersistenceError extends Schema.TaggedError
   }
 }
 
-export class EnvironmentLinkListPersistenceError extends Schema.TaggedErrorClass<EnvironmentLinkListPersistenceError>()(
+export class EnvironmentLinkListPersistenceError extends Schema.TaggedError<EnvironmentLinkListPersistenceError>()(
   "EnvironmentLinkListPersistenceError",
   {
     userId: Schema.String,
@@ -69,7 +69,7 @@ export class EnvironmentLinkListPersistenceError extends Schema.TaggedErrorClass
   }
 }
 
-export class EnvironmentLinkLookupPersistenceError extends Schema.TaggedErrorClass<EnvironmentLinkLookupPersistenceError>()(
+export class EnvironmentLinkLookupPersistenceError extends Schema.TaggedError<EnvironmentLinkLookupPersistenceError>()(
   "EnvironmentLinkLookupPersistenceError",
   {
     userId: Schema.String,
@@ -82,7 +82,7 @@ export class EnvironmentLinkLookupPersistenceError extends Schema.TaggedErrorCla
   }
 }
 
-export class EnvironmentLinkRevokePersistenceError extends Schema.TaggedErrorClass<EnvironmentLinkRevokePersistenceError>()(
+export class EnvironmentLinkRevokePersistenceError extends Schema.TaggedError<EnvironmentLinkRevokePersistenceError>()(
   "EnvironmentLinkRevokePersistenceError",
   {
     userId: Schema.String,

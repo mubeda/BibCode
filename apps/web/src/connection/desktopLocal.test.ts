@@ -19,6 +19,7 @@ describe("desktop local connection identity", () => {
       connectionId: desktopLocalConnectionId("wsl:Ubuntu"),
       environmentId: EnvironmentId.make("environment-wsl"),
       label: "WSL (Ubuntu)",
+      serverEnvironmentId: null,
     });
 
     expect(isDesktopLocalConnectionTarget(target)).toBe(true);

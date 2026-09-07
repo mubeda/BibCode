@@ -14,7 +14,7 @@
           "resolvedWorkspaceRoot": "C!",
           "operation": "write-file",
           "message": "name",
-          "cause": "undefined"
+          "cause": null
         }
       }
     ]

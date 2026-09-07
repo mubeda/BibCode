@@ -47,20 +47,17 @@ export const RelayDeployResult = Schema.Literals([
 ]);
 export type RelayDeployResult = typeof RelayDeployResult.Type;
 
-export class RelayDeployError extends Schema.TaggedErrorClass<RelayDeployError>()(
-  "RelayDeployError",
-  {
-    source: Schema.Literals(["alchemy_state", "alchemy_apply"]),
-    stage: Schema.String,
-    missingFields: Schema.Array(RelayDeployOutputField),
-  },
-) {
+export class RelayDeployError extends Schema.TaggedError<RelayDeployError>()("RelayDeployError", {
+  source: Schema.Literals(["alchemy_state", "alchemy_apply"]),
+  stage: Schema.String,
+  missingFields: Schema.Array(RelayDeployOutputField),
+}) {
   override get message(): string {
     return `Relay deploy output from '${this.source}' for stage '${this.stage}' is missing required public config fields: ${this.missingFields.join(", ")}`;
   }
 }
 
-export class RelayDeployEnvFilePathError extends Schema.TaggedErrorClass<RelayDeployEnvFilePathError>()(
+export class RelayDeployEnvFilePathError extends Schema.TaggedError<RelayDeployEnvFilePathError>()(
   "RelayDeployEnvFilePathError",
   {
     path: Schema.String,

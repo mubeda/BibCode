@@ -111,7 +111,10 @@ desktop release. The workflow intentionally does not publish the upstream
 
 ## Signing And OS Trust
 
-macOS application bundles are signed with Tauri's ad-hoc `-` identity. This
+macOS bundles merge `apps/desktop/src-tauri/Info.plist`, which relaxes App
+Transport Security for web content only so the desktop can reach plain-HTTP
+remote servers on a LAN or tailnet, and declares the Local Network usage
+description. macOS application bundles are signed with Tauri's ad-hoc `-` identity. This
 seals the complete bundle so Gatekeeper can verify that it is intact, but it
 does not associate the app with an Apple Developer team or notarize it. Users
 must approve a browser-downloaded build through Settings > Privacy & Security.
@@ -217,7 +220,8 @@ must retain the selected project-data root.
 
 [`desktop-upgrade-smoke.yml`](../../.github/workflows/desktop-upgrade-smoke.yml)
 runs real packaged previous-stable-to-candidate and protected-baseline upgrades
-for Windows x64 NSIS, macOS arm64 DMG, macOS x64 DMG, and Linux x64 AppImage.
+for Linux ARM64/x64 AppImages, Windows ARM64/x64 NSIS installers, and macOS
+ARM64/x64 DMGs.
 The protected lane verifies the same storage UUID, seeded project, and a
 verified `pre-update` backup after restart. A separate Windows job exercises a
 WSL primary when the runner declares WSL plus an installed distribution; an

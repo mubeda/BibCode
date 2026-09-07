@@ -11,6 +11,14 @@
  * bun process. Interactive terminals get the opentui view; otherwise tests
  * are logged line-by-line and failures are dumped at the end.
  */
+// The runner executes every test file's effects on ONE event loop, so any
+// fiber touching a relative path can race a transient process-wide chdir.
+// cross-spawn (bundled in vite/build tools the tests exercise) chdirs the
+// whole process to resolve a spawn's binary; `process.chdir.disabled` is
+// its own escape hatch (built for worker threads) — with it set, commands
+// still resolve via PATH and absolutize against the spawn's `cwd`.
+(process.chdir as { disabled?: boolean }).disabled = true;
+
 import * as BunRuntime from "@effect/platform-bun/BunRuntime";
 import * as BunServices from "@effect/platform-bun/BunServices";
 import * as Effect from "effect/Effect";
@@ -56,9 +64,9 @@ const retry = Flag.integer("retry").pipe(
 const concurrency = Flag.string("concurrency").pipe(
   Flag.withAlias("c"),
   Flag.withDescription(
-    'Maximum number of files running concurrently: a number or "unbounded" (default)',
+    'Maximum number of files running concurrently: a number (default 32) or "unbounded". Unbounded runs of large suites saturate the event loop and drown real failures in spurious 0ms beforeAll timeouts.',
   ),
-  Flag.withDefault("unbounded"),
+  Flag.withDefault("32"),
 );
 
 const toConcurrency = (value: string): number | "unbounded" => {

@@ -163,7 +163,7 @@ export function selectWorktreeWorkspaceActionsAvailable(
   );
 }
 
-export class WorktreeCatalogUnsupportedError extends Schema.TaggedErrorClass<WorktreeCatalogUnsupportedError>()(
+export class WorktreeCatalogUnsupportedError extends Schema.TaggedError<WorktreeCatalogUnsupportedError>()(
   "WorktreeCatalogUnsupportedError",
   {
     environmentId: EnvironmentId,
@@ -561,9 +561,10 @@ export function createWorktreeEnvironmentAtoms<R, E>(
                       threadId: target.input.threadId,
                     },
                   }).pipe(
-                    Effect.map(
-                      (plan): WorktreeRemoveCommandResult => ({ _tag: "PlanChanged", plan }),
-                    ),
+                    Effect.map((plan): WorktreeRemoveCommandResult => ({
+                      _tag: "PlanChanged",
+                      plan,
+                    })),
                   )
                 : Effect.fail(error),
             ),

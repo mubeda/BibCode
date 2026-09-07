@@ -7,7 +7,7 @@ import * as Schema from "effect/Schema";
 
 import { compatVerdictFromPrepared, initialConfigOption } from "./session.ts";
 
-class TestConfigError extends Schema.TaggedErrorClass<TestConfigError>()("TestConfigError", {
+class TestConfigError extends Schema.TaggedError<TestConfigError>()("TestConfigError", {
   message: Schema.String,
 }) {}
 
