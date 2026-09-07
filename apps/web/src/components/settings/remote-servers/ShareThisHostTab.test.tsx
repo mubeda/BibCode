@@ -355,6 +355,48 @@ describe("ShareThisHostTab", () => {
     );
   });
 
+  it("identifies discovered addresses by host and preserves the selected endpoint", async () => {
+    Object.assign(h.networkQuery.data.serverExposureState, wideState);
+    h.networkQuery.data.advertisedEndpoints = [
+      { ...nativePrivateDefaultObservation, status: "available" },
+      {
+        ...nativePrivateDefaultObservation,
+        id: "desktop-network:192.168.8.194:3773",
+        httpBaseUrl: "http://192.168.8.194:3773/",
+        wsBaseUrl: "ws://192.168.8.194:3773/",
+        status: "available",
+        isDefault: false,
+      },
+      {
+        ...nativePrivateDefaultObservation,
+        id: "tailscale-https",
+        label: "Tailscale HTTPS",
+        httpBaseUrl: "https://machine.tailnet.ts.net/",
+        wsBaseUrl: "wss://machine.tailnet.ts.net/",
+        reachability: "private-network",
+        status: "available",
+        isDefault: false,
+      },
+    ];
+    installBridge();
+    await renderTab();
+
+    const select = container.querySelector("select")!;
+    expect(Array.from(select.options, (option) => option.textContent)).toEqual([
+      "Automatic (LAN)",
+      "192.168.1.20",
+      "192.168.8.194",
+      "machine.tailnet.ts.net",
+    ]);
+    await act(async () => {
+      select.value = "desktop-network:192.168.8.194:3773";
+      select.dispatchEvent(new window.Event("change", { bubbles: true }));
+    });
+    expect(select.selectedOptions[0]?.textContent).toBe("192.168.8.194");
+    await click("Generate pairing offer");
+    expect(container.textContent).toContain("http://192.168.8.194:3773/pair");
+  });
+
   it("fails closed when native exposure discovers only a public address", async () => {
     h.networkQuery.data.advertisedEndpoints = [
       {

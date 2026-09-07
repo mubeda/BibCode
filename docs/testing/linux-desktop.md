@@ -169,6 +169,10 @@ verify:
 - when only the local Linux environment is configured, the rail shows Local and
   Add Project has no remote target; saved remote environments appear as separate
   rail entries and become the Add Project target when selected;
+- Add a server by pairing code with a **Server alias**. Confirm the saved-server
+  list and environment rail show that alias after reconnecting and restarting
+  the app. Blank aliases use the pairing code's server name; failed pairing
+  preserves the alias for retry. The remote server's own name remains unchanged;
 - Settings shows **Remote Servers** with **Connect to a host** and **Share this
   host** tabs; `/settings/connections` redirects there. SSH discovery and
   grant-driven sharing appears because the desktop bridge is present. Generate
@@ -184,7 +188,9 @@ verify:
   revocation, one compensating widen during a concurrent grant, bounded handling
   of a blackholed create response, and explicit legacy resume after a local-only
   restart. The address picker lists only usable IPv4 candidates until a
-  dual-stack listener exists, uses stable address/port IDs, safely preselects a
+  dual-stack listener exists, displays IP addresses (or endpoint hostnames)
+  instead of network labels while retaining **Automatic (LAN)**, uses stable
+  address/port IDs, safely preselects a
   private default, reports off-host interface observations unavailable before
   widening, and leaves generation disabled with externally managed
   listener/reverse-proxy guidance when native discovery has only a public or

@@ -442,6 +442,10 @@ minimum-size, and relevant Windows DPI states. Verify:
   current rail selection;
 - **Local environment** is visible at `/settings/local-environment` and never
   empty;
+- Add a server by pairing code with a **Server alias**. Confirm the saved-server
+  list and environment rail show that alias after reconnecting and restarting
+  the app. Blank aliases use the pairing code's server name; failed pairing
+  preserves the alias for retry. The remote server's own name remains unchanged;
 - Settings shows **Remote Servers** with **Connect to a host** and **Share this
   host** tabs; `/settings/connections` redirects there. SSH discovery and
   grant-driven sharing appears because the desktop bridge is present.
@@ -519,7 +523,9 @@ minimum-size, and relevant Windows DPI states. Verify:
   after the switch must be rejected by the host-side topology guard;
 
 - the address picker lists only usable IPv4 candidates until a dual-stack
-  listener exists, uses stable address/port IDs, safely preselects a private
+  listener exists, displays IP addresses (or endpoint hostnames) instead of
+  network labels while retaining **Automatic (LAN)**, uses stable address/port
+  IDs, safely preselects a private
   default, reports off-host interface observations unavailable before widening,
   and leaves generation disabled with externally managed listener/reverse-proxy
   guidance when native discovery has only a public or non-default private

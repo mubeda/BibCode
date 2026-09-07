@@ -1498,6 +1498,33 @@ describe("Remote Servers tabs", () => {
       });
     });
 
+    it("keeps the server alias after failed pairing and clears it after success", async () => {
+      stubBrowserWindow();
+      h.hasCloudConfig = false;
+      h.commands.connectRemoteServer.mockResolvedValueOnce(
+        failure({ _tag: "PairingAddError", reason: "pairing-rejected", detail: "expired" }),
+      );
+      const container = await mountConnections();
+      await enterPairingCode("abc123");
+      expect(container.textContent).toContain("Server alias (optional)");
+      await act(async () => {
+        invoke(control("input", "e.g. Linux workstation"), "onChange", {
+          target: { value: "  Linux workstation  " },
+        });
+      });
+      await submitAddServer();
+      expect(h.commands.connectRemoteServer).toHaveBeenLastCalledWith({
+        code: "abc123",
+        allowLoopbackTunnel: false,
+        label: "Linux workstation",
+      });
+      expect(findControls("input", "e.g. Linux workstation").at(-1)?.props.value).toBe(
+        "  Linux workstation  ",
+      );
+      await submitAddServer();
+      expect(findControls("input", "e.g. Linux workstation").at(-1)?.props.value).toBe("");
+    });
+
     it("renders classified failure copy for a rejected pairing", async () => {
       stubBrowserWindow();
       h.hasCloudConfig = false;

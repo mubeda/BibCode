@@ -87,7 +87,7 @@ export function resolveShareAddressOptions(input: {
     seen.add(endpoint.httpBaseUrl);
     options.push({
       id: endpoint.id,
-      label: endpoint.label,
+      label: new URL(endpoint.httpBaseUrl).hostname,
       httpBaseUrl: endpoint.httpBaseUrl,
       ...(endpoint.reachability === "public" ? { requiresExplicitSelection: true } : {}),
       ...(endpoint.description === undefined ? {} : { description: endpoint.description }),
