@@ -995,10 +995,11 @@ async fn terminal_rpc_attach_tracks_activity_and_cleans_up_running_child_process
         .await;
         assert_eq!(started["snapshot"]["status"], "running");
 
-        let upsert = next_matching_chunk_value(metadata, "1", |value| {
-            value["type"] == "upsert" && value["terminal"]["terminalId"] == "term-activity"
-        })
-        .await;
+        let upsert =
+            next_matching_chunk_value(metadata, "1", "initial running metadata upsert", |value| {
+                value["type"] == "upsert" && value["terminal"]["terminalId"] == "term-activity"
+            })
+            .await;
         assert_eq!(upsert["terminal"]["status"], "running");
 
         maybe_prime_terminal(control, "thread-activity", "term-activity").await;
@@ -1039,12 +1040,17 @@ async fn terminal_rpc_attach_tracks_activity_and_cleans_up_running_child_process
         .await;
         assert_eq!(activity["label"].as_str(), Some(long_running_label()));
 
-        let metadata_activity = next_matching_chunk_value(metadata, "1", |value| {
-            value["type"] == "upsert"
-                && value["terminal"]["terminalId"] == "term-activity"
-                && value["terminal"]["hasRunningSubprocess"] == true
-                && value["terminal"]["label"] == long_running_label()
-        })
+        let metadata_activity = next_matching_chunk_value(
+            metadata,
+            "1",
+            "running subprocess metadata upsert",
+            |value| {
+                value["type"] == "upsert"
+                    && value["terminal"]["terminalId"] == "term-activity"
+                    && value["terminal"]["hasRunningSubprocess"] == true
+                    && value["terminal"]["label"] == long_running_label()
+            },
+        )
         .await;
         assert_eq!(
             metadata_activity["terminal"]["label"].as_str(),
@@ -1159,10 +1165,11 @@ async fn terminal_rpc_clear_resize_restart_exit_and_restart_if_not_running_round
         })
         .await;
         assert_eq!(started["snapshot"]["status"], "running");
-        let running_metadata = next_matching_chunk_value(metadata, "1", |value| {
-            value["type"] == "upsert" && value["terminal"]["terminalId"] == "term-restart"
-        })
-        .await;
+        let running_metadata =
+            next_matching_chunk_value(metadata, "1", "opened terminal metadata upsert", |value| {
+                value["type"] == "upsert" && value["terminal"]["terminalId"] == "term-restart"
+            })
+            .await;
         assert_eq!(running_metadata["terminal"]["status"], "running");
 
         send_request(
@@ -1396,12 +1403,13 @@ async fn terminal_rpc_clear_resize_restart_exit_and_restart_if_not_running_round
             .await;
         assert_eq!(exited["exitCode"], expected_exit_code);
         assert_eq!(exited["exitSignal"], expected_killed_exit_signal());
-        let exited_metadata = next_matching_chunk_value(metadata, "1", |value| {
-            value["type"] == "upsert"
-                && value["terminal"]["terminalId"] == "term-restart"
-                && value["terminal"]["status"] == "exited"
-        })
-        .await;
+        let exited_metadata =
+            next_matching_chunk_value(metadata, "1", "exited terminal metadata upsert", |value| {
+                value["type"] == "upsert"
+                    && value["terminal"]["terminalId"] == "term-restart"
+                    && value["terminal"]["status"] == "exited"
+            })
+            .await;
         assert_eq!(exited_metadata["terminal"]["pid"], Value::Null);
         assert_eq!(exited_metadata["terminal"]["exitCode"], expected_exit_code);
 
@@ -1836,9 +1844,13 @@ async fn send_interrupt(socket: &mut TestSocket, request_id: &str) {
 }
 
 async fn next_message(socket: &mut TestSocket) -> ServerMessage {
+    next_message_for(socket, "server message").await
+}
+
+async fn next_message_for(socket: &mut TestSocket, expected: &str) -> ServerMessage {
     let message = tokio::time::timeout(TERMINAL_RPC_INTEGRATION_DEADLINE, socket.next())
         .await
-        .expect("response timeout")
+        .unwrap_or_else(|error| panic!("response timeout while waiting for {expected}: {error}"))
         .expect("socket remains open")
         .expect("valid socket message");
     let Message::Text(text) = message else {
@@ -1885,7 +1897,7 @@ async fn close_socket(socket: &mut Option<TestSocket>) {
 
 async fn request(socket: &mut TestSocket, id: &str, tag: &str, payload: Value) -> ServerMessage {
     send_request(socket, id, tag, payload).await;
-    next_message(socket).await
+    next_message_for(socket, &format!("{tag} response (request {id})")).await
 }
 
 fn assert_success(message: ServerMessage) {
@@ -1922,13 +1934,15 @@ async fn next_chunk_and_ack(socket: &mut TestSocket, request_id: &str) -> Vec<Va
 async fn next_matching_chunk_value<F>(
     socket: &mut TestSocket,
     request_id: &str,
+    expected: &str,
     matches: F,
 ) -> Value
 where
     F: Fn(&Value) -> bool,
 {
     loop {
-        let values = next_chunk_and_ack(socket, request_id).await;
+        let values = next_chunk_for(socket, request_id, expected).await;
+        send_ack(socket, request_id).await;
         if let Some(value) = values.into_iter().find(&matches) {
             return value;
         }
@@ -1944,7 +1958,7 @@ async fn next_expected_chunk_value_and_ack<F>(
 where
     F: Fn(&Value) -> bool,
 {
-    let values = next_chunk(socket, request_id).await;
+    let values = next_chunk_for(socket, request_id, expected).await;
     let [value] = values.as_slice() else {
         panic!("expected one {expected} chunk value, got {values:?}");
     };
@@ -1964,7 +1978,7 @@ where
     F: Fn(&Value) -> bool,
 {
     loop {
-        let values = next_chunk(socket, request_id).await;
+        let values = next_chunk_for(socket, request_id, expected).await;
         let [value] = values.as_slice() else {
             panic!("expected one terminal event while waiting for {expected}, got {values:?}");
         };
@@ -1990,7 +2004,7 @@ async fn next_restart_event_and_ack(
     let mut saw_exit = false;
 
     loop {
-        let values = next_chunk(socket, request_id).await;
+        let values = next_chunk_for(socket, request_id, "restarted terminal event").await;
         let [value] = values.as_slice() else {
             panic!("expected one terminal event while waiting for restarted, got {values:?}");
         };
@@ -2022,7 +2036,8 @@ async fn next_restart_metadata_upsert(
     let mut saw_exit = false;
 
     loop {
-        let values = next_chunk(socket, request_id).await;
+        let values =
+            next_chunk_for(socket, request_id, "running metadata upsert after restart").await;
         let [value] = values.as_slice() else {
             panic!("expected one metadata event while waiting for running upsert, got {values:?}");
         };
@@ -2046,7 +2061,11 @@ async fn next_restart_metadata_upsert(
 }
 
 async fn next_chunk(socket: &mut TestSocket, request_id: &str) -> Vec<Value> {
-    match next_message(socket).await {
+    next_chunk_for(socket, request_id, "stream chunk").await
+}
+
+async fn next_chunk_for(socket: &mut TestSocket, request_id: &str, expected: &str) -> Vec<Value> {
+    match next_message_for(socket, &format!("{expected} (request {request_id})")).await {
         ServerMessage::Chunk {
             request_id: actual_request_id,
             values,

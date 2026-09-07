@@ -20,6 +20,10 @@ the saved-server list and environment rail on this device and persists across
 restarts. Leave it blank to use the name supplied by the server. An alias does
 not rename the server for other clients.
 
+Loopback pairing through a local connection or SSH tunnel retains the saved
+connection when the server has already activated its standard credential;
+administrative permissions are not required to finish that pairing.
+
 ## Desktop and browser network access
 
 Use the Share controls to create an address-specific pairing offer:

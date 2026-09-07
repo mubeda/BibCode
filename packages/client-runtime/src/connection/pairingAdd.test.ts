@@ -748,6 +748,83 @@ describe("verifyAndAddPairingCode", () => {
     }),
   );
 
+  it.effect("keeps an already-active loopback credential after confirmation scope denial", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        pairingConfirmationRequired: false,
+        confirmationFailure: true,
+        supervisorStates: [supervisorState("connecting"), supervisorState("connected")],
+      });
+      expect(
+        yield* harness.run(
+          validPayload({ endpoint: "http://127.0.0.1:3773", reach: "this-computer" }),
+          true,
+          "Local tunnel",
+        ),
+      ).toBe(SAVED_ENVIRONMENT_ID);
+      expect(harness.registrations[0]).toMatchObject({
+        target: { label: "Local tunnel" },
+        profile: { label: "Local tunnel" },
+      });
+      expect(harness.events).toContain("observe-supervisor");
+    }),
+  );
+
+  it.effect("rejects a loopback credential when its confirmation fallback proof is rejected", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        pairingConfirmationRequired: false,
+        confirmationFailure: true,
+        supervisorStates: [
+          supervisorState(
+            "blocked",
+            new ConnectionBlockedError({
+              reason: "authentication",
+              detail: "Credential rejected",
+            }),
+          ),
+        ],
+      });
+      expect(
+        yield* failureReason(
+          harness.run(validPayload({ endpoint: "http://127.0.0.1:3773" }), true),
+        ),
+      ).toBe("pairing-rejected");
+      expect(harness.registrations).toEqual([]);
+      expect(harness.acceptedIdentities).toEqual([]);
+    }),
+  );
+
+  it.effect("still rejects off-host confirmation scope denial without the pending flag", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        pairingConfirmationRequired: false,
+        confirmationFailure: true,
+        supervisorStates: [supervisorState("connected")],
+      });
+      expect(yield* failureReason(harness.run(validPayload()))).toBe("local-persistence-failed");
+      expect(harness.registrations).toEqual([]);
+      expect(harness.events).not.toContain("observe-supervisor");
+    }),
+  );
+
+  it.effect("still requires confirmation for a pending loopback credential", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        pairingConfirmationRequired: true,
+        confirmationFailure: true,
+        supervisorStates: [supervisorState("connected")],
+      });
+      expect(
+        yield* failureReason(
+          harness.run(validPayload({ endpoint: "http://127.0.0.1:3773" }), true),
+        ),
+      ).toBe("local-persistence-failed");
+      expect(harness.registrations).toEqual([]);
+      expect(harness.events).not.toContain("observe-supervisor");
+    }),
+  );
+
   it.effect("keeps an active credential when a legacy server rejects the confirmation tag", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({

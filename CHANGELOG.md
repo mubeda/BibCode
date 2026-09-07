@@ -28,7 +28,14 @@ saving a paired connection.
   storage-instance identity introduced in v0.5.5. They do not rename the remote
   host, change its identity, or affect names on other clients.
 
-### Validation and documentation
+### Reliability, validation, and documentation
+
+- Fixed loopback/SSH-tunnel pairing being rolled back when an already-active
+  standard credential could not call the administrative confirmation RPC. The
+  client now verifies that credential through its connection supervisor;
+  server permission checks and pending-pairing confirmation remain enforced.
+- Fixed a terminal cleanup race by retaining a child process's exit result for
+  late subscribers, including children that finish before a watcher attaches.
 
 - Added regression coverage for address selection, alias persistence and
   hydration, blank aliases, and failed-pairing retry behavior.
