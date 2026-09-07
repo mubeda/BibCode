@@ -1,5 +1,42 @@
 # Changelog
 
+## [v0.5.7] - 2026-09-07
+
+BiBCode v0.5.7 makes remote servers easier to identify when sharing a host or
+saving a paired connection.
+
+### Remote server sharing
+
+- The **Share this host → Address** dropdown now displays each endpoint's IP
+  address or hostname instead of repeated labels such as “Local network” and
+  “Private network”. Active LAN, Tailscale, and NetBird interfaces can be
+  distinguished directly in the list, with duplicate endpoint URLs removed by
+  the existing selection logic.
+- **Automatic (LAN)** remains available. Explicit network addresses appear once
+  native sharing is enabled; endpoint availability, default selection, public
+  address restrictions, and pairing behavior remain unchanged.
+
+### Server aliases
+
+- Added **Server alias (optional)** to the **Add Server** pairing-code form.
+  The alias is saved on the connecting device and appears in its saved-server
+  list and environment rail, including after reconnecting or restarting.
+- Aliases are trimmed; blank input uses the name supplied by the pairing code.
+  Failed pairing preserves the entered alias for retry, while successful
+  pairing clears the completed form.
+- Aliases use the existing connection catalog labels and retain the
+  storage-instance identity introduced in v0.5.5. They do not rename the remote
+  host, change its identity, or affect names on other clients.
+
+### Validation and documentation
+
+- Added regression coverage for address selection, alias persistence and
+  hydration, blank aliases, and failed-pairing retry behavior.
+- Updated the remote-access guide, connection-runtime documentation, and
+  macOS, Linux, and Windows native validation procedures.
+
+**Full Changelog**: https://github.com/mubeda/BibCode/compare/v0.5.6...v0.5.7
+
 ## [v0.5.6] - 2026-09-04
 
 BiBCode v0.5.6 is a supported dependency and toolchain convergence release. It
