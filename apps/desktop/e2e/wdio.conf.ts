@@ -111,6 +111,7 @@ export const config = {
       {
         appBinaryPath,
         driverProvider: "embedded",
+        captureBackendLogs: true,
         embeddedPort: Number(process.env.BIBCODE_E2E_WEBDRIVER_PORT ?? 4_445),
         startTimeout: 90_000,
         statusPollTimeout: 10_000,

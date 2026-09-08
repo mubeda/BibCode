@@ -178,6 +178,51 @@ jobs:
             vp run test:ui:desktop
           fi
 
+      - name: Collect macOS application crash summaries
+        if: always() && matrix.platform == 'mac'
+        shell: bash
+        env:
+          BIBCODE_E2E_ARTIFACT_DIR: ${{ runner.temp }}/bibcode-desktop-ui-artifacts
+        run: |
+          python3 - <<'PYTHON'
+          import json, os
+          from pathlib import Path
+          directory = Path.home() / "Library/Logs/DiagnosticReports"
+          paths = sorted(set(directory.glob("bibcode-desktop*.ips")) | set(directory.glob("BiBCode*.ips")), key=lambda path: path.stat().st_mtime)[-10:]
+          summaries = []
+          for path in paths:
+              try:
+                  if path.stat().st_size > 8 * 1024 * 1024:
+                      raise ValueError("Crash report exceeds the bounded 8 MiB reader")
+                  raw = path.read_text()
+                  decoder = json.JSONDecoder()
+                  records = []
+                  while raw.strip():
+                      record, end = decoder.raw_decode(raw.lstrip())
+                      records.append(record)
+                      raw = raw.lstrip()[end:]
+                  report = records[-1]
+                  exception = report.get("exception", {})
+                  termination = report.get("termination", {})
+                  thread = report.get("faultingThread")
+                  threads = report.get("threads", [])
+                  frames = threads[thread].get("frames", []) if isinstance(thread, int) and 0 <= thread < len(threads) else []
+                  summaries.append({
+                      "report": path.name,
+                      "process": report.get("procName"),
+                      "captureTime": report.get("captureTime"),
+                      "exception": {key: exception[key] for key in ("type", "signal", "subtype", "codes") if key in exception},
+                      "termination": {key: termination[key] for key in ("namespace", "code", "indicator") if key in termination},
+                      "symbols": [frame.get("symbol", "<no symbol>") for frame in frames[:20]],
+                  })
+              except (OSError, ValueError, KeyError, TypeError, IndexError, AttributeError) as error:
+                  summaries.append({"report": path.name, "error": str(error)})
+          output = Path(os.environ["BIBCODE_E2E_ARTIFACT_DIR"])
+          output.mkdir(parents=True, exist_ok=True)
+          (output / "native-crashes.log").write_text(json.dumps(summaries, indent=2) + "\n")
+          print(json.dumps(summaries, indent=2))
+          PYTHON
+
       - name: Unmount macOS test application
         if: always() && matrix.platform == 'mac'
         shell: bash
