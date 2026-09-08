@@ -1210,6 +1210,8 @@ three times and checks a complete, distinct document after each native finish.
 The suite disables
 WebDriver command retries. Treat reporter hook errors, retries, and timeouts as
 test failures even when the individual scenarios are reported as passing.
+On macOS, copy the signed DMG payload to an isolated installation directory,
+compare its executable bytes, and verify its signature before running the suite.
 The Tauri service captures backend stdout/stderr in the artifact directory.
 macOS CI also retains `native-crashes.log`, a bounded summary of application
 crash types, termination reasons, and faulting symbols; it excludes raw memory

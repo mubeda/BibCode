@@ -3,7 +3,7 @@ import { describe, expect, it } from "vite-plus/test";
 import { DesktopAppPathConfigurationError, resolveDesktopAppPath } from "./app-path.ts";
 
 describe("resolveDesktopAppPath", () => {
-  it("resolves the executable inside a macOS app mounted from a DMG", () => {
+  it("resolves the executable inside a macOS app installed from a DMG", () => {
     expect(
       resolveDesktopAppPath({
         platform: "mac",
@@ -62,7 +62,7 @@ describe("resolveDesktopAppPath", () => {
         platform: "mac",
         environment: { BIBCODE_E2E_APP_PATH: "/tmp/BiBCode.dmg" },
       }),
-    ).toThrowError(/mount the DMG/i);
+    ).toThrowError(/copy the app from the DMG/i);
 
     expect(() =>
       resolveDesktopAppPath({

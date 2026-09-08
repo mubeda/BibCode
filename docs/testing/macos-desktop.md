@@ -149,11 +149,18 @@ Build and run packaged E2E with:
 
 ```sh
 export BIBCODE_E2E_PLATFORM=mac
+export BIBCODE_E2E_ARCH="$(node -p process.arch)"
+case "$BIBCODE_E2E_ARCH" in
+  arm64) rust_target=aarch64-apple-darwin ;;
+  x64) rust_target=x86_64-apple-darwin ;;
+  *) echo 'Unsupported macOS architecture' >&2; exit 1 ;;
+esac
 vp run test:ui:desktop:build
 
-dmg=$(find "$PWD/target/release/bundle/dmg" -maxdepth 1 -type f -name 'BiBCode_*.dmg' -print -quit)
+dmg=$(find "$PWD/target/$rust_target/release/bundle/dmg" -maxdepth 1 -type f -name 'BiBCode_*.dmg' -print -quit)
 test -n "$dmg"
 mount_dir=$(mktemp -d /private/tmp/bibcode-macos-e2e-mount.XXXXXX)
+install_dir=$(mktemp -d /private/tmp/bibcode-macos-e2e-install.XXXXXX)
 cleanup_e2e_mount() {
   hdiutil detach "$mount_dir" >/dev/null 2>&1 || true
   rmdir "$mount_dir" 2>/dev/null || true
@@ -161,16 +168,22 @@ cleanup_e2e_mount() {
 trap cleanup_e2e_mount EXIT HUP INT TERM
 hdiutil attach -readonly -nobrowse -mountpoint "$mount_dir" "$dmg"
 
-export BIBCODE_E2E_APP_PATH="$mount_dir/BiBCode.app"
+ditto "$mount_dir/BiBCode.app" "$install_dir/BiBCode.app"
+executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$mount_dir/BiBCode.app/Contents/Info.plist")
+cmp "$mount_dir/BiBCode.app/Contents/MacOS/$executable" "$install_dir/BiBCode.app/Contents/MacOS/$executable"
+codesign --verify --deep --strict "$install_dir/BiBCode.app"
+export BIBCODE_E2E_APP_PATH="$install_dir/BiBCode.app"
 test -d "$BIBCODE_E2E_APP_PATH"
 vp run test:ui:desktop
 ```
 
-`BIBCODE_E2E_APP_PATH` deliberately selects the application bundle produced by
-the E2E build in the current worktree, not an installed production copy. The
-DMG-only bundler removes its transient staging `.app` after packaging, so mount
-the resulting DMG read-only instead of depending on that staging path. Keep the
-cleanup trap active until WebDriver and the packaged application have exited.
+`BIBCODE_E2E_APP_PATH` selects the isolated installation copied from the current
+worktree's E2E DMG. The DMG-only bundler removes its transient staging `.app`;
+mount the resulting image to inspect and copy its signed payload, then validate
+the installed copy as in the normal macOS installation flow. Binary comparison
+and signature verification bind the test to that exact payload. Keep the cleanup
+trap active until WebDriver and the packaged application have exited. Retain the
+installation directory with the execution evidence for inspection.
 
 ## Renderer-data isolation
 
