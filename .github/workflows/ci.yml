@@ -227,7 +227,9 @@ jobs:
 
       - name: Verify macOS release exception recovery
         if: matrix.platform == 'mac'
-        run: cargo run --release -p bibcode-desktop --example objc_exception_probe
+        run: |
+          rust_target="$(rustc -Vv | sed -n 's/^host: //p')"
+          cargo run --release --target "$rust_target" -p bibcode-desktop --example objc_exception_probe
 
       - name: Test Windows desktop E2E support contracts
         if: matrix.platform == 'win'
