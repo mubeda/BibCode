@@ -3,6 +3,8 @@
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 
+import { refreshDesktopUiDocument } from "./support/document-navigation.ts";
+
 import { resolveDesktopAppPath, type DesktopUiPlatform } from "./support/app-path.ts";
 import { isFinalDesktopUiSpec, requestDesktopUiApplicationExit } from "./support/app-lifecycle.ts";
 import {
@@ -95,18 +97,7 @@ async function resetDesktopUiConnectionCache(): Promise<void> {
   if (resetResult.error !== null) {
     throw new Error(resetResult.error);
   }
-  await browser.refresh();
-  await waitForDesktopUiDocumentLoad();
-}
-
-async function waitForDesktopUiDocumentLoad(): Promise<void> {
-  await browser.executeAsync((done: (result: string) => void) => {
-    if (document.readyState === "complete") {
-      done("ready");
-      return;
-    }
-    window.addEventListener("load", () => done("ready"), { once: true });
-  });
+  await refreshDesktopUiDocument();
 }
 
 export const config = {
@@ -166,14 +157,17 @@ export const config = {
     }
   },
   beforeTest: async () => {
-    await resetDesktopUiConnectionCache();
-    await browser.execute(() => {
-      const selector = "style[data-bibcode-desktop-ui-automation]";
-      if (!document.querySelector(selector)) {
-        const style = document.createElement("style");
-        style.dataset.bibcodeDesktopUiAutomation = "true";
-        style.textContent = [
-          `
+    let setupStage = "connection reset and navigation";
+    try {
+      await resetDesktopUiConnectionCache();
+      setupStage = "motion stylesheet";
+      await browser.execute(() => {
+        const selector = "style[data-bibcode-desktop-ui-automation]";
+        if (!document.querySelector(selector)) {
+          const style = document.createElement("style");
+          style.dataset.bibcodeDesktopUiAutomation = "true";
+          style.textContent = [
+            `
         html:not([data-bibcode-desktop-ui-motion="native"]) *,
         html:not([data-bibcode-desktop-ui-motion="native"]) *::before,
         html:not([data-bibcode-desktop-ui-motion="native"]) *::after {
@@ -182,28 +176,33 @@ export const config = {
           transition-delay: 0s !important;
           transition-duration: 0s !important;
         }`,
-          `
+            `
         [data-open][data-starting-style] {
           opacity: 1 !important;
           scale: 1 !important;
           translate: none !important;
           transform: none !important;
         }`,
-          `
+            `
         [data-closed] {
           display: none !important;
         }`,
-          `
+            `
         [data-slot="sidebar-group"]:has([data-testid="new-main-chat-button"])
           ul[data-sidebar="menu"] > li {
           opacity: 1 !important;
           transform: none !important;
         }`,
-        ].join("\n");
-        document.head.append(style);
-      }
-      document.documentElement.dataset.bibcodeDesktopUiMotion = "disabled";
-    });
+          ].join("\n");
+          document.head.append(style);
+        }
+        document.documentElement.dataset.bibcodeDesktopUiMotion = "disabled";
+      });
+    } catch (error) {
+      throw new Error(`Desktop UI setup failed during ${setupStage}: ${String(error)}`, {
+        cause: error,
+      });
+    }
   },
   afterTest: async (
     test: { readonly title: string },

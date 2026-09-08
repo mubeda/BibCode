@@ -40,6 +40,9 @@ follow the server you are working on.
 
 ### Reliability and validation
 
+- Wait for the replacement document after desktop test reloads so setup cannot
+  proceed against a completed page that is about to be discarded.
+
 - Made packaged desktop validation independent of suspended macOS paint frames,
   wait for native viewport resizing and workspace terminal controls, and target
   Pierre selection shortcuts

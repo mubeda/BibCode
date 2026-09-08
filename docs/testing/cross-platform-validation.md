@@ -1197,7 +1197,9 @@ sizes. Cover relevant:
   process growth.
 
 The default packaged suite runs all of its spec files in one embedded-driver
-session, resets client connection state before every test, and disables
+session, resets client connection state before every test, and waits for a
+replacement document with a new navigation time origin to finish loading after
+refresh. The old page reporting complete is insufficient. The suite disables
 WebDriver command retries. Treat reporter hook errors, retries, and timeouts as
 test failures even when the individual scenarios are reported as passing.
 Window resizing polls the actual viewport and native window until the requested
