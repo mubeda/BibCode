@@ -80,7 +80,7 @@ export const ConsumeCodexRateLimitResetResult = Schema.Struct({
 });
 export type ConsumeCodexRateLimitResetResult = typeof ConsumeCodexRateLimitResetResult.Type;
 
-export class ServerProviderUsageResetError extends Schema.TaggedErrorClass<ServerProviderUsageResetError>()(
+export class ServerProviderUsageResetError extends Schema.TaggedError<ServerProviderUsageResetError>()(
   "ServerProviderUsageResetError",
   {
     message: Schema.String,

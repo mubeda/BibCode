@@ -2557,9 +2557,18 @@ impl WorktreeCatalogService {
             )));
         }
 
-        let mut worktrees = Vec::with_capacity(inventory.records.len());
-        let mut matched_threads = HashSet::new();
+        let mut normalized_record_paths = Vec::with_capacity(inventory.records.len());
         for record in &inventory.records {
+            normalized_record_paths.push(self.physical_path_key(&record.path, cancellation).await?);
+        }
+        let mut matched_threads = normalized_record_paths
+            .iter()
+            .filter_map(|normalized_path| thread_paths.get(normalized_path))
+            .filter_map(|threads| threads.first())
+            .map(|thread| thread.thread_id.clone())
+            .collect::<HashSet<_>>();
+        let mut worktrees = Vec::with_capacity(inventory.records.len());
+        for (record, normalized_path) in inventory.records.iter().zip(normalized_record_paths) {
             let directory_probe = directory_probes
                 .get(&record.path)
                 .copied()
@@ -2573,7 +2582,6 @@ impl WorktreeCatalogService {
             } else {
                 None
             };
-            let normalized_path = self.physical_path_key(&record.path, cancellation).await?;
             let record_worktree_key =
                 worktree_key(common_dir, Path::new(&normalized_path), platform)
                     .as_str()
@@ -2591,6 +2599,9 @@ impl WorktreeCatalogService {
                         })?
                         .thread_id
                         .as_str();
+                    if matched_threads.contains(prior_thread_id) {
+                        return None;
+                    }
                     canonical_threads(project).find(|thread| thread.thread_id == prior_thread_id)
                 });
             if let Some(owner) = owner {

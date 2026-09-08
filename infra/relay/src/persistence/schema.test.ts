@@ -21,7 +21,7 @@ import {
   relayManagedEndpointAllocations,
 } from "./schema.ts";
 
-class EmbeddedSqlError extends Schema.TaggedErrorClass<EmbeddedSqlError>()("EmbeddedSqlError", {
+class EmbeddedSqlError extends Schema.TaggedError<EmbeddedSqlError>()("EmbeddedSqlError", {
   cause: Schema.Defect(),
 }) {}
 

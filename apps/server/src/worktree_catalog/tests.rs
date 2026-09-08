@@ -2751,6 +2751,68 @@ async fn catalog_joins_an_owner_and_inventory_record_by_physical_workspace_ident
 }
 
 #[tokio::test]
+async fn current_owner_path_wins_over_previous_snapshot_fallback_after_retarget() {
+    let projections = Arc::new(FakeProjectionSource::new([project(
+        "project-1",
+        "/repo/main",
+        [thread("owner", "/repo/old")],
+    )]));
+    let observed_inventory = inventory(
+        "/repo/common",
+        [
+            record("/repo/main", true),
+            record("/repo/old", false),
+            record("/repo/target", false),
+        ],
+    );
+    let service = WorktreeCatalogService::with_dependencies(
+        projections.clone(),
+        Arc::new(FakeInventorySource::new([
+            observed_inventory.clone(),
+            observed_inventory,
+        ])),
+        Arc::new(FakeFileSystem::new([
+            ("/repo/main", DirectoryProbeState::Present),
+            ("/repo/old", DirectoryProbeState::Present),
+            ("/repo/target", DirectoryProbeState::Present),
+            ("/repo/common", DirectoryProbeState::Present),
+        ])),
+        CatalogServiceOptions::default(),
+    );
+    let subscription = service.subscribe("project-1").await.expect("catalog");
+    let initial = subscription.latest();
+    assert_eq!(
+        descriptor(&initial, "/repo/old")
+            .adopted_thread_id
+            .as_deref(),
+        Some("owner")
+    );
+
+    projections.set_project(project(
+        "project-1",
+        "/repo/main",
+        [thread("owner", "/repo/target")],
+    ));
+    let retargeted = service
+        .refresh("project-1", CatalogRefreshTrigger::Explicit)
+        .await
+        .expect("retargeted catalog");
+
+    assert_eq!(
+        descriptor(&retargeted, "/repo/old").adopted_thread_id,
+        None,
+        "the previous-snapshot fallback must not reclaim the old path"
+    );
+    assert_eq!(
+        descriptor(&retargeted, "/repo/target")
+            .adopted_thread_id
+            .as_deref(),
+        Some("owner")
+    );
+    assert_eq!(adopted(&retargeted, "owner").path, "/repo/target");
+}
+
+#[tokio::test]
 async fn concurrent_refresh_waiters_receive_the_same_ownership_conflict() {
     let projections = Arc::new(FakeProjectionSource::new([project(
         "project-1",

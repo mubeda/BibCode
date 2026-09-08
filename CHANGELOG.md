@@ -1,5 +1,226 @@
 # Changelog
 
+## [v0.5.7] - 2026-09-07
+
+BiBCode v0.5.7 makes remote servers easier to identify when sharing a host or
+saving a paired connection.
+
+### Remote server sharing
+
+- The **Share this host → Address** dropdown now displays each endpoint's IP
+  address or hostname instead of repeated labels such as “Local network” and
+  “Private network”. Active LAN, Tailscale, and NetBird interfaces can be
+  distinguished directly in the list, with duplicate endpoint URLs removed by
+  the existing selection logic.
+- **Automatic (LAN)** remains available. Explicit network addresses appear once
+  native sharing is enabled; endpoint availability, default selection, public
+  address restrictions, and pairing behavior remain unchanged.
+
+### Server aliases
+
+- Added **Server alias (optional)** to the **Add Server** pairing-code form.
+  The alias is saved on the connecting device and appears in its saved-server
+  list and environment rail, including after reconnecting or restarting.
+- Aliases are trimmed; blank input uses the name supplied by the pairing code.
+  Failed pairing preserves the entered alias for retry, while successful
+  pairing clears the completed form.
+- Aliases use the existing connection catalog labels and retain the
+  storage-instance identity introduced in v0.5.5. They do not rename the remote
+  host, change its identity, or affect names on other clients.
+
+### Reliability, validation, and documentation
+
+- Fixed loopback/SSH-tunnel pairing being rolled back when an already-active
+  standard credential could not call the administrative confirmation RPC. The
+  client now verifies that credential through its connection supervisor;
+  server permission checks and pending-pairing confirmation remain enforced.
+- Fixed a terminal cleanup race by retaining a child process's exit result for
+  late subscribers, including children that finish before a watcher attaches.
+
+- Added regression coverage for address selection, alias persistence and
+  hydration, blank aliases, and failed-pairing retry behavior.
+- Updated the remote-access guide, connection-runtime documentation, and
+  macOS, Linux, and Windows native validation procedures.
+
+**Full Changelog**: https://github.com/mubeda/BibCode/compare/v0.5.6...v0.5.7
+
+## [v0.5.6] - 2026-09-04
+
+BiBCode v0.5.6 is a supported dependency and toolchain convergence release. It
+moves the web, desktop, server, relay, and repository tooling onto one reviewed
+set of current compatible versions while preserving the native Rust/Tauri
+runtime and the existing browser/desktop RPC boundary.
+
+### Toolchains and frontend foundations
+
+- Standardized development on Node.js 26.8.1, pnpm 11.25.0, Rust/Cargo 1.98.0,
+  Vite+ 0.3.0, Vite 8.2.2, and the single Vitest 4.1.11 runtime supplied by
+  Vite+. The main workspace now uses TypeScript 7.0.2; the Astro marketing app
+  remains on TypeScript 6.0.3 until its public checker supports TypeScript 7.
+- Updated React and React DOM to 19.2.8 with matching types, and refreshed the
+  Base UI, Lexical, TanStack, fonts, icons, DOM test runtime, and other
+  maintained frontend dependencies as compatible cohorts.
+- Moved Pierre Diffs to stable 1.3.6 and its public editing API, removed the
+  retired Pierre prerelease patch, and retained diff review, partial staging,
+  editor history, undo, and conversation rendering behavior.
+
+### Runtime and dependency compatibility
+
+- Converged Effect core and its selected v4 companions on
+  `4.0.0-beta.107`. Alchemy remains on the newest compatible beta.72 release,
+  paired with the exact Drizzle ORM and Kit RC5 build required by that train,
+  avoiding the incompatible Effect RC.112 split.
+- Updated the supported Rust and Tauri dependency floors under Rust 1.98,
+  including the source compatibility repairs required by the new compiler and
+  libraries. The application remains a native Rust/Tauri desktop and server
+  runtime; no production Node.js service or Electron host was introduced.
+- Retained WebdriverIO 9.29 and the Tauri automation service/plugin 1.2 cohort.
+  The 1.3 line remains blocked until upstream fixes teardown ordering and aligns
+  its globals/expect dependency train.
+
+### Reliability, security, and maintenance
+
+- Reworked vendored-reference synchronization into an exact,
+  history-independent snapshot transaction. Linked worktrees share one writer
+  lock; literal Git paths, pruning, casing, and file modes are preserved; and
+  typed failures, defects, interruption, and timed rollback all quiesce their
+  child processes before recovery advances. An unverifiable recovery keeps the
+  lock for explicit repair instead of exposing partial state.
+- Refreshed the exact Effect and Alchemy reference snapshots and made the
+  dependency ledger declaration-complete: 221 audited entries, no pending row,
+  and no unaccounted direct dependency or toolchain declaration.
+- Hardened Clerk frontend-domain validation by rejecting malformed or
+  unsupported Punycode labels before URL construction. Valid IDN custom Clerk
+  domains remain unsupported until BiBCode owns one deterministic
+  cross-runtime IDNA validator.
+- Updated immutable GitHub Actions pins, release/test contracts, native port
+  probing, process-watchdog coverage, raw Git parsing, and repository identity
+  checks used by the cross-platform build and packaged-test paths. The Git
+  broadcaster cancellation regression now proves synchronous lifecycle
+  cancellation and joined cleanup without depending on a five-second scheduler
+  race, and Claude hook-plumbing coverage uses an isolated probe context under
+  parallel load. Catalog joins now reserve a workspace's current direct path
+  before any retained-snapshot fallback, preventing duplicate old/new ownership
+  after a retarget; its integration coverage uses an owned healthy-refresh
+  boundary.
+
+### Supported release assets
+
+- Desktop installers for macOS 11+ on Apple Silicon and Intel, Linux on ARM64
+  and x64, and Windows 11 ARM64 plus Windows 10/11 x64.
+- Standalone server archives for all six OS/architecture targets, plus ARM64
+  and x64 Debian and RPM packages and `bibcode-server-SHA256SUMS`.
+- Signed updater payloads and a six-target `latest.json` manifest for the
+  stable in-app update channel. macOS applications remain ad-hoc signed and
+  unnotarized, and Windows installers remain without Authenticode.
+
+**Full Changelog**: https://github.com/mubeda/BibCode/compare/v0.5.5...v0.5.6
+
+## [v0.5.5] - 2026-09-04
+
+BiBCode v0.5.5 fixes desktop pairing: **Add Server** refused every pairing code
+with "Server already saved" even when no server was saved at all.
+
+### Pairing fixes
+
+- A saved remote server is now identified by the host's storage instance id
+  rather than by the environment id the host declares about itself. Every
+  BiBCode server declares the same id — `local` — including the server the
+  desktop app runs in process, so the app's own **Local** environment and every
+  remote host claimed one key in the client's environment registry. Pairing saw
+  that key already taken and refused the code; removing the saved server could
+  not help, because the entry it collided with was Local, which cannot be
+  removed. Two different remote servers would have overwritten each other the
+  same way. Reproduced in the desktop app on a data root that had never seen the
+  remote host, and verified afterwards against an independent second server:
+  both hosts declare `local` with different storage ids, the remote pairs
+  end-to-end encrypted, and it now appears in the environment rail alongside
+  Local instead of replacing it.
+- The host's declared id is kept beside the client's own key, and the connection
+  resolver checks the endpoint against that stored value on every connect, so
+  the identity assertion is preserved rather than dropped. Servers saved before
+  this release carry the declared id in their existing field and resolve through
+  it unchanged — no re-pairing and no migration.
+- The manual endpoint-and-token path identifies a server the same way, keeping
+  the declared id for hosts that report no storage id.
+- "Server already saved" now names the entry that was collided with instead of
+  printing one generic sentence, so the dialog says which saved server to
+  reconnect to or adopt.
+
+### Documentation
+
+- The remote architecture document records how a saved remote is identified and
+  why a host's declared id cannot key it. The Linux, macOS, and Windows desktop
+  runbooks check that a paired server appears alongside Local and that a second
+  offer from the same host is refused by name.
+
+## [v0.5.4] - 2026-09-04
+
+BiBCode v0.5.4 fixes the desktop workspace sidebar: the floating **Toggle main
+sidebar** control sat on top of the environment rail's first entry, so aiming
+at **Local** collapsed the sidebar instead of selecting the environment.
+
+### Interface fixes
+
+- The environment rail now reserves the same topbar strip the thread sidebar
+  header reserves, so the first environment entry starts below the fixed
+  toggle instead of underneath it. The rail's separator line is continued
+  across the reserved strip, keeping the header edge unbroken between rail and
+  sidebar. On a native macOS titlebar the control resolves to the top-left
+  52px column, which is exactly the rail's width, so the two overlapped
+  completely; a WebKit geometry harness built from the shipped stylesheet
+  reported 672 px^2 of overlap and a hit-test at Local's centre landing on the
+  toggle, and reports no overlap with Local receiving the hit after the fix.
+  The thread sidebar brand drops its control-clearance margin because the
+  control no longer overlays that header, while the collapsed-sidebar centre
+  panel header keeps using the shared offset variable. A regression assertion
+  pins the reserved strip ahead of the environments group.
+
+## [v0.5.3] - 2026-09-03
+
+BiBCode v0.5.3 fixes the encrypted pairing channel in every desktop app: with
+the v0.5.1 connect policy and the v0.5.2 macOS transport exception in place,
+pairing still ended as "Server unreachable" because the client rejected the
+server's handshake reply.
+
+### Connection fixes
+
+- The end-to-end-encrypted channel now reads WebSocket frames delivered as
+  `ArrayBuffer`, which is what every real browser hands over once the socket
+  is switched to `binaryType "arraybuffer"`. The client previously treated
+  such frames as non-binary, failed the Noise handshake as a protocol error
+  right after receiving the server's reply, and closed the socket without
+  sending its pairing message. Verified end to end inside a WebKit page
+  carrying the app's policy against a live server: the handshake completes,
+  the pairing token is consumed, and the session is minted. A regression test
+  drives the handshake through a socket that delivers `ArrayBuffer` frames.
+
+### Test reliability
+
+- The blocked-remote cancellation test in the Git status broadcaster awaits
+  the cancellation before releasing the blocking permit, removing a race that
+  failed a release preflight under CI load.
+
+## [v0.5.2] - 2026-09-03
+
+BiBCode v0.5.2 is a macOS-only fix on top of v0.5.1: the desktop app can now
+reach plain-HTTP remote servers on a LAN or tailnet, which App Transport
+Security had been refusing before any packet left the machine.
+
+### Connection fixes
+
+- The macOS bundle now merges an `Info.plist` that relaxes App Transport
+  Security for web content only (`NSAllowsArbitraryLoadsInWebContent` and
+  `NSAllowsLocalNetworking`) and declares the Local Network usage description,
+  so **Add Server → Pairing code** works against `http://` servers. Native
+  code keeps the default policy, and the hardening test rejects the blanket
+  `NSAllowsArbitraryLoads`.
+
+### Documentation
+
+- The remote architecture and release documents record the macOS gate beside
+  the webview connect policy introduced in v0.5.1.
+
 ## [v0.5.1] - 2026-09-03
 
 BiBCode v0.5.1 makes headless servers pairable from the desktop app without a

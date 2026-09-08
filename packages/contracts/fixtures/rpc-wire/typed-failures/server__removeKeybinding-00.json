@@ -10,7 +10,7 @@
           "_tag": "KeybindingsConfigParseError",
           "configPath": "~length ",
           "detail": "toString",
-          "cause": "undefined"
+          "cause": null
         }
       }
     ]

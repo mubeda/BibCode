@@ -293,6 +293,7 @@ describe("ConnectionResolver", () => {
         environmentId: ENVIRONMENT_ID,
         label: "Saved",
         connectionId: "saved-1",
+        serverEnvironmentId: null,
       });
       const profile = new BearerConnectionProfile({
         connectionId: "saved-1",
@@ -337,6 +338,7 @@ describe("ConnectionResolver", () => {
         environmentId: ENVIRONMENT_ID,
         label: "Pinned",
         connectionId: "saved-e2ee",
+        serverEnvironmentId: null,
       });
       const profile = new BearerConnectionProfile({
         connectionId: target.connectionId,

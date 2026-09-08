@@ -29,6 +29,8 @@ export const referenceRepos: ReadonlyArray<ReferenceRepo> = [
     packageVersionPath: ["dependencies", "alchemy"],
     versionTagPrefix: "v",
     packageSourceRefPrefix: "https://pkg.ing/alchemy/",
-    prunePaths: [".gitmodules", ".vendor/alchemy", "cloudflare-tools", "distilled"],
+    // Nested gitlinks are not materialized by snapshot sync and are not usable
+    // reference content, so prune the complete vendor directory.
+    prunePaths: [".gitmodules", ".vendor", "cloudflare-tools", "distilled"],
   },
 ];

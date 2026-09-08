@@ -3,8 +3,9 @@ import * as Schema from "effect/Schema";
 const ClerkPublishableKeyPrefix = Schema.Literals(["pk_test", "pk_live", "unknown"]);
 const CanonicalAsciiDnsHostname =
   /^(?=.{1,253}$)(?=.*[a-z])(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
+const PunycodeDnsLabel = /(?:^|\.)xn--/u;
 
-export class ClerkPublishableKeyDecodeError extends Schema.TaggedErrorClass<ClerkPublishableKeyDecodeError>()(
+export class ClerkPublishableKeyDecodeError extends Schema.TaggedError<ClerkPublishableKeyDecodeError>()(
   "ClerkPublishableKeyDecodeError",
   {
     keyPrefix: ClerkPublishableKeyPrefix,
@@ -16,7 +17,7 @@ export class ClerkPublishableKeyDecodeError extends Schema.TaggedErrorClass<Cler
   }
 }
 
-export class ClerkPublishableKeyFrontendApiError extends Schema.TaggedErrorClass<ClerkPublishableKeyFrontendApiError>()(
+export class ClerkPublishableKeyFrontendApiError extends Schema.TaggedError<ClerkPublishableKeyFrontendApiError>()(
   "ClerkPublishableKeyFrontendApiError",
   {
     keyPrefix: ClerkPublishableKeyPrefix,
@@ -69,7 +70,7 @@ function parseClerkFrontendApi(publishableKey: string): {
       ...(hostname === undefined ? {} : { hostname }),
     });
   }
-  if (!CanonicalAsciiDnsHostname.test(frontendApi)) {
+  if (!CanonicalAsciiDnsHostname.test(frontendApi) || PunycodeDnsLabel.test(frontendApi)) {
     const hostname = safeClerkFrontendApiHostname(frontendApi);
     throw new ClerkPublishableKeyFrontendApiError({
       keyPrefix,

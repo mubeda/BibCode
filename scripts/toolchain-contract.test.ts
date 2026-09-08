@@ -53,16 +53,14 @@ describe("repository toolchain contract", () => {
     const workspace = readText("pnpm-workspace.yaml");
     const workspaceConfiguration = parseYaml(workspace) as Record<string, unknown>;
 
-    expect(rootPackage.engines).toEqual({ node: "26.5.0" });
-    expect(rootPackage.packageManager).toBe("pnpm@11.15.0");
-    expect(workspace).toMatch(/^  "@types\/node": 26\.1\.1$/m);
-    expect(workspace).toMatch(/^  vite: npm:@voidzero-dev\/vite-plus-core@0\.2\.5$/m);
-    expect(workspace).toMatch(/^  vite-plus: 0\.2\.5$/m);
+    expect(rootPackage.engines).toEqual({ node: "26.8.1" });
+    expect(rootPackage.packageManager).toBe("pnpm@11.25.0");
+    expect(workspace).toMatch(/^  "@types\/node": 26\.4\.1$/m);
+    expect(workspace).toMatch(/^  vite: npm:@voidzero-dev\/vite-plus-core@0\.3\.0$/m);
+    expect(workspace).toMatch(/^  vite-plus: 0\.3\.0$/m);
     expect(workspaceConfiguration.minimumReleaseAgeExclude).toEqual([
       "geckodriver@6.1.1",
-      "@cloudflare/workers-types@5.20260718.1",
-      "@tanstack/router-generator@1.167.21",
-      "@tanstack/router-plugin@1.168.22",
+      "@cloudflare/workers-types@5.20260903.1",
       "@noble/ciphers@2.4.0",
     ]);
     expect(workspace).not.toMatch(/^trustLockfile:\s+true$/m);
@@ -91,7 +89,7 @@ describe("repository toolchain contract", () => {
     const catalog = workspace.catalog as Record<string, string>;
     const peerDependencyRules = workspace.peerDependencyRules as Record<string, unknown>;
 
-    expect(catalog["@effect/tsgo"]).toBe("0.24.1");
+    expect(catalog["@effect/tsgo"]).toBe("0.40.0");
     expect(catalog.typescript).toBe("7.0.2");
     expect(catalog).not.toHaveProperty("@typescript/native-preview");
     expect(rootDevDependencies).not.toHaveProperty("@typescript/native-preview");
@@ -128,10 +126,10 @@ describe("repository toolchain contract", () => {
     const workspace = cargo.workspace as Record<string, unknown>;
     const workspacePackage = workspace.package as Record<string, unknown>;
 
-    expect(toolchain.channel).toBe("1.97.1");
+    expect(toolchain.channel).toBe("1.98.0");
     expect(toolchain.profile).toBe("minimal");
     expect(toolchain.components).toEqual(["rustfmt", "clippy"]);
-    expect(workspacePackage["rust-version"]).toBe("1.97.1");
+    expect(workspacePackage["rust-version"]).toBe("1.98.0");
 
     for (const workflowPath of [
       ".github/workflows/ci.yml",
@@ -140,7 +138,7 @@ describe("repository toolchain contract", () => {
     ]) {
       const workflow = readText(workflowPath);
       expect(workflow).not.toMatch(/dtolnay\/rust-toolchain@(stable|1\.88(?:\.0)?)/);
-      expect(workflow).toMatch(/dtolnay\/rust-toolchain@[0-9a-f]{40} # 1\.97\.1/);
+      expect(workflow).toMatch(/dtolnay\/rust-toolchain@[0-9a-f]{40} # 1\.98\.0/);
     }
   });
 
@@ -158,11 +156,11 @@ describe("repository toolchain contract", () => {
     ]);
     expect(Object.keys(features).some((feature) => /(?:^|\/)bun:/.test(feature))).toBe(false);
     expect(features["ghcr.io/devcontainers/features/node:2.1.0"]).toEqual({
-      version: "26.5.0",
+      version: "26.8.1",
     });
     expect(devcontainer.postCreateCommand).toEqual({
       install:
-        "npm install --global corepack@0.35.0 && corepack enable && corepack prepare pnpm@11.15.0 --activate && pnpm install --frozen-lockfile",
+        "npm install --global corepack@0.35.0 && corepack enable && corepack prepare pnpm@11.25.0 --activate && pnpm install --frozen-lockfile",
     });
   });
 

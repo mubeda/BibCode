@@ -173,6 +173,9 @@ verify:
   list and environment rail show that alias after reconnecting and restarting
   the app. Blank aliases use the pairing code's server name; failed pairing
   preserves the alias for retry. The remote server's own name remains unchanged;
+- Pair a loopback offer through a local connection or tunnel and confirm the
+  already-active standard credential remains saved without administrative
+  confirmation scope. Pending and off-host scope denials must still fail;
 - Settings shows **Remote Servers** with **Connect to a host** and **Share this
   host** tabs; `/settings/connections` redirects there. SSH discovery and
   grant-driven sharing appears because the desktop bridge is present. Generate
@@ -205,10 +208,14 @@ verify:
   flow still has no Host selector; remote targeting is driven by the environment
   rail;
 - Headless pairing: on a second machine or VM run `bibcode serve --host
-<routable address>`, confirm the startup line contains `pairingCode`, mint a
-  second offer with `bibcode pairing offer --endpoint http://<address>:3773`,
-  add each through **Add Server → Pairing code**, then restart the headless
-  server and confirm the saved server reconnects without re-pairing.
+<routable address>`, confirm the startup line contains `pairingCode`, and add it
+  through **Add Server → Pairing code**. Confirm the saved server appears
+  alongside — not in place of — the app's own **Local** environment, since both
+  hosts declare the environment id `local`. Mint a second offer with `bibcode
+pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
+  it by name ("<label> is already saved."): two offers describe one environment.
+  Then restart the headless server and confirm the saved server reconnects
+  without re-pairing.
 - Headless service: on the second machine run `bibcode service install --host
 <routable address>`, confirm `bibcode service status` reports `active`,
   reboot that machine, and confirm the desktop's saved server reconnects
@@ -266,6 +273,12 @@ scoped AppImage, desktop, server, provider, terminal, WebDriver, Xvfb, and
 fixture processes. Confirm cancellation and shutdown converge on bounded
 terminate/wait/reap, late descendants cannot escape after a natural root exit,
 peer runtimes remain alive, and no run-owned process survives.
+
+Run a terminal command that exits immediately, then close its terminal after
+observing completion. Also close while the command is finishing. Both paths
+must complete without an exit-wait timeout or a surviving process. The native
+PTY regression covers exit before any subscriber exists and verifies that a
+late subscriber receives the retained completion.
 
 Remove only exact fixture, profile, artifact, and evidence roots created by the
 run. Report pre-existing processes or temporary roots without terminating or

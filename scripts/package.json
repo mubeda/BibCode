@@ -12,7 +12,7 @@
     "@bibcode/shared": "workspace:*",
     "@effect/platform-node": "catalog:",
     "effect": "catalog:",
-    "smol-toml": "1.7.0",
+    "smol-toml": "1.8.0",
     "yaml": "catalog:"
   },
   "devDependencies": {

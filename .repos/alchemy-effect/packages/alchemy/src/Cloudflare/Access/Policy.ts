@@ -22,6 +22,20 @@ import type { Providers } from "../Providers.ts";
 export type PolicyRule = zeroTrust.CreateAccessPolicyRequest["include"][number];
 
 /**
+ * One arm of the exclude-side rule union, and its require-side twin.
+ * Cloudflare's spec types the exclude/require rule lists separately from
+ * include — a few rule kinds (e.g. the GitHub-organization rule) carry the
+ * raw wire shape there — so these props use the SDK's own unions rather
+ * than reusing {@link PolicyRule}.
+ */
+export type PolicyExcludeRule = NonNullable<
+  zeroTrust.CreateAccessPolicyRequest["exclude"]
+>[number];
+export type PolicyRequireRule = NonNullable<
+  zeroTrust.CreateAccessPolicyRequest["require"]
+>[number];
+
+/**
  * Decision Cloudflare Access takes when a request matches this policy.
  *
  * - `"allow"` — admit the user.
@@ -61,12 +75,12 @@ export type PolicyProps = {
    * Rules combined with logical NOT. A request matching any exclude rule is
    * rejected by the policy even if it satisfied an include rule.
    */
-  exclude?: Policy.RuleGroup[];
+  exclude?: PolicyExcludeRule[];
   /**
    * Rules combined with logical AND. A request must satisfy every require
    * rule in addition to an include rule.
    */
-  require?: Policy.RuleGroup[];
+  require?: PolicyRequireRule[];
   /**
    * Duration of issued session tokens. Format: `300ms`, `2h45m`, etc. When
    * unset, applications using this policy fall back to their own configured
@@ -177,10 +191,11 @@ export const PolicyProvider = () =>
       if ((output?.accountId ?? accountId) !== accountId) {
         return { action: "replace" } as const;
       }
-      const name = yield* createPolicyName(id, news.name);
-      const oldName = output?.name
-        ? output.name
-        : yield* createPolicyName(id, olds.name);
+      const oldName = output?.name ?? (yield* createPolicyName(id, olds.name));
+      // Auto-generated names are engine-owned: the deployed name stays
+      // authoritative even if the generator would name this id differently
+      // today. Only an explicit user-provided name can force a replace.
+      const name = news.name ?? oldName;
       if (name !== oldName) {
         return { action: "replace" } as const;
       }
@@ -191,7 +206,9 @@ export const PolicyProvider = () =>
     }),
     reconcile: Effect.fn(function* ({ id, news = {} as PolicyProps, output }) {
       const { accountId } = yield* yield* CloudflareEnvironment;
-      const name = yield* createPolicyName(id, news.name);
+      // Prefer the deployed name: regenerating would target a different
+      // resource if the generator's output for this id ever drifts.
+      const name = yield* createPolicyName(id, news.name ?? output?.name);
       const acct = output?.accountId ?? accountId;
 
       // Observe — prefer cached policyId, fall back to a name lookup so
@@ -367,7 +384,7 @@ const createPolicyName = (id: string, name: string | undefined) =>
 
 const findPolicyByName = (acct: string, name: string) =>
   zeroTrust.listAccessPolicies.items({ accountId: acct }).pipe(
-    Stream.filter((p): p is ObservedPolicy => p.name === name),
+    Stream.filter((p) => p.name === name),
     Stream.runHead,
     Effect.map(Option.getOrUndefined),
     Effect.catch(() => Effect.succeed(undefined)),
