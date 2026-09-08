@@ -614,6 +614,7 @@ fn register_terminal_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalS
             Ok(Value::Null)
         }
     });
+    register_ordered_input_rpcs(registry, services);
     register_terminal_unary(
         registry,
         "terminal.resize",
@@ -753,6 +754,111 @@ async fn acquire_terminal_attach(
             .map_err(workspace_admission_error);
     }
     acquire_terminal_thread(Some(admission), &input.thread_id).await
+}
+
+fn register_ordered_input_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalServices) {
+    let terminal = services.terminal.clone();
+    let availability = services.workspace_admission.clone();
+    registry.register_unary_with_context(
+        "terminal.beginInput",
+        move |request, context, _cancellation| {
+            let terminal = terminal.clone();
+            let availability = availability.clone();
+            async move {
+                let input: TerminalInputBeginPayload = decode_payload(&request.payload)?;
+                let admission =
+                    acquire_terminal_thread(availability.as_ref(), &input.thread_id).await?;
+                let lease = await_terminal_publication(
+                    admission,
+                    terminal.begin_input(
+                        context.connection_id(),
+                        context.connection_closed(),
+                        &input.thread_id,
+                        &input.terminal_id,
+                        input.attachment_sequence,
+                    ),
+                )
+                .await?;
+                Ok(serde_json::to_value(lease).expect("input lease serializes"))
+            }
+        },
+    );
+
+    let terminal = services.terminal.clone();
+    let availability = services.workspace_admission.clone();
+    registry.register_unary_with_context(
+        "terminal.writeInput",
+        move |request, context, _cancellation| {
+            let terminal = terminal.clone();
+            let availability = availability.clone();
+            async move {
+                if let Some(data) = request.payload.get("data").and_then(Value::as_str)
+                    && (data.is_empty() || data.len() > 16 * 1024)
+                {
+                    if let (Some(thread_id), Some(terminal_id), Some(input_id)) = (
+                        request.payload.get("threadId").and_then(Value::as_str),
+                        request.payload.get("terminalId").and_then(Value::as_str),
+                        request.payload.get("inputId").and_then(Value::as_str),
+                    ) {
+                        let _ = terminal.cancel_input(context.connection_id(), thread_id, terminal_id, input_id);
+                    }
+                    return Err(json!({"_tag":"TerminalInputError", "code":"capacity", "message":"Terminal input exceeded its frame limit. Reconnect input before typing again."}));
+                }
+                let input: TerminalInputFramePayload = decode_payload(&request.payload)?;
+                // Reserve before filesystem/database admission so those waits cannot
+                // retain more than the connection's input count and byte budget.
+                let frame = terminal.prepare_input_write(context.connection_id(), &input.thread_id, &input.terminal_id, &input.input_id, input.sequence, &input.data).map_err(terminal_error)?;
+                let admission =
+                    match acquire_terminal_thread(availability.as_ref(), &input.thread_id).await {
+                        Ok(admission) => admission,
+                        Err(error) => {
+                            let _ = terminal.cancel_input(
+                                context.connection_id(),
+                                &input.thread_id,
+                                &input.terminal_id,
+                                &input.input_id,
+                            );
+                            return Err(error);
+                        }
+                    };
+                let result = await_terminal_publication(
+                    admission,
+                    frame.write(),
+                )
+                .await;
+                if result.is_err() {
+                    let _ = terminal.cancel_input(
+                        context.connection_id(),
+                        &input.thread_id,
+                        &input.terminal_id,
+                        &input.input_id,
+                    );
+                }
+                result
+                    .map(|ack| serde_json::to_value(ack).expect("input acknowledgement serializes"))
+            }
+        },
+    );
+
+    let terminal = services.terminal.clone();
+    registry.register_unary_with_context(
+        "terminal.cancelInput",
+        move |request, context, _cancellation| {
+            let terminal = terminal.clone();
+            async move {
+                let input: TerminalInputCancelPayload = decode_payload(&request.payload)?;
+                terminal
+                    .cancel_input(
+                        context.connection_id(),
+                        &input.thread_id,
+                        &input.terminal_id,
+                        &input.input_id,
+                    )
+                    .map_err(terminal_error)?;
+                Ok(Value::Null)
+            }
+        },
+    );
 }
 
 async fn acquire_terminal_thread(
@@ -1016,6 +1122,32 @@ struct TerminalWritePayload {
     thread_id: String,
     terminal_id: String,
     data: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TerminalInputBeginPayload {
+    thread_id: String,
+    terminal_id: String,
+    attachment_sequence: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TerminalInputFramePayload {
+    thread_id: String,
+    terminal_id: String,
+    input_id: String,
+    sequence: u64,
+    data: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TerminalInputCancelPayload {
+    thread_id: String,
+    terminal_id: String,
+    input_id: String,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1428,6 +1560,11 @@ fn terminal_error(error: TerminalError) -> Value {
             "_tag": "TerminalCwdStatError",
             "cwd": "",
             "cause": message,
+        }),
+        TerminalError::Input(error) => json!({
+            "_tag": "TerminalInputError",
+            "code": error.code,
+            "message": error.message,
         }),
         TerminalError::Close => json!({
             "_tag": "TerminalCloseError",

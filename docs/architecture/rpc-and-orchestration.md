@@ -995,9 +995,61 @@ Every method on this surface holds a path admission lease for the whole
 operation, and the mutations additionally cross the finalization fence described
 in [Missing-workspace runtime guard](#missing-workspace-runtime-guard).
 
+## Ordered terminal input
+
+Current servers advertise `terminalOrderedInput`. The client negotiates from
+the actual RPC session's initial configuration; an omitted/false capability
+keeps the serialized `terminal.write` path. A failure on the ordered path does
+not retry through the legacy method.
+
+| Method                 | Input                                                                 | Successful result                                          |
+| ---------------------- | --------------------------------------------------------------------- | ---------------------------------------------------------- |
+| `terminal.beginInput`  | Thread, terminal, and a monotonically increasing `attachmentSequence` | An opaque `inputId`                                        |
+| `terminal.writeInput`  | Thread, terminal, `inputId`, zero-based frame `sequence`, and `data`  | The matching `inputId` and `sequence`, after the PTY write |
+| `terminal.cancelInput` | Thread, terminal, and `inputId`                                       | Null; unknown/already removed leases are harmless          |
+
+All three use `terminal:operate`. The server binds each lease to the physical
+RPC connection and captured terminal process generation. Reconnecting with the
+same bearer still creates a different connection identity. A newer attachment
+supersedes the previous lease; a delayed older begin cannot supersede the newer
+attachment. Cancellation and terminal generation changes invalidate leases.
+
+The Rust terminal owner reserves a shared per-connection window of 16 frames
+and 256 KiB before filesystem/database workspace admission. Each frame is at
+most 16 KiB of UTF-8. Reordered arrivals wait for the missing sequence without
+writing a suffix early. A five-second gap deadline, duplicate/invalid sequence,
+overflow, dropped admitted work, or I/O failure seals the lease and wakes all
+waiters. PTY delivery uses the existing generation publication guard and exact
+process identity. A write already executing when cancellation arrives can have
+completed; it is never replayed after a lost acknowledgement.
+
+The shared client runtime counts unary and persistent stream requests against
+the physical connection's 64-request limit. Input begins/writes stop admission
+at 56 occupied slots, leaving eight for other operations; input also shares the
+16-frame/256-KiB window. Its aggregate waiting dispatch payload is capped at
+1 MiB. Each terminal's renderer scheduler and negotiated binding separately cap
+pending data at 1 MiB, so the renderer limit is per terminal. Frames split at
+Unicode scalar boundaries. Reset cancels the captured old lease asynchronously
+without deleting or cancelling a newer binding, and stale replies cannot
+revive failed input. Lease preparation starts after confirmed attachment to
+avoid an additional setup round trip on the first keystroke. Successful open
+and restart commands also prepare the confirmed terminal on the same captured
+session before returning, so immediate programmatic writes work before the
+renderer arrives. Idempotent open preserves an already-live binding.
+
+The renderer retains its input binding across visual hide/reparent operations.
+Process/attachment changes reset it. On delivery failure it pauses input and
+offers **Reconnect input**, which refreshes the attachment to the same running
+process and never replays discarded text. This removes acknowledgement queuing
+during ordinary typing; remote echo still includes network round-trip latency.
+
 ## Provider usage refresh
 
 `server.getProviderUsage` reads the server's current provider-usage snapshots.
+The status bar targets the environment selected in the rail for this query and
+for refresh or usage-reset commands. Switching environments changes the query
+and interaction state; a late command result remains in its originating
+environment's cache.
 `server.refreshProviderUsage` accepts an optional provider list and an optional
 boolean `force`. Omitting `force`, or sending `false`, uses the normal refresh
 throttle; `force: true` starts an explicit fetch even inside that interval.

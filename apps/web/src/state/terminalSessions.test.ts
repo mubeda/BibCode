@@ -11,6 +11,7 @@ const harness = vi.hoisted(() => ({
     options: unknown;
   }>,
   producerAtom: { kind: "attach-producer" },
+  refreshedAtoms: [] as unknown[],
   snapshotAtom: { kind: "attach-snapshot" },
   snapshotValue: {
     metadata: { emptyMetadata: true },
@@ -52,6 +53,7 @@ vi.mock("react", () => ({
   ],
 }));
 vi.mock("@effect/atom-react", () => ({
+  useAtomRefresh: (atom: unknown) => () => harness.refreshedAtoms.push(atom),
   useAtomSubscribe: (atom: unknown, callback: (result: unknown) => void, options: unknown) => {
     harness.subscribeCalls.push({ atom, callback, options });
   },
@@ -107,6 +109,7 @@ beforeEach(() => {
   harness.queryInputs.length = 0;
   harness.atomValueInputs.length = 0;
   harness.subscribeCalls.length = 0;
+  harness.refreshedAtoms.length = 0;
   harness.snapshotValue = {
     metadata: { emptyMetadata: true },
     transcriptRuntime: null,
@@ -122,10 +125,17 @@ beforeEach(() => {
 });
 
 describe("useAttachedTerminalSession", () => {
+  it("reattaches the selected terminal producer without replacing its process", () => {
+    const state = useAttachedTerminalSession({ environmentId, terminal });
+    state.reattach();
+    expect(harness.refreshedAtoms).toEqual([harness.producerAtom]);
+  });
+
   it("returns the empty state when either scope input is missing", () => {
     expect(useAttachedTerminalSession({ environmentId: null, terminal })).toEqual({
       emptySession: true,
       transcriptRuntime: null,
+      reattach: expect.any(Function),
     });
     expect(harness.queryInputs).toEqual([null]);
     expect(harness.attachProducer).not.toHaveBeenCalled();
@@ -135,6 +145,7 @@ describe("useAttachedTerminalSession", () => {
     expect(useAttachedTerminalSession({ environmentId, terminal: null })).toEqual({
       emptySession: true,
       transcriptRuntime: null,
+      reattach: expect.any(Function),
     });
     expect(harness.queryInputs[0]).not.toBeNull();
   });
@@ -158,6 +169,7 @@ describe("useAttachedTerminalSession", () => {
     expect(useAttachedTerminalSession({ environmentId, terminal })).toEqual({
       summary,
       metadata: { generation: 1, revision: 1, status: "running" },
+      reattach: expect.any(Function),
       status: "running",
       transcriptRuntime: { kind: "runtime" },
     });
@@ -178,6 +190,7 @@ describe("useAttachedTerminalSession", () => {
       metadata: { emptyMetadata: true },
       status: "running",
       transcriptRuntime: null,
+      reattach: expect.any(Function),
     });
     expect(harness.attachProducer).not.toHaveBeenCalled();
     expect(harness.attachSnapshot).not.toHaveBeenCalled();
@@ -206,6 +219,7 @@ describe("useAttachedTerminalSession", () => {
       metadata: { emptyMetadata: true },
       status: "error",
       error: "attach failed",
+      reattach: expect.any(Function),
       transcriptRuntime: { kind: "last-runtime" },
     });
 

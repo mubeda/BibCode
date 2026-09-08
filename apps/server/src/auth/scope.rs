@@ -117,12 +117,15 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "worktree.retarget"
         | "worktree.updateDiscoveryPolicy" => Some(SCOPE_ORCHESTRATION_OPERATE),
         "terminal.attach"
+        | "terminal.beginInput"
+        | "terminal.cancelInput"
         | "terminal.clear"
         | "terminal.close"
         | "terminal.open"
         | "terminal.resize"
         | "terminal.restart"
         | "terminal.write"
+        | "terminal.writeInput"
         | "subscribeTerminalEvents"
         | "subscribeTerminalMetadata" => Some(SCOPE_TERMINAL_OPERATE),
         "review.getDiffPreview" => Some(SCOPE_REVIEW_WRITE),

@@ -30,6 +30,11 @@ import {
   TerminalThreadInput,
   TerminalWriteError,
   TerminalWriteInput,
+  TerminalBeginInput,
+  TerminalCancelInput,
+  TerminalInputAcknowledgement,
+  TerminalInputLease,
+  TerminalWriteInputFrame,
 } from "./terminal.ts";
 import {
   expectDecodeFailure,
@@ -53,6 +58,73 @@ function decodes<S extends Schema.Top>(schema: S, input: unknown): boolean {
 const encodeTerminalRestartInput = Schema.encodeSync(TerminalRestartInput);
 const decodeTerminalError = Schema.decodeUnknownSync(TerminalError);
 const encodeTerminalError = Schema.encodeUnknownSync(TerminalError);
+
+describe("ordered terminal input", () => {
+  it("requires a nonnegative safe attachment sequence on every begin", () => {
+    for (const attachmentSequence of [undefined, -1, 0.5, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(
+        decodes(TerminalBeginInput, { threadId: "thread", terminalId: "term", attachmentSequence }),
+      ).toBe(false);
+    }
+    expect(
+      decodes(TerminalBeginInput, {
+        threadId: "thread",
+        terminalId: "term",
+        attachmentSequence: Number.MAX_SAFE_INTEGER,
+      }),
+    ).toBe(true);
+  });
+  it("decodes lease lifecycle payloads and acknowledgements", () => {
+    expect(
+      decodeSync(TerminalBeginInput, {
+        threadId: "thread",
+        terminalId: "term-1",
+        attachmentSequence: 0,
+      }),
+    ).toEqual({
+      threadId: "thread",
+      terminalId: "term-1",
+      attachmentSequence: 0,
+    });
+    expect(decodeSync(TerminalInputLease, { inputId: "lease" })).toEqual({ inputId: "lease" });
+    expect(
+      decodeSync(TerminalWriteInputFrame, {
+        threadId: "thread",
+        terminalId: "term-1",
+        inputId: "lease",
+        sequence: 0,
+        data: "x",
+      }),
+    ).toMatchObject({ inputId: "lease", sequence: 0, data: "x" });
+    expect(decodeSync(TerminalInputAcknowledgement, { inputId: "lease", sequence: 0 })).toEqual({
+      inputId: "lease",
+      sequence: 0,
+    });
+    expect(
+      decodeSync(TerminalCancelInput, {
+        threadId: "thread",
+        terminalId: "term-1",
+        inputId: "lease",
+      }),
+    ).toMatchObject({ inputId: "lease" });
+  });
+
+  it("rejects invalid frame sequences and data", () => {
+    const frame = {
+      threadId: "thread",
+      terminalId: "term-1",
+      inputId: "lease",
+      sequence: 0,
+      data: "x",
+    };
+    for (const sequence of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => decodeSync(TerminalWriteInputFrame, { ...frame, sequence })).toThrow();
+    }
+    for (const data of ["", "x".repeat(16_385)]) {
+      expect(() => decodeSync(TerminalWriteInputFrame, { ...frame, data })).toThrow();
+    }
+  });
+});
 
 describe("TerminalOpenInput", () => {
   it("accepts valid open input", () => {

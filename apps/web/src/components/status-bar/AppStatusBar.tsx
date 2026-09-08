@@ -13,10 +13,8 @@ import { RefreshCwIcon } from "lucide-react";
 import { useCallback, useContext, useEffect, useRef, useState } from "react";
 
 import { useClientSettings } from "../../hooks/useSettings";
-import {
-  usePrimaryEnvironment,
-  usePrimaryLocalEnvironmentForSelected,
-} from "../../state/environments";
+import { useActiveEnvironmentId } from "../../state/entities";
+import { usePrimaryLocalEnvironmentForSelected } from "../../state/environments";
 import { useEnvironmentQuery } from "../../state/query";
 import { serverEnvironment } from "../../state/server";
 import { useKnownTerminalSessions } from "../../state/terminalSessions";
@@ -286,8 +284,7 @@ export function AppStatusBarView({
 export function AppStatusBar() {
   const atomRegistry = useContext(RegistryContext);
   const navigate = useNavigate();
-  const primaryEnvironment = usePrimaryEnvironment();
-  const environmentId = primaryEnvironment?.environmentId ?? null;
+  const environmentId = useActiveEnvironmentId();
   const primaryLocalEnvironment = usePrimaryLocalEnvironmentForSelected(environmentId);
   const primaryLocalEnvironmentId = primaryLocalEnvironment?.environmentId ?? null;
   const containerRef = useRef<HTMLDivElement | null>(null);

@@ -32,6 +32,97 @@ function deferred(): Deferred {
 const flush = () => Promise.resolve();
 
 describe("createTerminalInputScheduler", () => {
+  it("starts later ordered input while the first reply remains pending", async () => {
+    const sent: string[] = [];
+    const gate = deferred();
+    const scheduler = createTerminalInputScheduler({
+      maxInFlight: 16,
+      send: (data) => {
+        sent.push(data);
+        return gate.promise;
+      },
+    });
+    scheduler.enqueue("a");
+    await flush();
+    scheduler.enqueue("b");
+    await flush();
+    expect(sent).toEqual(["a", "b"]);
+    gate.resolveOk();
+    await flush();
+  });
+
+  it("bounds UTF-8 frames and preserves surrogate pairs joined in the same turn", async () => {
+    const sent: string[] = [];
+    const scheduler = createTerminalInputScheduler({
+      maxInFlight: 16,
+      maxFrameBytes: 4,
+      send: async (data) => {
+        sent.push(data);
+        return { ok: true };
+      },
+    });
+    scheduler.enqueue("a\ud83d");
+    scheduler.enqueue("\ude00éb");
+    await flush();
+    await flush();
+    expect(sent.join("")).toBe("a😀éb");
+    expect(sent.every((frame) => new TextEncoder().encode(frame).length <= 4)).toBe(true);
+  });
+
+  it("stops ordered overflow and write failures until reset", async () => {
+    const errors: unknown[] = [];
+    const sent: string[] = [];
+    const scheduler = createTerminalInputScheduler({
+      maxInFlight: 16,
+      maxPendingBytes: 4,
+      stopOnError: true,
+      onWriteError: (error) => errors.push(error),
+      send: async (data) => {
+        sent.push(data);
+        return { ok: false, error: "lost reply" };
+      },
+    });
+    scheduler.enqueue("12345");
+    scheduler.enqueue("a");
+    await flush();
+    expect(errors).toHaveLength(1);
+    expect(sent).toEqual([]);
+    scheduler.reset();
+    scheduler.enqueue("a");
+    await flush();
+    await flush();
+    scheduler.enqueue("b");
+    await flush();
+    expect(sent).toEqual(["a"]);
+    expect(errors).toHaveLength(2);
+  });
+
+  it("ignores stale lost replies after ordered reset without blocking new input", async () => {
+    const first = deferred();
+    const errors: unknown[] = [];
+    const sent: string[] = [];
+    const scheduler = createTerminalInputScheduler({
+      maxInFlight: 16,
+      stopOnError: true,
+      onWriteError: (error) => errors.push(error),
+      send: (data) => {
+        sent.push(data);
+        return data === "old" ? first.promise : Promise.resolve({ ok: true });
+      },
+    });
+    scheduler.enqueue("old");
+    await flush();
+    scheduler.reset();
+    scheduler.enqueue("new");
+    await flush();
+    expect(sent).toEqual(["old", "new"]);
+    first.rejectWith(new Error("late"));
+    await flush();
+    await flush();
+    expect(errors).toEqual([]);
+    expect(scheduler.isDraining()).toBe(false);
+  });
+
   it("coalesces same-turn input into a single write via a microtask", async () => {
     const sent: string[] = [];
     const scheduler = createTerminalInputScheduler({

@@ -98,11 +98,21 @@ const terminalInputBindings = new Map<string, TerminalInputBinding>();
 const TERMINAL_WRITE_INTERRUPTED = Symbol("terminal-write-interrupted");
 
 interface TerminalInputBinding {
-  renderer: { readonly owner: object; readonly terminal: Terminal } | null;
+  renderer: {
+    readonly owner: object;
+    readonly terminal: Terminal;
+    readonly onInputError: (message: string | null) => void;
+  } | null;
   write: ((data: string, fallbackError: string) => Promise<TerminalInputSendResult>) | null;
+  ordered: boolean;
+  generation: number;
+  attachment: { readonly runtime: object; readonly generation: number } | null;
+  error: string | null;
+  resetInput: (() => void) | null;
   readonly pendingFallbacks: Array<{
     remaining: number;
     message: string;
+    notified?: boolean;
     onWriteError?: ((error: unknown) => void) | undefined;
   }>;
 }
@@ -260,6 +270,14 @@ export function enqueueTerminalInput<A, E>(input: {
   if (input.data.length === 0) return;
   const inputKey = terminalInputKey(input.environmentId, input.threadId, input.terminalId);
   const { binding, scheduler } = acquireTerminalInputBinding(inputKey);
+  if (binding.ordered && binding.error !== null) {
+    try {
+      input.onWriteError?.(new Error(binding.error));
+    } catch {
+      // Failure observers are isolated from input admission.
+    }
+    return;
+  }
   binding.write = async (data, fallbackError) =>
     atomCommandTerminalInputResult(await input.write(data), fallbackError);
   binding.pendingFallbacks.push({
@@ -283,6 +301,11 @@ function acquireTerminalInputBinding(inputKey: string): {
     binding = {
       renderer: null,
       write: null,
+      ordered: false,
+      generation: 0,
+      attachment: null,
+      error: null,
+      resetInput: null,
       pendingFallbacks: [],
     };
     terminalInputBindings.set(inputKey, binding);
@@ -291,18 +314,27 @@ function acquireTerminalInputBinding(inputKey: string): {
   const keyedBinding = binding;
   const scheduler = terminalInputRegistry.acquire(inputKey, () => {
     const rawScheduler = createTerminalInputScheduler({
+      maxInFlight: () => (keyedBinding.ordered ? 16 : 1),
+      maxFrameBytes: 16 * 1024,
+      maxPendingBytes: 1024 * 1024,
+      stopOnError: () => keyedBinding.ordered,
+      onReset: () => keyedBinding.resetInput?.(),
       send: async (data) => {
+        const generation = keyedBinding.generation;
         let remaining = data.length;
         let fallbackError = "Terminal write failed";
         let hasFallback = false;
         const consumedFallbacks = new Set<(typeof keyedBinding.pendingFallbacks)[number]>();
         const notifyFallbackFailures = (error: unknown) => {
-          if (error === TERMINAL_WRITE_INTERRUPTED) return;
+          if (error === TERMINAL_WRITE_INTERRUPTED || generation !== keyedBinding.generation)
+            return;
           const affectedFallbacks = new Set([
             ...consumedFallbacks,
             ...keyedBinding.pendingFallbacks,
           ]);
           for (const fallback of affectedFallbacks) {
+            if (fallback.notified) continue;
+            fallback.notified = true;
             try {
               fallback.onWriteError?.(error);
             } catch {
@@ -344,7 +376,21 @@ function acquireTerminalInputBinding(inputKey: string): {
         return result;
       },
       onWriteError: (error) => {
+        for (const fallback of keyedBinding.pendingFallbacks) {
+          if (fallback.notified || error === TERMINAL_WRITE_INTERRUPTED) continue;
+          fallback.notified = true;
+          try {
+            fallback.onWriteError?.(error);
+          } catch {
+            // Failure observers must not break scheduler cleanup.
+          }
+        }
         keyedBinding.pendingFallbacks.length = 0;
+        if (keyedBinding.ordered) {
+          keyedBinding.error =
+            error instanceof Error ? error.message : "Terminal input was interrupted.";
+          keyedBinding.renderer?.onInputError(keyedBinding.error);
+        }
         if (error === TERMINAL_WRITE_INTERRUPTED) return;
         const active = keyedBinding.renderer?.terminal;
         if (!active) return;
@@ -358,6 +404,9 @@ function acquireTerminalInputBinding(inputKey: string): {
     return {
       enqueue: (data) => rawScheduler.enqueue(data),
       reset: () => {
+        keyedBinding.generation += 1;
+        keyedBinding.error = null;
+        keyedBinding.renderer?.onInputError(null);
         keyedBinding.pendingFallbacks.length = 0;
         rawScheduler.reset();
       },
@@ -690,6 +739,9 @@ export function TerminalViewport({
   const fitAddonRef = useRef<FitAddon | null>(null);
   const environmentId = threadRef.environmentId;
   const serverConfig = useAtomValue(serverEnvironment.configValueAtom(environmentId));
+  const orderedInput = serverConfig?.environment.capabilities?.terminalOrderedInput === true;
+  const [inputError, setInputError] = useState<string | null>(null);
+  const [inputReattaching, setInputReattaching] = useState(false);
   const openInPreferredEditor = useOpenInPreferredEditor(
     environmentId,
     serverConfig?.availableEditors ?? [],
@@ -702,6 +754,10 @@ export function TerminalViewport({
   const runTerminalWrite = useAtomCommand(terminalEnvironment.write, {
     reportFailure: false,
   });
+  const runPrepareInput = useAtomCommand(terminalEnvironment.prepareInput, {
+    reportFailure: false,
+  });
+  const runResetInput = useAtomCommand(terminalEnvironment.resetInput, { reportFailure: false });
   const runTerminalResize = useAtomCommand(terminalEnvironment.resize, {
     reportFailure: false,
   });
@@ -906,10 +962,6 @@ export function TerminalViewport({
     error: null as string | null,
     status: "closed" as typeof terminalStatus,
   });
-  const previousRuntimeGenerationRef = useRef({
-    runtime: transcriptRuntime,
-    generation: terminalGeneration,
-  });
 
   const restartForTheme = useCallback(() => {
     const terminal = terminalRef.current;
@@ -1061,7 +1113,12 @@ export function TerminalViewport({
     const { binding: inputBinding, scheduler: inputScheduler } =
       acquireTerminalInputBinding(inputKey);
     inputSchedulerRef.current = inputScheduler;
-    inputBinding.renderer = { owner: rendererOwner, terminal };
+    inputBinding.renderer = { owner: rendererOwner, terminal, onInputError: setInputError };
+    inputBinding.ordered = orderedInput;
+    inputBinding.resetInput = () => {
+      void runResetInput({ environmentId, input: { threadId, terminalId } });
+    };
+    setInputError(inputBinding.error);
     inputBinding.write = createTerminalInputWriter({
       environmentId,
       threadId,
@@ -1173,6 +1230,7 @@ export function TerminalViewport({
     const sendTerminalInput = (data: string, fallbackError: string) => {
       if (
         readWorkspaceUnavailable() ||
+        (inputBinding.ordered && inputBinding.error !== null) ||
         inputBinding.renderer?.owner !== rendererOwner ||
         data.length === 0
       )
@@ -1467,6 +1525,7 @@ export function TerminalViewport({
     terminalId,
     threadId,
     transcriptRuntime,
+    orderedInput,
     worktreePath,
   ]);
 
@@ -1653,21 +1712,46 @@ export function TerminalViewport({
   ]);
 
   useEffect(() => {
-    const previous = previousRuntimeGenerationRef.current;
-    previousRuntimeGenerationRef.current = {
-      runtime: transcriptRuntime,
-      generation: terminalGeneration,
-    };
+    if (!shouldRender || transcriptRuntime === null) return;
+    const binding = terminalInputBindings.get(
+      terminalInputKey(environmentId, threadId, terminalId),
+    );
+    if (!binding || binding.renderer?.terminal !== terminalRef.current) return;
+    const previous = binding.attachment;
     if (
-      !shouldRender ||
-      transcriptRuntime === null ||
-      previous.runtime !== transcriptRuntime ||
-      terminalGeneration <= previous.generation
+      previous !== null &&
+      (previous.runtime !== transcriptRuntime || previous.generation !== terminalGeneration)
     ) {
-      return;
+      inputSchedulerRef.current?.reset();
     }
-    inputSchedulerRef.current?.reset();
-  }, [shouldRender, terminalGeneration, transcriptRuntime]);
+    binding.attachment = { runtime: transcriptRuntime, generation: terminalGeneration };
+    setInputReattaching(false);
+    const generation = binding.generation;
+    void runPrepareInput({ environmentId, input: { threadId, terminalId } }).then((result) => {
+      if (
+        generation !== binding.generation ||
+        result._tag === "Success" ||
+        isAtomCommandInterrupted(result)
+      )
+        return;
+      const error = squashAtomCommandFailure(result);
+      binding.error = error instanceof Error ? error.message : "Terminal input could not connect.";
+      binding.renderer?.onInputError(binding.error);
+    });
+  }, [
+    environmentId,
+    orderedInput,
+    runPrepareInput,
+    shouldRender,
+    terminalGeneration,
+    terminalId,
+    threadId,
+    transcriptRuntime,
+  ]);
+
+  useEffect(() => {
+    if (terminalError !== null) setInputReattaching(false);
+  }, [terminalError]);
 
   useEffect(() => {
     const generation = focusGenerationRef.current + 1;
@@ -1794,6 +1878,26 @@ export function TerminalViewport({
           className="absolute inset-0 flex items-center justify-center px-4 text-center text-xs text-destructive"
         >
           {terminalError}
+        </div>
+      ) : null}
+      {shouldRender && orderedInput && inputError !== null ? (
+        <div
+          role="alert"
+          className="absolute inset-x-2 bottom-2 z-20 flex items-center gap-3 rounded-md border bg-popover px-3 py-2 text-xs text-popover-foreground shadow-md"
+        >
+          <span className="min-w-0 flex-1">{inputError}</span>
+          <Button
+            type="button"
+            size="xs"
+            variant="outline"
+            disabled={inputReattaching}
+            onClick={() => {
+              setInputReattaching(true);
+              terminalSession.reattach();
+            }}
+          >
+            {inputReattaching ? "Reconnecting…" : "Reconnect input"}
+          </Button>
         </div>
       ) : null}
       {showCodexThemeNotice ? (

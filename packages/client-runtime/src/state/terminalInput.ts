@@ -13,6 +13,11 @@ export interface TerminalInputSchedulerOptions {
   readonly onWriteError?: (error: unknown) => void;
   /** Maximum UTF-16 length of a single RPC frame. */
   readonly maxFrameLength?: number;
+  readonly maxInFlight?: number | (() => number);
+  readonly maxFrameBytes?: number;
+  readonly maxPendingBytes?: number;
+  readonly stopOnError?: boolean | (() => boolean);
+  readonly onReset?: () => void;
 }
 
 export interface TerminalInputScheduler {
@@ -34,27 +39,41 @@ export function createTerminalInputScheduler(
     ? Math.max(1, Math.floor(requestedMaxFrameLength))
     : DEFAULT_MAX_INPUT_FRAME_LENGTH;
   let pending = "";
-  let draining = false;
+  const maxInFlight = () =>
+    Math.max(
+      1,
+      Math.min(
+        16,
+        Math.floor(
+          typeof options.maxInFlight === "function"
+            ? options.maxInFlight()
+            : (options.maxInFlight ?? 1),
+        ) || 1,
+      ),
+    );
+  const maxFrameBytes = Math.max(
+    4,
+    Math.min(16 * 1024, Math.floor(options.maxFrameBytes ?? 16 * 1024) || 16 * 1024),
+  );
+  const maxPendingBytes = Math.max(
+    1,
+    Math.min(1024 * 1024, Math.floor(options.maxPendingBytes ?? 1024 * 1024) || 1024 * 1024),
+  );
+  const encoder = new TextEncoder();
+  const inFlight = new Set<object>();
+  let stopped = false;
   let scheduled = false;
   let generation = 0;
 
   const takeFrame = (): string => {
-    if (pending.length <= maxFrameLength) {
-      const frame = pending;
-      pending = "";
-      return frame;
-    }
-
-    let end = maxFrameLength;
-    const last = pending.charCodeAt(end - 1);
-    const next = pending.charCodeAt(end);
-    const splitsSurrogatePair =
-      last >= 0xd800 && last <= 0xdbff && next >= 0xdc00 && next <= 0xdfff;
-    if (splitsSurrogatePair) {
-      // A one-unit limit cannot contain a surrogate pair. Keep the pair intact
-      // and allow this frame to exceed that limit by one unit so draining
-      // always makes progress.
-      end = end === 1 ? 2 : end - 1;
+    let end = 0;
+    let bytes = 0;
+    for (const character of pending) {
+      const size = terminalInputCharacterBytes(character);
+      if (end > 0 && (end + character.length > maxFrameLength || bytes + size > maxFrameBytes))
+        break;
+      end += character.length;
+      bytes += size;
     }
 
     const frame = pending.slice(0, end);
@@ -70,59 +89,80 @@ export function createTerminalInputScheduler(
     }
   };
 
-  const drain = async (): Promise<void> => {
-    if (draining) return;
-    draining = true;
+  const notifyReset = (): void => {
     try {
-      while (pending.length > 0) {
-        const frameGeneration = generation;
-        const frame = takeFrame();
-        let result: TerminalInputSendResult;
+      options.onReset?.();
+    } catch {
+      /* Lifecycle observers cannot break draining. */
+    }
+  };
+
+  const fail = (error: unknown): void => {
+    pending = "";
+    if (typeof options.stopOnError === "function" ? options.stopOnError() : options.stopOnError) {
+      stopped = true;
+      notifyReset();
+    }
+    notifyWriteError(error);
+  };
+
+  const drain = (): void => {
+    if (stopped) return;
+    while (pending.length > 0 && inFlight.size < maxInFlight()) {
+      const frameGeneration = generation;
+      const frame = takeFrame();
+      const token = {};
+      inFlight.add(token);
+      void (async () => {
         try {
-          result = await options.send(frame);
+          const result = await options.send(frame);
+          if (frameGeneration === generation && !result.ok && !stopped) fail(result.error);
         } catch (error) {
-          if (frameGeneration !== generation) continue;
-          pending = "";
-          notifyWriteError(error);
-          return;
+          if (frameGeneration === generation && !stopped) fail(error);
+        } finally {
+          if (inFlight.delete(token)) {
+            drain();
+          }
         }
-        if (frameGeneration !== generation) continue;
-        if (!result.ok) {
-          pending = "";
-          notifyWriteError(result.error);
-          return;
-        }
-      }
-    } finally {
-      draining = false;
-      if (pending.length > 0) scheduleDrain();
+      })();
     }
   };
 
   const scheduleDrain = () => {
-    if (scheduled || draining) return;
+    if (scheduled) return;
     scheduled = true;
     queueMicrotask(() => {
       scheduled = false;
-      void drain();
+      drain();
     });
   };
 
   return {
     enqueue(data) {
-      if (data.length === 0) return;
+      if (data.length === 0 || stopped) return;
+      if (encoder.encode(pending + data).length > maxPendingBytes) {
+        fail(
+          new Error(
+            "Terminal input exceeded the 1 MiB pending limit. Reattach before typing again.",
+          ),
+        );
+        return;
+      }
       pending += data;
       scheduleDrain();
     },
     reset() {
       generation += 1;
       pending = "";
+      stopped = false;
+      if (maxInFlight() > 1) inFlight.clear();
+      notifyReset();
     },
     pendingLength() {
       return pending.length;
     },
     isDraining() {
-      return draining;
+      return inFlight.size > 0;
     },
   };
 }
@@ -164,4 +204,10 @@ export function terminalInputKey(
   terminalId: string,
 ): string {
   return JSON.stringify([environmentId, threadId, terminalId]);
+}
+
+/** The UTF-8 encoding width of one for-of Unicode character. */
+export function terminalInputCharacterBytes(character: string): number {
+  const codePoint = character.codePointAt(0)!;
+  return codePoint <= 0x7f ? 1 : codePoint <= 0x7ff ? 2 : codePoint <= 0xffff ? 3 : 4;
 }

@@ -15,6 +15,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 const harness = vi.hoisted(() => ({
+  primaryEnvironmentId: null as EnvironmentId | null,
   selectedEnvironmentId: null as EnvironmentId | null,
   localEnvironmentId: null as EnvironmentId | null,
   usageAtom: null as unknown,
@@ -32,11 +33,13 @@ const harness = vi.hoisted(() => ({
 
 vi.mock("../../state/environments", () => ({
   usePrimaryEnvironment: () =>
-    harness.selectedEnvironmentId === null
-      ? null
-      : { environmentId: harness.selectedEnvironmentId },
+    harness.primaryEnvironmentId === null ? null : { environmentId: harness.primaryEnvironmentId },
   usePrimaryLocalEnvironmentForSelected: () =>
     harness.localEnvironmentId === null ? null : { environmentId: harness.localEnvironmentId },
+}));
+
+vi.mock("../../state/entities", () => ({
+  useActiveEnvironmentId: () => harness.selectedEnvironmentId,
 }));
 
 vi.mock("../../state/server", () => ({
@@ -253,6 +256,7 @@ beforeEach(() => {
       disconnect() {}
     },
   );
+  harness.primaryEnvironmentId = primaryEnvironmentId;
   harness.selectedEnvironmentId = remoteEnvironmentId;
   harness.localEnvironmentId = null;
   harness.providerUsageCalls = [];
@@ -298,6 +302,50 @@ afterEach(async () => {
 });
 
 describe("AppStatusBar real hook rerenders", () => {
+  it("shows and refreshes the selected server's usage when the primary connection stays local", async () => {
+    harness.usageAtoms.set(primaryEnvironmentId, Atom.make(AsyncResult.success(codexUsage(90))));
+    harness.usageAtoms.set(remoteEnvironmentId, Atom.make(AsyncResult.success(codexUsage(30))));
+
+    await renderStatusBar();
+
+    expect(providerPercentageLabel()).toBe("70% remaining");
+    expect(harness.refreshProviderUsage).toHaveBeenCalledWith({
+      environmentId: remoteEnvironmentId,
+      input: { providers: ["claude", "codex"], force: false },
+    });
+
+    harness.selectedEnvironmentId = primaryEnvironmentId;
+    await renderStatusBar();
+    expect(providerPercentageLabel()).toBe("10% remaining");
+
+    harness.selectedEnvironmentId = remoteEnvironmentId;
+    await renderStatusBar();
+    expect(providerPercentageLabel()).toBe("70% remaining");
+  });
+
+  it.each(["loading", "offline"] as const)(
+    "does not display local usage while the selected remote is %s",
+    async (state) => {
+      harness.usageAtoms.set(primaryEnvironmentId, Atom.make(AsyncResult.success(codexUsage(90))));
+      harness.usageAtoms.set(
+        remoteEnvironmentId,
+        Atom.make(
+          state === "loading"
+            ? AsyncResult.initial<ServerProviderUsageResult, Error>(true)
+            : AsyncResult.failure<ServerProviderUsageResult, Error>(
+                Cause.fail(new Error("Remote server is offline.")),
+              ),
+        ),
+      );
+
+      await renderStatusBar();
+
+      expect(harness.providerProps).toEqual([]);
+      expect(harness.providerUsageCalls).not.toContain(primaryEnvironmentId);
+      expect(harness.refreshProviderUsage).not.toHaveBeenCalled();
+    },
+  );
+
   it("renders reset command usage through the mounted provider cache immediately", async () => {
     const beforeReset = codexUsage(83);
     const afterReset = codexUsage(0, DateTime.makeUnsafe("2026-07-19T18:01:00.000Z"));

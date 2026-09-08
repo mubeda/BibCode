@@ -10,7 +10,7 @@ import {
   type TerminalTranscriptRuntime,
 } from "@bibcode/client-runtime/state/terminal";
 import { ThreadId, type EnvironmentId, type TerminalAttachInput } from "@bibcode/contracts";
-import { useAtomSubscribe, useAtomValue } from "@effect/atom-react";
+import { useAtomRefresh, useAtomSubscribe, useAtomValue } from "@effect/atom-react";
 import { AsyncResult, Atom } from "effect/unstable/reactivity";
 import { useCallback, useMemo, useRef, useState } from "react";
 
@@ -19,11 +19,13 @@ import { terminalEnvironment } from "./terminal";
 
 export interface AttachedTerminalSessionState extends TerminalSessionState {
   readonly transcriptRuntime: TerminalTranscriptRuntime | null;
+  readonly reattach: () => void;
 }
 
 const EMPTY_ATTACHED_TERMINAL_SESSION_STATE = Object.freeze<AttachedTerminalSessionState>({
   ...EMPTY_TERMINAL_SESSION_STATE,
   transcriptRuntime: null,
+  reattach: () => undefined,
 });
 
 const EMPTY_ATTACH_SNAPSHOT_ATOM = Atom.make<TerminalAttachSnapshot>(
@@ -55,6 +57,7 @@ export function useAttachedTerminalSession(input: {
     ? terminalEnvironment.attachSnapshot(target)
     : EMPTY_ATTACH_SNAPSHOT_ATOM;
   const attachSnapshot = useAtomValue(attachSnapshotAtom);
+  const reattach = useAtomRefresh(attachProducer);
   const targetKey =
     target === null
       ? null
@@ -124,11 +127,13 @@ export function useAttachedTerminalSession(input: {
         error: attachError,
         status: "error",
         transcriptRuntime: attachSnapshot.transcriptRuntime ?? retainedTranscriptRuntime,
+        reattach,
       };
     }
     return {
       ...state,
       transcriptRuntime: attachSnapshot.transcriptRuntime ?? retainedTranscriptRuntime,
+      reattach,
     };
   }, [
     attachProducer,
@@ -138,6 +143,7 @@ export function useAttachedTerminalSession(input: {
     metadata.data,
     producerError,
     retainedTranscriptRuntime,
+    reattach,
   ]);
 }
 

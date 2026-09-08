@@ -4,6 +4,11 @@ BiBCode is split into left, center, and right work areas. The left panel
 navigates agents and project/worktree threads, the center panel runs chats and
 terminals, and the right panel hosts project tools.
 
+The bottom status bar shows Claude and Codex usage for the environment selected
+in the left rail. Selecting a remote server changes both the displayed account
+usage and the target of refresh or usage-reset actions. A server that has not
+returned usage does not borrow the local server's values.
+
 ## Left Panel
 
 The panel opens 320px wide. Drag its right edge to resize it; the width is
@@ -132,6 +137,12 @@ removal succeeds but deleting the sidebar row fails, retrying that stale row is
 safe even when a new worktree has since reused the old folder.
 
 ## Center Panel
+
+Terminal input pauses if delivery fails. **Reconnect input** reattaches to the
+existing running process without restarting the agent or replaying discarded
+keystrokes. Check the prompt before typing again. With an updated client and
+server, normal typing no longer waits for each preceding write's reply;
+network latency still affects when remote output appears.
 
 The active thread's main chat starts as the first center tab. It can be reordered,
 moved between split panes, or closed from the center layout without deleting the

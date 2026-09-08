@@ -18,6 +18,8 @@ import {
   ConnectionTransientError as ConnectionTransientErrorClass,
 } from "../connection/model.ts";
 
+import { withInputAdmission } from "./inputAdmission.ts";
+
 const SOCKET_OPEN_TIMEOUT = "15 seconds";
 
 export interface RpcSession {
@@ -178,7 +180,9 @@ export const make = Effect.gen(function* () {
     const protocolContext = yield* Layer.build(protocolLayer).pipe(
       Effect.withSpan("environment.websocket.connect"),
     );
-    const client = yield* makeWsRpcProtocolClient.pipe(Effect.provide(protocolContext));
+    const client = withInputAdmission(
+      yield* makeWsRpcProtocolClient.pipe(Effect.provide(protocolContext)),
+    );
     const initialConfig = yield* Effect.cached(
       client[WS_METHODS.serverGetConfig]({}).pipe(
         Effect.mapError(mapInitialConfigError),

@@ -3,6 +3,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   ExecutionEnvironmentDescriptor,
+  ExecutionEnvironmentCapabilities,
   MIN_COMPATIBLE_REMOTE_PROTOCOL,
   REMOTE_PROTOCOL_VERSION,
 } from "./environment.ts";
@@ -56,7 +57,12 @@ const legacyClientDecoders = {
   ),
 } as const;
 
+const decodeTerminalCapabilities = Schema.decodeUnknownSync(ExecutionEnvironmentCapabilities);
+
 describe("execution environment contracts", () => {
+  it("defaults ordered terminal input support to false when omitted", () => {
+    expect(decodeTerminalCapabilities({}).terminalOrderedInput).toBe(false);
+  });
   it("pins the remote protocol window constants", () => {
     expect(REMOTE_PROTOCOL_VERSION).toBe(1);
     expect(MIN_COMPATIBLE_REMOTE_PROTOCOL).toBe(1);
