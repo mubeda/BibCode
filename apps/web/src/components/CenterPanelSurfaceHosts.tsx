@@ -110,7 +110,11 @@ function relativeRect(root: Element, target: Element): CenterPanelBodyRect | nul
 }
 
 /** Tracks structural pane body targets in the coordinate space of their shared workspace root. */
-export function useCenterPanelBodyTargets(): CenterPanelBodyTargetRegistry {
+export function useCenterPanelBodyTargets(
+  groups: ThreadCenterPanelState["groups"],
+): CenterPanelBodyTargetRegistry {
+  const activationKey = JSON.stringify(groups.map((group) => [group.id, group.activeSurfaceId]));
+  const measuredActivationRef = useRef<string | null>(null);
   const rootElementRef = useRef<HTMLDivElement | null>(null);
   const targetElementsRef = useRef(new Map<string, HTMLDivElement>());
   const targetRefCallbacks = useRef(new Map<string, (node: HTMLDivElement | null) => void>());
@@ -145,6 +149,7 @@ export function useCenterPanelBodyTargets(): CenterPanelBodyTargetRegistry {
     (node: HTMLDivElement | null) => {
       const previous = rootElementRef.current;
       if (previous === node) return;
+      measuredActivationRef.current = null;
       if (previous) observerRef.current?.unobserve(previous);
       rootElementRef.current = node;
       if (node) observerRef.current?.observe(node);
@@ -160,6 +165,7 @@ export function useCenterPanelBodyTargets(): CenterPanelBodyTargetRegistry {
       const callback = (node: HTMLDivElement | null) => {
         const previous = targetElementsRef.current.get(groupId);
         if (previous === node) return;
+        measuredActivationRef.current = null;
         if (previous) observerRef.current?.unobserve(previous);
         if (node) {
           targetElementsRef.current.set(groupId, node);
@@ -193,6 +199,18 @@ export function useCenterPanelBodyTargets(): CenterPanelBodyTargetRegistry {
       }
     };
   }, [scheduleMeasurement]);
+
+  useLayoutEffect(() => {
+    if (measuredActivationRef.current === activationKey) return;
+    measuredActivationRef.current = activationKey;
+    // A newly active surface must not stay hidden behind a stale rectangle map
+    // when WebKit defers paint. Keep ordinary resize notifications frame-batched.
+    if (frameRef.current !== null) {
+      cancelAnimationFrame(frameRef.current);
+      frameRef.current = null;
+    }
+    publishMeasurements();
+  });
 
   return { rootRef, registerBodyTarget, rects, readBodyRect };
 }

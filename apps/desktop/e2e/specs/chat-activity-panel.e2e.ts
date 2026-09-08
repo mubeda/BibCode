@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off - Packaged UI tests retain native acceptance artifacts.
+import { installDesktopUiMotionGuard, setDesktopUiMotionMode } from "../support/motion-guard.ts";
 import { refreshDesktopUiDocument } from "../support/document-navigation.ts";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
@@ -129,6 +130,7 @@ async function openMaterializedFixtureChat(): Promise<{
     ),
   );
   await refreshDesktopUiDocument();
+  await installDesktopUiMotionGuard();
   await browser.waitUntil(
     async () => {
       for (const project of await browser.$$(
@@ -399,10 +401,42 @@ async function openCodexProviderTerminal(): Promise<string> {
   expect(requestedExecutable).toBe(preparedCodexExecutable);
   const terminalDock = `[data-provider-terminal-activity-host="${terminalId}"] [data-testid="activity-dock"]`;
   if (supportsCodexTerminalActivity) {
-    await browser.$(terminalDock).waitForDisplayed({
-      timeout: 60_000,
-      timeoutMsg: "The live Codex terminal activity dock did not become visible.",
-    });
+    try {
+      await browser.$(terminalDock).waitForDisplayed({
+        timeout: 60_000,
+        timeoutMsg: "The live Codex terminal activity dock did not become visible.",
+      });
+    } catch (error) {
+      const diagnostics = await browser
+        .execute(() => ({
+          visibility: document.visibilityState,
+          focused: document.hasFocus(),
+          elements: [
+            ...document.querySelectorAll<HTMLElement>(
+              "[data-center-panel-body-target], [data-center-surface-host], [data-provider-terminal-activity-host], [data-provider-terminal-activity-host] [data-testid='activity-dock']",
+            ),
+          ].map((element) => {
+            const rect = element.getBoundingClientRect();
+            const style = getComputedStyle(element);
+            return {
+              target: element.dataset.centerPanelBodyTarget,
+              surface: element.dataset.centerSurfaceHost,
+              activityHost: element.dataset.providerTerminalActivityHost,
+              visible: element.dataset.visible,
+              geometry: element.dataset.centerSurfaceGeometry,
+              display: style.display,
+              visibility: style.visibility,
+              width: rect.width,
+              height: rect.height,
+            };
+          }),
+        }))
+        .catch((diagnosticError: unknown) => ({ error: String(diagnosticError) }));
+      throw new Error(
+        `The live Codex terminal activity dock did not become visible. Diagnostics: ${JSON.stringify(diagnostics)}`,
+        { cause: error },
+      );
+    }
   } else {
     await expectMissing(terminalDock);
   }
@@ -875,9 +909,14 @@ async function assertRuntimeMotionState(reduced: boolean): Promise<void> {
 }
 
 async function assertRuntimeMotionContract(): Promise<void> {
-  await assertRuntimeMotionState(false);
-  await assertRuntimeMotionState(true);
-  await assertRuntimeMotionState(false);
+  await setDesktopUiMotionMode("native");
+  try {
+    await assertRuntimeMotionState(false);
+    await assertRuntimeMotionState(true);
+    await assertRuntimeMotionState(false);
+  } finally {
+    await setDesktopUiMotionMode("disabled");
+  }
 }
 
 describe("packaged responsive activity experience", () => {

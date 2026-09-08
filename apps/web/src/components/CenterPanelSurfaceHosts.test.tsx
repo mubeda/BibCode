@@ -155,17 +155,22 @@ function Surface({ id, mounted }: { readonly id: string; readonly mounted: (id: 
   return <div data-surface-instance={id} />;
 }
 
-const BodyTargetHarness = forwardRef<CenterPanelBodyTargetRegistry>(
-  function BodyTargetHarness(_, ref) {
-    const registry = useCenterPanelBodyTargets();
-    useImperativeHandle(ref, () => registry, [registry]);
-    return (
-      <div ref={registry.rootRef} data-target="root">
-        <div ref={registry.registerBodyTarget("group-left")} data-target="group-left" />
-      </div>
-    );
-  },
-);
+const BodyTargetHarness = forwardRef<
+  CenterPanelBodyTargetRegistry,
+  { readonly groups?: ThreadCenterPanelState["groups"]; readonly targetKey?: string }
+>(function BodyTargetHarness({ groups = stateWithTerminalInLeft.groups, targetKey = "body" }, ref) {
+  const registry = useCenterPanelBodyTargets(groups);
+  useImperativeHandle(ref, () => registry, [registry]);
+  return (
+    <div ref={registry.rootRef} data-target="root">
+      <div
+        key={targetKey}
+        ref={registry.registerBodyTarget("group-left")}
+        data-target="group-left"
+      />
+    </div>
+  );
+});
 
 describe("CenterPanelSurfaceHosts", () => {
   it("keeps a visible terminal host mounted while its group target changes", async () => {
@@ -315,6 +320,77 @@ describe("CenterPanelSurfaceHosts", () => {
     surfaceHost.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
     surfaceHost.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
     expect(onFocusGroup).not.toHaveBeenCalled();
+  });
+
+  it("publishes initial targets before a deferred animation frame", async () => {
+    const registryRef = { current: null } as RefObject<CenterPanelBodyTargetRegistry | null>;
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
+      function (this: HTMLElement) {
+        return this.dataset.target === "root"
+          ? rect({ left: 100, top: 200, width: 800, height: 600 })
+          : rect({ left: 140, top: 260, width: 320, height: 360 });
+      },
+    );
+    await act(async () => root.render(<BodyTargetHarness ref={registryRef} />));
+    expect(registryRef.current?.rects.get("group-left")).toEqual({
+      left: 40,
+      top: 60,
+      width: 320,
+      height: 360,
+    });
+  });
+
+  it("refreshes geometry on panel activation without waiting for paint", async () => {
+    const registryRef = { current: null } as RefObject<CenterPanelBodyTargetRegistry | null>;
+    let left = 140;
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
+      function (this: HTMLElement) {
+        return this.dataset.target === "root"
+          ? rect({ left: 100, top: 200, width: 800, height: 600 })
+          : rect({ left, top: 260, width: 320, height: 360 });
+      },
+    );
+    await act(async () => root.render(<BodyTargetHarness ref={registryRef} />));
+    await act(async () => frameCallbacks.shift()?.(0));
+    left = 180;
+    await act(async () =>
+      root.render(<BodyTargetHarness ref={registryRef} groups={stateWithTerminalInRight.groups} />),
+    );
+    expect(registryRef.current?.rects.get("group-left")?.left).toBe(80);
+  });
+
+  it("refreshes a replaced body target with unchanged activation state", async () => {
+    const registryRef = { current: null } as RefObject<CenterPanelBodyTargetRegistry | null>;
+    let left = 140;
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
+      function (this: HTMLElement) {
+        return this.dataset.target === "root"
+          ? rect({ left: 100, top: 200, width: 800, height: 600 })
+          : rect({ left, top: 260, width: 320, height: 360 });
+      },
+    );
+    await act(async () => root.render(<BodyTargetHarness ref={registryRef} />));
+    left = 200;
+    await act(async () =>
+      root.render(<BodyTargetHarness ref={registryRef} targetKey="replacement" />),
+    );
+    expect(registryRef.current?.rects.get("group-left")?.left).toBe(100);
+  });
+
+  it("does not measure again for equivalent group activation state", async () => {
+    const measure = vi
+      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
+      .mockReturnValue(rect({ left: 0, top: 0, width: 800, height: 600 }));
+    await act(async () => root.render(<BodyTargetHarness />));
+    measure.mockClear();
+    await act(async () =>
+      root.render(
+        <BodyTargetHarness
+          groups={stateWithTerminalInLeft.groups.map((group) => ({ ...group }))}
+        />,
+      ),
+    );
+    expect(measure).not.toHaveBeenCalled();
   });
 
   it("publishes root-relative body rectangles and reads the current rectangle synchronously", async () => {

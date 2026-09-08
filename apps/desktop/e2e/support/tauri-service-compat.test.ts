@@ -71,7 +71,7 @@ describe("@wdio/tauri-service compatibility", () => {
     expect(wdioConfig).not.toContain("done(error)");
     expect(wdioConfig).not.toContain("done()");
     expect(wdioConfig).not.toContain("browser.waitUntil");
-    expect(wdioConfig).toContain("data-bibcode-desktop-ui-automation");
+    expect(wdioConfig).toContain("await installDesktopUiMotionGuard()");
     expect(wdioConfig).not.toContain("sheet.insertRule");
     expect(wdioConfig).toContain("window.localStorage.clear()");
     expect(wdioConfig).toContain("window.sessionStorage.clear()");
