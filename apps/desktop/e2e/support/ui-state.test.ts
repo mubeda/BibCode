@@ -3,7 +3,7 @@ import * as NodeFS from "node:fs";
 
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { mockDesktopUiFolderPicker } from "./ui-state.ts";
+import { mockDesktopUiFolderPicker, setDesktopUiWindowSize } from "./ui-state.ts";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -20,6 +20,39 @@ describe("mockDesktopUiFolderPicker", () => {
     expect(mock).toHaveBeenCalledExactlyOnceWith("desktop_bridge_pick_folder");
     expect(mockReturnValue).toHaveBeenCalledExactlyOnceWith("/tmp/bibcode-ui-project");
   });
+});
+
+describe("setDesktopUiWindowSize", () => {
+  it.each([1, 2])(
+    "observes the requested viewport at scale %s without relying on animation frames",
+    async (scale) => {
+      const viewport = { devicePixelRatio: scale, innerWidth: 1_100, innerHeight: 716 };
+      const frame = { width: 1_100 * scale, height: 760 * scale };
+      vi.stubGlobal("window", viewport);
+      vi.stubGlobal("browser", {
+        execute: async (callback: () => unknown) => callback(),
+        executeAsync: async () => {
+          throw new Error("Script execution timed out: animation frames suspended.");
+        },
+        getWindowSize: async () => ({ ...frame }),
+        setWindowSize: async (width: number, height: number) => {
+          frame.width = width;
+          frame.height = height;
+          viewport.innerWidth = width / scale;
+          viewport.innerHeight = height / scale - 44;
+        },
+        waitUntil: async (predicate: () => Promise<boolean>) => {
+          for (let attempt = 0; attempt < 5; attempt++) if (await predicate()) return;
+          throw new Error("Viewport did not settle.");
+        },
+      });
+      await setDesktopUiWindowSize(1_200, 720);
+      expect({ width: viewport.innerWidth, height: viewport.innerHeight }).toEqual({
+        width: 1_200,
+        height: 720,
+      });
+    },
+  );
 });
 
 describe("desktop UI motion stabilization", () => {
