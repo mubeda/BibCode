@@ -1200,9 +1200,10 @@ The default packaged suite runs all of its spec files in one embedded-driver
 session, resets client connection state before every test, and disables
 WebDriver command retries. Treat reporter hook errors, retries, and timeouts as
 test failures even when the individual scenarios are reported as passing.
-Window resizing waits for the webview to match the native window geometry
-before applying another correction, without depending on animation frames,
-which can stop in occluded macOS webviews. The host display may cap
+Window resizing polls the actual viewport and native window until the requested
+size is reached, including when GTK startup dimensions settle independently.
+It does not depend on animation frames, which can stop in occluded macOS
+webviews. The host display may cap
 large requested sizes; keep the scenario layout assertions and screenshots.
 Terminal setup waits for the workspace menu trigger before opening it. Pierre
 fixture replacement sends select-all to the shadow editor itself and requires
