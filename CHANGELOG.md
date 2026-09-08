@@ -41,7 +41,8 @@ follow the server you are working on.
 ### Reliability and validation
 
 - Made packaged desktop validation independent of suspended macOS paint frames,
-  wait for workspace terminal controls, and target Pierre selection shortcuts
+  wait for native viewport resizing and workspace terminal controls, and target
+  Pierre selection shortcuts
   at the shadow editor on Windows. Existing edit, undo, and lifecycle assertions
   remain in the native platform suite.
 
