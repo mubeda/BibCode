@@ -14,34 +14,37 @@ export async function setDesktopUiWindowSize(width: number, height: number): Pro
       height: window.innerHeight,
     }));
   const scale = Number.isFinite(devicePixelRatio) && devicePixelRatio > 0 ? devicePixelRatio : 1;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    const before = await readViewport();
-    if (before.width === width && before.height === height) return;
-    const outerBefore = await browser.getWindowSize();
-    const requestedOuter = correctDesktopUiOuterSize(
-      outerBefore,
-      requestedViewportSize,
-      before,
-      scale,
-    );
-    await browser.setWindowSize(requestedOuter.width, requestedOuter.height);
-    const outerAfter = await browser.getWindowSize();
-    const expected = {
-      width: Math.round(before.width + (outerAfter.width - outerBefore.width) / scale),
-      height: Math.round(before.height + (outerAfter.height - outerBefore.height) / scale),
-    };
-    // Native resize completion can precede the webview resize. Observe that
-    // transition before correcting again, without requiring paint callbacks.
-    await browser.waitUntil(
-      async () => {
-        const observed = await readViewport();
-        return observed.width === expected.width && observed.height === expected.height;
-      },
-      { timeoutMsg: "The webview did not reach the native window geometry after resize." },
-    );
-    // The host display can cap large requests; preserve that native constraint.
-    if (outerAfter.width === outerBefore.width && outerAfter.height === outerBefore.height) return;
-  }
+  let previous:
+    | { width: number; height: number; outerWidth: number; outerHeight: number }
+    | undefined;
+  await browser.waitUntil(
+    async () => {
+      const observed = await readViewport();
+      if (observed.width === width && observed.height === height) return true;
+      const outer = await browser.getWindowSize();
+      const available = await browser.execute(() => ({
+        width: screen.availWidth,
+        height: screen.availHeight,
+      }));
+      // Oversized screenshots are bounded by the native display. Exact-size
+      // responsive assertions remain mandatory for viewports that fit the screen.
+      if (
+        (width > available.width || height > available.height) &&
+        previous?.width === observed.width &&
+        previous.height === observed.height &&
+        previous.outerWidth === outer.width &&
+        previous.outerHeight === outer.height
+      )
+        return true;
+      previous = { ...observed, outerWidth: outer.width, outerHeight: outer.height };
+      const corrected = correctDesktopUiOuterSize(outer, requestedViewportSize, observed, scale);
+      await browser.setWindowSize(corrected.width, corrected.height);
+      // Poll actual geometry before the next correction. Initial GTK decoration
+      // and webview sizes can settle independently, so a predicted delta is unsafe.
+      return false;
+    },
+    { timeoutMsg: `The webview did not reach the requested ${width}x${height} viewport.` },
+  );
 }
 
 export async function ensureMainSidebarOpen(): Promise<void> {

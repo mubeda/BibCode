@@ -23,6 +23,28 @@ describe("mockDesktopUiFolderPicker", () => {
 });
 
 describe("setDesktopUiWindowSize", () => {
+  it("corrects again when startup native and webview dimensions do not yet agree", async () => {
+    const viewport = { devicePixelRatio: 1, innerWidth: 1100, innerHeight: 800 };
+    let outer = { width: 1060, height: 739 };
+    vi.stubGlobal("window", viewport);
+    vi.stubGlobal("screen", { availWidth: 1920, availHeight: 1080 });
+    vi.stubGlobal("browser", {
+      execute: async (callback: () => unknown) => callback(),
+      getWindowSize: async () => ({ ...outer }),
+      setWindowSize: async (width: number, height: number) => {
+        outer = { width, height };
+        viewport.innerWidth = width;
+        viewport.innerHeight = height - 44;
+      },
+      waitUntil: async (predicate: () => Promise<boolean>) => {
+        for (let attempt = 0; attempt < 5; attempt++) if (await predicate()) return;
+        throw new Error("Viewport did not settle.");
+      },
+    });
+    await setDesktopUiWindowSize(1000, 720);
+    expect([viewport.innerWidth, viewport.innerHeight]).toEqual([1000, 720]);
+  });
+
   it("waits for the webview to catch up with native resizing before correcting again", async () => {
     const viewport = { devicePixelRatio: 1, innerWidth: 980, innerHeight: 720 };
     let outer = { width: 980, height: 764 };
@@ -35,6 +57,7 @@ describe("setDesktopUiWindowSize", () => {
       };
     });
     vi.stubGlobal("window", viewport);
+    vi.stubGlobal("screen", { availWidth: 1920, availHeight: 1080 });
     vi.stubGlobal("browser", {
       execute: async (callback: () => unknown) => callback(),
       getWindowSize: async () => ({ ...outer }),
@@ -56,6 +79,7 @@ describe("setDesktopUiWindowSize", () => {
       const viewport = { devicePixelRatio: scale, innerWidth: 1_100, innerHeight: 716 };
       const frame = { width: 1_100 * scale, height: 760 * scale };
       vi.stubGlobal("window", viewport);
+      vi.stubGlobal("screen", { availWidth: 1920, availHeight: 1080 });
       vi.stubGlobal("browser", {
         execute: async (callback: () => unknown) => callback(),
         executeAsync: async () => {
