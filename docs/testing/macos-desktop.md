@@ -110,6 +110,17 @@ tables for it and only exception-unwinding performance of that test binary is
 affected. It is not emitted for shipped release artifacts; report it with the
 affected test target rather than suppressing the `linker_messages` lint.
 
+Validate Objective-C recovery with the actual optimized profile:
+
+```sh
+cargo run --release -p bibcode-desktop --example objc_exception_probe
+```
+
+The probe must catch its native exception and exit successfully. The workspace
+release profile preserves unwinding because Wry relies on it when a custom
+URL-scheme task is cancelled during navigation. The macOS desktop crate rejects
+`panic=abort`; do not disable that guard to produce an installer.
+
 For update validation, use an isolated `BIBCODE_HOME` and disposable project.
 Keep a read subscription open while installing an available test update and
 confirm it does not block protection. During a deliberately held mutation,

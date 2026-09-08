@@ -225,6 +225,10 @@ jobs:
       - name: Test desktop Rust host
         run: vp run --filter @bibcode/desktop test
 
+      - name: Verify macOS release exception recovery
+        if: matrix.platform == 'mac'
+        run: cargo run --release -p bibcode-desktop --example objc_exception_probe
+
       - name: Test Windows desktop E2E support contracts
         if: matrix.platform == 'win'
         run: vp test run apps/desktop/e2e/support/test-project.test.ts

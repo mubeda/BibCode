@@ -617,6 +617,12 @@ rather than assuming the Chromium behavior that browser mode and Windows
 happen to share. Linux text rendering has its own rules; see
 [Linux webview text rendering](#linux-webview-text-rendering).
 
+Optimized native builds preserve exception unwinding. On macOS, Wry can receive
+an Objective-C exception while completing a URL-scheme request cancelled by
+navigation; its catch boundary must recover without terminating the host.
+`panic=abort` is therefore rejected by the macOS desktop crate. Existing Rust
+panic boundaries and drop-based cleanup also retain their unwind behavior.
+
 Center chat-panel creation reserves and activates its client surface before the
 server command settles. A confirmed command failure removes that reservation;
 an interrupted result is ambiguous because durable thread creation may already

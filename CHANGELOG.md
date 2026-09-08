@@ -40,6 +40,10 @@ follow the server you are working on.
 
 ### Reliability and validation
 
+- Fixed macOS process termination when navigation cancels an in-flight WebKit
+  request. Optimized builds now retain the exception unwinding required by
+  Wry's recovery path, with a native release-profile regression and build guard.
+
 - Wait for native navigation and the new document's load event after desktop
   test reloads. This avoids sending JavaScript into a document being replaced.
   Readiness generations are recorded only in test builds. Backend logs and

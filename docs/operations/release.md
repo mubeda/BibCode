@@ -33,6 +33,13 @@ on the matching operating system:
 | Windows  | `windows-11-vs2026-arm` | arm64        | NSIS executable |
 | Windows  | `windows-2025`          | x64          | NSIS executable |
 
+Release builds retain `panic=unwind`. Wry's macOS custom-protocol handlers use
+Objective-C exception recovery when navigation cancels an in-flight request;
+`panic=abort` turns that recoverable condition into process termination. Thin LTO,
+one codegen unit, and symbol stripping remain enabled. Native macOS CI executes
+the release-profile `objc_exception_probe`, and the desktop crate rejects an
+abort profile on macOS.
+
 Each matrix job installs the frontend build toolchain and Rust, restores Cargo
 caches, and runs `scripts/build-desktop-artifact.ts`. Tauri compiles the native
 host and in-process server and embeds the built React assets. No Node runtime or
