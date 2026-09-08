@@ -1200,6 +1200,12 @@ The default packaged suite runs all of its spec files in one embedded-driver
 session, resets client connection state before every test, and disables
 WebDriver command retries. Treat reporter hook errors, retries, and timeouts as
 test failures even when the individual scenarios are reported as passing.
+Window resizing reads native viewport geometry without depending on animation
+frames, which can stop in occluded macOS webviews. The host display may cap
+large requested sizes; keep the scenario layout assertions and screenshots.
+Terminal setup waits for the workspace menu trigger before opening it. Pierre
+fixture replacement sends select-all to the shadow editor itself and requires
+the editor to handle both selection and input before verifying edits and undo.
 
 The maintained Pierre acceptance scenario
 (`apps/desktop/e2e/specs/pierre-diffs.e2e.ts`) uses that same isolated launcher

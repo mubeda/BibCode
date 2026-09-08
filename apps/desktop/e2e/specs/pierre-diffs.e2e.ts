@@ -1,7 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off - Packaged UI tests inspect disposable Git state and save screenshots.
 import * as NodeChildProcess from "node:child_process";
 import * as NodePath from "node:path";
-import { Key } from "webdriverio";
 
 import {
   pierreVisualFixture,
@@ -181,7 +180,6 @@ async function replaceShadowEditorText(
   text: string,
 ): Promise<void> {
   await pointAtShadowTarget(hostSelector, targetSelector, true);
-  await browser.keys([Key.Ctrl, "a"]);
   const result = await browser.execute(
     (hostQuery: string, targetQuery: string, replacement: string) => {
       const host = [...document.querySelectorAll<HTMLElement>(hostQuery)].find((candidate) => {
@@ -190,6 +188,20 @@ async function replaceShadowEditorText(
       });
       const target = host?.shadowRoot?.querySelector<HTMLElement>(targetQuery);
       if (target === undefined || target === null) return { found: false, handled: false };
+      // Dispatch the selection shortcut to the editor itself. WebView2 can
+      // leave WebDriver keyboard focus on the file tree after a shadow click.
+      target.focus({ preventScroll: true });
+      const selectAll = new KeyboardEvent("keydown", {
+        key: "a",
+        code: "KeyA",
+        ctrlKey: !navigator.platform.includes("Mac"),
+        metaKey: navigator.platform.includes("Mac"),
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+      });
+      target.dispatchEvent(selectAll);
+      if (!selectAll.defaultPrevented) return { found: true, handled: false };
       const input = new InputEvent("beforeinput", {
         bubbles: true,
         cancelable: true,

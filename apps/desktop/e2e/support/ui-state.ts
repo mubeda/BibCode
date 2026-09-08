@@ -11,11 +11,8 @@ export async function setDesktopUiWindowSize(width: number, height: number): Pro
   let outerSize = scaleDesktopUiWindowSize(requestedViewportSize, devicePixelRatio);
   for (let attempt = 0; attempt < 3; attempt += 1) {
     await browser.setWindowSize(outerSize.width, outerSize.height);
-    await browser.executeAsync((done: () => void) => {
-      window.requestAnimationFrame(() => {
-        window.requestAnimationFrame(done);
-      });
-    });
+    // Occluded macOS webviews can suspend animation frames. Read geometry
+    // through WebDriver; native screen constraints may cap the requested size.
     const observedViewportSize = await browser.execute(() => ({
       width: window.innerWidth,
       height: window.innerHeight,

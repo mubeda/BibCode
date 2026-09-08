@@ -40,6 +40,11 @@ follow the server you are working on.
 
 ### Reliability and validation
 
+- Made packaged desktop validation independent of suspended macOS paint frames,
+  wait for workspace terminal controls, and target Pierre selection shortcuts
+  at the shadow editor on Windows. Existing edit, undo, and lifecycle assertions
+  remain in the native platform suite.
+
 - Added regression coverage for input ordering, queue bounds, cancellation,
   stale attachments, legacy-server compatibility, immediate writes after
   lifecycle changes, and provider-usage isolation.
