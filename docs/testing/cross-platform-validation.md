@@ -1201,7 +1201,9 @@ session and resets client connection state before every test. After refresh,
 it waits for a new main-webview page-load completion from the test-only Tauri
 logging plugin in `userdata/logs/server.log`. Navigation generations distinguish
 old completions and loading pages without sending WebDriver JavaScript into a
-document being replaced. These markers carry no page URLs and are absent from
+document being replaced. Once that native signal establishes the replacement
+document, the harness waits for its DOM load event as well; WebKitGTK can still
+report an interactive DOM at native completion. These markers carry no page URLs and are absent from
 production builds. The disposable fixture enables only this lifecycle target
 even when its parent process uses a warning-only filter. The maintained `document-navigation.e2e.ts` scenario reloads
 three times and checks a complete, distinct document after each native finish.
