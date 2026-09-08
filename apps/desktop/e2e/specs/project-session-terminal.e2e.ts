@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off - Packaged UI tests save native screenshots.
+import { refreshDesktopUiDocument } from "../support/document-navigation.ts";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 
@@ -117,7 +118,7 @@ describe("packaged project session and terminal", () => {
     expect(closedTerminal).toBe(true);
     await browser.$(".xterm-screen").waitForExist({ reverse: true });
 
-    await browser.refresh();
+    await refreshDesktopUiDocument();
     await expect(
       browser.$(`//*[contains(normalize-space(), "${desktopUiFixture.streamedResponse}")]`),
     ).toBeDisplayed();

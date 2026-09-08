@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off - Packaged UI tests retain native acceptance artifacts.
+import { refreshDesktopUiDocument } from "../support/document-navigation.ts";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 
@@ -127,7 +128,7 @@ async function openMaterializedFixtureChat(): Promise<{
       2,
     ),
   );
-  await browser.refresh();
+  await refreshDesktopUiDocument();
   await browser.waitUntil(
     async () => {
       for (const project of await browser.$$(
