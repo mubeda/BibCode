@@ -122,7 +122,11 @@ it.layer(NodeServices.layer)("canonical Rust workspace", (it) => {
       assert.equal(releaseProfile.lto, "thin");
       assert.equal(releaseProfile["codegen-units"], 1);
       assert.equal(releaseProfile.strip, "symbols");
-      assert.equal(releaseProfile.panic, "abort");
+      assert.equal(
+        releaseProfile.panic,
+        "unwind",
+        "Wry Objective-C cancellation recovery requires unwinding",
+      );
 
       for (const rustPackage of rustPackages) {
         assert.equal(
