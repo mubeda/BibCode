@@ -1,5 +1,65 @@
 # Changelog
 
+## [v0.5.8] - 2026-09-08
+
+BiBCode v0.5.8 improves remote terminal responsiveness and makes AI usage status
+follow the server you are working on.
+
+### Remote terminal responsiveness
+
+- Added capability-negotiated, ordered terminal input. Updated clients can send
+  subsequent keystrokes before the previous write's reply, reducing the extra
+  queue delay on remote connections. A controlled 120 ms round-trip test reduced
+  median time queued before sending from about 59 ms to under 1 ms. Network
+  round-trip latency still affects when remote output appears.
+- Added bounded input windows and reserved RPC capacity for control operations,
+  including when terminal traffic competes with persistent subscriptions.
+  Unicode paste and control sequences retain their delivery order.
+- Bound each input lease to its physical connection and exact terminal process.
+  Failed, duplicate, incomplete, disconnected, or stale input cannot be replayed
+  into a replacement process. A delayed old attachment request cannot replace
+  a newer attachment's lease.
+- Added **Reconnect input** after delivery failures. It reattaches to the
+  existing agent process without restarting it or replaying discarded text.
+- Fixed input preparation after open, reopen, restart, and fresh attachment so
+  immediate programmatic writes work before the terminal renderer arrives.
+  Visual panel hiding and moving preserve the existing input binding.
+- Older servers retain the existing serialized input path. Update both the
+  desktop client and remote server to activate ordered input; failures on the
+  new path never silently retry through the old path.
+
+### Correct AI usage and environment status
+
+- Claude and Codex usage now comes from the environment selected in the rail,
+  rather than always using the primary local server.
+- Manual/background refresh and usage-reset actions target that same selected
+  environment. Late responses remain associated with their original server.
+- A loading or disconnected remote server no longer borrows local account
+  usage. Terminal counts and remote diagnostics also follow the selection,
+  while the separate local desktop diagnostic source remains available.
+
+### Reliability and validation
+
+- Added regression coverage for input ordering, queue bounds, cancellation,
+  stale attachments, legacy-server compatibility, immediate writes after
+  lifecycle changes, and provider-usage isolation.
+- Added a native encrypted-transport test that delivers reversed frame arrivals
+  into a real PTY in the correct order and refuses another socket's lease use,
+  even when it authenticates with the same bearer.
+- Integrated current main without reverting its toolchain changes and
+  regenerated the new RPC fixtures against the current Effect protocol.
+- Updated the connection/RPC architecture, workspace guide, and native testing
+  procedures for input recovery and selected-server usage.
+
+### Downloads
+
+Desktop installers and standalone server distributions are provided for macOS,
+Linux, and Windows on ARM64 and x64. Linux server `.deb` and `.rpm` packages are
+included for both architectures. Stable desktop updater payloads and signatures
+remain available through `latest.json`.
+
+**Full Changelog**: https://github.com/mubeda/BibCode/compare/v0.5.7...v0.5.8
+
 ## [v0.5.7] - 2026-09-07
 
 BiBCode v0.5.7 makes remote servers easier to identify when sharing a host or
