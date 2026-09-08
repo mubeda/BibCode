@@ -243,7 +243,7 @@ async fn prepare_desktop_runtime_for_exit<R: tauri::Runtime>(
     backend_result
 }
 
-#[cfg(feature = "desktop-e2e")]
+#[cfg(all(feature = "desktop-e2e", not(test)))]
 #[tauri::command]
 async fn desktop_e2e_prepare_for_exit(
     app_handle: tauri::AppHandle<bridge::DesktopRuntime>,
@@ -257,6 +257,7 @@ fn desktop_context<R: tauri::Runtime>() -> tauri::Context<R> {
 
 #[cfg(feature = "desktop-e2e")]
 fn desktop_e2e_logging_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
+    let mut page_loads = desktop_e2e_page_load::PageLoadTracker::new();
     tauri::plugin::Builder::new("desktop-e2e-logging")
         .setup(|app, _api| {
             let server_log = config::state_dir(app)
@@ -266,6 +267,11 @@ fn desktop_e2e_logging_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin
             bibcode_server::logging::initialize(&server_log)?;
             Ok(())
         })
+        .on_page_load(move |webview, payload| {
+            if let Some(message) = page_loads.message(webview.label(), payload.event()) {
+                tracing::info!(target: "bibcode::desktop_e2e", "{message}");
+            }
+        })
         .build()
 }
 
@@ -274,6 +280,8 @@ mod bridge;
 mod config;
 mod context_menu;
 mod data_safety;
+#[cfg(any(feature = "desktop-e2e", test))]
+mod desktop_e2e_page_load;
 mod firewall;
 #[cfg(target_os = "linux")]
 mod linux_text_rendering;
