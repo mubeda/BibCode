@@ -3,6 +3,11 @@
 Run JavaScript/TypeScript workspace commands through Vite+ (`vp`). Run commands
 from the repository root unless noted otherwise.
 
+The declared development toolchain is Node.js 26.8.1, pnpm 11.25.0, Rust
+1.98.0, and Vite+ 0.3.0. The root workspace and application packages use
+TypeScript 7.0.2. `apps/marketing` remains a TypeScript 6.0.3 compatibility
+island until Astro's checker supports TypeScript 7 through its public API.
+
 ## Setup And Development
 
 - `vp install`: install workspace dependencies.
@@ -95,7 +100,9 @@ find the runner` before collecting tests. The launcher exits with code 3 and an
 install instruction when workspace dependencies are missing, and otherwise
 forwards the child exit code unchanged. Every package `test` script,
 `check:contracts`, and `test:coverage:ts` invoke Vitest through this launcher
-for the same reason, so `vp run test` stays correct wherever it runs.
+for the same reason, so `vp run test` stays correct wherever it runs. Vite+
+0.3.0 supplies the workspace's single Vitest 4.1.11 runtime; packages must not
+add or invoke a second local Vitest installation.
 
 ## Desktop Artifacts
 
@@ -155,8 +162,29 @@ preservation in the documented native-architecture containers.
 
 ## Repository Maintenance
 
-- `vp run sync:repos`: synchronize configured read-only reference repositories
-  under `.repos`; pass `-- --repo <id>` to synchronize one entry.
+- `vp run sync:repos`: fetch and stage exact read-only reference snapshots under
+  `.repos`; pass `--repo <id>` to synchronize one entry. The command requires a
+  clean index and working tree, preserves fetched path casing, modes, and
+  upstream-tracked ignored files, applies configured pruning, treats every
+  configured prefix and prune path as a literal Git path, and creates no commit.
+  It holds the atomic file
+  `<absolute-git-common-dir>/bibcode-reference-repos-sync.lock` from the initial
+  clean check through fetch, snapshot construction, apply, and any verified
+  rollback, so linked worktrees share one writer. A concurrent invocation fails
+  before fetch without changing or stealing the lock. Success, pre-apply
+  failure, verified rollback, and recovered interruption remove the lock. A
+  timed-out, failed, or unverified rollback keeps the lock because the
+  index/worktree may require manual recovery. The mutating apply owns a nested
+  child-process scope, so interruption closes and reaps that command before
+  rollback starts. Every timed rollback command likewise owns a nested scope;
+  timeout, failure, and success finish its child cleanup before the next
+  recovery step or return. If a process crash or failed recovery leaves the
+  lock behind, first use process inspection to verify that no
+  `sync-reference-repos` process owns the repository and verify or recover the
+  index/worktree. Then obtain the exact common directory with
+  `git rev-parse --path-format=absolute --git-common-dir` and remove only its
+  `bibcode-reference-repos-sync.lock` file; the command never removes a stale
+  lock automatically.
 - `vp run measure:desktop-runtime -- ...`: capture startup, memory, and
   process-tree measurements.
 - `node scripts/measure-vcs-runtime.ts`: on Windows, build and run the

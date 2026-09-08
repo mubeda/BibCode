@@ -228,13 +228,10 @@ export const makeEnvironmentActivityState = Effect.fn("EnvironmentActivityState.
   )(function* () {
     const recoveries = yield* Ref.get(activeRecoveries);
     if (recoveries.observation !== null || recoveries.control !== null) {
-      yield* SubscriptionRef.update(
-        state,
-        (current): EnvironmentActivityState => ({
-          ...current,
-          status: "stale",
-        }),
-      );
+      yield* SubscriptionRef.update(state, (current): EnvironmentActivityState => ({
+        ...current,
+        status: "stale",
+      }));
     }
   });
 
@@ -688,9 +685,8 @@ export function createEnvironmentActivityAtoms<R, E>(
   const stateAtom = (target: EnvironmentActivityTarget) => stateFamily(environmentRpcKey(target));
   const stateValueFamily = Atom.family((key: string) => {
     const target = parseEnvironmentRpcKey<ActivityScopeRef>(key);
-    return Atom.make(
-      (get): EnvironmentActivityState =>
-        Option.getOrElse(AsyncResult.value(get(stateAtom(target))), () => emptyActivityState()),
+    return Atom.make((get): EnvironmentActivityState =>
+      Option.getOrElse(AsyncResult.value(get(stateAtom(target))), () => emptyActivityState()),
     ).pipe(
       Atom.setIdleTTL(ACTIVITY_STATE_IDLE_TTL_MS),
       Atom.withLabel(`environment-activity-state-value:${key}`),

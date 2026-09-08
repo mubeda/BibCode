@@ -713,6 +713,12 @@ are captured by exact PID and creation time; residual cleanup follows only
 their descendant closure and cannot signal children registered to a peer
 runtime in the same application process.
 
+Native PTY exit completion is retained even when no observer is subscribed.
+A terminal that exits before manager subscription, or while close replaces the
+supervisor's subscription with its cleanup subscription, still exposes its
+completed reap result to the later subscriber. Closing that terminal does not
+wait for a second exit notification or extend the cleanup deadline.
+
 For each admitted loss transition, `WorktreeRuntime` resolves every live
 ordinary or panel thread in the same persisted project whose physical path
 matches the guarded physical workspace. It deduplicates those IDs, appends one

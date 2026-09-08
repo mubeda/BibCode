@@ -190,6 +190,14 @@ describe("EnvironmentRail", () => {
     expect(markup).toContain('data-testid="environment-rail"');
     expect(buttonByTestId("environment-rail-local")).toBeDefined();
     expect(markup).not.toContain('data-testid="environment-rail-divider"');
+    // The fixed sidebar toggle is pinned over the rail's top strip, so the rail
+    // reserves the topbar height ahead of the environments group; otherwise
+    // the toggle sits on the Local entry and clicking Local collapses the sidebar.
+    const topbar = markup.indexOf('data-testid="environment-rail-topbar"');
+    const environments = markup.indexOf('aria-label="Environments"');
+    expect(topbar).toBeGreaterThan(-1);
+    expect(topbar).toBeLessThan(environments);
+    expect(markup).toMatch(/environment-rail-topbar"[^>]*class="[^"]*workspace-topbar[^"]*"/);
   });
 
   it("writes selection to the active-environment atom and nothing else", () => {

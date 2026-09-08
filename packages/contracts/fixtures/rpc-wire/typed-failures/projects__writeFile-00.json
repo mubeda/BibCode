@@ -13,7 +13,7 @@
           "resolvedWorkspaceRoot": "\" %",
           "operationPath": "neG",
           "message": ";~",
-          "cause": "undefined"
+          "cause": null
         }
       }
     ]

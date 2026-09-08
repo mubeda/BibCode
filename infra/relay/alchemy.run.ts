@@ -1,7 +1,7 @@
 // @effect-diagnostics anyUnknownInErrorContext:off layerMergeAllWithDependencies:off - Alchemy provider helpers expose framework-owned any requirements.
 import * as Alchemy from "alchemy";
 import * as Cloudflare from "alchemy/Cloudflare";
-import * as Drizzle from "alchemy/Drizzle";
+import * as Drizzle from "alchemy/Drizzle/Providers";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Planetscale from "alchemy/Planetscale";

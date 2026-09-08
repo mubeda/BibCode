@@ -2310,7 +2310,9 @@ struct WslDistroEntry {
 fn decode_wsl_command_output(bytes: &[u8]) -> String {
     if bytes.starts_with(&[0xff, 0xfe]) {
         let values = bytes[2..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
             .collect::<Vec<_>>();
         return String::from_utf16_lossy(&values);
@@ -2817,25 +2819,28 @@ fn select_desktop_backend_port_excluding(excluded: &[u16]) -> Option<u16> {
 /// prompt (or silently create Block rules) on the first launch, so the probe
 /// deliberately never listens. Unix keeps `SO_REUSEADDR` to match the
 /// semantics of the listener the server creates afterwards.
-fn can_listen_on_host(port: u16, host: &str) -> bool {
+fn bind_port_probe(port: u16, host: &str) -> Option<socket2::Socket> {
     let Ok(mut addresses) = (host, port).to_socket_addrs() else {
-        return false;
+        return None;
     };
-    let Some(address) = addresses.next() else {
-        return false;
-    };
+    let address = addresses.next()?;
     let Ok(socket) = socket2::Socket::new(
         socket2::Domain::for_address(address),
         socket2::Type::STREAM,
         Some(socket2::Protocol::TCP),
     ) else {
-        return false;
+        return None;
     };
     #[cfg(unix)]
     if socket.set_reuse_address(true).is_err() {
-        return false;
+        return None;
     }
-    socket.bind(&socket2::SockAddr::from(address)).is_ok()
+    socket.bind(&socket2::SockAddr::from(address)).ok()?;
+    Some(socket)
+}
+
+fn can_listen_on_host(port: u16, host: &str) -> bool {
+    bind_port_probe(port, host).is_some()
 }
 
 fn normalize_tailscale_serve_port(value: Option<u64>) -> u16 {
@@ -5327,7 +5332,7 @@ exit /b 9
             .stop(BackendShutdownConfig::default())
             .await
             .expect("default backend should stop");
-        let _released_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, restarted.port))
+        let _released_probe = bind_port_probe(restarted.port, "127.0.0.1")
             .expect("joined backend shutdown must release the listener address");
     }
 
@@ -6296,13 +6301,17 @@ $client.Dispose()
         assert!(can_listen_on_host(0, "127.0.0.1"));
         assert!(can_listen_on_host(0, "0.0.0.0"));
 
-        drop(occupied);
-        // A probe must never leave a listener behind: nothing accepts on the
-        // probed port once the probe returns.
-        assert!(can_listen_on_host(port, "127.0.0.1"));
+        let probe = bind_port_probe(0, "127.0.0.1").expect("probe socket should bind");
+        let probe_port = probe
+            .local_addr()
+            .expect("probe address should be readable")
+            .as_socket()
+            .expect("probe address should be an IP socket")
+            .port();
+        // The retained probe owns its exact port but never listens on it.
         assert!(
             TcpStream::connect_timeout(
-                &(Ipv4Addr::LOCALHOST, port).into(),
+                &(Ipv4Addr::LOCALHOST, probe_port).into(),
                 Duration::from_millis(250),
             )
             .is_err()

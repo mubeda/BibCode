@@ -218,8 +218,18 @@ agents.
 - Prefer examples and patterns from the vendored source code over generated guesses or web search results.
 - Do not edit files under `.repos/` unless explicitly asked.
 - Do not import from `.repos/`; application code must continue importing from normal package dependencies.
-- Manage vendored subtrees with `vp run sync:repos`; use `vp run sync:repos -- --repo <id>` to sync one
-  configured repository.
+- Manage vendored snapshots with `vp run sync:repos`; use `vp run sync:repos --repo <id>` to sync one
+  configured repository. Sync requires a clean index and working tree, stages
+  only the exact fetched snapshot replacement for review, treats every
+  configured Git path as literal, and creates no commit. One atomic
+  `bibcode-reference-repos-sync.lock` file in the absolute Git common directory
+  serializes sync across linked worktrees from the initial clean check through
+  apply or verified rollback. A busy command exits before fetch. Success,
+  pre-apply failure, and verified recovery remove the lock; a failed, timed-out,
+  or unverified rollback deliberately leaves it in place. Never remove a stale
+  or retained lock until you have verified that no reference-repository sync
+  process owns that repository and the index/worktree is recovered; then remove
+  only that exact lock file.
 - When updating a dependency with a configured vendored subtree, sync that subtree in the same change so
   `.repos/` matches the installed dependency version.
 - When writing Effect code, read `.repos/effect-smol/LLMS.md` first and inspect `.repos/effect-smol/` for

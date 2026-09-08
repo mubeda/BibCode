@@ -50,7 +50,7 @@ const relayDefaultEnvPath = joinPath(relayRoot, ".env");
 const rootEnvPath = joinPath(repoRoot, ".env");
 const deployScriptPath = pathFromUrl(new URL("./deploy.ts", import.meta.url));
 const deployScriptUrl = NodeURL.pathToFileURL(deployScriptPath).href;
-const decodeUnknownJson = Schema.decodeUnknownSync(Schema.UnknownFromJsonString);
+const decodeUnknownJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
 const coverageResults = (value: unknown): ReadonlyArray<unknown> => {
   if (typeof value !== "object" || value === null || !("result" in value)) {

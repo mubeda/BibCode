@@ -198,21 +198,19 @@ function buildSlashItems(
       seenNames.add(comparableName);
       return true;
     })
-    .map(
-      (skill): ProviderSkillItem => ({
-        id: providerItemId("provider-skill", input.providerInstanceId, `slash:${skill.name}`),
-        type: "provider-skill",
-        group: "skills",
-        providerInstanceId: input.providerInstanceId,
-        skill,
-        label: `/${skill.name}`,
-        description:
-          skill.shortDescription ??
-          skill.description ??
-          (skill.scope ? `${skill.scope} skill` : "Run provider skill"),
-        replacement: `/${skill.name} `,
-      }),
-    );
+    .map((skill): ProviderSkillItem => ({
+      id: providerItemId("provider-skill", input.providerInstanceId, `slash:${skill.name}`),
+      type: "provider-skill",
+      group: "skills",
+      providerInstanceId: input.providerInstanceId,
+      skill,
+      label: `/${skill.name}`,
+      description:
+        skill.shortDescription ??
+        skill.description ??
+        (skill.scope ? `${skill.scope} skill` : "Run provider skill"),
+      replacement: `/${skill.name} `,
+    }));
 
   return [...rankedCommands, ...skills];
 }
@@ -251,18 +249,16 @@ function buildReferenceItems(
 } {
   const files = [...input.pathSearch.entries]
     .sort((left, right) => compareText(left.path, right.path) || compareText(left.kind, right.kind))
-    .map(
-      (entry): FileReferenceItem => ({
-        id: `file-reference:${entry.kind}:${entry.path}`,
-        type: "file-reference",
-        group: "files",
-        path: entry.path,
-        pathKind: entry.kind,
-        label: basenameOfPath(entry.path),
-        description: parentOfPath(entry.path),
-        replacement: `${serializeComposerReference(entry.path)} `,
-      }),
-    );
+    .map((entry): FileReferenceItem => ({
+      id: `file-reference:${entry.kind}:${entry.path}`,
+      type: "file-reference",
+      group: "files",
+      path: entry.path,
+      pathKind: entry.kind,
+      label: basenameOfPath(entry.path),
+      description: parentOfPath(entry.path),
+      replacement: `${serializeComposerReference(entry.path)} `,
+    }));
 
   const normalized = normalizedQuery(query);
   const seenNames = new Set<string>();
@@ -281,18 +277,16 @@ function buildReferenceItems(
       seenNames.add(comparableName);
       return true;
     })
-    .map(
-      (agent): AgentReferenceItem => ({
-        id: providerItemId("agent-reference", input.providerInstanceId, agent.name),
-        type: "agent-reference",
-        group: "agents",
-        providerInstanceId: input.providerInstanceId,
-        agent,
-        label: `@${agent.name}`,
-        description: agent.description ?? agent.model ?? "Use provider agent",
-        replacement: `@${agent.name} `,
-      }),
-    );
+    .map((agent): AgentReferenceItem => ({
+      id: providerItemId("agent-reference", input.providerInstanceId, agent.name),
+      type: "agent-reference",
+      group: "agents",
+      providerInstanceId: input.providerInstanceId,
+      agent,
+      label: `@${agent.name}`,
+      description: agent.description ?? agent.model ?? "Use provider agent",
+      replacement: `@${agent.name} `,
+    }));
   const agents = searchComposerCommandCandidates(
     agentItems.map((item) => ({
       item,

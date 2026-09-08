@@ -12022,6 +12022,7 @@ cat >/dev/null
 #[cfg(unix)]
 #[tokio::test]
 async fn native_claude_driver_routes_stable_hook_input_through_activity_plumbing() {
+    let probe_context = ClaudeActivityProbeTestContext::new();
     let temp = TempDir::new().unwrap();
     let executable = executable_fixture(
         &temp,
@@ -12037,7 +12038,7 @@ cat >/dev/null
 "#,
         "",
     );
-    let factory = NativeProviderDriverFactory::new(temp.path().join("attachments"));
+    let factory = probe_context.driver_factory(temp.path().join("attachments"));
     let mut request = launch();
     request.provider = "claudeAgent".to_owned();
     request.binary_path = executable.to_string_lossy().into_owned();

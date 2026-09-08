@@ -59,7 +59,7 @@ const emptyCatalog = {
 } as const;
 const decodeCatalog = Schema.decodeUnknownSync(Schema.fromJsonString(ConnectionCatalogDocument));
 const encodeCatalog = Schema.encodeSync(Schema.fromJsonString(ConnectionCatalogDocument));
-const encodeUnknownJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
+const encodeUnknownJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 const unusedCatalogCompare: CatalogBackend["compare"] = () =>
   Effect.die(new Error("Catalog comparison is not used by this test."));
 
@@ -280,6 +280,7 @@ function bearerRegistration(): BearerConnectionRegistration {
       environmentId,
       label: "Bearer backend",
       connectionId,
+      serverEnvironmentId: null,
     }),
     profile: new BearerConnectionProfile({
       connectionId,
@@ -1877,6 +1878,7 @@ describe("connectionStorageLayer", () => {
         environmentId,
         label: "Replacement backend",
         connectionId,
+        serverEnvironmentId: null,
       }),
       profile: new BearerConnectionProfile({
         connectionId,

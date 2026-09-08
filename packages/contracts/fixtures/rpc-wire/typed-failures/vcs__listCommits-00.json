@@ -14,7 +14,7 @@
           "exitCode": 3.402821032496136e38,
           "stdoutLength": -3.4028181929587916e38,
           "detail": "sl",
-          "cause": "undefined"
+          "cause": null
         }
       }
     ]
