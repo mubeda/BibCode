@@ -113,7 +113,8 @@ affected test target rather than suppressing the `linker_messages` lint.
 Validate Objective-C recovery with the actual optimized profile:
 
 ```sh
-cargo run --release -p bibcode-desktop --example objc_exception_probe
+rust_target="$(rustc -Vv | sed -n 's/^host: //p')"
+cargo run --release --target "$rust_target" -p bibcode-desktop --example objc_exception_probe
 ```
 
 The probe must catch its native exception and exit successfully. The workspace
