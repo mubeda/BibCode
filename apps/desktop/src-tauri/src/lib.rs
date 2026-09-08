@@ -1,3 +1,6 @@
+#[cfg(all(target_os = "macos", panic = "abort"))]
+compile_error!("macOS desktop builds require panic=unwind for Objective-C exception recovery");
+
 use tauri::Manager;
 
 #[cfg(test)]

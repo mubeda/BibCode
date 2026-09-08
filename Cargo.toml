@@ -110,4 +110,6 @@ tao = { git = "https://github.com/tauri-apps/tao", rev = "c704261c519c58cfdd0bc2
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
-panic = "abort"
+# Wry catches Objective-C exceptions when WebKit cancels URL-scheme tasks.
+# panic=abort prevents that recovery and terminates the macOS host.
+panic = "unwind"
