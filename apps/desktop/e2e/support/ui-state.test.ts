@@ -23,6 +23,33 @@ describe("mockDesktopUiFolderPicker", () => {
 });
 
 describe("setDesktopUiWindowSize", () => {
+  it("waits for the webview to catch up with native resizing before correcting again", async () => {
+    const viewport = { devicePixelRatio: 1, innerWidth: 980, innerHeight: 720 };
+    let outer = { width: 980, height: 764 };
+    let pending: (() => void) | undefined;
+    const setWindowSize = vi.fn(async (width: number, height: number) => {
+      outer = { width, height };
+      pending = () => {
+        viewport.innerWidth = width;
+        viewport.innerHeight = height - 44;
+      };
+    });
+    vi.stubGlobal("window", viewport);
+    vi.stubGlobal("browser", {
+      execute: async (callback: () => unknown) => callback(),
+      getWindowSize: async () => ({ ...outer }),
+      setWindowSize,
+      waitUntil: async (predicate: () => Promise<boolean>) => {
+        if (await predicate()) return;
+        pending?.();
+        if (!(await predicate())) throw new Error("Native resize did not reach the webview.");
+      },
+    });
+    await setDesktopUiWindowSize(981, 720);
+    expect(viewport.innerWidth).toBe(981);
+    expect(setWindowSize).toHaveBeenCalledTimes(1);
+  });
+
   it.each([1, 2])(
     "observes the requested viewport at scale %s without relying on animation frames",
     async (scale) => {

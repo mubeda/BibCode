@@ -1,4 +1,4 @@
-import { correctDesktopUiOuterSize, scaleDesktopUiWindowSize } from "./window-size.ts";
+import { correctDesktopUiOuterSize } from "./window-size.ts";
 
 export async function mockDesktopUiFolderPicker(projectPath: string): Promise<void> {
   const picker = await browser.tauri.mock("desktop_bridge_pick_folder");
@@ -8,22 +8,39 @@ export async function mockDesktopUiFolderPicker(projectPath: string): Promise<vo
 export async function setDesktopUiWindowSize(width: number, height: number): Promise<void> {
   const devicePixelRatio = await browser.execute(() => window.devicePixelRatio);
   const requestedViewportSize = { width, height };
-  let outerSize = scaleDesktopUiWindowSize(requestedViewportSize, devicePixelRatio);
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    await browser.setWindowSize(outerSize.width, outerSize.height);
-    // Occluded macOS webviews can suspend animation frames. Read geometry
-    // through WebDriver; native screen constraints may cap the requested size.
-    const observedViewportSize = await browser.execute(() => ({
+  const readViewport = () =>
+    browser.execute(() => ({
       width: window.innerWidth,
       height: window.innerHeight,
     }));
-    if (observedViewportSize.width === width && observedViewportSize.height === height) return;
-    outerSize = correctDesktopUiOuterSize(
-      outerSize,
+  const scale = Number.isFinite(devicePixelRatio) && devicePixelRatio > 0 ? devicePixelRatio : 1;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const before = await readViewport();
+    if (before.width === width && before.height === height) return;
+    const outerBefore = await browser.getWindowSize();
+    const requestedOuter = correctDesktopUiOuterSize(
+      outerBefore,
       requestedViewportSize,
-      observedViewportSize,
-      devicePixelRatio,
+      before,
+      scale,
     );
+    await browser.setWindowSize(requestedOuter.width, requestedOuter.height);
+    const outerAfter = await browser.getWindowSize();
+    const expected = {
+      width: Math.round(before.width + (outerAfter.width - outerBefore.width) / scale),
+      height: Math.round(before.height + (outerAfter.height - outerBefore.height) / scale),
+    };
+    // Native resize completion can precede the webview resize. Observe that
+    // transition before correcting again, without requiring paint callbacks.
+    await browser.waitUntil(
+      async () => {
+        const observed = await readViewport();
+        return observed.width === expected.width && observed.height === expected.height;
+      },
+      { timeoutMsg: "The webview did not reach the native window geometry after resize." },
+    );
+    // The host display can cap large requests; preserve that native constraint.
+    if (outerAfter.width === outerBefore.width && outerAfter.height === outerBefore.height) return;
   }
 }
 
