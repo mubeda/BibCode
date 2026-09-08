@@ -1197,9 +1197,15 @@ sizes. Cover relevant:
   process growth.
 
 The default packaged suite runs all of its spec files in one embedded-driver
-session, resets client connection state before every test, and waits for a
-replacement document with a new navigation time origin to finish loading after
-refresh. The old page reporting complete is insufficient. The suite disables
+session and resets client connection state before every test. After refresh,
+it waits for a new main-webview page-load completion from the test-only Tauri
+logging plugin in `userdata/logs/server.log`. Navigation generations distinguish
+old completions and loading pages without sending WebDriver JavaScript into a
+document being replaced. These markers carry no page URLs and are absent from
+production builds. The disposable fixture enables only this lifecycle target
+even when its parent process uses a warning-only filter. The maintained `document-navigation.e2e.ts` scenario reloads
+three times and checks a complete, distinct document after each native finish.
+The suite disables
 WebDriver command retries. Treat reporter hook errors, retries, and timeouts as
 test failures even when the individual scenarios are reported as passing.
 Window resizing polls the actual viewport and native window until the requested

@@ -40,8 +40,9 @@ follow the server you are working on.
 
 ### Reliability and validation
 
-- Wait for the replacement document after desktop test reloads so setup cannot
-  proceed against a completed page that is about to be discarded.
+- Observe native page-load completion after desktop test reloads so setup does
+  not send JavaScript into a document being replaced. Readiness generations are
+  recorded only in test builds.
 
 - Made packaged desktop validation independent of suspended macOS paint frames,
   wait for native viewport resizing and workspace terminal controls, and target
