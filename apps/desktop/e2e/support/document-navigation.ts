@@ -43,4 +43,13 @@ export async function refreshDesktopUiDocument(
     },
     { timeoutMsg: "Tauri did not report the replacement desktop document finishing its load." },
   );
+  // WebKitGTK can report the native finish while the new DOM is interactive.
+  // It is now safe to install a load listener in that replacement document.
+  await browser.executeAsync((done: (result: string) => void) => {
+    if (document.readyState === "complete") {
+      done("ready");
+      return;
+    }
+    window.addEventListener("load", () => done("ready"), { once: true });
+  });
 }

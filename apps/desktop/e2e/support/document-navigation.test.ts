@@ -18,32 +18,53 @@ it("does not accept stale completions, other log lines, or an unfinished navigat
   ).toEqual({ phase: "started", id: next });
 });
 
-it("waits for the replacement native completion without executing JavaScript during reload", async () => {
-  const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "desktop-navigation-"));
-  NodeFS.mkdirSync(NodePath.join(root, "userdata", "logs"), { recursive: true });
-  const path = NodePath.join(root, "userdata", "logs", "server.log");
-  const append = (phase: string, id: string) =>
-    NodeFS.appendFileSync(path, `INFO desktop_e2e_page_load_${phase} id=${id}\n`);
-  append("finished", previous);
-  const readiness: boolean[] = [];
-  vi.stubGlobal("browser", {
-    execute: async () => {
-      throw new Error("Script execution lost during navigation");
-    },
-    refresh: async () => undefined,
-    waitUntil: async (predicate: () => boolean) => {
-      if (predicate()) return;
-      readiness.push(false);
-      append("started", next);
-      readiness.push(predicate());
-      append("finished", next);
-      readiness.push(predicate());
-    },
-  });
-  try {
-    await refreshDesktopUiDocument(root);
-    expect(readiness).toEqual([false, false, true]);
-  } finally {
-    NodeFS.rmSync(root, { recursive: true, force: true });
-  }
-});
+it.each(["interactive", "complete"])(
+  "finishes a %s document only after native navigation completes",
+  async (readyState) => {
+    const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "desktop-navigation-"));
+    NodeFS.mkdirSync(NodePath.join(root, "userdata", "logs"), { recursive: true });
+    const path = NodePath.join(root, "userdata", "logs", "server.log");
+    const append = (phase: string, id: string) =>
+      NodeFS.appendFileSync(path, `INFO desktop_e2e_page_load_${phase} id=${id}\n`);
+    append("finished", previous);
+    const readiness: boolean[] = [];
+    const documentState = { readyState };
+    const addEventListener = vi.fn((_event: string, loaded: () => void) => {
+      documentState.readyState = "complete";
+      loaded();
+    });
+    vi.stubGlobal("document", documentState);
+    vi.stubGlobal("window", { addEventListener });
+    const executeAsync = vi.fn(async (callback: (done: (value: string) => void) => void) => {
+      expect(readNativePageLoad(NodeFS.readFileSync(path, "utf8"))).toEqual({
+        phase: "finished",
+        id: next,
+      });
+      return new Promise<string>((resolve) => callback(resolve));
+    });
+    vi.stubGlobal("browser", {
+      execute: async () => {
+        throw new Error("Script execution lost during navigation");
+      },
+      refresh: async () => undefined,
+      executeAsync,
+      waitUntil: async (predicate: () => boolean) => {
+        if (predicate()) return;
+        readiness.push(false);
+        append("started", next);
+        readiness.push(predicate());
+        append("finished", next);
+        readiness.push(predicate());
+      },
+    });
+    try {
+      await refreshDesktopUiDocument(root);
+      expect(readiness).toEqual([false, false, true]);
+      expect(executeAsync).toHaveBeenCalledTimes(1);
+      expect(documentState.readyState).toBe("complete");
+      expect(addEventListener).toHaveBeenCalledTimes(readyState === "interactive" ? 1 : 0);
+    } finally {
+      NodeFS.rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
