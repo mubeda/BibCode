@@ -139,7 +139,7 @@ jobs:
             exit 1
           fi
 
-      - name: Resolve macOS application from DMG build
+      - name: Install macOS application from DMG build
         if: matrix.platform == 'mac'
         shell: bash
         run: |
@@ -148,10 +148,17 @@ jobs:
           mount_point="$RUNNER_TEMP/bibcode-desktop-ui-dmg"
           mkdir -p "$mount_point"
           hdiutil attach "$dmg_path" -mountpoint "$mount_point" -nobrowse -readonly
-          app_path="$(find "$mount_point" -maxdepth 1 -name 'BiBCode.app' -print -quit)"
-          test -n "$app_path"
-          echo "BIBCODE_E2E_APP_PATH=$app_path" >> "$GITHUB_ENV"
           echo "BIBCODE_E2E_DMG_MOUNT_POINT=$mount_point" >> "$GITHUB_ENV"
+          mounted_app="$(find "$mount_point" -maxdepth 1 -name 'BiBCode.app' -print -quit)"
+          test -n "$mounted_app"
+          install_directory="$(mktemp -d "$RUNNER_TEMP/bibcode-ui-install.XXXXXX")"
+          echo "BIBCODE_E2E_INSTALL_DIRECTORY=$install_directory" >> "$GITHUB_ENV"
+          app_path="$install_directory/BiBCode.app"
+          ditto "$mounted_app" "$app_path"
+          executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$mounted_app/Contents/Info.plist")"
+          cmp "$mounted_app/Contents/MacOS/$executable" "$app_path/Contents/MacOS/$executable"
+          codesign --verify --deep --strict "$app_path"
+          echo "BIBCODE_E2E_APP_PATH=$app_path" >> "$GITHUB_ENV"
 
       - name: Install and resolve Windows NSIS application
         if: matrix.platform == 'win'

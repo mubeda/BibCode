@@ -43,7 +43,8 @@ follow the server you are working on.
 - Wait for native navigation and the new document's load event after desktop
   test reloads. This avoids sending JavaScript into a document being replaced.
   Readiness generations are recorded only in test builds. Backend logs and
-  bounded macOS crash summaries are retained for native test failures.
+  bounded macOS crash summaries are retained for native test failures. macOS
+  smoke tests now verify and run an isolated installation copied from the DMG.
 
 - Made packaged desktop validation independent of suspended macOS paint frames,
   wait for native viewport resizing and workspace terminal controls, and target
@@ -63,6 +64,8 @@ follow the server you are working on.
   procedures for input recovery and selected-server usage.
 
 ### Downloads
+
+On macOS, copy BiBCode.app from the DMG to Applications before launching it.
 
 Desktop installers and standalone server distributions are provided for macOS,
 Linux, and Windows on ARM64 and x64. Linux server `.deb` and `.rpm` packages are
