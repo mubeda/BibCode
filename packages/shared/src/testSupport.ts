@@ -6,6 +6,7 @@ export function makeTestExecutionEnvironmentCapabilities(
 ): ExecutionEnvironmentCapabilities {
   return {
     repositoryIdentity: false,
+    terminalOrderedInput: false,
     worktreeCatalog: false,
     worktreeCatalogRefreshReason: false,
     vcsStatusSummary: false,

@@ -160,6 +160,12 @@ import {
   TerminalRestartInput,
   TerminalSessionSnapshot,
   TerminalWriteInput,
+  TerminalBeginInput,
+  TerminalCancelInput,
+  TerminalInputAcknowledgement,
+  TerminalInputError,
+  TerminalInputLease,
+  TerminalWriteInputFrame,
 } from "./terminal.ts";
 import {
   DiscoveredLocalServerList,
@@ -412,6 +418,9 @@ export const WS_METHODS = {
   terminalOpen: "terminal.open",
   terminalAttach: "terminal.attach",
   terminalWrite: "terminal.write",
+  terminalBeginInput: "terminal.beginInput",
+  terminalWriteInput: "terminal.writeInput",
+  terminalCancelInput: "terminal.cancelInput",
   terminalResize: "terminal.resize",
   terminalClear: "terminal.clear",
   terminalRestart: "terminal.restart",
@@ -1184,6 +1193,32 @@ export const WsTerminalWriteRpc = Rpc.make(WS_METHODS.terminalWrite, {
   ]),
 });
 
+const TerminalOrderedInputError = Schema.Union([
+  TerminalInputError,
+  TerminalError,
+  WorkspaceUnavailableError,
+  WorkspaceIdentityError,
+  EnvironmentRpcError,
+]);
+
+export const WsTerminalBeginInputRpc = Rpc.make(WS_METHODS.terminalBeginInput, {
+  payload: TerminalBeginInput,
+  success: TerminalInputLease,
+  error: TerminalOrderedInputError,
+});
+
+export const WsTerminalWriteInputRpc = Rpc.make(WS_METHODS.terminalWriteInput, {
+  payload: TerminalWriteInputFrame,
+  success: TerminalInputAcknowledgement,
+  error: TerminalOrderedInputError,
+});
+
+export const WsTerminalCancelInputRpc = Rpc.make(WS_METHODS.terminalCancelInput, {
+  payload: TerminalCancelInput,
+  success: Schema.Null,
+  error: TerminalOrderedInputError,
+});
+
 export const WsTerminalResizeRpc = Rpc.make(WS_METHODS.terminalResize, {
   payload: TerminalResizeInput,
   error: Schema.Union([TerminalError, EnvironmentRpcError]),
@@ -1501,6 +1536,9 @@ export const WsRpcGroup = RpcGroup.make(
   WsTerminalOpenRpc,
   WsTerminalAttachRpc,
   WsTerminalWriteRpc,
+  WsTerminalBeginInputRpc,
+  WsTerminalWriteInputRpc,
+  WsTerminalCancelInputRpc,
   WsTerminalResizeRpc,
   WsTerminalClearRpc,
   WsTerminalRestartRpc,

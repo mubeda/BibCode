@@ -417,7 +417,7 @@ const testState = vi.hoisted(() => ({
     environment: { platform: { os: "windows" } },
   } as {
     availableEditors: string[];
-    environment: { platform: { os: string } };
+    environment: { platform: { os: string }; capabilities?: { terminalOrderedInput?: boolean } };
   } | null,
   session: {
     buffer: "",
@@ -430,6 +430,9 @@ const testState = vi.hoisted(() => ({
   },
   attachedSessionInputs: [] as unknown[],
   writeCommand: vi.fn(),
+  prepareInputCommand: vi.fn(),
+  resetInputCommand: vi.fn(),
+  reattachCommand: vi.fn(),
   resizeCommand: vi.fn(),
   restartCommand: vi.fn(),
   previewCommand: vi.fn(),
@@ -477,6 +480,8 @@ vi.mock("../state/preview", () => ({ previewEnvironment: { open: "preview-open" 
 vi.mock("../state/terminal", () => ({
   terminalEnvironment: {
     write: "terminal-write",
+    prepareInput: "terminal-prepare-input",
+    resetInput: "terminal-reset-input",
     resize: "terminal-resize",
     restart: "terminal-restart",
   },
@@ -484,6 +489,8 @@ vi.mock("../state/terminal", () => ({
 vi.mock("../state/use-atom-command", () => ({
   useAtomCommand: (command: string) => {
     if (command === "terminal-write") return testState.writeCommand;
+    if (command === "terminal-prepare-input") return testState.prepareInputCommand;
+    if (command === "terminal-reset-input") return testState.resetInputCommand;
     if (command === "terminal-resize") return testState.resizeCommand;
     if (command === "terminal-restart") return testState.restartCommand;
     return testState.previewCommand;
@@ -492,7 +499,7 @@ vi.mock("../state/use-atom-command", () => ({
 vi.mock("../state/terminalSessions", () => ({
   useAttachedTerminalSession: (input: unknown) => {
     testState.attachedSessionInputs.push(input);
-    return testState.session;
+    return { ...testState.session, reattach: testState.reattachCommand };
   },
 }));
 vi.mock("../hooks/useSettings", () => ({
@@ -1141,6 +1148,9 @@ beforeEach(() => {
   testState.enableTerminalAgentActivityByEnvironment.clear();
   testState.settingsListeners.clear();
   testState.writeCommand.mockReset().mockResolvedValue(AsyncResult.success(undefined));
+  testState.prepareInputCommand.mockReset().mockResolvedValue(AsyncResult.success(undefined));
+  testState.resetInputCommand.mockReset().mockResolvedValue(AsyncResult.success(undefined));
+  testState.reattachCommand.mockReset();
   testState.resizeCommand.mockReset().mockResolvedValue(AsyncResult.success(undefined));
   testState.restartCommand.mockReset().mockResolvedValue(AsyncResult.success(undefined));
   testState.previewCommand.mockReset().mockResolvedValue(AsyncResult.success(undefined));
@@ -2859,6 +2869,88 @@ describe("TerminalViewport mounted lifecycle", () => {
       environmentId: ENVIRONMENT_ID,
       input: { threadId: THREAD_ID, terminalId: "term-coalesced", data: "abc" },
     });
+  });
+
+  it("prepares legacy input again after a fresh attachment resets its binding", async () => {
+    const props = viewportProps({ terminalId: "term-gated" });
+    const mounted = await mount(<TerminalViewport {...props} />);
+    testState.prepareInputCommand.mockClear();
+    testState.resetInputCommand.mockClear();
+    testState.session = { ...testState.session, generation: testState.session.generation + 1 };
+    await act(async () => mounted.root.render(<TerminalViewport {...props} />));
+    expect(testState.resetInputCommand).toHaveBeenCalledOnce();
+    expect(testState.prepareInputCommand).toHaveBeenCalledWith({
+      environmentId: ENVIRONMENT_ID,
+      input: { threadId: THREAD_ID, terminalId: "term-gated" },
+    });
+    expect(testState.resetInputCommand.mock.invocationCallOrder[0]).toBeLessThan(
+      testState.prepareInputCommand.mock.invocationCallOrder[0]!,
+    );
+  });
+
+  it("pipelines interactive and programmatic input on an ordered server before acknowledgement", async () => {
+    testState.serverConfig!.environment.capabilities = { terminalOrderedInput: true };
+    let completeFirst!: (result: unknown) => void;
+    testState.writeCommand.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          completeFirst = resolve;
+        }),
+    );
+    await mount(<TerminalViewport {...viewportProps({ terminalId: "term-gated" })} />);
+    const terminal = xtermState.terminals[0]!;
+    terminal.dataHandler?.("a");
+    await act(async () => Promise.resolve());
+    enqueueTerminalInput({
+      environmentId: ENVIRONMENT_ID,
+      threadId: THREAD_ID,
+      terminalId: "term-gated",
+      data: "b",
+      fallbackError: "input failed",
+      write: (data) =>
+        testState.writeCommand({
+          environmentId: ENVIRONMENT_ID,
+          input: { threadId: THREAD_ID, terminalId: "term-gated", data },
+        }),
+    });
+    await act(async () => Promise.resolve());
+    expect(testState.writeCommand.mock.calls.map(([request]) => request.input.data)).toEqual([
+      "a",
+      "b",
+    ]);
+    expect(testState.prepareInputCommand).toHaveBeenCalledWith({
+      environmentId: ENVIRONMENT_ID,
+      input: { threadId: THREAD_ID, terminalId: "term-gated" },
+    });
+    completeFirst(AsyncResult.success(undefined));
+    await act(async () => Promise.resolve());
+  });
+
+  it("pauses failed ordered input until a fresh attachment and offers reconnect without restarting the process", async () => {
+    testState.serverConfig!.environment.capabilities = { terminalOrderedInput: true };
+    testState.writeCommand.mockResolvedValueOnce(
+      AsyncResult.failure(Cause.fail(new Error("Input was not delivered."))),
+    );
+    const props = viewportProps({ terminalId: "term-gated" });
+    const mounted = await mount(<TerminalViewport {...props} />);
+    const terminal = xtermState.terminals[0]!;
+    await act(async () => terminal.dataHandler?.("failed"));
+    await act(async () => terminal.dataHandler?.("must not send"));
+    expect(testState.writeCommand).toHaveBeenCalledTimes(1);
+    const reconnect = Array.from(mounted.container.querySelectorAll("button")).find((button) =>
+      button.textContent?.includes("Reconnect input"),
+    );
+    expect(reconnect).toBeDefined();
+    await act(async () => reconnect!.click());
+    expect(testState.reattachCommand).toHaveBeenCalledOnce();
+    expect(testState.restartCommand).not.toHaveBeenCalled();
+    testState.session = { ...testState.session, generation: testState.session.generation + 1 };
+    await act(async () => mounted.root.render(<TerminalViewport {...props} />));
+    await act(async () => terminal.dataHandler?.("fresh"));
+    expect(testState.writeCommand.mock.calls.map(([request]) => request.input.data)).toEqual([
+      "failed",
+      "fresh",
+    ]);
   });
 
   it("keeps terminal writes single-flight and drops dependent input after failure", async () => {

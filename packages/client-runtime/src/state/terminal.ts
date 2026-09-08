@@ -2,6 +2,7 @@ import {
   type EnvironmentId,
   type TerminalMetadataStreamEvent,
   type TerminalSummary,
+  type TerminalSessionSnapshot,
   WS_METHODS,
 } from "@bibcode/contracts";
 import * as Effect from "effect/Effect";
@@ -10,6 +11,7 @@ import { Atom } from "effect/unstable/reactivity";
 
 import {
   createAtomCommandScheduler,
+  createEnvironmentCommand,
   createEnvironmentRpcCommand,
   createEnvironmentRpcSubscriptionAtomFamily,
   createEnvironmentSubscriptionAtomFamily,
@@ -17,8 +19,16 @@ import {
   followStreamInEnvironment,
   parseEnvironmentRpcKey,
 } from "./runtime.ts";
+import type { RpcSession } from "../rpc/session.ts";
 import type { EnvironmentRegistry } from "../connection/registry.ts";
-import { subscribe, type EnvironmentRpcInput } from "../rpc/client.ts";
+import {
+  currentSession,
+  request,
+  requestInSession,
+  EnvironmentRpcUnavailableError,
+  subscribe,
+  type EnvironmentRpcInput,
+} from "../rpc/client.ts";
 import {
   acquireTerminalMetadataStream,
   createTerminalTranscriptRuntimeRegistry,
@@ -30,6 +40,12 @@ import {
   type TerminalMetadataSnapshot,
   type TerminalTranscriptRuntime,
 } from "./terminalTranscriptRuntime.ts";
+
+import { EnvironmentSupervisor } from "../connection/supervisor.ts";
+import {
+  createTerminalInputBindingRegistry,
+  type TerminalInputTarget,
+} from "./orderedTerminalInput.ts";
 
 export interface TerminalAttachSnapshot {
   readonly metadata: TerminalMetadataSnapshot;
@@ -53,6 +69,26 @@ export function accumulateTerminalMetadataEvents<E, R>(
 export function createTerminalEnvironmentAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, E>,
 ) {
+  const inputBindings = createTerminalInputBindingRegistry();
+  const prepareConfirmedInput = Effect.fn("terminal.prepareConfirmedInput")(function* (
+    session: RpcSession,
+    environmentId: string,
+    snapshot: TerminalSessionSnapshot,
+  ) {
+    if ((yield* currentSession()) !== session) {
+      return yield* new EnvironmentRpcUnavailableError({
+        environmentId,
+        message: "Terminal connection changed during the operation. Reattach before typing again.",
+      });
+    }
+    yield* inputBindings.prepare(
+      session,
+      environmentId,
+      { threadId: snapshot.threadId, terminalId: snapshot.terminalId },
+      yield* Effect.context(),
+    );
+    return snapshot;
+  });
   const lifecycleScheduler = createAtomCommandScheduler();
   const resizeScheduler = createAtomCommandScheduler();
   const transcriptRuntimes = createTerminalTranscriptRuntimeRegistry();
@@ -132,15 +168,59 @@ export function createTerminalEnvironmentAtoms<R, E>(
       subscribe: (_input: null) =>
         accumulateTerminalMetadataEvents(subscribe(WS_METHODS.subscribeTerminalMetadata, {})),
     }),
-    open: createEnvironmentRpcCommand(runtime, {
+    open: createEnvironmentCommand(runtime, {
       label: "environment-data:terminal:open",
-      tag: WS_METHODS.terminalOpen,
+      execute: Effect.fn("terminal.open")(function* (
+        input: EnvironmentRpcInput<typeof WS_METHODS.terminalOpen>,
+      ) {
+        const supervisor = yield* EnvironmentSupervisor;
+        const session = yield* currentSession();
+        const snapshot = yield* requestInSession(
+          session,
+          supervisor.target.environmentId,
+          WS_METHODS.terminalOpen,
+          input,
+        );
+        return yield* prepareConfirmedInput(session, supervisor.target.environmentId, snapshot);
+      }),
       scheduler: lifecycleScheduler,
       concurrency: lifecycleConcurrency,
     }),
-    write: createEnvironmentRpcCommand(runtime, {
+    prepareInput: createEnvironmentCommand(runtime, {
+      label: "environment-data:terminal:prepare-input",
+      execute: Effect.fn("terminal.prepareInput")(function* (input: TerminalInputTarget) {
+        const supervisor = yield* EnvironmentSupervisor;
+        const session = yield* currentSession();
+        return yield* inputBindings.prepare(
+          session,
+          supervisor.target.environmentId,
+          input,
+          yield* Effect.context(),
+        );
+      }),
+    }),
+    resetInput: createEnvironmentCommand(runtime, {
+      label: "environment-data:terminal:reset-input",
+      execute: Effect.fn("terminal.resetInput")(function* (input: TerminalInputTarget) {
+        const supervisor = yield* EnvironmentSupervisor;
+        inputBindings.reset(supervisor.target.environmentId, input);
+      }),
+    }),
+    write: createEnvironmentCommand(runtime, {
       label: "environment-data:terminal:write",
-      tag: WS_METHODS.terminalWrite,
+      execute: Effect.fn("terminal.write")(function* (
+        input: EnvironmentRpcInput<typeof WS_METHODS.terminalWrite>,
+      ) {
+        const supervisor = yield* EnvironmentSupervisor;
+        const session = yield* currentSession();
+        return yield* inputBindings.write(
+          session,
+          supervisor.target.environmentId,
+          input,
+          input.data,
+          yield* Effect.context(),
+        );
+      }),
     }),
     resize: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:terminal:resize",
@@ -154,15 +234,34 @@ export function createTerminalEnvironmentAtoms<R, E>(
       scheduler: lifecycleScheduler,
       concurrency: lifecycleConcurrency,
     }),
-    restart: createEnvironmentRpcCommand(runtime, {
+    restart: createEnvironmentCommand(runtime, {
       label: "environment-data:terminal:restart",
-      tag: WS_METHODS.terminalRestart,
+      execute: Effect.fn("terminal.restart")(function* (
+        input: EnvironmentRpcInput<typeof WS_METHODS.terminalRestart>,
+      ) {
+        const supervisor = yield* EnvironmentSupervisor;
+        const session = yield* currentSession();
+        inputBindings.reset(supervisor.target.environmentId, input);
+        const snapshot = yield* requestInSession(
+          session,
+          supervisor.target.environmentId,
+          WS_METHODS.terminalRestart,
+          input,
+        );
+        return yield* prepareConfirmedInput(session, supervisor.target.environmentId, snapshot);
+      }),
       scheduler: lifecycleScheduler,
       concurrency: lifecycleConcurrency,
     }),
-    close: createEnvironmentRpcCommand(runtime, {
+    close: createEnvironmentCommand(runtime, {
       label: "environment-data:terminal:close",
-      tag: WS_METHODS.terminalClose,
+      execute: Effect.fn("terminal.close")(function* (
+        input: EnvironmentRpcInput<typeof WS_METHODS.terminalClose>,
+      ) {
+        const supervisor = yield* EnvironmentSupervisor;
+        inputBindings.reset(supervisor.target.environmentId, input);
+        return yield* request(WS_METHODS.terminalClose, input);
+      }),
       scheduler: lifecycleScheduler,
       concurrency: lifecycleConcurrency,
     }),

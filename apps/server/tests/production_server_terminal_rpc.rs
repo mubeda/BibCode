@@ -36,6 +36,7 @@ const TERMINAL_RPC_INTEGRATION_DEADLINE: Duration = Duration::from_secs(5);
 struct GateTestPty {
     identity: diagnostics::ProcessIdentity,
     killed: AtomicBool,
+    writes: std::sync::Mutex<Vec<String>>,
     output: tokio::sync::broadcast::Sender<String>,
     exit: tokio::sync::watch::Sender<Option<PtyExit>>,
 }
@@ -53,6 +54,7 @@ impl GateTestPty {
                 started_at: generation,
             },
             killed: AtomicBool::new(false),
+            writes: std::sync::Mutex::new(Vec::new()),
             output,
             exit,
         }
@@ -68,7 +70,11 @@ impl PtyProcess for GateTestPty {
         Some(self.identity)
     }
 
-    fn write(&self, _data: &str) -> Result<(), String> {
+    fn write(&self, data: &str) -> Result<(), String> {
+        self.writes
+            .lock()
+            .expect("input writes")
+            .push(data.to_owned());
         Ok(())
     }
 
@@ -92,6 +98,134 @@ impl PtyProcess for GateTestPty {
     fn subscribe_exit(&self) -> tokio::sync::watch::Receiver<Option<PtyExit>> {
         self.exit.subscribe()
     }
+}
+
+#[tokio::test]
+async fn ordered_input_rpc_delivers_in_order_and_binds_lease_to_physical_socket() {
+    let temp = TempDir::new().expect("temp");
+    let process = Arc::new(GateTestPty::new());
+    let (release, released) = std::sync::mpsc::channel();
+    release.send(()).expect("allow spawn");
+    let backend = Arc::new(GateTestBackend {
+        process: process.clone(),
+        started: std::sync::Mutex::new(None),
+        release: std::sync::Mutex::new(released),
+    });
+    let manager =
+        terminal::TerminalManager::new(backend, terminal::TerminalManagerOptions::default());
+    let services = fixture_services_with_manager(manager.clone(), empty_usage());
+    let mut rpc = RpcRegistry::empty();
+    register_server_terminal_rpc(&mut rpc, services);
+    let handle = ServerRuntime::start_with_registry(test_config(&temp), rpc)
+        .await
+        .expect("server");
+    let mut socket = open_socket(handle.local_addr()).await;
+    let mut other = open_socket(handle.local_addr()).await;
+    assert_success(
+        request(
+            &mut socket,
+            "1",
+            "terminal.open",
+            json!({"threadId":"ordered", "terminalId":"term", "cwd":temp.path().to_string_lossy()}),
+        )
+        .await,
+    );
+    let lease = success_value(
+        request(
+            &mut socket,
+            "2",
+            "terminal.beginInput",
+            json!({"threadId":"ordered", "terminalId":"term", "attachmentSequence":0}),
+        )
+        .await,
+    );
+    let frame = |sequence, data| json!({"threadId":"ordered", "terminalId":"term", "inputId":lease["inputId"], "sequence":sequence, "data":data});
+    assert_error_tag(
+        request(&mut other, "1", "terminal.writeInput", frame(0, "foreign")).await,
+        "TerminalInputError",
+    );
+    send_request(&mut socket, "3", "terminal.writeInput", frame(1, "b")).await;
+    send_request(&mut socket, "4", "terminal.writeInput", frame(0, "a")).await;
+    let mut sequences = Vec::new();
+    for _ in 0..2 {
+        sequences.push(
+            success_value(next_message(&mut socket).await)["sequence"]
+                .as_u64()
+                .expect("sequence"),
+        );
+    }
+    sequences.sort_unstable();
+    assert_eq!(sequences, [0, 1]);
+    assert_eq!(*process.writes.lock().expect("input writes"), ["a", "b"]);
+    assert_error_tag(
+        request(
+            &mut socket,
+            "5",
+            "terminal.writeInput",
+            frame(0, "duplicate"),
+        )
+        .await,
+        "TerminalInputError",
+    );
+    assert_eq!(*process.writes.lock().expect("input writes"), ["a", "b"]);
+    socket.close(None).await.expect("close socket");
+    assert_error_tag(
+        request(
+            &mut other,
+            "2",
+            "terminal.writeInput",
+            frame(2, "after disconnect"),
+        )
+        .await,
+        "TerminalInputError",
+    );
+    other.close(None).await.expect("close other");
+    manager.shutdown().await;
+    handle.shutdown();
+    handle.join().await.expect("server joins");
+}
+
+#[tokio::test]
+async fn ordered_input_rpc_reserves_capacity_for_control_requests() {
+    let temp = TempDir::new().expect("temp");
+    let (started, mut starts) = mpsc::channel(64);
+    let mut registry = RpcRegistry::empty();
+    registry.register_unary("test.hold", move |_request, cancellation| {
+        let started = started.clone();
+        async move {
+            started.send(()).await.expect("started observer");
+            cancellation.cancelled().await;
+            Ok(Value::Null)
+        }
+    });
+    registry.register_unary("terminal.writeInput", |_request, _cancellation| async {
+        Ok(Value::Null)
+    });
+    registry.register_unary("test.control", |_request, _cancellation| async {
+        Ok(json!({"ready":true}))
+    });
+    let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
+        .await
+        .expect("server");
+    let mut socket = open_socket(handle.local_addr()).await;
+    for id in 1..=56 {
+        send_request(&mut socket, &id.to_string(), "test.hold", json!({})).await;
+    }
+    for _ in 0..56 {
+        tokio::time::timeout(Duration::from_secs(2), starts.recv())
+            .await
+            .expect("request starts")
+            .expect("start signal");
+    }
+    let rejected =
+        failure_value(request(&mut socket, "57", "terminal.writeInput", json!({})).await);
+    assert_eq!(rejected["_tag"], "TerminalInputError");
+    assert_eq!(rejected["code"], "capacity");
+    let control = success_value(request(&mut socket, "58", "test.control", json!({})).await);
+    assert_eq!(control["ready"], true);
+    socket.close(None).await.expect("close");
+    handle.shutdown();
+    handle.join().await.expect("join");
 }
 
 #[test]

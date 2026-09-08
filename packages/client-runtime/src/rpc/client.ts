@@ -99,7 +99,7 @@ export interface EnvironmentSubscriptionOptions<TTag extends EnvironmentSubscrip
   readonly retryExpectedFailureAfter?: Duration.Input;
 }
 
-const currentSession = Effect.fn("EnvironmentRpc.currentSession")(function* () {
+export const currentSession = Effect.fn("EnvironmentRpc.currentSession")(function* () {
   const supervisor = yield* EnvironmentSupervisor;
   return yield* SubscriptionRef.get(supervisor.session).pipe(
     Effect.flatMap(

@@ -24,7 +24,7 @@ import {
   ServerSignalProcessInput,
 } from "../src/server.ts";
 import { DEFAULT_SERVER_SETTINGS } from "../src/settings.ts";
-import { TerminalOpenInput } from "../src/terminal.ts";
+import { TerminalBeginInput, TerminalOpenInput } from "../src/terminal.ts";
 
 const StreamSchemaTypeId = "~effect/rpc/RpcSchema/StreamSchema";
 const requestId = "900719925474099312345";
@@ -587,6 +587,20 @@ dynamicFixtures.set(
   ),
 );
 dynamicFixtures.set(
+  "contract-shapes/terminal__beginInput-request.json",
+  serializeWireFixture({
+    _tag: "Request",
+    id: requestId,
+    tag: WS_METHODS.terminalBeginInput,
+    payload: compileUnknownEncoder(TerminalBeginInput)({
+      threadId: "thread-1",
+      terminalId: "terminal-1",
+      attachmentSequence: 0,
+    }),
+    headers: [],
+  } satisfies RpcMessage.RequestEncoded),
+);
+dynamicFixtures.set(
   "contract-shapes/server__signalProcess-request.json",
   serializeWireFixture({
     _tag: "Request",
@@ -736,8 +750,8 @@ for (const rpc of [...WsRpcGroup.requests.values()].toSorted((left, right) =>
   }
 }
 
-if (methods.length !== 115) {
-  throw new Error(`Expected 115 active RPC methods, found ${methods.length}.`);
+if (methods.length !== 118) {
+  throw new Error(`Expected 118 active RPC methods, found ${methods.length}.`);
 }
 const streamMethodCount = methods.filter(({ mode }) => mode === "stream").length;
 if (streamMethodCount !== 20) {
@@ -753,8 +767,8 @@ if (streamShapeFixtures.length !== topLevelStreamShapeCount) {
     `Exported ${streamShapeFixtures.length} stream shape fixtures, expected ${topLevelStreamShapeCount}.`,
   );
 }
-if (typedFailureFixtures.length !== 254) {
-  throw new Error(`Expected 254 typed failure fixtures, found ${typedFailureFixtures.length}.`);
+if (typedFailureFixtures.length !== 269) {
+  throw new Error(`Expected 269 typed failure fixtures, found ${typedFailureFixtures.length}.`);
 }
 if (orchestrationEventShapeCount !== 23) {
   throw new Error(`Expected 23 orchestration event shapes, found ${orchestrationEventShapeCount}.`);

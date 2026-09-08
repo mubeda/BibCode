@@ -351,6 +351,7 @@ struct PlatformDescriptor {
 struct EnvironmentCapabilities {
     repository_identity: bool,
     remote_update_control: bool,
+    terminal_ordered_input: bool,
 }
 
 async fn environment_descriptor(State(state): State<AppState>) -> Json<EnvironmentDescriptor> {
@@ -373,6 +374,7 @@ async fn environment_descriptor(State(state): State<AppState>) -> Json<Environme
         capabilities: EnvironmentCapabilities {
             repository_identity: true,
             remote_update_control: true,
+            terminal_ordered_input: true,
         },
     })
 }

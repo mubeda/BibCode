@@ -143,6 +143,12 @@ Browser clients set the E2EE socket's `binaryType` to `arraybuffer` before the
 RPC socket adapter attaches. Ciphertext records therefore enter the Noise
 decryptor in WebSocket delivery order without asynchronous `Blob` conversion.
 
+Ordered terminal input uses the same typed RPC inside this channel. Its lease
+is scoped to the physical connection lifetime, not the persisted bearer
+session, so reconnecting cannot reuse or replay uncertain input. The same
+ownership and admission rules apply to plain WebSocket, E2EE, relay, and SSH
+connections; see [Ordered terminal input](./rpc-and-orchestration.md#ordered-terminal-input).
+
 The first logical message authenticates inside the encrypted channel. A new
 device sends `{"type":"e2ee_auth","pairing":"<one-time token>"}` with no
 confirmation field: the **server** decides delivery from the grant it

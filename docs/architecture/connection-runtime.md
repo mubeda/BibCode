@@ -31,6 +31,15 @@ public package has no root export; callers use focused subpaths such as
 - Domain modules under `state/*` consume the registry and expose focused Atom
   constructors. React presentation does not own sockets or retry loops.
 
+Terminal input preparation, sequenced writes, and cancellation retain the exact
+`RpcSession` object. A replacement session cannot inherit queued input. The
+physical session owns request admission, including long-lived subscriptions,
+and reserves capacity for control operations while terminal input is busy.
+The terminal state owner shares one negotiated writer across callers for a
+terminal; the renderer's per-terminal scheduler handles coalescing and bounded
+pending input. See [Ordered terminal input](./rpc-and-orchestration.md#ordered-terminal-input)
+for the wire methods, limits, and failure rules.
+
 The composition root is
 [`connection/layer.ts`](../../packages/client-runtime/src/connection/layer.ts).
 
@@ -370,6 +379,12 @@ grouped per the `DESKTOP_LOCAL_CONNECTION_ID_PREFIX` convention) and one entry
 per saved remote environment. Selection writes `activeEnvironmentIdAtom` and
 scopes _presentation only_: the panel filters which environments' projects and
 threads it shows, and **Add project** targets the selected environment.
+The status bar also reads that selected identity for provider usage, refresh,
+usage-reset actions, process diagnostics, and terminal counts. Its usage query
+and reset overlay remain keyed by environment; the primary connection is not a
+fallback for an unselected or unavailable server. Desktop resource presentation
+can additionally query the primary local host through its separate diagnostic
+source.
 Exception: the Agents view (opened from the Agents nav row, whose unread badge
 also aggregates across environments) is the single cross-environment surface;
 it ignores rail selection by design, and its jump-to-workspace action re-points

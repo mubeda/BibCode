@@ -18,6 +18,9 @@ import {
   WsCloudInstallRelayClientRpc,
   WsTerminalOpenRpc,
   WsTerminalWriteRpc,
+  WsTerminalBeginInputRpc,
+  WsTerminalWriteInputRpc,
+  WsTerminalCancelInputRpc,
   WsPreviewListRpc,
   WsSourceControlLookupRepositoryRpc,
   WsProjectsReadFileRpc,
@@ -91,6 +94,9 @@ describe("WS_METHODS", () => {
     );
     expect(WS_METHODS.vcsPull).toBe("vcs.pull");
     expect(WS_METHODS.terminalOpen).toBe("terminal.open");
+    expect(WS_METHODS.terminalBeginInput).toBe("terminal.beginInput");
+    expect(WS_METHODS.terminalWriteInput).toBe("terminal.writeInput");
+    expect(WS_METHODS.terminalCancelInput).toBe("terminal.cancelInput");
     expect(WS_METHODS.subscribeVcsStatus).toBe("subscribeVcsStatus");
     expect(WS_METHODS.subscribeVcsStatusSummary).toBe("subscribeVcsStatusSummary");
     expect(WS_METHODS.cloudInstallRelayClient).toBe("cloud.installRelayClient");
@@ -116,7 +122,29 @@ describe("WS_METHODS", () => {
   });
 });
 
+const decodeTerminalBeginInputError = Schema.decodeUnknownSync(WsTerminalBeginInputRpc.errorSchema);
+const decodeTerminalWriteInputError = Schema.decodeUnknownSync(WsTerminalWriteInputRpc.errorSchema);
+const decodeTerminalCancelInputError = Schema.decodeUnknownSync(
+  WsTerminalCancelInputRpc.errorSchema,
+);
+const decodeLegacyTerminalWriteError = Schema.decodeUnknownSync(WsTerminalWriteRpc.errorSchema);
+
 describe("individual RPC definitions", () => {
+  it("accepts ordered-input failures only on ordered terminal RPCs", () => {
+    const failure = {
+      _tag: "TerminalInputError",
+      code: "capacity",
+      message: "Ordered terminal input capacity is exhausted.",
+    };
+    for (const decode of [
+      decodeTerminalBeginInputError,
+      decodeTerminalWriteInputError,
+      decodeTerminalCancelInputError,
+    ]) {
+      expect(() => decode(failure)).not.toThrow();
+    }
+    expect(() => decodeLegacyTerminalWriteError(failure)).toThrow();
+  });
   it("decodes update-maintenance rejection as an expected provider refresh failure", () => {
     expect(
       decodeRefreshProviderUsageError({
@@ -139,6 +167,9 @@ describe("individual RPC definitions", () => {
       WsOrchestrationDispatchCommandRpc,
       WsTerminalOpenRpc,
       WsTerminalWriteRpc,
+      WsTerminalBeginInputRpc,
+      WsTerminalWriteInputRpc,
+      WsTerminalCancelInputRpc,
       WsVcsPullRpc,
       WsProjectsReadFileRpc,
       WsReviewGetDiffPreviewRpc,
@@ -158,6 +189,9 @@ describe("individual RPC definitions", () => {
       WsOrchestrationDispatchCommandRpc,
       WsTerminalOpenRpc,
       WsTerminalWriteRpc,
+      WsTerminalBeginInputRpc,
+      WsTerminalWriteInputRpc,
+      WsTerminalCancelInputRpc,
       WsVcsPullRpc,
       WsProjectsReadFileRpc,
       WsReviewGetDiffPreviewRpc,
@@ -212,6 +246,9 @@ describe("individual RPC definitions", () => {
     expect(WsShellOpenInEditorRpc._tag).toBe(WS_METHODS.shellOpenInEditor);
     expect(WsTerminalOpenRpc._tag).toBe(WS_METHODS.terminalOpen);
     expect(WsTerminalWriteRpc._tag).toBe(WS_METHODS.terminalWrite);
+    expect(WsTerminalBeginInputRpc._tag).toBe(WS_METHODS.terminalBeginInput);
+    expect(WsTerminalWriteInputRpc._tag).toBe(WS_METHODS.terminalWriteInput);
+    expect(WsTerminalCancelInputRpc._tag).toBe(WS_METHODS.terminalCancelInput);
     expect(WsPreviewListRpc._tag).toBe(WS_METHODS.previewList);
     expect(WsSourceControlLookupRepositoryRpc._tag).toBe(WS_METHODS.sourceControlLookupRepository);
     expect(WsProjectsReadFileRpc._tag).toBe(WS_METHODS.projectsReadFile);

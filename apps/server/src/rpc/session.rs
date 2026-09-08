@@ -35,6 +35,7 @@ use crate::{
 
 const OUTBOUND_CAPACITY: usize = 64;
 const MAX_IN_FLIGHT_REQUESTS: usize = 64;
+const INPUT_RESERVED_CONTROL_REQUESTS: usize = 8;
 const OUTBOUND_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const PUMP_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -216,6 +217,21 @@ pub(crate) struct RpcSessionContext {
     auth: Option<AuthService>,
     admission: Option<RpcPermit>,
     pairing_confirmation: Option<PairingConfirmationLatch>,
+    connection: Arc<RpcConnectionLifetime>,
+}
+
+struct RpcConnectionLifetime {
+    id: uuid::Uuid,
+    closed: CancellationToken,
+}
+
+impl Default for RpcConnectionLifetime {
+    fn default() -> Self {
+        Self {
+            id: uuid::Uuid::new_v4(),
+            closed: CancellationToken::new(),
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -245,6 +261,7 @@ impl RpcSessionContext {
             auth: Some(auth),
             admission: None,
             pairing_confirmation: None,
+            connection: Arc::default(),
         }
     }
 
@@ -259,6 +276,7 @@ impl RpcSessionContext {
             auth: Some(auth),
             admission: None,
             pairing_confirmation: Some(pairing_confirmation),
+            connection: Arc::default(),
         }
     }
 
@@ -278,6 +296,22 @@ impl RpcSessionContext {
         self.principal
             .as_ref()
             .map(|principal| principal.session_id.as_str())
+    }
+
+    pub(crate) fn connection_id(&self) -> uuid::Uuid {
+        self.connection.id
+    }
+
+    pub(crate) fn connection_closed(&self) -> CancellationToken {
+        self.connection.closed.clone()
+    }
+
+    fn with_connection(mut self, closed: CancellationToken) -> Self {
+        self.connection = Arc::new(RpcConnectionLifetime {
+            id: uuid::Uuid::new_v4(),
+            closed,
+        });
+        self
     }
 
     fn has_pending_pairing_capability_for(&self, method: &str) -> bool {
@@ -642,6 +676,8 @@ pub(crate) async fn run_session_split_budgeted<W, R>(
     W::Error: Send,
     R: Stream<Item = Result<RpcInboundFrame, axum::Error>> + Send,
 {
+    let context = context.with_connection(session_shutdown.clone());
+    let _connection_guard = session_shutdown.clone().drop_guard();
     let socket_reader = socket_reader;
     let mut socket_reader = std::pin::pin!(socket_reader);
     let (outbound_sender, mut outbound_receiver) =
@@ -844,6 +880,21 @@ async fn process_client_message(
             };
             if in_flight.contains_key(&request.id) {
                 return Ok(());
+            }
+            if matches!(
+                request.tag.as_str(),
+                "terminal.beginInput" | "terminal.writeInput"
+            ) && in_flight.len() >= MAX_IN_FLIGHT_REQUESTS - INPUT_RESERVED_CONTROL_REQUESTS
+            {
+                return send_server_message(
+                    dispatch.outbound,
+                    dispatch.shutdown,
+                    ServerMessage::failure(request.id, json!({
+                        "_tag": "TerminalInputError",
+                        "code": "capacity",
+                        "message": "Terminal input is paused because the connection is busy. Reconnect the terminal before typing again.",
+                    })),
+                ).await;
             }
             if in_flight.len() >= MAX_IN_FLIGHT_REQUESTS {
                 return send_server_message(

@@ -81,6 +81,7 @@ async fn headless_server_answers_manual_update_surface() {
     .await
     .expect("descriptor JSON");
     assert_eq!(descriptor["capabilities"]["remoteUpdateControl"], true);
+    assert_eq!(descriptor["capabilities"]["terminalOrderedInput"], true);
     assert_eq!(
         descriptor["remoteUpdateSupport"],
         json!({ "installMode": "manual", "reason": "manual-update-required" })

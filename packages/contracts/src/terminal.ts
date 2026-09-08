@@ -93,6 +93,39 @@ export const TerminalWriteInput = Schema.Struct({
 });
 export type TerminalWriteInput = Schema.Codec.Encoded<typeof TerminalWriteInput>;
 
+const TerminalInputSequence = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).check(
+  Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER),
+);
+
+export const TerminalBeginInput = Schema.Struct({
+  ...TerminalSessionInput.fields,
+  attachmentSequence: TerminalInputSequence,
+});
+export type TerminalBeginInput = Schema.Codec.Encoded<typeof TerminalBeginInput>;
+
+export const TerminalInputLease = Schema.Struct({ inputId: TrimmedNonEmptyStringSchema });
+export type TerminalInputLease = typeof TerminalInputLease.Type;
+
+export const TerminalWriteInputFrame = Schema.Struct({
+  ...TerminalSessionInput.fields,
+  inputId: TrimmedNonEmptyStringSchema,
+  sequence: TerminalInputSequence,
+  data: Schema.String.check(Schema.isNonEmpty()).check(Schema.isMaxLength(16_384)),
+});
+export type TerminalWriteInputFrame = typeof TerminalWriteInputFrame.Type;
+
+export const TerminalInputAcknowledgement = Schema.Struct({
+  inputId: TrimmedNonEmptyStringSchema,
+  sequence: TerminalInputSequence,
+});
+export type TerminalInputAcknowledgement = typeof TerminalInputAcknowledgement.Type;
+
+export const TerminalCancelInput = Schema.Struct({
+  ...TerminalSessionInput.fields,
+  inputId: TrimmedNonEmptyStringSchema,
+});
+export type TerminalCancelInput = typeof TerminalCancelInput.Type;
+
 export const TerminalResizeInput = Schema.Struct({
   ...TerminalSessionInput.fields,
   cols: TerminalColsSchema,
@@ -408,6 +441,11 @@ export class TerminalResizeError extends Schema.TaggedErrorClass<TerminalResizeE
     return `Failed to resize terminal for thread: ${this.threadId}, terminal: ${this.terminalId}, PID: ${this.terminalPid} to ${this.cols}x${this.rows}`;
   }
 }
+
+export class TerminalInputError extends Schema.TaggedErrorClass<TerminalInputError>()(
+  "TerminalInputError",
+  { code: Schema.Literals(["closed", "sequence", "capacity", "write"]), message: Schema.String },
+) {}
 
 export const TerminalError = Schema.Union([
   TerminalCwdError,

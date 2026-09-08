@@ -85,6 +85,38 @@ delivery, partial streams, and cleanup.
 
 ## Focused tests
 
+### Ordered terminal input
+
+When changing terminal input scheduling, request admission, lease ownership, or
+reattachment, run the contracts, shared-runtime, renderer, and Rust owner seams:
+
+```sh
+vp test run packages/contracts/src/terminal.test.ts packages/contracts/src/environment.test.ts packages/contracts/src/rpc.test.ts packages/contracts/src/rpcRustParity.test.ts
+vp test run packages/client-runtime/src/state/terminalInput.test.ts packages/client-runtime/src/state/orderedTerminalInput.test.ts packages/client-runtime/src/state/terminalSession.test.ts packages/client-runtime/src/state/terminalCommands.test.ts packages/client-runtime/src/rpc
+vp test run apps/web/src/components/ThreadTerminalPanel apps/web/src/state/terminalSessions apps/web/src/components/status-bar
+cargo test -p bibcode-server --lib terminal:: -j 2
+cargo test -p bibcode-server --lib rpc::session::tests -j 2
+cargo test -p bibcode-server --test production_server_terminal_rpc -j 2
+```
+
+Use delayed acknowledgements to prove that multiple ordered frames are sent
+before the first reply while the legacy path remains serialized. Include two
+input callers, Unicode paste boundaries, connection-wide saturation with
+persistent subscriptions, control admission, missing/duplicate frames, a late
+old begin issuing after a newer attachment, dropped responses, and disconnect
+or process replacement while input is queued. Uncertain input must never replay.
+Also verify open-after-close and restart followed by immediate programmatic
+writes in both ordered and legacy modes, before a renderer has attached.
+
+On a disposable native terminal, verify **Reconnect input** after a controlled
+delivery failure preserves the running process and resumes only newly entered
+text. Hiding or moving a terminal panel must preserve its binding. Exercise a
+server without `terminalOrderedInput` to prove the negotiated legacy path.
+Record network round-trip, client queue, and paint measurements separately;
+an improved simulated queue time is not proof of an improved live network.
+
+### Selecting other focused coverage
+
 Run the closest behavioral coverage before broad suites. Discover exact Rust
 targets and filters from manifests and `cargo test -- --list`; do not invent
 test names. When concurrency matters, run the affected owner at its default
@@ -1130,6 +1162,12 @@ sizes. Cover relevant:
   per-row jump-to-workspace action returns to the normal view and re-points the
   rail to that row's environment;
 - provider settings and provider/terminal action menus;
+- status-bar Claude/Codex usage with different accounts or usage values on local
+  and remote servers: switching the environment rail changes the displayed
+  usage, manual refresh targets that server, and an unavailable or still-loading
+  remote never displays the local account's values; keep a refresh in flight
+  while switching to verify that its completion does not replace the new
+  selection's usage;
 - discovered and adopted external worktrees;
 - Create Worktree exact local and remote ref selection: the exact value appears
   once, the derived name remains correct, and a remote-to-local race succeeds

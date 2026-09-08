@@ -56,7 +56,11 @@ fn connect_environment_descriptor(config: &ServerConfig) -> serde_json::Value {
         "remoteUpdateSupport": config.remote_update_support,
         "remoteProtocolVersion": crate::http::REMOTE_PROTOCOL_VERSION,
         "minCompatibleRemoteProtocol": crate::http::MIN_COMPATIBLE_REMOTE_PROTOCOL,
-        "capabilities": { "repositoryIdentity": true, "remoteUpdateControl": true },
+        "capabilities": {
+            "repositoryIdentity": true,
+            "remoteUpdateControl": true,
+            "terminalOrderedInput": true,
+        },
     })
 }
 
@@ -773,6 +777,7 @@ mod tests {
         let descriptor = connect_environment_descriptor(&config);
         assert_eq!(descriptor["capabilities"]["repositoryIdentity"], true);
         assert_eq!(descriptor["capabilities"]["remoteUpdateControl"], true);
+        assert_eq!(descriptor["capabilities"]["terminalOrderedInput"], true);
         assert_eq!(
             descriptor["remoteUpdateSupport"],
             serde_json::json!({ "installMode": "manual", "reason": "manual-update-required" })

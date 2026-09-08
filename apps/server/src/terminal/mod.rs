@@ -1,9 +1,11 @@
 mod history;
+mod input;
 mod manager;
 mod model;
 mod osc;
 mod pty;
 
+pub use input::TerminalInputError;
 pub(crate) use manager::TerminalSessionIdentity;
 pub use manager::{
     SubprocessInspection, TerminalAttachment, TerminalError, TerminalManager,

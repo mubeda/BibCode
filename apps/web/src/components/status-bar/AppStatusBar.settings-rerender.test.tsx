@@ -24,8 +24,11 @@ vi.mock("~/localApi", () => ({
   }),
 }));
 
+vi.mock("../../state/entities", () => ({
+  useActiveEnvironmentId: () => null,
+}));
+
 vi.mock("../../state/environments", () => ({
-  usePrimaryEnvironment: () => null,
   usePrimaryLocalEnvironmentForSelected: () => null,
 }));
 

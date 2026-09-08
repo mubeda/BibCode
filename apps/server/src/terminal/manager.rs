@@ -175,6 +175,8 @@ pub enum TerminalError {
     },
     #[error("terminal I/O failed: {0}")]
     Io(String),
+    #[error(transparent)]
+    Input(#[from] super::input::TerminalInputError),
     #[error("terminal processes did not exit before cleanup timed out")]
     Close,
     #[error("worktree removal is in progress for terminal thread: {thread_id}")]
@@ -215,6 +217,53 @@ pub(crate) struct TerminalSessionIdentity {
     session: SharedSession,
     generation: Arc<SessionGeneration>,
     process: Arc<dyn PtyProcess>,
+}
+
+impl TerminalSessionIdentity {
+    pub(super) fn input_key(&self) -> (String, String) {
+        self.key.clone()
+    }
+
+    pub(super) fn input_cancellation(&self) -> CancellationToken {
+        self.generation.cancellation.clone()
+    }
+
+    pub(super) async fn write_input(
+        &self,
+        data: &str,
+        cancelled: &CancellationToken,
+        connection_closed: &CancellationToken,
+    ) -> Result<(), TerminalError> {
+        let _publication = tokio::select! {
+            biased;
+            () = cancelled.cancelled() => return Err(TerminalError::PublicationCancelled),
+            () = connection_closed.cancelled() => return Err(TerminalError::PublicationCancelled),
+            () = self.generation.cancellation.cancelled() => return Err(TerminalError::PublicationCancelled),
+            guard = self.generation.publication.lock() => guard,
+        };
+        let session = self.session.lock().await;
+        if cancelled.is_cancelled()
+            || connection_closed.is_cancelled()
+            || self.generation.is_invalidated()
+            || self
+                .generation
+                .closing
+                .load(std::sync::atomic::Ordering::Acquire)
+            || !Arc::ptr_eq(&session.generation, &self.generation)
+            || session.status != TerminalStatus::Running
+            || !session
+                .process
+                .as_ref()
+                .is_some_and(|process| Arc::ptr_eq(process, &self.process))
+        {
+            return Err(TerminalError::NotRunning {
+                thread_id: self.key.0.clone(),
+                terminal_id: self.key.1.clone(),
+            });
+        }
+        drop(session);
+        self.process.write(data).map_err(TerminalError::Io)
+    }
 }
 
 #[derive(Clone)]
@@ -1507,6 +1556,7 @@ struct Inner {
     operations: SessionOperationRegistry,
     worktree_removals: Arc<WorktreeRemovalRegistry>,
     generations: SessionGenerationRegistry,
+    input: super::input::TerminalInputRegistry,
     sessions: RwLock<HashMap<SessionKey, SharedSession>>,
     events: broadcast::Sender<TerminalEvent>,
     metadata: broadcast::Sender<TerminalMetadataEvent>,
@@ -1568,6 +1618,7 @@ impl TerminalManager {
                 generations: SessionGenerationRegistry::new(
                     tokio::runtime::Handle::try_current().ok(),
                 ),
+                input: super::input::TerminalInputRegistry::default(),
                 sessions: RwLock::new(HashMap::new()),
                 events,
                 metadata,
@@ -2667,6 +2718,82 @@ impl TerminalManager {
         })
     }
 
+    pub(crate) async fn begin_input(
+        &self,
+        connection_id: uuid::Uuid,
+        connection_closed: CancellationToken,
+        thread_id: &str,
+        terminal_id: &str,
+        attachment_sequence: u64,
+    ) -> Result<super::input::TerminalInputLease, TerminalError> {
+        let session = self.require_session(thread_id, terminal_id).await?;
+        let current = session.lock().await;
+        if current.generation.is_invalidated()
+            || current
+                .generation
+                .closing
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(TerminalError::PublicationCancelled);
+        }
+        let identity = TerminalSessionIdentity {
+            key: (thread_id.to_owned(), terminal_id.to_owned()),
+            session: session.clone(),
+            generation: current.generation.clone(),
+            process: current
+                .process
+                .clone()
+                .filter(|_| current.status == TerminalStatus::Running)
+                .ok_or_else(|| TerminalError::NotRunning {
+                    thread_id: thread_id.to_owned(),
+                    terminal_id: terminal_id.to_owned(),
+                })?,
+        };
+        drop(current);
+        self.inner
+            .input
+            .begin(
+                connection_id,
+                connection_closed,
+                self.inner.cancellation.clone(),
+                identity,
+                attachment_sequence,
+            )
+            .map_err(TerminalError::from)
+    }
+
+    pub(crate) fn prepare_input_write<'a>(
+        &self,
+        connection_id: uuid::Uuid,
+        thread_id: &str,
+        terminal_id: &str,
+        input_id: &'a str,
+        sequence: u64,
+        data: &'a str,
+    ) -> Result<super::input::PreparedTerminalInput<'a>, TerminalError> {
+        self.inner.input.prepare_write(
+            connection_id,
+            thread_id,
+            terminal_id,
+            input_id,
+            sequence,
+            data,
+        )
+    }
+
+    pub(crate) fn cancel_input(
+        &self,
+        connection_id: uuid::Uuid,
+        thread_id: &str,
+        terminal_id: &str,
+        input_id: &str,
+    ) -> Result<(), TerminalError> {
+        self.inner
+            .input
+            .cancel(connection_id, thread_id, terminal_id, input_id)
+            .map_err(TerminalError::from)
+    }
+
     pub async fn write(
         &self,
         thread_id: &str,
@@ -3748,6 +3875,7 @@ mod tests {
         tree_exit_supported: std::sync::atomic::AtomicBool,
         tree_exited: std::sync::atomic::AtomicBool,
         kill_error: std::sync::Mutex<Option<String>>,
+        write_error: std::sync::Mutex<Option<String>>,
         writes: std::sync::Mutex<Vec<String>>,
     }
 
@@ -3766,6 +3894,7 @@ mod tests {
                 tree_exit_supported: std::sync::atomic::AtomicBool::new(false),
                 tree_exited: std::sync::atomic::AtomicBool::new(true),
                 kill_error: std::sync::Mutex::new(None),
+                write_error: std::sync::Mutex::new(None),
                 writes: std::sync::Mutex::new(Vec::new()),
             }
         }
@@ -3844,7 +3973,11 @@ mod tests {
                 .lock()
                 .expect("writes lock")
                 .push(data.to_owned());
-            Ok(())
+            self.write_error
+                .lock()
+                .expect("write error")
+                .clone()
+                .map_or(Ok(()), Err)
         }
 
         fn resize(&self, _cols: u16, _rows: u16) -> Result<(), String> {
@@ -4031,6 +4164,393 @@ mod tests {
             .await
             .expect("restart publishes while prior exit callback settles");
         assert_eq!(backend.processes.lock().expect("processes lock").len(), 2);
+        manager.shutdown().await;
+    }
+
+    async fn ordered_write(
+        manager: &TerminalManager,
+        connection: uuid::Uuid,
+        thread_id: &str,
+        terminal_id: &str,
+        input_id: &str,
+        sequence: u64,
+        data: &str,
+    ) -> Result<crate::terminal::input::TerminalInputAcknowledgement, TerminalError> {
+        manager
+            .prepare_input_write(connection, thread_id, terminal_id, input_id, sequence, data)?
+            .write()
+            .await
+    }
+
+    async fn ordered_input_fixture() -> (
+        tempfile::TempDir,
+        Arc<HistoryTestBackend>,
+        TerminalManager,
+        uuid::Uuid,
+        CancellationToken,
+        String,
+    ) {
+        let root = tempfile::tempdir().expect("root");
+        let backend = Arc::new(HistoryTestBackend::default());
+        let manager = TerminalManager::new(
+            backend.clone(),
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::ZERO,
+                ..TerminalManagerOptions::default()
+            },
+        );
+        manager
+            .open(TerminalOpenInput::new(
+                "thread",
+                "term",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .expect("open");
+        let connection = uuid::Uuid::new_v4();
+        let closed = CancellationToken::new();
+        let lease = manager
+            .begin_input(connection, closed.clone(), "thread", "term", 0)
+            .await
+            .expect("lease");
+        (root, backend, manager, connection, closed, lease.input_id)
+    }
+
+    #[tokio::test]
+    async fn ordered_input_delayed_old_begin_cannot_replace_a_newer_attachment() {
+        let (_root, backend, manager, connection, closed, _input_id) =
+            ordered_input_fixture().await;
+        let old_begin = manager.begin_input(connection, closed.clone(), "thread", "term", 1);
+        let fresh = manager
+            .begin_input(connection, closed, "thread", "term", 2)
+            .await
+            .expect("fresh attachment");
+        assert!(
+            old_begin.await.is_err(),
+            "late old issuance must not supersede fresh lease"
+        );
+        ordered_write(
+            &manager,
+            connection,
+            "thread",
+            "term",
+            &fresh.input_id,
+            0,
+            "fresh input",
+        )
+        .await
+        .expect("fresh lease remains valid");
+        assert_eq!(backend.latest().writes(), ["fresh input"]);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ordered_input_reorders_arrivals_before_writing_the_real_pty() {
+        let (_root, backend, manager, connection, _closed, input_id) =
+            ordered_input_fixture().await;
+        let later = ordered_write(&manager, connection, "thread", "term", &input_id, 1, "b");
+        tokio::pin!(later);
+        assert!(futures_util::poll!(&mut later).is_pending());
+        assert!(backend.latest().writes().is_empty());
+        let first = ordered_write(&manager, connection, "thread", "term", &input_id, 0, "a")
+            .await
+            .expect("first");
+        assert_eq!(first.sequence, 0);
+        assert_eq!(later.await.expect("later").sequence, 1);
+        assert_eq!(backend.latest().writes(), ["a", "b"]);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ordered_input_failed_prefix_discards_waiting_suffix_and_cannot_replay() {
+        let (_root, backend, manager, connection, _closed, input_id) =
+            ordered_input_fixture().await;
+        *backend.latest().write_error.lock().expect("write error") =
+            Some("partial PTY write".into());
+        let later = ordered_write(
+            &manager, connection, "thread", "term", &input_id, 1, "suffix",
+        );
+        tokio::pin!(later);
+        assert!(futures_util::poll!(&mut later).is_pending());
+        assert!(
+            ordered_write(
+                &manager, connection, "thread", "term", &input_id, 0, "prefix"
+            )
+            .await
+            .is_err()
+        );
+        assert!(later.await.is_err());
+        assert!(
+            ordered_write(
+                &manager, connection, "thread", "term", &input_id, 0, "prefix"
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(backend.latest().writes(), ["prefix"]);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ordered_input_rejects_foreign_connection_without_poisoning_owner() {
+        let (_root, backend, manager, connection, _closed, input_id) =
+            ordered_input_fixture().await;
+        let other = uuid::Uuid::new_v4();
+        assert!(
+            ordered_write(&manager, other, "thread", "term", &input_id, 0, "foreign")
+                .await
+                .is_err()
+        );
+        assert!(
+            manager
+                .cancel_input(other, "thread", "term", &input_id)
+                .is_err()
+        );
+        ordered_write(
+            &manager, connection, "thread", "term", &input_id, 0, "owner",
+        )
+        .await
+        .expect("owner");
+        assert_eq!(backend.latest().writes(), ["owner"]);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ordered_input_disconnect_and_restart_reject_old_leases() {
+        let (root, backend, manager, connection, closed, input_id) = ordered_input_fixture().await;
+        closed.cancel();
+        assert!(
+            ordered_write(
+                &manager,
+                connection,
+                "thread",
+                "term",
+                &input_id,
+                0,
+                "disconnected"
+            )
+            .await
+            .is_err()
+        );
+        let connection = uuid::Uuid::new_v4();
+        let lease = manager
+            .begin_input(connection, CancellationToken::new(), "thread", "term", 0)
+            .await
+            .expect("new attachment");
+        manager
+            .restart(TerminalOpenInput::new(
+                "thread",
+                "term",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .expect("restart");
+        assert!(
+            ordered_write(
+                &manager,
+                connection,
+                "thread",
+                "term",
+                &lease.input_id,
+                0,
+                "old process"
+            )
+            .await
+            .is_err()
+        );
+        assert!(backend.latest().writes().is_empty());
+        manager.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ordered_input_missing_sequence_expires_and_rejects_late_prefix() {
+        let (_root, backend, manager, connection, _closed, input_id) =
+            ordered_input_fixture().await;
+        let later = ordered_write(
+            &manager, connection, "thread", "term", &input_id, 1, "suffix",
+        );
+        tokio::pin!(later);
+        assert!(futures_util::poll!(&mut later).is_pending());
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(later.await.is_err());
+        assert!(
+            ordered_write(&manager, connection, "thread", "term", &input_id, 0, "late")
+                .await
+                .is_err()
+        );
+        assert!(backend.latest().writes().is_empty());
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ordered_input_disconnect_fences_a_frame_waiting_for_pty_publication() {
+        let (_root, backend, manager, connection, closed, input_id) = ordered_input_fixture().await;
+        let session = manager
+            .require_session("thread", "term")
+            .await
+            .expect("session");
+        let generation = session.lock().await.generation.clone();
+        let publication = generation.publication.lock().await;
+        let write = ordered_write(
+            &manager, connection, "thread", "term", &input_id, 0, "unsent",
+        );
+        tokio::pin!(write);
+        assert!(futures_util::poll!(&mut write).is_pending());
+        closed.cancel();
+        drop(publication);
+        assert!(write.await.is_err());
+        assert!(backend.latest().writes().is_empty());
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ordered_input_utf8_byte_limit_preserves_legacy_writer() {
+        let (_root, backend, manager, connection, _closed, input_id) =
+            ordered_input_fixture().await;
+        let exact = "😀".repeat(4096);
+        ordered_write(&manager, connection, "thread", "term", &input_id, 0, &exact)
+            .await
+            .expect("exact byte cap");
+        let oversized = "😀".repeat(4097);
+        assert!(
+            matches!(ordered_write(&manager, connection, "thread", "term", &input_id, 1, &oversized).await, Err(TerminalError::Input(error)) if error.code == "capacity")
+        );
+        assert!(
+            ordered_write(
+                &manager, connection, "thread", "term", &input_id, 2, "suffix"
+            )
+            .await
+            .is_err()
+        );
+        manager
+            .write("thread", "term", "legacy")
+            .await
+            .expect("legacy path");
+        assert_eq!(backend.latest().writes(), [exact, "legacy".to_owned()]);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ordered_input_duplicate_cannot_be_delivered_twice() {
+        let (_root, backend, manager, connection, _closed, input_id) =
+            ordered_input_fixture().await;
+        ordered_write(&manager, connection, "thread", "term", &input_id, 0, "once")
+            .await
+            .expect("first");
+        assert!(
+            ordered_write(&manager, connection, "thread", "term", &input_id, 0, "once")
+                .await
+                .is_err()
+        );
+        assert!(
+            ordered_write(
+                &manager, connection, "thread", "term", &input_id, 1, "suffix"
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(backend.latest().writes(), ["once"]);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ordered_input_window_is_shared_across_terminals_but_not_connections() {
+        let (root, backend, manager, connection, closed, first_id) = ordered_input_fixture().await;
+        let first_process = backend.latest();
+        manager
+            .open(TerminalOpenInput::new(
+                "thread",
+                "other",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .expect("other terminal");
+        let second = manager
+            .begin_input(connection, closed, "thread", "other", 0)
+            .await
+            .expect("second lease");
+        let payload = "x".repeat(16 * 1024);
+        let mut pending = Vec::new();
+        for sequence in 1..=8 {
+            for (terminal_id, input_id) in [
+                ("term", first_id.as_str()),
+                ("other", second.input_id.as_str()),
+            ] {
+                let mut write = Box::pin(ordered_write(
+                    &manager,
+                    connection,
+                    "thread",
+                    terminal_id,
+                    input_id,
+                    sequence,
+                    &payload,
+                ));
+                assert!(futures_util::poll!(&mut write).is_pending());
+                pending.push(write);
+            }
+        }
+        assert!(
+            matches!(ordered_write(&manager, connection, "thread", "term", &first_id, 9, "overflow").await, Err(TerminalError::Input(error)) if error.code == "capacity")
+        );
+        let independent_connection = uuid::Uuid::new_v4();
+        let independent = manager
+            .begin_input(
+                independent_connection,
+                CancellationToken::new(),
+                "thread",
+                "term",
+                0,
+            )
+            .await
+            .expect("independent lease");
+        ordered_write(
+            &manager,
+            independent_connection,
+            "thread",
+            "term",
+            &independent.input_id,
+            0,
+            "independent",
+        )
+        .await
+        .expect("other connection is not blocked");
+        assert_eq!(first_process.writes(), ["independent"]);
+        assert!(backend.latest().writes().is_empty());
+        drop(pending);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ordered_input_expired_gap_rejects_prefix_before_waiter_is_polled_again() {
+        let (_root, backend, manager, connection, _closed, input_id) =
+            ordered_input_fixture().await;
+        let later = ordered_write(
+            &manager, connection, "thread", "term", &input_id, 1, "suffix",
+        );
+        tokio::pin!(later);
+        assert!(futures_util::poll!(&mut later).is_pending());
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(
+            ordered_write(
+                &manager,
+                connection,
+                "thread",
+                "term",
+                &input_id,
+                0,
+                "late prefix"
+            )
+            .await
+            .is_err()
+        );
+        assert!(later.await.is_err());
+        assert!(backend.latest().writes().is_empty());
         manager.shutdown().await;
     }
 

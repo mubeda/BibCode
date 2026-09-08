@@ -220,6 +220,120 @@ describe.skipIf(serverBinary === undefined)(
       second.close();
     }, 30_000);
 
+    it("delivers ordered native PTY input over E2EE and rejects another socket's lease", async () => {
+      const { payload, hostKey } = await mintedPairing(server);
+      const channel = await openEncrypted(server, hostKey);
+      let nextRequestId = 1;
+      const nextId = () => String(nextRequestId++);
+      const scope = { threadId: "interop-ordered-input", terminalId: "term-ordered" };
+      const cwd = NodePath.join(server.dataRoot, "ordered-input-fixture");
+      NodeFS.mkdirSync(cwd, { recursive: true });
+      let opened = false;
+      try {
+        channel.sendMessage(JSON.stringify({ type: "e2ee_auth", pairing: payload.token }));
+        const authenticated = JSON.parse(await channel.nextMessage()) as {
+          type: string;
+          credential: string;
+          pairingConfirmationRequired?: boolean;
+        };
+        expect(authenticated.type).toBe("e2ee_authenticated");
+        if (authenticated.pairingConfirmationRequired) {
+          expect(await requestTestRpc(channel, nextId(), "auth.confirmPairing")).toMatchObject({
+            exit: { _tag: "Success" },
+          });
+        }
+        const config = (await requestTestRpc(channel, nextId(), "server.getConfig")) as {
+          exit: { value: { environment: { platform: { os: string } } } };
+        };
+        expect(config).toMatchObject({
+          exit: {
+            _tag: "Success",
+            value: { environment: { capabilities: { terminalOrderedInput: true } } },
+          },
+        });
+        const isWindows = config.exit.value.environment.platform.os === "windows";
+        const command = isWindows
+          ? { executable: "cmd.exe", args: ["/D", "/Q", "/K"] }
+          : { executable: "/bin/sh", args: ["-s"] };
+        expect(
+          await requestTestRpc(channel, nextId(), "terminal.open", {
+            ...scope,
+            cwd,
+            cols: 80,
+            rows: 24,
+            command,
+          }),
+        ).toMatchObject({ exit: { _tag: "Success" } });
+        opened = true;
+        const begun = (await requestTestRpc(channel, nextId(), "terminal.beginInput", {
+          ...scope,
+          attachmentSequence: 0,
+        })) as { exit: { _tag: string; value: { inputId: string } } };
+        expect(begun.exit._tag).toBe("Success");
+        const inputId = begun.exit.value.inputId;
+        const frames = ["echo ordered-", "input-ok > ordered-input.txt", isWindows ? "\r" : "\n"];
+        const expected = new Map<string, number>();
+        for (const sequence of [2, 1, 0]) {
+          const id = nextId();
+          expected.set(id, sequence);
+          channel.sendMessage(
+            JSON.stringify({
+              _tag: "Request",
+              id,
+              tag: "terminal.writeInput",
+              payload: { ...scope, inputId, sequence, data: frames[sequence] },
+              headers: [],
+            }),
+          );
+        }
+        for (let index = 0; index < frames.length; index++) {
+          const response = JSON.parse(await channel.nextMessage()) as { requestId: string };
+          expect(response).toMatchObject({
+            _tag: "Exit",
+            exit: {
+              _tag: "Success",
+              value: { inputId, sequence: expected.get(response.requestId) },
+            },
+          });
+          expect(expected.delete(response.requestId)).toBe(true);
+        }
+        expect(expected.size).toBe(0);
+        const output = NodePath.join(cwd, "ordered-input.txt");
+        await expect
+          .poll(
+            () => (NodeFS.existsSync(output) ? NodeFS.readFileSync(output, "utf8").trim() : ""),
+            { timeout: 5_000 },
+          )
+          .toBe("ordered-input-ok");
+        const other = await openEncrypted(server, hostKey);
+        try {
+          other.sendMessage(
+            JSON.stringify({ type: "e2ee_auth", bearer: authenticated.credential }),
+          );
+          expect(JSON.parse(await other.nextMessage())).toEqual({ type: "e2ee_authenticated" });
+          expect(
+            await requestTestRpc(other, "1", "terminal.writeInput", {
+              ...scope,
+              inputId,
+              sequence: 3,
+              data: "foreign\n",
+            }),
+          ).toMatchObject({
+            exit: {
+              _tag: "Failure",
+              cause: [{ _tag: "Fail", error: { _tag: "TerminalInputError", code: "closed" } }],
+            },
+          });
+        } finally {
+          other.close();
+        }
+      } finally {
+        if (opened)
+          await requestTestRpc(channel, nextId(), "terminal.close", scope).catch(() => undefined);
+        channel.close();
+      }
+    }, 30_000);
+
     it("reassembles a fragmented client message across the language boundary", async () => {
       const { payload, hostKey } = await mintedPairing(server);
       const channel = await openEncrypted(server, hostKey);

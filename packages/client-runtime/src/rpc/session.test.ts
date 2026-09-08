@@ -2,6 +2,7 @@ import {
   DEFAULT_SERVER_SETTINGS,
   EnvironmentId,
   ServerConfig,
+  ThreadId,
   type ServerConfig as ServerConfigType,
   WS_METHODS,
 } from "@bibcode/contracts";
@@ -24,6 +25,7 @@ import {
   type PreparedConnection,
 } from "../connection/model.ts";
 import * as RpcSession from "./session.ts";
+import { createOrderedTerminalInputBinding } from "../state/orderedTerminalInput.ts";
 
 type SocketEventType = "open" | "message" | "close" | "error";
 type SocketEvent = {
@@ -218,6 +220,7 @@ const awaitBinaryFrame = Effect.fn("TestRpcSessionFactory.awaitBinaryFrame")(fun
 
 const completeInitialConfig = Effect.fn("TestRpcSessionFactory.completeInitialConfig")(function* (
   socket: TestWebSocket,
+  config = SERVER_CONFIG,
 ) {
   const request = yield* awaitRequest(socket);
   expect(request).toMatchObject({
@@ -231,13 +234,134 @@ const completeInitialConfig = Effect.fn("TestRpcSessionFactory.completeInitialCo
       requestId: request.id,
       exit: {
         _tag: "Success",
-        value: encodeServerConfig(SERVER_CONFIG),
+        value: encodeServerConfig(config),
       },
     }),
   );
 });
 
 describe("RpcSessionFactory", () => {
+  it.effect("starts ordered frames through the real session before earlier replies arrive", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { factory, sockets } = yield* makeFactory();
+        const session = yield* factory.connect(PREPARED);
+        const ready = yield* Effect.forkChild(session.ready);
+        const socket = yield* awaitSocket(sockets);
+        socket.open();
+        yield* completeInitialConfig(socket, {
+          ...SERVER_CONFIG,
+          environment: {
+            ...SERVER_CONFIG.environment,
+            capabilities: { ...SERVER_CONFIG.environment.capabilities, terminalOrderedInput: true },
+          },
+        });
+        yield* Fiber.join(ready);
+        const binding = createOrderedTerminalInputBinding(
+          session,
+          "environment-1",
+          { threadId: ThreadId.make("thread"), terminalId: "terminal" },
+          yield* Effect.context(),
+        );
+        const preparation = yield* Effect.forkChild(binding.prepare);
+        const begin = yield* awaitRequest(socket, 1);
+        expect(begin).toMatchObject({
+          tag: WS_METHODS.terminalBeginInput,
+          payload: { attachmentSequence: 0 },
+        });
+        socket.serverMessage(
+          encodeJson({
+            _tag: "Exit",
+            requestId: begin.id,
+            exit: { _tag: "Success", value: { inputId: "lease" } },
+          }),
+        );
+        yield* Fiber.join(preparation);
+        const first = yield* Effect.forkChild(binding.write("a"));
+        const a = yield* awaitRequest(socket, 2);
+        const second = yield* Effect.forkChild(binding.write("b"));
+        const b = yield* awaitRequest(socket, 3);
+        expect(a).toMatchObject({
+          tag: WS_METHODS.terminalWriteInput,
+          payload: { inputId: "lease", sequence: 0, data: "a" },
+        });
+        expect(b).toMatchObject({
+          tag: WS_METHODS.terminalWriteInput,
+          payload: { inputId: "lease", sequence: 1, data: "b" },
+        });
+        socket.serverMessage(
+          encodeJson({
+            _tag: "Exit",
+            requestId: b.id,
+            exit: { _tag: "Success", value: { inputId: "lease", sequence: 1 } },
+          }),
+        );
+        socket.serverMessage(
+          encodeJson({
+            _tag: "Exit",
+            requestId: a.id,
+            exit: { _tag: "Success", value: { inputId: "lease", sequence: 0 } },
+          }),
+        );
+        yield* Fiber.join(first);
+        yield* Fiber.join(second);
+        binding.dispose();
+        socket.close();
+      }),
+    ),
+  );
+
+  it.effect("fences a lost ordered reply at the real session seam without replay", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { factory, sockets } = yield* makeFactory();
+        const session = yield* factory.connect(PREPARED);
+        const ready = yield* Effect.forkChild(session.ready);
+        const socket = yield* awaitSocket(sockets);
+        socket.open();
+        yield* completeInitialConfig(socket, {
+          ...SERVER_CONFIG,
+          environment: {
+            ...SERVER_CONFIG.environment,
+            capabilities: { ...SERVER_CONFIG.environment.capabilities, terminalOrderedInput: true },
+          },
+        });
+        yield* Fiber.join(ready);
+        const binding = createOrderedTerminalInputBinding(
+          session,
+          "environment-1",
+          { threadId: ThreadId.make("thread"), terminalId: "terminal" },
+          yield* Effect.context(),
+        );
+        const preparation = yield* Effect.forkChild(binding.prepare);
+        const begin = yield* awaitRequest(socket, 1);
+        socket.serverMessage(
+          encodeJson({
+            _tag: "Exit",
+            requestId: begin.id,
+            exit: { _tag: "Success", value: { inputId: "lease" } },
+          }),
+        );
+        yield* Fiber.join(preparation);
+        const writing = yield* Effect.forkChild(binding.write("uncertain").pipe(Effect.flip));
+        const frame = yield* awaitRequest(socket, 2);
+        expect(frame.tag).toBe(WS_METHODS.terminalWriteInput);
+        yield* TestClock.adjust("15 seconds");
+        const failure = yield* Fiber.join(writing);
+        expect(failure._tag).toBe("TerminalInputError");
+        yield* binding.write("do not replay").pipe(Effect.flip);
+        const requests = socket.sent
+          .filter((value): value is string => typeof value === "string")
+          .map((value) => JSON.parse(value) as { tag?: string });
+        expect(
+          requests.filter((request) => request.tag === WS_METHODS.terminalWriteInput),
+        ).toHaveLength(1);
+        expect(requests.some((request) => request.tag === WS_METHODS.terminalWrite)).toBe(false);
+        socket.close();
+      }),
+    ),
+  );
+
   it.effect("owns one scoped websocket attempt and exposes readiness and closure", () =>
     Effect.gen(function* () {
       const { factory, sockets } = yield* makeFactory();

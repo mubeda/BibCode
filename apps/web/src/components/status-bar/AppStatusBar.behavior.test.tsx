@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 const harness = vi.hoisted(() => ({
-  primaryEnvironment: null as null | { environmentId: string },
+  selectedEnvironment: null as null | { environmentId: string },
   primaryLocalEnvironment: null as null | { environmentId: string },
   primaryLocalSelectionInput: null as unknown,
   refSeeds: {} as Record<number, unknown>,
@@ -60,8 +60,10 @@ vi.mock("react", async (importOriginal) => ({
       : [typeof initial === "function" ? (initial as () => unknown)() : initial, vi.fn()];
   },
 }));
+vi.mock("../../state/entities", () => ({
+  useActiveEnvironmentId: () => harness.selectedEnvironment?.environmentId ?? null,
+}));
 vi.mock("../../state/environments", () => ({
-  usePrimaryEnvironment: () => harness.primaryEnvironment,
   usePrimaryLocalEnvironmentForSelected: (selectedEnvironmentId: unknown) => {
     harness.primaryLocalSelectionInput = selectedEnvironmentId;
     return harness.primaryLocalEnvironment;
@@ -171,7 +173,7 @@ function latestProviderControl(): Record<string, unknown> {
 }
 
 beforeEach(() => {
-  harness.primaryEnvironment = null;
+  harness.selectedEnvironment = null;
   harness.primaryLocalEnvironment = null;
   harness.primaryLocalSelectionInput = null;
   harness.refSeeds = {};
@@ -258,7 +260,7 @@ describe("AppStatusBar", () => {
   it("keeps the provider query warm while hidden and re-enables from cached data", () => {
     const environmentId = EnvironmentId.make("environment-warm");
     const cachedUsage = { providers: [{ provider: "claude" }, { provider: "codex" }] };
-    harness.primaryEnvironment = { environmentId };
+    harness.selectedEnvironment = { environmentId };
     harness.clientSettings.statusBarItems = ["resource-usage"];
     harness.queries = [query(cachedUsage), query(), query()];
 
@@ -278,7 +280,7 @@ describe("AppStatusBar", () => {
 
   it("propagates percentage, detail, breakpoint, and settings navigation", () => {
     const environmentId = EnvironmentId.make("environment-settings");
-    harness.primaryEnvironment = { environmentId };
+    harness.selectedEnvironment = { environmentId };
     harness.clientSettings.statusBarUsageMode = "compact";
     harness.clientSettings.usagePercentageDisplay = "used";
     harness.iconOnly = true;
@@ -326,7 +328,7 @@ describe("AppStatusBar", () => {
   it("queries selected and desktop-local live diagnostics without requesting history", () => {
     const environmentId = EnvironmentId.make("environment-1");
     const localEnvironmentId = EnvironmentId.make("primary");
-    harness.primaryEnvironment = { environmentId };
+    harness.selectedEnvironment = { environmentId };
     harness.primaryLocalEnvironment = { environmentId: localEnvironmentId };
     harness.queries = [query(null), query(), query()];
     harness.refSeeds = { 4: environmentId, 6: environmentId };
@@ -348,7 +350,7 @@ describe("AppStatusBar", () => {
 
   it("avoids a local diagnostics RPC for browser or selected-local environments", () => {
     const environmentId = EnvironmentId.make("primary");
-    harness.primaryEnvironment = { environmentId };
+    harness.selectedEnvironment = { environmentId };
     harness.primaryLocalEnvironment = null;
     harness.queries = [query({ providers: [] }), query({ diagnostics: true }), query()];
 
@@ -365,7 +367,7 @@ describe("AppStatusBar", () => {
     const localEnvironmentId = EnvironmentId.make("primary");
     const oldUsageCleanup = vi.fn();
     const oldResourceCleanup = vi.fn();
-    harness.primaryEnvironment = { environmentId };
+    harness.selectedEnvironment = { environmentId };
     harness.primaryLocalEnvironment = { environmentId: localEnvironmentId };
     harness.queries = [
       query({ providers: [] }),
@@ -419,7 +421,7 @@ describe("AppStatusBar", () => {
   it("keeps safe no-op refreshers until command handlers are installed", () => {
     vi.useFakeTimers();
     const environmentId = EnvironmentId.make("environment-initializing");
-    harness.primaryEnvironment = { environmentId };
+    harness.selectedEnvironment = { environmentId };
     harness.queries = [query({ providers: [] }), query(), query()];
     renderStatusBar();
     harness.effects[3]?.();
