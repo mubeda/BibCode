@@ -1207,8 +1207,9 @@ report an interactive DOM at native completion. These markers carry no page URLs
 production builds. The disposable fixture enables only this lifecycle target
 even when its parent process uses a warning-only filter. The maintained `document-navigation.e2e.ts` scenario reloads
 three times and checks a complete, distinct document after each native finish.
-The suite disables
-WebDriver command retries. Treat reporter hook errors, retries, and timeouts as
+The suite restores its motion guard after scenario reloads. Runtime motion
+assertions explicitly select native transitions and restore the guard afterward.
+The suite disables WebDriver command retries. Treat reporter hook errors, retries, and timeouts as
 test failures even when the individual scenarios are reported as passing.
 On macOS, copy the signed DMG payload to an isolated installation directory,
 compare its executable bytes, and verify its signature before running the suite.
@@ -1216,7 +1217,9 @@ The Tauri service captures backend stdout/stderr in the artifact directory.
 macOS CI also retains `native-crashes.log`, a bounded summary of application
 crash types, termination reasons, and faulting symbols; it excludes raw memory
 and the rest of the diagnostic report. Inspect these logs when the app or
-embedded driver exits unexpectedly.
+embedded driver exits unexpectedly. A missing provider-terminal activity dock
+also records structural pane, surface, and activity-host geometry to distinguish
+layout visibility from provider-observation failures.
 Window resizing polls the actual viewport and native window until the requested
 size is reached, including when GTK startup dimensions settle independently.
 It does not depend on animation frames, which can stop in occluded macOS

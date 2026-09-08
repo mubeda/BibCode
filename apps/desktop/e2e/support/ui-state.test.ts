@@ -108,7 +108,10 @@ describe("setDesktopUiWindowSize", () => {
 
 describe("desktop UI motion stabilization", () => {
   it("keeps the WDIO motion guard from overriding open or closed portal styles", () => {
-    const configuration = NodeFS.readFileSync(new URL("../wdio.conf.ts", import.meta.url), "utf8");
+    const configuration = NodeFS.readFileSync(
+      new URL("./motion-guard.ts", import.meta.url),
+      "utf8",
+    );
 
     // The guard is one marked stylesheet installed once per document; it never
     // sets inline styles or observes and rewrites portal lifecycle attributes.
@@ -125,7 +128,10 @@ describe("desktop UI motion stabilization", () => {
   });
 
   it("settles stuck opening portals and hides closed portals through state-aware CSS", () => {
-    const configuration = NodeFS.readFileSync(new URL("../wdio.conf.ts", import.meta.url), "utf8");
+    const configuration = NodeFS.readFileSync(
+      new URL("./motion-guard.ts", import.meta.url),
+      "utf8",
+    );
 
     expect(configuration).toContain("[data-open][data-starting-style]");
     expect(configuration).toMatch(
@@ -135,7 +141,10 @@ describe("desktop UI motion stabilization", () => {
   });
 
   it("settles auto-animated project rows without overriding unrelated content", () => {
-    const configuration = NodeFS.readFileSync(new URL("../wdio.conf.ts", import.meta.url), "utf8");
+    const configuration = NodeFS.readFileSync(
+      new URL("./motion-guard.ts", import.meta.url),
+      "utf8",
+    );
 
     expect(configuration).toMatch(
       /\[data-slot="sidebar-group"\]:has\(\[data-testid="new-main-chat-button"\]\)\s+ul\[data-sidebar="menu"\]\s*>\s*li\s*\{[^}]*opacity:\s*1\s*!important;[^}]*\}/s,

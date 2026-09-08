@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off - Packaged UI tests save native screenshots.
+import { installDesktopUiMotionGuard } from "../support/motion-guard.ts";
 import { refreshDesktopUiDocument } from "../support/document-navigation.ts";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
@@ -119,6 +120,7 @@ describe("packaged project session and terminal", () => {
     await browser.$(".xterm-screen").waitForExist({ reverse: true });
 
     await refreshDesktopUiDocument();
+    await installDesktopUiMotionGuard();
     await expect(
       browser.$(`//*[contains(normalize-space(), "${desktopUiFixture.streamedResponse}")]`),
     ).toBeDisplayed();

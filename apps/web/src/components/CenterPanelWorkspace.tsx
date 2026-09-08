@@ -253,7 +253,7 @@ export const CenterPanelWorkspace = forwardRef<
   CenterPanelWorkspaceHandle,
   CenterPanelWorkspaceProps
 >(function CenterPanelWorkspace(props, ref) {
-  const targets = useCenterPanelBodyTargets();
+  const targets = useCenterPanelBodyTargets(props.state.groups);
   const surfaceHostsRef = useRef<CenterPanelSurfaceHostsHandle>(null);
   const workspaceElementRef = useRef<HTMLDivElement | null>(null);
   const propsRef = useRef(props);

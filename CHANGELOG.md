@@ -40,6 +40,10 @@ follow the server you are working on.
 
 ### Reliability and validation
 
+- Fixed newly active center panels remaining blank while a geometry update is
+  waiting for paint. Initial and activation layout measurements run before
+  paint and refresh replaced targets, while ordinary resizing remains batched.
+
 - Fixed macOS process termination when navigation cancels an in-flight WebKit
   request. Optimized builds now retain the exception unwinding required by
   Wry's recovery path, with a native release-profile regression and build guard.
@@ -49,6 +53,8 @@ follow the server you are working on.
   Readiness generations are recorded only in test builds. Backend logs and
   bounded macOS crash summaries are retained for native test failures. macOS
   smoke tests now verify and run an isolated installation copied from the DMG.
+  Scenario reloads restore the test motion guard, while motion assertions
+  explicitly exercise native transitions.
 
 - Made packaged desktop validation independent of suspended macOS paint frames,
   wait for native viewport resizing and workspace terminal controls, and target
