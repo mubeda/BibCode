@@ -1,5 +1,53 @@
 # Changelog
 
+## [v0.5.9] - 2026-09-11
+
+BiBCode v0.5.9 fixes Git network operations from the Linux AppImage and adds
+repeatable compatibility coverage for Debian, Ubuntu, Fedora, and Arch.
+
+### Linux Git compatibility
+
+- Fixed **Fetch origin** and other system Git operations failing from the Linux
+  AppImage with `symbol lookup error` when Fedora's `libcurl` loaded an
+  incompatible `libnghttp2` bundled by the AppImage.
+- Isolated Git and source-control helper processes from both the current
+  AppImage library directory and stale `.mount_*` directories inherited after
+  application updates. This applies to text and binary-output Git commands.
+- Preserved unrelated host library directories, credential and SSH-agent
+  settings, command-local environment overrides, and Linux loader semantics for
+  current-directory entries. The desktop process environment remains unchanged.
+- Kept ordinary non-AppImage server launches unchanged and avoided
+  distribution-specific library paths, so the fix uses each host's own system
+  Git dependency set.
+
+### Validation and supported distributions
+
+- Added a production-runner regression that builds an intentionally
+  incompatible shared library, proves the system Git HTTPS helper fails when it
+  loads that library, and verifies the patched runner restores normal helper
+  initialization without contacting an external Git server.
+- Added CI coverage using system Git on Debian 12 and 13, Ubuntu 22.04 and
+  24.04, Fedora 44, and Arch rolling. Coverage includes extracted AppImages,
+  paths containing spaces, stale mounts, colon and semicolon separators, and
+  parent-environment isolation.
+- Reproduced the original Fedora failure and verified a patched dry-run fetch
+  against the affected repository completed without a loader error or changing
+  refs or `FETCH_HEAD`.
+- Updated the Linux testing runbook, runtime architecture, CI reference, and
+  script reference to define the cross-distribution Git compatibility contract
+  and distinguish it from complete packaged desktop qualification.
+
+### Downloads
+
+On macOS, copy BiBCode.app from the DMG to Applications before launching it.
+
+Desktop installers and standalone server distributions are provided for macOS,
+Linux, and Windows on ARM64 and x64. Linux server `.deb` and `.rpm` packages are
+included for both architectures. Stable desktop updater payloads and signatures
+remain available through `latest.json`.
+
+**Full Changelog**: https://github.com/mubeda/BibCode/compare/v0.5.8...v0.5.9
+
 ## [v0.5.8] - 2026-09-08
 
 BiBCode v0.5.8 improves remote terminal responsiveness and makes AI usage status
