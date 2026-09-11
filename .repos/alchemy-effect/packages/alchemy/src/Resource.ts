@@ -5,12 +5,18 @@ import * as Option from "effect/Option";
 import type { Pipeable } from "effect/Pipeable";
 import { AdoptPolicy } from "./AdoptPolicy.ts";
 import { toFqn } from "./FQN.ts";
-import type { Input, InputProps } from "./Input.ts";
+import type { Input, InputProps, PropsInput } from "./Input.ts";
 import { CurrentNamespace, type NamespaceNode } from "./Namespace.ts";
 import * as Output from "./Output.ts";
 import { Provider } from "./Provider.ts";
+import {
+  ConflictingProviderModeError,
+  ProviderModePolicy,
+  type ProviderMode,
+} from "./ProviderMode.ts";
 import { ref as makeRef } from "./Ref.ts";
 import { RemovalPolicy } from "./RemovalPolicy.ts";
+import { RenamePolicy } from "./Rename.ts";
 import { Self } from "./Self.ts";
 import { Stack } from "./Stack.ts";
 
@@ -22,17 +28,11 @@ export type ResourceConstructor<R extends ResourceLike, Req = never> = {
   ): ResourceClassWithMethods<R, Methods>;
   (
     id: string,
+    // PropsInput distributes over union Props so discriminated-union
+    // resources keep the correlation between discriminant and payload.
     ...args: {} extends R["Props"]
-      ? [
-          props?: {
-            [prop in keyof R["Props"]]: Input<R["Props"][prop]>;
-          },
-        ]
-      : [
-          props: {
-            [prop in keyof R["Props"]]: Input<R["Props"][prop]>;
-          },
-        ]
+      ? [props?: PropsInput<R["Props"]>]
+      : [props: PropsInput<R["Props"]>]
   ): Effect.Effect<R, never, Req>;
   <PropsReq = never>(
     id: string,
@@ -130,6 +130,22 @@ export interface ResourceLike<
    * resource-scoped override — the planner falls back to the stack/CLI default.
    */
   Adopt: boolean | undefined;
+  /**
+   * Per-resource provider mode captured from the ambient
+   * {@link ProviderModePolicy} at registration time. `"live"` when the
+   * resource was pinned via `.pipe(remote())` (opting out of local emulation
+   * during dev); `undefined` means the run default (`AlchemyContext.dev`).
+   */
+  Mode: ProviderMode | undefined;
+  /**
+   * Former FQNs this resource's state may still be persisted under,
+   * captured from the ambient {@link RenamePolicy} at registration (via
+   * `.pipe(renamedFrom("OldId"))`) and resolved against the same namespace
+   * as the resource's own FQN. The planner migrates a state row found at a
+   * former FQN to {@link FQN} instead of planning a create+delete
+   * replacement — see `renamedFrom` in Rename.ts for the full semantics.
+   */
+  FormerFqns: readonly string[] | undefined;
   /** @internal phantom */
   Attributes: Attributes;
   /** @internal phantom */
@@ -139,7 +155,19 @@ export interface ResourceLike<
 }
 
 export const isResource = (value: any): value is ResourceLike => {
-  return typeof value === "object" && value !== null && "Type" in value;
+  // Require the full resource identity (Type AND FQN), not just `Type`:
+  // user-authored prop objects legitimately carry a `Type` field (e.g.
+  // Amazon States Language states like `{ Type: "Pass", End: true }` in a
+  // Step Functions definition) and must not be mistaken for resources.
+  // Locally-declared resources always expose both as own keys; refs
+  // (`Resource.ref(...)`) deliberately report neither via `in` so they keep
+  // routing through Output resolution.
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "Type" in value &&
+    "FQN" in value
+  );
 };
 
 /**
@@ -178,8 +206,25 @@ export type Resource<
       ...args: any[]
     ): (binding: Input<Binding>) => Effect.Effect<void>;
   } & {
-    [attr in keyof Attributes]-?: Output.Output<Attributes[attr], never>;
+    [attr in keyof Attributes]-?: AttrOutput<Attributes[attr]>;
   };
+
+/**
+ * Accessor type for one attribute. Pure object attributes upgrade to
+ * {@link Output.ObjectExpr} so nested access is typed —
+ * `hyperpod.instanceGroups.workers` — while primitives, unions with
+ * `undefined`, branded string unions (`"a" | (string & {})`), and arrays
+ * stay plain {@link Output.Output} (running them through `ToOutput` would
+ * classify the `string & {}` branch as an object and explode into
+ * String-method mapped types).
+ */
+type AttrOutput<A> = [A] extends [
+  string | number | boolean | bigint | null | undefined | Date | any[],
+]
+  ? Output.Output<A, never>
+  : [A] extends [Record<string, any>]
+    ? Output.ObjectExpr<A, never>
+    : Output.Output<A, never>;
 
 export interface ResourceOptions {
   /**
@@ -236,8 +281,41 @@ export function Resource<R extends ResourceLike>(
       const namespace = yield* CurrentNamespace;
       const fqn = toFqn(namespace, id);
 
+      // `remote()` opts resources out of local emulation during dev. The
+      // captured Mode is either "live" (pinned) or undefined (run default).
+      // The Reference default is `undefined` — "no explicit decoration" —
+      // which is distinct from an explicit `remote(false)`.
+      const ambientPolicy = yield* ProviderModePolicy;
+      const ambientMode: ProviderMode | undefined = ambientPolicy
+        ? "live"
+        : undefined;
+
       const existing = stack.resources[fqn];
       if (existing) {
+        // A resource may be `yield*`ed from several places (idempotent
+        // registration). If a later site carries an *explicit* ambient
+        // ProviderModePolicy that disagrees with what the resource was
+        // registered with, the decorations are conflicting — fail loudly
+        // instead of silently picking one. A later site with NO ambient
+        // policy simply inherits the registered resource (the common
+        // "reference it from elsewhere" pattern).
+        if (ambientPolicy !== undefined && existing.Mode !== ambientMode) {
+          return yield* Effect.die(
+            new ConflictingProviderModeError({
+              message:
+                `Resource '${fqn}' was registered with provider mode ` +
+                `'${existing.Mode ?? "default"}' but is now being registered ` +
+                `with conflicting mode '${ambientMode ?? "default"}'. A ` +
+                "resource must resolve to a single provider mode: register " +
+                "it once and close over the returned value, or make both " +
+                "registration sites agree (e.g. wrap both in the same " +
+                "`remote()` scope).",
+              fqn,
+              existingMode: existing.Mode,
+              conflictingMode: ambientMode,
+            }),
+          );
+        }
         // // TODO(sam): check if props are different and die
         return existing;
       }
@@ -311,6 +389,24 @@ export function Resource<R extends ResourceLike>(
         ),
         Adopt: yield* Effect.serviceOption(AdoptPolicy).pipe(
           Effect.map(Option.getOrUndefined),
+        ),
+        Mode: ambientMode,
+        // Bare-string former ids resolve against the SAME namespace as the
+        // resource's own id, so `renamedFrom("Site/Worker")` declared at the
+        // caller's level claims `<callerNs>/Site/Worker`; the `{ fqn }` form
+        // is absolute (cross-namespace moves).
+        FormerFqns: yield* Effect.serviceOption(RenamePolicy).pipe(
+          Effect.map(
+            Option.match({
+              onNone: () => undefined,
+              onSome: (formerIds) =>
+                formerIds.map((formerId) =>
+                  typeof formerId === "string"
+                    ? toFqn(namespace, formerId)
+                    : formerId.fqn,
+                ),
+            }),
+          ),
         ),
         bind,
         toString(this: typeof target) {

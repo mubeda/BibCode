@@ -13,7 +13,7 @@ import * as SubscriptionRef from "effect/SubscriptionRef";
 import type { ConnectionCatalogEntry, ConnectionRegistration } from "../connection/catalog.ts";
 import type { ConnectionTarget } from "../connection/model.ts";
 
-export class ConnectionPersistenceError extends Schema.TaggedErrorClass<ConnectionPersistenceError>()(
+export class ConnectionPersistenceError extends Schema.TaggedError<ConnectionPersistenceError>()(
   "ConnectionPersistenceError",
   {
     operation: Schema.Literals([

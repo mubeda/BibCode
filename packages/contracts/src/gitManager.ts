@@ -460,7 +460,7 @@ export const GitManagerPullRequestsResult = Schema.Struct({
 });
 export type GitManagerPullRequestsResult = typeof GitManagerPullRequestsResult.Type;
 
-export class GitManagerOperationError extends Schema.TaggedErrorClass<GitManagerOperationError>()(
+export class GitManagerOperationError extends Schema.TaggedError<GitManagerOperationError>()(
   "GitManagerOperationError",
   {
     operation: TrimmedNonEmptyStringSchema,

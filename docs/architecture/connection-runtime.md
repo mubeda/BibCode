@@ -136,6 +136,14 @@ routing endpoint from substituting a different logical environment or
 persistent store after the pinned handshake without leaving a
 delivered-but-unpersisted durable client.
 
+Loopback offers can deliver an already-active standard credential without a
+pending-confirmation capability. When that pinned handshake does not require
+confirmation, an `access:write` denial of the confirmation RPC is resolved
+through the same supervisor bearer proof instead of discarding the saved
+connection. Pending-confirmation handshakes and off-host scope denials still
+roll back. Server authorization rules are unchanged; the fallback never grants
+administrative scopes and rolls back a credential that the supervisor rejects.
+
 Presentation uses `connectionTransportSecurity` as the shared policy:
 non-null bearer `hostKey` is `e2ee`, null is `unencrypted`, relay and SSH are
 `channel-secured`, and primary or desktop-local targets are `local`. Legacy

@@ -37,6 +37,7 @@ import {
   ConnectionTransientError,
   type ConnectionAttemptError,
 } from "./model.ts";
+import { bearerServerEnvironmentId } from "./remoteIdentity.ts";
 import * as ConnectionProfileStore from "./profileStore.ts";
 
 export class ConnectionResolver extends Context.Service<
@@ -143,14 +144,17 @@ const makeBearerBroker = Effect.fn("clientRuntime.connection.broker.makeBearer")
       return yield* credentialMissingError(target.connectionId);
     }
     const authorized = yield* remote.authorizeBearer({
-      expectedEnvironmentId: target.environmentId,
+      // The host declares its own id; the registry key is the client's. For a
+      // paired remote those differ, so the endpoint is checked against what it
+      // said when it was saved.
+      expectedEnvironmentId: bearerServerEnvironmentId(target),
       httpBaseUrl: profile.httpBaseUrl,
       wsBaseUrl: profile.wsBaseUrl,
       bearerToken: credential.token,
       hostKey: profile.hostKey,
     });
     return {
-      environmentId: authorized.environmentId,
+      environmentId: target.environmentId,
       label: authorized.label,
       descriptor: authorized.descriptor,
       httpBaseUrl: authorized.httpBaseUrl,

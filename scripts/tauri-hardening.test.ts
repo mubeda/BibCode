@@ -398,6 +398,25 @@ it.layer(NodeServices.layer)("Tauri production hardening", (it) => {
         assert.match(connectSource, /(^|\s)ws:(\s|$)/, "connect-src must allow off-host ws:");
       }
       assert.match(tauri.app.security.csp ?? "", /script-src 'self';/);
+      // macOS App Transport Security refuses plain-HTTP loads from web content
+      // unless the bundle declares the exception. Remote servers are
+      // user-chosen plain-HTTP endpoints reached from the webview, so the
+      // desktop bundle must carry the web-content exemption (and a Local
+      // Network usage description for the macOS permission prompt), or every
+      // Add Server attempt on macOS fails as "Server unreachable".
+      const macPlist = yield* fs.readFileString(
+        path.join(repoRoot, "apps/desktop/src-tauri/Info.plist"),
+      );
+      assert.match(
+        macPlist,
+        /<key>NSAppTransportSecurity<\/key>\s*<dict>[\s\S]*?<key>NSAllowsArbitraryLoadsInWebContent<\/key>\s*<true\/>/,
+      );
+      assert.match(macPlist, /<key>NSAllowsLocalNetworking<\/key>\s*<true\/>/);
+      assert.match(
+        macPlist,
+        /<key>NSLocalNetworkUsageDescription<\/key>\s*<string>[^<]+<\/string>/,
+      );
+      assert.notMatch(macPlist, /NSAllowsArbitraryLoads<\/key>\s*<true/);
       assert.deepEqual(capability.permissions, [
         "allow-desktop-bridge",
         "allow-desktop-preview",

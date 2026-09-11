@@ -1152,6 +1152,7 @@ export function prepareDesktopUiTestContext(
   }
   environment.PATH = `${shimDirectory}${NodePath.delimiter}${environment.PATH ?? ""}`;
   environment.RUST_LOG ??= "bibcode=debug";
+  environment.BIBCODE_LOG = `${environment.BIBCODE_LOG ?? environment.RUST_LOG},bibcode::desktop_e2e=info`;
 
   return {
     runRoot,

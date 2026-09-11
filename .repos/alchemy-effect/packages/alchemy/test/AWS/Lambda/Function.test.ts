@@ -1,6 +1,7 @@
 import * as AWS from "@/AWS";
 import * as Provider from "@/Provider";
 import * as Test from "@/Test/Alchemy";
+import * as iam from "@distilled.cloud/aws/iam";
 import * as Lambda from "@distilled.cloud/aws/lambda";
 import { expect } from "alchemy-test";
 import * as Duration from "effect/Duration";
@@ -16,6 +17,13 @@ const timeoutHandlerPath = fileURLToPath(
 const externalPackageHandlerPath = fileURLToPath(
   new URL("./external-package-handler.ts", import.meta.url),
 );
+const lockfilePinnedHandlerPath = (format: "npm" | "bun" | "pnpm" | "yarn") =>
+  fileURLToPath(
+    new URL(
+      `./fixtures/lockfile-pinning/${format}/handler.ts`,
+      import.meta.url,
+    ),
+  );
 
 const { test } = Test.make({ providers: AWS.providers() });
 
@@ -23,7 +31,9 @@ test.provider(
   "create, update, delete function",
   (stack) =>
     Effect.gen(function* () {
-      const { functionName, functionUrl } = yield* stack.deploy(
+      yield* stack.destroy();
+
+      const { functionName, functionUrl, roleName } = yield* stack.deploy(
         TestFunction.pipe(Effect.provide(TestFunctionLive)),
       );
 
@@ -58,6 +68,10 @@ test.provider(
           "lambda:InvokedViaFunctionUrl": "true",
         },
       });
+
+      yield* stack.destroy();
+      yield* assertFunctionDeleted(functionName);
+      yield* assertRoleDeleted(roleName);
     }).pipe(
       Effect.tap(() => stack.destroy()),
       Effect.onError(() => stack.destroy().pipe(Effect.ignore)),
@@ -69,6 +83,8 @@ test.provider(
   "applies and updates the Lambda timeout",
   (stack) =>
     Effect.gen(function* () {
+      yield* stack.destroy();
+
       const initial = yield* stack.deploy(
         AWS.Lambda.Function("TimeoutFn", {
           main: timeoutHandlerPath,
@@ -109,6 +125,9 @@ test.provider(
         }),
       );
       expect(updatedConfig.Configuration?.Timeout).toBe(45);
+
+      yield* stack.destroy();
+      yield* assertFunctionDeleted(initial.functionName);
     }).pipe(
       Effect.tap(() => stack.destroy()),
       Effect.onError(() => stack.destroy().pipe(Effect.ignore)),
@@ -120,7 +139,9 @@ test.provider(
   "installs explicit external packages into the deployment artifact",
   (stack) =>
     Effect.gen(function* () {
-      const { functionUrl } = yield* stack.deploy(
+      yield* stack.destroy();
+
+      const { functionName, functionUrl } = yield* stack.deploy(
         AWS.Lambda.Function("InstallFn", {
           main: externalPackageHandlerPath,
           handler: "handler",
@@ -152,6 +173,77 @@ test.provider(
       expect(body.id).toMatch(
         /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
       );
+
+      yield* stack.destroy();
+      yield* assertFunctionDeleted(functionName);
+    }).pipe(
+      Effect.tap(() => stack.destroy()),
+      Effect.onError(() => stack.destroy().pipe(Effect.ignore)),
+    ),
+  { timeout: 360_000 },
+);
+
+test.provider(
+  "installs external packages at the versions pinned by each lockfile format",
+  (stack) =>
+    Effect.gen(function* () {
+      yield* stack.destroy();
+
+      // Each fixture project declares make-dir@^3.0.0 but its lockfile pins
+      // make-dir@3.0.0 and its transitive semver@6.3.0 — both below the latest
+      // versions satisfying their ranges (3.1.0 / 6.3.1). Free npm resolution
+      // installs the newer versions, so the assertions below fail without
+      // lockfile pinning. Legacy binary bun.lockb has no live fixture because
+      // current Bun can only write the text format; its print-and-parse path
+      // is covered by the yarn-v1 unit fixtures.
+      const formats = ["npm", "bun", "pnpm", "yarn"] as const;
+      const pinnedFunction = (format: (typeof formats)[number]) =>
+        AWS.Lambda.Function(`LockfilePinnedFn-${format}`, {
+          main: lockfilePinnedHandlerPath(format),
+          handler: "handler",
+          isExternal: true,
+          url: true,
+          build: {
+            install: ["make-dir"],
+          },
+        });
+      const deployed = yield* stack.deploy(
+        Effect.all({
+          npm: pinnedFunction("npm"),
+          bun: pinnedFunction("bun"),
+          pnpm: pinnedFunction("pnpm"),
+          yarn: pinnedFunction("yarn"),
+        }),
+      );
+
+      for (const format of formats) {
+        const { functionUrl } = deployed[format];
+        const response = yield* HttpClient.get(functionUrl!).pipe(
+          Effect.flatMap((response) =>
+            response.status === 200
+              ? Effect.succeed(response)
+              : Effect.fail(
+                  new Error(`Function URL returned ${response.status}`),
+                ),
+          ),
+          Effect.retry({
+            schedule: Schedule.max([
+              Schedule.exponential(500),
+              Schedule.recurs(10),
+            ]),
+          }),
+        );
+
+        const body = JSON.parse(yield* response.text) as {
+          makeDir: string;
+          semver: string;
+        };
+        expect(body.makeDir, format).toBe("3.0.0");
+        expect(body.semver, format).toBe("6.3.0");
+      }
+
+      yield* stack.destroy();
+      yield* assertFunctionDeleted(deployed.npm.functionName);
     }).pipe(
       Effect.tap(() => stack.destroy()),
       Effect.onError(() => stack.destroy().pipe(Effect.ignore)),
@@ -188,6 +280,9 @@ test.provider(
 
       expect(updated.functionName).toBe(initial.functionName);
       yield* waitForArchitecture(updated.functionName, "x86_64");
+
+      yield* stack.destroy();
+      yield* assertFunctionDeleted(initial.functionName);
     }).pipe(
       Effect.tap(() => stack.destroy()),
       Effect.onError(() => stack.destroy().pipe(Effect.ignore)),
@@ -239,6 +334,9 @@ test.provider(
       expect(removed.functionName).toBe(initial.functionName);
       expect(removed.reservedConcurrentExecutions).toBeUndefined();
       yield* waitForReservedConcurrency(removed.functionName, undefined);
+
+      yield* stack.destroy();
+      yield* assertFunctionDeleted(initial.functionName);
     }).pipe(
       Effect.tap(() => stack.destroy()),
       Effect.onError(() => stack.destroy().pipe(Effect.ignore)),
@@ -271,6 +369,9 @@ test.provider(
       expect(all.some((f) => f.functionName === deployed.functionName)).toBe(
         true,
       );
+
+      yield* stack.destroy();
+      yield* assertFunctionDeleted(deployed.functionName);
     }).pipe(
       Effect.tap(() => stack.destroy()),
       Effect.onError(() => stack.destroy().pipe(Effect.ignore)),
@@ -282,6 +383,8 @@ test.provider(
   "updates function URL auth to AWS_IAM",
   (stack) =>
     Effect.gen(function* () {
+      yield* stack.destroy();
+
       const initial = yield* stack.deploy(
         AWS.Lambda.Function("IamUrlFn", {
           main: timeoutHandlerPath,
@@ -362,12 +465,44 @@ test.provider(
         }),
       );
       expect(response.status).toBe(403);
+
+      yield* stack.destroy();
+      yield* assertFunctionDeleted(initial.functionName);
     }).pipe(
       Effect.tap(() => stack.destroy()),
       Effect.onError(() => stack.destroy().pipe(Effect.ignore)),
     ),
   { timeout: 360_000 },
 );
+
+// Out-of-band proof that the trailing destroy actually removed the function
+// from the cloud (bounded retry to ride out delete propagation).
+const assertFunctionDeleted = Effect.fn(function* (functionName: string) {
+  yield* Lambda.getFunction({ FunctionName: functionName }).pipe(
+    Effect.flatMap(() =>
+      Effect.fail(new Error(`Function ${functionName} still exists`)),
+    ),
+    Effect.catchTag("ResourceNotFoundException", () => Effect.void),
+    Effect.retry({
+      schedule: Schedule.max([Schedule.exponential(500), Schedule.recurs(8)]),
+    }),
+  );
+});
+
+// Function cleanup owns its generated execution role. Verify the role is not
+// stranded when deletion also waits for Lambda's asynchronous log flush.
+const assertRoleDeleted = Effect.fn(function* (roleName: string) {
+  yield* iam.getRole({ RoleName: roleName }).pipe(
+    Effect.flatMap(() =>
+      Effect.fail(new Error(`Role ${roleName} still exists`)),
+    ),
+    Effect.catchTag("NoSuchEntityException", () => Effect.void),
+    Effect.retry({
+      schedule: Schedule.spaced("1 second"),
+      times: 8,
+    }),
+  );
+});
 
 const getPolicyStatement = Effect.fn(function* (
   functionName: string,

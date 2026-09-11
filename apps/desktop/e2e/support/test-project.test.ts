@@ -675,6 +675,7 @@ describe("packaged provider composer fixture", () => {
     expect(environment.BIBCODE_E2E_PROVIDER_INPUT_LOG).toBe(context.providerInputLogPath);
     expect(NodePath.isAbsolute(context.nativeActionLogPath)).toBe(true);
     expect(environment.BIBCODE_E2E_NATIVE_ACTION_LOG).toBe(context.nativeActionLogPath);
+    expect(environment.BIBCODE_LOG).toContain("bibcode::desktop_e2e=info");
     expect(NodeFS.readFileSync(context.nativeActionLogPath, "utf8")).toBe("");
   });
 

@@ -201,8 +201,16 @@ export function EnvironmentRail() {
   return (
     <div
       data-testid="environment-rail"
-      className="flex h-full w-[52px] shrink-0 flex-col items-center gap-2 border-r border-panel-separator bg-sidebar py-2"
+      className="flex h-full w-[52px] shrink-0 flex-col items-center gap-2 border-r border-panel-separator bg-sidebar pb-2"
     >
+      {/* The fixed sidebar toggle is pinned over the rail's top strip; reserve
+          the same topbar height the thread sidebar header reserves so the
+          Local entry starts below it and the separator line stays continuous. */}
+      <div
+        data-testid="environment-rail-topbar"
+        aria-hidden
+        className="workspace-topbar w-full shrink-0 border-b border-panel-separator"
+      />
       <div
         role="radiogroup"
         aria-label="Environments"

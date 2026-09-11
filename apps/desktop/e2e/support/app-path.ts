@@ -36,7 +36,7 @@ export function resolveDesktopAppPath(input: ResolveDesktopAppPathInput): string
       }
       if (/\.dmg$/i.test(configuredPath)) {
         throw new DesktopAppPathConfigurationError(
-          "Mount the DMG and set BIBCODE_E2E_APP_PATH to its .app bundle.",
+          "Copy the app from the DMG to an isolated install directory and set BIBCODE_E2E_APP_PATH to that .app bundle.",
         );
       }
       if (/\.app$/i.test(configuredPath)) {
@@ -46,7 +46,7 @@ export function resolveDesktopAppPath(input: ResolveDesktopAppPathInput): string
         return configuredPath;
       }
       throw new DesktopAppPathConfigurationError(
-        "BIBCODE_E2E_APP_PATH must point to a mounted .app bundle or its executable.",
+        "BIBCODE_E2E_APP_PATH must point to an installed .app bundle or its executable.",
       );
     }
     case "linux": {

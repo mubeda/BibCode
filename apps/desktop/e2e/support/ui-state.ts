@@ -1,4 +1,4 @@
-import { correctDesktopUiOuterSize, scaleDesktopUiWindowSize } from "./window-size.ts";
+import { correctDesktopUiOuterSize } from "./window-size.ts";
 
 export async function mockDesktopUiFolderPicker(projectPath: string): Promise<void> {
   const picker = await browser.tauri.mock("desktop_bridge_pick_folder");
@@ -8,26 +8,43 @@ export async function mockDesktopUiFolderPicker(projectPath: string): Promise<vo
 export async function setDesktopUiWindowSize(width: number, height: number): Promise<void> {
   const devicePixelRatio = await browser.execute(() => window.devicePixelRatio);
   const requestedViewportSize = { width, height };
-  let outerSize = scaleDesktopUiWindowSize(requestedViewportSize, devicePixelRatio);
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    await browser.setWindowSize(outerSize.width, outerSize.height);
-    await browser.executeAsync((done: () => void) => {
-      window.requestAnimationFrame(() => {
-        window.requestAnimationFrame(done);
-      });
-    });
-    const observedViewportSize = await browser.execute(() => ({
+  const readViewport = () =>
+    browser.execute(() => ({
       width: window.innerWidth,
       height: window.innerHeight,
     }));
-    if (observedViewportSize.width === width && observedViewportSize.height === height) return;
-    outerSize = correctDesktopUiOuterSize(
-      outerSize,
-      requestedViewportSize,
-      observedViewportSize,
-      devicePixelRatio,
-    );
-  }
+  const scale = Number.isFinite(devicePixelRatio) && devicePixelRatio > 0 ? devicePixelRatio : 1;
+  let previous:
+    | { width: number; height: number; outerWidth: number; outerHeight: number }
+    | undefined;
+  await browser.waitUntil(
+    async () => {
+      const observed = await readViewport();
+      if (observed.width === width && observed.height === height) return true;
+      const outer = await browser.getWindowSize();
+      const available = await browser.execute(() => ({
+        width: screen.availWidth,
+        height: screen.availHeight,
+      }));
+      // Oversized screenshots are bounded by the native display. Exact-size
+      // responsive assertions remain mandatory for viewports that fit the screen.
+      if (
+        (width > available.width || height > available.height) &&
+        previous?.width === observed.width &&
+        previous.height === observed.height &&
+        previous.outerWidth === outer.width &&
+        previous.outerHeight === outer.height
+      )
+        return true;
+      previous = { ...observed, outerWidth: outer.width, outerHeight: outer.height };
+      const corrected = correctDesktopUiOuterSize(outer, requestedViewportSize, observed, scale);
+      await browser.setWindowSize(corrected.width, corrected.height);
+      // Poll actual geometry before the next correction. Initial GTK decoration
+      // and webview sizes can settle independently, so a predicted delta is unsafe.
+      return false;
+    },
+    { timeoutMsg: `The webview did not reach the requested ${width}x${height} viewport.` },
+  );
 }
 
 export async function ensureMainSidebarOpen(): Promise<void> {
