@@ -186,6 +186,15 @@ flowchart TB
   owners to the typed RPC registry and the worktree catalog's existing mutation
   arbitration.
 
+  On Linux, the shared Git process runner isolates system Git and source-control
+  helper commands from AppImage library directories. For an AppImage launch it
+  filters the current `APPDIR` and stale `.mount_*` paths from the child's
+  `LD_LIBRARY_PATH`, retaining unrelated custom directories and credential
+  settings. Text and binary-output paths use the same policy. It does not
+  change the desktop process environment or replace the host's library paths
+  with distribution-specific locations. Ordinary non-AppImage launches keep
+  their configured environment.
+
 - **Contracts (`packages/contracts`)** contains Effect schemas and TypeScript
   contracts only. It defines persisted models, RPC methods, HTTP APIs, desktop
   bridge values, and provider events without application runtime logic.

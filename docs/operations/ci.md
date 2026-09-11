@@ -51,6 +51,12 @@ its immutable SHA.
 
 ## Other Workflows
 
+- `.github/workflows/linux-git-compatibility.yml` builds the real server Git
+  runner regression test on Ubuntu 22.04, then executes it against system Git
+  in Debian 12/13, Ubuntu 22.04/24.04, Fedora 44, and Arch rolling containers.
+  It verifies AppImage library isolation for text and binary subprocesses,
+  including inherited mounts from previous updates. This is Git compatibility
+  evidence; native packaged desktop and updater validation remain separate.
 - `.github/workflows/desktop-ui-smoke.yml` is a manual or reusable packaged-app
   UI smoke matrix for all six supported native targets.
 - `.github/workflows/desktop-upgrade-smoke.yml` runs real seeded updater flows on
