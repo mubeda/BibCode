@@ -110,6 +110,18 @@ tables for it and only exception-unwinding performance of that test binary is
 affected. It is not emitted for shipped release artifacts; report it with the
 affected test target rather than suppressing the `linker_messages` lint.
 
+Validate Objective-C recovery with the actual optimized profile:
+
+```sh
+rust_target="$(rustc -Vv | sed -n 's/^host: //p')"
+cargo run --release --target "$rust_target" -p bibcode-desktop --example objc_exception_probe
+```
+
+The probe must catch its native exception and exit successfully. The workspace
+release profile preserves unwinding because Wry relies on it when a custom
+URL-scheme task is cancelled during navigation. The macOS desktop crate rejects
+`panic=abort`; do not disable that guard to produce an installer.
+
 For update validation, use an isolated `BIBCODE_HOME` and disposable project.
 Keep a read subscription open while installing an available test update and
 confirm it does not block protection. During a deliberately held mutation,
@@ -149,11 +161,18 @@ Build and run packaged E2E with:
 
 ```sh
 export BIBCODE_E2E_PLATFORM=mac
+export BIBCODE_E2E_ARCH="$(node -p process.arch)"
+case "$BIBCODE_E2E_ARCH" in
+  arm64) rust_target=aarch64-apple-darwin ;;
+  x64) rust_target=x86_64-apple-darwin ;;
+  *) echo 'Unsupported macOS architecture' >&2; exit 1 ;;
+esac
 vp run test:ui:desktop:build
 
-dmg=$(find "$PWD/target/release/bundle/dmg" -maxdepth 1 -type f -name 'BiBCode_*.dmg' -print -quit)
+dmg=$(find "$PWD/target/$rust_target/release/bundle/dmg" -maxdepth 1 -type f -name 'BiBCode_*.dmg' -print -quit)
 test -n "$dmg"
 mount_dir=$(mktemp -d /private/tmp/bibcode-macos-e2e-mount.XXXXXX)
+install_dir=$(mktemp -d /private/tmp/bibcode-macos-e2e-install.XXXXXX)
 cleanup_e2e_mount() {
   hdiutil detach "$mount_dir" >/dev/null 2>&1 || true
   rmdir "$mount_dir" 2>/dev/null || true
@@ -161,16 +180,22 @@ cleanup_e2e_mount() {
 trap cleanup_e2e_mount EXIT HUP INT TERM
 hdiutil attach -readonly -nobrowse -mountpoint "$mount_dir" "$dmg"
 
-export BIBCODE_E2E_APP_PATH="$mount_dir/BiBCode.app"
+ditto "$mount_dir/BiBCode.app" "$install_dir/BiBCode.app"
+executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$mount_dir/BiBCode.app/Contents/Info.plist")
+cmp "$mount_dir/BiBCode.app/Contents/MacOS/$executable" "$install_dir/BiBCode.app/Contents/MacOS/$executable"
+codesign --verify --deep --strict "$install_dir/BiBCode.app"
+export BIBCODE_E2E_APP_PATH="$install_dir/BiBCode.app"
 test -d "$BIBCODE_E2E_APP_PATH"
 vp run test:ui:desktop
 ```
 
-`BIBCODE_E2E_APP_PATH` deliberately selects the application bundle produced by
-the E2E build in the current worktree, not an installed production copy. The
-DMG-only bundler removes its transient staging `.app` after packaging, so mount
-the resulting DMG read-only instead of depending on that staging path. Keep the
-cleanup trap active until WebDriver and the packaged application have exited.
+`BIBCODE_E2E_APP_PATH` selects the isolated installation copied from the current
+worktree's E2E DMG. The DMG-only bundler removes its transient staging `.app`;
+mount the resulting image to inspect and copy its signed payload, then validate
+the installed copy as in the normal macOS installation flow. Binary comparison
+and signature verification bind the test to that exact payload. Keep the cleanup
+trap active until WebDriver and the packaged application have exited. Retain the
+installation directory with the execution evidence for inspection.
 
 ## Renderer-data isolation
 
@@ -208,6 +233,9 @@ minimum sizes verify:
   list and environment rail show that alias after reconnecting and restarting
   the app. Blank aliases use the pairing code's server name; failed pairing
   preserves the alias for retry. The remote server's own name remains unchanged;
+- Pair a loopback offer through a local connection or tunnel and confirm the
+  already-active standard credential remains saved without administrative
+  confirmation scope. Pending and off-host scope denials must still fail;
 - Settings shows **Remote Servers** with **Connect to a host** and **Share this
   host** tabs; `/settings/connections` redirects there. SSH discovery and
   grant-driven sharing appears because the desktop bridge is present. Generate
@@ -239,10 +267,14 @@ minimum sizes verify:
   management remains explicitly operator-owned. The local-machine flow still
   has no Host selector; remote targeting is driven by the environment rail;
 - Headless pairing: on a second machine or VM run `bibcode serve --host
-<routable address>`, confirm the startup line contains `pairingCode`, mint a
-  second offer with `bibcode pairing offer --endpoint http://<address>:3773`,
-  add each through **Add Server → Pairing code**, then restart the headless
-  server and confirm the saved server reconnects without re-pairing.
+<routable address>`, confirm the startup line contains `pairingCode`, and add it
+  through **Add Server → Pairing code**. Confirm the saved server appears
+  alongside — not in place of — the app's own **Local** environment, since both
+  hosts declare the environment id `local`. Mint a second offer with `bibcode
+pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
+  it by name ("<label> is already saved."): two offers describe one environment.
+  Then restart the headless server and confirm the saved server reconnects
+  without re-pairing.
 - Headless service: on the second machine run `bibcode service install --host
 <routable address>`, confirm `bibcode service status` reports `active`,
   reboot that machine, and confirm the desktop's saved server reconnects
@@ -291,6 +323,12 @@ Capture PID, PPID, process group, start time, executable, and command line for
 scoped app, server, provider, terminal, WebDriver, mount, and fixture roots.
 Confirm bounded terminate/wait/reap, late-descendant cleanup after natural root
 exit, peer-runtime isolation, and zero run-owned survivors.
+
+Run a terminal command that exits immediately, then close its terminal after
+observing completion. Also close while the command is finishing. Both paths
+must complete without an exit-wait timeout or a surviving process. The native
+PTY regression covers exit before any subscriber exists and verifies that a
+late subscriber receives the retained completion.
 
 Detach only the exact DMG mount. Remove only exact fixture, profile, artifact,
 and evidence directories created by the run. Leave pre-existing targets and

@@ -2,12 +2,18 @@
 
 import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as Cause from "effect/Cause";
 import * as Console from "effect/Console";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as PlatformError from "effect/PlatformError";
+import * as Ref from "effect/Ref";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
+import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import { Command, Flag } from "effect/unstable/cli";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
@@ -15,7 +21,8 @@ import { fromYaml } from "@bibcode/shared/schemaYaml";
 
 import { referenceRepos, type ReferenceRepo } from "./lib/reference-repos.ts";
 
-export type ReferenceRepoSyncAction = "add" | "pull";
+export type ReferenceRepoSyncAction = "replace";
+export type ReferenceRepoSyncPhase = "verify-clean" | "fetch" | "build" | "apply" | "rollback";
 
 export interface ReferenceRepoSyncOptions {
   readonly rootDir?: string | undefined;
@@ -28,11 +35,10 @@ export interface ReferenceRepoSyncPlan {
   readonly repo: ReferenceRepo;
   readonly action: ReferenceRepoSyncAction;
   readonly ref: string;
-  readonly args: ReadonlyArray<string>;
-  readonly pruneArgs: ReadonlyArray<string> | null;
+  readonly fetchArgs: ReadonlyArray<string>;
 }
 
-export class ReferenceRepoSelectionError extends Schema.TaggedErrorClass<ReferenceRepoSelectionError>()(
+export class ReferenceRepoSelectionError extends Schema.TaggedError<ReferenceRepoSelectionError>()(
   "ReferenceRepoSelectionError",
   {
     repoId: Schema.String,
@@ -44,7 +50,7 @@ export class ReferenceRepoSelectionError extends Schema.TaggedErrorClass<Referen
   }
 }
 
-export class ReferenceRepoPathValidationError extends Schema.TaggedErrorClass<ReferenceRepoPathValidationError>()(
+export class ReferenceRepoPathValidationError extends Schema.TaggedError<ReferenceRepoPathValidationError>()(
   "ReferenceRepoPathValidationError",
   {
     repoId: Schema.String,
@@ -65,7 +71,7 @@ export class ReferenceRepoPathValidationError extends Schema.TaggedErrorClass<Re
   }
 }
 
-export class ReferenceRepoVersionSourceError extends Schema.TaggedErrorClass<ReferenceRepoVersionSourceError>()(
+export class ReferenceRepoVersionSourceError extends Schema.TaggedError<ReferenceRepoVersionSourceError>()(
   "ReferenceRepoVersionSourceError",
   {
     operation: Schema.Literals(["read", "parse"]),
@@ -79,7 +85,7 @@ export class ReferenceRepoVersionSourceError extends Schema.TaggedErrorClass<Ref
   }
 }
 
-export class ReferenceRepoVersionResolutionError extends Schema.TaggedErrorClass<ReferenceRepoVersionResolutionError>()(
+export class ReferenceRepoVersionResolutionError extends Schema.TaggedError<ReferenceRepoVersionResolutionError>()(
   "ReferenceRepoVersionResolutionError",
   {
     repoId: Schema.String,
@@ -92,12 +98,49 @@ export class ReferenceRepoVersionResolutionError extends Schema.TaggedErrorClass
   }
 }
 
-export class ReferenceRepoGitSubtreeError extends Schema.TaggedErrorClass<ReferenceRepoGitSubtreeError>()(
-  "ReferenceRepoGitSubtreeError",
+export class ReferenceRepoWorkspaceDirtyError extends Schema.TaggedError<ReferenceRepoWorkspaceDirtyError>()(
+  "ReferenceRepoWorkspaceDirtyError",
+  {
+    rootDir: Schema.String,
+    statusLength: Schema.Finite,
+  },
+) {
+  override get message(): string {
+    return `Reference repository sync requires a clean index and working tree at ${this.rootDir}.`;
+  }
+}
+
+export class ReferenceRepoSyncBusyError extends Schema.TaggedError<ReferenceRepoSyncBusyError>()(
+  "ReferenceRepoSyncBusyError",
+  {
+    repoIds: Schema.Array(Schema.String),
+  },
+) {
+  override get message(): string {
+    return `Reference repository sync is busy for: ${this.repoIds.join(", ")}.`;
+  }
+}
+
+export class ReferenceRepoSyncLockError extends Schema.TaggedError<ReferenceRepoSyncLockError>()(
+  "ReferenceRepoSyncLockError",
+  {
+    repoIds: Schema.Array(Schema.String),
+    operation: Schema.Literals(["resolve", "acquire", "release"]),
+    failure: Schema.Literals(["invalid-common-directory", "filesystem"]),
+  },
+) {
+  override get message(): string {
+    return `Reference repository sync lock ${this.operation} failed for: ${this.repoIds.join(", ")}.`;
+  }
+}
+
+export class ReferenceRepoGitSnapshotError extends Schema.TaggedError<ReferenceRepoGitSnapshotError>()(
+  "ReferenceRepoGitSnapshotError",
   {
     operation: Schema.Literals(["spawn", "communicate", "exit"]),
+    phase: Schema.Literals(["verify-clean", "fetch", "build", "apply", "rollback"]),
     repoId: Schema.String,
-    action: Schema.Literals(["add", "pull"]),
+    action: Schema.Literal("replace"),
     repository: Schema.String,
     ref: Schema.String,
     rootDir: Schema.String,
@@ -109,7 +152,35 @@ export class ReferenceRepoGitSubtreeError extends Schema.TaggedErrorClass<Refere
   },
 ) {
   override get message(): string {
-    return `Git subtree ${this.action} for reference repo "${this.repoId}" failed during "${this.operation}".`;
+    return `Git snapshot ${this.action} for reference repo "${this.repoId}" failed during ${this.phase} ${this.operation}.`;
+  }
+}
+
+export class ReferenceRepoApplyRolledBackError extends Schema.TaggedError<ReferenceRepoApplyRolledBackError>()(
+  "ReferenceRepoApplyRolledBackError",
+  {
+    repoIds: Schema.Array(Schema.String),
+    applyOperation: Schema.Literals(["spawn", "communicate", "exit"]),
+    applyExitCode: Schema.optional(Schema.Finite),
+  },
+) {
+  override get message(): string {
+    return `Reference repository snapshot application failed; the original clean state was restored for: ${this.repoIds.join(", ")}.`;
+  }
+}
+
+export class ReferenceRepoRollbackError extends Schema.TaggedError<ReferenceRepoRollbackError>()(
+  "ReferenceRepoRollbackError",
+  {
+    repoIds: Schema.Array(Schema.String),
+    applyOperation: Schema.optional(Schema.Literals(["spawn", "communicate", "exit"])),
+    failure: Schema.Literals(["command", "verification", "timeout"]),
+    rollbackOperation: Schema.optional(Schema.Literals(["spawn", "communicate", "exit"])),
+    rollbackExitCode: Schema.optional(Schema.Finite),
+  },
+) {
+  override get message(): string {
+    return `Reference repository snapshot application and rollback failed for: ${this.repoIds.join(", ")}. Manual recovery is required before continuing.`;
   }
 }
 
@@ -118,16 +189,25 @@ export const ReferenceRepoSyncError = Schema.Union([
   ReferenceRepoPathValidationError,
   ReferenceRepoVersionSourceError,
   ReferenceRepoVersionResolutionError,
-  ReferenceRepoGitSubtreeError,
+  ReferenceRepoWorkspaceDirtyError,
+  ReferenceRepoSyncBusyError,
+  ReferenceRepoSyncLockError,
+  ReferenceRepoGitSnapshotError,
+  ReferenceRepoApplyRolledBackError,
+  ReferenceRepoRollbackError,
 ]);
 export type ReferenceRepoSyncError = typeof ReferenceRepoSyncError.Type;
 export const isReferenceRepoSyncError = Schema.is(ReferenceRepoSyncError);
 
-const decodeJsonSource = Schema.decodeUnknownEffect(Schema.UnknownFromJsonString);
+const decodeJsonSource = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
 const decodeYamlSource = Schema.decodeEffect(fromYaml(Schema.Unknown));
 const WINDOWS_ABSOLUTE_PATH = /^[A-Za-z]:/;
 const WINDOWS_RESERVED_BASENAME = /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?$/i;
 const WINDOWS_FORBIDDEN_CHARACTER = /[<>:"|?*]/;
+const REFERENCE_REPO_SYNC_LOCK_NAME = "bibcode-reference-repos-sync.lock";
+const ROLLBACK_TIMEOUT = "30 seconds";
+
+const literalGitPathspec = (value: string): string => `:(literal)${value}`;
 
 const hasWindowsControlCharacter = (segment: string): boolean =>
   Array.from(segment).some((character) => {
@@ -235,18 +315,19 @@ function decodeVersionSource(
 
 function getSelectedRepos(
   repoId: string | undefined,
+  configuredRepos: ReadonlyArray<ReferenceRepo>,
 ): Effect.Effect<ReadonlyArray<ReferenceRepo>, ReferenceRepoSyncError> {
   if (!repoId) {
-    return Effect.succeed(referenceRepos);
+    return Effect.succeed(configuredRepos);
   }
 
-  const repo = referenceRepos.find((candidate) => candidate.id === repoId);
+  const repo = configuredRepos.find((candidate) => candidate.id === repoId);
   return repo
     ? Effect.succeed([repo])
     : Effect.fail(
         new ReferenceRepoSelectionError({
           repoId,
-          expectedRepoIds: referenceRepos.map((candidate) => candidate.id),
+          expectedRepoIds: configuredRepos.map((candidate) => candidate.id),
         }),
       );
 }
@@ -301,35 +382,39 @@ export const planReferenceRepoSync = Effect.fn("planReferenceRepoSync")(function
   latest: boolean,
 ) {
   yield* validateReferenceRepoPaths(repo);
-  const fs = yield* FileSystem.FileSystem;
-  const path = yield* Path.Path;
-  const action: ReferenceRepoSyncAction = (yield* fs.exists(path.join(rootDir, repo.prefix)))
-    ? "pull"
-    : "add";
   const ref = yield* resolveReferenceRepoRef(repo, rootDir, latest);
 
   return {
     repo,
-    action,
+    action: "replace",
     ref,
-    args: ["subtree", action, `--prefix=${repo.prefix}`, repo.repository, ref, "--squash"],
-    pruneArgs:
-      repo.prunePaths && repo.prunePaths.length > 0
-        ? [
-            "rm",
-            "-rf",
-            "--ignore-unmatch",
-            "--",
-            ...repo.prunePaths.map((prunePath) => `${repo.prefix}/${prunePath}`),
-          ]
-        : null,
+    fetchArgs: ["fetch", "--no-tags", repo.repository, ref],
   } satisfies ReferenceRepoSyncPlan;
 });
 
-const runGitCommand = Effect.fn("runGitCommand")(function* (
+interface GitCommandOptions {
+  readonly indexFile?: string | undefined;
+  readonly logStdout?: boolean | undefined;
+}
+
+export type ReferenceRepoGitCommandRunner = (
   rootDir: string,
   plan: ReferenceRepoSyncPlan,
+  phase: ReferenceRepoSyncPhase,
   args: ReadonlyArray<string>,
+  options?: GitCommandOptions,
+) => Effect.Effect<
+  { readonly stderr: string; readonly stdout: string },
+  ReferenceRepoGitSnapshotError,
+  ChildProcessSpawner.ChildProcessSpawner | Scope.Scope
+>;
+
+export const runGitCommand = Effect.fn("runGitCommand")(function* (
+  rootDir: string,
+  plan: ReferenceRepoSyncPlan,
+  phase: ReferenceRepoSyncPhase,
+  args: ReadonlyArray<string>,
+  options: GitCommandOptions = {},
 ) {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const errorContext = {
@@ -339,17 +424,30 @@ const runGitCommand = Effect.fn("runGitCommand")(function* (
     ref: plan.ref,
     rootDir,
     argumentCount: args.length,
+    phase,
   } as const;
-  const child = yield* spawner.spawn(ChildProcess.make("git", args, { cwd: rootDir })).pipe(
-    Effect.mapError(
-      (cause) =>
-        new ReferenceRepoGitSubtreeError({
-          ...errorContext,
-          operation: "spawn",
-          cause,
-        }),
-    ),
-  );
+  const child = yield* spawner
+    .spawn(
+      ChildProcess.make("git", args, {
+        cwd: rootDir,
+        ...(options.indexFile
+          ? {
+              env: { GIT_INDEX_FILE: options.indexFile },
+              extendEnv: true,
+            }
+          : {}),
+      }),
+    )
+    .pipe(
+      Effect.mapError(
+        (cause) =>
+          new ReferenceRepoGitSnapshotError({
+            ...errorContext,
+            operation: "spawn",
+            cause,
+          }),
+      ),
+    );
   const [stdout, stderr, exitCode] = yield* Effect.all(
     [
       collectStreamAsString(child.stdout),
@@ -360,7 +458,7 @@ const runGitCommand = Effect.fn("runGitCommand")(function* (
   ).pipe(
     Effect.mapError(
       (cause) =>
-        new ReferenceRepoGitSubtreeError({
+        new ReferenceRepoGitSnapshotError({
           ...errorContext,
           operation: "communicate",
           cause,
@@ -369,7 +467,7 @@ const runGitCommand = Effect.fn("runGitCommand")(function* (
   );
 
   if (exitCode !== 0) {
-    return yield* new ReferenceRepoGitSubtreeError({
+    return yield* new ReferenceRepoGitSnapshotError({
       ...errorContext,
       operation: "exit",
       exitCode,
@@ -378,33 +476,386 @@ const runGitCommand = Effect.fn("runGitCommand")(function* (
     });
   }
 
-  if (stdout.trim().length > 0) {
+  if ((options.logStdout ?? false) && stdout.trim().length > 0) {
     yield* Console.log(stdout.trim());
+  }
+
+  return { stderr, stdout };
+});
+
+const findGitSnapshotError = <A>(
+  exit: Exit.Exit<A, ReferenceRepoGitSnapshotError>,
+): ReferenceRepoGitSnapshotError | undefined => {
+  if (Exit.isSuccess(exit)) {
+    return undefined;
+  }
+  const error = Cause.findError(exit.cause);
+  return Result.isSuccess(error) ? error.success : undefined;
+};
+
+const assertCleanWorkspace = Effect.fn("assertCleanWorkspace")(function* (
+  rootDir: string,
+  plans: ReadonlyArray<ReferenceRepoSyncPlan>,
+  commandRunner: ReferenceRepoGitCommandRunner,
+) {
+  const firstPlan = plans[0];
+  if (firstPlan === undefined) {
+    return;
+  }
+
+  const result = yield* commandRunner(rootDir, firstPlan, "verify-clean", [
+    "status",
+    "--porcelain=v1",
+    "--untracked-files=all",
+  ]);
+  if (result.stdout.trim().length > 0) {
+    return yield* new ReferenceRepoWorkspaceDirtyError({
+      rootDir,
+      statusLength: result.stdout.length,
+    });
+  }
+
+  const managedResult = yield* commandRunner(rootDir, firstPlan, "verify-clean", [
+    "status",
+    "--porcelain=v1",
+    "--untracked-files=all",
+    "--ignored=matching",
+    "--",
+    ...plans.map((plan) => literalGitPathspec(plan.repo.prefix)),
+  ]);
+  if (managedResult.stdout.trim().length > 0) {
+    return yield* new ReferenceRepoWorkspaceDirtyError({
+      rootDir,
+      statusLength: managedResult.stdout.length,
+    });
   }
 });
 
-const runGit = Effect.fn("runGit")(function* (rootDir: string, plan: ReferenceRepoSyncPlan) {
-  yield* runGitCommand(rootDir, plan, plan.args);
-  if (plan.pruneArgs) {
-    yield* runGitCommand(rootDir, plan, plan.pruneArgs);
+const runSnapshotSyncWithLockHeld = Effect.fn("runSnapshotSyncWithLockHeld")(function* (
+  rootDir: string,
+  plans: ReadonlyArray<ReferenceRepoSyncPlan>,
+  commandRunner: ReferenceRepoGitCommandRunner,
+  stateIsValid: Ref.Ref<boolean>,
+) {
+  const firstPlan = plans[0];
+  if (firstPlan === undefined) {
+    return;
   }
+
+  yield* assertCleanWorkspace(rootDir, plans, commandRunner);
+  const originalTree = (yield* commandRunner(rootDir, firstPlan, "verify-clean", [
+    "write-tree",
+  ])).stdout.trim();
+
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const tempDir = yield* fs.makeTempDirectoryScoped({ prefix: "bibcode-reference-sync-" });
+  const replacementIndex = path.join(tempDir, "replacement.index");
+  const snapshots: Array<{ readonly plan: ReferenceRepoSyncPlan; readonly tree: string }> = [];
+
+  for (const [index, plan] of plans.entries()) {
+    yield* commandRunner(rootDir, plan, "fetch", plan.fetchArgs, { logStdout: true });
+    const sourceIndex = path.join(tempDir, `source-${index}.index`);
+    yield* commandRunner(rootDir, plan, "build", ["read-tree", "FETCH_HEAD^{tree}"], {
+      indexFile: sourceIndex,
+    });
+    if (plan.repo.prunePaths && plan.repo.prunePaths.length > 0) {
+      yield* commandRunner(
+        rootDir,
+        plan,
+        "build",
+        [
+          "rm",
+          "-r",
+          "-f",
+          "--cached",
+          "--ignore-unmatch",
+          "--",
+          ...plan.repo.prunePaths.map(literalGitPathspec),
+        ],
+        { indexFile: sourceIndex },
+      );
+    }
+    const sourceTree = (yield* commandRunner(rootDir, plan, "build", ["write-tree"], {
+      indexFile: sourceIndex,
+    })).stdout.trim();
+    snapshots.push({ plan, tree: sourceTree });
+  }
+
+  yield* commandRunner(rootDir, firstPlan, "build", ["read-tree", "HEAD"], {
+    indexFile: replacementIndex,
+  });
+  for (const snapshot of snapshots) {
+    yield* commandRunner(
+      rootDir,
+      snapshot.plan,
+      "build",
+      [
+        "rm",
+        "-r",
+        "-f",
+        "--cached",
+        "--ignore-unmatch",
+        "--",
+        literalGitPathspec(snapshot.plan.repo.prefix),
+      ],
+      { indexFile: replacementIndex },
+    );
+    yield* commandRunner(
+      rootDir,
+      snapshot.plan,
+      "build",
+      ["read-tree", `--prefix=${snapshot.plan.repo.prefix}/`, snapshot.tree],
+      { indexFile: replacementIndex },
+    );
+  }
+  const replacementTree = (yield* commandRunner(rootDir, firstPlan, "build", ["write-tree"], {
+    indexFile: replacementIndex,
+  })).stdout.trim();
+
+  return yield* Effect.uninterruptibleMask((restore) =>
+    Effect.gen(function* () {
+      yield* restore(assertCleanWorkspace(rootDir, plans, commandRunner));
+      yield* Ref.set(stateIsValid, false);
+      const applyExit = yield* restore(
+        commandRunner(rootDir, firstPlan, "apply", [
+          "read-tree",
+          "-m",
+          "-u",
+          originalTree,
+          replacementTree,
+        ]).pipe(Effect.scoped),
+      ).pipe(Effect.exit);
+      if (Exit.isSuccess(applyExit)) {
+        yield* Ref.set(stateIsValid, true);
+        return;
+      }
+
+      const repoIds = plans.map((plan) => plan.repo.id);
+      const applyErrorResult = Cause.findError(applyExit.cause);
+      const applyError = Result.isSuccess(applyErrorResult) ? applyErrorResult.success : undefined;
+      const applyContext = applyError === undefined ? {} : { applyOperation: applyError.operation };
+      const rollbackRestoreAttempt = yield* commandRunner(rootDir, firstPlan, "rollback", [
+        "restore",
+        `--source=${originalTree}`,
+        "--staged",
+        "--worktree",
+        "--",
+        ...plans.map((plan) => literalGitPathspec(plan.repo.prefix)),
+      ]).pipe(Effect.scoped, Effect.exit, Effect.timeoutOption(ROLLBACK_TIMEOUT));
+      if (Option.isNone(rollbackRestoreAttempt)) {
+        return yield* new ReferenceRepoRollbackError({
+          repoIds,
+          ...applyContext,
+          failure: "timeout",
+        });
+      }
+      const rollbackCleanupAttempt = yield* commandRunner(rootDir, firstPlan, "rollback", [
+        "clean",
+        "-d",
+        "-f",
+        "-x",
+        "--",
+        ...plans.map((plan) => literalGitPathspec(plan.repo.prefix)),
+      ]).pipe(Effect.scoped, Effect.exit, Effect.timeoutOption(ROLLBACK_TIMEOUT));
+      if (Option.isNone(rollbackCleanupAttempt)) {
+        return yield* new ReferenceRepoRollbackError({
+          repoIds,
+          ...applyContext,
+          failure: "timeout",
+        });
+      }
+      const rollbackRestore = rollbackRestoreAttempt.value;
+      const rollbackCleanup = rollbackCleanupAttempt.value;
+      if (Exit.isFailure(rollbackRestore) || Exit.isFailure(rollbackCleanup)) {
+        const rollbackCommandError = Exit.isFailure(rollbackRestore)
+          ? findGitSnapshotError(rollbackRestore)
+          : findGitSnapshotError(rollbackCleanup);
+        return yield* new ReferenceRepoRollbackError({
+          repoIds,
+          ...applyContext,
+          failure: "command",
+          ...(rollbackCommandError === undefined
+            ? {}
+            : { rollbackOperation: rollbackCommandError.operation }),
+          ...(rollbackCommandError?.exitCode === undefined
+            ? {}
+            : { rollbackExitCode: rollbackCommandError.exitCode }),
+        });
+      }
+
+      const [rollbackStatusAttempt, rollbackManagedStatusAttempt, rollbackTreeAttempt] =
+        yield* Effect.all([
+          commandRunner(rootDir, firstPlan, "rollback", [
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+          ]).pipe(Effect.scoped, Effect.exit, Effect.timeoutOption(ROLLBACK_TIMEOUT)),
+          commandRunner(rootDir, firstPlan, "rollback", [
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignored=matching",
+            "--",
+            ...plans.map((plan) => literalGitPathspec(plan.repo.prefix)),
+          ]).pipe(Effect.scoped, Effect.exit, Effect.timeoutOption(ROLLBACK_TIMEOUT)),
+          commandRunner(rootDir, firstPlan, "rollback", ["write-tree"]).pipe(
+            Effect.scoped,
+            Effect.exit,
+            Effect.timeoutOption(ROLLBACK_TIMEOUT),
+          ),
+        ]);
+      if (
+        Option.isNone(rollbackStatusAttempt) ||
+        Option.isNone(rollbackManagedStatusAttempt) ||
+        Option.isNone(rollbackTreeAttempt)
+      ) {
+        return yield* new ReferenceRepoRollbackError({
+          repoIds,
+          ...applyContext,
+          failure: "timeout",
+        });
+      }
+      const rollbackStatus = rollbackStatusAttempt.value;
+      const rollbackManagedStatus = rollbackManagedStatusAttempt.value;
+      const rollbackTree = rollbackTreeAttempt.value;
+      if (
+        Exit.isFailure(rollbackStatus) ||
+        Exit.isFailure(rollbackManagedStatus) ||
+        Exit.isFailure(rollbackTree) ||
+        rollbackStatus.value.stdout.trim().length > 0 ||
+        rollbackManagedStatus.value.stdout.trim().length > 0 ||
+        rollbackTree.value.stdout.trim() !== originalTree
+      ) {
+        const commandError = Exit.isFailure(rollbackStatus)
+          ? findGitSnapshotError(rollbackStatus)
+          : Exit.isFailure(rollbackManagedStatus)
+            ? findGitSnapshotError(rollbackManagedStatus)
+            : Exit.isFailure(rollbackTree)
+              ? findGitSnapshotError(rollbackTree)
+              : undefined;
+        return yield* new ReferenceRepoRollbackError({
+          repoIds,
+          ...applyContext,
+          failure: "verification",
+          ...(commandError === undefined ? {} : { rollbackOperation: commandError.operation }),
+          ...(commandError?.exitCode === undefined
+            ? {}
+            : { rollbackExitCode: commandError.exitCode }),
+        });
+      }
+
+      yield* Ref.set(stateIsValid, true);
+      if (
+        applyError !== undefined &&
+        !Cause.hasDies(applyExit.cause) &&
+        !Cause.hasInterrupts(applyExit.cause)
+      ) {
+        return yield* new ReferenceRepoApplyRolledBackError({
+          repoIds,
+          applyOperation: applyError.operation,
+          ...(applyError.exitCode === undefined ? {} : { applyExitCode: applyError.exitCode }),
+        });
+      }
+      return yield* Effect.failCause(applyExit.cause);
+    }),
+  );
+});
+
+const isAlreadyExistsError = (error: PlatformError.PlatformError): boolean =>
+  error.reason._tag === "AlreadyExists";
+
+const runSnapshotSync = Effect.fn("runSnapshotSync")(function* (
+  rootDir: string,
+  plans: ReadonlyArray<ReferenceRepoSyncPlan>,
+  commandRunner: ReferenceRepoGitCommandRunner,
+) {
+  const firstPlan = plans[0];
+  if (firstPlan === undefined) {
+    return;
+  }
+
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const repoIds = plans.map((plan) => plan.repo.id);
+  const stateIsValid = yield* Ref.make(true);
+  const commonDirResult = yield* commandRunner(rootDir, firstPlan, "verify-clean", [
+    "rev-parse",
+    "--path-format=absolute",
+    "--git-common-dir",
+  ]);
+  const commonDirWithoutLf = commonDirResult.stdout.endsWith("\n")
+    ? commonDirResult.stdout.slice(0, -1)
+    : commonDirResult.stdout;
+  const commonDirOutput = commonDirWithoutLf.endsWith("\r")
+    ? commonDirWithoutLf.slice(0, -1)
+    : commonDirWithoutLf;
+  if (
+    commonDirOutput.length === 0 ||
+    commonDirOutput.includes("\0") ||
+    commonDirOutput.includes("\n") ||
+    commonDirOutput.includes("\r")
+  ) {
+    return yield* new ReferenceRepoSyncLockError({
+      repoIds,
+      operation: "resolve",
+      failure: "invalid-common-directory",
+    });
+  }
+  const lockPath = path.join(path.resolve(rootDir, commonDirOutput), REFERENCE_REPO_SYNC_LOCK_NAME);
+
+  return yield* Effect.acquireUseRelease(
+    fs.writeFileString(lockPath, "", { flag: "wx", mode: 0o600 }).pipe(
+      Effect.mapError((error) =>
+        isAlreadyExistsError(error)
+          ? new ReferenceRepoSyncBusyError({ repoIds })
+          : new ReferenceRepoSyncLockError({
+              repoIds,
+              operation: "acquire",
+              failure: "filesystem",
+            }),
+      ),
+      Effect.as(lockPath),
+    ),
+    () =>
+      runSnapshotSyncWithLockHeld(rootDir, plans, commandRunner, stateIsValid).pipe(Effect.scoped),
+    (acquiredLockPath) =>
+      Ref.get(stateIsValid).pipe(
+        Effect.flatMap((isValid) =>
+          isValid
+            ? fs.remove(acquiredLockPath).pipe(
+                Effect.mapError(
+                  () =>
+                    new ReferenceRepoSyncLockError({
+                      repoIds,
+                      operation: "release",
+                      failure: "filesystem",
+                    }),
+                ),
+              )
+            : Effect.void,
+        ),
+      ),
+  );
 });
 
 export const syncReferenceRepos = Effect.fn("syncReferenceRepos")(function* (
   options: ReferenceRepoSyncOptions = {},
+  configuredRepos: ReadonlyArray<ReferenceRepo> = referenceRepos,
+  commandRunner: ReferenceRepoGitCommandRunner = runGitCommand,
 ) {
   const path = yield* Path.Path;
   const rootDir = path.resolve(options.rootDir ?? process.cwd());
-  const repos = yield* getSelectedRepos(options.repoId);
+  const repos = yield* getSelectedRepos(options.repoId, configuredRepos);
   const plans: Array<ReferenceRepoSyncPlan> = [];
 
   for (const repo of repos) {
     const plan = yield* planReferenceRepoSync(repo, rootDir, options.latest ?? false);
     plans.push(plan);
-    yield* Console.log(`Syncing ${repo.id} from ${plan.ref} with git subtree ${plan.action}.`);
-    if (!(options.dryRun ?? false)) {
-      yield* runGit(rootDir, plan).pipe(Effect.scoped);
-    }
+    yield* Console.log(`Syncing ${repo.id} from ${plan.ref} with exact Git snapshot replacement.`);
+  }
+  if (!(options.dryRun ?? false)) {
+    yield* runSnapshotSync(rootDir, plans, commandRunner).pipe(Effect.scoped);
   }
 
   return plans;

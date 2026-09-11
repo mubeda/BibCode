@@ -1,4 +1,9 @@
-import { type EnvironmentId, type RemotePairingCodePayload, WS_METHODS } from "@bibcode/contracts";
+import {
+  EnvironmentAuthorizationError,
+  type EnvironmentId,
+  type RemotePairingCodePayload,
+  WS_METHODS,
+} from "@bibcode/contracts";
 import { classifyPairingEndpoint } from "@bibcode/shared/advertisedEndpoint";
 import {
   PairingCodeParseError,
@@ -33,6 +38,7 @@ import {
   type PreparedConnection,
 } from "./model.ts";
 import * as EnvironmentRegistry from "./registry.ts";
+import { remoteEnvironmentId } from "./remoteIdentity.ts";
 import { storageIdentityTargetKey } from "./storageIdentity.ts";
 
 export type PairingAddFailureReason =
@@ -43,7 +49,7 @@ export type PairingAddFailureReason =
   | "duplicate-storage-identity"
   | "local-persistence-failed";
 
-export class PairingAddError extends Schema.TaggedErrorClass<PairingAddError>()("PairingAddError", {
+export class PairingAddError extends Schema.TaggedError<PairingAddError>()("PairingAddError", {
   reason: Schema.Literals([
     "unreachable",
     "host-identity-mismatch",
@@ -59,7 +65,7 @@ export class PairingAddError extends Schema.TaggedErrorClass<PairingAddError>()(
   }
 }
 
-export class PairingLoopbackAcknowledgementRequiredError extends Schema.TaggedErrorClass<PairingLoopbackAcknowledgementRequiredError>()(
+export class PairingLoopbackAcknowledgementRequiredError extends Schema.TaggedError<PairingLoopbackAcknowledgementRequiredError>()(
   "PairingLoopbackAcknowledgementRequiredError",
   { endpoint: Schema.String },
 ) {
@@ -85,6 +91,7 @@ const isPairingCodeParseError = Schema.is(PairingCodeParseError);
 const isPairingCodeUnsupportedVersionError = Schema.is(PairingCodeUnsupportedVersionError);
 const isPairingAddError = Schema.is(PairingAddError);
 const isRpcClientError = Schema.is(RpcClientError.RpcClientError);
+const isEnvironmentAuthorizationError = Schema.is(EnvironmentAuthorizationError);
 const LEGACY_CONFIRMATION_UNSUPPORTED_DEFECT = `Unknown request tag: ${WS_METHODS.authConfirmPairing}`;
 
 type PairingConfirmationFailureDisposition = "rollback" | "verify-authority";
@@ -92,11 +99,23 @@ type PairingConfirmationFailureDisposition = "rollback" | "verify-authority";
 const classifyPairingConfirmationFailure = (
   cause: Cause.Cause<unknown>,
   pairingConfirmationRequired: boolean,
+  loopbackEndpoint: boolean,
 ): PairingConfirmationFailureDisposition => {
   if (cause.reasons.length !== 1) return "verify-authority";
   const reason = cause.reasons[0]!;
   if (Cause.isInterruptReason(reason)) return "verify-authority";
   if (Cause.isFailReason(reason)) {
+    // On-host grants are already active and carry no pending-confirmation
+    // capability. A scope denial does not invalidate that delivered credential;
+    // verify it through the supervisor without broadening server permissions.
+    if (
+      loopbackEndpoint &&
+      !pairingConfirmationRequired &&
+      isEnvironmentAuthorizationError(reason.error) &&
+      reason.error.requiredScope === "access:write"
+    ) {
+      return "verify-authority";
+    }
     return isRpcClientError(reason.error) ? "verify-authority" : "rollback";
   }
   if (Cause.isDieReason(reason) && reason.defect === LEGACY_CONFIRMATION_UNSUPPORTED_DEFECT) {
@@ -150,11 +169,8 @@ const pairingBearerProof = (
     }),
     Stream.runHead,
     Effect.timeoutOption(Duration.millis(PAIRING_BEARER_PROOF_TIMEOUT_MS)),
-    Effect.map(
-      (outcome): PairingBearerProof =>
-        Option.isSome(outcome) && Option.isSome(outcome.value)
-          ? outcome.value.value
-          : "inconclusive",
+    Effect.map((outcome): PairingBearerProof =>
+      Option.isSome(outcome) && Option.isSome(outcome.value) ? outcome.value.value : "inconclusive",
     ),
     Effect.orElseSucceed((): PairingBearerProof => "inconclusive"),
   );
@@ -215,6 +231,10 @@ export const verifyAndAddPairingCode = Effect.fn(
   const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
   const identities = yield* Persistence.AcceptedStorageIdentityStore;
   const entries = yield* SubscriptionRef.get(registry.entries);
+  // Keyed by the host's storage instance id, never by the environment id it
+  // declares: every server calls itself "local", so that id collides with the
+  // client's own Local environment and with every other saved remote.
+  const environmentId = remoteEnvironmentId(payload.storageInstanceId);
   for (const entry of entries.values()) {
     const accepted = yield* identities.get(storageIdentityTargetKey(entry.target));
     if (Option.isSome(accepted) && accepted.value === payload.storageInstanceId) {
@@ -240,10 +260,11 @@ export const verifyAndAddPairingCode = Effect.fn(
     }),
   );
 
-  if (entries.has(descriptor.environmentId)) {
+  const saved = entries.get(environmentId);
+  if (saved !== undefined) {
     return yield* new PairingAddError({
       reason: "duplicate-storage-identity",
-      detail: `${descriptor.label} is already saved.`,
+      detail: `${saved.target.label} is already saved.`,
     });
   }
 
@@ -259,14 +280,15 @@ export const verifyAndAddPairingCode = Effect.fn(
   }
 
   const sessions = yield* RpcSession.RpcSessionFactory;
-  const connectionId = `bearer:${descriptor.environmentId}`;
+  const connectionId = `bearer:${environmentId}`;
   const target = new BearerConnectionTarget({
-    environmentId: descriptor.environmentId,
+    environmentId,
     label,
     connectionId,
+    serverEnvironmentId: descriptor.environmentId,
   });
   const prepared: PreparedConnection = {
-    environmentId: descriptor.environmentId,
+    environmentId,
     label,
     descriptor,
     httpBaseUrl,
@@ -311,7 +333,7 @@ export const verifyAndAddPairingCode = Effect.fn(
       }
       const verified = {
         credential: authenticated.credential,
-        environmentId: descriptor.environmentId,
+        environmentId,
         storageInstanceId: authenticated.storageInstanceId,
       };
       const registration = new BearerConnectionRegistration({
@@ -396,6 +418,7 @@ export const verifyAndAddPairingCode = Effect.fn(
               const disposition = classifyPairingConfirmationFailure(
                 confirmation.cause,
                 authenticated.pairingConfirmationRequired === true,
+                classifyPairingEndpoint(payload.endpoint) === "loopback",
               );
               if (disposition === "rollback") {
                 return yield* pairingConfirmationFailure(confirmation.cause);
@@ -432,7 +455,7 @@ export const verifyAndAddPairingCode = Effect.fn(
               detail: `The server rejected the paired credential before confirmation completed; the one-time code was consumed, so generate a new pairing code and pair again.${cleanupDetail}`,
             });
           }
-          // "authenticated" proves the confirmation committed;
+          // "authenticated" proves the saved credential is active;
           // "inconclusive" keeps the saved entry and leaves recovery to the
           // supervisor, exactly like a lost confirmation reply.
         }

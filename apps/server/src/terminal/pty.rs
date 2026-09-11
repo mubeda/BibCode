@@ -364,6 +364,15 @@ impl PortablePtyBackend {
         input: &PtySpawnInput,
         prepared: PreparedPtyCommand,
     ) -> Result<Arc<dyn PtyProcess>, String> {
+        self.spawn_command_with_waiter(input, prepared, spawn_pty_thread)
+    }
+
+    fn spawn_command_with_waiter(
+        &self,
+        input: &PtySpawnInput,
+        prepared: PreparedPtyCommand,
+        spawn_waiter: impl FnOnce(String, PtyThreadTask) -> std::io::Result<()>,
+    ) -> Result<Arc<dyn PtyProcess>, String> {
         let command = prepared.command;
         #[cfg(windows)]
         let job = prepared.job;
@@ -469,7 +478,7 @@ impl PortablePtyBackend {
         #[cfg(unix)]
         let waiter_process_group_ownership = Arc::clone(&process_group_ownership);
         let wait_child = child.handoff_child_to_waiter();
-        spawn_pty_thread(
+        spawn_waiter(
             format!("bibcode-pty-wait-{pid}"),
             Box::new(move || {
                 let mut child = wait_child;
@@ -517,7 +526,9 @@ impl PortablePtyBackend {
                     drop(child);
                     drop(waiter_job);
                 }
-                let _ = exit_sender.send(Some(event));
+                // Completion must survive both initial subscription latency and
+                // the receiver gap when manager shutdown replaces its watcher.
+                exit_sender.send_replace(Some(event));
             }),
         )
         .map_err(|error| error.to_string())?;
@@ -2214,6 +2225,52 @@ mod tests {
             })
             .unwrap();
         assert!(process.pid() > 0);
+    }
+
+    #[tokio::test]
+    async fn portable_backend_retains_exit_for_a_late_subscriber() {
+        let input = PtySpawnInput {
+            executable: if cfg!(windows) { "cmd.exe" } else { "/bin/sh" }.to_owned(),
+            args: if cfg!(windows) {
+                vec!["/D".to_owned(), "/C".to_owned(), "exit 7".to_owned()]
+            } else {
+                vec!["-c".to_owned(), "exit 7".to_owned()]
+            },
+            cwd: std::env::temp_dir(),
+            cols: 80,
+            rows: 24,
+            env: BTreeMap::new(),
+        };
+        let prepared = build_pty_command(&input).unwrap();
+        let (completed, waiter_completed) = tokio::sync::oneshot::channel();
+        let process = PortablePtyBackend
+            .spawn_command_with_waiter(&input, prepared, |name, task| {
+                spawn_pty_thread_with(name, task, |builder, task| {
+                    builder.spawn(move || {
+                        task();
+                        let _ = completed.send(());
+                    })
+                })
+            })
+            .unwrap();
+
+        // Wait for native reaping and exit publication, without ever creating
+        // an exit receiver. A PID disappearance alone would race publication.
+        let event_timeout = Duration::from_secs(if cfg!(windows) { 10 } else { 3 });
+        tokio::time::timeout(event_timeout, waiter_completed)
+            .await
+            .expect("native PTY waiter completes")
+            .expect("native PTY waiter reports completion");
+
+        let exit = process.subscribe_exit();
+        assert_eq!(
+            *exit.borrow(),
+            Some(PtyExit {
+                exit_code: Some(7),
+                signal: None,
+            }),
+            "late subscribers must observe the already reaped native child"
+        );
     }
 
     #[tokio::test]

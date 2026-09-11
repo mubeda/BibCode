@@ -66,16 +66,12 @@ describe("@wdio/tauri-service compatibility", () => {
     expect(wdioConfig).toContain("connectionRetryCount: 0");
     expect(wdioConfig).toContain("commandTimeout: 60_000");
     expect(wdioConfig).toContain("beforeTest: async () =>");
-    expect(wdioConfig).toContain('document.readyState === "complete"');
-    expect(wdioConfig).toContain(
-      'window.addEventListener("load", () => done("ready"), { once: true })',
-    );
+    expect(wdioConfig).toContain("await refreshDesktopUiDocument()");
     expect(wdioConfig).toContain("done({ error })");
-    expect(wdioConfig).toContain('done("ready")');
     expect(wdioConfig).not.toContain("done(error)");
     expect(wdioConfig).not.toContain("done()");
     expect(wdioConfig).not.toContain("browser.waitUntil");
-    expect(wdioConfig).toContain("data-bibcode-desktop-ui-automation");
+    expect(wdioConfig).toContain("await installDesktopUiMotionGuard()");
     expect(wdioConfig).not.toContain("sheet.insertRule");
     expect(wdioConfig).toContain("window.localStorage.clear()");
     expect(wdioConfig).toContain("window.sessionStorage.clear()");
@@ -87,7 +83,7 @@ describe("@wdio/tauri-service compatibility", () => {
       wdioConfig.indexOf('indexedDB.open("bibcode:connection-runtime", 2)'),
     );
     expect(wdioConfig.indexOf("transaction.objectStore(storeName).clear()")).toBeLessThan(
-      wdioConfig.indexOf("await browser.refresh()"),
+      wdioConfig.indexOf("await refreshDesktopUiDocument()"),
     );
   });
 });

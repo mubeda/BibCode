@@ -1197,9 +1197,51 @@ sizes. Cover relevant:
   process growth.
 
 The default packaged suite runs all of its spec files in one embedded-driver
-session, resets client connection state before every test, and disables
-WebDriver command retries. Treat reporter hook errors, retries, and timeouts as
+session and resets client connection state before every test. After refresh,
+it waits for a new main-webview page-load completion from the test-only Tauri
+logging plugin in `userdata/logs/server.log`. Navigation generations distinguish
+old completions and loading pages without sending WebDriver JavaScript into a
+document being replaced. Once that native signal establishes the replacement
+document, the harness waits for its DOM load event as well; WebKitGTK can still
+report an interactive DOM at native completion. These markers carry no page URLs and are absent from
+production builds. The disposable fixture enables only this lifecycle target
+even when its parent process uses a warning-only filter. The maintained `document-navigation.e2e.ts` scenario reloads
+three times and checks a complete, distinct document after each native finish.
+The suite restores its motion guard after scenario reloads. Runtime motion
+assertions explicitly select native transitions and restore the guard afterward.
+The suite disables WebDriver command retries. Treat reporter hook errors, retries, and timeouts as
 test failures even when the individual scenarios are reported as passing.
+On macOS, copy the signed DMG payload to an isolated installation directory,
+compare its executable bytes, and verify its signature before running the suite.
+The Tauri service captures backend stdout/stderr in the artifact directory.
+macOS CI also retains `native-crashes.log`, a bounded summary of application
+crash types, termination reasons, and faulting symbols; it excludes raw memory
+and the rest of the diagnostic report. Inspect these logs when the app or
+embedded driver exits unexpectedly. A missing provider-terminal activity dock
+also records structural pane, surface, and activity-host geometry to distinguish
+layout visibility from provider-observation failures.
+Window resizing polls the actual viewport and native window until the requested
+size is reached, including when GTK startup dimensions settle independently.
+It does not depend on animation frames, which can stop in occluded macOS
+webviews. The host display may cap
+large requested sizes; keep the scenario layout assertions and screenshots.
+Terminal setup waits for the workspace menu trigger before opening it. Pierre
+fixture replacement sends select-all to the shadow editor itself and requires
+the editor to handle both selection and input before verifying edits and undo.
+
+The maintained Pierre acceptance scenario
+(`apps/desktop/e2e/specs/pierre-diffs.e2e.ts`) uses that same isolated launcher
+and disposable application state. It creates its own committed editor fixture
+and three independent working-tree hunks, then verifies the packaged app's
+unified and split renderers, line hover utility, line selection, conversation
+diff card, partial stage and unstage controls, editable-file input, and undo
+history after switching to another right-panel tab and back. It is part of the
+default suite. To rerun only this scenario against the exact package selected
+by the native platform page, set
+`BIBCODE_E2E_SPEC=./specs/pierre-diffs.e2e.ts` for the
+`vp run test:ui:desktop` invocation. Retain its named `pierre-*.png` screenshots
+with the other bounded UI artifacts; do not put fixture state or screenshots in
+the repository.
 
 At final packaged shutdown, inspect the raw worker and server logs. Provider and
 terminal owners, operational logs, orchestration, and the SQLite worker must all

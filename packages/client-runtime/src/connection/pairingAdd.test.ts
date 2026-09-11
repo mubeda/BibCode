@@ -39,6 +39,7 @@ import {
 import {
   BearerConnectionTarget,
   ConnectionBlockedError,
+  PrimaryConnectionTarget,
   ConnectionTransientError,
   type ConnectionAttemptError,
   type PreparedConnection,
@@ -54,6 +55,8 @@ import * as EnvironmentRegistry from "./registry.ts";
 import { storageIdentityTargetKey } from "./storageIdentity.ts";
 
 const ENVIRONMENT_ID = EnvironmentId.make("environment-paired");
+/** What the client keys the saved entry by: derived from the host's store. */
+const SAVED_ENVIRONMENT_ID = EnvironmentId.make(`remote:3f2f6a52-6f5f-4f4e-9d38-0a1e2ac21d11`);
 const STORAGE_IDENTITY = "3f2f6a52-6f5f-4f4e-9d38-0a1e2ac21d11";
 const HOST_KEY = "HcMLXPPBHFNvcbHrCVMH-DMh49rd5AGCzSCqAVJ49hM";
 
@@ -400,11 +403,15 @@ describe("verifyAndAddPairingCode", () => {
       Effect.gen(function* () {
         const harness = yield* makeHarness();
         expect(yield* harness.run(validPayload({ name: "Local" }), false, alias)).toBe(
-          ENVIRONMENT_ID,
+          SAVED_ENVIRONMENT_ID,
         );
         expect(harness.registrations[0]).toMatchObject({
-          target: { label, environmentId: ENVIRONMENT_ID },
-          profile: { label, environmentId: ENVIRONMENT_ID },
+          target: {
+            label,
+            environmentId: SAVED_ENVIRONMENT_ID,
+            serverEnvironmentId: ENVIRONMENT_ID,
+          },
+          profile: { label, environmentId: SAVED_ENVIRONMENT_ID },
         });
         expect(harness.preparedConnections[0]).toMatchObject({
           label,
@@ -431,7 +438,7 @@ describe("verifyAndAddPairingCode", () => {
     Effect.gen(function* () {
       const harness = yield* makeHarness();
       expect(yield* harness.run(validPayload({ endpoint: "http://127.0.0.1:3773" }), true)).toBe(
-        ENVIRONMENT_ID,
+        SAVED_ENVIRONMENT_ID,
       );
       expect(harness.registrations[0]).toMatchObject({
         profile: { hostKey: HOST_KEY, label: "AI-SERVER" },
@@ -469,7 +476,7 @@ describe("verifyAndAddPairingCode", () => {
       const legacy = yield* makeHarness({
         descriptor: descriptor({ remoteProtocolVersion: 0, minCompatibleRemoteProtocol: 0 }),
       });
-      expect(yield* legacy.run(validPayload())).toBe(ENVIRONMENT_ID);
+      expect(yield* legacy.run(validPayload())).toBe(SAVED_ENVIRONMENT_ID);
     }),
   );
 
@@ -515,21 +522,68 @@ describe("verifyAndAddPairingCode", () => {
       expect(yield* failureReason(harness.run(validPayload()))).toBe("unreachable");
       expect(harness.registrations).toEqual([]);
       expect(harness.acceptedIdentities).toEqual([]);
-      expect(yield* harness.run(validPayload())).toBe(ENVIRONMENT_ID);
+      expect(yield* harness.run(validPayload())).toBe(SAVED_ENVIRONMENT_ID);
     }),
   );
 
-  it.effect("rejects an environment already present in the registry", () =>
+  it.effect("adds a server whose declared id matches the client's own local environment id", () =>
     Effect.gen(function* () {
-      const target = new BearerConnectionTarget({
-        environmentId: ENVIRONMENT_ID,
-        label: "Existing",
-        connectionId: "bearer:existing",
-      });
+      // Every BiBCode server declares the same environment id, so the client's
+      // own local environment and a remote host both call themselves "local".
+      // The saved entry is keyed by the host's storage instance id instead.
+      const localEnvironmentId = EnvironmentId.make("local");
       const harness = yield* makeHarness({
-        entries: new Map([[ENVIRONMENT_ID, { target, profile: Option.none() }]]),
+        entries: new Map([
+          [
+            localEnvironmentId,
+            {
+              target: new PrimaryConnectionTarget({
+                environmentId: localEnvironmentId,
+                label: "Local",
+                httpBaseUrl: "http://127.0.0.1:13773/",
+                wsBaseUrl: "ws://127.0.0.1:13773/",
+              }),
+              profile: Option.none(),
+            },
+          ],
+        ]),
+        accepted: new Map([["platform:primary", "0f7b9d2c-2f1a-4d0e-9a44-1c5a7e6b8d90"]]),
+        descriptor: descriptor({ environmentId: localEnvironmentId }),
+        authenticatedEnvironmentId: localEnvironmentId,
       });
-      expect(yield* failureReason(harness.run(validPayload()))).toBe("duplicate-storage-identity");
+      expect(yield* harness.run(validPayload())).toBe(SAVED_ENVIRONMENT_ID);
+      const registration = harness.registrations.at(0);
+      expect(registration?.target.environmentId).toBe(SAVED_ENVIRONMENT_ID);
+      expect(
+        registration?.target._tag === "BearerConnectionTarget"
+          ? registration.target.serverEnvironmentId
+          : null,
+      ).toBe(localEnvironmentId);
+    }),
+  );
+
+  it.effect("refuses a server that is already saved and names the saved entry", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        entries: new Map([
+          [
+            SAVED_ENVIRONMENT_ID,
+            {
+              target: new BearerConnectionTarget({
+                environmentId: SAVED_ENVIRONMENT_ID,
+                label: "ai-server",
+                connectionId: `bearer:${SAVED_ENVIRONMENT_ID}`,
+                serverEnvironmentId: EnvironmentId.make("local"),
+              }),
+              profile: Option.none(),
+            },
+          ],
+        ]),
+      });
+      const error = yield* harness.run(validPayload()).pipe(Effect.flip);
+      if (!isPairingAddError(error)) throw new Error("expected PairingAddError");
+      expect(error.reason).toBe("duplicate-storage-identity");
+      expect(error.detail).toBe("ai-server is already saved.");
     }),
   );
 
@@ -540,6 +594,7 @@ describe("verifyAndAddPairingCode", () => {
         environmentId: existingEnvironmentId,
         label: "Existing",
         connectionId: "existing",
+        serverEnvironmentId: null,
       });
       const harness = yield* makeHarness({
         entries: new Map([[existingEnvironmentId, { target, profile: Option.none() }]]),
@@ -621,7 +676,7 @@ describe("verifyAndAddPairingCode", () => {
   it.effect("persists only the identity and credential authenticated in channel", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness();
-      expect(yield* harness.run(validPayload())).toBe(ENVIRONMENT_ID);
+      expect(yield* harness.run(validPayload())).toBe(SAVED_ENVIRONMENT_ID);
 
       expect(harness.preparedConnections[0]).toMatchObject({
         socketUrl: "ws://192.168.1.20:3773/ws-e2ee",
@@ -631,8 +686,8 @@ describe("verifyAndAddPairingCode", () => {
       expect(harness.registrations[0]).toMatchObject({
         target: {
           _tag: "BearerConnectionTarget",
-          environmentId: ENVIRONMENT_ID,
-          connectionId: `bearer:${ENVIRONMENT_ID}`,
+          environmentId: SAVED_ENVIRONMENT_ID,
+          connectionId: `bearer:${SAVED_ENVIRONMENT_ID}`,
           label: "AI-SERVER",
         },
         profile: {
@@ -647,7 +702,7 @@ describe("verifyAndAddPairingCode", () => {
       ).toBeInstanceOf(BearerConnectionProfile);
       expect(harness.acceptedIdentities).toEqual([
         {
-          targetKey: `bearer:bearer:${ENVIRONMENT_ID}`,
+          targetKey: `bearer:bearer:${SAVED_ENVIRONMENT_ID}`,
           storageInstanceId: STORAGE_IDENTITY,
         },
       ]);
@@ -670,7 +725,7 @@ describe("verifyAndAddPairingCode", () => {
     Effect.gen(function* () {
       const harness = yield* makeHarness();
 
-      expect(yield* harness.run(validPayload())).toBe(ENVIRONMENT_ID);
+      expect(yield* harness.run(validPayload())).toBe(SAVED_ENVIRONMENT_ID);
       expect(harness.events.slice(-2)).toEqual(["confirm", "retry-supervisor"]);
     }),
   );
@@ -679,7 +734,7 @@ describe("verifyAndAddPairingCode", () => {
     Effect.gen(function* () {
       const harness = yield* makeHarness({ pairingConfirmationRequired: false });
 
-      expect(yield* harness.run(validPayload())).toBe(ENVIRONMENT_ID);
+      expect(yield* harness.run(validPayload())).toBe(SAVED_ENVIRONMENT_ID);
       expect(harness.events).toEqual([
         "verify",
         "register",
@@ -693,6 +748,83 @@ describe("verifyAndAddPairingCode", () => {
     }),
   );
 
+  it.effect("keeps an already-active loopback credential after confirmation scope denial", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        pairingConfirmationRequired: false,
+        confirmationFailure: true,
+        supervisorStates: [supervisorState("connecting"), supervisorState("connected")],
+      });
+      expect(
+        yield* harness.run(
+          validPayload({ endpoint: "http://127.0.0.1:3773", reach: "this-computer" }),
+          true,
+          "Local tunnel",
+        ),
+      ).toBe(SAVED_ENVIRONMENT_ID);
+      expect(harness.registrations[0]).toMatchObject({
+        target: { label: "Local tunnel" },
+        profile: { label: "Local tunnel" },
+      });
+      expect(harness.events).toContain("observe-supervisor");
+    }),
+  );
+
+  it.effect("rejects a loopback credential when its confirmation fallback proof is rejected", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        pairingConfirmationRequired: false,
+        confirmationFailure: true,
+        supervisorStates: [
+          supervisorState(
+            "blocked",
+            new ConnectionBlockedError({
+              reason: "authentication",
+              detail: "Credential rejected",
+            }),
+          ),
+        ],
+      });
+      expect(
+        yield* failureReason(
+          harness.run(validPayload({ endpoint: "http://127.0.0.1:3773" }), true),
+        ),
+      ).toBe("pairing-rejected");
+      expect(harness.registrations).toEqual([]);
+      expect(harness.acceptedIdentities).toEqual([]);
+    }),
+  );
+
+  it.effect("still rejects off-host confirmation scope denial without the pending flag", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        pairingConfirmationRequired: false,
+        confirmationFailure: true,
+        supervisorStates: [supervisorState("connected")],
+      });
+      expect(yield* failureReason(harness.run(validPayload()))).toBe("local-persistence-failed");
+      expect(harness.registrations).toEqual([]);
+      expect(harness.events).not.toContain("observe-supervisor");
+    }),
+  );
+
+  it.effect("still requires confirmation for a pending loopback credential", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        pairingConfirmationRequired: true,
+        confirmationFailure: true,
+        supervisorStates: [supervisorState("connected")],
+      });
+      expect(
+        yield* failureReason(
+          harness.run(validPayload({ endpoint: "http://127.0.0.1:3773" }), true),
+        ),
+      ).toBe("local-persistence-failed");
+      expect(harness.registrations).toEqual([]);
+      expect(harness.events).not.toContain("observe-supervisor");
+    }),
+  );
+
   it.effect("keeps an active credential when a legacy server rejects the confirmation tag", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({
@@ -701,7 +833,7 @@ describe("verifyAndAddPairingCode", () => {
         supervisorStates: [supervisorState("connecting"), supervisorState("connected")],
       });
 
-      expect(yield* harness.run(validPayload())).toBe(ENVIRONMENT_ID);
+      expect(yield* harness.run(validPayload())).toBe(SAVED_ENVIRONMENT_ID);
       expect(harness.events).toEqual([
         "verify",
         "register",
@@ -723,7 +855,7 @@ describe("verifyAndAddPairingCode", () => {
         confirmationDefect: "Unknown request tag: auth.confirmPairing ",
       });
 
-      expect(yield* harness.run(validPayload())).toBe(ENVIRONMENT_ID);
+      expect(yield* harness.run(validPayload())).toBe(SAVED_ENVIRONMENT_ID);
       expect(harness.events).toEqual([
         "verify",
         "register",
@@ -751,7 +883,7 @@ describe("verifyAndAddPairingCode", () => {
         supervisorStates: [supervisorState("connecting"), supervisorState("connected")],
       });
 
-      expect(yield* harness.run(validPayload())).toBe(ENVIRONMENT_ID);
+      expect(yield* harness.run(validPayload())).toBe(SAVED_ENVIRONMENT_ID);
       expect(harness.events).toEqual([
         "verify",
         "register",
@@ -807,7 +939,7 @@ describe("verifyAndAddPairingCode", () => {
         supervisorStates: [supervisorState("connecting"), supervisorState("backoff")],
       });
 
-      expect(yield* harness.run(validPayload())).toBe(ENVIRONMENT_ID);
+      expect(yield* harness.run(validPayload())).toBe(SAVED_ENVIRONMENT_ID);
       expect(harness.preparedConnections).toHaveLength(1);
       expect(harness.registrations).toHaveLength(1);
       expect(harness.acceptedIdentities).toHaveLength(1);
@@ -832,7 +964,7 @@ describe("verifyAndAddPairingCode", () => {
         ],
       });
 
-      expect(yield* harness.run(validPayload())).toBe(ENVIRONMENT_ID);
+      expect(yield* harness.run(validPayload())).toBe(SAVED_ENVIRONMENT_ID);
       expect(harness.preparedConnections).toHaveLength(1);
       expect(harness.registrations).toHaveLength(1);
       expect(harness.acceptedIdentities).toHaveLength(1);
@@ -849,7 +981,7 @@ describe("verifyAndAddPairingCode", () => {
         supervisorStates: [supervisorState("offline")],
       });
 
-      expect(yield* harness.run(validPayload())).toBe(ENVIRONMENT_ID);
+      expect(yield* harness.run(validPayload())).toBe(SAVED_ENVIRONMENT_ID);
       expect(harness.registrations).toHaveLength(1);
       expect(harness.acceptedIdentities).toHaveLength(1);
       expect(harness.events.at(-1)).toBe("observe-supervisor");
@@ -892,9 +1024,10 @@ describe("verifyAndAddPairingCode", () => {
     Effect.gen(function* () {
       const targetKey = storageIdentityTargetKey(
         new BearerConnectionTarget({
-          environmentId: ENVIRONMENT_ID,
+          environmentId: SAVED_ENVIRONMENT_ID,
           label: "AI-SERVER",
-          connectionId: `bearer:${ENVIRONMENT_ID}`,
+          connectionId: `bearer:${SAVED_ENVIRONMENT_ID}`,
+          serverEnvironmentId: null,
         }),
       );
       const harness = yield* makeHarness({
@@ -912,9 +1045,10 @@ describe("verifyAndAddPairingCode", () => {
   it.effect("preserves a concurrent identity replacement during confirmation rollback", () =>
     Effect.gen(function* () {
       const target = new BearerConnectionTarget({
-        environmentId: ENVIRONMENT_ID,
+        environmentId: SAVED_ENVIRONMENT_ID,
         label: "AI-SERVER",
-        connectionId: `bearer:${ENVIRONMENT_ID}`,
+        connectionId: `bearer:${SAVED_ENVIRONMENT_ID}`,
+        serverEnvironmentId: null,
       });
       const targetKey = storageIdentityTargetKey(target);
       const harness = yield* makeHarness({
@@ -952,7 +1086,7 @@ describe("verifyAndAddPairingCode", () => {
         confirmationInterrupted: true,
         supervisorStates: [supervisorState("connected")],
       });
-      expect(yield* harness.run(validPayload())).toBe(ENVIRONMENT_ID);
+      expect(yield* harness.run(validPayload())).toBe(SAVED_ENVIRONMENT_ID);
 
       expect(harness.events).toEqual([
         "verify",

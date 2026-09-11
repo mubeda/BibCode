@@ -58,20 +58,20 @@ jobs:
       BIBCODE_E2E_BUNDLE: ${{ matrix.bundle }}
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Vite+
-        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1.15.0
+        uses: voidzero-dev/setup-vp@1b32467adbe183473499fd9d5d372c3ed9641754 # v1.18.0
         with:
           node-version-file: package.json
           cache: true
           run-install: false
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1
+        uses: dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1 # 1.98.0
 
       - name: Cache Rust build output
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
             . -> target
@@ -139,7 +139,7 @@ jobs:
             exit 1
           fi
 
-      - name: Resolve macOS application from DMG build
+      - name: Install macOS application from DMG build
         if: matrix.platform == 'mac'
         shell: bash
         run: |
@@ -148,10 +148,17 @@ jobs:
           mount_point="$RUNNER_TEMP/bibcode-desktop-ui-dmg"
           mkdir -p "$mount_point"
           hdiutil attach "$dmg_path" -mountpoint "$mount_point" -nobrowse -readonly
-          app_path="$(find "$mount_point" -maxdepth 1 -name 'BiBCode.app' -print -quit)"
-          test -n "$app_path"
-          echo "BIBCODE_E2E_APP_PATH=$app_path" >> "$GITHUB_ENV"
           echo "BIBCODE_E2E_DMG_MOUNT_POINT=$mount_point" >> "$GITHUB_ENV"
+          mounted_app="$(find "$mount_point" -maxdepth 1 -name 'BiBCode.app' -print -quit)"
+          test -n "$mounted_app"
+          install_directory="$(mktemp -d "$RUNNER_TEMP/bibcode-ui-install.XXXXXX")"
+          echo "BIBCODE_E2E_INSTALL_DIRECTORY=$install_directory" >> "$GITHUB_ENV"
+          app_path="$install_directory/BiBCode.app"
+          ditto "$mounted_app" "$app_path"
+          executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$mounted_app/Contents/Info.plist")"
+          cmp "$mounted_app/Contents/MacOS/$executable" "$app_path/Contents/MacOS/$executable"
+          codesign --verify --deep --strict "$app_path"
+          echo "BIBCODE_E2E_APP_PATH=$app_path" >> "$GITHUB_ENV"
 
       - name: Install and resolve Windows NSIS application
         if: matrix.platform == 'win'
@@ -177,6 +184,51 @@ jobs:
           else
             vp run test:ui:desktop
           fi
+
+      - name: Collect macOS application crash summaries
+        if: always() && matrix.platform == 'mac'
+        shell: bash
+        env:
+          BIBCODE_E2E_ARTIFACT_DIR: ${{ runner.temp }}/bibcode-desktop-ui-artifacts
+        run: |
+          python3 - <<'PYTHON'
+          import json, os
+          from pathlib import Path
+          directory = Path.home() / "Library/Logs/DiagnosticReports"
+          paths = sorted(set(directory.glob("bibcode-desktop*.ips")) | set(directory.glob("BiBCode*.ips")), key=lambda path: path.stat().st_mtime)[-10:]
+          summaries = []
+          for path in paths:
+              try:
+                  if path.stat().st_size > 8 * 1024 * 1024:
+                      raise ValueError("Crash report exceeds the bounded 8 MiB reader")
+                  raw = path.read_text()
+                  decoder = json.JSONDecoder()
+                  records = []
+                  while raw.strip():
+                      record, end = decoder.raw_decode(raw.lstrip())
+                      records.append(record)
+                      raw = raw.lstrip()[end:]
+                  report = records[-1]
+                  exception = report.get("exception", {})
+                  termination = report.get("termination", {})
+                  thread = report.get("faultingThread")
+                  threads = report.get("threads", [])
+                  frames = threads[thread].get("frames", []) if isinstance(thread, int) and 0 <= thread < len(threads) else []
+                  summaries.append({
+                      "report": path.name,
+                      "process": report.get("procName"),
+                      "captureTime": report.get("captureTime"),
+                      "exception": {key: exception[key] for key in ("type", "signal", "subtype", "codes") if key in exception},
+                      "termination": {key: termination[key] for key in ("namespace", "code", "indicator") if key in termination},
+                      "symbols": [frame.get("symbol", "<no symbol>") for frame in frames[:20]],
+                  })
+              except (OSError, ValueError, KeyError, TypeError, IndexError, AttributeError) as error:
+                  summaries.append({"report": path.name, "error": str(error)})
+          output = Path(os.environ["BIBCODE_E2E_ARTIFACT_DIR"])
+          output.mkdir(parents=True, exist_ok=True)
+          (output / "native-crashes.log").write_text(json.dumps(summaries, indent=2) + "\n")
+          print(json.dumps(summaries, indent=2))
+          PYTHON
 
       - name: Unmount macOS test application
         if: always() && matrix.platform == 'mac'

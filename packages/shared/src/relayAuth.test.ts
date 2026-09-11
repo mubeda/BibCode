@@ -163,6 +163,7 @@ describe("Clerk relay auth", () => {
     }
 
     expectSafeFrontendApiRejection("clerk.\u00a0bibcode.codes");
+    expectSafeFrontendApiRejection("clerk.xn--xample-9ua.accounts.dev");
     expectSafeFrontendApiRejection("xn--a.clerk.accounts.dev");
     expectSafeFrontendApiRejection("clerk.bibcode.codes.");
   });

@@ -94,9 +94,9 @@ it.layer(NodeServices.layer)("canonical Rust workspace", (it) => {
         path.join(repoRoot, ".github", "workflows", "ci.yml"),
       );
       assert.equal(
-        ciWorkflow.match(/uses: dtolnay\/rust-toolchain@[0-9a-f]{40} # 1\.97\.1/g)?.length ?? 0,
+        ciWorkflow.match(/uses: dtolnay\/rust-toolchain@[0-9a-f]{40} # 1\.98\.0/g)?.length ?? 0,
         3,
-        "Every Rust CI job must exercise the declared Rust 1.97.1 toolchain",
+        "Every Rust CI job must exercise the declared Rust 1.98.0 toolchain",
       );
 
       const rootPackageJson = yield* decodePackageJson(
@@ -115,14 +115,18 @@ it.layer(NodeServices.layer)("canonical Rust workspace", (it) => {
 
       const workspacePackage = table(workspace.package);
       assert.equal(workspacePackage.edition, "2024");
-      assert.equal(workspacePackage["rust-version"], "1.97.1");
+      assert.equal(workspacePackage["rust-version"], "1.98.0");
       assert.equal(table(table(workspace.lints).rust).warnings, "deny");
 
       const releaseProfile = table(table(workspaceManifest.profile).release);
       assert.equal(releaseProfile.lto, "thin");
       assert.equal(releaseProfile["codegen-units"], 1);
       assert.equal(releaseProfile.strip, "symbols");
-      assert.equal(releaseProfile.panic, "abort");
+      assert.equal(
+        releaseProfile.panic,
+        "unwind",
+        "Wry Objective-C cancellation recovery requires unwinding",
+      );
 
       for (const rustPackage of rustPackages) {
         assert.equal(

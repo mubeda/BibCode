@@ -3,7 +3,7 @@ import * as NodeFS from "node:fs";
 
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { mockDesktopUiFolderPicker } from "./ui-state.ts";
+import { mockDesktopUiFolderPicker, setDesktopUiWindowSize } from "./ui-state.ts";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -22,9 +22,96 @@ describe("mockDesktopUiFolderPicker", () => {
   });
 });
 
+describe("setDesktopUiWindowSize", () => {
+  it("corrects again when startup native and webview dimensions do not yet agree", async () => {
+    const viewport = { devicePixelRatio: 1, innerWidth: 1100, innerHeight: 800 };
+    let outer = { width: 1060, height: 739 };
+    vi.stubGlobal("window", viewport);
+    vi.stubGlobal("screen", { availWidth: 1920, availHeight: 1080 });
+    vi.stubGlobal("browser", {
+      execute: async (callback: () => unknown) => callback(),
+      getWindowSize: async () => ({ ...outer }),
+      setWindowSize: async (width: number, height: number) => {
+        outer = { width, height };
+        viewport.innerWidth = width;
+        viewport.innerHeight = height - 44;
+      },
+      waitUntil: async (predicate: () => Promise<boolean>) => {
+        for (let attempt = 0; attempt < 5; attempt++) if (await predicate()) return;
+        throw new Error("Viewport did not settle.");
+      },
+    });
+    await setDesktopUiWindowSize(1000, 720);
+    expect([viewport.innerWidth, viewport.innerHeight]).toEqual([1000, 720]);
+  });
+
+  it("waits for the webview to catch up with native resizing before correcting again", async () => {
+    const viewport = { devicePixelRatio: 1, innerWidth: 980, innerHeight: 720 };
+    let outer = { width: 980, height: 764 };
+    let pending: (() => void) | undefined;
+    const setWindowSize = vi.fn(async (width: number, height: number) => {
+      outer = { width, height };
+      pending = () => {
+        viewport.innerWidth = width;
+        viewport.innerHeight = height - 44;
+      };
+    });
+    vi.stubGlobal("window", viewport);
+    vi.stubGlobal("screen", { availWidth: 1920, availHeight: 1080 });
+    vi.stubGlobal("browser", {
+      execute: async (callback: () => unknown) => callback(),
+      getWindowSize: async () => ({ ...outer }),
+      setWindowSize,
+      waitUntil: async (predicate: () => Promise<boolean>) => {
+        if (await predicate()) return;
+        pending?.();
+        if (!(await predicate())) throw new Error("Native resize did not reach the webview.");
+      },
+    });
+    await setDesktopUiWindowSize(981, 720);
+    expect(viewport.innerWidth).toBe(981);
+    expect(setWindowSize).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([1, 2])(
+    "observes the requested viewport at scale %s without relying on animation frames",
+    async (scale) => {
+      const viewport = { devicePixelRatio: scale, innerWidth: 1_100, innerHeight: 716 };
+      const frame = { width: 1_100 * scale, height: 760 * scale };
+      vi.stubGlobal("window", viewport);
+      vi.stubGlobal("screen", { availWidth: 1920, availHeight: 1080 });
+      vi.stubGlobal("browser", {
+        execute: async (callback: () => unknown) => callback(),
+        executeAsync: async () => {
+          throw new Error("Script execution timed out: animation frames suspended.");
+        },
+        getWindowSize: async () => ({ ...frame }),
+        setWindowSize: async (width: number, height: number) => {
+          frame.width = width;
+          frame.height = height;
+          viewport.innerWidth = width / scale;
+          viewport.innerHeight = height / scale - 44;
+        },
+        waitUntil: async (predicate: () => Promise<boolean>) => {
+          for (let attempt = 0; attempt < 5; attempt++) if (await predicate()) return;
+          throw new Error("Viewport did not settle.");
+        },
+      });
+      await setDesktopUiWindowSize(1_200, 720);
+      expect({ width: viewport.innerWidth, height: viewport.innerHeight }).toEqual({
+        width: 1_200,
+        height: 720,
+      });
+    },
+  );
+});
+
 describe("desktop UI motion stabilization", () => {
   it("keeps the WDIO motion guard from overriding open or closed portal styles", () => {
-    const configuration = NodeFS.readFileSync(new URL("../wdio.conf.ts", import.meta.url), "utf8");
+    const configuration = NodeFS.readFileSync(
+      new URL("./motion-guard.ts", import.meta.url),
+      "utf8",
+    );
 
     // The guard is one marked stylesheet installed once per document; it never
     // sets inline styles or observes and rewrites portal lifecycle attributes.
@@ -41,7 +128,10 @@ describe("desktop UI motion stabilization", () => {
   });
 
   it("settles stuck opening portals and hides closed portals through state-aware CSS", () => {
-    const configuration = NodeFS.readFileSync(new URL("../wdio.conf.ts", import.meta.url), "utf8");
+    const configuration = NodeFS.readFileSync(
+      new URL("./motion-guard.ts", import.meta.url),
+      "utf8",
+    );
 
     expect(configuration).toContain("[data-open][data-starting-style]");
     expect(configuration).toMatch(
@@ -51,7 +141,10 @@ describe("desktop UI motion stabilization", () => {
   });
 
   it("settles auto-animated project rows without overriding unrelated content", () => {
-    const configuration = NodeFS.readFileSync(new URL("../wdio.conf.ts", import.meta.url), "utf8");
+    const configuration = NodeFS.readFileSync(
+      new URL("./motion-guard.ts", import.meta.url),
+      "utf8",
+    );
 
     expect(configuration).toMatch(
       /\[data-slot="sidebar-group"\]:has\(\[data-testid="new-main-chat-button"\]\)\s+ul\[data-sidebar="menu"\]\s*>\s*li\s*\{[^}]*opacity:\s*1\s*!important;[^}]*\}/s,

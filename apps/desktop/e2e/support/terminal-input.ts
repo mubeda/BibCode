@@ -11,12 +11,21 @@ export async function sendTerminalCommand(command: string): Promise<void> {
 
 export async function openCenterTerminal(): Promise<void> {
   const newPanelSelector = '[aria-label="New panel"]';
-  for (const candidate of await browser.$$(newPanelSelector)) {
-    if ((await candidate.isDisplayed()) && (await candidate.isEnabled())) {
-      await candidate.click();
-      break;
-    }
-  }
+  let trigger: WebdriverIO.Element | undefined;
+  await browser.waitUntil(
+    async () => {
+      for (const candidate of await browser.$$(newPanelSelector)) {
+        if ((await candidate.isDisplayed()) && (await candidate.isEnabled())) {
+          trigger = candidate;
+          return true;
+        }
+      }
+      return false;
+    },
+    { timeoutMsg: "The workspace New panel control did not become ready." },
+  );
+  if (!trigger) throw new Error("The workspace New panel control disappeared.");
+  await trigger.click();
   const openTerminal = browser.$('//*[@role="menuitem" and normalize-space()="Open Terminal"]');
   await openTerminal.waitForDisplayed();
   await openTerminal.waitForEnabled();

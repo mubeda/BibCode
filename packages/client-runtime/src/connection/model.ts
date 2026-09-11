@@ -1,7 +1,12 @@
 import { EnvironmentId, type ExecutionEnvironmentDescriptor } from "@bibcode/contracts";
+import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import type { E2eeAuthRequest } from "../e2ee/socket.ts";
+
+const SavedServerEnvironmentId = Schema.NullOr(EnvironmentId).pipe(
+  Schema.withDecodingDefault(Effect.succeed(null)),
+);
 
 const ConnectionTargetBase = {
   environmentId: EnvironmentId,
@@ -22,6 +27,11 @@ export class BearerConnectionTarget extends Schema.TaggedClass<BearerConnectionT
   {
     ...ConnectionTargetBase,
     connectionId: Schema.String,
+    // What the host declares about itself, kept apart from `environmentId`,
+    // which is the client's own key for this environment. Null on entries
+    // saved before the two were separated: those carry the host-declared id
+    // in `environmentId`, so readers fall back to it.
+    serverEnvironmentId: SavedServerEnvironmentId,
   },
 ) {}
 
@@ -96,7 +106,7 @@ export const ConnectionBlockedReason = Schema.Literals([
 ]);
 export type ConnectionBlockedReason = typeof ConnectionBlockedReason.Type;
 
-export class ConnectionTransientError extends Schema.TaggedErrorClass<ConnectionTransientError>()(
+export class ConnectionTransientError extends Schema.TaggedError<ConnectionTransientError>()(
   "ConnectionTransientError",
   {
     reason: ConnectionTransientReason,
@@ -109,7 +119,7 @@ export class ConnectionTransientError extends Schema.TaggedErrorClass<Connection
   }
 }
 
-export class ConnectionBlockedError extends Schema.TaggedErrorClass<ConnectionBlockedError>()(
+export class ConnectionBlockedError extends Schema.TaggedError<ConnectionBlockedError>()(
   "ConnectionBlockedError",
   {
     reason: ConnectionBlockedReason,
@@ -122,7 +132,7 @@ export class ConnectionBlockedError extends Schema.TaggedErrorClass<ConnectionBl
   }
 }
 
-export class ConnectionStorageChangedError extends Schema.TaggedErrorClass<ConnectionStorageChangedError>()(
+export class ConnectionStorageChangedError extends Schema.TaggedError<ConnectionStorageChangedError>()(
   "ConnectionStorageChangedError",
   {
     reason: Schema.Literal("storage-changed"),

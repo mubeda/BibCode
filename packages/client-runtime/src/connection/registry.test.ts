@@ -105,6 +105,7 @@ const BEARER_TARGET = new BearerConnectionTarget({
   environmentId: EnvironmentId.make("environment-bearer"),
   label: "Bearer environment",
   connectionId: "bearer-connection",
+  serverEnvironmentId: null,
 });
 const BEARER_PROFILE = new BearerConnectionProfile({
   connectionId: BEARER_TARGET.connectionId,
@@ -1294,6 +1295,7 @@ describe("EnvironmentRegistry", () => {
       const replacementTarget = new BearerConnectionTarget({
         ...BEARER_TARGET,
         label: "Replacement environment",
+        serverEnvironmentId: null,
       });
       const replacement = new BearerConnectionRegistration({
         target: replacementTarget,
@@ -1348,6 +1350,7 @@ describe("EnvironmentRegistry", () => {
       const replacementTarget = new BearerConnectionTarget({
         ...BEARER_TARGET,
         label: "Replacement environment",
+        serverEnvironmentId: null,
       });
       const replacement = new BearerConnectionRegistration({
         target: replacementTarget,
