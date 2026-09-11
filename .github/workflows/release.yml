@@ -38,9 +38,10 @@ jobs:
   preflight:
     name: Preflight
     runs-on: ubuntu-24.04
-    # GitHub-hosted runners have fewer vCPUs than the upstream Blacksmith
-    # runners, so the check/typecheck/test suite needs more headroom.
-    timeout-minutes: 30
+    # A cold publication preflight compiles the full Rust workspace through
+    # `vp run test`; two v0.5.9 approval runs reached the old 30-minute
+    # watchdog with no failing test. Match the main CI test-job budget.
+    timeout-minutes: 45
     outputs:
       release_channel: ${{ steps.release_meta.outputs.release_channel }}
       version: ${{ steps.release_meta.outputs.version }}
