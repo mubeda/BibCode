@@ -251,6 +251,12 @@ describe("cross-platform CI contract", () => {
 });
 
 describe("cross-platform release contract", () => {
+  it("gives the publication preflight enough time for a cold full test graph", () => {
+    const { workflow } = readWorkflow(RELEASE_WORKFLOW_PATH);
+
+    expect(requireJob(workflow, "preflight")["timeout-minutes"]).toBeGreaterThanOrEqual(45);
+  });
+
   it("installs the pinned Rust toolchain before parallel preflight typechecks", () => {
     const { workflow } = readWorkflow(RELEASE_WORKFLOW_PATH);
     const steps = requireJob(workflow, "preflight").steps ?? [];
