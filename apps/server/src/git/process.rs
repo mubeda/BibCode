@@ -129,14 +129,7 @@ impl ProcessRunner {
         cancellation: &CancellationToken,
     ) -> Result<ProcessBytesOutput, ProcessError> {
         let command_label = request.command.to_string_lossy().into_owned();
-        let mut command = Command::new(&request.command);
-        command
-            .args(&request.args)
-            .current_dir(&request.cwd)
-            .envs(request.env.iter().cloned())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        let command = process_command(&request, false);
         let output = run_supervised(
             SupervisedRunRequest {
                 command,
@@ -201,17 +194,7 @@ impl ProcessRunner {
         clear_environment: bool,
     ) -> Result<ProcessOutput, ProcessError> {
         let command_label = request.command.to_string_lossy().into_owned();
-        let mut command = Command::new(&request.command);
-        if clear_environment {
-            command.env_clear();
-        }
-        command
-            .args(&request.args)
-            .current_dir(&request.cwd)
-            .envs(request.env.iter().cloned())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        let command = process_command(&request, clear_environment);
         let output = run_supervised(
             SupervisedRunRequest {
                 command,
@@ -260,6 +243,87 @@ impl ProcessRunner {
             stdout_truncated,
             stderr_truncated,
         })
+    }
+}
+
+fn process_command(request: &ProcessRequest, clear_environment: bool) -> Command {
+    let mut command = Command::new(&request.command);
+    if clear_environment {
+        command.env_clear();
+    }
+    command
+        .args(&request.args)
+        .current_dir(&request.cwd)
+        .envs(request.env.iter().cloned())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(target_os = "linux")]
+    isolate_appimage_libraries(&mut command, !clear_environment);
+    command
+}
+
+#[cfg(target_os = "linux")]
+fn isolate_appimage_libraries(command: &mut Command, inherit_environment: bool) {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt, path::Path};
+
+    // Read the effective child environment, including command-local overrides.
+    // Never mutate process-global state in the multithreaded desktop runtime.
+    let variable = |name: &str| match command.as_std().get_envs().find(|(key, _)| *key == name) {
+        Some((_, value)) => value.map(std::ffi::OsStr::to_owned),
+        None if inherit_environment => std::env::var_os(name),
+        None => None,
+    };
+    if variable("APPIMAGE").is_none_or(|value| value.is_empty()) {
+        return;
+    }
+    let Some(appdir) = variable("APPDIR").map(PathBuf::from) else {
+        return;
+    };
+    if !appdir.is_absolute() || appdir.parent().is_none() {
+        return;
+    }
+    let Some(library_path) = variable("LD_LIBRARY_PATH") else {
+        return;
+    };
+    let mut removed = false;
+    // glibc accepts both separators in LD_LIBRARY_PATH; split_paths only
+    // understands colons and would discard host entries after a semicolon.
+    let host_paths: Vec<_> = library_path
+        .as_bytes()
+        .split(|byte| matches!(byte, b':' | b';'))
+        .map(|entry| Path::new(OsStr::from_bytes(entry)))
+        .filter(|path| {
+            // AppImage restarts can retain mount paths from older versions.
+            // APPDIR also handles extraction mode and arbitrary bundle names.
+            let bundled = path.starts_with(&appdir)
+                || (path.is_absolute()
+                    && path.components().any(|component| {
+                        component
+                            .as_os_str()
+                            .as_encoded_bytes()
+                            .starts_with(b".mount_")
+                    }));
+            removed |= bundled;
+            !bundled
+        })
+        .collect();
+    if !removed {
+        return;
+    }
+    if host_paths.is_empty() {
+        command.env_remove("LD_LIBRARY_PATH");
+    } else if host_paths.len() == 1 && host_paths[0].as_os_str().is_empty() {
+        // An empty entry means cwd, but an entirely empty variable disables
+        // this search. Keep the caller's cwd entry when it is the sole survivor.
+        command.env("LD_LIBRARY_PATH", ".");
+    } else {
+        // Entries obtained by splitting a Unix path list cannot contain its
+        // separator, so joining this subset cannot fail.
+        command.env(
+            "LD_LIBRARY_PATH",
+            std::env::join_paths(host_paths).expect("split Unix library paths can be rejoined"),
+        );
     }
 }
 
