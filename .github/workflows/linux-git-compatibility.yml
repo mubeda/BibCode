@@ -1,0 +1,52 @@
+name: Linux Git compatibility
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  git_appimage_environment:
+    name: Git subprocesses across Linux distributions
+    # The test executable must also load on Ubuntu 22.04. Building it on a
+    # newer distribution would hide a glibc compatibility requirement.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Build the production Git runner regression test
+        run: |
+          cargo test --locked -p bibcode-server \
+            --test linux_appimage_git_environment --no-run -j 2 \
+            --message-format=json > git-compatibility-build.json
+
+      - name: Test Debian, Ubuntu, Fedora, and Arch
+        run: |
+          binary=$(python3 - <<'PY'
+          import json
+          from pathlib import Path
+          artifacts = [json.loads(line) for line in Path("git-compatibility-build.json").read_text().splitlines()]
+          binaries = [item["executable"] for item in artifacts
+                      if item.get("reason") == "compiler-artifact"
+                      and item.get("target", {}).get("name") == "linux_appimage_git_environment"
+                      and item.get("profile", {}).get("test")
+                      and item.get("executable")]
+          assert len(binaries) == 1, binaries
+          print(binaries[0])
+          PY
+          )
+          bash scripts/test-linux-git-compatibility.sh "$binary"

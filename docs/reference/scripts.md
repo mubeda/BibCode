@@ -155,6 +155,12 @@ preservation in the documented native-architecture containers.
 
 ## Repository Maintenance
 
+- `bash scripts/test-linux-git-compatibility.sh TEST_BINARY [IMAGE ...]`: run the
+  compiled Linux Git-runner regression in disposable Debian, Ubuntu, Fedora,
+  and Arch containers. Build the executable on the Ubuntu 22.04 glibc baseline;
+  set `CONTAINER_ENGINE=podman` to use Podman instead of Docker. The script
+  reports every selected image's result and fails if any check fails. See the
+  [Linux runbook](../testing/linux-desktop.md) for build and validation scope.
 - `vp run sync:repos`: synchronize configured read-only reference repositories
   under `.repos`; pass `-- --repo <id>` to synchronize one entry.
 - `vp run measure:desktop-runtime -- ...`: capture startup, memory, and
