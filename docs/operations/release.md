@@ -21,10 +21,11 @@ graph. `validate_only` and `publish` are mutually exclusive.
 
 Publication-capable preflight runs `vp check`, `vp run typecheck`, and
 `vp run test`; validation-only preflight skips the duplicated full test graph
-after check and typecheck. The publication preflight has the same 45-minute
-budget as the main CI test job because a cold runner compiles the full Rust
-workspace through the package graph. The build matrix then creates native Tauri
-installers on the matching operating system:
+after check and typecheck. The publication preflight has a 60-minute budget
+because a cold runner compiles the full Rust workspace through the package
+graph; measured hosted runs exceeded both 30 and 45 minutes without a failing
+test. The build matrix then creates native Tauri installers on the matching
+operating system:
 
 | Platform | Runner                  | Architecture | Installer       |
 | -------- | ----------------------- | ------------ | --------------- |

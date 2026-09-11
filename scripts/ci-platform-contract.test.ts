@@ -254,7 +254,7 @@ describe("cross-platform release contract", () => {
   it("gives the publication preflight enough time for a cold full test graph", () => {
     const { workflow } = readWorkflow(RELEASE_WORKFLOW_PATH);
 
-    expect(requireJob(workflow, "preflight")["timeout-minutes"]).toBeGreaterThanOrEqual(45);
+    expect(requireJob(workflow, "preflight")["timeout-minutes"]).toBeGreaterThanOrEqual(60);
   });
 
   it("installs the pinned Rust toolchain before parallel preflight typechecks", () => {
