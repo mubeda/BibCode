@@ -39,9 +39,10 @@ jobs:
     name: Preflight
     runs-on: ubuntu-24.04
     # A cold publication preflight compiles the full Rust workspace through
-    # `vp run test`; two v0.5.9 approval runs reached the old 30-minute
-    # watchdog with no failing test. Match the main CI test-job budget.
-    timeout-minutes: 45
+    # `vp run test`; v0.5.9 approval runs reached both the old 30-minute and
+    # 45-minute watchdogs with no failing test. Keep every gate and allow the
+    # measured hosted-runner variance.
+    timeout-minutes: 60
     outputs:
       release_channel: ${{ steps.release_meta.outputs.release_channel }}
       version: ${{ steps.release_meta.outputs.version }}
