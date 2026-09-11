@@ -5,10 +5,11 @@ page contains only native Linux additions.
 
 ## Supported native target
 
-The supported desktop release targets are Linux ARM64 and x64 AppImages built on
-matching Ubuntu 22.04 runners. CI also exercises Ubuntu 24.04, and desktop release
-support includes Ubuntu 22.04, Ubuntu 24.04, and Debian 12. Record any different
-distribution as compatibility exploration rather than silently broadening support.
+Linux distribution support targets are Debian, Ubuntu, Fedora, and Arch. Desktop
+release artifacts are ARM64 and x64 AppImages built on matching Ubuntu 22.04
+runners. Record the distribution release, architecture, and desktop session for
+each native validation; a passing Git subprocess check alone does not qualify
+the complete desktop, installer, or updater on that system.
 
 Standalone server releases add ARM64/x64 `.tar.gz`, `.deb`, and `.rpm` artifacts. Native
 package evidence covers Ubuntu 22.04, Ubuntu 24.04, Debian 12, Rocky Linux 9, and Fedora
@@ -130,6 +131,51 @@ the native host, and an installer failure restarts the exact pre-update backend
 set.
 
 ## AppImage build and inspection
+
+### Git subprocess library isolation
+
+The Git runner must exclude AppImage directories from child
+`LD_LIBRARY_PATH` values while retaining custom host library directories and
+credential configuration. Cover extracted AppImages, paths containing spaces,
+stale `.mount_*` entries inherited across updates, and both text and binary
+process output. The parent desktop environment must remain unchanged.
+
+Run the production-runner regression on Linux with a C compiler and system Git:
+
+```sh
+cargo test --locked -p bibcode-server --test linux_appimage_git_environment -j 2
+```
+
+The test compiles an incompatible library into a disposable AppImage fixture,
+first proves that the system HTTPS helper fails when it loads that library,
+then exercises the real Git runner in an isolated child process. It does not
+contact an external Git host or change application data.
+
+`.github/workflows/linux-git-compatibility.yml` builds that test on Ubuntu 22.04
+and runs the executable with each distribution's system Git in Debian 12/13,
+Ubuntu 22.04/24.04, Fedora 44, and Arch rolling containers. The build baseline
+matters: a test built against a newer glibc cannot qualify older distributions.
+The matrix tests x64 in CI; native ARM64 runs remain required for ARM64 evidence.
+
+To repeat the matrix, pass the executable path from Cargo's
+`--message-format=json` compiler-artifact event:
+
+```sh
+bash scripts/test-linux-git-compatibility.sh /absolute/path/to/test-executable
+CONTAINER_ENGINE=podman bash scripts/test-linux-git-compatibility.sh /absolute/path/to/test-executable
+```
+
+Optional trailing arguments select specific image names from the script's
+matrix. Package installation is confined to disposable containers; each
+container has a bounded timeout and is removed after its result. Record every
+distribution result separately, including failures.
+
+For release qualification, also use the packaged app to fetch from a disposable
+HTTPS repository on each target distribution. Record the Git Manager result,
+library-loader diagnostics, and desktop/update checks separately from this
+subprocess regression.
+
+### Native artifact
 
 Build the supported artifact:
 
