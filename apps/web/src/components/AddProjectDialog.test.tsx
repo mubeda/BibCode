@@ -40,6 +40,31 @@ vi.mock("./add-project/useAddProjectWorkflow", async () => {
   };
 });
 
+vi.mock("./RemoteDirectoryBrowser", () => ({
+  RemoteDirectoryBrowser: (props: {
+    readonly secondaryAction?: { readonly label: string; readonly onClick: () => void };
+    readonly selectLabel?: string;
+    readonly onSelect: (path: string) => void;
+    readonly onCancel?: () => void;
+  }) => (
+    <div>
+      {props.onCancel ? (
+        <button type="button" onClick={props.onCancel}>
+          Cancel
+        </button>
+      ) : null}
+      {props.secondaryAction ? (
+        <button type="button" onClick={props.secondaryAction.onClick}>
+          {props.secondaryAction.label}
+        </button>
+      ) : null}
+      <button type="button" onClick={() => props.onSelect("/srv/code/demo")}>
+        {props.selectLabel ?? "Select folder"}
+      </button>
+    </div>
+  ),
+}));
+
 import { AddProjectDialog } from "./AddProjectDialog";
 
 interface MountedTree {
@@ -119,6 +144,8 @@ beforeEach(() => {
     browse: vi.fn(async () => {}),
     setHostPath: vi.fn(),
     submitHostPath: vi.fn(async () => {}),
+    openHostPath: vi.fn(),
+    selectBrowsedFolder: vi.fn(async () => {}),
     openClone: vi.fn(),
     setCloneUrl: vi.fn(),
     setCloneParent: vi.fn(),
@@ -211,5 +238,69 @@ describe("AddProjectDialog mounted interactions", () => {
     await mount(<AddProjectDialog open onOpenChange={onOpenChange} />);
     await pressEscape();
     expect(onOpenChange).not.toHaveBeenCalledWith(false);
+  });
+
+  it("renders the server directory browser for the remote-browse step", async () => {
+    testState.workflow.step = "remote-browse";
+    testState.workflow.selectedHost = {
+      ...testState.workflow.selectedHost,
+      label: "Remote",
+    };
+    await mount(<AddProjectDialog open onOpenChange={vi.fn()} />);
+    expect(document.body.textContent).toContain("Open project folder on Remote");
+    expect(document.body.textContent).toContain("Type a path instead");
+    expect(document.body.textContent).toContain("Open project");
+  });
+
+  it("disables the remote browser controls while registration is busy", async () => {
+    testState.workflow.step = "remote-browse";
+    testState.workflow.selectedHost = {
+      ...testState.workflow.selectedHost,
+      label: "Remote",
+    };
+    testState.workflow.busy = true;
+    await mount(<AddProjectDialog open onOpenChange={vi.fn()} />);
+    const busyFieldset = document.querySelector("fieldset");
+    expect(busyFieldset).not.toBeNull();
+    expect(busyFieldset?.hasAttribute("disabled")).toBe(true);
+  });
+
+  it("leaves the remote browser controls enabled when not busy", async () => {
+    testState.workflow.step = "remote-browse";
+    testState.workflow.selectedHost = {
+      ...testState.workflow.selectedHost,
+      label: "Remote",
+    };
+    await mount(<AddProjectDialog open onOpenChange={vi.fn()} />);
+    const fieldset = document.querySelector("fieldset");
+    expect(fieldset).not.toBeNull();
+    expect(fieldset?.hasAttribute("disabled")).toBe(false);
+  });
+
+  it("wires the remote-browse step's browser actions to the workflow", async () => {
+    testState.workflow.step = "remote-browse";
+    testState.workflow.selectedHost = {
+      ...testState.workflow.selectedHost,
+      label: "Remote",
+    };
+    testState.workflow.error = "Folder is not readable.";
+    await mount(<AddProjectDialog open onOpenChange={vi.fn()} />);
+
+    const alert = document.querySelector('[role="alert"]');
+    expect(alert?.textContent).toContain("Folder is not readable.");
+
+    await click(buttonWithText("Open project"));
+    expect(testState.workflow.selectBrowsedFolder).toHaveBeenCalledWith("/srv/code/demo");
+
+    await click(buttonWithText("Type a path instead"));
+    expect(testState.workflow.openHostPath).toHaveBeenCalledTimes(1);
+
+    // The dialog's own "Back" link (asserted elsewhere) is the only way back from this
+    // step; the browser must not render its own duplicate Cancel exit here.
+    expect(
+      Array.from(document.querySelectorAll("button")).some(
+        (button) => button.textContent?.trim() === "Cancel",
+      ),
+    ).toBe(false);
   });
 });
