@@ -250,6 +250,31 @@ describe("AddProjectDialog mounted interactions", () => {
     expect(document.body.textContent).toContain("Open project");
   });
 
+  it("disables the remote browser controls while registration is busy", async () => {
+    testState.workflow.step = "remote-browse";
+    testState.workflow.selectedHost = {
+      ...testState.workflow.selectedHost,
+      label: "Remote",
+    };
+    testState.workflow.busy = true;
+    await mount(<AddProjectDialog open onOpenChange={vi.fn()} />);
+    const busyFieldset = document.querySelector("fieldset");
+    expect(busyFieldset).not.toBeNull();
+    expect(busyFieldset?.hasAttribute("disabled")).toBe(true);
+  });
+
+  it("leaves the remote browser controls enabled when not busy", async () => {
+    testState.workflow.step = "remote-browse";
+    testState.workflow.selectedHost = {
+      ...testState.workflow.selectedHost,
+      label: "Remote",
+    };
+    await mount(<AddProjectDialog open onOpenChange={vi.fn()} />);
+    const fieldset = document.querySelector("fieldset");
+    expect(fieldset).not.toBeNull();
+    expect(fieldset?.hasAttribute("disabled")).toBe(false);
+  });
+
   it("wires the remote-browse step's browser actions to the workflow", async () => {
     testState.workflow.step = "remote-browse";
     testState.workflow.selectedHost = {

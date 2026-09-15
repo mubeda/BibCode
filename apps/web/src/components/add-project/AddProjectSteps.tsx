@@ -451,15 +451,17 @@ export function AddProjectRemoteBrowseStep({
         description={`Choose a folder on ${hostLabel}.`}
         title={`Open project folder on ${hostLabel}`}
       />
-      <RemoteDirectoryBrowser
-        environmentId={environmentId}
-        initialPath={initialPath}
-        resetKey={environmentId}
-        onSelect={onSelect}
-        onCancel={onCancel}
-        secondaryAction={{ label: "Type a path instead", onClick: onTypePath }}
-        selectLabel={busy ? "Opening…" : "Open project"}
-      />
+      <fieldset disabled={busy} className="m-0 min-w-0 border-0 p-0">
+        <RemoteDirectoryBrowser
+          environmentId={environmentId}
+          initialPath={initialPath}
+          resetKey={environmentId}
+          onSelect={onSelect}
+          onCancel={onCancel}
+          secondaryAction={{ label: "Type a path instead", onClick: onTypePath }}
+          selectLabel={busy ? "Opening…" : "Open project"}
+        />
+      </fieldset>
       {error ? <ErrorMessage>{error}</ErrorMessage> : null}
     </div>
   );
