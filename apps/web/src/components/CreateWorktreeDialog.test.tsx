@@ -1571,6 +1571,7 @@ if (browserRuntime) {
       );
       const reuseCheckbox = reuseLabel?.querySelector<HTMLInputElement>("input[type='checkbox']");
       expect(reuseCheckbox?.disabled).toBe(true);
+      expect(reuseCheckbox?.checked).toBe(false);
       expect(container.textContent).toContain(
         '"origin/feature/remote-only" is a remote branch. A local branch will be created from it.',
       );
@@ -1930,7 +1931,7 @@ if (browserRuntime) {
       );
       expect(lines).toEqual([
         "Branches could not be loaded: Git is unavailable on this host.",
-        "Retry after fixing Git, or type a branch name to create a new one.",
+        "Retry after fixing Git, or clear this field and enter a Name above to create a new branch.",
       ]);
 
       await React.act(async () => root.unmount());
