@@ -26,15 +26,13 @@ export function RemoteDirectoryPickerDialog({
           <DialogDescription>Browse directories on the selected BiBCode host.</DialogDescription>
         </DialogHeader>
         <div className="px-6 pb-5">
-          {open ? (
-            <RemoteDirectoryBrowser
-              environmentId={environmentId}
-              initialPath={initialPath}
-              resetKey={open}
-              onSelect={onSelect}
-              onCancel={() => onOpenChange(false)}
-            />
-          ) : null}
+          <RemoteDirectoryBrowser
+            environmentId={environmentId}
+            initialPath={initialPath}
+            resetKey={open}
+            onSelect={onSelect}
+            onCancel={() => onOpenChange(false)}
+          />
         </div>
       </DialogPopup>
     </Dialog>

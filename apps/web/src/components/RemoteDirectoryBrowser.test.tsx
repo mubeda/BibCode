@@ -11,11 +11,7 @@ interface BrowseResultFixture {
   readonly directoryPath: string;
   readonly ancestorPath: string;
   readonly breadcrumbs: ReadonlyArray<{ readonly name: string; readonly path: string }>;
-  readonly entries: ReadonlyArray<{
-    readonly name: string;
-    readonly path: string;
-    readonly kind: string;
-  }>;
+  readonly entries: ReadonlyArray<{ readonly name: string; readonly path: string }>;
 }
 
 const h = vi.hoisted(() => ({
@@ -113,7 +109,7 @@ describe("RemoteDirectoryBrowser", () => {
         { name: "srv", path: "/srv" },
         { name: "code", path: "/srv/code" },
       ],
-      entries: [{ name: "app", path: "/srv/code/app", kind: "directory" }],
+      entries: [{ name: "app", path: "/srv/code/app" }],
     };
     const onSelect = vi.fn();
     const onCancel = vi.fn();
