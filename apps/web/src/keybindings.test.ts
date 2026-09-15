@@ -926,7 +926,10 @@ describe("terminalNavigationShortcutData", () => {
 
 describe("terminalNewlineShortcutData", () => {
   it("maps Shift+Enter to ESC CR so CLI prompts insert a newline", () => {
-    assert.strictEqual(terminalNewlineShortcutData(event({ key: "Enter", shiftKey: true })), "\r");
+    assert.strictEqual(
+      terminalNewlineShortcutData(event({ key: "Enter", shiftKey: true })),
+      "\u001b\r",
+    );
   });
 
   it("leaves plain and otherwise-modified Enter to xterm", () => {
