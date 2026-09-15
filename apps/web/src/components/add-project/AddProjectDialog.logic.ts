@@ -10,7 +10,7 @@ import {
 import { canUseNativeHostFolderPicker } from "../hostFolderPicker";
 export { getEnvironmentBrowsePlatform } from "../hostFolderPicker";
 
-export type AddProjectStep = "start" | "host-path" | "clone" | "create";
+export type AddProjectStep = "start" | "host-path" | "remote-browse" | "clone" | "create";
 
 export interface AddProjectHostOption {
   readonly environmentId: EnvironmentId;

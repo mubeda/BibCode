@@ -119,6 +119,8 @@ beforeEach(() => {
     browse: vi.fn(async () => {}),
     setHostPath: vi.fn(),
     submitHostPath: vi.fn(async () => {}),
+    openHostPath: vi.fn(),
+    selectBrowsedFolder: vi.fn(async () => {}),
     openClone: vi.fn(),
     setCloneUrl: vi.fn(),
     setCloneParent: vi.fn(),
