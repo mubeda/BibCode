@@ -27,6 +27,7 @@ import {
   terminalClipboardShortcut,
   terminalDeleteShortcutData,
   terminalNavigationShortcutData,
+  terminalNewlineShortcutData,
   threadJumpCommandForIndex,
   threadJumpIndexFromCommand,
   threadTraversalDirectionFromCommand,
@@ -919,6 +920,32 @@ describe("terminalNavigationShortcutData", () => {
         event({ type: "keyup", key: "ArrowLeft", altKey: true }),
         "MacIntel",
       ),
+    );
+  });
+});
+
+describe("terminalNewlineShortcutData", () => {
+  it("maps Shift+Enter to ESC CR so CLI prompts insert a newline", () => {
+    assert.strictEqual(terminalNewlineShortcutData(event({ key: "Enter", shiftKey: true })), "\r");
+  });
+
+  it("leaves plain and otherwise-modified Enter to xterm", () => {
+    assert.isNull(terminalNewlineShortcutData(event({ key: "Enter" })));
+    assert.isNull(
+      terminalNewlineShortcutData(event({ key: "Enter", shiftKey: true, altKey: true })),
+    );
+    assert.isNull(
+      terminalNewlineShortcutData(event({ key: "Enter", shiftKey: true, ctrlKey: true })),
+    );
+    assert.isNull(
+      terminalNewlineShortcutData(event({ key: "Enter", shiftKey: true, metaKey: true })),
+    );
+    assert.isNull(terminalNewlineShortcutData(event({ key: "a", shiftKey: true })));
+  });
+
+  it("ignores non-keydown events", () => {
+    assert.isNull(
+      terminalNewlineShortcutData(event({ type: "keypress", key: "Enter", shiftKey: true })),
     );
   });
 });
