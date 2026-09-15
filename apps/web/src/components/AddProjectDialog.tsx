@@ -77,7 +77,6 @@ export function AddProjectDialog({ open, onOpenChange }: AddProjectDialogProps) 
               busy={workflow.busy}
               error={workflow.error}
               onSelect={(path) => void workflow.selectBrowsedFolder(path)}
-              onCancel={workflow.back}
               onTypePath={workflow.openHostPath}
             />
           ) : null}

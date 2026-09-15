@@ -512,7 +512,14 @@ describe("RemoteDirectoryPickerDialog runtime behavior", () => {
     expect(document.body.querySelector('input[aria-label="New folder name"]')).toBeNull();
   });
 
-  it.each(["environment", "open", "initialPath", "command"] as const)(
+  // "open" is intentionally not covered here: resetKey is now environmentId, so an
+  // in-flight completion resolving during the render where only `open` changes is no
+  // longer rejected by resetKey — the browser stays mounted (and this context valid)
+  // through Base UI's exit transition by design. A genuine close-then-reopen still
+  // discards the stale completion because Base UI actually unmounts and remounts the
+  // component once the exit transition finishes; see "ignores a stale creation
+  // completion after the dialog closes and reopens" above.
+  it.each(["environment", "initialPath", "command"] as const)(
     "rejects a completion resolved during the %s replacement render",
     async (replacement) => {
       h.responses.set("environment-one:/workspace", {
@@ -544,8 +551,6 @@ describe("RemoteDirectoryPickerDialog runtime behavior", () => {
           environmentId: EnvironmentId.make("environment-two"),
           initialPath: "/remote",
         });
-      } else if (replacement === "open") {
-        nextProps = pickerProps({ open: false });
       } else if (replacement === "initialPath") {
         nextProps = pickerProps({ initialPath: "/other" });
       } else {
@@ -557,9 +562,6 @@ describe("RemoteDirectoryPickerDialog runtime behavior", () => {
       h.resolveOnQueryRender = () =>
         creation.resolve(AsyncResult.success({ relativePath: "stale" }));
       await rerender(picker, <RemoteDirectoryPickerDialog {...nextProps} />);
-      if (replacement === "open") {
-        await rerender(picker, <RemoteDirectoryPickerDialog {...pickerProps()} />);
-      }
 
       expect(h.browseCalls.some((call) => call.input.partialPath.endsWith("/stale"))).toBe(false);
       expect(h.refreshCalls.some((key) => key.endsWith("/stale"))).toBe(false);

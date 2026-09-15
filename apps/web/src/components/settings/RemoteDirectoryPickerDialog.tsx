@@ -29,7 +29,10 @@ export function RemoteDirectoryPickerDialog({
           <RemoteDirectoryBrowser
             environmentId={environmentId}
             initialPath={initialPath}
-            resetKey={open}
+            // Base UI keeps the popup (and this browser) mounted through its ~200ms exit
+            // transition after `open` flips to false, so the key must stay stable across
+            // that transition; it only needs to change when the browsing target does.
+            resetKey={environmentId}
             onSelect={onSelect}
             onCancel={() => onOpenChange(false)}
           />
