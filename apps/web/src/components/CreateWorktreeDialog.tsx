@@ -645,7 +645,8 @@ export function CreateWorktreeDialog({
               <p role="alert" className="text-destructive text-xs">
                 <span className="block">Branches could not be loaded: {refsQuery.error}</span>
                 <span className="block">
-                  Retry after fixing Git, or type a branch name to create a new one.
+                  Retry after fixing Git, or clear this field and enter a Name above to create a new
+                  branch.
                 </span>
               </p>
             ) : null}
@@ -673,7 +674,7 @@ export function CreateWorktreeDialog({
                 <label className="flex w-fit items-center gap-2 text-xs text-foreground">
                   <input
                     type="checkbox"
-                    checked={reuseSelectedBranch}
+                    checked={reuseSelectedBranch && canReuseSelectedBranch}
                     disabled={!canReuseSelectedBranch}
                     onChange={(event) => handleReuseSelectedBranchChange(event.target.checked)}
                     className="accent-primary size-4 disabled:opacity-50"
