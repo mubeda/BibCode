@@ -206,11 +206,32 @@ describe("useAddProjectWorkflowState", () => {
     expect(view.current.step).toBe("start");
   });
 
-  it("uses host-path entry when the selected host is not picker-routable", async () => {
+  it("opens the server directory browser when the selected host is not picker-routable", async () => {
     const view = await mountWorkflow({ open: true });
     act(() => view.current.selectHost(ENV_REMOTE));
     await act(async () => view.current.browse());
+    expect(view.current.step).toBe("remote-browse");
+    expect(testState.pickFolder).not.toHaveBeenCalled();
+  });
+
+  it("adds the browsed folder on the remote host", async () => {
+    const view = await mountWorkflow({ open: true });
+    act(() => view.current.selectHost(ENV_REMOTE));
+    await act(async () => view.current.browse());
+    await act(async () => view.current.selectBrowsedFolder("/srv/code/app"));
+    expect(testState.operations.addFolder).toHaveBeenCalledWith(
+      expect.objectContaining({ environmentId: ENV_REMOTE, workspaceRoot: "/srv/code/app" }),
+    );
+    expect(testState.onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("switches from the browser to manual path entry", async () => {
+    const view = await mountWorkflow({ open: true });
+    act(() => view.current.selectHost(ENV_REMOTE));
+    await act(async () => view.current.browse());
+    act(() => view.current.openHostPath());
     expect(view.current.step).toBe("host-path");
+    expect(view.current.error).toBeNull();
   });
 
   it("uses the native picker and adds its routed selection", async () => {

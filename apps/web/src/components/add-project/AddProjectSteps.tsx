@@ -4,6 +4,7 @@ import type { EnvironmentId } from "@bibcode/contracts";
 import { ChevronDownIcon, FolderOpenIcon, GitBranchIcon, GlobeIcon, PlusIcon } from "lucide-react";
 import { type KeyboardEvent, type ReactNode, useState } from "react";
 
+import { RemoteDirectoryBrowser } from "~/components/RemoteDirectoryBrowser";
 import { cn } from "~/lib/utils";
 
 import {
@@ -420,6 +421,46 @@ export function AddProjectHostPathStep({
         {busy ? "Opening…" : "Open project"}
       </Button>
     </form>
+  );
+}
+
+export interface AddProjectRemoteBrowseStepProps {
+  readonly hostLabel: string;
+  readonly environmentId: EnvironmentId;
+  readonly initialPath: string;
+  readonly busy: boolean;
+  readonly error: string | null;
+  readonly onSelect: (path: string) => void;
+  readonly onTypePath: () => void;
+}
+
+export function AddProjectRemoteBrowseStep({
+  hostLabel,
+  environmentId,
+  initialPath,
+  busy,
+  error,
+  onSelect,
+  onTypePath,
+}: AddProjectRemoteBrowseStepProps) {
+  return (
+    <div className="space-y-5" aria-busy={busy}>
+      <StepHeading
+        description={`Choose a folder on ${hostLabel}.`}
+        title={`Open project folder on ${hostLabel}`}
+      />
+      <fieldset disabled={busy} className="m-0 min-w-0 border-0 p-0">
+        <RemoteDirectoryBrowser
+          environmentId={environmentId}
+          initialPath={initialPath}
+          resetKey={environmentId}
+          onSelect={onSelect}
+          secondaryAction={{ label: "Type a path instead", onClick: onTypePath }}
+          selectLabel={busy ? "Opening…" : "Open project"}
+        />
+      </fieldset>
+      {error ? <ErrorMessage>{error}</ErrorMessage> : null}
+    </div>
   );
 }
 

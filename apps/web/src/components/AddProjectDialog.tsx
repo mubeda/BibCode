@@ -6,6 +6,7 @@ import {
   AddProjectCloneStep,
   AddProjectCreateStep,
   AddProjectHostPathStep,
+  AddProjectRemoteBrowseStep,
   AddProjectStartStep,
 } from "./add-project/AddProjectSteps";
 import { useAddProjectWorkflow } from "./add-project/useAddProjectWorkflow";
@@ -66,6 +67,17 @@ export function AddProjectDialog({ open, onOpenChange }: AddProjectDialogProps) 
               busy={workflow.busy}
               onPathChange={workflow.setHostPath}
               onSubmit={() => void workflow.submitHostPath()}
+            />
+          ) : null}
+          {workflow.step === "remote-browse" ? (
+            <AddProjectRemoteBrowseStep
+              hostLabel={workflow.selectedHost.label}
+              environmentId={workflow.selectedHost.environmentId}
+              initialPath={workflow.selectedHost.baseDirectory}
+              busy={workflow.busy}
+              error={workflow.error}
+              onSelect={(path) => void workflow.selectBrowsedFolder(path)}
+              onTypePath={workflow.openHostPath}
             />
           ) : null}
           {workflow.step === "clone" ? (
