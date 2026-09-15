@@ -71,6 +71,17 @@ export function canReuseBranch(ref: RefLike | null): boolean {
   return ref !== null && ref.isRemote !== true && ref.current !== true && ref.worktreePath == null;
 }
 
+/** Explains why the Reuse branch control is enabled or disabled for the selected ref. */
+export function reuseBranchHint(ref: RefLike): string {
+  if (canReuseBranch(ref)) {
+    return "Check out the existing branch instead of creating a new one from it.";
+  }
+  if (ref.isRemote === true) {
+    return `"${ref.name}" is a remote branch. A local branch will be created from it.`;
+  }
+  return `"${ref.name}" is already checked out. A new branch ("${ref.name}-2" or the next available name) will be created from it.`;
+}
+
 function isOccupiedLocalBranch(ref: RefLike): boolean {
   return ref.isRemote !== true && (ref.current === true || ref.worktreePath != null);
 }

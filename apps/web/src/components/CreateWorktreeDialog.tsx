@@ -47,6 +47,7 @@ import {
   githubWorkItemBranchName,
   parseGitHubWorkItem,
   resolveWorktreeCreateInput,
+  reuseBranchHint,
   suggestNextAvailableBranchName,
   suggestWorktreeNameFromRef,
   type GitHubWorkItemRef,
@@ -658,31 +659,22 @@ export function CreateWorktreeDialog({
               </div>
             ) : null}
 
-            {canReuseSelectedBranch ? (
+            {selectedBranchRef ? (
               <div className="space-y-1 pt-1">
                 <label className="flex w-fit items-center gap-2 text-xs text-foreground">
                   <input
                     type="checkbox"
                     checked={reuseSelectedBranch}
+                    disabled={!canReuseSelectedBranch}
                     onChange={(event) => handleReuseSelectedBranchChange(event.target.checked)}
-                    className="accent-primary size-4"
+                    className="accent-primary size-4 disabled:opacity-50"
                   />
                   Reuse branch
                 </label>
-                <p className="text-muted-foreground pl-6 text-xs">
-                  Check out the existing branch instead of creating a new one from it.
+                <p className="text-muted-foreground pl-6 text-xs" role="status">
+                  {reuseBranchHint(selectedBranchRef)}
                 </p>
               </div>
-            ) : null}
-
-            {selectedBranchRef &&
-            selectedBranchRef.isRemote !== true &&
-            (selectedBranchRef.current === true || selectedBranchRef.worktreePath != null) ? (
-              <p className="text-muted-foreground text-xs" role="status">
-                &quot;{selectedBranchRef.name}&quot; is already checked out. A new branch (&quot;
-                {selectedBranchRef.name}-2&quot; or the next available name) will be created from
-                it.
-              </p>
             ) : null}
 
             {mode === "smart" ? (
