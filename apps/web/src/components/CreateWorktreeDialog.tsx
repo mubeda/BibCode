@@ -47,6 +47,7 @@ import {
   githubWorkItemBranchName,
   parseGitHubWorkItem,
   resolveWorktreeCreateInput,
+  reuseBranchHint,
   suggestNextAvailableBranchName,
   suggestWorktreeNameFromRef,
   type GitHubWorkItemRef,
@@ -640,6 +641,16 @@ export function CreateWorktreeDialog({
               </div>
             ) : null}
 
+            {refsQuery.error ? (
+              <p role="alert" className="text-destructive text-xs">
+                <span className="block">Branches could not be loaded: {refsQuery.error}</span>
+                <span className="block">
+                  Retry after fixing Git, or clear this field and enter a Name above to create a new
+                  branch.
+                </span>
+              </p>
+            ) : null}
+
             {mode === "branch" && branchRows.length > 0 ? (
               <div className="border-border/70 max-h-48 overflow-y-auto rounded-lg border">
                 {branchRows.map((ref) => (
@@ -658,31 +669,22 @@ export function CreateWorktreeDialog({
               </div>
             ) : null}
 
-            {canReuseSelectedBranch ? (
+            {selectedBranchRef ? (
               <div className="space-y-1 pt-1">
                 <label className="flex w-fit items-center gap-2 text-xs text-foreground">
                   <input
                     type="checkbox"
-                    checked={reuseSelectedBranch}
+                    checked={reuseSelectedBranch && canReuseSelectedBranch}
+                    disabled={!canReuseSelectedBranch}
                     onChange={(event) => handleReuseSelectedBranchChange(event.target.checked)}
-                    className="accent-primary size-4"
+                    className="accent-primary size-4 disabled:opacity-50"
                   />
                   Reuse branch
                 </label>
-                <p className="text-muted-foreground pl-6 text-xs">
-                  Check out the existing branch instead of creating a new one from it.
+                <p className="text-muted-foreground pl-6 text-xs" role="status">
+                  {reuseBranchHint(selectedBranchRef)}
                 </p>
               </div>
-            ) : null}
-
-            {selectedBranchRef &&
-            selectedBranchRef.isRemote !== true &&
-            (selectedBranchRef.current === true || selectedBranchRef.worktreePath != null) ? (
-              <p className="text-muted-foreground text-xs" role="status">
-                &quot;{selectedBranchRef.name}&quot; is already checked out. A new branch (&quot;
-                {selectedBranchRef.name}-2&quot; or the next available name) will be created from
-                it.
-              </p>
             ) : null}
 
             {mode === "smart" ? (

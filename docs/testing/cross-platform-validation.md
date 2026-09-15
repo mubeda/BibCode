@@ -824,11 +824,6 @@ printf '%s\n' "main resolution" > conflict.txt
 git add conflict.txt
 git commit --quiet -m "conflicting main change"
 
-git switch --quiet -c merge-ready
-printf '%s\n' "merge preview fixture" > merge-ready.txt
-git add merge-ready.txt
-git commit --quiet -m "merge-ready change"
-git switch --quiet main
 git switch --quiet -c cherry-source
 printf '%s\n' "cherry-pick fixture" > cherry-source.txt
 git add cherry-source.txt
@@ -1010,9 +1005,23 @@ starts.
    each changed file to inspect its per-entry diff. Apply one entry and verify it
    remains listed, clean the applied changes, then pop that entry and verify it
    is removed; clean again and drop the other entry through its destructive
-   confirmation. Open **Merge…**, select `merge-ready`, review the server-computed
-   ahead/behind and mergeability preview, then merge and confirm the operation's
-   started-to-finished presentation and resulting history.
+   confirmation. From the companion shell, create `merge-ready` from the
+   current `main` tip so that a plain merge could fast-forward:
+
+   ```sh
+   git -C "$GIT_MANAGER_FIXTURE_ROOT/main" switch --quiet -c merge-ready
+   printf '%s\n' "merge preview fixture" > "$GIT_MANAGER_FIXTURE_ROOT/main/merge-ready.txt"
+   git -C "$GIT_MANAGER_FIXTURE_ROOT/main" add merge-ready.txt
+   git -C "$GIT_MANAGER_FIXTURE_ROOT/main" commit --quiet -m "merge-ready change"
+   git -C "$GIT_MANAGER_FIXTURE_ROOT/main" switch --quiet main
+   ```
+
+   Open **Merge…**, select `merge-ready`, confirm the server-computed preview
+   reports one commit ahead and none behind, then merge with **Merge commit**.
+   Confirm the operation's started-to-finished presentation and that History
+   shows a new merge commit on `main` with two parents rather than a
+   fast-forward.
+
 8. Check out `conflict-continue` in the panel and create the deliberate rebase
    conflict from the companion shell:
 

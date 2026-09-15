@@ -387,6 +387,11 @@ grouped per the `DESKTOP_LOCAL_CONNECTION_ID_PREFIX` convention) and one entry
 per saved remote environment. Selection writes `activeEnvironmentIdAtom` and
 scopes _presentation only_: the panel filters which environments' projects and
 threads it shows, and **Add project** targets the selected environment.
+When the target cannot use the native folder dialog, the dialog embeds
+`RemoteDirectoryBrowser`, which lists directories through the read-scoped
+`filesystem.browse` RPC on that environment's server, while its **New folder**
+action uses the operate-scoped `projects.createEntry` RPC, the same write path
+Settings already exposes.
 The status bar also reads that selected identity for provider usage, refresh,
 usage-reset actions, process diagnostics, and terminal counts. Its usage query
 and reset overlay remain keyed by environment; the primary connection is not a

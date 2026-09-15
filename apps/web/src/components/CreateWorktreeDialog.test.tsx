@@ -150,6 +150,7 @@ const testState = vi.hoisted(() => ({
     worktreePath?: string | null;
   }>,
   queryAtoms: [] as unknown[],
+  refsError: null as string | null,
   refreshRefs: vi.fn(),
   createWorktree: vi.fn(),
   replaceMainWithTerminal: vi.fn(),
@@ -182,8 +183,8 @@ vi.mock("~/state/query", () => ({
   useEnvironmentQuery: (atom: unknown) => {
     testState.queryAtoms.push(atom);
     return {
-      data: atom ? { refs: testState.refs } : null,
-      error: null,
+      data: testState.refsError ? undefined : atom ? { refs: testState.refs } : null,
+      error: testState.refsError,
       isPending: false,
       refresh: testState.refreshRefs,
     };
@@ -402,6 +403,7 @@ function resetScenario(): void {
   testState.projects = [project()];
   testState.serverConfigs = new Map();
   testState.refs = [];
+  testState.refsError = null;
   testState.queryAtoms = [];
   testState.refreshRefs.mockReset();
   testState.createWorktree.mockReset().mockResolvedValue(
@@ -1543,7 +1545,59 @@ if (browserRuntime) {
       expect(container.textContent).toContain(
         '"main" is already checked out. A new branch ("main-2" or the next available name) will be created from it.',
       );
-      expect(container.textContent).not.toContain("Reuse branch");
+      const reuseLabel = Array.from(container.querySelectorAll("label")).find((label) =>
+        label.textContent?.includes("Reuse branch"),
+      );
+      expect(reuseLabel).toBeDefined();
+      const reuseCheckbox = reuseLabel?.querySelector<HTMLInputElement>("input[type='checkbox']");
+      expect(reuseCheckbox?.disabled).toBe(true);
+      expect(reuseCheckbox?.checked).toBe(false);
+
+      await React.act(async () => root.unmount());
+      container.remove();
+    });
+
+    it("offers Reuse branch disabled for a selected remote branch and says why", async () => {
+      testState.refs = [
+        { name: "origin/feature/remote-only", isRemote: true, remoteName: "origin" },
+      ];
+      const { container, root } = await mountDialog();
+
+      await React.act(async () => requiredButton(container, "Branch").click());
+      await React.act(async () => requiredButton(container, "origin/feature/remote-only").click());
+
+      const reuseLabel = Array.from(container.querySelectorAll("label")).find((label) =>
+        label.textContent?.includes("Reuse branch"),
+      );
+      const reuseCheckbox = reuseLabel?.querySelector<HTMLInputElement>("input[type='checkbox']");
+      expect(reuseCheckbox?.disabled).toBe(true);
+      expect(reuseCheckbox?.checked).toBe(false);
+      expect(container.textContent).toContain(
+        '"origin/feature/remote-only" is a remote branch. A local branch will be created from it.',
+      );
+
+      await React.act(async () => root.unmount());
+      container.remove();
+    });
+
+    it("offers Reuse branch enabled and checked for a free local branch", async () => {
+      testState.refs = [
+        { name: "feature/free", isRemote: false, current: false, worktreePath: null },
+      ];
+      const { container, root } = await mountDialog();
+
+      await React.act(async () => requiredButton(container, "Branch").click());
+      await React.act(async () => requiredButton(container, "feature/free").click());
+
+      const reuseLabel = Array.from(container.querySelectorAll("label")).find((label) =>
+        label.textContent?.includes("Reuse branch"),
+      );
+      const reuseCheckbox = reuseLabel?.querySelector<HTMLInputElement>("input[type='checkbox']");
+      expect(reuseCheckbox?.disabled).toBe(false);
+      expect(reuseCheckbox?.checked).toBe(true);
+      expect(container.textContent).toContain(
+        "Check out the existing branch instead of creating a new one from it.",
+      );
 
       await React.act(async () => root.unmount());
       container.remove();
@@ -1861,6 +1915,28 @@ if (browserRuntime) {
 
       await React.act(async () => root.unmount());
       container.remove();
+    });
+
+    it("explains when the branch list could not be loaded", async () => {
+      testState.refsError = "Git is unavailable on this host.";
+      const { container, root } = await mountDialog();
+
+      await React.act(async () => requiredButton(container, "Branch").click());
+
+      const alert = container.querySelector("[role='alert']");
+      expect(alert?.textContent).toContain("Git is unavailable on this host.");
+      expect(alert?.textContent).toContain("Branches could not be loaded");
+      const lines = Array.from(alert?.querySelectorAll("span") ?? []).map(
+        (span) => span.textContent,
+      );
+      expect(lines).toEqual([
+        "Branches could not be loaded: Git is unavailable on this host.",
+        "Retry after fixing Git, or clear this field and enter a Name above to create a new branch.",
+      ]);
+
+      await React.act(async () => root.unmount());
+      container.remove();
+      testState.refsError = null;
     });
   });
 }
