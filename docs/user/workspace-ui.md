@@ -72,9 +72,11 @@ a new Git repository. On macOS and Linux desktop, Add Project uses this device
 and omits a redundant location selector. On Windows, it shows **Location** when
 a mapped WSL backend is available, offering **This device** and the usable WSL
 locations. Browser clients retain connected-host selection. Local and mapped
-WSL locations use the native folder picker; browser-only remote hosts accept an
-explicit host path. Selecting a folder adds that folder as one project and does
-not scan for nested repositories.
+WSL locations use the native folder picker. Remote hosts, and browser clients
+without a native dialog, open a folder browser that lists the selected host's
+directories; **Type a path instead** switches to manual entry of an absolute
+or home-relative path. Selecting a folder adds that folder as one project and
+does not scan for nested repositories.
 
 Workspace row context menus include update/open/copy/pin/unread actions, plus
 delete worktree for worktree rows and remove project for primary rows. On the
