@@ -85,6 +85,15 @@ local desktop environment, **Open in → File Explorer** opens the repository
 folder for a primary row or the worktree folder for a worktree row. The action
 is omitted for remote environments and browser mode.
 
+External editors are listed when the server host can find them on `PATH`. Zed
+is additionally detected through the `zeditor` alias, a Flatpak export
+(`dev.zed.Zed`), `~/.local/bin`, the macOS app bundle CLI, and the Windows
+per-user install directory. A Flatpak editor is launched with access to the
+opened file's directory, so projects outside your home directory open without
+extra Flatpak overrides. Detection runs on the server that owns the
+environment, so a remote environment lists the editors installed on that remote
+host.
+
 ### Discovering existing worktrees
 
 When a connected server advertises worktree-catalog support, BiBCode can show
