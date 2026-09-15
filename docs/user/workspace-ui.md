@@ -174,7 +174,9 @@ split, `Cmd/Ctrl+Shift+D` creates one in a new lower center split, and
 `Cmd/Ctrl+W` closes the focused terminal. Closing the final tab in a split
 collapses the empty pane. Infeasible splits, including attempts beyond the
 four-pane limit or below the minimum pane size, show a notice without opening a
-terminal session.
+terminal session. Inside a terminal, `Shift+Enter` sends a soft newline (ESC CR)
+so Codex and Claude Code prompts insert a line break instead of submitting;
+plain `Enter` still submits.
 
 Project script actions run in a visible center terminal. They reuse the focused
 idle center terminal when possible and otherwise open a new center terminal.
