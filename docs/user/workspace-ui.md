@@ -309,8 +309,14 @@ mounted confirmation and multi-commit dialogs.
 Above the tabs, **Stashes** opens the full native stash list with per-entry diff
 and apply, pop, and drop actions. Choosing **Leave my changes** while switching
 branches creates a normal visible stash. **Merge…** loads a server preview and
-starts a normal or squash merge. **Rebase…** opens a branch chooser and warns
-when the rewrite will require updating an upstream with force-with-lease.
+starts a merge-commit or squash merge. **Merge commit** never fast-forwards:
+whenever the source has commits the current branch lacks, it records a merge
+commit. Both modes override repository merge settings such as `merge.ff` or
+branch merge options that would otherwise skip the commit, squash, or reject
+the merge. A source with no commits the current branch lacks is reported as
+nothing to merge and Merge stays disabled. **Rebase…** opens a branch chooser
+and warns when the rewrite will require updating an upstream with
+force-with-lease.
 Repositories with a merge, rebase, cherry-pick, or revert in progress show a
 continue/abort strip, and conflicted paths are marked in Changes. For supported
 conflicted operations, resolve each listed path with Ours or Theirs in the

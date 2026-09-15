@@ -12,6 +12,14 @@ export function summarizeMergePreview(preview: GitManagerMergePreview): MergePre
   const base = { ahead: preview.ahead, behind: preview.behind };
   switch (preview._tag) {
     case "clean":
+      if (preview.ahead === 0) {
+        return {
+          kind: preview._tag,
+          message: `Nothing to merge: \`${preview.source}\` has no commits that \`${preview.current}\` lacks.`,
+          mergeEnabled: false,
+          ...base,
+        };
+      }
       return {
         kind: preview._tag,
         message: `This will merge ${preview.ahead} commits from \`${preview.source}\` into \`${preview.current}\`.`,

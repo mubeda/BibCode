@@ -107,7 +107,7 @@ pub async fn squash_merge(
         return Ok(vec![merge]);
     }
     let commit = repository
-        .git_manager_squash_merge_commit(cwd, cancellation)
+        .git_manager_squash_merge_commit(cwd, no_verify, cancellation)
         .await?;
     Ok(vec![merge, commit])
 }

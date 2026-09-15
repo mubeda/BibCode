@@ -26,6 +26,16 @@ describe("summarizeMergePreview", () => {
     });
   });
 
+  it("disables a clean preview whose source has nothing to merge", () => {
+    expect(summarizeMergePreview(preview({ _tag: "clean", ahead: 0 }))).toEqual({
+      kind: "clean",
+      message: "Nothing to merge: `feature` has no commits that `main` lacks.",
+      mergeEnabled: false,
+      ahead: 0,
+      behind: 3,
+    });
+  });
+
   it("presents the server's conflicted file count", () => {
     expect(summarizeMergePreview(preview({ _tag: "conflicted", fileCount: 4 }))).toEqual({
       kind: "conflicted",

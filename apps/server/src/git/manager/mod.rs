@@ -370,7 +370,7 @@ mod telemetry {
             .await
             .expect("squash merge operation");
         repository
-            .git_manager_squash_merge_commit(cwd, &cancellation)
+            .git_manager_squash_merge_commit(cwd, false, &cancellation)
             .await
             .expect("squash merge commit operation");
         repository
