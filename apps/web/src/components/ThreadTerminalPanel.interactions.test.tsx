@@ -3448,6 +3448,31 @@ describe("TerminalViewport mounted lifecycle", () => {
     });
   });
 
+  it("sends ESC CR for Shift+Enter instead of a bare carriage return", async () => {
+    await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+
+    const shiftEnter = new KeyboardEvent("keydown", {
+      key: "Enter",
+      shiftKey: true,
+      cancelable: true,
+    });
+    expect(terminal.keyHandler?.(shiftEnter)).toBe(false);
+    await act(async () => Promise.resolve());
+
+    // preventDefault on keydown suppresses xterm's keypress fallback, which would otherwise still
+    // emit "\r" (CoreBrowserTerminal._keyPress).
+    expect(shiftEnter.defaultPrevented).toBe(true);
+    expect(testState.writeCommand).toHaveBeenCalledOnce();
+    expect(testState.writeCommand).toHaveBeenCalledWith({
+      environmentId: ENVIRONMENT_ID,
+      input: { threadId: THREAD_ID, terminalId: "term-1", data: "\u001b\r" },
+    });
+
+    // Plain Enter still belongs to xterm.
+    expect(terminal.keyHandler?.(new KeyboardEvent("keydown", { key: "Enter" }))).toBe(true);
+  });
+
   it("adds a normalized terminal selection through the native context menu", async () => {
     testState.localApiAvailable = true;
     testState.contextMenuShow.mockResolvedValue("add-to-chat");
