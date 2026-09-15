@@ -641,6 +641,13 @@ export function CreateWorktreeDialog({
               </div>
             ) : null}
 
+            {refsQuery.error ? (
+              <p role="alert" className="text-destructive text-xs">
+                Branches could not be loaded. {refsQuery.error} Retry after fixing Git, or type a
+                branch name to create a new one.
+              </p>
+            ) : null}
+
             {mode === "branch" && branchRows.length > 0 ? (
               <div className="border-border/70 max-h-48 overflow-y-auto rounded-lg border">
                 {branchRows.map((ref) => (

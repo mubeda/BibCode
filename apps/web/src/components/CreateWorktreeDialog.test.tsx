@@ -150,6 +150,7 @@ const testState = vi.hoisted(() => ({
     worktreePath?: string | null;
   }>,
   queryAtoms: [] as unknown[],
+  refsError: null as string | null,
   refreshRefs: vi.fn(),
   createWorktree: vi.fn(),
   replaceMainWithTerminal: vi.fn(),
@@ -182,8 +183,8 @@ vi.mock("~/state/query", () => ({
   useEnvironmentQuery: (atom: unknown) => {
     testState.queryAtoms.push(atom);
     return {
-      data: atom ? { refs: testState.refs } : null,
-      error: null,
+      data: testState.refsError ? undefined : atom ? { refs: testState.refs } : null,
+      error: testState.refsError,
       isPending: false,
       refresh: testState.refreshRefs,
     };
@@ -402,6 +403,7 @@ function resetScenario(): void {
   testState.projects = [project()];
   testState.serverConfigs = new Map();
   testState.refs = [];
+  testState.refsError = null;
   testState.queryAtoms = [];
   testState.refreshRefs.mockReset();
   testState.createWorktree.mockReset().mockResolvedValue(
@@ -1912,6 +1914,21 @@ if (browserRuntime) {
 
       await React.act(async () => root.unmount());
       container.remove();
+    });
+
+    it("explains when the branch list could not be loaded", async () => {
+      testState.refsError = "Git is unavailable on this host.";
+      const { container, root } = await mountDialog();
+
+      await React.act(async () => requiredButton(container, "Branch").click());
+
+      const alert = container.querySelector("[role='alert']");
+      expect(alert?.textContent).toContain("Git is unavailable on this host.");
+      expect(alert?.textContent).toContain("Branches could not be loaded");
+
+      await React.act(async () => root.unmount());
+      container.remove();
+      testState.refsError = null;
     });
   });
 }
