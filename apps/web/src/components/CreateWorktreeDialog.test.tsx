@@ -1925,6 +1925,13 @@ if (browserRuntime) {
       const alert = container.querySelector("[role='alert']");
       expect(alert?.textContent).toContain("Git is unavailable on this host.");
       expect(alert?.textContent).toContain("Branches could not be loaded");
+      const lines = Array.from(alert?.querySelectorAll("span") ?? []).map(
+        (span) => span.textContent,
+      );
+      expect(lines).toEqual([
+        "Branches could not be loaded: Git is unavailable on this host.",
+        "Retry after fixing Git, or type a branch name to create a new one.",
+      ]);
 
       await React.act(async () => root.unmount());
       container.remove();
