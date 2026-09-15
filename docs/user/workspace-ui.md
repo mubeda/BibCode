@@ -59,9 +59,12 @@ environment completes synchronization.
 Use the project `+` action to create a worktree. The Create Worktree dialog has a
 permanent Name field, an optional Smart/GitHub/Branch **Create From** selector,
 an agent picker, advanced options, a Create more toggle, and Ctrl+Enter submit.
-Selecting a free local branch suggests its name and enables **Reuse branch** by
-default; edited names are preserved, and branches already checked out elsewhere
-continue through the server's safe suffixed-branch flow. Typing an exact local
+Selecting any branch shows **Reuse branch**. It is enabled and on by default
+for a free local branch; for a remote branch or a branch already checked out
+elsewhere it stays visible but disabled, with a note explaining that a new
+branch will be created from it through the server's safe suffixed-branch flow.
+If the branch list fails to load, the dialog says so and a typed name still
+creates a new branch. Edited names are preserved. Typing an exact local
 or remote branch selects that ref without repeating the same value as a result
 row below the input. If the chosen remote branch becomes local before submit,
 the server reuses it when free and still suffixes it when another worktree owns
