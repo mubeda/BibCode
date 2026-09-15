@@ -1543,7 +1543,58 @@ if (browserRuntime) {
       expect(container.textContent).toContain(
         '"main" is already checked out. A new branch ("main-2" or the next available name) will be created from it.',
       );
-      expect(container.textContent).not.toContain("Reuse branch");
+      const reuseLabel = Array.from(container.querySelectorAll("label")).find((label) =>
+        label.textContent?.includes("Reuse branch"),
+      );
+      expect(reuseLabel).toBeDefined();
+      const reuseCheckbox = reuseLabel?.querySelector<HTMLInputElement>("input[type='checkbox']");
+      expect(reuseCheckbox?.disabled).toBe(true);
+      expect(reuseCheckbox?.checked).toBe(false);
+
+      await React.act(async () => root.unmount());
+      container.remove();
+    });
+
+    it("offers Reuse branch disabled for a selected remote branch and says why", async () => {
+      testState.refs = [
+        { name: "origin/feature/remote-only", isRemote: true, remoteName: "origin" },
+      ];
+      const { container, root } = await mountDialog();
+
+      await React.act(async () => requiredButton(container, "Branch").click());
+      await React.act(async () => requiredButton(container, "origin/feature/remote-only").click());
+
+      const reuseLabel = Array.from(container.querySelectorAll("label")).find((label) =>
+        label.textContent?.includes("Reuse branch"),
+      );
+      const reuseCheckbox = reuseLabel?.querySelector<HTMLInputElement>("input[type='checkbox']");
+      expect(reuseCheckbox?.disabled).toBe(true);
+      expect(container.textContent).toContain(
+        '"origin/feature/remote-only" is a remote branch. A local branch will be created from it.',
+      );
+
+      await React.act(async () => root.unmount());
+      container.remove();
+    });
+
+    it("offers Reuse branch enabled and checked for a free local branch", async () => {
+      testState.refs = [
+        { name: "feature/free", isRemote: false, current: false, worktreePath: null },
+      ];
+      const { container, root } = await mountDialog();
+
+      await React.act(async () => requiredButton(container, "Branch").click());
+      await React.act(async () => requiredButton(container, "feature/free").click());
+
+      const reuseLabel = Array.from(container.querySelectorAll("label")).find((label) =>
+        label.textContent?.includes("Reuse branch"),
+      );
+      const reuseCheckbox = reuseLabel?.querySelector<HTMLInputElement>("input[type='checkbox']");
+      expect(reuseCheckbox?.disabled).toBe(false);
+      expect(reuseCheckbox?.checked).toBe(true);
+      expect(container.textContent).toContain(
+        "Check out the existing branch instead of creating a new one from it.",
+      );
 
       await React.act(async () => root.unmount());
       container.remove();
