@@ -264,4 +264,49 @@ mod tests {
             ));
         }
     }
+
+    #[tokio::test]
+    async fn browse_directory_expands_home_and_reports_breadcrumbs_and_ancestor() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("code/app");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir(root.path().join("code/.hidden")).unwrap();
+
+        let result = browse_directory(&root.path().join("code").to_string_lossy(), None)
+            .await
+            .unwrap();
+        let canonical = std::fs::canonicalize(root.path().join("code")).unwrap();
+        assert_eq!(
+            result.directory_path.as_deref(),
+            Some(canonical.to_str().unwrap())
+        );
+        assert_eq!(
+            result.ancestor_path.as_deref(),
+            Some(canonical.parent().unwrap().to_str().unwrap())
+        );
+        let names: Vec<_> = result
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, vec![".hidden", "app"]);
+        assert!(
+            result
+                .breadcrumbs
+                .as_ref()
+                .is_some_and(|crumbs| !crumbs.is_empty())
+        );
+
+        let home = browse_directory("~", None).await;
+        match dirs::home_dir() {
+            Some(_) => assert!(home.is_ok()),
+            None => assert!(home.is_err()),
+        }
+
+        let missing = browse_directory(&root.path().join("nope").to_string_lossy(), None).await;
+        assert!(matches!(
+            missing,
+            Err(WorkspaceError::Operation { .. }) | Err(WorkspaceError::NotFound { .. })
+        ));
+    }
 }
