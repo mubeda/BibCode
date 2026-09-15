@@ -1,7 +1,6 @@
 //! One server-owned catalog of external editors: how each is detected on the host and how its
 //! launch arguments are shaped. `control.rs` reports availability from it and `git_vcs.rs`
 //! launches through it, so the two can never disagree.
-#![allow(dead_code)] // Wired into control.rs (Task 2) and git_vcs.rs (Task 3).
 
 use std::path::{Path, PathBuf};
 
