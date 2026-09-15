@@ -40,6 +40,29 @@ vi.mock("./add-project/useAddProjectWorkflow", async () => {
   };
 });
 
+vi.mock("./RemoteDirectoryBrowser", () => ({
+  RemoteDirectoryBrowser: (props: {
+    readonly secondaryAction?: { readonly label: string; readonly onClick: () => void };
+    readonly selectLabel?: string;
+    readonly onSelect: (path: string) => void;
+    readonly onCancel: () => void;
+  }) => (
+    <div>
+      <button type="button" onClick={props.onCancel}>
+        Cancel
+      </button>
+      {props.secondaryAction ? (
+        <button type="button" onClick={props.secondaryAction.onClick}>
+          {props.secondaryAction.label}
+        </button>
+      ) : null}
+      <button type="button" onClick={() => props.onSelect("/srv/code/demo")}>
+        {props.selectLabel ?? "Select folder"}
+      </button>
+    </div>
+  ),
+}));
+
 import { AddProjectDialog } from "./AddProjectDialog";
 
 interface MountedTree {
@@ -213,5 +236,39 @@ describe("AddProjectDialog mounted interactions", () => {
     await mount(<AddProjectDialog open onOpenChange={onOpenChange} />);
     await pressEscape();
     expect(onOpenChange).not.toHaveBeenCalledWith(false);
+  });
+
+  it("renders the server directory browser for the remote-browse step", async () => {
+    testState.workflow.step = "remote-browse";
+    testState.workflow.selectedHost = {
+      ...testState.workflow.selectedHost,
+      label: "Remote",
+    };
+    await mount(<AddProjectDialog open onOpenChange={vi.fn()} />);
+    expect(document.body.textContent).toContain("Open project folder on Remote");
+    expect(document.body.textContent).toContain("Type a path instead");
+    expect(document.body.textContent).toContain("Open project");
+  });
+
+  it("wires the remote-browse step's browser actions to the workflow", async () => {
+    testState.workflow.step = "remote-browse";
+    testState.workflow.selectedHost = {
+      ...testState.workflow.selectedHost,
+      label: "Remote",
+    };
+    testState.workflow.error = "Folder is not readable.";
+    await mount(<AddProjectDialog open onOpenChange={vi.fn()} />);
+
+    const alert = document.querySelector('[role="alert"]');
+    expect(alert?.textContent).toContain("Folder is not readable.");
+
+    await click(buttonWithText("Open project"));
+    expect(testState.workflow.selectBrowsedFolder).toHaveBeenCalledWith("/srv/code/demo");
+
+    await click(buttonWithText("Type a path instead"));
+    expect(testState.workflow.openHostPath).toHaveBeenCalledTimes(1);
+
+    await click(buttonWithText("Cancel"));
+    expect(testState.workflow.back).toHaveBeenCalledTimes(1);
   });
 });

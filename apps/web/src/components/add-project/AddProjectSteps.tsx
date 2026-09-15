@@ -5,6 +5,7 @@ import { ChevronDownIcon, FolderOpenIcon, GitBranchIcon, GlobeIcon, PlusIcon } f
 import { type KeyboardEvent, type ReactNode, useState } from "react";
 
 import { cn } from "~/lib/utils";
+import { RemoteDirectoryBrowser } from "~/components/RemoteDirectoryBrowser";
 
 import {
   joinProjectPath,
@@ -420,6 +421,47 @@ export function AddProjectHostPathStep({
         {busy ? "Opening…" : "Open project"}
       </Button>
     </form>
+  );
+}
+
+export interface AddProjectRemoteBrowseStepProps {
+  readonly hostLabel: string;
+  readonly environmentId: EnvironmentId;
+  readonly initialPath: string;
+  readonly busy: boolean;
+  readonly error: string | null;
+  readonly onSelect: (path: string) => void;
+  readonly onCancel: () => void;
+  readonly onTypePath: () => void;
+}
+
+export function AddProjectRemoteBrowseStep({
+  hostLabel,
+  environmentId,
+  initialPath,
+  busy,
+  error,
+  onSelect,
+  onCancel,
+  onTypePath,
+}: AddProjectRemoteBrowseStepProps) {
+  return (
+    <div className="space-y-5" aria-busy={busy}>
+      <StepHeading
+        description={`Choose a folder on ${hostLabel}.`}
+        title={`Open project folder on ${hostLabel}`}
+      />
+      <RemoteDirectoryBrowser
+        environmentId={environmentId}
+        initialPath={initialPath}
+        resetKey={environmentId}
+        onSelect={onSelect}
+        onCancel={onCancel}
+        secondaryAction={{ label: "Type a path instead", onClick: onTypePath }}
+        selectLabel={busy ? "Opening…" : "Open project"}
+      />
+      {error ? <ErrorMessage>{error}</ErrorMessage> : null}
+    </div>
   );
 }
 
