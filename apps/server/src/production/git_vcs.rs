@@ -1765,9 +1765,14 @@ fn open_in_editor_with(
                 id: definition.id,
                 program,
                 args: definition.args,
+                flatpak_app_id: None,
             }
         })
     });
+    // Unreachable while every catalog entry in `EDITOR_DEFINITIONS` has at least one `Path`
+    // candidate: `fallback_program` always finds one, so `resolved` is always `Some`. A future
+    // candidate-only editor (no `Path` candidate) should report
+    // `ExternalLauncherCommandNotFoundError` here instead of reusing the unknown-editor error.
     let Some(resolved) = resolved else {
         return Err(
             json!({ "_tag": "ExternalLauncherUnknownEditorError", "editor": input.editor }),
@@ -4721,26 +4726,33 @@ esac
     }
 
     #[cfg(not(windows))]
-    #[test]
-    fn open_in_editor_launches_flatpak_zed_through_its_export_wrapper() {
-        let temp = tempfile::tempdir().unwrap();
-        let exports = temp.path().join("exports/bin");
-        std::fs::create_dir_all(&exports).unwrap();
+    fn flatpak_export_env(
+        exports: std::path::PathBuf,
+    ) -> crate::production::editor_launch::EditorProbeEnv {
         let wrapper = exports.join("dev.zed.Zed");
         std::fs::write(&wrapper, b"#!/bin/sh\n").unwrap();
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let env = crate::production::editor_launch::EditorProbeEnv {
+        crate::production::editor_launch::EditorProbeEnv {
             path_entries: Vec::new(),
             home: None,
             flatpak_export_dirs: vec![exports],
             local_app_data: None,
-        };
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn open_in_editor_launches_flatpak_zed_with_a_filesystem_grant_for_a_file_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let exports = temp.path().join("exports/bin");
+        std::fs::create_dir_all(&exports).unwrap();
+        let env = flatpak_export_env(exports);
         let captured = std::sync::Mutex::new(None);
         open_in_editor_with(
-            json!({ "cwd": "/repo", "editor": "zed" }),
+            json!({ "cwd": "/repo/src/main.ts:4:2", "editor": "zed" }),
             &env,
             |strategy| {
                 *captured.lock().unwrap() = Some(strategy.clone());
@@ -4751,8 +4763,47 @@ esac
         assert_eq!(
             captured.into_inner().unwrap(),
             Some(EditorLaunchStrategy::Process {
-                command: wrapper.to_string_lossy().into_owned(),
-                args: vec!["/repo".to_owned()],
+                command: "flatpak".to_owned(),
+                args: vec![
+                    "run".to_owned(),
+                    "--filesystem=/repo/src".to_owned(),
+                    "dev.zed.Zed".to_owned(),
+                    "/repo/src/main.ts:4:2".to_owned(),
+                ],
+            })
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn open_in_editor_launches_flatpak_zed_with_a_filesystem_grant_for_a_directory_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let exports = temp.path().join("exports/bin");
+        std::fs::create_dir_all(&exports).unwrap();
+        let env = flatpak_export_env(exports);
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let project_str = project.to_string_lossy().into_owned();
+        let captured = std::sync::Mutex::new(None);
+        open_in_editor_with(
+            json!({ "cwd": project_str, "editor": "zed" }),
+            &env,
+            |strategy| {
+                *captured.lock().unwrap() = Some(strategy.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            captured.into_inner().unwrap(),
+            Some(EditorLaunchStrategy::Process {
+                command: "flatpak".to_owned(),
+                args: vec![
+                    "run".to_owned(),
+                    format!("--filesystem={project_str}"),
+                    "dev.zed.Zed".to_owned(),
+                    project_str.clone(),
+                ],
             })
         );
     }

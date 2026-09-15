@@ -92,6 +92,7 @@ impl EditorProbeEnv {
         let home = dirs::home_dir();
         let mut flatpak_export_dirs = vec![PathBuf::from("/var/lib/flatpak/exports/bin")];
         let user_data = std::env::var_os("XDG_DATA_HOME")
+            .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .or_else(|| home.as_ref().map(|home| home.join(".local/share")));
         if let Some(user_data) = user_data {
@@ -112,15 +113,54 @@ pub(crate) struct ResolvedEditor {
     pub id: &'static str,
     pub program: String,
     pub args: EditorArgs,
+    /// `Some(app_id)` when this editor launches through Flatpak, so `args_for` can grant the
+    /// opened path's directory instead of relying on the sandbox's default `filesystems=home`.
+    pub flatpak_app_id: Option<&'static str>,
 }
 
 impl ResolvedEditor {
     pub(crate) fn args_for(&self, target: &str) -> Vec<String> {
-        match self.args {
+        let style_args = match self.args {
             EditorArgs::Goto => vec!["--goto".to_owned(), target.to_owned()],
             EditorArgs::DirectPath => vec![target.to_owned()],
             EditorArgs::KiroIde => vec!["ide".to_owned(), "--goto".to_owned(), target.to_owned()],
+        };
+        let Some(app_id) = self.flatpak_app_id else {
+            return style_args;
+        };
+        let mut args = vec![
+            "run".to_owned(),
+            format!("--filesystem={}", target_directory(target)),
+            app_id.to_owned(),
+        ];
+        args.extend(style_args);
+        args
+    }
+}
+
+/// Directory a launcher must be able to reach to open `target` (`path[:line[:col]]`).
+pub(crate) fn target_directory(target: &str) -> String {
+    let mut path = target;
+    for _ in 0..2 {
+        let Some(colon) = path.rfind(':') else {
+            break;
+        };
+        let (prefix, suffix) = path.split_at(colon);
+        let digits = &suffix[1..];
+        if prefix.is_empty()
+            || digits.is_empty()
+            || !digits.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            break;
         }
+        path = prefix;
+    }
+    if Path::new(path).is_dir() {
+        return path.to_owned();
+    }
+    match Path::new(path).parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_string_lossy().into_owned(),
+        _ => path.to_owned(),
     }
 }
 
@@ -132,7 +172,7 @@ pub(crate) fn editor_definition(id: &str) -> Option<&'static EditorDefinition> {
 
 pub(crate) fn resolve_editor(id: &str, env: &EditorProbeEnv) -> Option<ResolvedEditor> {
     let definition = editor_definition(id)?;
-    let program = definition
+    let (program, flatpak_app_id) = definition
         .candidates
         .iter()
         .find_map(|candidate| resolve_candidate(candidate, env))?;
@@ -140,6 +180,7 @@ pub(crate) fn resolve_editor(id: &str, env: &EditorProbeEnv) -> Option<ResolvedE
         id: definition.id,
         program,
         args: definition.args,
+        flatpak_app_id,
     })
 }
 
@@ -162,19 +203,26 @@ pub(crate) fn fallback_program(definition: &EditorDefinition) -> Option<String> 
         })
 }
 
-fn resolve_candidate(candidate: &EditorCandidate, env: &EditorProbeEnv) -> Option<String> {
+/// Resolves a candidate to its launch program and, for Flatpak, the app id `args_for` needs to
+/// grant a filesystem override. The export wrapper's existence remains the detection signal, but
+/// the program launched is `flatpak` itself (the wrapper execs `/usr/bin/flatpak`, so it is on
+/// the host) rather than the wrapper path, so a per-run `--filesystem` override can be inserted.
+fn resolve_candidate(
+    candidate: &EditorCandidate,
+    env: &EditorProbeEnv,
+) -> Option<(String, Option<&'static str>)> {
     match candidate {
         EditorCandidate::Path(command) => env
             .path_entries
             .iter()
             .any(|directory| is_executable_file(&directory.join(command)))
-            .then(|| (*command).to_owned()),
+            .then(|| ((*command).to_owned(), None)),
         EditorCandidate::Flatpak(app_id) => env
             .flatpak_export_dirs
             .iter()
             .map(|directory| directory.join(app_id))
-            .find(|wrapper| is_executable_file(wrapper))
-            .map(|wrapper| wrapper.to_string_lossy().into_owned()),
+            .any(|wrapper| is_executable_file(&wrapper))
+            .then(|| ("flatpak".to_owned(), Some(*app_id))),
         EditorCandidate::HomeRelative(relative) => {
             let base = if relative.starts_with("AppData/Local/") {
                 env.local_app_data
@@ -184,11 +232,11 @@ fn resolve_candidate(candidate: &EditorCandidate, env: &EditorProbeEnv) -> Optio
                 env.home.as_ref().map(|home| home.join(relative))
             };
             base.filter(|path| is_executable_file(path))
-                .map(|path| path.to_string_lossy().into_owned())
+                .map(|path| (path.to_string_lossy().into_owned(), None))
         }
         EditorCandidate::Absolute(absolute) => {
             let path = Path::new(absolute);
-            is_executable_file(path).then(|| (*absolute).to_owned())
+            is_executable_file(path).then(|| ((*absolute).to_owned(), None))
         }
     }
 }
@@ -259,7 +307,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let exports = temp.path().join("exports/bin");
         fs::create_dir_all(&exports).unwrap();
-        let wrapper = executable(&exports, "dev.zed.Zed");
+        let _wrapper = executable(&exports, "dev.zed.Zed");
         let env = EditorProbeEnv {
             path_entries: Vec::new(),
             home: None,
@@ -268,8 +316,37 @@ mod tests {
         };
 
         let resolved = resolve_editor("zed", &env).expect("flatpak zed resolves");
-        assert_eq!(resolved.program, wrapper.to_string_lossy());
+        assert_eq!(resolved.program, "flatpak");
+        assert_eq!(resolved.flatpak_app_id, Some("dev.zed.Zed"));
+        assert_eq!(
+            resolved.args_for("/repo/src/main.ts:4:2"),
+            vec![
+                "run",
+                "--filesystem=/repo/src",
+                "dev.zed.Zed",
+                "/repo/src/main.ts:4:2",
+            ]
+        );
         assert_eq!(available_editor_ids(&env), vec!["zed"]);
+    }
+
+    #[test]
+    fn target_directory_strips_up_to_two_trailing_line_and_column_suffixes() {
+        assert_eq!(target_directory("/repo/src/main.ts:4:2"), "/repo/src");
+        assert_eq!(target_directory("/repo/src/main.ts"), "/repo/src");
+    }
+
+    #[test]
+    fn target_directory_returns_an_existing_directory_target_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_string_lossy().into_owned();
+        assert_eq!(target_directory(&dir), dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn target_directory_strips_a_windows_line_suffix() {
+        assert_eq!(target_directory("C:\\repo\\a.ts:3"), "C:\\repo");
     }
 
     #[test]
