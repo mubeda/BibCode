@@ -4,8 +4,8 @@ import type { EnvironmentId } from "@bibcode/contracts";
 import { ChevronDownIcon, FolderOpenIcon, GitBranchIcon, GlobeIcon, PlusIcon } from "lucide-react";
 import { type KeyboardEvent, type ReactNode, useState } from "react";
 
-import { cn } from "~/lib/utils";
 import { RemoteDirectoryBrowser } from "~/components/RemoteDirectoryBrowser";
+import { cn } from "~/lib/utils";
 
 import {
   joinProjectPath,
@@ -431,7 +431,6 @@ export interface AddProjectRemoteBrowseStepProps {
   readonly busy: boolean;
   readonly error: string | null;
   readonly onSelect: (path: string) => void;
-  readonly onCancel: () => void;
   readonly onTypePath: () => void;
 }
 
@@ -442,7 +441,6 @@ export function AddProjectRemoteBrowseStep({
   busy,
   error,
   onSelect,
-  onCancel,
   onTypePath,
 }: AddProjectRemoteBrowseStepProps) {
   return (
@@ -457,7 +455,6 @@ export function AddProjectRemoteBrowseStep({
           initialPath={initialPath}
           resetKey={environmentId}
           onSelect={onSelect}
-          onCancel={onCancel}
           secondaryAction={{ label: "Type a path instead", onClick: onTypePath }}
           selectLabel={busy ? "Opening…" : "Open project"}
         />

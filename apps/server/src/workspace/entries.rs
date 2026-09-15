@@ -290,11 +290,11 @@ mod tests {
             .map(|entry| entry.name.as_str())
             .collect();
         assert_eq!(names, vec![".hidden", "app"]);
-        assert!(
-            result
-                .breadcrumbs
-                .as_ref()
-                .is_some_and(|crumbs| !crumbs.is_empty())
+        let breadcrumbs = result.breadcrumbs.as_ref().expect("breadcrumbs present");
+        assert!(!breadcrumbs.is_empty());
+        assert_eq!(
+            breadcrumbs.last().map(|crumb| crumb.full_path.as_str()),
+            Some(canonical.to_str().unwrap())
         );
 
         let home = browse_directory("~", None).await;

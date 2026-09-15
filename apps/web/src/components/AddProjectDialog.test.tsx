@@ -45,12 +45,14 @@ vi.mock("./RemoteDirectoryBrowser", () => ({
     readonly secondaryAction?: { readonly label: string; readonly onClick: () => void };
     readonly selectLabel?: string;
     readonly onSelect: (path: string) => void;
-    readonly onCancel: () => void;
+    readonly onCancel?: () => void;
   }) => (
     <div>
-      <button type="button" onClick={props.onCancel}>
-        Cancel
-      </button>
+      {props.onCancel ? (
+        <button type="button" onClick={props.onCancel}>
+          Cancel
+        </button>
+      ) : null}
       {props.secondaryAction ? (
         <button type="button" onClick={props.secondaryAction.onClick}>
           {props.secondaryAction.label}
@@ -293,7 +295,12 @@ describe("AddProjectDialog mounted interactions", () => {
     await click(buttonWithText("Type a path instead"));
     expect(testState.workflow.openHostPath).toHaveBeenCalledTimes(1);
 
-    await click(buttonWithText("Cancel"));
-    expect(testState.workflow.back).toHaveBeenCalledTimes(1);
+    // The dialog's own "Back" link (asserted elsewhere) is the only way back from this
+    // step; the browser must not render its own duplicate Cancel exit here.
+    expect(
+      Array.from(document.querySelectorAll("button")).some(
+        (button) => button.textContent?.trim() === "Cancel",
+      ),
+    ).toBe(false);
   });
 });

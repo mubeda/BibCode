@@ -25,12 +25,17 @@ import { useAtomCommand } from "~/state/use-atom-command";
 export interface RemoteDirectoryBrowserProps {
   readonly environmentId: EnvironmentId;
   readonly initialPath: string;
-  /** Re-runs the reset effect (path, hidden toggle, warnings) when it changes; dialogs pass `open`. */
+  /**
+   * Re-runs the reset effect (path, hidden toggle, warnings, pending create) when this
+   * value changes. Pass a value that stays stable while the component is visible — for
+   * example the browsing target's `environmentId` — not one that flips during a host
+   * dialog's exit transition, since the browser typically stays mounted through it.
+   */
   readonly resetKey: unknown;
   /** Called with the canonical directory path when the user confirms. */
   readonly onSelect: (path: string) => void;
-  /** Called when the user cancels; the host decides what cancel means. */
-  readonly onCancel: () => void;
+  /** Called when the user cancels; omit to hide the Cancel button when the host provides its own way back. */
+  readonly onCancel?: () => void;
   /** Optional extra secondary action rendered next to Cancel (Add Project uses "Type a path instead"). */
   readonly secondaryAction?: { readonly label: string; readonly onClick: () => void };
   readonly selectLabel?: string;
@@ -481,9 +486,11 @@ export function RemoteDirectoryBrowser({
         </p>
       ) : null}
       <div className="flex items-center justify-end gap-2 pt-2">
-        <Button type="button" variant="outline" onClick={onCancel}>
-          Cancel
-        </Button>
+        {onCancel ? (
+          <Button type="button" variant="outline" onClick={onCancel}>
+            Cancel
+          </Button>
+        ) : null}
         {secondaryAction ? (
           <Button type="button" variant="ghost" onClick={secondaryAction.onClick}>
             {secondaryAction.label}
