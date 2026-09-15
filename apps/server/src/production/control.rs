@@ -2171,28 +2171,9 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
 }
 
 fn available_editors() -> Vec<&'static str> {
-    [
-        ("code", "vscode"),
-        ("cursor", "cursor"),
-        ("idea", "intellij"),
-        ("zed", "zed"),
-    ]
-    .into_iter()
-    .filter_map(|(binary, id)| command_exists(binary).then_some(id))
-    .collect()
-}
-
-fn command_exists(command: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|path| {
-        std::env::split_paths(&path).any(|directory| {
-            let direct = directory.join(command);
-            direct.is_file()
-                || (cfg!(windows)
-                    && ["exe", "cmd", "bat"]
-                        .into_iter()
-                        .any(|extension| direct.with_extension(extension).is_file()))
-        })
-    })
+    crate::production::editor_launch::available_editor_ids(
+        &crate::production::editor_launch::EditorProbeEnv::from_process(),
+    )
 }
 
 const fn platform_os() -> &'static str {
@@ -5169,8 +5150,13 @@ mod tests {
             environment_descriptor(&config, false)["capabilities"]["worktreeCatalogRefreshReason"],
             true
         );
-        let _ = available_editors();
-        assert!(!command_exists("definitely-not-a-bibcode-editor"));
+        let editors = available_editors();
+        assert!(
+            editors
+                .iter()
+                .all(|id| super::super::editor_launch::editor_definition(id).is_some())
+        );
+        assert!(!editors.contains(&"intellij"));
 
         let call = |method, payload, cancellation| control.call(method, payload, cancellation);
         assert!(
