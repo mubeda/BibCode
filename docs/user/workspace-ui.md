@@ -59,9 +59,12 @@ environment completes synchronization.
 Use the project `+` action to create a worktree. The Create Worktree dialog has a
 permanent Name field, an optional Smart/GitHub/Branch **Create From** selector,
 an agent picker, advanced options, a Create more toggle, and Ctrl+Enter submit.
-Selecting a free local branch suggests its name and enables **Reuse branch** by
-default; edited names are preserved, and branches already checked out elsewhere
-continue through the server's safe suffixed-branch flow. Typing an exact local
+Selecting any branch suggests its name and shows **Reuse branch**. It is enabled and on by default
+for a free local branch; for a remote branch or a branch already checked out
+elsewhere it stays visible but disabled, with a note explaining that a new
+branch will be created from it through the server's safe suffixed-branch flow.
+If the branch list fails to load, the dialog says so and a typed name still
+creates a new branch. Edited names are preserved. Typing an exact local
 or remote branch selects that ref without repeating the same value as a result
 row below the input. If the chosen remote branch becomes local before submit,
 the server reuses it when free and still suffixes it when another worktree owns
@@ -72,15 +75,26 @@ a new Git repository. On macOS and Linux desktop, Add Project uses this device
 and omits a redundant location selector. On Windows, it shows **Location** when
 a mapped WSL backend is available, offering **This device** and the usable WSL
 locations. Browser clients retain connected-host selection. Local and mapped
-WSL locations use the native folder picker; browser-only remote hosts accept an
-explicit host path. Selecting a folder adds that folder as one project and does
-not scan for nested repositories.
+WSL locations use the native folder picker. Remote hosts, and browser clients
+without a native dialog, open a folder browser that lists the selected host's
+directories; **Type a path instead** switches to manual entry of an absolute
+or home-relative path. Selecting a folder adds that folder as one project and
+does not scan for nested repositories.
 
 Workspace row context menus include update/open/copy/pin/unread actions, plus
 delete worktree for worktree rows and remove project for primary rows. On the
 local desktop environment, **Open in → File Explorer** opens the repository
 folder for a primary row or the worktree folder for a worktree row. The action
 is omitted for remote environments and browser mode.
+
+External editors are listed when the server host can find them on `PATH`. Zed
+is additionally detected through the `zeditor` alias, a Flatpak export
+(`dev.zed.Zed`), `~/.local/bin`, the macOS app bundle CLI, and the Windows
+per-user install directory. A Flatpak editor is launched with access to the
+opened file's directory, so projects outside your home directory open without
+extra Flatpak overrides. Detection runs on the server that owns the
+environment, so a remote environment lists the editors installed on that remote
+host.
 
 ### Discovering existing worktrees
 
@@ -174,7 +188,9 @@ split, `Cmd/Ctrl+Shift+D` creates one in a new lower center split, and
 `Cmd/Ctrl+W` closes the focused terminal. Closing the final tab in a split
 collapses the empty pane. Infeasible splits, including attempts beyond the
 four-pane limit or below the minimum pane size, show a notice without opening a
-terminal session.
+terminal session. Inside a terminal, `Shift+Enter` sends a soft newline (ESC CR)
+so Codex and Claude Code prompts insert a line break instead of submitting;
+plain `Enter` still submits.
 
 Project script actions run in a visible center terminal. They reuse the focused
 idle center terminal when possible and otherwise open a new center terminal.
@@ -293,8 +309,14 @@ mounted confirmation and multi-commit dialogs.
 Above the tabs, **Stashes** opens the full native stash list with per-entry diff
 and apply, pop, and drop actions. Choosing **Leave my changes** while switching
 branches creates a normal visible stash. **Merge…** loads a server preview and
-starts a normal or squash merge. **Rebase…** opens a branch chooser and warns
-when the rewrite will require updating an upstream with force-with-lease.
+starts a merge-commit or squash merge. **Merge commit** never fast-forwards:
+whenever the source has commits the current branch lacks, it records a merge
+commit. Both modes override repository merge settings such as `merge.ff` or
+branch merge options that would otherwise skip the commit, squash, or reject
+the merge. A source with no commits the current branch lacks is reported as
+nothing to merge and Merge stays disabled. **Rebase…** opens a branch chooser
+and warns when the rewrite will require updating an upstream with
+force-with-lease.
 Repositories with a merge, rebase, cherry-pick, or revert in progress show a
 continue/abort strip, and conflicted paths are marked in Changes. For supported
 conflicted operations, resolve each listed path with Ours or Theirs in the

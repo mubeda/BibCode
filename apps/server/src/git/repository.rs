@@ -4150,7 +4150,21 @@ impl GitRepository {
     ) -> Result<ProcessOutput, GitCommandError> {
         let mut args = vec!["merge".to_owned()];
         if squash {
-            args.push("--squash".to_owned());
+            // `--squash` never commits, but `merge.ff` and `branch.<name>.mergeOptions`
+            // can inject `--no-ff`, `--ff-only`, or `--commit`, each of which makes Git
+            // reject or abort the squash, so its controls are pinned explicitly too.
+            args.extend(strings(&["--squash", "--ff", "--no-commit"]));
+        } else {
+            // "Merge commit" mode must always record a merge commit. Git's default
+            // fast-forwards when it can, and `branch.<name>.mergeOptions` may inject
+            // `--no-commit` or `--squash`, so every control is pinned on the command
+            // line. `--no-ff` cannot combine with `--squash`, so squash mode stays apart.
+            args.extend(strings(&[
+                "--no-ff",
+                "--no-squash",
+                "--commit",
+                "--no-edit",
+            ]));
         }
         if no_verify {
             args.push("--no-verify".to_owned());
@@ -4163,12 +4177,17 @@ impl GitRepository {
     pub(crate) async fn git_manager_squash_merge_commit(
         &self,
         cwd: &Path,
+        no_verify: bool,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, GitCommandError> {
+        let mut args = strings(&["commit", "--no-edit"]);
+        if no_verify {
+            args.push("--no-verify".to_owned());
+        }
         self.execute(
             "GitManager.squashMerge.commit",
             cwd,
-            &strings(&["commit", "--no-edit"]),
+            &args,
             true,
             cancellation,
         )
@@ -7226,6 +7245,73 @@ mod tests {
             .collect::<Vec<_>>()
         );
         assert!(!args.iter().any(|argument| argument == "--force"));
+    }
+
+    #[tokio::test]
+    async fn git_manager_merge_commands_match_the_command_contract() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([
+                ("GitManager.merge".into(), process_output("")),
+                ("GitManager.squashMerge.commit".into(), process_output("")),
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+        let cwd = Path::new("/repo");
+        let cancellation = CancellationToken::new();
+
+        for (no_verify, squash) in [(false, false), (true, false), (false, true), (true, true)] {
+            repository
+                .git_manager_merge(cwd, "topic", no_verify, squash, &cancellation)
+                .await
+                .expect("merge command");
+        }
+        for no_verify in [false, true] {
+            repository
+                .git_manager_squash_merge_commit(cwd, no_verify, &cancellation)
+                .await
+                .expect("squash merge commit command");
+        }
+
+        let args = runner
+            .requests()
+            .into_iter()
+            .map(|request| request.args)
+            .collect::<Vec<_>>();
+        let expected = [
+            vec![
+                "merge",
+                "--no-ff",
+                "--no-squash",
+                "--commit",
+                "--no-edit",
+                "topic",
+            ],
+            vec![
+                "merge",
+                "--no-ff",
+                "--no-squash",
+                "--commit",
+                "--no-edit",
+                "--no-verify",
+                "topic",
+            ],
+            vec!["merge", "--squash", "--ff", "--no-commit", "topic"],
+            vec![
+                "merge",
+                "--squash",
+                "--ff",
+                "--no-commit",
+                "--no-verify",
+                "topic",
+            ],
+            vec!["commit", "--no-edit"],
+            vec!["commit", "--no-edit", "--no-verify"],
+        ]
+        .into_iter()
+        .map(|args| args.into_iter().map(OsString::from).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+        assert_eq!(args, expected);
     }
 
     #[tokio::test]

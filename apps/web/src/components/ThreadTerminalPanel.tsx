@@ -60,6 +60,7 @@ import {
   terminalClipboardShortcut,
   terminalDeleteShortcutData,
   terminalNavigationShortcutData,
+  terminalNewlineShortcutData,
 } from "../keybindings";
 import { MAX_TERMINALS_PER_GROUP, type ThreadTerminalGroup } from "../types";
 import { readLocalApi } from "~/localApi";
@@ -1309,6 +1310,14 @@ export function TerminalViewport({
         event.preventDefault();
         event.stopPropagation();
         sendTerminalInput(deleteData, "Failed to delete terminal input");
+        return false;
+      }
+
+      const newlineData = terminalNewlineShortcutData(event);
+      if (newlineData !== null) {
+        event.preventDefault();
+        event.stopPropagation();
+        sendTerminalInput(newlineData, "Failed to insert newline");
         return false;
       }
 

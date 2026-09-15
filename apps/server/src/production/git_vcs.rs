@@ -1650,7 +1650,11 @@ impl GitVcsRpcServices {
     }
 
     async fn open_in_editor(&self, payload: Value) -> RpcResult {
-        open_in_editor_with(payload, launch_editor)
+        open_in_editor_with(
+            payload,
+            &crate::production::editor_launch::EditorProbeEnv::from_process(),
+            launch_editor,
+        )
     }
 
     async fn guard_payload_cwd(
@@ -1732,31 +1736,55 @@ fn is_workspace_unavailable(error: &Value) -> bool {
 
 fn open_in_editor_with(
     payload: Value,
+    env: &crate::production::editor_launch::EditorProbeEnv,
     launch: impl FnOnce(&EditorLaunchStrategy) -> std::io::Result<()>,
 ) -> RpcResult {
+    use crate::production::editor_launch::{editor_definition, fallback_program, resolve_editor};
+
     let input: LaunchEditorInput = decode(payload, "shell.openInEditor")?;
-    let (command, args): (&str, Vec<String>) = match input.editor.as_str() {
-            "file-manager" => return open::that_detached(&input.cwd).map(|()| Value::Null).map_err(|error| json!({
-                "_tag": "ExternalLauncherEditorSpawnError", "editor": input.editor,
-                "target": display_path(&input.cwd), "command": "open", "args": [], "cause": error.to_string(),
-            })),
-            "cursor" => ("cursor", vec!["--goto".into(), display_path(&input.cwd)]),
-            "trae" => ("trae", vec!["--goto".into(), display_path(&input.cwd)]),
-            "kiro" => ("kiro", vec!["ide".into(), "--goto".into(), display_path(&input.cwd)]),
-            "vscode" => ("code", vec!["--goto".into(), display_path(&input.cwd)]),
-            "vscode-insiders" => ("code-insiders", vec!["--goto".into(), display_path(&input.cwd)]),
-            "vscodium" => ("codium", vec!["--goto".into(), display_path(&input.cwd)]),
-            "zed" => ("zed", vec![display_path(&input.cwd)]),
-            "antigravity" => ("agy", vec!["--goto".into(), display_path(&input.cwd)]),
-            editor if JETBRAINS_EDITORS.contains(&editor) => (editor, vec![display_path(&input.cwd)]),
-            editor => return Err(json!({ "_tag": "ExternalLauncherUnknownEditorError", "editor": editor })),
-        };
+    if input.editor == "file-manager" {
+        return open::that_detached(&input.cwd)
+            .map(|()| Value::Null)
+            .map_err(|error| {
+                json!({
+                    "_tag": "ExternalLauncherEditorSpawnError", "editor": input.editor,
+                    "target": display_path(&input.cwd), "command": "open", "args": [],
+                    "cause": error.to_string(),
+                })
+            });
+    }
+    let Some(definition) = editor_definition(&input.editor) else {
+        return Err(
+            json!({ "_tag": "ExternalLauncherUnknownEditorError", "editor": input.editor }),
+        );
+    };
     let target = display_path(&input.cwd);
-    let strategy = editor_launch_strategy(command, args.clone(), target.clone());
+    let resolved = resolve_editor(definition.id, env).or_else(|| {
+        fallback_program(definition).map(|program| {
+            crate::production::editor_launch::ResolvedEditor {
+                id: definition.id,
+                program,
+                args: definition.args,
+                flatpak_app_id: None,
+            }
+        })
+    });
+    // Unreachable while every catalog entry in `EDITOR_DEFINITIONS` has at least one `Path`
+    // candidate: `fallback_program` always finds one, so `resolved` is always `Some`. A future
+    // candidate-only editor (no `Path` candidate) should report
+    // `ExternalLauncherCommandNotFoundError` here instead of reusing the unknown-editor error.
+    let Some(resolved) = resolved else {
+        return Err(
+            json!({ "_tag": "ExternalLauncherUnknownEditorError", "editor": input.editor }),
+        );
+    };
+    let args = resolved.args_for(&target);
+    let strategy = editor_launch_strategy(&resolved.program, args.clone(), target.clone());
     launch(&strategy).map(|()| Value::Null).map_err(|error| {
         json!({
             "_tag": "ExternalLauncherEditorSpawnError", "editor": input.editor,
-            "target": target, "command": command, "args": args, "cause": error.to_string()
+            "target": target, "command": resolved.program, "args": args,
+            "cause": error.to_string(),
         })
     })
 }
@@ -1780,7 +1808,7 @@ fn launch_editor(strategy: &EditorLaunchStrategy) -> std::io::Result<()> {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 enum EditorLaunchStrategy {
     #[cfg(windows)]
     ShellAssociation { application: String, target: String },
@@ -1810,21 +1838,6 @@ fn editor_launch_strategy(
         }
     }
 }
-
-const JETBRAINS_EDITORS: &[&str] = &[
-    "idea",
-    "aqua",
-    "clion",
-    "datagrip",
-    "dataspell",
-    "goland",
-    "phpstorm",
-    "pycharm",
-    "rider",
-    "rubymine",
-    "rustrover",
-    "webstorm",
-];
 
 #[derive(Deserialize)]
 struct EmptyInput {}
@@ -3658,11 +3671,18 @@ mod tests {
 
     #[test]
     fn editor_spawn_errors_are_typed_without_launching_an_external_application() {
+        let env = crate::production::editor_launch::EditorProbeEnv {
+            path_entries: Vec::new(),
+            home: None,
+            flatpak_export_dirs: Vec::new(),
+            local_app_data: None,
+        };
         let error = open_in_editor_with(
             json!({
                 "cwd": "C:\\repo",
                 "editor": "rustrover",
             }),
+            &env,
             |_| {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
@@ -4668,5 +4688,140 @@ esac
                 "{method} unexpectedly accepted a string payload"
             );
         }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn open_in_editor_launches_zed_with_the_bare_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let zed = temp.path().join("zed");
+        std::fs::write(&zed, b"#!/bin/sh\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&zed, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let env = crate::production::editor_launch::EditorProbeEnv {
+            path_entries: vec![temp.path().to_path_buf()],
+            home: None,
+            flatpak_export_dirs: Vec::new(),
+            local_app_data: None,
+        };
+        let captured = std::sync::Mutex::new(None);
+        let result = open_in_editor_with(
+            json!({ "cwd": "/repo/src/main.ts:4:2", "editor": "zed" }),
+            &env,
+            |strategy| {
+                *captured.lock().unwrap() = Some(strategy.clone());
+                Ok(())
+            },
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            captured.into_inner().unwrap(),
+            Some(EditorLaunchStrategy::Process {
+                command: "zed".to_owned(),
+                args: vec!["/repo/src/main.ts:4:2".to_owned()],
+            })
+        );
+    }
+
+    #[cfg(not(windows))]
+    fn flatpak_export_env(
+        exports: std::path::PathBuf,
+    ) -> crate::production::editor_launch::EditorProbeEnv {
+        let wrapper = exports.join("dev.zed.Zed");
+        std::fs::write(&wrapper, b"#!/bin/sh\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        crate::production::editor_launch::EditorProbeEnv {
+            path_entries: Vec::new(),
+            home: None,
+            flatpak_export_dirs: vec![exports],
+            local_app_data: None,
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn open_in_editor_launches_flatpak_zed_with_a_filesystem_grant_for_a_file_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let exports = temp.path().join("exports/bin");
+        std::fs::create_dir_all(&exports).unwrap();
+        let env = flatpak_export_env(exports);
+        let captured = std::sync::Mutex::new(None);
+        open_in_editor_with(
+            json!({ "cwd": "/repo/src/main.ts:4:2", "editor": "zed" }),
+            &env,
+            |strategy| {
+                *captured.lock().unwrap() = Some(strategy.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            captured.into_inner().unwrap(),
+            Some(EditorLaunchStrategy::Process {
+                command: "flatpak".to_owned(),
+                args: vec![
+                    "run".to_owned(),
+                    "--filesystem=/repo/src".to_owned(),
+                    "dev.zed.Zed".to_owned(),
+                    "/repo/src/main.ts:4:2".to_owned(),
+                ],
+            })
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn open_in_editor_launches_flatpak_zed_with_a_filesystem_grant_for_a_directory_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let exports = temp.path().join("exports/bin");
+        std::fs::create_dir_all(&exports).unwrap();
+        let env = flatpak_export_env(exports);
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let project_str = project.to_string_lossy().into_owned();
+        let captured = std::sync::Mutex::new(None);
+        open_in_editor_with(
+            json!({ "cwd": project_str, "editor": "zed" }),
+            &env,
+            |strategy| {
+                *captured.lock().unwrap() = Some(strategy.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            captured.into_inner().unwrap(),
+            Some(EditorLaunchStrategy::Process {
+                command: "flatpak".to_owned(),
+                args: vec![
+                    "run".to_owned(),
+                    format!("--filesystem={project_str}"),
+                    "dev.zed.Zed".to_owned(),
+                    project_str.clone(),
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn open_in_editor_still_tries_the_path_name_when_nothing_resolved() {
+        let env = crate::production::editor_launch::EditorProbeEnv {
+            path_entries: Vec::new(),
+            home: None,
+            flatpak_export_dirs: Vec::new(),
+            local_app_data: None,
+        };
+        let error =
+            open_in_editor_with(json!({ "cwd": "/repo", "editor": "vscode" }), &env, |_| {
+                Err(std::io::Error::other("spawn failed"))
+            })
+            .unwrap_err();
+        assert_eq!(error["_tag"], "ExternalLauncherEditorSpawnError");
+        assert_eq!(error["command"], "code");
     }
 }

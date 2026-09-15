@@ -140,6 +140,16 @@ describe("GitManagerMergeDialog", () => {
     expect(container.textContent).toContain("unrelated histories");
   });
 
+  it("disables confirm and explains when the source has nothing to merge", async () => {
+    h.preview = { ...cleanPreview, ahead: 0, behind: 1 };
+    await renderDialog([branch("main", true), branch("feature")]);
+
+    const confirm = buttonWithText("Merge");
+    expect(confirm.disabled).toBe(true);
+    expect(confirm.title).toBe("Nothing to merge: `feature` has no commits that `main` lacks.");
+    expect(container.textContent).toContain("Nothing to merge");
+  });
+
   it("renders a server block verbatim and links it to the disabled confirm button", async () => {
     const message = "Server says the working tree must be clean first.";
     const feature = {

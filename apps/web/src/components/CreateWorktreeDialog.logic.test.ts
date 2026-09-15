@@ -9,6 +9,7 @@ import {
   githubWorkItemBranchName,
   parseGitHubWorkItem,
   resolveWorktreeCreateInput,
+  reuseBranchHint,
   sanitizeBranchName,
   suggestNextAvailableBranchName,
   suggestWorktreeNameFromRef,
@@ -110,6 +111,41 @@ describe("canReuseBranch", () => {
     expect(canReuseBranch({ name: "origin/feature", isRemote: true })).toBe(false);
     expect(canReuseBranch({ name: "main", current: true })).toBe(false);
     expect(canReuseBranch({ name: "feature", worktreePath: "/repo-feature" })).toBe(false);
+  });
+});
+
+describe("reuseBranchHint", () => {
+  it("explains the enabled state for a free local branch", () => {
+    expect(
+      reuseBranchHint({
+        name: "feature/free",
+        isRemote: false,
+        current: false,
+        worktreePath: null,
+      }),
+    ).toBe("Check out the existing branch instead of creating a new one from it.");
+  });
+
+  it("explains that a remote branch yields a new local branch", () => {
+    expect(
+      reuseBranchHint({ name: "origin/main", isRemote: true, current: false, worktreePath: null }),
+    ).toBe('"origin/main" is a remote branch. A local branch will be created from it.');
+  });
+
+  it("explains that the current branch is already checked out", () => {
+    expect(
+      reuseBranchHint({ name: "main", isRemote: false, current: true, worktreePath: null }),
+    ).toBe(
+      '"main" is already checked out. A new branch ("main-2" or the next available name) will be created from it.',
+    );
+  });
+
+  it("explains that a branch checked out in another worktree is occupied", () => {
+    expect(
+      reuseBranchHint({ name: "wip", isRemote: false, current: false, worktreePath: "/repo/wip" }),
+    ).toBe(
+      '"wip" is already checked out. A new branch ("wip-2" or the next available name) will be created from it.',
+    );
   });
 });
 

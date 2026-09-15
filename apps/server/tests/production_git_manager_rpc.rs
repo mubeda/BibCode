@@ -1353,6 +1353,8 @@ async fn stash_and_merge_operations_execute_through_the_existing_mutation_path()
     git(&cwd, &["add", "feature.txt"]);
     git(&cwd, &["commit", "-q", "-m", "feature"]);
     git(&cwd, &["switch", "-q", "main"]);
+    let main_tip = git_stdout(&cwd, &["rev-parse", "main"]);
+    let feature_tip = git_stdout(&cwd, &["rev-parse", "feature"]);
     let merged = collect_events(fixture.operation(
         "43",
         json!({
@@ -1366,7 +1368,14 @@ async fn stash_and_merge_operations_execute_through_the_existing_mutation_path()
         Some("finished")
     );
     assert!(cwd.join("feature.txt").exists());
+    assert_eq!(
+        head_parents(&cwd),
+        [main_tip.clone(), feature_tip],
+        "a merge commit is recorded even when a fast-forward was possible"
+    );
+    assert!(!merge_in_progress(&cwd));
 
+    let main_before_squash = git_stdout(&cwd, &["rev-parse", "main"]);
     git(&cwd, &["switch", "-q", "-c", "squash-source"]);
     fs::write(cwd.join("squash.txt"), "squash\n").expect("squash file");
     git(&cwd, &["add", "squash.txt"]);
@@ -1385,6 +1394,12 @@ async fn stash_and_merge_operations_execute_through_the_existing_mutation_path()
         Some("finished")
     );
     assert!(cwd.join("squash.txt").exists());
+    assert_ne!(git_stdout(&cwd, &["rev-parse", "main"]), main_before_squash);
+    assert_eq!(
+        head_parents(&cwd),
+        [main_before_squash],
+        "a squash merge records one ordinary commit, not a merge commit"
+    );
 
     fs::write(cwd.join("dirty.txt"), "dirty\n").expect("dirty file");
     let blocked = collect_events(fixture.operation(
@@ -1397,6 +1412,164 @@ async fn stash_and_merge_operations_execute_through_the_existing_mutation_path()
     .await;
     assert_eq!(event_kinds(&blocked), ["started", "failed"]);
     assert_eq!(blocked[1]["code"], "dirty-working-tree");
+}
+
+#[tokio::test]
+async fn merge_commit_mode_overrides_branch_merge_options_that_would_skip_the_commit() {
+    let fixture = Fixture::new().await;
+    let cwd = fixture.repository_path.clone();
+
+    let configurations = [
+        ("branch.main.mergeOptions", "--no-commit"),
+        ("branch.main.mergeOptions", "--squash"),
+        ("merge.ff", "only"),
+    ];
+    for (index, (key, value)) in configurations.into_iter().enumerate() {
+        let source = format!("source-{index}");
+        git(&cwd, &["config", key, value]);
+        git(&cwd, &["switch", "-q", "-c", &source]);
+        fs::write(cwd.join(format!("{source}.txt")), "change\n").expect("source file");
+        git(&cwd, &["add", "."]);
+        git(&cwd, &["commit", "-q", "-m", &source]);
+        git(&cwd, &["switch", "-q", "main"]);
+        let main_tip = git_stdout(&cwd, &["rev-parse", "main"]);
+        let source_tip = git_stdout(&cwd, &["rev-parse", &source]);
+
+        let events = collect_events(fixture.operation(
+            &(470 + index).to_string(),
+            json!({
+                "_tag": "merge", "cwd": cwd, "projectId": "project-1",
+                "source": source, "noVerify": false
+            }),
+        ))
+        .await;
+
+        assert_eq!(
+            events.last().and_then(|event| event["_tag"].as_str()),
+            Some("finished"),
+            "merge with {key}={value}: {events:?}"
+        );
+        assert!(
+            !merge_in_progress(&cwd),
+            "no merge is left in progress with {key}={value}"
+        );
+        assert_eq!(
+            head_parents(&cwd),
+            [main_tip, source_tip],
+            "a merge commit is recorded despite {key}={value}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn squash_merge_overrides_merge_configuration_that_rejects_a_squash() {
+    let fixture = Fixture::new().await;
+    let cwd = fixture.repository_path.clone();
+
+    let configurations = [
+        ("merge.ff", "false"),
+        ("merge.ff", "only"),
+        ("branch.main.mergeOptions", "--commit"),
+    ];
+    for (index, (key, value)) in configurations.into_iter().enumerate() {
+        let source = format!("squash-source-{index}");
+        git(&cwd, &["config", key, value]);
+        git(&cwd, &["switch", "-q", "-c", &source]);
+        fs::write(cwd.join(format!("{source}.txt")), "change\n").expect("source file");
+        git(&cwd, &["add", "."]);
+        git(&cwd, &["commit", "-q", "-m", &source]);
+        git(&cwd, &["switch", "-q", "main"]);
+        fs::write(cwd.join(format!("main-{index}.txt")), "diverged\n").expect("main file");
+        git(&cwd, &["add", "."]);
+        git(
+            &cwd,
+            &["commit", "-q", "-m", &format!("main diverges {index}")],
+        );
+        let main_tip = git_stdout(&cwd, &["rev-parse", "main"]);
+
+        let events = collect_events(fixture.operation(
+            &(480 + index).to_string(),
+            json!({
+                "_tag": "squash-merge", "cwd": cwd, "projectId": "project-1",
+                "source": source, "noVerify": false
+            }),
+        ))
+        .await;
+
+        assert_eq!(
+            events.last().and_then(|event| event["_tag"].as_str()),
+            Some("finished"),
+            "squash merge with {key}={value}: {events:?}"
+        );
+        assert!(cwd.join(format!("{source}.txt")).exists());
+        assert_ne!(git_stdout(&cwd, &["rev-parse", "main"]), main_tip);
+        assert_eq!(
+            head_parents(&cwd),
+            [main_tip],
+            "a squash merge records one ordinary commit despite {key}={value}"
+        );
+        assert!(!merge_in_progress(&cwd));
+    }
+}
+
+#[tokio::test]
+async fn squash_merge_bypasses_commit_hooks_only_when_no_verify_is_requested() {
+    let fixture = Fixture::new().await;
+    let cwd = fixture.repository_path.clone();
+    let hooks = fixture._root.path().join("hooks");
+    fs::create_dir(&hooks).expect("hooks directory");
+    let hook = hooks.join("pre-commit");
+    fs::write(
+        &hook,
+        "#!/bin/sh\necho 'pre-commit hook blocked the commit' >&2\nexit 1\n",
+    )
+    .expect("pre-commit hook");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("executable hook");
+    }
+    git(
+        &cwd,
+        &[
+            "config",
+            "core.hooksPath",
+            &hooks.to_string_lossy().replace('\\', "/"),
+        ],
+    );
+
+    for (index, (no_verify, expected)) in [(true, "finished"), (false, "failed")]
+        .into_iter()
+        .enumerate()
+    {
+        let source = format!("hooked-source-{index}");
+        git(&cwd, &["switch", "-q", "-c", &source]);
+        fs::write(cwd.join(format!("{source}.txt")), "change\n").expect("source file");
+        git(&cwd, &["add", "."]);
+        git(&cwd, &["commit", "-q", "--no-verify", "-m", &source]);
+        git(&cwd, &["switch", "-q", "main"]);
+        let main_tip = git_stdout(&cwd, &["rev-parse", "main"]);
+
+        let events = collect_events(fixture.operation(
+            &(490 + index).to_string(),
+            json!({
+                "_tag": "squash-merge", "cwd": cwd, "projectId": "project-1",
+                "source": source, "noVerify": no_verify
+            }),
+        ))
+        .await;
+
+        assert_eq!(
+            events.last().and_then(|event| event["_tag"].as_str()),
+            Some(expected),
+            "squash merge with noVerify={no_verify}: {events:?}"
+        );
+        let committed = git_stdout(&cwd, &["rev-parse", "main"]) != main_tip;
+        assert_eq!(
+            committed, no_verify,
+            "the squash commit is created only when the hook is bypassed"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1913,6 +2086,19 @@ fn git(cwd: &Path, args: &[&str]) {
         "git fixture failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn head_parents(cwd: &Path) -> Vec<String> {
+    git_stdout(cwd, &["rev-list", "--parents", "-n", "1", "HEAD"])
+        .split_whitespace()
+        .skip(1)
+        .map(str::to_owned)
+        .collect()
+}
+
+fn merge_in_progress(cwd: &Path) -> bool {
+    let merge_head = git_stdout(cwd, &["rev-parse", "--git-path", "MERGE_HEAD"]);
+    cwd.join(&merge_head).exists() || Path::new(&merge_head).exists()
 }
 
 fn git_stdout(cwd: &Path, args: &[&str]) -> String {

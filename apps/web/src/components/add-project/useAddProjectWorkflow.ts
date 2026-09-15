@@ -82,6 +82,8 @@ export interface AddProjectWorkflow {
   readonly browse: () => Promise<void>;
   readonly setHostPath: (path: string) => void;
   readonly submitHostPath: () => Promise<void>;
+  readonly openHostPath: () => void;
+  readonly selectBrowsedFolder: (path: string) => Promise<void>;
   readonly openClone: () => void;
   readonly setCloneUrl: (url: string) => void;
   readonly setCloneParent: (path: string) => void;
@@ -305,7 +307,7 @@ export function useAddProjectWorkflowState(
 
   const browse = useCallback(async () => {
     if (!shouldUseNativePicker(selectedHost)) {
-      setStep("host-path");
+      setStep("remote-browse");
       setError(null);
       return;
     }
@@ -369,6 +371,28 @@ export function useAddProjectWorkflowState(
       }),
     );
   }, [beginAsync, completeOperation, hostPath, input.operations, selectedHost]);
+
+  const openHostPath = useCallback(() => {
+    setStep("host-path");
+    setError(null);
+  }, []);
+
+  const selectBrowsedFolder = useCallback(
+    async (path: string) => {
+      const generation = beginAsync();
+      if (generation === null) {
+        return;
+      }
+      await completeOperation(generation, (shouldContinue) =>
+        input.operations.addFolder({
+          environmentId: selectedHost.environmentId,
+          workspaceRoot: path,
+          shouldContinue,
+        }),
+      );
+    },
+    [beginAsync, completeOperation, input.operations, selectedHost.environmentId],
+  );
 
   const openClone = useCallback(() => {
     setStep("clone");
@@ -538,6 +562,8 @@ export function useAddProjectWorkflowState(
     browse,
     setHostPath,
     submitHostPath,
+    openHostPath,
+    selectBrowsedFolder,
     openClone,
     setCloneUrl,
     setCloneParent,
