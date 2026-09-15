@@ -643,8 +643,10 @@ export function CreateWorktreeDialog({
 
             {refsQuery.error ? (
               <p role="alert" className="text-destructive text-xs">
-                Branches could not be loaded. {refsQuery.error} Retry after fixing Git, or type a
-                branch name to create a new one.
+                <span className="block">Branches could not be loaded: {refsQuery.error}</span>
+                <span className="block">
+                  Retry after fixing Git, or type a branch name to create a new one.
+                </span>
               </p>
             ) : null}
 
