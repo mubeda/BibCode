@@ -1,5 +1,77 @@
 # Changelog
 
+## [v0.5.10] - 2026-09-15
+
+BiBCode v0.5.10 makes Git Manager merges keep their promises, detects and
+launches Zed as an external editor, lets Add Project browse remote host
+folders, and fixes Create Worktree and terminal input problems.
+
+### Git Manager merges
+
+- **Merge commit** always records a merge commit. It never fast-forwards and
+  overrides repository settings such as `merge.ff` or branch merge options
+  that would skip the commit or squash it.
+- **Squash merge** now works in repositories that set `merge.ff=false`,
+  `merge.ff=only`, or a branch `--commit` merge option; Git previously
+  rejected or aborted the squash.
+- The bypass-hooks option of the squash-merge operation now applies to the
+  squash commit itself.
+- The merge dialog disables Merge and says **Nothing to merge** when the
+  source branch has no commits the current branch lacks.
+
+### External editors
+
+- **Open in Zed** now appears when Zed is installed. Zed is detected on `PATH`,
+  through the `zeditor` alias, a Flatpak export (`dev.zed.Zed`),
+  `~/.local/bin`, the macOS app bundle CLI, and the Windows per-user install
+  directory.
+- Every external editor is resolved through one shared server catalog.
+  Detection runs on the server that owns the environment, so a remote
+  environment lists the editors installed on that remote host.
+- Flatpak editors are launched with access to the opened file's directory, so
+  projects outside the home directory open without extra Flatpak overrides.
+
+### Add Project on remote hosts
+
+- Remote hosts, and browser clients without a native dialog, open a folder
+  browser that lists the selected host's directories; **Type a path instead**
+  switches to manual entry of an absolute or home-relative path. Local and WSL
+  locations keep the native folder picker.
+- The Settings remote directory picker uses the same browser and stays stable
+  through the dialog's exit transition.
+
+### Create Worktree
+
+- The **Reuse branch** control is visible whenever a branch is selected. It is
+  enabled for a free local branch and disabled, with an explanation, for a
+  remote branch or a branch already checked out elsewhere.
+- A branch list that fails to load is reported in the dialog with a recovery
+  hint, and a typed name still creates a new branch.
+
+### Terminals
+
+- `Shift+Enter` inside a terminal sends a soft newline, so Codex and Claude
+  Code prompts insert a line break instead of submitting; plain `Enter` still
+  submits.
+
+### Release engineering
+
+- Raised the publication preflight budget to 60 minutes after v0.5.9 approval
+  runs reached the previous 30- and 45-minute limits while the full test graph
+  was still running. Every gate stays enabled, and the workflow contract and
+  release runbook record the measured limits.
+
+### Downloads
+
+On macOS, copy BiBCode.app from the DMG to Applications before launching it.
+
+Desktop installers and standalone server distributions are provided for macOS,
+Linux, and Windows on ARM64 and x64. Linux server `.deb` and `.rpm` packages are
+included for both architectures. Stable desktop updater payloads and signatures
+remain available through `latest.json`.
+
+**Full Changelog**: https://github.com/mubeda/BibCode/compare/v0.5.9...v0.5.10
+
 ## [v0.5.9] - 2026-09-11
 
 BiBCode v0.5.9 fixes Git network operations from the Linux AppImage and adds
