@@ -49,6 +49,9 @@ const TERMINAL_WORD_FORWARD = "\u001bf";
 const TERMINAL_LINE_START = "\u0001";
 const TERMINAL_LINE_END = "\u0005";
 const TERMINAL_DELETE_TO_LINE_START = "\u0015";
+// ESC CR is what xterm already emits for Alt+Enter, what Claude Code's /terminal-setup binds
+// Shift+Enter to, and what Codex maps to insert_newline. CLI prompts treat it as a soft newline.
+const TERMINAL_SOFT_NEWLINE = "\u001b\r";
 const EVENT_CODE_KEY_ALIASES: Readonly<Record<string, readonly string[]>> = {
   BracketLeft: ["["],
   BracketRight: ["]"],
@@ -568,4 +571,21 @@ export function terminalNavigationShortcutData(
   }
 
   return null;
+}
+
+/**
+ * Maps Shift+Enter to the soft-newline sequence CLI prompts (Codex, Claude Code) accept, or
+ * returns null so xterm encodes the key itself.
+ */
+export function terminalNewlineShortcutData(event: ShortcutEventLike): string | null {
+  if (event.type !== undefined && event.type !== "keydown") {
+    return null;
+  }
+  if (normalizeEventKey(event.key) !== "enter") {
+    return null;
+  }
+  if (!event.shiftKey || event.ctrlKey || event.altKey || event.metaKey) {
+    return null;
+  }
+  return TERMINAL_SOFT_NEWLINE;
 }
