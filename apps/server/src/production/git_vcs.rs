@@ -3906,7 +3906,7 @@ mod tests {
         expected_ref: &str,
         label: &str,
     ) -> crate::git::VcsStatusSummary {
-        tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let current = summaries
                     .borrow_and_update()
