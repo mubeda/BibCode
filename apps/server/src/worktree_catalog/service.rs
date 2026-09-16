@@ -524,6 +524,26 @@ impl WorktreeCatalogService {
     }
 
     #[cfg(test)]
+    pub(crate) fn new_with_options_for_test(
+        repositories: Arc<Repositories>,
+        repository: Arc<GitRepository>,
+        availability_registry: WorkspaceAvailabilityRegistry,
+        options: CatalogServiceOptions,
+    ) -> Self {
+        Self::build(
+            Arc::new(RepositoriesProjectionSource { repositories }),
+            Arc::new(GitInventorySource {
+                repository: repository.clone(),
+            }),
+            Arc::new(TokioCatalogFileSystem),
+            Arc::new(NativeCatalogFingerprintSource),
+            options,
+            availability_registry,
+            Some(repository),
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn with_dependencies_and_availability(
         projections: Arc<dyn CatalogProjectionSource>,
         inventory: Arc<dyn InventorySource>,
