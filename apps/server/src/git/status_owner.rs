@@ -199,9 +199,16 @@ pub(crate) struct StatusReadOwner {
     inner: Arc<Inner>,
 }
 
+/// Runs after a finished mutation or a reported local change (for example a
+/// terminal command exiting). Watcher-driven reads stay inside the status
+/// owner's own debounced loop and do not reach it. It receives the canonical
+/// worktree path and must not block.
+pub(crate) type LocalChangeObserver = Arc<dyn Fn(&Path) + Send + Sync>;
+
 struct Inner {
     state: Mutex<State>,
     tasks: TaskTracker,
+    local_change_observer: Mutex<Option<LocalChangeObserver>>,
     #[cfg(test)]
     lease_changed: tokio::sync::Notify,
     #[cfg(test)]
@@ -340,6 +347,7 @@ impl StatusReadOwner {
             inner: Arc::new(Inner {
                 state: Mutex::new(State::default()),
                 tasks: TaskTracker::new(),
+                local_change_observer: Mutex::new(None),
                 #[cfg(test)]
                 lease_changed: tokio::sync::Notify::new(),
                 #[cfg(test)]
@@ -527,6 +535,27 @@ impl StatusReadOwner {
             .send_modify(|generation| *generation = generation.wrapping_add(1));
         #[cfg(test)]
         self.inner.lease_changed.notify_waiters();
+        self.observe_local_change(canonical_cwd);
+    }
+
+    pub(crate) fn set_local_change_observer(&self, observer: LocalChangeObserver) {
+        *self
+            .inner
+            .local_change_observer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(observer);
+    }
+
+    fn observe_local_change(&self, canonical_cwd: &Path) {
+        let observer = self
+            .inner
+            .local_change_observer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(observer) = observer {
+            observer(canonical_cwd);
+        }
     }
 
     pub(crate) fn cancel_reads(&self, canonical_cwd: &Path) {
@@ -1088,17 +1117,17 @@ impl StatusMutationGuard {
         };
         {
             let mut state = self.owner.lock_state();
-            let Some(worktree) = state.worktrees.get_mut(&self.canonical_cwd) else {
-                return;
-            };
-            worktree.epoch = worktree.epoch.wrapping_add(1);
-            retire_reads(worktree);
-            worktree.mutation_active = false;
-            worktree.trailing_refresh_pending = true;
+            if let Some(worktree) = state.worktrees.get_mut(&self.canonical_cwd) {
+                worktree.epoch = worktree.epoch.wrapping_add(1);
+                retire_reads(worktree);
+                worktree.mutation_active = false;
+                worktree.trailing_refresh_pending = true;
+            }
         }
         drop(mutation_guard);
         self.owner
             .finish_mutation_burst_if_idle(&self.canonical_cwd);
+        self.owner.observe_local_change(&self.canonical_cwd);
     }
 }
 

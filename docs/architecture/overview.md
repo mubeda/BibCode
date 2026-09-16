@@ -133,7 +133,8 @@ flowchart TB
   provider PR list are successful absence. An operational Git or provider-
   discovery failure before a fresh base retains the exact prior summary and
   observation time as stale. Subscribers share the producer, refresh after 30
-  seconds, and cancel and await in-flight Git or provider work when the final
+  seconds or as soon as a mutation finishes or a local change is reported for
+  that worktree, and cancel and await in-flight Git or provider work when the final
   subscriber leaves. This path never starts automatic fetch.
 
   Automatic fetch has a separate owner per canonical Git common directory. A

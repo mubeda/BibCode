@@ -1,6 +1,12 @@
-import { scopeThreadRef } from "@bibcode/client-runtime/environment";
+import { scopeProjectRef, scopeThreadRef } from "@bibcode/client-runtime/environment";
 import type { EnvironmentAvailabilityStatus } from "@bibcode/client-runtime/state/shell";
-import type { EnvironmentId, ScopedThreadRef, ThreadId } from "@bibcode/contracts";
+import type {
+  EnvironmentId,
+  ProjectId,
+  ScopedProjectRef,
+  ScopedThreadRef,
+  ThreadId,
+} from "@bibcode/contracts";
 import type { DraftId } from "./composerDraftStore";
 
 export type ThreadRouteTarget =
@@ -37,6 +43,19 @@ export function resolveThreadRouteRef(
   }
 
   return scopeThreadRef(params.environmentId as EnvironmentId, params.threadId as ThreadId);
+}
+
+/**
+ * The project a project-scoped route such as the Git Manager names. Thread
+ * routes carry a thread id and resolve to null here.
+ */
+export function resolveProjectRouteRef(
+  params: Partial<Record<"environmentId" | "projectId" | "threadId", string | undefined>>,
+): ScopedProjectRef | null {
+  if (!params.environmentId || !params.projectId || params.threadId) {
+    return null;
+  }
+  return scopeProjectRef(params.environmentId as EnvironmentId, params.projectId as ProjectId);
 }
 
 export interface MissingRouteThreadRedirectInput {

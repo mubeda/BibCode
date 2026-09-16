@@ -23,7 +23,12 @@ authority.
 lives in the server catalog, orchestration, and availability services; React
 does not reproduce it.
 
-Git Manager mutations reuse the catalog service's same process-local lock set
+Git Manager operations that can move a worktree HEAD or change the branch set
+(checkout, create, rename, delete, pull, merge, rebase, cherry-pick, revert,
+reset, and their continue/abort paths) invalidate every project view sharing
+the repository when they finish, so sidebar worktree rows follow a checkout
+without waiting for the polling interval. Fetch, push, and stash operations do
+not. Git Manager mutations reuse the catalog service's same process-local lock set
 and acquisition order: stable project identity first, then the optional lock
 for the pinned physical repository. Their non-waiting acquisition reports
 `operation-in-flight` when either lock is held, including by a catalog mutation;
