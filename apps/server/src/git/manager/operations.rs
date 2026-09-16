@@ -500,6 +500,23 @@ impl GitManagerOperationRequest {
     }
 
     #[must_use]
+    /// Operations that can move a worktree's HEAD or change the branch set.
+    /// The worktree catalog must rescan after them instead of waiting for its
+    /// poller; fetch, push, and stash operations leave every HEAD in place.
+    fn changes_worktree_heads(&self) -> bool {
+        !matches!(
+            self,
+            Self::Fetch { .. }
+                | Self::Push { .. }
+                | Self::PublishBranch { .. }
+                | Self::ForcePush { .. }
+                | Self::StashPush { .. }
+                | Self::StashApply { .. }
+                | Self::StashPop { .. }
+                | Self::StashDrop { .. }
+        )
+    }
+
     pub fn project_id(&self) -> &str {
         match self {
             Self::BranchCreate { project_id, .. }
@@ -910,7 +927,7 @@ pub async fn run_branch_or_sync_operation(
     let locked_broadcaster = broadcaster.clone();
     let locked_request = request.clone();
     let operation_cancellation = cancellation.clone();
-    match catalog
+    let result = match catalog
         .try_with_project_mutation_lock_cancellation(&project_id, &cancellation, || async move {
             let mut snapshot = build_refs_snapshot(
                 &locked_repository,
@@ -967,7 +984,15 @@ pub async fn run_branch_or_sync_operation(
             },
         )),
         ProjectMutationAttempt::Cancelled => Err(cancelled_error(operation)),
+    };
+    if result.is_ok() && request.changes_worktree_heads() {
+        // Every project view sharing this repository shows worktree branches
+        // and heads from the catalog; rescan now rather than on the next poll.
+        catalog
+            .invalidate_repository_after_mutation(&project_id)
+            .await;
     }
+    result
 }
 
 fn blocked_reason_for_operation(

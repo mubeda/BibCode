@@ -317,14 +317,31 @@ impl GitVcsRpcServices {
         repositories: Option<Repositories>,
     ) -> Self {
         let pull_requests = PullRequestService::default();
+        let broadcaster = StatusBroadcaster::with_automatic_remote_refresh_interval(
+            Arc::clone(&repository),
+            STATUS_SAFETY_INTERVAL,
+            automatic_remote_refresh_interval,
+            STREAM_CAPACITY,
+        );
+        let summary = GitStatusSummaryService::new(Arc::clone(&repository), pull_requests.clone());
+        // Passive summaries feed labels such as the sidebar branch. A finished
+        // Git Manager or VCS mutation and a reported local change (a terminal
+        // command exiting) start a fresh summary cycle instead of waiting for
+        // the 30-second deadline. Both are user-paced, so restarting an
+        // in-flight cycle is cheap. The observer only schedules the nudge; it
+        // never blocks the caller.
+        let observed_summary = summary.clone();
+        broadcaster.set_local_change_observer(move |cwd| {
+            let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                return;
+            };
+            let summary = observed_summary.clone();
+            let cwd = cwd.to_path_buf();
+            handle.spawn(async move { summary.notify_local_change(&cwd).await });
+        });
         Self {
-            broadcaster: StatusBroadcaster::with_automatic_remote_refresh_interval(
-                Arc::clone(&repository),
-                STATUS_SAFETY_INTERVAL,
-                automatic_remote_refresh_interval,
-                STREAM_CAPACITY,
-            ),
-            summary: GitStatusSummaryService::new(Arc::clone(&repository), pull_requests.clone()),
+            broadcaster,
+            summary,
             repository,
             discovery: SourceControlDiscovery::default(),
             pull_requests,
@@ -3880,6 +3897,75 @@ mod tests {
         assert_eq!(error["_tag"], "WorkspaceUnavailableError");
         assert_eq!(error["threadId"], "thread-git");
         assert!(operation_cancellation_probe.is_cancelled());
+    }
+
+    async fn named_summary(
+        summaries: &mut watch::Receiver<
+            Option<Result<crate::git::VcsStatusSummary, GitCommandError>>,
+        >,
+        expected_ref: &str,
+        label: &str,
+    ) -> crate::git::VcsStatusSummary {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let current = summaries
+                    .borrow_and_update()
+                    .as_ref()
+                    .and_then(|result| result.as_ref().ok())
+                    .cloned();
+                if let Some(summary) = current
+                    && summary.ref_name.as_deref() == Some(expected_ref)
+                {
+                    return summary;
+                }
+                summaries
+                    .changed()
+                    .await
+                    .expect("summary producer stays alive");
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{label}"))
+    }
+
+    #[tokio::test]
+    async fn finished_local_mutation_refreshes_the_passive_summary_immediately() {
+        let sandbox = crate::test_support::TestSandbox::new("passive-summary-mutation");
+        let cwd = sandbox.root().to_path_buf();
+        git(&sandbox, &cwd, &["init", "-b", "main"]).await;
+        git(&sandbox, &cwd, &["config", "user.name", "Summary Test"]).await;
+        git(
+            &sandbox,
+            &cwd,
+            &["config", "user.email", "summary@example.test"],
+        )
+        .await;
+        std::fs::write(cwd.join("tracked.txt"), "base\n").expect("base file");
+        git(&sandbox, &cwd, &["add", "tracked.txt"]).await;
+        git(&sandbox, &cwd, &["commit", "-q", "-m", "base"]).await;
+        git(&sandbox, &cwd, &["branch", "feature"]).await;
+        let repository = Arc::new(GitRepository::with_runner_for_test(Arc::new(
+            CapturedGitRunner::new(&sandbox),
+        )));
+        let services = GitVcsRpcServices::with_repository(repository);
+        let mut summaries = services
+            .summary
+            .subscribe(cwd.clone())
+            .await
+            .expect("summary subscription");
+        named_summary(&mut summaries, "main", "initial passive summary names main").await;
+
+        let mutation = services.broadcaster.begin_mutation(&cwd).await;
+        git(&sandbox, &cwd, &["switch", "-q", "feature"]).await;
+        mutation.finish().await;
+
+        let refreshed = named_summary(
+            &mut summaries,
+            "feature",
+            "the passive summary reflects the finished checkout without waiting for its 30-second cycle",
+        )
+        .await;
+        assert!(!refreshed.stale);
     }
 
     #[tokio::test]

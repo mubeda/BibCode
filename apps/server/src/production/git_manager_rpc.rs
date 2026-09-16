@@ -2006,6 +2006,117 @@ mod tests {
         assert_eq!(result["checks"], json!([]));
     }
 
+    fn primary_branch(
+        snapshot: &crate::worktree_catalog::WorktreeCatalogSnapshot,
+    ) -> Option<String> {
+        snapshot
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.is_primary)
+            .and_then(|worktree| worktree.branch.clone())
+    }
+
+    #[tokio::test]
+    async fn branch_checkout_publishes_the_new_head_to_catalog_subscribers_without_polling() {
+        let repository_fixture = TempDir::new().expect("temporary repository");
+        let repo = repository_fixture.path();
+        git(repo, &["init", "-q", "-b", "main"]);
+        git(repo, &["config", "user.name", "Git Manager Test"]);
+        git(repo, &["config", "user.email", "git-manager@example.test"]);
+        fs::write(repo.join("tracked.txt"), "base\n").expect("base file");
+        git(repo, &["add", "tracked.txt"]);
+        git(repo, &["commit", "-q", "-m", "base"]);
+        git(repo, &["branch", "feature"]);
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let repositories = Repositories::new(database);
+        repositories
+            .upsert_project(ProjectionProject {
+                project_id: "project-checkout".to_owned(),
+                title: "Checkout".to_owned(),
+                workspace_root: repo.to_string_lossy().into_owned(),
+                default_model_selection: None,
+                scripts: json!([]),
+                worktree_discovery: json!({}),
+                worktree_repository_key: None,
+                created_at: "2026-08-31T00:00:00Z".to_owned(),
+                updated_at: "2026-08-31T00:00:00Z".to_owned(),
+                deleted_at: None,
+            })
+            .await
+            .expect("project projection");
+        let repository = Arc::new(GitRepository::default());
+        let broadcaster = StatusBroadcaster::new(repository.clone(), Duration::from_secs(3_600), 8);
+        let availability = WorkspaceAvailabilityRegistry::new();
+        // A one-hour poll interval proves that only an explicit invalidation can
+        // deliver the checked-out branch within the assertion window.
+        let catalog = WorktreeCatalogService::new_with_options_for_test(
+            Arc::new(repositories.clone()),
+            repository.clone(),
+            availability.clone(),
+            crate::worktree_catalog::CatalogServiceOptions {
+                poll_interval: Duration::from_secs(3_600),
+                ..crate::worktree_catalog::CatalogServiceOptions::default()
+            },
+        );
+        let services = GitManagerRpcServices::with_dependencies(
+            repository,
+            broadcaster,
+            catalog.clone(),
+            repositories,
+            availability,
+            Arc::new(NativeFileTrash::default()),
+        );
+        let mut subscription = catalog
+            .subscribe("project-checkout")
+            .await
+            .expect("catalog subscription");
+        assert_eq!(
+            primary_branch(&subscription.initial_latest()).as_deref(),
+            Some("main")
+        );
+
+        let mut stream = services.operation_stream(
+            request(
+                "gitManager.runOperation",
+                json!({
+                    "_tag": "branch-checkout", "cwd": repo, "projectId": "project-checkout",
+                    "name": "feature", "strategy": "bring"
+                }),
+            ),
+            CancellationToken::new(),
+        );
+        let mut finished = false;
+        while let Some(chunk) = tokio::time::timeout(Duration::from_secs(15), stream.recv())
+            .await
+            .expect("operation stream timeout")
+        {
+            for event in chunk.expect("operation chunk") {
+                assert_ne!(event["_tag"], "failed", "checkout failed: {event}");
+                finished |= event["_tag"] == "finished";
+            }
+        }
+        assert!(finished, "the checkout operation finished");
+
+        let updated = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = subscription.changed().await.expect("catalog stays alive");
+                if primary_branch(&snapshot).as_deref() == Some("feature") {
+                    return snapshot;
+                }
+            }
+        })
+        .await
+        .expect("the catalog publishes the checked-out branch without waiting for its poller");
+        assert!(updated.authoritative);
+    }
+
     #[tokio::test]
     async fn configured_commit_handler_commits_the_visible_index_without_a_socket() {
         let repository_fixture = repository_with_change();
