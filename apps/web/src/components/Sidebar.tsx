@@ -158,7 +158,11 @@ import {
 import { threadEnvironment, useEnvironmentThread } from "../state/threads";
 import { vcsEnvironment } from "../state/vcs";
 import { useEnvironment, useEnvironments, usePrimaryEnvironmentId } from "../state/environments";
-import { buildThreadRouteParams, resolveThreadRouteRef } from "../threadRoutes";
+import {
+  buildThreadRouteParams,
+  resolveProjectRouteRef,
+  resolveThreadRouteRef,
+} from "../threadRoutes";
 import { stackedThreadToast, toastManager } from "./ui/toast";
 import { formatRelativeTimeLabel } from "../timestampFormat";
 import { SettingsSidebarNav } from "./settings/SettingsSidebarNav";
@@ -1502,6 +1506,7 @@ interface SidebarProjectItemProps {
   project: SidebarProjectSnapshot;
   isThreadListExpanded: boolean;
   activeRouteThreadKey: string | null;
+  gitManagerActive: boolean;
   handleNewThread: ReturnType<typeof useNewThreadHandler>;
   openCreateWorktreeDialog: (projectRef?: ScopedProjectRef | null) => void;
   archiveThread: ReturnType<typeof useThreadActions>["archiveThread"];
@@ -1522,6 +1527,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     project,
     isThreadListExpanded,
     activeRouteThreadKey,
+    gitManagerActive,
     handleNewThread,
     openCreateWorktreeDialog,
     archiveThread,
@@ -3078,6 +3084,8 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         <SidebarMenuButton
           ref={isManualProjectSorting ? dragHandleProps?.setActivatorNodeRef : undefined}
           aria-expanded={projectExpanded}
+          aria-current={gitManagerActive ? "page" : undefined}
+          isActive={gitManagerActive}
           size="sm"
           className={`gap-2 px-2 py-1.5 text-left hover:bg-accent group-hover/project-header:bg-accent group-hover/project-header:text-sidebar-accent-foreground ${
             project.environmentPresence === "remote-only" ? "pr-20" : "pr-14"
@@ -3782,6 +3790,7 @@ interface SidebarProjectsContentProps {
   expandedThreadListsByProject: ReadonlySet<string>;
   activeRouteProjectKey: string | null;
   routeThreadKey: string | null;
+  gitManagerRouteProjectKey: string | null;
   commandPaletteShortcutLabel: string | null;
   threadJumpLabelByKey: ReadonlyMap<string, string>;
   attachThreadListAutoAnimateRef: (node: HTMLElement | null) => void;
@@ -3831,6 +3840,7 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
     expandedThreadListsByProject,
     activeRouteProjectKey,
     routeThreadKey,
+    gitManagerRouteProjectKey,
     commandPaletteShortcutLabel,
     threadJumpLabelByKey,
     attachThreadListAutoAnimateRef,
@@ -3983,6 +3993,7 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
                         activeRouteThreadKey={
                           activeRouteProjectKey === project.projectKey ? routeThreadKey : null
                         }
+                        gitManagerActive={gitManagerRouteProjectKey === project.projectKey}
                         handleNewThread={handleNewThread}
                         openCreateWorktreeDialog={openCreateWorktreeDialog}
                         archiveThread={archiveThread}
@@ -4015,6 +4026,7 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
                 activeRouteThreadKey={
                   activeRouteProjectKey === project.projectKey ? routeThreadKey : null
                 }
+                gitManagerActive={gitManagerRouteProjectKey === project.projectKey}
                 handleNewThread={handleNewThread}
                 openCreateWorktreeDialog={openCreateWorktreeDialog}
                 archiveThread={archiveThread}
@@ -4158,6 +4170,13 @@ export default function Sidebar() {
     select: (params) => resolveThreadRouteRef(params),
   });
   const routeThreadKey = routeThreadRef ? scopedThreadKey(routeThreadRef) : null;
+  const routeProjectScopedKey = useParams({
+    strict: false,
+    select: (params) => {
+      const ref = resolveProjectRouteRef(params);
+      return ref === null ? null : scopedProjectKey(ref);
+    },
+  });
   const routeTerminalOpen = useThreadHasTerminalSurface(routeThreadRef);
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
   const openAddProjectCommandPalette = useOpenAddProjectCommandPalette();
@@ -4350,6 +4369,16 @@ export default function Sidebar() {
   }, [routeThreadKey, sidebarThreadByKey, physicalToLogicalKey, projectPhysicalKeyByScopedRef]);
   const activeRouteProjectRef = activeRouteProject?.projectRef ?? null;
   const activeRouteProjectKey = activeRouteProject?.projectKey ?? null;
+  // The Git Manager route names a project but no thread. Highlight that
+  // project's header so the left panel shows which project the manager is for.
+  const gitManagerRouteProjectKey = useMemo(() => {
+    if (routeProjectScopedKey === null || !pathname.endsWith("/git")) {
+      return null;
+    }
+    const physicalKey =
+      projectPhysicalKeyByScopedRef.get(routeProjectScopedKey) ?? routeProjectScopedKey;
+    return physicalToLogicalKey.get(physicalKey) ?? physicalKey;
+  }, [pathname, physicalToLogicalKey, projectPhysicalKeyByScopedRef, routeProjectScopedKey]);
 
   // Group threads by logical project key so all threads from grouped projects
   // are displayed together.
@@ -4819,6 +4848,7 @@ export default function Sidebar() {
             expandedThreadListsByProject={expandedThreadListsByProject}
             activeRouteProjectKey={activeRouteProjectKey}
             routeThreadKey={routeThreadKey}
+            gitManagerRouteProjectKey={gitManagerRouteProjectKey}
             commandPaletteShortcutLabel={commandPaletteShortcutLabel}
             threadJumpLabelByKey={visibleThreadJumpLabelByKey}
             attachThreadListAutoAnimateRef={attachThreadListAutoAnimateRef}

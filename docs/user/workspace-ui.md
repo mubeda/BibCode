@@ -262,7 +262,9 @@ pane-local and do close their underlying panel thread or terminal session.
 Each project header in the left panel has a **Git Manager** branch icon directly
 after **New worktree**. It opens the project-scoped centre route
 `/project/<environmentId>/<projectId>/git`; opening it again navigates to the
-same route instead of creating a second manager or centre tab. The selected
+same route instead of creating a second manager or centre tab. While it is
+open, that project's header row stays highlighted in the left panel, and the
+toolbar leads with the project's name (its checkout path on hover). The selected
 environment owns every path and Git process, so a remote project's checkout
 path remains opaque to the browser.
 

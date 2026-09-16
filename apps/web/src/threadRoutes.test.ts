@@ -7,6 +7,7 @@ import {
   buildDraftThreadRouteParams,
   buildThreadRouteParams,
   missingRouteThreadRedirectDelay,
+  resolveProjectRouteRef,
   resolveThreadRouteRef,
   resolveThreadRouteTarget,
   shouldRedirectMissingRouteThread,
@@ -135,5 +136,19 @@ describe("shouldRedirectMissingRouteThread", () => {
         environmentHasServerThreads: true,
       }),
     ).toBe(false);
+  });
+});
+
+describe("resolveProjectRouteRef", () => {
+  it("names the project of a project-scoped route and ignores thread routes", () => {
+    expect(resolveProjectRouteRef({ environmentId: "env-a", projectId: "project-a" })).toEqual({
+      environmentId: "env-a",
+      projectId: "project-a",
+    });
+    expect(resolveProjectRouteRef({ environmentId: "env-a", threadId: "thread-a" })).toBeNull();
+    expect(
+      resolveProjectRouteRef({ environmentId: "env-a", projectId: "project-a", threadId: "t" }),
+    ).toBeNull();
+    expect(resolveProjectRouteRef({})).toBeNull();
   });
 });
