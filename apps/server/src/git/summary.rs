@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -46,6 +46,7 @@ struct State {
 struct SummaryEntry {
     generation: u64,
     sender: watch::Sender<Option<Result<VcsStatusSummary, GitCommandError>>>,
+    refresh: Arc<Notify>,
 }
 
 struct RetainedPullRequest {
@@ -141,11 +142,13 @@ impl GitStatusSummaryService {
         let generation = state.next_generation;
         state.next_generation = state.next_generation.wrapping_add(1);
         let (sender, receiver) = watch::channel(None);
+        let refresh = Arc::new(Notify::new());
         state.entries.insert(
             key.clone(),
             SummaryEntry {
                 generation,
                 sender: sender.clone(),
+                refresh: Arc::clone(&refresh),
             },
         );
         #[cfg(test)]
@@ -154,7 +157,7 @@ impl GitStatusSummaryService {
 
         let inner = Arc::clone(&self.inner);
         tokio::spawn(async move {
-            run_summary_producer(Arc::clone(&inner), cwd, &sender).await;
+            run_summary_producer(Arc::clone(&inner), cwd, &sender, refresh).await;
             let mut state = inner
                 .state
                 .lock()
@@ -170,6 +173,24 @@ impl GitStatusSummaryService {
             }
         });
         Ok(receiver)
+    }
+
+    /// Starts a fresh summary cycle for `cwd` as soon as its producer is
+    /// waiting, or restarts an in-flight cycle, so a finished local mutation
+    /// is reflected without waiting for the freshness deadline. Paths with no
+    /// active subscriber are ignored.
+    pub async fn notify_local_change(&self, cwd: &Path) {
+        let Ok(key) = canonical_worktree_path_key(cwd).await else {
+            return;
+        };
+        let refresh = self
+            .lock_state()
+            .entries
+            .get(&key)
+            .map(|entry| Arc::clone(&entry.refresh));
+        if let Some(refresh) = refresh {
+            refresh.notify_one();
+        }
     }
 
     #[cfg(test)]
@@ -228,6 +249,7 @@ async fn run_summary_producer(
     inner: Arc<Inner>,
     cwd: PathBuf,
     sender: &watch::Sender<Option<Result<VcsStatusSummary, GitCommandError>>>,
+    refresh: Arc<Notify>,
 ) {
     let mut last = None;
     let mut retained_pull_request: Option<RetainedPullRequest> = None;
@@ -258,6 +280,11 @@ async fn run_summary_producer(
                 }
                 continue 'producer;
             }
+            () = refresh.notified() => {
+                cancellation.cancel();
+                let _ = read.await;
+                continue 'producer;
+            }
             () = &mut deadline => {
                 cancellation.cancel();
                 let _ = read.await;
@@ -277,6 +304,7 @@ async fn run_summary_producer(
                 tokio::select! {
                     biased;
                     () = sender.closed() => return,
+                    () = refresh.notified() => {}
                     () = &mut deadline => {
                         publish_stale_at_cycle_boundary(sender, &mut last);
                     }
@@ -305,6 +333,7 @@ async fn run_summary_producer(
             tokio::select! {
                 biased;
                 () = sender.closed() => return,
+                () = refresh.notified() => {}
                 () = &mut deadline => {
                     publish_stale_at_cycle_boundary(sender, &mut last);
                 }
@@ -334,6 +363,11 @@ async fn run_summary_producer(
                 if sender.receiver_count() == 0 {
                     return;
                 }
+                continue 'producer;
+            }
+            () = refresh.notified() => {
+                enrichment_cancellation.cancel();
+                let _ = enrichment_read.await;
                 continue 'producer;
             }
             () = &mut deadline => {
@@ -375,6 +409,7 @@ async fn run_summary_producer(
         tokio::select! {
             biased;
             () = sender.closed() => return,
+            () = refresh.notified() => {}
             () = &mut deadline => {
                 publish_stale_at_cycle_boundary(sender, &mut last);
             }
@@ -813,6 +848,39 @@ mod tests {
             .expect("reconnected subscription");
         wait_for_calls(&runner, 3).await;
         assert!(!next_summary(&mut reconnected).await.stale);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn notify_local_change_starts_a_fresh_cycle_before_the_freshness_deadline() {
+        let sandbox = TestSandbox::new("summary-local-change");
+        let cwd = sandbox.path("repo");
+        fs::create_dir(&cwd).expect("summary cwd");
+        let runner = Arc::new(SummaryRunner::new());
+        let service = GitStatusSummaryService::with_dependencies(
+            Arc::new(GitRepository::with_runner_for_test(runner.clone())),
+            PullRequestService::default(),
+            Duration::from_secs(30),
+        );
+        let mut subscription = service.subscribe(cwd.clone()).await.expect("subscription");
+        wait_for_calls(&runner, 1).await;
+        assert!(!next_summary(&mut subscription).await.stale);
+        service.wait_for_refresh_armed_for_test().await;
+
+        service.notify_local_change(&cwd).await;
+        wait_for_calls(&runner, 2).await;
+        wait_for_change(&mut subscription, "publication after a local change").await;
+        assert!(!next_summary(&mut subscription).await.stale);
+        assert_eq!(runner.status_calls.load(Ordering::Acquire), 2);
+
+        service
+            .notify_local_change(&sandbox.path("elsewhere"))
+            .await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            runner.status_calls.load(Ordering::Acquire),
+            2,
+            "a path without a subscriber starts no cycle"
+        );
     }
 
     #[tokio::test(start_paused = true)]

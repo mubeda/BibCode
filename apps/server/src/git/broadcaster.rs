@@ -734,6 +734,16 @@ impl StatusBroadcaster {
         }
     }
 
+    /// Registers the observer that runs after a finished mutation or a
+    /// reported local change (`notify_local_change`). Watcher-driven reads do
+    /// not reach it. It receives the canonical worktree path and must only
+    /// schedule work, never block.
+    pub fn set_local_change_observer(&self, observer: impl Fn(&Path) + Send + Sync + 'static) {
+        self.inner
+            .status_owner
+            .set_local_change_observer(Arc::new(observer));
+    }
+
     pub async fn begin_mutation(&self, cwd: &Path) -> StatusMutationGuard {
         let cwd = tokio::fs::canonicalize(cwd)
             .await

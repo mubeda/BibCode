@@ -1,5 +1,38 @@
 # Changelog
 
+## [v0.5.11] - 2026-09-16
+
+BiBCode v0.5.11 makes the left panel follow Git Manager branch changes at
+once and makes the active host and the managed project visible at a glance.
+
+### Left panel and Git Manager
+
+- The project row's branch label updates as soon as a Git Manager or
+  source-control mutation finishes, or a terminal command exits, instead of
+  waiting for the passive status summary's 30-second cycle.
+- Worktree rows follow a Git Manager checkout, branch create, rename, delete,
+  pull, merge, rebase, cherry-pick, revert, or reset without waiting for the
+  worktree catalog's polling interval.
+- The Git Manager shows which project it manages: the project's header row
+  stays highlighted in the left panel while the manager is open, and the
+  toolbar leads with the project's name, with its checkout path on hover.
+
+### Environment rail
+
+- The selected host is framed by a primary-colored ring and unselected hosts
+  are muted, so the active host is unambiguous next to the panel separator.
+
+### Downloads
+
+On macOS, copy BiBCode.app from the DMG to Applications before launching it.
+
+Desktop installers and standalone server distributions are provided for macOS,
+Linux, and Windows on ARM64 and x64. Linux server `.deb` and `.rpm` packages are
+included for both architectures. Stable desktop updater payloads and signatures
+remain available through `latest.json`.
+
+**Full Changelog**: https://github.com/mubeda/BibCode/compare/v0.5.10...v0.5.11
+
 ## [v0.5.10] - 2026-09-15
 
 BiBCode v0.5.10 makes Git Manager merges keep their promises, detects and

@@ -3620,6 +3620,28 @@ staticDescribe("new thread entry points", () => {
     expect(mustFindProps(byAriaLabel("Git Manager for Repo A"), "row Git Manager")).toBeDefined();
   });
 
+  it("highlights the project header while its Git Manager route is open", () => {
+    baseScenario();
+    h.state.pathname = `/project/${ENV_MAIN}/${projectA.id}/git`;
+    h.state.routeParams = { environmentId: ENV_MAIN, projectId: projectA.id };
+    render(<Sidebar />);
+    const header = captured("SidebarMenuButton").find(
+      (entry) => typeof entry.props["onPointerDownCapture"] === "function",
+    )!;
+    expect(header.props["isActive"]).toBe(true);
+    expect(header.props["aria-current"]).toBe("page");
+
+    h.state.captures = [];
+    h.state.pathname = "/";
+    h.state.routeParams = {};
+    render(<Sidebar />);
+    const idleHeader = captured("SidebarMenuButton").find(
+      (entry) => typeof entry.props["onPointerDownCapture"] === "function",
+    )!;
+    expect(idleHeader.props["isActive"]).toBe(false);
+    expect(idleHeader.props["aria-current"]).toBeUndefined();
+  });
+
   it("navigates idempotently to one project-scoped Git Manager", () => {
     baseScenario();
     render(<Sidebar />);
