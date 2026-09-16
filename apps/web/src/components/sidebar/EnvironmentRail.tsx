@@ -35,8 +35,14 @@ const STATUS_DOT_CLASS: Record<EnvironmentRailStatus, string> = {
 const RAIL_BUTTON_CLASS =
   "relative flex size-9 items-center justify-center rounded-[10px] text-muted-foreground outline-hidden transition-colors hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring";
 
+// The active host must read at a glance: a full-strength primary ring around
+// the rounded square (the app's selected-state vocabulary), a solid accent
+// fill, foreground-strength icon, and the edge bar. The unselected entries stay
+// muted so the ring is the only framed element in the rail. No ring offset:
+// the rail's `bg-sidebar` is not a theme color token, so an offset would paint
+// its gap in the default ring-offset color.
 const RAIL_BUTTON_SELECTED_CLASS =
-  "bg-accent text-foreground before:absolute before:top-2 before:bottom-2 before:-left-2 before:w-[3px] before:rounded-full before:bg-primary";
+  "bg-accent text-foreground ring-2 ring-primary before:absolute before:top-2 before:bottom-2 before:-left-2 before:w-[3px] before:rounded-full before:bg-primary";
 
 function StatusDot({ status }: { readonly status: EnvironmentRailStatus }) {
   return (
@@ -65,6 +71,7 @@ function RemoteEntryButton({
             type="button"
             role="radio"
             aria-checked={entry.selected}
+            data-selected={entry.selected}
             tabIndex={entry.selected ? 0 : -1}
             aria-label={entry.label}
             data-testid={`environment-rail-entry-${entry.environmentId}`}
@@ -76,7 +83,9 @@ function RemoteEntryButton({
         <span
           className={cn(
             "flex size-[26px] items-center justify-center rounded-lg text-[10px] font-semibold tracking-wide",
-            entry.selected ? "bg-primary text-primary-foreground" : "bg-muted",
+            entry.selected
+              ? "bg-primary text-primary-foreground"
+              : "bg-muted text-muted-foreground",
           )}
         >
           {entry.avatar}
@@ -192,6 +201,7 @@ export function EnvironmentRail() {
     type: "button" as const,
     role: "radio" as const,
     "aria-checked": model.localSelected,
+    "data-selected": model.localSelected,
     tabIndex: model.localSelected ? 0 : -1,
     "aria-label": "Local — this machine",
     "data-testid": "environment-rail-local",

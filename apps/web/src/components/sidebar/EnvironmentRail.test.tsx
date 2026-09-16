@@ -168,9 +168,13 @@ describe("EnvironmentRail", () => {
     expect(markup).toContain('role="radiogroup"');
     const local = buttonByTestId("environment-rail-local");
     expect(local?.["aria-checked"]).toBe(true);
+    expect(local?.["data-selected"]).toBe(true);
+    expect(local?.className).toContain("ring-primary");
     expect(local?.tabIndex).toBe(0);
     const remote = buttonByTestId(`environment-rail-entry-${ENV_REMOTE}`);
     expect(remote?.["aria-checked"]).toBe(false);
+    expect(remote?.["data-selected"]).toBe(false);
+    expect(remote?.className).not.toContain("ring-primary");
     expect(remote?.tabIndex).toBe(-1);
     expect(buttonByTestId("environment-rail-add-server")).toBeDefined();
     expect(buttonByTestId("environment-rail-manage")).toBeDefined();
