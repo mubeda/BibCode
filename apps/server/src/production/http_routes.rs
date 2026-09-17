@@ -55,7 +55,7 @@ pub type McpHandler = Arc<
         + Sync,
 >;
 pub type TransferDownloadHandler = Arc<
-    dyn Fn(String, RouteContext) -> BoxFuture<Result<TransferDownloadHttpResponse, HttpRouteError>>
+    dyn Fn(String, RouteContext) -> BoxFuture<Result<TransferDownloadHttpOutcome, HttpRouteError>>
         + Send
         + Sync,
 >;
@@ -173,6 +173,35 @@ pub struct TransferDownloadHttpResponse {
     pub file_name: String,
     pub content_type: &'static str,
     pub body: Body,
+}
+
+/// Which archive budget a folder download blew through.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransferArchiveLimitUnit {
+    Entries,
+    Bytes,
+}
+
+impl TransferArchiveLimitUnit {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Entries => "entries",
+            Self::Bytes => "bytes",
+        }
+    }
+}
+
+/// The outcomes a download route reports back to the client.
+///
+/// An oversized folder is an outcome rather than an error so that the route, not the handler,
+/// stays responsible for HTTP framing -- the same split the upload outcome already uses.
+pub enum TransferDownloadHttpOutcome {
+    Stream(TransferDownloadHttpResponse),
+    ArchiveTooLarge {
+        limit: u64,
+        unit: TransferArchiveLimitUnit,
+    },
 }
 
 /// The three outcomes an upload route reports back to the client.
@@ -459,7 +488,17 @@ async fn transfer_download(
         cancellation,
     };
     match (state.transfer_download)(token, context).await {
-        Ok(download) => Response::builder()
+        Ok(TransferDownloadHttpOutcome::ArchiveTooLarge { limit, unit }) => json_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            BTreeMap::new(),
+            json!({
+                "_tag": "TransferArchiveTooLargeError",
+                "limit": limit,
+                "unit": unit.as_str(),
+                "message": "Folder is too large to download as an archive."
+            }),
+        ),
+        Ok(TransferDownloadHttpOutcome::Stream(download)) => Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, download.content_type)
             .header(

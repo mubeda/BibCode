@@ -12,8 +12,9 @@ use axum::http::StatusCode;
 use serde_json::json;
 
 use crate::production::http_routes::{
-    BoxFuture, HttpRouteError, TransferDownloadHandler, TransferDownloadHttpResponse,
-    TransferUploadHandler, TransferUploadHttpOutcome,
+    BoxFuture, HttpRouteError, TransferArchiveLimitUnit, TransferDownloadHandler,
+    TransferDownloadHttpOutcome, TransferDownloadHttpResponse, TransferUploadHandler,
+    TransferUploadHttpOutcome,
 };
 use crate::transfer::{self, TransferAccess, TransferClaims};
 use crate::workspace::paths;
@@ -25,6 +26,21 @@ pub type UploadedCallback = Arc<dyn Fn(PathBuf) -> BoxFuture<()> + Send + Sync>;
 /// Streams a single file, or a folder as a zip archive, for a valid download token.
 #[must_use]
 pub fn download_handler(access: TransferAccess) -> TransferDownloadHandler {
+    download_handler_with_limits(
+        access,
+        transfer::archive::MAX_ARCHIVE_ENTRIES,
+        transfer::archive::MAX_ARCHIVE_BYTES,
+    )
+}
+
+/// [`download_handler`] with explicit archive budgets, so a caller -- or a test -- can prove the
+/// oversized-folder path without building a workspace that exceeds the production limits.
+#[must_use]
+pub fn download_handler_with_limits(
+    access: TransferAccess,
+    max_entries: usize,
+    max_bytes: u64,
+) -> TransferDownloadHandler {
     Arc::new(move |token, _context| {
         let access = access.clone();
         Box::pin(async move {
@@ -46,32 +62,46 @@ pub fn download_handler(access: TransferAccess) -> TransferDownloadHandler {
             if metadata.is_dir() {
                 // The plan both enforces the archive limits and proves to `archive_body` that
                 // they were enforced, so an oversized folder fails before the response starts.
-                let plan = match transfer::archive::plan_archive(&canonical).await {
+                let plan = match transfer::archive::plan_archive_with_limits(
+                    &canonical,
+                    max_entries,
+                    max_bytes,
+                )
+                .await
+                {
                     Ok(plan) => plan,
-                    Err(
-                        transfer::TransferError::TooManyEntries { .. }
-                        | transfer::TransferError::TooManyBytes { .. },
-                    ) => {
-                        return Err(payload_too_large(
-                            "Folder is too large to download as an archive.",
-                        ));
+                    Err(transfer::TransferError::TooManyEntries { limit }) => {
+                        return Ok(TransferDownloadHttpOutcome::ArchiveTooLarge {
+                            limit: u64::try_from(limit).unwrap_or(u64::MAX),
+                            unit: TransferArchiveLimitUnit::Entries,
+                        });
+                    }
+                    Err(transfer::TransferError::TooManyBytes { limit }) => {
+                        return Ok(TransferDownloadHttpOutcome::ArchiveTooLarge {
+                            limit,
+                            unit: TransferArchiveLimitUnit::Bytes,
+                        });
                     }
                     Err(_) => return Err(not_found()),
                 };
-                Ok(TransferDownloadHttpResponse {
-                    file_name: format!("{name}.zip"),
-                    content_type: "application/zip",
-                    body: transfer::archive::archive_body(plan, canonical),
-                })
+                Ok(TransferDownloadHttpOutcome::Stream(
+                    TransferDownloadHttpResponse {
+                        file_name: format!("{name}.zip"),
+                        content_type: "application/zip",
+                        body: transfer::archive::archive_body(plan, canonical),
+                    },
+                ))
             } else {
                 let file = tokio::fs::File::open(&canonical)
                     .await
                     .map_err(|_| not_found())?;
-                Ok(TransferDownloadHttpResponse {
-                    file_name: name,
-                    content_type: "application/octet-stream",
-                    body: Body::from_stream(tokio_util::io::ReaderStream::new(file)),
-                })
+                Ok(TransferDownloadHttpOutcome::Stream(
+                    TransferDownloadHttpResponse {
+                        file_name: name,
+                        content_type: "application/octet-stream",
+                        body: Body::from_stream(tokio_util::io::ReaderStream::new(file)),
+                    },
+                ))
             }
         }) as BoxFuture<_>
     })
@@ -161,16 +191,6 @@ fn bad_request(message: &str) -> HttpRouteError {
         StatusCode::BAD_REQUEST,
         json!({
             "_tag": "EnvironmentHttpBadRequestError",
-            "message": message,
-        }),
-    )
-}
-
-fn payload_too_large(message: &str) -> HttpRouteError {
-    HttpRouteError::new(
-        StatusCode::PAYLOAD_TOO_LARGE,
-        json!({
-            "_tag": "TransferTooLargeError",
             "message": message,
         }),
     )
