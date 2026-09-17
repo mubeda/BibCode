@@ -1,17 +1,19 @@
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use base64::Engine;
-use hmac::{Hmac, KeyInit as _, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 use thiserror::Error;
 
 use crate::project::ProjectFaviconResolver;
 use crate::provider::attachments::AttachmentMaterializer;
+use crate::signed_token;
 use crate::workspace::{WorkspaceError, paths};
 
 pub const ASSET_ROUTE_PREFIX: &str = "/api/assets";
+/// Domain separation for [`crate::signed_token`]: asset tokens share the server secret with
+/// transfer tokens, and only this purpose keeps a read-only asset capability from verifying as
+/// a write-capable upload one.
+const ASSET_TOKEN_PURPOSE: &str = "asset";
 
 const PREVIEW_ENTRY_EXTENSIONS: &[&str] = &["htm", "html", "pdf"];
 const IMAGE_EXTENSIONS: &[&str] = &["avif", "gif", "ico", "jpeg", "jpg", "png", "svg", "webp"];
@@ -93,7 +95,7 @@ impl AssetAccess {
     }
 
     pub async fn issue(&self, request: AssetIssueRequest) -> Result<IssuedAssetUrl, AssetError> {
-        let expires_at = now_millis().saturating_add(duration_millis(self.ttl));
+        let expires_at = signed_token::now_millis().saturating_add(duration_millis(self.ttl));
         let (claims, filename) = match request.resource {
             AssetResource::WorkspaceFile { path, .. } => {
                 let root = request
@@ -172,7 +174,7 @@ impl AssetAccess {
 
     pub async fn resolve(&self, token: &str, requested_path: &str) -> Option<ResolvedAsset> {
         let claims = self.verify(token)?;
-        if claims.expires_at() <= now_millis() {
+        if claims.expires_at() <= signed_token::now_millis() {
             return None;
         }
         match claims {
@@ -218,28 +220,15 @@ impl AssetAccess {
     }
 
     fn sign(&self, claims: &Claims) -> Result<String, AssetError> {
-        let payload =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims)?);
-        let mut mac = Hmac::<Sha256>::new_from_slice(&self.secret)
-            .expect("HMAC accepts arbitrary key lengths");
-        mac.update(payload.as_bytes());
-        let signature =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
-        Ok(format!("{payload}.{signature}"))
+        Ok(signed_token::sign(
+            &self.secret,
+            ASSET_TOKEN_PURPOSE,
+            claims,
+        )?)
     }
 
     fn verify(&self, token: &str) -> Option<Claims> {
-        let (payload, signature) = token.split_once('.')?;
-        let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(signature)
-            .ok()?;
-        let mut mac = Hmac::<Sha256>::new_from_slice(&self.secret).ok()?;
-        mac.update(payload.as_bytes());
-        mac.verify_slice(&signature).ok()?;
-        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(payload)
-            .ok()?;
-        serde_json::from_slice(&bytes).ok()
+        signed_token::verify(&self.secret, ASSET_TOKEN_PURPOSE, token)
     }
 }
 
@@ -342,15 +331,6 @@ fn file_name(path: &Path) -> String {
 
 fn percent_encode(value: &str) -> String {
     url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
-}
-
-fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
 }
 
 fn duration_millis(duration: Duration) -> u64 {

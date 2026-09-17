@@ -54,6 +54,22 @@ pub type McpHandler = Arc<
         + Send
         + Sync,
 >;
+pub type TransferDownloadHandler = Arc<
+    dyn Fn(String, RouteContext) -> BoxFuture<Result<TransferDownloadHttpOutcome, HttpRouteError>>
+        + Send
+        + Sync,
+>;
+pub type TransferUploadHandler = Arc<
+    dyn Fn(
+            String,
+            String,
+            bool,
+            Body,
+            RouteContext,
+        ) -> BoxFuture<Result<TransferUploadHttpOutcome, HttpRouteError>>
+        + Send
+        + Sync,
+>;
 
 #[derive(Clone)]
 pub struct HttpRoutesState {
@@ -62,6 +78,8 @@ pub struct HttpRoutesState {
     pub diagnostic_logs: DiagnosticLogsHandler,
     pub assets: AssetHandler,
     pub mcp: McpHandler,
+    pub transfer_download: TransferDownloadHandler,
+    pub transfer_upload: TransferUploadHandler,
 }
 
 impl HttpRoutesState {
@@ -72,6 +90,8 @@ impl HttpRoutesState {
         diagnostic_logs: DiagnosticLogsHandler,
         assets: AssetHandler,
         mcp: McpHandler,
+        transfer_download: TransferDownloadHandler,
+        transfer_upload: TransferUploadHandler,
     ) -> Self {
         Self {
             authorize,
@@ -79,6 +99,8 @@ impl HttpRoutesState {
             diagnostic_logs,
             assets,
             mcp,
+            transfer_download,
+            transfer_upload,
         }
     }
 }
@@ -146,6 +168,53 @@ pub struct DiagnosticLogsHttpResponse {
     pub bytes: Vec<u8>,
 }
 
+/// A download response whose body is streamed: a file's bytes, or a folder's zip archive.
+///
+/// `content_length` is `Some` only when the whole length is known before the first byte goes
+/// out -- a file on disk. A zip is produced as it streams, so it stays chunked with no length.
+pub struct TransferDownloadHttpResponse {
+    pub file_name: String,
+    pub content_type: &'static str,
+    pub content_length: Option<u64>,
+    pub body: Body,
+}
+
+/// Which archive budget a folder download blew through.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransferArchiveLimitUnit {
+    Entries,
+    Bytes,
+}
+
+impl TransferArchiveLimitUnit {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Entries => "entries",
+            Self::Bytes => "bytes",
+        }
+    }
+}
+
+/// The outcomes a download route reports back to the client.
+///
+/// An oversized folder is an outcome rather than an error so that the route, not the handler,
+/// stays responsible for HTTP framing -- the same split the upload outcome already uses.
+pub enum TransferDownloadHttpOutcome {
+    Stream(TransferDownloadHttpResponse),
+    ArchiveTooLarge {
+        limit: u64,
+        unit: TransferArchiveLimitUnit,
+    },
+}
+
+/// The three outcomes an upload route reports back to the client.
+pub enum TransferUploadHttpOutcome {
+    Created { relative_path: String },
+    Exists,
+    TooLarge { limit: u64 },
+}
+
 pub struct McpHttpResponse {
     pub status: u16,
     pub headers: BTreeMap<String, String>,
@@ -203,6 +272,10 @@ where
         )
         .route("/api/diagnostics/logs.zip", post(diagnostic_logs))
         .route("/api/assets/{token}/{*path}", get(asset))
+        .route(
+            "/api/transfers/{token}",
+            get(transfer_download).post(transfer_upload),
+        )
         .route("/mcp", post(mcp_post).delete(mcp_delete))
 }
 
@@ -401,6 +474,109 @@ async fn asset(
             .header("x-content-type-options", "nosniff")
             .body(Body::from(asset.bytes))
             .unwrap_or_else(|_| internal_error()),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn transfer_download(
+    State(state): State<HttpRoutesState>,
+    Path(token): Path<String>,
+    request: Request,
+) -> Response {
+    let cancellation = CancellationToken::new();
+    let _guard = CancellationGuard(cancellation.clone());
+    let (parts, _) = request.into_parts();
+    let context = RouteContext {
+        headers: parts.headers,
+        uri: parts.uri,
+        cancellation,
+    };
+    match (state.transfer_download)(token, context).await {
+        Ok(TransferDownloadHttpOutcome::ArchiveTooLarge { limit, unit }) => json_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            BTreeMap::new(),
+            json!({
+                "_tag": "TransferArchiveTooLargeError",
+                "limit": limit,
+                "unit": unit.as_str(),
+                "message": "Folder is too large to download as an archive."
+            }),
+        ),
+        Ok(TransferDownloadHttpOutcome::Stream(download)) => {
+            let mut builder = Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, download.content_type)
+                .header(
+                    header::CONTENT_DISPOSITION,
+                    format!(
+                        "attachment; filename=\"{}\"",
+                        download.file_name.replace('"', "")
+                    ),
+                )
+                .header(header::CACHE_CONTROL, NO_STORE)
+                .header("x-content-type-options", "nosniff");
+            if let Some(length) = download.content_length {
+                builder = builder.header(header::CONTENT_LENGTH, length);
+            }
+            builder
+                .body(download.body)
+                .unwrap_or_else(|_| internal_error())
+        }
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn transfer_upload(
+    State(state): State<HttpRoutesState>,
+    Path(token): Path<String>,
+    request: Request,
+) -> Response {
+    let cancellation = CancellationToken::new();
+    let _guard = CancellationGuard(cancellation.clone());
+    let (parts, body) = request.into_parts();
+    let query: BTreeMap<String, String> = parts
+        .uri
+        .query()
+        .map(|query| {
+            url::form_urlencoded::parse(query.as_bytes())
+                .into_owned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let Some(name) = query.get("name").cloned() else {
+        return bad_request("Query parameter 'name' is required.");
+    };
+    let overwrite = query
+        .get("overwrite")
+        .is_some_and(|value| value == "1" || value == "true");
+    let context = RouteContext {
+        headers: parts.headers,
+        uri: parts.uri,
+        cancellation,
+    };
+    match (state.transfer_upload)(token, name, overwrite, body, context).await {
+        Ok(TransferUploadHttpOutcome::Created { relative_path }) => json_response(
+            StatusCode::CREATED,
+            BTreeMap::new(),
+            json!({ "relativePath": relative_path }),
+        ),
+        Ok(TransferUploadHttpOutcome::Exists) => json_response(
+            StatusCode::CONFLICT,
+            BTreeMap::new(),
+            json!({
+                "_tag": "TransferEntryExistsError",
+                "message": "An entry with that name already exists."
+            }),
+        ),
+        Ok(TransferUploadHttpOutcome::TooLarge { limit }) => json_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            BTreeMap::new(),
+            json!({
+                "_tag": "TransferTooLargeError",
+                "message": "Upload exceeds the configured limit.",
+                "limit": limit
+            }),
+        ),
         Err(error) => error.into_response(),
     }
 }

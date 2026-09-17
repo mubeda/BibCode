@@ -33,6 +33,7 @@ use crate::{
                 build_refs_snapshot, read_image_blob,
             },
             stash::{self, GitManagerStashError},
+            tags::{self, GitManagerTagError},
         },
         validate_pathspecs,
     },
@@ -57,6 +58,7 @@ pub const GIT_MANAGER_UNARY_METHODS: &[&str] = &[
     "gitManager.getCommits",
     "gitManager.getDiff",
     "gitManager.getRefs",
+    "gitManager.getRemoteTags",
     "gitManager.getStashes",
     "gitManager.listPullRequests",
     "gitManager.previewMerge",
@@ -394,6 +396,19 @@ impl ConfiguredGitManagerRpcServices {
                     stash::list_stashes(&self.repository, &input.cwd, &cancellation)
                         .await
                         .map_err(|error| stash_error(&request.tag, error)),
+                )
+            }
+            "gitManager.getRemoteTags" => {
+                let input: GitManagerRemoteTagsInput = decode(request.payload, &request.tag)?;
+                encode_result(
+                    tags::list_remote_tags(
+                        &self.repository,
+                        &input.cwd,
+                        &input.remote,
+                        &cancellation,
+                    )
+                    .await
+                    .map_err(|error| tag_read_error(&request.tag, error)),
                 )
             }
             "gitManager.previewMerge" => {
@@ -962,6 +977,7 @@ pub fn register_git_manager_rpc(
                 | "gitManager.getCommits"
                 | "gitManager.getDiff"
                 | "gitManager.getStashes"
+                | "gitManager.getRemoteTags"
                 | "gitManager.previewMerge"
                 | "gitManager.listPullRequests"
                 | "gitManager.commit"
@@ -983,6 +999,7 @@ pub fn register_git_manager_rpc(
         "gitManager.getCommits",
         "gitManager.getDiff",
         "gitManager.getStashes",
+        "gitManager.getRemoteTags",
         "gitManager.previewMerge",
         "gitManager.listPullRequests",
     ] {
@@ -1064,6 +1081,12 @@ async fn send_terminal_operation_error(
 #[derive(Deserialize)]
 struct GitManagerCwdInput {
     cwd: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct GitManagerRemoteTagsInput {
+    cwd: PathBuf,
+    remote: String,
 }
 
 #[derive(Deserialize)]
@@ -1640,6 +1663,24 @@ fn graph_error(operation: &str, error: GitManagerGraphError) -> Value {
             "Git returned malformed commit history.",
         ),
         GitManagerGraphError::Git(error) => git_error(operation, error),
+    }
+}
+
+fn tag_read_error(operation: &str, error: GitManagerTagError) -> Value {
+    match error {
+        GitManagerTagError::InvalidName => operation_error(
+            operation,
+            "invalid-remote-name",
+            "The remote name is invalid.",
+        ),
+        GitManagerTagError::NotFound
+        | GitManagerTagError::Malformed
+        | GitManagerTagError::CommandFailed
+        | GitManagerTagError::Git(_) => operation_error(
+            operation,
+            "git-command-failed",
+            "Git could not list the remote's tags.",
+        ),
     }
 }
 

@@ -26,3 +26,11 @@ it("selects Changes while a merge needs to be finished", () => {
     "changes",
   );
 });
+
+it("never pulls the user off the Tags tab for a clean transition", () => {
+  expect(resolveGitManagerDefaultTab(null, false, "tags")).toBeNull();
+  expect(resolveGitManagerDefaultTab(null, false, "changes")).toBe("history");
+  expect(
+    resolveGitManagerDefaultTab({ kind: "merge", current: null, total: null }, true, "tags"),
+  ).toBe("changes");
+});

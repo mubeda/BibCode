@@ -173,6 +173,16 @@ describe("thread status indicators", () => {
     expect(renderToStaticMarkup(<ThreadWorktreeIndicator thread={thread} />)).toContain(
       "feature/test",
     );
+    // The label is text, not an icon: the folder-git glyph is reserved for the
+    // sidebar's "New worktree" action and must not appear on thread rows.
+    expect(renderToStaticMarkup(<ThreadWorktreeIndicator thread={thread} />)).not.toContain("<svg");
+    expect(
+      renderToStaticMarkup(
+        <ThreadWorktreeIndicator
+          thread={{ id: thread.id, branch: null, worktreePath: "/repo/worktree" }}
+        />,
+      ),
+    ).toContain(">worktree<");
 
     const status = {
       label: "Working" as const,

@@ -24,6 +24,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "gitManager.getCommits"
         | "gitManager.getDiff"
         | "gitManager.getRefs"
+        | "gitManager.getRemoteTags"
         | "gitManager.getStashes"
         | "gitManager.listPullRequests"
         | "gitManager.previewMerge"
@@ -34,6 +35,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "orchestration.subscribeShell"
         | "orchestration.subscribeThread"
         | "preview.list"
+        | "projects.createDownloadUrl"
         | "projects.listEntries"
         | "projects.readFile"
         | "projects.searchEntries"
@@ -83,6 +85,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "previewAutomation.focusHost"
         | "previewAutomation.respond"
         | "projects.createEntry"
+        | "projects.createUploadUrl"
         | "projects.deleteEntry"
         | "projects.duplicateEntry"
         | "projects.renameEntry"
@@ -214,6 +217,7 @@ mod tests {
             "gitManager.getCommits",
             "gitManager.getDiff",
             "gitManager.getRefs",
+            "gitManager.getRemoteTags",
             "gitManager.getStashes",
             "gitManager.listPullRequests",
             "gitManager.previewMerge",

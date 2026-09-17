@@ -3989,6 +3989,25 @@ impl GitRepository {
         .await
     }
 
+    /// Lists the tags a remote currently advertises. Network-bound like fetch,
+    /// non-interactive, and a non-zero exit is returned to the caller so an
+    /// unreachable remote can be reported instead of failing the read.
+    pub(crate) async fn git_manager_ls_remote_tags(
+        &self,
+        cwd: &Path,
+        remote: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute(
+            "GitManager.tags.listRemote",
+            cwd,
+            &["ls-remote".into(), "--tags".into(), remote.into()],
+            true,
+            cancellation,
+        )
+        .await
+    }
+
     pub(crate) async fn git_manager_pull(
         &self,
         cwd: &Path,
@@ -4033,6 +4052,7 @@ impl GitRepository {
         remote_branch: Option<&str>,
         set_upstream: bool,
         force_with_lease: bool,
+        push_tags: bool,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, GitCommandError> {
         let refspec = remote_branch.map_or_else(
@@ -4045,6 +4065,12 @@ impl GitRepository {
         }
         if force_with_lease {
             args.push("--force-with-lease".into());
+        }
+        if push_tags {
+            // All local tags travel with the branch; `--atomic` keeps a tag the
+            // remote rejects from leaving the branch half-pushed.
+            args.push("--tags".into());
+            args.push("--atomic".into());
         }
         self.execute("GitManager.push", cwd, &args, true, cancellation)
             .await
@@ -7225,12 +7251,27 @@ mod tests {
                 Some("review/topic"),
                 true,
                 true,
+                false,
                 &CancellationToken::new(),
             )
             .await
             .expect("push succeeds");
+        repository
+            .git_manager_push(
+                Path::new("/repo"),
+                "origin",
+                "topic",
+                None,
+                false,
+                false,
+                true,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("push with tags succeeds");
 
-        let args = &runner.requests()[0].args;
+        let requests = runner.requests();
+        let args = &requests[0].args;
         assert_eq!(
             args,
             &[
@@ -7245,6 +7286,14 @@ mod tests {
             .collect::<Vec<_>>()
         );
         assert!(!args.iter().any(|argument| argument == "--force"));
+        assert_eq!(
+            requests[1].args,
+            ["push", "origin", "topic", "--tags", "--atomic"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>(),
+            "pushing tags travels with the branch atomically"
+        );
     }
 
     #[tokio::test]

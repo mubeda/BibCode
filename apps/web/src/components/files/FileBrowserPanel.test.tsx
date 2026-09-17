@@ -229,6 +229,8 @@ vi.mock("~/state/projects", () => ({
   projectEnvironment: {
     create: { label: "create" },
     createEntry: { label: "createEntry" },
+    createDownloadUrl: { label: "createDownloadUrl" },
+    createUploadUrl: { label: "createUploadUrl" },
     refreshEntries: { label: "refreshEntries" },
     subscribeEntries: () => ({ kind: "entry-changes" }),
     renameEntry: { label: "renameEntry" },
@@ -406,19 +408,40 @@ function lastDialogRequest(): Record<string, unknown> {
   return call.applied as Record<string, unknown>;
 }
 
-/** Invoke `renderContextMenu` and return the row `actions` handed to the menu. */
-function rowActionsFor(path: string, kind: ProjectEntry["kind"]): RowActions {
+/** Invoke `renderContextMenu` and return the menu element rendered for a row. */
+function rowMenuFor(path: string, kind: ProjectEntry["kind"]): React.ReactElement {
   const fileTree = ui.last("FileTree")!;
   const renderContextMenu = fileTree["renderContextMenu"] as (
     item: { path: string; kind: string },
     context: { anchorElement: unknown; close: () => void },
   ) => React.ReactElement;
   const treePath = kind === "directory" ? `${path}/` : path;
-  const element = renderContextMenu(
+  return renderContextMenu(
     { path: treePath, kind },
     { anchorElement: { id: "anchor" }, close: vi.fn() },
   );
-  return (element.props as { actions: RowActions }).actions;
+}
+
+/** Invoke `renderContextMenu` and return the row `actions` handed to the menu. */
+function rowActionsFor(path: string, kind: ProjectEntry["kind"]): RowActions {
+  return (rowMenuFor(path, kind).props as { actions: RowActions }).actions;
+}
+
+/** Invoke `renderContextMenu` and return the menu `model` handed to the menu. */
+function rowModelFor(
+  path: string,
+  kind: ProjectEntry["kind"],
+): { groups: Array<Array<{ id: string; enabled: boolean }>> } {
+  return (
+    rowMenuFor(path, kind).props as {
+      model: { groups: Array<Array<{ id: string; enabled: boolean }>> };
+    }
+  ).model;
+}
+
+/** A desktop bridge exposing only the transfer commands a test cares about. */
+function stubDesktopBridge(bridge: Record<string, unknown>): void {
+  vi.stubGlobal("window", { desktopBridge: bridge });
 }
 
 beforeEach(() => {
@@ -1843,6 +1866,428 @@ describe("open in preview", () => {
   });
 });
 
+describe("download entry", () => {
+  beforeEach(() => {
+    setEntries([entry("src", "directory"), entry("src/app.ts", "file")]);
+    testState.environmentHttpBaseUrl = "http://127.0.0.1:4100";
+    testState.commandResults["createDownloadUrl"] = {
+      _tag: "Success",
+      value: {
+        relativeUrl: "/api/transfers/t.k",
+        expiresAt: 1,
+        fileName: "src.zip",
+        kind: "archive",
+      },
+    };
+  });
+
+  it("mints a transfer URL and saves it through the desktop bridge", async () => {
+    const downloadToFolder = vi.fn(async () => "/home/me/Downloads/src (1).zip");
+    const pickFolder = vi.fn(async () => "/home/me/Downloads");
+    stubDesktopBridge({ pickFolder, downloadToFolder });
+    renderPanel();
+
+    rowActionsFor("src", "directory").onDownload();
+    await flushPromises();
+
+    const minted = testState.commandCalls.find((call) => call.label === "createDownloadUrl");
+    expect(minted!.input).toEqual({
+      environmentId,
+      input: { cwd: "/workspace/demo", relativePath: "src" },
+    });
+    expect(downloadToFolder).toHaveBeenCalledWith({
+      url: "http://127.0.0.1:4100/api/transfers/t.k",
+      directory: "/home/me/Downloads",
+      fileName: "src.zip",
+    });
+    expect(testState.toastAdd).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "success",
+        title: "Download saved",
+        description: "/home/me/Downloads/src (1).zip",
+      }),
+    );
+  });
+
+  it("says nothing extra when the folder picker is dismissed", async () => {
+    stubDesktopBridge({ pickFolder: vi.fn(async () => null), downloadToFolder: vi.fn() });
+    renderPanel();
+
+    rowActionsFor("src", "directory").onDownload();
+    await flushPromises();
+
+    expect(testState.toastAdd).not.toHaveBeenCalled();
+  });
+
+  it("hands the URL to the browser downloader without a desktop bridge", async () => {
+    renderPanel();
+    const anchor = { href: "", download: "", rel: "", click: vi.fn(), remove: vi.fn() };
+    vi.stubGlobal("document", {
+      createElement: vi.fn(() => anchor),
+      body: { appendChild: vi.fn() },
+    });
+
+    rowActionsFor("src/app.ts", "file").onDownload();
+    await flushPromises();
+
+    expect(anchor.href).toBe("http://127.0.0.1:4100/api/transfers/t.k");
+    expect(anchor.download).toBe("src.zip");
+    expect(anchor.click).toHaveBeenCalledOnce();
+    expect(testState.toastAdd).not.toHaveBeenCalled();
+  });
+
+  it("explains a download that cannot start because the server is unknown", async () => {
+    testState.environmentHttpBaseUrl = null;
+    renderPanel();
+
+    rowActionsFor("src", "directory").onDownload();
+    await flushPromises();
+
+    expect(testState.commandCalls.some((call) => call.label === "createDownloadUrl")).toBe(false);
+    expect(testState.toastAdd).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "error",
+        title: 'Can’t download "src"',
+        description: "Not connected to this environment's server. Reconnect and try again.",
+      }),
+    );
+  });
+
+  it("reports a failed mint but ignores interrupts", async () => {
+    testState.commandResults["createDownloadUrl"] = {
+      _tag: "Failure",
+      error: new Error("no such entry"),
+    };
+    renderPanel();
+    rowActionsFor("src", "directory").onDownload();
+    await flushPromises();
+    expect(testState.toastAdd).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: 'Failed to prepare a download for "src"',
+        description: "no such entry",
+      }),
+    );
+
+    testState.toastAdd = vi.fn();
+    testState.commandResults["createDownloadUrl"] = { _tag: "Failure", interrupted: true };
+    renderPanel();
+    rowActionsFor("src", "directory").onDownload();
+    await flushPromises();
+    expect(testState.toastAdd).not.toHaveBeenCalled();
+  });
+
+  it("refuses a minted URL that points away from this environment's server", async () => {
+    // The desktop host streams this URL with host privileges, so a foreign origin must never
+    // reach it — the download is refused before the bridge is asked to do anything.
+    testState.commandResults["createDownloadUrl"] = {
+      _tag: "Success",
+      value: {
+        relativeUrl: "https://evil.example/api/transfers/t.k",
+        expiresAt: 1,
+        fileName: "src.zip",
+        kind: "archive",
+      },
+    };
+    const downloadToFolder = vi.fn();
+    const pickFolder = vi.fn();
+    stubDesktopBridge({ pickFolder, downloadToFolder });
+    renderPanel();
+
+    rowActionsFor("src", "directory").onDownload();
+    await flushPromises();
+
+    expect(downloadToFolder).not.toHaveBeenCalled();
+    expect(pickFolder).not.toHaveBeenCalled();
+    expect(testState.toastAdd).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "error",
+        title: 'Can’t download "src"',
+        description: "The server did not return a usable download URL.",
+      }),
+    );
+  });
+
+  it("reports a desktop transfer that fails", async () => {
+    stubDesktopBridge({
+      pickFolder: vi.fn(async () => "/home/me/Downloads"),
+      downloadToFolder: vi.fn(async () => {
+        throw new Error("disk full");
+      }),
+    });
+    renderPanel();
+
+    rowActionsFor("src", "directory").onDownload();
+    await flushPromises();
+
+    expect(testState.toastAdd).toHaveBeenCalledWith(
+      expect.objectContaining({ title: 'Failed to download "src"', description: "disk full" }),
+    );
+  });
+
+  it("stays available while the workspace is unavailable", () => {
+    renderPanel(baseProps({ workspaceUnavailable: "Workspace unavailable." }));
+    const actions = rowMenuFor("src", "directory").props as {
+      actions: Record<string, unknown>;
+    };
+    expect(actions.actions["onDownload"]).toEqual(expect.any(Function));
+    expect(actions.actions["onUpload"]).toBeUndefined();
+  });
+});
+
+describe("upload files", () => {
+  beforeEach(() => {
+    setEntries([entry("src", "directory"), entry("src/app.ts", "file")]);
+    testState.environmentHttpBaseUrl = "http://127.0.0.1:4100";
+    testState.commandResults["createUploadUrl"] = {
+      _tag: "Success",
+      value: { relativeUrl: "/api/transfers/u.k", expiresAt: 1, maxBytes: 1024 },
+    };
+  });
+
+  it("offers Upload on folder rows and disables it on file rows", () => {
+    renderPanel();
+    expect(rowActionsFor("src", "directory").onUpload).toBeDefined();
+    expect(rowActionsFor("src/app.ts", "file").onUpload).toBeDefined();
+    const fileItem = rowModelFor("src/app.ts", "file")
+      .groups.flat()
+      .find((item) => item.id === "upload");
+    expect(fileItem?.enabled).toBe(false);
+    const folderItem = rowModelFor("src", "directory")
+      .groups.flat()
+      .find((item) => item.id === "upload");
+    expect(folderItem?.enabled).toBe(true);
+  });
+
+  it("uploads every picked file into the right-clicked folder and refreshes the tree", async () => {
+    const uploadFile = vi.fn(async () => ({ status: 201, body: '{"relativePath":"src/a.txt"}' }));
+    const pickFiles = vi.fn(async () => ["/home/me/a.txt", "/home/me/b.txt"]);
+    stubDesktopBridge({ pickFolder: vi.fn(async () => null), pickFiles, uploadFile });
+    const refresh = vi.fn();
+    testState.entriesQuery.refresh = refresh;
+    renderPanel();
+
+    rowActionsFor("src", "directory").onUpload();
+    await flushPromises();
+
+    expect(pickFiles).toHaveBeenCalledWith({ title: "Select files to upload" });
+    const minted = testState.commandCalls.find((call) => call.label === "createUploadUrl");
+    expect(minted!.input).toEqual({
+      environmentId,
+      input: { cwd: "/workspace/demo", relativeDirectory: "src" },
+    });
+    expect(uploadFile).toHaveBeenNthCalledWith(1, {
+      url: "http://127.0.0.1:4100/api/transfers/u.k?name=a.txt",
+      path: "/home/me/a.txt",
+    });
+    expect(uploadFile).toHaveBeenNthCalledWith(2, {
+      url: "http://127.0.0.1:4100/api/transfers/u.k?name=b.txt",
+      path: "/home/me/b.txt",
+    });
+    expect(refresh).toHaveBeenCalled();
+    expect(testState.toastAdd).not.toHaveBeenCalled();
+  });
+
+  it("keeps uploading the rest of the batch when one file is rejected", async () => {
+    const uploadFile = vi
+      .fn<(input: { url: string; path: string }) => Promise<{ status: number; body: string }>>()
+      .mockRejectedValueOnce(new Error("Could not read the file."))
+      .mockResolvedValueOnce({ status: 201, body: '{"relativePath":"src/b.txt"}' });
+    stubDesktopBridge({
+      pickFolder: vi.fn(async () => null),
+      pickFiles: vi.fn(async () => ["/home/me/a.txt", "/home/me/b.txt"]),
+      uploadFile,
+    });
+    const refresh = vi.fn();
+    testState.entriesQuery.refresh = refresh;
+    renderPanel();
+
+    rowActionsFor("src", "directory").onUpload();
+    await flushPromises();
+
+    expect(testState.toastAdd).toHaveBeenCalledTimes(1);
+    expect(testState.toastAdd).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "error",
+        title: 'Can\u2019t upload "a.txt"',
+        description: "Could not read the file.",
+      }),
+    );
+    expect(uploadFile).toHaveBeenNthCalledWith(2, {
+      url: "http://127.0.0.1:4100/api/transfers/u.k?name=b.txt",
+      path: "/home/me/b.txt",
+    });
+    expect(refresh).toHaveBeenCalled();
+  });
+
+  it("targets a file row's parent folder", async () => {
+    stubDesktopBridge({
+      pickFolder: vi.fn(async () => null),
+      pickFiles: vi.fn(async () => ["/home/me/a.txt"]),
+      uploadFile: vi.fn(async () => ({ status: 201, body: '{"relativePath":"src/a.txt"}' })),
+    });
+    renderPanel();
+
+    rowActionsFor("src/app.ts", "file").onUpload();
+    await flushPromises();
+
+    const minted = testState.commandCalls.find((call) => call.label === "createUploadUrl");
+    expect(
+      (minted!.input as { input: { relativeDirectory: string } }).input.relativeDirectory,
+    ).toBe("src");
+  });
+
+  it("asks before replacing an existing file and retries with overwrite", async () => {
+    const uploadFile = vi
+      .fn<(input: { url: string; path: string }) => Promise<{ status: number; body: string }>>()
+      .mockResolvedValueOnce({ status: 409, body: '{"_tag":"TransferEntryExistsError"}' })
+      .mockResolvedValueOnce({ status: 201, body: '{"relativePath":"src/a.txt"}' });
+    stubDesktopBridge({
+      pickFolder: vi.fn(async () => null),
+      pickFiles: vi.fn(async () => ["/home/me/a.txt"]),
+      uploadFile,
+    });
+    renderPanel();
+
+    rowActionsFor("src", "directory").onUpload();
+    await flushPromises();
+
+    const request = lastDialogRequest();
+    expect(request["mode"]).toBe("confirm");
+    expect(request["title"]).toBe('Replace "a.txt"?');
+    expect(request["destructive"]).toBe(true);
+    expect(request["confirmLabel"]).toBe("Replace");
+    expect(request["description"]).toContain("src");
+    expect(uploadFile).toHaveBeenCalledTimes(1);
+
+    (request["onConfirm"] as () => void)();
+    await flushPromises();
+
+    expect(uploadFile).toHaveBeenNthCalledWith(2, {
+      url: "http://127.0.0.1:4100/api/transfers/u.k?name=a.txt&overwrite=1",
+      path: "/home/me/a.txt",
+    });
+    expect(testState.toastAdd).not.toHaveBeenCalled();
+  });
+
+  it("keeps the existing file when the replace prompt is dismissed", async () => {
+    const uploadFile = vi.fn(async () => ({
+      status: 409,
+      body: '{"_tag":"TransferEntryExistsError"}',
+    }));
+    stubDesktopBridge({
+      pickFolder: vi.fn(async () => null),
+      pickFiles: vi.fn(async () => ["/home/me/a.txt"]),
+      uploadFile,
+    });
+    renderPanel();
+
+    rowActionsFor("src", "directory").onUpload();
+    await flushPromises();
+
+    const dialog = ui.last("FileEntryDialog")!;
+    (dialog["onClose"] as () => void)();
+    await flushPromises();
+
+    expect(uploadFile).toHaveBeenCalledTimes(1);
+    expect(testState.toastAdd).not.toHaveBeenCalled();
+  });
+
+  it("explains a file the server refuses as too large", async () => {
+    stubDesktopBridge({
+      pickFolder: vi.fn(async () => null),
+      pickFiles: vi.fn(async () => ["/home/me/big.bin"]),
+      uploadFile: vi.fn(async () => ({
+        status: 413,
+        body: `{"_tag":"TransferTooLargeError","limit":${1024 * 1024 * 1024}}`,
+      })),
+    });
+    renderPanel();
+
+    rowActionsFor("src", "directory").onUpload();
+    await flushPromises();
+
+    expect(testState.toastAdd).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "error",
+        title: 'Can’t upload "big.bin"',
+        description: "The file is larger than the 1 GiB the server accepts.",
+      }),
+    );
+  });
+
+  it("refuses a minted upload URL that points away from this environment's server", async () => {
+    testState.commandResults["createUploadUrl"] = {
+      _tag: "Success",
+      value: {
+        relativeUrl: "https://evil.example/api/transfers/u.k",
+        expiresAt: 1,
+        maxBytes: 1024,
+      },
+    };
+    const uploadFile = vi.fn();
+    stubDesktopBridge({
+      pickFolder: vi.fn(async () => null),
+      pickFiles: vi.fn(async () => ["/home/me/a.txt"]),
+      uploadFile,
+    });
+    renderPanel();
+
+    rowActionsFor("src", "directory").onUpload();
+    await flushPromises();
+
+    expect(uploadFile).not.toHaveBeenCalled();
+    expect(testState.toastAdd).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "error",
+        title: 'Can’t upload "a.txt"',
+        description: "The server did not return a usable upload URL.",
+      }),
+    );
+  });
+
+  it("reports a failed mint", async () => {
+    testState.commandResults["createUploadUrl"] = {
+      _tag: "Failure",
+      error: new Error("read-only workspace"),
+    };
+    stubDesktopBridge({
+      pickFolder: vi.fn(async () => null),
+      pickFiles: vi.fn(async () => ["/home/me/a.txt"]),
+      uploadFile: vi.fn(),
+    });
+    renderPanel();
+
+    rowActionsFor("src", "directory").onUpload();
+    await flushPromises();
+
+    expect(testState.toastAdd).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: 'Failed to prepare an upload to "src"',
+        description: "read-only workspace",
+      }),
+    );
+  });
+
+  it("does nothing when the picker is dismissed", async () => {
+    const uploadFile = vi.fn();
+    stubDesktopBridge({
+      pickFolder: vi.fn(async () => null),
+      pickFiles: vi.fn(async () => []),
+      uploadFile,
+    });
+    const refresh = vi.fn();
+    testState.entriesQuery.refresh = refresh;
+    renderPanel();
+
+    rowActionsFor("src", "directory").onUpload();
+    await flushPromises();
+
+    expect(uploadFile).not.toHaveBeenCalled();
+    expect(testState.commandCalls.some((call) => call.label === "createUploadUrl")).toBe(false);
+    expect(refresh).not.toHaveBeenCalled();
+  });
+});
+
 describe("background context menu", () => {
   beforeEach(() => {
     setEntries([entry("src/app.ts", "file")]);
@@ -1920,6 +2365,40 @@ describe("background context menu", () => {
     await flushPromises();
     const call = testState.commandCalls.find((entry) => entry.label === "createEntry");
     expect((call!.input as { input: { relativePath: string } }).input.relativePath).toBe("a.ts");
+  });
+
+  it("uploads into the workspace root from the background menu", async () => {
+    testState.environmentHttpBaseUrl = "http://127.0.0.1:4100";
+    testState.commandResults["createUploadUrl"] = {
+      _tag: "Success",
+      value: { relativeUrl: "/api/transfers/u.k", expiresAt: 1, maxBytes: 1024 },
+    };
+    const uploadFile = vi.fn(async () => ({ status: 201, body: '{"relativePath":"a.txt"}' }));
+    vi.stubGlobal("window", {
+      desktopBridge: {
+        pickFolder: vi.fn(async () => null),
+        pickFiles: vi.fn(async () => ["/home/me/a.txt"]),
+        uploadFile,
+      },
+    });
+    harness.seedState((initial) => initial === null, null);
+    harness.seedState((initial) => initial === null, { x: 5, y: 6 });
+    renderPanel();
+
+    const menus = ui.filter("FileTreeContextMenu");
+    const background = menus[menus.length - 1]!;
+    const actions = background["actions"] as { onUpload: () => void };
+    actions.onUpload();
+    await flushPromises();
+
+    const minted = testState.commandCalls.find((call) => call.label === "createUploadUrl");
+    expect(
+      (minted!.input as { input: { relativeDirectory: string } }).input.relativeDirectory,
+    ).toBe("");
+    expect(uploadFile).toHaveBeenCalledWith({
+      url: "http://127.0.0.1:4100/api/transfers/u.k?name=a.txt",
+      path: "/home/me/a.txt",
+    });
   });
 
   it("keeps copy and refresh while removing every file mutation action", () => {

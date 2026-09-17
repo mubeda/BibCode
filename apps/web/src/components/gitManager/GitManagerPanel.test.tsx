@@ -52,6 +52,8 @@ const h = vi.hoisted(() => ({
   })),
   toolbarProps: [] as Array<Record<string, unknown>>,
   historyProps: [] as Array<Record<string, unknown>>,
+
+  tagsViewProps: [] as Array<Record<string, unknown>>,
   refsSnapshot: null as GitManagerRefsSnapshot | null,
   status: null as VcsStatusResult | null,
   signalGeneration: 1,
@@ -172,6 +174,13 @@ vi.mock("./history/GitManagerHistoryView", () => ({
   },
 }));
 
+vi.mock("./tags/GitManagerTagsView", () => ({
+  GitManagerTagsView: (props: Record<string, unknown>) => {
+    h.tagsViewProps.push(props);
+    return <div data-testid="git-manager-tags" />;
+  },
+}));
+
 vi.mock("./dialogs/GitManagerBranchDialogs", () => ({
   GitManagerBranchDialogs: (props: Record<string, unknown>) => {
     h.branchDialogProps.push(props);
@@ -222,6 +231,7 @@ function renderPanel(): string {
   h.queryAtoms.length = 0;
   h.toolbarProps.length = 0;
   h.historyProps.length = 0;
+  h.tagsViewProps.length = 0;
   return renderToStaticMarkup(<GitManagerPanel projectRef={projectRef} />);
 }
 
@@ -314,6 +324,7 @@ beforeEach(() => {
   h.listPullRequests.mockClear();
   h.runOperation.mockClear();
   h.historyProps.length = 0;
+  h.tagsViewProps.length = 0;
   h.branchDialogProps.length = 0;
   h.historyTagDialogProps.length = 0;
   useGitManagerStore.setState({ byProjectKey: {} });
@@ -346,6 +357,7 @@ describe("GitManagerPanel", () => {
 
     expect(markup).toContain("Changes");
     expect(markup).toContain("History");
+    expect(markup).toContain("Tags");
     expect(h.catalogAtom).toHaveBeenCalledTimes(1);
     expect(h.signalAtom).toHaveBeenCalledWith(
       expect.objectContaining({ input: { cwd: "/opaque/main" } }),

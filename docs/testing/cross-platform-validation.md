@@ -1020,7 +1020,13 @@ starts.
    reports one commit ahead and none behind, then merge with **Merge commit**.
    Confirm the operation's started-to-finished presentation and that History
    shows a new merge commit on `main` with two parents rather than a
-   fast-forward.
+   fast-forward. Open the **Tags** tab: collapse and expand the **Local** and
+   **Remote origin** sections and confirm the state survives leaving and
+   reopening the manager; create a tag from a History commit with **Push to
+   origin after creating** on and confirm it appears under Remote origin
+   without a "not fetched" badge; then choose **Push origin** on `main`, tick
+   **Also push tags**, and confirm the dialog names the branch and the push
+   completes.
 
 8. Check out `conflict-continue` in the panel and create the deliberate rebase
    conflict from the companion shell:
@@ -1195,6 +1201,11 @@ sizes. Cover relevant:
   entry in the clicked nested folder while expanded folders stay expanded, a
   drag-move onto a folder row and onto the tree root, and a refused move (a name
   the target already holds) reported as an error with the tree resynced;
+- Files Download and Upload: right-click a folder → **Download** → pick a
+  destination folder → verify the resulting `.zip`; right-click the tree
+  background → **Upload Files…** → pick a file → verify it appears in the
+  workspace root; upload a file whose name collides with an existing entry and
+  verify the Replace prompt, then confirm it and verify the replacement lands;
 - Files picking up a file created in the workspace by another tool while the
   packaged application stays open, both on its own within seconds and
   immediately via **Refresh**; while a controlled rescan is pending, verify the

@@ -1,0 +1,20 @@
+{
+  "_tag": "Exit",
+  "requestId": "900719925474099312345",
+  "exit": {
+    "_tag": "Failure",
+    "cause": [
+      {
+        "_tag": "Fail",
+        "error": {
+          "_tag": "WorkspaceUnavailableError",
+          "reason": "workspace-unavailable",
+          "message": "<Q\".tF",
+          "threadId": "4nYg6",
+          "path": "FGn6",
+          "availability": "verification-unavailable"
+        }
+      }
+    ]
+  }
+}

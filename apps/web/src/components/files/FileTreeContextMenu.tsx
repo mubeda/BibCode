@@ -24,6 +24,8 @@ export interface FileTreeMenuActions {
   onRename?: () => void;
   onDelete?: () => void;
   onRefresh?: () => void;
+  onDownload?: () => void;
+  onUpload?: () => void;
 }
 
 const ACTION_BY_ID: Record<FileTreeMenuItemId, keyof FileTreeMenuActions> = {
@@ -39,6 +41,8 @@ const ACTION_BY_ID: Record<FileTreeMenuItemId, keyof FileTreeMenuActions> = {
   rename: "onRename",
   delete: "onDelete",
   refresh: "onRefresh",
+  download: "onDownload",
+  upload: "onUpload",
 };
 
 type MenuAnchor = React.ComponentProps<typeof MenuPopup>["anchor"];
