@@ -1184,6 +1184,7 @@ async fn workspace_rpc_surfaces_optional_dependency_and_backend_failures() {
         WorkspaceService::default(),
         WorkspaceRpcDependencies {
             asset_access: Some(access),
+            transfer_access: None,
             asset_context_resolver: Some(Arc::new(StaticAssetContextResolver {
                 roots: std::collections::HashMap::from([(
                     "thread-1".to_owned(),
@@ -1214,6 +1215,7 @@ async fn workspace_rpc_surfaces_optional_dependency_and_backend_failures() {
         WorkspaceService::default(),
         WorkspaceRpcDependencies {
             asset_access: None,
+            transfer_access: None,
             asset_context_resolver: None,
             review_service: Some(ReviewService::new(Arc::new(FailingReviewBackend))),
             mutation_observer: None,
@@ -1967,6 +1969,7 @@ async fn workspace_rpc_routes_asset_urls_through_workspace_context_resolution() 
         WorkspaceService::default(),
         WorkspaceRpcDependencies {
             asset_access: Some(access.clone()),
+            transfer_access: None,
             asset_context_resolver: Some(Arc::new(StaticAssetContextResolver {
                 roots: std::collections::HashMap::from([(
                     "thread-1".to_owned(),
@@ -2050,6 +2053,7 @@ async fn assets_create_url_never_signs_an_untrusted_attachment_id() {
         WorkspaceService::default(),
         WorkspaceRpcDependencies {
             asset_access: Some(AssetAccess::new(vec![8; 32], attachments)),
+            transfer_access: None,
             asset_context_resolver: None,
             review_service: None,
             mutation_observer: None,
@@ -2161,6 +2165,7 @@ async fn workspace_rpc_routes_review_requests_through_the_injected_service() {
         WorkspaceService::default(),
         WorkspaceRpcDependencies {
             asset_access: None,
+            transfer_access: None,
             asset_context_resolver: None,
             review_service: Some(service),
             mutation_observer: None,
@@ -2384,4 +2389,90 @@ async fn public_workspace_service_maps_filesystem_failures() {
     let mut root_permissions = std::fs::metadata(root.path()).unwrap().permissions();
     root_permissions.set_mode(0o700);
     std::fs::set_permissions(root.path(), root_permissions).expect("unlock root");
+}
+
+#[tokio::test]
+async fn transfer_urls_are_minted_for_files_folders_and_root_and_reject_escapes() {
+    let temp = TempDir::new().expect("root");
+    let root = temp.path().to_path_buf();
+    let rpc = WorkspaceRpc::with_dependencies(
+        WorkspaceService::default(),
+        WorkspaceRpcDependencies {
+            transfer_access: Some(bibcode_server::transfer::TransferAccess::new(
+                b"secret".to_vec(),
+            )),
+            ..WorkspaceRpcDependencies::default()
+        },
+    );
+    let unary = |method: &'static str, payload: serde_json::Value| rpc.handle(method, payload);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/app.ts"), "x").unwrap();
+    let cwd = path_string(&root);
+
+    let file = unary(
+        "projects.createDownloadUrl",
+        json!({"cwd": cwd, "relativePath": "src/app.ts"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(file["kind"], "file");
+    assert_eq!(file["fileName"], "app.ts");
+    assert!(
+        file["relativeUrl"]
+            .as_str()
+            .unwrap()
+            .starts_with("/api/transfers/")
+    );
+
+    let folder = unary(
+        "projects.createDownloadUrl",
+        json!({"cwd": cwd, "relativePath": "src"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(folder["kind"], "archive");
+    assert_eq!(folder["fileName"], "src.zip");
+
+    let upload_root = unary(
+        "projects.createUploadUrl",
+        json!({"cwd": cwd, "relativeDirectory": ""}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(upload_root["maxBytes"], 1024 * 1024 * 1024);
+    let upload_dir = unary(
+        "projects.createUploadUrl",
+        json!({"cwd": cwd, "relativeDirectory": "src"}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        upload_dir["relativeUrl"]
+            .as_str()
+            .unwrap()
+            .starts_with("/api/transfers/")
+    );
+
+    let escape = unary(
+        "projects.createDownloadUrl",
+        json!({"cwd": cwd, "relativePath": "../etc"}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(escape["_tag"], "ProjectTransferError");
+    assert_eq!(escape["failure"], "outside_root");
+    let missing = unary(
+        "projects.createDownloadUrl",
+        json!({"cwd": cwd, "relativePath": "nope"}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(missing["failure"], "not_found");
+    let file_as_dir = unary(
+        "projects.createUploadUrl",
+        json!({"cwd": cwd, "relativeDirectory": "src/app.ts"}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(file_as_dir["failure"], "not_found");
 }

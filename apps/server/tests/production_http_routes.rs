@@ -425,5 +425,142 @@ fn state_with_json_recorder(calls: Arc<Mutex<Vec<JsonRecorderCall>>>) -> HttpRou
                 .with_header("www-authenticate", "Bearer"))
             })
         }),
+        Arc::new(|_token, _context| {
+            Box::pin(async {
+                Err(HttpRouteError::new(
+                    StatusCode::NOT_FOUND,
+                    json!({"message": "Not Found"}),
+                ))
+            })
+        }),
+        Arc::new(|_token, _name, _overwrite, _body, _context| {
+            Box::pin(async {
+                Err(HttpRouteError::new(
+                    StatusCode::NOT_FOUND,
+                    json!({"message": "Not Found"}),
+                ))
+            })
+        }),
     )
+}
+
+#[tokio::test]
+async fn transfer_routes_stream_downloads_and_accept_uploads() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    let access = bibcode_server::transfer::TransferAccess::new(b"secret".to_vec());
+    let mut state = state_with_json_recorder(Arc::new(Mutex::new(Vec::new())));
+    state.transfer_download =
+        bibcode_server::production::transfer_routes::download_handler(access.clone());
+    state.transfer_upload = bibcode_server::production::transfer_routes::upload_handler(
+        access.clone(),
+        Arc::new(|_root| Box::pin(async {})),
+    );
+    let app = add_routes(Router::new()).with_state(TestState(state));
+    std::fs::create_dir_all(root.join("dir")).unwrap();
+    std::fs::write(root.join("dir/a.txt"), "hello").unwrap();
+
+    let file_url = access
+        .issue_download(&root, "dir/a.txt")
+        .unwrap()
+        .relative_url;
+    let response = app
+        .clone()
+        .oneshot(Request::get(&file_url).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["content-disposition"],
+        "attachment; filename=\"a.txt\""
+    );
+    assert_eq!(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+        "hello"
+    );
+
+    let folder_url = access.issue_download(&root, "dir").unwrap().relative_url;
+    let response = app
+        .clone()
+        .oneshot(Request::get(&folder_url).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "application/zip");
+    assert_eq!(
+        response.headers()["content-disposition"],
+        "attachment; filename=\"dir.zip\""
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(bytes.starts_with(b"PK"));
+
+    let upload_url = access.issue_upload(&root, "dir").unwrap().relative_url;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(format!("{upload_url}?name=b.txt"))
+                .body(Body::from("new"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(std::fs::read(root.join("dir/b.txt")).unwrap(), b"new");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(format!("{upload_url}?name=b.txt"))
+                .body(Body::from("again"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(format!("{upload_url}?name=b.txt&overwrite=1"))
+                .body(Body::from("again"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(std::fs::read(root.join("dir/b.txt")).unwrap(), b"again");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(format!("{upload_url}?name=../x"))
+                .body(Body::from("x"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/transfers/not.a.token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = app
+        .oneshot(
+            Request::post(format!("{file_url}?name=z"))
+                .body(Body::from("x"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // A download token cannot upload.
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
