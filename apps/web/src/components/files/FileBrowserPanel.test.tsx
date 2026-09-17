@@ -2056,6 +2056,38 @@ describe("upload files", () => {
     expect(testState.toastAdd).not.toHaveBeenCalled();
   });
 
+  it("keeps uploading the rest of the batch when one file is rejected", async () => {
+    const uploadFile = vi
+      .fn<(input: { url: string; path: string }) => Promise<{ status: number; body: string }>>()
+      .mockRejectedValueOnce(new Error("Could not read the file."))
+      .mockResolvedValueOnce({ status: 201, body: '{"relativePath":"src/b.txt"}' });
+    stubDesktopBridge({
+      pickFolder: vi.fn(async () => null),
+      pickFiles: vi.fn(async () => ["/home/me/a.txt", "/home/me/b.txt"]),
+      uploadFile,
+    });
+    const refresh = vi.fn();
+    testState.entriesQuery.refresh = refresh;
+    renderPanel();
+
+    rowActionsFor("src", "directory").onUpload();
+    await flushPromises();
+
+    expect(testState.toastAdd).toHaveBeenCalledTimes(1);
+    expect(testState.toastAdd).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "error",
+        title: 'Can\u2019t upload "a.txt"',
+        description: "Could not read the file.",
+      }),
+    );
+    expect(uploadFile).toHaveBeenNthCalledWith(2, {
+      url: "http://127.0.0.1:4100/api/transfers/u.k?name=b.txt",
+      path: "/home/me/b.txt",
+    });
+    expect(refresh).toHaveBeenCalled();
+  });
+
   it("targets a file row's parent folder", async () => {
     stubDesktopBridge({
       pickFolder: vi.fn(async () => null),
