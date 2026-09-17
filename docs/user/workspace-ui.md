@@ -451,11 +451,24 @@ The Files surface is a full file manager for the active workspace:
   and the contents below an ignored directory are loaded eagerly with the rest
   of the tree.
 - Right-click files, folders, or the tree background to create files/folders,
-  rename, delete, duplicate, copy paths, add a folder as a project, open in an
-  external editor, or open previewable files in the preview browser.
+  rename, delete, duplicate, copy paths, add a folder as a project, download or
+  upload files, open in an external editor, or open previewable files in the
+  preview browser.
 - **New File…** and **New Folder…** create the entry in the clicked folder. On a
   file row they use that file's parent directory, and on the tree background
   they use the workspace root.
+- **Download** saves the right-clicked file, or a `.zip` of the right-clicked
+  folder, into a folder you choose (the desktop app asks for the folder; a
+  browser uses its own download location). The zip includes ignored files such
+  as `.git` and `node_modules`; symbolic links are skipped. Folders larger than
+  2 GiB or 200,000 entries are refused with a message. On the desktop app a
+  download never overwrites an existing file with the same name; it saves as
+  `name (2).ext` instead.
+- **Upload Files…** on a folder row, or on the tree background for the
+  workspace root, opens a file picker and uploads the chosen files into that
+  folder. It is disabled on file rows. An upload that would replace an existing
+  file asks first. Files up to 1 GiB each are accepted. Both actions work for
+  remote environments; the transfer goes to the server that owns the workspace.
 - Drag one or more files and folders onto a folder row, or onto the tree's root
   area, to move them there. Entries already in the target folder stay put. A
   move the server rejects is reported and the tree resyncs to the server's state
