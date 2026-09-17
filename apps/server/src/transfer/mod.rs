@@ -1,12 +1,10 @@
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use base64::Engine;
-use hmac::{Hmac, KeyInit as _, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 use thiserror::Error;
 
+use crate::signed_token;
 use crate::workspace::WorkspaceError;
 
 pub mod archive;
@@ -124,46 +122,23 @@ impl TransferAccess {
     }
 
     pub fn verify(&self, token: &str) -> Option<TransferClaims> {
-        let (payload, signature) = token.split_once('.')?;
-        let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(signature)
-            .ok()?;
-        let mut mac = Hmac::<Sha256>::new_from_slice(&self.secret).ok()?;
-        mac.update(payload.as_bytes());
-        mac.verify_slice(&signature).ok()?;
-        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(payload)
-            .ok()?;
-        let claims: TransferClaims = serde_json::from_slice(&bytes).ok()?;
-        (claims.expires_at() > now_millis()).then_some(claims)
+        let claims: TransferClaims = signed_token::verify(&self.secret, token)?;
+        (claims.expires_at() > signed_token::now_millis()).then_some(claims)
     }
 
     fn issue(&self, claims: TransferClaims) -> Result<IssuedTransferUrl, TransferError> {
         let expires_at = claims.expires_at();
-        let payload =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims)?);
-        let mut mac = Hmac::<Sha256>::new_from_slice(&self.secret)
-            .expect("HMAC accepts arbitrary key lengths");
-        mac.update(payload.as_bytes());
-        let signature =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        let token = signed_token::sign(&self.secret, &claims)?;
         Ok(IssuedTransferUrl {
-            relative_url: format!("{TRANSFER_URL_PREFIX}{payload}.{signature}"),
+            relative_url: format!("{TRANSFER_URL_PREFIX}{token}"),
             expires_at,
         })
     }
 
     fn expiry(&self) -> u64 {
-        now_millis().saturating_add(u64::try_from(self.ttl.as_millis()).unwrap_or(u64::MAX))
+        signed_token::now_millis()
+            .saturating_add(u64::try_from(self.ttl.as_millis()).unwrap_or(u64::MAX))
     }
-}
-
-fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| {
-            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
-        })
 }
 
 #[cfg(test)]
