@@ -28,7 +28,7 @@ use super::{EntryKind, SearchLimits, WorkspaceError, WorkspaceSearchIndex, Works
 
 const PROJECT_ENTRIES_MAX_LIMIT: usize = 200;
 
-pub const TASK_SIX_RPC_METHODS: [&str; 11] = [
+pub const TASK_SIX_RPC_METHODS: [&str; 13] = [
     "projects.searchEntries",
     "projects.listEntries",
     "projects.readFile",
@@ -37,6 +37,8 @@ pub const TASK_SIX_RPC_METHODS: [&str; 11] = [
     "projects.renameEntry",
     "projects.deleteEntry",
     "projects.duplicateEntry",
+    "projects.createDownloadUrl",
+    "projects.createUploadUrl",
     "filesystem.browse",
     "assets.createUrl",
     "review.getDiffPreview",
