@@ -1931,6 +1931,26 @@ mod tests {
         Released,
     }
 
+    /// Reports a blocked remote refresh's terminal branch exactly once, also
+    /// when the refresh future is dropped without reaching a branch.
+    struct BlockingRemoteOutcomeReport {
+        sender: Option<mpsc::UnboundedSender<BlockingRemoteOutcome>>,
+    }
+
+    impl BlockingRemoteOutcomeReport {
+        fn report(&mut self, outcome: BlockingRemoteOutcome) {
+            if let Some(sender) = self.sender.take() {
+                let _ = sender.send(outcome);
+            }
+        }
+    }
+
+    impl Drop for BlockingRemoteOutcomeReport {
+        fn drop(&mut self) {
+            self.report(BlockingRemoteOutcome::Cancelled);
+        }
+    }
+
     struct EpochGitRunner {
         branch: Mutex<String>,
         ref_calls: AtomicUsize,
@@ -2345,22 +2365,25 @@ mod tests {
                 }
                 if request.operation == "GitVcsDriver.statusDetailsRemote.status" {
                     let _ = self.remote_started.send(());
+                    // The production owner may drop this future on cancellation
+                    // before it is polled again, so the outcome is reported from a
+                    // drop guard as well: a dropped blocked refresh is a cancelled
+                    // one, and only an explicit release counts as `Released`.
+                    let mut outcome = BlockingRemoteOutcomeReport {
+                        sender: self.remote_outcome.clone(),
+                    };
                     tokio::select! {
                         biased;
                         () = cancellation.cancelled() => {
                             let _ = self.remote_cancelled.send(());
-                            if let Some(outcome) = &self.remote_outcome {
-                                let _ = outcome.send(BlockingRemoteOutcome::Cancelled);
-                            }
+                            outcome.report(BlockingRemoteOutcome::Cancelled);
                             return Err(ProcessError::Cancelled {
                                 operation: request.operation,
                             });
                         }
                         permit = self.release_remote.acquire() => {
                             permit.expect("remote release owner remains alive").forget();
-                            if let Some(outcome) = &self.remote_outcome {
-                                let _ = outcome.send(BlockingRemoteOutcome::Released);
-                            }
+                            outcome.report(BlockingRemoteOutcome::Released);
                         }
                     }
                 }
