@@ -316,8 +316,14 @@ mod tests {
             assert!(name.ends_with(".bibcode-upload.part"));
             assert!(!name.contains('/'));
         }
-        // A multi-byte name is cut on a character boundary, never mid-scalar.
-        assert!(partial_file_name(&"é".repeat(200)).is_char_boundary(1));
+        // A budget that lands mid-scalar backs off to a boundary: one ASCII byte then 3-byte
+        // characters puts byte 96 inside a character, so the stem must stop at byte 94.
+        let multi_byte = partial_file_name(&format!("a{}", "\u{2603}".repeat(100)));
+        assert!(multi_byte.len() <= 255, "{multi_byte}");
+        assert!(
+            multi_byte.starts_with(&format!(".a{}.", "\u{2603}".repeat(31))),
+            "{multi_byte}"
+        );
     }
 
     #[tokio::test]
