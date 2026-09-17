@@ -1257,6 +1257,13 @@ export interface DesktopBridge {
   setWslOnly: (enabled: boolean) => Promise<DesktopWslState>;
   pickFolder: (options?: PickFolderOptions) => Promise<string | null>;
   saveDiagnosticLogs?: (filename: string, bytes: Uint8Array) => Promise<string | null>;
+  pickFiles?: (options?: { title?: string }) => Promise<readonly string[]>;
+  downloadToFolder?: (input: {
+    url: string;
+    directory: string;
+    fileName: string;
+  }) => Promise<string>;
+  uploadFile?: (input: { url: string; path: string }) => Promise<{ status: number; body: string }>;
   confirm: (message: string) => Promise<boolean>;
   setTheme: (theme: DesktopTheme) => Promise<void>;
   showContextMenu: <T extends string>(
