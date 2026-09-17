@@ -1,5 +1,73 @@
 # Changelog
 
+## [v0.5.12] - 2026-09-17
+
+BiBCode v0.5.12 adds Download and Upload to the Files panel for local and
+remote environments, gives the Git Manager a Tags tab with push options, and
+fixes four left-panel and Git Manager presentation problems.
+
+### Files panel
+
+- **Download** on a right-clicked file saves that file; on a folder it saves a
+  `.zip` of the folder. The desktop app asks for a destination folder and never
+  overwrites an existing file (`name (2).ext`); a browser uses its own
+  download location. Folders over 2 GiB or 200,000 entries are refused with a
+  message before the download starts; symbolic links and special files are
+  skipped, ignored files are included.
+- **Upload Files…** on a folder row, or on the tree background for the
+  workspace root, opens a file picker and uploads the chosen files into that
+  folder. It is disabled on file rows with the reason in the label. A file
+  that already exists asks before it is replaced; a failure names the file and
+  the rest of the batch still uploads. Files up to 1 GiB each are accepted.
+- Both actions work for remote environments. Transfers stream over two new
+  token-authenticated routes on the server that owns the workspace
+  (`/api/transfers/{token}`, five-minute signed tokens bound to one file,
+  folder, or upload directory), so they work on every connection profile.
+  After an upload the file tree and the Git status refresh at once.
+
+### Git Manager tags
+
+- A **Tags** tab after Changes and History lists local tags and, per remote,
+  the tags that remote advertises, in collapsible sections whose state is
+  remembered per project. Remote tags are queried when the tab opens and on
+  its refresh button; rows are marked when a tag is missing locally or points
+  elsewhere, and an unreachable remote shows its reason with Retry.
+- Creating a tag offers **Push to `<remote>` after creating**; if that push
+  fails the tag still exists locally and the failure says so.
+- Push, publish, and force push confirm in one dialog with **Also push tags**,
+  which sends every local tag with the branch in one atomic push.
+- Annotated tags are compared by the commit they point to on both sides, so a
+  tag that matches the remote is no longer reported as differing.
+
+### Left panel and Git Manager
+
+- A selected project node stays selected in the left panel until another
+  thread is opened.
+- The Git Manager toolbar shows the connected environment next to the project.
+- The merge dialog's **Merge commit** option is the default and stays visibly
+  selected.
+- A thread that runs in its own worktree shows its branch as a muted label
+  after its title instead of a folder icon that looked like the project's
+  "New worktree" action.
+
+### Server
+
+- Asset and transfer URL tokens share one signed-token module with separate
+  purposes, so a token minted for one can never be redeemed as the other.
+- The route inventory used by the maintenance audit now lists the transfer
+  routes.
+
+### Downloads
+
+On macOS, copy BiBCode.app from the DMG to Applications before launching it.
+
+Desktop installers and standalone server distributions are provided for macOS,
+Linux, and Windows on ARM64 and x64. Linux server `.deb` and `.rpm` packages are
+included for both architectures. Stable desktop updater payloads and signatures
+remain available through `latest.json`.
+
+**Full Changelog**: https://github.com/mubeda/BibCode/compare/v0.5.11...v0.5.12
+
 ## [v0.5.11] - 2026-09-16
 
 BiBCode v0.5.11 makes the left panel follow Git Manager branch changes at
