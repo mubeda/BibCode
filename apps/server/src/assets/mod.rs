@@ -10,6 +10,10 @@ use crate::signed_token;
 use crate::workspace::{WorkspaceError, paths};
 
 pub const ASSET_ROUTE_PREFIX: &str = "/api/assets";
+/// Domain separation for [`crate::signed_token`]: asset tokens share the server secret with
+/// transfer tokens, and only this purpose keeps a read-only asset capability from verifying as
+/// a write-capable upload one.
+const ASSET_TOKEN_PURPOSE: &str = "asset";
 
 const PREVIEW_ENTRY_EXTENSIONS: &[&str] = &["htm", "html", "pdf"];
 const IMAGE_EXTENSIONS: &[&str] = &["avif", "gif", "ico", "jpeg", "jpg", "png", "svg", "webp"];
@@ -216,11 +220,15 @@ impl AssetAccess {
     }
 
     fn sign(&self, claims: &Claims) -> Result<String, AssetError> {
-        Ok(signed_token::sign(&self.secret, claims)?)
+        Ok(signed_token::sign(
+            &self.secret,
+            ASSET_TOKEN_PURPOSE,
+            claims,
+        )?)
     }
 
     fn verify(&self, token: &str) -> Option<Claims> {
-        signed_token::verify(&self.secret, token)
+        signed_token::verify(&self.secret, ASSET_TOKEN_PURPOSE, token)
     }
 }
 

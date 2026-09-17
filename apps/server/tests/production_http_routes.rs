@@ -480,6 +480,8 @@ async fn transfer_routes_stream_downloads_and_accept_uploads() {
         response.headers()["content-disposition"],
         "attachment; filename=\"a.txt\""
     );
+    // A file's length is known before the first byte, so the client can show real progress.
+    assert_eq!(response.headers()[header::CONTENT_LENGTH], "5");
     assert_eq!(
         axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -499,6 +501,8 @@ async fn transfer_routes_stream_downloads_and_accept_uploads() {
         response.headers()["content-disposition"],
         "attachment; filename=\"dir.zip\""
     );
+    // A zip is produced as it streams, so it carries no length and stays chunked.
+    assert!(!response.headers().contains_key(header::CONTENT_LENGTH));
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();

@@ -169,9 +169,13 @@ pub struct DiagnosticLogsHttpResponse {
 }
 
 /// A download response whose body is streamed: a file's bytes, or a folder's zip archive.
+///
+/// `content_length` is `Some` only when the whole length is known before the first byte goes
+/// out -- a file on disk. A zip is produced as it streams, so it stays chunked with no length.
 pub struct TransferDownloadHttpResponse {
     pub file_name: String,
     pub content_type: &'static str,
+    pub content_length: Option<u64>,
     pub body: Body,
 }
 
@@ -498,20 +502,26 @@ async fn transfer_download(
                 "message": "Folder is too large to download as an archive."
             }),
         ),
-        Ok(TransferDownloadHttpOutcome::Stream(download)) => Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, download.content_type)
-            .header(
-                header::CONTENT_DISPOSITION,
-                format!(
-                    "attachment; filename=\"{}\"",
-                    download.file_name.replace('"', "")
-                ),
-            )
-            .header(header::CACHE_CONTROL, NO_STORE)
-            .header("x-content-type-options", "nosniff")
-            .body(download.body)
-            .unwrap_or_else(|_| internal_error()),
+        Ok(TransferDownloadHttpOutcome::Stream(download)) => {
+            let mut builder = Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, download.content_type)
+                .header(
+                    header::CONTENT_DISPOSITION,
+                    format!(
+                        "attachment; filename=\"{}\"",
+                        download.file_name.replace('"', "")
+                    ),
+                )
+                .header(header::CACHE_CONTROL, NO_STORE)
+                .header("x-content-type-options", "nosniff");
+            if let Some(length) = download.content_length {
+                builder = builder.header(header::CONTENT_LENGTH, length);
+            }
+            builder
+                .body(download.body)
+                .unwrap_or_else(|_| internal_error())
+        }
         Err(error) => error.into_response(),
     }
 }

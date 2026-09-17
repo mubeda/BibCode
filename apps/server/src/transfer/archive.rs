@@ -13,6 +13,8 @@ use super::TransferError;
 pub const MAX_ARCHIVE_ENTRIES: usize = 200_000;
 /// Maximum total uncompressed byte size a single folder download may contain.
 pub const MAX_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Chunk size for every streamed download body, archive or single file.
+pub const DOWNLOAD_CHUNK_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArchivePlan {
@@ -20,9 +22,33 @@ pub struct ArchivePlan {
     pub bytes: u64,
 }
 
+/// The budgets a folder download is planned against. [`Default`] is the production limit; a
+/// caller -- or a test -- can bind a tighter one without rebuilding an oversized workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArchiveLimits {
+    pub max_entries: usize,
+    pub max_bytes: u64,
+}
+
+impl Default for ArchiveLimits {
+    fn default() -> Self {
+        Self {
+            max_entries: MAX_ARCHIVE_ENTRIES,
+            max_bytes: MAX_ARCHIVE_BYTES,
+        }
+    }
+}
+
+impl ArchiveLimits {
+    /// Walks `root` to size the archive, refusing a tree that exceeds these budgets.
+    pub async fn plan(&self, root: &Path) -> Result<ArchivePlan, TransferError> {
+        plan_archive_with_limits(root, self.max_entries, self.max_bytes).await
+    }
+}
+
 /// Walks `root` to size the archive before streaming it, enforcing the default limits.
 pub async fn plan_archive(root: &Path) -> Result<ArchivePlan, TransferError> {
-    plan_archive_with_limits(root, MAX_ARCHIVE_ENTRIES, MAX_ARCHIVE_BYTES).await
+    ArchiveLimits::default().plan(root).await
 }
 
 /// Walks `root` to size the archive before streaming it, enforcing the given limits.
@@ -96,7 +122,9 @@ pub fn archive_body(plan: ArchivePlan, root: PathBuf) -> Body {
             tracing::warn!(root = %root.display(), %error, "folder download stream failed");
         }
     });
-    Body::from_stream(ReaderStream::new(reader))
+    // 64 KiB chunks rather than the 4 KiB `ReaderStream` default: a folder download is bulk
+    // I/O, and the smaller default costs sixteen times the per-chunk framing for the same bytes.
+    Body::from_stream(ReaderStream::with_capacity(reader, DOWNLOAD_CHUNK_BYTES))
 }
 
 fn write_archive<W: Write>(root: &Path, sink: W) -> io::Result<()> {

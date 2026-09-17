@@ -1132,11 +1132,19 @@ replacement that now occupies the old path.
 - `GET`/`POST /api/transfers/{token}` authenticate with a five-minute HMAC
   token minted by `projects.createDownloadUrl` (read scope) or
   `projects.createUploadUrl` (operate scope) while those RPCs hold the
-  workspace path lease. A download token names one file or folder under a
-  normalized workspace root; a folder streams as a zip after an entry/byte
-  pre-scan. An upload token names one directory and a byte cap; uploads land
-  in a `.part` file and rename into place, refusing collisions unless
-  `overwrite=1`, and never replacing directories. The upload handler
+  workspace path lease. Transfer and asset tokens share the server secret but
+  not the MAC input: each signature covers a purpose string, so an asset
+  capability can never redeem as a transfer capability, and the reverse.
+  A download token names one file or folder under a normalized workspace root.
+  A folder is sized against the archive limits when its URL is minted, so an
+  oversized folder is refused as a `ProjectTransferError` the panel can show;
+  the route repeats the pre-scan before streaming because the tree can grow
+  between mint and redemption. A file download carries `Content-Length`; a zip
+  is produced as it streams and stays chunked. An upload token names one
+  directory and a byte cap; uploads reserve the target name, stream into a
+  per-invocation `.part` file, and rename into place, refusing collisions
+  unless `overwrite=1`, never replacing directories, and removing the partial
+  and any reservation this server created on failure. The upload handler
   invalidates the entries index for that root and notifies the Git status
   broadcaster.
 - Cancellation flows from client interrupt or socket closure until the
