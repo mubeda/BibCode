@@ -7,7 +7,6 @@ import type {
   VcsStatusResult,
   VcsWorkingTreeFileStatus,
 } from "@bibcode/contracts";
-import { resolveAssetUrl } from "@bibcode/client-runtime/state/assets";
 import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
@@ -59,6 +58,7 @@ import {
   describeByteLimit,
   downloadWithBridge,
   interpretUploadResponse,
+  resolveTransferUrl,
   sendBrowserUpload,
   triggerBrowserDownload,
   uploadUrlFor,
@@ -610,7 +610,7 @@ export default function FileBrowserPanel({
           }
           return;
         }
-        const url = resolveAssetUrl(environmentHttpBaseUrl, minted.value.relativeUrl);
+        const url = resolveTransferUrl(environmentHttpBaseUrl, minted.value.relativeUrl);
         if (url === null) {
           showMutationError(
             new Error("The server did not return a usable download URL."),
@@ -697,11 +697,14 @@ export default function FileBrowserPanel({
           }
           return;
         }
+        const transferUrl = resolveTransferUrl(environmentHttpBaseUrl, minted.value.relativeUrl);
+        if (transferUrl === null) {
+          refuse("The server did not return a usable upload URL.");
+          return;
+        }
         let overwrite = false;
         for (;;) {
-          const response = await file.send(
-            uploadUrlFor(minted.value.relativeUrl, environmentHttpBaseUrl, file.name, overwrite),
-          );
+          const response = await file.send(uploadUrlFor(transferUrl, file.name, overwrite));
           const step = interpretUploadResponse(response.status, response.body);
           if (step._tag === "Uploaded") return;
           if (step._tag === "Exists" && !overwrite) {
