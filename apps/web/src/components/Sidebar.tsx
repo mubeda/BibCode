@@ -1016,6 +1016,7 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
               </TooltipPopup>
             </Tooltip>
           )}
+          <ThreadWorktreeIndicator thread={thread} />
         </div>
         <div className="ml-auto flex shrink-0 items-center gap-1.5">
           {discoveredPorts.length > 0 && (
@@ -1038,7 +1039,6 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
               </TooltipPopup>
             </Tooltip>
           )}
-          <ThreadWorktreeIndicator thread={thread} />
           {terminalStatus && (
             <Tooltip>
               <TooltipTrigger
@@ -1507,6 +1507,8 @@ interface SidebarProjectItemProps {
   isThreadListExpanded: boolean;
   activeRouteThreadKey: string | null;
   gitManagerActive: boolean;
+  selectedProjectKey: string | null;
+  selectProject: (projectKey: string) => void;
   handleNewThread: ReturnType<typeof useNewThreadHandler>;
   openCreateWorktreeDialog: (projectRef?: ScopedProjectRef | null) => void;
   archiveThread: ReturnType<typeof useThreadActions>["archiveThread"];
@@ -1528,6 +1530,8 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     isThreadListExpanded,
     activeRouteThreadKey,
     gitManagerActive,
+    selectedProjectKey,
+    selectProject,
     handleNewThread,
     openCreateWorktreeDialog,
     archiveThread,
@@ -1885,6 +1889,8 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     visibleProjectThreads,
   ]);
 
+  const projectSelected = selectedProjectKey === project.projectKey;
+
   const handleProjectButtonClick = useCallback(
     (event: React.MouseEvent<HTMLButtonElement>) => {
       if (suppressProjectClickForContextMenuRef.current) {
@@ -1907,13 +1913,17 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       if (useThreadSelectionStore.getState().hasSelection()) {
         clearSelection();
       }
+      // The clicked header becomes the selected node; expansion still toggles.
+      selectProject(project.projectKey);
       setProjectExpanded(projectPreferenceKeys, !projectExpanded);
     },
     [
       clearSelection,
       dragInProgressRef,
+      project.projectKey,
       projectExpanded,
       projectPreferenceKeys,
+      selectProject,
       setProjectExpanded,
       suppressProjectClickAfterDragRef,
       suppressProjectClickForContextMenuRef,
@@ -1927,9 +1937,17 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       if (dragInProgressRef.current) {
         return;
       }
+      selectProject(project.projectKey);
       setProjectExpanded(projectPreferenceKeys, !projectExpanded);
     },
-    [dragInProgressRef, projectExpanded, projectPreferenceKeys, setProjectExpanded],
+    [
+      dragInProgressRef,
+      project.projectKey,
+      projectExpanded,
+      projectPreferenceKeys,
+      selectProject,
+      setProjectExpanded,
+    ],
   );
 
   const handleProjectButtonPointerDownCapture = useCallback(
@@ -3085,7 +3103,8 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
           ref={isManualProjectSorting ? dragHandleProps?.setActivatorNodeRef : undefined}
           aria-expanded={projectExpanded}
           aria-current={gitManagerActive ? "page" : undefined}
-          isActive={gitManagerActive}
+          data-selected={projectSelected}
+          isActive={gitManagerActive || projectSelected}
           size="sm"
           className={`gap-2 px-2 py-1.5 text-left hover:bg-accent group-hover/project-header:bg-accent group-hover/project-header:text-sidebar-accent-foreground ${
             project.environmentPresence === "remote-only" ? "pr-20" : "pr-14"
@@ -3791,6 +3810,8 @@ interface SidebarProjectsContentProps {
   activeRouteProjectKey: string | null;
   routeThreadKey: string | null;
   gitManagerRouteProjectKey: string | null;
+  selectedProjectKey: string | null;
+  selectProject: (projectKey: string) => void;
   commandPaletteShortcutLabel: string | null;
   threadJumpLabelByKey: ReadonlyMap<string, string>;
   attachThreadListAutoAnimateRef: (node: HTMLElement | null) => void;
@@ -3841,6 +3862,8 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
     activeRouteProjectKey,
     routeThreadKey,
     gitManagerRouteProjectKey,
+    selectedProjectKey,
+    selectProject,
     commandPaletteShortcutLabel,
     threadJumpLabelByKey,
     attachThreadListAutoAnimateRef,
@@ -3994,6 +4017,8 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
                           activeRouteProjectKey === project.projectKey ? routeThreadKey : null
                         }
                         gitManagerActive={gitManagerRouteProjectKey === project.projectKey}
+                        selectedProjectKey={selectedProjectKey}
+                        selectProject={selectProject}
                         handleNewThread={handleNewThread}
                         openCreateWorktreeDialog={openCreateWorktreeDialog}
                         archiveThread={archiveThread}
@@ -4027,6 +4052,8 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
                   activeRouteProjectKey === project.projectKey ? routeThreadKey : null
                 }
                 gitManagerActive={gitManagerRouteProjectKey === project.projectKey}
+                selectedProjectKey={selectedProjectKey}
+                selectProject={selectProject}
                 handleNewThread={handleNewThread}
                 openCreateWorktreeDialog={openCreateWorktreeDialog}
                 archiveThread={archiveThread}
@@ -4369,6 +4396,17 @@ export default function Sidebar() {
   }, [routeThreadKey, sidebarThreadByKey, physicalToLogicalKey, projectPhysicalKeyByScopedRef]);
   const activeRouteProjectRef = activeRouteProject?.projectRef ?? null;
   const activeRouteProjectKey = activeRouteProject?.projectKey ?? null;
+  // A clicked project header stays the selected node until the routed thread
+  // changes; the store remembers the route it was selected under.
+  const selectedProjectKey = useThreadSelectionStore((state) =>
+    state.selectedProjectRouteThreadKey === routeThreadKey ? state.selectedProjectKey : null,
+  );
+  const selectProject = useCallback(
+    (projectKey: string) => {
+      useThreadSelectionStore.getState().selectProject(projectKey, routeThreadKey);
+    },
+    [routeThreadKey],
+  );
   // The Git Manager route names a project but no thread. Highlight that
   // project's header so the left panel shows which project the manager is for.
   const gitManagerRouteProjectKey = useMemo(() => {
@@ -4849,6 +4887,8 @@ export default function Sidebar() {
             activeRouteProjectKey={activeRouteProjectKey}
             routeThreadKey={routeThreadKey}
             gitManagerRouteProjectKey={gitManagerRouteProjectKey}
+            selectedProjectKey={selectedProjectKey}
+            selectProject={selectProject}
             commandPaletteShortcutLabel={commandPaletteShortcutLabel}
             threadJumpLabelByKey={visibleThreadJumpLabelByKey}
             attachThreadListAutoAnimateRef={attachThreadListAutoAnimateRef}

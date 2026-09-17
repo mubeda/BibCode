@@ -140,6 +140,17 @@ describe("GitManagerMergeDialog", () => {
     expect(container.textContent).toContain("unrelated histories");
   });
 
+  it("opens on Merge commit as the visibly selected mode and moves the frame on click", async () => {
+    await renderDialog([branch("main", true), branch("feature")]);
+    expect(buttonWithText("Merge commit").getAttribute("aria-pressed")).toBe("true");
+    expect(buttonWithText("Squash merge").getAttribute("aria-pressed")).toBe("false");
+    expect(buttonWithText("Merge commit").className).toContain("aria-pressed:border-primary");
+
+    await act(async () => buttonWithText("Squash merge").click());
+    expect(buttonWithText("Squash merge").getAttribute("aria-pressed")).toBe("true");
+    expect(buttonWithText("Merge commit").getAttribute("aria-pressed")).toBe("false");
+  });
+
   it("disables confirm and explains when the source has nothing to merge", async () => {
     h.preview = { ...cleanPreview, ahead: 0, behind: 1 };
     await renderDialog([branch("main", true), branch("feature")]);

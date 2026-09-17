@@ -4,7 +4,7 @@ import {
   scopeThreadRef,
 } from "@bibcode/client-runtime/environment";
 import type { VcsStatusResult, VcsStatusSummary } from "@bibcode/contracts";
-import { CloudIcon, FolderGit2Icon, GitPullRequestIcon, TerminalIcon } from "lucide-react";
+import { CloudIcon, GitPullRequestIcon, TerminalIcon } from "lucide-react";
 import { useMemo } from "react";
 import { useEnvironment, usePrimaryEnvironmentId } from "../state/environments";
 import { useProject } from "../state/entities";
@@ -108,6 +108,12 @@ export function terminalStatusFromRunningIds(
   };
 }
 
+/**
+ * Names the worktree a thread runs in, as muted text next to the title. It is
+ * deliberately not an icon: the folder-git glyph is the sidebar's "New
+ * worktree" action, and a status glyph in the trailing column read as a stray
+ * button.
+ */
 export function ThreadWorktreeIndicator({
   thread,
 }: {
@@ -122,20 +128,20 @@ export function ThreadWorktreeIndicator({
   const tooltip = thread.branch
     ? `Worktree: ${displayPath} (${thread.branch})`
     : `Worktree: ${displayPath}`;
+  const label = thread.branch ?? displayPath;
 
   return (
     <Tooltip>
       <TooltipTrigger
         render={
           <span
-            role="img"
             aria-label={tooltip}
             data-testid={`thread-worktree-${thread.id}`}
-            className="inline-flex items-center justify-center"
+            className="max-w-24 shrink-0 truncate font-mono text-[10px] leading-none text-muted-foreground/70"
           />
         }
       >
-        <FolderGit2Icon className="size-3 text-muted-foreground/40" />
+        {label}
       </TooltipTrigger>
       <TooltipPopup side="top">{tooltip}</TooltipPopup>
     </Tooltip>

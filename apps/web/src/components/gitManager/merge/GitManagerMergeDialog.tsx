@@ -41,6 +41,12 @@ import { GitManagerOperationBanner } from "../toolbar/GitManagerOperationBanner"
 import { groupBranches } from "../toolbar/branchGrouping";
 import { resolveMergeConfirmCopy, summarizeMergePreview } from "./GitManagerMergeDialog.logic";
 
+// The mode buttons carry `aria-pressed`, which the shared Button styles do not
+// read (they key on Base UI's `data-pressed`), so the selected mode needs its
+// own frame: primary border and tint, the app's selected-state vocabulary.
+const MERGE_MODE_BUTTON_CLASS =
+  "aria-pressed:border-primary aria-pressed:bg-primary/15 aria-pressed:text-foreground";
+
 const NO_RECENT_BRANCHES: ReadonlyArray<string> = Object.freeze([]);
 const noop = () => undefined;
 
@@ -212,6 +218,7 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
           <div className="flex gap-2" role="group" aria-label="Merge mode">
             <Button
               aria-pressed={mode === "merge"}
+              className={MERGE_MODE_BUTTON_CLASS}
               size="sm"
               variant="outline"
               onClick={chooseMerge}
@@ -220,6 +227,7 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
             </Button>
             <Button
               aria-pressed={mode === "squash"}
+              className={MERGE_MODE_BUTTON_CLASS}
               size="sm"
               variant="outline"
               onClick={chooseSquash}
