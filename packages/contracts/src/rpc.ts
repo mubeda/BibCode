@@ -30,6 +30,13 @@ import {
 } from "./filesystem.ts";
 import { AssetAccessError, AssetCreateUrlInput, AssetCreateUrlResult } from "./assets.ts";
 import {
+  ProjectCreateDownloadUrlInput,
+  ProjectCreateDownloadUrlResult,
+  ProjectCreateUploadUrlInput,
+  ProjectCreateUploadUrlResult,
+  ProjectTransferError,
+} from "./transfer.ts";
+import {
   GitActionProgressEvent,
   VcsSwitchRefInput,
   VcsSwitchRefResult,
@@ -362,6 +369,8 @@ export const WS_METHODS = {
   // Filesystem methods
   filesystemBrowse: "filesystem.browse",
   assetsCreateUrl: "assets.createUrl",
+  projectsCreateDownloadUrl: "projects.createDownloadUrl",
+  projectsCreateUploadUrl: "projects.createUploadUrl",
 
   // VCS methods
   vcsPull: "vcs.pull",
@@ -790,6 +799,28 @@ export const WsAssetsCreateUrlRpc = Rpc.make(WS_METHODS.assetsCreateUrl, {
   success: AssetCreateUrlResult,
   error: Schema.Union([
     AssetAccessError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentRpcError,
+  ]),
+});
+
+export const WsProjectsCreateDownloadUrlRpc = Rpc.make(WS_METHODS.projectsCreateDownloadUrl, {
+  payload: ProjectCreateDownloadUrlInput,
+  success: ProjectCreateDownloadUrlResult,
+  error: Schema.Union([
+    ProjectTransferError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentRpcError,
+  ]),
+});
+
+export const WsProjectsCreateUploadUrlRpc = Rpc.make(WS_METHODS.projectsCreateUploadUrl, {
+  payload: ProjectCreateUploadUrlInput,
+  success: ProjectCreateUploadUrlResult,
+  error: Schema.Union([
+    ProjectTransferError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
     EnvironmentRpcError,
@@ -1500,6 +1531,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsShellOpenInEditorRpc,
   WsFilesystemBrowseRpc,
   WsAssetsCreateUrlRpc,
+  WsProjectsCreateDownloadUrlRpc,
+  WsProjectsCreateUploadUrlRpc,
   WsSubscribeVcsStatusRpc,
   WsSubscribeVcsStatusSummaryRpc,
   WsVcsPullRpc,

@@ -628,10 +628,10 @@ with ordinal caseless comparison rather than ASCII or Unicode lowercase.
 Public work admission takes a path-scoped lease after resolving the durable
 thread projection. This includes panel threads that do not appear in the
 workspace catalog: their persisted worktree path, or their project root when
-they have no override, is authoritative. File, browse, search, asset, review,
-and filesystem-mutation handlers retain that lease for the entire operation,
-not just an entry-point check. Mutations acquire its finalization permit before
-the filesystem/durable commit boundary. Turn and process handlers retain the
+they have no override, is authoritative. File, browse, search, asset, transfer,
+review, and filesystem-mutation handlers retain that lease for the entire
+operation, not just an entry-point check. Mutations acquire its finalization
+permit before the filesystem/durable commit boundary. Turn and process handlers retain the
 lease through durable command admission or external-process publication. Guard
 installation and lease admission are serialized, so loss either waits for work
 owned by an earlier lease and finalization permit or rejects a later lease.
@@ -1129,6 +1129,24 @@ replacement that now occupies the old path.
   retry sockets independently.
 - Authorization is checked at each HTTP route or RPC method, not inferred from
   successful authentication alone.
+- `GET`/`POST /api/transfers/{token}` authenticate with a five-minute HMAC
+  token minted by `projects.createDownloadUrl` (read scope) or
+  `projects.createUploadUrl` (operate scope) while those RPCs hold the
+  workspace path lease. Transfer and asset tokens share the server secret but
+  not the MAC input: each signature covers a purpose string, so an asset
+  capability can never redeem as a transfer capability, and the reverse.
+  A download token names one file or folder under a normalized workspace root.
+  A folder is sized against the archive limits when its URL is minted, so an
+  oversized folder is refused as a `ProjectTransferError` the panel can show;
+  the route repeats the pre-scan before streaming because the tree can grow
+  between mint and redemption. A file download carries `Content-Length`; a zip
+  is produced as it streams and stays chunked. An upload token names one
+  directory and a byte cap; uploads reserve the target name, stream into a
+  per-invocation `.part` file, and rename into place, refusing collisions
+  unless `overwrite=1`, never replacing directories, and removing the partial
+  and any reservation this server created on failure. The upload handler
+  invalidates the entries index for that root and notifies the Git status
+  broadcaster.
 - Cancellation flows from client interrupt or socket closure until the
   operation's documented handoff. After a durable engine handoff, the
   server-owned lifecycle continues to a terminal receipt while only the caller

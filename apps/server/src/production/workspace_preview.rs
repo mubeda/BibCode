@@ -25,7 +25,9 @@ const MAX_AUTOMATION_CLIENTS: usize = 64;
 const WORKSPACE_METHODS: &[&str] = &[
     "assets.createUrl",
     "filesystem.browse",
+    "projects.createDownloadUrl",
     "projects.createEntry",
+    "projects.createUploadUrl",
     "projects.deleteEntry",
     "projects.duplicateEntry",
     "projects.listEntries",
