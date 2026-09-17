@@ -571,6 +571,19 @@ function createTauriDesktopBridge(
         filename,
         bytes: Array.from(bytes),
       }),
+    pickFiles: (options) =>
+      tauriInvokeOr<readonly string[]>("desktop_bridge_pick_files", { options }, () => []),
+    downloadToFolder: (input) =>
+      tauriInvokeDesktop<string>("desktop_bridge_download_to_folder", {
+        url: input.url,
+        directory: input.directory,
+        fileName: input.fileName,
+      }),
+    uploadFile: (input) =>
+      tauriInvokeDesktop<{ status: number; body: string }>("desktop_bridge_upload_file", {
+        url: input.url,
+        path: input.path,
+      }),
     confirm: (message) =>
       tauriInvokeOr("desktop_bridge_confirm", { message }, () => window.confirm(message)),
     setTheme: (theme) => tauriInvokeOr("desktop_bridge_set_theme", { theme }, () => undefined),

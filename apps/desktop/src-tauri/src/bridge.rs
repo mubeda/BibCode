@@ -1591,6 +1591,154 @@ pub async fn desktop_bridge_save_diagnostic_logs(
     Ok(Some(path.to_string_lossy().into_owned()))
 }
 
+fn validate_transfer_url(url: &str) -> Result<reqwest::Url, String> {
+    let parsed =
+        reqwest::Url::parse(url).map_err(|error| bridge_error("Transfer URL is invalid", error))?;
+    match parsed.scheme() {
+        "http" | "https" => Ok(parsed),
+        other => Err(format!("Transfer URL scheme '{other}' is not allowed.")),
+    }
+}
+
+fn validate_download_file_name(name: &str) -> Result<(), String> {
+    let plain = !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name.len() <= 255
+        && !name.contains(['/', '\\', '\0']);
+    if plain {
+        Ok(())
+    } else {
+        Err("Download file name must be a plain file name.".to_owned())
+    }
+}
+
+fn unique_destination(directory: &Path, file_name: &str) -> PathBuf {
+    let candidate = directory.join(file_name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let (stem, extension) = match file_name.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() => (stem.to_owned(), format!(".{extension}")),
+        _ => (file_name.to_owned(), String::new()),
+    };
+    (2u32..)
+        .map(|index| directory.join(format!("{stem} ({index}){extension}")))
+        .find(|path| !path.exists())
+        .expect("an unused suffix exists")
+}
+
+#[tauri::command]
+pub async fn desktop_bridge_pick_files(
+    app: AppHandle<DesktopRuntime>,
+    options: Option<Value>,
+) -> Result<Vec<String>, String> {
+    let title = options
+        .as_ref()
+        .and_then(|value| value.get("title"))
+        .and_then(Value::as_str)
+        .unwrap_or("Select files to upload");
+    let selected = app
+        .dialog()
+        .file()
+        .set_title(title)
+        .blocking_pick_files()
+        .unwrap_or_default();
+    selected
+        .into_iter()
+        .map(dialog_file_path_to_string)
+        .collect()
+}
+
+#[tauri::command]
+pub async fn desktop_bridge_download_to_folder(
+    url: String,
+    directory: String,
+    file_name: String,
+) -> Result<String, String> {
+    let url = validate_transfer_url(&url)?;
+    validate_download_file_name(&file_name)?;
+    let directory = PathBuf::from(directory);
+    if !directory.is_dir() {
+        return Err("Download folder does not exist.".to_owned());
+    }
+    let response = reqwest::Client::new()
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| bridge_error("Download request failed", error))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Download failed with HTTP {}.",
+            response.status().as_u16()
+        ));
+    }
+    let partial = directory.join(format!(".{file_name}.bibcode-download.part"));
+    let mut file = tokio::fs::File::create(&partial)
+        .await
+        .map_err(|error| bridge_error("Could not create the download file", error))?;
+    let mut stream = response.bytes_stream();
+    let outcome: Result<(), String> = async {
+        use futures_util::StreamExt as _;
+        use tokio::io::AsyncWriteExt as _;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| bridge_error("Download stream failed", error))?;
+            file.write_all(&chunk)
+                .await
+                .map_err(|error| bridge_error("Could not write the download file", error))?;
+        }
+        file.flush()
+            .await
+            .map_err(|error| bridge_error("Could not finish the download file", error))
+    }
+    .await;
+    drop(file);
+    if let Err(error) = outcome {
+        let _ = tokio::fs::remove_file(&partial).await;
+        return Err(error);
+    }
+    let destination = unique_destination(&directory, &file_name);
+    tokio::fs::rename(&partial, &destination)
+        .await
+        .map_err(|error| bridge_error("Could not place the download file", error))?;
+    Ok(destination.to_string_lossy().into_owned())
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadFileOutcome {
+    pub status: u16,
+    pub body: String,
+}
+
+#[tauri::command]
+pub async fn desktop_bridge_upload_file(
+    url: String,
+    path: String,
+) -> Result<UploadFileOutcome, String> {
+    let url = validate_transfer_url(&url)?;
+    let file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|error| bridge_error("Could not open the file to upload", error))?;
+    let length = file
+        .metadata()
+        .await
+        .map_err(|error| bridge_error("Could not read the file to upload", error))?
+        .len();
+    let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
+    let response = reqwest::Client::new()
+        .post(url)
+        .header(reqwest::header::CONTENT_LENGTH, length)
+        .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+        .body(body)
+        .send()
+        .await
+        .map_err(|error| bridge_error("Upload request failed", error))?;
+    let status = response.status().as_u16();
+    let body = response.text().await.unwrap_or_default();
+    Ok(UploadFileOutcome { status, body })
+}
+
 #[tauri::command]
 pub fn desktop_bridge_confirm(app: AppHandle<DesktopRuntime>, message: String) -> bool {
     app.dialog()
@@ -1969,6 +2117,86 @@ mod tests {
             validate_diagnostic_archive_bytes(&vec![0_u8; MAX_DIAGNOSTIC_ARCHIVE_BYTES + 1])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn transfer_urls_must_be_http_or_https() {
+        assert!(validate_transfer_url("https://host:3773/api/transfers/a.b").is_ok());
+        assert!(validate_transfer_url("http://127.0.0.1:3773/api/transfers/a.b").is_ok());
+        assert!(validate_transfer_url("file:///etc/passwd").is_err());
+        assert!(validate_transfer_url("not a url").is_err());
+    }
+
+    #[test]
+    fn download_file_names_must_be_plain() {
+        assert!(validate_download_file_name("src.zip").is_ok());
+        for bad in ["", ".", "..", "a/b", "a\\b"] {
+            assert!(validate_download_file_name(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn unique_destination_suffixes_on_collision() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            unique_destination(temp.path(), "a.txt"),
+            temp.path().join("a.txt")
+        );
+        std::fs::write(temp.path().join("a.txt"), b"").unwrap();
+        assert_eq!(
+            unique_destination(temp.path(), "a.txt"),
+            temp.path().join("a (2).txt")
+        );
+        std::fs::write(temp.path().join("a (2).txt"), b"").unwrap();
+        assert_eq!(
+            unique_destination(temp.path(), "a.txt"),
+            temp.path().join("a (3).txt")
+        );
+        std::fs::write(temp.path().join("src.zip"), b"").unwrap();
+        assert_eq!(
+            unique_destination(temp.path(), "src.zip"),
+            temp.path().join("src (2).zip")
+        );
+        assert_eq!(
+            unique_destination(temp.path(), "Makefile"),
+            temp.path().join("Makefile")
+        );
+    }
+
+    #[test]
+    fn pick_files_command_is_async() {
+        fn assert_async_command<Command, CommandFuture>(_: Command)
+        where
+            Command: Fn(AppHandle<DesktopRuntime>, Option<Value>) -> CommandFuture,
+            CommandFuture: Future<Output = Result<Vec<String>, String>> + Send,
+        {
+        }
+
+        assert_async_command(desktop_bridge_pick_files);
+    }
+
+    #[test]
+    fn download_to_folder_command_is_async() {
+        fn assert_async_command<Command, CommandFuture>(_: Command)
+        where
+            Command: Fn(String, String, String) -> CommandFuture,
+            CommandFuture: Future<Output = Result<String, String>> + Send,
+        {
+        }
+
+        assert_async_command(desktop_bridge_download_to_folder);
+    }
+
+    #[test]
+    fn upload_file_command_is_async() {
+        fn assert_async_command<Command, CommandFuture>(_: Command)
+        where
+            Command: Fn(String, String) -> CommandFuture,
+            CommandFuture: Future<Output = Result<UploadFileOutcome, String>> + Send,
+        {
+        }
+
+        assert_async_command(desktop_bridge_upload_file);
     }
 
     fn read_test_http_request(stream: &mut TcpStream) -> String {
@@ -3401,6 +3629,9 @@ mod tests {
                 desktop_bridge_install_update,
                 desktop_bridge_pick_folder,
                 desktop_bridge_save_diagnostic_logs,
+                desktop_bridge_pick_files,
+                desktop_bridge_download_to_folder,
+                desktop_bridge_upload_file,
                 desktop_bridge_confirm,
                 desktop_bridge_open_external,
                 desktop_bridge_open_in_file_manager,
@@ -3638,6 +3869,24 @@ mod tests {
             )
             .is_err()
         );
+        for (command, arguments) in [
+            (
+                "desktop_bridge_download_to_folder",
+                json!({"url":"file:///etc/passwd","directory":"/does/not/matter","fileName":"a.txt"}),
+            ),
+            (
+                "desktop_bridge_upload_file",
+                json!({"url":"file:///etc/passwd","path":"/does/not/matter"}),
+            ),
+        ] {
+            let error = invoke(command, arguments).unwrap_err();
+            assert!(
+                error
+                    .as_str()
+                    .is_some_and(|error| error.contains("is not allowed")),
+                "unexpected validation result for {command}: {error}",
+            );
+        }
         let handle = app.handle();
         assert!(app_branding(handle)["displayName"].is_string());
         assert!(
