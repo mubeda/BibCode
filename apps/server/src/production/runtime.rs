@@ -41,7 +41,7 @@ use crate::{
         git_vcs::{GitVcsRpcServices, WorktreeRemovalTaskTracker, register_git_vcs_rpc},
         http_routes::{
             AssetHttpResponse, DiagnosticLogsHttpResponse, HttpRouteError, JsonOperation,
-            JsonRouteResponse, RouteContext,
+            JsonRouteResponse, RouteContext, TransferDownloadHandler, TransferUploadHandler,
         },
         managed_endpoint::ManagedEndpointRuntime,
         operational_logs::{OperationalLogOptions, OperationalLogs},
@@ -58,6 +58,7 @@ use crate::{
         server_terminal::{
             ProcessTreeCleanup, ServerTerminalServices, register_server_terminal_rpc,
         },
+        transfer_routes,
         turn_delivery::TurnDeliveryService,
         workspace_preview::{WorkspacePreviewRpcServices, register_workspace_preview_rpc},
         worktree_catalog_rpc::{
@@ -80,6 +81,7 @@ use crate::{
     rpc::RpcRegistry,
     server_settings::ProviderSettingsStore,
     terminal::{PortablePtyBackend, TerminalManager, TerminalManagerOptions},
+    transfer::TransferAccess,
     workspace::{AssetContextResolver, WorkspaceRpc, WorkspaceRpcDependencies, WorkspaceService},
     worktree_catalog::{WorkspaceAvailabilityRegistry, WorktreeCatalogService},
 };
@@ -90,6 +92,7 @@ pub struct ProductionRuntime {
     pub activity_projections: ActivityProjections,
     pub preview_automation: PreviewAutomationBroker,
     asset_access: AssetAccess,
+    transfer_access: TransferAccess,
     terminal_services: ServerTerminalServices,
     provider_runtime: Arc<ProviderRuntimeSupervisor>,
     turn_delivery: Arc<TurnDeliveryService>,
@@ -125,6 +128,35 @@ impl ProductionRuntime {
     #[must_use]
     pub fn managed_endpoint_runtime(&self) -> ManagedEndpointRuntime {
         self.managed_endpoint.clone()
+    }
+
+    /// The handler that serves signed download URLs.
+    #[must_use]
+    pub fn transfer_download_handler(&self) -> TransferDownloadHandler {
+        transfer_routes::download_handler(self.transfer_access.clone())
+    }
+
+    /// The handler that accepts signed uploads.
+    ///
+    /// An upload is a workspace mutation that never passes through `run_workspace_mutation`, so
+    /// the callback has to publish both of that path's observable effects itself: drop the
+    /// entry-index snapshot for the root, and tell the Git status broadcaster the working tree
+    /// changed, exactly as the terminal-exit callback below does.
+    #[must_use]
+    pub fn transfer_upload_handler(&self) -> TransferUploadHandler {
+        let workspace = self.workspace.clone();
+        let status_broadcaster = self.status_broadcaster.clone();
+        transfer_routes::upload_handler(
+            self.transfer_access.clone(),
+            Arc::new(move |root| {
+                let workspace = workspace.clone();
+                let status_broadcaster = status_broadcaster.clone();
+                Box::pin(async move {
+                    workspace.invalidate_index(&root.to_string_lossy()).await;
+                    status_broadcaster.notify_local_change(&root).await;
+                })
+            }),
+        )
     }
 
     pub async fn start(
@@ -272,6 +304,7 @@ impl ProductionRuntime {
         provider_runtime
             .attach_activity_cancellation(activity_cancellation.clone())
             .await;
+        let transfer_access = TransferAccess::new(asset_secret.clone());
         let asset_access = AssetAccess::new(asset_secret, state_paths.attachments_dir.clone());
         let git_repository = Arc::new(GitRepository::with_worktree_settings(control.clone()));
         let workspace_availability = WorkspaceAvailabilityRegistry::new();
@@ -300,6 +333,8 @@ impl ProductionRuntime {
             WorkspaceService::default(),
             WorkspaceRpcDependencies {
                 asset_access: Some(asset_access.clone()),
+                transfer_access: Some(transfer_access.clone()),
+                archive_limits: crate::transfer::archive::ArchiveLimits::default(),
                 asset_context_resolver: Some(Arc::new(ProjectionAssetContext {
                     repositories: repositories.clone(),
                 })),
@@ -420,6 +455,7 @@ impl ProductionRuntime {
             activity_projections,
             preview_automation,
             asset_access,
+            transfer_access,
             terminal_services,
             provider_runtime,
             turn_delivery,

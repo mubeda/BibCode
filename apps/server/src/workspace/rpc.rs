@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 use crate::assets::{AssetAccess, AssetError, AssetIssueRequest, AssetResource};
 use crate::git::StatusMutationGuard;
 use crate::review::{ReviewDiffPreviewInput, ReviewError, ReviewService};
+use crate::transfer::archive::ArchiveLimits;
+use crate::transfer::{self, TransferAccess, TransferError};
 use crate::worktree_catalog::{
     WorkspaceAdmissionCancellation, WorkspaceAdmissionLease, WorkspaceAvailabilityRegistry,
 };
@@ -19,7 +21,7 @@ use tokio::sync::{Mutex, broadcast};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use super::paths::normalize_root;
+use super::paths::{self, normalize_root};
 use super::search::emit_index_phase;
 #[cfg(test)]
 use super::search::{WorkspaceIndexPhase, WorkspaceIndexPhaseSink};
@@ -28,7 +30,7 @@ use super::{EntryKind, SearchLimits, WorkspaceError, WorkspaceSearchIndex, Works
 
 const PROJECT_ENTRIES_MAX_LIMIT: usize = 200;
 
-pub const TASK_SIX_RPC_METHODS: [&str; 11] = [
+pub const TASK_SIX_RPC_METHODS: [&str; 13] = [
     "projects.searchEntries",
     "projects.listEntries",
     "projects.readFile",
@@ -37,6 +39,8 @@ pub const TASK_SIX_RPC_METHODS: [&str; 11] = [
     "projects.renameEntry",
     "projects.deleteEntry",
     "projects.duplicateEntry",
+    "projects.createDownloadUrl",
+    "projects.createUploadUrl",
     "filesystem.browse",
     "assets.createUrl",
     "review.getDiffPreview",
@@ -58,6 +62,10 @@ pub trait WorkspaceMutationObserver: Send + Sync {
 #[derive(Clone, Default)]
 pub struct WorkspaceRpcDependencies {
     pub asset_access: Option<AssetAccess>,
+    pub transfer_access: Option<TransferAccess>,
+    /// Budgets a folder download is planned against when its URL is minted. Production uses
+    /// the default; a test binds a tighter one rather than building an oversized workspace.
+    pub archive_limits: ArchiveLimits,
     pub asset_context_resolver: Option<Arc<dyn AssetContextResolver>>,
     pub review_service: Option<ReviewService>,
     pub mutation_observer: Option<Arc<dyn WorkspaceMutationObserver>>,
@@ -576,6 +584,14 @@ impl WorkspaceRpc {
                 let input: AssetCreateUrlInput = decode(payload)?;
                 self.handle_asset_create_url(input).await
             }
+            "projects.createDownloadUrl" => {
+                let input: ProjectCreateDownloadUrlInput = decode(payload)?;
+                self.handle_create_download_url(input).await
+            }
+            "projects.createUploadUrl" => {
+                let input: ProjectCreateUploadUrlInput = decode(payload)?;
+                self.handle_create_upload_url(input).await
+            }
             "review.getDiffPreview" => {
                 let input: ReviewDiffPreviewInput = decode(payload)?;
                 let _admission = self.acquire_path(&input.cwd).await?;
@@ -964,11 +980,115 @@ impl WorkspaceRpc {
         Ok(index)
     }
 
-    async fn invalidate_index(&self, cwd: &str) {
+    pub(crate) async fn invalidate_index(&self, cwd: &str) {
         let Ok(canonical) = tokio::fs::canonicalize(cwd).await else {
             return;
         };
         self.indexes.lock().await.invalidate(&canonical);
+    }
+
+    /// Mints a short-lived signed URL for downloading a file, or a folder as a zip archive.
+    ///
+    /// The token binds the canonical workspace root and the relative path, so the HTTP route
+    /// never has to trust a client-supplied path.
+    async fn handle_create_download_url(
+        &self,
+        input: ProjectCreateDownloadUrlInput,
+    ) -> Result<Value, Value> {
+        let access = self.transfer_access(&input.cwd, &input.relative_path)?;
+        let _admission = self.acquire_path(&input.cwd).await?;
+        let root = normalize_root(Path::new(&input.cwd), false)
+            .await
+            .map_err(|error| transfer_wire(&input.cwd, &input.relative_path, &error))?;
+        let (target, relative) = paths::resolve_relative(&root, &input.relative_path)
+            .map_err(|error| transfer_wire(&input.cwd, &input.relative_path, &error))?;
+        let (_, canonical) = paths::canonical_existing_within(&root, &target)
+            .await
+            .map_err(|error| transfer_wire(&input.cwd, &input.relative_path, &error))?;
+        let metadata = tokio::fs::metadata(&canonical).await.map_err(|error| {
+            transfer_wire(
+                &input.cwd,
+                &input.relative_path,
+                &WorkspaceError::operation("stat", &canonical, error),
+            )
+        })?;
+        let kind = if metadata.is_dir() {
+            // Sizing the folder here is what makes an oversized download refusable: the panel
+            // shows this error, whereas the redeem-time refusal reaches the user only as a bare
+            // HTTP status. The route keeps its own pre-scan as defence in depth, because the
+            // tree can grow between the mint and the redemption.
+            self.dependencies
+                .archive_limits
+                .plan(&canonical)
+                .await
+                .map_err(|error| archive_limit_wire(&input.cwd, &input.relative_path, &error))?;
+            "archive"
+        } else {
+            "file"
+        };
+        let file_name = transfer::download_file_name(&canonical, metadata.is_dir());
+        let issued = access
+            .issue_download(&root, &relative)
+            .map_err(|error| transfer_error_wire(&input.cwd, &input.relative_path, &error))?;
+        Ok(json!({
+            "relativeUrl": issued.relative_url,
+            "expiresAt": issued.expires_at,
+            "fileName": file_name,
+            "kind": kind,
+        }))
+    }
+
+    /// Mints a short-lived signed URL for uploading a single file into an existing folder.
+    ///
+    /// An empty `relativeDirectory` targets the workspace root itself.
+    async fn handle_create_upload_url(
+        &self,
+        input: ProjectCreateUploadUrlInput,
+    ) -> Result<Value, Value> {
+        let access = self.transfer_access(&input.cwd, &input.relative_directory)?;
+        let _admission = self.acquire_path(&input.cwd).await?;
+        let root = normalize_root(Path::new(&input.cwd), false)
+            .await
+            .map_err(|error| transfer_wire(&input.cwd, &input.relative_directory, &error))?;
+        let relative = if input.relative_directory.is_empty() {
+            String::new()
+        } else {
+            let (target, relative) = paths::resolve_relative(&root, &input.relative_directory)
+                .map_err(|error| transfer_wire(&input.cwd, &input.relative_directory, &error))?;
+            let (_, canonical) = paths::canonical_existing_within(&root, &target)
+                .await
+                .map_err(|error| transfer_wire(&input.cwd, &input.relative_directory, &error))?;
+            if !canonical.is_dir() {
+                return Err(json!({
+                    "_tag": "ProjectTransferError",
+                    "cwd": input.cwd,
+                    "relativePath": input.relative_directory,
+                    "failure": "not_found",
+                    "message": "Upload target is not a folder.",
+                }));
+            }
+            relative
+        };
+        let issued = access
+            .issue_upload(&root, &relative)
+            .map_err(|error| transfer_error_wire(&input.cwd, &input.relative_directory, &error))?;
+        Ok(json!({
+            "relativeUrl": issued.relative_url,
+            "expiresAt": issued.expires_at,
+            "maxBytes": crate::transfer::MAX_UPLOAD_BYTES,
+        }))
+    }
+
+    fn transfer_access(&self, cwd: &str, relative_path: &str) -> Result<&TransferAccess, Value> {
+        self.dependencies.transfer_access.as_ref().ok_or_else(|| {
+            json!({
+                "_tag": "ProjectTransferError",
+                "cwd": cwd,
+                "relativePath": relative_path,
+                "failure": "not_configured",
+                "message": "File transfers are not configured on this server.",
+            })
+        })
     }
 
     async fn handle_asset_create_url(&self, input: AssetCreateUrlInput) -> Result<Value, Value> {
@@ -1254,6 +1374,68 @@ fn asset_wire_from_error(resource: &AssetResource, error: &AssetError) -> Value 
     }
 }
 
+fn transfer_wire(cwd: &str, relative_path: &str, error: &WorkspaceError) -> Value {
+    json!({
+        "_tag": "ProjectTransferError",
+        "cwd": cwd,
+        "relativePath": relative_path,
+        "failure": transfer_failure(error),
+        "message": error.to_string(),
+    })
+}
+
+fn transfer_failure(error: &WorkspaceError) -> &'static str {
+    match error {
+        WorkspaceError::PathOutsideRoot { .. } | WorkspaceError::ResolvedPathOutsideRoot { .. } => {
+            "outside_root"
+        }
+        WorkspaceError::NotFound { .. } | WorkspaceError::RootNotFound { .. } => "not_found",
+        WorkspaceError::Operation { source, .. }
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            "not_found"
+        }
+        _ => "operation_failed",
+    }
+}
+
+/// A folder whose contents blow an archive budget is refused when its download URL is minted,
+/// with a message that names the limit and its unit so the person reading the toast knows why.
+fn archive_limit_wire(cwd: &str, relative_path: &str, error: &TransferError) -> Value {
+    // Names the budget that was blown and the one thing that can be done about it: UI.md asks an
+    // error to say what happened and what the reader can do next.
+    let message = match error {
+        TransferError::TooManyEntries { limit } => format!(
+            "Folder exceeds the {limit}-entry download limit. Download a subfolder instead."
+        ),
+        TransferError::TooManyBytes { limit } => format!(
+            "Folder exceeds the {} download limit. Download a subfolder instead.",
+            transfer::describe_bytes(*limit)
+        ),
+        other => return transfer_error_wire(cwd, relative_path, other),
+    };
+    json!({
+        "_tag": "ProjectTransferError",
+        "cwd": cwd,
+        "relativePath": relative_path,
+        "failure": "operation_failed",
+        "message": message,
+    })
+}
+
+fn transfer_error_wire(cwd: &str, relative_path: &str, error: &TransferError) -> Value {
+    match error {
+        TransferError::Workspace(workspace) => transfer_wire(cwd, relative_path, workspace),
+        _ => json!({
+            "_tag": "ProjectTransferError",
+            "cwd": cwd,
+            "relativePath": relative_path,
+            "failure": "operation_failed",
+            "message": error.to_string(),
+        }),
+    }
+}
+
 fn review_wire_error(error: ReviewError) -> Value {
     json!({
         "_tag": "Defect",
@@ -1327,6 +1509,20 @@ struct BrowseInput {
 #[serde(rename_all = "camelCase")]
 struct AssetCreateUrlInput {
     resource: AssetResource,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectCreateDownloadUrlInput {
+    cwd: String,
+    relative_path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectCreateUploadUrlInput {
+    cwd: String,
+    relative_directory: String,
 }
 
 #[cfg(test)]

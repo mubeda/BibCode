@@ -112,6 +112,8 @@ pub const ROUTE_INVENTORY: &[RouteSpec] = &[
     route(RouteMethod::Get, WS_E2EE_PATH),
     route(RouteMethod::Post, "/api/diagnostics/logs.zip"),
     route(RouteMethod::Get, "/api/assets/*"),
+    route(RouteMethod::Get, "/api/transfers/*"),
+    route(RouteMethod::Post, "/api/transfers/*"),
     route(RouteMethod::Post, DESKTOP_SHUTDOWN_PATH),
     route(RouteMethod::Post, MAINTENANCE_UPDATE_PREPARE_PATH),
     route(RouteMethod::Post, MAINTENANCE_UPDATE_COMMIT_PATH),

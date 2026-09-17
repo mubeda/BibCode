@@ -122,6 +122,14 @@ export function createProjectEnvironmentAtoms<R, E>(
         key: ({ environmentId, input }) => JSON.stringify([environmentId, input.cwd]),
       },
     }),
+    createDownloadUrl: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:projects:create-download-url",
+      tag: WS_METHODS.projectsCreateDownloadUrl,
+    }),
+    createUploadUrl: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:projects:create-upload-url",
+      tag: WS_METHODS.projectsCreateUploadUrl,
+    }),
     refreshEntries: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:projects:refresh-entries",
       tag: WS_METHODS.projectsListEntries,

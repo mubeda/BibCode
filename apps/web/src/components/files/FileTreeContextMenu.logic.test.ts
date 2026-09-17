@@ -37,7 +37,7 @@ function find(
 }
 
 describe("buildFileTreeMenuModel — file rows", () => {
-  it("orders groups create / actions / mutate", () => {
+  it("orders groups create / actions / transfers / mutate", () => {
     const groupIds = buildFileTreeMenuModel({
       ...BASE,
       isPrimaryEnv: true,
@@ -53,6 +53,7 @@ describe("buildFileTreeMenuModel — file rows", () => {
         "open-external-editor",
         "open-preview",
       ],
+      ["download", "upload"],
       ["rename", "delete"],
     ]);
   });
@@ -109,11 +110,45 @@ describe("buildFileTreeMenuModel — directory rows", () => {
 describe("buildFileTreeMenuModel — background", () => {
   const BG: BuildFileTreeMenuModelInput = { ...BASE, entryKind: "background" };
 
-  it("offers enabled create items plus Copy Path and Refresh, no rename/delete", () => {
+  it("offers enabled create items plus Upload, Copy Path and Refresh, no rename/delete", () => {
     const list = ids(BG);
-    expect(list).toEqual(["new-file", "new-folder", "copy-path", "refresh"]);
+    expect(list).toEqual(["new-file", "new-folder", "upload", "copy-path", "refresh"]);
     expect(find(BG, "new-file")?.enabled).toBe(true);
     expect(find(BG, "refresh")?.enabled).toBe(true);
+  });
+});
+
+describe("buildFileTreeMenuModel — transfers", () => {
+  it("offers Download and an enabled Upload on directory rows", () => {
+    const download = find({ ...BASE, entryKind: "directory" }, "download");
+    const upload = find({ ...BASE, entryKind: "directory" }, "upload");
+    expect(download).toEqual({ id: "download", label: "Download", enabled: true });
+    expect(upload).toEqual({ id: "upload", label: "Upload Files…", enabled: true });
+  });
+
+  it("offers Download and a disabled, explained Upload on file rows", () => {
+    expect(find(BASE, "download")).toEqual({ id: "download", label: "Download", enabled: true });
+    expect(find(BASE, "upload")).toEqual({
+      id: "upload",
+      label: "Upload Files… (choose a folder)",
+      enabled: false,
+    });
+  });
+
+  it("offers Upload to the workspace root from the background and no Download", () => {
+    const background = { ...BASE, entryKind: "background" as const };
+    expect(find(background, "upload")).toEqual({
+      id: "upload",
+      label: "Upload Files…",
+      enabled: true,
+    });
+    expect(find(background, "download")).toBeUndefined();
+  });
+
+  it("keeps transfers available outside the primary environment", () => {
+    expect(ids({ ...BASE, entryKind: "directory", isPrimaryEnv: false })).toEqual(
+      expect.arrayContaining(["download", "upload"]),
+    );
   });
 });
 
