@@ -49,7 +49,12 @@ pub async fn plan_archive_with_limits(
                 let path = entry.path();
                 let metadata = std::fs::symlink_metadata(&path)
                     .map_err(|error| TransferError::operation("stat", &path, error))?;
-                if metadata.file_type().is_symlink() {
+                let file_type = metadata.file_type();
+                if !file_type.is_file() && !file_type.is_dir() {
+                    // Skips symlinks (never followed) and any other non-regular entry
+                    // (sockets, FIFOs, device nodes, ...): opening those for reading can
+                    // block forever (FIFO) or fail unpredictably (socket), and none of
+                    // them belong in a folder download.
                     continue;
                 }
                 plan.entries += 1;
@@ -78,10 +83,13 @@ pub async fn plan_archive_with_limits(
     })?
 }
 
-/// Streams a zip of `root`'s contents. Entry and byte limits are enforced by `plan_archive`
-/// before the response starts; I/O failures during streaming truncate the response and are
-/// logged since the HTTP response has already begun.
-pub fn archive_body(root: PathBuf) -> Body {
+/// Streams a zip of `root`'s contents. `plan` is a proof token: callers must have already
+/// obtained a successful `ArchivePlan` (via `plan_archive`/`plan_archive_with_limits`) for
+/// `root` before starting the response, so this signature makes it impossible to stream an
+/// archive whose limits were never checked. I/O failures during streaming truncate the
+/// response and are logged since the HTTP response has already begun.
+pub fn archive_body(plan: ArchivePlan, root: PathBuf) -> Body {
+    tracing::debug!(root = %root.display(), entries = plan.entries, bytes = plan.bytes, "streaming folder download");
     let (writer, reader) = tokio::io::duplex(64 * 1024);
     tokio::task::spawn_blocking(move || {
         if let Err(error) = write_archive(&root, SyncIoBridge::new(writer)) {
@@ -103,7 +111,9 @@ fn write_archive<W: Write>(root: &Path, sink: W) -> io::Result<()> {
         for child in children {
             let path = child.path();
             let metadata = std::fs::symlink_metadata(&path)?;
-            if metadata.file_type().is_symlink() {
+            let file_type = metadata.file_type();
+            if !file_type.is_file() && !file_type.is_dir() {
+                // See the matching skip in `plan_archive_with_limits`.
                 continue;
             }
             let relative = path.strip_prefix(root).map_err(io::Error::other)?;
@@ -136,12 +146,14 @@ mod tests {
         std::fs::write(root.join("nested/b.bin"), [0u8, 1, 2]).unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(root.join("a.txt"), root.join("link.txt")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::net::UnixListener::bind(root.join("x.sock")).unwrap();
 
         let plan = plan_archive(&root).await.unwrap();
         assert_eq!(plan.entries, 3); // a.txt, nested/, nested/b.bin
         assert_eq!(plan.bytes, 8);
 
-        let body = archive_body(root.clone());
+        let body = archive_body(plan, root.clone());
         let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
         let mut names: Vec<String> = (0..archive.len())
@@ -149,6 +161,7 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, vec!["a.txt", "nested/", "nested/b.bin"]);
+        assert!(!names.iter().any(|name| name.contains("sock")));
         let mut content = String::new();
         archive
             .by_name("a.txt")

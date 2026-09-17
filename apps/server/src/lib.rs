@@ -31,6 +31,7 @@ pub mod review;
 mod rpc;
 pub mod server_settings;
 mod service_manager;
+pub mod signed_token;
 pub mod source_control;
 mod static_assets;
 pub mod terminal;
