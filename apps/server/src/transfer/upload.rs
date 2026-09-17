@@ -292,9 +292,13 @@ mod tests {
         });
         // Give the first call time to reserve the name before the second one tries.
         tokio::task::yield_now().await;
-        while !temp.path().join("a.txt").exists() {
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        }
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !temp.path().join("a.txt").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the first upload reserves the name");
         let second = write_upload(temp.path(), "a.txt", false, 1024, body(&[b"second"]))
             .await
             .unwrap_err();

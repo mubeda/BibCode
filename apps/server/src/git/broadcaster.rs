@@ -3638,14 +3638,19 @@ mod tests {
             .subscribe(repository.clone(), CancellationToken::new())
             .await
             .expect("status subscription starts");
+        // Every wait here is bounded: on a loaded CI runner this test once sat
+        // on an unbounded `recv()` until the job's 60-minute timeout cancelled
+        // the whole preflight instead of failing with a message.
         assert!(matches!(
-            subscription.recv().await,
+            tokio::time::timeout(Duration::from_secs(30), subscription.recv())
+                .await
+                .expect("initial snapshot arrives"),
             Some(VcsStatusStreamEvent::Snapshot { ref local, .. })
                 if !local.has_working_tree_changes
         ));
-        local_status_started_rx
-            .recv()
+        tokio::time::timeout(Duration::from_secs(30), local_status_started_rx.recv())
             .await
+            .expect("initial local status scan starts")
             .expect("initial local status scan was observed");
         tokio::time::timeout(Duration::from_secs(5), remote_started_rx.recv())
             .await
