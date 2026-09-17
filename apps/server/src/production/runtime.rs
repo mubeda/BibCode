@@ -136,17 +136,24 @@ impl ProductionRuntime {
         transfer_routes::download_handler(self.transfer_access.clone())
     }
 
-    /// The handler that accepts signed uploads, invalidating the workspace entry index for the
-    /// affected root so the next listing sees the new file.
+    /// The handler that accepts signed uploads.
+    ///
+    /// An upload is a workspace mutation that never passes through `run_workspace_mutation`, so
+    /// the callback has to publish both of that path's observable effects itself: drop the
+    /// entry-index snapshot for the root, and tell the Git status broadcaster the working tree
+    /// changed, exactly as the terminal-exit callback below does.
     #[must_use]
     pub fn transfer_upload_handler(&self) -> TransferUploadHandler {
         let workspace = self.workspace.clone();
+        let status_broadcaster = self.status_broadcaster.clone();
         transfer_routes::upload_handler(
             self.transfer_access.clone(),
             Arc::new(move |root| {
                 let workspace = workspace.clone();
+                let status_broadcaster = status_broadcaster.clone();
                 Box::pin(async move {
                     workspace.invalidate_index(&root.to_string_lossy()).await;
+                    status_broadcaster.notify_local_change(&root).await;
                 })
             }),
         )

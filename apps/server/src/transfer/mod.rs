@@ -113,10 +113,21 @@ impl TransferAccess {
         root: &Path,
         relative_dir: &str,
     ) -> Result<IssuedTransferUrl, TransferError> {
+        self.issue_upload_with_limit(root, relative_dir, MAX_UPLOAD_BYTES)
+    }
+
+    /// [`Self::issue_upload`] with an explicit byte cap, so a caller -- or a test -- can bind a
+    /// token to a tighter limit than the server-wide maximum.
+    pub fn issue_upload_with_limit(
+        &self,
+        root: &Path,
+        relative_dir: &str,
+        max_bytes: u64,
+    ) -> Result<IssuedTransferUrl, TransferError> {
         self.issue(TransferClaims::Upload {
             root: root.to_path_buf(),
             relative_dir: relative_dir.to_owned(),
-            max_bytes: MAX_UPLOAD_BYTES,
+            max_bytes,
             expires_at: self.expiry(),
         })
     }
