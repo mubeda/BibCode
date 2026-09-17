@@ -3696,16 +3696,19 @@ mod tests {
         // branch avoids sampling a nested callback before it has published.
         release_remote.add_permits(1);
         assert_eq!(
-            remote_outcome_rx
-                .recv()
+            tokio::time::timeout(Duration::from_secs(30), remote_outcome_rx.recv())
                 .await
+                .expect("blocked remote runner reaches its terminal branch after cancellation")
                 .expect("blocked remote runner reports its terminal branch"),
             BlockingRemoteOutcome::Cancelled,
             "final subscriber cancellation wins over the ready release permit"
         );
-        broadcaster
-            .await_retired_lifecycle(&canonical_repository)
-            .await;
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            broadcaster.await_retired_lifecycle(&canonical_repository),
+        )
+        .await
+        .expect("retired lifecycle tasks report completion after the final subscriber drops");
     }
 
     #[tokio::test(start_paused = true)]
