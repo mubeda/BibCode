@@ -20,6 +20,7 @@ pub mod relay;
 pub mod remote_update_rpc;
 pub mod runtime;
 pub mod server_terminal;
+pub mod transfer_routes;
 pub mod turn_delivery;
 pub(crate) mod workspace_availability;
 pub mod workspace_preview;

@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use crate::assets::{AssetAccess, AssetError, AssetIssueRequest, AssetResource};
 use crate::git::StatusMutationGuard;
 use crate::review::{ReviewDiffPreviewInput, ReviewError, ReviewService};
+use crate::transfer::{TransferAccess, TransferError};
 use crate::worktree_catalog::{
     WorkspaceAdmissionCancellation, WorkspaceAdmissionLease, WorkspaceAvailabilityRegistry,
 };
@@ -19,7 +20,7 @@ use tokio::sync::{Mutex, broadcast};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use super::paths::normalize_root;
+use super::paths::{self, normalize_root};
 use super::search::emit_index_phase;
 #[cfg(test)]
 use super::search::{WorkspaceIndexPhase, WorkspaceIndexPhaseSink};
@@ -60,6 +61,7 @@ pub trait WorkspaceMutationObserver: Send + Sync {
 #[derive(Clone, Default)]
 pub struct WorkspaceRpcDependencies {
     pub asset_access: Option<AssetAccess>,
+    pub transfer_access: Option<TransferAccess>,
     pub asset_context_resolver: Option<Arc<dyn AssetContextResolver>>,
     pub review_service: Option<ReviewService>,
     pub mutation_observer: Option<Arc<dyn WorkspaceMutationObserver>>,
@@ -578,6 +580,14 @@ impl WorkspaceRpc {
                 let input: AssetCreateUrlInput = decode(payload)?;
                 self.handle_asset_create_url(input).await
             }
+            "projects.createDownloadUrl" => {
+                let input: ProjectCreateDownloadUrlInput = decode(payload)?;
+                self.handle_create_download_url(input).await
+            }
+            "projects.createUploadUrl" => {
+                let input: ProjectCreateUploadUrlInput = decode(payload)?;
+                self.handle_create_upload_url(input).await
+            }
             "review.getDiffPreview" => {
                 let input: ReviewDiffPreviewInput = decode(payload)?;
                 let _admission = self.acquire_path(&input.cwd).await?;
@@ -966,11 +976,109 @@ impl WorkspaceRpc {
         Ok(index)
     }
 
-    async fn invalidate_index(&self, cwd: &str) {
+    pub(crate) async fn invalidate_index(&self, cwd: &str) {
         let Ok(canonical) = tokio::fs::canonicalize(cwd).await else {
             return;
         };
         self.indexes.lock().await.invalidate(&canonical);
+    }
+
+    /// Mints a short-lived signed URL for downloading a file, or a folder as a zip archive.
+    ///
+    /// The token binds the canonical workspace root and the relative path, so the HTTP route
+    /// never has to trust a client-supplied path.
+    async fn handle_create_download_url(
+        &self,
+        input: ProjectCreateDownloadUrlInput,
+    ) -> Result<Value, Value> {
+        let access = self.transfer_access(&input.cwd, &input.relative_path)?;
+        let _admission = self.acquire_path(&input.cwd).await?;
+        let root = normalize_root(Path::new(&input.cwd), false)
+            .await
+            .map_err(|error| transfer_wire(&input.cwd, &input.relative_path, &error))?;
+        let (target, relative) = paths::resolve_relative(&root, &input.relative_path)
+            .map_err(|error| transfer_wire(&input.cwd, &input.relative_path, &error))?;
+        let (_, canonical) = paths::canonical_existing_within(&root, &target)
+            .await
+            .map_err(|error| transfer_wire(&input.cwd, &input.relative_path, &error))?;
+        let metadata = tokio::fs::metadata(&canonical).await.map_err(|error| {
+            transfer_wire(
+                &input.cwd,
+                &input.relative_path,
+                &WorkspaceError::operation("stat", &canonical, error),
+            )
+        })?;
+        let name = canonical
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "download".to_owned());
+        let (kind, file_name) = if metadata.is_dir() {
+            ("archive", format!("{name}.zip"))
+        } else {
+            ("file", name)
+        };
+        let issued = access
+            .issue_download(&root, &relative)
+            .map_err(|error| transfer_error_wire(&input.cwd, &input.relative_path, &error))?;
+        Ok(json!({
+            "relativeUrl": issued.relative_url,
+            "expiresAt": issued.expires_at,
+            "fileName": file_name,
+            "kind": kind,
+        }))
+    }
+
+    /// Mints a short-lived signed URL for uploading a single file into an existing folder.
+    ///
+    /// An empty `relativeDirectory` targets the workspace root itself.
+    async fn handle_create_upload_url(
+        &self,
+        input: ProjectCreateUploadUrlInput,
+    ) -> Result<Value, Value> {
+        let access = self.transfer_access(&input.cwd, &input.relative_directory)?;
+        let _admission = self.acquire_path(&input.cwd).await?;
+        let root = normalize_root(Path::new(&input.cwd), false)
+            .await
+            .map_err(|error| transfer_wire(&input.cwd, &input.relative_directory, &error))?;
+        let relative = if input.relative_directory.is_empty() {
+            String::new()
+        } else {
+            let (target, relative) = paths::resolve_relative(&root, &input.relative_directory)
+                .map_err(|error| transfer_wire(&input.cwd, &input.relative_directory, &error))?;
+            let (_, canonical) = paths::canonical_existing_within(&root, &target)
+                .await
+                .map_err(|error| transfer_wire(&input.cwd, &input.relative_directory, &error))?;
+            if !canonical.is_dir() {
+                return Err(json!({
+                    "_tag": "ProjectTransferError",
+                    "cwd": input.cwd,
+                    "relativePath": input.relative_directory,
+                    "failure": "not_found",
+                    "message": "Upload target is not a folder.",
+                }));
+            }
+            relative
+        };
+        let issued = access
+            .issue_upload(&root, &relative)
+            .map_err(|error| transfer_error_wire(&input.cwd, &input.relative_directory, &error))?;
+        Ok(json!({
+            "relativeUrl": issued.relative_url,
+            "expiresAt": issued.expires_at,
+            "maxBytes": crate::transfer::MAX_UPLOAD_BYTES,
+        }))
+    }
+
+    fn transfer_access(&self, cwd: &str, relative_path: &str) -> Result<&TransferAccess, Value> {
+        self.dependencies.transfer_access.as_ref().ok_or_else(|| {
+            json!({
+                "_tag": "ProjectTransferError",
+                "cwd": cwd,
+                "relativePath": relative_path,
+                "failure": "not_configured",
+                "message": "File transfers are not configured on this server.",
+            })
+        })
     }
 
     async fn handle_asset_create_url(&self, input: AssetCreateUrlInput) -> Result<Value, Value> {
@@ -1256,6 +1364,44 @@ fn asset_wire_from_error(resource: &AssetResource, error: &AssetError) -> Value 
     }
 }
 
+fn transfer_wire(cwd: &str, relative_path: &str, error: &WorkspaceError) -> Value {
+    json!({
+        "_tag": "ProjectTransferError",
+        "cwd": cwd,
+        "relativePath": relative_path,
+        "failure": transfer_failure(error),
+        "message": error.to_string(),
+    })
+}
+
+fn transfer_failure(error: &WorkspaceError) -> &'static str {
+    match error {
+        WorkspaceError::PathOutsideRoot { .. } | WorkspaceError::ResolvedPathOutsideRoot { .. } => {
+            "outside_root"
+        }
+        WorkspaceError::NotFound { .. } | WorkspaceError::RootNotFound { .. } => "not_found",
+        WorkspaceError::Operation { source, .. }
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            "not_found"
+        }
+        _ => "operation_failed",
+    }
+}
+
+fn transfer_error_wire(cwd: &str, relative_path: &str, error: &TransferError) -> Value {
+    match error {
+        TransferError::Workspace(workspace) => transfer_wire(cwd, relative_path, workspace),
+        _ => json!({
+            "_tag": "ProjectTransferError",
+            "cwd": cwd,
+            "relativePath": relative_path,
+            "failure": "operation_failed",
+            "message": error.to_string(),
+        }),
+    }
+}
+
 fn review_wire_error(error: ReviewError) -> Value {
     json!({
         "_tag": "Defect",
@@ -1329,6 +1475,20 @@ struct BrowseInput {
 #[serde(rename_all = "camelCase")]
 struct AssetCreateUrlInput {
     resource: AssetResource,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectCreateDownloadUrlInput {
+    cwd: String,
+    relative_path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectCreateUploadUrlInput {
+    cwd: String,
+    relative_directory: String,
 }
 
 #[cfg(test)]
