@@ -671,51 +671,56 @@ export default function FileBrowserPanel({
   );
 
   // One file, one freshly minted upload token. `send` is the transport (desktop host or browser
-  // fetch) so the retry-after-replace loop is identical in both runtimes.
+  // fetch) so the retry-after-replace loop is identical in both runtimes. Every failure — a refused
+  // upload or a rejected transport (unreadable file, permission error) — is reported against this
+  // file's own name and stops here, so one bad file never aborts the rest of a batch.
   const uploadOne = useCallback(
     async (
       relativeDirectory: string,
       file: { name: string; send: (url: string) => Promise<{ status: number; body: string }> },
     ): Promise<void> => {
       const target = uploadTargetLabel(relativeDirectory);
+      const refuse = (message: string) =>
+        showMutationError(new Error(message), `Can’t upload "${file.name}"`);
       if (!environmentHttpBaseUrl) {
-        showMutationError(new Error(NO_SERVER_MESSAGE), `Can’t upload "${file.name}"`);
+        refuse(NO_SERVER_MESSAGE);
         return;
       }
-      const minted = await createUploadUrl({ environmentId, input: { cwd, relativeDirectory } });
-      if (minted._tag === "Failure") {
-        if (!isAtomCommandInterrupted(minted)) {
-          showMutationError(
-            squashAtomCommandFailure(minted),
-            `Failed to prepare an upload to ${target}`,
+      try {
+        const minted = await createUploadUrl({ environmentId, input: { cwd, relativeDirectory } });
+        if (minted._tag === "Failure") {
+          if (!isAtomCommandInterrupted(minted)) {
+            showMutationError(
+              squashAtomCommandFailure(minted),
+              `Failed to prepare an upload to ${target}`,
+            );
+          }
+          return;
+        }
+        let overwrite = false;
+        for (;;) {
+          const response = await file.send(
+            uploadUrlFor(minted.value.relativeUrl, environmentHttpBaseUrl, file.name, overwrite),
           );
-        }
-        return;
-      }
-      let overwrite = false;
-      for (;;) {
-        const response = await file.send(
-          uploadUrlFor(minted.value.relativeUrl, environmentHttpBaseUrl, file.name, overwrite),
-        );
-        const step = interpretUploadResponse(response.status, response.body);
-        if (step._tag === "Uploaded") return;
-        if (step._tag === "Exists" && !overwrite) {
-          const replace = await confirmReplace(file.name, relativeDirectory);
-          if (!replace || workspaceUnavailableRef.current) return;
-          overwrite = true;
-          continue;
-        }
-        showMutationError(
-          new Error(
+          const step = interpretUploadResponse(response.status, response.body);
+          if (step._tag === "Uploaded") return;
+          if (step._tag === "Exists" && !overwrite) {
+            const replace = await confirmReplace(file.name, relativeDirectory);
+            if (!replace || workspaceUnavailableRef.current) return;
+            overwrite = true;
+            continue;
+          }
+          refuse(
             step._tag === "TooLarge"
               ? `The file is larger than the ${describeByteLimit(step.limit)} the server accepts.`
               : step._tag === "Exists"
                 ? `Something else now uses that name in ${target}. Refresh the tree and try again.`
                 : step.message,
-          ),
-          `Can’t upload "${file.name}"`,
-        );
-        return;
+          );
+          return;
+        }
+      } catch (error) {
+        showMutationError(error, `Can’t upload "${file.name}"`);
       }
     },
     [
@@ -739,18 +744,22 @@ export default function FileBrowserPanel({
         return;
       }
       void (async () => {
+        // `uploadOne` reports its own failures per file, so the batch runs to the end and the tree
+        // resyncs even when some of the files were refused.
+        let picked: readonly string[] = [];
         try {
-          const paths = await pickFiles({ title: "Select files to upload" });
-          for (const path of paths) {
+          picked = await pickFiles({ title: "Select files to upload" });
+          for (const path of picked) {
             const name = path.split(/[\\/]/).pop() ?? path;
             await uploadOne(relativeDirectory, {
               name,
               send: (url) => uploadFile({ url, path }),
             });
           }
-          if (paths.length > 0) entriesQuery.refresh();
         } catch (error) {
           showMutationError(error, "Failed to upload files");
+        } finally {
+          if (picked.length > 0) entriesQuery.refresh();
         }
       })();
     },
