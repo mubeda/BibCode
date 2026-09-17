@@ -24,6 +24,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "gitManager.getCommits"
         | "gitManager.getDiff"
         | "gitManager.getRefs"
+        | "gitManager.getRemoteTags"
         | "gitManager.getStashes"
         | "gitManager.listPullRequests"
         | "gitManager.previewMerge"
@@ -214,6 +215,7 @@ mod tests {
             "gitManager.getCommits",
             "gitManager.getDiff",
             "gitManager.getRefs",
+            "gitManager.getRemoteTags",
             "gitManager.getStashes",
             "gitManager.listPullRequests",
             "gitManager.previewMerge",

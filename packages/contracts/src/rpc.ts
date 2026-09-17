@@ -79,6 +79,8 @@ import {
   GitManagerPreviewMergeInput,
   GitManagerPullRequestsResult,
   GitManagerRefsSnapshot,
+  GitManagerRemoteTags,
+  GitManagerRemoteTagsInput,
   GitManagerSignalEvent,
   GitManagerStashEntry,
   GitManagerUndoCommitResult,
@@ -389,6 +391,7 @@ export const WS_METHODS = {
   gitManagerGetCommits: "gitManager.getCommits",
   gitManagerGetDiff: "gitManager.getDiff",
   gitManagerGetStashes: "gitManager.getStashes",
+  gitManagerGetRemoteTags: "gitManager.getRemoteTags",
   gitManagerPreviewMerge: "gitManager.previewMerge",
   gitManagerListPullRequests: "gitManager.listPullRequests",
   gitManagerCommit: "gitManager.commit",
@@ -1082,6 +1085,12 @@ export const WsGitManagerGetStashesRpc = Rpc.make(WS_METHODS.gitManagerGetStashe
   error: GitManagerOperationError,
 });
 
+export const WsGitManagerGetRemoteTagsRpc = Rpc.make(WS_METHODS.gitManagerGetRemoteTags, {
+  payload: GitManagerRemoteTagsInput,
+  success: GitManagerRemoteTags,
+  error: GitManagerOperationError,
+});
+
 export const WsGitManagerPreviewMergeRpc = Rpc.make(WS_METHODS.gitManagerPreviewMerge, {
   payload: GitManagerPreviewMergeInput,
   success: GitManagerMergePreview,
@@ -1522,6 +1531,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsGitManagerGetCommitsRpc,
   WsGitManagerGetDiffRpc,
   WsGitManagerGetStashesRpc,
+  WsGitManagerGetRemoteTagsRpc,
   WsGitManagerPreviewMergeRpc,
   WsGitManagerListPullRequestsRpc,
   WsGitManagerCommitRpc,

@@ -81,6 +81,10 @@ directories; **Type a path instead** switches to manual entry of an absolute
 or home-relative path. Selecting a folder adds that folder as one project and
 does not scan for nested repositories.
 
+Clicking a project header selects it and toggles its thread list; the header
+stays highlighted as the selected node until you open a thread, and it is also
+highlighted while that project's Git Manager is open.
+
 Workspace row context menus include update/open/copy/pin/unread actions, plus
 delete worktree for worktree rows and remove project for primary rows. On the
 local desktop environment, **Open in → File Explorer** opens the repository
@@ -264,7 +268,8 @@ after **New worktree**. It opens the project-scoped centre route
 `/project/<environmentId>/<projectId>/git`; opening it again navigates to the
 same route instead of creating a second manager or centre tab. While it is
 open, that project's header row stays highlighted in the left panel, and the
-toolbar leads with the project's name (its checkout path on hover). The selected
+toolbar leads with the project's name (its checkout path on hover) and the
+environment it is connected to. The selected
 environment owns every path and Git process, so a remote project's checkout
 path remains opaque to the browser.
 
@@ -279,17 +284,31 @@ The toolbar has three segments:
    such as `origin/HEAD` are not branch rows, while an actual local branch named
    `origin` remains available.
 3. **Sync** derives fetch, pull, push, publish-branch, and diverged
-   force-with-lease states from the current branch and upstream. A configured
+   force-with-lease states from the current branch and upstream. Push, publish,
+   and force push confirm in one dialog that offers **Also push tags**: every
+   local tag then travels with the branch in one atomic push, and a tag the
+   remote rejects cancels the whole push. Creating a tag from History offers
+   **Push to `<remote>` after creating**; if that push fails, the tag still
+   exists locally and the failure says so. A configured
    upstream whose remote-tracking ref has not been fetched keeps the local
    repository usable; ahead/behind remain unknown at zero until Fetch obtains
    that ref instead of making the complete Git Manager unavailable.
 
 The manager opens on **History**. When a checkout with pending changes becomes
 clean after a commit, discard, or recovery, it returns to History. Dirty or
-still-loading checkouts preserve the tab the user chose. An in-progress merge
+still-loading checkouts preserve the tab the user chose, and so does the
+**Tags** tab, which is unrelated to the working tree. An in-progress merge
 always selects **Changes**, since that merge is finished there, and returns to
 History once the merge is committed or aborted; the tab is not remembered
 between openings.
+
+The **Tags** tab lists local tags newest first, then one collapsible section
+per remote with the tags that remote currently advertises, queried with
+`git ls-remote` when the tab opens and again on its refresh button. Remote rows
+are marked **not fetched** or **differs locally** against the local set; an
+unreachable remote shows its reason with Retry instead of hiding the local
+list. Local rows offer Push and Delete through the tag dialog. Each section's
+collapsed state is remembered per project.
 
 The **Changes** tab filters and groups working-directory changes, keeps file
 inclusion separate from row selection, renders per-file diffs, uses whole-file

@@ -34,6 +34,11 @@ export function createGitManagerEnvironmentAtoms<R, E>(
       tag: WS_METHODS.gitManagerGetStashes,
       staleTimeMs: 5_000,
     }),
+    getRemoteTags: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:git-manager:get-remote-tags",
+      tag: WS_METHODS.gitManagerGetRemoteTags,
+      staleTimeMs: 30_000,
+    }),
     previewMerge: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:git-manager:preview-merge",
       tag: WS_METHODS.gitManagerPreviewMerge,

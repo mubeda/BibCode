@@ -1573,6 +1573,181 @@ async fn squash_merge_bypasses_commit_hooks_only_when_no_verify_is_requested() {
 }
 
 #[tokio::test]
+async fn remote_tags_read_lists_tags_on_the_remote_and_reports_an_unavailable_remote() {
+    let fixture = Fixture::new().await;
+    let cwd = fixture.repository_path.clone();
+    git(&cwd, &["tag", "v1.0.0"]);
+    git(&cwd, &["push", "-q", "origin", "v1.0.0"]);
+    git(&cwd, &["tag", "local-only"]);
+
+    let tags = fixture
+        .read(
+            "60",
+            "gitManager.getRemoteTags",
+            json!({ "cwd": cwd, "remote": "origin" }),
+        )
+        .await
+        .expect("remote tags");
+    assert_eq!(tags["remote"], "origin");
+    assert_eq!(tags["status"], "available");
+    assert_eq!(tags["reason"], Value::Null);
+    let names = tags["tags"]
+        .as_array()
+        .expect("tag list")
+        .iter()
+        .map(|tag| tag["name"].as_str().expect("tag name").to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["v1.0.0"]);
+    assert_eq!(
+        tags["tags"][0]["targetSha"],
+        json!(git_stdout(&cwd, &["rev-parse", "v1.0.0"]))
+    );
+
+    git(
+        &cwd,
+        &[
+            "remote",
+            "add",
+            "elsewhere",
+            "/nonexistent/bibcode-missing-remote.git",
+        ],
+    );
+    let unavailable = fixture
+        .read(
+            "61",
+            "gitManager.getRemoteTags",
+            json!({ "cwd": cwd, "remote": "elsewhere" }),
+        )
+        .await
+        .expect("an unavailable remote is a result, not an RPC failure");
+    assert_eq!(unavailable["status"], "unavailable");
+    assert!(
+        unavailable["reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty()),
+        "{unavailable}"
+    );
+    assert_eq!(unavailable["tags"], json!([]));
+}
+
+#[tokio::test]
+async fn push_with_tags_publishes_local_tags_atomically() {
+    let fixture = Fixture::new().await;
+    let cwd = fixture.repository_path.clone();
+    git(&cwd, &["push", "-q", "-u", "origin", "main"]);
+    git(&cwd, &["tag", "v1"]);
+
+    let pushed = collect_events(fixture.operation(
+        "62",
+        json!({
+            "_tag": "push", "cwd": cwd, "projectId": "project-1",
+            "remote": "origin", "localBranch": "main", "remoteBranch": "main", "pushTags": true
+        }),
+    ))
+    .await;
+    assert_eq!(
+        pushed.last().and_then(|event| event["_tag"].as_str()),
+        Some("finished"),
+        "{pushed:?}"
+    );
+    assert!(git_stdout(&cwd, &["ls-remote", "--tags", "origin"]).contains("refs/tags/v1"));
+
+    // A tag that already exists on the remote at another commit must reject the
+    // whole push: the branch ref on the remote may not move.
+    let base = git_stdout(&cwd, &["rev-parse", "HEAD"]);
+    git(&fixture.remote_path, &["update-ref", "refs/tags/v2", &base]);
+    fs::write(cwd.join("next.txt"), "next\n").expect("next file");
+    git(&cwd, &["add", "next.txt"]);
+    git(&cwd, &["commit", "-q", "-m", "next"]);
+    git(&cwd, &["tag", "v2"]);
+    let rejected = collect_events(fixture.operation(
+        "63",
+        json!({
+            "_tag": "push", "cwd": cwd, "projectId": "project-1",
+            "remote": "origin", "localBranch": "main", "remoteBranch": "main", "pushTags": true
+        }),
+    ))
+    .await;
+    assert_eq!(
+        rejected.last().and_then(|event| event["_tag"].as_str()),
+        Some("failed"),
+        "{rejected:?}"
+    );
+    assert_eq!(
+        git_stdout(&fixture.remote_path, &["rev-parse", "refs/heads/main"]),
+        base,
+        "an atomic push with a rejected tag leaves the remote branch untouched"
+    );
+
+    let without_tags = collect_events(fixture.operation(
+        "64",
+        json!({
+            "_tag": "push", "cwd": cwd, "projectId": "project-1",
+            "remote": "origin", "localBranch": "main", "remoteBranch": "main"
+        }),
+    ))
+    .await;
+    assert_eq!(
+        without_tags.last().and_then(|event| event["_tag"].as_str()),
+        Some("finished"),
+        "{without_tags:?}"
+    );
+    assert_eq!(
+        git_stdout(&fixture.remote_path, &["rev-parse", "refs/heads/main"]),
+        git_stdout(&cwd, &["rev-parse", "HEAD"])
+    );
+}
+
+#[tokio::test]
+async fn tag_create_can_push_the_new_tag_to_a_remote() {
+    let fixture = Fixture::new().await;
+    let cwd = fixture.repository_path.clone();
+    let sha = git_stdout(&cwd, &["rev-parse", "HEAD"]);
+
+    let created = collect_events(fixture.operation(
+        "65",
+        json!({
+            "_tag": "tag-create", "cwd": cwd, "projectId": "project-1",
+            "name": "v9", "sha": sha, "pushRemote": "origin"
+        }),
+    ))
+    .await;
+    assert_eq!(
+        created.last().and_then(|event| event["_tag"].as_str()),
+        Some("finished"),
+        "{created:?}"
+    );
+    assert!(git_stdout(&cwd, &["ls-remote", "--tags", "origin"]).contains("refs/tags/v9"));
+
+    git(
+        &cwd,
+        &[
+            "remote",
+            "add",
+            "elsewhere",
+            "/nonexistent/bibcode-missing-remote.git",
+        ],
+    );
+    let failed = collect_events(fixture.operation(
+        "66",
+        json!({
+            "_tag": "tag-create", "cwd": cwd, "projectId": "project-1",
+            "name": "v10", "sha": sha, "pushRemote": "elsewhere"
+        }),
+    ))
+    .await;
+    let last = failed.last().expect("tag create event");
+    assert_eq!(last["_tag"], "failed", "{failed:?}");
+    assert!(
+        last["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("locally")),
+        "the failure says the tag still exists locally: {last}"
+    );
+    assert_eq!(git_stdout(&cwd, &["tag", "-l", "v10"]), "v10");
+}
+
+#[tokio::test]
 async fn conflicting_merge_reports_conflicts_and_leaves_the_operation_in_progress() {
     let fixture = Fixture::new().await;
     let cwd = fixture.repository_path.clone();

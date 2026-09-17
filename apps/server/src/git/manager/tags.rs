@@ -5,12 +5,34 @@ use std::{collections::BTreeMap, path::Path};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+use serde::Serialize;
+
 use crate::git::{GitCommandError, GitRepository, ProcessOutput};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GitManagerTag {
     pub name: String,
     pub target_sha: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GitManagerRemoteTagsStatus {
+    Available,
+    Unavailable,
+}
+
+/// The tags one remote advertises. An unreachable or rejecting remote is a
+/// result with `Unavailable` and a reason, never a read failure, so the local
+/// tag list and other remotes stay usable.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitManagerRemoteTags {
+    pub remote: String,
+    pub status: GitManagerRemoteTagsStatus,
+    pub reason: Option<String>,
+    pub tags: Vec<GitManagerTag>,
 }
 
 #[derive(Debug, Error)]
@@ -77,13 +99,23 @@ pub async fn list_tags(
         return Err(GitManagerTagError::CommandFailed);
     }
 
+    parse_tag_listing(&output.stdout)
+}
+
+/// Parses `show-ref -d` / `ls-remote --tags` output into one entry per tag,
+/// preferring the dereferenced `^{}` commit of an annotated tag over its tag
+/// object so local and remote tips compare like for like.
+fn parse_tag_listing(stdout: &str) -> Result<Vec<GitManagerTag>, GitManagerTagError> {
     let mut tags = BTreeMap::<String, (String, bool)>::new();
-    for line in output.stdout.lines().filter(|line| !line.is_empty()) {
-        let (target_sha, reference) = line.split_once(' ').ok_or(GitManagerTagError::Malformed)?;
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        let (target_sha, reference) = line
+            .split_once([' ', '\t'])
+            .ok_or(GitManagerTagError::Malformed)?;
         if !valid_object_id(target_sha) {
             return Err(GitManagerTagError::Malformed);
         }
         let reference = reference
+            .trim()
             .strip_prefix("refs/tags/")
             .ok_or(GitManagerTagError::Malformed)?;
         let (name, dereferenced) = reference
@@ -108,6 +140,41 @@ pub async fn list_tags(
         .into_iter()
         .map(|(name, (target_sha, _))| GitManagerTag { name, target_sha })
         .collect())
+}
+
+pub async fn list_remote_tags(
+    repository: &GitRepository,
+    cwd: &Path,
+    remote: &str,
+    cancellation: &CancellationToken,
+) -> Result<GitManagerRemoteTags, GitManagerTagError> {
+    if !valid_remote_name(remote) {
+        return Err(GitManagerTagError::InvalidName);
+    }
+    let output = repository
+        .git_manager_ls_remote_tags(cwd, remote, cancellation)
+        .await?;
+    if output.exit_code != 0 {
+        let reason = output
+            .stderr
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("Git could not reach the remote.")
+            .to_owned();
+        return Ok(GitManagerRemoteTags {
+            remote: remote.to_owned(),
+            status: GitManagerRemoteTagsStatus::Unavailable,
+            reason: Some(reason),
+            tags: Vec::new(),
+        });
+    }
+    Ok(GitManagerRemoteTags {
+        remote: remote.to_owned(),
+        status: GitManagerRemoteTagsStatus::Available,
+        reason: None,
+        tags: parse_tag_listing(&output.stdout)?,
+    })
 }
 
 pub async fn delete_tag(
@@ -144,12 +211,7 @@ pub async fn push_tag(
     name: &str,
     cancellation: &CancellationToken,
 ) -> Result<ProcessOutput, GitManagerTagError> {
-    if !valid_tag_name(name)
-        || remote.is_empty()
-        || remote.trim() != remote
-        || remote.starts_with('-')
-        || remote.chars().any(char::is_control)
-    {
+    if !valid_tag_name(name) || !valid_remote_name(remote) {
         return Err(GitManagerTagError::InvalidName);
     }
     repository
@@ -165,6 +227,13 @@ pub async fn push_tag(
         )
         .await
         .map_err(Into::into)
+}
+
+fn valid_remote_name(remote: &str) -> bool {
+    !remote.is_empty()
+        && remote.trim() == remote
+        && !remote.starts_with('-')
+        && !remote.chars().any(char::is_control)
 }
 
 fn valid_object_id(value: &str) -> bool {
@@ -341,6 +410,30 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn remote_tag_listing_prefers_the_peeled_commit_of_an_annotated_tag() {
+        let tags = parse_tag_listing(concat!(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/tags/v1\n",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/tags/v1^{}\n",
+            "cccccccccccccccccccccccccccccccccccccccc\trefs/tags/lightweight\n",
+        ))
+        .expect("ls-remote output parses");
+
+        assert_eq!(
+            tags,
+            [
+                GitManagerTag {
+                    name: "lightweight".to_owned(),
+                    target_sha: "cccccccccccccccccccccccccccccccccccccccc".to_owned(),
+                },
+                GitManagerTag {
+                    name: "v1".to_owned(),
+                    target_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+                },
+            ]
         );
     }
 

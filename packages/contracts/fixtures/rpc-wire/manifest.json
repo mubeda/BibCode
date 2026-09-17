@@ -78,6 +78,10 @@
       "mode": "unary"
     },
     {
+      "name": "gitManager.getRemoteTags",
+      "mode": "unary"
+    },
+    {
       "name": "gitManager.getStashes",
       "mode": "unary"
     },
@@ -585,6 +589,7 @@
     "typed-failures/gitManager__getCommits-00.json",
     "typed-failures/gitManager__getDiff-00.json",
     "typed-failures/gitManager__getRefs-00.json",
+    "typed-failures/gitManager__getRemoteTags-00.json",
     "typed-failures/gitManager__getStashes-00.json",
     "typed-failures/gitManager__listPullRequests-00.json",
     "typed-failures/gitManager__previewMerge-00.json",
@@ -865,6 +870,7 @@
     "typed-failures/gitManager__getCommits-00.json": "883baf93d32f318fa6534166a36a08192dc3531c17c00af8bce261b1918945a5",
     "typed-failures/gitManager__getDiff-00.json": "883baf93d32f318fa6534166a36a08192dc3531c17c00af8bce261b1918945a5",
     "typed-failures/gitManager__getRefs-00.json": "883baf93d32f318fa6534166a36a08192dc3531c17c00af8bce261b1918945a5",
+    "typed-failures/gitManager__getRemoteTags-00.json": "883baf93d32f318fa6534166a36a08192dc3531c17c00af8bce261b1918945a5",
     "typed-failures/gitManager__getStashes-00.json": "883baf93d32f318fa6534166a36a08192dc3531c17c00af8bce261b1918945a5",
     "typed-failures/gitManager__listPullRequests-00.json": "883baf93d32f318fa6534166a36a08192dc3531c17c00af8bce261b1918945a5",
     "typed-failures/gitManager__previewMerge-00.json": "883baf93d32f318fa6534166a36a08192dc3531c17c00af8bce261b1918945a5",
@@ -1282,6 +1288,7 @@
     "typed-failures/gitManager__getCommits-00.json",
     "typed-failures/gitManager__getDiff-00.json",
     "typed-failures/gitManager__getRefs-00.json",
+    "typed-failures/gitManager__getRemoteTags-00.json",
     "typed-failures/gitManager__getStashes-00.json",
     "typed-failures/gitManager__listPullRequests-00.json",
     "typed-failures/gitManager__previewMerge-00.json",

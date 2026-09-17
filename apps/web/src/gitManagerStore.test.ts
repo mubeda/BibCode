@@ -94,6 +94,9 @@ describe("gitManagerStore", () => {
     const store = useGitManagerStore.getState();
     store.setSelectedStash(project, "stable-stash-sha");
     store.setStashPaneOpen(project, true);
+    store.setTagSectionCollapsed(project, "remote:origin", true);
+    store.setTagSectionCollapsed(project, "local", true);
+    store.setTagSectionCollapsed(project, "local", false);
 
     const serialized = persisted.get(GIT_MANAGER_STORAGE_KEY);
     const parsed = JSON.parse(serialized!) as {
@@ -112,6 +115,7 @@ describe("gitManagerStore", () => {
     expect(useGitManagerStore.getState().selectViewState(project)).toMatchObject({
       selectedStashSha: "stable-stash-sha",
       stashPaneOpen: true,
+      collapsedTagSections: ["remote:origin"],
       selectedWorktreeCwd: null,
     });
   });

@@ -335,6 +335,7 @@ mod telemetry {
                     Some("topic"),
                     set_upstream,
                     force_with_lease,
+                    false,
                     &cancellation,
                 )
                 .await
