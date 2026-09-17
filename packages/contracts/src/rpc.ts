@@ -30,6 +30,13 @@ import {
 } from "./filesystem.ts";
 import { AssetAccessError, AssetCreateUrlInput, AssetCreateUrlResult } from "./assets.ts";
 import {
+  ProjectCreateDownloadUrlInput,
+  ProjectCreateDownloadUrlResult,
+  ProjectCreateUploadUrlInput,
+  ProjectCreateUploadUrlResult,
+  ProjectTransferError,
+} from "./transfer.ts";
+import {
   GitActionProgressEvent,
   VcsSwitchRefInput,
   VcsSwitchRefResult,
@@ -79,6 +86,8 @@ import {
   GitManagerPreviewMergeInput,
   GitManagerPullRequestsResult,
   GitManagerRefsSnapshot,
+  GitManagerRemoteTags,
+  GitManagerRemoteTagsInput,
   GitManagerSignalEvent,
   GitManagerStashEntry,
   GitManagerUndoCommitResult,
@@ -360,6 +369,8 @@ export const WS_METHODS = {
   // Filesystem methods
   filesystemBrowse: "filesystem.browse",
   assetsCreateUrl: "assets.createUrl",
+  projectsCreateDownloadUrl: "projects.createDownloadUrl",
+  projectsCreateUploadUrl: "projects.createUploadUrl",
 
   // VCS methods
   vcsPull: "vcs.pull",
@@ -389,6 +400,7 @@ export const WS_METHODS = {
   gitManagerGetCommits: "gitManager.getCommits",
   gitManagerGetDiff: "gitManager.getDiff",
   gitManagerGetStashes: "gitManager.getStashes",
+  gitManagerGetRemoteTags: "gitManager.getRemoteTags",
   gitManagerPreviewMerge: "gitManager.previewMerge",
   gitManagerListPullRequests: "gitManager.listPullRequests",
   gitManagerCommit: "gitManager.commit",
@@ -793,6 +805,28 @@ export const WsAssetsCreateUrlRpc = Rpc.make(WS_METHODS.assetsCreateUrl, {
   ]),
 });
 
+export const WsProjectsCreateDownloadUrlRpc = Rpc.make(WS_METHODS.projectsCreateDownloadUrl, {
+  payload: ProjectCreateDownloadUrlInput,
+  success: ProjectCreateDownloadUrlResult,
+  error: Schema.Union([
+    ProjectTransferError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentRpcError,
+  ]),
+});
+
+export const WsProjectsCreateUploadUrlRpc = Rpc.make(WS_METHODS.projectsCreateUploadUrl, {
+  payload: ProjectCreateUploadUrlInput,
+  success: ProjectCreateUploadUrlResult,
+  error: Schema.Union([
+    ProjectTransferError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentRpcError,
+  ]),
+});
+
 export const WsSubscribeVcsStatusRpc = Rpc.make(WS_METHODS.subscribeVcsStatus, {
   payload: VcsStatusInput,
   success: VcsStatusStreamEvent,
@@ -1079,6 +1113,12 @@ export const WsGitManagerGetDiffRpc = Rpc.make(WS_METHODS.gitManagerGetDiff, {
 export const WsGitManagerGetStashesRpc = Rpc.make(WS_METHODS.gitManagerGetStashes, {
   payload: GitManagerCwdInput,
   success: Schema.Array(GitManagerStashEntry),
+  error: GitManagerOperationError,
+});
+
+export const WsGitManagerGetRemoteTagsRpc = Rpc.make(WS_METHODS.gitManagerGetRemoteTags, {
+  payload: GitManagerRemoteTagsInput,
+  success: GitManagerRemoteTags,
   error: GitManagerOperationError,
 });
 
@@ -1491,6 +1531,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsShellOpenInEditorRpc,
   WsFilesystemBrowseRpc,
   WsAssetsCreateUrlRpc,
+  WsProjectsCreateDownloadUrlRpc,
+  WsProjectsCreateUploadUrlRpc,
   WsSubscribeVcsStatusRpc,
   WsSubscribeVcsStatusSummaryRpc,
   WsVcsPullRpc,
@@ -1522,6 +1564,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsGitManagerGetCommitsRpc,
   WsGitManagerGetDiffRpc,
   WsGitManagerGetStashesRpc,
+  WsGitManagerGetRemoteTagsRpc,
   WsGitManagerPreviewMergeRpc,
   WsGitManagerListPullRequestsRpc,
   WsGitManagerCommitRpc,

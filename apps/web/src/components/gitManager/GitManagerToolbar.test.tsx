@@ -34,6 +34,15 @@ vi.mock("../../state/entities", () => ({
   useProject: () => ({ id: "project-current", title: "pathfinder-docker" }),
 }));
 
+vi.mock("../../state/environments", () => ({
+  useEnvironment: () => ({
+    environmentId: "env-a",
+    label: "ai-server",
+    displayUrl: "http://ai-server:3773",
+  }),
+  usePrimaryEnvironmentId: () => "env-primary",
+}));
+
 vi.mock("../../state/query", () => ({
   useEnvironmentQuery: (atom: { kind: string } | null) => ({
     data: atom?.kind === "refs" ? h.snapshot : null,
@@ -186,6 +195,9 @@ describe("GitManagerToolbar", () => {
     expect(markup).toContain('data-testid="git-manager-project"');
     expect(markup).toContain("pathfinder-docker");
     expect(markup).toContain('title="/opaque/main"');
+    expect(markup).toContain('data-testid="git-manager-environment"');
+    expect(markup).toContain("ai-server");
+    expect(markup).toContain('title="http://ai-server:3773"');
   });
 
   it("persists an explicit worktree selection through its callback", () => {

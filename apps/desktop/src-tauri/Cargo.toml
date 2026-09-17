@@ -1,6 +1,6 @@
 [package]
 name = "bibcode-desktop"
-version = "0.5.11"
+version = "0.5.12"
 description = "BiBCode Tauri desktop shell"
 authors = ["BiBCode"]
 edition.workspace = true
@@ -19,6 +19,7 @@ tauri-build.workspace = true
 
 [dependencies]
 base64.workspace = true
+futures-util.workspace = true
 if-addrs.workspace = true
 libc.workspace = true
 portpicker.workspace = true
@@ -41,6 +42,7 @@ tauri-plugin-wdio-webdriver = { workspace = true, optional = true }
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 url.workspace = true
 uuid.workspace = true

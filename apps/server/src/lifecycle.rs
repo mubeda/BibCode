@@ -471,6 +471,8 @@ fn core_http_routes(
         Box::pin(async move { runtime.diagnostic_logs(frontend_log).await })
             as crate::production::http_routes::BoxFuture<_>
     });
+    let transfer_download = runtime.transfer_download_handler();
+    let transfer_upload = runtime.transfer_upload_handler();
     let asset_runtime = runtime;
     let assets = Arc::new(move |token, path, _context| {
         let runtime = asset_runtime.clone();
@@ -482,7 +484,15 @@ fn core_http_routes(
         Box::pin(async move { connect.mcp_http(method, body, context).await })
             as crate::production::http_routes::BoxFuture<_>
     });
-    HttpRoutesState::new(authorize, json, diagnostic_logs, assets, mcp)
+    HttpRoutesState::new(
+        authorize,
+        json,
+        diagnostic_logs,
+        assets,
+        mcp,
+        transfer_download,
+        transfer_upload,
+    )
 }
 
 fn default_ui_process_observer(mode: ServerMode) -> Arc<dyn DesktopUiProcessObserver> {
@@ -544,7 +554,33 @@ fn fallback_http_routes(auth: AuthService) -> HttpRoutesState {
             ))
         }) as crate::production::http_routes::BoxFuture<_>
     });
-    HttpRoutesState::new(authorize, json, diagnostic_logs, assets, mcp)
+    let transfer_download = Arc::new(move |_token, _context| {
+        Box::pin(async move { Err(transfer_unavailable()) })
+            as crate::production::http_routes::BoxFuture<_>
+    });
+    let transfer_upload = Arc::new(move |_token, _name, _overwrite, _body, _context| {
+        Box::pin(async move { Err(transfer_unavailable()) })
+            as crate::production::http_routes::BoxFuture<_>
+    });
+    HttpRoutesState::new(
+        authorize,
+        json,
+        diagnostic_logs,
+        assets,
+        mcp,
+        transfer_download,
+        transfer_upload,
+    )
+}
+
+fn transfer_unavailable() -> HttpRouteError {
+    HttpRouteError::new(
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        serde_json::json!({
+            "_tag": "NativeRuntimeUnavailableError",
+            "message": "The native production runtime is unavailable."
+        }),
+    )
 }
 
 impl ServerHandle {

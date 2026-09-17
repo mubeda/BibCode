@@ -290,3 +290,29 @@ describe("threadSelectionStore", () => {
     });
   });
 });
+
+describe("selectProject", () => {
+  it("selects a project header, replaces thread selection, and remembers the route", () => {
+    const store = useThreadSelectionStore.getState();
+    store.clearSelection();
+    store.toggleThread("thread-a");
+    store.selectProject("project-a", "thread-route");
+    expect(useThreadSelectionStore.getState().selectedProjectKey).toBe("project-a");
+    expect(useThreadSelectionStore.getState().selectedProjectRouteThreadKey).toBe("thread-route");
+    expect(useThreadSelectionStore.getState().selectedThreadKeys.size).toBe(0);
+  });
+
+  it("hands the selection back to thread rows when a thread is selected or cleared", () => {
+    const store = useThreadSelectionStore.getState();
+    store.selectProject("project-a", null);
+    store.toggleThread("thread-a");
+    expect(useThreadSelectionStore.getState().selectedProjectKey).toBeNull();
+    store.selectProject("project-a", null);
+    store.clearSelection();
+    expect(useThreadSelectionStore.getState().selectedProjectKey).toBeNull();
+    store.selectProject("project-b", null);
+    store.clearProjectSelection();
+    expect(useThreadSelectionStore.getState().selectedProjectKey).toBeNull();
+    expect(useThreadSelectionStore.getState().selectedThreadKeys.size).toBe(0);
+  });
+});

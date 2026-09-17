@@ -102,6 +102,7 @@ async fn production_runtime_registers_every_git_manager_method() {
             ("gitManager.getCommits", MethodMode::Unary),
             ("gitManager.getDiff", MethodMode::Unary),
             ("gitManager.getRefs", MethodMode::Unary),
+            ("gitManager.getRemoteTags", MethodMode::Unary),
             ("gitManager.getStashes", MethodMode::Unary),
             ("gitManager.listPullRequests", MethodMode::Unary),
             ("gitManager.previewMerge", MethodMode::Unary),

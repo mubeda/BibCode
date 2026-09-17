@@ -207,6 +207,8 @@ const GitManagerBranchPushBase = {
   remote: TrimmedNonEmptyStringSchema,
   localBranch: TrimmedNonEmptyStringSchema,
   remoteBranch: Schema.NullOr(TrimmedNonEmptyStringSchema),
+  /** Push every local tag with the branch (`--tags --atomic`). Older clients omit it. */
+  pushTags: Schema.optional(Schema.Boolean),
 };
 const GitManagerStashSelectionBase = {
   ...GitManagerOperationBase.fields,
@@ -310,6 +312,8 @@ export const GitManagerOperationRequest = Schema.Union([
     ...GitManagerOperationBase.fields,
     name: TrimmedNonEmptyStringSchema,
     sha: TrimmedNonEmptyStringSchema,
+    /** Push the new tag to this remote right after creating it. */
+    pushRemote: Schema.optional(Schema.NullOr(TrimmedNonEmptyStringSchema)),
   }),
   Schema.TaggedStruct("tag-delete", {
     ...GitManagerOperationBase.fields,
@@ -369,6 +373,30 @@ export const GitManagerGetDiffInput = Schema.Struct({
   source: GitManagerDiffSource,
 });
 export type GitManagerGetDiffInput = typeof GitManagerGetDiffInput.Type;
+
+export const GitManagerRemoteTagsInput = Schema.Struct({
+  cwd: TrimmedNonEmptyStringSchema,
+  remote: TrimmedNonEmptyStringSchema,
+});
+export type GitManagerRemoteTagsInput = typeof GitManagerRemoteTagsInput.Type;
+
+export const GitManagerRemoteTag = Schema.Struct({
+  name: TrimmedNonEmptyStringSchema,
+  targetSha: TrimmedNonEmptyStringSchema,
+});
+export type GitManagerRemoteTag = typeof GitManagerRemoteTag.Type;
+
+/**
+ * The tags one remote advertises. An unreachable or rejecting remote is an
+ * `unavailable` result with a reason, not an RPC failure.
+ */
+export const GitManagerRemoteTags = Schema.Struct({
+  remote: TrimmedNonEmptyStringSchema,
+  status: Schema.Literals(["available", "unavailable"]),
+  reason: Schema.NullOr(Schema.String),
+  tags: Schema.Array(GitManagerRemoteTag),
+});
+export type GitManagerRemoteTags = typeof GitManagerRemoteTags.Type;
 
 export const GitManagerPreviewMergeInput = Schema.Struct({
   cwd: TrimmedNonEmptyStringSchema,

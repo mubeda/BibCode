@@ -29,6 +29,21 @@ vi.mock("../toolbar/GitManagerOperationBanner", () => ({
     operation === null ? null : <div data-operation-event={operation._tag} />,
 }));
 
+vi.mock("~/components/ui/checkbox", () => ({
+  Checkbox: (props: Record<string, unknown>) => (
+    <input
+      aria-label={props["aria-label"] as string | undefined}
+      checked={props.checked as boolean}
+      type="checkbox"
+      onChange={(event) =>
+        (props.onCheckedChange as ((checked: boolean) => void) | undefined)?.(
+          event.currentTarget.checked,
+        )
+      }
+    />
+  ),
+}));
+
 import { GitManagerTagDialog } from "./GitManagerTagDialog";
 
 let container: HTMLDivElement;
@@ -98,8 +113,34 @@ describe("GitManagerTagDialog", () => {
         projectId: "project-a",
         name: "release/v1",
         sha: "0123456789abcdef0123456789abcdef01234567",
+        pushRemote: null,
       },
     });
+  });
+
+  it("pushes the new tag to the remote when the create checkbox is on", async () => {
+    await renderDialog({});
+    // Type the name first so the checkbox is the last state change before
+    // confirming: a confirm closure that ignores it would send null.
+    const input = container.querySelector<HTMLInputElement>('input[aria-label="Tag name"]');
+    await act(async () => {
+      setInputValue(input!, "release/v2");
+    });
+    const checkbox = container.querySelector<HTMLElement>(
+      '[aria-label="Push to origin after creating"]',
+    );
+    expect(checkbox).not.toBeNull();
+    await act(async () => checkbox!.click());
+    await act(async () => button("Create Tag").click());
+
+    expect(h.runOperation.mock.calls[0]?.[1]).toMatchObject({
+      input: { _tag: "tag-create", name: "release/v2", pushRemote: "origin" },
+    });
+  });
+
+  it("offers no push checkbox without a remote", async () => {
+    await renderDialog({ remote: null });
+    expect(container.querySelector('[aria-label^="Push to"]')).toBeNull();
   });
 
   it("disables duplicate creation immediately with an accessible reason", async () => {

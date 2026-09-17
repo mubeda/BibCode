@@ -124,6 +124,12 @@ function installTauriHarness(options?: {
         });
       case "desktop_bridge_save_diagnostic_logs":
         return Promise.resolve("C:\\Users\\test\\Downloads\\diagnostics.zip");
+      case "desktop_bridge_pick_files":
+        return Promise.resolve(["C:\\workspace\\demo\\a.txt", "C:\\workspace\\demo\\b.txt"]);
+      case "desktop_bridge_download_to_folder":
+        return Promise.resolve("C:\\Users\\test\\Downloads\\src.zip");
+      case "desktop_bridge_upload_file":
+        return Promise.resolve({ status: 201, body: "{}" });
       case "desktop_bridge_ensure_ssh_environment":
         if (options?.rejectSshProvisioning) {
           return Promise.reject(unsupportedSshError);
@@ -1050,6 +1056,53 @@ describe("tauriDesktopBridge", () => {
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_save_diagnostic_logs", {
       filename: "diagnostics.zip",
       bytes: [0x50, 0x4b],
+    });
+  });
+
+  it("picks files to upload through the Tauri host", async () => {
+    const harness = installTauriHarness();
+    const bridge = await installBridge();
+
+    await expect(bridge.pickFiles?.({ title: "Select files to upload" })).resolves.toEqual([
+      "C:\\workspace\\demo\\a.txt",
+      "C:\\workspace\\demo\\b.txt",
+    ]);
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_pick_files", {
+      options: { title: "Select files to upload" },
+    });
+  });
+
+  it("downloads a transfer URL to a folder through the Tauri host", async () => {
+    const harness = installTauriHarness();
+    const bridge = await installBridge();
+
+    await expect(
+      bridge.downloadToFolder?.({
+        url: "https://127.0.0.1:3773/api/transfers/a.b",
+        directory: "C:\\Users\\test\\Downloads",
+        fileName: "src.zip",
+      }),
+    ).resolves.toBe("C:\\Users\\test\\Downloads\\src.zip");
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_download_to_folder", {
+      url: "https://127.0.0.1:3773/api/transfers/a.b",
+      directory: "C:\\Users\\test\\Downloads",
+      fileName: "src.zip",
+    });
+  });
+
+  it("uploads a file to a transfer URL through the Tauri host", async () => {
+    const harness = installTauriHarness();
+    const bridge = await installBridge();
+
+    await expect(
+      bridge.uploadFile?.({
+        url: "https://127.0.0.1:3773/api/transfers/a.b?name=src.zip&overwrite=0",
+        path: "C:\\workspace\\demo\\src.zip",
+      }),
+    ).resolves.toEqual({ status: 201, body: "{}" });
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_upload_file", {
+      url: "https://127.0.0.1:3773/api/transfers/a.b?name=src.zip&overwrite=0",
+      path: "C:\\workspace\\demo\\src.zip",
     });
   });
 

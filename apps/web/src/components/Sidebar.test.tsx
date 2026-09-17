@@ -246,6 +246,19 @@ const h = vi.hoisted(() => {
     hasSelection: () =>
       (selectionStore.getState() as { selectedThreadKeys: Set<string> }).selectedThreadKeys.size >
       0,
+    selectedProjectKey: null as string | null,
+    selectedProjectRouteThreadKey: null as string | null,
+    selectProject: (projectKey: string, routeThreadKey: string | null) => {
+      selectionStore.setState({
+        selectedThreadKeys: new Set<string>(),
+        anchorThreadKey: null,
+        selectedProjectKey: projectKey,
+        selectedProjectRouteThreadKey: routeThreadKey,
+      });
+    },
+    clearProjectSelection: () => {
+      selectionStore.setState({ selectedProjectKey: null, selectedProjectRouteThreadKey: null });
+    },
   }));
 
   const metaStore = makeStore(() => ({
@@ -3618,6 +3631,28 @@ staticDescribe("new thread entry points", () => {
     ).toBeDefined();
     expect(mustFindProps(byAriaLabel("New worktree in Repo A"), "row worktree")).toBeDefined();
     expect(mustFindProps(byAriaLabel("Git Manager for Repo A"), "row Git Manager")).toBeDefined();
+  });
+
+  it("keeps a clicked project header selected until another thread route opens", () => {
+    baseScenario();
+    const findHeader = () =>
+      captured("SidebarMenuButton").find(
+        (entry) => typeof entry.props["onPointerDownCapture"] === "function",
+      )!;
+    render(<Sidebar />);
+    expect(findHeader().props["isActive"]).toBe(false);
+
+    invoke(findHeader().props, "onClick", mouseEvent());
+    h.state.captures = [];
+    render(<Sidebar />);
+    expect(findHeader().props["isActive"]).toBe(true);
+    expect(findHeader().props["data-selected"]).toBe(true);
+
+    h.state.captures = [];
+    h.state.routeParams = { environmentId: ENV_MAIN, threadId: "thread-idle" };
+    render(<Sidebar />);
+    expect(findHeader().props["isActive"]).toBe(false);
+    expect(findHeader().props["data-selected"]).toBe(false);
   });
 
   it("highlights the project header while its Git Manager route is open", () => {

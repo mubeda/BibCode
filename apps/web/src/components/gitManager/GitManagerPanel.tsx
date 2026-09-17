@@ -71,6 +71,7 @@ import {
   type GitManagerMultiCommitState,
 } from "./rewrite/gitManagerMultiCommitOperation.logic";
 import { GitManagerTagDialog } from "./tags/GitManagerTagDialog";
+import { GitManagerTagsView, type GitManagerTagRowAction } from "./tags/GitManagerTagsView";
 import { GitManagerOperationBanner } from "./toolbar/GitManagerOperationBanner";
 
 const EMPTY_WORKTREES: ReadonlyArray<VcsWorktreeDescriptor> = Object.freeze([]);
@@ -78,6 +79,8 @@ const EMPTY_REFS: ReadonlyArray<GitManagerRefEntry> = Object.freeze([]);
 const EMPTY_STASHES: ReadonlyArray<GitManagerStashEntry> = Object.freeze([]);
 const EMPTY_CONFLICT_PATHS: ReadonlyArray<string> = Object.freeze([]);
 const EMPTY_TAG_NAMES: ReadonlyArray<string> = Object.freeze([]);
+const EMPTY_TAGS: ReadonlyArray<GitManagerRefEntry> = Object.freeze([]);
+const EMPTY_REMOTES: ReadonlyArray<string> = Object.freeze([]);
 const STASH_MUTATION_OPERATIONS = new Set(["stash-apply", "stash-pop", "stash-drop"]);
 
 type ResumableInProgressOperation = Omit<GitManagerInProgressOperation, "kind"> & {
@@ -207,6 +210,12 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
       state.byProjectKey[storeKey]?.stashPaneOpen ?? DEFAULT_GIT_MANAGER_VIEW_STATE.stashPaneOpen,
     [storeKey],
   );
+  const selectCollapsedTagSections = useCallback(
+    (state: ReturnType<typeof useGitManagerStore.getState>) =>
+      state.byProjectKey[storeKey]?.collapsedTagSections ??
+      DEFAULT_GIT_MANAGER_VIEW_STATE.collapsedTagSections,
+    [storeKey],
+  );
   const selectSelectedFilePath = useCallback(
     (state: ReturnType<typeof useGitManagerStore.getState>) =>
       state.byProjectKey[storeKey]?.selectedFilePath ??
@@ -226,6 +235,12 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
   );
   const selectedStashSha = useGitManagerStore(selectSelectedStashSha);
   const stashPaneOpen = useGitManagerStore(selectStashPaneOpen);
+  const collapsedTagSections = useGitManagerStore(selectCollapsedTagSections);
+  const setTagSectionCollapsed = useGitManagerStore((state) => state.setTagSectionCollapsed);
+  const handleTagSectionCollapsedChange = useCallback(
+    (section: string, collapsed: boolean) => setTagSectionCollapsed(projectRef, section, collapsed),
+    [projectRef, setTagSectionCollapsed],
+  );
   const selectedFilePath = useGitManagerStore(selectSelectedFilePath);
   const providerPaneOpen = useGitManagerStore(selectProviderPaneOpen);
   const recentRef = useGitManagerStore(selectRecentRef);
@@ -289,6 +304,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
   const defaultTab = resolveGitManagerDefaultTab(
     inProgressOperation,
     statusQuery.data?.hasWorkingTreeChanges,
+    activeTab,
   );
   // A clean transition after commit, discard, or recovery moves to History. A
   // merge still owns Changes; otherwise manual tab picks remain untouched.
@@ -313,7 +329,11 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
   const [historyBranchDialog, setHistoryBranchDialog] = useState<GitManagerBranchDialog | null>(
     null,
   );
-  const [historyTagTargetSha, setHistoryTagTargetSha] = useState<string | null>(null);
+  const [tagDialog, setTagDialog] = useState<{
+    readonly action: "create" | GitManagerTagRowAction;
+    readonly tag: string | null;
+    readonly targetSha: string | null;
+  } | null>(null);
   const [resetTargetSha, setResetTargetSha] = useState<string | null>(null);
   const [historyActionMessage, setHistoryActionMessage] = useState<string | null>(null);
   const [pendingRewriteRequest, setPendingRewriteRequest] =
@@ -524,7 +544,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
             setHistoryActionMessage(tagDisabledReason);
             return;
           }
-          setHistoryTagTargetSha(action.sha);
+          setTagDialog({ action: "create", tag: null, targetSha: action.sha });
       }
     },
     [
@@ -723,8 +743,18 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
     },
     [branchSyncDisabledReason, cwd, executeOperation, projectId],
   );
+  const handleTagRowAction = useCallback(
+    (action: GitManagerTagRowAction, tag: string) => {
+      if (tagDisabledReason !== null) {
+        setHistoryActionMessage(tagDisabledReason);
+        return;
+      }
+      setTagDialog({ action, tag, targetSha: null });
+    },
+    [tagDisabledReason],
+  );
   const closeHistoryTagDialog = useCallback((open: boolean) => {
-    if (!open) setHistoryTagTargetSha(null);
+    if (!open) setTagDialog(null);
   }, []);
   const closeResetDialog = useCallback(() => setResetTargetSha(null), []);
   const confirmReset = useCallback(
@@ -967,6 +997,12 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
             >
               History
             </TabsTab>
+            <TabsTab
+              className="rounded-none border-b-2 border-transparent px-3 py-2 data-selected:border-foreground data-selected:bg-transparent data-selected:shadow-none"
+              value="tags"
+            >
+              Tags
+            </TabsTab>
           </TabsList>
         </div>
         <TabsPanel className="min-h-0 flex-1 gap-0 p-4" value="changes">
@@ -983,6 +1019,19 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
               scope={scope}
               tagDisabledReason={tagDisabledReason}
               onAction={handleHistoryAction}
+            />
+          ) : null}
+        </TabsPanel>
+        <TabsPanel className="min-h-0 flex-1 gap-0 p-4" value="tags">
+          {activeTab === "tags" ? (
+            <GitManagerTagsView
+              collapsedSections={collapsedTagSections}
+              remotes={snapshot?.remotes ?? EMPTY_REMOTES}
+              scope={historyTagScope}
+              tagDisabledReason={tagDisabledReason}
+              tags={snapshot?.tags ?? EMPTY_TAGS}
+              onSectionCollapsedChange={handleTagSectionCollapsedChange}
+              onTagAction={handleTagRowAction}
             />
           ) : null}
         </TabsPanel>
@@ -1006,15 +1055,15 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
         onSubmit={submitHistoryBranchDialog}
       />
       <GitManagerTagDialog
-        action="create"
+        action={tagDialog?.action ?? "create"}
         disabledReason={tagDisabledReason}
         existingTags={historyTagNames}
-        open={historyTagTargetSha !== null}
+        open={tagDialog !== null}
         projectRef={projectRef}
         remote={historyTagRemote}
         scope={historyTagScope}
-        tag={null}
-        targetSha={historyTagTargetSha}
+        tag={tagDialog?.tag ?? null}
+        targetSha={tagDialog?.targetSha ?? null}
         onFinished={refreshRefs}
         onOpenChange={closeHistoryTagDialog}
       />
@@ -1106,7 +1155,7 @@ export const GitManagerPanel = memo(function GitManagerPanel({ projectRef }: Git
 
   const handleTabChange = useCallback(
     (value: string | number | null) => {
-      if (value === "changes" || value === "history") {
+      if (value === "changes" || value === "history" || value === "tags") {
         setActiveTab(stableProjectRef, value as GitManagerTab);
       }
     },

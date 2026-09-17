@@ -16,7 +16,9 @@ export type FileTreeMenuItemId =
   | "open-preview"
   | "rename"
   | "delete"
-  | "refresh";
+  | "refresh"
+  | "download"
+  | "upload";
 
 export interface FileTreeMenuItem {
   id: FileTreeMenuItemId;
@@ -54,6 +56,7 @@ export function buildFileTreeMenuModel(input: BuildFileTreeMenuModelInput): File
     return {
       groups: dropEmptyGroups([
         [NEW_FILE, NEW_FOLDER],
+        [{ id: "upload", label: "Upload Files…", enabled: true }],
         [
           { id: "copy-path", label: "Copy Path", enabled: hasWorkspaceRoot },
           { id: "refresh", label: "Refresh", enabled: true },
@@ -93,12 +96,21 @@ export function buildFileTreeMenuModel(input: BuildFileTreeMenuModelInput): File
     actionGroup.push({ id: "open-preview", label: "Open in Preview", enabled: true });
   }
 
+  const transferGroup: FileTreeMenuItem[] = [
+    { id: "download", label: "Download", enabled: true },
+    isDirectory
+      ? { id: "upload", label: "Upload Files…", enabled: true }
+      : { id: "upload", label: "Upload Files… (choose a folder)", enabled: false },
+  ];
+
   const mutateGroup: FileTreeMenuItem[] = [
     { id: "rename", label: "Rename…", enabled: true },
     { id: "delete", label: "Delete", enabled: true, destructive: true },
   ];
 
-  return { groups: dropEmptyGroups([[NEW_FILE, NEW_FOLDER], actionGroup, mutateGroup]) };
+  return {
+    groups: dropEmptyGroups([[NEW_FILE, NEW_FOLDER], actionGroup, transferGroup, mutateGroup]),
+  };
 }
 
 function dropEmptyGroups(groups: FileTreeMenuItem[][]): FileTreeMenuItem[][] {

@@ -27,6 +27,7 @@ import {
   DialogPopup,
   DialogTitle,
 } from "~/components/ui/dialog";
+import { Checkbox } from "~/components/ui/checkbox";
 import { Input } from "~/components/ui/input";
 import { runGitManagerOperation, type GitManagerOperationHandle } from "~/state/gitManager";
 
@@ -75,6 +76,7 @@ export const GitManagerTagDialog = memo(function GitManagerTagDialog({
     [],
   );
 
+  const [pushAfterCreate, setPushAfterCreate] = useState(false);
   const selectedTag = action === "create" ? name : (tag ?? "");
   const validation = validateTagName(selectedTag, action === "create" ? existingTags : []);
   const missingOperand =
@@ -136,6 +138,7 @@ export const GitManagerTagDialog = memo(function GitManagerTagDialog({
         projectId: projectRef.projectId,
         name: selectedTag,
         sha: targetSha,
+        pushRemote: pushAfterCreate && remote !== null ? remote : null,
       };
     } else if (action === "delete") {
       input = {
@@ -195,6 +198,7 @@ export const GitManagerTagDialog = memo(function GitManagerTagDialog({
     onFinished,
     onOpenChange,
     projectRef.projectId,
+    pushAfterCreate,
     registry,
     remote,
     scope.cwd,
@@ -220,19 +224,33 @@ export const GitManagerTagDialog = memo(function GitManagerTagDialog({
         </DialogHeader>
         <div className="space-y-3 px-6 pb-4">
           {action === "create" ? (
-            <label className="block space-y-1">
-              <span className="text-xs font-medium">Tag name</span>
-              <Input
-                aria-describedby="git-manager-tag-name-reason"
-                aria-label="Tag name"
-                autoComplete="off"
-                name="tag-name"
-                spellCheck={false}
-                value={name}
-                onChange={changeName}
-                onKeyDown={submitName}
-              />
-            </label>
+            <>
+              <label className="block space-y-1">
+                <span className="text-xs font-medium">Tag name</span>
+                <Input
+                  aria-describedby="git-manager-tag-name-reason"
+                  aria-label="Tag name"
+                  autoComplete="off"
+                  name="tag-name"
+                  spellCheck={false}
+                  value={name}
+                  onChange={changeName}
+                  onKeyDown={submitName}
+                />
+              </label>
+              {remote === null ? null : (
+                <label className="flex items-center gap-2 text-xs">
+                  <Checkbox
+                    aria-label={`Push to ${remote} after creating`}
+                    checked={pushAfterCreate}
+                    onCheckedChange={(checked) => setPushAfterCreate(checked === true)}
+                  />
+                  <span>
+                    Push to <span className="font-mono">{remote}</span> after creating
+                  </span>
+                </label>
+              )}
+            </>
           ) : (
             <p className="flex items-center gap-2 rounded-md border border-border px-3 py-2 font-mono text-xs">
               <TagIcon aria-hidden="true" className="size-3.5" />

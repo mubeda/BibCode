@@ -11,6 +11,17 @@ export interface ThreadSelectionState {
   selectedThreadKeys: ReadonlySet<string>;
   /** The scoped thread key that anchors shift-click range selection. */
   anchorThreadKey: string | null;
+  /**
+   * The sidebar project whose header is the selected node, if any. Thread
+   * selection and project selection are mutually exclusive.
+   */
+  selectedProjectKey: string | null;
+  /**
+   * The route thread key that was active when the project was selected. The
+   * selection is only shown while that route is unchanged, so opening another
+   * thread hands the selection back to the thread rows.
+   */
+  selectedProjectRouteThreadKey: string | null;
 }
 
 interface ThreadSelectionStore extends ThreadSelectionState {
@@ -30,6 +41,10 @@ interface ThreadSelectionStore extends ThreadSelectionState {
   setAnchor: (threadKey: string) => void;
   /** Check if any threads are selected. */
   hasSelection: () => boolean;
+  /** Make a project header the selected node; clears any thread selection. */
+  selectProject: (projectKey: string, routeThreadKey: string | null) => void;
+  /** Drop the project selection without touching thread selection. */
+  clearProjectSelection: () => void;
 }
 
 const EMPTY_SET = new Set<string>();
@@ -37,6 +52,8 @@ const EMPTY_SET = new Set<string>();
 export const useThreadSelectionStore = create<ThreadSelectionStore>((set, get) => ({
   selectedThreadKeys: EMPTY_SET,
   anchorThreadKey: null,
+  selectedProjectKey: null,
+  selectedProjectRouteThreadKey: null,
 
   toggleThread: (threadKey) => {
     set((state) => {
@@ -49,6 +66,8 @@ export const useThreadSelectionStore = create<ThreadSelectionStore>((set, get) =
       return {
         selectedThreadKeys: next,
         anchorThreadKey: next.has(threadKey) ? threadKey : state.anchorThreadKey,
+        selectedProjectKey: null,
+        selectedProjectRouteThreadKey: null,
       };
     });
   },
@@ -60,7 +79,12 @@ export const useThreadSelectionStore = create<ThreadSelectionStore>((set, get) =
         // No anchor yet — treat as a single toggle
         const next = new Set(state.selectedThreadKeys);
         next.add(threadKey);
-        return { selectedThreadKeys: next, anchorThreadKey: threadKey };
+        return {
+          selectedThreadKeys: next,
+          anchorThreadKey: threadKey,
+          selectedProjectKey: null,
+          selectedProjectRouteThreadKey: null,
+        };
       }
 
       const anchorIndex = orderedThreadKeys.indexOf(anchor);
@@ -69,7 +93,12 @@ export const useThreadSelectionStore = create<ThreadSelectionStore>((set, get) =
         // Anchor or target not in this list (different project?) — fallback to toggle
         const next = new Set(state.selectedThreadKeys);
         next.add(threadKey);
-        return { selectedThreadKeys: next, anchorThreadKey: threadKey };
+        return {
+          selectedThreadKeys: next,
+          anchorThreadKey: threadKey,
+          selectedProjectKey: null,
+          selectedProjectRouteThreadKey: null,
+        };
       }
 
       const start = Math.min(anchorIndex, targetIndex);
@@ -82,14 +111,44 @@ export const useThreadSelectionStore = create<ThreadSelectionStore>((set, get) =
         }
       }
       // Keep anchor stable so subsequent shift-clicks extend from the same point
-      return { selectedThreadKeys: next, anchorThreadKey: anchor };
+      return {
+        selectedThreadKeys: next,
+        anchorThreadKey: anchor,
+        selectedProjectKey: null,
+        selectedProjectRouteThreadKey: null,
+      };
     });
   },
 
   clearSelection: () => {
     const state = get();
-    if (state.selectedThreadKeys.size === 0 && state.anchorThreadKey === null) return;
-    set({ selectedThreadKeys: EMPTY_SET, anchorThreadKey: null });
+    if (
+      state.selectedThreadKeys.size === 0 &&
+      state.anchorThreadKey === null &&
+      state.selectedProjectKey === null
+    ) {
+      return;
+    }
+    set({
+      selectedThreadKeys: EMPTY_SET,
+      anchorThreadKey: null,
+      selectedProjectKey: null,
+      selectedProjectRouteThreadKey: null,
+    });
+  },
+
+  selectProject: (projectKey, routeThreadKey) => {
+    set({
+      selectedThreadKeys: EMPTY_SET,
+      anchorThreadKey: null,
+      selectedProjectKey: projectKey,
+      selectedProjectRouteThreadKey: routeThreadKey,
+    });
+  },
+
+  clearProjectSelection: () => {
+    if (get().selectedProjectKey === null) return;
+    set({ selectedProjectKey: null, selectedProjectRouteThreadKey: null });
   },
 
   setAnchor: (threadKey) => {
