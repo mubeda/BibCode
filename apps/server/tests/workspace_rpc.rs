@@ -2265,6 +2265,8 @@ fn owned_rpc_inventory_matches_task_six_contract_methods() {
             "projects.renameEntry",
             "projects.deleteEntry",
             "projects.duplicateEntry",
+            "projects.createDownloadUrl",
+            "projects.createUploadUrl",
             "filesystem.browse",
             "assets.createUrl",
             "review.getDiffPreview",
