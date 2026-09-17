@@ -1976,6 +1976,37 @@ describe("download entry", () => {
     expect(testState.toastAdd).not.toHaveBeenCalled();
   });
 
+  it("refuses a minted URL that points away from this environment's server", async () => {
+    // The desktop host streams this URL with host privileges, so a foreign origin must never
+    // reach it — the download is refused before the bridge is asked to do anything.
+    testState.commandResults["createDownloadUrl"] = {
+      _tag: "Success",
+      value: {
+        relativeUrl: "https://evil.example/api/transfers/t.k",
+        expiresAt: 1,
+        fileName: "src.zip",
+        kind: "archive",
+      },
+    };
+    const downloadToFolder = vi.fn();
+    const pickFolder = vi.fn();
+    stubDesktopBridge({ pickFolder, downloadToFolder });
+    renderPanel();
+
+    rowActionsFor("src", "directory").onDownload();
+    await flushPromises();
+
+    expect(downloadToFolder).not.toHaveBeenCalled();
+    expect(pickFolder).not.toHaveBeenCalled();
+    expect(testState.toastAdd).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "error",
+        title: 'Can’t download "src"',
+        description: "The server did not return a usable download URL.",
+      }),
+    );
+  });
+
   it("reports a desktop transfer that fails", async () => {
     stubDesktopBridge({
       pickFolder: vi.fn(async () => "/home/me/Downloads"),
@@ -2180,6 +2211,36 @@ describe("upload files", () => {
         type: "error",
         title: 'Can’t upload "big.bin"',
         description: "The file is larger than the 1 GiB the server accepts.",
+      }),
+    );
+  });
+
+  it("refuses a minted upload URL that points away from this environment's server", async () => {
+    testState.commandResults["createUploadUrl"] = {
+      _tag: "Success",
+      value: {
+        relativeUrl: "https://evil.example/api/transfers/u.k",
+        expiresAt: 1,
+        maxBytes: 1024,
+      },
+    };
+    const uploadFile = vi.fn();
+    stubDesktopBridge({
+      pickFolder: vi.fn(async () => null),
+      pickFiles: vi.fn(async () => ["/home/me/a.txt"]),
+      uploadFile,
+    });
+    renderPanel();
+
+    rowActionsFor("src", "directory").onUpload();
+    await flushPromises();
+
+    expect(uploadFile).not.toHaveBeenCalled();
+    expect(testState.toastAdd).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "error",
+        title: 'Can’t upload "a.txt"',
+        description: "The server did not return a usable upload URL.",
       }),
     );
   });

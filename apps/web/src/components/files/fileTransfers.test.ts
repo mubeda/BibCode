@@ -4,6 +4,7 @@ import {
   describeByteLimit,
   downloadWithBridge,
   interpretUploadResponse,
+  resolveTransferUrl,
   sendBrowserUpload,
   triggerBrowserDownload,
   uploadUrlFor,
@@ -59,13 +60,14 @@ describe("upload helpers", () => {
   // `URLSearchParams` writes a space as "+", which the server's `url::form_urlencoded::parse`
   // decodes back to a space (see production/http_routes.rs transfer_upload).
   it("builds the upload URL with an encoded name and overwrite flag", () => {
-    expect(uploadUrlFor("/api/transfers/t.k", "https://h:3773/", "a b.txt", false)).toBe(
+    const base = "https://h:3773/api/transfers/t.k";
+    expect(uploadUrlFor(base, "a b.txt", false)).toBe(
       "https://h:3773/api/transfers/t.k?name=a+b.txt",
     );
-    expect(uploadUrlFor("/api/transfers/t.k", "https://h:3773/", "a&b#c.txt", false)).toBe(
+    expect(uploadUrlFor(base, "a&b#c.txt", false)).toBe(
       "https://h:3773/api/transfers/t.k?name=a%26b%23c.txt",
     );
-    expect(uploadUrlFor("/api/transfers/t.k", "https://h:3773/", "a.txt", true)).toBe(
+    expect(uploadUrlFor(base, "a.txt", true)).toBe(
       "https://h:3773/api/transfers/t.k?name=a.txt&overwrite=1",
     );
   });
@@ -82,13 +84,24 @@ describe("upload helpers", () => {
       _tag: "TooLarge",
       limit: 4,
     });
-    expect(interpretUploadResponse(500, "boom")._tag).toBe("Failed");
+    expect(interpretUploadResponse(500, '{"_tag":"X","message":"Disk is full."}')).toEqual({
+      _tag: "Failed",
+      message: "Disk is full.",
+    });
   });
 
-  it("explains a failure the server did not describe", () => {
-    expect(interpretUploadResponse(502, "   ")).toEqual({
+  it("never puts a raw response body in front of the reader", () => {
+    // A proxy's HTML page, a bare string, a JSON blob with no message: none of these say
+    // anything a person can act on, so the status is all we claim.
+    for (const body of ["boom", "<html><body>502 Bad Gateway</body></html>", "{}", "   "]) {
+      expect(interpretUploadResponse(502, body)).toEqual({
+        _tag: "Failed",
+        message: "Upload failed with HTTP 502.",
+      });
+    }
+    expect(interpretUploadResponse(500, '{"message":42}')).toEqual({
       _tag: "Failed",
-      message: "Upload failed with HTTP 502.",
+      message: "Upload failed with HTTP 500.",
     });
   });
 
@@ -130,5 +143,37 @@ describe("upload helpers", () => {
       credentials: "omit",
     });
     expect(response).toEqual({ status: 201, body: '{"relativePath":"a.txt"}' });
+  });
+});
+
+describe("resolveTransferUrl", () => {
+  const base = "http://127.0.0.1:4100/";
+
+  it("resolves a relative transfer path against the environment's own server", () => {
+    expect(resolveTransferUrl(base, "/api/transfers/t.k")).toBe(
+      "http://127.0.0.1:4100/api/transfers/t.k",
+    );
+    expect(resolveTransferUrl(base, "/api/transfers/t.k?name=a.txt")).toBe(
+      "http://127.0.0.1:4100/api/transfers/t.k?name=a.txt",
+    );
+  });
+
+  it("refuses a URL that leaves this environment's origin", () => {
+    // The desktop host fetches this URL with host privileges; a hostile or compromised server
+    // must not be able to point that fetch at anything but its own transfer routes.
+    expect(resolveTransferUrl(base, "https://evil.example/api/transfers/t.k")).toBeNull();
+    expect(resolveTransferUrl(base, "//evil.example/api/transfers/t.k")).toBeNull();
+    expect(resolveTransferUrl(base, "http://127.0.0.1:9999/api/transfers/t.k")).toBeNull();
+  });
+
+  it("refuses a path outside the transfer namespace", () => {
+    expect(resolveTransferUrl(base, "/api/assets/t.k")).toBeNull();
+    expect(resolveTransferUrl(base, "/api/transfers/../assets/t.k")).toBeNull();
+    expect(resolveTransferUrl(base, "/api/transfersX/t.k")).toBeNull();
+    expect(resolveTransferUrl(base, "")).toBeNull();
+  });
+
+  it("refuses an unusable base or URL instead of throwing", () => {
+    expect(resolveTransferUrl("not a url", "/api/transfers/t.k")).toBeNull();
   });
 });

@@ -69,18 +69,38 @@ export type UploadStep =
   | { _tag: "TooLarge"; limit: number }
   | { _tag: "Failed"; message: string };
 
+const TRANSFER_PATH_PREFIX = "/api/transfers/";
+
 /**
- * Absolute `POST` URL for one upload. `URL.searchParams` applies form encoding to the name (a space
- * becomes `+`, `&` becomes `%26`); the server decodes the query with `url::form_urlencoded::parse`,
- * which reverses exactly that.
+ * Resolves a minted transfer URL against this environment's own server, or `null` if it does not
+ * land there.
+ *
+ * The minted `relativeUrl` is data from the server, and a download or upload URL is handed
+ * straight to the desktop host's `fetch` (which carries host privileges, not the WebView's) or to
+ * the browser's downloader. An absolute URL, a protocol-relative `//host/...`, or a path that
+ * traverses out of the transfer namespace would point that transfer somewhere else entirely, so the
+ * resolved URL must share the environment's origin and stay under `/api/transfers/` — the same
+ * shape `previewUrlPresentation` requires of an asset URL.
  */
-export function uploadUrlFor(
-  relativeUrl: string,
-  httpBaseUrl: string,
-  name: string,
-  overwrite: boolean,
-): string {
-  const url = new URL(relativeUrl, httpBaseUrl);
+export function resolveTransferUrl(httpBaseUrl: string, relativeUrl: string): string | null {
+  try {
+    const url = new URL(relativeUrl, httpBaseUrl);
+    const environmentUrl = new URL(httpBaseUrl);
+    if (url.origin !== environmentUrl.origin) return null;
+    if (!url.pathname.startsWith(TRANSFER_PATH_PREFIX)) return null;
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Adds one upload's query to an already-resolved transfer URL. `URL.searchParams` applies form
+ * encoding to the name (a space becomes `+`, `&` becomes `%26`); the server decodes the query with
+ * `url::form_urlencoded::parse`, which reverses exactly that.
+ */
+export function uploadUrlFor(transferUrl: string, name: string, overwrite: boolean): string {
+  const url = new URL(transferUrl);
   url.searchParams.set("name", name);
   if (overwrite) url.searchParams.set("overwrite", "1");
   return url.toString();
@@ -117,9 +137,15 @@ export function describeByteLimit(bytes: number): string {
   return `${bytes} bytes`;
 }
 
-/** Translate one upload response into the next step of the flow. */
+/**
+ * Translate one upload response into the next step of the flow.
+ *
+ * An unexpected status shows the server's own `message` when the body is the JSON error shape the
+ * routes emit, and otherwise a plain sentence naming the status. The raw body is never shown: a
+ * proxy's HTML error page or a JSON blob in a toast tells the reader nothing they can act on.
+ */
 export function interpretUploadResponse(status: number, body: string): UploadStep {
-  let parsed: { _tag?: string; relativePath?: string; limit?: number } = {};
+  let parsed: { _tag?: string; relativePath?: string; limit?: number; message?: string } = {};
   try {
     parsed = JSON.parse(body) as typeof parsed;
   } catch {
@@ -132,8 +158,9 @@ export function interpretUploadResponse(status: number, body: string): UploadSte
   if (status === 413) {
     return { _tag: "TooLarge", limit: typeof parsed.limit === "number" ? parsed.limit : 0 };
   }
+  const message = typeof parsed.message === "string" ? parsed.message.trim() : "";
   return {
     _tag: "Failed",
-    message: body.trim().length > 0 ? body.trim() : `Upload failed with HTTP ${status}.`,
+    message: message.length > 0 ? message : `Upload failed with HTTP ${status}.`,
   };
 }
