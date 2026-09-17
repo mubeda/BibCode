@@ -35,6 +35,7 @@ pub mod source_control;
 mod static_assets;
 pub mod terminal;
 pub mod text_generation;
+pub mod transfer;
 pub mod vcs;
 pub mod workspace;
 pub mod worktree_catalog;
