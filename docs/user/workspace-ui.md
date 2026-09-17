@@ -461,7 +461,8 @@ The Files surface is a full file manager for the active workspace:
   folder, into a folder you choose (the desktop app asks for the folder; a
   browser uses its own download location). The zip includes ignored files such
   as `.git` and `node_modules`; symbolic links are skipped. Folders larger than
-  2 GiB or 200,000 entries are refused with a message. On the desktop app a
+  2 GiB or 200,000 entries are refused with a message that names the limit,
+  before the download starts. On the desktop app a
   download never overwrites an existing file with the same name; it saves as
   `name (2).ext` instead.
 - **Upload Files…** on a folder row, or on the tree background for the

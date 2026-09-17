@@ -55,10 +55,7 @@ pub fn download_handler_with_limits(
             let metadata = tokio::fs::metadata(&canonical)
                 .await
                 .map_err(|_| not_found())?;
-            let name = canonical
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "download".to_owned());
+            let file_name = transfer::download_file_name(&canonical, metadata.is_dir());
             if metadata.is_dir() {
                 // The plan both enforces the archive limits and proves to `archive_body` that
                 // they were enforced, so an oversized folder fails before the response starts.
@@ -86,8 +83,11 @@ pub fn download_handler_with_limits(
                 };
                 Ok(TransferDownloadHttpOutcome::Stream(
                     TransferDownloadHttpResponse {
-                        file_name: format!("{name}.zip"),
+                        file_name,
                         content_type: "application/zip",
+                        // A zip is produced as it streams, so its length is unknown until the
+                        // last entry: the archive response stays chunked.
+                        content_length: None,
                         body: transfer::archive::archive_body(plan, canonical),
                     },
                 ))
@@ -95,11 +95,18 @@ pub fn download_handler_with_limits(
                 let file = tokio::fs::File::open(&canonical)
                     .await
                     .map_err(|_| not_found())?;
+                // The length comes from the opened handle, not the earlier stat, so the header
+                // describes the bytes this response will actually read.
+                let content_length = file.metadata().await.map(|metadata| metadata.len()).ok();
                 Ok(TransferDownloadHttpOutcome::Stream(
                     TransferDownloadHttpResponse {
-                        file_name: name,
+                        file_name,
                         content_type: "application/octet-stream",
-                        body: Body::from_stream(tokio_util::io::ReaderStream::new(file)),
+                        content_length,
+                        body: Body::from_stream(tokio_util::io::ReaderStream::with_capacity(
+                            file,
+                            transfer::archive::DOWNLOAD_CHUNK_BYTES,
+                        )),
                     },
                 ))
             }

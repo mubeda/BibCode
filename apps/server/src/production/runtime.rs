@@ -334,6 +334,7 @@ impl ProductionRuntime {
             WorkspaceRpcDependencies {
                 asset_access: Some(asset_access.clone()),
                 transfer_access: Some(transfer_access.clone()),
+                archive_limits: crate::transfer::archive::ArchiveLimits::default(),
                 asset_context_resolver: Some(Arc::new(ProjectionAssetContext {
                     repositories: repositories.clone(),
                 })),

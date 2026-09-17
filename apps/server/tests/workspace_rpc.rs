@@ -1194,6 +1194,7 @@ async fn workspace_rpc_surfaces_optional_dependency_and_backend_failures() {
             })),
             review_service: None,
             mutation_observer: None,
+            ..WorkspaceRpcDependencies::default()
         },
     );
     let missing_asset = asset_rpc
@@ -1219,6 +1220,7 @@ async fn workspace_rpc_surfaces_optional_dependency_and_backend_failures() {
             asset_context_resolver: None,
             review_service: Some(ReviewService::new(Arc::new(FailingReviewBackend))),
             mutation_observer: None,
+            ..WorkspaceRpcDependencies::default()
         },
     );
     let backend_failure = review_rpc
@@ -1979,6 +1981,7 @@ async fn workspace_rpc_routes_asset_urls_through_workspace_context_resolution() 
             })),
             review_service: None,
             mutation_observer: None,
+            ..WorkspaceRpcDependencies::default()
         },
     );
 
@@ -2057,6 +2060,7 @@ async fn assets_create_url_never_signs_an_untrusted_attachment_id() {
             asset_context_resolver: None,
             review_service: None,
             mutation_observer: None,
+            ..WorkspaceRpcDependencies::default()
         },
     );
 
@@ -2169,6 +2173,7 @@ async fn workspace_rpc_routes_review_requests_through_the_injected_service() {
             asset_context_resolver: None,
             review_service: Some(service),
             mutation_observer: None,
+            ..WorkspaceRpcDependencies::default()
         },
     );
     let cwd = path_string(TempDir::new().expect("cwd").path());
@@ -2475,4 +2480,91 @@ async fn transfer_urls_are_minted_for_files_folders_and_root_and_reject_escapes(
     .await
     .unwrap_err();
     assert_eq!(file_as_dir["failure"], "not_found");
+}
+
+#[tokio::test]
+async fn minting_a_folder_download_refuses_a_tree_over_the_archive_limits() {
+    let temp = TempDir::new().expect("root");
+    let root = temp.path().to_path_buf();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/app.ts"), "0123456789").unwrap();
+    let cwd = path_string(&root);
+    let rpc_with = |limits: bibcode_server::transfer::archive::ArchiveLimits| {
+        WorkspaceRpc::with_dependencies(
+            WorkspaceService::default(),
+            WorkspaceRpcDependencies {
+                transfer_access: Some(bibcode_server::transfer::TransferAccess::new(
+                    b"secret".to_vec(),
+                )),
+                archive_limits: limits,
+                ..WorkspaceRpcDependencies::default()
+            },
+        )
+    };
+
+    // The person sees why the download was refused, at mint time, in the panel's toast --
+    // rather than a bare HTTP status once the transfer is already under way.
+    let too_many_bytes = rpc_with(bibcode_server::transfer::archive::ArchiveLimits {
+        max_entries: 1_000,
+        max_bytes: 2 * 1024 * 1024 * 1024,
+    });
+    // A folder that fits still mints.
+    assert_eq!(
+        too_many_bytes
+            .handle(
+                "projects.createDownloadUrl",
+                json!({"cwd": cwd, "relativePath": "src"}),
+            )
+            .await
+            .unwrap()["kind"],
+        "archive"
+    );
+
+    let over_bytes = rpc_with(bibcode_server::transfer::archive::ArchiveLimits {
+        max_entries: 1_000,
+        max_bytes: 4,
+    })
+    .handle(
+        "projects.createDownloadUrl",
+        json!({"cwd": cwd, "relativePath": "src"}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(over_bytes["_tag"], "ProjectTransferError");
+    assert_eq!(over_bytes["failure"], "operation_failed");
+    assert_eq!(
+        over_bytes["message"],
+        "Folder exceeds the 4 bytes download limit. Download a subfolder instead."
+    );
+
+    let over_entries = rpc_with(bibcode_server::transfer::archive::ArchiveLimits {
+        max_entries: 0,
+        max_bytes: 2 * 1024 * 1024 * 1024,
+    })
+    .handle(
+        "projects.createDownloadUrl",
+        json!({"cwd": cwd, "relativePath": "src"}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(over_entries["failure"], "operation_failed");
+    assert_eq!(
+        over_entries["message"],
+        "Folder exceeds the 0-entry download limit. Download a subfolder instead."
+    );
+
+    // A single file never runs the walk, so a tiny archive budget cannot refuse it.
+    assert_eq!(
+        rpc_with(bibcode_server::transfer::archive::ArchiveLimits {
+            max_entries: 0,
+            max_bytes: 0,
+        })
+        .handle(
+            "projects.createDownloadUrl",
+            json!({"cwd": cwd, "relativePath": "src/app.ts"}),
+        )
+        .await
+        .unwrap()["kind"],
+        "file"
+    );
 }

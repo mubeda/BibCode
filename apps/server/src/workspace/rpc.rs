@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 use crate::assets::{AssetAccess, AssetError, AssetIssueRequest, AssetResource};
 use crate::git::StatusMutationGuard;
 use crate::review::{ReviewDiffPreviewInput, ReviewError, ReviewService};
-use crate::transfer::{TransferAccess, TransferError};
+use crate::transfer::archive::ArchiveLimits;
+use crate::transfer::{self, TransferAccess, TransferError};
 use crate::worktree_catalog::{
     WorkspaceAdmissionCancellation, WorkspaceAdmissionLease, WorkspaceAvailabilityRegistry,
 };
@@ -62,6 +63,9 @@ pub trait WorkspaceMutationObserver: Send + Sync {
 pub struct WorkspaceRpcDependencies {
     pub asset_access: Option<AssetAccess>,
     pub transfer_access: Option<TransferAccess>,
+    /// Budgets a folder download is planned against when its URL is minted. Production uses
+    /// the default; a test binds a tighter one rather than building an oversized workspace.
+    pub archive_limits: ArchiveLimits,
     pub asset_context_resolver: Option<Arc<dyn AssetContextResolver>>,
     pub review_service: Option<ReviewService>,
     pub mutation_observer: Option<Arc<dyn WorkspaceMutationObserver>>,
@@ -1008,15 +1012,21 @@ impl WorkspaceRpc {
                 &WorkspaceError::operation("stat", &canonical, error),
             )
         })?;
-        let name = canonical
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "download".to_owned());
-        let (kind, file_name) = if metadata.is_dir() {
-            ("archive", format!("{name}.zip"))
+        let kind = if metadata.is_dir() {
+            // Sizing the folder here is what makes an oversized download refusable: the panel
+            // shows this error, whereas the redeem-time refusal reaches the user only as a bare
+            // HTTP status. The route keeps its own pre-scan as defence in depth, because the
+            // tree can grow between the mint and the redemption.
+            self.dependencies
+                .archive_limits
+                .plan(&canonical)
+                .await
+                .map_err(|error| archive_limit_wire(&input.cwd, &input.relative_path, &error))?;
+            "archive"
         } else {
-            ("file", name)
+            "file"
         };
+        let file_name = transfer::download_file_name(&canonical, metadata.is_dir());
         let issued = access
             .issue_download(&root, &relative)
             .map_err(|error| transfer_error_wire(&input.cwd, &input.relative_path, &error))?;
@@ -1387,6 +1397,30 @@ fn transfer_failure(error: &WorkspaceError) -> &'static str {
         }
         _ => "operation_failed",
     }
+}
+
+/// A folder whose contents blow an archive budget is refused when its download URL is minted,
+/// with a message that names the limit and its unit so the person reading the toast knows why.
+fn archive_limit_wire(cwd: &str, relative_path: &str, error: &TransferError) -> Value {
+    // Names the budget that was blown and the one thing that can be done about it: UI.md asks an
+    // error to say what happened and what the reader can do next.
+    let message = match error {
+        TransferError::TooManyEntries { limit } => format!(
+            "Folder exceeds the {limit}-entry download limit. Download a subfolder instead."
+        ),
+        TransferError::TooManyBytes { limit } => format!(
+            "Folder exceeds the {} download limit. Download a subfolder instead.",
+            transfer::describe_bytes(*limit)
+        ),
+        other => return transfer_error_wire(cwd, relative_path, other),
+    };
+    json!({
+        "_tag": "ProjectTransferError",
+        "cwd": cwd,
+        "relativePath": relative_path,
+        "failure": "operation_failed",
+        "message": message,
+    })
 }
 
 fn transfer_error_wire(cwd: &str, relative_path: &str, error: &TransferError) -> Value {
