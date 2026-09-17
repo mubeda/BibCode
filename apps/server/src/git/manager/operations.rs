@@ -315,6 +315,8 @@ pub enum GitManagerOperationRequest {
         remote: String,
         local_branch: String,
         remote_branch: Option<String>,
+        #[serde(default)]
+        push_tags: bool,
     },
     PublishBranch {
         cwd: PathBuf,
@@ -322,6 +324,8 @@ pub enum GitManagerOperationRequest {
         remote: String,
         local_branch: String,
         remote_branch: Option<String>,
+        #[serde(default)]
+        push_tags: bool,
     },
     ForcePush {
         cwd: PathBuf,
@@ -329,6 +333,8 @@ pub enum GitManagerOperationRequest {
         remote: String,
         local_branch: String,
         remote_branch: Option<String>,
+        #[serde(default)]
+        push_tags: bool,
     },
     StashPush {
         cwd: PathBuf,
@@ -418,6 +424,8 @@ pub enum GitManagerOperationRequest {
         project_id: String,
         name: String,
         sha: String,
+        #[serde(default)]
+        push_remote: Option<String>,
     },
     TagDelete {
         cwd: PathBuf,
@@ -1197,6 +1205,7 @@ async fn execute_branch_or_sync_operation(
             remote,
             local_branch,
             remote_branch,
+            push_tags,
             ..
         }
         | GitManagerOperationRequest::PublishBranch {
@@ -1204,6 +1213,7 @@ async fn execute_branch_or_sync_operation(
             remote,
             local_branch,
             remote_branch,
+            push_tags,
             ..
         }
         | GitManagerOperationRequest::ForcePush {
@@ -1211,6 +1221,7 @@ async fn execute_branch_or_sync_operation(
             remote,
             local_branch,
             remote_branch,
+            push_tags,
             ..
         } => one_output(
             operation,
@@ -1222,6 +1233,7 @@ async fn execute_branch_or_sync_operation(
                     remote_branch.as_deref(),
                     matches!(request, GitManagerOperationRequest::PublishBranch { .. }),
                     matches!(request, GitManagerOperationRequest::ForcePush { .. }),
+                    *push_tags,
                     cancellation,
                 )
                 .await,
@@ -1481,11 +1493,48 @@ async fn execute_branch_or_sync_operation(
                 .map_err(|error| git_command_error(operation, error, Vec::new()))?;
             require_last_success(operation, outputs)?
         }
-        GitManagerOperationRequest::TagCreate { cwd, name, sha, .. } => {
-            let output = tags::create_tag(repository, cwd, name, sha, cancellation)
+        GitManagerOperationRequest::TagCreate {
+            cwd,
+            name,
+            sha,
+            push_remote,
+            ..
+        } => {
+            let created = tags::create_tag(repository, cwd, name, sha, cancellation)
                 .await
                 .map_err(|error| tag_operation_error(operation, error))?;
-            require_last_success(operation, vec![output])?
+            let mut outputs = require_last_success(operation, vec![created])?;
+            if let Some(remote) = push_remote {
+                // The tag exists locally from here on; a failed push must say so
+                // instead of reading as "nothing happened".
+                let failure =
+                    match tags::push_tag(repository, cwd, remote, name, cancellation).await {
+                        Ok(pushed) if pushed.exit_code == 0 => {
+                            outputs.push(pushed);
+                            None
+                        }
+                        Ok(pushed) => Some(
+                            pushed
+                                .stderr
+                                .lines()
+                                .map(str::trim)
+                                .find(|line| !line.is_empty())
+                                .unwrap_or("Git could not reach the remote.")
+                                .to_owned(),
+                        ),
+                        Err(error) => Some(error.to_string()),
+                    };
+                if let Some(detail) = failure {
+                    return Err(operation_error(
+                        operation,
+                        "tag-push-failed",
+                        &format!(
+                            "Created tag {name} locally, but pushing it to {remote} failed: {detail}"
+                        ),
+                    ));
+                }
+            }
+            outputs
         }
         GitManagerOperationRequest::TagDelete { cwd, name, .. } => {
             let output = tags::delete_tag(repository, cwd, name, cancellation)

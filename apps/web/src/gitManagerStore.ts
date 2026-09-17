@@ -9,7 +9,7 @@ export const GIT_MANAGER_STORAGE_KEY = "bibcode:git-manager-state:v1";
 const GIT_MANAGER_STORAGE_VERSION = 1;
 const GIT_MANAGER_VIEW_STATE_LIMIT = 2;
 
-export type GitManagerTab = "changes" | "history";
+export type GitManagerTab = "changes" | "history" | "tags";
 export type GitManagerOpenDropdown = "branch" | "sync" | null;
 export type GitManagerImageDiffMode = "two-up" | "swipe" | "onion" | "difference";
 
@@ -36,6 +36,8 @@ export interface GitManagerViewState {
   readonly selectedFilePath: string | null;
   readonly selectedStashSha: string | null;
   readonly stashPaneOpen: boolean;
+  /** Tags tab sections the user collapsed: `local` or `remote:<name>`. */
+  readonly collapsedTagSections: ReadonlyArray<string>;
   readonly imageDiffMode: GitManagerImageDiffMode;
   readonly providerPaneOpen: boolean;
   readonly lineSelectionByPath: Record<string, SerializedGitManagerLineSelection>;
@@ -70,6 +72,7 @@ export const DEFAULT_GIT_MANAGER_VIEW_STATE: GitManagerViewState = Object.freeze
   selectedFilePath: null,
   selectedStashSha: null,
   stashPaneOpen: false,
+  collapsedTagSections: Object.freeze([]),
   imageDiffMode: "two-up",
   providerPaneOpen: false,
   lineSelectionByPath: Object.freeze({}),
@@ -95,6 +98,11 @@ interface GitManagerStoreState {
   readonly setSelectedFile: (ref: ScopedProjectRef, path: string | null) => void;
   readonly setSelectedStash: (ref: ScopedProjectRef, sha: string | null) => void;
   readonly setStashPaneOpen: (ref: ScopedProjectRef, open: boolean) => void;
+  readonly setTagSectionCollapsed: (
+    ref: ScopedProjectRef,
+    section: string,
+    collapsed: boolean,
+  ) => void;
   readonly setImageDiffMode: (ref: ScopedProjectRef, mode: GitManagerImageDiffMode) => void;
   readonly setProviderPaneOpen: (ref: ScopedProjectRef, open: boolean) => void;
   readonly setLineSelection: (
@@ -245,6 +253,7 @@ function sanitizeViewState(value: unknown): PersistedGitManagerViewState | null 
     selectedFilePath: nullableString(candidate.selectedFilePath),
     selectedStashSha: nullableString(candidate.selectedStashSha),
     stashPaneOpen: candidate.stashPaneOpen === true,
+    collapsedTagSections: nonEmptyUniqueStringArray(candidate.collapsedTagSections),
     imageDiffMode:
       candidate.imageDiffMode === "swipe" ||
       candidate.imageDiffMode === "onion" ||
@@ -367,6 +376,16 @@ export const useGitManagerStore = create<GitManagerStoreState>()(
       setStashPaneOpen: (ref, open) =>
         set((state) =>
           updateProject(state, ref, (current) => ({ ...current, stashPaneOpen: open })),
+        ),
+      setTagSectionCollapsed: (ref, section, collapsed) =>
+        set((state) =>
+          updateProject(state, ref, (current) => {
+            const without = current.collapsedTagSections.filter((entry) => entry !== section);
+            return {
+              ...current,
+              collapsedTagSections: collapsed ? [...without, section] : without,
+            };
+          }),
         ),
       setImageDiffMode: (ref, mode) =>
         set((state) =>

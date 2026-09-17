@@ -10,7 +10,7 @@ import type {
   VcsWorktreeDescriptor,
 } from "@bibcode/contracts";
 import * as Cause from "effect/Cause";
-import { FolderGit2Icon, FolderIcon, TagIcon } from "lucide-react";
+import { CloudIcon, FolderGit2Icon, FolderIcon, MonitorIcon, TagIcon } from "lucide-react";
 import { memo, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 
 import { DEFAULT_GIT_MANAGER_VIEW_STATE, useGitManagerStore } from "../../gitManagerStore";
@@ -20,6 +20,7 @@ import {
   type GitManagerOperationHandle,
 } from "../../state/gitManager";
 import { useProject } from "../../state/entities";
+import { useEnvironment, usePrimaryEnvironmentId } from "../../state/environments";
 import { useEnvironmentQuery } from "../../state/query";
 import {
   GitManagerBranchDialogs,
@@ -29,7 +30,11 @@ import {
 import { GitManagerSwitchWithChangesDialog } from "./dialogs/GitManagerSwitchWithChangesDialog";
 import { GitManagerBranchDropdown } from "./toolbar/GitManagerBranchDropdown";
 import { GitManagerOperationBanner } from "./toolbar/GitManagerOperationBanner";
-import { GitManagerSyncButton, type SyncOperationKind } from "./toolbar/GitManagerSyncButton";
+import {
+  GitManagerSyncButton,
+  type SyncOperationKind,
+  type SyncOperationOptions,
+} from "./toolbar/GitManagerSyncButton";
 import { resolveSyncState, type SyncState } from "./toolbar/syncButton.logic";
 import { GitManagerTagDialog } from "./tags/GitManagerTagDialog";
 import {
@@ -182,6 +187,8 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
   );
   const storeKey = projectKey(stableProjectRef);
   const project = useProject(stableProjectRef);
+  const environment = useEnvironment(environmentId);
+  const environmentIsLocal = usePrimaryEnvironmentId() === environmentId;
   const worktreeOptions = useMemo<ReadonlyArray<WorktreeOption>>(() => {
     const options: WorktreeOption[] = [
       { value: mainCheckoutCwd, label: "Main Checkout", path: mainCheckoutCwd },
@@ -497,7 +504,7 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
     setTagDialog((current) => ({ ...current, open }));
   }, []);
   const runSyncOperation = useCallback(
-    (kind: SyncOperationKind) => {
+    (kind: SyncOperationKind, options: SyncOperationOptions) => {
       if (branchSyncDisabledReason !== null) {
         setOperationError(branchSyncDisabledReason);
         return;
@@ -523,6 +530,7 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
         _tag: kind,
         ...pushBase,
         remoteBranch: kind === "publish-branch" ? null : pushBase.remoteBranch,
+        pushTags: options.pushTags,
       });
     },
     [
@@ -555,14 +563,34 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
         <div className="flex min-w-0 flex-1 items-center border-r border-panel-separator px-2 py-1.5">
           {project === null ? null : (
             // The manager is a project-scoped surface with no other project cue
-            // on screen; name the project ahead of the worktree selector.
-            <span
-              className="mr-1.5 flex min-w-0 max-w-[45%] shrink items-center gap-1.5 rounded-md bg-accent/60 px-2 py-1 text-xs font-medium text-foreground"
-              data-testid="git-manager-project"
-              title={mainCheckoutCwd}
-            >
-              <FolderIcon aria-hidden="true" className="size-3.5 shrink-0 text-muted-foreground" />
-              <span className="truncate">{project.title}</span>
+            // on screen; name the project and the environment it runs on ahead
+            // of the worktree selector.
+            <span className="mr-1.5 flex min-w-0 max-w-[55%] shrink items-center gap-1">
+              <span
+                className="flex min-w-0 shrink items-center gap-1.5 rounded-md bg-accent/60 px-2 py-1 text-xs font-medium text-foreground"
+                data-testid="git-manager-project"
+                title={mainCheckoutCwd}
+              >
+                <FolderIcon
+                  aria-hidden="true"
+                  className="size-3.5 shrink-0 text-muted-foreground"
+                />
+                <span className="truncate">{project.title}</span>
+              </span>
+              {environment === null ? null : (
+                <span
+                  className="flex min-w-0 shrink items-center gap-1.5 rounded-md bg-accent/40 px-2 py-1 text-xs text-muted-foreground"
+                  data-testid="git-manager-environment"
+                  title={environment.displayUrl ?? undefined}
+                >
+                  {environmentIsLocal ? (
+                    <MonitorIcon aria-hidden="true" className="size-3.5 shrink-0" />
+                  ) : (
+                    <CloudIcon aria-hidden="true" className="size-3.5 shrink-0" />
+                  )}
+                  <span className="truncate">{environment.label}</span>
+                </span>
+              )}
             </span>
           )}
           <Select

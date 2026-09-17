@@ -73,6 +73,7 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     read_unary("gitManager.getCommits"),
     read_unary("gitManager.getDiff"),
     read_unary("gitManager.getRefs"),
+    read_unary("gitManager.getRemoteTags"),
     read_unary("gitManager.getStashes"),
     read_unary("gitManager.listPullRequests"),
     read_unary("gitManager.previewMerge"),
