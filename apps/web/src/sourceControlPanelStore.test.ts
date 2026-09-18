@@ -33,4 +33,15 @@ describe("sourceControlPanelStore", () => {
     useSourceControlPanelStore.getState().removeThread(THREAD_REF);
     expect(useSourceControlPanelStore.getState().byThreadKey).toEqual({});
   });
+
+  it("groups changes by folder by default", () => {
+    expect(useSourceControlPanelStore.getInitialState().sourceControlGroupByFolder).toBe(true);
+  });
+
+  it("switches the changes view between grouped and flat", () => {
+    useSourceControlPanelStore.getState().setSourceControlGroupByFolder(false);
+    expect(useSourceControlPanelStore.getState().sourceControlGroupByFolder).toBe(false);
+    useSourceControlPanelStore.getState().setSourceControlGroupByFolder(true);
+    expect(useSourceControlPanelStore.getState().sourceControlGroupByFolder).toBe(true);
+  });
 });

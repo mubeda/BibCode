@@ -3,8 +3,11 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 const harness = vi.hoisted(() => ({
+  stateCursor: 0,
   menuState: null as { file: Record<string, unknown>; x: number; y: number } | null,
   setMenu: vi.fn(),
+  collapsedDirectories: new Set<string>() as ReadonlySet<string>,
+  setCollapsedDirectories: vi.fn(),
   rowActions: [] as Array<Record<string, unknown>>,
   contextGroups: [] as Array<Array<Record<string, unknown>>>,
   buttons: [] as Array<Record<string, unknown>>,
@@ -17,7 +20,17 @@ const harness = vi.hoisted(() => ({
 
 vi.mock("react", async (importOriginal) => ({
   ...(await importOriginal<typeof import("react")>()),
-  useState: () => [harness.menuState, harness.setMenu],
+  // The list keeps two state slots, in this order: the row context menu, then
+  // the collapsed folder labels. `renderList` rewinds the cursor per render.
+  useState: () => {
+    const slot = harness.stateCursor;
+    harness.stateCursor += 1;
+    return slot === 0
+      ? [harness.menuState, harness.setMenu]
+      : [harness.collapsedDirectories, harness.setCollapsedDirectories];
+  },
+  useMemo: (factory: () => unknown) => factory(),
+  useId: () => "list-id-",
 }));
 vi.mock("./SourceControlRowActions.logic", () => ({
   buildRowContextMenu: () => ({ groups: harness.contextGroups }),
@@ -96,6 +109,7 @@ function renderList(overrides: Record<string, unknown> = {}) {
     onOpenFile: vi.fn(),
     ...overrides,
   };
+  harness.stateCursor = 0;
   const tree = SourceControlChangesList(props as never);
   return { props, tree, markup: renderToStaticMarkup(tree) };
 }
@@ -115,9 +129,24 @@ function invokeHandler(
   handler(...args);
 }
 
+function folderHeaderButtons(tree: React.ReactNode): ReactElement[] {
+  return visit(tree).filter(
+    (element) =>
+      element.type === "button" &&
+      (element.props as Record<string, unknown>)["aria-expanded"] !== undefined,
+  );
+}
+
+function checkboxByLabel(label: string): Record<string, unknown> | undefined {
+  return harness.checkboxes.find((props) => props["aria-label"] === label);
+}
+
 beforeEach(() => {
+  harness.stateCursor = 0;
   harness.menuState = null;
   harness.setMenu.mockReset();
+  harness.collapsedDirectories = new Set<string>();
+  harness.setCollapsedDirectories.mockReset();
   harness.rowActions = [];
   harness.contextGroups = [];
   harness.buttons.length = 0;
@@ -159,15 +188,11 @@ describe("SourceControlChangesList", () => {
     expect(markup).toContain("badge");
 
     const elements = visit(tree);
-    const row = elements.find(
-      (element) =>
-        element.type === "div" &&
-        typeof (element.props as Record<string, unknown>).onContextMenu === "function",
-    );
+    const row = elements.find((element) => element.key === "src/file.ts");
     const openButton = elements.find(
       (element) =>
         element.type === "button" &&
-        String((element.props as Record<string, unknown>).className).includes("min-w-0"),
+        (element.props as Record<string, unknown>).title === "src/file.ts",
     );
     invokeHandler(openButton?.props as Record<string, unknown> | undefined, "onClick");
     expect(onOpenFile).toHaveBeenCalledWith("src/file.ts", "unstaged");
@@ -188,10 +213,13 @@ describe("SourceControlChangesList", () => {
       onSelect: vi.fn(),
     });
 
-    expect(harness.checkboxes).toHaveLength(2);
+    // Root files group first, and every folder header owns the checkbox above
+    // the rows it covers.
     expect(harness.checkboxes.map((props) => props["aria-label"])).toEqual([
-      "Stage src/file.ts",
+      "Stage all files in the repository root",
       "Stage README.md",
+      "Stage all files in src",
+      "Stage src/file.ts",
     ]);
   });
 
@@ -209,9 +237,12 @@ describe("SourceControlChangesList", () => {
       onStageFile: vi.fn(),
     });
 
-    expect(harness.checkboxes).toHaveLength(2);
-    expect(harness.checkboxes[0]?.["aria-label"]).toBe("Deselect src/file.ts");
-    expect(harness.checkboxes[1]?.["aria-label"]).toBe("Select README.md");
+    expect(harness.checkboxes.map((props) => props["aria-label"])).toEqual([
+      "Select all files in the repository root",
+      "Select README.md",
+      "Deselect all files in src",
+      "Deselect src/file.ts",
+    ]);
     invokeHandler(harness.checkboxes[1], "onCheckedChange", true);
     expect(onSelect).toHaveBeenCalledWith("README.md", true);
     expect(onToggle).not.toHaveBeenCalled();
@@ -236,11 +267,7 @@ describe("SourceControlChangesList", () => {
       onIgnoreParentFolder,
     });
 
-    const row = visit(tree).find(
-      (element) =>
-        element.type === "div" &&
-        typeof (element.props as Record<string, unknown>).onContextMenu === "function",
-    );
+    const row = visit(tree).find((element) => element.key === "src/file.ts");
     const preventDefault = vi.fn();
     invokeHandler(row?.props as Record<string, unknown> | undefined, "onContextMenu", {
       preventDefault,
@@ -324,5 +351,124 @@ describe("SourceControlChangesList", () => {
     ];
     renderList();
     expect(harness.menus).toHaveLength(0);
+  });
+  it("groups rows under a collapsible folder header per directory", () => {
+    const { tree, markup } = renderList();
+    const headers = folderHeaderButtons(tree);
+
+    expect(headers.map((header) => (header.props as Record<string, unknown>).title)).toEqual([
+      "Repository root",
+      "src",
+    ]);
+    expect(
+      headers.map((header) => (header.props as Record<string, unknown>)["aria-expanded"]),
+    ).toEqual([true, true]);
+    // The label is start-truncated and the count is a bare numeral, so the
+    // button names the folder and its size itself and points at its rows.
+    expect(
+      headers.map((header) => (header.props as Record<string, unknown>)["aria-label"]),
+    ).toEqual(["Repository root, 1 file", "src, 1 file"]);
+    expect(
+      headers.map((header) => (header.props as Record<string, unknown>)["aria-controls"]),
+    ).toEqual(["list-id-folder-0", "list-id-folder-1"]);
+    // Both rows stay visible while every folder is expanded.
+    expect(markup).toContain("README.md");
+    expect(markup).toContain("file.ts");
+  });
+
+  it("toggles one folder at a time and hides the rows of a collapsed folder", () => {
+    harness.collapsedDirectories = new Set(["src"]);
+    const { tree, markup } = renderList();
+
+    expect(markup).not.toContain("file.ts");
+    expect(markup).toContain("README.md");
+    const srcHeader = folderHeaderButtons(tree)[1];
+    if (!srcHeader) throw new Error("Missing src folder header");
+    const srcHeaderProps = srcHeader.props as Record<string, unknown>;
+    expect(srcHeaderProps["aria-expanded"]).toBe(false);
+
+    invokeHandler(srcHeaderProps, "onClick");
+    const update = harness.setCollapsedDirectories.mock.calls[0]?.[0] as (
+      current: ReadonlySet<string>,
+    ) => ReadonlySet<string>;
+    expect([...update(new Set(["src"]))]).toEqual([]);
+    expect([...update(new Set())]).toEqual(["src"]);
+  });
+
+  it("stages only the not-yet-staged files of a mixed folder in one request", () => {
+    const onStageFiles = vi.fn();
+    const onUnstageFiles = vi.fn();
+    const onToggle = vi.fn();
+    renderList({
+      files: [nestedFile, { ...nestedFile, path: "src/other.ts" }],
+      checked: (file: typeof nestedFile) => file.path === "src/file.ts",
+      onStageFiles,
+      onUnstageFiles,
+      onToggle,
+    });
+
+    const header = checkboxByLabel("Stage all files in src");
+    expect(header?.indeterminate).toBe(true);
+    expect(header?.checked).toBe(false);
+    invokeHandler(header, "onCheckedChange", true);
+    expect(onStageFiles).toHaveBeenCalledWith(["src/other.ts"]);
+    expect(onUnstageFiles).not.toHaveBeenCalled();
+    expect(onToggle).not.toHaveBeenCalled();
+  });
+
+  it("unstages a fully staged folder in one request", () => {
+    const onUnstageFiles = vi.fn();
+    renderList({
+      files: [nestedFile, { ...nestedFile, path: "src/other.ts" }],
+      checked: () => true,
+      onStageFiles: vi.fn(),
+      onUnstageFiles,
+    });
+
+    const header = checkboxByLabel("Unstage all files in src");
+    expect(header?.checked).toBe(true);
+    expect(header?.indeterminate).toBe(false);
+    invokeHandler(header, "onCheckedChange", false);
+    expect(onUnstageFiles).toHaveBeenCalledWith(["src/file.ts", "src/other.ts"]);
+  });
+
+  it("falls back to per-file toggling when no batch handler is wired", () => {
+    const onToggle = vi.fn();
+    renderList({
+      files: [nestedFile, { ...nestedFile, path: "src/other.ts" }],
+      checked: () => false,
+      onToggle,
+    });
+
+    invokeHandler(checkboxByLabel("Stage all files in src"), "onCheckedChange", true);
+    expect(onToggle.mock.calls.map((call) => call[0])).toEqual(["src/file.ts", "src/other.ts"]);
+  });
+
+  it("selects a whole folder through the batch selection handler", () => {
+    const onSelectFiles = vi.fn();
+    const onSelect = vi.fn();
+    renderList({
+      selectionMode: true,
+      selected: () => false,
+      onSelect,
+      onSelectFiles,
+    });
+
+    invokeHandler(checkboxByLabel("Select all files in src"), "onCheckedChange", true);
+    expect(onSelectFiles).toHaveBeenCalledWith([nestedFile], true);
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it("renders a flat list with per-row directories when grouping is off", () => {
+    const { tree, markup } = renderList({ groupByFolder: false, checked: () => false });
+
+    expect(folderHeaderButtons(tree)).toHaveLength(0);
+    expect(harness.checkboxes.map((props) => props["aria-label"])).toEqual([
+      "Stage src/file.ts",
+      "Stage README.md",
+    ]);
+    // The row keeps its own directory hint, truncated from the start.
+    expect(markup).toContain('dir="rtl"');
+    expect(markup).toContain("src");
   });
 });
