@@ -94,13 +94,11 @@ export const useSourceControlPanelStore = create<SourceControlPanelStoreState>()
       ),
       migrate: (persistedState) => {
         const state = persistedState as Partial<SourceControlPanelStoreState> | undefined;
+        // `sourceControlGroupByFolder` is intentionally absent: persist's shallow
+        // merge keeps a stored value and falls back to the grouped default.
         return {
           byThreadKey: state?.byThreadKey ?? {},
           byCwdKey: state?.byCwdKey ?? {},
-          sourceControlGroupByFolder:
-            typeof state?.sourceControlGroupByFolder === "boolean"
-              ? state.sourceControlGroupByFolder
-              : true,
         };
       },
       partialize: (state) => ({

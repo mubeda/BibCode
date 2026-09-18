@@ -449,7 +449,8 @@ The Source Control panel is Orca-parity for the shipped local Git workflow:
   Files in the repository root come first under `/`, then directories in path
   order. A directory too long for the panel truncates from its start so the
   deepest folder stays readable, and the header tooltip carries the full path.
-  Collapsing a folder lasts for the panel session; it is not persisted.
+  A collapsed folder stays collapsed until the panel or its section is
+  collapsed; the state is not persisted.
 - The folder header checkbox stages or unstages every file in that folder in one
   request, and selects or deselects them in selection mode. It shows a mixed
   state when only some of the folder's files are staged or selected.

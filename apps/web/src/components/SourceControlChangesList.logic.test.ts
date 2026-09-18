@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  fileCountLabel,
   folderActionTarget,
   folderCheckboxState,
   groupFilesByDirectory,
@@ -79,5 +80,16 @@ describe("folderActionTarget", () => {
     expect(folderActionTarget({ directory: null, label: ROOT_FOLDER_LABEL, files: [] })).toBe(
       "the repository root",
     );
+  });
+});
+
+describe("fileCountLabel", () => {
+  it("keeps the count singular for one file", () => {
+    expect(fileCountLabel(1)).toBe("1 file");
+  });
+
+  it("pluralizes every other count", () => {
+    expect(fileCountLabel(0)).toBe("0 files");
+    expect(fileCountLabel(4)).toBe("4 files");
   });
 });

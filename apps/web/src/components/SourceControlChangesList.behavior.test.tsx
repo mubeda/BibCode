@@ -30,6 +30,7 @@ vi.mock("react", async (importOriginal) => ({
       : [harness.collapsedDirectories, harness.setCollapsedDirectories];
   },
   useMemo: (factory: () => unknown) => factory(),
+  useId: () => "list-id-",
 }));
 vi.mock("./SourceControlRowActions.logic", () => ({
   buildRowContextMenu: () => ({ groups: harness.contextGroups }),
@@ -362,6 +363,14 @@ describe("SourceControlChangesList", () => {
     expect(
       headers.map((header) => (header.props as Record<string, unknown>)["aria-expanded"]),
     ).toEqual([true, true]);
+    // The label is start-truncated and the count is a bare numeral, so the
+    // button names the folder and its size itself and points at its rows.
+    expect(
+      headers.map((header) => (header.props as Record<string, unknown>)["aria-label"]),
+    ).toEqual(["Repository root, 1 file", "src, 1 file"]);
+    expect(
+      headers.map((header) => (header.props as Record<string, unknown>)["aria-controls"]),
+    ).toEqual(["list-id-folder-0", "list-id-folder-1"]);
     // Both rows stay visible while every folder is expanded.
     expect(markup).toContain("README.md");
     expect(markup).toContain("file.ts");

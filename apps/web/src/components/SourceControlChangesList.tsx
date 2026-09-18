@@ -1,6 +1,6 @@
 import type { VcsStagingArea } from "@bibcode/contracts";
 import { ChevronDownIcon } from "lucide-react";
-import { Fragment, useMemo, useState, type ReactNode } from "react";
+import { Fragment, useId, useMemo, useState, type ReactNode } from "react";
 
 import { DiffStatLabel } from "~/components/chat/DiffStatLabel";
 import { Button } from "~/components/ui/button";
@@ -9,6 +9,7 @@ import { Menu, MenuItem, MenuPopup, MenuSeparator } from "~/components/ui/menu";
 import { cn } from "~/lib/utils";
 
 import {
+  fileCountLabel,
   folderActionTarget,
   folderCheckboxState,
   groupFilesByDirectory,
@@ -85,10 +86,8 @@ interface RowMenuState {
 
 const NO_COLLAPSED_DIRECTORIES: ReadonlySet<string> = new Set<string>();
 
-/** Left-to-right marks keep a start-truncated path from reordering under `dir="rtl"`. */
-const LRM = "\u200e";
-
 export function SourceControlChangesList(props: SourceControlChangesListProps) {
+  const listId = useId();
   const [menu, setMenu] = useState<RowMenuState | null>(null);
   const [collapsedDirectories, setCollapsedDirectories] =
     useState<ReadonlySet<string>>(NO_COLLAPSED_DIRECTORIES);
@@ -152,7 +151,11 @@ export function SourceControlChangesList(props: SourceControlChangesListProps) {
     for (const file of files) props.onSelect?.(file.path, selected);
   }
 
-  function renderFolderHeader(group: SourceControlFolderGroup, collapsed: boolean) {
+  function renderFolderHeader(
+    group: SourceControlFolderGroup,
+    collapsed: boolean,
+    filesId: string,
+  ) {
     const selects = props.selectionMode === true && props.onSelect !== undefined;
     const isChecked = selects
       ? (file: WorkingTreeFile) => props.selected?.(file) ?? false
@@ -191,6 +194,10 @@ export function SourceControlChangesList(props: SourceControlChangesListProps) {
         <button
           type="button"
           aria-expanded={!collapsed}
+          aria-controls={filesId}
+          // The label is start-truncated and the count is a bare numeral, so the
+          // button spells its own accessible name out in full.
+          aria-label={`${group.directory ?? "Repository root"}, ${fileCountLabel(group.files.length)}`}
           onClick={() => toggleDirectory(group.label)}
           title={group.directory ?? "Repository root"}
           className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
@@ -201,17 +208,20 @@ export function SourceControlChangesList(props: SourceControlChangesListProps) {
               collapsed && "-rotate-90",
             )}
           />
-          {/* Truncates from the start so the deepest folder stays readable. */}
+          {/* Truncates from the start so the deepest folder stays readable. The
+              inner bdi isolates the path from the rtl container without putting
+              bidi marks into the text the user can copy. */}
           <span
             dir="rtl"
+            aria-hidden="true"
             className="min-w-0 truncate text-left font-mono text-xs text-muted-foreground"
           >
-            {LRM}
-            {group.label}
-            {LRM}
+            <bdi dir="ltr">{group.label}</bdi>
           </span>
           {/* Count sits next to the label, like the section headers above. */}
-          <span className="ml-1 shrink-0 text-xs text-muted-foreground">{group.files.length}</span>
+          <span aria-hidden="true" className="ml-1 shrink-0 text-xs text-muted-foreground">
+            {group.files.length}
+          </span>
         </button>
       </div>
     );
@@ -265,20 +275,20 @@ export function SourceControlChangesList(props: SourceControlChangesListProps) {
           <span
             className={cn(
               "min-w-0 truncate font-mono text-xs",
-              // Flat rows share the width with the directory; grouped rows own it.
-              showDirectory ? "max-w-[55%]" : "flex-1",
+              // A grouped row owns the whole width; a flat row keeps its natural
+              // width and only gives way once the directory hits its floor.
+              !showDirectory && "flex-1",
             )}
           >
             {name}
           </span>
           {showDirectory && dir ? (
+            // Takes the leftover width, never less than a readable tail.
             <span
               dir="rtl"
-              className="min-w-0 flex-1 truncate text-left text-xs text-muted-foreground"
+              className="min-w-[4.5rem] shrink basis-0 grow truncate text-left text-xs text-muted-foreground"
             >
-              {LRM}
-              {dir}
-              {LRM}
+              <bdi dir="ltr">{dir}</bdi>
             </span>
           ) : null}
           <DiffStatLabel
@@ -318,12 +328,17 @@ export function SourceControlChangesList(props: SourceControlChangesListProps) {
   return (
     <div className="space-y-0.5 p-1">
       {grouped
-        ? groups.map((group) => {
+        ? groups.map((group, index) => {
             const collapsed = collapsedDirectories.has(group.label);
+            // Stays in the DOM while collapsed so the header's aria-controls
+            // always resolves.
+            const filesId = `${listId}folder-${index}`;
             return (
               <div key={`folder:${group.label}`} className="space-y-0.5">
-                {renderFolderHeader(group, collapsed)}
-                {collapsed ? null : group.files.map((file) => renderRow(file, false))}
+                {renderFolderHeader(group, collapsed, filesId)}
+                <div id={filesId} className="space-y-0.5">
+                  {collapsed ? null : group.files.map((file) => renderRow(file, false))}
+                </div>
               </div>
             );
           })

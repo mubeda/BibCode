@@ -63,6 +63,12 @@ describe("SourceControlChangesList", () => {
     expect(markup).toContain('title="docs/prps/PFS-1848"');
     expect(markup.match(/aria-expanded="true"/g)).toHaveLength(2);
     expect(markup.indexOf("Repository root")).toBeLessThan(markup.indexOf("docs/prps/PFS-1848"));
+    expect(markup).toContain('aria-label="docs/prps/PFS-1848, 1 file"');
+    expect(markup).toContain("aria-controls=");
+    // The path is isolated with <bdi>, so no bidi control characters end up in
+    // the text the user can select and copy.
+    expect(markup).toContain('<bdi dir="ltr">docs/prps/PFS-1848</bdi>');
+    expect(markup).not.toContain("\u200e");
   });
 
   it("renders one flat row per file with its own directory when grouping is off", () => {
@@ -77,6 +83,10 @@ describe("SourceControlChangesList", () => {
     expect(markup).not.toContain("aria-expanded");
     expect(markup).toContain("docs/prps/PFS-1848");
     expect(markup).toContain("master-plan.md");
+    // The directory keeps a readable floor and yields the rest to the name,
+    // which is never capped.
+    expect(markup).toContain("min-w-[4.5rem]");
+    expect(markup).not.toContain("max-w-[");
   });
 
   it("renders a folder header checkbox that stages the whole folder", () => {
