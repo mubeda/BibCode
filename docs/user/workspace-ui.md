@@ -279,7 +279,10 @@ The toolbar has three segments:
    worktrees. A first open or reload starts on the main checkout; a later
    selection is remembered while the current client session remains alive.
 2. **Branch** groups local branches into Default, Recent, and Other, and offers
-   create, checkout, rename, delete, and merge actions. The same segment exposes
+   create, checkout, rename, delete, and merge actions. **New branch** always
+   forks from the checked-out branch (or the current HEAD commit when HEAD is
+   detached), never from the repository default, and the dialog names that base
+   in a highlighted chip before you confirm. The same segment exposes
    tag creation, deletion, and push actions. Symbolic remote default pointers
    such as `origin/HEAD` are not branch rows, while an actual local branch named
    `origin` remains available.
