@@ -61,6 +61,9 @@ Desktop releases are built by the Tauri 2 pipeline in `apps/desktop`.
 > → Privacy & Security and choose **Open Anyway** for BiBCode. For local testing,
 > the quarantine flag can instead be removed with
 > `xattr -dr com.apple.quarantine "/Applications/BiBCode.app"`.
+> Because each ad-hoc signed build has a new code identity, macOS also asks
+> again for folder and network permissions after every update; grant them once
+> per version.
 > Windows releases remain unsigned; choose "More info" → "Run anyway" if
 > SmartScreen warns.
 
