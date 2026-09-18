@@ -40,8 +40,12 @@ function checkboxCount(markup: string): number {
   return markup.match(/data-slot="checkbox"/g)?.length ?? 0;
 }
 
+// FILES spans two folders, so the grouped view renders one header checkbox per
+// folder on top of the per-row ones.
+const GROUPED_CHECKBOX_COUNT = FILES.length * 2;
+
 describe("SourceControlChangesList", () => {
-  it("renders each file's name, directory hint and +/- counts", () => {
+  it("renders each file's name under its folder header with +/- counts", () => {
     const markup = renderToStaticMarkup(
       <SourceControlChangesList files={FILES} onToggle={() => {}} onOpenFile={() => {}} />,
     );
@@ -49,6 +53,53 @@ describe("SourceControlChangesList", () => {
     expect(markup).toContain("docs/prps/PFS-1848");
     expect(markup).toContain("+218");
     expect(markup).toContain("-4");
+  });
+
+  it("groups files under expandable folder headers, root first", () => {
+    const markup = renderToStaticMarkup(
+      <SourceControlChangesList files={FILES} onToggle={() => {}} onOpenFile={() => {}} />,
+    );
+    expect(markup).toContain('title="Repository root"');
+    expect(markup).toContain('title="docs/prps/PFS-1848"');
+    expect(markup.match(/aria-expanded="true"/g)).toHaveLength(2);
+    expect(markup.indexOf("Repository root")).toBeLessThan(markup.indexOf("docs/prps/PFS-1848"));
+    expect(markup).toContain('aria-label="docs/prps/PFS-1848, 1 file"');
+    expect(markup).toContain("aria-controls=");
+    // The path is isolated with <bdi>, so no bidi control characters end up in
+    // the text the user can select and copy.
+    expect(markup).toContain('<bdi dir="ltr">docs/prps/PFS-1848</bdi>');
+    expect(markup).not.toContain("\u200e");
+  });
+
+  it("renders one flat row per file with its own directory when grouping is off", () => {
+    const markup = renderToStaticMarkup(
+      <SourceControlChangesList
+        files={FILES}
+        groupByFolder={false}
+        onToggle={() => {}}
+        onOpenFile={() => {}}
+      />,
+    );
+    expect(markup).not.toContain("aria-expanded");
+    expect(markup).toContain("docs/prps/PFS-1848");
+    expect(markup).toContain("master-plan.md");
+    // The directory keeps a readable floor and yields the rest to the name,
+    // which is never capped.
+    expect(markup).toContain("min-w-[4.5rem]");
+    expect(markup).not.toContain("max-w-[");
+  });
+
+  it("renders a folder header checkbox that stages the whole folder", () => {
+    const markup = renderToStaticMarkup(
+      <SourceControlChangesList
+        files={FILES}
+        checked={() => false}
+        onToggle={() => {}}
+        onOpenFile={() => {}}
+      />,
+    );
+    expect(markup).toContain('aria-label="Stage all files in docs/prps/PFS-1848"');
+    expect(markup).toContain('aria-label="Stage all files in the repository root"');
   });
 
   it("renders the injected badge slot", () => {
@@ -89,7 +140,7 @@ describe("SourceControlChangesList", () => {
       />,
     );
     expect(markup).toContain('data-slot="checkbox"');
-    expect(checkboxCount(markup)).toBe(FILES.length);
+    expect(checkboxCount(markup)).toBe(GROUPED_CHECKBOX_COUNT);
     expect(markup).toContain(`aria-label="Unstage ${FILES[0]!.path}"`);
     expect(markup).toContain('data-checked=""');
   });
@@ -104,7 +155,7 @@ describe("SourceControlChangesList", () => {
       />,
     );
     expect(markup).toContain('data-slot="checkbox"');
-    expect(checkboxCount(markup)).toBe(FILES.length);
+    expect(checkboxCount(markup)).toBe(GROUPED_CHECKBOX_COUNT);
     expect(markup).toContain(`aria-label="Stage ${FILES[0]!.path}"`);
     expect(markup).toContain('data-unchecked=""');
   });
@@ -122,7 +173,7 @@ describe("SourceControlChangesList", () => {
       />,
     );
 
-    expect(checkboxCount(markup)).toBe(FILES.length);
+    expect(checkboxCount(markup)).toBe(GROUPED_CHECKBOX_COUNT);
     expect(markup).toContain(`aria-label="Deselect ${FILES[0]!.path}"`);
     expect(markup).not.toContain(`aria-label="Stage ${FILES[0]!.path}"`);
   });
