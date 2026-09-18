@@ -72,3 +72,8 @@ export function folderCheckboxState(
 export function folderActionTarget(group: SourceControlFolderGroup): string {
   return group.directory ?? "the repository root";
 }
+
+/** "1 file" / "3 files", for a folder header's accessible name. */
+export function fileCountLabel(count: number): string {
+  return `${count} ${count === 1 ? "file" : "files"}`;
+}
