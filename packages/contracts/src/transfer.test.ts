@@ -38,11 +38,26 @@ describe("transfer contracts", () => {
   });
 
   it("allows an empty upload directory for the workspace root", () => {
-    expect(decodeUploadInput({ cwd: "/repo", relativeDirectory: "" }).relativeDirectory).toBe("");
+    expect(
+      decodeUploadInput({ cwd: "/repo", relativeDirectory: "", fileName: "a.txt" })
+        .relativeDirectory,
+    ).toBe("");
     expect(
       decodeUploadResult({ relativeUrl: "/api/transfers/x.y", expiresAt: 1, maxBytes: 1024 })
         .maxBytes,
     ).toBe(1024);
+  });
+
+  it("requires the upload token to name one file", () => {
+    // The token authorises exactly this name, so an absent or over-long name is refused before a
+    // URL is ever minted.
+    expect(() => decodeUploadInput({ cwd: "/repo", relativeDirectory: "" })).toThrow();
+    expect(() =>
+      decodeUploadInput({ cwd: "/repo", relativeDirectory: "", fileName: "" }),
+    ).toThrow();
+    expect(() =>
+      decodeUploadInput({ cwd: "/repo", relativeDirectory: "", fileName: "x".repeat(256) }),
+    ).toThrow();
   });
 
   it("encodes the transfer error", () => {

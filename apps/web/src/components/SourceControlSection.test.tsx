@@ -147,6 +147,24 @@ describe("SourceControlSection", () => {
     expect(discard).toHaveBeenCalledOnce();
   });
 
+  it("forwards the panel-wide grouping preference and the folder batch handlers", () => {
+    const onStageFiles = vi.fn();
+    const onUnstageFiles = vi.fn();
+    const onSelectFiles = vi.fn();
+    renderSection({ groupByFolder: false, onStageFiles, onUnstageFiles, onSelectFiles });
+    expect(harness.listProps[0]).toMatchObject({
+      groupByFolder: false,
+      onStageFiles,
+      onUnstageFiles,
+      onSelectFiles,
+    });
+
+    harness.listProps.length = 0;
+    renderSection();
+    expect(harness.listProps[0]).not.toHaveProperty("groupByFolder");
+    expect(harness.listProps[0]).not.toHaveProperty("onStageFiles");
+  });
+
   it("shows only selection controls while selection mode is active", () => {
     const primary = vi.fn();
     const discard = vi.fn();

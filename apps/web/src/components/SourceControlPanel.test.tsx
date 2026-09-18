@@ -119,6 +119,8 @@ const testState = vi.hoisted(() => ({
   rightPanelOpen: vi.fn(),
   selectGitScope: vi.fn(),
   toast: { add: vi.fn(), update: vi.fn(), close: vi.fn() },
+  groupByFolder: true,
+  setGroupByFolder: vi.fn(),
 }));
 
 interface CapturedButtonProps {
@@ -128,6 +130,7 @@ interface CapturedButtonProps {
   autoFocus?: boolean;
   title?: string;
   "aria-label"?: string;
+  "aria-pressed"?: boolean;
   className?: string;
 }
 
@@ -161,6 +164,10 @@ interface CapturedSectionProps {
   onIgnoreFileName?: (path: string) => void;
   onIgnoreParentFolder?: (path: string) => void;
   isPrimaryEnv?: boolean;
+  groupByFolder?: boolean;
+  onStageFiles?: (paths: readonly string[]) => void;
+  onUnstageFiles?: (paths: readonly string[]) => void;
+  onSelectFiles?: (files: readonly WorkingTreeFile[], selected: boolean) => void;
 }
 
 interface CapturedDialogProps {
@@ -277,6 +284,14 @@ vi.mock("~/lib/sourceControlActions", () => ({
     isPending: testState.generatePending,
   }),
   useSourceControlActionRunning: () => testState.isBusy,
+}));
+
+vi.mock("~/sourceControlPanelStore", () => ({
+  useSourceControlPanelStore: (selector: (state: Record<string, unknown>) => unknown) =>
+    selector({
+      sourceControlGroupByFolder: testState.groupByFolder,
+      setSourceControlGroupByFolder: testState.setGroupByFolder,
+    }),
 }));
 
 vi.mock("~/sourceControlDraft", () => ({
@@ -592,6 +607,8 @@ beforeEach(() => {
     .mockResolvedValue(AsyncResult.success({ message: "Generated message" }));
   testState.generatePending = false;
   testState.isBusy = false;
+  testState.groupByFolder = true;
+  testState.setGroupByFolder.mockReset();
   testState.primaryEnvironmentId = ENVIRONMENT_ID;
   testState.availableEditors = ["vscode"];
   testState.preferredEditor = "vscode";
@@ -837,6 +854,47 @@ describe("SourceControlPanel", () => {
     // The commits list refetches via the bumped reload token.
     rerender();
     expect(captured.commits[0]?.reloadToken).toBe(1);
+  });
+
+  it("switches the changes view between folder groups and a flat list", () => {
+    render();
+    const grouped = captured.buttons.find((button) => button["aria-label"] === "Group by folder");
+    expect(grouped?.["aria-pressed"]).toBe(true);
+    expect(sectionByTitle("Changes")?.groupByFolder).toBe(true);
+    grouped?.onClick?.();
+    expect(testState.setGroupByFolder).toHaveBeenCalledWith(false);
+
+    testState.groupByFolder = false;
+    render();
+    expect(
+      captured.buttons.find((button) => button["aria-label"] === "Group by folder")?.[
+        "aria-pressed"
+      ],
+    ).toBe(false);
+    expect(sectionByTitle("Changes")?.groupByFolder).toBe(false);
+  });
+
+  it("hides the view toggle while the working tree is clean", () => {
+    testState.statusQuery.data = status({
+      hasWorkingTreeChanges: false,
+      workingTree: { files: [], insertions: 0, deletions: 0 },
+    });
+    render(buildProps());
+    expect(
+      captured.buttons.find((button) => button["aria-label"] === "Group by folder"),
+    ).toBeUndefined();
+  });
+
+  it("stages and unstages a whole folder in one request", async () => {
+    render();
+    const section = sectionByTitle("Changes");
+    section?.onStageFiles?.([UNSTAGED_FILE.path]);
+    await flushPromises();
+    expect(testState.runStage).toHaveBeenCalledWith([UNSTAGED_FILE.path]);
+
+    sectionByTitle("Staged Changes")?.onUnstageFiles?.([STAGED_FILE.path]);
+    await flushPromises();
+    expect(testState.runUnstage).toHaveBeenCalledWith([STAGED_FILE.path]);
   });
 
   it("stages everything when nothing is staged yet", async () => {

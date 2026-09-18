@@ -12,21 +12,129 @@ use super::TransferError;
 /// name never share one.
 static PARTIAL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// How many bytes of the requested name a partial file may echo. The rest of the partial name
-/// (process id, counter, nanoseconds, suffix) plus this budget stays well inside the 255-byte
-/// component limit every supported filesystem enforces, so a long but valid upload name can
-/// still be written.
-const PARTIAL_NAME_BUDGET: usize = 96;
+/// One path component may hold 255 bytes on every filesystem BiBCode supports.
+pub const MAX_PATH_COMPONENT_BYTES: usize = 255;
 
-/// Validates that `name` is a plain file name suitable for joining onto an upload directory:
-/// non-empty, not `.`/`..`, no path separators or NUL bytes, and no longer than 255 bytes.
+/// The tail `write_upload` gives its partial files.
+pub const UPLOAD_PARTIAL_SUFFIX: &str = "bibcode-upload.part";
+
+/// Path separators, refused wherever the file lands: they would change which entry is addressed
+/// rather than merely how it is spelled. Control characters (NUL included) are refused with them.
+const UNIVERSAL_FORBIDDEN_CHARACTERS: [char; 2] = ['/', '\\'];
+
+/// Characters Windows forbids in a file name. They are ordinary bytes on Linux and macOS, where
+/// `report:v2.txt` is a perfectly good name, so they are only refused when the filesystem that
+/// will store the file is a Windows one.
+pub const WINDOWS_FORBIDDEN_CHARACTERS: [char; 7] = ['<', '>', ':', '"', '|', '?', '*'];
+
+/// The bytes a partial name adds around the stem it echoes, with every counter at its widest.
+/// Derived from the same formatter the partial name uses, so the budget cannot drift away from
+/// the format it is protecting.
+#[must_use]
+pub fn partial_name_overhead(suffix: &str) -> usize {
+    partial_name("", suffix, u32::MAX, u64::MAX, u128::MAX).len()
+}
+
+/// How much of a file name its partial sibling may echo. This is a budget for the *partial*,
+/// not a cap on the name: a partial is a temporary file nobody reads, so it echoes as much of
+/// the name as fits and drops the rest. The name itself is only held to
+/// [`MAX_PATH_COMPONENT_BYTES`].
+#[must_use]
+pub fn max_transfer_stem_bytes(suffix: &str) -> usize {
+    MAX_PATH_COMPONENT_BYTES.saturating_sub(partial_name_overhead(suffix))
+}
+
+/// The file-name policy a BiBCode transfer applies.
+///
+/// The rules that hold everywhere always apply: a non-empty name, not `.` or `..`, no path
+/// separator, no control character, and short enough that its partial sibling still fits one
+/// path component.
+///
+/// `windows_rules` adds what only Windows forbids -- `< > : " | ? *`, a trailing dot or space
+/// (Windows strips those, so the entry written would not be the entry named), and the reserved
+/// device names. The caller passes it for the filesystem that will actually store the file, not
+/// for the host that happens to be asking: `report:v2.txt`, `nul`, and `notes.` are legal names
+/// on Linux and macOS, and refusing them there would make files a workspace already holds
+/// untransferable for no reason.
+#[must_use]
+pub fn is_plain_transfer_file_name(name: &str, max_bytes: usize, windows_rules: bool) -> bool {
+    if name.is_empty() || name.len() > max_bytes || name == "." || name == ".." {
+        return false;
+    }
+    if name.chars().any(|character| {
+        UNIVERSAL_FORBIDDEN_CHARACTERS.contains(&character) || character.is_control()
+    }) {
+        return false;
+    }
+    if !windows_rules {
+        return true;
+    }
+    if name.ends_with('.') || name.ends_with(' ') {
+        return false;
+    }
+    if name
+        .chars()
+        .any(|character| WINDOWS_FORBIDDEN_CHARACTERS.contains(&character))
+    {
+        return false;
+    }
+    !is_windows_device_name(name)
+}
+
+/// `CON`, `con.txt`, and `CON.tar.gz` all address the console device on Windows, so the stem
+/// before the first dot is what is compared, without regard to case.
+#[must_use]
+pub fn is_windows_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name);
+    if ["CON", "PRN", "AUX", "NUL"]
+        .iter()
+        .any(|device| stem.eq_ignore_ascii_case(device))
+    {
+        return true;
+    }
+    let Some(port) = stem.chars().next_back() else {
+        return false;
+    };
+    if !matches!(port, '1'..='9') {
+        return false;
+    }
+    let head = &stem[..stem.len() - port.len_utf8()];
+    head.eq_ignore_ascii_case("COM") || head.eq_ignore_ascii_case("LPT")
+}
+
+/// The upload-name rule as a person can act on it. It lives beside the rule so a refusal can
+/// never describe a policy the code no longer applies: the byte cap comes from the same
+/// derivation the validator uses, and the Windows clause appears only where it is enforced.
+#[must_use]
+pub fn upload_file_name_rule() -> String {
+    upload_file_name_rule_for(cfg!(windows))
+}
+
+fn upload_file_name_rule_for(windows_rules: bool) -> String {
+    let windows = if windows_rules {
+        " This server stores files on Windows, so the name must also avoid < > : \" | ? *, a \
+         trailing dot or space, and device names such as CON or COM1."
+    } else {
+        ""
+    };
+    format!(
+        "Upload file name must be a plain file name: no / or \\, no control characters, and at \
+         most {MAX_PATH_COMPONENT_BYTES} bytes.{windows}"
+    )
+}
+
+/// Validates that `name` is a plain file name suitable for joining onto an upload directory.
+///
+/// The Windows rules apply only when this server is the one running on Windows, because this
+/// server's filesystem is where the upload lands.
 pub fn validate_upload_file_name(name: &str) -> Result<(), TransferError> {
-    let valid = !name.is_empty()
-        && name.len() <= 255
-        && name != "."
-        && name != ".."
-        && !name.contains(['/', '\\', '\0']);
-    if valid {
+    validate_upload_file_name_for(name, cfg!(windows))
+}
+
+/// [`validate_upload_file_name`] with the host decision made explicit, so both branches are
+/// reachable from a test whatever the host running it.
+fn validate_upload_file_name_for(name: &str, windows_rules: bool) -> Result<(), TransferError> {
+    if is_plain_transfer_file_name(name, MAX_PATH_COMPONENT_BYTES, windows_rules) {
         Ok(())
     } else {
         Err(TransferError::InvalidFileName {
@@ -147,16 +255,35 @@ async fn reservation_error(target: &Path, error: std::io::Error) -> TransferErro
 /// A partial file name unique to this process, this call, and this instant, so concurrent
 /// uploads of the same name never stream into the same file.
 fn partial_file_name(name: &str) -> String {
+    partial_transfer_file_name(name, UPLOAD_PARTIAL_SUFFIX)
+}
+
+/// The partial-file name a transfer streams into: `.{stem}.{unique}.{suffix}`, unique to this
+/// process, this call, and this instant, and always inside one path component whatever name it
+/// echoes -- the stem is truncated to whatever [`max_transfer_stem_bytes`] leaves.
+///
+/// The upload route and the desktop download host both call this, so neither can drift into
+/// writing a different shape or a different budget from the one the other measures.
+#[must_use]
+pub fn partial_transfer_file_name(name: &str, suffix: &str) -> String {
     let counter = PARTIAL_COUNTER.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
-    let stem = truncate_on_char_boundary(name, PARTIAL_NAME_BUDGET);
-    let pid = std::process::id();
-    format!(".{stem}.{pid}-{counter}-{nanos}.bibcode-upload.part")
+    let stem = truncate_on_char_boundary(name, max_transfer_stem_bytes(suffix));
+    partial_name(stem, suffix, std::process::id(), counter, nanos)
 }
 
-fn truncate_on_char_boundary(name: &str, budget: usize) -> &str {
+/// The one place the partial-name shape is written down: the budget and the name are both
+/// derived from it.
+fn partial_name(stem: &str, suffix: &str, pid: u32, counter: u64, nanos: u128) -> String {
+    format!(".{stem}.{pid}-{counter}-{nanos}.{suffix}")
+}
+
+/// Shortens `name` to at most `budget` bytes without splitting a character. Shared with the
+/// desktop host, which has to fit a sanitised download name into the same component budget.
+#[must_use]
+pub fn truncate_on_char_boundary(name: &str, budget: usize) -> &str {
     if name.len() <= budget {
         return name;
     }
@@ -183,17 +310,135 @@ mod tests {
         )
     }
 
+    /// Names that are not plain file names anywhere: refused whatever stores them.
+    const UNIVERSALLY_INVALID: &[&str] =
+        &["", ".", "..", "a/b", "a\\b", "a\0b", "a\nb", "a\u{7f}b"];
+
+    /// Legal names on Linux and macOS that a Windows filesystem cannot store.
+    const WINDOWS_ONLY_INVALID: &[&str] = &[
+        "a<b",
+        "a>b",
+        "report:v2.txt",
+        "a\"b",
+        "a|b",
+        "a?b",
+        "a*b",
+        "notes.",
+        "notes ",
+        "...",
+        "CON",
+        "con",
+        "CON.txt",
+        "nul.tar.gz",
+        "PRN",
+        "aux",
+        "COM1",
+        "com9.log",
+        "LPT1",
+        "lpt9.txt",
+    ];
+
     #[test]
-    fn validates_plain_file_names() {
-        assert!(validate_upload_file_name("report.pdf").is_ok());
-        for bad in ["", ".", "..", "a/b", "a\\b", &"x".repeat(256)] {
+    fn validates_plain_file_names_on_every_host() {
+        for good in [
+            "report.pdf",
+            ".gitignore",
+            "a b.txt",
+            "CONTACTS.txt",
+            "COM0.txt",
+            "COM10.txt",
+            "console",
+            // Well past the partial-name budget: a partial echoes what fits, the name itself
+            // is only held to the path-component limit.
+            &"x".repeat(200),
+            &"x".repeat(MAX_PATH_COMPONENT_BYTES),
+        ] {
+            for windows_rules in [false, true] {
+                assert!(
+                    validate_upload_file_name_for(good, windows_rules).is_ok(),
+                    "{good} ({windows_rules})"
+                );
+            }
+        }
+        let too_long = "x".repeat(MAX_PATH_COMPONENT_BYTES + 1);
+        for windows_rules in [false, true] {
+            for bad in UNIVERSALLY_INVALID
+                .iter()
+                .copied()
+                .chain([too_long.as_str()])
+            {
+                assert!(
+                    matches!(
+                        validate_upload_file_name_for(bad, windows_rules),
+                        Err(TransferError::InvalidFileName { .. })
+                    ),
+                    "{bad:?} ({windows_rules})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_windows_rules_apply_only_where_the_upload_lands_on_windows() {
+        // The upload is written to *this* server's filesystem, so a POSIX host must keep
+        // accepting names a POSIX filesystem stores perfectly well.
+        for name in WINDOWS_ONLY_INVALID {
+            assert!(
+                validate_upload_file_name_for(name, false).is_ok(),
+                "{name:?} is a legal POSIX name"
+            );
             assert!(
                 matches!(
-                    validate_upload_file_name(bad),
+                    validate_upload_file_name_for(name, true),
                     Err(TransferError::InvalidFileName { .. })
                 ),
-                "{bad}"
+                "{name:?} is not storable on Windows"
             );
+        }
+    }
+
+    #[test]
+    fn the_refusal_names_the_windows_rules_only_where_they_are_enforced() {
+        let posix = upload_file_name_rule_for(false);
+        assert!(posix.contains("plain file name"), "{posix}");
+        assert!(
+            posix.contains(&MAX_PATH_COMPONENT_BYTES.to_string()),
+            "{posix}"
+        );
+        assert!(!posix.contains("CON"), "{posix}");
+        let windows = upload_file_name_rule_for(true);
+        assert!(windows.contains("CON"), "{windows}");
+        assert!(windows.contains("trailing dot"), "{windows}");
+    }
+
+    #[test]
+    fn the_partial_stem_budget_is_derived_from_the_partial_name_format() {
+        // The budget exists only so the `.part` sibling fits one path component; a hard-coded
+        // number would drift the moment the partial format changes.
+        let budget = max_transfer_stem_bytes(UPLOAD_PARTIAL_SUFFIX);
+        assert_eq!(
+            partial_name(
+                &"x".repeat(budget),
+                UPLOAD_PARTIAL_SUFFIX,
+                u32::MAX,
+                u64::MAX,
+                u128::MAX
+            )
+            .len(),
+            MAX_PATH_COMPONENT_BYTES
+        );
+        // A longer suffix buys a shorter stem, and the two always add up to the component limit.
+        assert!(max_transfer_stem_bytes("bibcode-download.part") < budget);
+        // Any name the validator accepts still yields a partial inside one component, because
+        // the partial echoes only what fits rather than the whole name.
+        for name in [
+            "a.txt",
+            &"x".repeat(200),
+            &"x".repeat(MAX_PATH_COMPONENT_BYTES),
+        ] {
+            let partial = partial_transfer_file_name(name, UPLOAD_PARTIAL_SUFFIX);
+            assert!(partial.len() <= MAX_PATH_COMPONENT_BYTES, "{partial}");
+            assert!(partial.ends_with(UPLOAD_PARTIAL_SUFFIX), "{partial}");
         }
     }
 
@@ -222,6 +467,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::fs::read(&written).unwrap(), b"new");
+    }
+
+    #[tokio::test]
+    async fn writes_a_name_longer_than_the_partial_stem_budget() {
+        // 200 bytes is past what a partial name can echo but well inside a path component, so
+        // the upload must land: the budget shortens the partial, never the file.
+        let temp = tempfile::tempdir().unwrap();
+        let long = format!("{}.txt", "x".repeat(196));
+        assert_eq!(long.len(), 200);
+        assert!(long.len() > max_transfer_stem_bytes(UPLOAD_PARTIAL_SUFFIX));
+        let written = write_upload(temp.path(), &long, false, 1024, body(&[b"hello"]))
+            .await
+            .unwrap();
+        assert_eq!(written.file_name().unwrap().to_string_lossy(), long);
+        assert_eq!(std::fs::read(&written).unwrap(), b"hello");
+        assert_eq!(entry_names(temp.path()), vec![long]);
+
+        // One byte past the component limit is still refused, before anything is opened.
+        let over = "x".repeat(MAX_PATH_COMPONENT_BYTES + 1);
+        assert!(matches!(
+            write_upload(temp.path(), &over, false, 1024, body(&[b"x"])).await,
+            Err(TransferError::InvalidFileName { .. })
+        ));
     }
 
     #[tokio::test]
@@ -311,23 +579,27 @@ mod tests {
 
     #[test]
     fn partial_names_are_unique_per_call_and_stay_within_a_path_component() {
-        let long = "x".repeat(255);
+        let long = "x".repeat(MAX_PATH_COMPONENT_BYTES);
         let first = partial_file_name(&long);
         let second = partial_file_name(&long);
         assert_ne!(first, second);
         for name in [&first, &second] {
-            assert!(name.len() <= 255, "{name}");
+            assert!(name.len() <= MAX_PATH_COMPONENT_BYTES, "{name}");
             assert!(name.ends_with(".bibcode-upload.part"));
             assert!(!name.contains('/'));
         }
         // A budget that lands mid-scalar backs off to a boundary: one ASCII byte then 3-byte
-        // characters puts byte 96 inside a character, so the stem must stop at byte 94.
+        // characters puts the budget inside a character, so the stem stops short of it.
+        let budget = max_transfer_stem_bytes(UPLOAD_PARTIAL_SUFFIX);
         let multi_byte = partial_file_name(&format!("a{}", "\u{2603}".repeat(100)));
-        assert!(multi_byte.len() <= 255, "{multi_byte}");
+        assert!(multi_byte.len() <= MAX_PATH_COMPONENT_BYTES, "{multi_byte}");
+        let snowmen = (budget - 1) / "\u{2603}".len();
         assert!(
-            multi_byte.starts_with(&format!(".a{}.", "\u{2603}".repeat(31))),
+            multi_byte.starts_with(&format!(".a{}.", "\u{2603}".repeat(snowmen))),
             "{multi_byte}"
         );
+        // The prefix really is short of the budget, so the back-off was exercised.
+        assert!(1 + snowmen * "\u{2603}".len() < budget);
     }
 
     #[tokio::test]

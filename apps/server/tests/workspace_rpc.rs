@@ -2440,14 +2440,14 @@ async fn transfer_urls_are_minted_for_files_folders_and_root_and_reject_escapes(
 
     let upload_root = unary(
         "projects.createUploadUrl",
-        json!({"cwd": cwd, "relativeDirectory": ""}),
+        json!({"cwd": cwd, "relativeDirectory": "", "fileName": "notes.md"}),
     )
     .await
     .unwrap();
     assert_eq!(upload_root["maxBytes"], 1024 * 1024 * 1024);
     let upload_dir = unary(
         "projects.createUploadUrl",
-        json!({"cwd": cwd, "relativeDirectory": "src"}),
+        json!({"cwd": cwd, "relativeDirectory": "src", "fileName": "notes.md"}),
     )
     .await
     .unwrap();
@@ -2475,11 +2475,47 @@ async fn transfer_urls_are_minted_for_files_folders_and_root_and_reject_escapes(
     assert_eq!(missing["failure"], "not_found");
     let file_as_dir = unary(
         "projects.createUploadUrl",
-        json!({"cwd": cwd, "relativeDirectory": "src/app.ts"}),
+        json!({"cwd": cwd, "relativeDirectory": "src/app.ts", "fileName": "notes.md"}),
     )
     .await
     .unwrap_err();
     assert_eq!(file_as_dir["failure"], "not_found");
+}
+
+#[tokio::test]
+async fn minting_an_upload_refuses_a_name_that_is_not_a_plain_file_name() {
+    let temp = TempDir::new().expect("root");
+    let root = temp.path().to_path_buf();
+    let rpc = WorkspaceRpc::with_dependencies(
+        WorkspaceService::default(),
+        WorkspaceRpcDependencies {
+            transfer_access: Some(bibcode_server::transfer::TransferAccess::new(
+                b"secret".to_vec(),
+            )),
+            ..WorkspaceRpcDependencies::default()
+        },
+    );
+    let cwd = path_string(&root);
+    // The token carries the name, so a name the write would refuse must never reach a token.
+    for bad in ["..", "../escape", "nested/name.txt", "back\\slash.txt"] {
+        let refused = rpc
+            .handle(
+                "projects.createUploadUrl",
+                json!({"cwd": cwd, "relativeDirectory": "", "fileName": bad}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused["_tag"], "ProjectTransferError", "{bad}");
+        assert_eq!(refused["failure"], "operation_failed", "{bad}");
+        assert_eq!(refused["relativePath"], bad, "{bad}");
+        assert!(
+            refused["message"]
+                .as_str()
+                .unwrap()
+                .contains("plain file name"),
+            "{bad}"
+        );
+    }
 }
 
 #[tokio::test]
