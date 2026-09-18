@@ -9459,34 +9459,25 @@ async fn agent_activity_toggle_claude_hook_is_dormant_without_stopping_terminal(
     first_chunk_seen.await.expect("first body chunk sent");
     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
 
+    // The hook sink bounds an incomplete body with a fixed deadline, so the
+    // in-flight body only spans the two toggles: anything slower (an HTTP
+    // round trip, a projection read) on a starved runner would let the
+    // server answer first and drop the client's release channel.
     let stopped = manager.set_agent_activity_enabled(false).await;
     assert_eq!(stopped.stopped, 1);
     assert_eq!(stopped.dormant, 1);
     assert!(!process.killed.load(Ordering::Acquire));
-    let response = reqwest::Client::new()
-        .post(&endpoint)
-        .bearer_auth(&token)
-        .header("X-BiBCode-Launch-Correlation", &correlation)
-        .header("content-type", "application/json")
-        .body("{this body must not be decoded while dormant")
-        .send()
-        .await
-        .expect("dormant Claude hook response");
-    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
-    assert!(
-        projection.snapshot(&scope).await.is_err(),
-        "dormant hook must not publish or create tracker state"
-    );
-
     let resumed = manager.set_agent_activity_enabled(true).await;
     assert_eq!(resumed.resumed, 1);
-    release_body.send(()).expect("release old-generation body");
+    let released = release_body.send(());
+    let response = request.await.expect("request task");
+    assert!(
+        released.is_ok(),
+        "old-generation body was dropped before release; hook responded {:?}",
+        response.as_ref().map(reqwest::Response::status),
+    );
     assert_eq!(
-        request
-            .await
-            .expect("request task")
-            .expect("hook response")
-            .status(),
+        response.expect("hook response").status(),
         reqwest::StatusCode::NO_CONTENT,
     );
     assert!(
@@ -9522,19 +9513,38 @@ async fn agent_activity_toggle_claude_hook_is_dormant_without_stopping_terminal(
 
     let stopped = manager.set_agent_activity_enabled(false).await;
     assert_eq!(stopped.stopped, 1);
-    release_body.send(()).expect("release malformed body");
+    let released = release_body.send(());
+    let response = request.await.expect("malformed request task");
+    assert!(
+        released.is_ok(),
+        "malformed body was dropped before release; hook responded {:?}",
+        response.as_ref().map(reqwest::Response::status),
+    );
     assert_eq!(
-        request
-            .await
-            .expect("malformed request task")
-            .expect("malformed hook response")
-            .status(),
+        response.expect("malformed hook response").status(),
         reqwest::StatusCode::NO_CONTENT,
         "a body completed while dormant must be rejected before JSON parsing",
     );
     assert!(
         projection.snapshot(&scope).await.is_err(),
         "a body completed while dormant must not create tracker state",
+    );
+
+    // Still dormant, with no body in flight: a fresh hook is refused before
+    // its body is decoded and publishes nothing.
+    let response = reqwest::Client::new()
+        .post(&endpoint)
+        .bearer_auth(&token)
+        .header("X-BiBCode-Launch-Correlation", &correlation)
+        .header("content-type", "application/json")
+        .body("{this body must not be decoded while dormant")
+        .send()
+        .await
+        .expect("dormant Claude hook response");
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    assert!(
+        projection.snapshot(&scope).await.is_err(),
+        "dormant hook must not publish or create tracker state"
     );
     let resumed = manager.set_agent_activity_enabled(true).await;
     assert_eq!(resumed.resumed, 1);
