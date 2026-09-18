@@ -40,6 +40,23 @@ function uploadTargetLabel(relativeDirectory: string): string {
   return relativeDirectory ? `"${relativeDirectory}"` : "the workspace root";
 }
 
+/**
+ * Whether a refused mint is about this file rather than the folder it was headed for.
+ *
+ * The server refuses a name it cannot store with `operation_failed`; `not_found`,
+ * `outside_root`, and `not_configured` are all properties of the destination or the server. The
+ * distinction decides which name the toast leads with, because "Failed to prepare an upload to
+ * the workspace root" tells someone dragging in twenty files nothing about which one was wrong.
+ */
+function isFileLevelMintFailure(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "failure" in error &&
+    (error as { failure?: unknown }).failure === "operation_failed"
+  );
+}
+
 export interface UseFileTransfersInput {
   readonly environmentId: EnvironmentId;
   readonly cwd: string;
@@ -204,9 +221,12 @@ export function useFileTransfers({
         });
         if (minted._tag === "Failure") {
           if (!isAtomCommandInterrupted(minted)) {
+            const error = squashAtomCommandFailure(minted);
             showMutationError(
-              squashAtomCommandFailure(minted),
-              `Failed to prepare an upload to ${target}`,
+              error,
+              isFileLevelMintFailure(error)
+                ? `Can’t upload "${file.name}"`
+                : `Failed to prepare an upload to ${target}`,
             );
           }
           return;
