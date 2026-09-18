@@ -17,6 +17,13 @@ upload names behave on every platform.
   remembered per user. The flat list keeps file names visible and shortens
   only the directory.
 
+### Git Manager
+
+- **New branch** now forks from the branch you have checked out (or the
+  current HEAD commit when HEAD is detached) instead of the repository's
+  default branch, and the dialog shows that base branch in a highlighted chip
+  before you confirm.
+
 ### Files panel transfers
 
 - An upload URL is now bound to one file name; a leaked upload link can no
