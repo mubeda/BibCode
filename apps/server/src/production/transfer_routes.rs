@@ -1,8 +1,9 @@
 //! Production handlers for the signed file-transfer routes.
 //!
 //! The signed token is the only authority these handlers trust: it carries the canonical
-//! workspace root plus the relative path the RPC layer already validated, so a client can
-//! never widen the scope of a download or steer an upload outside its folder.
+//! workspace root plus the relative path the RPC layer already validated -- and, for an upload,
+//! the single file name it authorises -- so a client can never widen the scope of a download or
+//! steer an upload at another name or folder.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -114,25 +115,36 @@ pub fn download_handler_with_limits(
     })
 }
 
-/// Streams a request body into the folder a valid upload token names.
+/// Streams a request body into the one file a valid upload token names.
+///
+/// `requested_name` is the `?name=` a client still sent, if any. It is never the authority: the
+/// file name comes from the token. A value that disagrees with the token is refused outright, so
+/// a stale or hostile client cannot steer a token at another name and then read the 201 as
+/// confirmation that it did.
 #[must_use]
 pub fn upload_handler(
     access: TransferAccess,
     on_uploaded: UploadedCallback,
 ) -> TransferUploadHandler {
-    Arc::new(move |token, name, overwrite, body, _context| {
+    Arc::new(move |token, requested_name, overwrite, body, _context| {
         let access = access.clone();
         let on_uploaded = on_uploaded.clone();
         Box::pin(async move {
             let Some(TransferClaims::Upload {
                 root,
                 relative_dir,
+                file_name,
                 max_bytes,
                 ..
             }) = access.verify(&token)
             else {
                 return Err(not_found());
             };
+            if requested_name.is_some_and(|requested| requested != file_name) {
+                return Err(bad_request(
+                    "Query parameter 'name' does not match the upload token.",
+                ));
+            }
             // Both branches canonicalize, so the written path always shares a prefix with the
             // root the relative result is reported against.
             let (canonical_root, directory) = if relative_dir.is_empty() {
@@ -147,12 +159,9 @@ pub fn upload_handler(
                     .await
                     .map_err(|_| not_found())?
             };
-            if transfer::upload::validate_upload_file_name(&name).is_err() {
-                return Err(bad_request("Upload file name must be a plain file name."));
-            }
             match transfer::upload::write_upload(
                 &directory,
-                &name,
+                &file_name,
                 overwrite,
                 max_bytes,
                 body.into_data_stream(),
@@ -164,7 +173,7 @@ pub fn upload_handler(
                     let relative = written
                         .strip_prefix(&canonical_root)
                         .map(paths::to_posix)
-                        .unwrap_or_else(|_| name.clone());
+                        .unwrap_or_else(|_| file_name.clone());
                     Ok(TransferUploadHttpOutcome::Created {
                         relative_path: relative,
                     })
@@ -174,6 +183,11 @@ pub fn upload_handler(
                 }
                 Err(transfer::TransferError::UploadTooLarge { limit }) => {
                     Ok(TransferUploadHttpOutcome::TooLarge { limit })
+                }
+                // The mint validates the name, so this is only reachable if a token outlived a
+                // change to the rules. It is still the client's name, not a server fault.
+                Err(transfer::TransferError::InvalidFileName { .. }) => {
+                    Err(bad_request("Upload file name must be a plain file name."))
                 }
                 Err(error) => Err(internal(error.to_string())),
             }

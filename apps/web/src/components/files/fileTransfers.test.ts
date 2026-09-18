@@ -57,19 +57,12 @@ describe("downloadWithBridge", () => {
 });
 
 describe("upload helpers", () => {
-  // `URLSearchParams` writes a space as "+", which the server's `url::form_urlencoded::parse`
-  // decodes back to a space (see production/http_routes.rs transfer_upload).
-  it("builds the upload URL with an encoded name and overwrite flag", () => {
+  // The file name lives in the token, so nothing about it reaches the query; the retry after a
+  // Replace prompt reuses the same token and only adds the overwrite flag.
+  it("leaves the token URL alone and only adds the overwrite flag", () => {
     const base = "https://h:3773/api/transfers/t.k";
-    expect(uploadUrlFor(base, "a b.txt", false)).toBe(
-      "https://h:3773/api/transfers/t.k?name=a+b.txt",
-    );
-    expect(uploadUrlFor(base, "a&b#c.txt", false)).toBe(
-      "https://h:3773/api/transfers/t.k?name=a%26b%23c.txt",
-    );
-    expect(uploadUrlFor(base, "a.txt", true)).toBe(
-      "https://h:3773/api/transfers/t.k?name=a.txt&overwrite=1",
-    );
+    expect(uploadUrlFor(base, false)).toBe(base);
+    expect(uploadUrlFor(base, true)).toBe("https://h:3773/api/transfers/t.k?overwrite=1");
   });
 
   it("interprets server responses", () => {

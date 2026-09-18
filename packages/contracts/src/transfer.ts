@@ -21,6 +21,9 @@ export const ProjectCreateUploadUrlInput = Schema.Struct({
   cwd: TrimmedNonEmptyString,
   // "" (empty string) targets the workspace root.
   relativeDirectory: Schema.String.check(Schema.isMaxLength(PROJECT_ENTRY_PATH_MAX_LENGTH)),
+  // The one file the minted token authorises. The upload route takes the name from the token, so a
+  // leaked URL can only write this file in this directory.
+  fileName: TrimmedNonEmptyString.check(Schema.isMaxLength(255)),
 });
 export type ProjectCreateUploadUrlInput = typeof ProjectCreateUploadUrlInput.Type;
 

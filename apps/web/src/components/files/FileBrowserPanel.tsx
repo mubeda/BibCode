@@ -670,10 +670,11 @@ export default function FileBrowserPanel({
     [],
   );
 
-  // One file, one freshly minted upload token. `send` is the transport (desktop host or browser
-  // fetch) so the retry-after-replace loop is identical in both runtimes. Every failure — a refused
-  // upload or a rejected transport (unreadable file, permission error) — is reported against this
-  // file's own name and stops here, so one bad file never aborts the rest of a batch.
+  // One file, one freshly minted upload token bound to that one file name. `send` is the transport
+  // (desktop host or browser fetch) so the retry-after-replace loop is identical in both runtimes.
+  // Every failure — a refused upload or a rejected transport (unreadable file, permission error) —
+  // is reported against this file's own name and stops here, so one bad file never aborts the rest
+  // of a batch.
   const uploadOne = useCallback(
     async (
       relativeDirectory: string,
@@ -687,7 +688,10 @@ export default function FileBrowserPanel({
         return;
       }
       try {
-        const minted = await createUploadUrl({ environmentId, input: { cwd, relativeDirectory } });
+        const minted = await createUploadUrl({
+          environmentId,
+          input: { cwd, relativeDirectory, fileName: file.name },
+        });
         if (minted._tag === "Failure") {
           if (!isAtomCommandInterrupted(minted)) {
             showMutationError(
@@ -704,7 +708,8 @@ export default function FileBrowserPanel({
         }
         let overwrite = false;
         for (;;) {
-          const response = await file.send(uploadUrlFor(transferUrl, file.name, overwrite));
+          // The same token is reused for the replace retry: it already names this file.
+          const response = await file.send(uploadUrlFor(transferUrl, overwrite));
           const step = interpretUploadResponse(response.status, response.body);
           if (step._tag === "Uploaded") return;
           if (step._tag === "Exists" && !overwrite) {
