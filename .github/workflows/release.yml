@@ -41,7 +41,8 @@ jobs:
     # A cold publication preflight compiles the full Rust workspace through
     # `vp run test`; v0.5.9 approval runs reached both the old 30-minute and
     # 45-minute watchdogs with no failing test. Keep every gate and allow the
-    # measured hosted-runner variance.
+    # measured hosted-runner variance; the serialized test graph below trades
+    # some wall-clock for tests that no longer share the CPU with rustc.
     timeout-minutes: 60
     outputs:
       release_channel: ${{ steps.release_meta.outputs.release_channel }}
@@ -176,9 +177,13 @@ jobs:
       - name: Typecheck
         run: vp run typecheck
 
+      # One package test task at a time: each Cargo invocation finishes
+      # compiling before its test binaries run, so rustc never competes with
+      # the server and desktop suites (about thirty of them hold 2-second
+      # deadlines that starved hosted runners have missed).
       - name: Test
         if: steps.release_meta.outputs.validate_only != 'true'
-        run: vp run test
+        run: vp run --concurrency-limit 1 test
 
       - id: previous_tag
         name: Resolve previous release tag
