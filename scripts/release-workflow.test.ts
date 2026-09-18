@@ -144,7 +144,7 @@ it("assembles final assets without creating a GitHub release in validation-only 
   );
   assert.match(
     releaseWorkflow,
-    /name: Test\s*\n\s*if: steps\.release_meta\.outputs\.validate_only != 'true'\s*\n\s*run: vp run test/,
+    /name: Test\s*\n\s*if: steps\.release_meta\.outputs\.validate_only != 'true'\s*\n\s*run: vp run --concurrency-limit 1 test/,
   );
 
   const releaseMutationStepNames = [
