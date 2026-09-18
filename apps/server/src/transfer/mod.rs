@@ -108,6 +108,9 @@ pub enum TransferClaims {
     Upload {
         root: PathBuf,
         relative_dir: String,
+        /// The one file name this token authorises. The upload route writes this name and no
+        /// other, so a leaked URL can overwrite only the file the mint named.
+        file_name: String,
         max_bytes: u64,
         expires_at: u64,
     },
@@ -154,12 +157,15 @@ impl TransferAccess {
         })
     }
 
+    /// Mints an upload capability for exactly one file name in one directory. The name is
+    /// validated here so a token can never carry one the write would refuse.
     pub fn issue_upload(
         &self,
         root: &Path,
         relative_dir: &str,
+        file_name: &str,
     ) -> Result<IssuedTransferUrl, TransferError> {
-        self.issue_upload_with_limit(root, relative_dir, MAX_UPLOAD_BYTES)
+        self.issue_upload_with_limit(root, relative_dir, file_name, MAX_UPLOAD_BYTES)
     }
 
     /// [`Self::issue_upload`] with an explicit byte cap, so a caller -- or a test -- can bind a
@@ -168,11 +174,14 @@ impl TransferAccess {
         &self,
         root: &Path,
         relative_dir: &str,
+        file_name: &str,
         max_bytes: u64,
     ) -> Result<IssuedTransferUrl, TransferError> {
+        upload::validate_upload_file_name(file_name)?;
         self.issue(TransferClaims::Upload {
             root: root.to_path_buf(),
             relative_dir: relative_dir.to_owned(),
+            file_name: file_name.to_owned(),
             max_bytes,
             expires_at: self.expiry(),
         })
@@ -247,17 +256,21 @@ mod tests {
     }
 
     #[test]
-    fn upload_token_binds_directory_and_limit_and_rejects_tampering() {
+    fn upload_token_binds_one_file_name_directory_and_limit_and_rejects_tampering() {
         let access = TransferAccess::new(b"secret".to_vec());
-        let issued = access.issue_upload(Path::new("/repo"), "").unwrap();
+        let issued = access
+            .issue_upload(Path::new("/repo"), "", "report.pdf")
+            .unwrap();
         let token = issued.relative_url.rsplit('/').next().unwrap().to_owned();
         match access.verify(&token) {
             Some(TransferClaims::Upload {
                 relative_dir,
+                file_name,
                 max_bytes,
                 ..
             }) => {
                 assert_eq!(relative_dir, "");
+                assert_eq!(file_name, "report.pdf");
                 assert_eq!(max_bytes, MAX_UPLOAD_BYTES);
             }
             other => panic!("unexpected claims: {other:?}"),
@@ -269,6 +282,20 @@ mod tests {
     }
 
     #[test]
+    fn a_token_is_never_minted_for_a_name_the_write_would_refuse() {
+        let access = TransferAccess::new(b"secret".to_vec());
+        for bad in ["", "..", "../escape", "a/b"] {
+            assert!(
+                matches!(
+                    access.issue_upload(Path::new("/repo"), "", bad),
+                    Err(TransferError::InvalidFileName { .. })
+                ),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
     fn a_token_signed_for_the_asset_purpose_is_not_a_transfer_token() {
         // Assets and transfers share one server secret, so the purpose in the MAC input is the
         // only thing stopping a read-only asset capability from redeeming as an upload.
@@ -276,6 +303,7 @@ mod tests {
         let claims = TransferClaims::Upload {
             root: PathBuf::from("/repo"),
             relative_dir: String::new(),
+            file_name: "a.txt".to_owned(),
             max_bytes: MAX_UPLOAD_BYTES,
             expires_at: signed_token::now_millis().saturating_add(60_000),
         };

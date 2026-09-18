@@ -1038,14 +1038,25 @@ impl WorkspaceRpc {
         }))
     }
 
-    /// Mints a short-lived signed URL for uploading a single file into an existing folder.
+    /// Mints a short-lived signed URL for uploading a single named file into an existing folder.
     ///
-    /// An empty `relativeDirectory` targets the workspace root itself.
+    /// An empty `relativeDirectory` targets the workspace root itself. The token binds the file
+    /// name as well as the folder, so a leaked URL can write only the file the caller named here.
     async fn handle_create_upload_url(
         &self,
         input: ProjectCreateUploadUrlInput,
     ) -> Result<Value, Value> {
         let access = self.transfer_access(&input.cwd, &input.relative_directory)?;
+        // Checked before the path lease: an unusable name costs nothing to refuse.
+        if transfer::upload::validate_upload_file_name(&input.file_name).is_err() {
+            return Err(json!({
+                "_tag": "ProjectTransferError",
+                "cwd": input.cwd,
+                "relativePath": input.file_name,
+                "failure": "operation_failed",
+                "message": "Upload file name must be a plain file name.",
+            }));
+        }
         let _admission = self.acquire_path(&input.cwd).await?;
         let root = normalize_root(Path::new(&input.cwd), false)
             .await
@@ -1070,7 +1081,7 @@ impl WorkspaceRpc {
             relative
         };
         let issued = access
-            .issue_upload(&root, &relative)
+            .issue_upload(&root, &relative, &input.file_name)
             .map_err(|error| transfer_error_wire(&input.cwd, &input.relative_directory, &error))?;
         Ok(json!({
             "relativeUrl": issued.relative_url,
@@ -1523,6 +1534,7 @@ struct ProjectCreateDownloadUrlInput {
 struct ProjectCreateUploadUrlInput {
     cwd: String,
     relative_directory: String,
+    file_name: String,
 }
 
 #[cfg(test)]

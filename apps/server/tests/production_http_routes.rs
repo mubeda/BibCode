@@ -508,14 +508,14 @@ async fn transfer_routes_stream_downloads_and_accept_uploads() {
         .unwrap();
     assert!(bytes.starts_with(b"PK"));
 
-    let upload_url = access.issue_upload(&root, "dir").unwrap().relative_url;
+    // The token names the file: no `?name=` is sent, and the write lands on the token's name.
+    let upload_url = access
+        .issue_upload(&root, "dir", "b.txt")
+        .unwrap()
+        .relative_url;
     let response = app
         .clone()
-        .oneshot(
-            Request::post(format!("{upload_url}?name=b.txt"))
-                .body(Body::from("new"))
-                .unwrap(),
-        )
+        .oneshot(Request::post(&upload_url).body(Body::from("new")).unwrap())
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
@@ -525,7 +525,7 @@ async fn transfer_routes_stream_downloads_and_accept_uploads() {
     let response = app
         .clone()
         .oneshot(
-            Request::post(format!("{upload_url}?name=b.txt"))
+            Request::post(&upload_url)
                 .body(Body::from("again"))
                 .unwrap(),
         )
@@ -539,7 +539,7 @@ async fn transfer_routes_stream_downloads_and_accept_uploads() {
     let response = app
         .clone()
         .oneshot(
-            Request::post(format!("{upload_url}?name=b.txt&overwrite=1"))
+            Request::post(format!("{upload_url}?overwrite=1"))
                 .body(Body::from("again"))
                 .unwrap(),
         )
@@ -548,22 +548,34 @@ async fn transfer_routes_stream_downloads_and_accept_uploads() {
     assert_eq!(response.status(), StatusCode::CREATED);
     assert_eq!(std::fs::read(root.join("dir/b.txt")).unwrap(), b"again");
 
+    // A `?name=` that repeats the token's own name is harmless and accepted.
     let response = app
         .clone()
         .oneshot(
-            Request::post(format!("{upload_url}?name=../x"))
-                .body(Body::from("x"))
+            Request::post(format!("{upload_url}?name=b.txt&overwrite=1"))
+                .body(Body::from("echoed"))
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let response = app
-        .clone()
-        .oneshot(Request::post(&upload_url).body(Body::from("x")).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(std::fs::read(root.join("dir/b.txt")).unwrap(), b"echoed");
+
+    // A `?name=` that disagrees with the token cannot redirect it.
+    for name in ["../x", "c.txt"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(format!("{upload_url}?name={name}&overwrite=1"))
+                    .body(Body::from("x"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{name}");
+    }
+    assert!(!root.join("dir/c.txt").exists());
+    assert_eq!(std::fs::read(root.join("dir/b.txt")).unwrap(), b"echoed");
     let response = app
         .clone()
         .oneshot(
@@ -646,12 +658,12 @@ async fn transfer_routes_distinguish_archive_and_upload_size_failures() {
     );
     let upload_app = add_routes(Router::new()).with_state(TestState(state));
     let upload_url = access
-        .issue_upload_with_limit(&root, "dir", 2)
+        .issue_upload_with_limit(&root, "dir", "big.txt", 2)
         .unwrap()
         .relative_url;
     let response = upload_app
         .oneshot(
-            Request::post(format!("{upload_url}?name=big.txt"))
+            Request::post(&upload_url)
                 .body(Body::from("too long"))
                 .unwrap(),
         )
@@ -709,4 +721,61 @@ async fn a_minted_download_url_redeems_against_the_transfer_route() {
         to_bytes(response.into_body(), usize::MAX).await.unwrap(),
         "export const answer = 42;"
     );
+}
+
+#[tokio::test]
+async fn a_minted_upload_url_writes_only_the_name_the_mint_bound() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+
+    let access = bibcode_server::transfer::TransferAccess::new(b"secret".to_vec());
+    let rpc = bibcode_server::workspace::WorkspaceRpc::with_dependencies(
+        bibcode_server::workspace::WorkspaceService::default(),
+        bibcode_server::workspace::WorkspaceRpcDependencies {
+            transfer_access: Some(access.clone()),
+            ..bibcode_server::workspace::WorkspaceRpcDependencies::default()
+        },
+    );
+    let minted = rpc
+        .handle(
+            "projects.createUploadUrl",
+            json!({
+                "cwd": root.to_string_lossy(),
+                "relativeDirectory": "src",
+                "fileName": "notes.md",
+            }),
+        )
+        .await
+        .expect("minted upload URL");
+    let upload_url = minted["relativeUrl"].as_str().expect("relativeUrl");
+
+    let mut state = state_with_json_recorder(Arc::new(Mutex::new(Vec::new())));
+    state.transfer_upload = bibcode_server::production::transfer_routes::upload_handler(
+        access,
+        Arc::new(|_root| Box::pin(async {})),
+    );
+    let app = add_routes(Router::new()).with_state(TestState(state));
+
+    // No `?name=`: the route takes the name from the token the RPC minted.
+    let response = app
+        .clone()
+        .oneshot(Request::post(upload_url).body(Body::from("hi")).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(body_json(response).await["relativePath"], "src/notes.md");
+    assert_eq!(std::fs::read(root.join("src/notes.md")).unwrap(), b"hi");
+
+    // The same token cannot be pointed at a second file in that folder.
+    let response = app
+        .oneshot(
+            Request::post(format!("{upload_url}?name=other.md&overwrite=1"))
+                .body(Body::from("nope"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(!root.join("src/other.md").exists());
 }

@@ -59,10 +59,13 @@ pub type TransferDownloadHandler = Arc<
         + Send
         + Sync,
 >;
+/// `(token, requested_name, overwrite, body, context)`. The upload's file name lives in the
+/// token, so `requested_name` is only the `?name=` a client still sent: the handler refuses one
+/// that disagrees with the token rather than honouring it.
 pub type TransferUploadHandler = Arc<
     dyn Fn(
             String,
-            String,
+            Option<String>,
             bool,
             Body,
             RouteContext,
@@ -543,9 +546,9 @@ async fn transfer_upload(
                 .collect()
         })
         .unwrap_or_default();
-    let Some(name) = query.get("name").cloned() else {
-        return bad_request("Query parameter 'name' is required.");
-    };
+    // The token names the file; `?name=` survives only so a stale client that still sends it is
+    // refused loudly instead of silently writing somewhere it did not intend.
+    let requested_name = query.get("name").cloned();
     let overwrite = query
         .get("overwrite")
         .is_some_and(|value| value == "1" || value == "true");
@@ -554,7 +557,7 @@ async fn transfer_upload(
         uri: parts.uri,
         cancellation,
     };
-    match (state.transfer_upload)(token, name, overwrite, body, context).await {
+    match (state.transfer_upload)(token, requested_name, overwrite, body, context).await {
         Ok(TransferUploadHttpOutcome::Created { relative_path }) => json_response(
             StatusCode::CREATED,
             BTreeMap::new(),

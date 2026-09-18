@@ -1141,10 +1141,13 @@ replacement that now occupies the old path.
   the route repeats the pre-scan before streaming because the tree can grow
   between mint and redemption. A file download carries `Content-Length`; a zip
   is produced as it streams and stays chunked. An upload token names one
-  directory and a byte cap; uploads reserve the target name, stream into a
-  per-invocation `.part` file, and rename into place, refusing collisions
-  unless `overwrite=1`, never replacing directories, and removing the partial
-  and any reservation this server created on failure. The upload handler
+  directory, one file name, and a byte cap: `POST /api/transfers/{token}` takes
+  the name from the token, so a leaked URL can write only that one file, and a
+  `?name=` that disagrees with the token is refused with 400 rather than
+  honoured. Uploads reserve the target name, stream into a per-invocation
+  `.part` file, and rename into place, refusing collisions unless
+  `overwrite=1`, never replacing directories, and removing the partial and any
+  reservation this server created on failure. The upload handler
   invalidates the entries index for that root and notifies the Git status
   broadcaster.
 - Cancellation flows from client interrupt or socket closure until the
