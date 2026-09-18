@@ -19,7 +19,12 @@ interface SourceControlSectionProps extends SourceControlRowActions {
   checked?: (file: WorkingTreeFile) => boolean;
   selected?: (file: WorkingTreeFile) => boolean;
   onSelect?: (path: string, selected: boolean) => void;
+  /** Batch selection for a folder header; see the changes list. */
+  onSelectFiles?: (files: readonly WorkingTreeFile[], selected: boolean) => void;
   onToggle: (path: string) => void;
+  /** Batch staging for a folder header; see the changes list. */
+  onStageFiles?: (paths: readonly string[]) => void;
+  onUnstageFiles?: (paths: readonly string[]) => void;
   onOpenFile: (path: string, area?: VcsStagingArea) => void;
   primaryAction?: { icon: "stage" | "unstage"; label: string; onClick: () => void };
   onDiscard?: () => void;
@@ -32,6 +37,8 @@ interface SourceControlSectionProps extends SourceControlRowActions {
   disabled?: boolean;
   /** Gates the primary-env-only "Open in External Editor" context-menu item. */
   isPrimaryEnv?: boolean;
+  /** Panel-wide changes view: folder groups (default) or one flat list. */
+  groupByFolder?: boolean;
 }
 
 export function SourceControlSection(props: SourceControlSectionProps) {
@@ -104,6 +111,10 @@ export function SourceControlSection(props: SourceControlSectionProps) {
           {...(props.checked ? { checked: props.checked } : {})}
           {...(props.selected ? { selected: props.selected } : {})}
           {...(props.onSelect ? { onSelect: props.onSelect } : {})}
+          {...(props.onSelectFiles ? { onSelectFiles: props.onSelectFiles } : {})}
+          {...(props.onStageFiles ? { onStageFiles: props.onStageFiles } : {})}
+          {...(props.onUnstageFiles ? { onUnstageFiles: props.onUnstageFiles } : {})}
+          {...(props.groupByFolder !== undefined ? { groupByFolder: props.groupByFolder } : {})}
           {...(props.disabled !== undefined ? { disabled: props.disabled } : {})}
           {...(props.isPrimaryEnv !== undefined ? { isPrimaryEnv: props.isPrimaryEnv } : {})}
           {...(props.onStageFile ? { onStageFile: props.onStageFile } : {})}
@@ -124,7 +135,7 @@ export function SourceControlSection(props: SourceControlSectionProps) {
             const badge = workingTreeStatusBadge(file.status);
             return (
               <span
-                className={cn("w-4 shrink-0 text-center text-[10px] font-bold", badge.className)}
+                className={cn("w-4 shrink-0 text-center text-xs font-bold", badge.className)}
                 title={badge.label}
               >
                 {badge.letter}
