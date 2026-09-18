@@ -1,5 +1,54 @@
 # Changelog
 
+## [v0.5.13] - 2026-09-18
+
+BiBCode v0.5.13 shows where pending changes live in the Source Control panel,
+narrows Files-panel upload tokens to a single file, and makes download and
+upload names behave on every platform.
+
+### Source Control
+
+- Pending changes are grouped by folder inside each section. A folder row
+  shows the full relative directory (shortened from the start so the deepest
+  part stays readable), a file count, a collapse chevron, and a checkbox that
+  stages, unstages, or selects every file in that folder in one request. File
+  rows underneath show only the name and its diff stats.
+- A **Group by folder / Flat list** toggle next to the section actions is
+  remembered per user. The flat list keeps file names visible and shortens
+  only the directory.
+
+### Files panel transfers
+
+- An upload URL is now bound to one file name; a leaked upload link can no
+  longer write any other name in that folder, and a request that names a
+  different file is refused.
+- Download names with non-ASCII characters arrive intact in browser mode
+  (`Content-Disposition` carries an RFC 5987 encoded name), and a name that
+  previously broke the response no longer does.
+- Upload names are validated for the filesystem that stores them: Windows-only
+  rules (reserved names, `<>:"|?*`, trailing dots or spaces) apply only when
+  the server runs on Windows, so Linux and macOS workspaces keep accepting
+  their legal names. Names up to 255 bytes upload; the desktop host shortens
+  an over-long download name instead of refusing it, and on Windows renames a
+  download that Windows could not store, reporting the saved path.
+- A refused upload now names the file in its message.
+
+### Desktop
+
+- macOS builds stay ad-hoc signed; the README and the release runbook explain
+  that folder and network permissions are asked again after each update.
+
+### Downloads
+
+On macOS, copy BiBCode.app from the DMG to Applications before launching it.
+
+Desktop installers and standalone server distributions are provided for macOS,
+Linux, and Windows on ARM64 and x64. Linux server `.deb` and `.rpm` packages are
+included for both architectures. Stable desktop updater payloads and signatures
+remain available through `latest.json`.
+
+**Full Changelog**: https://github.com/mubeda/BibCode/compare/v0.5.12...v0.5.13
+
 ## [v0.5.12] - 2026-09-17
 
 BiBCode v0.5.12 adds Download and Upload to the Files panel for local and
