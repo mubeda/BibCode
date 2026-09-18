@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -28,25 +27,22 @@ const UNIVERSAL_FORBIDDEN_CHARACTERS: [char; 2] = ['/', '\\'];
 /// will store the file is a Windows one.
 pub const WINDOWS_FORBIDDEN_CHARACTERS: [char; 7] = ['<', '>', ':', '"', '|', '?', '*'];
 
-/// The bytes a partial name adds around the file name it echoes, with every counter at its
-/// widest. Derived from the same formatter the partial name uses, so the budget cannot drift
-/// away from the format it is protecting.
+/// The bytes a partial name adds around the stem it echoes, with every counter at its widest.
+/// Derived from the same formatter the partial name uses, so the budget cannot drift away from
+/// the format it is protecting.
 #[must_use]
 pub fn partial_name_overhead(suffix: &str) -> usize {
     partial_name("", suffix, u32::MAX, u64::MAX, u128::MAX).len()
 }
 
-/// The longest file name that still leaves room for its partial sibling inside one path
-/// component. Shared with the desktop host, whose download partials use a different suffix.
+/// How much of a file name its partial sibling may echo. This is a budget for the *partial*,
+/// not a cap on the name: a partial is a temporary file nobody reads, so it echoes as much of
+/// the name as fits and drops the rest. The name itself is only held to
+/// [`MAX_PATH_COMPONENT_BYTES`].
 #[must_use]
-pub fn max_transfer_file_name_bytes(suffix: &str) -> usize {
+pub fn max_transfer_stem_bytes(suffix: &str) -> usize {
     MAX_PATH_COMPONENT_BYTES.saturating_sub(partial_name_overhead(suffix))
 }
-
-/// The cap an upload name is held to: long enough for any realistic name, short enough that the
-/// `.part` sibling written beside it still fits one component.
-pub static MAX_UPLOAD_FILE_NAME_BYTES: LazyLock<usize> =
-    LazyLock::new(|| max_transfer_file_name_bytes(UPLOAD_PARTIAL_SUFFIX));
 
 /// The file-name policy a BiBCode transfer applies.
 ///
@@ -123,8 +119,7 @@ fn upload_file_name_rule_for(windows_rules: bool) -> String {
     };
     format!(
         "Upload file name must be a plain file name: no / or \\, no control characters, and at \
-         most {} bytes.{windows}",
-        *MAX_UPLOAD_FILE_NAME_BYTES
+         most {MAX_PATH_COMPONENT_BYTES} bytes.{windows}"
     )
 }
 
@@ -139,7 +134,7 @@ pub fn validate_upload_file_name(name: &str) -> Result<(), TransferError> {
 /// [`validate_upload_file_name`] with the host decision made explicit, so both branches are
 /// reachable from a test whatever the host running it.
 fn validate_upload_file_name_for(name: &str, windows_rules: bool) -> Result<(), TransferError> {
-    if is_plain_transfer_file_name(name, *MAX_UPLOAD_FILE_NAME_BYTES, windows_rules) {
+    if is_plain_transfer_file_name(name, MAX_PATH_COMPONENT_BYTES, windows_rules) {
         Ok(())
     } else {
         Err(TransferError::InvalidFileName {
@@ -260,20 +255,23 @@ async fn reservation_error(target: &Path, error: std::io::Error) -> TransferErro
 /// A partial file name unique to this process, this call, and this instant, so concurrent
 /// uploads of the same name never stream into the same file.
 fn partial_file_name(name: &str) -> String {
+    partial_transfer_file_name(name, UPLOAD_PARTIAL_SUFFIX)
+}
+
+/// The partial-file name a transfer streams into: `.{stem}.{unique}.{suffix}`, unique to this
+/// process, this call, and this instant, and always inside one path component whatever name it
+/// echoes -- the stem is truncated to whatever [`max_transfer_stem_bytes`] leaves.
+///
+/// The upload route and the desktop download host both call this, so neither can drift into
+/// writing a different shape or a different budget from the one the other measures.
+#[must_use]
+pub fn partial_transfer_file_name(name: &str, suffix: &str) -> String {
     let counter = PARTIAL_COUNTER.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
-    // Validation already caps the name, so the truncation is only what keeps this total for a
-    // name that reached here another way.
-    let stem = truncate_on_char_boundary(name, *MAX_UPLOAD_FILE_NAME_BYTES);
-    partial_name(
-        stem,
-        UPLOAD_PARTIAL_SUFFIX,
-        std::process::id(),
-        counter,
-        nanos,
-    )
+    let stem = truncate_on_char_boundary(name, max_transfer_stem_bytes(suffix));
+    partial_name(stem, suffix, std::process::id(), counter, nanos)
 }
 
 /// The one place the partial-name shape is written down: the budget and the name are both
@@ -350,7 +348,10 @@ mod tests {
             "COM0.txt",
             "COM10.txt",
             "console",
-            &"x".repeat(*MAX_UPLOAD_FILE_NAME_BYTES),
+            // Well past the partial-name budget: a partial echoes what fits, the name itself
+            // is only held to the path-component limit.
+            &"x".repeat(200),
+            &"x".repeat(MAX_PATH_COMPONENT_BYTES),
         ] {
             for windows_rules in [false, true] {
                 assert!(
@@ -359,7 +360,7 @@ mod tests {
                 );
             }
         }
-        let too_long = "x".repeat(*MAX_UPLOAD_FILE_NAME_BYTES + 1);
+        let too_long = "x".repeat(MAX_PATH_COMPONENT_BYTES + 1);
         for windows_rules in [false, true] {
             for bad in UNIVERSALLY_INVALID
                 .iter()
@@ -401,7 +402,7 @@ mod tests {
         let posix = upload_file_name_rule_for(false);
         assert!(posix.contains("plain file name"), "{posix}");
         assert!(
-            posix.contains(&MAX_UPLOAD_FILE_NAME_BYTES.to_string()),
+            posix.contains(&MAX_PATH_COMPONENT_BYTES.to_string()),
             "{posix}"
         );
         assert!(!posix.contains("CON"), "{posix}");
@@ -411,13 +412,13 @@ mod tests {
     }
 
     #[test]
-    fn the_name_cap_is_derived_from_the_partial_name_format() {
-        // The cap exists only so the `.part` sibling fits one path component; a hard-coded number
-        // would drift the moment the partial format changes.
-        let longest = "x".repeat(*MAX_UPLOAD_FILE_NAME_BYTES);
+    fn the_partial_stem_budget_is_derived_from_the_partial_name_format() {
+        // The budget exists only so the `.part` sibling fits one path component; a hard-coded
+        // number would drift the moment the partial format changes.
+        let budget = max_transfer_stem_bytes(UPLOAD_PARTIAL_SUFFIX);
         assert_eq!(
             partial_name(
-                &longest,
+                &"x".repeat(budget),
                 UPLOAD_PARTIAL_SUFFIX,
                 u32::MAX,
                 u64::MAX,
@@ -426,12 +427,19 @@ mod tests {
             .len(),
             MAX_PATH_COMPONENT_BYTES
         );
-        assert!(partial_file_name(&longest).len() <= MAX_PATH_COMPONENT_BYTES);
-        // A longer suffix buys a shorter name, and the two always add up to the component limit.
-        assert!(
-            max_transfer_file_name_bytes("bibcode-download.part")
-                < max_transfer_file_name_bytes(UPLOAD_PARTIAL_SUFFIX)
-        );
+        // A longer suffix buys a shorter stem, and the two always add up to the component limit.
+        assert!(max_transfer_stem_bytes("bibcode-download.part") < budget);
+        // Any name the validator accepts still yields a partial inside one component, because
+        // the partial echoes only what fits rather than the whole name.
+        for name in [
+            "a.txt",
+            &"x".repeat(200),
+            &"x".repeat(MAX_PATH_COMPONENT_BYTES),
+        ] {
+            let partial = partial_transfer_file_name(name, UPLOAD_PARTIAL_SUFFIX);
+            assert!(partial.len() <= MAX_PATH_COMPONENT_BYTES, "{partial}");
+            assert!(partial.ends_with(UPLOAD_PARTIAL_SUFFIX), "{partial}");
+        }
     }
 
     #[tokio::test]
@@ -459,6 +467,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::fs::read(&written).unwrap(), b"new");
+    }
+
+    #[tokio::test]
+    async fn writes_a_name_longer_than_the_partial_stem_budget() {
+        // 200 bytes is past what a partial name can echo but well inside a path component, so
+        // the upload must land: the budget shortens the partial, never the file.
+        let temp = tempfile::tempdir().unwrap();
+        let long = format!("{}.txt", "x".repeat(196));
+        assert_eq!(long.len(), 200);
+        assert!(long.len() > max_transfer_stem_bytes(UPLOAD_PARTIAL_SUFFIX));
+        let written = write_upload(temp.path(), &long, false, 1024, body(&[b"hello"]))
+            .await
+            .unwrap();
+        assert_eq!(written.file_name().unwrap().to_string_lossy(), long);
+        assert_eq!(std::fs::read(&written).unwrap(), b"hello");
+        assert_eq!(entry_names(temp.path()), vec![long]);
+
+        // One byte past the component limit is still refused, before anything is opened.
+        let over = "x".repeat(MAX_PATH_COMPONENT_BYTES + 1);
+        assert!(matches!(
+            write_upload(temp.path(), &over, false, 1024, body(&[b"x"])).await,
+            Err(TransferError::InvalidFileName { .. })
+        ));
     }
 
     #[tokio::test]
@@ -558,18 +589,17 @@ mod tests {
             assert!(!name.contains('/'));
         }
         // A budget that lands mid-scalar backs off to a boundary: one ASCII byte then 3-byte
-        // characters puts the budget inside a character, so the stem stops short of it. This is
-        // only reachable for a name that got here without validation, but it keeps the helper
-        // total.
+        // characters puts the budget inside a character, so the stem stops short of it.
+        let budget = max_transfer_stem_bytes(UPLOAD_PARTIAL_SUFFIX);
         let multi_byte = partial_file_name(&format!("a{}", "\u{2603}".repeat(100)));
         assert!(multi_byte.len() <= MAX_PATH_COMPONENT_BYTES, "{multi_byte}");
-        let snowmen = (*MAX_UPLOAD_FILE_NAME_BYTES - 1) / "\u{2603}".len();
+        let snowmen = (budget - 1) / "\u{2603}".len();
         assert!(
             multi_byte.starts_with(&format!(".a{}.", "\u{2603}".repeat(snowmen))),
             "{multi_byte}"
         );
         // The prefix really is short of the budget, so the back-off was exercised.
-        assert!(1 + snowmen * "\u{2603}".len() < *MAX_UPLOAD_FILE_NAME_BYTES);
+        assert!(1 + snowmen * "\u{2603}".len() < budget);
     }
 
     #[tokio::test]

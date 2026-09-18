@@ -502,7 +502,8 @@ The Files surface is a full file manager for the active workspace:
   folder. It is disabled on file rows. An upload that would replace an existing
   file asks first. Files up to 1 GiB each are accepted. A name that is not a
   plain file name — empty, `.`, `..`, containing a path separator or a control
-  character, or very long — is always refused with a message naming the rule.
+  character, or longer than 255 bytes — is always refused with a message naming
+  the rule and the file it applies to.
   When the server holding the workspace runs on **Windows**, the names Windows
   itself cannot store are refused too: those containing `< > : " | ? *`, ending
   in a dot or a space, or named after a device such as `CON` or `COM1`. A
@@ -512,7 +513,8 @@ The Files surface is a full file manager for the active workspace:
   whose name Windows cannot store is still downloadable: the desktop app on
   Windows saves it under the closest name Windows accepts (forbidden characters
   become `_`, trailing dots and spaces are dropped, a device name gains a `_`),
-  and the toast shows the path it actually wrote. On Linux and macOS the name
+  and the toast shows the path it actually wrote. A name longer than 255 bytes
+  is shortened to fit, keeping its extension, rather than refused. On Linux and macOS the name
   is kept as is, and a browser download always follows the browser's own rules. Both actions work for
   remote environments; the transfer goes to the server that owns the workspace.
 - Drag one or more files and folders onto a folder row, or onto the tree's root

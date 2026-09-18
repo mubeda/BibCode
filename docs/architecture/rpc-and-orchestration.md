@@ -1145,8 +1145,10 @@ replacement that now occupies the old path.
   raw non-ASCII or control byte is not a legal header value and would fail the
   whole response. One file-name policy (`transfer::upload`) governs both
   directions: a plain, non-empty name with no path separator or control
-  character, short enough that its `.part` sibling still fits a 255-byte path
-  component. The additional Windows rules (`< > : " | ? *`, a trailing dot or
+  character, within the 255-byte path-component limit. The `.part` sibling is
+  sized separately by `partial_transfer_file_name`, which echoes only as much
+  of the name as its own budget allows, so the partial never constrains the
+  name a user may upload. The additional Windows rules (`< > : " | ? *`, a trailing dot or
   space, the reserved device names) are applied for the filesystem that will
   store the file, not the host asking — the upload route applies them only when
   the server itself runs on Windows, and a Windows desktop host renames a

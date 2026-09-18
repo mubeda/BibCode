@@ -6,11 +6,8 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     process::Command,
-    sync::{
-        LazyLock, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::Mutex,
+    time::Duration,
 };
 use tauri::{AppHandle, Manager, Runtime, State};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
@@ -1606,10 +1603,12 @@ fn validate_transfer_url(url: &str) -> Result<reqwest::Url, String> {
 /// The tail `desktop_bridge_download_to_folder` gives its partial files.
 const DOWNLOAD_PARTIAL_SUFFIX: &str = "bibcode-download.part";
 
-/// The longest download name that still leaves its `.part` sibling inside one path component.
-static MAX_DOWNLOAD_FILE_NAME_BYTES: LazyLock<usize> = LazyLock::new(|| {
-    bibcode_server::transfer::upload::max_transfer_file_name_bytes(DOWNLOAD_PARTIAL_SUFFIX)
-});
+/// One path component may hold 255 bytes on every filesystem BiBCode supports.
+const MAX_PATH_COMPONENT_BYTES: usize = bibcode_server::transfer::upload::MAX_PATH_COMPONENT_BYTES;
+
+/// The longest tail still treated as an extension worth preserving when a name is shortened.
+/// Past this it is not an extension, it is the name.
+const MAX_KEPT_EXTENSION_BYTES: usize = 16;
 
 /// The name this host will write to its own disk.
 ///
@@ -1626,22 +1625,45 @@ fn validate_download_file_name(name: &str) -> Result<String, String> {
 /// [`validate_download_file_name`] with the host decision made explicit, so both branches are
 /// reachable from a test whatever the host running it.
 fn download_file_name_for(name: &str, windows_rules: bool) -> Result<String, String> {
-    if !bibcode_server::transfer::upload::is_plain_transfer_file_name(
-        name,
-        *MAX_DOWNLOAD_FILE_NAME_BYTES,
-        false,
-    ) {
-        return Err(format!(
-            "Download file name must be a plain file name: no / or \\, no control characters, \
-             and at most {} bytes.",
-            *MAX_DOWNLOAD_FILE_NAME_BYTES
-        ));
+    // Length never refuses a download: an over-long name is shortened below, because the name
+    // came from the server's filesystem and the user has no way to change it. Only a name that
+    // is not a plain file name at all -- empty, `.`/`..`, a separator, a control byte -- refuses,
+    // because that means something is wrong rather than merely unportable.
+    if !bibcode_server::transfer::upload::is_plain_transfer_file_name(name, usize::MAX, false) {
+        return Err(
+            "Download file name must be a plain file name: no / or \\ and no control characters."
+                .to_owned(),
+        );
     }
+    // Shortened before the Windows rewrite so the extension survives it; the rewrite re-applies
+    // the component budget itself, because its device prefix is the one step that lengthens.
+    let fitted = fit_within_component(name);
     Ok(if windows_rules {
-        windows_safe_file_name(name, *MAX_DOWNLOAD_FILE_NAME_BYTES)
+        windows_safe_file_name(&fitted, MAX_PATH_COMPONENT_BYTES)
     } else {
-        name.to_owned()
+        fitted
     })
+}
+
+/// One path component may hold 255 bytes, so a longer name is shortened to fit rather than
+/// refused. The extension is kept when there is a plausible one, so the saved file still opens
+/// with the application the user expects; the "Download saved" toast reports the path written.
+fn fit_within_component(name: &str) -> String {
+    if name.len() <= MAX_PATH_COMPONENT_BYTES {
+        return name.to_owned();
+    }
+    let extension = name
+        .rfind('.')
+        .filter(|dot| *dot > 0)
+        .map(|dot| &name[dot..])
+        .filter(|extension| extension.len() <= MAX_KEPT_EXTENSION_BYTES)
+        .unwrap_or("");
+    let stem = &name[..name.len() - extension.len()];
+    let kept = bibcode_server::transfer::upload::truncate_on_char_boundary(
+        stem,
+        MAX_PATH_COMPONENT_BYTES - extension.len(),
+    );
+    format!("{kept}{extension}")
 }
 
 /// Rewrites a name a Windows filesystem cannot store into the closest one it can: the characters
@@ -1684,19 +1706,6 @@ fn transfer_http_client() -> Result<reqwest::Client, String> {
         .connect_timeout(Duration::from_secs(10))
         .build()
         .map_err(|error| bridge_error("Could not create the transfer HTTP client", error))
-}
-
-/// Returns a suffix that is unique per call, even across concurrent calls in
-/// the same process, so two simultaneous downloads of the same file name
-/// never share a partial-download path.
-fn unique_partial_suffix() -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{}-{counter}-{nanos}", std::process::id())
 }
 
 /// Reserves a collision-free destination path for `file_name` inside
@@ -1779,10 +1788,14 @@ pub async fn desktop_bridge_download_to_folder(
             response.status().as_u16()
         ));
     }
-    let partial = directory.join(format!(
-        ".{file_name}.{}.{DOWNLOAD_PARTIAL_SUFFIX}",
-        unique_partial_suffix()
-    ));
+    // The partial-name shape and its stem budget both come from the server crate, so the two
+    // sides of a transfer cannot drift into writing different partials.
+    let partial = directory.join(
+        bibcode_server::transfer::upload::partial_transfer_file_name(
+            &file_name,
+            DOWNLOAD_PARTIAL_SUFFIX,
+        ),
+    );
     let mut file = tokio::fs::File::create(&partial)
         .await
         .map_err(|error| bridge_error("Could not create the download file", error))?;
@@ -2252,6 +2265,9 @@ mod tests {
             "a b.txt",
             "CONTACTS.txt",
             "COM0.zip",
+            // Past what a partial name can echo, but a perfectly good name to save under.
+            &format!("{}.txt", "x".repeat(196)),
+            &"x".repeat(MAX_PATH_COMPONENT_BYTES),
         ] {
             for windows_rules in [false, true] {
                 assert_eq!(
@@ -2261,9 +2277,9 @@ mod tests {
                 );
             }
         }
-        // Only a name that is not a plain file name anywhere refuses the download.
-        let too_long = "x".repeat(*MAX_DOWNLOAD_FILE_NAME_BYTES + 1);
-        for bad in ["", ".", "..", "a/b", "a\\b", "a\0b", "a\nb", &too_long] {
+        // Only a name that is not a plain file name anywhere refuses the download. Length is
+        // never a refusal; see the shortening test below.
+        for bad in ["", ".", "..", "a/b", "a\\b", "a\0b", "a\nb"] {
             for windows_rules in [false, true] {
                 assert!(
                     download_file_name_for(bad, windows_rules).is_err(),
@@ -2271,17 +2287,42 @@ mod tests {
                 );
             }
         }
-        // The cap leaves room for the partial sibling this command writes.
-        let longest = "x".repeat(*MAX_DOWNLOAD_FILE_NAME_BYTES);
-        assert!(download_file_name_for(&longest, true).is_ok());
-        let partial = format!(
-            ".{longest}.{}.{DOWNLOAD_PARTIAL_SUFFIX}",
-            unique_partial_suffix()
-        );
-        assert!(
-            partial.len() <= bibcode_server::transfer::upload::MAX_PATH_COMPONENT_BYTES,
-            "{partial}"
-        );
+    }
+
+    #[test]
+    fn an_over_long_download_name_is_shortened_rather_than_refused() {
+        // The name comes from the server's filesystem, so the user cannot shorten it; refusing
+        // would strand the file. The partial sibling is sized by the shared builder, so only the
+        // saved name has to fit here.
+        for (name, expected_extension) in [
+            (format!("{}.txt", "x".repeat(296)), ".txt"),
+            (format!("{}.tar.gz", "\u{2603}".repeat(100)), ".gz"),
+            // No plausible extension: the whole name is stem.
+            ("x".repeat(300), ""),
+            (format!(".{}", "x".repeat(299)), ""),
+        ] {
+            for windows_rules in [false, true] {
+                let saved = download_file_name_for(&name, windows_rules)
+                    .expect("an over-long name is shortened, not refused");
+                assert!(
+                    saved.len() <= MAX_PATH_COMPONENT_BYTES,
+                    "{saved} ({windows_rules})"
+                );
+                assert!(
+                    saved.ends_with(expected_extension),
+                    "{saved} ({windows_rules})"
+                );
+                assert!(!saved.is_empty(), "{name} ({windows_rules})");
+                let partial = bibcode_server::transfer::upload::partial_transfer_file_name(
+                    &saved,
+                    DOWNLOAD_PARTIAL_SUFFIX,
+                );
+                assert!(
+                    partial.len() <= MAX_PATH_COMPONENT_BYTES,
+                    "{partial} ({windows_rules})"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2317,11 +2358,11 @@ mod tests {
     fn a_renamed_download_still_fits_one_path_component() {
         // The device prefix is the one rewrite that lengthens a name, so a device name already at
         // the cap must still come back within it.
-        let name = format!("CON.{}", "x".repeat(*MAX_DOWNLOAD_FILE_NAME_BYTES - 4));
-        assert_eq!(name.len(), *MAX_DOWNLOAD_FILE_NAME_BYTES);
+        let name = format!("CON.{}", "x".repeat(MAX_PATH_COMPONENT_BYTES - 4));
+        assert_eq!(name.len(), MAX_PATH_COMPONENT_BYTES);
         let saved = download_file_name_for(&name, true).expect("renamed rather than refused");
         assert!(saved.starts_with("_CON."), "{saved}");
-        assert!(saved.len() <= *MAX_DOWNLOAD_FILE_NAME_BYTES, "{saved}");
+        assert!(saved.len() <= MAX_PATH_COMPONENT_BYTES, "{saved}");
     }
 
     #[test]

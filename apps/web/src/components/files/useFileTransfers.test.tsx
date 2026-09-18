@@ -126,6 +126,51 @@ function respond(status: number, body: string) {
   return { status, text: async () => body };
 }
 
+describe("a refused mint", () => {
+  it("names the file when the server refuses its name", async () => {
+    // `operation_failed` is the code the server uses for a name it cannot store. Naming the
+    // folder here would leave someone uploading a batch with no idea which file was wrong.
+    testState.commandResults["createUploadUrl"] = {
+      _tag: "Failure",
+      error: {
+        _tag: "ProjectTransferError",
+        failure: "operation_failed",
+        message: "Upload file name must be a plain file name.",
+      },
+    };
+    const harness = renderTransfers();
+
+    pickOne(harness.transfers, "report:v2.txt");
+    await flushPromises();
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(harness.showMutationError).toHaveBeenCalledWith(
+      expect.objectContaining({ failure: "operation_failed" }),
+      'Can\u2019t upload "report:v2.txt"',
+    );
+  });
+
+  it("names the folder when the destination is what failed", async () => {
+    testState.commandResults["createUploadUrl"] = {
+      _tag: "Failure",
+      error: {
+        _tag: "ProjectTransferError",
+        failure: "not_found",
+        message: "Upload target is not a folder.",
+      },
+    };
+    const harness = renderTransfers();
+
+    pickOne(harness.transfers, "a.txt");
+    await flushPromises();
+
+    expect(harness.showMutationError).toHaveBeenCalledWith(
+      expect.objectContaining({ failure: "not_found" }),
+      "Failed to prepare an upload to the workspace root",
+    );
+  });
+});
+
 describe("the replace prompt settles exactly once", () => {
   it("retries once when the prompt is confirmed and then closed", async () => {
     fetchMock
