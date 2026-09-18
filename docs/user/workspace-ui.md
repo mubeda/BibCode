@@ -444,6 +444,19 @@ The Source Control panel is Orca-parity for the shipped local Git workflow:
   hiding them.
 - Files are grouped into staged, unstaged, and untracked sections with status
   badges.
+- Inside each section, pending files sit under a folder header that names the
+  full relative directory, counts its files, and collapses with its chevron.
+  Files in the repository root come first under `/`, then directories in path
+  order. A directory too long for the panel truncates from its start so the
+  deepest folder stays readable, and the header tooltip carries the full path.
+  A collapsed folder stays collapsed until the panel or its section is
+  collapsed; the state is not persisted.
+- The folder header checkbox stages or unstages every file in that folder in one
+  request, and selects or deselects them in selection mode. It shows a mixed
+  state when only some of the folder's files are staged or selected.
+- **Group by folder** next to the panel actions switches between the folder view
+  and a flat list whose rows each show their own directory. The choice is
+  remembered per user; folder grouping is the default.
 - Per-file hover actions support stage, unstage, discard, restore deleted files,
   and delete untracked files. Destructive actions require confirmation.
 - Row context menus provide view, copy path, copy relative path, open in external
@@ -487,7 +500,22 @@ The Files surface is a full file manager for the active workspace:
 - **Upload Files…** on a folder row, or on the tree background for the
   workspace root, opens a file picker and uploads the chosen files into that
   folder. It is disabled on file rows. An upload that would replace an existing
-  file asks first. Files up to 1 GiB each are accepted. Both actions work for
+  file asks first. Files up to 1 GiB each are accepted. A name that is not a
+  plain file name — empty, `.`, `..`, containing a path separator or a control
+  character, or longer than 255 bytes — is always refused with a message naming
+  the rule and the file it applies to.
+  When the server holding the workspace runs on **Windows**, the names Windows
+  itself cannot store are refused too: those containing `< > : " | ? *`, ending
+  in a dot or a space, or named after a device such as `CON` or `COM1`. A
+  server on Linux or macOS accepts those names, because its filesystem stores
+  them.
+- Downloads follow the same reasoning from the other side. A workspace file
+  whose name Windows cannot store is still downloadable: the desktop app on
+  Windows saves it under the closest name Windows accepts (forbidden characters
+  become `_`, trailing dots and spaces are dropped, a device name gains a `_`),
+  and the toast shows the path it actually wrote. A name longer than 255 bytes
+  is shortened to fit, keeping its extension, rather than refused. On Linux and macOS the name
+  is kept as is, and a browser download always follows the browser's own rules. Both actions work for
   remote environments; the transfer goes to the server that owns the workspace.
 - Drag one or more files and folders onto a folder row, or onto the tree's root
   area, to move them there. Entries already in the target folder stay put. A

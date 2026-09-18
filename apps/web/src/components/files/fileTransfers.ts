@@ -1,5 +1,5 @@
 // Pure flow helpers for the Files panel's Download and Upload commands. No React, no module-level
-// I/O — the panel owns minting the signed transfer URLs (projects.createDownloadUrl /
+// I/O — `useFileTransfers` owns minting the signed transfer URLs (projects.createDownloadUrl /
 // projects.createUploadUrl) and reporting outcomes, while the URL math, the desktop-vs-browser
 // branch, and the server's response vocabulary are decided here so they are unit testable.
 
@@ -95,14 +95,16 @@ export function resolveTransferUrl(httpBaseUrl: string, relativeUrl: string): st
 }
 
 /**
- * Adds one upload's query to an already-resolved transfer URL. `URL.searchParams` applies form
- * encoding to the name (a space becomes `+`, `&` becomes `%26`); the server decodes the query with
- * `url::form_urlencoded::parse`, which reverses exactly that.
+ * Adds one upload's query to an already-resolved transfer URL.
+ *
+ * The file name is not part of the query: the token minted by `projects.createUploadUrl` names the
+ * one file it authorises, so a leaked URL cannot be pointed at a different name. Only the
+ * replace-after-prompt retry adds anything, and it reuses the same token.
  */
-export function uploadUrlFor(transferUrl: string, name: string, overwrite: boolean): string {
+export function uploadUrlFor(transferUrl: string, overwrite: boolean): string {
+  if (!overwrite) return transferUrl;
   const url = new URL(transferUrl);
-  url.searchParams.set("name", name);
-  if (overwrite) url.searchParams.set("overwrite", "1");
+  url.searchParams.set("overwrite", "1");
   return url.toString();
 }
 

@@ -1140,11 +1140,27 @@ replacement that now occupies the old path.
   oversized folder is refused as a `ProjectTransferError` the panel can show;
   the route repeats the pre-scan before streaming because the tree can grow
   between mint and redemption. A file download carries `Content-Length`; a zip
-  is produced as it streams and stays chunked. An upload token names one
-  directory and a byte cap; uploads reserve the target name, stream into a
-  per-invocation `.part` file, and rename into place, refusing collisions
-  unless `overwrite=1`, never replacing directories, and removing the partial
-  and any reservation this server created on failure. The upload handler
+  is produced as it streams and stays chunked. `Content-Disposition` names the
+  entry with an ASCII-safe `filename` plus an RFC 5987 `filename*`, because a
+  raw non-ASCII or control byte is not a legal header value and would fail the
+  whole response. One file-name policy (`transfer::upload`) governs both
+  directions: a plain, non-empty name with no path separator or control
+  character, within the 255-byte path-component limit. The `.part` sibling is
+  sized separately by `partial_transfer_file_name`, which echoes only as much
+  of the name as its own budget allows, so the partial never constrains the
+  name a user may upload. The additional Windows rules (`< > : " | ? *`, a trailing dot or
+  space, the reserved device names) are applied for the filesystem that will
+  store the file, not the host asking — the upload route applies them only when
+  the server itself runs on Windows, and a Windows desktop host renames a
+  download it cannot store rather than refusing it, so a workspace file
+  legitimately named `report:v2.txt` on Linux stays transferable. An upload token names one
+  directory, one file name, and a byte cap: `POST /api/transfers/{token}` takes
+  the name from the token, so a leaked URL can write only that one file, and a
+  `?name=` that disagrees with the token is refused with 400 rather than
+  honoured. Uploads reserve the target name, stream into a per-invocation
+  `.part` file, and rename into place, refusing collisions unless
+  `overwrite=1`, never replacing directories, and removing the partial and any
+  reservation this server created on failure. The upload handler
   invalidates the entries index for that root and notifies the Git status
   broadcaster.
 - Cancellation flows from client interrupt or socket closure until the

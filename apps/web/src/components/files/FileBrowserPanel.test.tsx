@@ -2073,14 +2073,20 @@ describe("upload files", () => {
     const minted = testState.commandCalls.find((call) => call.label === "createUploadUrl");
     expect(minted!.input).toEqual({
       environmentId,
-      input: { cwd: "/workspace/demo", relativeDirectory: "src" },
+      input: { cwd: "/workspace/demo", relativeDirectory: "src", fileName: "a.txt" },
     });
+    // One token per file, each bound to that file's name, so no name reaches the query.
+    expect(
+      testState.commandCalls
+        .filter((call) => call.label === "createUploadUrl")
+        .map((call) => (call.input as { input: { fileName: string } }).input.fileName),
+    ).toEqual(["a.txt", "b.txt"]);
     expect(uploadFile).toHaveBeenNthCalledWith(1, {
-      url: "http://127.0.0.1:4100/api/transfers/u.k?name=a.txt",
+      url: "http://127.0.0.1:4100/api/transfers/u.k",
       path: "/home/me/a.txt",
     });
     expect(uploadFile).toHaveBeenNthCalledWith(2, {
-      url: "http://127.0.0.1:4100/api/transfers/u.k?name=b.txt",
+      url: "http://127.0.0.1:4100/api/transfers/u.k",
       path: "/home/me/b.txt",
     });
     expect(refresh).toHaveBeenCalled();
@@ -2113,7 +2119,7 @@ describe("upload files", () => {
       }),
     );
     expect(uploadFile).toHaveBeenNthCalledWith(2, {
-      url: "http://127.0.0.1:4100/api/transfers/u.k?name=b.txt",
+      url: "http://127.0.0.1:4100/api/transfers/u.k",
       path: "/home/me/b.txt",
     });
     expect(refresh).toHaveBeenCalled();
@@ -2163,7 +2169,7 @@ describe("upload files", () => {
     await flushPromises();
 
     expect(uploadFile).toHaveBeenNthCalledWith(2, {
-      url: "http://127.0.0.1:4100/api/transfers/u.k?name=a.txt&overwrite=1",
+      url: "http://127.0.0.1:4100/api/transfers/u.k?overwrite=1",
       path: "/home/me/a.txt",
     });
     expect(testState.toastAdd).not.toHaveBeenCalled();
@@ -2396,7 +2402,7 @@ describe("background context menu", () => {
       (minted!.input as { input: { relativeDirectory: string } }).input.relativeDirectory,
     ).toBe("");
     expect(uploadFile).toHaveBeenCalledWith({
-      url: "http://127.0.0.1:4100/api/transfers/u.k?name=a.txt",
+      url: "http://127.0.0.1:4100/api/transfers/u.k",
       path: "/home/me/a.txt",
     });
   });

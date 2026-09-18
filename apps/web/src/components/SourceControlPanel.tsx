@@ -14,8 +14,10 @@ import {
   ChevronDownIcon,
   CloudUploadIcon,
   DownloadIcon,
+  FolderTreeIcon,
   GitCommitIcon,
   ListChecksIcon,
+  ListIcon,
   SparklesIcon,
   SquareIcon,
   Undo2Icon,
@@ -51,6 +53,7 @@ import {
 import { cn, randomUUID } from "~/lib/utils";
 import { readLocalApi } from "~/localApi";
 import { useRightPanelStore } from "~/rightPanelStore";
+import { useSourceControlPanelStore } from "~/sourceControlPanelStore";
 import { getSourceControlPresentation } from "~/sourceControlPresentation";
 import { useSourceControlDraft } from "~/sourceControlDraft";
 import { usePrimaryEnvironmentId } from "~/state/environments";
@@ -160,6 +163,11 @@ export default function SourceControlPanel({
     cwd: gitCwd ?? "",
     legacyThreadKey: scopedThreadKey(threadRef),
   });
+
+  const groupByFolder = useSourceControlPanelStore((state) => state.sourceControlGroupByFolder);
+  const setGroupByFolder = useSourceControlPanelStore(
+    (state) => state.setSourceControlGroupByFolder,
+  );
 
   const runAction = useGitStackedAction(scope);
   const pullAction = useVcsPullAction(scope);
@@ -734,19 +742,19 @@ export default function SourceControlPanel({
     <div className="flex min-w-0 flex-1 items-center gap-2">
       <span className="truncate text-sm font-medium">{status?.refName ?? "Source Control"}</span>
       {vsBaseLabel ? (
-        <span className="shrink-0 text-[11px] text-muted-foreground">{vsBaseLabel}</span>
+        <span className="shrink-0 text-xs text-muted-foreground">{vsBaseLabel}</span>
       ) : null}
       {status?.pr?.state === "open" ? (
         <button
           type="button"
           onClick={openPr}
-          className="shrink-0 rounded-full border border-border px-2 py-0.5 text-[11px] text-muted-foreground hover:text-foreground"
+          className="shrink-0 rounded-full border border-border px-2 py-0.5 text-xs text-muted-foreground hover:text-foreground"
         >
           {terminology.shortLabel} #{status.pr.number}
         </button>
       ) : null}
       {status && (status.aheadCount > 0 || status.behindCount > 0) ? (
-        <span className="shrink-0 text-[11px] text-muted-foreground">
+        <span className="shrink-0 text-xs text-muted-foreground">
           {status.aheadCount > 0 ? `↑${status.aheadCount}` : ""}{" "}
           {status.behindCount > 0 ? `↓${status.behindCount}` : ""}
         </span>
@@ -787,6 +795,14 @@ export default function SourceControlPanel({
   // Per-row affordances shared by the staging-area sections. getRowActions
   // gates which inline buttons render per area, so passing the full set to every
   // section is safe (e.g. onUnstageFile is a no-op for an unstaged row).
+  // Folder headers act on a whole folder in one request instead of one per file.
+  const folderActionProps = {
+    onStageFiles: (paths: readonly string[]) => void runStage([...paths]),
+    onUnstageFiles: (paths: readonly string[]) => void runUnstage([...paths]),
+    onSelectFiles: setFilesSelected,
+    groupByFolder,
+  };
+
   const rowActionProps = {
     onStageFile: (path: string) => void runStage([path]),
     onUnstageFile: (path: string) => void runUnstage([path]),
@@ -1040,6 +1056,27 @@ export default function SourceControlPanel({
               )}
             </>
           )}
+          {files.length > 0 ? (
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              aria-label="Group by folder"
+              aria-pressed={groupByFolder}
+              title={
+                groupByFolder
+                  ? "Grouped by folder — show a flat list"
+                  : "Flat list — group by folder"
+              }
+              onClick={() => setGroupByFolder(!groupByFolder)}
+              className={cn(groupByFolder && "bg-accent text-foreground")}
+            >
+              {groupByFolder ? (
+                <FolderTreeIcon className="size-3.5" />
+              ) : (
+                <ListIcon className="size-3.5" />
+              )}
+            </Button>
+          ) : null}
         </div>
 
         <ScrollArea className="min-h-0 flex-1 rounded-md border border-border/60">
@@ -1058,6 +1095,7 @@ export default function SourceControlPanel({
               onToggle={LEGACY_NOOP_TOGGLE}
               onOpenFile={openFileInDiff}
               disabled={isBusy}
+              groupByFolder={groupByFolder}
             />
           ) : (
             <>
@@ -1074,6 +1112,7 @@ export default function SourceControlPanel({
                 }}
                 disabled={isBusy || ignorePending}
                 {...rowActionProps}
+                {...folderActionProps}
                 selectionMode={activeSelectionMode}
                 selected={(file) => selectedFilePaths.has(file.path)}
                 onSelect={toggleSelectedFile}
@@ -1100,6 +1139,7 @@ export default function SourceControlPanel({
                 }
                 disabled={isBusy || ignorePending}
                 {...rowActionProps}
+                {...folderActionProps}
                 selectionMode={activeSelectionMode}
                 selected={(file) => selectedFilePaths.has(file.path)}
                 onSelect={toggleSelectedFile}
@@ -1127,6 +1167,7 @@ export default function SourceControlPanel({
                 discardVariant="delete-untracked"
                 disabled={isBusy || ignorePending}
                 {...rowActionProps}
+                {...folderActionProps}
                 selectionMode={activeSelectionMode}
                 selected={(file) => selectedFilePaths.has(file.path)}
                 onSelect={toggleSelectedFile}
@@ -1138,7 +1179,7 @@ export default function SourceControlPanel({
         </ScrollArea>
 
         {summary.totalCount > 0 ? (
-          <div className={cn("flex justify-end px-1 font-mono text-[11px]")}>
+          <div className={cn("flex justify-end px-1 font-mono text-xs")}>
             <span className="text-success">+{summary.insertions}</span>
             <span className="text-muted-foreground"> / </span>
             <span className="text-destructive">-{summary.deletions}</span>
