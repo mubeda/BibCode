@@ -196,6 +196,12 @@ flowchart TB
   with distribution-specific locations. Ordinary non-AppImage launches keep
   their configured environment.
 
+  On Unix the supervised process runner retries a spawn that fails with
+  `ETXTBSY` (the executable is still open for writing, typically a helper
+  that was just installed or rewritten, or a fork of this process that has
+  not exec'd yet) every 25 ms for at most one second and never past the run's
+  own deadline. Every other spawn error is returned immediately.
+
 - **Contracts (`packages/contracts`)** contains Effect schemas and TypeScript
   contracts only. It defines persisted models, RPC methods, HTTP APIs, desktop
   bridge values, and provider events without application runtime logic.

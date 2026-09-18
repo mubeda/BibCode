@@ -157,7 +157,9 @@ where
         }
     };
     #[cfg(not(windows))]
-    let mut child = spawn_wrapped(&mut command).map_err(SupervisedRunError::Spawn)?;
+    let mut child = spawn_wrapped_until(&mut command, overall_deadline)
+        .await
+        .map_err(SupervisedRunError::Spawn)?;
     observer(child.id());
 
     let outcome = execute_child(
@@ -426,6 +428,40 @@ pub(crate) fn log_cleanup_failures(operation: &'static str, report: &ProcessClea
 #[cfg(not(windows))]
 fn spawn_wrapped(command: &mut CommandWrap) -> io::Result<Box<dyn ChildWrapper>> {
     command.spawn()
+}
+
+#[cfg(not(windows))]
+const SPAWN_BUSY_RETRY_DELAY: Duration = Duration::from_millis(25);
+#[cfg(not(windows))]
+const SPAWN_BUSY_RETRY_BUDGET: Duration = Duration::from_secs(1);
+
+/// Spawns the command, retrying briefly while the executable is busy.
+///
+/// Linux refuses to execute a file that any process still holds open for
+/// writing (`ETXTBSY`). A freshly installed or rewritten executable hits this
+/// when the writer is still closing it, or when another thread of this
+/// process forked between the writer's open and close and the child has not
+/// exec'd yet. The condition clears within milliseconds, so the spawn retries
+/// for at most one second inside the run's own deadline; every other error,
+/// and a deadline that would be crossed by the next retry, returns
+/// immediately.
+#[cfg(not(windows))]
+async fn spawn_wrapped_until(
+    command: &mut CommandWrap,
+    deadline: tokio::time::Instant,
+) -> io::Result<Box<dyn ChildWrapper>> {
+    let retry_until = deadline.min(tokio::time::Instant::now() + SPAWN_BUSY_RETRY_BUDGET);
+    loop {
+        match spawn_wrapped(command) {
+            Err(error)
+                if error.kind() == io::ErrorKind::ExecutableFileBusy
+                    && tokio::time::Instant::now() + SPAWN_BUSY_RETRY_DELAY < retry_until =>
+            {
+                tokio::time::sleep(SPAWN_BUSY_RETRY_DELAY).await;
+            }
+            result => return result,
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -740,6 +776,89 @@ mod tests {
             ready,
             polls,
         )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn busy_executable_fixture(directory: &std::path::Path) -> (std::path::PathBuf, std::fs::File) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = directory.join("busy.sh");
+        std::fs::write(&path, "#!/bin/sh\nprintf ok\n").expect("write fixture script");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .expect("fixture script permissions");
+        let writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("hold the fixture script open for writing");
+        (path, writer)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn busy_executable_request(path: &std::path::Path, timeout: Duration) -> SupervisedRunRequest {
+        let mut command = Command::new(path);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        SupervisedRunRequest {
+            command,
+            stdin: None,
+            timeout,
+            cleanup_timeout: PROCESS_CLEANUP_WAIT_TIMEOUT,
+            max_output_bytes: 1024,
+            overflow: SupervisedOverflow::Error,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn spawn_retries_while_the_executable_is_still_open_for_writing() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (path, writer) = busy_executable_fixture(directory.path());
+        let cancellation = CancellationToken::new();
+        let run = tokio::spawn({
+            let request = busy_executable_request(&path, Duration::from_secs(5));
+            let cancellation = cancellation.clone();
+            async move { run_supervised(request, &cancellation).await }
+        });
+        // The first attempts must fail with ETXTBSY while the writer is open.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            !run.is_finished(),
+            "spawn must keep retrying while the script is busy"
+        );
+        drop(writer);
+
+        let output = run
+            .await
+            .expect("supervised run task")
+            .expect("spawn must succeed once the writer closes");
+        assert!(output.status.success());
+        assert_eq!(output.stdout.bytes, b"ok");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn spawn_stops_retrying_a_busy_executable_at_the_run_deadline() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (path, _writer) = busy_executable_fixture(directory.path());
+        let cancellation = CancellationToken::new();
+        let started = std::time::Instant::now();
+        let error = run_supervised(
+            busy_executable_request(&path, Duration::from_millis(100)),
+            &cancellation,
+        )
+        .await
+        .expect_err("a permanently busy executable must not spawn");
+
+        assert!(
+            matches!(&error, SupervisedRunError::Spawn(source) if source.kind() == io::ErrorKind::ExecutableFileBusy),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "retries must stop at the run deadline, not the retry budget"
+        );
     }
 
     #[tokio::test]
