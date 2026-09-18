@@ -487,13 +487,20 @@ The Files surface is a full file manager for the active workspace:
 - **Upload Files…** on a folder row, or on the tree background for the
   workspace root, opens a file picker and uploads the chosen files into that
   folder. It is disabled on file rows. An upload that would replace an existing
-  file asks first. Files up to 1 GiB each are accepted. A file whose name would
-  be illegal on Windows — one containing `/ \ : * ? " < > |`, ending in a dot
-  or a space, or named after a device such as `CON` or `COM1` — is refused with
-  a message naming the rule, so a workspace never grows an entry one supported
-  platform cannot open. The desktop app applies the same rule to the name it
-  saves a download under; a browser download is never refused, because the
-  browser applies its own naming rules. Both actions work for
+  file asks first. Files up to 1 GiB each are accepted. A name that is not a
+  plain file name — empty, `.`, `..`, containing a path separator or a control
+  character, or very long — is always refused with a message naming the rule.
+  When the server holding the workspace runs on **Windows**, the names Windows
+  itself cannot store are refused too: those containing `< > : " | ? *`, ending
+  in a dot or a space, or named after a device such as `CON` or `COM1`. A
+  server on Linux or macOS accepts those names, because its filesystem stores
+  them.
+- Downloads follow the same reasoning from the other side. A workspace file
+  whose name Windows cannot store is still downloadable: the desktop app on
+  Windows saves it under the closest name Windows accepts (forbidden characters
+  become `_`, trailing dots and spaces are dropped, a device name gains a `_`),
+  and the toast shows the path it actually wrote. On Linux and macOS the name
+  is kept as is, and a browser download always follows the browser's own rules. Both actions work for
   remote environments; the transfer goes to the server that owns the workspace.
 - Drag one or more files and folders onto a folder row, or onto the tree's root
   area, to move them there. Entries already in the target folder stay put. A

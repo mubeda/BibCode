@@ -1611,21 +1611,67 @@ static MAX_DOWNLOAD_FILE_NAME_BYTES: LazyLock<usize> = LazyLock::new(|| {
     bibcode_server::transfer::upload::max_transfer_file_name_bytes(DOWNLOAD_PARTIAL_SUFFIX)
 });
 
-/// The host writes this name to the local disk, so it applies the same policy the upload route
-/// applies to a name coming the other way: one shared rule means a file BiBCode will accept is
-/// a file BiBCode will also hand back.
-fn validate_download_file_name(name: &str) -> Result<(), String> {
-    if bibcode_server::transfer::upload::is_plain_transfer_file_name(
+/// The name this host will write to its own disk.
+///
+/// A download name comes from the *server's* filesystem, which may be a Linux one holding a file
+/// legitimately called `report:v2.txt` or `nul`. Refusing to save it would leave the user with an
+/// error they cannot act on -- they cannot rename a remote file from a save dialog -- so a
+/// Windows host renames instead: the file still arrives, under a name Windows can store. Only the
+/// rules that hold everywhere (a plain, non-empty, control-free name that fits a path component)
+/// can refuse the download, because those signal a bad name rather than an unportable one.
+fn validate_download_file_name(name: &str) -> Result<String, String> {
+    download_file_name_for(name, cfg!(windows))
+}
+
+/// [`validate_download_file_name`] with the host decision made explicit, so both branches are
+/// reachable from a test whatever the host running it.
+fn download_file_name_for(name: &str, windows_rules: bool) -> Result<String, String> {
+    if !bibcode_server::transfer::upload::is_plain_transfer_file_name(
         name,
         *MAX_DOWNLOAD_FILE_NAME_BYTES,
+        false,
     ) {
-        Ok(())
-    } else {
-        Err(format!(
-            "Download file name must be a plain file name: no / \\ : * ? \" < > |, no trailing \
-             dot or space, not a Windows device name such as CON or COM1, and at most {} bytes.",
+        return Err(format!(
+            "Download file name must be a plain file name: no / or \\, no control characters, \
+             and at most {} bytes.",
             *MAX_DOWNLOAD_FILE_NAME_BYTES
-        ))
+        ));
+    }
+    Ok(if windows_rules {
+        windows_safe_file_name(name, *MAX_DOWNLOAD_FILE_NAME_BYTES)
+    } else {
+        name.to_owned()
+    })
+}
+
+/// Rewrites a name a Windows filesystem cannot store into the closest one it can: the characters
+/// Windows forbids become `_`, trailing dots and spaces go (Windows would strip them anyway), and
+/// a reserved device name gains a `_` prefix so `NUL` saves as `_NUL` rather than vanishing into
+/// the device.
+fn windows_safe_file_name(name: &str, max_bytes: usize) -> String {
+    let replaced: String = name
+        .chars()
+        .map(|character| {
+            if bibcode_server::transfer::upload::WINDOWS_FORBIDDEN_CHARACTERS.contains(&character) {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect();
+    let trimmed = replaced.trim_end_matches(['.', ' ']);
+    let mut safe = trimmed.to_owned();
+    if bibcode_server::transfer::upload::is_windows_device_name(&safe) {
+        safe.insert(0, '_');
+    }
+    // The device prefix is the one step that can lengthen the name, so the budget is re-applied;
+    // trimming again keeps a cut that lands after a dot from reintroducing a trailing one.
+    let fitted = bibcode_server::transfer::upload::truncate_on_char_boundary(&safe, max_bytes)
+        .trim_end_matches(['.', ' ']);
+    if fitted.is_empty() {
+        "download".to_owned()
+    } else {
+        fitted.to_owned()
     }
 }
 
@@ -1715,7 +1761,9 @@ pub async fn desktop_bridge_download_to_folder(
     file_name: String,
 ) -> Result<String, String> {
     let url = validate_transfer_url(&url)?;
-    validate_download_file_name(&file_name)?;
+    // A Windows host may have renamed the file to something it can store; everything below uses
+    // the name that will actually be written.
+    let file_name = validate_download_file_name(&file_name)?;
     let directory = PathBuf::from(directory);
     if !directory.is_dir() {
         return Err("Download folder does not exist.".to_owned());
@@ -2197,7 +2245,7 @@ mod tests {
     }
 
     #[test]
-    fn download_file_names_must_be_plain() {
+    fn download_file_names_must_be_plain_on_every_host() {
         for good in [
             "src.zip",
             ".gitignore",
@@ -2205,38 +2253,27 @@ mod tests {
             "CONTACTS.txt",
             "COM0.zip",
         ] {
-            assert!(validate_download_file_name(good).is_ok(), "{good}");
+            for windows_rules in [false, true] {
+                assert_eq!(
+                    download_file_name_for(good, windows_rules).as_deref(),
+                    Ok(good),
+                    "{good} ({windows_rules})"
+                );
+            }
         }
-        // The same policy the upload route applies: separators, the characters Windows forbids,
-        // control characters, a trailing dot or space, device names, and an over-long name.
-        for bad in [
-            "",
-            ".",
-            "..",
-            "a/b",
-            "a\\b",
-            "a<b",
-            "a>b",
-            "a:b",
-            "a\"b",
-            "a|b",
-            "a?b",
-            "a*b",
-            "a\0b",
-            "a\nb",
-            "trailing.",
-            "trailing ",
-            "CON",
-            "nul.txt",
-            "com1.log",
-            "LPT9",
-            &"x".repeat(*MAX_DOWNLOAD_FILE_NAME_BYTES + 1),
-        ] {
-            assert!(validate_download_file_name(bad).is_err(), "{bad:?}");
+        // Only a name that is not a plain file name anywhere refuses the download.
+        let too_long = "x".repeat(*MAX_DOWNLOAD_FILE_NAME_BYTES + 1);
+        for bad in ["", ".", "..", "a/b", "a\\b", "a\0b", "a\nb", &too_long] {
+            for windows_rules in [false, true] {
+                assert!(
+                    download_file_name_for(bad, windows_rules).is_err(),
+                    "{bad:?} ({windows_rules})"
+                );
+            }
         }
         // The cap leaves room for the partial sibling this command writes.
         let longest = "x".repeat(*MAX_DOWNLOAD_FILE_NAME_BYTES);
-        assert!(validate_download_file_name(&longest).is_ok());
+        assert!(download_file_name_for(&longest, true).is_ok());
         let partial = format!(
             ".{longest}.{}.{DOWNLOAD_PARTIAL_SUFFIX}",
             unique_partial_suffix()
@@ -2245,6 +2282,46 @@ mod tests {
             partial.len() <= bibcode_server::transfer::upload::MAX_PATH_COMPONENT_BYTES,
             "{partial}"
         );
+    }
+
+    #[test]
+    fn a_windows_host_renames_an_unstorable_download_instead_of_refusing_it() {
+        // These are legal names on the Linux or macOS workspace the file came from. A POSIX host
+        // saves them verbatim; a Windows host saves the file under a name Windows can store,
+        // because the user cannot rename a remote file from a save dialog.
+        for (name, windows_name) in [
+            ("report:v2.txt", "report_v2.txt"),
+            ("a<b>c|d?e*f\"g.txt", "a_b_c_d_e_f_g.txt"),
+            ("notes.", "notes"),
+            ("notes ", "notes"),
+            ("...", "download"),
+            ("NUL", "_NUL"),
+            ("con.txt", "_con.txt"),
+            ("COM1", "_COM1"),
+            ("lpt9.log", "_lpt9.log"),
+        ] {
+            assert_eq!(
+                download_file_name_for(name, false).as_deref(),
+                Ok(name),
+                "{name:?} is a legal POSIX name"
+            );
+            assert_eq!(
+                download_file_name_for(name, true).as_deref(),
+                Ok(windows_name),
+                "{name:?} on Windows"
+            );
+        }
+    }
+
+    #[test]
+    fn a_renamed_download_still_fits_one_path_component() {
+        // The device prefix is the one rewrite that lengthens a name, so a device name already at
+        // the cap must still come back within it.
+        let name = format!("CON.{}", "x".repeat(*MAX_DOWNLOAD_FILE_NAME_BYTES - 4));
+        assert_eq!(name.len(), *MAX_DOWNLOAD_FILE_NAME_BYTES);
+        let saved = download_file_name_for(&name, true).expect("renamed rather than refused");
+        assert!(saved.starts_with("_CON."), "{saved}");
+        assert!(saved.len() <= *MAX_DOWNLOAD_FILE_NAME_BYTES, "{saved}");
     }
 
     #[test]

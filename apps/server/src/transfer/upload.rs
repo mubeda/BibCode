@@ -19,10 +19,14 @@ pub const MAX_PATH_COMPONENT_BYTES: usize = 255;
 /// The tail `write_upload` gives its partial files.
 pub const UPLOAD_PARTIAL_SUFFIX: &str = "bibcode-upload.part";
 
-/// Characters a file name may not carry. The separators and NUL would change which entry is
-/// addressed; the rest are what Windows forbids, refused on every host so a transfer never
-/// creates an entry one supported platform cannot name.
-const FORBIDDEN_CHARACTERS: [char; 9] = ['/', '\\', '<', '>', ':', '"', '|', '?', '*'];
+/// Path separators, refused wherever the file lands: they would change which entry is addressed
+/// rather than merely how it is spelled. Control characters (NUL included) are refused with them.
+const UNIVERSAL_FORBIDDEN_CHARACTERS: [char; 2] = ['/', '\\'];
+
+/// Characters Windows forbids in a file name. They are ordinary bytes on Linux and macOS, where
+/// `report:v2.txt` is a perfectly good name, so they are only refused when the filesystem that
+/// will store the file is a Windows one.
+pub const WINDOWS_FORBIDDEN_CHARACTERS: [char; 7] = ['<', '>', ':', '"', '|', '?', '*'];
 
 /// The bytes a partial name adds around the file name it echoes, with every counter at its
 /// widest. Derived from the same formatter the partial name uses, so the budget cannot drift
@@ -44,21 +48,37 @@ pub fn max_transfer_file_name_bytes(suffix: &str) -> usize {
 pub static MAX_UPLOAD_FILE_NAME_BYTES: LazyLock<usize> =
     LazyLock::new(|| max_transfer_file_name_bytes(UPLOAD_PARTIAL_SUFFIX));
 
-/// The file-name policy every BiBCode transfer applies, in both directions and on every host: a
-/// non-empty plain name, no `.`/`..`, nothing Windows forbids, no control characters, no trailing
-/// dot or space (Windows strips those, so the entry written would not be the entry named), no
-/// Windows device name, and short enough for a partial sibling.
+/// The file-name policy a BiBCode transfer applies.
+///
+/// The rules that hold everywhere always apply: a non-empty name, not `.` or `..`, no path
+/// separator, no control character, and short enough that its partial sibling still fits one
+/// path component.
+///
+/// `windows_rules` adds what only Windows forbids -- `< > : " | ? *`, a trailing dot or space
+/// (Windows strips those, so the entry written would not be the entry named), and the reserved
+/// device names. The caller passes it for the filesystem that will actually store the file, not
+/// for the host that happens to be asking: `report:v2.txt`, `nul`, and `notes.` are legal names
+/// on Linux and macOS, and refusing them there would make files a workspace already holds
+/// untransferable for no reason.
 #[must_use]
-pub fn is_plain_transfer_file_name(name: &str, max_bytes: usize) -> bool {
+pub fn is_plain_transfer_file_name(name: &str, max_bytes: usize, windows_rules: bool) -> bool {
     if name.is_empty() || name.len() > max_bytes || name == "." || name == ".." {
         return false;
+    }
+    if name.chars().any(|character| {
+        UNIVERSAL_FORBIDDEN_CHARACTERS.contains(&character) || character.is_control()
+    }) {
+        return false;
+    }
+    if !windows_rules {
+        return true;
     }
     if name.ends_with('.') || name.ends_with(' ') {
         return false;
     }
     if name
         .chars()
-        .any(|character| FORBIDDEN_CHARACTERS.contains(&character) || character.is_control())
+        .any(|character| WINDOWS_FORBIDDEN_CHARACTERS.contains(&character))
     {
         return false;
     }
@@ -67,7 +87,8 @@ pub fn is_plain_transfer_file_name(name: &str, max_bytes: usize) -> bool {
 
 /// `CON`, `con.txt`, and `CON.tar.gz` all address the console device on Windows, so the stem
 /// before the first dot is what is compared, without regard to case.
-fn is_windows_device_name(name: &str) -> bool {
+#[must_use]
+pub fn is_windows_device_name(name: &str) -> bool {
     let stem = name.split('.').next().unwrap_or(name);
     if ["CON", "PRN", "AUX", "NUL"]
         .iter()
@@ -86,21 +107,39 @@ fn is_windows_device_name(name: &str) -> bool {
 }
 
 /// The upload-name rule as a person can act on it. It lives beside the rule so a refusal can
-/// never describe a policy the code no longer applies; the byte cap is read from the same
-/// derivation the validator uses.
+/// never describe a policy the code no longer applies: the byte cap comes from the same
+/// derivation the validator uses, and the Windows clause appears only where it is enforced.
 #[must_use]
 pub fn upload_file_name_rule() -> String {
+    upload_file_name_rule_for(cfg!(windows))
+}
+
+fn upload_file_name_rule_for(windows_rules: bool) -> String {
+    let windows = if windows_rules {
+        " This server stores files on Windows, so the name must also avoid < > : \" | ? *, a \
+         trailing dot or space, and device names such as CON or COM1."
+    } else {
+        ""
+    };
     format!(
-        "Upload file name must be a plain file name: no / \\ : * ? \" < > |, no trailing dot or \
-         space, not a Windows device name such as CON or COM1, and at most {} bytes.",
+        "Upload file name must be a plain file name: no / or \\, no control characters, and at \
+         most {} bytes.{windows}",
         *MAX_UPLOAD_FILE_NAME_BYTES
     )
 }
 
 /// Validates that `name` is a plain file name suitable for joining onto an upload directory.
-/// See [`is_plain_transfer_file_name`] for the rules.
+///
+/// The Windows rules apply only when this server is the one running on Windows, because this
+/// server's filesystem is where the upload lands.
 pub fn validate_upload_file_name(name: &str) -> Result<(), TransferError> {
-    if is_plain_transfer_file_name(name, *MAX_UPLOAD_FILE_NAME_BYTES) {
+    validate_upload_file_name_for(name, cfg!(windows))
+}
+
+/// [`validate_upload_file_name`] with the host decision made explicit, so both branches are
+/// reachable from a test whatever the host running it.
+fn validate_upload_file_name_for(name: &str, windows_rules: bool) -> Result<(), TransferError> {
+    if is_plain_transfer_file_name(name, *MAX_UPLOAD_FILE_NAME_BYTES, windows_rules) {
         Ok(())
     } else {
         Err(TransferError::InvalidFileName {
@@ -243,7 +282,10 @@ fn partial_name(stem: &str, suffix: &str, pid: u32, counter: u64, nanos: u128) -
     format!(".{stem}.{pid}-{counter}-{nanos}.{suffix}")
 }
 
-fn truncate_on_char_boundary(name: &str, budget: usize) -> &str {
+/// Shortens `name` to at most `budget` bytes without splitting a character. Shared with the
+/// desktop host, which has to fit a sanitised download name into the same component budget.
+#[must_use]
+pub fn truncate_on_char_boundary(name: &str, budget: usize) -> &str {
     if name.len() <= budget {
         return name;
     }
@@ -270,8 +312,36 @@ mod tests {
         )
     }
 
+    /// Names that are not plain file names anywhere: refused whatever stores them.
+    const UNIVERSALLY_INVALID: &[&str] =
+        &["", ".", "..", "a/b", "a\\b", "a\0b", "a\nb", "a\u{7f}b"];
+
+    /// Legal names on Linux and macOS that a Windows filesystem cannot store.
+    const WINDOWS_ONLY_INVALID: &[&str] = &[
+        "a<b",
+        "a>b",
+        "report:v2.txt",
+        "a\"b",
+        "a|b",
+        "a?b",
+        "a*b",
+        "notes.",
+        "notes ",
+        "...",
+        "CON",
+        "con",
+        "CON.txt",
+        "nul.tar.gz",
+        "PRN",
+        "aux",
+        "COM1",
+        "com9.log",
+        "LPT1",
+        "lpt9.txt",
+    ];
+
     #[test]
-    fn validates_plain_file_names() {
+    fn validates_plain_file_names_on_every_host() {
         for good in [
             "report.pdf",
             ".gitignore",
@@ -282,53 +352,62 @@ mod tests {
             "console",
             &"x".repeat(*MAX_UPLOAD_FILE_NAME_BYTES),
         ] {
-            assert!(validate_upload_file_name(good).is_ok(), "{good}");
+            for windows_rules in [false, true] {
+                assert!(
+                    validate_upload_file_name_for(good, windows_rules).is_ok(),
+                    "{good} ({windows_rules})"
+                );
+            }
         }
-        for bad in [
-            // Empty, the directory entries themselves, and separators.
-            "",
-            ".",
-            "..",
-            "a/b",
-            "a\\b",
-            // Characters Windows forbids.
-            "a<b",
-            "a>b",
-            "a:b",
-            "a\"b",
-            "a|b",
-            "a?b",
-            "a*b",
-            // Control characters, including NUL.
-            "a\0b",
-            "a\nb",
-            "a\u{7f}b",
-            // Windows strips a trailing dot or space.
-            "trailing.",
-            "trailing ",
-            "...",
-            // Windows device names, with and without an extension, in any case.
-            "CON",
-            "con",
-            "CON.txt",
-            "nul.tar.gz",
-            "PRN",
-            "aux",
-            "COM1",
-            "com9.log",
-            "LPT1",
-            "lpt9.txt",
-            // Too long for a partial sibling to fit one path component.
-            &"x".repeat(*MAX_UPLOAD_FILE_NAME_BYTES + 1),
-        ] {
+        let too_long = "x".repeat(*MAX_UPLOAD_FILE_NAME_BYTES + 1);
+        for windows_rules in [false, true] {
+            for bad in UNIVERSALLY_INVALID
+                .iter()
+                .copied()
+                .chain([too_long.as_str()])
+            {
+                assert!(
+                    matches!(
+                        validate_upload_file_name_for(bad, windows_rules),
+                        Err(TransferError::InvalidFileName { .. })
+                    ),
+                    "{bad:?} ({windows_rules})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_windows_rules_apply_only_where_the_upload_lands_on_windows() {
+        // The upload is written to *this* server's filesystem, so a POSIX host must keep
+        // accepting names a POSIX filesystem stores perfectly well.
+        for name in WINDOWS_ONLY_INVALID {
+            assert!(
+                validate_upload_file_name_for(name, false).is_ok(),
+                "{name:?} is a legal POSIX name"
+            );
             assert!(
                 matches!(
-                    validate_upload_file_name(bad),
+                    validate_upload_file_name_for(name, true),
                     Err(TransferError::InvalidFileName { .. })
                 ),
-                "{bad:?}"
+                "{name:?} is not storable on Windows"
             );
         }
+    }
+
+    #[test]
+    fn the_refusal_names_the_windows_rules_only_where_they_are_enforced() {
+        let posix = upload_file_name_rule_for(false);
+        assert!(posix.contains("plain file name"), "{posix}");
+        assert!(
+            posix.contains(&MAX_UPLOAD_FILE_NAME_BYTES.to_string()),
+            "{posix}"
+        );
+        assert!(!posix.contains("CON"), "{posix}");
+        let windows = upload_file_name_rule_for(true);
+        assert!(windows.contains("CON"), "{windows}");
+        assert!(windows.contains("trailing dot"), "{windows}");
     }
 
     #[test]

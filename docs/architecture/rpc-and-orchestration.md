@@ -1144,9 +1144,14 @@ replacement that now occupies the old path.
   entry with an ASCII-safe `filename` plus an RFC 5987 `filename*`, because a
   raw non-ASCII or control byte is not a legal header value and would fail the
   whole response. One file-name policy (`transfer::upload`) governs both
-  directions and both hosts: a plain name with nothing Windows forbids, no
-  control characters, no trailing dot or space, no device name, and short
-  enough that its `.part` sibling still fits a 255-byte path component. An upload token names one
+  directions: a plain, non-empty name with no path separator or control
+  character, short enough that its `.part` sibling still fits a 255-byte path
+  component. The additional Windows rules (`< > : " | ? *`, a trailing dot or
+  space, the reserved device names) are applied for the filesystem that will
+  store the file, not the host asking — the upload route applies them only when
+  the server itself runs on Windows, and a Windows desktop host renames a
+  download it cannot store rather than refusing it, so a workspace file
+  legitimately named `report:v2.txt` on Linux stays transferable. An upload token names one
   directory, one file name, and a byte cap: `POST /api/transfers/{token}` takes
   the name from the token, so a leaked URL can write only that one file, and a
   `?name=` that disagrees with the token is refused with 400 rather than
