@@ -132,7 +132,11 @@ Release CI mounts both macOS DMGs and verifies their recursive bundle
 signatures before upload.
 
 Windows artifacts remain without Authenticode. macOS remains ad-hoc
-signed/unnotarized. Tauri updater signatures verify update payloads; they do
+signed/unnotarized by decision (2026-09-18): an ad-hoc identity changes with
+every build, so macOS privacy grants (folder access, local network) are
+re-requested after each update. Only a Developer ID certificate with
+notarization would make those grants persist; adopting one requires an Apple
+Developer account and new signing secrets in the release workflow. Tauri updater signatures verify update payloads; they do
 not replace Apple Developer ID signing, macOS notarization, or Windows
 Authenticode.
 
