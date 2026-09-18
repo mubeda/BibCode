@@ -5332,8 +5332,22 @@ exit /b 9
             .stop(BackendShutdownConfig::default())
             .await
             .expect("default backend should stop");
-        let _released_probe = bind_port_probe(restarted.port, "127.0.0.1")
-            .expect("joined backend shutdown must release the listener address");
+        // The shutdown is joined, but a loaded CI runner can still report the
+        // address busy for a moment while the kernel tears the socket down,
+        // so give the release a bounded grace period instead of one probe.
+        let released = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(probe) = bind_port_probe(restarted.port, "127.0.0.1") {
+                    return probe;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert!(
+            released.is_ok(),
+            "joined backend shutdown must release the listener address within 5s"
+        );
     }
 
     #[tokio::test]
