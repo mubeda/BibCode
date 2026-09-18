@@ -158,6 +158,26 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
 "#;
 
 #[cfg(any(unix, windows))]
+/// Waits until every capture file a fixture script writes exists and has
+/// content. A shell redirect creates the file before its content lands, so an
+/// existence check alone can read an empty token or a half-written settings
+/// document on a starved runner.
+async fn wait_for_captures(paths: &[&std::path::Path]) {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if paths
+                .iter()
+                .all(|path| std::fs::metadata(path).is_ok_and(|meta| meta.len() > 0))
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("fixture should write its capture files");
+}
+
 fn executable_fixture(
     temp: &TempDir,
     name: &str,
@@ -11172,13 +11192,7 @@ cat >/dev/null
     );
     let driver = factory.create(request).await.unwrap();
     driver.start().await.unwrap();
-    timeout(Duration::from_secs(2), async {
-        while !(settings_path.exists() && token_path.exists()) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    wait_for_captures(&[&settings_path, &token_path]).await;
     let settings: Value =
         serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
     let hook_url = settings["hooks"]["SubagentStart"][0]["hooks"][0]["url"]
@@ -12145,13 +12159,7 @@ cat >/dev/null
             targeted_actor_cancellation: true,
         }
     );
-    timeout(Duration::from_secs(2), async {
-        while !(settings_path.exists() && token_path.exists() && args_path.exists()) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("fixture should capture launch settings");
+    wait_for_captures(&[&settings_path, &token_path, &args_path]).await;
     let settings: Value =
         serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
     let handler = &settings["hooks"]["SubagentStart"][0]["hooks"][0];
@@ -12308,13 +12316,7 @@ while [ ! -f "$BIBCODE_TEST_EXIT_RELEASE" ]; do sleep 0.01; done
     let driver = factory.create(request).await.unwrap();
     driver.start().await.unwrap();
 
-    timeout(Duration::from_secs(2), async {
-        while !(settings_path.exists() && token_path.exists()) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("fixture should capture hook settings and token");
+    wait_for_captures(&[&settings_path, &token_path]).await;
     let settings: Value =
         serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
     let hook_url = settings["hooks"]["SubagentStart"][0]["hooks"][0]["url"]
