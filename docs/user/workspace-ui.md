@@ -444,6 +444,18 @@ The Source Control panel is Orca-parity for the shipped local Git workflow:
   hiding them.
 - Files are grouped into staged, unstaged, and untracked sections with status
   badges.
+- Inside each section, pending files sit under a folder header that names the
+  full relative directory, counts its files, and collapses with its chevron.
+  Files in the repository root come first under `/`, then directories in path
+  order. A directory too long for the panel truncates from its start so the
+  deepest folder stays readable, and the header tooltip carries the full path.
+  Collapsing a folder lasts for the panel session; it is not persisted.
+- The folder header checkbox stages or unstages every file in that folder in one
+  request, and selects or deselects them in selection mode. It shows a mixed
+  state when only some of the folder's files are staged or selected.
+- **Group by folder** next to the panel actions switches between the folder view
+  and a flat list whose rows each show their own directory. The choice is
+  remembered per user; folder grouping is the default.
 - Per-file hover actions support stage, unstage, discard, restore deleted files,
   and delete untracked files. Destructive actions require confirmation.
 - Row context menus provide view, copy path, copy relative path, open in external

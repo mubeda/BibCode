@@ -14,6 +14,12 @@ const DEFAULT_DRAFT: SourceControlDraft = { message: "" };
 interface SourceControlPanelStoreState {
   byThreadKey: Record<string, SourceControlDraft>;
   byCwdKey: Record<string, SourceControlDraft>;
+  /**
+   * Changes view preference: pending files grouped under folder headers
+   * (default) or one flat list. Panel-wide, not per section or per thread.
+   */
+  sourceControlGroupByFolder: boolean;
+  setSourceControlGroupByFolder: (groupByFolder: boolean) => void;
   setMessage: (ref: ScopedThreadRef, message: string) => void;
   clearDraft: (ref: ScopedThreadRef) => void;
   removeThread: (ref: ScopedThreadRef) => void;
@@ -37,6 +43,9 @@ export const useSourceControlPanelStore = create<SourceControlPanelStoreState>()
     (set) => ({
       byThreadKey: {},
       byCwdKey: {},
+      sourceControlGroupByFolder: true,
+      setSourceControlGroupByFolder: (groupByFolder) =>
+        set(() => ({ sourceControlGroupByFolder: groupByFolder })),
       setMessage: (ref, message) =>
         set((state) => updateDraft(state, ref, (draft) => ({ ...draft, message }))),
       clearDraft: (ref) => set((state) => updateDraft(state, ref, () => ({ ...DEFAULT_DRAFT }))),
@@ -88,11 +97,16 @@ export const useSourceControlPanelStore = create<SourceControlPanelStoreState>()
         return {
           byThreadKey: state?.byThreadKey ?? {},
           byCwdKey: state?.byCwdKey ?? {},
+          sourceControlGroupByFolder:
+            typeof state?.sourceControlGroupByFolder === "boolean"
+              ? state.sourceControlGroupByFolder
+              : true,
         };
       },
       partialize: (state) => ({
         byThreadKey: state.byThreadKey,
         byCwdKey: state.byCwdKey,
+        sourceControlGroupByFolder: state.sourceControlGroupByFolder,
       }),
     },
   ),
