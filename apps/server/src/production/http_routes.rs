@@ -511,10 +511,7 @@ async fn transfer_download(
                 .header(header::CONTENT_TYPE, download.content_type)
                 .header(
                     header::CONTENT_DISPOSITION,
-                    format!(
-                        "attachment; filename=\"{}\"",
-                        download.file_name.replace('"', "")
-                    ),
+                    attachment_disposition(&download.file_name),
                 )
                 .header(header::CACHE_CONTROL, NO_STORE)
                 .header("x-content-type-options", "nosniff");
@@ -659,12 +656,61 @@ fn diagnostic_logs_response(response: DiagnosticLogsHttpResponse) -> Response {
         .header(header::CONTENT_TYPE, "application/zip")
         .header(
             header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{}\"", response.filename),
+            attachment_disposition(&response.filename),
         )
         .header(header::CACHE_CONTROL, NO_STORE)
         .header("x-content-type-options", "nosniff")
         .body(Body::from(response.bytes))
         .unwrap_or_else(|_| internal_error())
+}
+
+/// The RFC 5987 `attr-char` set: everything outside it is percent-encoded in a `filename*`.
+const RFC5987_ATTR_CHAR: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'!')
+    .remove(b'#')
+    .remove(b'$')
+    .remove(b'&')
+    .remove(b'+')
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'^')
+    .remove(b'_')
+    .remove(b'`')
+    .remove(b'|')
+    .remove(b'~');
+
+/// `Content-Disposition` for a download, for any name a workspace can hold.
+///
+/// A header value carries bytes, not text: a raw `é` or a control byte in `filename` would make
+/// `Response::builder` refuse the whole response, turning a downloadable file into an opaque 500.
+/// So `filename` is an ASCII transliteration every client understands, and the real name rides
+/// alongside in an RFC 5987 `filename*`, which every current browser prefers when present. A name
+/// that is already plain ASCII carries no `filename*` at all.
+fn attachment_disposition(file_name: &str) -> String {
+    let fallback: String = file_name
+        .chars()
+        .map(|character| {
+            if character.is_ascii()
+                && !character.is_ascii_control()
+                && !matches!(character, '"' | '\\')
+            {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if fallback == file_name {
+        return format!("attachment; filename=\"{fallback}\"");
+    }
+    // An all-substituted name still needs something readable in the ASCII slot.
+    let fallback = if fallback.chars().all(|character| character == '_') {
+        "download".to_owned()
+    } else {
+        fallback
+    };
+    let encoded = percent_encoding::utf8_percent_encode(file_name, RFC5987_ATTR_CHAR);
+    format!("attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}")
 }
 
 fn append_headers(response: &mut Response, headers: BTreeMap<String, String>) {

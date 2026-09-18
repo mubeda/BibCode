@@ -487,7 +487,13 @@ The Files surface is a full file manager for the active workspace:
 - **Upload Files…** on a folder row, or on the tree background for the
   workspace root, opens a file picker and uploads the chosen files into that
   folder. It is disabled on file rows. An upload that would replace an existing
-  file asks first. Files up to 1 GiB each are accepted. Both actions work for
+  file asks first. Files up to 1 GiB each are accepted. A file whose name would
+  be illegal on Windows — one containing `/ \ : * ? " < > |`, ending in a dot
+  or a space, or named after a device such as `CON` or `COM1` — is refused with
+  a message naming the rule, so a workspace never grows an entry one supported
+  platform cannot open. The desktop app applies the same rule to the name it
+  saves a download under; a browser download is never refused, because the
+  browser applies its own naming rules. Both actions work for
   remote environments; the transfer goes to the server that owns the workspace.
 - Drag one or more files and folders onto a folder row, or onto the tree's root
   area, to move them there. Entries already in the target folder stay put. A

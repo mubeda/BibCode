@@ -1206,6 +1206,10 @@ sizes. Cover relevant:
   background → **Upload Files…** → pick a file → verify it appears in the
   workspace root; upload a file whose name collides with an existing entry and
   verify the Replace prompt, then confirm it and verify the replacement lands;
+  download a file whose name is not ASCII (for example `résumé.txt`) and verify
+  the saved file keeps that name rather than a mangled or numbered one; attempt
+  to upload a file named `report:v2.txt` (create it on a Linux or macOS host)
+  and verify the refusal names the rule instead of failing silently;
 - Files picking up a file created in the workspace by another tool while the
   packaged application stays open, both on its own within seconds and
   immediately via **Refresh**; while a controlled rescan is pending, verify the
