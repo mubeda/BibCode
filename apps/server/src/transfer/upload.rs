@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -12,21 +13,94 @@ use super::TransferError;
 /// name never share one.
 static PARTIAL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// How many bytes of the requested name a partial file may echo. The rest of the partial name
-/// (process id, counter, nanoseconds, suffix) plus this budget stays well inside the 255-byte
-/// component limit every supported filesystem enforces, so a long but valid upload name can
-/// still be written.
-const PARTIAL_NAME_BUDGET: usize = 96;
+/// One path component may hold 255 bytes on every filesystem BiBCode supports.
+pub const MAX_PATH_COMPONENT_BYTES: usize = 255;
 
-/// Validates that `name` is a plain file name suitable for joining onto an upload directory:
-/// non-empty, not `.`/`..`, no path separators or NUL bytes, and no longer than 255 bytes.
+/// The tail `write_upload` gives its partial files.
+pub const UPLOAD_PARTIAL_SUFFIX: &str = "bibcode-upload.part";
+
+/// Characters a file name may not carry. The separators and NUL would change which entry is
+/// addressed; the rest are what Windows forbids, refused on every host so a transfer never
+/// creates an entry one supported platform cannot name.
+const FORBIDDEN_CHARACTERS: [char; 9] = ['/', '\\', '<', '>', ':', '"', '|', '?', '*'];
+
+/// The bytes a partial name adds around the file name it echoes, with every counter at its
+/// widest. Derived from the same formatter the partial name uses, so the budget cannot drift
+/// away from the format it is protecting.
+#[must_use]
+pub fn partial_name_overhead(suffix: &str) -> usize {
+    partial_name("", suffix, u32::MAX, u64::MAX, u128::MAX).len()
+}
+
+/// The longest file name that still leaves room for its partial sibling inside one path
+/// component. Shared with the desktop host, whose download partials use a different suffix.
+#[must_use]
+pub fn max_transfer_file_name_bytes(suffix: &str) -> usize {
+    MAX_PATH_COMPONENT_BYTES.saturating_sub(partial_name_overhead(suffix))
+}
+
+/// The cap an upload name is held to: long enough for any realistic name, short enough that the
+/// `.part` sibling written beside it still fits one component.
+pub static MAX_UPLOAD_FILE_NAME_BYTES: LazyLock<usize> =
+    LazyLock::new(|| max_transfer_file_name_bytes(UPLOAD_PARTIAL_SUFFIX));
+
+/// The file-name policy every BiBCode transfer applies, in both directions and on every host: a
+/// non-empty plain name, no `.`/`..`, nothing Windows forbids, no control characters, no trailing
+/// dot or space (Windows strips those, so the entry written would not be the entry named), no
+/// Windows device name, and short enough for a partial sibling.
+#[must_use]
+pub fn is_plain_transfer_file_name(name: &str, max_bytes: usize) -> bool {
+    if name.is_empty() || name.len() > max_bytes || name == "." || name == ".." {
+        return false;
+    }
+    if name.ends_with('.') || name.ends_with(' ') {
+        return false;
+    }
+    if name
+        .chars()
+        .any(|character| FORBIDDEN_CHARACTERS.contains(&character) || character.is_control())
+    {
+        return false;
+    }
+    !is_windows_device_name(name)
+}
+
+/// `CON`, `con.txt`, and `CON.tar.gz` all address the console device on Windows, so the stem
+/// before the first dot is what is compared, without regard to case.
+fn is_windows_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name);
+    if ["CON", "PRN", "AUX", "NUL"]
+        .iter()
+        .any(|device| stem.eq_ignore_ascii_case(device))
+    {
+        return true;
+    }
+    let Some(port) = stem.chars().next_back() else {
+        return false;
+    };
+    if !matches!(port, '1'..='9') {
+        return false;
+    }
+    let head = &stem[..stem.len() - port.len_utf8()];
+    head.eq_ignore_ascii_case("COM") || head.eq_ignore_ascii_case("LPT")
+}
+
+/// The upload-name rule as a person can act on it. It lives beside the rule so a refusal can
+/// never describe a policy the code no longer applies; the byte cap is read from the same
+/// derivation the validator uses.
+#[must_use]
+pub fn upload_file_name_rule() -> String {
+    format!(
+        "Upload file name must be a plain file name: no / \\ : * ? \" < > |, no trailing dot or \
+         space, not a Windows device name such as CON or COM1, and at most {} bytes.",
+        *MAX_UPLOAD_FILE_NAME_BYTES
+    )
+}
+
+/// Validates that `name` is a plain file name suitable for joining onto an upload directory.
+/// See [`is_plain_transfer_file_name`] for the rules.
 pub fn validate_upload_file_name(name: &str) -> Result<(), TransferError> {
-    let valid = !name.is_empty()
-        && name.len() <= 255
-        && name != "."
-        && name != ".."
-        && !name.contains(['/', '\\', '\0']);
-    if valid {
+    if is_plain_transfer_file_name(name, *MAX_UPLOAD_FILE_NAME_BYTES) {
         Ok(())
     } else {
         Err(TransferError::InvalidFileName {
@@ -151,9 +225,22 @@ fn partial_file_name(name: &str) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
-    let stem = truncate_on_char_boundary(name, PARTIAL_NAME_BUDGET);
-    let pid = std::process::id();
-    format!(".{stem}.{pid}-{counter}-{nanos}.bibcode-upload.part")
+    // Validation already caps the name, so the truncation is only what keeps this total for a
+    // name that reached here another way.
+    let stem = truncate_on_char_boundary(name, *MAX_UPLOAD_FILE_NAME_BYTES);
+    partial_name(
+        stem,
+        UPLOAD_PARTIAL_SUFFIX,
+        std::process::id(),
+        counter,
+        nanos,
+    )
+}
+
+/// The one place the partial-name shape is written down: the budget and the name are both
+/// derived from it.
+fn partial_name(stem: &str, suffix: &str, pid: u32, counter: u64, nanos: u128) -> String {
+    format!(".{stem}.{pid}-{counter}-{nanos}.{suffix}")
 }
 
 fn truncate_on_char_boundary(name: &str, budget: usize) -> &str {
@@ -185,16 +272,87 @@ mod tests {
 
     #[test]
     fn validates_plain_file_names() {
-        assert!(validate_upload_file_name("report.pdf").is_ok());
-        for bad in ["", ".", "..", "a/b", "a\\b", &"x".repeat(256)] {
+        for good in [
+            "report.pdf",
+            ".gitignore",
+            "a b.txt",
+            "CONTACTS.txt",
+            "COM0.txt",
+            "COM10.txt",
+            "console",
+            &"x".repeat(*MAX_UPLOAD_FILE_NAME_BYTES),
+        ] {
+            assert!(validate_upload_file_name(good).is_ok(), "{good}");
+        }
+        for bad in [
+            // Empty, the directory entries themselves, and separators.
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            // Characters Windows forbids.
+            "a<b",
+            "a>b",
+            "a:b",
+            "a\"b",
+            "a|b",
+            "a?b",
+            "a*b",
+            // Control characters, including NUL.
+            "a\0b",
+            "a\nb",
+            "a\u{7f}b",
+            // Windows strips a trailing dot or space.
+            "trailing.",
+            "trailing ",
+            "...",
+            // Windows device names, with and without an extension, in any case.
+            "CON",
+            "con",
+            "CON.txt",
+            "nul.tar.gz",
+            "PRN",
+            "aux",
+            "COM1",
+            "com9.log",
+            "LPT1",
+            "lpt9.txt",
+            // Too long for a partial sibling to fit one path component.
+            &"x".repeat(*MAX_UPLOAD_FILE_NAME_BYTES + 1),
+        ] {
             assert!(
                 matches!(
                     validate_upload_file_name(bad),
                     Err(TransferError::InvalidFileName { .. })
                 ),
-                "{bad}"
+                "{bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_name_cap_is_derived_from_the_partial_name_format() {
+        // The cap exists only so the `.part` sibling fits one path component; a hard-coded number
+        // would drift the moment the partial format changes.
+        let longest = "x".repeat(*MAX_UPLOAD_FILE_NAME_BYTES);
+        assert_eq!(
+            partial_name(
+                &longest,
+                UPLOAD_PARTIAL_SUFFIX,
+                u32::MAX,
+                u64::MAX,
+                u128::MAX
+            )
+            .len(),
+            MAX_PATH_COMPONENT_BYTES
+        );
+        assert!(partial_file_name(&longest).len() <= MAX_PATH_COMPONENT_BYTES);
+        // A longer suffix buys a shorter name, and the two always add up to the component limit.
+        assert!(
+            max_transfer_file_name_bytes("bibcode-download.part")
+                < max_transfer_file_name_bytes(UPLOAD_PARTIAL_SUFFIX)
+        );
     }
 
     #[tokio::test]
@@ -311,23 +469,28 @@ mod tests {
 
     #[test]
     fn partial_names_are_unique_per_call_and_stay_within_a_path_component() {
-        let long = "x".repeat(255);
+        let long = "x".repeat(MAX_PATH_COMPONENT_BYTES);
         let first = partial_file_name(&long);
         let second = partial_file_name(&long);
         assert_ne!(first, second);
         for name in [&first, &second] {
-            assert!(name.len() <= 255, "{name}");
+            assert!(name.len() <= MAX_PATH_COMPONENT_BYTES, "{name}");
             assert!(name.ends_with(".bibcode-upload.part"));
             assert!(!name.contains('/'));
         }
         // A budget that lands mid-scalar backs off to a boundary: one ASCII byte then 3-byte
-        // characters puts byte 96 inside a character, so the stem must stop at byte 94.
+        // characters puts the budget inside a character, so the stem stops short of it. This is
+        // only reachable for a name that got here without validation, but it keeps the helper
+        // total.
         let multi_byte = partial_file_name(&format!("a{}", "\u{2603}".repeat(100)));
-        assert!(multi_byte.len() <= 255, "{multi_byte}");
+        assert!(multi_byte.len() <= MAX_PATH_COMPONENT_BYTES, "{multi_byte}");
+        let snowmen = (*MAX_UPLOAD_FILE_NAME_BYTES - 1) / "\u{2603}".len();
         assert!(
-            multi_byte.starts_with(&format!(".a{}.", "\u{2603}".repeat(31))),
+            multi_byte.starts_with(&format!(".a{}.", "\u{2603}".repeat(snowmen))),
             "{multi_byte}"
         );
+        // The prefix really is short of the budget, so the back-off was exercised.
+        assert!(1 + snowmen * "\u{2603}".len() < *MAX_UPLOAD_FILE_NAME_BYTES);
     }
 
     #[tokio::test]

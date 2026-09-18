@@ -779,3 +779,52 @@ async fn a_minted_upload_url_writes_only_the_name_the_mint_bound() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(!root.join("src/other.md").exists());
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_download_names_a_non_ascii_file_without_breaking_the_response() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    let access = bibcode_server::transfer::TransferAccess::new(b"secret".to_vec());
+    let mut state = state_with_json_recorder(Arc::new(Mutex::new(Vec::new())));
+    state.transfer_download =
+        bibcode_server::production::transfer_routes::download_handler(access.clone());
+    let app = add_routes(Router::new()).with_state(TestState(state));
+
+    // A raw non-ASCII or control byte in `filename` is not a legal header value, so the ASCII
+    // slot is transliterated and the real name rides in `filename*`.
+    for (name, expected) in [
+        (
+            "é.txt",
+            "attachment; filename=\"_.txt\"; filename*=UTF-8''%C3%A9.txt",
+        ),
+        (
+            "a\nb.txt",
+            "attachment; filename=\"a_b.txt\"; filename*=UTF-8''a%0Ab.txt",
+        ),
+        (
+            // Nothing survives transliteration, so the ASCII slot falls back to a plain word.
+            "\u{4f60}\u{597d}",
+            "attachment; filename=\"download\"; filename*=UTF-8''%E4%BD%A0%E5%A5%BD",
+        ),
+    ] {
+        std::fs::write(root.join(name), "hello").unwrap();
+        let url = access.issue_download(&root, name).unwrap().relative_url;
+        let response = app
+            .clone()
+            .oneshot(Request::get(&url).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{name:?}");
+        assert_eq!(
+            response.headers()["content-disposition"],
+            expected,
+            "{name:?}"
+        );
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+            "hello",
+            "{name:?}"
+        );
+    }
+}

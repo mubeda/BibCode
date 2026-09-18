@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{
-        Mutex,
+        LazyLock, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -1603,16 +1603,29 @@ fn validate_transfer_url(url: &str) -> Result<reqwest::Url, String> {
     }
 }
 
+/// The tail `desktop_bridge_download_to_folder` gives its partial files.
+const DOWNLOAD_PARTIAL_SUFFIX: &str = "bibcode-download.part";
+
+/// The longest download name that still leaves its `.part` sibling inside one path component.
+static MAX_DOWNLOAD_FILE_NAME_BYTES: LazyLock<usize> = LazyLock::new(|| {
+    bibcode_server::transfer::upload::max_transfer_file_name_bytes(DOWNLOAD_PARTIAL_SUFFIX)
+});
+
+/// The host writes this name to the local disk, so it applies the same policy the upload route
+/// applies to a name coming the other way: one shared rule means a file BiBCode will accept is
+/// a file BiBCode will also hand back.
 fn validate_download_file_name(name: &str) -> Result<(), String> {
-    let plain = !name.is_empty()
-        && name != "."
-        && name != ".."
-        && name.len() <= 255
-        && !name.contains(['/', '\\', '\0']);
-    if plain {
+    if bibcode_server::transfer::upload::is_plain_transfer_file_name(
+        name,
+        *MAX_DOWNLOAD_FILE_NAME_BYTES,
+    ) {
         Ok(())
     } else {
-        Err("Download file name must be a plain file name.".to_owned())
+        Err(format!(
+            "Download file name must be a plain file name: no / \\ : * ? \" < > |, no trailing \
+             dot or space, not a Windows device name such as CON or COM1, and at most {} bytes.",
+            *MAX_DOWNLOAD_FILE_NAME_BYTES
+        ))
     }
 }
 
@@ -1719,7 +1732,7 @@ pub async fn desktop_bridge_download_to_folder(
         ));
     }
     let partial = directory.join(format!(
-        ".{file_name}.{}.bibcode-download.part",
+        ".{file_name}.{}.{DOWNLOAD_PARTIAL_SUFFIX}",
         unique_partial_suffix()
     ));
     let mut file = tokio::fs::File::create(&partial)
@@ -2185,10 +2198,53 @@ mod tests {
 
     #[test]
     fn download_file_names_must_be_plain() {
-        assert!(validate_download_file_name("src.zip").is_ok());
-        for bad in ["", ".", "..", "a/b", "a\\b"] {
-            assert!(validate_download_file_name(bad).is_err(), "{bad}");
+        for good in [
+            "src.zip",
+            ".gitignore",
+            "a b.txt",
+            "CONTACTS.txt",
+            "COM0.zip",
+        ] {
+            assert!(validate_download_file_name(good).is_ok(), "{good}");
         }
+        // The same policy the upload route applies: separators, the characters Windows forbids,
+        // control characters, a trailing dot or space, device names, and an over-long name.
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "a<b",
+            "a>b",
+            "a:b",
+            "a\"b",
+            "a|b",
+            "a?b",
+            "a*b",
+            "a\0b",
+            "a\nb",
+            "trailing.",
+            "trailing ",
+            "CON",
+            "nul.txt",
+            "com1.log",
+            "LPT9",
+            &"x".repeat(*MAX_DOWNLOAD_FILE_NAME_BYTES + 1),
+        ] {
+            assert!(validate_download_file_name(bad).is_err(), "{bad:?}");
+        }
+        // The cap leaves room for the partial sibling this command writes.
+        let longest = "x".repeat(*MAX_DOWNLOAD_FILE_NAME_BYTES);
+        assert!(validate_download_file_name(&longest).is_ok());
+        let partial = format!(
+            ".{longest}.{}.{DOWNLOAD_PARTIAL_SUFFIX}",
+            unique_partial_suffix()
+        );
+        assert!(
+            partial.len() <= bibcode_server::transfer::upload::MAX_PATH_COMPONENT_BYTES,
+            "{partial}"
+        );
     }
 
     #[test]

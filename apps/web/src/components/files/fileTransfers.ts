@@ -1,5 +1,5 @@
 // Pure flow helpers for the Files panel's Download and Upload commands. No React, no module-level
-// I/O — the panel owns minting the signed transfer URLs (projects.createDownloadUrl /
+// I/O — `useFileTransfers` owns minting the signed transfer URLs (projects.createDownloadUrl /
 // projects.createUploadUrl) and reporting outcomes, while the URL math, the desktop-vs-browser
 // branch, and the server's response vocabulary are decided here so they are unit testable.
 

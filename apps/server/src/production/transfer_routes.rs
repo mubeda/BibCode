@@ -187,7 +187,7 @@ pub fn upload_handler(
                 // The mint validates the name, so this is only reachable if a token outlived a
                 // change to the rules. It is still the client's name, not a server fault.
                 Err(transfer::TransferError::InvalidFileName { .. }) => {
-                    Err(bad_request("Upload file name must be a plain file name."))
+                    Err(bad_request(&transfer::upload::upload_file_name_rule()))
                 }
                 Err(error) => Err(internal(error.to_string())),
             }

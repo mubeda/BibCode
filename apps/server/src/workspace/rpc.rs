@@ -1054,7 +1054,7 @@ impl WorkspaceRpc {
                 "cwd": input.cwd,
                 "relativePath": input.file_name,
                 "failure": "operation_failed",
-                "message": "Upload file name must be a plain file name.",
+                "message": transfer::upload::upload_file_name_rule(),
             }));
         }
         let _admission = self.acquire_path(&input.cwd).await?;

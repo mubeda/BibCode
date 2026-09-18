@@ -14,7 +14,7 @@ import {
 import type { FileTreeDropResult, GitStatus, GitStatusEntry } from "@pierre/trees";
 import { FileTree, useFileTree } from "@pierre/trees/react";
 import { FolderClosed, FolderOpen, RefreshCw, Search } from "lucide-react";
-import type { ChangeEvent, MouseEvent } from "react";
+import type { MouseEvent } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { isBrowserPreviewFile, openFileInPreview } from "~/browser/openFileInPreview";
@@ -54,16 +54,8 @@ import {
   parentRelativePath,
   stripTrailingSlash,
 } from "./FileTreeContextMenu.logic";
-import {
-  describeByteLimit,
-  downloadWithBridge,
-  interpretUploadResponse,
-  resolveTransferUrl,
-  sendBrowserUpload,
-  triggerBrowserDownload,
-  uploadUrlFor,
-} from "./fileTransfers";
 import { useProjectEntriesQuery } from "./projectFilesQueryState";
+import { useFileTransfers } from "./useFileTransfers";
 
 interface FileBrowserPanelProps {
   environmentId: EnvironmentId;
@@ -91,13 +83,6 @@ const TREE_UNSAFE_CSS = `
   }
   button[data-type='item'] { border-radius: 5px; }
 `;
-
-const NO_SERVER_MESSAGE = "Not connected to this environment's server. Reconnect and try again.";
-
-/** How an upload destination reads in a message: a quoted folder, or the root it stands for. */
-function uploadTargetLabel(relativeDirectory: string): string {
-  return relativeDirectory ? `"${relativeDirectory}"` : "the workspace root";
-}
 
 /** Stable identity while the query is pending, so the path-reset effect does not run every render. */
 const NO_ENTRIES: ReadonlyArray<ProjectEntry> = Object.freeze([]);
@@ -242,12 +227,6 @@ export default function FileBrowserPanel({
   const duplicateEntry = useAtomCommand(projectEnvironment.duplicateEntry, {
     reportFailure: false,
   });
-  const createDownloadUrl = useAtomCommand(projectEnvironment.createDownloadUrl, {
-    reportFailure: false,
-  });
-  const createUploadUrl = useAtomCommand(projectEnvironment.createUploadUrl, {
-    reportFailure: false,
-  });
   const openInEditor = useAtomCommand(shellEnvironment.openInEditor, "open in editor");
 
   const environmentHttpBaseUrl = useEnvironmentHttpBaseUrl(environmentId);
@@ -265,28 +244,6 @@ export default function FileBrowserPanel({
   // Right-click on empty tree space: Pierre only surfaces row menus, so a background menu is
   // opened from the container's contextmenu event, anchored to the cursor point.
   const [backgroundMenu, setBackgroundMenu] = useState<{ x: number; y: number } | null>(null);
-
-  // FileEntryDialog only reports "closed", so a flow that awaits an answer (the upload replace
-  // prompt) leaves its "not confirmed" resolver here. Every close path — Cancel, Escape, or the
-  // workspace going away — runs through closeDialog, so such a flow can never hang.
-  const dialogCancelRef = useRef<(() => void) | null>(null);
-  // Browser-mode upload picker: the hidden input below is clicked for the folder recorded here.
-  const uploadInputRef = useRef<HTMLInputElement | null>(null);
-  const uploadTargetRef = useRef<string>("");
-  const closeDialog = useCallback(() => {
-    setDialogRequest(null);
-    const cancel = dialogCancelRef.current;
-    dialogCancelRef.current = null;
-    cancel?.();
-  }, []);
-
-  useEffect(() => {
-    workspaceUnavailableRef.current = workspaceUnavailable;
-    if (workspaceUnavailable) {
-      closeDialog();
-      setBackgroundMenu(null);
-    }
-  }, [closeDialog, workspaceUnavailable]);
 
   const copyText = useCallback((text: string) => {
     void navigator.clipboard.writeText(text).catch((error: unknown) => {
@@ -322,6 +279,28 @@ export default function FileBrowserPanel({
       }),
     );
   }, []);
+
+  // Download and Upload are the panel's only awaitable, multi-step flows — a minted URL, a
+  // transport that differs between desktop and browser, and a prompt the upload waits on — so
+  // they live in their own hook. The panel still owns the dialog state the prompt writes into.
+  const { downloadEntry, uploadTo, handleUploadInputChange, uploadInputRef, closeDialog } =
+    useFileTransfers({
+      environmentId,
+      cwd,
+      httpBaseUrl: environmentHttpBaseUrl,
+      workspaceUnavailable,
+      showMutationError,
+      setDialogRequest,
+      refreshEntries: entriesQuery.refresh,
+    });
+
+  useEffect(() => {
+    workspaceUnavailableRef.current = workspaceUnavailable;
+    if (workspaceUnavailable) {
+      closeDialog();
+      setBackgroundMenu(null);
+    }
+  }, [closeDialog, workspaceUnavailable]);
 
   // The server keeps a cached workspace index, so refreshing the query atom alone replays the stale
   // list. This is the user-initiated rescan: it asks the server to rebuild first, then refreshes the
@@ -586,218 +565,6 @@ export default function FileBrowserPanel({
         .catch((error) => showMutationError(error, "Unable to open in file manager"));
     },
     [cwd, showMutationError],
-  );
-
-  // Download and Upload mint a short-lived signed URL (projects.createDownloadUrl /
-  // createUploadUrl) and then move the bytes over plain HTTP against the same environment base URL
-  // asset previews use. The desktop host streams to/from native pickers so a remote workspace
-  // transfers host-to-host; the browser falls back to an anchor download and a hidden file input.
-  const downloadEntry = useCallback(
-    (relativePath: string) => {
-      const name = entryName(relativePath);
-      if (!environmentHttpBaseUrl) {
-        showMutationError(new Error(NO_SERVER_MESSAGE), `Can’t download "${name}"`);
-        return;
-      }
-      void (async () => {
-        const minted = await createDownloadUrl({ environmentId, input: { cwd, relativePath } });
-        if (minted._tag === "Failure") {
-          if (!isAtomCommandInterrupted(minted)) {
-            showMutationError(
-              squashAtomCommandFailure(minted),
-              `Failed to prepare a download for "${name}"`,
-            );
-          }
-          return;
-        }
-        const url = resolveTransferUrl(environmentHttpBaseUrl, minted.value.relativeUrl);
-        if (url === null) {
-          showMutationError(
-            new Error("The server did not return a usable download URL."),
-            `Can’t download "${name}"`,
-          );
-          return;
-        }
-        try {
-          const outcome = await downloadWithBridge({
-            url,
-            fileName: minted.value.fileName,
-            bridge: typeof window === "undefined" ? undefined : window.desktopBridge,
-          });
-          if (outcome._tag === "BrowserDownload") {
-            triggerBrowserDownload(outcome.url, outcome.fileName);
-          } else if (outcome._tag === "Saved") {
-            // The host never overwrites: it uniquifies the name, so show the path it actually wrote.
-            toastManager.add(
-              stackedThreadToast({
-                type: "success",
-                title: "Download saved",
-                description: outcome.path,
-              }),
-            );
-          }
-        } catch (error) {
-          showMutationError(error, `Failed to download "${name}"`);
-        }
-      })();
-    },
-    [createDownloadUrl, cwd, environmentHttpBaseUrl, environmentId, showMutationError],
-  );
-
-  /** Resolves false unless the user confirms; see `closeDialog` for the cancel path. */
-  const confirmReplace = useCallback(
-    (fileName: string, relativeDirectory: string) =>
-      new Promise<boolean>((resolve) => {
-        // A prompt this one displaces must not strand the flow awaiting it.
-        dialogCancelRef.current?.();
-        let settled = false;
-        const settle = (value: boolean) => {
-          if (settled) return;
-          settled = true;
-          resolve(value);
-        };
-        // The dialog calls onConfirm and then onClose, so both paths settle and only the first wins.
-        dialogCancelRef.current = () => settle(false);
-        setDialogRequest({
-          mode: "confirm",
-          title: `Replace "${fileName}"?`,
-          description: `"${fileName}" already exists in ${uploadTargetLabel(relativeDirectory)}. Replacing it can't be undone.`,
-          confirmLabel: "Replace",
-          destructive: true,
-          onConfirm: () => settle(true),
-        });
-      }),
-    [],
-  );
-
-  // One file, one freshly minted upload token bound to that one file name. `send` is the transport
-  // (desktop host or browser fetch) so the retry-after-replace loop is identical in both runtimes.
-  // Every failure — a refused upload or a rejected transport (unreadable file, permission error) —
-  // is reported against this file's own name and stops here, so one bad file never aborts the rest
-  // of a batch.
-  const uploadOne = useCallback(
-    async (
-      relativeDirectory: string,
-      file: { name: string; send: (url: string) => Promise<{ status: number; body: string }> },
-    ): Promise<void> => {
-      const target = uploadTargetLabel(relativeDirectory);
-      const refuse = (message: string) =>
-        showMutationError(new Error(message), `Can’t upload "${file.name}"`);
-      if (!environmentHttpBaseUrl) {
-        refuse(NO_SERVER_MESSAGE);
-        return;
-      }
-      try {
-        const minted = await createUploadUrl({
-          environmentId,
-          input: { cwd, relativeDirectory, fileName: file.name },
-        });
-        if (minted._tag === "Failure") {
-          if (!isAtomCommandInterrupted(minted)) {
-            showMutationError(
-              squashAtomCommandFailure(minted),
-              `Failed to prepare an upload to ${target}`,
-            );
-          }
-          return;
-        }
-        const transferUrl = resolveTransferUrl(environmentHttpBaseUrl, minted.value.relativeUrl);
-        if (transferUrl === null) {
-          refuse("The server did not return a usable upload URL.");
-          return;
-        }
-        let overwrite = false;
-        for (;;) {
-          // The same token is reused for the replace retry: it already names this file.
-          const response = await file.send(uploadUrlFor(transferUrl, overwrite));
-          const step = interpretUploadResponse(response.status, response.body);
-          if (step._tag === "Uploaded") return;
-          if (step._tag === "Exists" && !overwrite) {
-            const replace = await confirmReplace(file.name, relativeDirectory);
-            if (!replace || workspaceUnavailableRef.current) return;
-            overwrite = true;
-            continue;
-          }
-          refuse(
-            step._tag === "TooLarge"
-              ? `The file is larger than the ${describeByteLimit(step.limit)} the server accepts.`
-              : step._tag === "Exists"
-                ? `Something else now uses that name in ${target}. Refresh the tree and try again.`
-                : step.message,
-          );
-          return;
-        }
-      } catch (error) {
-        showMutationError(error, `Can’t upload "${file.name}"`);
-      }
-    },
-    [
-      confirmReplace,
-      createUploadUrl,
-      cwd,
-      environmentHttpBaseUrl,
-      environmentId,
-      showMutationError,
-    ],
-  );
-
-  const uploadTo = useCallback(
-    (relativeDirectory: string) => {
-      const bridge = typeof window === "undefined" ? undefined : window.desktopBridge;
-      const pickFiles = bridge?.pickFiles;
-      const uploadFile = bridge?.uploadFile;
-      if (pickFiles === undefined || uploadFile === undefined) {
-        uploadTargetRef.current = relativeDirectory;
-        uploadInputRef.current?.click();
-        return;
-      }
-      void (async () => {
-        // `uploadOne` reports its own failures per file, so the batch runs to the end and the tree
-        // resyncs even when some of the files were refused.
-        let picked: readonly string[] = [];
-        try {
-          picked = await pickFiles({ title: "Select files to upload" });
-          for (const path of picked) {
-            const name = path.split(/[\\/]/).pop() ?? path;
-            await uploadOne(relativeDirectory, {
-              name,
-              send: (url) => uploadFile({ url, path }),
-            });
-          }
-        } catch (error) {
-          showMutationError(error, "Failed to upload files");
-        } finally {
-          if (picked.length > 0) entriesQuery.refresh();
-        }
-      })();
-    },
-    [entriesQuery, showMutationError, uploadOne],
-  );
-
-  const handleUploadInputChange = useCallback(
-    (event: ChangeEvent<HTMLInputElement>) => {
-      const input = event.currentTarget;
-      const files = Array.from(input.files ?? []);
-      // Clear the picker so choosing the same file twice in a row fires another change event.
-      input.value = "";
-      if (files.length === 0) return;
-      const relativeDirectory = uploadTargetRef.current;
-      void (async () => {
-        try {
-          for (const file of files) {
-            await uploadOne(relativeDirectory, {
-              name: file.name,
-              send: (url) => sendBrowserUpload(url, file),
-            });
-          }
-        } catch (error) {
-          showMutationError(error, "Failed to upload files");
-        } finally {
-          entriesQuery.refresh();
-        }
-      })();
-    },
-    [entriesQuery, showMutationError, uploadOne],
   );
 
   const openPreviewFor = useCallback(

@@ -1140,7 +1140,13 @@ replacement that now occupies the old path.
   oversized folder is refused as a `ProjectTransferError` the panel can show;
   the route repeats the pre-scan before streaming because the tree can grow
   between mint and redemption. A file download carries `Content-Length`; a zip
-  is produced as it streams and stays chunked. An upload token names one
+  is produced as it streams and stays chunked. `Content-Disposition` names the
+  entry with an ASCII-safe `filename` plus an RFC 5987 `filename*`, because a
+  raw non-ASCII or control byte is not a legal header value and would fail the
+  whole response. One file-name policy (`transfer::upload`) governs both
+  directions and both hosts: a plain name with nothing Windows forbids, no
+  control characters, no trailing dot or space, no device name, and short
+  enough that its `.part` sibling still fits a 255-byte path component. An upload token names one
   directory, one file name, and a byte cap: `POST /api/transfers/{token}` takes
   the name from the token, so a leaked URL can write only that one file, and a
   `?name=` that disagrees with the token is refused with 400 rather than
