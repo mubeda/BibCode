@@ -1,4 +1,5 @@
 import type { GitManagerRefEntry } from "@bibcode/contracts";
+import { GitBranchIcon } from "lucide-react";
 import { memo, useCallback, useEffect, useMemo, useState } from "react";
 
 import { Button } from "~/components/ui/button";
@@ -115,7 +116,16 @@ function CreateBranchDialog({
         <DialogHeader>
           <DialogTitle>New Branch</DialogTitle>
           <DialogDescription>
-            Create and check out a local branch from {baseBranch ?? "the current HEAD"}.
+            Creates a local branch from{" "}
+            <span
+              className="inline-flex items-center gap-1 rounded-md border border-primary/50 bg-primary/15 px-1.5 py-0.5 align-baseline font-mono text-xs text-foreground"
+              data-testid="git-manager-branch-base"
+              title={`New branch starts from ${baseBranch ?? "the current HEAD"}`}
+            >
+              <GitBranchIcon aria-hidden="true" className="size-3" />
+              {baseBranch ?? "current HEAD"}
+            </span>{" "}
+            and checks it out.
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-3 px-6 pb-4">
