@@ -86,6 +86,45 @@ describe("GitManagerBranchDialogs", () => {
     expect(buttonWithText("Rename").title).toBe(message);
   });
 
+  it("names the checked-out base branch prominently in the New Branch dialog", async () => {
+    await act(async () =>
+      root?.render(
+        <GitManagerBranchDialogs
+          busy={false}
+          dialog={{ kind: "create", baseBranch: "alpha" }}
+          errorMessage={null}
+          refs={[]}
+          onClose={() => undefined}
+          onSubmit={() => Promise.resolve()}
+        />,
+      ),
+    );
+
+    const base = document.querySelector('[data-testid="git-manager-branch-base"]');
+    expect(base?.textContent).toBe("alpha");
+    expect(base?.getAttribute("title")).toBe("New branch starts from alpha");
+    expect(document.body.textContent).not.toContain("master");
+  });
+
+  it("says the new branch starts from the current HEAD when it is detached", async () => {
+    await act(async () =>
+      root?.render(
+        <GitManagerBranchDialogs
+          busy={false}
+          dialog={{ kind: "create", baseBranch: null }}
+          errorMessage={null}
+          refs={[]}
+          onClose={() => undefined}
+          onSubmit={() => Promise.resolve()}
+        />,
+      ),
+    );
+
+    expect(document.querySelector('[data-testid="git-manager-branch-base"]')?.textContent).toBe(
+      "current HEAD",
+    );
+  });
+
   it("requires explicit confirmation before deleting a branch", async () => {
     const submissions: GitManagerBranchDialogSubmission[] = [];
     await act(async () =>

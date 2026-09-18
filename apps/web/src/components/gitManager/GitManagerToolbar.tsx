@@ -28,6 +28,7 @@ import {
   type GitManagerBranchDialogSubmission,
 } from "./dialogs/GitManagerBranchDialogs";
 import { GitManagerSwitchWithChangesDialog } from "./dialogs/GitManagerSwitchWithChangesDialog";
+import { resolveBranchCreateBase } from "./toolbar/branchCreateBase";
 import { GitManagerBranchDropdown } from "./toolbar/GitManagerBranchDropdown";
 import { GitManagerOperationBanner } from "./toolbar/GitManagerOperationBanner";
 import {
@@ -408,7 +409,10 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
     () =>
       setBranchDialog({
         kind: "create",
-        baseBranch: snapshot?.defaultBranch ?? currentBranchName,
+        baseBranch: resolveBranchCreateBase({
+          currentBranchName,
+          defaultBranch: snapshot?.defaultBranch ?? null,
+        }),
       }),
     [currentBranchName, snapshot?.defaultBranch],
   );
