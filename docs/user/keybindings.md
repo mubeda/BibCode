@@ -110,6 +110,11 @@ lists, menus, dialogs, and buttons. RPC tags such as `gitManager.getRefs` and
 `gitManager.runOperation` are protocol method names, not keybinding commands;
 putting them in `keybindings.json` makes that rule invalid and it is ignored.
 
+Pull Requests registers no `KeybindingCommand` values. Open it with the
+project-header **Pull Requests** button and use its keyboard-operable tabs,
+menus, forms, and dialogs. `pullRequests.*` names are RPC methods, not
+keybinding commands. Comment editors support Ctrl/Cmd+Enter locally.
+
 ### Key Syntax
 
 Supported modifiers:

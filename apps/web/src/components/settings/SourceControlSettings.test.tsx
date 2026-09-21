@@ -223,6 +223,13 @@ vi.mock("./settingsLayout", () => ({
       </section>
     );
   },
+  SettingsRow: (props: Record<string, unknown>) => (
+    <div>
+      {props.title as ReactNode}
+      {props.description as ReactNode}
+      {props.control as ReactNode}
+    </div>
+  ),
   SettingResetButton: (props: Record<string, unknown>) => {
     ui.record("SettingResetButton", props);
     return <button type="button" data-reset />;
@@ -295,7 +302,10 @@ beforeEach(() => {
   ui.reset();
   testState.environmentId = ENV;
   testState.discovery = { data: null, error: null, isPending: false, refresh: vi.fn() };
-  testState.settings = { automaticGitFetchInterval: Duration.seconds(120) };
+  testState.settings = {
+    pullRequestsEnabled: true,
+    automaticGitFetchInterval: Duration.seconds(120),
+  };
   testState.updateSettings.mockReset();
 });
 
@@ -518,4 +528,40 @@ describe("discovery row expand toggle", () => {
     (toggle.onClick as () => void)();
     expect(harness.setStateCalls.some((call) => call.applied === true)).toBe(true);
   });
+});
+
+describe("Pull Requests settings", () => {
+  it("toggles the global client setting even without discovery data", () => {
+    expect(render()).toContain(
+      "Show the Pull Requests button on every project and enable the pull request views.",
+    );
+    const toggle = ui.find("Switch", (p) => p["aria-label"] === "Enable pull requests");
+    expect(toggle.checked).toBe(true);
+    (toggle.onCheckedChange as (checked: boolean) => void)(false);
+    expect(testState.updateSettings).toHaveBeenCalledWith({ pullRequestsEnabled: false });
+  });
+  it.each(["github", "gitlab"] as const)(
+    "shows each configured %s host with its authentication state",
+    (kind) => {
+      testState.discovery.data = result({
+        sourceControlProviders: [
+          providerItem({
+            kind,
+            auth: providerAuth({
+              hosts: [
+                { host: "public.test", account: "alice", authenticated: true },
+                { host: "company.test", account: null, authenticated: false },
+              ],
+            }),
+          }),
+        ],
+      });
+      const markup = render();
+      expect(markup).toContain("public.test");
+      expect(markup).toContain("Authenticated as");
+      expect(markup).toContain("company.test");
+      expect(markup).toContain("Not authenticated");
+      expect(ui.filter("RedactedSensitiveText").some((p) => p.value === "alice")).toBe(true);
+    },
+  );
 });

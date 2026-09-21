@@ -549,6 +549,8 @@ vi.mock("../hooks/useHandleNewThread", () => ({
 }));
 
 vi.mock("~/hooks/useSettings", () => ({
+  usePrimarySettings: (selector: (settings: unknown) => unknown) =>
+    selector({ ...h.state.clientSettings }),
   useClientSettings: (selector: (settings: unknown) => unknown) => selector(h.state.clientSettings),
   useUpdateClientSettings: () => h.spies.updateSettings,
 }));
@@ -3696,6 +3698,64 @@ staticDescribe("new thread entry points", () => {
     expect(firstClick.preventDefault).toHaveBeenCalled();
     expect(secondClick.stopPropagation).toHaveBeenCalled();
   });
+  it("highlights the project header while its Pull Requests route is open", () => {
+    baseScenario();
+    h.state.pathname = `/project/${ENV_MAIN}/${projectA.id}/pull-requests/14`;
+    h.state.routeParams = { environmentId: ENV_MAIN, projectId: projectA.id };
+    render(<Sidebar />);
+    const header = captured("SidebarMenuButton").find(
+      (entry) => typeof entry.props["onPointerDownCapture"] === "function",
+    )!;
+    expect(header.props["isActive"]).toBe(true);
+    expect(header.props["aria-current"]).toBe("page");
+
+    h.state.captures = [];
+    h.state.pathname = "/";
+    h.state.routeParams = {};
+    render(<Sidebar />);
+    const idleHeader = captured("SidebarMenuButton").find(
+      (entry) => typeof entry.props["onPointerDownCapture"] === "function",
+    )!;
+    expect(idleHeader.props["isActive"]).toBe(false);
+    expect(idleHeader.props["aria-current"]).toBeUndefined();
+  });
+
+  it("navigates idempotently to one project-scoped Pull Requests", () => {
+    baseScenario();
+    render(<Sidebar />);
+    const pullRequests = mustFindProps(byTestId("pull-requests-button"), "Pull Requests button");
+    const firstClick = mouseEvent();
+    const secondClick = mouseEvent();
+
+    invoke(pullRequests, "onClick", firstClick);
+    invoke(pullRequests, "onClick", secondClick);
+
+    const navigation = {
+      to: "/project/$environmentId/$projectId/pull-requests",
+      params: { environmentId: ENV_MAIN, projectId: projectA.id },
+    };
+    expect(h.spies.navigate).toHaveBeenNthCalledWith(1, navigation);
+    expect(h.spies.navigate).toHaveBeenNthCalledWith(2, navigation);
+    expect(firstClick.preventDefault).toHaveBeenCalled();
+    expect(secondClick.stopPropagation).toHaveBeenCalled();
+  });
+  it("hides the Pull Requests button when disabled in settings", () => {
+    baseScenario();
+    render(<Sidebar />);
+    expect(findProps(byTestId("pull-requests-button"))).not.toBeNull();
+    h.state.captures = [];
+    h.state.clientSettings.pullRequestsEnabled = false;
+    render(<Sidebar />);
+    expect(findProps(byTestId("pull-requests-button"))).toBeNull();
+  });
+
+  it("labels the Pull Requests button for its project", () => {
+    baseScenario();
+    render(<Sidebar />);
+    expect(
+      mustFindProps(byAriaLabel("Pull Requests for Repo A"), "Pull Requests button"),
+    ).toBeDefined();
+  });
 });
 
 staticDescribe("grouped and remote projects", () => {
@@ -3754,6 +3814,25 @@ staticDescribe("grouped and remote projects", () => {
     expect(h.spies.contextMenuShow).toHaveBeenCalled();
     expect(h.spies.navigate).toHaveBeenCalledWith({
       to: "/project/$environmentId/$projectId/git",
+      params: { environmentId: ENV_REMOTE, projectId: ProjectId.make("project-a-remote") },
+    });
+  });
+
+  it("opens the chosen grouped-project member's Pull Requests", async () => {
+    groupedScenario();
+    render(<Sidebar />);
+    fakeLocalApi();
+    h.spies.contextMenuShow.mockImplementation(
+      async (items: Array<{ id: string }>) => items[1]!.id,
+    );
+
+    const pullRequests = mustFindProps(byTestId("pull-requests-button"), "Pull Requests button");
+    invoke(pullRequests, "onClick", mouseEvent());
+    await flush();
+
+    expect(h.spies.contextMenuShow).toHaveBeenCalled();
+    expect(h.spies.navigate).toHaveBeenCalledWith({
+      to: "/project/$environmentId/$projectId/pull-requests",
       params: { environmentId: ENV_REMOTE, projectId: ProjectId.make("project-a-remote") },
     });
   });

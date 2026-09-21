@@ -208,6 +208,13 @@ user profile globally.
 
 ## Packaged UI scenarios
 
+Include the shared [Pull Requests smoke](./cross-platform-validation.md#pull-requests-web-shell-validation):
+open the project-header sidebar button, inspect the repository list, open a
+request, and render a real text patch on Files changed/Changes with `tab=files`
+retained after reload. Record unavailable fixture/host states separately from
+that pass. The packaged Pierre spec's sibling checks route entry only; the
+shared procedure owns authenticated list/detail/files evidence.
+
 Use Codex Computer Use to operate the packaged executable. Capture the actual
 X11/Wayland and desktop environment in the report. At normal and minimum sizes
 verify:

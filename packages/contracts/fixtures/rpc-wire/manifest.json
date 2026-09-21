@@ -218,6 +218,46 @@
       "mode": "unary"
     },
     {
+      "name": "pullRequests.checkout",
+      "mode": "unary"
+    },
+    {
+      "name": "pullRequests.get",
+      "mode": "unary"
+    },
+    {
+      "name": "pullRequests.getChecks",
+      "mode": "unary"
+    },
+    {
+      "name": "pullRequests.getCommits",
+      "mode": "unary"
+    },
+    {
+      "name": "pullRequests.getContext",
+      "mode": "unary"
+    },
+    {
+      "name": "pullRequests.getFiles",
+      "mode": "unary"
+    },
+    {
+      "name": "pullRequests.getTimeline",
+      "mode": "unary"
+    },
+    {
+      "name": "pullRequests.getVocabulary",
+      "mode": "unary"
+    },
+    {
+      "name": "pullRequests.list",
+      "mode": "unary"
+    },
+    {
+      "name": "pullRequests.runAction",
+      "mode": "unary"
+    },
+    {
       "name": "review.getDiffPreview",
       "mode": "unary"
     },
@@ -674,6 +714,16 @@
     "typed-failures/projects__writeFile-01.json",
     "typed-failures/projects__writeFile-02.json",
     "typed-failures/projects__writeFile-03.json",
+    "typed-failures/pullRequests__checkout-00.json",
+    "typed-failures/pullRequests__get-00.json",
+    "typed-failures/pullRequests__getChecks-00.json",
+    "typed-failures/pullRequests__getCommits-00.json",
+    "typed-failures/pullRequests__getContext-00.json",
+    "typed-failures/pullRequests__getFiles-00.json",
+    "typed-failures/pullRequests__getTimeline-00.json",
+    "typed-failures/pullRequests__getVocabulary-00.json",
+    "typed-failures/pullRequests__list-00.json",
+    "typed-failures/pullRequests__runAction-00.json",
     "typed-failures/review__getDiffPreview-00.json",
     "typed-failures/review__getDiffPreview-01.json",
     "typed-failures/review__getDiffPreview-02.json",
@@ -973,6 +1023,16 @@
     "typed-failures/projects__writeFile-01.json": "d30145df2096df3675ffde7a840acb67a4f2e26cb8d9a607b828688560d2ca82",
     "typed-failures/projects__writeFile-02.json": "b2fbde91e8a8ad7b3e8fce9b4d378041efef24ffd25156a058c7cb69f6fd91e9",
     "typed-failures/projects__writeFile-03.json": "ab08a5a9459dd717e1ee0d5bea28eb9092c8b860c22cb291e86bb70075bf559e",
+    "typed-failures/pullRequests__checkout-00.json": "af1f2578bb3450b7492ccefc0142cc25e859d26726baad23eaa85ef840db5792",
+    "typed-failures/pullRequests__get-00.json": "af1f2578bb3450b7492ccefc0142cc25e859d26726baad23eaa85ef840db5792",
+    "typed-failures/pullRequests__getChecks-00.json": "af1f2578bb3450b7492ccefc0142cc25e859d26726baad23eaa85ef840db5792",
+    "typed-failures/pullRequests__getCommits-00.json": "af1f2578bb3450b7492ccefc0142cc25e859d26726baad23eaa85ef840db5792",
+    "typed-failures/pullRequests__getContext-00.json": "af1f2578bb3450b7492ccefc0142cc25e859d26726baad23eaa85ef840db5792",
+    "typed-failures/pullRequests__getFiles-00.json": "af1f2578bb3450b7492ccefc0142cc25e859d26726baad23eaa85ef840db5792",
+    "typed-failures/pullRequests__getTimeline-00.json": "af1f2578bb3450b7492ccefc0142cc25e859d26726baad23eaa85ef840db5792",
+    "typed-failures/pullRequests__getVocabulary-00.json": "af1f2578bb3450b7492ccefc0142cc25e859d26726baad23eaa85ef840db5792",
+    "typed-failures/pullRequests__list-00.json": "af1f2578bb3450b7492ccefc0142cc25e859d26726baad23eaa85ef840db5792",
+    "typed-failures/pullRequests__runAction-00.json": "af1f2578bb3450b7492ccefc0142cc25e859d26726baad23eaa85ef840db5792",
     "typed-failures/review__getDiffPreview-00.json": "2a8b930af5e192b453d795b220a321337f0b6f464aeda2ed0af4077ce3cb1b55",
     "typed-failures/review__getDiffPreview-01.json": "d30145df2096df3675ffde7a840acb67a4f2e26cb8d9a607b828688560d2ca82",
     "typed-failures/review__getDiffPreview-02.json": "b2fbde91e8a8ad7b3e8fce9b4d378041efef24ffd25156a058c7cb69f6fd91e9",
@@ -1040,12 +1100,12 @@
     "stream-shapes/subscribePreviewEvents-03.json": "610d11c2c75756edfc18e224e5e91c6944162760c00c48c4d0de54fc4772acff",
     "stream-shapes/subscribePreviewEvents-04.json": "f501cfce13136cfa7ae7bad4febe03c8c2f251deb39b95d89a955a1c39b449aa",
     "stream-shapes/subscribeProjectEntries-00.json": "16f4733b371dc6218161dd4edea9bdd75720b67a9e18533b6bdf20d00e120db5",
-    "stream-shapes/subscribeServerConfig-00.json": "8ea7deefb0c2127ee1d6a0ca3ba479c3e9cfb70d029fd5b393d40988d2ab88ee",
+    "stream-shapes/subscribeServerConfig-00.json": "ad503d8e0ffc6ecd49b9422050c7ddbd8f87bac2888c0e6ccd68c9ed5a7fa3e1",
     "stream-shapes/subscribeServerConfig-01.json": "a866ebe3e362b57799e25e8b10466b265109e4629a4b70b6ede87aae60fab7ef",
     "stream-shapes/subscribeServerConfig-02.json": "ab00106a9216eab62871872a4a78a54e777749fdc22c73eb0ee613463b6c2f12",
     "stream-shapes/subscribeServerConfig-03.json": "170831fd420c93bb7028261110e84a506b90762a469d9d9de9fed374b1856967",
-    "stream-shapes/subscribeServerLifecycle-00.json": "4289acd2c3ee49d1abcfc4d41f29929620cf7cbecef537f7fc538b17f663a332",
-    "stream-shapes/subscribeServerLifecycle-01.json": "2f66542f5c76733793d36bf4ede0615218bbe5f2d4a7f6cdcddb222e5e3fcdc4",
+    "stream-shapes/subscribeServerLifecycle-00.json": "eec60c25ed2ae84614791fa2402c983f3e6d89b8e6561b9e1177acf2c3d8bb27",
+    "stream-shapes/subscribeServerLifecycle-01.json": "5704694329d42d4e57bad4d3d258bfe0ca7ead3f9bd8a7feada21bb940b73b73",
     "stream-shapes/subscribeTerminalEvents-00.json": "59355c753b61de3ed4b80e95bfa1f9907335af13f8c9d043ff1abf1cca7d57e6",
     "stream-shapes/subscribeTerminalEvents-01.json": "8910c9265e5eb8ab0cdd98289a899d28b720c08decad2ec7d2967346570eaee6",
     "stream-shapes/subscribeTerminalEvents-02.json": "218d03fab79954845f38c1ed752082aab5340619a28c684920da1af6a7360fa8",
@@ -1397,6 +1457,16 @@
     "typed-failures/projects__writeFile-01.json",
     "typed-failures/projects__writeFile-02.json",
     "typed-failures/projects__writeFile-03.json",
+    "typed-failures/pullRequests__checkout-00.json",
+    "typed-failures/pullRequests__get-00.json",
+    "typed-failures/pullRequests__getChecks-00.json",
+    "typed-failures/pullRequests__getCommits-00.json",
+    "typed-failures/pullRequests__getContext-00.json",
+    "typed-failures/pullRequests__getFiles-00.json",
+    "typed-failures/pullRequests__getTimeline-00.json",
+    "typed-failures/pullRequests__getVocabulary-00.json",
+    "typed-failures/pullRequests__list-00.json",
+    "typed-failures/pullRequests__runAction-00.json",
     "typed-failures/review__getDiffPreview-00.json",
     "typed-failures/review__getDiffPreview-01.json",
     "typed-failures/review__getDiffPreview-02.json",

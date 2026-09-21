@@ -1,12 +1,15 @@
 import type {
   EnvironmentId,
+  ScopedProjectRef,
   GitManagerCheckEntry,
   GitManagerPullRequestEntry,
   GitManagerPullRequestsResult,
 } from "@bibcode/contracts";
+import { Link } from "@tanstack/react-router";
 import { CheckCircle2Icon, GitPullRequestIcon, RefreshCwIcon } from "lucide-react";
 import { memo, useCallback, useMemo, useState } from "react";
 
+import { usePullRequestsStore } from "../../../pullRequestsStore";
 import { gitManagerEnvironment } from "../../../state/gitManager";
 import { useEnvironmentQuery } from "../../../state/query";
 import { Button } from "../../ui/button";
@@ -27,9 +30,15 @@ function safeExternalUrl(value: string): string | null {
 
 interface PullRequestRowProps {
   readonly pullRequest: GitManagerPullRequestEntry;
+  readonly cwd: string;
+  readonly projectRef?: ScopedProjectRef;
 }
 
-const PullRequestRow = memo(function PullRequestRow({ pullRequest }: PullRequestRowProps) {
+const PullRequestRow = memo(function PullRequestRow({
+  pullRequest,
+  cwd,
+  projectRef,
+}: PullRequestRowProps) {
   const url = safeExternalUrl(pullRequest.url);
   return (
     <li className="rounded-md border border-border p-3">
@@ -52,6 +61,17 @@ const PullRequestRow = memo(function PullRequestRow({ pullRequest }: PullRequest
             #{pullRequest.number} · {pullRequest.headBranch} → {pullRequest.baseBranch} ·{` `}
             {pullRequest.state}
           </p>
+          {projectRef ? (
+            <Link
+              className="mt-1 inline-block text-xs text-muted-foreground underline underline-offset-2 hover:text-foreground"
+              to="/project/$environmentId/$projectId/pull-requests/$number"
+              params={{ ...projectRef, number: String(pullRequest.number) }}
+              search={{ tab: "conversation" }}
+              onClick={() => usePullRequestsStore.getState().setCheckoutCwd(projectRef, cwd)}
+            >
+              Open in Pull Requests
+            </Link>
+          ) : null}
         </div>
       </div>
     </li>
@@ -93,6 +113,7 @@ const CheckRow = memo(function CheckRow({ check }: CheckRowProps) {
 });
 
 export interface GitManagerPullRequestPanelProps {
+  readonly projectRef?: ScopedProjectRef;
   readonly scope: { readonly environmentId: EnvironmentId; readonly cwd: string };
   readonly disabledReason?: string | null;
   readonly onRefresh: () => void;
@@ -100,6 +121,7 @@ export interface GitManagerPullRequestPanelProps {
 
 export const GitManagerPullRequestPanel = memo(function GitManagerPullRequestPanel({
   scope,
+  projectRef,
   disabledReason = null,
   onRefresh,
 }: GitManagerPullRequestPanelProps) {
@@ -193,7 +215,12 @@ export const GitManagerPullRequestPanel = memo(function GitManagerPullRequestPan
           <h3 className="text-xs font-semibold">Current pull request</h3>
           <ul className="space-y-2">
             {pullRequests.map((pullRequest) => (
-              <PullRequestRow key={pullRequest.number} pullRequest={pullRequest} />
+              <PullRequestRow
+                key={pullRequest.number}
+                pullRequest={pullRequest}
+                cwd={scope.cwd}
+                {...(projectRef ? { projectRef } : {})}
+              />
             ))}
           </ul>
         </div>

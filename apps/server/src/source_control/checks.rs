@@ -86,7 +86,7 @@ struct RawGitHubPullRequestRollup {
 /// (context, state, targetUrl); every field is optional on the wire.
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
-struct RawGitHubCheckContext {
+pub(crate) struct RawGitHubCheckContext {
     name: Option<String>,
     context: Option<String>,
     status: Option<String>,
@@ -102,7 +102,7 @@ struct RawGitHubCheckContext {
 /// status context or per check-run name within a workflow, state taken from the
 /// context state, else the completed conclusion, else the run status. The rollup
 /// export carries no workflow-run event, so the check-run key omits it.
-fn aggregate_github_checks(
+pub(crate) fn aggregate_github_checks(
     mut contexts: Vec<RawGitHubCheckContext>,
 ) -> Result<Vec<ProviderCheck>, ()> {
     contexts.sort_by(|left, right| compare_started_at_desc(&left.started_at, &right.started_at));
@@ -178,6 +178,7 @@ fn checks_error(cwd: &Path, detail: &str) -> SourceControlProviderError {
         command: None,
         reference: None,
         detail: detail.into(),
+        command_failure: None,
     }
 }
 

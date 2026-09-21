@@ -1,0 +1,20 @@
+{
+  "github": {
+    "path": "text.rs",
+    "previousPath": null,
+    "changeType": "modified",
+    "additions": 1,
+    "deletions": 1,
+    "patch": "diff --git a/text.rs b/text.rs\n--- a/text.rs\n+++ b/text.rs\n@@ -1 +1 @@\n-old\n+new\n",
+    "tooLarge": false
+  },
+  "gitlab": {
+    "path": "new.rs",
+    "previousPath": "old.rs",
+    "changeType": "renamed",
+    "additions": 1,
+    "deletions": 1,
+    "patch": "--- a/old.rs\n+++ b/new.rs\n@@ -1 +1 @@\n-old\n+new\n",
+    "tooLarge": false
+  }
+}

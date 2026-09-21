@@ -16,6 +16,35 @@ machine running the BiBCode server.
 | Create a PR/MR                        | Yes              | Yes              | Yes              | Yes              |
 | Open or prepare a PR branch locally   | Yes              | Yes              | Yes              | Yes              |
 
+The dedicated **Pull Requests** module has this host matrix. “Yes” still
+requires the action's server-authored permission and current host state; it is
+not a promise that every authenticated account can write.
+
+| Pull Requests operation                              | GitHub               | GitLab                                             | Bitbucket | Azure DevOps |
+| ---------------------------------------------------- | -------------------- | -------------------------------------------------- | --------- | ------------ |
+| List PRs / MRs                                       | Yes                  | Yes                                                | No        | No           |
+| Review (comments, threads, reactions, inline review) | Yes                  | Yes                                                | No        | No           |
+| Approve                                              | Yes; not your own PR | Yes; host eligibility                              | No        | No           |
+| Request changes                                      | Yes                  | Yes; GitLab 17.2+ and listed reviewer              | No        | No           |
+| Merge / auto-merge                                   | Yes                  | Yes; project merge method                          | No        | No           |
+| Edit metadata                                        | Yes                  | Yes                                                | No        | No           |
+| Checkout (current / other / new worktree)            | Yes                  | Yes                                                | No        | No           |
+| Revert (creates a new request)                       | Yes; merged PR       | Yes; merged MR                                     | No        | No           |
+| Delete                                               | No                   | Yes; owner grant                                   | No        | No           |
+| Apply suggestion                                     | No; no public API    | Yes; applicable suggestion and source write access | No        | No           |
+| Minimize comment / dismiss review                    | Yes                  | No                                                 | No        | No           |
+| Revoke approval                                      | No                   | Yes                                                | No        | No           |
+| Remove own change request                            | No                   | Yes; GitLab 17.8+                                  | No        | No           |
+
+GitLab version-gated actions stay disabled with a reason if the server cannot
+read the host version. Reviewer states themselves have no version gate.
+GitLab's current public reads do not expose a custom maintainer-delete grant;
+the server conservatively requires Owner access. Unsupported operations show
+the host's reason. GitHub rejects auto-merge combined with bypass; GitLab
+requires both permissions when both choices are selected. For GitLab merge
+message writes, the API payload sends both `auto_merge` (renamed in 17.11) and
+`merge_when_pipeline_succeeds` for older hosts.
+
 “Clone from URL” is a generic Git clone. It does not require BiBCode to identify
 the hosting provider, but the URL's normal SSH or HTTPS credentials must work on
 the server.
@@ -61,6 +90,45 @@ From the Git actions or Source Control UI, BiBCode can:
 Provider terminology follows the host: GitLab uses merge requests, while the
 other supported hosts use pull requests.
 
+The separate Pull Requests server RPC surface supports GitHub and GitLab
+context, lazy picker vocabularies, paginated repository lists, and independent
+detail, timeline, commits, checks/pipelines, and file reads. It resolves
+the selected checkout's origin and supports custom hosts configured in the
+provider CLI. Every request pins the host and repository. Its review mutations
+support comments, reactions, threads and reviews, including GitHub review
+dismissal/minimization and GitLab approval revocation, change-request removal
+and suggestion application. The server also supports title/body/base edits,
+reviewer/assignee/label/milestone changes, lock/unlock, branch updates,
+merge/auto-merge, draft and open/closed state changes, revert creation, and
+GitLab deletion. Checkout supports the selected checkout, another project worktree or a new managed worktree. Started Git writes continue after cancellation; reconnect and refresh to see the result. GitHub cannot delete
+a pull request or apply suggestions through a public API; GitLab
+multi-line review drafts currently post at the end line. Partial review errors
+report comments already posted so a refresh can precede a retry. Permissions and merge
+readiness are computed by the server, including host and version restrictions.
+Merge pins the viewed head and validates the selected method and any bypass or
+auto-merge permission before mutation. GitLab merge messages stay in a private
+body file. Revert returns the created request, and a partial GitLab revert failure
+states whether the branch or revert commit already exists so the user can inspect
+the host before retrying. GitHub milestone picker IDs stay numeric and are
+resolved to titles at edit time. Large and binary diffs retain file rows without text patches. Its dedicated
+project-header module now provides the repository list, filters, explicit
+pagination/refresh, context recovery, and reviewable detail tabs with server
+readiness and permission reasons. Conversation and file lists are virtualized;
+file patches render lazily and remote markdown images become browser links.
+Comments, edits, replies, reactions, inline review, review decisions, dismissal,
+re-request, and supported suggestion actions use the same typed command path.
+Review receipts include `reviewPosted` plus failed path/line/body entries so
+retries retain unsent work without repeating a posted summary. GitHub thread
+comment reads carry authoritative minimization state. Request metadata editing
+and merge are available with server permission reasons. Metadata edits offer five-second
+Undo; merge uses the loaded head and confirms method, target, branch deletion and
+auto/bypass choices. Draft/state/lock, revert and GitLab deletion are supported.
+Checkout follows the guarded [worktree catalog lifecycle](../architecture/worktree-catalog.md); the existing pull-request creation dialog remains available. **Settings → Source Control** can disable the module and lists
+every configured GitHub/GitLab host with its redacted account and authentication
+status. Discovery retains the legacy primary-account summary and adds an
+optional `auth.hosts` array without any additional provider probe. Existing Git
+Manager and Source Control operations remain as described below.
+
 Passive workspace summaries publish their fresh Git/provider base before the
 optional PR lookup. While that lookup is pending or fails, a same-branch and
 same-provider PR completed in the previous producer cycle may appear for one
@@ -98,6 +166,43 @@ duplicates a pull request because the server resolves an existing open pull
 request for the branch (`opened_existing`) before creating one. The Source
 Control right-panel menu still creates a pull request directly from its
 existing action path.
+
+### Pull Requests command inventory
+
+Successful CLI discovery/auth probes and GitLab host contexts have a request-driven
+30-second cache (at most 32 entries per cache, no polling). The origin is still
+read each time. Rescan bypasses cached answers; authentication/repository-access
+failures invalidate them. GitLab writes always re-read project access/merge policy
+and the MR permission/head observations, while omitting UI-only precheck reads.
+Timeline and reaction paths reuse a viewer already available in context.
+
+All module host access uses the server's supervised `HostCommandRunner` and
+only `gh`, `glab`, or `git`. No browser HTTP request, avatar lookup, or module
+background polling contacts the provider. The shared worktree catalog owns
+managed-worktree creation after the module fetches the requested head.
+
+| Operation family                  | GitHub commands                                                                                                                               | GitLab commands                                                                                                                                                                   |
+| --------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Context and vocabulary            | `gh auth status`, `gh api user`, repository/branch/label/milestone/collaborator REST and GraphQL reads                                        | `glab auth status`, `glab api user`, project/version/member/branch/label/milestone reads                                                                                          |
+| List and detail                   | `gh api graphql`; filtered lists use `gh pr list --search`; `gh pr view` plus bounded GraphQL metadata                                        | `glab mr list -F json` (open default, `--closed`, `--merged`, `--all`); `glab api` project/MR/approval/reviewer reads                                                             |
+| Timeline, commits, checks, files  | Bounded GraphQL timeline/thread/comment connections; `gh pr view` commits/check rollup/files; `gh pr diff --patch`                            | Bounded GraphQL discussions with notes/awards/positions and REST resource events; REST commits, pipeline jobs, diffs and versions                                                 |
+| Comments, reviews, reactions      | `gh pr comment --body-file -`; REST review/comment/reply/reaction writes; GraphQL resolve/minimize; REST dismiss; `gh pr edit --add-reviewer` | REST notes/discussions/awards/suggestions; `glab mr approve --sha`, `glab mr revoke`; GraphQL request/remove changes and re-request review                                        |
+| Metadata, state and branch update | `gh pr edit`, `lock`, `unlock`, `ready [--undo]`, `close`, `reopen`, `update-branch [--rebase]`                                               | REST MR updates; `glab mr update --ready/--draft`, `close`, `reopen`, `rebase [--skip-ci]`                                                                                        |
+| Merge and cancel auto-merge       | `gh pr merge` with an allowed method, `--match-head-commit`, optional `--auto` or `--admin`, and `--disable-auto`                             | `glab mr merge --sha -y` without message edits, or REST MR merge with pinned SHA and private subject/body; GraphQL requested-change override when allowed; REST cancel auto-merge |
+| Revert / delete                   | `gh pr revert`; no delete command                                                                                                             | REST target branch creation, merge-commit revert and MR creation; `glab mr delete`                                                                                                |
+| Checkout / worktree fetch         | `gh pr checkout` in the target; `git fetch origin refs/pull/<n>/head:<branch>`                                                                | `glab mr checkout` in the target; `git fetch origin refs/merge-requests/<n>/head:<branch>`                                                                                        |
+
+Bodies, descriptions, review summaries and merge messages never enter argv.
+GitHub reads body data from stdin; GitLab API writes use a private temporary
+JSON file (0600 on Unix, restricted ACL on Windows), removed after success,
+failure or cancellation. Every private-file GitLab API request, including
+GraphQL reads, passes `-H "Content-Type: application/json"` before `--input`:
+`glab api --method <M> <path> -H "Content-Type: application/json" --input <file>`.
+The explicit header makes the raw file payload JSON on hosts that reject an
+empty content type; GraphQL queries and variables remain in the private file.
+Host/repository operands and `GH_HOST` / `GITLAB_HOST`
+pin every request; `glab api` also receives `--hostname`. See the
+[RPC flow and limits](../architecture/rpc-and-orchestration.md#pull-requests-flow).
 
 ## Source Control panel
 
@@ -143,6 +248,27 @@ glab auth login
 
 GitLab supports provider lookup and merge-request operations. Native repository
 publishing is not implemented.
+
+### GitHub Enterprise and self-hosted GitLab
+
+Run authentication on the machine hosting the selected BiBCode environment,
+using the same account/configuration as its server process:
+
+```bash
+gh auth login --hostname github.company.example
+glab auth login --hostname gitlab.company.example
+```
+
+Use the actual hostname from the checkout's `origin`. BiBCode recognizes
+configured CLI hosts, including GitLab subgroup repository paths; it does not
+guess a provider from an arbitrary hostname. An `unknown_host` state offers the
+login advice, while `not_authenticated` names the selected provider and host.
+Open **Settings → Source Control**, leave **Pull requests** enabled and Rescan
+the provider. Check the per-host authentication/account lines (accounts remain
+redacted until revealed), then **Rescan** in Pull Requests to refresh context.
+Authentication to another host alone does not authorize this repository.
+Missing checkout directories require restoring the path or choosing a reachable
+worktree before rescanning.
 
 ### Azure DevOps
 

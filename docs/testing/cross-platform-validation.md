@@ -117,6 +117,92 @@ an improved simulated queue time is not proof of an improved live network.
 
 ### Selecting other focused coverage
 
+For the Pull Requests web shell/detail/review, settings, and auth-host display, run:
+
+```sh
+vp test run apps/web/src/pullRequestsStore.test.ts apps/web/src/components/pullRequests apps/web/src/components/Sidebar.test.tsx apps/web/src/components/settings apps/web/src/components/gitManager/provider
+vp run typecheck
+vp check
+cargo test -p bibcode-server discovery -j 2
+```
+
+Auth schema changes also require regenerated RPC fixtures and contract parity
+checks. A sandbox denial of TCP binding is a blocked validation result; record
+the exact error and rerun the affected target on a capable host. Do not report
+blocked targets as passed or skipped.
+
+For Pull Requests server context, vocabulary, list, detail/tab reads, permissions,
+review/edit/merge/state mutations, checkout, or host-runner changes,
+run the owner and RPC boundaries from the repository root:
+
+```sh
+cargo test -p bibcode-server pull_requests -j 2
+cargo test -p bibcode-server --test pull_requests_context_list -j 2
+cargo test -p bibcode-server --test pull_requests_detail_reads -j 2
+cargo test -p bibcode-server --test pull_requests_review_actions -j 2
+cargo test -p bibcode-server --test pull_requests_edit_merge_actions -j 2
+cargo test -p bibcode-server --test pull_requests_checkout -j 2
+cargo test -p bibcode-server --test rpc_wire -j 2
+cargo test -p bibcode-server registers_every -j 2
+```
+
+The inline CLI-script integration fixtures currently run on Unix. Shared
+parser, model, error, capability, deadline, and registration tests cover
+platform-independent behavior; native Windows CLI and private-file ACL
+execution still require native evidence. Verify custom-host discovery,
+host/repository pinning, no-origin and auth failures, pagination, optional
+totals, bounded cancellation, and private body-file cleanup. For detail reads,
+verify the permission/readiness tables and server-authored reasons, GitLab
+version gates, reviewer-state mappings, opaque timeline ids and line positions,
+native GitLab `appliable` suggestions and observed note/body reactions,
+GitHub inventories beyond 100 files, nullable check timings and check grouping,
+diff refs, binary rows, 1 MiB
+per-file omission, 8 MiB whole-patch truncation, and page caps. Verify unknown
+merge/check/reviewer states remain conservative and no live host calls occur
+in fixture tests. GitLab patch-bearing JSON uses the patch budget; ordinary
+metadata JSON retains the smaller cap. Exercise both adapters through the
+unary RPC service and verify context is read once for detail. The RPC transport
+cases require TCP listeners; a denied bind is blocked evidence with the exact
+error, never a pass or skip. The module has no idle provider polling or logging
+of host/repository/user content. Dedicated packaged UI validation belongs with
+the later UI implementation.
+
+For edit/merge/state mutations, exercise every supported action on each host with
+recording CLI fixtures. Verify numeric GitHub milestone IDs resolve to titles,
+GitLab people edits preserve the full current-plus-add-minus-remove list with one
+lookup per retained login, and an empty edit does not open an interactive CLI.
+Concurrent edits of one request from different checkouts must wait before reading
+fresh metadata; cancellation must remove queued work without a host action while
+another request remains independent. Verify immediate GitLab merges explicitly
+disable the CLI's default auto-merge mode.
+Merge must reject missing/blank or stale heads, denied permissions, and disallowed
+methods without any mutation call after the fresh pre-check reads. Exercise normal,
+bypass, and auto-merge permission paths, exact head-pinning flags, GitLab's GraphQL
+override before merging, and private-file REST merge messages. Verify the returned
+`autoMergeEnabled` and nullable `mergedSha`, and GitHub deletion's unavailable reason.
+GitLab revert must create the target-based branch, revert the known merge/squash
+commit, then create the MR through the existing creation service, with all three
+calls using the pinned runner and private body transport. Fail each step and verify
+later calls do not run, body files are removed, and errors preserve their code and
+describe any completed steps. An override followed by a failed merge must likewise
+report the applied override. Validate new GraphQL documents against a disposable,
+authorized live host separately; fixture acceptance is not live API evidence.
+
+For review mutations, record exact CLI argv, pinned host/repository, stdin JSON
+and body-file bytes, 0600 mode at invocation, and removal after success/failure.
+Check all supported action routes and unavailable reasons; reject malformed
+opaque ids without mutation. A fresh pre-check denial or stale head must start
+no mutation process. Exercise reaction and resolution no-ops, reaction removal
+for the authenticated viewer only, GitLab user-id lookup before re-request,
+GitHub atomic comment-related 422 rejection, pinned GitLab diff-version paths
+and both coordinates for context lines (including renamed files), missing-line
+draft retention, and GitLab per-comment failure
+continuation plus later summary/event failures with posted counts. Review
+success must not start a server reread. Validate new GraphQL documents against
+the intended hosts separately from recording-stub tests and report blocked
+network/listener execution with the exact error. GitLab multi-line review
+comments currently use the documented end-line fallback.
+
 Run the closest behavioral coverage before broad suites. Discover exact Rust
 targets and filters from manifests and `cargo test -- --list`; do not invent
 test names. When concurrency matters, run the affected owner at its default
@@ -1131,6 +1217,195 @@ tripwire in `apps/server/tests/git_rpc.rs`. Run them through
 [VCS coordination gates](#vcs-coordination-gates); the manual pass above is the
 evidence for the packaged application.
 
+### Pull Requests web shell validation
+
+Use a disposable project or an existing project with authorized read access to
+a configured GitHub or GitLab repository. Keep provider authentication on the
+server host. Exercise the same flows in the packaged UI on each native target
+and in browser mode; do not substitute direct RPC calls for missing controls.
+
+Start with this read-only packaged smoke on each native target; retain the
+screenshots and route evidence in the execution report:
+
+- Open the project's **Pull Requests** sidebar button (accessible label
+  `Pull Requests for <project>`), assert the URL contains `/pull-requests`, and
+  capture the list with the project header still highlighted.
+- With a configured, authenticated GitHub/GitLab host and a readable request,
+  open a row, capture the detail title/state, then select **Files changed** /
+  **Changes**. Verify `?tab=files`, a real text patch rendered by FileDiff and
+  retained selection after reload. An empty or unavailable repository is
+  availability evidence only; it does not pass the list/detail/files smoke.
+- With the disposable no-remote packaged fixture, record the actionable
+  unavailable state instead. The Pull Requests sibling beside the Git Manager
+  navigation in `apps/desktop/e2e/specs/pierre-diffs.e2e.ts` checks only route
+  entry and saves `pierre-pull-requests-route.png`; it does not substitute for
+  the authenticated list/detail/files pass or authorize host writes.
+
+Run the regression tripwires without a browser:
+
+```sh
+vp test run apps/web/src/components/pullRequests/pullRequestsTelemetry.test.tsx
+cargo test -p bibcode-server --lib pull_requests::tripwires -j 2
+```
+
+The web test forbids direct fetch/Image/WebSocket/XHR/beacon use and rendered
+images, checks all actor initials, advances an idle hour, and counts explicit
+refresh/action dispatches. Server tripwires inspect every module source,
+default `gh`/`glab`/`git` specs and direct HTTP/background workers. One-shot
+request deadlines and the protected 24-hour checkout write ceiling are
+allowed. Keep TCP-listener failures blocked with their exact bind error;
+never count a sandbox-denied listener test as passed or skipped.
+
+1. Hover the project header and verify **Pull Requests** is the fourth action,
+   after Git Manager. Open it, reload the list URL, and open a row. Both list and
+   detail routes must keep that physical/grouped project header highlighted.
+   The detail route must render title, state, branches, count tabs and metadata;
+   reload `?tab=files` and verify that Files changed/Changes remains selected.
+2. In **Settings → Source Control**, toggle **Pull requests** off. Confirm the
+   button disappears and an existing route links to the setting with an
+   explanation. Re-enable it. Verify the GitHub/GitLab rows list each configured
+   host, redact authenticated accounts, and distinguish unauthenticated hosts.
+3. Inspect provider/repository/account/custom-host header data. Switch checkouts
+   and verify reads target the selected opaque checkout on its environment.
+   A saved unavailable checkout must still offer the worktree selector for
+   recovery. Disconnect the environment and verify opening the route does not
+   reconnect it or issue module reads.
+4. Verify host-specific tabs/counts, 300 ms text search and Enter, each filter,
+   lazy label/milestone/branch vocabularies, Clear filters, and fixed-height
+   virtualized rows. Load more must retain earlier rows, then disappear when
+   nextCursor is null. Refresh must return to the first page. Leaving and
+   returning to the list must restore its saved scroll position, including
+   previously loaded later pages. Reload while scrolled and repeat the check.
+   Rescan after changing origin/account in a disposable checkout: the new
+   header must never retain old repository rows or picker results.
+5. Verify empty, no-remote, unsupported-host, missing-tool, and authentication
+   states. Copy any offered login command and use Rescan after recovery. Use
+   an isolated CLI config when simulating authentication loss; preserve the
+   real account configuration. List failures must show the server message,
+   optional host detail, Retry, and Clear filters when filters are active.
+   GitLab review-status filters currently return this explicit unavailable
+   state. GitHub search has no cursor/total and must not show a zero comment
+   badge or Load more.
+6. Open **New pull request** (using host vocabulary) and cancel the existing
+   Git Manager review dialog; opening it must not publish anything. Follow
+   **Open in Pull Requests** from a loaded Git Manager provider row and verify
+   its environment/project/number URL.
+7. Inspect the module DOM and network log: no avatar images, remote images,
+   client HTTP fetches, provider polling, or window-focus refresh. Module data
+   uses the existing typed WebSocket RPC. Record React best-practice and UI.md
+   reviews separately from visual/native evidence.
+8. In Conversation verify description markdown, comments, reviews, threads,
+   resolved/outdated markers, suggestions and system events. Remote images
+   must be labelled browser links. A minimized comment opens with Show comment;
+   a thread's file link must select Files and scroll to its encoded path.
+   Confirm metadata moves above the merge box below the large-screen breakpoint.
+   On GitLab, post an authorized inline suggestion, then refresh Conversation and
+   Files: a `DiffNote`/other Note-subtype GlobalID must retain its thread, numeric
+   note id, suggestion and actions. Inspect label/milestone add/remove events.
+   Measure provider-process counts separately for cold and warm writes/read refreshes.
+   Confirm the 30-second context bound, Rescan bypass, and fresh permission/head
+   refusal after access is revoked or the request changes within that window.
+9. Verify Commits copy the full SHA and open the host commit. Checks/Pipelines
+   group rows with state, duration and links and distinguish the host's empty
+   state. Refresh reloads detail plus the active tab (including timeline in
+   Files); reopening a cached tab refreshes it before displaying its previous result. Exercise an expired
+   authentication response and verify context recovery and Retry.
+10. Verify real GitHub split patches and GitLab synthetic-header patches render
+    in Files, including renamed files. Scroll far enough to exercise list and
+    diff virtualization. Viewed must survive tab changes and reload. Test the
+    whitespace toggle, binary/unavailable/too-large rows, long-line plain text,
+    and the explicit Show diff anyway gate using controlled fixtures.
+11. Exercise the merge readiness states with host data or declared fixtures,
+    including merged author/time, closed, reviews required and conflicts.
+    Every denied action
+    must have a hover explanation and screen-reader description. A read-only
+    viewer sees the server merge reason without a method select. Allowed method,
+    delete-branch and auto-merge values match the server.
+    Record fixture-based unit rendering separately from browser/native evidence.
+12. On an explicitly authorized throwaway request, post a comment, preview it,
+    edit it, add/remove a reaction, and delete it through confirmation. Reply
+    to and resolve/unresolve a thread. Confirm each action refreshes the header
+    and timeline without reloading the page. Copy/Open on host currently use
+    the request URL; the comment model has no host permalink.
+13. Add single-line and reverse-drag multi-line inline comments; insert a
+    suggestion with the selected new source lines. Verify amber pending cards,
+    Edit/Remove, the sticky counter in both tabs, and review submission. Reload
+    while comment, reply, edit, inline, and review-summary drafts exist and
+    verify they survive. Unrenderable lines must retain draft cards below the diff.
+14. Exercise full-success, zero-landed, and partial-landed review receipts with
+    controlled fixtures or an authorized test host. Only failed comments stay
+    pending by path, line, and body; identical duplicate drafts retain their
+    candidates for inspection. A posted GitLab summary must not be reposted on
+    retry; a GitHub atomic rejection must keep its unsent summary. Move
+    the head before submission: retain every draft and show the actionable
+    stale-head Refresh toast. Verify own-approval/request-changes denials and
+    all unsupported host actions stay visible with server reasons.
+15. Where supported, apply one suggestion with an optional commit message and
+    a batch selected from Files. GitHub offers the Apply denial reason and Copy.
+    Dismiss a review only after a required message and confirmation; re-request
+    an eligible reviewer. Confirm the environment mutation capability also
+    disables review writes while Refresh and Retry remain available. Minimize a
+    GitHub thread comment, refresh, then verify Unminimize and collapsed content.
+    Refresh after removing a commented file from the diff and verify saved
+    drafts remain editable/removable. Repeat a failed action and verify draft retention.
+    Capture gate output, React/UI reviews, and browser/native evidence separately.
+16. On an authorized disposable request, edit title and description, preview,
+    save, cancel with Escape, and reload drafts. Add/remove reviewers, assignees,
+    labels and milestones; verify author exclusion, milestone Clear, five-second
+    Undo, no write on expiry, lazy vocabulary reads and 300 ms truncated search.
+    Delay the detail refresh after Undo: a still-checked label must remain disabled
+    until the refreshed unchecked value arrives, and the next click must re-add it.
+    If that read fails, show Retry rather than allowing edits against stale metadata.
+    Change the base with pending comments: Cancel and host failure preserve them,
+    and only success clears them after the warning.
+17. On that disposable request, verify repository merge defaults, single-method
+    hiding and GitLab's project-method text. Confirm Merge names the method,
+    target, branch deletion and auto-merge choice. On GitLab, verify the title is
+    **Merge merge request** and recovery/toast, list-state and checkout labels use
+    **merge request**; the **Pull Requests** module name stays unchanged.
+    Auto-merge reports enabled
+    rather than merged and supports Disable. GitHub disables bypass during
+    auto-merge with its reason; GitLab permits the combination only when both
+    server permissions allow it. Verify bypass confirmations name the consequence.
+    Move the head before confirming: verify stale-head Refresh and retained drafts,
+    with no automatic retry. Simulate a partial-progress failure and preserve the
+    exact server message. Verify Update branch merge/rebase and GitLab Skip CI.
+18. Verify Mark ready/Convert to draft, Close/Reopen without unnecessary confirmation,
+    GitHub lock-reason selection and GitLab reasonless lock, Unlock, Copy URL and
+    Open in browser. Revert a merged disposable request after its creation warning
+    and verify navigation to the returned number. Delete a GitLab disposable
+    request only after the host/number/permanence confirmation and verify return
+    to the list. Check denied actions and the environment mutation capability,
+    keyboard operation, and absence of Base UI native-button console errors.
+
+19. On a disposable request, use **Checkout** in the selected clean checkout and
+    verify its branch and head with Git. Dirty the target, then repeat: the
+    server reason must appear and existing changes must remain. Repeat with an
+    unfinished merge/rebase. Use another project worktree as the target and
+    verify the source checkout stays unchanged. For an occupied branch, choose
+    **Switch to that worktree**, then confirm the successful result path.
+20. Choose **New worktree…** and verify its branch/head, persisted workspace owner,
+    and sidebar row. With a conflicting local head branch, verify the new branch
+    uses the request suffix and the original tip is unchanged. Repeat with the
+    matching head already checked out in the main or another worktree: the name
+    must be `<head>-pr-<number>`, then `-2` on further collision. A matching,
+    unoccupied local branch must be reused. Once catalog data arrives, neither
+    the Pull Requests toolbar nor checkout menu may keep showing **Loading worktrees…**;
+    an empty snapshot also counts as loaded, and catalog errors must remain visible. **Open Git Manager
+    there** must select the result worktree in the correct project/environment.
+    Repeat on GitLab and a remote environment. During a deliberately slow checkout,
+    close/disconnect the client: the write must finish with the expected branch,
+    clean working tree and no stale `index.lock`. Reconnect and refresh to observe
+    it. Repeat during branch fetch and managed worktree creation; verify the catalog
+    owner appears and competing mutations/removal stay fenced until completion.
+    Cancellation or deadline expiry before writing may stop preparation; after
+    writing starts it only ends the wait with a neutral background message. Verify
+    graceful server shutdown drains the write within the documented command/host
+    bounds. Simulate Git failure, unavailable worktrees and read-only connections;
+    `git status` in the reported path is the recovery starting point. No automatic
+    retry or late navigation is permitted. An existing redirect toast must honor a
+    subsequent mutation denial. Record browser/native checks separately from CLI-stub tests.
+
 ### Remote-hosted Git Manager run
 
 Create the disposable fixture on the remote host, attach that environment by
@@ -1193,6 +1468,11 @@ sizes. Cover relevant:
   list with the partial-staging gutter, History with a selected commit diff, the
   branch dropdown, fetch/pull/push/force-with-lease sync states, the native
   stash list, and an in-progress/conflicted repository state;
+- Pull Requests sidebar entry, settings switch/host list, list tabs and filters,
+  pagination, unavailable/auth recovery, detail tabs, editors, metadata Undo,
+  merge/state confirmations, and draft recovery; include the
+  [read-only list/detail/files smoke](#pull-requests-web-shell-validation) with
+  route, selected tab and real patch evidence;
 - thread creation, switching, persistence, and streaming;
 - terminal input/output and panel switching, including reopening the global right panel after a
   sibling chat suppresses a previously active Activity surface;

@@ -826,6 +826,30 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
 - The Git Manager performs no repository lifecycle: it cannot add, create,
   clone, publish, remove, or delete a repository, and every request remains
   scoped to the checkout selected for its project.
+- The server's Pull Requests module owns GitHub/GitLab context, vocabulary,
+  list, detail, timeline, commit, check/pipeline, and file reads through typed RPC and a single bounded `ProcessRunner`
+  wrapper. Host detection, authentication, and capabilities are server-owned;
+  permissions and merge readiness are computed only on the server, and reads
+  start only on explicit requests. Successful CLI probes and GitLab context
+  observations use bounded 30-second caches (32 entries each); mutations still
+  re-read repository access/policy and request permission/head observations.
+  Rescan/auth failures invalidate the caches, and no worker polls them.
+  The web module adds project-scoped
+  list/detail routes, capability/connection gating, and a two-project persisted
+  view-state cache. The detail surface mounts the header and active tab's query
+  (Files also reads timeline for anchored threads), virtualizes timeline/files,
+  renders diffs near the viewport, and replaces remote markdown images with
+  browser links. Review, metadata, merge, and state writes share one command hook and refresh
+  the affected query atoms without optimistic cache changes. Comment, reply,
+  title/description, merge-message, inline-composer, pending-review, and
+  review-summary drafts survive navigation and reload. Metadata changes offer
+  an explicit five-second Undo; merge confirmations pin the loaded head.
+  Checkout shares the per-request action gate and worktree catalog guards,
+  creates managed workspace ownership for new worktrees, and keeps started Git
+  writes alive through client disconnect until settlement (with the documented
+  24-hour per-command safety ceiling). Only `gh`, `glab`, and `git` run through
+  the module’s process boundary; it owns no HTTP client or background poller. See
+  [Pull Requests contract boundary](./rpc-and-orchestration.md#pull-requests-contract-boundary).
 - Git Manager force-push always uses `--force-with-lease`. Its execution paths
   forbid bare `--force`, `--ignore-other-worktrees`, forced
   `git worktree add -f`, and plumbing `update-ref` as ways to bypass the

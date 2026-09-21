@@ -11,3 +11,8 @@ in source code, tests, current documentation, and the issue tracker. Do not edit
 these records to match later implementation; add a new current document when
 the product contract changes. Mechanical formatting or link repairs are allowed
 only when they do not change the recorded meaning.
+
+## Feature plan folders
+
+- [`git-manager/`](./git-manager/) — Git Manager specification, plan, phases, research (2026-08-31).
+- [`pull-requests/`](./pull-requests/) — Pull Requests module specification, plan, phases, research (2026-09-20).

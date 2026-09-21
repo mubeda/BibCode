@@ -2,6 +2,26 @@ import * as Schema from "effect/Schema";
 import * as Rpc from "effect/unstable/rpc/Rpc";
 import * as RpcGroup from "effect/unstable/rpc/RpcGroup";
 
+import {
+  PullRequestsActionRequest,
+  PullRequestsActionResult,
+  PullRequestsCheckoutInput,
+  PullRequestsCheckoutResult,
+  PullRequestsChecks,
+  PullRequestsCommits,
+  PullRequestsContext,
+  PullRequestsCwdInput,
+  PullRequestsDetail,
+  PullRequestsFiles,
+  PullRequestsListInput,
+  PullRequestsListPage,
+  PullRequestsNumberInput,
+  PullRequestsOperationError,
+  PullRequestsTimeline,
+  PullRequestsVocabulary,
+  PullRequestsVocabularyInput,
+} from "./pullRequests.ts";
+
 import { ExternalLauncherError, LaunchEditorInput } from "./editor.ts";
 import {
   AuthAccessStreamError,
@@ -410,6 +430,18 @@ export const WS_METHODS = {
   gitManagerUnstagePartial: "gitManager.unstagePartial",
   gitManagerDiscardPartial: "gitManager.discardPartial",
   gitManagerRunOperation: "gitManager.runOperation",
+
+  // Pull Requests methods
+  pullRequestsGetContext: "pullRequests.getContext",
+  pullRequestsGetVocabulary: "pullRequests.getVocabulary",
+  pullRequestsList: "pullRequests.list",
+  pullRequestsGet: "pullRequests.get",
+  pullRequestsGetTimeline: "pullRequests.getTimeline",
+  pullRequestsGetCommits: "pullRequests.getCommits",
+  pullRequestsGetChecks: "pullRequests.getChecks",
+  pullRequestsGetFiles: "pullRequests.getFiles",
+  pullRequestsRunAction: "pullRequests.runAction",
+  pullRequestsCheckout: "pullRequests.checkout",
 
   // Git workflow methods
   gitRunStackedAction: "git.runStackedAction",
@@ -1184,6 +1216,66 @@ export const WsSubscribeGitManagerSignalRpc = Rpc.make(WS_METHODS.subscribeGitMa
   stream: true,
 });
 
+export const WsPullRequestsGetContextRpc = Rpc.make(WS_METHODS.pullRequestsGetContext, {
+  payload: PullRequestsCwdInput,
+  success: PullRequestsContext,
+  error: PullRequestsOperationError,
+});
+
+export const WsPullRequestsGetVocabularyRpc = Rpc.make(WS_METHODS.pullRequestsGetVocabulary, {
+  payload: PullRequestsVocabularyInput,
+  success: PullRequestsVocabulary,
+  error: PullRequestsOperationError,
+});
+
+export const WsPullRequestsListRpc = Rpc.make(WS_METHODS.pullRequestsList, {
+  payload: PullRequestsListInput,
+  success: PullRequestsListPage,
+  error: PullRequestsOperationError,
+});
+
+export const WsPullRequestsGetRpc = Rpc.make(WS_METHODS.pullRequestsGet, {
+  payload: PullRequestsNumberInput,
+  success: PullRequestsDetail,
+  error: PullRequestsOperationError,
+});
+
+export const WsPullRequestsGetTimelineRpc = Rpc.make(WS_METHODS.pullRequestsGetTimeline, {
+  payload: PullRequestsNumberInput,
+  success: PullRequestsTimeline,
+  error: PullRequestsOperationError,
+});
+
+export const WsPullRequestsGetCommitsRpc = Rpc.make(WS_METHODS.pullRequestsGetCommits, {
+  payload: PullRequestsNumberInput,
+  success: PullRequestsCommits,
+  error: PullRequestsOperationError,
+});
+
+export const WsPullRequestsGetChecksRpc = Rpc.make(WS_METHODS.pullRequestsGetChecks, {
+  payload: PullRequestsNumberInput,
+  success: PullRequestsChecks,
+  error: PullRequestsOperationError,
+});
+
+export const WsPullRequestsGetFilesRpc = Rpc.make(WS_METHODS.pullRequestsGetFiles, {
+  payload: PullRequestsNumberInput,
+  success: PullRequestsFiles,
+  error: PullRequestsOperationError,
+});
+
+export const WsPullRequestsRunActionRpc = Rpc.make(WS_METHODS.pullRequestsRunAction, {
+  payload: PullRequestsActionRequest,
+  success: PullRequestsActionResult,
+  error: PullRequestsOperationError,
+});
+
+export const WsPullRequestsCheckoutRpc = Rpc.make(WS_METHODS.pullRequestsCheckout, {
+  payload: PullRequestsCheckoutInput,
+  success: PullRequestsCheckoutResult,
+  error: PullRequestsOperationError,
+});
+
 /**
  * Ephemeral live diff preview for compact/mobile surfaces.
  * Not the persisted BiBCode Review model. Future review sessions should use
@@ -1575,6 +1667,16 @@ export const WsRpcGroup = RpcGroup.make(
   WsGitManagerDiscardPartialRpc,
   WsGitManagerRunOperationRpc,
   WsSubscribeGitManagerSignalRpc,
+  WsPullRequestsGetContextRpc,
+  WsPullRequestsGetVocabularyRpc,
+  WsPullRequestsListRpc,
+  WsPullRequestsGetRpc,
+  WsPullRequestsGetTimelineRpc,
+  WsPullRequestsGetCommitsRpc,
+  WsPullRequestsGetChecksRpc,
+  WsPullRequestsGetFilesRpc,
+  WsPullRequestsRunActionRpc,
+  WsPullRequestsCheckoutRpc,
   WsReviewGetDiffPreviewRpc,
   WsTerminalOpenRpc,
   WsTerminalAttachRpc,

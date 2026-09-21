@@ -391,6 +391,19 @@ describe("packaged Pierre diff and editor interactions", () => {
       `//button[.//span[normalize-space()="${desktopUiFixture.projectName}"]]`,
     );
     await project.waitForDisplayed();
+    const pullRequestsOpened = await browser.execute((label: string) => {
+      const button = document.querySelector<HTMLButtonElement>(
+        `button[aria-label="Pull Requests for ${CSS.escape(label)}"]`,
+      );
+      button?.click();
+      return button !== null;
+    }, desktopUiFixture.projectName);
+    expect(pullRequestsOpened).toBe(true);
+    await browser.waitUntil(async () => (await browser.getUrl()).includes("/pull-requests"), {
+      timeoutMsg: "The packaged Pull Requests route did not open.",
+    });
+    await saveEvidence("pierre-pull-requests-route");
+
     const gitManagerOpened = await browser.execute((label: string) => {
       const button = document.querySelector<HTMLButtonElement>(
         `button[aria-label="Git Manager for ${CSS.escape(label)}"]`,
