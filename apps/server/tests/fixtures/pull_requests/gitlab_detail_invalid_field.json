@@ -1,0 +1,4 @@
+{
+  "errors": [{ "message": "Field 'resolveNote' doesn't exist on type 'MergeRequestPermissions'" }],
+  "data": null
+}

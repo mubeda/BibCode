@@ -108,6 +108,16 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     mutation_unary("projects.renameEntry"),
     read_unary("projects.searchEntries"),
     mutation_unary("projects.writeFile"),
+    mutation_unary("pullRequests.checkout"),
+    read_unary("pullRequests.get"),
+    read_unary("pullRequests.getChecks"),
+    read_unary("pullRequests.getCommits"),
+    read_unary("pullRequests.getContext"),
+    read_unary("pullRequests.getFiles"),
+    read_unary("pullRequests.getTimeline"),
+    read_unary("pullRequests.getVocabulary"),
+    read_unary("pullRequests.list"),
+    mutation_unary("pullRequests.runAction"),
     read_unary("review.getDiffPreview"),
     mutation_unary("server.consumeCodexRateLimitReset"),
     read_unary("server.discoverSourceControl"),
@@ -188,6 +198,25 @@ pub(crate) fn method_mutability(name: &str) -> Option<MethodMutability> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pull_requests_methods_are_unary_with_explicit_mutability() {
+        for name in [
+            "pullRequests.getContext",
+            "pullRequests.getVocabulary",
+            "pullRequests.list",
+            "pullRequests.get",
+            "pullRequests.getTimeline",
+            "pullRequests.getCommits",
+            "pullRequests.getChecks",
+            "pullRequests.getFiles",
+        ] {
+            assert!(ACTIVE_RPC_METHODS.contains(&read_unary(name)), "{name}");
+        }
+        for name in ["pullRequests.runAction", "pullRequests.checkout"] {
+            assert!(ACTIVE_RPC_METHODS.contains(&mutation_unary(name)), "{name}");
+        }
+    }
 
     #[test]
     fn method_spec_constructors_preserve_name_and_mode_at_runtime() {

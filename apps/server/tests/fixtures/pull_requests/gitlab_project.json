@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "project_access": { "access_level": 40 },
+    "group_access": { "access_level": 30 }
+  },
+  "merge_method": "merge",
+  "squash_option": "default_on",
+  "remove_source_branch_after_merge": true,
+  "only_allow_merge_if_pipeline_succeeds": true,
+  "only_allow_merge_if_all_discussions_are_resolved": true,
+  "default_branch": "main",
+  "web_url": "https://git.acme.example/team/sub/repo"
+}

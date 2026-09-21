@@ -1,0 +1,20 @@
+{
+  "_tag": "Exit",
+  "requestId": "900719925474099312345",
+  "exit": {
+    "_tag": "Failure",
+    "cause": [
+      {
+        "_tag": "Fail",
+        "error": {
+          "_tag": "PullRequestsOperationError",
+          "operation": "1w6C}STL%",
+          "code": "5]3h+j+^g<*",
+          "message": "9~]_z>LXN",
+          "hostDetail": "y'x[{|!<\"f",
+          "retryable": true
+        }
+      }
+    ]
+  }
+}

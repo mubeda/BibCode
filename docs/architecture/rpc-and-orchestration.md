@@ -269,6 +269,426 @@ explicit refresh or an unresolvable pinned tip resets the pages. Repositories
 over the cap fall back to `--all` paging with `degradedToAllPaging: true`, and
 the History view warns that new commits may shift the list.
 
+## Pull Requests contract boundary
+
+`packages/contracts/src/pullRequests.ts` defines the repository-scoped Pull
+Requests model, server-authored permissions and `PullRequestsOperationError`.
+Eight unary reads (`pullRequests.getContext`, `getVocabulary`, `list`, `get`,
+`getTimeline`, `getCommits`, `getChecks`, `getFiles`) require
+`orchestration:read`; `pullRequests.runAction` and `pullRequests.checkout`
+require `orchestration:operate`. Every request carries the selected checkout's
+`cwd`; the client does not resolve repository paths or compute permissions.
+
+### Pull Requests flow
+
+| Method                       | Required scope          | Responsibility                                                          |
+| ---------------------------- | ----------------------- | ----------------------------------------------------------------------- |
+| `pullRequests.getContext`    | `orchestration:read`    | Resolve origin, host/account, repository policy and availability.       |
+| `pullRequests.getVocabulary` | `orchestration:read`    | Load bounded searchable picker values on demand.                        |
+| `pullRequests.list`          | `orchestration:read`    | Page the repository list for explicit tabs/filters.                     |
+| `pullRequests.get`           | `orchestration:read`    | Read detail and compute permissions/readiness.                          |
+| `pullRequests.getTimeline`   | `orchestration:read`    | Read bounded comments, reviews, threads and events.                     |
+| `pullRequests.getCommits`    | `orchestration:read`    | Read the request's commit list.                                         |
+| `pullRequests.getChecks`     | `orchestration:read`    | Read GitHub checks or GitLab pipeline jobs.                             |
+| `pullRequests.getFiles`      | `orchestration:read`    | Read file metadata, bounded patches and diff refs.                      |
+| `pullRequests.runAction`     | `orchestration:operate` | Revalidate and serialize review/metadata/merge/state mutations.         |
+| `pullRequests.checkout`      | `orchestration:operate` | Guard current/other/new-worktree checkout and settle durable ownership. |
+
+Browser and desktop clients use these same typed unary RPCs; native actions such
+as opening a host URL retain the existing DesktopBridge/local API boundary.
+Reads begin on route/tab/picker open, user filters/pagination, Refresh, Rescan,
+or successful-action invalidation. No timer, window focus, constructor, or idle
+worker initiates provider traffic. The five-second Undo lifetime and 300 ms
+input debounce do not poll. Detail mounts `get` plus the active tab's query;
+Files also mounts timeline for line-anchored threads. Inactive atom invalidation
+does not mount extra reads.
+
+`@bibcode/client-runtime/state/pull-requests` exposes the query families and
+commands. Reads have bounded stale times without polling; mutations share the
+existing VCS scheduler, serialized by environment and checkout path. The
+`pullRequestsEnabled` client preference defaults to true. The environment
+flags `pullRequestsReads` and `pullRequestsMutations` default to false when
+omitted by older servers and are advertised by the current server.
+
+Production registers all ten handlers through `PullRequestsRpcServices` with
+the environment state directory and durable repositories. The server's
+`pull_requests` module implements all eight reads for GitHub and GitLab:
+context, lazy vocabulary, paginated lists, detail, timeline, commits,
+checks/pipelines, and files. `runAction` also implements conversation and
+review mutations: comments, edits/deletes, reactions, replies/resolution,
+review submission, and each host's supported review controls. It also implements
+metadata edits, locking, branch updates, merge/auto-merge, draft and open/closed
+state changes, GitLab deletion, and revert creation. Checkout uses the guarded
+worktree catalog path described below.
+
+### Permissions and serialized mutations
+
+Detail reads context once and joins host observations with the pure
+`permissions::compute` policy. The server owns every action reason, merge
+method/default, version gate, and readiness explanation. The client renders
+those values verbatim; the host remains authoritative when a later mutation
+runs. GitHub approvals need no write grant, but self-approval is denied;
+GitLab comment/approval/merge answers come from the host, including public
+readers with no project membership. GitHub suggestion application
+remains unavailable because there is no public API. GitLab versions that
+cannot be read retain the explicit version-unavailable reason. The current
+public GitLab reads do not expose a custom maintainer-delete grant, so that
+branch of the permission rule remains closed. GitLab readiness leaves the
+active auto-merge method null when unknown; the repository default remains in
+merge permissions.
+
+Mutations resolve the checkout, acquire a gate shared by service clones for the
+normalized provider/host/repository/request number, and read fresh permission
+observations before checking the same pure policy that the client displays.
+GitLab mutation prechecks read the MR, approvals, reviewers, GraphQL permission
+metadata and current project access/merge policy. `ActionDetail` carries those
+inputs and action operands without constructing the full UI detail; approval-rule
+display, reaction counts, closing issues and display-only diff-base recovery are
+not read for a mutation. Full detail retains those reads. Cached context never
+replaces the fresh MR/head or project access/policy check. Denials preserve
+the permission reason; unsupported host capabilities return `unavailable`.
+Review submission rejects a changed head before starting side effects. GitHub
+submits one atomic review; a comment-related 422 reports zero landed comments
+and a failure for every inline draft. GitLab fetches diff versions once,
+rechecks the head, reads that immutable version’s diff to derive rename paths
+and context-line coordinates, posts inline discussions individually, then the general
+summary and review event. Inline failures do not discard successful comments.
+A later summary/event failure reports the number already posted and tells the
+client to refresh before retrying. Success performs no server reread; the
+client owns explicit invalidation. The result's `landed` count covers inline
+comments, while a partial-error message also counts a posted general summary.
+The version diff uses the 8 MiB patch budget and is scanned once per selected
+file; missing/unavailable positions remain failed drafts.
+
+Merge requires the viewed head SHA and a method from the computed allowed list.
+Immediate merge checks `merge`; bypass checks `mergeBypass`; scheduling auto-merge
+checks `enableAutoMerge`. GitLab requests selecting both special paths must satisfy
+both permissions. GitHub rejects the combination with `invalid_request` before
+the adapter starts a CLI process; its merge controls must offer the two modes
+separately. These permissions include access and their own readiness rules,
+so immediate-merge readiness does not block an authorized bypass or scheduled merge.
+GitHub pins the head with `--match-head-commit`; GitLab pins it with `--sha` or
+the REST merge body's `sha`. GitLab bypass first calls the public
+`mergeRequestUpdate(overrideRequestedChanges: true)` mutation. If merging then
+fails, the error reports that the override already succeeded. Delete checks
+fresh host capability and permission; its contract has no head SHA.
+
+An internal action context carries the fresh metadata snapshot to the adapter;
+it is never client supplied or persisted. GitLab reviewer and assignee updates
+resolve each retained login once and send the complete current-plus-add-minus-remove
+ID list. GitHub milestone IDs remain milestone numbers, resolved to titles before
+`gh pr edit --milestone`. GitLab milestone IDs are numeric database IDs.
+Empty metadata edits do not start an interactive CLI.
+The mutation gate covers the read/modify/write sequence across different checkouts
+of the same host request. Waiting respects the RPC cancellation token and overall
+deadline; unrelated requests remain independent. Weak gate entries are removed on
+subsequent admission, without a timer or permanent per-request queue. For hosted-only actions, this remote
+identity gate does not use the local cwd status-mutation lock or trigger local Git
+refreshes. Checkout additionally participates in the catalog and VCS mutation lifecycle. External host edits still remain subject to the host's API concurrency
+semantics.
+
+GitLab merge messages use REST with a private JSON body file. Plain CLI merges
+explicitly pass `--auto-merge=false` for immediate merging because the CLI defaults
+to enabling auto-merge. A revert creates
+`revert-<iid>-<eight-character-sha>` from the target branch, reverts the known
+merge commit (or known squash commit), then calls `source_control::PullRequestService::create`.
+That service owns creation payloads and response normalization; an injected,
+crate-private GitLab transport keeps this module's calls inside `HostCommandRunner`.
+Classified command failures cross that internal seam without changing the legacy
+source-control wire error. A partial revert error states which steps succeeded
+and requires inspecting the host before retrying; it does not retry or delete the
+created branch. GitHub revert reuses the existing create URL parser. Both return
+the created request's number and URL without rereading it.
+
+### Checkout lifecycle
+
+`pullRequests.checkout` uses the same per-request action gate and the worktree
+catalog's non-waiting project/repository lock. Under that lock it resolves project
+ownership and verifies both physical Git common directories against the catalog's
+repository pin, then evaluates the shared Git Manager guards for the target.
+Unknown targets and targets owned by another project return a successful `blocked`
+payload. Registered external worktrees are accepted only after repository identity
+and live membership checks. Dirty or in-progress targets are blocked before the
+provider checkout command. A current branch still runs the ordinary non-forcing
+provider checkout: its name alone cannot prove it contains the request's head.
+
+New-worktree checkout fetches the provider head ref with the bounded,
+non-interactive Git runner and reuses a matching local branch only when it is
+unoccupied. A divergent tip or occupancy in any worktree (including the current
+checkout or a registration whose directory is missing) selects `<head>-pr-<number>`,
+then `<head>-pr-<number>-2` and subsequent suffixes on further collisions. Planning
+uses the live worktree snapshot under the catalog lock before invoking the existing
+managed creation transaction; it does not rely on generic numeric worktree naming. It inherits the project's
+default workspace settings; the transaction owns Git rollback, durable workspace
+creation and catalog/status publication. The shared worktree operation runtime
+retains admission and cleanup through durable handoff. Only pre-write reads and
+planning receive the request token. At write admission, a separate token shields
+the complete Git/write-and-owner sequence; each write command uses a 24-hour safety
+ceiling instead of the 60-second request budget or managed Git's ordinary 30-second
+budget. The catalog lock and availability lease stay with that task even if the
+RPC wait ends. The preparation deadline and admission loss also notify the waiter,
+without interrupting the write. The cancellation observer ends before normal read
+scope cleanup, so successful completion cannot manufacture a cancelled wait.
+
+After handoff, an interrupted wait returns `PullRequestsOperationError` with code
+`timeout`, `retryable: false`, and the neutral message “Checkout continues in the
+background; refresh to see the result”. Pre-write cancellation states that no Git
+changes were made. Browser interruption and socket/heartbeat loss have an unknown
+outcome and show “Checkout may still be running; refresh to see the result”. Pending
+UI state clears in all cases; none automatically retry or report the cancelled wait
+as a failed checkout. Context/detail and worktree catalog refresh use their normal
+paths after reconnect. Git's own failure remains an error: inspect `git status` in
+the checkout path before retrying, with no automatic reset or lock-file removal.
+
+Graceful server shutdown drains the existing worktree operation runtime; it does
+not cancel started writes. That runtime has no additional drain deadline; the
+24-hour per-command ceiling remains. The desktop's existing five-second stop wait
+does not abort the in-process server owner. Forced process exit is outside this
+lifetime guarantee. Runtime admission failures are translated into
+`PullRequestsOperationError` at the RPC boundary. Local Git mutations invalidate
+catalog views even when Git fails after fetching. The web uses the shared environment catalog query for targets. Catalog loading
+is shown only while there is no snapshot: Effect's stream `waiting` flag remains
+true between emissions and is not a refresh-progress signal. The web
+shows server-authored blocked reasons, and offers explicit Git Manager navigation
+for successful receipts; stale toast retries recheck current mutation eligibility.
+
+Mutation bodies use GitHub stdin or GitLab's private body file. GitLab review
+GraphQL commands contain only escaped identifiers via `-f query=…`; comment
+bodies never enter argv. Timeline identifiers retain their host kind, database
+and node segments when passed back to actions; malformed or inappropriate
+kinds fail as typed request errors. Reactions and thread resolution read the
+current state before changing it so repeating the current state succeeds
+without another mutation. GitLab multi-line comments currently post on their
+end line: this server has no directly usable SHA-1 dependency for the host's
+line codes, and does not substitute Git object hashes.
+
+Tabs read independently. GitHub timelines use bounded GraphQL connections
+(including nested thread comments), while GitLab joins discussions, resource
+events, and synthetic approval/reviewer entries. Comment/review/thread ids are
+opaque host-specific identifiers carrying the prefixes needed by later
+mutations. GitLab note GlobalIDs accept the `Note` subtype family (including
+`DiffNote`, `DiscussionNote` and `LegacyDiffNote`); the wire/action ids retain
+the numeric REST note id and opaque discussion hash. Non-note GlobalID kinds
+remain rejected at the note boundary. GitHub body reaction flags come from the supplementary GraphQL
+read; GitLab body awards are explicitly paginated. GitLab timeline GraphQL
+pages include discussion notes, award emoji and positions, keeping the number
+of child processes bounded independently of note count.
+Synthetic GitLab review timestamps use the MR update timestamp
+because approvals have no submission timestamp. The GitHub check read reuses
+the existing newest-run fold and adds workflow grouping and nullable timing
+metadata; GitLab groups jobs from the latest pipeline by stage. GitLab detail
+uses bounded public GraphQL metadata for counts and source-branch permissions
+absent from the REST record and reads closing issues separately.
+
+### Client views and drafts
+
+The web shell uses project-scoped `/pull-requests` and `/pull-requests/$number`
+routes inside the chat route inset. Availability checks the client preference,
+passive connection state, and read capability before mounting context or
+catalog queries; it never dials a disconnected environment. Context and list
+reads use only the client-runtime atom families. A list or detail/tab authentication failure
+invalidates context once through the panel's existing refresh callback. There
+are no provider timers or focus refreshes; the 300 ms text-input debounce is
+scheduled only by typing.
+
+`apps/web/src/pullRequestsStore.ts` owns version-1 local view state under
+`bibcode:pull-requests-state:v1`, keyed by the physical environment/project
+identity and bounded to the two most recently used projects. It persists the
+opaque checkout, tab, filters, sort, scroll position, last number, viewed files,
+and separate per-number comment/review/edit/merge drafts. Server results and
+permissions remain in atoms. Paging retains prior rows in the mounted view,
+resets on scope/filter changes and explicit Refresh, and requests a further
+page only through Load more when a non-null cursor exists. Rows are virtualized
+at 56 px. Navigation back to a saved offset reopens only enough cursor pages
+to restore that viewport. Scroll is saved on navigation and pagehide without
+writing storage on every scroll event. Because a checkout path can acquire a
+new origin/account, each explicit list/picker/detail/tab open refreshes a cached value
+before displaying it (without restarting an already-pending mount read).
+Rescan identity changes remount repository-bound UI, clearing open dialogs and
+picker state before new data appears. Creation uses the existing Git Manager
+dialog and mutation capability reason.
+
+`PullRequestsDetailView` mounts `get` plus the active tab read; Files also
+mounts timeline in parallel for existing inline threads. Its route search
+stores `conversation|commits|checks|files`; Refresh invalidates `get` and that
+tab, including timeline when Files is active. Timeline ids remain opaque, including host kind prefixes. The
+conversation and file lists use LegendList; file bodies mount through
+IntersectionObserver with a 600 px margin and apply the Git Manager size
+ladder before parsing. File anchors use `#file=<encodeURIComponent(path)>`.
+Viewed paths persist in the existing per-project, per-number store; the
+whitespace toggle starts from the existing client setting and only changes
+the rendered patch, retaining source line coordinates. The full files result
+retains diff refs for later review submission.
+
+Markdown reuses the sanitizer exported by ChatMarkdown and replaces images
+with links opened through the local shell API. No avatar or host image is
+loaded. Readiness text and denied-action reasons are displayed verbatim.
+Review controls use the server permission, including visible disabled controls
+for unsupported host actions. The environment mutation capability gate applies to write controls and before
+dispatch; read-only Refresh/Retry and local draft recovery remain available.
+Metadata, merge and state controls use the same command path. Checkout uses
+`pullRequestsEnvironment.checkout` through its sibling checkout runner.
+Approval rules have no edit action/permission in the current contract and are
+displayed without an edit control.
+
+`useRunPullRequestsAction(scope, number)` is the detail surface's hosted-action write
+path through `pullRequestsEnvironment.runAction`. The detail view supplies
+refresh handles; inactive affected atoms are invalidated without extra query
+subscriptions. Success (including a `reviewSubmitted` partial receipt) refreshes
+`get` plus these queries:
+
+| Actions                                                                                 | Queries                  |
+| --------------------------------------------------------------------------------------- | ------------------------ |
+| comment, editComment, deleteComment, minimizeComment, react, replyThread, resolveThread | timeline                 |
+| submitReview                                                                            | timeline, files          |
+| revokeApproval, removeOwnChangeRequest, dismissReview, rerequestReview                  | timeline                 |
+| applySuggestions                                                                        | timeline, files, commits |
+| editPullRequest, setDraft, close, reopen                                                | timeline                 |
+| setReviewers, setAssignees, setLabels, setMilestone, lock, unlock, disableAutoMerge     | none beyond get          |
+| updateBranch                                                                            | commits, checks, files   |
+| merge                                                                                   | timeline, commits        |
+
+A `deleted` receipt navigates to the project list; `pullRequestCreated` navigates
+to its returned number on Conversation. These receipts do not re-read the old
+detail. A `merged` receipt with `autoMergeEnabled: true` reports **Auto-merge
+enabled**; otherwise it reports **Merged**. Both refresh the merge queries.
+No optimistic cache writes, provider timers, direct provider requests, or focus
+refreshes are introduced. A typed failure is toasted and rethrown. `stale_head` offers an
+explicit Refresh action for detail and all four tab atoms and keeps every
+pending comment and merge draft. Structured error messages and optional host
+detail are displayed verbatim; no failure automatically retries a write. Review requests send
+the loaded detail's `headSha` and strip only locally generated draft ids.
+Receipts reconcile the submitted snapshot with current drafts, preserving
+concurrent edits/additions. Failed entries include the original body, so the
+client matches path + line + body. Indistinguishable duplicate drafts are
+preserved conservatively. `reviewPosted` distinguishes a completed review/event
+and summary from GitHub's atomic rejection: only a confirmed posted summary
+is cleared, and retrying partial success defaults to Comment without repeating
+an approval. A thrown failure keeps all drafts. Thread comments include the
+host's `minimized` state; both initial and paginated GitHub comment reads select
+`isMinimized`, while GitLab reports false and denies the unsupported action.
+
+Title and description edits use the existing per-request drafts and clear only
+the successfully submitted value. Cancel/Escape retains the draft. Merge drafts
+add a backward-compatible `mergeDraftEdited` boolean: legacy nonempty messages
+remain edited, while legacy empty defaults remain untouched. Explicitly blank
+new edits stay blank across reloads; clearing a successful merge draft restores
+host-derived defaults. Merge confirmation snapshots retain the selected method,
+target, deletion/auto/bypass choices and loaded detail head SHA until submission.
+GitHub auto-merge selection disables bypass with an explanation; GitLab supports
+both when the server grants both permissions. Read-only viewers have the server's
+merge denial and no method picker.
+
+Metadata and branch vocabularies mount only while their picker is open. Complete
+results filter locally; truncated results search the server after a 300 ms typing
+debounce that is cancelled on close. Reviewers exclude the author. Metadata writes
+send exact add/remove deltas; milestone values remain numeric strings. A successful
+metadata, lock or draft-state edit may offer a five-second toast whose Undo dispatches
+its exact inverse through the scoped command hook, once and only on explicit click.
+Expiry and dismissal perform no write. A clicked Undo uses the hook's explicit
+`waitForPending` admission option to run once after any current command settles;
+ordinary duplicate submissions are still rejected. This queues an authorized
+intent and never retries a dispatched mutation. Picker selection reconciles on
+each authoritative detail receipt, including a receipt identical to the initial
+selection after Undo. Metadata controls remain disabled with “Refreshing request
+details…” while the detail query is pending after a successful write or Undo;
+command completion alone cannot enable a checkbox showing the previous state.
+Late revert/delete results retain success feedback but
+automatic navigation is fenced by the initiating view's mounted identity. A base change confirms pending review-comment
+loss and clears those comments only after the host accepts the change. Linked issues
+remain description-derived and have no separate editing action.
+
+Version-1 drafts additionally persist `replyDrafts`, `inlineDrafts`, and
+`reviewBody`; old snapshots sanitize these to empty values. Text is cleared
+only after a confirmed action, and a successful old submission cannot erase a
+newer draft. Gutter selections use path, source-side line/range, and side;
+annotation slots anchor composers, pending comments, and threads. Unrenderable
+or missing lines retain their annotations below the diff; drafts for files no
+longer present have an editable/removable recovery section. Comment links use
+the loaded request URL because timeline contracts have no comment permalink;
+opaque ids are never decoded to manufacture host URLs.
+
+### Context reuse
+
+Each service still reads the selected checkout's origin for every RPC. Successful
+CLI presence/auth/discovery probes and parsed GitLab host contexts are memoized
+for at most **30 seconds from the start of their load**, without extending that
+window on hits. Each cache has at most **32 entries**, evicts the oldest admitted
+entry when full, and owns no timer or worker. Context keys contain normalized
+host plus the exact repository path; probe keys additionally include provider
+and argv. Values belong to this server runtime, remain in memory and are never
+persisted or logged.
+
+Concurrent loads of the same key share a cancellable lock; unrelated keys load
+independently. Failures and cancelled loads are not cached. Invalidating or
+evicting an entry detaches its in-flight load, so late completion cannot restore
+a superseded cache entry. An explicit `pullRequests.getContext` (including
+Rescan/auth recovery) clears context/probe caches before reading. Authentication,
+repository-denial/missing and CLI-availability failures also invalidate them.
+
+GitLab timeline reads reuse an available context viewer; reaction mutations use
+the viewer carried by their fresh permission observations. Neither needs a
+second `api user` when that identity is already held. Identity/version can lag
+external CLI-account or host-version changes within the bounded window; use
+Rescan for immediate refresh. Every mutation still reads fresh repository access,
+merge policy, MR state/head, approvals, reviewers and host permission flags under
+the per-request gate, and the host remains authoritative on the write itself.
+
+### CLI boundary and resource limits
+
+Each explicit read resolves the selected checkout's origin once. Known
+providers use the existing source-control detection; unknown hosts are matched
+against bounded CLI auth discovery. Host and repository identity are pinned on
+every subsequent command. Context returns actionable unavailable data for
+missing remotes, unsupported/unconfigured hosts, missing or outdated CLIs,
+authentication, and repository access. Process failures remain typed errors.
+
+`HostCommandRunner` is the module's single process boundary and delegates all
+Git/provider work to `ProcessRunner`. It supplies noninteractive Git settings,
+host environment variables, repository operands, cancellation, output caps,
+and deadlines. One overall deadline covers context/vocabulary (30 seconds),
+lists, detail/tab reads and ordinary mutations (60 seconds), including their
+child calls; cancellation awaits bounded process cleanup. Checkout is the
+documented exception: after the guarded write handoff, each Git/provider write
+has a 24-hour safety ceiling and an independent cancellation token. The caller
+may stop waiting while the operation owner retains locks/admission and settles
+the write; it must not inherit the short read/mutation deadline. Metadata JSON responses are
+capped at 1 MiB. Patch reads, including GitLab's patch-bearing diff JSON, use
+an 8 MiB budget. Per-file patches over 1 MiB are omitted with `tooLarge: true`;
+binary rows remain without text patches. Whole-patch overflow returns a
+truncated file list with omitted patches. GitLab recovers that list from
+bounded metadata-only `diffStats`; when a diff never arrived, its unavailable
+change-kind metadata is represented conservatively as `modified`. GitHub inventories at the CLI’s
+100-file boundary are completed with bounded GraphQL pages. Timelines
+cap paginated connections/discussions at ten pages, resource events at 100 per
+type, GitHub file metadata at ten 100-file pages, and GitLab file reads at
+twenty 50-file pages. GitLab award reads cap at ten 100-award pages; a capped
+note read marks the timeline truncated, while detail reports `output_limit`
+because its contract has no truncation field. GitLab commits and latest
+pipeline jobs currently use the specified first 100-row read; their contracts
+have no truncation field. The GitLab body helper writes only a private temporary
+file under the state directory and removes it after success, failure, or
+cancellation. GitLab private-file requests set `Content-Type: application/json`
+explicitly, including GraphQL reads with query/variables in that file.
+Construction and idle time start no provider work or poller. Source tripwires
+cover every module file and the RPC adapter: no direct process constructors,
+`reqwest` HTTP client, periodic intervals or thread workers; async task spawning
+is confined to the request-owning production boundary. A constructor tripwire
+checks the actual default command specifications (`gh`, `glab`, `git`).
+One-shot request deadlines and the protected checkout write ceiling remain
+permitted. Bodies never appear in argv: GitHub uses stdin, and GitLab uses the
+private body helper; process output and user/host content stay out of logs.
+
+GitHub lists use GraphQL cursors unless filters require CLI search. Search
+never requests comment bodies and currently reports comment count zero with
+unknown totals and no next cursor. GitLab lists use 30-row pages and optional
+header totals; list rows do not include approval decisions or pipeline status.
+Review-status filters return an actionable `unavailable` error until per-row approval
+reads are added to list filtering. Filtered result totals remain unknown while tab counts
+remain available. GitLab version gates close when the version cannot be read;
+the wire context exposes a null version, and internal context retains the
+reason for permission computation. No host data or CLI stderr is logged.
+
 ## Worktree catalog flow
 
 The catalog protocol is server-resolved and capability gated:

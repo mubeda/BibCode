@@ -54,6 +54,7 @@ use crate::{
             NativeProviderDriverFactory, ProviderRuntimeSupervisor, SupervisorOptions,
             reconcile_abandoned_provider_sessions,
         },
+        pull_requests_rpc::{PullRequestsRpcServices, register_pull_requests_rpc},
         relay::relay_client_service,
         server_terminal::{
             ProcessTreeCleanup, ServerTerminalServices, register_server_terminal_rpc,
@@ -436,6 +437,11 @@ impl ProductionRuntime {
             WorktreeCatalogRpcServices::new(worktree_catalog.clone(), orchestration.clone())
                 .with_status_broadcaster(status_broadcaster.clone())
                 .with_removal_quiescer(Arc::new(worktree_runtime.clone()));
+        register_pull_requests_rpc(
+            &mut registry,
+            PullRequestsRpcServices::with_dependencies(config.state_dir(), repositories.clone())
+                .with_worktrees(worktree_catalog_rpc.clone()),
+        );
         let worktree_catalog_operations = worktree_catalog_rpc.operation_runtime();
         register_worktree_catalog_rpc(&mut registry, worktree_catalog_rpc);
         register_server_terminal_rpc(&mut registry, terminal_services.clone());

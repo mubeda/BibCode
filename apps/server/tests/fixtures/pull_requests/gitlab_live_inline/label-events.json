@@ -1,0 +1,80 @@
+[
+  {
+    "id": 182,
+    "user": {
+      "id": 4,
+      "username": "mubeda",
+      "public_email": "",
+      "name": "Mauro Ubeda",
+      "state": "active",
+      "locked": false,
+      "avatar_url": "https://luna.tripunkt.de/uploads/-/system/user/avatar/4/avatar.png",
+      "web_url": "https://luna.tripunkt.de/mubeda"
+    },
+    "created_at": "2026-09-21T12:38:07.526Z",
+    "resource_type": "MergeRequest",
+    "resource_id": 420,
+    "label": {
+      "id": 60,
+      "name": "mr-e2e",
+      "description": "Pull Requests module acceptance",
+      "text_color": "#FFFFFF",
+      "description_html": "Pull Requests module acceptance",
+      "color": "#1d76db",
+      "archived": false
+    },
+    "action": "add"
+  },
+  {
+    "id": 183,
+    "user": {
+      "id": 4,
+      "username": "mubeda",
+      "public_email": "",
+      "name": "Mauro Ubeda",
+      "state": "active",
+      "locked": false,
+      "avatar_url": "https://luna.tripunkt.de/uploads/-/system/user/avatar/4/avatar.png",
+      "web_url": "https://luna.tripunkt.de/mubeda"
+    },
+    "created_at": "2026-09-21T12:38:21.649Z",
+    "resource_type": "MergeRequest",
+    "resource_id": 420,
+    "label": {
+      "id": 60,
+      "name": "mr-e2e",
+      "description": "Pull Requests module acceptance",
+      "text_color": "#FFFFFF",
+      "description_html": "Pull Requests module acceptance",
+      "color": "#1d76db",
+      "archived": false
+    },
+    "action": "remove"
+  },
+  {
+    "id": 184,
+    "user": {
+      "id": 4,
+      "username": "mubeda",
+      "public_email": "",
+      "name": "Mauro Ubeda",
+      "state": "active",
+      "locked": false,
+      "avatar_url": "https://luna.tripunkt.de/uploads/-/system/user/avatar/4/avatar.png",
+      "web_url": "https://luna.tripunkt.de/mubeda"
+    },
+    "created_at": "2026-09-21T12:38:47.830Z",
+    "resource_type": "MergeRequest",
+    "resource_id": 420,
+    "label": {
+      "id": 60,
+      "name": "mr-e2e",
+      "description": "Pull Requests module acceptance",
+      "text_color": "#FFFFFF",
+      "description_html": "Pull Requests module acceptance",
+      "color": "#1d76db",
+      "archived": false
+    },
+    "action": "add"
+  }
+]

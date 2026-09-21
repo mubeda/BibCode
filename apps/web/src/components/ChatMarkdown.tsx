@@ -153,7 +153,7 @@ export function findTaskListMarkerOffset(markdown: string, listItemStart: number
   if (!match?.[1]) return null;
   return listItemStart + firstLine.indexOf(match[1]);
 }
-const CHAT_MARKDOWN_SANITIZE_SCHEMA = {
+export const CHAT_MARKDOWN_SANITIZE_SCHEMA = {
   ...defaultSchema,
   attributes: {
     ...defaultSchema.attributes,

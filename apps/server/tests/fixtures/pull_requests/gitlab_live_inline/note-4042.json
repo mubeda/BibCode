@@ -1,0 +1,54 @@
+{
+  "id": 4042,
+  "type": "DiffNote",
+  "body": "Suggestion from the acceptance run.\n\n```suggestion\nline two (suggested)\n```",
+  "author": {
+    "id": 4,
+    "username": "mubeda",
+    "public_email": "",
+    "name": "Mauro Ubeda",
+    "state": "active",
+    "locked": false,
+    "avatar_url": "https://luna.tripunkt.de/uploads/-/system/user/avatar/4/avatar.png",
+    "web_url": "https://luna.tripunkt.de/mubeda"
+  },
+  "created_at": "2026-09-21T12:47:08.493Z",
+  "updated_at": "2026-09-21T12:47:08.493Z",
+  "system": false,
+  "noteable_id": 420,
+  "noteable_type": "MergeRequest",
+  "project_id": 72,
+  "commit_id": null,
+  "position": {
+    "base_sha": "b56a4a996683b8da2e19e71934d4f27a0a4558f8",
+    "start_sha": "b56a4a996683b8da2e19e71934d4f27a0a4558f8",
+    "head_sha": "5432c58b18ba4462a93ca8dfb43a833a46b2f7ce",
+    "old_path": "mr-e2e-1.txt",
+    "new_path": "mr-e2e-1.txt",
+    "position_type": "text",
+    "old_line": null,
+    "new_line": 2,
+    "line_range": null
+  },
+  "resolvable": true,
+  "resolved": false,
+  "resolved_by": null,
+  "resolved_at": null,
+  "suggestions": [
+    {
+      "id": 3,
+      "from_line": 2,
+      "to_line": 2,
+      "appliable": true,
+      "applied": false,
+      "from_content": "line two\n",
+      "to_content": "line two (suggested)\n"
+    }
+  ],
+  "confidential": false,
+  "internal": false,
+  "imported": false,
+  "imported_from": "none",
+  "noteable_iid": 1,
+  "commands_changes": {}
+}

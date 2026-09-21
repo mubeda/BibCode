@@ -26,6 +26,7 @@ pub mod project;
 pub mod provider;
 pub mod provider_terminal;
 pub mod provider_usage;
+pub mod pull_requests;
 pub mod remote_update;
 pub mod review;
 mod rpc;

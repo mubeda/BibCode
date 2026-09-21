@@ -491,7 +491,7 @@ async fn secure_file(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-async fn secure_windows_path(path: &Path, inheritable: bool) -> io::Result<()> {
+pub(crate) async fn secure_windows_path(path: &Path, inheritable: bool) -> io::Result<()> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || set_restrictive_windows_acl(&path, inheritable))
         .await

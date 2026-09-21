@@ -115,6 +115,15 @@ export type SourceControlProviderAuthStatus = typeof SourceControlProviderAuthSt
 
 export const SourceControlProviderAuth = Schema.Struct({
   status: SourceControlProviderAuthStatus,
+  hosts: Schema.optional(
+    Schema.Array(
+      Schema.Struct({
+        host: Schema.String,
+        account: Schema.NullOr(Schema.String),
+        authenticated: Schema.Boolean,
+      }),
+    ),
+  ),
   account: Schema.Option(TrimmedNonEmptyString),
   host: Schema.Option(TrimmedNonEmptyString),
   detail: Schema.Option(TrimmedNonEmptyString),

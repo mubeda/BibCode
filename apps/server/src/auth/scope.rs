@@ -28,6 +28,14 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "gitManager.getStashes"
         | "gitManager.listPullRequests"
         | "gitManager.previewMerge"
+        | "pullRequests.getContext"
+        | "pullRequests.getVocabulary"
+        | "pullRequests.list"
+        | "pullRequests.get"
+        | "pullRequests.getTimeline"
+        | "pullRequests.getCommits"
+        | "pullRequests.getChecks"
+        | "pullRequests.getFiles"
         | "orchestration.getArchivedShellSnapshot"
         | "orchestration.getFullThreadDiff"
         | "orchestration.getTurnDiff"
@@ -72,6 +80,8 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "gitManager.stagePartial"
         | "gitManager.undoCommit"
         | "gitManager.unstagePartial"
+        | "pullRequests.runAction"
+        | "pullRequests.checkout"
         | "activity.cancelSubtree"
         | "activity.retrySubtreeCancellation"
         | "orchestration.dispatchCommand"
@@ -214,6 +224,14 @@ mod tests {
             );
         }
         for method in [
+            "pullRequests.getContext",
+            "pullRequests.getVocabulary",
+            "pullRequests.list",
+            "pullRequests.get",
+            "pullRequests.getTimeline",
+            "pullRequests.getCommits",
+            "pullRequests.getChecks",
+            "pullRequests.getFiles",
             "gitManager.getCommits",
             "gitManager.getDiff",
             "gitManager.getRefs",
@@ -242,6 +260,8 @@ mod tests {
             Some(SCOPE_ORCHESTRATION_OPERATE)
         );
         for method in [
+            "pullRequests.runAction",
+            "pullRequests.checkout",
             "gitManager.commit",
             "gitManager.discard",
             "gitManager.discardPartial",

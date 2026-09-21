@@ -67,6 +67,10 @@
       "types": "./src/state/gitManager.ts",
       "default": "./src/state/gitManager.ts"
     },
+    "./state/pull-requests": {
+      "types": "./src/state/pullRequests.ts",
+      "default": "./src/state/pullRequests.ts"
+    },
     "./state/models": {
       "types": "./src/state/models.ts",
       "default": "./src/state/models.ts"

@@ -1,0 +1,19 @@
+{
+  "number": 14,
+  "title": "PR 14 fixture",
+  "state": "MERGED",
+  "isDraft": false,
+  "createdAt": "2026-09-01T00:00:00Z",
+  "updatedAt": "2026-09-02T00:00:00Z",
+  "mergedAt": "2026-09-02T00:00:00Z",
+  "closedAt": "2026-09-02T00:00:00Z",
+  "url": "https://github.com/mubeda/BibCode/pull/14",
+  "headRefName": "feature",
+  "baseRefName": "main",
+  "author": { "login": "mubeda", "name": "" },
+  "labels": [{ "name": "bug", "color": "d73a4a", "description": "Bug fix" }],
+  "reviewDecision": "",
+  "statusCheckRollup": [
+    { "__typename": "CheckRun", "status": "COMPLETED", "conclusion": "FAILURE" }
+  ]
+}

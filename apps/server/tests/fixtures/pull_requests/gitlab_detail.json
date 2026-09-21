@@ -1,0 +1,64 @@
+{
+  "iid": 3941,
+  "title": "CLI update",
+  "description": "Description",
+  "state": "opened",
+  "draft": false,
+  "created_at": "2026-09-19T00:00:00Z",
+  "updated_at": "2026-09-20T00:00:00Z",
+  "merged_at": null,
+  "closed_at": null,
+  "author": {
+    "id": 1,
+    "username": "author",
+    "name": "Author"
+  },
+  "merge_user": null,
+  "source_branch": "feature",
+  "target_branch": "main",
+  "sha": "head-sha",
+  "diff_refs": {
+    "base_sha": "base-sha",
+    "start_sha": "start-sha",
+    "head_sha": "head-sha"
+  },
+  "source_project_id": 1,
+  "target_project_id": 2,
+  "allow_maintainer_to_push": true,
+  "changes_count": "2",
+  "labels": ["bug"],
+  "milestone": {
+    "id": 2,
+    "title": "Next",
+    "due_date": null
+  },
+  "assignees": [
+    {
+      "id": 1,
+      "username": "author",
+      "name": "Author"
+    }
+  ],
+  "reviewers": [],
+  "references": {
+    "short": "!3941",
+    "relative": "!3941",
+    "full": "gitlab-org/cli!3941"
+  },
+  "user_notes_count": 3,
+  "blocking_discussions_resolved": true,
+  "detailed_merge_status": "not_approved",
+  "has_conflicts": false,
+  "discussion_locked": false,
+  "merge_when_pipeline_succeeds": false,
+  "head_pipeline": {
+    "id": 9,
+    "status": "success",
+    "web_url": "https://gitlab.com/gitlab-org/cli/-/pipelines/9"
+  },
+  "web_url": "https://gitlab.com/gitlab-org/cli/-/merge_requests/3941",
+  "user": {
+    "can_merge": false
+  },
+  "merge_commit_sha": null
+}

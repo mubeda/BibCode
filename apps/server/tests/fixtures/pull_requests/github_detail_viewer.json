@@ -1,0 +1,50 @@
+{
+  "data": {
+    "repository": {
+      "viewerPermission": "READ",
+      "pullRequest": {
+        "locked": false,
+        "activeLockReason": null,
+        "viewerCanUpdate": false,
+        "viewerDidAuthor": false,
+        "viewerCanMergeAsAdmin": false,
+        "viewerCanEnableAutoMerge": false,
+        "viewerCanDisableAutoMerge": false,
+        "viewerCanApplySuggestion": false,
+        "commits": {
+          "totalCount": 1
+        },
+        "mergeCommit": null,
+        "baseRef": {
+          "refUpdateRule": {
+            "requiredApprovingReviewCount": 1,
+            "viewerAllowedToDismissReviews": false
+          }
+        },
+        "reviewThreads": {
+          "totalCount": 1,
+          "nodes": [
+            {
+              "viewerCanResolve": false
+            }
+          ]
+        },
+        "comments": {
+          "totalCount": 2
+        },
+        "reviews": {
+          "totalCount": 1
+        },
+        "reactionGroups": [
+          {
+            "content": "THUMBS_UP",
+            "users": {
+              "totalCount": 2
+            },
+            "viewerHasReacted": true
+          }
+        ]
+      }
+    }
+  }
+}

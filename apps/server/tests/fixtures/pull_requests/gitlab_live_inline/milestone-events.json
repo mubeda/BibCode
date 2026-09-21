@@ -1,0 +1,66 @@
+[
+  {
+    "id": 1,
+    "user": {
+      "id": 4,
+      "username": "mubeda",
+      "public_email": "",
+      "name": "Mauro Ubeda",
+      "state": "active",
+      "locked": false,
+      "avatar_url": "https://luna.tripunkt.de/uploads/-/system/user/avatar/4/avatar.png",
+      "web_url": "https://luna.tripunkt.de/mubeda"
+    },
+    "created_at": "2026-09-21T12:39:18.108Z",
+    "resource_type": "MergeRequest",
+    "resource_id": 420,
+    "milestone": {
+      "id": 4,
+      "iid": 1,
+      "project_id": 72,
+      "title": "mr-e2e",
+      "description": "Pull Requests module acceptance",
+      "state": "active",
+      "created_at": "2026-09-21T11:47:16.567Z",
+      "updated_at": "2026-09-21T11:47:16.567Z",
+      "due_date": null,
+      "start_date": null,
+      "expired": false,
+      "web_url": "https://luna.tripunkt.de/mubeda/sourcecontroltest/-/milestones/1"
+    },
+    "action": "add",
+    "state": "opened"
+  },
+  {
+    "id": 2,
+    "user": {
+      "id": 4,
+      "username": "mubeda",
+      "public_email": "",
+      "name": "Mauro Ubeda",
+      "state": "active",
+      "locked": false,
+      "avatar_url": "https://luna.tripunkt.de/uploads/-/system/user/avatar/4/avatar.png",
+      "web_url": "https://luna.tripunkt.de/mubeda"
+    },
+    "created_at": "2026-09-21T12:39:43.940Z",
+    "resource_type": "MergeRequest",
+    "resource_id": 420,
+    "milestone": {
+      "id": 4,
+      "iid": 1,
+      "project_id": 72,
+      "title": "mr-e2e",
+      "description": "Pull Requests module acceptance",
+      "state": "active",
+      "created_at": "2026-09-21T11:47:16.567Z",
+      "updated_at": "2026-09-21T11:47:16.567Z",
+      "due_date": null,
+      "start_date": null,
+      "expired": false,
+      "web_url": "https://luna.tripunkt.de/mubeda/sourcecontroltest/-/milestones/1"
+    },
+    "action": "remove",
+    "state": "opened"
+  }
+]

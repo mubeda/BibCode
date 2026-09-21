@@ -2,14 +2,19 @@ pub mod checks;
 mod discovery;
 mod pull_request;
 
+pub(crate) use discovery::provider_install_hint;
+
 #[allow(unused_imports)]
 pub use discovery::{
     AuthStatus, DiscoveryStatus, SourceControlDiscovery, SourceControlDiscoveryResult,
     SourceControlProviderAuth, SourceControlProviderDiscoveryItem, VcsDiscoveryItem,
     VcsDiscoveryKind, WireOption,
 };
+pub(crate) use pull_request::GitLabCreateTransport;
+pub(crate) use pull_request::ProviderCommandFailure;
 #[allow(unused_imports)]
 pub(crate) use pull_request::ProviderCommandSpec;
+pub(crate) use pull_request::parse_github_create_url;
 #[allow(unused_imports)]
 pub use pull_request::{
     ChangeRequestState, CreatePullRequestInput, PullRequestService, ResolvePullRequestInput,
@@ -192,7 +197,7 @@ fn looks_like_host(value: &str) -> bool {
         && (without_port.contains('.') || without_port.starts_with('['))
 }
 
-fn remote_host(remote: &str) -> Option<String> {
+pub fn remote_host(remote: &str) -> Option<String> {
     let value = remote.trim();
     if let Some(after_scheme) = value.split_once("://").map(|(_, value)| value) {
         return after_scheme
@@ -211,9 +216,47 @@ fn remote_host(remote: &str) -> Option<String> {
         .map(|host| host.to_lowercase())
 }
 
+/// The repository path from an HTTP/SSH URL or an scp-style Git remote.
+pub fn remote_repository_path(remote: &str) -> Option<String> {
+    let remote = remote.trim();
+    let path = if remote.contains("://") {
+        let url = url::Url::parse(remote).ok()?;
+        url.host_str()?;
+        url.path().to_owned()
+    } else {
+        let (_, host_and_path) = remote.rsplit_once('@')?;
+        let (host, path) = host_and_path.split_once(':')?;
+        if host.is_empty() {
+            return None;
+        }
+        path.to_owned()
+    };
+    let path = path.trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    (!path.is_empty()).then(|| path.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pull_requests_remote_repository_path_preserves_nested_groups() {
+        for (remote, expected) in [
+            ("https://host/a/b.git", Some("a/b")),
+            ("git@host:a/b.git", Some("a/b")),
+            ("ssh://git@host:2222/a/b/c.git", Some("a/b/c")),
+            ("https://user@host:8443/a/b/c.git/", Some("a/b/c")),
+            ("/local/repo", None),
+            ("https://host/", None),
+        ] {
+            assert_eq!(
+                remote_repository_path(remote).as_deref(),
+                expected,
+                "{remote}"
+            );
+        }
+    }
 
     #[test]
     fn malformed_github_status_is_not_parsed() {
