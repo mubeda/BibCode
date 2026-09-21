@@ -51,6 +51,8 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   gitManagerTagOperations: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   gitManagerLiveSignal: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   gitManagerPullRequests: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  pullRequestsReads: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  pullRequestsMutations: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   activityProtocolVersion: Schema.NullOr(Schema.Literal(2)).pipe(
     Schema.withDecodingDefault(Effect.succeed(null)),
   ),

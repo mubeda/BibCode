@@ -8,6 +8,8 @@ mod pairing_offer;
 mod rpc;
 mod scope;
 mod secret_store;
+#[cfg(windows)]
+pub(crate) use secret_store::secure_windows_path;
 mod service;
 mod token;
 

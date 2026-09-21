@@ -370,7 +370,10 @@ impl WorktreeCatalogOperationRuntime {
         }
     }
 
-    async fn run(&self, operation: impl Future<Output = RpcResult> + Send + 'static) -> RpcResult {
+    pub(crate) async fn run(
+        &self,
+        operation: impl Future<Output = RpcResult> + Send + 'static,
+    ) -> RpcResult {
         let operation_permit = match self.admission.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(TryAcquireError::NoPermits) => {
@@ -490,6 +493,81 @@ impl WorktreeCatalogRpcServices {
     #[must_use]
     pub fn operation_runtime(&self) -> WorktreeCatalogOperationRuntime {
         self.operations.clone()
+    }
+
+    pub(crate) fn catalog(&self) -> &WorktreeCatalogService {
+        &self.catalog
+    }
+
+    pub(crate) fn status_broadcaster(&self) -> Option<&StatusBroadcaster> {
+        self.status_broadcaster.as_ref()
+    }
+
+    /// Caller retains the catalog project/repository lock and operation runtime.
+    /// The same managed creation transaction owns Git rollback and the durable owner.
+    pub(crate) async fn create_managed_from_ref_locked(
+        &self,
+        project_id: &str,
+        branch: &str,
+        cancellation: &CancellationToken,
+    ) -> RpcResult {
+        let defaults = self
+            .orchestration
+            .repositories()
+            .list_threads_by_project(project_id.to_owned())
+            .await
+            .map_err(|_| {
+                encode(adoption_error(
+                    WorktreeAdoptionErrorReason::Internal,
+                    "Workspace defaults could not be read.",
+                    None,
+                ))
+            })?
+            .into_iter()
+            .find(|thread| thread.kind == "default" && thread.deleted_at.is_none())
+            .ok_or_else(|| {
+                encode(adoption_error(
+                    WorktreeAdoptionErrorReason::ProjectNotFound,
+                    "The project's default workspace is unavailable.",
+                    None,
+                ))
+            })?;
+        let input = WorktreeCreateManagedInput {
+            command_id: uuid::Uuid::new_v4().to_string(),
+            project_id: project_id.to_owned(),
+            thread_id: uuid::Uuid::new_v4().to_string(),
+            title: branch.to_owned(),
+            ref_name: branch.to_owned(),
+            new_ref_name: None,
+            base_ref_name: Some(branch.to_owned()),
+            thread_defaults: WorktreeAdoptThreadDefaults {
+                model_selection: defaults.model_selection,
+                runtime_mode: defaults.runtime_mode,
+                interaction_mode: defaults.interaction_mode,
+            },
+        };
+        let digest = canonical_command_digest(&input).map_err(|_| {
+            encode(adoption_error(
+                WorktreeAdoptionErrorReason::Internal,
+                "The managed creation payload could not be admitted.",
+                None,
+            ))
+        })?;
+        let claim =
+            acquire_worktree_command_claim(&self.orchestration, &input.command_id, cancellation)
+                .await
+                .map_err(|error| encode(adoption_orchestration_error(error, None)))?;
+        let write_services = Self {
+            creation_git: self
+                .creation_git
+                .as_ref()
+                .map(|repository| Arc::new(repository.for_checkout_write())),
+            ..self.clone()
+        };
+        create_managed_worktree_locked(&write_services, input, digest, claim, cancellation)
+            .await
+            .finish(self)
+            .await
     }
 
     async fn notify_status_mutations(&self, paths: Vec<PathBuf>) {

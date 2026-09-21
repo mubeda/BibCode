@@ -133,6 +133,7 @@ pub struct GitRepository {
     runner: Arc<dyn GitProcessRunner>,
     worktree_settings: Arc<dyn WorktreeBaseDirectoryProvider>,
     worktree_porcelain_z_supported: Arc<Mutex<Option<bool>>>,
+    command_timeout: Duration,
 }
 
 pub(crate) struct StatusObservation {
@@ -164,6 +165,7 @@ impl Default for GitRepository {
             runner: Arc::new(ProcessRunner),
             worktree_settings: Arc::new(DefaultWorktreeBaseDirectory),
             worktree_porcelain_z_supported: Arc::new(Mutex::new(None)),
+            command_timeout: DEFAULT_TIMEOUT,
         }
     }
 }
@@ -284,6 +286,15 @@ impl OwnedWorktreePath {
 }
 
 impl GitRepository {
+    /// Only the owned checkout transaction uses this clone; ordinary Git operations
+    /// retain their existing deadlines. The caller supplies its independent token.
+    pub(crate) fn for_checkout_write(&self) -> Self {
+        Self {
+            command_timeout: super::CHECKOUT_WRITE_TIMEOUT,
+            ..self.clone()
+        }
+    }
+
     pub fn with_worktree_settings(
         worktree_settings: Arc<dyn WorktreeBaseDirectoryProvider>,
     ) -> Self {
@@ -291,6 +302,7 @@ impl GitRepository {
             runner: Arc::new(ProcessRunner),
             worktree_settings,
             worktree_porcelain_z_supported: Arc::new(Mutex::new(None)),
+            command_timeout: DEFAULT_TIMEOUT,
         }
     }
 
@@ -300,6 +312,7 @@ impl GitRepository {
             runner,
             worktree_settings: Arc::new(DefaultWorktreeBaseDirectory),
             worktree_porcelain_z_supported: Arc::new(Mutex::new(None)),
+            command_timeout: DEFAULT_TIMEOUT,
         }
     }
 
@@ -452,7 +465,7 @@ impl GitRepository {
                     cwd: cwd.to_path_buf(),
                     env: input.environment,
                     stdin: input.stdin,
-                    timeout: DEFAULT_TIMEOUT,
+                    timeout: self.command_timeout,
                     max_output_bytes: options.max_output_bytes,
                     output_policy: options.output_policy,
                     append_truncation_marker: false,
@@ -6576,7 +6589,7 @@ fn rename_worktree_path_with_retries_blocking(
     Err(last_error.unwrap_or_else(|| io::Error::other("worktree rename failed")))
 }
 
-fn git_environment() -> Vec<(OsString, OsString)> {
+pub(crate) fn git_environment() -> Vec<(OsString, OsString)> {
     [
         ("GCM_INTERACTIVE", "never"),
         ("GIT_ASKPASS", ""),

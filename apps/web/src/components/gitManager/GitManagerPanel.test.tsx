@@ -23,6 +23,7 @@ const h = vi.hoisted(() => ({
     workspaceRoot: "/opaque/main",
   } as Record<string, unknown> | null,
   catalog: null as Record<string, unknown> | null,
+  catalogPending: false,
   queryAtoms: [] as Array<{ kind: string; cwd?: string } | null>,
   effects: [] as Array<() => void | (() => void)>,
   activeSubscriptions: 0,
@@ -105,7 +106,7 @@ vi.mock("../../state/query", () => ({
     return {
       data,
       error: null,
-      isPending: false,
+      isPending: atom?.kind === "catalog" && h.catalogPending,
       refresh: () => undefined,
       emission: data === null ? { _tag: "Initial" } : { _tag: "Success", value: data },
     };
@@ -306,6 +307,7 @@ beforeEach(() => {
     title: "Repository",
     workspaceRoot: "/opaque/main",
   };
+  h.catalogPending = false;
   h.catalog = {
     worktrees: [
       { path: "/opaque/main", branch: "main", isPrimary: true },
@@ -331,6 +333,15 @@ beforeEach(() => {
 });
 
 describe("GitManagerPanel", () => {
+  it("reports catalog loading only until the first live snapshot", () => {
+    h.catalogPending = true;
+    renderPanel();
+    expect(h.toolbarProps.at(-1)).toMatchObject({ catalogPending: false });
+    h.catalog = null;
+    renderPanel();
+    expect(h.toolbarProps.at(-1)).toMatchObject({ catalogPending: true });
+  });
+
   it("renders the disconnected reason and starts no RPC-backed atom", () => {
     h.connectionState = connection({
       desired: false,

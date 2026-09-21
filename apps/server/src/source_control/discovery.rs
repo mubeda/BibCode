@@ -81,8 +81,17 @@ pub enum AuthStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SourceControlProviderAuthHost {
+    pub host: String,
+    pub account: Option<String>,
+    pub authenticated: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SourceControlProviderAuth {
     pub status: AuthStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hosts: Option<Vec<SourceControlProviderAuthHost>>,
     pub account: WireOption<String>,
     pub host: WireOption<String>,
     pub detail: WireOption<String>,
@@ -172,6 +181,13 @@ const PROVIDER_PROBES: &[ProviderProbe] = &[
         install_hint: "Install Azure CLI from https://learn.microsoft.com/cli/azure/install-azure-cli.",
     },
 ];
+
+pub(crate) fn provider_install_hint(kind: ProviderKind) -> Option<&'static str> {
+    PROVIDER_PROBES
+        .iter()
+        .find(|probe| probe.kind == kind)
+        .map(|probe| probe.install_hint)
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SourceControlDiscovery {
@@ -314,7 +330,7 @@ fn parse_auth(kind: ProviderKind, result: Option<&ProcessOutput>) -> SourceContr
                 .iter()
                 .find(|account| account.authenticated && account.active)
                 .or_else(|| parsed.accounts.iter().find(|account| account.authenticated));
-            account.map_or_else(
+            let mut auth = account.map_or_else(
                 || {
                     if parsed.parsed {
                         unauthenticated_auth()
@@ -324,26 +340,60 @@ fn parse_auth(kind: ProviderKind, result: Option<&ProcessOutput>) -> SourceContr
                 },
                 |account| SourceControlProviderAuth {
                     status: AuthStatus::Authenticated,
+                    hosts: None,
                     account: WireOption::some(account.account.clone()),
                     host: WireOption::some(account.host.clone()),
                     detail: WireOption::none(),
                 },
-            )
+            );
+            if parsed.parsed {
+                let mut accounts = parsed.accounts.iter().collect::<Vec<_>>();
+                accounts.sort_by(|left, right| {
+                    left.host.cmp(&right.host).then_with(|| {
+                        (right.authenticated, right.active).cmp(&(left.authenticated, left.active))
+                    })
+                });
+                accounts.dedup_by(|left, right| left.host == right.host);
+                auth.hosts = Some(
+                    accounts
+                        .into_iter()
+                        .map(|account| SourceControlProviderAuthHost {
+                            host: account.host.clone(),
+                            account: Some(account.account.clone()),
+                            authenticated: account.authenticated,
+                        })
+                        .collect(),
+                );
+            }
+            auth
         }
         ProviderKind::Gitlab => {
             let hosts = parse_gitlab_auth_status(&combined);
-            hosts
+            let mut auth = hosts
                 .iter()
                 .find(|host| host.account.is_some())
                 .map_or_else(unauthenticated_auth, |host| SourceControlProviderAuth {
                     status: AuthStatus::Authenticated,
+                    hosts: None,
                     account: WireOption(host.account.clone()),
                     host: WireOption::some(host.host.clone()),
                     detail: WireOption::none(),
-                })
+                });
+            auth.hosts = Some(
+                hosts
+                    .into_iter()
+                    .map(|host| SourceControlProviderAuthHost {
+                        authenticated: host.account.is_some(),
+                        host: host.host,
+                        account: host.account,
+                    })
+                    .collect(),
+            );
+            auth
         }
         ProviderKind::AzureDevops if result.exit_code == 0 => SourceControlProviderAuth {
             status: AuthStatus::Authenticated,
+            hosts: None,
             account: WireOption::none(),
             host: WireOption::some("dev.azure.com".into()),
             detail: WireOption::none(),
@@ -355,6 +405,7 @@ fn parse_auth(kind: ProviderKind, result: Option<&ProcessOutput>) -> SourceContr
 fn unknown_auth(detail: &str) -> SourceControlProviderAuth {
     SourceControlProviderAuth {
         status: AuthStatus::Unknown,
+        hosts: None,
         account: WireOption::none(),
         host: WireOption::none(),
         detail: WireOption::some(detail.into()),
@@ -364,6 +415,7 @@ fn unknown_auth(detail: &str) -> SourceControlProviderAuth {
 fn unauthenticated_auth() -> SourceControlProviderAuth {
     SourceControlProviderAuth {
         status: AuthStatus::Unauthenticated,
+        hosts: None,
         account: WireOption::none(),
         host: WireOption::none(),
         detail: WireOption::none(),
@@ -417,12 +469,19 @@ mod tests {
             ProviderKind::Github,
             Some(&output(
                 0,
-                r#"{"hosts":{"github.com":[{"state":"success","active":true,"host":"github.com","login":"octo"}]}}"#,
+                r#"{"hosts":{"github.com":[{"state":"success","active":true,"host":"github.com","login":"octo"},{"state":"success","active":false,"host":"github.com","login":"inactive"}],"company.test":[{"state":"error","active":false,"host":"company.test","login":"old"}]}}"#,
                 "",
             )),
         );
         assert_eq!(github.status, AuthStatus::Authenticated);
         assert_eq!(github.account.0.as_deref(), Some("octo"));
+        assert_eq!(
+            serde_json::to_value(&github).unwrap()["hosts"],
+            serde_json::json!([
+                { "host": "company.test", "account": "old", "authenticated": false },
+                { "host": "github.com", "account": "octo", "authenticated": true }
+            ])
+        );
         assert_eq!(
             parse_auth(
                 ProviderKind::Github,
@@ -440,12 +499,19 @@ mod tests {
             ProviderKind::Gitlab,
             Some(&output(
                 0,
-                "gitlab.example.test\n  Logged in to gitlab.example.test as user\n",
+                "gitlab.example.test\n  Logged in to gitlab.example.test as user\ncompany.test\n  not logged in\n",
                 "",
             )),
         );
         assert_eq!(gitlab.status, AuthStatus::Authenticated);
         assert_eq!(gitlab.account.0.as_deref(), Some("user"));
+        assert_eq!(
+            serde_json::to_value(&gitlab).unwrap()["hosts"],
+            serde_json::json!([
+                { "host": "gitlab.example.test", "account": "user", "authenticated": true },
+                { "host": "company.test", "account": null, "authenticated": false }
+            ])
+        );
         assert_eq!(
             parse_auth(
                 ProviderKind::Gitlab,

@@ -12,6 +12,7 @@ export interface EnvironmentQueryView<A, E = unknown> {
   /** The exact AsyncResult emission observed by this render. */
   readonly emission: AsyncResult.AsyncResult<A, E>;
   readonly error: string | null;
+  /** Stream queries keep waiting between emissions; initial loading also requires data === null. */
   readonly isPending: boolean;
   readonly refresh: () => void;
 }

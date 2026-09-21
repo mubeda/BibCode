@@ -34,6 +34,22 @@ const encodeProviderSessionDefaultsMap = Schema.encodeSync(ProviderSessionDefaul
 const decodeCodexSettings = Schema.decodeUnknownSync(CodexSettings);
 const decodeCursorSettings = Schema.decodeUnknownSync(CursorSettings);
 
+describe("ClientSettings Pull Requests", () => {
+  it("enables the module by default and preserves an explicit opt-out", () => {
+    expect(decodeClientSettings({}).pullRequestsEnabled).toBe(true);
+    expect(DEFAULT_CLIENT_SETTINGS.pullRequestsEnabled).toBe(true);
+    expect(decodeClientSettings({ pullRequestsEnabled: false }).pullRequestsEnabled).toBe(false);
+  });
+
+  it("patches the preference without resetting an omitted value", () => {
+    expect(decodeClientSettingsPatch({ pullRequestsEnabled: false })).toMatchObject({
+      pullRequestsEnabled: false,
+    });
+    expect(decodeClientSettingsPatch({})).not.toHaveProperty("pullRequestsEnabled");
+    expect(() => decodeClientSettingsPatch({ pullRequestsEnabled: "false" })).toThrow();
+  });
+});
+
 describe("ServerSettings Grok defaults", () => {
   it("defaults Grok to disabled for legacy and fresh settings", () => {
     expect(decodeServerSettings({}).providers.grok.enabled).toBe(false);

@@ -1,4 +1,4 @@
-use std::{ffi::OsString, path::PathBuf, time::Duration};
+use std::{ffi::OsString, future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
 
 use futures_util::StreamExt;
 use reqwest::{Client, RequestBuilder, Response};
@@ -17,7 +17,7 @@ const NO_OPEN_BITBUCKET_PULL_REQUEST: &str =
 
 #[derive(Clone, Debug)]
 pub(crate) struct ProviderCommandSpec {
-    executable: PathBuf,
+    pub(crate) executable: PathBuf,
     prefix_args: Vec<OsString>,
 }
 
@@ -49,7 +49,7 @@ impl ProviderCommandSpec {
         self.executable.to_str().unwrap_or("provider")
     }
 
-    fn args(&self, args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+    pub(crate) fn args(&self, args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
         self.prefix_args.iter().cloned().chain(args).collect()
     }
 }
@@ -109,6 +109,16 @@ pub struct SourceControlProviderError {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reference: Option<Box<str>>,
     pub detail: Box<str>,
+    /// Classified command failure supplied by a scoped creation transport.
+    /// Kept off the legacy source-control wire envelope.
+    #[serde(skip)]
+    pub(crate) command_failure: Option<Box<ProviderCommandFailure>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProviderCommandFailure {
+    pub code: &'static str,
+    pub host_detail: Option<String>,
 }
 
 impl std::fmt::Display for SourceControlProviderError {
@@ -123,6 +133,16 @@ impl std::fmt::Display for SourceControlProviderError {
 
 impl std::error::Error for SourceControlProviderError {}
 
+/// Allows hosted operations to retain their pinned host and private body transport
+/// while creation payloads and response normalization stay owned by this service.
+pub(crate) trait GitLabCreateTransport: Send + Sync + std::fmt::Debug {
+    fn create<'a>(
+        &'a self,
+        body: serde_json::Value,
+        cancellation: &'a CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<String, SourceControlProviderError>> + Send + 'a>>;
+}
+
 #[derive(Clone, Debug)]
 pub struct PullRequestService {
     runner: ProcessRunner,
@@ -133,6 +153,7 @@ pub struct PullRequestService {
     github_command: ProviderCommandSpec,
     gitlab_command: ProviderCommandSpec,
     azure_command: ProviderCommandSpec,
+    gitlab_create_transport: Option<Arc<dyn GitLabCreateTransport>>,
 }
 
 impl Default for PullRequestService {
@@ -146,11 +167,18 @@ impl Default for PullRequestService {
             github_command: ProviderCommandSpec::plain("gh"),
             gitlab_command: ProviderCommandSpec::plain("glab"),
             azure_command: ProviderCommandSpec::plain("az"),
+            gitlab_create_transport: None,
         }
     }
 }
 
 impl PullRequestService {
+    pub(crate) fn with_gitlab_create_transport(transport: Arc<dyn GitLabCreateTransport>) -> Self {
+        Self {
+            gitlab_create_transport: Some(transport),
+            ..Self::default()
+        }
+    }
     #[must_use]
     pub fn with_provider_commands(
         github_command: impl Into<String>,
@@ -350,6 +378,29 @@ impl PullRequestService {
         input: CreatePullRequestInput,
         cancellation: &CancellationToken,
     ) -> Result<ResolvedPullRequest, SourceControlProviderError> {
+        if input.provider == ProviderKind::Gitlab
+            && let Some(transport) = &self.gitlab_create_transport
+        {
+            let output = transport
+                .create(
+                    serde_json::json!({
+                        "source_branch":input.head_branch,"target_branch":input.base_branch,
+                        "title":input.title,"description":input.body,
+                    }),
+                    cancellation,
+                )
+                .await?;
+            return parse_gitlab_merge_request(&output).ok_or_else(|| {
+                operation_error(
+                    input.provider,
+                    &input.cwd,
+                    "createPullRequest",
+                    Some("glab"),
+                    Some(&input.head_branch),
+                    "Provider CLI returned an unrecognized pull-request payload.",
+                )
+            });
+        }
         if input.provider == ProviderKind::Bitbucket {
             return self.create_bitbucket(&input, cancellation).await;
         }
@@ -1262,19 +1313,24 @@ fn parse_github_create_output(
     text: &str,
     input: &CreatePullRequestInput,
 ) -> Option<ResolvedPullRequest> {
+    let (number, url) = parse_github_create_url(text)?;
+    Some(ResolvedPullRequest {
+        number,
+        title: input.title.clone(),
+        url,
+        base_branch: input.base_branch.clone(),
+        head_branch: input.head_branch.clone(),
+        state: ChangeRequestState::Open,
+    })
+}
+
+pub(crate) fn parse_github_create_url(text: &str) -> Option<(u64, String)> {
     let url = text
         .lines()
         .map(str::trim)
         .find(|line| line.starts_with("http://") || line.starts_with("https://"))?;
     let number = url.rsplit('/').next()?.parse().ok()?;
-    Some(ResolvedPullRequest {
-        number,
-        title: input.title.clone(),
-        url: url.to_owned(),
-        base_branch: input.base_branch.clone(),
-        head_branch: input.head_branch.clone(),
-        state: ChangeRequestState::Open,
-    })
+    Some((number, url.to_owned()))
 }
 
 fn normalize_bitbucket_pull_request(
@@ -1399,6 +1455,7 @@ fn provider_error(
         command: command.map(Into::into),
         reference: Some(reference.into()),
         detail: detail.into(),
+        command_failure: None,
     }
 }
 
@@ -1418,6 +1475,7 @@ fn operation_error(
         command: command.map(Into::into),
         reference: reference.map(Into::into),
         detail: detail.into(),
+        command_failure: None,
     }
 }
 

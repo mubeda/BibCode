@@ -3,6 +3,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   ChangeRequest,
+  SourceControlProviderAuth,
   SourceControlCloneRepositoryInput,
   SourceControlProviderError,
   SourceControlRepositoryError,
@@ -12,6 +13,9 @@ import {
   expectEncodeFailure,
   makeInvalidClassInstance,
 } from "./test/schemaAssertions.ts";
+
+const decodeAuth = Schema.decodeUnknownSync(Schema.toCodecJson(SourceControlProviderAuth));
+const encodeAuth = Schema.encodeSync(Schema.toCodecJson(SourceControlProviderAuth));
 
 const decodeCloneRepositoryInput = Schema.decodeUnknownSync(SourceControlCloneRepositoryInput);
 const encodeCloneRepositoryInput = Schema.encodeSync(SourceControlCloneRepositoryInput);
@@ -111,5 +115,22 @@ describe("source control errors", () => {
       makeInvalidClassInstance(SourceControlProviderError.prototype, invalid),
       encodeExpected,
     );
+  });
+});
+
+describe("source control auth hosts", () => {
+  it("preserves optional per-host authentication through the wire schema", () => {
+    const legacy = {
+      status: "authenticated",
+      account: { _tag: "None" },
+      host: { _tag: "None" },
+      detail: { _tag: "None" },
+    };
+    expect(decodeAuth(legacy)).not.toHaveProperty("hosts");
+    const hosts = [
+      { host: "github.com", account: "octo", authenticated: true },
+      { host: "company.test", account: null, authenticated: false },
+    ];
+    expect(encodeAuth(decodeAuth({ ...legacy, hosts }))).toMatchObject({ hosts });
   });
 });

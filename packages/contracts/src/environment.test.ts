@@ -60,6 +60,27 @@ const legacyClientDecoders = {
 const decodeTerminalCapabilities = Schema.decodeUnknownSync(ExecutionEnvironmentCapabilities);
 
 describe("execution environment contracts", () => {
+  it("defaults Pull Requests capabilities off for older servers and preserves advertised support", () => {
+    const legacy = decodeExecutionEnvironmentDescriptor({
+      environmentId: "env-1",
+      label: "Local",
+      platform: { os: "linux", arch: "x64" },
+      serverVersion: "1.0.0",
+      capabilities: {},
+    });
+    expect(legacy.capabilities).toMatchObject({
+      pullRequestsReads: false,
+      pullRequestsMutations: false,
+    });
+    const current = decodeExecutionEnvironmentDescriptor({
+      ...legacy,
+      capabilities: { pullRequestsReads: true, pullRequestsMutations: true },
+    });
+    expect(current.capabilities).toMatchObject({
+      pullRequestsReads: true,
+      pullRequestsMutations: true,
+    });
+  });
   it("defaults ordered terminal input support to false when omitted", () => {
     expect(decodeTerminalCapabilities({}).terminalOrderedInput).toBe(false);
   });

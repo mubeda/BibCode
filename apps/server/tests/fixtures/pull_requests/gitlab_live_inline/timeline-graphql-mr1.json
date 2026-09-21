@@ -1,0 +1,365 @@
+{
+  "data": {
+    "project": {
+      "mergeRequest": {
+        "userPermissions": {
+          "createNote": true
+        },
+        "discussions": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": "MTA"
+          },
+          "nodes": [
+            {
+              "id": "gid://gitlab/Discussion/b8cf359973f936a49b2af57ace0332a6f6f3a174",
+              "resolvable": false,
+              "resolved": false,
+              "notes": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "MQ"
+                },
+                "nodes": [
+                  {
+                    "id": "gid://gitlab/Note/4033",
+                    "body": "Acceptance note 1789994223000",
+                    "system": false,
+                    "resolvable": false,
+                    "resolved": false,
+                    "createdAt": "2026-09-21T12:37:15Z",
+                    "updatedAt": "2026-09-21T12:37:15Z",
+                    "author": {
+                      "username": "mubeda",
+                      "name": "Mauro Ubeda"
+                    },
+                    "position": null,
+                    "awardEmoji": {
+                      "pageInfo": {
+                        "hasNextPage": false,
+                        "endCursor": null
+                      },
+                      "nodes": []
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "id": "gid://gitlab/Discussion/e8e7d81ec468e456e187f7d70c4a955213089ea0",
+              "resolvable": false,
+              "resolved": false,
+              "notes": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "MQ"
+                },
+                "nodes": [
+                  {
+                    "id": "gid://gitlab/Note/4034",
+                    "body": "assigned to @mubeda",
+                    "system": true,
+                    "resolvable": false,
+                    "resolved": false,
+                    "createdAt": "2026-09-21T12:41:01Z",
+                    "updatedAt": "2026-09-21T12:41:01Z",
+                    "author": {
+                      "username": "mubeda",
+                      "name": "Mauro Ubeda"
+                    },
+                    "position": null,
+                    "awardEmoji": {
+                      "pageInfo": {
+                        "hasNextPage": false,
+                        "endCursor": null
+                      },
+                      "nodes": []
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "id": "gid://gitlab/Discussion/bc8848a63bbf247c617b1e1ee1b692b64a9898e6",
+              "resolvable": false,
+              "resolved": false,
+              "notes": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "MQ"
+                },
+                "nodes": [
+                  {
+                    "id": "gid://gitlab/Note/4035",
+                    "body": "locked the discussion in this merge request",
+                    "system": true,
+                    "resolvable": false,
+                    "resolved": false,
+                    "createdAt": "2026-09-21T12:41:53Z",
+                    "updatedAt": "2026-09-21T12:41:53Z",
+                    "author": {
+                      "username": "mubeda",
+                      "name": "Mauro Ubeda"
+                    },
+                    "position": null,
+                    "awardEmoji": {
+                      "pageInfo": {
+                        "hasNextPage": false,
+                        "endCursor": null
+                      },
+                      "nodes": []
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "id": "gid://gitlab/Discussion/3083cb004b19c6891f2609d750826afae128b2a0",
+              "resolvable": false,
+              "resolved": false,
+              "notes": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "MQ"
+                },
+                "nodes": [
+                  {
+                    "id": "gid://gitlab/Note/4036",
+                    "body": "unlocked the discussion in this merge request",
+                    "system": true,
+                    "resolvable": false,
+                    "resolved": false,
+                    "createdAt": "2026-09-21T12:42:19Z",
+                    "updatedAt": "2026-09-21T12:42:19Z",
+                    "author": {
+                      "username": "mubeda",
+                      "name": "Mauro Ubeda"
+                    },
+                    "position": null,
+                    "awardEmoji": {
+                      "pageInfo": {
+                        "hasNextPage": false,
+                        "endCursor": null
+                      },
+                      "nodes": []
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "id": "gid://gitlab/Discussion/4d4e38ee8b8decc4cc124aa28001ff05868d5a41",
+              "resolvable": false,
+              "resolved": false,
+              "notes": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "MQ"
+                },
+                "nodes": [
+                  {
+                    "id": "gid://gitlab/Note/4037",
+                    "body": "<p>changed title from <code class=\"idiff\">test(mr-e2e): fixture 1</code> to <code class=\"idiff\">test(mr-e2e): fixture 1<span class=\"idiff left right addition\"> (edited)</span></code></p>",
+                    "system": true,
+                    "resolvable": false,
+                    "resolved": false,
+                    "createdAt": "2026-09-21T12:42:40Z",
+                    "updatedAt": "2026-09-21T12:42:40Z",
+                    "author": {
+                      "username": "mubeda",
+                      "name": "Mauro Ubeda"
+                    },
+                    "position": null,
+                    "awardEmoji": {
+                      "pageInfo": {
+                        "hasNextPage": false,
+                        "endCursor": null
+                      },
+                      "nodes": []
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "id": "gid://gitlab/Discussion/1ad31916e2b845eee901fe65d9971d965e2c0f3d",
+              "resolvable": false,
+              "resolved": false,
+              "notes": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "MQ"
+                },
+                "nodes": [
+                  {
+                    "id": "gid://gitlab/Note/4038",
+                    "body": "marked this merge request as **draft**",
+                    "system": true,
+                    "resolvable": false,
+                    "resolved": false,
+                    "createdAt": "2026-09-21T12:43:00Z",
+                    "updatedAt": "2026-09-21T12:43:00Z",
+                    "author": {
+                      "username": "mubeda",
+                      "name": "Mauro Ubeda"
+                    },
+                    "position": null,
+                    "awardEmoji": {
+                      "pageInfo": {
+                        "hasNextPage": false,
+                        "endCursor": null
+                      },
+                      "nodes": []
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "id": "gid://gitlab/Discussion/5e83c8385e171e8c6c07185f6c0cc7201bb12c72",
+              "resolvable": false,
+              "resolved": false,
+              "notes": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "MQ"
+                },
+                "nodes": [
+                  {
+                    "id": "gid://gitlab/Note/4039",
+                    "body": "marked this merge request as **ready**",
+                    "system": true,
+                    "resolvable": false,
+                    "resolved": false,
+                    "createdAt": "2026-09-21T12:43:26Z",
+                    "updatedAt": "2026-09-21T12:43:26Z",
+                    "author": {
+                      "username": "mubeda",
+                      "name": "Mauro Ubeda"
+                    },
+                    "position": null,
+                    "awardEmoji": {
+                      "pageInfo": {
+                        "hasNextPage": false,
+                        "endCursor": null
+                      },
+                      "nodes": []
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "id": "gid://gitlab/Discussion/a377478eb02d841b259e7d6d729e0017eb45460e",
+              "resolvable": false,
+              "resolved": false,
+              "notes": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "MQ"
+                },
+                "nodes": [
+                  {
+                    "id": "gid://gitlab/Note/4040",
+                    "body": "approved this merge request",
+                    "system": true,
+                    "resolvable": false,
+                    "resolved": false,
+                    "createdAt": "2026-09-21T12:44:22Z",
+                    "updatedAt": "2026-09-21T12:44:22Z",
+                    "author": {
+                      "username": "mubeda",
+                      "name": "Mauro Ubeda"
+                    },
+                    "position": null,
+                    "awardEmoji": {
+                      "pageInfo": {
+                        "hasNextPage": false,
+                        "endCursor": null
+                      },
+                      "nodes": []
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "id": "gid://gitlab/Discussion/f036f7be3137f733ee9bbb2dc2a508a8c72c51c5",
+              "resolvable": false,
+              "resolved": false,
+              "notes": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "MQ"
+                },
+                "nodes": [
+                  {
+                    "id": "gid://gitlab/Note/4041",
+                    "body": "unapproved this merge request",
+                    "system": true,
+                    "resolvable": false,
+                    "resolved": false,
+                    "createdAt": "2026-09-21T12:46:26Z",
+                    "updatedAt": "2026-09-21T12:46:26Z",
+                    "author": {
+                      "username": "mubeda",
+                      "name": "Mauro Ubeda"
+                    },
+                    "position": null,
+                    "awardEmoji": {
+                      "pageInfo": {
+                        "hasNextPage": false,
+                        "endCursor": null
+                      },
+                      "nodes": []
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "id": "gid://gitlab/Discussion/0329eb8aad3f0d3a99329990d6ea36cdeb9ead67",
+              "resolvable": true,
+              "resolved": false,
+              "notes": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "MQ"
+                },
+                "nodes": [
+                  {
+                    "id": "gid://gitlab/DiffNote/4042",
+                    "body": "Suggestion from the acceptance run.\n\n```suggestion\nline two (suggested)\n```",
+                    "system": false,
+                    "resolvable": true,
+                    "resolved": false,
+                    "createdAt": "2026-09-21T12:47:08Z",
+                    "updatedAt": "2026-09-21T12:47:08Z",
+                    "author": {
+                      "username": "mubeda",
+                      "name": "Mauro Ubeda"
+                    },
+                    "position": {
+                      "filePath": "mr-e2e-1.txt",
+                      "newPath": "mr-e2e-1.txt",
+                      "oldPath": "mr-e2e-1.txt",
+                      "newLine": 2,
+                      "oldLine": null
+                    },
+                    "awardEmoji": {
+                      "pageInfo": {
+                        "hasNextPage": false,
+                        "endCursor": null
+                      },
+                      "nodes": []
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

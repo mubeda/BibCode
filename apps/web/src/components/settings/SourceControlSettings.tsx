@@ -48,7 +48,12 @@ import {
   type Icon,
 } from "../Icons";
 import { RedactedSensitiveText } from "./RedactedSensitiveText";
-import { SettingResetButton, SettingsPageContainer, SettingsSection } from "./settingsLayout";
+import {
+  SettingResetButton,
+  SettingsPageContainer,
+  SettingsRow,
+  SettingsSection,
+} from "./settingsLayout";
 
 const EMPTY_DISCOVERY_RESULT: SourceControlDiscoveryResult = {
   versionControlSystems: [],
@@ -194,8 +199,8 @@ function itemSummary({
       return (
         <span>
           {item.label} is not authenticated on this server. Sign in or configure credentials using
-          the <code className="rounded bg-muted px-1 py-px text-[11px]">{item.executable}</code>{" "}
-          tool on the server host to enable pull request features.
+          the <code className="rounded bg-muted px-1 py-px text-xs">{item.executable}</code> tool on
+          the server host to enable pull request features.
         </span>
       );
     }
@@ -253,9 +258,23 @@ function DiscoveryItemRow({
                 </Badge>
               ) : null}
             </div>
-            <p className="flex min-w-0 flex-wrap items-center gap-x-1 text-xs text-muted-foreground/80">
+            <p className="flex min-w-0 flex-wrap items-center gap-x-1 text-xs text-muted-foreground">
               {itemSummary({ item, auth, authAccount })}
             </p>
+            {isProviderDiscoveryItem(item) &&
+            (item.kind === "github" || item.kind === "gitlab") &&
+            item.auth.hosts ? (
+              <ul className="space-y-1 text-xs text-muted-foreground">
+                {item.auth.hosts.map((host) => (
+                  <li key={host.host} className="flex flex-wrap items-center gap-x-1">
+                    <span>
+                      {host.host} — {host.authenticated ? "Authenticated as" : "Not authenticated"}
+                    </span>
+                    {host.authenticated ? <RedactedAccount account={host.account} /> : null}
+                  </li>
+                ))}
+              </ul>
+            ) : null}
           </div>
           <div className="flex w-full shrink-0 items-center gap-2 sm:w-auto sm:justify-end">
             {hasDetails ? (
@@ -441,6 +460,8 @@ function EmptySourceControlDiscovery({
 }
 
 export function SourceControlSettingsPanel() {
+  const pullRequestsEnabled = usePrimarySettings((settings) => settings.pullRequestsEnabled);
+  const updateSettings = useUpdatePrimarySettings();
   const environmentId = usePrimaryEnvironment()?.environmentId ?? null;
   const discovery = useEnvironmentQuery(
     environmentId === null
@@ -479,6 +500,21 @@ export function SourceControlSettingsPanel() {
 
   return (
     <SettingsPageContainer>
+      <SettingsSection title="Pull Requests">
+        <SettingsRow
+          title="Pull requests"
+          description="Show the Pull Requests button on every project and enable the pull request views."
+          control={
+            <Switch
+              checked={pullRequestsEnabled}
+              onCheckedChange={(checked) =>
+                updateSettings({ pullRequestsEnabled: Boolean(checked) })
+              }
+              aria-label="Enable pull requests"
+            />
+          }
+        />
+      </SettingsSection>
       {isInitialScanPending ? (
         <>
           <SourceControlSectionSkeleton title="Version Control" headerAction={scanButton} />

@@ -1,5 +1,11 @@
 // @vitest-environment happy-dom
 
+import {
+  createMemoryHistory,
+  createRootRoute,
+  createRouter,
+  RouterProvider,
+} from "@tanstack/react-router";
 import type { GitManagerPullRequestsResult } from "@bibcode/contracts";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -39,6 +45,7 @@ vi.mock("./GitManagerCreatePullRequestDialog", () => ({
   },
 }));
 
+import { usePullRequestsStore } from "../../../pullRequestsStore";
 import { GitManagerPullRequestPanel } from "./GitManagerPullRequestPanel";
 
 let container: HTMLDivElement;
@@ -176,4 +183,53 @@ describe("GitManagerPullRequestPanel", () => {
     expect(container.querySelector('[data-testid="create-pr-dialog"]')).toBeNull();
     expect(h.createPr).not.toHaveBeenCalled();
   });
+});
+
+it("links each current-branch row to its project-scoped Pull Requests detail", async () => {
+  const projectRef = { environmentId: "env-a", projectId: "project-a" } as never;
+  usePullRequestsStore.getState().setCheckoutCwd(projectRef, "/wrong-checkout");
+  h.result = {
+    status: "available",
+    pullRequests: [
+      {
+        number: 14,
+        title: "Review me",
+        url: "https://github.test/14",
+        baseBranch: "main",
+        headBranch: "feature",
+        state: "open",
+      },
+    ],
+    checks: [],
+  };
+  const route = createRootRoute({
+    component: () => (
+      <GitManagerPullRequestPanel
+        scope={{ environmentId: "env-a" as never, cwd: "/repo" }}
+        projectRef={{ environmentId: "env-a", projectId: "project-a" } as never}
+        onRefresh={() => undefined}
+      />
+    ),
+  });
+  const router = createRouter({
+    routeTree: route,
+    history: createMemoryHistory({ initialEntries: ["/"] }),
+  });
+  await act(async () => {
+    await router.load();
+    root.render(<RouterProvider router={router} />);
+  });
+  await act(async () => button("Refresh").click());
+  const link = [...container.querySelectorAll("a")].find(
+    (a) => a.textContent === "Open in Pull Requests",
+  );
+  expect(link?.getAttribute("href")).toBe(
+    "/project/env-a/project-a/pull-requests/14?tab=conversation",
+  );
+  await act(async () =>
+    link!.dispatchEvent(
+      new MouseEvent("click", { bubbles: true, cancelable: true, ctrlKey: true }),
+    ),
+  );
+  expect(usePullRequestsStore.getState().selectViewState(projectRef).checkoutCwd).toBe("/repo");
 });

@@ -1,0 +1,64 @@
+[
+  {
+    "id": "discussion-1",
+    "individual_note": false,
+    "notes": [
+      {
+        "id": 10,
+        "system": false,
+        "author": {
+          "id": 8,
+          "username": "viewer",
+          "name": null
+        },
+        "body": "```suggestion\nnew\n```",
+        "created_at": "2026-09-20T01:00:00Z",
+        "updated_at": "2026-09-20T02:00:00Z",
+        "resolvable": true,
+        "resolved": false,
+        "position": {
+          "new_path": "src/main.rs",
+          "old_path": "src/main.rs",
+          "new_line": 2,
+          "old_line": null,
+          "head_sha": "head-sha"
+        }
+      }
+    ]
+  },
+  {
+    "id": "discussion-2",
+    "individual_note": true,
+    "notes": [
+      {
+        "id": 11,
+        "system": false,
+        "author": {
+          "id": 8,
+          "username": "viewer",
+          "name": null
+        },
+        "body": "Hello",
+        "created_at": "2026-09-19T01:00:00Z",
+        "updated_at": "2026-09-19T01:00:00Z"
+      }
+    ]
+  },
+  {
+    "id": "discussion-3",
+    "individual_note": true,
+    "notes": [
+      {
+        "id": 12,
+        "system": true,
+        "author": {
+          "id": 8,
+          "username": "viewer",
+          "name": null
+        },
+        "body": "added 2 commits\nextra detail",
+        "created_at": "2026-09-20T03:00:00Z"
+      }
+    ]
+  }
+]

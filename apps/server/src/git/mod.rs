@@ -33,6 +33,7 @@ pub use process::{OutputPolicy, ProcessError, ProcessOutput, ProcessRequest, Pro
 #[cfg(test)]
 pub(crate) use repository::BoxGitProcessFuture;
 pub(crate) use repository::GitProcessRunner;
+pub(crate) use repository::git_environment;
 pub use repository::{
     BoxWorktreeBaseDirectoryFuture, GitManagerCommitOutcome, GitManagerHeadCommit, GitRepository,
     WorktreeBaseDirectoryProvider,
@@ -56,3 +57,8 @@ pub use worktree::{
     host_path_platform, normalize_worktree_path_key, parse_worktree_porcelain,
     resolved_worktree_keys, worktree_key, worktree_repository_key,
 };
+
+/// Safety bound for server-owned checkout writes, independent of RPC/read deadlines.
+/// A started write must retain its lock and owner throughout this window.
+pub(crate) const CHECKOUT_WRITE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);

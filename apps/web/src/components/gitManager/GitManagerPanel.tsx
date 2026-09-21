@@ -932,6 +932,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
       {providerPaneOpen ? (
         <div className="h-80 min-h-0 overflow-auto border-b border-panel-separator">
           <GitManagerPullRequestPanel
+            projectRef={projectRef}
             disabledReason={pullRequestsDisabledReason}
             scope={scope}
             onRefresh={refreshRefs}
@@ -1185,7 +1186,7 @@ export const GitManagerPanel = memo(function GitManagerPanel({ projectRef }: Git
           mainCheckoutCwd={mainCheckoutCwd}
           selectedWorktreeCwd={activeCwd}
           worktrees={worktrees}
-          catalogPending={catalog.isPending}
+          catalogPending={catalog.isPending && catalog.data === null}
           catalogError={catalog.error}
           liveSignalAvailable={capabilityDisabledReasons.liveSignal === null}
           stashMergeDisabledReason={capabilityDisabledReasons.stashMerge}

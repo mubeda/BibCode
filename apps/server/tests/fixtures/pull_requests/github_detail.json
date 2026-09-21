@@ -1,0 +1,121 @@
+{
+  "number": 35882,
+  "title": "Toolchain update",
+  "body": "Description",
+  "state": "OPEN",
+  "isDraft": false,
+  "createdAt": "2026-09-19T00:00:00Z",
+  "updatedAt": "2026-09-20T00:00:00Z",
+  "mergedAt": null,
+  "closedAt": null,
+  "mergedBy": null,
+  "author": {
+    "login": "contributor",
+    "name": null,
+    "is_bot": false
+  },
+  "headRefName": "update-toolchain",
+  "baseRefName": "main",
+  "headRefOid": "head-sha",
+  "baseRefOid": "base-sha",
+  "isCrossRepository": true,
+  "headRepository": {
+    "name": "codex"
+  },
+  "headRepositoryOwner": {
+    "login": "contributor"
+  },
+  "maintainerCanModify": true,
+  "additions": 2,
+  "deletions": 1,
+  "changedFiles": 2,
+  "labels": [
+    {
+      "name": "rust",
+      "color": "123456",
+      "description": null
+    }
+  ],
+  "milestone": {
+    "number": 1,
+    "title": "Next",
+    "dueOn": null
+  },
+  "assignees": [],
+  "reviewRequests": [
+    {
+      "login": "reviewer"
+    }
+  ],
+  "latestReviews": [
+    {
+      "author": {
+        "login": "prior-reviewer"
+      },
+      "state": "COMMENTED"
+    }
+  ],
+  "closingIssuesReferences": [
+    {
+      "number": 99,
+      "title": "Toolchain issue",
+      "url": "https://github.com/openai/codex/issues/99"
+    }
+  ],
+  "reactionGroups": [
+    {
+      "content": "THUMBS_UP",
+      "users": {
+        "totalCount": 2
+      }
+    }
+  ],
+  "autoMergeRequest": null,
+  "mergeStateStatus": "BLOCKED",
+  "mergeable": "MERGEABLE",
+  "reviewDecision": "REVIEW_REQUIRED",
+  "statusCheckRollup": [
+    {
+      "__typename": "CheckRun",
+      "name": "build",
+      "workflowName": "CI",
+      "status": "COMPLETED",
+      "conclusion": "FAILURE",
+      "startedAt": "2026-09-19T10:00:00Z"
+    },
+    {
+      "__typename": "CheckRun",
+      "name": "build",
+      "workflowName": "CI",
+      "status": "COMPLETED",
+      "conclusion": "SUCCESS",
+      "startedAt": "2026-09-20T10:00:00Z"
+    },
+    {
+      "__typename": "CheckRun",
+      "name": "build",
+      "workflowName": "Release",
+      "status": "COMPLETED",
+      "conclusion": "SUCCESS",
+      "startedAt": "2026-09-20T09:00:00Z"
+    },
+    {
+      "__typename": "StatusContext",
+      "context": "ci/preview",
+      "state": "FAILURE",
+      "startedAt": "2026-09-19T09:00:00Z"
+    },
+    {
+      "__typename": "StatusContext",
+      "context": "ci/preview",
+      "state": "SUCCESS",
+      "startedAt": "2026-09-20T09:00:00Z"
+    }
+  ],
+  "url": "https://github.com/openai/codex/pull/35882",
+  "commits": [
+    {
+      "oid": "head-sha"
+    }
+  ]
+}

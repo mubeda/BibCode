@@ -222,6 +222,13 @@ report the residual instead of attempting a destructive repair.
 
 ## Packaged UI scenarios
 
+Include the shared [Pull Requests smoke](./cross-platform-validation.md#pull-requests-web-shell-validation):
+open the project-header sidebar button, inspect the repository list, open a
+request, and render a real text patch on Files changed/Changes with `tab=files`
+retained after reload. Record unavailable fixture/host states separately from
+that pass. The packaged Pierre spec's sibling checks route entry only; the
+shared procedure owns authenticated list/detail/files evidence.
+
 Use Codex Computer Use to operate the packaged executable. Confirm the
 executable path and PID before using any frame as evidence. At normal and
 minimum sizes verify:
