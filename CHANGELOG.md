@@ -1,5 +1,83 @@
 # Changelog
 
+## [v0.6.0] - 2026-09-21
+
+BiBCode v0.6.0 adds a Pull Requests module: a project-scoped view, next to
+the Git Manager, that lists pull requests and merge requests, opens them,
+reviews, edits, merges and checks them out locally, on GitHub and on
+self-hosted GitLab.
+
+### Pull Requests
+
+- A **Pull Requests** button on each project header (after Git Manager) opens
+  the hosted repository for the selected checkout. The view detects whether it
+  can be used and explains what is missing: no `origin`, an unsupported
+  provider (Azure DevOps, Bitbucket), a host that the `gh`/`glab` CLI does not
+  know (with the exact `auth login --hostname` command), a missing CLI, or a
+  host that is not authenticated. **Settings → Source Control → Pull
+  requests** turns the module off and lists every configured GitHub and
+  GitLab host with its authentication state.
+- List with Open/Closed tabs (GitLab: Open, Merged, Closed, All), search,
+  author, assignee, reviewer, review-status, draft, label, milestone and
+  target-branch filters, sort, and explicit **Load more**.
+- Detail page in the shape of the GitHub pull request page: header with
+  state, branches and server-computed merge readiness; Conversation with
+  comments, reviews, threads, suggestions, reactions and system events;
+  Commits; Checks (GitLab: Pipelines); Files changed with lazy diffs,
+  **Viewed** state and an ignore-whitespace toggle. The selected tab lives in
+  the URL.
+- Reviewing: post, edit and delete comments; reactions; reply, resolve and
+  unresolve threads; inline comments from a diff line with **Insert
+  suggestion**; a pending review submitted as Comment, Approve or Request
+  changes against the head you reviewed; dismiss and re-request reviews;
+  GitLab approve, revoke, remove your change request and apply suggestions
+  with an optional commit message.
+- Editing: title, description and base branch; reviewers, assignees, labels
+  and milestone through searchable pickers with a five-second **Undo**;
+  lock (GitHub reasons) and unlock; convert to draft and mark ready; close
+  and reopen.
+- Merge box with the methods the repository allows, subject and body,
+  delete-branch and auto-merge options, and a confirmation that names the
+  method, target and options; bypass of branch requirements with its own
+  warning; update branch or rebase when behind; revert a merged request into
+  a new one; delete a merge request (GitLab).
+- **Checkout** for local verification into the current checkout, another
+  worktree or a **New worktree…**; blocked checkouts show the Git Manager's
+  reason; a started checkout always completes even if the window closes.
+- Every control that the host does not allow stays visible, disabled, with
+  the host's reason. Drafts (comments, replies, pending review, title,
+  description, merge message) survive navigation and reload. Actions on the
+  same request are serialized on the server; permissions are re-read before
+  each write; a changed head is reported instead of merged.
+- Verified end to end on GitHub and on a self-hosted GitLab 19.3 instance.
+  Along the way: `glab` JSON bodies now send an explicit content type, GitLab
+  inline notes with subclass ids parse, and repeated CLI probes are memoized
+  for thirty seconds so GitLab actions take about half the time.
+
+### Git Manager and Source Control
+
+- Worktree toolbars no longer show **Loading worktrees…** after the list has
+  loaded.
+- Worktrees created from a pull request use the head branch name, or
+  `<head>-pr-<n>` when that branch is already checked out elsewhere.
+
+### Server
+
+- A supervised process spawn retries briefly while the executable is still
+  busy being written, and fixture capture reads wait for content (test-only
+  robustness on hosted runners).
+
+### Downloads
+
+On macOS, copy BiBCode.app from the DMG to Applications before launching it.
+
+Desktop installers and standalone server distributions are provided for macOS,
+Linux, and Windows on ARM64 and x64. Linux server `.deb` and `.rpm` packages are
+included for both architectures. Stable desktop updater payloads and signatures
+remain available through `latest.json`.
+
+**Full Changelog**: https://github.com/mubeda/BibCode/compare/v0.5.13...v0.6.0
+
 ## [v0.5.13] - 2026-09-18
 
 BiBCode v0.5.13 shows where pending changes live in the Source Control panel,
