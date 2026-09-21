@@ -16,6 +16,7 @@ pub mod orchestration_rpc;
 mod provider_inventory;
 mod provider_maintenance;
 pub mod provider_runtime;
+pub mod pull_requests_rpc;
 pub mod relay;
 pub mod remote_update_rpc;
 pub mod runtime;

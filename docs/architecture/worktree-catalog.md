@@ -37,6 +37,36 @@ commands, a Git Manager operation has no orchestration receipt, but its lock,
 workspace-admission lease, cancellation token, supervised Git process, and VCS
 mutation fence remain owned together until that request settles.
 
+Pull Requests checkout shares these locks and invalidation rules. It validates
+both source and target physical repository identities against the catalog pin,
+including when an externally registered worktree is not yet adopted. A new
+worktree's fetched branch is passed to the same managed creation transaction used
+by `worktree.createManaged`, while retaining the repository lock. Pull Requests
+planning reuses a matching branch only if it is unoccupied; divergent or occupied
+names use `<head>-pr-<number>`, then `-2`, `-3`, and so on. Occupancy includes the
+current checkout and registered worktrees whose directories are missing. The transaction
+inherits the project's default workspace settings and creates the durable owner
+that appears in the sidebar. Checkout uses the same bounded operation runtime.
+Guards, host reads, branch planning and `ls-remote` remain cancellable. Immediately
+before the first write, checkout hands off to an independent cancellation token:
+a started provider checkout, branch fetch and managed creation run to completion
+despite client disconnect, request cancellation, the 60-second read deadline or
+availability loss. The server-owned task retains the project/repository lock and
+availability admission until Git and durable owner settlement finish. Cancellation
+ends only the caller's wait; normal refresh observes the resulting branch/workspace.
+Its fetch status fence settles before managed creation's existing completion
+notifications; these paths never acquire the same VCS mutation fence recursively.
+
+Each checkout write command has a 24-hour safety ceiling, including the scoped
+GitRepository clone used for managed creation and rollback; ordinary Git operations
+retain their existing deadlines. Graceful server shutdown closes worktree operation
+admission and drains these owners without a shorter abort timer before catalog and
+orchestration teardown. The desktop's existing five-second in-process backend stop
+wait can report a timeout but does not abort the owned server task. Forced host/OS
+termination and the safety ceiling remain outside graceful completion. If Git
+itself fails, inspect `git status` in the reported checkout path before retrying;
+checkout does not reset the tree or remove lock files automatically.
+
 ## Identity and trust
 
 Clients address candidates by project ID, opaque worktree key, and catalog
@@ -225,8 +255,9 @@ The same authority boundary covers every worktree-bearing owner mutation:
   owner-creation RPC; the legacy PR preparation RPC is local-checkout-only. If
   remote-ref selection becomes stale because the corresponding local branch
   appears before Git creation starts, the operation reuses that now-existing
-  unoccupied local branch. A branch already occupied by another worktree keeps
-  the existing safe suffixed-branch policy.
+  unoccupied local branch. Ordinary managed creation from an occupied branch keeps
+  its existing safe numeric-suffix policy; Pull Requests checkout first applies the
+  PR-specific naming policy described above.
 - `worktree.createPanel` accepts a host thread and derives project, kind,
   branch, and path from that persisted host.
 - `worktree.retarget` accepts an opaque worktree key and expected generation;

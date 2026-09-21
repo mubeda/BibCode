@@ -83,7 +83,7 @@ does not scan for nested repositories.
 
 Clicking a project header selects it and toggles its thread list; the header
 stays highlighted as the selected node until you open a thread, and it is also
-highlighted while that project's Git Manager is open.
+highlighted while that project's Git Manager or Pull Requests route is open.
 
 Workspace row context menus include update/open/copy/pin/unread actions, plus
 delete worktree for worktree rows and remove project for primary rows. On the
@@ -368,6 +368,177 @@ so the right-panel Source Control surface and Git Manager do not diverge. The
 selected worktree is intentionally session-only and resets to the main checkout
 after a reload. Evicted or hidden projects retain no mounted panel or live Git
 Manager subscription.
+
+## Pull Requests
+
+Hover a project header and choose **Pull Requests**, immediately after Git
+Manager, to browse the hosted repository for one checkout. Grouped projects
+use the same environment/member picker as other project actions. The project
+header stays highlighted on the list and detail routes, including after reload.
+
+### Availability and setup
+
+**Settings → Source Control → Pull requests** controls the button and views
+for every environment. Turning it off hides the button; an existing route
+explains the setting and links back to Source Control. GitHub and GitLab
+provider rows list configured hosts, with account names redacted until revealed.
+
+The repository header shows the provider, account, and custom host. Choose a
+worktree to change the checkout scope, **Refresh** to reload the first list
+page, or **Rescan** to recheck repository context. A disconnected environment
+stays disconnected. Missing remotes, tools, authentication, and repository
+access show server advice, install hints, and a copyable login command when
+available. The checkout selector remains available for recovery when a saved
+checkout cannot resolve context. Availability identifies `no_remote` (add an
+`origin`), `unsupported_provider` (Azure DevOps or Bitbucket), `unknown_host`
+(configure that host with `gh auth login --hostname <host>` or
+`glab auth login --hostname <host>`), `cli_missing` (install the named CLI on
+the server), and `not_authenticated` (log in to the selected host). A missing
+checkout path says to select another checkout or restore the directory, then
+Rescan. An older server without read support explains that the environment does
+not support Pull Requests; without mutation support the view stays read-only.
+
+### List and detail views
+
+GitHub has Open and Closed tabs (Closed includes merged); GitLab has Open,
+Merged, Closed, and All. Search applies after 300 ms or immediately on Enter.
+Author, assignee, reviewer, review status, draft, labels, milestone, target
+branch, and sort controls filter the list. Picker vocabulary loads on first
+open. **Load more** appears only when the host supplies a next page; provider
+errors remain visible with **Retry** and filtered errors offer **Clear filters**.
+GitHub search currently has no further page or total count and does not display
+its unknown comment counts as zero badges. GitLab review-status filters
+currently return advice to clear that filter because list data lacks approvals.
+
+List rows open a detail view with the title, branches, state, and
+server-reported merge readiness. Conversation, Commits, Checks/Pipelines, and
+Files changed/Changes show counts and keep the selected tab in the `tab` search
+parameter (`conversation`, `commits`, `checks`, or `files`). Only
+the active tab loads its data; Files also loads review threads. Detail
+**Refresh** reloads the header and active tab, including those threads in Files.
+Reviewers, assignees, labels, milestone, linked issues, and GitLab approval rules appear alongside the review, or above the merge box on narrow screens.
+Comments, reviews, threads, suggestions, and system events retain host order;
+actors use local initials and names/logins, and remote markdown images become
+labelled browser links without loading avatars or image URLs. File diffs load
+near the viewport,
+with **Viewed** saved per request, a local **Ignore whitespace** toggle, and
+host links for unavailable or oversized content and a Binary file fallback.
+
+### Checkout for local verification
+
+**Checkout** checks out the request in the selected checkout. Its arrow menu
+lists **Current checkout**, other project worktrees and **New worktree…**, which
+creates a managed workspace from the request head. Dirty targets and unfinished Git operations
+show the server's reason. If another worktree holds the branch, **Switch to that
+worktree** retries there. A success toast names the branch and path and offers
+**Open Git Manager there**; opening it selects that worktree. Existing work and
+conflicting local branches are preserved. A matching branch is reused when it is
+free. If its name is already checked out anywhere or points to another commit,
+the new worktree uses `<head>-pr-<number>`, then `<head>-pr-<number>-2` and so on
+if needed. Other unavailable actions show the host's permission reason.
+
+Once checkout starts writing, closing the view/browser or losing the connection
+ends only your wait; the checkout continues on the server. Reconnect, reopen Pull
+Requests and use **Refresh** to see the result, or check the project's worktree list.
+A cancelled wait clears the busy button and shows a neutral background message;
+cancellation before writing says that no Git changes were made. Checkout is never
+retried automatically. If Git itself reports a failure, run `git status` in the
+checkout path shown by the action and inspect its state before retrying.
+
+### Comments and pending reviews
+
+Post comments with Write/Preview and Ctrl/Cmd+Enter. The comment menu offers
+own-comment editing and confirmed deletion, host-supported minimize/unminimize,
+Copy link, and Open on host. Reactions toggle from the count or eight-emoji
+picker. Threads keep reply drafts and offer Resolve/Unresolve with the host's
+permission reason when unavailable.
+
+Click or drag a diff line to compose an inline comment. **Insert suggestion**
+prefills the selected new source lines. **Add review comment** saves an amber
+pending card; **Add single comment** posts it immediately. The sticky Review
+bar in Conversation and Files opens a popover with a summary and Comment,
+Approve, and Request changes, plus separate Revoke approval and Remove my change request controls. A review
+uses the loaded head commit. On a changed head, Refresh and inspect the new
+commits before submitting again; pending comments remain. Partial results keep
+failed comments by file, line, and body and list host messages. An already-posted
+summary is cleared and retries default to Comment so they do not repeat the
+summary or approval. Saved comments for files no longer in the diff remain
+available to edit or remove.
+
+GitLab suggestions offer Apply with an optional commit message; selecting
+several enables **Apply N selected** in Files. Unsupported Apply keeps its
+reason visible and offers Copy. Dismiss review requires a message and
+confirmation; eligible reviewers offer Re-request. Unsupported host controls
+stay visible with their reasons. Successful writes refresh affected views.
+Comment text, edits, replies, inline drafts, pending comments, and review
+summaries survive navigation and reload; failures preserve them.
+
+### Editing and Undo
+
+Use the title pencil or description **Edit** to change the request in place.
+Descriptions offer Write/Preview; Save publishes the edit, while Cancel or Escape
+keeps its draft. Reviewers, assignees, labels and milestones have searchable
+pickers. Changes apply immediately and offer **Undo** for five seconds; expiry
+does nothing. Milestone **Clear** removes the milestone. Changing the base branch
+asks before clearing pending review comments and keeps them if the change fails.
+The base confirmation says “Changing the base clears N pending review comments.”
+(with singular wording for one). Title, description, and base saves do not offer
+Undo; the five-second Undo applies to reviewer, assignee, label, milestone, lock
+and draft-state changes. Clicking it reverses the exact edit once and may wait
+for a running action; closing the toast or letting it expire sends no write.
+Picker choices stay disabled with “Refreshing request details…” until the
+refreshed selection arrives after a write or Undo.
+Linked issues come from the description.
+
+### Merge and other host actions
+
+The merge box shows allowed methods and the repository's defaults. GitLab shows
+its project method as text. Edit the merge subject/body, choose branch deletion
+and optional auto-merge, then inspect the confirmation's method and target before
+merging. A read-only viewer sees the server reason without a method picker.
+**Auto-merge enabled** means merging has been scheduled, not completed; use
+**Disable auto-merge** to cancel it. GitHub disables bypass while auto-merge is
+selected, and the server rejects the auto-merge/bypass combination on GitHub.
+For a target named `main`, the confirmation says “Merge now into main.” or
+“Merge automatically when requirements pass into main.” and lists Method,
+Delete branch, and Auto-merge.
+Bypass additionally says “Branch requirements will be bypassed.” on GitHub or
+“Requested changes will be overridden.” on GitLab. Behind branches offer
+**Update branch** or **Rebase**,
+with **Skip CI** on GitLab. A changed head asks you to refresh and try again;
+merge drafts remain. Partial-progress messages state what completed and never
+trigger an automatic retry.
+
+**More actions** offers Mark ready/Convert to draft, Lock/Unlock, Close/Reopen,
+Copy URL and Open in browser. GitHub Lock lists the host's reasons. Merged requests
+offer **Revert**, whose confirmation explains that it creates a new request;
+success opens that request. GitLab **Delete** names the request and host, for
+example “Delete !14. This cannot be undone on gitlab.company.example.”, then
+returns to the list after success. Revert says “This creates a new pull request
+that reverts #14.” (or “merge request” and `!14` on GitLab). Dismiss review names
+the reviewer and host, for example “This dismisses alice’s review on github.com.
+Include a message explaining why.”, and requires that message. These actions require explicit confirmation; Close/Reopen do not.
+Title, description and merge-message drafts survive navigation and reload.
+
+### Navigation, refresh, and saved work
+
+**New pull request**
+(or the host's equivalent wording) reuses the Git Manager creation dialog:
+opening it creates nothing, and only its explicit primary action publishes.
+Git Manager's current-branch pane also links each row to **Open in Pull Requests**,
+selecting that pane's checkout before navigation.
+The local `bibcode:pull-requests-state:v1` cache retains the two most recently
+used physical projects (LRU), including checkout, filters, tab, sort, scroll
+position, viewed files, and unsent per-review drafts. This module does not fetch avatar images or refresh on a timer or
+window focus.
+
+The server serializes actions for the same provider, host, repository and
+request number, including actions from different checkouts or clients. An
+action rereads current permissions before writing; the host can still refuse
+it. Approval and merge carry the head you reviewed. A stale-head error says
+“This pull request changed; reload and try again” and offers Refresh while
+preserving drafts. Errors include server recovery advice; partial writes report
+what landed and are never retried automatically.
 
 ## Right Panel
 

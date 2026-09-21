@@ -1222,7 +1222,7 @@ fn validate_commit_input(input: &GitManagerCommitInput) -> Result<(), Value> {
     Ok(())
 }
 
-async fn resolve_project_id(
+pub(crate) async fn resolve_project_id(
     repositories: &Repositories,
     cwd: &std::path::Path,
 ) -> Result<String, &'static str> {

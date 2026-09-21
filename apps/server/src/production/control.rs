@@ -2163,6 +2163,8 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
             "gitManagerTagOperations": true,
             "gitManagerLiveSignal": true,
             "gitManagerPullRequests": true,
+            "pullRequestsReads": true,
+            "pullRequestsMutations": true,
             "activityProtocolVersion": activity_protocol_registered.then_some(2),
             "remoteUpdateControl": true,
             "terminalOrderedInput": true,
@@ -5052,6 +5054,8 @@ mod tests {
             "gitManagerTagOperations",
             "gitManagerLiveSignal",
             "gitManagerPullRequests",
+            "pullRequestsReads",
+            "pullRequestsMutations",
         ] {
             assert_eq!(
                 descriptor["capabilities"][capability], true,

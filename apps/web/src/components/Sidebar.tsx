@@ -7,6 +7,7 @@ import {
   FolderGit2Icon,
   FolderPlusIcon,
   GitBranchIcon,
+  GitPullRequestIcon,
   Globe2Icon,
   LoaderIcon,
   MessageSquarePlusIcon,
@@ -24,6 +25,7 @@ import {
   ThreadStatusLabel,
   ThreadWorktreeIndicator,
 } from "./ThreadStatusIndicators";
+import { projectModuleRouteProjectKey } from "./pullRequests/shared/projectModuleRoute.logic";
 import { ProjectFavicon } from "./ProjectFavicon";
 import { CreateWorktreeDialog } from "./CreateWorktreeDialog";
 import { useAtomValue } from "@effect/atom-react";
@@ -254,7 +256,11 @@ import { SidebarUpdatePill } from "./sidebar/SidebarUpdatePill";
 import { useCopyToClipboard } from "~/hooks/useCopyToClipboard";
 import { useIsMobile } from "~/hooks/useMediaQuery";
 import { CommandDialogTrigger } from "./ui/command";
-import { useClientSettings, useUpdateClientSettings } from "~/hooks/useSettings";
+import {
+  useClientSettings,
+  usePrimarySettings,
+  useUpdateClientSettings,
+} from "~/hooks/useSettings";
 import { primaryServerConfigAtom, primaryServerKeybindingsAtom } from "../state/server";
 import {
   derivePhysicalProjectKey,
@@ -1506,7 +1512,7 @@ interface SidebarProjectItemProps {
   project: SidebarProjectSnapshot;
   isThreadListExpanded: boolean;
   activeRouteThreadKey: string | null;
-  gitManagerActive: boolean;
+  moduleRouteActive: boolean;
   selectedProjectKey: string | null;
   selectProject: (projectKey: string) => void;
   handleNewThread: ReturnType<typeof useNewThreadHandler>;
@@ -1529,7 +1535,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     project,
     isThreadListExpanded,
     activeRouteThreadKey,
-    gitManagerActive,
+    moduleRouteActive,
     selectedProjectKey,
     selectProject,
     handleNewThread,
@@ -1546,6 +1552,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     isManualProjectSorting,
     dragHandleProps,
   } = props;
+  const pullRequestsEnabled = usePrimarySettings((settings) => settings.pullRequestsEnabled);
   const requestWorktreeRemoval = useContext(WorktreeRemovalRequestContext);
   const threadSortOrder = useClientSettings<SidebarThreadSortOrder>(
     (settings) => settings.sidebarThreadSortOrder,
@@ -2563,6 +2570,24 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     [openGitManagerForProjectMember, runProjectMemberAction],
   );
 
+  const openPullRequestsForProjectMember = useCallback(
+    (member: SidebarProjectGroupMember) => {
+      if (isMobile) setOpenMobile(false);
+      void navigate({
+        to: "/project/$environmentId/$projectId/pull-requests",
+        params: { environmentId: member.environmentId, projectId: member.id },
+      });
+    },
+    [isMobile, navigate, setOpenMobile],
+  );
+
+  const handleOpenPullRequestsClick = useCallback(
+    (event: React.MouseEvent<HTMLButtonElement>) => {
+      runProjectMemberAction(event, openPullRequestsForProjectMember);
+    },
+    [openPullRequestsForProjectMember, runProjectMemberAction],
+  );
+
   const attemptArchiveThread = useCallback(
     async (threadRef: ScopedThreadRef) => {
       const result = await archiveThread(threadRef);
@@ -3102,9 +3127,9 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         <SidebarMenuButton
           ref={isManualProjectSorting ? dragHandleProps?.setActivatorNodeRef : undefined}
           aria-expanded={projectExpanded}
-          aria-current={gitManagerActive ? "page" : undefined}
+          aria-current={moduleRouteActive ? "page" : undefined}
           data-selected={projectSelected}
-          isActive={gitManagerActive || projectSelected}
+          isActive={moduleRouteActive || projectSelected}
           size="sm"
           className={`gap-2 px-2 py-1.5 text-left hover:bg-accent group-hover/project-header:bg-accent group-hover/project-header:text-sidebar-accent-foreground ${
             project.environmentPresence === "remote-only" ? "pr-20" : "pr-14"
@@ -3235,6 +3260,24 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
             </TooltipTrigger>
             <TooltipPopup side="top">Git Manager</TooltipPopup>
           </Tooltip>
+          {pullRequestsEnabled ? (
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <button
+                    type="button"
+                    aria-label={`Pull Requests for ${project.displayName}`}
+                    data-testid="pull-requests-button"
+                    className={SIDEBAR_ICON_ACTION_BUTTON_CLASS}
+                    onClick={handleOpenPullRequestsClick}
+                  />
+                }
+              >
+                <GitPullRequestIcon aria-hidden="true" className="size-3.5" />
+              </TooltipTrigger>
+              <TooltipPopup side="top">Pull Requests</TooltipPopup>
+            </Tooltip>
+          ) : null}
         </div>
       </div>
 
@@ -3744,7 +3787,7 @@ export function SidebarBrandContent({
         {appBaseName}
       </span>
       {stageLabel ? (
-        <span className="sidebar-brand-stage shrink-0 items-center whitespace-nowrap rounded-full bg-muted/50 px-1.5 py-0.5 text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground/60">
+        <span className="sidebar-brand-stage shrink-0 items-center whitespace-nowrap rounded-full bg-muted/50 px-1.5 py-0.5 text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">
           {stageLabel}
         </span>
       ) : null}
@@ -3770,7 +3813,7 @@ const SidebarChromeFooter = memo(function SidebarChromeFooter() {
         <SidebarMenuItem>
           <SidebarMenuButton
             size="sm"
-            className="gap-2 px-2 py-1.5 text-muted-foreground/70 hover:bg-accent hover:text-foreground"
+            className="gap-2 px-2 py-1.5 text-muted-foreground hover:bg-accent hover:text-foreground"
             onClick={handleSettingsClick}
           >
             <SettingsIcon className="size-3.5" />
@@ -3809,7 +3852,7 @@ interface SidebarProjectsContentProps {
   expandedThreadListsByProject: ReadonlySet<string>;
   activeRouteProjectKey: string | null;
   routeThreadKey: string | null;
-  gitManagerRouteProjectKey: string | null;
+  moduleRouteProjectKey: string | null;
   selectedProjectKey: string | null;
   selectProject: (projectKey: string) => void;
   commandPaletteShortcutLabel: string | null;
@@ -3861,7 +3904,7 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
     expandedThreadListsByProject,
     activeRouteProjectKey,
     routeThreadKey,
-    gitManagerRouteProjectKey,
+    moduleRouteProjectKey,
     selectedProjectKey,
     selectProject,
     commandPaletteShortcutLabel,
@@ -4016,7 +4059,7 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
                         activeRouteThreadKey={
                           activeRouteProjectKey === project.projectKey ? routeThreadKey : null
                         }
-                        gitManagerActive={gitManagerRouteProjectKey === project.projectKey}
+                        moduleRouteActive={moduleRouteProjectKey === project.projectKey}
                         selectedProjectKey={selectedProjectKey}
                         selectProject={selectProject}
                         handleNewThread={handleNewThread}
@@ -4051,7 +4094,7 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
                 activeRouteThreadKey={
                   activeRouteProjectKey === project.projectKey ? routeThreadKey : null
                 }
-                gitManagerActive={gitManagerRouteProjectKey === project.projectKey}
+                moduleRouteActive={moduleRouteProjectKey === project.projectKey}
                 selectedProjectKey={selectedProjectKey}
                 selectProject={selectProject}
                 handleNewThread={handleNewThread}
@@ -4407,16 +4450,17 @@ export default function Sidebar() {
     },
     [routeThreadKey],
   );
-  // The Git Manager route names a project but no thread. Highlight that
-  // project's header so the left panel shows which project the manager is for.
-  const gitManagerRouteProjectKey = useMemo(() => {
-    if (routeProjectScopedKey === null || !pathname.endsWith("/git")) {
-      return null;
-    }
-    const physicalKey =
-      projectPhysicalKeyByScopedRef.get(routeProjectScopedKey) ?? routeProjectScopedKey;
-    return physicalToLogicalKey.get(physicalKey) ?? physicalKey;
-  }, [pathname, physicalToLogicalKey, projectPhysicalKeyByScopedRef, routeProjectScopedKey]);
+  // Project modules highlight the same physical or grouped project header.
+  const moduleRouteProjectKey = useMemo(
+    () =>
+      projectModuleRouteProjectKey(
+        pathname,
+        routeProjectScopedKey,
+        projectPhysicalKeyByScopedRef,
+        physicalToLogicalKey,
+      ),
+    [pathname, physicalToLogicalKey, projectPhysicalKeyByScopedRef, routeProjectScopedKey],
+  );
 
   // Group threads by logical project key so all threads from grouped projects
   // are displayed together.
@@ -4886,7 +4930,7 @@ export default function Sidebar() {
             expandedThreadListsByProject={expandedThreadListsByProject}
             activeRouteProjectKey={activeRouteProjectKey}
             routeThreadKey={routeThreadKey}
-            gitManagerRouteProjectKey={gitManagerRouteProjectKey}
+            moduleRouteProjectKey={moduleRouteProjectKey}
             selectedProjectKey={selectedProjectKey}
             selectProject={selectProject}
             commandPaletteShortcutLabel={commandPaletteShortcutLabel}

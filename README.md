@@ -93,6 +93,11 @@ BiBCode is organized around three work areas:
   context menus, create/rename/delete/duplicate, external open/preview, and
   explicit Ctrl/Cmd+S saves.
 
+Project headers also open **Git Manager** for local Git work and
+**Pull Requests** for GitHub/GitLab repository lists, reviews, metadata edits,
+merge and guarded checkout. Pull Requests shows host permission reasons and
+refreshes on explicit interaction, with local initials and image links.
+
 See [Workspace UI](./docs/user/workspace-ui.md) for the detailed guide.
 
 ## Some notes
