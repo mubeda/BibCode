@@ -156,7 +156,7 @@ export function useRunPullRequestsCheckout({
         }
         toastManager.add({
           type: "error",
-          title: pullRequestsActionError(cause),
+          title: pullRequestsActionError(cause, actions.requestKind),
           ...(cause !== null &&
           typeof cause === "object" &&
           "hostDetail" in cause &&
@@ -172,6 +172,7 @@ export function useRunPullRequestsCheckout({
     },
     [
       actions.pending,
+      actions.requestKind,
       command,
       disabledReason,
       headBranch,

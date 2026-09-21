@@ -46,6 +46,7 @@ beforeEach(async () => {
   await act(async () =>
     root.render(
       <PullRequestsActionProvider
+        requestKind="pull request"
         scope={{ environmentId: "env" as EnvironmentId, cwd: "Z:\\repo" }}
         number={14}
         refresh={refresh}
@@ -122,6 +123,7 @@ describe("useRunPullRequestsAction", () => {
     await act(async () =>
       root.render(
         <PullRequestsActionProvider
+          requestKind="pull request"
           scope={{ environmentId: "env" as EnvironmentId, cwd: "Z:\\repo" }}
           number={14}
           refresh={refresh}

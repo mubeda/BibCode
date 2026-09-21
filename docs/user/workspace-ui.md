@@ -499,6 +499,9 @@ merging. A read-only viewer sees the server reason without a method picker.
 **Auto-merge enabled** means merging has been scheduled, not completed; use
 **Disable auto-merge** to cancel it. GitHub disables bypass while auto-merge is
 selected, and the server rejects the auto-merge/bypass combination on GitHub.
+The normal confirmation title is “Merge pull request” on GitHub and “Merge
+merge request” on GitLab. Request-specific recovery messages and accessibility
+labels use the same host vocabulary; the module remains **Pull Requests**.
 For a target named `main`, the confirmation says “Merge now into main.” or
 “Merge automatically when requirements pass into main.” and lists Method,
 Delete branch, and Auto-merge.

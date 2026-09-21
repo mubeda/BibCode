@@ -128,6 +128,7 @@ export function PullRequestsDetailView({
       key={JSON.stringify([scope.environmentId, scope.cwd, number])}
       scope={scope}
       number={number}
+      requestKind={vocabulary.pullRequest}
       refresh={actionRefresh}
       disabledReason={mutationsDisabledReason}
     >

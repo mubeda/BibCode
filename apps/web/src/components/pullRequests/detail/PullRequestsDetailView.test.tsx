@@ -136,6 +136,31 @@ afterEach(async () => {
   container.remove();
 });
 describe("PullRequestsDetailView", () => {
+  it("uses the loaded GitLab vocabulary in the action owner's stale-head toast", async () => {
+    h.data.get = { ...detail, permissions: { ...detail.permissions, comment: allowed } };
+    usePullRequestsStore.getState().setCommentDraft(projectRef, 14, "Keep this draft");
+    h.command.mockResolvedValue({
+      _tag: "Failure",
+      cause: Cause.fail(
+        new PullRequestsOperationError({
+          operation: "pullRequests.runAction",
+          code: "stale_head",
+          message: "Head moved",
+          hostDetail: null,
+          retryable: true,
+        }),
+      ),
+    });
+    await render("conversation", 14, null, gitlabContext);
+    await click("Comment");
+    expect(h.toast).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "This merge request changed; reload and try again" }),
+    );
+    expect(h.command).toHaveBeenCalledOnce();
+    expect(usePullRequestsStore.getState().selectDraft(projectRef, 14).comment).toBe(
+      "Keep this draft",
+    );
+  });
   it.each(["conversation", "checks"] as const)(
     "blocks stale label toggles after Undo until refreshed detail arrives on %s",
     async (tab) => {

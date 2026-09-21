@@ -54,10 +54,16 @@ const receipt: PullRequestsCheckoutResult = {
   cwd: "/selected",
   branch: "feature",
 };
-async function render(permission = allowed, disabled: string | null = null) {
+async function render(
+  permission = allowed,
+  disabled: string | null = null,
+  requestKind = "pull request",
+) {
   await act(async () =>
     root.render(
-      <PullRequestsActionsContext value={{ run: vi.fn(), pending: h.pendingAction, error: null }}>
+      <PullRequestsActionsContext
+        value={{ run: vi.fn(), pending: h.pendingAction, error: null, requestKind }}
+      >
         <PullRequestsMutationsDisabledContext value={disabled}>
           <PullRequestsCheckoutMenu
             scope={scope}
@@ -102,6 +108,20 @@ afterEach(async () => {
   container.remove();
 });
 describe("PullRequestsCheckoutMenu", () => {
+  it("uses GitLab vocabulary for the checkout group and stale-head error toast", async () => {
+    await render(allowed, null, "merge request");
+    expect(container.querySelector('[role="group"]')?.getAttribute("aria-label")).toBe(
+      "Check out merge request",
+    );
+    h.command.mockResolvedValue({
+      _tag: "Failure",
+      cause: Cause.fail({ code: "stale_head", message: "Head moved" }),
+    });
+    await click("Checkout");
+    expect(h.toast).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "This merge request changed; reload and try again" }),
+    );
+  });
   it("shows worktree loading only before the live catalog supplies data", async () => {
     h.loading = true;
     h.hasCatalog = false;

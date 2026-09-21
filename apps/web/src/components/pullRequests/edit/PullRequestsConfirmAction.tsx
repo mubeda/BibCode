@@ -13,7 +13,7 @@ import {
   PullRequestsPermissionButton,
   constrainPermission,
 } from "../shared/PullRequestsPermissionButton";
-import { pullRequestsActionError } from "../usePullRequestsAction";
+import { pullRequestsActionError, usePullRequestsActions } from "../usePullRequestsAction";
 
 export function PullRequestsConfirmAction({
   title,
@@ -32,6 +32,7 @@ export function PullRequestsConfirmAction({
   onClose: () => void;
   destructive?: boolean;
 }) {
+  const { requestKind } = usePullRequestsActions();
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const busy = useRef(false);
@@ -44,7 +45,7 @@ export function PullRequestsConfirmAction({
       await onConfirm();
       onClose();
     } catch (cause) {
-      setError(pullRequestsActionError(cause));
+      setError(pullRequestsActionError(cause, requestKind));
     } finally {
       busy.current = false;
       setPending(false);

@@ -68,7 +68,9 @@ describe("PullRequestsHeader", () => {
     try {
       await act(async () =>
         root.render(
-          <PullRequestsActionsContext value={{ run: mockRun(), pending: false, error: null }}>
+          <PullRequestsActionsContext
+            value={{ run: mockRun(), pending: false, error: null, requestKind: "pull request" }}
+          >
             <PullRequestsHeader
               scope={{ environmentId: projectRef.environmentId, cwd: "/repo" }}
               projectRef={projectRef}

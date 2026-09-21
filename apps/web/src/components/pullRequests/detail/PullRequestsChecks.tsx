@@ -75,7 +75,7 @@ export const PullRequestsChecks = memo(function PullRequestsChecks({
       <p className="text-sm text-muted-foreground">
         {empty
           ? context.capabilities.vocabulary.checks === "Pipelines"
-            ? "No pipeline for this merge request"
+            ? `No pipeline for this ${context.capabilities.vocabulary.pullRequest}`
             : "No checks reported"
           : checksSummaryLabel(checks)}
       </p>

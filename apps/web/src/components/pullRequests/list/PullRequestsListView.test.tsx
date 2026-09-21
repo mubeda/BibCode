@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 import { usePullRequestsStore } from "../../../pullRequestsStore";
 import { PullRequestsContextRefresh } from "../pullRequestsContextRefresh";
 import { context, row } from "../testFixtures";
+import { gitlabContext } from "../detail/testFixtures";
 const h = vi.hoisted(() => ({
   first: null as PullRequestsListPage | null,
   second: null as PullRequestsListPage | null,
@@ -128,6 +129,22 @@ afterEach(async () => {
   container.remove();
 });
 describe("PullRequestsListView", () => {
+  it("names the state tabs and empty list with GitLab vocabulary", async () => {
+    h.first = { rows: [], nextCursor: null, totalCount: 0, counts: null };
+    await act(async () =>
+      root.render(
+        <PullRequestsListView
+          scope={{ environmentId: "env" as never, cwd: "/repo" }}
+          projectRef={projectRef}
+          context={gitlabContext}
+        />,
+      ),
+    );
+    expect(container.querySelector('[role="tablist"]')?.getAttribute("aria-label")).toBe(
+      "merge request state",
+    );
+    expect(container.textContent).toContain("No open merge requests");
+  });
   it("renders atom rows using fixed-height virtualization and count tabs", async () => {
     await render();
     expect(container.querySelector('[role="tabpanel"]')?.textContent).toContain(

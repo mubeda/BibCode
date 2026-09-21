@@ -18,7 +18,7 @@ import {
   constrainPermission,
 } from "./shared/PullRequestsPermissionButton";
 import { checkoutTargets, type CheckoutWorktree } from "./pullRequestsCheckout.logic";
-import type { PullRequestsScope } from "./usePullRequestsAction";
+import { usePullRequestsActions, type PullRequestsScope } from "./usePullRequestsAction";
 import { useRunPullRequestsCheckout } from "./useRunPullRequestsCheckout";
 const EMPTY_WORKTREES: readonly CheckoutWorktree[] = [];
 export function PullRequestsCheckoutMenu({
@@ -35,6 +35,7 @@ export function PullRequestsCheckoutMenu({
   permission: PullRequestsPermission;
 }) {
   const reasonId = useId();
+  const { requestKind } = usePullRequestsActions();
   const catalogAtom = useMemo(
     () =>
       worktreeEnvironment.catalog({
@@ -59,7 +60,7 @@ export function PullRequestsCheckoutMenu({
   const targets = checkoutTargets(worktrees, scope.cwd);
   const others = targets.filter((target) => target.kind === "checkout" && target.cwd !== scope.cwd);
   return (
-    <div className="inline-flex" role="group" aria-label="Check out pull request">
+    <div className="inline-flex" role="group" aria-label={`Check out ${requestKind}`}>
       <PullRequestsPermissionButton
         mutation
         permission={available}

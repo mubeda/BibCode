@@ -26,7 +26,7 @@ export function PullRequestsTextEditor({
 }: PullRequestsEditorProps & { field: "title" | "body"; children: ReactNode }) {
   const draftKey = field === "title" ? "titleEdit" : "bodyEdit";
   const saved = usePullRequestsStore((s) => s.selectDraft(projectRef, detail.number)[draftKey]);
-  const { run, pending } = usePullRequestsActions();
+  const { run, pending, requestKind } = usePullRequestsActions();
   const [editing, setEditing] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -66,7 +66,7 @@ export function PullRequestsTextEditor({
         setDraft(null);
       setEditing(false);
     } catch (cause) {
-      setError(pullRequestsActionError(cause));
+      setError(pullRequestsActionError(cause, requestKind));
     } finally {
       busy.current = false;
       setSaving(false);

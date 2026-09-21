@@ -8,7 +8,7 @@ export const projectRef = { environmentId: "env", projectId: "project" } as Scop
 export const allowed = { allowed: true, reason: null };
 export const mockRun = () =>
   vi.fn<PullRequestsActions["run"]>().mockResolvedValue({ kind: "done" });
-export async function mount(ui: ReactNode, run = mockRun()) {
+export async function mount(ui: ReactNode, run = mockRun(), requestKind = "pull request") {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   const container = document.createElement("div");
   document.body.append(container);
@@ -16,7 +16,7 @@ export async function mount(ui: ReactNode, run = mockRun()) {
   const render = async (node: ReactNode) => {
     await act(async () =>
       root.render(
-        <PullRequestsActionsContext value={{ run, pending: false, error: null }}>
+        <PullRequestsActionsContext value={{ run, pending: false, error: null, requestKind }}>
           {node}
         </PullRequestsActionsContext>,
       ),
@@ -56,7 +56,9 @@ export async function input(element: HTMLTextAreaElement | HTMLInputElement, val
 
 export function renderReviewMarkup(ui: ReactNode) {
   return renderToStaticMarkup(
-    <PullRequestsActionsContext value={{ run: mockRun(), pending: false, error: null }}>
+    <PullRequestsActionsContext
+      value={{ run: mockRun(), pending: false, error: null, requestKind: "pull request" }}
+    >
       {ui}
     </PullRequestsActionsContext>,
   );
