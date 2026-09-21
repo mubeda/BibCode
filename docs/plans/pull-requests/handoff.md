@@ -1,8 +1,8 @@
 # Pull Requests — Hand-off for code review
 
-**Last touched:** 2026-09-21 09:45 UTC (coordinator, after Phase 10)
+**Last touched:** 2026-09-21 14:30 UTC (coordinator, after live acceptance)
 **Branch:** main-3 (worktree `/work/workspaces/orca/BibCode/main-3`, base commit `1bbc8d1a`)
-**Status:** Phases 00–09 accepted; Phase 10 `in_progress` — GitLab end-to-end and live host-write acceptance pending (see TODOs). Nothing is committed.
+**Status:** all phases accepted, including live acceptance on GitHub (`mubeda/SourceControlTest`) and the company GitLab (`luna.tripunkt.de/mubeda/sourcecontroltest`, GitLab 19.3.2). Committed on `main-3` as `e807bb01` plus a vocabulary follow-up; not merged into `main`.
 
 ## What this iteration delivered
 
@@ -55,8 +55,9 @@ Counts from `git status --short -uall` against `1bbc8d1a` (248 paths, all uncomm
 
 ## TODOs / known limitations left in code
 
-- **GitLab end-to-end verification pending**: needs a GitLab host with an authenticated `glab` (company server or a gitlab.com token). All GitLab GraphQL documents were validated against gitlab.com's schema and every GitLab command shape against the installed `glab` 1.114.0, but no live GitLab read or write ran. `tasks.md` keeps Phase 10 `in_progress` with "GitLab e2e pending: needs a GitLab host with an authenticated `glab`".
-- **Live host writes not exercised**: comment/edit/react/delete, label with undo, milestone, lock, merge, revert and GitLab delete were verified only through exact-command tests and read-only browser checks (controls, confirmations, disabled reasons). They need a repository the requester designates for writes.
+- **Live acceptance done on both hosts (2026-09-21)** through the UI with API verification: GitHub PR #4 (comment, reaction, label with Undo, milestone, assignee, lock, title, draft, inline review with suggestion, review submission, thread resolve, merge with custom subject and branch deletion, revert → #5, close/reopen) and GitLab !1/!2 (note, award, label with Undo, milestone, assignee, lock, title, draft, approve/revoke, suggestion applied with commit message, merge with custom subject/body through REST, revert → !3, close/reopen, checkout into the clone, delete). Drivers: scratchpad `pw/live-github.mjs`, `pw/live-gitlab.mjs`; screenshots `shots-live-gh/`, `shots-live-gl/`.
+- Live rounds fixed three host-level defects that unit tests could not see: `glab api --input` needs an explicit `Content-Type: application/json` (REST 415, GraphQL "Unexpected end of document" on gitlab.com and self-hosted); GitLab GraphQL note ids carry subclass names (`gid://gitlab/DiffNote/…`), which broke the timeline once an inline note existed; GitLab actions took 13–16 s, now roughly halved by a bounded 30-second context cache (14 → 7 processes per warm action).
+- Not exercised live: GitLab "Request changes" (the author is not a listed reviewer on the test project) and GitHub Approve/Request changes (own pull request); both paths are covered by exact-command tests and validated GraphQL documents.
 - GitLab review-status list filters return advice to clear the filter (list data lacks approvals); GitHub search results have no total count or further page; GitLab multi-line review drafts post at the end line.
 - Three pre-existing `provider_terminal` timing tests (`codex::…still_reaps_the_child`, `opencode::…transfers_exact_child…`, `opencode::…retained_child_true_reap`) can fail in the full `-j 2` server run and pass individually; their files are untouched by this work.
 - Native Windows private-file ACL path and native desktop packaged e2e were not executed here (typechecked only).
@@ -93,6 +94,5 @@ Browser checks (dev server `vp run dev`, web http://localhost:5733, Playwright p
 
 ## Open questions for the reviewer
 
-1. Which repository may be used for live write acceptance (comment, label + undo, milestone, lock, merge, revert; GitLab delete)?
-2. Which GitLab host and account should run the GitLab end-to-end pass?
-3. Should the iteration be committed as one commit per accepted phase or as a single feature commit (both need the task-resume commit body)?
+1. When should `main-3` be merged into `main` and pushed (the standing workflow: local merge, push, then `origin/main` into `develop`)?
+2. Should the 30-second context cache window stay, or be exposed as a setting for slow hosts?

@@ -1360,7 +1360,10 @@ never count a sandbox-denied listener test as passed or skipped.
     and only success clears them after the warning.
 17. On that disposable request, verify repository merge defaults, single-method
     hiding and GitLab's project-method text. Confirm Merge names the method,
-    target, branch deletion and auto-merge choice. Auto-merge reports enabled
+    target, branch deletion and auto-merge choice. On GitLab, verify the title is
+    **Merge merge request** and recovery/toast, list-state and checkout labels use
+    **merge request**; the **Pull Requests** module name stays unchanged.
+    Auto-merge reports enabled
     rather than merged and supports Disable. GitHub disables bypass during
     auto-merge with its reason; GitLab permits the combination only when both
     server permissions allow it. Verify bypass confirmations name the consequence.

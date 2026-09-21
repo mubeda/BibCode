@@ -85,8 +85,8 @@ The packaged spec is written/typechecked, not browser-executed. Row 10 stays
 
 ## Verification
 
-- [ ] Telemetry test and server tripwires exist and pass; `rg -n "<img|avatar" apps/web/src/components/pullRequests --glob '!*test*'` returns only the image-to-link component.
-- [ ] Docs updated per § Files; `docs/README.md` links unchanged or extended; runbooks updated or recorded as reviewed.
-- [ ] Whole test graph and the server suite green; fmt/clippy/typecheck/check clean.
-- [ ] GitHub e2e recorded with screenshots; GitLab e2e status recorded honestly.
-- [ ] `handoff.md` complete.
+- [x] Telemetry test and server tripwires exist and pass; `rg -n "<img|avatar" apps/web/src/components/pullRequests --glob '!*test*'` returns only the image-to-link component.
+- [x] Docs updated per § Files; `docs/README.md` links unchanged or extended; runbooks updated or recorded as reviewed.
+- [x] Whole test graph and the server suite green; fmt/clippy/typecheck/check clean.
+- [x] GitHub e2e recorded with screenshots; GitLab e2e status recorded honestly.
+- [x] `handoff.md` complete.

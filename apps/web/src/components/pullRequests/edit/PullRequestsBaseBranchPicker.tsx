@@ -81,7 +81,7 @@ export function PullRequestsBaseBranchPicker({
   scope: PullRequestsScope;
   projectRef: ScopedProjectRef;
 }) {
-  const { run, pending } = usePullRequestsActions();
+  const { run, pending, requestKind } = usePullRequestsActions();
   const [open, setOpen] = useState(false);
   const [target, setTarget] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -107,7 +107,10 @@ export function PullRequestsBaseBranchPicker({
             setError(null);
             if (value === detail.baseBranch || !permission.allowed) return;
             if (comments) setTarget(value);
-            else void change(value).catch((cause) => setError(pullRequestsActionError(cause)));
+            else
+              void change(value).catch((cause) =>
+                setError(pullRequestsActionError(cause, requestKind)),
+              );
           }}
         />
       ) : (

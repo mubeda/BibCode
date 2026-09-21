@@ -3,7 +3,7 @@ import type { PullRequestsDetail, PullRequestsMergeMethod } from "@bibcode/contr
 import { act } from "react";
 import { afterEach, beforeEach, describe, expect, it } from "vite-plus/test";
 import { usePullRequestsStore } from "../../../pullRequestsStore";
-import { allowed, button, click, input, mount, projectRef } from "../review/testHelpers";
+import { allowed, button, click, input, mockRun, mount, projectRef } from "../review/testHelpers";
 import { context, detail, gitlabContext } from "./testFixtures";
 import { PullRequestsMergeBox } from "./PullRequestsMergeBox";
 let view: Awaited<ReturnType<typeof mount>>;
@@ -40,6 +40,42 @@ async function checkbox(label: string) {
   );
 }
 describe("merge controls", () => {
+  it.each([
+    { host: context, title: "Merge pull request" },
+    { host: gitlabContext, title: "Merge merge request" },
+  ] as const)("uses the host vocabulary for $title", async ({ host, title }) => {
+    view = await mount(
+      <PullRequestsMergeBox detail={mergeable} context={host} projectRef={projectRef} />,
+      mockRun(),
+      host.capabilities.vocabulary.pullRequest,
+    );
+    await click("Merge");
+    const dialog = document.querySelector('[role="alertdialog"]')!;
+    const titleId = dialog.getAttribute("aria-labelledby")!;
+    expect(document.getElementById(titleId)?.textContent).toBe(title);
+    expect(view.run).not.toHaveBeenCalled();
+  });
+  it("uses GitLab vocabulary for merge readiness and stale-head recovery copy", async () => {
+    view = await mount(
+      <PullRequestsMergeBox
+        detail={{ ...mergeable, headSha: "" }}
+        context={gitlabContext}
+        projectRef={projectRef}
+      />,
+      mockRun(),
+      gitlabContext.capabilities.vocabulary.pullRequest,
+    );
+    expect(button("Merge").title).toBe("Reload this merge request before merging");
+    await view.render(
+      <PullRequestsMergeBox detail={mergeable} context={gitlabContext} projectRef={projectRef} />,
+    );
+    view.run.mockRejectedValueOnce({ code: "stale_head", message: "Head moved" });
+    await click("Merge");
+    await click("Merge", document.querySelector('[role="alertdialog"]')!);
+    expect(document.querySelector('[role="alert"]')?.textContent).toBe(
+      "This merge request changed; reload and try again",
+    );
+  });
   it.each([false, true])(
     "rechecks both GitLab permissions after auto selection, with confirmation open=%s",
     async (confirming) => {

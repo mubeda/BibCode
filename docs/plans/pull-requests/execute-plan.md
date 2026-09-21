@@ -42,5 +42,5 @@ This file is the **coordinator procedure** for executing the decomposed plan in 
 - **Mutation verification touches a real host account.** Reads may run against `mubeda/BibCode` and `openai/codex`. Writes (comments, labels, reviews, merge, revert, delete, checkout) run only in a repository the requester designates or authorizes the coordinator to create; Phases 06–10's Playwright write steps wait for that designation. GitLab writes additionally need the company server or a token.
 
 - Codex cannot allocate a dev-server port in its sandbox (known from the Git Manager). Web-phase visual verification is the coordinator's job; Codex's gate is tests + typecheck + check.
-- GitLab end to end needs a host with an authenticated `glab`; Phase 10 stays open until the requester runs it or provides a token.
+- GitLab end to end ran on 2026-09-21 against the requester's company host (luna.tripunkt.de) with `glab` logged in from the git credential store; the GitHub pass ran on mubeda/SourceControlTest.
 - A phase that needs a contract field the plan lacks reports it in `tasks.md`; the coordinator decides, updates the plan, and re-dispatches.

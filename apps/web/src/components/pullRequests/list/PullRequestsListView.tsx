@@ -308,7 +308,10 @@ export function PullRequestsListView({
             usePullRequestsStore.getState().setListTab(projectRef, value);
         }}
       >
-        <TabsList aria-label="Pull request state" className="mx-4 mt-3 shrink-0">
+        <TabsList
+          aria-label={`${context.capabilities.vocabulary.pullRequest} state`}
+          className="mx-4 mt-3 shrink-0"
+        >
           {tabs.map((tab) => {
             const counts = firstQuery.data?.counts;
             const count =

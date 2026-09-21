@@ -104,7 +104,9 @@ describe("PullRequestsTimelineItem", () => {
     try {
       await act(async () =>
         root.render(
-          <PullRequestsActionsContext value={{ run: vi.fn(), pending: false, error: null }}>
+          <PullRequestsActionsContext
+            value={{ run: vi.fn(), pending: false, error: null, requestKind: "pull request" }}
+          >
             <PullRequestsTimelineItem {...props} item={{ ...comment, minimized: true }} />
           </PullRequestsActionsContext>,
         ),

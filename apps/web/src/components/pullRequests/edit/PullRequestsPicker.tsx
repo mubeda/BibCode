@@ -11,7 +11,7 @@ import {
 } from "../shared/PullRequestsPermissionButton";
 import { PullRequestsLabelChip } from "../shared/PullRequestsLabelChip";
 import { PullRequestsMutationsDisabledContext } from "../pullRequestsMutationAvailability";
-import { pullRequestsActionError } from "../usePullRequestsAction";
+import { pullRequestsActionError, usePullRequestsActions } from "../usePullRequestsAction";
 import { usePullRequestsVocabulary } from "./usePullRequestsVocabulary";
 export interface PullRequestsPickerProps {
   scope: PullRequestsScope;
@@ -24,6 +24,7 @@ export interface PullRequestsPickerProps {
   onChange: (add: string[], remove: string[]) => Promise<unknown>;
 }
 function PickerDialog({ onClose, ...props }: PullRequestsPickerProps & { onClose: () => void }) {
+  const { requestKind } = usePullRequestsActions();
   const query = usePullRequestsVocabulary(props.scope, props.kind);
   const name = useId();
   const source = props.selected;
@@ -67,7 +68,7 @@ function PickerDialog({ onClose, ...props }: PullRequestsPickerProps & { onClose
       await props.onChange(add, remove);
       setSelection({ source, values });
     } catch (cause) {
-      setError(pullRequestsActionError(cause));
+      setError(pullRequestsActionError(cause, requestKind));
     } finally {
       busy.current = false;
       setPending(false);

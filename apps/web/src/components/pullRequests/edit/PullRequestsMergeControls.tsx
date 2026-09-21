@@ -203,7 +203,7 @@ export function PullRequestsMergeControls({
   const methodReason = !method
     ? "Choose a merge method"
     : !detail.headSha
-      ? "Reload this pull request before merging"
+      ? `Reload this ${context.capabilities.vocabulary.pullRequest} before merging`
       : null;
   function actionPermission(action: { auto: boolean; bypass: boolean }, reason: string | null) {
     let permission = action.bypass
@@ -378,7 +378,7 @@ export function PullRequestsMergeControls({
               ? bypassLabel
               : confirmation.action.auto
                 ? "Enable auto-merge"
-                : "Merge pull request"
+                : `Merge ${context.capabilities.vocabulary.pullRequest}`
           }
           confirmLabel={
             confirmation.action.bypass

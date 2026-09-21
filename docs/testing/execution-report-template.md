@@ -100,7 +100,7 @@ Delete the unused result values above. Do not leave an ambiguous status.
 - Lazy metadata/branch pickers, truncated-search debounce, exact deltas, numeric milestone Clear, and five-second Undo:
 - Undo during another action, disabled picker controls until post-Undo detail refresh, correct next-toggle direction, refresh failure/Retry, and late initial vocabulary response:
 - Base-change pending-comment warning, cancel/failure preservation, and success-only clearing:
-- Merge confirmation method/target/deletion/auto/bypass, loaded-head pinning and retained merge-message drafts:
+- Merge confirmation host terminology/method/target/deletion/auto/bypass, host-specific recovery and accessibility copy, loaded-head pinning and retained merge-message drafts:
 - Read-only merge without a method selector; GitHub auto/bypass exclusion; GitLab current dual permission:
 - Auto-merge enabled versus merged result, Disable, Update branch/Rebase and GitLab Skip CI:
 - Draft/state/lock actions, host lock reasons, Revert creation/navigation and permanent GitLab Delete/list navigation:

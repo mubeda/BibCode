@@ -27,6 +27,7 @@ export type PullRequestsActionRunner = (
   options?: { waitForPending: true },
 ) => Promise<PullRequestsActionResult>;
 export interface PullRequestsActions {
+  requestKind: string;
   run: PullRequestsActionRunner;
   pending: boolean;
   error: string | null;
@@ -68,10 +69,10 @@ const REFRESH_AFTER_ACTION: Partial<
   close: ["timeline"],
   reopen: ["timeline"],
 };
-export function pullRequestsActionError(cause: unknown): string {
+export function pullRequestsActionError(cause: unknown, requestKind: string): string {
   if (cause !== null && typeof cause === "object") {
     if ("code" in cause && cause.code === "stale_head")
-      return "This pull request changed; reload and try again";
+      return `This ${requestKind} changed; reload and try again`;
     if ("message" in cause && typeof cause.message === "string") return cause.message;
   }
   return "The action failed. Refresh and try again.";
@@ -83,7 +84,11 @@ export function usePullRequestsActions(): PullRequestsActions {
   if (!actions) throw new Error("Pull Requests actions require the detail view provider");
   return actions;
 }
-export function useRunPullRequestsAction(scope: Scope, number: number): PullRequestsActions {
+export function useRunPullRequestsAction(
+  scope: Scope,
+  number: number,
+  requestKind: string,
+): PullRequestsActions {
   const refresh = useContext(RefreshContext);
   const disabledReason = useContext(PullRequestsMutationsDisabledContext);
   if (!refresh) throw new Error("Pull Requests actions require the detail query refresh handles");
@@ -155,7 +160,7 @@ export function useRunPullRequestsAction(scope: Scope, number: number): PullRequ
           typeof cause === "object" &&
           "code" in cause &&
           cause.code === "stale_head";
-        const message = pullRequestsActionError(cause);
+        const message = pullRequestsActionError(cause, requestKind);
         setError(message);
         toastManager.add({
           type: "error",
@@ -189,31 +194,35 @@ export function useRunPullRequestsAction(scope: Scope, number: number): PullRequ
         setPending(false);
       }
     },
-    [command, disabledReason, number, refresh, scope.cwd, scope.environmentId],
+    [command, disabledReason, number, refresh, requestKind, scope.cwd, scope.environmentId],
   );
-  return useMemo(() => ({ run, pending, error }), [run, pending, error]);
+  return useMemo(() => ({ run, pending, error, requestKind }), [run, pending, error, requestKind]);
 }
 function ActionOwner({
   scope,
   number,
+  requestKind,
   children,
 }: {
   scope: Scope;
   number: number;
+  requestKind: string;
   children?: ReactNode;
 }) {
-  const actions = useRunPullRequestsAction(scope, number);
+  const actions = useRunPullRequestsAction(scope, number, requestKind);
   return createElement(PullRequestsActionsContext, { value: actions }, children);
 }
 export function PullRequestsActionProvider({
   scope,
   number,
+  requestKind,
   refresh,
   children,
   disabledReason = null,
 }: {
   scope: Scope;
   number: number;
+  requestKind: string;
   refresh: PullRequestsRefreshHandles;
   children: ReactNode;
   disabledReason?: string | null;
@@ -224,7 +233,7 @@ export function PullRequestsActionProvider({
     createElement(
       PullRequestsMutationsDisabledContext,
       { value: disabledReason },
-      createElement(ActionOwner, { scope, number }, children),
+      createElement(ActionOwner, { scope, number, requestKind }, children),
     ),
   );
 }
