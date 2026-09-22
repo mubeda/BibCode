@@ -259,14 +259,17 @@ impl PtyBackend for BlockingBackend {
         {
             spawn_started.send(()).expect("spawn started receiver");
         }
-        self.spawn_release
-            .lock()
-            .expect("spawn release lock")
-            // This is only a deadlock guard. The 250 ms observer wait in the
-            // lifecycle test below owns the behavioral timing assertion, so a
-            // loaded CI runner must not make this blocking helper fail first.
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .expect("spawn release");
+        // Let the runtime hand off this worker so close and its timer can run.
+        tokio::task::block_in_place(|| {
+            self.spawn_release
+                .lock()
+                .expect("spawn release lock")
+                // This is only a deadlock guard. The 250 ms observer wait in the
+                // lifecycle test below owns the behavioral timing assertion, so a
+                // loaded CI runner must not make this blocking helper fail first.
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("spawn release");
+        });
         Ok(self.process.clone())
     }
 }
@@ -2376,21 +2379,22 @@ async fn lifecycle_close_cancels_a_prepared_in_flight_observer_before_invalidati
     .await
     .expect("spawn waiter");
 
-    let close_manager = manager.clone();
-    let close = tokio::spawn(async move {
-        close_manager
-            .close("thread-1", Some("terminal-1"))
-            .await
-            .expect("close terminal");
-    });
-    let cancelled_before_release = tokio::time::timeout(
-        std::time::Duration::from_millis(250),
-        observer.wait_for_cancellation(),
-    )
-    .await;
+    let close = manager.close("thread-1", Some("terminal-1"));
+    tokio::pin!(close);
+    // Drive close and cancellation observation in the same task so spawn cannot
+    // resume between close's cancellation signal and its invalidation fence.
+    let cancelled_before_release =
+        tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            tokio::select! {
+                biased;
+                result = &mut close => panic!("close completed before spawn release: {result:?}"),
+                cancellation = observer.wait_for_cancellation() => cancellation,
+            }
+        })
+        .await;
     spawn_release_tx.send(()).expect("spawn release receiver");
     let open_result = open.await.expect("open task");
-    close.await.expect("close task");
+    close.await.expect("close terminal");
 
     let cancellation =
         cancelled_before_release.expect("observer cancellation must precede spawn invalidation");
