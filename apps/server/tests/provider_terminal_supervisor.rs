@@ -274,6 +274,100 @@ impl PtyBackend for BlockingBackend {
     }
 }
 
+#[derive(Debug)]
+struct LaunchBarrier {
+    started: tokio::sync::Notify,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl LaunchBarrier {
+    fn new() -> (Arc<Self>, std::sync::mpsc::Sender<()>) {
+        let (release, receiver) = std::sync::mpsc::channel();
+        (
+            Arc::new(Self {
+                started: tokio::sync::Notify::new(),
+                release: Mutex::new(receiver),
+            }),
+            release,
+        )
+    }
+
+    fn block(&self) {
+        self.started.notify_one();
+        self.release
+            .lock()
+            .expect("launch barrier lock")
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("release launch barrier");
+    }
+}
+
+#[derive(Debug)]
+struct FirstSpawnBarrierBackend {
+    backend: Arc<RecordingBackend>,
+    barrier: Mutex<Option<Arc<LaunchBarrier>>>,
+}
+
+impl PtyBackend for FirstSpawnBarrierBackend {
+    fn spawn(&self, input: &PtySpawnInput) -> Result<Arc<dyn PtyProcess>, String> {
+        let barrier = self.barrier.lock().expect("spawn barrier lock").take();
+        if let Some(barrier) = barrier {
+            barrier.block();
+        }
+        self.backend.spawn(input)
+    }
+}
+
+struct ReadinessBarrierPreparer {
+    generation: Mutex<Option<oneshot::Sender<TerminalObserverGenerationLease>>>,
+    readiness: Arc<LaunchBarrier>,
+}
+
+impl TerminalLaunchPreparer for ReadinessBarrierPreparer {
+    fn prepare(
+        &self,
+        input: TerminalLaunchPreparationInput,
+    ) -> Pin<Box<dyn Future<Output = TerminalLaunchPreparation> + Send + '_>> {
+        Box::pin(async move {
+            self.generation
+                .lock()
+                .expect("generation sender lock")
+                .take()
+                .expect("one preparation")
+                .send(input.generation.observation())
+                .expect("generation receiver");
+            TerminalLaunchPreparation::Prepared(PreparedTerminalLaunch {
+                executable: "prepared-command".to_owned(),
+                args: Vec::new(),
+                private_env: BTreeMap::new(),
+                observer: Box::new(ReadinessBarrierObserver(self.readiness.clone())),
+            })
+        })
+    }
+}
+
+struct ReadinessBarrierObserver(Arc<LaunchBarrier>);
+
+impl PreparedTerminalObserver for ReadinessBarrierObserver {
+    fn is_ready_for_on_spawned(&self) -> bool {
+        self.0.block();
+        false
+    }
+
+    fn on_spawned(
+        &self,
+        _pid: u32,
+        _generation: TerminalObserverGenerationLease,
+        _workers: TerminalObserverWorkerContext,
+    ) {
+        panic!("cancelled observer must not receive on_spawned");
+    }
+
+    fn diagnostic_label(&self) -> &str {
+        "readiness-barrier-observer"
+    }
+}
+
 impl RecordingBackend {
     fn new(events: Arc<Mutex<Vec<&'static str>>>) -> Self {
         Self {
@@ -2406,6 +2500,132 @@ async fn lifecycle_close_cancels_a_prepared_in_flight_observer_before_invalidati
     assert!(open_result.is_err());
     assert!(process.killed.load(Ordering::Acquire));
     manager.shutdown().await;
+}
+
+async fn assert_lifecycle_cancellation_never_falls_back(restart: bool, during_readiness: bool) {
+    let root = tempfile::tempdir().expect("temp dir");
+    let backend = Arc::new(RecordingBackend::new(Arc::new(Mutex::new(Vec::new()))));
+    let (spawn_barrier, spawn_release) = LaunchBarrier::new();
+    let (readiness, readiness_release) = LaunchBarrier::new();
+    let (generation_tx, generation_rx) = oneshot::channel();
+    let manager = TerminalManager::new(
+        Arc::new(FirstSpawnBarrierBackend {
+            backend: backend.clone(),
+            barrier: Mutex::new(Some(spawn_barrier.clone())),
+        }),
+        TerminalManagerOptions {
+            subprocess_poll_interval: std::time::Duration::ZERO,
+            launch_preparer: Some(Arc::new(ReadinessBarrierPreparer {
+                generation: Mutex::new(Some(generation_tx)),
+                readiness: readiness.clone(),
+            })),
+            ..TerminalManagerOptions::default()
+        },
+    );
+    let mut input =
+        TerminalOpenInput::new("thread-1", "terminal-1", root.path().to_path_buf(), 80, 24);
+    input.command = Some(command(true));
+    let open_manager = manager.clone();
+    let open_input = input.clone();
+    let open = tokio::spawn(async move { open_manager.open(open_input).await });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        spawn_barrier.started.notified(),
+    )
+    .await
+    .expect("first spawn started");
+    let generation = generation_rx.await.expect("prepared generation");
+    if during_readiness {
+        spawn_release.send(()).expect("release first spawn");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            readiness.started.notified(),
+        )
+        .await
+        .expect("readiness callback started");
+    }
+
+    // A real restart has one legitimate replacement spawn, distinguishable from
+    // the original command's forbidden fallback.
+    input.command = Some(TerminalLaunchCommand {
+        executable: "replacement-command".to_owned(),
+        activity: None,
+        ..command(false)
+    });
+    let cleanup_manager = manager.clone();
+    let cleanup = tokio::spawn(async move {
+        if restart {
+            cleanup_manager.restart(input).await.map(|_| ())
+        } else {
+            cleanup_manager.close("thread-1", Some("terminal-1")).await
+        }
+    });
+    let cancellation =
+        tokio::time::timeout(std::time::Duration::from_secs(2), generation.cancelled()).await;
+    // Always release the fixture before asserting, including on timeout.
+    if during_readiness {
+        readiness_release.send(()).expect("release readiness");
+    } else {
+        spawn_release.send(()).expect("release cancelled spawn");
+    }
+    let open_result = tokio::time::timeout(std::time::Duration::from_secs(2), open)
+        .await
+        .expect("open completed")
+        .expect("open task");
+    tokio::time::timeout(std::time::Duration::from_secs(2), cleanup)
+        .await
+        .expect("lifecycle cleanup completed")
+        .expect("cleanup task")
+        .expect("close or restart succeeded");
+    let spawns = backend.spawns();
+    let processes = backend.processes.lock().expect("processes lock").clone();
+    let old_process_killed = processes[0].killed.load(Ordering::Acquire);
+    manager.shutdown().await;
+
+    assert_eq!(
+        cancellation.expect("observer cancellation observed before release"),
+        if restart {
+            TerminalObserverCancellationReason::Restarted
+        } else {
+            TerminalObserverCancellationReason::Closed
+        }
+    );
+    assert!(generation.cancellation_was_requested_while_current());
+    assert!(
+        matches!(
+            open_result,
+            Err(bibcode_server::terminal::TerminalError::NotFound { .. })
+        ),
+        "invalidated open: {open_result:?}"
+    );
+    assert!(old_process_killed, "invalidated process was not killed");
+    let executables = spawns
+        .iter()
+        .map(|spawn| spawn.executable.as_str())
+        .collect::<Vec<_>>();
+    let expected = if restart {
+        vec!["prepared-command", "replacement-command"]
+    } else {
+        vec!["prepared-command"]
+    };
+    assert_eq!(
+        executables, expected,
+        "invalidated open must spawn exactly once"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lifecycle_close_during_spawn_or_readiness_never_falls_back() {
+    for during_readiness in [false, true] {
+        assert_lifecycle_cancellation_never_falls_back(false, during_readiness).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lifecycle_restart_during_spawn_or_readiness_never_falls_back() {
+    for during_readiness in [false, true] {
+        assert_lifecycle_cancellation_never_falls_back(true, during_readiness).await;
+    }
 }
 
 #[tokio::test]

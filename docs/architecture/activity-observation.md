@@ -212,6 +212,19 @@ worker thread and permit until joining proves the OS thread exited, so a worker
 that retains its observation lease cannot form an ownership cycle or
 permanently consume observer capacity.
 
+Closing or restarting an individual terminal fences its generation against new
+work while holding the observer's first-cancellation-reason arbitration, before
+publishing observer cancellation. An invalidated open cannot replace that
+lifecycle reason with its own cleanup reason. This admission fence is separate
+from the observer's publication fence: the one-shot cancellation reason and
+bounded worker drain still precede publication invalidation. An in-flight open
+checks both closing and invalidation after observer readiness and again after any
+rejected-preparation cleanup, before attempting the original command as a
+fallback. Lifecycle cancellation follows generation-invalidation cleanup and
+cannot be treated as a preparation rejection that starts another PTY. The
+per-terminal operation lock remains held across spawn and publication, so a
+restart starts its replacement only after the displaced open releases ownership.
+
 Terminal-observer setup and activity-transition callbacks use a separate
 isolation boundary with eight admissions per manager and sixteen across the
 process. One named process-wide standard-library join reaper retains every
@@ -431,10 +444,12 @@ observer's reserved environment key is instead a hard terminal error, as is
 failure to spawn the selected prepared command. Neither path retries the
 original command. If the prepared PTY starts but its observer is not ready
 immediately before `on_spawned`, the manager discards that uncommitted PTY and
-respawns the original command. If the bounded `on_spawned` callback times out or
-panics, the manager instead cancels the observer and invalidates further
-activity publication, then continues creating and registering the prepared PTY
-as the running terminal. It does not respawn the original command.
+respawns the original command only while the terminal generation remains open
+and valid. If the bounded `on_spawned` callback times out or panics while that
+generation is still open and valid, the manager instead cancels the observer
+and invalidates further activity publication, then continues creating and
+registering the prepared PTY as the running terminal. It does not respawn the
+original command.
 
 Provider root correlation is asynchronous after `on_spawned`. A correlation or
 later observer failure does not replace the running prepared command with the
