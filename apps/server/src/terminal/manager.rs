@@ -969,13 +969,26 @@ struct ClosedSessions {
 /// Owns a newly spawned PTY until a registered, supervised session takes responsibility for it.
 struct UncommittedPtyProcess {
     process: Option<Arc<dyn PtyProcess>>,
+    _operation: Arc<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 impl UncommittedPtyProcess {
-    fn new(process: Arc<dyn PtyProcess>) -> Self {
-        Self {
-            process: Some(process),
-        }
+    async fn spawn(
+        backend: Arc<dyn PtyBackend>,
+        input: PtySpawnInput,
+        operation: Arc<tokio::sync::OwnedMutexGuard<()>>,
+    ) -> Result<Self, String> {
+        // The blocking task must return the owner, not a bare process: dropping
+        // the join while spawn is in flight must still kill its late result.
+        // Retain the key's operation lock until that cleanup has run as well.
+        tokio::task::spawn_blocking(move || {
+            backend.spawn(&input).map(|process| Self {
+                process: Some(process),
+                _operation: operation,
+            })
+        })
+        .await
+        .map_err(|_| "terminal spawn task failed".to_owned())?
     }
 
     fn process(&self) -> Arc<dyn PtyProcess> {
@@ -1074,6 +1087,10 @@ impl SessionGeneration {
 
     fn is_invalidated(&self) -> bool {
         self.invalidated.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn is_closing(&self) -> bool {
+        self.closing.load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn install_observer(
@@ -1738,14 +1755,16 @@ impl TerminalManager {
     ) -> Result<TerminalSessionSnapshot, TerminalError> {
         let key = (input.thread_id.clone(), input.terminal_id.clone());
         if let Some(generation) = self.inner.generations.peek(&key) {
-            generation.begin_closing();
-            generation
-                .observation
-                .request_cancellation(TerminalObserverCancellationReason::Restarted);
-            generation.prevent_new_work();
+            generation.observation.request_cancellation_after(
+                TerminalObserverCancellationReason::Restarted,
+                || {
+                    generation.begin_closing();
+                    generation.prevent_new_work();
+                },
+            );
         }
         let operation = self.inner.operations.for_key(&key);
-        let _operation = operation.lock_owned().await;
+        let operation = Arc::new(operation.lock_owned().await);
         let (displaced, generation, _startup) = {
             let _lifecycle = self.inner.lifecycle.lock().await;
             self.inner.worktree_removals.ensure_available(
@@ -1795,7 +1814,14 @@ impl TerminalManager {
             .await;
         log_terminal_cleanup("restart", &closed.report);
         match self
-            .start_inner(input, true, generation, None, publication_cancellation)
+            .start_inner(
+                input,
+                true,
+                generation,
+                None,
+                publication_cancellation,
+                operation.clone(),
+            )
             .await
         {
             Ok(snapshot) => Ok(snapshot),
@@ -1816,7 +1842,7 @@ impl TerminalManager {
     ) -> Result<TerminalSessionSnapshot, TerminalError> {
         let key = (input.thread_id.clone(), input.terminal_id.clone());
         let operation = self.inner.operations.for_key(&key);
-        let _operation = operation.lock_owned().await;
+        let operation = Arc::new(operation.lock_owned().await);
         let startup = generation.startup.clone();
         let _startup = startup.lock().await;
         self.start_inner(
@@ -1825,6 +1851,7 @@ impl TerminalManager {
             generation,
             initial_input,
             publication_cancellation,
+            operation,
         )
         .await
     }
@@ -1836,6 +1863,7 @@ impl TerminalManager {
         generation: Arc<SessionGeneration>,
         initial_input: Option<String>,
         publication_cancellation: CancellationToken,
+        operation: Arc<tokio::sync::OwnedMutexGuard<()>>,
     ) -> Result<TerminalSessionSnapshot, TerminalError> {
         self.inner.worktree_removals.ensure_available(
             &input.thread_id,
@@ -2039,7 +2067,9 @@ impl TerminalManager {
         let mut spawned = None;
         for (spawn, attempted_label) in spawn_candidates {
             attempted.push(attempted_label);
-            match self.inner.backend.spawn(&spawn) {
+            match UncommittedPtyProcess::spawn(self.inner.backend.clone(), spawn, operation.clone())
+                .await
+            {
                 Ok(process) => {
                     spawned = Some(process);
                     break;
@@ -2047,7 +2077,7 @@ impl TerminalManager {
                 Err(error) => last_error = redact_private_values(error, &private_values),
             }
         }
-        let Some(process) = spawned else {
+        let Some(mut uncommitted_process) = spawned else {
             generation
                 .cancel_observer(TerminalObserverCancellationReason::SpawnFailed)
                 .await;
@@ -2056,14 +2086,13 @@ impl TerminalManager {
                 message: last_error,
             });
         };
-        let mut uncommitted_process = UncommittedPtyProcess::new(process);
         if publication_cancellation.is_cancelled() {
             generation
                 .cancel_observer(TerminalObserverCancellationReason::GenerationInvalidated)
                 .await;
             return Err(TerminalError::PublicationCancelled);
         }
-        if generation.is_invalidated() {
+        if generation.is_invalidated() || generation.is_closing() {
             generation
                 .cancel_observer(TerminalObserverCancellationReason::GenerationInvalidated)
                 .await;
@@ -2073,10 +2102,20 @@ impl TerminalManager {
             && let Some(observer) = generation.observer()
             && !observer.is_ready_for_on_spawned().await
         {
+            if generation.is_invalidated() || generation.is_closing() {
+                generation
+                    .cancel_observer(TerminalObserverCancellationReason::GenerationInvalidated)
+                    .await;
+                return Err(invalidated_creation_error(&input));
+            }
             drop(uncommitted_process);
             generation
                 .cancel_observer(TerminalObserverCancellationReason::PreparationRejected)
                 .await;
+            // Observer cleanup can await while close or restart fences this generation.
+            if generation.is_invalidated() || generation.is_closing() {
+                return Err(invalidated_creation_error(&input));
+            }
             private_values.clear();
             let Some((executable, args, env)) = original_command_candidate else {
                 return Err(TerminalError::Io(
@@ -2085,22 +2124,23 @@ impl TerminalManager {
             };
             let attempted_label = format!("{executable} {args:?}");
             attempted.push(attempted_label);
-            let process = self
-                .inner
-                .backend
-                .spawn(&PtySpawnInput {
+            uncommitted_process = UncommittedPtyProcess::spawn(
+                self.inner.backend.clone(),
+                PtySpawnInput {
                     executable,
                     args,
                     cwd: input.cwd.clone(),
                     cols: input.cols,
                     rows: input.rows,
                     env,
-                })
-                .map_err(|error| TerminalError::Spawn {
-                    attempted: attempted.clone(),
-                    message: error,
-                })?;
-            uncommitted_process = UncommittedPtyProcess::new(process);
+                },
+                operation.clone(),
+            )
+            .await
+            .map_err(|error| TerminalError::Spawn {
+                attempted: attempted.clone(),
+                message: error,
+            })?;
         }
         let process = uncommitted_process.process();
         if let Some(observer) = generation.observer() {
@@ -2108,13 +2148,16 @@ impl TerminalManager {
                 .on_spawned(process.pid(), generation.observation.observation())
                 .await;
             if !completed {
-                generation
-                    .cancel_observer(TerminalObserverCancellationReason::PreparationRejected)
-                    .await;
+                let reason = if generation.is_invalidated() || generation.is_closing() {
+                    TerminalObserverCancellationReason::GenerationInvalidated
+                } else {
+                    TerminalObserverCancellationReason::PreparationRejected
+                };
+                generation.cancel_observer(reason).await;
                 generation.observation.invalidate().await;
             }
         }
-        if generation.is_invalidated() {
+        if generation.is_invalidated() || generation.is_closing() {
             generation
                 .cancel_observer(TerminalObserverCancellationReason::GenerationInvalidated)
                 .await;
@@ -2893,11 +2936,13 @@ impl TerminalManager {
                 .generations
                 .peek(&(thread_id.to_owned(), terminal_id.to_owned()))
         {
-            generation.begin_closing();
-            generation
-                .observation
-                .request_cancellation(TerminalObserverCancellationReason::Closed);
-            generation.prevent_new_work();
+            generation.observation.request_cancellation_after(
+                TerminalObserverCancellationReason::Closed,
+                || {
+                    generation.begin_closing();
+                    generation.prevent_new_work();
+                },
+            );
         }
         let operation = terminal_id.map(|terminal_id| {
             self.inner
@@ -5399,6 +5444,80 @@ mod tests {
         junction::delete(&alias).expect("remove fixture junction");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborting_open_during_spawn_reaps_the_late_process_after_shutdown() {
+        let root = tempfile::tempdir().expect("terminal root");
+        let process = Arc::new(HistoryTestPty::new(43));
+        let mut exit = process.subscribe_exit();
+        let (spawn_started, spawn_started_rx) = std::sync::mpsc::channel();
+        let (spawn_release, spawn_release_rx) = std::sync::mpsc::channel();
+        let manager = TerminalManager::new(
+            Arc::new(BlockingSpawnBackend {
+                process: process.clone(),
+                started: std::sync::Mutex::new(Some(spawn_started)),
+                release: std::sync::Mutex::new(spawn_release_rx),
+            }),
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::ZERO,
+                ..TerminalManagerOptions::default()
+            },
+        );
+        let mut metadata = manager.subscribe_metadata().await;
+        let open_manager = manager.clone();
+        let mut open = tokio::spawn(async move {
+            open_manager
+                .open(TerminalOpenInput::new(
+                    "thread-aborted-spawn",
+                    "term-aborted-spawn",
+                    root.path().to_path_buf(),
+                    80,
+                    24,
+                ))
+                .await
+        });
+        tokio::task::spawn_blocking(move || {
+            spawn_started_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("spawn started");
+        })
+        .await
+        .expect("spawn waiter");
+
+        open.abort();
+        let aborted_before_release =
+            tokio::time::timeout(Duration::from_millis(250), &mut open).await;
+        // Shutdown and loss of the async caller must not strand the blocking
+        // task's eventual process, even when the manager has already gone away.
+        manager.shutdown().await;
+        assert!(manager.subscribe_metadata().await.initial.is_empty());
+        drop(manager);
+        spawn_release.send(()).expect("release late spawn");
+        if aborted_before_release.is_err() {
+            let _ = open.await;
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while exit.borrow().is_none() {
+                exit.changed().await.expect("late process exit");
+            }
+        })
+        .await
+        .expect("late process was not reaped");
+        assert!(process.is_killed(), "late process was not killed");
+        assert!(
+            !matches!(
+                tokio::time::timeout(Duration::from_millis(50), metadata.recv()).await,
+                Ok(Some(_))
+            ),
+            "aborted spawn published terminal metadata"
+        );
+        assert!(
+            aborted_before_release
+                .expect("open cancellation must finish while PTY spawn is blocked")
+                .expect_err("aborted open")
+                .is_cancelled()
+        );
+    }
+
     #[tokio::test]
     async fn aborting_open_after_spawn_before_registration_kills_the_unowned_process() {
         let root = tempfile::tempdir().unwrap();
@@ -5437,6 +5556,18 @@ mod tests {
             .await
             .expect("spawn did not succeed")
             .expect("spawned sender");
+        // The backend's signal precedes the blocking-task handoff. Wait until
+        // open owns the result and is blocked on publication before aborting.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if manager.inner.lifecycle.try_lock().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("open reached session publication");
 
         open_task.abort();
         let join_error = open_task
@@ -5522,6 +5653,83 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Acquire),
             1
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn hardening_aborted_spawn_holds_key_until_late_process_cleanup() {
+        for restart in [false, true] {
+            let root = tempfile::tempdir().expect("temp dir");
+            let (first_started, first_started_rx) = std::sync::mpsc::channel();
+            let (first_release, first_release_rx) = std::sync::mpsc::channel();
+            let backend = Arc::new(FirstSpawnBlockingBackend {
+                processes: std::sync::Mutex::new(Vec::new()),
+                spawn_count: std::sync::atomic::AtomicUsize::new(0),
+                first_started: std::sync::Mutex::new(Some(first_started)),
+                first_release: std::sync::Mutex::new(first_release_rx),
+                second_spawned: tokio::sync::Semaphore::new(0),
+            });
+            let manager = TerminalManager::new(
+                backend.clone(),
+                TerminalManagerOptions {
+                    subprocess_poll_interval: Duration::ZERO,
+                    ..TerminalManagerOptions::default()
+                },
+            );
+            let input = TerminalOpenInput::new(
+                "thread-aborted-spawn",
+                "terminal-aborted-spawn",
+                root.path().to_path_buf(),
+                80,
+                24,
+            );
+            let first_manager = manager.clone();
+            let first_input = input.clone();
+            let first = tokio::spawn(async move { first_manager.open(first_input).await });
+            tokio::task::spawn_blocking(move || {
+                first_started_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("first spawn started");
+            })
+            .await
+            .expect("first spawn waiter");
+            first.abort();
+            assert!(first.await.expect_err("aborted open").is_cancelled());
+
+            let replacement_manager = manager.clone();
+            let replacement = tokio::spawn(async move {
+                if restart {
+                    replacement_manager.restart(input).await
+                } else {
+                    replacement_manager.open(input).await
+                }
+            });
+            let overlapping_spawn =
+                tokio::time::timeout(Duration::from_millis(250), backend.second_spawned.acquire())
+                    .await
+                    .is_ok();
+            first_release.send(()).expect("release abandoned spawn");
+            replacement
+                .await
+                .expect("replacement task")
+                .expect("replacement terminal");
+            let old_process_killed = backend
+                .processes
+                .lock()
+                .expect("processes lock")
+                .iter()
+                .find(|process| process.pid() == 1)
+                .expect("abandoned process")
+                .is_killed();
+            manager.shutdown().await;
+            assert!(!overlapping_spawn, "same-key spawn overlapped after abort");
+            assert!(old_process_killed, "abandoned process was not killed");
+            assert_eq!(
+                backend
+                    .spawn_count
+                    .load(std::sync::atomic::Ordering::Acquire),
+                2
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
