@@ -787,12 +787,23 @@ impl TerminalObserverGeneration {
     }
 
     pub(crate) fn request_cancellation(&self, reason: TerminalObserverCancellationReason) -> bool {
+        self.request_cancellation_after(reason, || {})
+    }
+
+    /// Fence the owning lifecycle under first-reason arbitration, before signalling workers.
+    /// The fence must be synchronous and must not re-enter observer cancellation.
+    pub(crate) fn request_cancellation_after(
+        &self,
+        reason: TerminalObserverCancellationReason,
+        fence: impl FnOnce(),
+    ) -> bool {
         let mut current = self
             .observation
             .inner
             .cancellation_reason
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        fence();
         if current.is_some() {
             return false;
         }
@@ -1873,6 +1884,56 @@ mod tests {
                 .is_empty(),
             "a cancelled publication must not mutate the projection"
         );
+    }
+
+    #[test]
+    fn lifecycle_cancellation_fence_preserves_the_first_reason() {
+        for reason in [
+            TerminalObserverCancellationReason::Closed,
+            TerminalObserverCancellationReason::Restarted,
+        ] {
+            let generation =
+                TerminalObserverGeneration::new("thread".to_owned(), "term".to_owned());
+            let competing_generation = generation.clone();
+            let (start, started) = std::sync::mpsc::channel();
+            let (entered, entry) = std::sync::mpsc::channel();
+            let (finished, completion) = std::sync::mpsc::channel();
+            let competing = std::thread::spawn(move || {
+                started.recv().expect("lifecycle fence entered");
+                entered.send(()).expect("competing request entry");
+                let won = competing_generation.request_cancellation(
+                    TerminalObserverCancellationReason::GenerationInvalidated,
+                );
+                finished.send(won).expect("competing request completion");
+            });
+            let mut completed_inside_fence = None;
+            assert!(generation.request_cancellation_after(reason, || {
+                start.send(()).expect("start competing invalidation");
+                entry.recv().expect("competing invalidation entered");
+                completed_inside_fence = completion.recv_timeout(Duration::from_millis(250)).ok();
+            }));
+            competing.join().expect("competing invalidation thread");
+            assert_eq!(
+                completed_inside_fence, None,
+                "invalidation bypassed lifecycle arbitration"
+            );
+            assert!(!completion.recv().expect("competing result"));
+            assert_eq!(generation.cancellation_reason(), Some(reason));
+            assert!(generation.cancellation_was_requested_while_current());
+
+            let mut fenced_again = false;
+            assert!(
+                !generation.request_cancellation_after(
+                    TerminalObserverCancellationReason::Shutdown,
+                    || fenced_again = true,
+                )
+            );
+            assert!(
+                fenced_again,
+                "already-cancelled generations still fence new work"
+            );
+            assert_eq!(generation.cancellation_reason(), Some(reason));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

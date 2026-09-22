@@ -1128,6 +1128,19 @@ checks its lease cancellation after spawn and again under the manager
 publication lock; a PTY that finishes spawning after loss is killed by its
 uncommitted-process owner and is never inserted as a live session.
 
+Initial PTY spawn and prepared-command fallback both run on Tokio's blocking
+pool. The blocking task constructs the uncommitted-process guard before
+returning its result; the join carries that guard until session supervision
+takes ownership. The guard also retains the per-terminal operation lock, so
+cancelling the caller cannot admit a same-key replacement before the late
+process has been killed. Cancelling or dropping the async caller therefore kills
+an unclaimed late process when the blocking result is discarded, including after
+terminal-manager shutdown. The native PTY backend retains its process waiter,
+which cleans up the process group or Windows Job and reaps the root independently
+of the caller's async task. A started native spawn cannot be forcibly cancelled;
+this ownership guarantee applies when that call returns, without blocking an
+async runtime worker for its duration.
+
 Runtime shutdown adds a separate per-runtime process-admission fence before
 provider and terminal managers drain. A terminal spawned after that fence is
 rejected as shut down and its uncommitted PTY owner kills and waits for the
