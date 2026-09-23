@@ -406,6 +406,13 @@ impl CommandBuilder {
         )
     }
 
+    /// Iterate over the complete effective environment without losing non-UTF-8 entries.
+    pub fn iter_full_env(&self) -> impl Iterator<Item = (&OsStr, &OsStr)> {
+        self.envs
+            .values()
+            .map(|entry| (entry.preferred_key.as_os_str(), entry.value.as_os_str()))
+    }
+
     pub fn iter_full_env_as_str(&self) -> impl Iterator<Item = (&str, &str)> {
         self.envs.values().filter_map(
             |EnvEntry {

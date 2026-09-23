@@ -875,6 +875,7 @@ fn review_diff_args(ignore_whitespace: bool, target: Option<&str>, three_dot: bo
 async fn run_review_diff(cwd: &str, args: Vec<String>) -> Result<String, ReviewError> {
     let mut command = Command::new("git");
     configure_background_command(&mut command);
+    crate::process::isolate_appimage_environment(&mut command);
     let output = command
         .args(["-C", cwd])
         .args(args)
@@ -921,6 +922,7 @@ fn review_source(
 async fn untracked_review_diff(cwd: &str) -> Result<UntrackedReviewDiff, ReviewError> {
     let mut command = Command::new("git");
     configure_background_command(&mut command);
+    crate::process::isolate_appimage_environment(&mut command);
     let output = command
         .args(["-C", cwd])
         .args([
@@ -2689,6 +2691,80 @@ mod tests {
 
         assert!(preview.sources.is_empty());
         assert!(preview.generated_at > 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn review_diff_commands_ignore_appimage_environment() {
+        use crate::test_support::appimage_environment::{
+            ENVIRONMENT_CASES, assert_child_environment, check_inherited_environment,
+        };
+        use crate::test_support::reexec;
+        use std::os::unix::fs::PermissionsExt;
+
+        const FIXTURE: &str = "BIBCODE_REVIEW_ENVIRONMENT_FIXTURE";
+        const TEST: &str =
+            "production::runtime::tests::review_diff_commands_ignore_appimage_environment";
+        if let Some(child) = reexec::enter(TEST, "review-diff") {
+            let directory = PathBuf::from(std::env::var_os(FIXTURE).expect("review fixture path"));
+            crate::test_support::run_on_current_thread(async {
+                assert_eq!(
+                    run_review_diff(
+                        &directory.to_string_lossy(),
+                        review_diff_args(false, Some("HEAD"), false),
+                    )
+                    .await
+                    .expect("tracked review diff"),
+                    "tracked review fixture\n"
+                );
+                let untracked = untracked_review_diff(&directory.to_string_lossy())
+                    .await
+                    .expect("untracked review diff");
+                assert!(untracked.diff.contains("+++ b/untracked.txt"));
+                assert!(untracked.diff.contains("+untracked review fixture"));
+                assert!(!untracked.truncated);
+            });
+            child.complete();
+            return;
+        }
+
+        check_inherited_environment(TEST, ENVIRONMENT_CASES, |expected| {
+            let directory = tempfile::tempdir().expect("review fixture directory");
+            let executable = directory.path().join("git");
+            std::fs::write(
+                &executable,
+                concat!(
+                    "#!/bin/sh\n",
+                    "[ \"$1\" = -C ] || exit 1\n",
+                    "case \"$3\" in\n",
+                    "  diff) /usr/bin/env -0 > \"$2/tracked.environment\"; printf 'tracked review fixture\\n' ;;\n",
+                    "  -c) /usr/bin/env -0 > \"$2/untracked.environment\"; printf 'untracked.txt\\0' ;;\n",
+                    "  *) exit 1 ;;\n",
+                    "esac\n",
+                ),
+            )
+            .expect("git review fixture");
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+                .expect("executable git fixture");
+            std::fs::write(
+                directory.path().join("untracked.txt"),
+                "untracked review fixture\n",
+            )
+            .expect("untracked file fixture");
+            reexec::run(TEST, "review-diff", None, |command| {
+                command
+                    .env(FIXTURE, directory.path())
+                    .env("PATH", directory.path());
+            });
+            let mut expected = expected.clone();
+            expected.insert("PATH", Some(directory.path().as_os_str().to_owned()));
+            for capture in ["tracked.environment", "untracked.environment"] {
+                assert_child_environment(
+                    &std::fs::read(directory.path().join(capture)).expect("review environment"),
+                    &expected,
+                );
+            }
+        });
     }
 
     #[tokio::test]

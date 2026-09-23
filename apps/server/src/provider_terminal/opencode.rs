@@ -1784,6 +1784,7 @@ impl OpenCodeCapabilityProbeRunner for SystemOpenCodeCapabilityProbeRunner {
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
+            crate::provider::environment::sanitize_provider_subprocess_environment(&mut command);
             let output = run_supervised(
                 SupervisedRunRequest {
                     command,
@@ -1936,6 +1937,7 @@ impl OpenCodeHelperLauncher for SystemOpenCodeHelperLauncher {
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::null());
+                crate::provider::environment::sanitize_provider_subprocess_environment(command);
             });
             configure_supervised_background_command_wrap(&mut command);
             let mut child = command
@@ -3429,6 +3431,63 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use crate::test_support::{FixtureEvent, TestSandbox};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn system_capability_probe_ignores_appimage_environment() {
+        crate::test_support::check_capability_probe_appimage_environment(
+            "provider_terminal::opencode::tests::system_capability_probe_ignores_appimage_environment",
+            |executable, args| async move {
+                let output = SystemOpenCodeCapabilityProbeRunner
+                    .run(&executable, args)
+                    .await?;
+                Ok((output.success, output.stdout))
+            },
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn system_helper_launcher_ignores_appimage_environment() {
+        use crate::test_support::{
+            ISOLATING_AND_NO_OP_CASES,
+            appimage_environment::{assert_child_environment, check_inherited_environment},
+        };
+
+        check_inherited_environment(
+            "provider_terminal::opencode::tests::system_helper_launcher_ignores_appimage_environment",
+            ISOLATING_AND_NO_OP_CASES,
+            |expected| {
+                let sandbox = TestSandbox::new("opencode-helper-appimage-environment");
+                let output_path = sandbox.path("environment");
+                let executable = sandbox.executable_script(
+                    "helper",
+                    "/usr/bin/env -0 > \"$1\"\nprintf 'opencode server listening on http://127.0.0.1:43127\\n'\nexec /bin/sleep 3600",
+                    "",
+                );
+                crate::test_support::run_on_current_thread(async {
+                    let launcher = SystemOpenCodeHelperLauncher::default();
+                    let ready = launcher
+                        .start(OpenCodeHelperLaunch {
+                            executable: executable.to_string_lossy().into_owned(),
+                            args: vec![output_path.to_string_lossy().into_owned()],
+                            cwd: sandbox.root().to_path_buf(),
+                            env: BTreeMap::new(),
+                            process_attribution: ProcessAttributionRegistry::new(),
+                        })
+                        .await
+                        .expect("OpenCode system helper launcher");
+                    ready.process.terminate_and_reap().await;
+                    launcher.shutdown().await;
+                    assert_eq!(ready.endpoint, "http://127.0.0.1:43127");
+                });
+                assert_child_environment(
+                    &std::fs::read(output_path).expect("OpenCode helper child environment"),
+                    expected,
+                );
+            },
+        );
+    }
 
     #[derive(Debug)]
     struct CancellationSensitiveWaitState {

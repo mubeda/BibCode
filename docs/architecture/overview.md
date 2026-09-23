@@ -187,15 +187,6 @@ flowchart TB
   owners to the typed RPC registry and the worktree catalog's existing mutation
   arbitration.
 
-  On Linux, the shared Git process runner isolates system Git and source-control
-  helper commands from AppImage library directories. For an AppImage launch it
-  filters the current `APPDIR` and stale `.mount_*` paths from the child's
-  `LD_LIBRARY_PATH`, retaining unrelated custom directories and credential
-  settings. Text and binary-output paths use the same policy. It does not
-  change the desktop process environment or replace the host's library paths
-  with distribution-specific locations. Ordinary non-AppImage launches keep
-  their configured environment.
-
   On Unix the supervised process runner retries a spawn that fails with
   `ETXTBSY` (the executable is still open for writing, typically a helper
   that was just installed or rewritten, or a fork of this process that has
@@ -210,6 +201,90 @@ flowchart TB
   It is used by browser and desktop clients.
 - **Shared runtime (`packages/shared`)** contains runtime utilities used by
   multiple packages through explicit subpath exports.
+
+## AppImage child environments
+
+`bibcode_server::process::isolate_appimage_environment(&mut command)` is the
+cross-platform entry point for child isolation and is a no-op off Linux.
+Standard, Tokio, and portable-pty command adapters live beside the policy in
+`apps/server/src/process/appimage.rs`. Standard and Tokio commands inherit by
+default; a command with a cleared environment uses
+`ChildCommand::Process { command, inheritance: EnvironmentInheritance::Cleared }`
+with its standard command builder. The inheritance mode belongs only to that
+process adapter; PTYs already own their complete captured environment.
+
+Provider commands use
+`crate::provider::environment::sanitize_provider_subprocess_environment` to
+remove `RUST_LOG` and apply child isolation. Production provider services and
+provider terminals both depend on this provider-owned module.
+
+Covered children include terminal PTYs, providers, their probes and helpers,
+Git and source-control helpers (including review Git commands), server-launched
+editors/file managers, and desktop-owned SSH, Tailscale, and host
+backend-shutdown `kill` commands. Isolation changes only the selected command.
+The desktop process, WebKitGTK-owned children, and BiBCode's own binaries retain
+the bundled environment; desktop external-backend launches and the generic
+supervised process runner deliberately do not apply this policy. The login-shell
+PATH probe also inherits the original desktop environment: its output hydrates
+the desktop's own PATH before Tauri starts, so stripping bundled entries there
+would change the desktop's executable ordering.
+
+The gate checks a few variables before copying the full environment. A nonempty
+`APPIMAGE` and an absolute, non-root `APPDIR` activate isolation. For an
+extracted AppDir without `APPIMAGE`, require the current executable to be under
+`APPDIR` and `$APPDIR/AppRun` to exist. This supports `squashfs-root/AppRun` on
+Ubuntu without FUSE while rejecting a stray `APPDIR` in an ordinary installation.
+Once gated, the policy inspects every variable in the effective child environment
+and removes entries rooted in `APPDIR` or absolute paths containing a stale
+`.mount_*` component. This covers launcher and plugin additions, including
+Python, Qt, and GStreamer settings, without a fixed path-variable list.
+
+Values are split on colons, with semicolons also accepted for `LD_LIBRARY_PATH`
+and spaces for `LD_PRELOAD`. Values with no bundled entry remain byte-for-byte
+unchanged, including non-path strings and non-UTF-8 values. Retained entries
+keep their order and host credentials such as `SSH_AUTH_SOCK` survive. If every
+surviving entry is empty, the variable is unset: AppRun appends a trailing
+separator when the original value is empty. A launcher-created empty loader
+path must never become `LD_LIBRARY_PATH=.` and search the working directory.
+Empty entries alongside real host entries, including an explicitly configured
+`.`, remain unchanged. The host library search path is never replaced with
+distribution-specific directories.
+
+The policy also removes `APPDIR`, `APPIMAGE`, `ARGV0`, and `OWD`, plus the
+launcher's forced `GTK_THEME`, `GDK_BACKEND`, `PYTHONDONTWRITEBYTECODE`, and
+`GTK_PATH`. The hook replaces `GTK_PATH` without retaining the user's value, so
+its host directories must also be removed. Terminal shells can reapply user
+settings from their rc files. Command-local overrides and removals participate
+in the effective environment; cleared process commands never recover ambient
+values. PTYs expose their complete captured environment through a raw
+`iter_full_env` accessor in vendored portable-pty, so non-UTF-8 command overrides
+cannot escape the policy. Ordinary non-AppImage launches keep their configured
+environment, and no selected child changes the parent environment.
+
+Linux file-manager launching takes opener candidates from `open::commands`,
+isolates each command, and starts a fallible detached reaper thread before
+spawning a child. The command uses the safe `process_group(0)` API; the thread
+calls `spawn`, reports its result, then owns the child handle until `wait` completes.
+The first successful spawn returns promptly while the opener may keep running;
+thread or spawn errors try the next candidate in the crate's order. Other
+platforms keep `open::that_detached`, including Windows ShellExecute. Desktop
+URL/path opening through `tauri-plugin-opener` remains a separate limitation:
+the plugin spawns its own opener commands without an environment customization
+API. Linux file reveal uses D-Bus and does not spawn a local opener.
+
+Linux desktop startup's `deep_link().register_all()` invokes the plugin's
+`update-desktop-database` and `xdg-mime` registration commands. These inherit
+the desktop's AppImage environment without an environment customization API.
+A failure to start a command reaches the startup warning, but the plugin
+discards the commands' exit statuses. If a tool starts and then exits nonzero
+because of bundled libraries, registration fails silently and can leave the
+`bibcode://` handler missing.
+
+The GTK hook appends `XDG_DATA_DIRS` after a forced `/usr/share` entry.
+When the original variable is unset, stripping the AppDir leaves `/usr/share:`:
+the usual `/usr/local/share` default is lost and an empty entry relative to the
+working directory remains. The child policy cannot reconstruct the pre-launch
+value, and the packaging wrapper leaves this hook behavior unchanged.
 
 ## Project-data ownership and identity
 
@@ -460,6 +535,8 @@ descendant keeps the stdout pipe open: the host terminates and reaps that group,
 joins the reader, then installs the merged PATH while startup is still
 single-threaded. Missing, malformed, oversized, or incomplete frames leave the
 inherited PATH unchanged.
+See [AppImage child environments](#appimage-child-environments) for the probe's
+environment policy.
 
 ```mermaid
 sequenceDiagram
@@ -678,6 +755,8 @@ renderer retargets error presentation, while the retained writer cannot keep
 the departed renderer or its terminal buffers reachable.
 
 ### Linux AppImage GTK packaging
+
+See the [AppImage child environment policy](#appimage-child-environments).
 
 The desktop build's `beforeBuildCommand` runs
 `scripts/prepare-tauri-appimage-tools.ts`, which prepares the repository GTK
