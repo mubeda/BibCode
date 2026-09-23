@@ -29,11 +29,13 @@ describe("provider input log", () => {
     const entries: ProviderInputLogEntry[] = [
       {
         provider: "codex",
+        kind: "start",
         prompt: "$refactor",
         recordedAt: "2026-07-23T12:00:00.000Z",
       },
       {
         provider: "opencode",
+        kind: "start",
         prompt: "@reviewer",
         recordedAt: "2026-07-23T12:00:01.000Z",
       },
@@ -62,6 +64,7 @@ describe("provider input log", () => {
     const path = NodePath.join(directory, "provider-input.jsonl");
     const entry: ProviderInputLogEntry = {
       provider: "cursor",
+      kind: "start",
       prompt: "/review",
       recordedAt: "2026-07-23T12:00:00.000Z",
     };
@@ -87,6 +90,7 @@ describe("provider input log", () => {
     const path = NodePath.join(directory, "provider-input.jsonl");
     const entry: ProviderInputLogEntry = {
       provider: "grok",
+      kind: "start",
       prompt: "/skills",
       recordedAt: "2026-07-23T12:00:00.000Z",
     };
@@ -133,5 +137,31 @@ describe("provider input log", () => {
         },
       ),
     ).rejects.toThrow(/provider input log became malformed.*not-json/iu);
+  });
+
+  it("distinguishes a steer from a new start with the same prompt", async () => {
+    const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "bibcode-provider-log-"));
+    temporaryDirectories.push(directory);
+    const path = NodePath.join(directory, "provider-input.jsonl");
+    const entry: ProviderInputLogEntry = {
+      provider: "codex",
+      kind: "steer",
+      prompt: "second",
+      turnId: "running-turn",
+      recordedAt: "2026-09-22T20:00:00.000Z",
+    };
+    appendProviderInputLogEntry(path, entry);
+
+    await expect(
+      waitForProviderInputLogEntry(path, 0, { provider: "codex", prompt: "second", kind: "start" }),
+    ).rejects.toThrow(/Provider input mismatch/);
+    await expect(
+      waitForProviderInputLogEntry(
+        path,
+        0,
+        { provider: "codex", prompt: "second", kind: "steer" },
+        { settleMs: 0 },
+      ),
+    ).resolves.toEqual(entry);
   });
 });

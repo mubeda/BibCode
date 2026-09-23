@@ -8,7 +8,9 @@ import type { composerProviderProfiles } from "./test-project.ts";
 
 export interface ProviderInputLogEntry {
   readonly provider: keyof typeof composerProviderProfiles;
+  readonly kind: "start" | "steer";
   readonly prompt: string;
+  readonly turnId?: string;
   readonly recordedAt: string;
 }
 
@@ -18,7 +20,8 @@ export interface WaitForProviderInputLogEntryOptions {
   readonly settleMs?: number;
 }
 
-type ExpectedProviderInputLogEntry = Pick<ProviderInputLogEntry, "provider" | "prompt">;
+type ExpectedProviderInputLogEntry = Pick<ProviderInputLogEntry, "provider" | "prompt"> &
+  Partial<Pick<ProviderInputLogEntry, "kind">>;
 
 export function appendProviderInputLogEntry(path: string, entry: ProviderInputLogEntry): void {
   if (!NodePath.isAbsolute(path)) {
@@ -80,7 +83,11 @@ export async function waitForProviderInputLogEntry(
     }
     const candidate = appended[0];
     if (candidate) {
-      if (candidate.provider !== expected.provider || candidate.prompt !== expected.prompt) {
+      if (
+        candidate.provider !== expected.provider ||
+        candidate.prompt !== expected.prompt ||
+        (expected.kind !== undefined && candidate.kind !== expected.kind)
+      ) {
         throw new Error(
           `Provider input mismatch: expected ${JSON.stringify(expected)}, observed ${JSON.stringify(candidate)}.`,
         );

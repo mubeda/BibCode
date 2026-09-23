@@ -39,6 +39,8 @@ export type UpdateThreadMetadataInput = CommandInput<"thread.meta.update">;
 export type SetThreadRuntimeModeInput = CommandInput<"thread.runtime-mode.set">;
 export type SetThreadInteractionModeInput = CommandInput<"thread.interaction-mode.set">;
 export type StartThreadTurnInput = CommandInput<"thread.turn.start">;
+export type SteerThreadTurnInput = CommandInput<"thread.turn.steer">;
+export type PromoteThreadTurnInput = CommandInput<"thread.turn.promote">;
 export type InterruptThreadTurnInput = CommandInput<"thread.turn.interrupt">;
 export type ResolveTurnDeliveryInput = CommandInput<"thread.turn-delivery.resolve">;
 export type RespondToThreadApprovalInput = CommandInput<"thread.approval.respond">;
@@ -194,6 +196,30 @@ export const startThreadTurn: (input: StartThreadTurnInput) => CommandEffect = E
   return yield* dispatch({
     ...input,
     type: "thread.turn.start",
+    commandId: metadata.commandId,
+    createdAt: metadata.createdAt,
+  });
+});
+
+export const steerThreadTurn: (input: SteerThreadTurnInput) => CommandEffect = Effect.fn(
+  "EnvironmentCommands.steerThreadTurn",
+)(function* (input) {
+  const metadata = yield* timestampedCommandMetadata(input);
+  return yield* dispatch({
+    ...input,
+    type: "thread.turn.steer",
+    commandId: metadata.commandId,
+    createdAt: metadata.createdAt,
+  });
+});
+
+export const promoteThreadTurn: (input: PromoteThreadTurnInput) => CommandEffect = Effect.fn(
+  "EnvironmentCommands.promoteThreadTurn",
+)(function* (input) {
+  const metadata = yield* timestampedCommandMetadata(input);
+  return yield* dispatch({
+    ...input,
+    type: "thread.turn.promote",
     commandId: metadata.commandId,
     createdAt: metadata.createdAt,
   });

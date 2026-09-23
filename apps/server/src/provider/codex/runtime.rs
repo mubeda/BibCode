@@ -34,9 +34,10 @@ use super::{
         BuildTurnStartInput, CodexProviderSnapshot, CodexRuntimeMode, CodexThreadSnapshot,
         ReconciliationThread, ThreadBackgroundTerminalsListParams, ThreadListParams,
         ThreadReadParams, build_initialize_params, build_turn_start_params,
-        decode_background_terminals_list_response, decode_thread_list_response,
-        decode_thread_read_response, delivery_key_exists, is_recoverable_thread_resume_error,
-        parse_model_list_response, parse_skills_list_response, parse_thread_snapshot,
+        build_turn_steer_params, decode_background_terminals_list_response,
+        decode_thread_list_response, decode_thread_read_response, delivery_key_exists,
+        is_recoverable_thread_resume_error, parse_model_list_response, parse_skills_list_response,
+        parse_thread_snapshot,
     },
     protocol::{IncomingEvent, JsonRpcConnection, ProtocolError},
 };
@@ -1221,13 +1222,48 @@ impl CodexSessionRuntime {
             })?
             .to_owned();
         let mut session = self.inner.session.lock().await;
+        if session.status != "running" || session.active_turn_id.is_none() {
+            session.active_turn_id = Some(turn_id.clone());
+        }
         session.status = "running".to_owned();
-        session.active_turn_id = Some(turn_id.clone());
         Ok(TurnStartResult {
             thread_id: session.thread_id.clone(),
             turn_id,
             resume_cursor: session.resume_cursor.clone(),
         })
+    }
+
+    pub async fn steer_turn(
+        &self,
+        input: Option<String>,
+        attachments: Vec<Value>,
+        expected_turn_id: String,
+        client_user_message_id: Option<String>,
+    ) -> Result<String, RuntimeError> {
+        let thread_id = self.provider_thread_id().await?;
+        let payload = build_turn_steer_params(
+            &thread_id,
+            input.as_deref(),
+            &attachments,
+            &expected_turn_id,
+            client_user_message_id.as_deref(),
+        );
+        let response = self
+            .inner
+            .connection
+            .lock()
+            .await
+            .clone()
+            .request("turn/steer", payload)
+            .await?;
+        response
+            .get("turnId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| RuntimeError::InvalidPayload {
+                message: "turn/steer response missing turnId".to_owned(),
+            })
     }
 
     pub async fn delivery_exists(&self, delivery_key: &str) -> Result<bool, RuntimeError> {
@@ -3701,6 +3737,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_turn_keeps_the_active_turn_id_while_running() {
+        // A follow-up response must not redirect Stop away from the provider's active turn.
+        let (connection, incoming, peer_stdout, peer_stdin, _peer_stderr) =
+            runtime_test_connection();
+        let runtime = CodexSessionRuntime::new(reconciliation_test_options(), connection, incoming);
+        runtime.inner.session.lock().await.resume_cursor = Some("provider-thread".to_owned());
+        let peer = tokio::spawn(async move {
+            let mut reader = BufReader::new(peer_stdin);
+            let mut writer = peer_stdout;
+            for id in ["active", "follow-up"] {
+                let request = read_runtime_test_json(&mut reader).await;
+                assert_eq!(request["method"], "turn/start");
+                write_runtime_test_json(
+                    &mut writer,
+                    json!({"id":request["id"], "result":{"turn":{"id":id}}}),
+                )
+                .await;
+            }
+            let interrupt = read_runtime_test_json(&mut reader).await;
+            write_runtime_test_json(&mut writer, json!({"id":interrupt["id"], "result":{}})).await;
+            interrupt
+        });
+        for _ in 0..2 {
+            runtime
+                .send_turn(Some("hello".into()), vec![], None, None)
+                .await
+                .unwrap();
+        }
+        runtime.interrupt_turn(None).await.unwrap();
+        let interrupt = peer.await.unwrap();
+        assert_eq!(interrupt["params"]["turnId"], "active");
+    }
+
+    #[tokio::test]
     async fn codex_option_update_changes_the_next_turn_payload() {
         let (connection, incoming, peer_stdout, peer_stdin, _peer_stderr) =
             runtime_test_connection();
@@ -4166,6 +4236,13 @@ mod tests {
         let session = runtime.inner.session.lock().await;
         assert_eq!(session.status, "closed");
         assert_eq!(session.active_turn_id, None);
+        drop(session);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), runtime.next_event())
+                .await
+                .is_err(),
+            "the runtime retains its event sender after loss; consumers must handle session.exited"
+        );
     }
 
     async fn assert_mcp_status_discovery_failure(responses: Vec<Value>, expected_warning: &str) {

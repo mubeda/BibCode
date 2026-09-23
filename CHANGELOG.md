@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Keep composing while an agent works: messages appear in a durable queue and
+  send in order when the current turn ends. Steer the first queued message on
+  Codex or Claude, or Cancel to return it to your draft. Stop restores queued
+  messages before interrupting, and the queue survives reloads and restarts.
+  After a restart interrupts a turn, queued messages wait for explicit Send now.
+
+### Fixed
+
+- Sending after a provider process exits mid-turn now launches a new provider
+  session, including Send now on a held queued message.
+
 ## [v0.6.0] - 2026-09-21
 
 BiBCode v0.6.0 adds a Pull Requests module: a project-scoped view, next to

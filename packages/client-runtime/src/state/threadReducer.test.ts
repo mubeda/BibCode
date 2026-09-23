@@ -5,6 +5,7 @@ import {
   EventId,
   MessageId,
   ProjectId,
+  ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
   TurnId,
@@ -55,6 +56,220 @@ function event(type: string, payload: Record<string, unknown>, sequence = 100) {
 }
 
 describe("applyThreadDetailEvent", () => {
+  describe("queued message delivery", () => {
+    const queuedMessage = {
+      id: MessageId.make("queued-1"),
+      role: "user" as const,
+      text: "next task",
+      turnId: null,
+      streaming: false,
+      delivery: {
+        state: "queued" as const,
+        provider: ProviderDriverKind.make("codex"),
+        mode: "start" as const,
+        held: true,
+      },
+      createdAt: "2026-04-02T00:00:00.000Z",
+      updatedAt: "2026-04-02T00:00:00.000Z",
+    };
+    const otherMessage = { ...queuedMessage, id: MessageId.make("queued-2"), text: "later task" };
+    const thread: OrchestrationThread = {
+      ...baseThread,
+      messages: [queuedMessage, otherMessage],
+      session: {
+        threadId: baseThread.id,
+        status: "running",
+        providerName: "codex",
+        runtimeMode: "full-access",
+        activeTurnId: TurnId.make("turn-1"),
+        lastError: null,
+        updatedAt: baseThread.updatedAt,
+      },
+      latestTurn: {
+        turnId: TurnId.make("turn-1"),
+        state: "running",
+        requestedAt: baseThread.createdAt,
+        startedAt: baseThread.createdAt,
+        completedAt: null,
+        assistantMessageId: null,
+      },
+    };
+    const updatedAt = "2026-04-02T01:00:00.000Z";
+
+    it("retimes only the promoted queued user message to the requested start time", () => {
+      const assistant = {
+        ...queuedMessage,
+        id: MessageId.make("previous-reply"),
+        role: "assistant" as const,
+        delivery: undefined,
+        text: "SECOND SEEN.",
+        turnId: TurnId.make("turn-1"),
+        createdAt: "2026-04-02T00:30:00.000Z",
+        updatedAt: "2026-04-02T00:30:00.000Z",
+      };
+      const original = { ...thread, messages: [queuedMessage, assistant, otherMessage] };
+      const result = applyThreadDetailEvent(
+        original,
+        event("thread.turn-start-requested", {
+          messageId: queuedMessage.id,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          createdAt: updatedAt,
+        }),
+      );
+      expect(result.kind).toBe("updated");
+      if (result.kind !== "updated") return;
+      expect(result.thread.messages[0]).toEqual({
+        ...queuedMessage,
+        createdAt: updatedAt,
+        updatedAt,
+      });
+      expect(result.thread.messages[1]).toBe(assistant);
+      expect(result.thread.messages[2]).toBe(otherMessage);
+      expect(original.messages[0]).toBe(queuedMessage);
+      const pending = applyThreadDetailEvent(
+        result.thread,
+        event("thread.turn-delivery-updated", {
+          messageId: queuedMessage.id,
+          delivery: { state: "pending", mode: "start", provider: "codex" },
+          updatedAt,
+        }),
+      );
+      expect(pending.kind).toBe("updated");
+      if (pending.kind !== "updated") return;
+      expect(
+        pending.thread.messages
+          .filter((message) => message.delivery?.state !== "queued")
+          .toSorted((left, right) => left.createdAt.localeCompare(right.createdAt))
+          .map((message) => message.id),
+      ).toEqual([assistant.id, queuedMessage.id]);
+    });
+
+    it("marks only the steered message pending without starting or attributing a new turn", () => {
+      const result = applyThreadDetailEvent(
+        thread,
+        event("thread.turn-steer-requested", {
+          messageId: queuedMessage.id,
+          turnId: "turn-1",
+          createdAt: updatedAt,
+        }),
+      );
+      expect(result.kind).toBe("updated");
+      if (result.kind !== "updated") return;
+      expect(result.thread.messages[0]).toEqual({
+        ...queuedMessage,
+        delivery: { ...queuedMessage.delivery, state: "pending", mode: "steer" },
+        updatedAt,
+      });
+      expect(result.thread.messages[1]).toBe(otherMessage);
+      expect(result.thread.latestTurn).toBe(thread.latestTurn);
+      expect(result.thread.session).toBe(thread.session);
+      expect(thread.messages[0]).toBe(queuedMessage);
+    });
+
+    it("withdraws only the cancelled message and ignores a repeated withdrawal", () => {
+      const withdrawn = event("thread.turn-delivery-updated", {
+        messageId: queuedMessage.id,
+        delivery: { state: "dismissed", provider: "codex" },
+        withdrawn: true,
+        updatedAt,
+      });
+      const result = applyThreadDetailEvent(thread, withdrawn);
+      expect(result.kind).toBe("updated");
+      if (result.kind !== "updated") return;
+      expect(result.thread.messages).toEqual([otherMessage]);
+      expect(result.thread.messages[0]).toBe(otherMessage);
+      expect(result.thread.latestTurn).toBe(thread.latestTurn);
+      expect(result.thread.session).toBe(thread.session);
+      expect(applyThreadDetailEvent(result.thread, withdrawn)).toEqual({ kind: "unchanged" });
+      expect(thread.messages).toEqual([queuedMessage, otherMessage]);
+    });
+
+    it("attributes accepted steering to the existing turn and applies delivery metadata", () => {
+      const result = applyThreadDetailEvent(
+        thread,
+        event("thread.turn-delivery-updated", {
+          messageId: queuedMessage.id,
+          delivery: { state: "delivered", provider: "codex" },
+          withdrawn: false,
+          turnId: "turn-1",
+          held: false,
+          mode: "steer",
+          updatedAt,
+        }),
+      );
+      expect(result.kind).toBe("updated");
+      if (result.kind !== "updated") return;
+      expect(result.thread.messages[0]).toEqual({
+        ...queuedMessage,
+        turnId: "turn-1",
+        delivery: { state: "delivered", provider: "codex", held: false, mode: "steer" },
+        updatedAt,
+      });
+      expect(result.thread.messages[1]).toBe(otherMessage);
+      expect(result.thread.latestTurn).toBe(thread.latestTurn);
+    });
+
+    it.each([
+      { held: true, mode: "start" },
+      { held: false, mode: "steer" },
+    ])("applies delivery flags from the snapshot-shaped delivery object %j", (fields) => {
+      const result = applyThreadDetailEvent(
+        thread,
+        event("thread.turn-delivery-updated", {
+          messageId: queuedMessage.id,
+          delivery: { state: "queued", provider: "codex", ...fields },
+          updatedAt,
+        }),
+      );
+      expect(result.kind).toBe("updated");
+      if (result.kind !== "updated") return;
+      expect(result.thread.messages[0]?.delivery).toEqual({
+        state: "queued",
+        provider: "codex",
+        ...fields,
+      });
+      expect(result.thread.messages[0]?.turnId).toBeNull();
+    });
+
+    it("applies legacy delivery updates without requiring mode, hold, or turn attribution", () => {
+      const result = applyThreadDetailEvent(
+        thread,
+        event("thread.turn-delivery-updated", {
+          messageId: otherMessage.id,
+          delivery: { state: "failed", provider: "codex", detail: "provider rejected" },
+          updatedAt,
+        }),
+      );
+      expect(result.kind).toBe("updated");
+      if (result.kind !== "updated") return;
+      expect(result.thread.messages[0]).toBe(queuedMessage);
+      expect(result.thread.messages[1]).toEqual({
+        ...otherMessage,
+        delivery: { state: "failed", provider: "codex", detail: "provider rejected" },
+        updatedAt,
+      });
+    });
+
+    it.each(["thread.turn-steer-requested", "thread.turn-delivery-updated"])(
+      "does not recreate a missing message for %s",
+      (type) => {
+        expect(
+          applyThreadDetailEvent(
+            thread,
+            event(type, {
+              messageId: "missing-message",
+              turnId: "turn-1",
+              createdAt: updatedAt,
+              delivery: { state: "delivered", provider: "codex" },
+              updatedAt,
+            }),
+          ),
+        ).toEqual({ kind: "unchanged" });
+      },
+    );
+  });
+
   describe("project events", () => {
     it("returns unchanged for project.created", () => {
       const result = applyThreadDetailEvent(baseThread, {

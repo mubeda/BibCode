@@ -1,0 +1,31 @@
+{
+  "_tag": "Exit",
+  "requestId": "900719925474099312345",
+  "exit": {
+    "_tag": "Success",
+    "value": [
+      {
+        "sequence": 1,
+        "eventId": "queue-event-1",
+        "aggregateKind": "thread",
+        "aggregateId": "thread-1",
+        "occurredAt": "2026-09-22T12:00:00.000Z",
+        "commandId": "queue-command-1",
+        "causationEventId": null,
+        "correlationId": null,
+        "metadata": {},
+        "type": "thread.turn-delivery-updated",
+        "payload": {
+          "threadId": "thread-1",
+          "messageId": "message-1",
+          "delivery": {
+            "state": "dismissed",
+            "provider": "codex"
+          },
+          "withdrawn": true,
+          "updatedAt": "2026-09-22T12:00:00.000Z"
+        }
+      }
+    ]
+  }
+}

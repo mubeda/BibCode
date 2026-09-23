@@ -15,7 +15,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::{
-    sync::{Mutex as AsyncMutex, OwnedMutexGuard, broadcast, mpsc, oneshot},
+    sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, broadcast, mpsc, oneshot},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -27,7 +27,7 @@ use crate::persistence::{
     OrchestrationEvent, PersistenceError, ProjectionPendingApproval, ProjectionProject,
     ProjectionState, ProjectionThread, ProjectionThreadActivity, ProjectionThreadMessage,
     ProjectionThreadProposedPlan, ProjectionThreadSession, ProjectionTurn, Repositories,
-    finalize_command_receipt_on,
+    can_promote_queued_provider_turn_on, finalize_command_receipt_on, hold_queued_provider_turns,
 };
 use crate::{
     checkpointing,
@@ -116,6 +116,7 @@ fn optional_nullable_is_missing<T>(value: &OptionalNullable<T>) -> bool {
 pub enum TurnDeliveryResolutionAction {
     Retry,
     Dismiss,
+    Cancel,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -519,6 +520,30 @@ pub enum OrchestrationCommand {
             skip_serializing_if = "Option::is_none"
         )]
         source_proposed_plan: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        queued: Option<bool>,
+        #[serde(rename = "createdAt")]
+        created_at: String,
+    },
+    #[serde(rename = "thread.turn.steer")]
+    ThreadTurnSteer {
+        #[serde(rename = "commandId")]
+        command_id: String,
+        #[serde(rename = "threadId")]
+        thread_id: String,
+        #[serde(rename = "messageId")]
+        message_id: String,
+        #[serde(rename = "createdAt")]
+        created_at: String,
+    },
+    #[serde(rename = "thread.turn.promote")]
+    ThreadTurnPromote {
+        #[serde(rename = "commandId")]
+        command_id: String,
+        #[serde(rename = "threadId")]
+        thread_id: String,
+        #[serde(rename = "messageId")]
+        message_id: String,
         #[serde(rename = "createdAt")]
         created_at: String,
     },
@@ -1737,6 +1762,7 @@ pub struct OrchestrationEngine {
     shutdown: CancellationToken,
     worker: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
     bootstrap_effects: Arc<StdMutex<Option<Arc<dyn ThreadTurnBootstrapEffects>>>>,
+    turn_delivery_wake: Arc<StdMutex<Option<Arc<Notify>>>>,
     project_command_effects: Arc<StdMutex<Option<Arc<dyn ProjectCommandEffects>>>>,
     command_admission: CommandAdmissionFence,
     workspace_ownership: WorkspaceOwnershipFence,
@@ -1757,6 +1783,7 @@ impl OrchestrationEngine {
         let (events, _) = broadcast::channel(128);
         let shutdown = CancellationToken::new();
         let project_command_effects = Arc::new(StdMutex::new(None));
+        let turn_delivery_wake = Arc::new(StdMutex::new(None));
         let worker = spawn_worker(
             repositories.clone(),
             initial_model,
@@ -1765,6 +1792,7 @@ impl OrchestrationEngine {
             shutdown.clone(),
             options.test_hooks.clone(),
             project_command_effects.clone(),
+            turn_delivery_wake.clone(),
         );
         Ok(Self {
             repositories,
@@ -1773,6 +1801,7 @@ impl OrchestrationEngine {
             shutdown,
             worker: Arc::new(tokio::sync::Mutex::new(Some(worker))),
             bootstrap_effects: Arc::new(StdMutex::new(None)),
+            turn_delivery_wake,
             project_command_effects,
             command_admission: CommandAdmissionFence::default(),
             workspace_ownership: WorkspaceOwnershipFence::default(),
@@ -2409,6 +2438,13 @@ impl OrchestrationEngine {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(effects);
     }
 
+    pub(crate) fn set_turn_delivery_waker(&self, wake: Arc<Notify>) {
+        *self
+            .turn_delivery_wake
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(wake);
+    }
+
     pub fn set_project_command_effects(&self, effects: Arc<dyn ProjectCommandEffects>) {
         *self
             .project_command_effects
@@ -2592,6 +2628,7 @@ impl OrchestrationEngine {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_worker(
     repositories: Repositories,
     mut model: CommandModel,
@@ -2600,6 +2637,7 @@ fn spawn_worker(
     shutdown: CancellationToken,
     hooks: TestHooks,
     project_command_effects: Arc<StdMutex<Option<Arc<dyn ProjectCommandEffects>>>>,
+    turn_delivery_wake: Arc<StdMutex<Option<Arc<Notify>>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -2642,6 +2680,12 @@ fn spawn_worker(
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                                 .clone();
+                            let wake_delivery = match &command {
+                                OrchestrationCommand::ThreadSessionSet { session, .. } => session.status == "ready",
+                                OrchestrationCommand::ThreadTurnPromote { .. } | OrchestrationCommand::ThreadTurnSteer { .. } | OrchestrationCommand::ThreadTurnDeliveryResolve { .. } => true,
+                                OrchestrationCommand::ThreadActivityAppend { activity, .. } => matches!(activity.kind.as_str(), "approval.resolved" | "user-input.resolved" | "provider.user-input.respond.failed"),
+                                _ => false,
+                            };
                             let mut result = process_envelope(
                                 &repositories,
                                 &mut model,
@@ -2679,6 +2723,9 @@ fn spawn_worker(
                             }
                             if result.as_ref().is_ok_and(|outcome| outcome.accepted_new)
                             {
+                                if wake_delivery && let Some(wake) = turn_delivery_wake.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref() {
+                                    wake.notify_one();
+                                }
                                 if let Some(ownership) = &ownership {
                                     ownership.commit();
                                 }
@@ -2695,7 +2742,12 @@ fn spawn_worker(
                             drop(command_claim);
                         }
                         WorkerEnvelope::DeliveryTransition(DeliveryTransitionEnvelope { transition, response }) => {
+                            let requeued = transition.next_state == TurnDeliveryState::Queued;
                             let result = persist_turn_delivery_transition(&repositories, &events, &hooks, transition).await;
+                            if requeued && matches!(result, Ok(true))
+                                && let Some(wake) = turn_delivery_wake.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref() {
+                                wake.notify_one();
+                            }
                             let _ = response.send(result);
                         }
                     }
@@ -2962,8 +3014,9 @@ async fn process_envelope(
             json!({
                 "threadId": turn.thread_id,
                 "messageId": turn.message_id,
-                "state": "pending",
+                "state": turn_delivery_state_name(turn.state),
                 "provider": turn.provider_kind,
+                "delivery": delivery_value(turn_delivery_state_name(turn.state), &turn.provider_kind, turn.mode.as_str(), false, None),
                 "detail": null,
                 "updatedAt": turn.created_at,
             }),
@@ -2986,6 +3039,7 @@ async fn process_envelope(
     let persisted = persist_command(
         repositories,
         hooks,
+        &command,
         &planned,
         &command_id,
         aggregate,
@@ -3932,6 +3986,7 @@ async fn plan_command(
             title_seed,
             bootstrap,
             source_proposed_plan,
+            queued,
             created_at,
             ..
         } => {
@@ -4026,6 +4081,9 @@ async fn plan_command(
                 metadata.clone(),
                 json!({"threadId":thread_id,"messageId":message.message_id,"role":"user","text":message.text,"attachments":message.attachments,"turnId":null,"streaming":false,"createdAt":created_at,"updatedAt":created_at}),
             );
+            if *queued == Some(true) {
+                return Ok(created.into_iter().chain([user]).collect());
+            }
             let mut payload = json!({"threadId":thread_id,"messageId":message.message_id,"runtimeMode":thread.runtime_mode,"interactionMode":thread.interaction_mode,"createdAt":created_at});
             insert_optional(&mut payload, "modelSelection", model_selection.clone());
             insert_optional(
@@ -4067,6 +4125,144 @@ async fn plan_command(
             turn_id.as_ref().map(|v| json!(v)),
             model,
         ),
+        OrchestrationCommand::ThreadTurnSteer {
+            command_id,
+            thread_id,
+            message_id,
+            created_at,
+        } => {
+            require_thread(model, command, thread_id)?;
+            let row = repositories
+                .get_queued_provider_turn_head(thread_id.clone())
+                .await
+                .map_err(wrap_persistence)?;
+            let Some(row) = row.filter(|row| row.message_id == *message_id) else {
+                return invariant(command, "Only the queued head can be steered.".to_owned());
+            };
+            let session = repositories
+                .get_thread_session(thread_id.clone())
+                .await
+                .map_err(wrap_persistence)?;
+            let Some(turn_id) = session
+                .filter(|session| session.status == "running")
+                .and_then(|session| session.active_turn_id)
+                .filter(|id| !id.trim().is_empty())
+            else {
+                return invariant(command, "Steering requires a running turn.".to_owned());
+            };
+            if !crate::provider::supports_turn_steer(&row.provider_kind) {
+                return invariant(command, "provider does not support steering".to_owned());
+            }
+            Ok(vec![
+                make_event(
+                    "thread.turn-steer-requested",
+                    "thread",
+                    thread_id,
+                    created_at,
+                    command_id,
+                    metadata.clone(),
+                    json!({"threadId":thread_id, "messageId":message_id, "turnId":turn_id, "createdAt":created_at}),
+                ),
+                make_event(
+                    "thread.turn-delivery-updated",
+                    "thread",
+                    thread_id,
+                    created_at,
+                    command_id,
+                    metadata,
+                    json!({"threadId":thread_id, "messageId":message_id, "state":"pending", "provider":row.provider_kind,
+                        "mode":"steer", "held":false, "detail":null, "updatedAt":created_at,
+                        "delivery":delivery_value("pending", &row.provider_kind, "steer", false, None)}),
+                ),
+            ])
+        }
+        OrchestrationCommand::ThreadTurnPromote {
+            command_id,
+            thread_id,
+            message_id,
+            created_at,
+        } => {
+            require_thread(model, command, thread_id)?;
+            if !repositories
+                .can_promote_queued_provider_turn(
+                    thread_id.clone(),
+                    message_id.clone(),
+                    command_id.starts_with("server:"),
+                )
+                .await
+                .map_err(wrap_persistence)?
+            {
+                return invariant(
+                    command,
+                    "Only the queued head of a settled thread can be promoted.".to_owned(),
+                );
+            }
+            let row = repositories
+                .get_provider_turn_delivery_for_message(thread_id.clone(), message_id.clone())
+                .await
+                .map_err(wrap_persistence)?;
+            let Some(row) = row else {
+                return invariant(command, "Queued delivery no longer exists.".to_owned());
+            };
+            let stored =
+                serde_json::from_value::<OrchestrationCommand>(row.payload).map_err(|_| {
+                    OrchestrationError::Invariant {
+                        command_type: command.command_type().to_owned(),
+                        detail: "Queued turn payload is invalid.".to_owned(),
+                    }
+                })?;
+            let OrchestrationCommand::ThreadTurnStart {
+                thread_id: stored_thread,
+                message,
+                model_selection,
+                runtime_mode,
+                interaction_mode,
+                title_seed,
+                source_proposed_plan,
+                ..
+            } = stored
+            else {
+                return invariant(
+                    command,
+                    "Queued delivery must contain a turn start.".to_owned(),
+                );
+            };
+            if stored_thread != *thread_id || message.message_id != *message_id {
+                return invariant(
+                    command,
+                    "Queued turn identity does not match its delivery.".to_owned(),
+                );
+            }
+            let mut payload = json!({"threadId":thread_id, "messageId":message_id, "runtimeMode":runtime_mode, "interactionMode":interaction_mode, "createdAt":created_at});
+            insert_optional(&mut payload, "modelSelection", model_selection);
+            insert_optional(
+                &mut payload,
+                "titleSeed",
+                title_seed.map(|value| json!(value)),
+            );
+            insert_optional(&mut payload, "sourceProposedPlan", source_proposed_plan);
+            Ok(vec![
+                make_event(
+                    "thread.turn-start-requested",
+                    "thread",
+                    thread_id,
+                    created_at,
+                    command_id,
+                    metadata.clone(),
+                    payload,
+                ),
+                make_event(
+                    "thread.turn-delivery-updated",
+                    "thread",
+                    thread_id,
+                    created_at,
+                    command_id,
+                    metadata,
+                    json!({"threadId":thread_id, "messageId":message_id, "state":"pending", "provider":row.provider_kind, "mode":"start", "held":false, "detail":null, "updatedAt":created_at,
+                        "delivery":delivery_value("pending", &row.provider_kind, "start", false, None)}),
+                ),
+            ])
+        }
         OrchestrationCommand::ThreadTurnDeliveryResolve { .. } => invariant(
             command,
             "Delivery resolution must be persisted through its atomic transition path.".to_owned(),
@@ -4433,6 +4629,18 @@ fn insert_optional(target: &mut Value, key: &str, value: Option<Value>) {
     }
 }
 
+fn delivery_value(
+    state: &str,
+    provider: &str,
+    mode: &str,
+    held: bool,
+    detail: Option<&str>,
+) -> Value {
+    let mut delivery = json!({"state":state, "provider":provider, "mode":mode, "held":held});
+    insert_optional(&mut delivery, "detail", detail.map(|value| json!(value)));
+    delivery
+}
+
 fn required_command_string(
     command: &OrchestrationCommand,
     value: &Value,
@@ -4457,6 +4665,7 @@ struct PersistCommandOutcome {
 async fn persist_command(
     repositories: &Repositories,
     hooks: &TestHooks,
+    command: &OrchestrationCommand,
     events: &[NewOrchestrationEvent],
     command_id: &str,
     aggregate: (&str, &str),
@@ -4466,14 +4675,95 @@ async fn persist_command(
 ) -> Result<PersistCommandOutcome, OrchestrationError> {
     let repositories = repositories.clone();
     let hooks = hooks.clone();
-    let event_list = events.to_vec();
+    let mut event_list = events.to_vec();
     let command_id = command_id.to_owned();
     let aggregate_kind = aggregate.0.to_owned();
     let aggregate_id = aggregate.1.to_owned();
+    let promotion = match command {
+        OrchestrationCommand::ThreadTurnPromote {
+            thread_id,
+            message_id,
+            command_id,
+            created_at,
+        } => Some((
+            thread_id.clone(),
+            message_id.clone(),
+            command_id.starts_with("server:"),
+            created_at.clone(),
+        )),
+        _ => None,
+    };
+    let steering = match command {
+        OrchestrationCommand::ThreadTurnSteer {
+            thread_id,
+            message_id,
+            created_at,
+            ..
+        } => Some((
+            thread_id.clone(),
+            message_id.clone(),
+            created_at.clone(),
+            events[0].payload["turnId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+        )),
+        _ => None,
+    };
+    let hold = match command {
+        OrchestrationCommand::ThreadTurnInterrupt {
+            thread_id,
+            created_at,
+            ..
+        } => Some((thread_id.clone(), created_at.clone())),
+        OrchestrationCommand::ThreadSessionSet {
+            thread_id,
+            session,
+            created_at,
+            ..
+        } if matches!(session.status.as_str(), "error" | "interrupted") => {
+            Some((thread_id.clone(), created_at.clone()))
+        }
+        _ => None,
+    };
     let committed = repositories
         .database()
         .call(move |connection| {
             let transaction = connection.transaction()?;
+            if let Some((thread_id, message_id, automatic, created_at)) = promotion {
+                // Recheck inside the event transaction: another owner may have cancelled,
+                // promoted, interrupted, or started a turn since command planning.
+                if !can_promote_queued_provider_turn_on(&transaction, &thread_id, &message_id, automatic)? {
+                    return Ok(None);
+                }
+                transaction.execute("UPDATE provider_turn_outbox SET state = 'pending', mode = 'start', held = 0, last_error = NULL, updated_at = ? WHERE thread_id = ? AND message_id = ? AND state = 'queued'",
+                    params![created_at, thread_id, message_id])?;
+            }
+            if let Some((thread_id, message_id, created_at, turn_id)) = steering {
+                let head = crate::persistence::queued_provider_turn_head_on(&transaction, &thread_id)?;
+                if !head.is_some_and(|row| row.message_id == message_id && crate::provider::supports_turn_steer(&row.provider_kind)) {
+                    return Ok(None);
+                }
+                let updated = transaction.execute(
+                    "UPDATE provider_turn_outbox SET state = 'pending', mode = 'steer', held = 0, last_error = NULL, updated_at = ?
+                     WHERE thread_id = ? AND message_id = ? AND state = 'queued'
+                       AND EXISTS(SELECT 1 FROM projection_thread_sessions WHERE thread_id = provider_turn_outbox.thread_id AND status = 'running' AND active_turn_id = ?)",
+                    params![created_at, thread_id, message_id, turn_id],
+                )?;
+                if updated != 1 { return Ok(None); }
+            }
+            if let Some((thread_id, updated_at)) = hold {
+                for delivery_id in hold_queued_provider_turns(&transaction, &thread_id, &updated_at)? {
+                    let (message_id, provider, mode, detail, state) = transaction.query_row(
+                        "SELECT message_id, provider_kind, mode, last_error, state FROM provider_turn_outbox WHERE command_id = ?",
+                        [&delivery_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, String>(4)?)),
+                    )?;
+                    event_list.push(make_event("thread.turn-delivery-updated", "thread", &thread_id, &updated_at, &command_id,
+                        json!({"deliveryCommandId":delivery_id}),
+                        json!({"threadId":thread_id, "messageId":message_id, "state":state, "provider":provider, "mode":mode, "held":true, "detail":detail, "updatedAt":updated_at,
+                            "delivery":delivery_value(&state, &provider, &mode, true, detail.as_deref())})));
+                }
+            }
             let mut committed = VecDeque::new();
             for planned in &event_list {
                 if projection_mode == ProjectionMode::UpdateExistingAssistantMessage
@@ -4541,8 +4831,8 @@ async fn persist_command(
                 }
                 if let Some(turn) = admission.provider_turn {
                     transaction.execute(
-                        "INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, NULL, ?, ?)",
-                        params![turn.command_id, turn.thread_id, turn.message_id, turn.provider_instance_id, turn.provider_kind, turn.provider_session_id, turn.delivery_key, json_string(&turn.payload)?, turn.created_at, turn.created_at],
+                        "INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, mode, attempts, last_error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?)",
+                        params![turn.command_id, turn.thread_id, turn.message_id, turn.provider_instance_id, turn.provider_kind, turn.provider_session_id, turn.delivery_key, json_string(&turn.payload)?, turn_delivery_state_name(turn.state), turn.mode.as_str(), turn.created_at, turn.created_at],
                     )?;
                 }
             }
@@ -4553,13 +4843,14 @@ async fn persist_command(
                 .transpose()?;
             hooks.maybe_pause_after_command_finalization();
             transaction.commit()?;
-            Ok(PersistCommandOutcome {
+            Ok(Some(PersistCommandOutcome {
                 committed,
                 result_sequence,
-            })
+            }))
         })
         .await
-        .map_err(wrap_persistence)?;
+        .map_err(wrap_persistence)?
+        .ok_or_else(|| OrchestrationError::Invariant { command_type: command.command_type().to_owned(), detail: "Queued delivery changed before promotion or steering.".to_owned() })?;
     Ok(committed)
 }
 
@@ -4602,12 +4893,12 @@ async fn persist_turn_delivery_transition(
             let transaction = connection.transaction()?;
             let current = transaction
                 .query_row(
-                    "SELECT thread_id, message_id, provider_kind, state, attempts FROM provider_turn_outbox WHERE command_id = ?",
+                    "SELECT thread_id, message_id, provider_kind, state, attempts, mode, held FROM provider_turn_outbox WHERE command_id = ?",
                     [&transition.command_id],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, i64>(4)?)),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, i64>(4)?, row.get::<_, String>(5)?, row.get::<_, bool>(6)?)),
                 )
                 .optional()?;
-            let Some((thread_id, message_id, provider, state, attempts)) = current else {
+            let Some((thread_id, message_id, provider, state, attempts, mut mode, held)) = current else {
                 return Ok(None);
             };
             if attempts != transition.expected_attempt
@@ -4619,28 +4910,32 @@ async fn persist_turn_delivery_transition(
                 return Ok(None);
             }
             let next_state = turn_delivery_state_name(transition.next_state);
-            let updated = transaction.execute(
-                "UPDATE provider_turn_outbox SET state = ?, last_error = ?, updated_at = ? WHERE command_id = ? AND state = ? AND attempts = ?",
-                params![next_state, transition.detail, transition.updated_at, transition.command_id, state, transition.expected_attempt],
-            )?;
-            if updated == 0 {
-                return Ok(None);
+            if transition.next_state == TurnDeliveryState::Queued {
+                let Some(row) = crate::persistence::requeue_provider_turn_on(
+                    &transaction, &transition.command_id, transition.expected_attempt, &transition.updated_at,
+                )? else { return Ok(None); };
+                mode = row.mode.as_str().to_owned();
+                transaction.execute("UPDATE provider_turn_outbox SET last_error = ? WHERE command_id = ?", params![transition.detail, transition.command_id])?;
+            } else {
+                let updated = transaction.execute(
+                    "UPDATE provider_turn_outbox SET state = ?, last_error = ?, updated_at = ? WHERE command_id = ? AND state = ? AND attempts = ?",
+                    params![next_state, transition.detail, transition.updated_at, transition.command_id, state, transition.expected_attempt],
+                )?;
+                if updated == 0 { return Ok(None); }
             }
+            let turn_id = if transition.next_state == TurnDeliveryState::Delivered && mode == "steer" {
+                transition.turn_id.or(crate::persistence::provider_turn_steer_target_on(&transaction, &thread_id, &message_id)?)
+            } else { None };
+            let mut payload = json!({
+                "threadId": thread_id, "messageId": message_id, "state": next_state, "provider": provider,
+                "mode":mode, "held":held, "detail":transition.detail,
+                "delivery":delivery_value(next_state, &provider, &mode, held, transition.detail.as_deref()),
+                "updatedAt":transition.updated_at,
+            });
+            insert_optional(&mut payload, "turnId", turn_id.map(Value::String));
             let planned = make_event(
-                "thread.turn-delivery-updated",
-                "thread",
-                &thread_id,
-                &transition.updated_at,
-                &format!("server:turn-delivery:{}", transition.command_id),
-                json!({}),
-                json!({
-                    "threadId": thread_id,
-                    "messageId": message_id,
-                    "state": next_state,
-                    "provider": provider,
-                    "detail": transition.detail,
-                    "updatedAt": transition.updated_at,
-                }),
+                "thread.turn-delivery-updated", "thread", &thread_id, &transition.updated_at,
+                &format!("server:turn-delivery:{}", transition.command_id), json!({}), payload,
             );
             let saved = append_event_tx(&transaction, planned)?;
             for projector in PROJECTOR_NAMES {
@@ -4693,7 +4988,7 @@ async fn persist_turn_delivery_resolution(
             let transaction = connection.transaction()?;
             let current = transaction
                 .query_row(
-                    "SELECT command_id, provider_kind, state, last_error FROM provider_turn_outbox WHERE thread_id = ? AND message_id = ?",
+                    "SELECT command_id, provider_kind, state, last_error, mode, held FROM provider_turn_outbox WHERE thread_id = ? AND message_id = ?",
                     params![thread_id, message_id],
                     |row| {
                         Ok((
@@ -4701,11 +4996,13 @@ async fn persist_turn_delivery_resolution(
                             row.get::<_, String>(1)?,
                             row.get::<_, String>(2)?,
                             row.get::<_, Option<String>>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, bool>(5)?,
                         ))
                     },
                 )
                 .optional()?;
-            let Some((delivery_command_id, provider, state, last_error)) = current else {
+            let Some((delivery_command_id, provider, state, last_error, mode, held)) = current else {
                 return Ok(None);
             };
             let resolvable = match action {
@@ -4713,12 +5010,21 @@ async fn persist_turn_delivery_resolution(
                 TurnDeliveryResolutionAction::Dismiss => {
                     matches!(state.as_str(), "pending" | "sending" | "uncertain" | "failed")
                 }
+                TurnDeliveryResolutionAction::Cancel => state == "queued",
             };
             if !resolvable {
                 return Ok(None);
             }
 
             let (next_state, detail, updated) = match action {
+                TurnDeliveryResolutionAction::Cancel => (
+                    "dismissed",
+                    last_error,
+                    transaction.execute(
+                        "UPDATE provider_turn_outbox SET state = 'dismissed', updated_at = ? WHERE command_id = ? AND state = 'queued'",
+                        params![updated_at, delivery_command_id],
+                    )?,
+                ),
                 TurnDeliveryResolutionAction::Retry => (
                     "pending",
                     None,
@@ -4740,21 +5046,26 @@ async fn persist_turn_delivery_resolution(
                 return Ok(None);
             }
 
+            let mut payload = json!({
+                "threadId": thread_id,
+                "messageId": message_id,
+                "state": next_state,
+                "provider": provider,
+                "detail": detail,
+                "delivery": delivery_value(next_state, &provider, &mode, held, detail.as_deref()),
+                "updatedAt": updated_at,
+            });
+            if matches!(action, TurnDeliveryResolutionAction::Cancel) {
+                payload["withdrawn"] = json!(true);
+            }
             let planned = make_event(
                 "thread.turn-delivery-updated",
                 "thread",
                 &thread_id,
                 &updated_at,
                 &resolution_command_id,
-                json!({"deliveryCommandId":delivery_command_id}),
-                json!({
-                    "threadId": thread_id,
-                    "messageId": message_id,
-                    "state": next_state,
-                    "provider": provider,
-                    "detail": detail,
-                    "updatedAt": updated_at,
-                }),
+                json!({"deliveryCommandId":delivery_command_id,"deliveryPreviousState":state}),
+                payload,
             );
             let saved = append_event_tx(&transaction, planned)?;
             for projector in PROJECTOR_NAMES {
@@ -4801,6 +5112,7 @@ async fn persist_turn_delivery_resolution(
 
 fn turn_delivery_state_name(state: TurnDeliveryState) -> &'static str {
     match state {
+        TurnDeliveryState::Queued => "queued",
         TurnDeliveryState::Pending => "pending",
         TurnDeliveryState::Sending => "sending",
         TurnDeliveryState::Delivered => "delivered",
@@ -5292,6 +5604,22 @@ fn apply_messages_projector_tx(
     event: &OrchestrationEvent,
     context: &mut ProjectionContext,
 ) -> Result<(), PersistenceError> {
+    if event.event.event_type == "thread.turn-start-requested" {
+        let payload = &event.event.payload;
+        // Promotion begins a new turn after the preceding response. Apply its
+        // timestamp through the event projector so live writes and replay agree;
+        // queued receipt order and steered messages keep their enqueue time.
+        transaction.execute(
+            "UPDATE projection_thread_messages SET created_at = ?, updated_at = ? WHERE thread_id = ? AND message_id = ? AND role = 'user'",
+            params![
+                required_str(payload, "createdAt")?,
+                required_str(payload, "createdAt")?,
+                required_str(payload, "threadId")?,
+                required_str(payload, "messageId")?,
+            ],
+        )?;
+        return Ok(());
+    }
     if event.event.event_type == "thread.reverted" {
         transaction.execute(
             "DELETE FROM projection_thread_messages WHERE thread_id = ? AND turn_id IN (SELECT json_extract(payload_json, '$.turnId') FROM orchestration_events WHERE event_type = 'thread.turn-diff-completed' AND stream_id = ? AND CAST(json_extract(payload_json, '$.checkpointTurnCount') AS INTEGER) > ?)",
@@ -5301,12 +5629,25 @@ fn apply_messages_projector_tx(
     }
     if event.event.event_type == "thread.turn-delivery-updated" {
         let payload = &event.event.payload;
+        if payload.get("withdrawn").and_then(Value::as_bool) == Some(true) {
+            transaction.execute(
+                "DELETE FROM projection_thread_messages WHERE message_id = ? AND thread_id = ?",
+                params![
+                    required_str(payload, "messageId")?,
+                    required_str(payload, "threadId")?
+                ],
+            )?;
+            return Ok(());
+        }
         transaction.execute(
-            "UPDATE projection_thread_messages SET delivery_state = ?, delivery_provider = ?, delivery_detail = ?, updated_at = ? WHERE message_id = ? AND thread_id = ?",
+            "UPDATE projection_thread_messages SET delivery_state = ?, delivery_provider = ?, delivery_detail = ?, delivery_mode = COALESCE(?, delivery_mode), delivery_held = COALESCE(?, delivery_held), turn_id = COALESCE(?, turn_id), updated_at = ? WHERE message_id = ? AND thread_id = ?",
             params![
                 required_str(payload, "state")?,
                 required_str(payload, "provider")?,
                 optional_string(payload.get("detail")),
+                optional_string(payload.pointer("/delivery/mode").or_else(|| payload.get("mode"))),
+                payload.pointer("/delivery/held").or_else(|| payload.get("held")).and_then(Value::as_bool),
+                optional_string(payload.get("turnId")),
                 required_str(payload, "updatedAt")?,
                 required_str(payload, "messageId")?,
                 required_str(payload, "threadId")?,
@@ -6174,6 +6515,8 @@ impl OrchestrationCommand {
             Self::ThreadRuntimeModeSet { .. } => "thread.runtime-mode.set",
             Self::ThreadInteractionModeSet { .. } => "thread.interaction-mode.set",
             Self::ThreadTurnStart { .. } => "thread.turn.start",
+            Self::ThreadTurnSteer { .. } => "thread.turn.steer",
+            Self::ThreadTurnPromote { .. } => "thread.turn.promote",
             Self::ThreadTurnInterrupt { .. } => "thread.turn.interrupt",
             Self::ThreadTurnDeliveryResolve { .. } => "thread.turn-delivery.resolve",
             Self::ThreadApprovalRespond { .. } => "thread.approval.respond",
@@ -6206,6 +6549,8 @@ impl OrchestrationCommand {
             | Self::ThreadRuntimeModeSet { command_id, .. }
             | Self::ThreadInteractionModeSet { command_id, .. }
             | Self::ThreadTurnStart { command_id, .. }
+            | Self::ThreadTurnSteer { command_id, .. }
+            | Self::ThreadTurnPromote { command_id, .. }
             | Self::ThreadTurnInterrupt { command_id, .. }
             | Self::ThreadTurnDeliveryResolve { command_id, .. }
             | Self::ThreadApprovalRespond { command_id, .. }
@@ -6238,6 +6583,8 @@ impl OrchestrationCommand {
             | Self::ThreadRuntimeModeSet { created_at, .. }
             | Self::ThreadInteractionModeSet { created_at, .. }
             | Self::ThreadTurnStart { created_at, .. }
+            | Self::ThreadTurnSteer { created_at, .. }
+            | Self::ThreadTurnPromote { created_at, .. }
             | Self::ThreadTurnInterrupt { created_at, .. }
             | Self::ThreadTurnDeliveryResolve { created_at, .. }
             | Self::ThreadApprovalRespond { created_at, .. }
@@ -6271,6 +6618,8 @@ impl OrchestrationCommand {
             | Self::ThreadRuntimeModeSet { thread_id, .. }
             | Self::ThreadInteractionModeSet { thread_id, .. }
             | Self::ThreadTurnStart { thread_id, .. }
+            | Self::ThreadTurnSteer { thread_id, .. }
+            | Self::ThreadTurnPromote { thread_id, .. }
             | Self::ThreadTurnInterrupt { thread_id, .. }
             | Self::ThreadTurnDeliveryResolve { thread_id, .. }
             | Self::ThreadApprovalRespond { thread_id, .. }
@@ -6411,7 +6760,21 @@ pub async fn load_snapshot(repositories: &Repositories) -> Result<Snapshot, Orch
     let receipts = list_receipts(repositories.database()).await?;
     let diffs = list_diffs(repositories.database()).await?;
     threads.sort_by(|left, right| left.thread_id.cmp(&right.thread_id));
-    messages.sort_by(|left, right| left.message_id.cmp(&right.message_id));
+    // Repository reads order queued messages by their durable admission sequence.
+    // Keep that per-thread order through this stable sort; ordinary messages retain
+    // the existing canonical order. The wire snapshot therefore identifies the same
+    // queue head as server promotion, even with tied or skewed client timestamps.
+    messages.sort_by(|left, right| {
+        match (
+            left.delivery_state.as_deref() == Some("queued"),
+            right.delivery_state.as_deref() == Some("queued"),
+        ) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            (false, false) => left.message_id.cmp(&right.message_id),
+        }
+    });
     sessions.sort_by(|left, right| left.thread_id.cmp(&right.thread_id));
     approvals.sort_by(|left, right| left.request_id.cmp(&right.request_id));
     proposed_plans.sort_by(|left, right| left.plan_id.cmp(&right.plan_id));
@@ -7751,6 +8114,8 @@ mod tests {
                 size_bytes: 5,
             }],
             provider_turn: Some(NewProviderTurnDelivery {
+                state: crate::orchestration::TurnDeliveryState::Pending,
+                mode: crate::orchestration::TurnDeliveryMode::Start,
                 command_id: command.command_id().to_owned(),
                 thread_id: thread_id.to_owned(),
                 message_id: message_id.to_owned(),
@@ -7771,6 +8136,76 @@ mod tests {
             "delivery-message",
             "2026-08-01T00:00:01Z",
         )
+    }
+
+    #[tokio::test]
+    async fn queued_turn_start_records_message_without_turn_start_requested() {
+        let (engine, thread_id) = delivery_engine(TestHooks::default()).await;
+        let mut command = delivery_turn("queued-start", &thread_id, "next task");
+        if let OrchestrationCommand::ThreadTurnStart { queued, .. } = &mut command {
+            *queued = Some(true);
+        }
+        let mut admission = delivery_admission(&command, &thread_id);
+        admission.provider_turn.as_mut().unwrap().state = TurnDeliveryState::Queued;
+        let before = engine
+            .read_events(0)
+            .await
+            .unwrap()
+            .last()
+            .unwrap()
+            .sequence;
+        engine
+            .dispatch_with_admission(command, admission, || {})
+            .await
+            .unwrap();
+        let events = engine.read_events(before).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            ["thread.message-sent", "thread.turn-delivery-updated"]
+        );
+        assert_eq!(events[0].event.payload["role"], "user");
+        assert_eq!(events[0].event.payload["turnId"], Value::Null);
+        assert_eq!(
+            events[1].event.payload["delivery"],
+            json!({"state":"queued", "provider":"codex", "mode":"start", "held":false})
+        );
+        assert!(
+            engine
+                .repositories()
+                .list_turns_by_thread(thread_id.clone())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            engine
+                .repositories()
+                .get_thread_session(thread_id.clone())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
+        let message = snapshot
+            .messages
+            .iter()
+            .find(|message| message.thread_id == thread_id)
+            .unwrap();
+        assert_eq!(message.delivery_state.as_deref(), Some("queued"));
+        assert_eq!(message.delivery_mode.as_deref(), Some("start"));
+        assert_eq!(message.delivery_held, Some(false));
+        let row = engine
+            .repositories()
+            .get_provider_turn_delivery("queued-start".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, TurnDeliveryState::Queued);
+        assert_eq!(row.attempts, 0);
+        engine.shutdown().await;
     }
 
     fn delivery_resolution(
@@ -7939,6 +8374,7 @@ mod tests {
             .expect("claimed");
         let before = engine.read_events(0).await.expect("before").len();
         let transition = TurnDeliveryTransition {
+            turn_id: None,
             command_id: claimed.command_id,
             expected_states: vec![TurnDeliveryState::Sending],
             expected_attempt: claimed.attempts,
@@ -8008,6 +8444,7 @@ mod tests {
         assert!(
             engine
                 .transition_turn_delivery(TurnDeliveryTransition {
+                    turn_id: None,
                     command_id: claimed.command_id.clone(),
                     expected_states: vec![TurnDeliveryState::Sending],
                     expected_attempt: 1,
@@ -8046,6 +8483,7 @@ mod tests {
         assert!(
             engine
                 .transition_turn_delivery(TurnDeliveryTransition {
+                    turn_id: None,
                     command_id: claimed.command_id,
                     expected_states: vec![TurnDeliveryState::Failed],
                     expected_attempt: 1,
@@ -8089,6 +8527,7 @@ mod tests {
         assert!(
             engine
                 .transition_turn_delivery(TurnDeliveryTransition {
+                    turn_id: None,
                     command_id: claimed.command_id,
                     expected_states: vec![TurnDeliveryState::Sending],
                     expected_attempt: 1,
@@ -8173,6 +8612,7 @@ mod tests {
         assert!(
             engine
                 .transition_turn_delivery(TurnDeliveryTransition {
+                    turn_id: None,
                     command_id: "delivery-dismiss-first".to_owned(),
                     expected_states: vec![TurnDeliveryState::Pending],
                     expected_attempt: 0,
@@ -8309,6 +8749,7 @@ mod tests {
         assert!(
             engine
                 .transition_turn_delivery(TurnDeliveryTransition {
+                    turn_id: None,
                     command_id: "delivery-resolution-rollback".to_owned(),
                     expected_states: vec![TurnDeliveryState::Pending],
                     expected_attempt: 0,
@@ -8627,6 +9068,8 @@ mod tests {
             payload_digest: canonical_command_digest(&command).expect("digest"),
             attachment_refs: vec![],
             provider_turn: Some(NewProviderTurnDelivery {
+                state: crate::orchestration::TurnDeliveryState::Pending,
+                mode: crate::orchestration::TurnDeliveryMode::Start,
                 command_id: "bootstrap-delivery".to_owned(),
                 thread_id: "bootstrap-thread".to_owned(),
                 message_id: "bootstrap-message".to_owned(),
@@ -8790,6 +9233,8 @@ mod tests {
             payload_digest: canonical_command_digest(&command).expect("digest"),
             attachment_refs: vec![],
             provider_turn: Some(NewProviderTurnDelivery {
+                state: crate::orchestration::TurnDeliveryState::Pending,
+                mode: crate::orchestration::TurnDeliveryMode::Start,
                 command_id: "bootstrap-not-enqueued".to_owned(),
                 thread_id: "bootstrap-not-enqueued".to_owned(),
                 message_id: "bootstrap-message".to_owned(),

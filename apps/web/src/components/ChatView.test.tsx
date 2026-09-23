@@ -132,6 +132,8 @@ vi.mock("../state/threads", () => ({
     setRuntimeMode: { key: "thread.setRuntimeMode" },
     setInteractionMode: { key: "thread.setInteractionMode" },
     startTurn: { key: "thread.startTurn" },
+    steerTurn: { key: "thread.steerTurn" },
+    promoteTurn: { key: "thread.promoteTurn" },
     interruptTurn: { key: "thread.interruptTurn" },
     resolveDelivery: { key: "thread.resolveDelivery" },
     respondToApproval: { key: "thread.respondToApproval" },

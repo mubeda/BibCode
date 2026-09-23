@@ -730,6 +730,15 @@ wrapper. Any new scrollable reading surface must add one.
 6. Provider runtimes translate commands to provider-native protocols and feed
    normalized events back into durable projections.
 
+Messages submitted while a turn runs enter a durable, server-owned FIFO and
+appear as queued cards without marking new work active. When the session settles
+to ready, the oldest eligible message starts the next turn with its saved model
+and modes and a new promotion timestamp. Codex and Claude support explicit
+steering through their native protocols; Cancel restores queued text to the
+cancelling client's composer, and Stop drains the queue before interrupting.
+Pending approvals/questions block automatic sending, interrupt/error settles
+hold the queue, and queued rows survive reloads and server restarts.
+
 See [RPC and orchestration](./rpc-and-orchestration.md) and
 [Connection runtime](./connection-runtime.md) for the detailed boundaries.
 

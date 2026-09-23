@@ -201,6 +201,44 @@ idle center terminal when possible and otherwise open a new center terminal.
 The retired bottom terminal drawer and its bottom-toolbar toggle no longer
 exist.
 
+### Queued messages
+
+While a turn runs or the provider is still accepting your previous message,
+Enter queues your message and clears the composer so you can keep writing.
+Queued cards show your text and attachment count below the working indicator,
+in the order the server accepted them. Queueing does not start another turn or
+change the sidebar's Working indicator. The queue is shared across connected
+clients and survives page reloads, disconnects, and server restarts.
+
+The first card says **Sends when the turn ends**; later cards say **Sends after
+the messages above**. When the session is ready, the first eligible message
+starts the next turn, and each later message waits its turn. The model and modes
+selected when you queued it are retained. Its timeline timestamp updates when
+it starts, placing it after the preceding reply.
+
+On Codex and Claude, **Steer** or `Mod+Shift+Enter` sends the first queued message
+to the running provider. Codex uses it at the next turn boundary. Claude consumes
+it at the next tool boundary, or immediately after a reply without tool calls as
+its next turn. The card shows **Steering…** until acknowledged, then becomes an
+ordinary user message in its attributed turn. You can keep composing while it
+waits. Cursor, Grok, and OpenCode explain that steering is unavailable; their
+queued messages still send automatically. A rejected or unavailable steer
+returns the message to the queue with its reason on the card.
+
+**Cancel** removes the card for everyone and appends its text to the cancelling
+client's draft. Attachments queued in that client session return up to the
+attachment limit. After reload or cancellation from another client, unavailable
+files are reported so you can attach them again. **Stop** restores queued messages
+in order before interrupting. If cancellation fails, that card stays with an
+error and Stop still interrupts.
+
+Approvals and questions must be answered before automatic sending resumes.
+Interrupts and errors hold queued messages even when the provider later becomes
+ready. A held first card says **Waiting for you** and offers **Send now**, which
+becomes available once the running turn and any pending approval or question are
+done. Cancelling remains available while the message is queued; it is disabled
+while steering is being acknowledged.
+
 ### Composer context window
 
 In the normal composer footer, controls remain visible in this order: MCP
@@ -241,11 +279,12 @@ dotted square followed by `Waiting for` and a whole-second elapsed timer, such
 as `Waiting for 3s`. The timer is anchored to the persisted user-message time
 after reload and never moves backward when the provider start time arrives.
 The animation uses the current theme's muted foreground and becomes static when
-reduced motion is requested. A later pending delivery queued behind an
+reduced motion is requested. A later `pending` delivery blocked behind an
 unresolved failed or uncertain delivery does not appear active; resolve the
-earlier delivery's Retry/Dismiss notice before the queued message can run. The
-composer remains blocked and offers `Cancel queued message` so queued work can
-be withdrawn before resolving the older delivery.
+earlier delivery's Retry/Dismiss notice before that pending message can run.
+The composer offers `Cancel queued message` for this blocked pending delivery.
+That control cancels an already admitted start; the durable **Queued** cards
+above have their own Cancel action and let you continue composing.
 
 Question and approval composer footers retain their specialized controls and do
 not gain the normal context-window control.

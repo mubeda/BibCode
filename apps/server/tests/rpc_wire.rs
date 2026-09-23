@@ -90,7 +90,7 @@ fn rust_registry_matches_the_active_typescript_rpc_group() {
     assert_eq!(rust_stream_count, 20);
     assert_eq!(rust_stream_count, manifest.stream_method_count);
     assert_eq!(manifest.expected_top_level_stream_shapes, 70);
-    assert_eq!(manifest.expected_orchestration_event_shapes, 23);
+    assert_eq!(manifest.expected_orchestration_event_shapes, 24);
     assert_eq!(manifest.stream_shape_fixtures.len(), 70);
     assert_eq!(manifest.typed_failure_fixtures.len(), 288);
     assert_eq!(

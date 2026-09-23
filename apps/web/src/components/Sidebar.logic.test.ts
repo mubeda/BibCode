@@ -683,6 +683,22 @@ describe("resolveThreadStatusPill", () => {
     },
   };
 
+  it("shows no Working or unread completion for a ready thread containing only queued messages", () => {
+    const thread = {
+      ...baseThread,
+      session: { ...baseThread.session, status: "ready" as const, activeTurnId: null },
+      messages: [
+        {
+          role: "user",
+          text: "later",
+          delivery: { state: "queued", mode: "start", provider: "codex" },
+        },
+      ],
+    };
+    expect(resolveThreadStatusPill({ thread })).toBeNull();
+    expect(hasUnseenCompletion(thread)).toBe(false);
+  });
+
   it("shows pending approval before all other statuses", () => {
     expect(
       resolveThreadStatusPill({

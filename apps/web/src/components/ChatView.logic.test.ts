@@ -1,6 +1,9 @@
+import { ProviderDriverKind } from "@bibcode/contracts";
 import {
   ACTIVITY_PAGE_MAX_LENGTH,
   type ActivityScopeRef,
+  MessageId,
+  type TurnDelivery,
   EnvironmentId,
   ProjectId,
   ProviderInstanceId,
@@ -34,6 +37,10 @@ import {
   deriveLockedProvider,
   findActiveDeliveryMessage,
   findLastCancellableDeliveryMessage,
+  selectQueuedMessages,
+  isQueuedTimelineMessage,
+  deriveQueuedCardStatus,
+  shouldEnqueueOnSend,
   getStartedThreadModelChangeBlockReason,
   hasServerAcknowledgedLocalDispatch,
   readFileAsDataUrl,
@@ -1159,5 +1166,165 @@ describe("threadErrorAttribution", () => {
         providerName: null,
       }),
     ).toBe("The agent reported an error");
+  });
+});
+
+describe("queued messages", () => {
+  const message = (id: string, delivery: TurnDelivery, createdAt = now): ChatMessage => ({
+    id: MessageId.make(id),
+    role: "user",
+    text: id,
+    createdAt,
+    updatedAt: createdAt,
+    streaming: false,
+    turnId: null,
+    delivery,
+  });
+  const queued: TurnDelivery = {
+    state: "queued",
+    mode: "start",
+    provider: ProviderDriverKind.make("codex"),
+  };
+  const base = {
+    index: 0,
+    phase: "running" as const,
+    sessionStatus: "running" as const,
+    supportsTurnSteer: true,
+    delivery: queued,
+    hasPendingApproval: false,
+    hasPendingUserInput: false,
+  };
+
+  it("keeps durable array order and includes both in-flight steer states only once", () => {
+    const first = message("first", queued, "2026-09-22T02:00:00Z");
+    const second = message(
+      "second",
+      { ...queued, state: "pending", mode: "steer" },
+      "2026-09-22T01:00:00Z",
+    );
+    const third = message("third", { ...queued, state: "sending", mode: "steer" });
+    const delivered = message("delivered", { ...queued, state: "delivered", mode: "steer" });
+    const start = message("start", { ...queued, state: "pending" });
+    expect(selectQueuedMessages([first, second, third, delivered, start])).toEqual([
+      first,
+      second,
+      third,
+    ]);
+    expect([first, second, third, delivered, start].map(isQueuedTimelineMessage)).toEqual([
+      true,
+      true,
+      true,
+      false,
+      false,
+    ]);
+  });
+
+  it.each(["queued", "pending", "sending"] as const)(
+    "does not count %s queue/steer delivery as busy",
+    (state) => {
+      const messages = [
+        message("queued", { ...queued, state, mode: state === "queued" ? "start" : "steer" }),
+      ];
+      expect(findLastCancellableDeliveryMessage(messages)).toBeNull();
+      expect(findActiveDeliveryMessage(messages)).toBeNull();
+    },
+  );
+
+  it("offers steer for a capable running head", () => {
+    expect(deriveQueuedCardStatus(base)).toMatchObject({
+      label: "Sends when the turn ends. Steer to send it now.",
+      canSteer: true,
+      steerDisabledReason: null,
+      canCancel: true,
+      steering: false,
+      primaryAction: "steer",
+    });
+  });
+
+  it("explains unsupported steering", () => {
+    expect(deriveQueuedCardStatus({ ...base, supportsTurnSteer: false })).toMatchObject({
+      label: "Sends when the turn ends.",
+      canSteer: false,
+      steerDisabledReason: "This provider cannot steer a running turn",
+      primaryAction: null,
+    });
+  });
+
+  it.each(["ready", "error", "stopped", "idle"] as const)(
+    "offers Send now when the session is %s",
+    (sessionStatus) => {
+      expect(deriveQueuedCardStatus({ ...base, phase: "ready", sessionStatus })).toMatchObject({
+        label: "Waiting for you",
+        canSteer: false,
+        canSendNow: true,
+        canCancel: true,
+        primaryAction: "send-now",
+      });
+    },
+  );
+
+  it("keeps a held head waiting for Send now even when another turn is running", () => {
+    expect(deriveQueuedCardStatus({ ...base, delivery: { ...queued, held: true } })).toMatchObject({
+      label: "Waiting for you",
+      primaryAction: "send-now",
+      canSteer: false,
+      canSendNow: false,
+      sendNowDisabledReason: "Wait for the running turn to end",
+    });
+  });
+
+  it("keeps the tail behind the head", () => {
+    expect(deriveQueuedCardStatus({ ...base, index: 1 })).toMatchObject({
+      label: "Sends after the messages above.",
+      canSteer: false,
+      canSendNow: false,
+      canCancel: true,
+    });
+  });
+
+  it.each(["pending", "sending"] as const)("disables both actions during %s steer", (state) => {
+    expect(
+      deriveQueuedCardStatus({ ...base, delivery: { ...queued, state, mode: "steer" } }),
+    ).toMatchObject({
+      label: "Steering…",
+      canSteer: false,
+      canSendNow: false,
+      canCancel: false,
+      steering: true,
+    });
+  });
+
+  it.each([
+    ["hasPendingApproval", "Respond to the pending approval first"],
+    ["hasPendingUserInput", "Answer the pending question first"],
+  ] as const)("blocks steer and promote for %s", (key, reason) => {
+    expect(deriveQueuedCardStatus({ ...base, [key]: true })).toMatchObject({
+      canSteer: false,
+      steerDisabledReason: reason,
+    });
+    expect(
+      deriveQueuedCardStatus({ ...base, phase: "ready", sessionStatus: "ready", [key]: true }),
+    ).toMatchObject({ canSendNow: false, sendNowDisabledReason: reason });
+  });
+
+  it.each(["disconnected", "connecting", "ready"] as const)(
+    "enqueues behind an unsettled initial delivery while phase is %s",
+    (phase) => {
+      expect(shouldEnqueueOnSend({ phase, sessionStatus: null, hasPendingDelivery: true })).toBe(
+        true,
+      );
+      expect(shouldEnqueueOnSend({ phase, sessionStatus: null, hasPendingDelivery: false })).toBe(
+        false,
+      );
+    },
+  );
+
+  it.each([
+    ["running", "running", true],
+    ["connecting", "starting", true],
+    ["ready", "ready", false],
+    ["disconnected", null, false],
+  ] as const)("enqueues for phase %s / session %s", (phase, sessionStatus, expected) => {
+    expect(shouldEnqueueOnSend({ phase, sessionStatus, hasPendingDelivery: false })).toBe(expected);
   });
 });

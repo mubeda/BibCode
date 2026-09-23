@@ -1,3 +1,4 @@
+import { ProviderDriverKind } from "@bibcode/contracts";
 import { describe, expect, it } from "vite-plus/test";
 import {
   computeStableMessagesTimelineRows,
@@ -1568,5 +1569,143 @@ describe("computeStableMessagesTimelineRows", () => {
 
     expect(reordered).not.toBe(initial);
     expect(reordered.result).toEqual([initial.result[1], initial.result[0]]);
+  });
+});
+
+describe("queued timeline rows", () => {
+  const message = (
+    id: string,
+    createdAt: string,
+    overrides: Partial<import("../../types").ChatMessage> = {},
+  ): import("../../types").ChatMessage => ({
+    id: id as never,
+    role: "user",
+    text: id,
+    turnId: null,
+    createdAt,
+    updatedAt: createdAt,
+    streaming: false,
+    delivery: { state: "queued", provider: ProviderDriverKind.make("codex"), mode: "start" },
+    ...overrides,
+  });
+  const status = {
+    label: "Sends when the turn ends.",
+    canSteer: false,
+    steerDisabledReason: "This provider cannot steer a running turn",
+    canCancel: true,
+    steering: false,
+    primaryAction: null,
+    canSendNow: false,
+    sendNowDisabledReason: "Wait for the running turn to end",
+  } as const;
+  const base = {
+    isWorking: true,
+    activeTurnStartedAt: null,
+    turnDiffSummaryByAssistantMessageId: new Map(),
+    revertTurnCountByUserMessageId: new Map(),
+  };
+  const entry = (message: import("../../types").ChatMessage) => ({
+    kind: "message" as const,
+    id: message.id,
+    createdAt: message.createdAt,
+    message,
+  });
+
+  it("appends FIFO cards after working, marks only the head, and never duplicates normal rows", () => {
+    const first = message("first", "2026-01-01T00:00:20Z");
+    const second = message("second", "2026-01-01T00:00:10Z");
+    const rows = deriveMessagesTimelineRows({
+      ...base,
+      timelineEntries: [entry(second), entry(first)],
+      queuedMessages: [first, second],
+      queuedStatuses: [status, status],
+    });
+    expect(rows.map((row) => row.kind)).toEqual(["working", "queued-message", "queued-message"]);
+    expect(rows.slice(1)).toMatchObject([
+      { message: first, isHead: true },
+      { message: second, isHead: false },
+    ]);
+    const stable = computeStableMessagesTimelineRows(rows, { byId: new Map(), result: [] });
+    expect(computeStableMessagesTimelineRows(rows, stable).result).toBe(stable.result);
+    const refreshedRows = deriveMessagesTimelineRows({
+      ...base,
+      timelineEntries: [entry(second), entry(first)],
+      queuedMessages: [first, second],
+      queuedStatuses: [{ ...status }, { ...status }],
+    });
+    expect(computeStableMessagesTimelineRows(refreshedRows, stable).result).toBe(stable.result);
+  });
+
+  it.each(["pending", "sending"] as const)("keeps %s steers out of normal rows", (state) => {
+    const steer = message("steer", "2026-01-01T00:00:20Z", {
+      delivery: { state, mode: "steer", provider: ProviderDriverKind.make("codex") },
+    });
+    const rows = deriveMessagesTimelineRows({
+      ...base,
+      timelineEntries: [entry(steer)],
+      queuedMessages: [steer],
+      queuedStatuses: [{ ...status, label: "Steering…", steering: true, canCancel: false }],
+    });
+    expect(rows.map((row) => row.kind)).toEqual(["working", "queued-message"]);
+  });
+
+  it("adds no card for an empty queue", () => {
+    expect(
+      deriveMessagesTimelineRows({
+        ...base,
+        timelineEntries: [],
+        queuedMessages: [],
+        queuedStatuses: [],
+      }).map((row) => row.kind),
+    ).toEqual(["working"]);
+  });
+
+  it("keeps delivered steers inside their original turn and fold without moving the next turn boundary", () => {
+    const turnId = "turn-1" as never;
+    const user = message("user", "2026-01-01T00:00:00Z", {
+      delivery: { state: "delivered", provider: ProviderDriverKind.make("codex") },
+    });
+    const thought = message("thought", "2026-01-01T00:00:10Z", {
+      role: "assistant",
+      turnId,
+      delivery: undefined,
+    });
+    const steer = message("steer", "2026-01-01T00:00:20Z", {
+      turnId,
+      delivery: { state: "delivered", mode: "steer", provider: ProviderDriverKind.make("codex") },
+    });
+    const answer = message("answer", "2026-01-01T00:00:30Z", {
+      role: "assistant",
+      turnId,
+      delivery: undefined,
+    });
+    const timelineEntries = [user, thought, steer, answer].map(entry);
+    const live = deriveMessagesTimelineRows({ ...base, timelineEntries, runningTurnId: turnId });
+    expect(live.map((row) => row.id)).toEqual([
+      "user",
+      "thought",
+      "steer",
+      "answer",
+      "working-indicator-row",
+    ]);
+    expect(live.find((row) => row.id === "steer")).toMatchObject({
+      kind: "message",
+      message: steer,
+    });
+    const settled = deriveMessagesTimelineRows({ ...base, isWorking: false, timelineEntries });
+    expect(settled.map((row) => row.id)).toEqual(["user", "turn-fold:turn-1", "answer"]);
+    const expanded = deriveMessagesTimelineRows({
+      ...base,
+      isWorking: false,
+      timelineEntries,
+      expandedTurnIds: new Set([turnId]),
+    });
+    expect(expanded.map((row) => row.id)).toEqual([
+      "user",
+      "turn-fold:turn-1",
+      "thought",
+      "steer",
+      "answer",
+    ]);
   });
 });

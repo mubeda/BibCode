@@ -17,6 +17,10 @@ advertise it because their adapters publish canonical `mcp.status.updated`
 snapshots. Other providers leave it absent until their adapter implements an
 equivalent status source; clients keep the control visible but disabled.
 
+`supportsTurnSteer` is also inventory-owned: Codex and Claude advertise native
+steering; Cursor, Grok, and OpenCode omit it. The server checks the same driver
+capability when admitting a steer of the oldest queued message.
+
 ## Execution path
 
 The web app sends typed Effect RPC requests to the Rust server. New turns and
@@ -24,21 +28,65 @@ thread controls use `orchestration.dispatchCommand`; snapshots and live updates
 use the orchestration query and subscription methods. The server validates the
 request, admits it through the `OrchestrationEngine`, and delegates provider
 work to `ProviderRuntimeSupervisor`. `TurnDeliveryService` preserves delivery
-ordering and recovery semantics across reconnects and process failures.
+ordering and recovery semantics across reconnects and process failures. Busy
+submissions stay in its durable queue without starting work; a ready settle
+promotes one eligible head. Explicit steering uses the same delivery owner and
+`ProviderDriver::steer`, gated by `supportsTurnSteer`.
 
 Each driver translates between the common orchestration model and its native
 protocol:
 
-| Provider | Native integration                             | Activity support                                                                           |
-| -------- | ---------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| Codex    | Codex App Server JSON-RPC                      | Structured chat and managed-terminal observation.                                          |
-| Claude   | Claude stream-JSON CLI and authenticated hooks | Structured chat and managed-terminal observation when required capabilities are available. |
-| Cursor   | Agent Client Protocol                          | Normal chat only in activity protocol v2.                                                  |
-| OpenCode | OpenCode server/events API                     | Structured chat and managed-terminal observation.                                          |
+| Provider | Native integration                             | Steer                 | Activity support                                                                           |
+| -------- | ---------------------------------------------- | --------------------- | ------------------------------------------------------------------------------------------ |
+| Codex    | Codex App Server JSON-RPC                      | `turn/steer`          | Structured chat and managed-terminal observation.                                          |
+| Claude   | Claude stream-JSON CLI and authenticated hooks | Stream-JSON user line | Structured chat and managed-terminal observation when required capabilities are available. |
+| Cursor   | Agent Client Protocol                          | Unsupported           | Normal chat only in activity protocol v2.                                                  |
+| Grok     | Agent Client Protocol                          | Unsupported           | No structured Activity observation.                                                        |
+| OpenCode | OpenCode server/events API                     | Unsupported           | Structured chat and managed-terminal observation.                                          |
 
 Provider-specific events are normalized into shared orchestration contracts;
 provider wire payloads do not leak into React state. See
 [RPC and orchestration](./rpc-and-orchestration.md).
+
+### Steering queued messages
+
+Steering uses the existing durable delivery owner and per-thread serialization.
+It requires a running session and injects only the queued head. Codex sends
+`turn/steer` with the active `expectedTurnId` and the outbox delivery key as
+`clientUserMessageId`. Codex injects the input at the running turn's next
+boundary; the request does not change the runtime's active turn.
+A follow-up `turn/start` response also preserves an already-running active ID,
+so Stop continues targeting the provider's active turn.
+
+Claude writes the same stream-JSON user input as ordinary delivery without
+calling `start_turn` or resetting runtime turn state. Claude may consume that
+input at its next tool boundary. For a tool-free reply, it consumes the input
+immediately after that reply as the next Claude turn. The latter sequence can
+include another `system init` before the replayed user message. Neither the
+original `result` nor that continuation allocates a new BiBCode runtime turn ID.
+
+Acceptance requires a stdout `type: user` replay matching the written text.
+For string `message.content`, the whole string is the key; for a content array,
+the first text block is the key regardless of other non-tool blocks, including
+images. A content array without a text block matches the empty-text registration
+used for attachment-only input. Any array containing a `tool_result` block is
+ignored, even when it also has matching text or images. Unrelated first text
+blocks cannot acknowledge delivery. Pending acknowledgements are scoped to the
+live process/session and keyed by the written text; matching echoes resolve one waiter in order. An outstanding steer does
+not prevent a normal delivery from registering its own waiter. Acceptance uses
+the runtime turn ID current when the matching echo arrives.
+
+The expected-turn cancellation fence applies through the first byte: input that
+has not begun writing when the expected turn ends, changes, or is interrupted
+is rejected. Once written, its acknowledgement wait survives turn completion
+and subsequent turn starts. Process exit, output-stream failure, or session
+replacement makes an unacknowledged write ambiguous; input known not written
+remains definitely not sent. Dropping a delivery releases only its own waiter.
+Rejected or unavailable steering returns to queued/start for normal promotion,
+with the reason in `delivery.detail`; transport
+ambiguity retains the existing uncertain-delivery behavior and never triggers
+a blind resend. Interrupt/error holds also cover steering in flight so a later
+rejection cannot auto-start the interrupted input.
 
 ### Failure attribution
 
@@ -58,6 +106,29 @@ provider's own failure and also BiBCode's restart notice, which is classified
 BiBCode defect. A driver that does not classify its failure projects as
 `provider_error`, since anything reaching that projection came off a provider's
 wire.
+
+When a provider reports a fatal `session.exited` or its event stream ends, the
+supervisor preserves that event and any already-projected turn failure, and
+settles an abandoned active turn only if one remains. Native runtimes can keep
+their event senders alive after process loss; recovery does not wait for channel
+closure. OpenCode's explicit-stop notice (`Session stopped.`) is excluded from
+the fatal-exit trigger, and intentional stop/idle suspension cancels and joins
+the supervisor event pump before shutting down any driver. The next start delivery,
+including **Send now** on a held queued message, detaches the dead session and
+releases its activity and process ownership through normal session cleanup.
+It retains the persisted resume cursor and follows the existing missing-session
+launch path to a new driver for the same native conversation when available.
+The supervisor's priority channel fences new deliveries while terminal
+projection finishes, including the interval after the error becomes visible.
+The fence waits at most five seconds, then warns and retains the pending
+completion on that session so a stuck projection cannot indefinitely block
+other threads' supervisor controls. Until settlement finishes, starts are
+definitely not sent and use normal delivery backoff, while steers are rejected;
+neither aborts the remaining assistant-message completions. A shutdown error
+from an already-dead driver is logged and still permits the missing-session
+recovery path.
+Steering against that dead session is rejected without relaunching and follows
+the queue's rejection recovery path.
 
 Attribution states who reported an error, never who is to blame — a provider
 rejecting a malformed BiBCode request is still provider-reported. Surfaces that

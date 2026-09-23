@@ -560,6 +560,34 @@ pub fn build_initialize_params(version: &str) -> Value {
     })
 }
 
+fn turn_input_parts(prompt: Option<&str>, attachments: &[Value]) -> Vec<Value> {
+    let mut input = Vec::new();
+    if let Some(prompt) = prompt.filter(|value| !value.is_empty()) {
+        input.push(json!({ "type": "text", "text": prompt }));
+    }
+    input.extend_from_slice(attachments);
+    input
+}
+
+#[must_use]
+pub fn build_turn_steer_params(
+    thread_id: &str,
+    prompt: Option<&str>,
+    attachments: &[Value],
+    expected_turn_id: &str,
+    client_user_message_id: Option<&str>,
+) -> Value {
+    let mut payload = json!({
+        "threadId": thread_id,
+        "input": turn_input_parts(prompt, attachments),
+        "expectedTurnId": expected_turn_id,
+    });
+    if let Some(id) = client_user_message_id {
+        payload["clientUserMessageId"] = json!(id);
+    }
+    payload
+}
+
 #[must_use]
 pub fn build_turn_start_params(input: &BuildTurnStartInput) -> Value {
     let (approval_policy, sandbox_policy) = match input.runtime_mode {
@@ -568,20 +596,11 @@ pub fn build_turn_start_params(input: &BuildTurnStartInput) -> Value {
         CodexRuntimeMode::FullAccess => ("never", json!({ "type": "dangerFullAccess" })),
     };
 
-    let mut turn_input = Vec::new();
-    if let Some(prompt) = input.prompt.as_ref().filter(|value| !value.is_empty()) {
-        turn_input.push(json!({
-            "type": "text",
-            "text": prompt,
-        }));
-    }
-    turn_input.extend(input.attachments.iter().cloned());
-
     let mut payload = json!({
         "threadId": input.thread_id,
         "approvalPolicy": approval_policy,
         "sandboxPolicy": sandbox_policy,
-        "input": turn_input,
+        "input": turn_input_parts(input.prompt.as_deref(), &input.attachments),
     });
 
     if let Some(client_user_message_id) = input.client_user_message_id.as_ref() {

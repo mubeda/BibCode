@@ -159,9 +159,69 @@ export function applyThreadDetailEvent(
             : {}),
           runtimeMode: event.payload.runtimeMode,
           interactionMode: event.payload.interactionMode,
+          // Match the server projector: a promoted prompt starts at promotion,
+          // while still-queued messages retain their receipt order and time.
+          messages: Arr.map(thread.messages, (message) =>
+            message.id === event.payload.messageId && message.role === "user"
+              ? {
+                  ...message,
+                  createdAt: event.payload.createdAt,
+                  updatedAt: event.payload.createdAt,
+                }
+              : message,
+          ),
           updatedAt: event.occurredAt,
         },
       };
+
+    case "thread.turn-steer-requested": {
+      const message = thread.messages.find((entry) => entry.id === event.payload.messageId);
+      if (message?.delivery === undefined) {
+        return { kind: "unchanged" };
+      }
+      const steeredMessage: OrchestrationMessage = {
+        ...message,
+        delivery: { ...message.delivery, state: "pending", mode: "steer" },
+        updatedAt: event.payload.createdAt,
+      };
+      return {
+        kind: "updated",
+        thread: {
+          ...thread,
+          messages: Arr.map(thread.messages, (entry) =>
+            entry.id === message.id ? steeredMessage : entry,
+          ),
+          updatedAt: event.occurredAt,
+        },
+      };
+    }
+
+    case "thread.turn-delivery-updated": {
+      const payload = event.payload;
+      if (!thread.messages.some((entry) => entry.id === payload.messageId)) {
+        return { kind: "unchanged" };
+      }
+      const messages = payload.withdrawn
+        ? Arr.filter(thread.messages, (entry) => entry.id !== payload.messageId)
+        : Arr.map(thread.messages, (entry) =>
+            entry.id !== payload.messageId
+              ? entry
+              : {
+                  ...entry,
+                  delivery: {
+                    ...payload.delivery,
+                    ...(payload.held !== undefined ? { held: payload.held } : {}),
+                    ...(payload.mode !== undefined ? { mode: payload.mode } : {}),
+                  },
+                  ...(payload.turnId !== undefined ? { turnId: payload.turnId } : {}),
+                  updatedAt: payload.updatedAt,
+                },
+          );
+      return {
+        kind: "updated",
+        thread: { ...thread, messages, updatedAt: event.occurredAt },
+      };
+    }
 
     case "thread.turn-interrupt-requested": {
       if (event.payload.turnId === undefined) {

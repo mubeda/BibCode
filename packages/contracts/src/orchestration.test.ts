@@ -29,6 +29,8 @@ import {
   ThreadCreatedPayload,
   ThreadTurnDiff,
   ThreadTurnStartRequestedPayload,
+  TurnDelivery,
+  TurnDeliveryResolutionAction,
 } from "./orchestration.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 import { expectDecodeFailure } from "./test/schemaAssertions.ts";
@@ -53,6 +55,138 @@ const encodeThreadCreatedPayload = Schema.encodeEffect(ThreadCreatedPayload);
 const decodeOrchestrationMessageSync = Schema.decodeUnknownSync(OrchestrationMessage);
 const decodeOrchestrationCommandSync = Schema.decodeUnknownSync(OrchestrationCommand);
 const decodeShell = Schema.decodeUnknownSync(OrchestrationThreadShell);
+const decodeTurnDelivery = Schema.decodeUnknownSync(TurnDelivery);
+const encodeTurnDelivery = Schema.encodeSync(TurnDelivery);
+const decodeDeliveryResolutionAction = Schema.decodeUnknownSync(TurnDeliveryResolutionAction);
+const decodeOrchestrationEventSync = Schema.decodeUnknownSync(OrchestrationEvent);
+const encodeOrchestrationEventSync = Schema.encodeSync(OrchestrationEvent);
+const decodeClientOrchestrationCommandSync = Schema.decodeUnknownSync(ClientOrchestrationCommand);
+
+describe("message queue contracts", () => {
+  const createdAt = "2026-09-22T12:00:00.000Z";
+  const commandFields = {
+    commandId: "queue-command-1",
+    threadId: "thread-1",
+    messageId: "message-1",
+    createdAt,
+  };
+  const eventFields = {
+    sequence: 1,
+    eventId: "queue-event-1",
+    aggregateKind: "thread",
+    aggregateId: "thread-1",
+    occurredAt: createdAt,
+    commandId: null,
+    causationEventId: null,
+    correlationId: null,
+    metadata: {},
+  };
+
+  it.each([
+    { state: "queued", provider: "codex" },
+    { state: "pending", provider: "codex", mode: "steer" },
+    { state: "queued", provider: "codex", mode: "start", held: true },
+    { state: "pending", provider: "codex", held: false },
+  ])("round-trips delivery $state with optional mode and hold", (input) => {
+    const decoded = decodeTurnDelivery(input);
+    expect(decoded).toEqual(input);
+    expect(encodeTurnDelivery(decoded)).toEqual(input);
+  });
+
+  it.each([{ mode: "queue" }, { mode: null }, { held: "true" }])(
+    "rejects invalid delivery fields %j",
+    (fields) => {
+      expect(() =>
+        decodeTurnDelivery({ state: "pending", provider: "codex", ...fields }),
+      ).toThrow();
+    },
+  );
+
+  it("accepts cancel and rejects unknown resolution actions", () => {
+    expect(decodeDeliveryResolutionAction("cancel")).toBe("cancel");
+    expect(() => decodeDeliveryResolutionAction("withdraw")).toThrow();
+  });
+
+  describe.each([
+    ["client", decodeClientOrchestrationCommandSync],
+    ["server", decodeOrchestrationCommandSync],
+  ] as const)("%s commands", (_name, decode) => {
+    const start = {
+      type: "thread.turn.start",
+      commandId: commandFields.commandId,
+      threadId: commandFields.threadId,
+      message: { messageId: "message-1", role: "user", text: "next task", attachments: [] },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      createdAt,
+    };
+
+    it.each([{}, { queued: true }, { queued: false }])(
+      "preserves optional queued flag %j",
+      (flags) => {
+        expect(decode({ ...start, ...flags })).toEqual({ ...start, ...flags });
+      },
+    );
+
+    it.each(["true", null, 1])("rejects non-boolean queued flag %j", (queued) => {
+      expect(() => decode({ ...start, queued })).toThrow();
+    });
+
+    it.each(["thread.turn.steer", "thread.turn.promote"])(
+      "decodes %s with a message id",
+      (type) => {
+        expect(decode({ type, ...commandFields })).toEqual({ type, ...commandFields });
+      },
+    );
+
+    it.each(["thread.turn.steer", "thread.turn.promote"])(
+      "requires a message id for %s",
+      (type) => {
+        const { messageId: _messageId, ...fields } = commandFields;
+        expect(() => decode({ type, ...fields })).toThrow();
+      },
+    );
+
+    it("decodes cancel resolution", () => {
+      const command = { type: "thread.turn-delivery.resolve", ...commandFields, action: "cancel" };
+      expect(decode(command)).toEqual(command);
+    });
+  });
+
+  it("round-trips a steer-requested event tied to the running turn", () => {
+    const event = {
+      ...eventFields,
+      type: "thread.turn-steer-requested",
+      payload: { threadId: "thread-1", messageId: "message-1", turnId: "turn-1", createdAt },
+    };
+    const decoded = decodeOrchestrationEventSync(event);
+    expect(decoded).toEqual(event);
+    expect(encodeOrchestrationEventSync(decoded)).toEqual(event);
+  });
+
+  it.each([
+    { withdrawn: true },
+    { turnId: "turn-1" },
+    { held: true },
+    { held: false, mode: "start" },
+    { mode: "steer" },
+  ])("preserves delivery update fields %j", (fields) => {
+    const event = {
+      ...eventFields,
+      type: "thread.turn-delivery-updated",
+      payload: {
+        threadId: "thread-1",
+        messageId: "message-1",
+        delivery: { state: "dismissed", provider: "codex" },
+        updatedAt: createdAt,
+        ...fields,
+      },
+    };
+    const decoded = decodeOrchestrationEventSync(event);
+    expect(decoded).toEqual(event);
+    expect(encodeOrchestrationEventSync(decoded)).toEqual(event);
+  });
+});
 
 const baseShellFixture = {
   id: "thread-1",
