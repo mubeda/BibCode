@@ -210,6 +210,13 @@ function buildProps() {
     onRevertUserMessage: () => {},
     onResolveTurnDelivery: () => {},
     resolvingTurnDeliveryMessageId: null,
+    queuedMessages: [],
+    queuedStatuses: [],
+    onSteerQueuedMessage: () => {},
+    onSendNowQueuedMessage: () => {},
+    onCancelQueuedMessage: () => {},
+    resolvingQueuedMessageId: null,
+    queuedMessageErrors: {},
     isRevertingCheckpoint: false,
     onImageExpand: () => {},
     activeThreadEnvironmentId: ACTIVE_THREAD_ENVIRONMENT_ID,
@@ -1840,4 +1847,44 @@ describe("MessagesTimeline mounted interactions", () => {
     expect(toggle?.getAttribute("aria-expanded")).toBe("true");
     expect(toggle?.textContent).toContain("Show fewer");
   });
+});
+
+it("renders the queue through the shared user body renderer exactly once after working", async () => {
+  const MessagesTimeline = await loadMessagesTimeline();
+  const message = {
+    id: MessageId.make("queue-card"),
+    role: "user" as const,
+    text: "Queued body",
+    turnId: null,
+    createdAt: "2026-09-22T12:00:00Z",
+    updatedAt: "2026-09-22T12:00:00Z",
+    streaming: false,
+    delivery: { state: "queued" as const, provider: ProviderDriverKind.make("codex") },
+  };
+  const markup = renderToStaticMarkup(
+    <MessagesTimeline
+      {...buildProps()}
+      isWorking
+      timelineEntries={[]}
+      queuedMessages={[message]}
+      queuedStatuses={[
+        {
+          label: "Waiting for you",
+          canSteer: false,
+          steerDisabledReason: "Waiting for you",
+          canCancel: true,
+          steering: false,
+          primaryAction: "send-now",
+          canSendNow: true,
+          sendNowDisabledReason: null,
+        },
+      ]}
+    />,
+  );
+  expect(markup).toContain('data-queued-message-row="queue-card"');
+  expect(markup).toContain('data-user-message-body="true"');
+  expect(markup.match(/Queued body/g)).toHaveLength(1);
+  expect(markup.indexOf('data-timeline-row-kind="working"')).toBeLessThan(
+    markup.indexOf('data-timeline-row-kind="queued-message"'),
+  );
 });

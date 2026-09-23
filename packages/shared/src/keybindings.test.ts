@@ -277,6 +277,14 @@ describe("compileResolvedKeybindingsConfig", () => {
 });
 
 describe("DEFAULT_KEYBINDINGS", () => {
+  it("steers a queued message with mod+shift+enter while editing", () => {
+    expect(DEFAULT_KEYBINDINGS).toContainEqual({
+      key: "mod+shift+enter",
+      command: "thread.steerQueuedMessage",
+      when: "editableFocus",
+    });
+  });
+
   it("opens a new center terminal from mod+j", () => {
     expect(DEFAULT_KEYBINDINGS).toContainEqual({
       key: "mod+j",

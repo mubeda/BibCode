@@ -31,6 +31,7 @@ use bibcode_server::{
             BoxRuntimeFuture, ProviderDeliveryOutcome, ProviderDriver, ProviderDriverFactory,
             ProviderLaunchRequest, ProviderReconciliationOutcome, ProviderRuntimeError,
             ProviderRuntimeSupervisor, StartedSession, SupervisorOptions, freeze_delivery_route,
+            reconcile_abandoned_provider_sessions,
         },
         server_terminal::{
             JsonFuture, JsonStream, ProductionServerControl, ServerTerminalServices,
@@ -485,8 +486,19 @@ async fn durable_boundary_crash_child() {
         supervisor.clone(),
         state.clone(),
     ));
-    if mode == "after-db-commit" {
+    if matches!(mode.as_str(), "after-db-commit" | "queued-after-db-commit") {
         delivery.shutdown().await;
+    }
+    if mode == "queued-after-db-commit" {
+        engine.dispatch(serde_json::from_value(serde_json::json!({
+            "type":"thread.session.set", "commandId":"queue-running", "threadId":"crash-thread",
+            "session":{"threadId":"crash-thread", "status":"running", "providerName":provider, "activeTurnId":"previous-turn", "lastError":null, "updatedAt":"2026-08-01T00:00:00Z"},
+            "createdAt":"2026-08-01T00:00:00Z"
+        })).unwrap()).await.unwrap();
+    }
+    let mut turn = crash_turn(&provider);
+    if mode == "queued-after-db-commit" {
+        turn["queued"] = serde_json::json!(true);
     }
     let mut registry = RpcRegistry::empty();
     register_orchestration_rpc_with_delivery(
@@ -511,7 +523,7 @@ async fn durable_boundary_crash_child() {
         .send(Message::Text(
             serde_json::json!({
                 "_tag":"Request", "id":"1",
-                "tag":"orchestration.dispatchCommand", "payload":crash_turn(&provider),
+                "tag":"orchestration.dispatchCommand", "payload":turn,
                 "headers":[]
             })
             .to_string()
@@ -519,7 +531,7 @@ async fn durable_boundary_crash_child() {
         ))
         .await
         .expect("crash RPC request");
-    if mode == "after-db-commit" {
+    if matches!(mode.as_str(), "after-db-commit" | "queued-after-db-commit") {
         let frame = socket
             .next()
             .await
@@ -567,6 +579,17 @@ fn run_durable_boundary_child(state: &Path, provider: &str, mode: &str, sends: &
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGABRT),
+            "{provider} {mode} must reach the intentional crash boundary\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 fn recorded_sends(path: &Path) -> usize {
@@ -621,15 +644,24 @@ async fn restart_crash_boundary(
         recorded_sends(sends),
         usize::from(expected_before == TurnDeliveryState::Sending)
     );
+    reconcile_abandoned_provider_sessions(&engine)
+        .await
+        .expect("restart session reconciliation");
 
-    let supervisor = Arc::new(ProviderRuntimeSupervisor::start(
-        engine.clone(),
+    let never = Arc::new(NeverProvider::default());
+    let factory: Arc<dyn ProviderDriverFactory> = if expected_before == TurnDeliveryState::Queued {
+        never.clone()
+    } else {
         Arc::new(CrashBoundaryFactory {
             provider: provider.to_owned(),
             sends: sends.to_path_buf(),
             crash_on_delivery: false,
             reconciliation,
-        }),
+        })
+    };
+    let supervisor = Arc::new(ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        factory,
         ActivityProjection::new(ActivityRepository::new(database)),
         SupervisorOptions::default(),
     ));
@@ -641,14 +673,22 @@ async fn restart_crash_boundary(
     }
     let delivery =
         TurnDeliveryService::start(engine.clone(), supervisor.clone(), state.to_path_buf());
+    if expected_before == TurnDeliveryState::Queued {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     wait_for_crash_delivery_state(&engine, expected_after).await;
     assert_eq!(
         recorded_sends(sends),
-        1,
-        "restart must not duplicate the send"
+        usize::from(expected_before != TurnDeliveryState::Queued),
+        "restart must not duplicate a send or send a queued row"
     );
 
     delivery.shutdown().await;
+    assert_eq!(
+        never.creates.load(Ordering::SeqCst),
+        0,
+        "queued recovery never launches a provider"
+    );
     supervisor
         .shutdown()
         .await
@@ -659,6 +699,26 @@ async fn restart_crash_boundary(
 #[tokio::test]
 async fn subprocess_crash_truth_table_preserves_exact_delivery_state_and_send_count() {
     for (provider, mode, before, after, reconciliation, launch_provider) in [
+        (
+            "codex",
+            "queued-after-db-commit",
+            TurnDeliveryState::Queued,
+            TurnDeliveryState::Queued,
+            ProviderReconciliationOutcome::Unavailable {
+                detail: "queued rows never reconcile".to_owned(),
+            },
+            false,
+        ),
+        (
+            "claudeAgent",
+            "queued-after-db-commit",
+            TurnDeliveryState::Queued,
+            TurnDeliveryState::Queued,
+            ProviderReconciliationOutcome::Unavailable {
+                detail: "queued rows never reconcile".to_owned(),
+            },
+            false,
+        ),
         (
             "codex",
             "after-db-commit",
@@ -1665,4 +1725,347 @@ async fn pre_39_migration_is_restart_idempotent_without_synthesizing_historical_
             .expect("legacy receipt");
         assert_eq!(payload_digest, None);
     }
+}
+
+#[tokio::test]
+async fn queued_deliveries_survive_restart_without_provider_launch() {
+    for (held, session_status, runtime_status) in [
+        (false, None, None),
+        (true, None, None),
+        (false, Some("running"), None),
+        (false, Some("starting"), None),
+        (false, Some("connecting"), None),
+        (false, Some("running"), Some("error")),
+        (false, Some("running"), Some("suspended")),
+    ] {
+        let state = TempDir::new().unwrap();
+        let path = state.path().join("queued.sqlite3");
+        let database = Database::create_new(&path).await.unwrap();
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let engine = OrchestrationEngine::start(database.clone(), EngineOptions::default())
+            .await
+            .unwrap();
+        seed_crash_delivery(&engine, state.path(), "codex").await;
+        if let Some(status) = session_status {
+            for command in [
+                serde_json::json!({
+                    "type":"thread.session.set", "commandId":"abandoned-session", "threadId":"crash-thread",
+                    "session":{"threadId":"crash-thread","status":status,"providerName":"codex","providerInstanceId":"codex","runtimeMode":"full-access","activeTurnId":"abandoned-turn","lastError":null,"updatedAt":"2026-08-01T00:00:00Z"},
+                    "createdAt":"2026-08-01T00:00:00Z"
+                }),
+                serde_json::json!({
+                    "type":"thread.message.assistant.delta", "commandId":"abandoned-partial", "threadId":"crash-thread",
+                    "messageId":"abandoned-assistant", "delta":"Partial response", "turnId":"abandoned-turn",
+                    "createdAt":"2026-08-01T00:00:00Z"
+                }),
+            ] {
+                engine
+                    .dispatch(serde_json::from_value(command).unwrap())
+                    .await
+                    .unwrap();
+            }
+        }
+        if let Some(status) = runtime_status {
+            engine
+                .repositories()
+                .upsert_provider_session_runtime(
+                    bibcode_server::persistence::ProviderSessionRuntime {
+                        thread_id: "crash-thread".into(),
+                        provider_name: "codex".into(),
+                        provider_instance_id: Some("codex".into()),
+                        adapter_key: "codex-app-server".into(),
+                        runtime_mode: "full-access".into(),
+                        status: status.into(),
+                        last_seen_at: "2026-08-01T00:00:00Z".into(),
+                        resume_cursor: Some(serde_json::json!({"threadId":"saved-native-thread"})),
+                        runtime_payload: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let mut payload = crash_turn("codex");
+        payload["queued"] = serde_json::json!(true);
+        engine
+            .dispatch(serde_json::from_value(payload.clone()).unwrap())
+            .await
+            .unwrap();
+        let stored = payload.clone();
+        database.call(move |connection| {
+            connection.execute("INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, delivery_key, payload_json, state, mode, held, created_at, updated_at) VALUES ('crash-turn', 'crash-thread', 'crash-message', 'codex', 'codex', 'saved-key', ?, 'queued', 'start', ?, '2026-08-01T00:00:01Z', '2026-08-01T00:00:01Z')", rusqlite::params![stored.to_string(), held])?;
+            connection.execute("UPDATE projection_thread_messages SET delivery_state = 'queued', delivery_provider = 'codex', delivery_mode = 'start', delivery_held = ? WHERE message_id = 'crash-message'", [held])?;
+            Ok(())
+        }).await.unwrap();
+        engine.shutdown().await;
+        drop(engine);
+        drop(database);
+        let database = Database::open_existing(&path).await.unwrap();
+        let engine = OrchestrationEngine::start(database.clone(), EngineOptions::default())
+            .await
+            .unwrap();
+        reconcile_abandoned_provider_sessions(&engine)
+            .await
+            .unwrap();
+        let event_count = engine.read_events(0).await.unwrap().len();
+        reconcile_abandoned_provider_sessions(&engine)
+            .await
+            .unwrap();
+        assert_eq!(engine.read_events(0).await.unwrap().len(), event_count);
+        let never = Arc::new(NeverProvider::default());
+        let supervisor = Arc::new(ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            never.clone(),
+            ActivityProjection::new(ActivityRepository::new(database)),
+            SupervisorOptions::default(),
+        ));
+        let delivery = TurnDeliveryService::start(
+            engine.clone(),
+            supervisor.clone(),
+            state.path().to_path_buf(),
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        delivery.shutdown().await;
+        let row = engine
+            .repositories()
+            .get_provider_turn_delivery("crash-turn".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, TurnDeliveryState::Queued);
+        let expected_held = held || session_status.is_some();
+        assert_eq!(
+            row.held, expected_held,
+            "session {session_status:?}, runtime {runtime_status:?}"
+        );
+        assert_eq!(
+            row.mode,
+            bibcode_server::orchestration::TurnDeliveryMode::Start
+        );
+        assert_eq!(row.payload, payload);
+        assert_eq!(row.attempts, 0);
+        assert_eq!(row.delivery_key, "saved-key");
+        assert_eq!(never.creates.load(Ordering::SeqCst), 0);
+        let message = engine
+            .repositories()
+            .get_message("crash-message".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(message.delivery_state.as_deref(), Some("queued"));
+        assert_eq!(message.delivery_held, Some(expected_held));
+        assert!(
+            !engine
+                .read_events(0)
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| event.event.event_type == "thread.turn-start-requested")
+        );
+        if session_status.is_some() {
+            let session = engine
+                .repositories()
+                .get_thread_session("crash-thread".into())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(session.status, "error");
+            assert_eq!(session.active_turn_id, None);
+            assert_eq!(session.provider_name.as_deref(), Some("codex"));
+            assert_eq!(session.provider_instance_id.as_deref(), Some("codex"));
+            assert_eq!(session.runtime_mode, "full-access");
+            assert_eq!(
+                session.last_error.as_deref(),
+                Some(
+                    "Provider session ended when BiBCode stopped. Review delivery status before continuing."
+                )
+            );
+            assert_eq!(session.last_error_class.as_deref(), Some("transport_error"));
+            let assistant = engine
+                .repositories()
+                .get_message("abandoned-assistant".into())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(assistant.text, "Partial response");
+            assert!(!assistant.is_streaming);
+            if runtime_status.is_some() {
+                assert_eq!(
+                    engine
+                        .repositories()
+                        .get_provider_session_runtime("crash-thread".into())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .resume_cursor,
+                    Some(serde_json::json!({"threadId":"saved-native-thread"}))
+                );
+            }
+            engine.dispatch(serde_json::from_value(serde_json::json!({
+                "type":"thread.turn.promote", "commandId":"send-now-after-restart", "threadId":"crash-thread",
+                "messageId":"crash-message", "createdAt":"2026-08-01T00:00:02Z"
+            })).unwrap()).await.unwrap();
+            let claimed = engine
+                .repositories()
+                .claim_provider_turn("crash-turn".into(), "2026-08-01T00:00:03Z".into())
+                .await
+                .unwrap()
+                .expect("Send now is claimable after restart reconciliation");
+            assert_eq!(claimed.state, TurnDeliveryState::Sending);
+            assert!(!claimed.held);
+        }
+        supervisor.shutdown().await.unwrap();
+        engine.shutdown().await;
+    }
+}
+
+async fn sending_steer_restart(provider: &str, expected: TurnDeliveryState) {
+    use bibcode_server::orchestration::TurnDeliveryMode;
+    use serde_json::json;
+
+    let state = TempDir::new().unwrap();
+    let path = state.path().join("steer.sqlite3");
+    let sends = state.path().join("provider-sends");
+    let database = Database::create_new(&path).await.unwrap();
+    database
+        .call(|connection| {
+            run_migrations(connection, None)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let engine = OrchestrationEngine::start(database.clone(), EngineOptions::default())
+        .await
+        .unwrap();
+    seed_crash_delivery(&engine, state.path(), provider).await;
+    let mut payload = crash_turn(provider);
+    payload["queued"] = json!(true);
+    let command: OrchestrationCommand = serde_json::from_value(payload.clone()).unwrap();
+    freeze_delivery_route(&engine, &state.path().to_path_buf(), &command, &mut payload)
+        .await
+        .unwrap();
+    engine.dispatch(command).await.unwrap();
+    let provider_kind = provider.to_owned();
+    database.call(move |connection| {
+        connection.execute(
+            "INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, mode, held, created_at, updated_at)
+             VALUES ('crash-turn', 'crash-thread', 'crash-message', ?, ?, 'crash-provider-session', 'steer-key', ?, 'queued', 'start', 0, '2026-08-01T00:00:01Z', '2026-08-01T00:00:01Z')",
+            rusqlite::params![provider_kind, provider_kind, payload.to_string()],
+        )?;
+        Ok(())
+    }).await.unwrap();
+    engine.dispatch(serde_json::from_value(json!({
+        "type":"thread.session.set","commandId":"steer-running","threadId":"crash-thread","createdAt":"2026-08-01T00:00:02Z",
+        "session":{"threadId":"crash-thread","status":"running","providerName":provider,"activeTurnId":"steer-active","lastError":null,"updatedAt":"2026-08-01T00:00:02Z"}
+    })).unwrap()).await.unwrap();
+    engine.dispatch(serde_json::from_value(json!({"type":"thread.turn.steer","commandId":"steer-request","threadId":"crash-thread","messageId":"crash-message","createdAt":"2026-08-01T00:00:03Z"})).unwrap()).await.unwrap();
+    let sending = engine
+        .repositories()
+        .claim_provider_turn("crash-turn".into(), "2026-08-01T00:00:04Z".into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(sending.mode, TurnDeliveryMode::Steer);
+    assert_eq!(sending.state, TurnDeliveryState::Sending);
+    engine.shutdown().await;
+    drop(engine);
+    drop(database);
+
+    let database = Database::open_existing(&path).await.unwrap();
+    let engine = OrchestrationEngine::start(database.clone(), EngineOptions::default())
+        .await
+        .unwrap();
+    reconcile_abandoned_provider_sessions(&engine)
+        .await
+        .unwrap();
+    let never = Arc::new(NeverProvider::default());
+    let factory: Arc<dyn ProviderDriverFactory> = if provider == "codex" {
+        Arc::new(CrashBoundaryFactory {
+            provider: provider.into(),
+            sends: sends.clone(),
+            crash_on_delivery: false,
+            reconciliation: ProviderReconciliationOutcome::Found,
+        })
+    } else {
+        never.clone()
+    };
+    let supervisor = Arc::new(ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        factory,
+        ActivityProjection::new(ActivityRepository::new(database)),
+        SupervisorOptions::default(),
+    ));
+    if provider == "codex" {
+        supervisor
+            .launch(crash_launch(provider, state.path()))
+            .await
+            .unwrap();
+    }
+    let delivery = TurnDeliveryService::start(
+        engine.clone(),
+        supervisor.clone(),
+        state.path().to_path_buf(),
+    );
+    wait_for_crash_delivery_state(&engine, expected).await;
+    delivery.shutdown().await;
+    let row = engine
+        .repositories()
+        .get_provider_turn_delivery("crash-turn".into())
+        .await
+        .unwrap()
+        .unwrap();
+    let message = engine
+        .repositories()
+        .get_message("crash-message".into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, expected);
+    assert_eq!(row.mode, TurnDeliveryMode::Steer);
+    assert_eq!(row.delivery_key, "steer-key");
+    assert_eq!(row.attempts, 1);
+    assert_eq!(
+        message.delivery_state.as_deref(),
+        Some(if provider == "codex" {
+            "delivered"
+        } else {
+            "uncertain"
+        })
+    );
+    assert_eq!(message.delivery_mode.as_deref(), Some("steer"));
+    assert_eq!(
+        message.turn_id.as_deref(),
+        if provider == "codex" {
+            Some("steer-active")
+        } else {
+            None
+        }
+    );
+    assert_eq!(
+        recorded_sends(&sends),
+        0,
+        "recovery must not resend steering"
+    );
+    assert_eq!(
+        never.creates.load(Ordering::SeqCst),
+        0,
+        "Claude ambiguity needs no runtime launch"
+    );
+    supervisor.shutdown().await.unwrap();
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn codex_sending_steer_recovers_as_delivered_with_turn_attribution() {
+    sending_steer_restart("codex", TurnDeliveryState::Delivered).await;
+}
+
+#[tokio::test]
+async fn claude_sending_steer_recovers_as_uncertain_without_resend() {
+    sending_steer_restart("claudeAgent", TurnDeliveryState::Uncertain).await;
 }

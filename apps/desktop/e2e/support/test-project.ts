@@ -8,6 +8,7 @@ import { desktopActivityFixture, desktopActivityMarkerFileName } from "./activit
 
 const FIXTURE_PROJECT_NAME = "BiBCode UI Fixture";
 const STREAMED_RESPONSE = "BiBCode deterministic streamed fixture response.";
+const SLOW_TURN_RELEASE_FILE_NAME = ".bibcode-e2e-slow-turn-release";
 
 const nativeActionLogFixtureSource = String.raw`
 import fs from "node:fs";
@@ -321,6 +322,31 @@ if (process.argv.includes("app-server") && listenArgumentIndex >= 0) {
   process.on("SIGINT", shutdown);
 } else {
 const reader = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+const slowTurnReleasePath = fixtureProjectPath + "/" + ${JSON.stringify(SLOW_TURN_RELEASE_FILE_NAME)};
+// The marker releases a specific turn after reload assertions; the watchdog
+// prevents a failed scenario from leaving its fixture working indefinitely.
+const slowTurnTimeoutMs = Number(process.env.BIBCODE_E2E_SLOW_TURN_MS ?? 60000);
+if (!Number.isSafeInteger(slowTurnTimeoutMs) || slowTurnTimeoutMs <= 0) {
+  throw new Error("BIBCODE_E2E_SLOW_TURN_MS must be a positive integer.");
+}
+let activeTurnId = null;
+let slowTurnTimer;
+let slowTurnPoll;
+const clearSlowTurn = () => {
+  clearTimeout(slowTurnTimer);
+  clearInterval(slowTurnPoll);
+};
+const completeTurn = (status = "completed") => {
+  clearSlowTurn();
+  const turnId = activeTurnId;
+  activeTurnId = null;
+  if (turnId === null) return;
+  send({ method: "turn/completed", params: {
+    threadId: "bibcode-ui-provider-thread",
+    turn: { id: turnId, status }
+  } });
+};
+reader.on("close", clearSlowTurn);
 
 reader.on("line", (line) => {
   const message = JSON.parse(line);
@@ -397,6 +423,10 @@ reader.on("line", (line) => {
       send({ id, result: activityResult(message.method, message.params) });
       break;
     case "turn/start": {
+      if (activeTurnId !== null) {
+        send({ id, error: { code: -32600, message: "A fixture turn is already running." } });
+        break;
+      }
       const prompt = promptTextFromParts(message.params?.input);
       if (prompt === "load deterministic activity") {
         activityEnabled = true;
@@ -416,8 +446,9 @@ reader.on("line", (line) => {
         activityRevision = 3;
         if (activityMarker) fs.writeFileSync(activityMarker, "3");
       }
-      const turnId = "bibcode-ui-turn-" + Math.max(activityRevision, 1);
-      appendProviderInput("codex", prompt);
+      const turnId = "bibcode-ui-turn-" + crypto.randomUUID();
+      activeTurnId = turnId;
+      appendProviderInput("codex", prompt, "start", turnId);
       send({ id, result: { turn: { id: turnId } } });
       send({ method: "turn/started", params: {
         threadId: "bibcode-ui-provider-thread",
@@ -426,17 +457,40 @@ reader.on("line", (line) => {
       send({ method: "item/agentMessage/delta", params: {
         threadId: "bibcode-ui-provider-thread",
         turnId,
-        itemId: "bibcode-ui-message",
+        itemId: "bibcode-ui-message-" + turnId,
         delta: streamResponse
       } });
-      send({ method: "turn/completed", params: {
-        threadId: "bibcode-ui-provider-thread",
-        turn: { id: turnId, status: "completed" }
-      } });
+      if (prompt.includes("[[slow]]")) {
+        slowTurnTimer = setTimeout(completeTurn, slowTurnTimeoutMs);
+        slowTurnPoll = setInterval(() => {
+          try {
+            if (fs.readFileSync(slowTurnReleasePath, "utf8") !== turnId) return;
+            fs.rmSync(slowTurnReleasePath, { force: true });
+            completeTurn();
+          } catch (error) {
+            if (error.code !== "ENOENT") throw error;
+          }
+        }, 25);
+      } else {
+        completeTurn();
+      }
+      break;
+    }
+    case "turn/steer": {
+      if (activeTurnId === null || message.params?.expectedTurnId !== activeTurnId) {
+        send({ id, error: { code: -32600, message: "Steer requires the active turn ID." } });
+        break;
+      }
+      appendProviderInput("codex", promptTextFromParts(message.params?.input), "steer", activeTurnId);
+      send({ id, result: { turnId: activeTurnId } });
       break;
     }
     case "turn/interrupt":
+      send({ id, result: null });
+      completeTurn("interrupted");
+      break;
     case "shutdown":
+      clearSlowTurn();
       send({ id, result: null });
       break;
     default:
@@ -456,14 +510,16 @@ export function promptTextFromParts(parts) {
     .join("");
 }
 
-export function appendProviderInput(provider, prompt) {
+export function appendProviderInput(provider, prompt, kind = "start", turnId) {
   const path = process.env.BIBCODE_E2E_PROVIDER_INPUT_LOG;
   if (!path) {
     throw new Error("BIBCODE_E2E_PROVIDER_INPUT_LOG is required.");
   }
   NodeFS.appendFileSync(path, JSON.stringify({
     provider,
+    kind,
     prompt,
+    ...(turnId === undefined ? {} : { turnId }),
     recordedAt: new Date().toISOString()
   }) + "\n", "utf8");
 }
@@ -1080,6 +1136,10 @@ function initializeGitProject(projectPath: string): void {
 
 export function clearDesktopActivityMarker(projectPath: string): void {
   NodeFS.rmSync(NodePath.join(projectPath, desktopActivityMarkerFileName), { force: true });
+}
+
+export function completeDesktopUiSlowTurn(projectPath: string, turnId: string): void {
+  NodeFS.writeFileSync(NodePath.join(projectPath, SLOW_TURN_RELEASE_FILE_NAME), turnId);
 }
 
 function desktopUiHostTemporaryDirectory(): string {

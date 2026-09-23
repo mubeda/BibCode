@@ -430,6 +430,14 @@ export function isChatNewShortcut(
   return matchesCommandShortcut(event, keybindings, "chat.new", options);
 }
 
+export function isSteerQueuedMessageShortcut(
+  event: ShortcutEventLike,
+  keybindings: ResolvedKeybindingsConfig,
+  options?: ShortcutMatchOptions,
+): boolean {
+  return matchesCommandShortcut(event, keybindings, "thread.steerQueuedMessage", options);
+}
+
 export function isChatNewLocalShortcut(
   event: ShortcutEventLike,
   keybindings: ResolvedKeybindingsConfig,

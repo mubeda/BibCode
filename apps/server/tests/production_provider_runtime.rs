@@ -280,6 +280,7 @@ struct DriverState {
     targeted_activity_active: Arc<AtomicUsize>,
     shutdowns: usize,
     shutdown_results: VecDeque<Result<(), ProviderRuntimeError>>,
+    shutdown_gate: Option<Arc<tokio::sync::Semaphore>>,
     stream_ended: Option<Arc<tokio::sync::Notify>>,
 }
 
@@ -598,9 +599,18 @@ impl ProviderDriver for FakeDriver {
 
     fn shutdown(&self) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
-            let mut state = self.state.lock().unwrap();
-            state.shutdowns += 1;
-            state.shutdown_results.pop_front().unwrap_or(Ok(()))
+            let (result, gate) = {
+                let mut state = self.state.lock().unwrap();
+                state.shutdowns += 1;
+                (
+                    state.shutdown_results.pop_front().unwrap_or(Ok(())),
+                    state.shutdown_gate.take(),
+                )
+            };
+            if let Some(gate) = gate {
+                let _permit = gate.acquire().await.expect("shutdown gate remains open");
+            }
+            result
         })
     }
 }
@@ -851,6 +861,8 @@ fn durable_turn_command_for(
 fn delivery_row(provider_kind: &str, delivery_key: &str) -> ProviderTurnDelivery {
     let command_id = format!("reconcile-{delivery_key}");
     ProviderTurnDelivery {
+        mode: bibcode_server::orchestration::TurnDeliveryMode::Start,
+        held: false,
         command_id: command_id.clone(),
         thread_id: "t1".to_owned(),
         message_id: format!("message-{delivery_key}"),
@@ -3519,16 +3531,13 @@ async fn delivery_service_orders_each_thread_without_blocking_another_thread() {
         delivery_release: Some(release.clone()),
         ..DriverState::default()
     }));
-    let mut receivers = VecDeque::new();
-    for _ in 0..2 {
-        let (_events_tx, events_rx) = mpsc::channel(1);
-        receivers.push_back(events_rx);
-    }
+    let (t1_events_tx, t1_events_rx) = mpsc::channel(1);
+    let (_t2_events_tx, t2_events_rx) = mpsc::channel(1);
     let supervisor = Arc::new(ProviderRuntimeSupervisor::start(
         engine.clone(),
         Arc::new(FakeFactory {
             state: state.clone(),
-            events: StdMutex::new(receivers),
+            events: StdMutex::new(VecDeque::from([t1_events_rx, t2_events_rx])),
         }),
         activity_projection(&engine),
         SupervisorOptions::default(),
@@ -3635,6 +3644,71 @@ async fn delivery_service_orders_each_thread_without_blocking_another_thread() {
         })
         .await
         .expect("release A1 terminal transition gate");
+    wait_for_delivery_state_for_command(&engine, "order-a1", TurnDeliveryState::Delivered).await;
+    let session = engine
+        .repositories()
+        .get_thread_session("t1".to_owned())
+        .await
+        .expect("t1 session after A1 acknowledgement")
+        .expect("t1 session");
+    assert_eq!(session.status, "running");
+    assert!(
+        timeout(Duration::from_millis(100), async {
+            loop {
+                if state
+                    .lock()
+                    .unwrap()
+                    .delivery_started
+                    .contains(&"A2".to_owned())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_err(),
+        "A1 acknowledgement must not release A2 while t1 is still running"
+    );
+    let a2 = engine
+        .repositories()
+        .get_provider_turn_delivery("order-a2".to_owned())
+        .await
+        .expect("A2 waiting delivery query")
+        .expect("A2 waiting delivery row");
+    assert_eq!(a2.state, TurnDeliveryState::Pending);
+    assert_eq!(a2.attempts, 0, "A2 must not be claimed before t1 settles");
+
+    t1_events_tx
+        .send(ProviderEvent {
+            native_event_id: None,
+            event_type: "turn.completed".to_owned(),
+            thread_id: "t1".to_owned(),
+            turn_id: session.active_turn_id,
+            item_id: None,
+            request_id: None,
+            payload: json!({"state":"completed"}),
+            activity: Vec::new(),
+            activity_controls: Default::default(),
+        })
+        .await
+        .expect("complete A1 through the provider event channel");
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if engine
+                .repositories()
+                .get_thread_session("t1".to_owned())
+                .await
+                .expect("t1 session after provider completion")
+                .is_some_and(|session| session.status == "ready")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("A1 completion projects t1 ready");
     timeout(Duration::from_secs(10), async {
         loop {
             if state
@@ -3649,7 +3723,7 @@ async fn delivery_service_orders_each_thread_without_blocking_another_thread() {
         }
     })
     .await
-    .expect("A2 starts after A1 settles");
+    .expect("A2 starts after t1 settles to ready");
     let (a1_state, early_a2_claims) = database
         .call(|connection| {
             let a1_state = connection.query_row(
@@ -3705,8 +3779,12 @@ async fn delivery_service_never_exceeds_its_configured_four_thread_semaphore() {
         ..DriverState::default()
     }));
     let mut receivers = VecDeque::new();
+    // Keep every event sender alive: a closed event stream marks the session dead
+    // and the next delivery would relaunch instead of reusing the live driver.
+    let mut live_event_senders = Vec::new();
     for _ in 0..5 {
-        let (_events_tx, events_rx) = mpsc::channel(1);
+        let (events_tx, events_rx) = mpsc::channel(1);
+        live_event_senders.push(events_tx);
         receivers.push_back(events_rx);
     }
     let supervisor = Arc::new(ProviderRuntimeSupervisor::start(
@@ -3817,6 +3895,7 @@ async fn delivery_service_never_exceeds_its_configured_four_thread_semaphore() {
     delivery.shutdown().await;
     supervisor.shutdown().await.expect("provider shutdown");
     engine.shutdown().await;
+    drop(live_event_senders);
 }
 
 fn mixed_attachment_rpc_turn(
@@ -3882,8 +3961,10 @@ async fn registered_dispatch_rpc_proves_one_mixed_attachment_delivery_for_every_
     }
     let state = Arc::new(StdMutex::new(DriverState::default()));
     let mut receivers = VecDeque::new();
+    let mut event_senders = Vec::new();
     for _ in 0..providers.len() {
-        let (_events_tx, events_rx) = mpsc::channel(1);
+        let (events_tx, events_rx) = mpsc::channel(1);
+        event_senders.push(events_tx);
         receivers.push_back(events_rx);
     }
     let supervisor = Arc::new(ProviderRuntimeSupervisor::start(
@@ -4003,6 +4084,11 @@ async fn registered_dispatch_rpc_proves_one_mixed_attachment_delivery_for_every_
     let snapshot = state.lock().unwrap();
     assert_eq!(snapshot.sends.len(), 4);
     assert_eq!(
+        snapshot.launches.len(),
+        4,
+        "live providers need no relaunch"
+    );
+    assert_eq!(
         snapshot.delivery_routes,
         vec![
             (
@@ -4112,6 +4198,7 @@ async fn routes_orchestration_commands_and_persists_resume_state() {
             interaction_mode: "default".to_owned(),
             bootstrap: None,
             source_proposed_plan: None,
+            queued: None,
             created_at: NOW.to_owned(),
         })
         .await
@@ -5086,6 +5173,585 @@ async fn unexpected_provider_stream_end_marks_activity_scope_stale() {
     supervisor.shutdown().await.unwrap();
 }
 
+#[derive(Clone, Copy)]
+enum ProviderLossSignal {
+    StreamEnd,
+    SessionExit,
+    FailedTurnThenSessionExit,
+}
+
+#[tokio::test]
+async fn provider_stream_end_relaunches_the_next_start_but_never_steer() {
+    assert_provider_loss_relaunch(ProviderLossSignal::StreamEnd).await;
+}
+
+#[tokio::test]
+async fn provider_session_exit_relaunches_with_the_event_sender_still_open() {
+    assert_provider_loss_relaunch(ProviderLossSignal::FailedTurnThenSessionExit).await;
+}
+
+#[tokio::test]
+async fn provider_session_exit_settles_an_abandoned_active_turn_before_relaunch() {
+    assert_provider_loss_relaunch(ProviderLossSignal::SessionExit).await;
+}
+
+#[tokio::test]
+async fn provider_session_exit_does_not_treat_opencode_explicit_stop_as_loss() {
+    let engine = engine().await;
+    let state = Arc::new(StdMutex::new(DriverState::default()));
+    let (events_tx, events_rx) = mpsc::channel(1);
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(VecDeque::from([events_rx])),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+    supervisor
+        .launch(launch_for_provider("t1", "opencode", "openai/gpt-5"))
+        .await
+        .unwrap();
+    events_tx
+        .send(ProviderEvent {
+            native_event_id: None,
+            event_type: "session.exited".into(),
+            thread_id: "t1".into(),
+            turn_id: None,
+            item_id: None,
+            request_id: None,
+            payload: json!({"reason":"Session stopped."}),
+            activity: Vec::new(),
+            activity_controls: Default::default(),
+        })
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if load_snapshot(&engine.repositories())
+                .await
+                .unwrap()
+                .activities
+                .iter()
+                .any(|activity| activity.summary == "session.exited")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    supervisor
+        .capture_session_identity("t1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        state.lock().unwrap().shutdowns,
+        0,
+        "explicit stop is not an unexpected connection loss"
+    );
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(state.lock().unwrap().shutdowns, 1);
+    engine.shutdown().await;
+}
+
+async fn assert_provider_loss_relaunch(signal: ProviderLossSignal) {
+    const CLOSED: &str = "Codex JSON-RPC connection is closed: stdout ended";
+    for (durable, draining) in [(false, false), (false, true), (true, false), (true, true)] {
+        let (engine, database) = engine_and_database().await;
+        let settings = TempDir::new().unwrap();
+        let state = Arc::new(StdMutex::new(DriverState {
+            shutdown_gate: draining.then(|| Arc::new(tokio::sync::Semaphore::new(0))),
+            shutdown_results: VecDeque::from([
+                Ok(()),
+                Err(ProviderRuntimeError::Provider {
+                    provider: "codex".into(),
+                    detail: "already-dead driver shutdown failed".into(),
+                }),
+            ]),
+            ..DriverState::default()
+        }));
+        let (events_tx, events_rx) = mpsc::channel(1);
+        let (_replacement_tx, replacement_rx) = mpsc::channel(1);
+        let supervisor = ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(FakeFactory {
+                state: state.clone(),
+                events: StdMutex::new(VecDeque::from([events_rx, replacement_rx])),
+            }),
+            activity_projection(&engine),
+            SupervisorOptions::default(),
+        );
+        supervisor.launch(launch()).await.unwrap();
+        let abandoned = durable_turn_command("before-provider-loss", "first turn");
+        engine.dispatch(abandoned.clone()).await.unwrap();
+        supervisor.handle_orchestration(abandoned).await.unwrap();
+        let retained_sender = match signal {
+            ProviderLossSignal::StreamEnd => {
+                drop(events_tx);
+                None
+            }
+            ProviderLossSignal::SessionExit | ProviderLossSignal::FailedTurnThenSessionExit => {
+                let event =
+                    |event_type: &str, turn_id: Option<&str>, payload: Value| ProviderEvent {
+                        native_event_id: None,
+                        event_type: event_type.into(),
+                        thread_id: "t1".into(),
+                        turn_id: turn_id.map(str::to_owned),
+                        item_id: None,
+                        request_id: None,
+                        payload,
+                        activity: Vec::new(),
+                        activity_controls: Default::default(),
+                    };
+                if matches!(signal, ProviderLossSignal::FailedTurnThenSessionExit) {
+                    events_tx
+                        .send(event(
+                            "turn.completed",
+                            Some("provider-turn-1"),
+                            json!({
+                                "state":"failed", "errorMessage":CLOSED
+                            }),
+                        ))
+                        .await
+                        .unwrap();
+                }
+                events_tx
+                    .send(event("session.exited", None, json!({"reason":CLOSED})))
+                    .await
+                    .unwrap();
+                Some(events_tx)
+            }
+        };
+        let expected_error = match signal {
+            ProviderLossSignal::StreamEnd => "Provider event stream ended unexpectedly.".to_owned(),
+            ProviderLossSignal::SessionExit => {
+                format!("Provider event stream ended unexpectedly: {CLOSED}")
+            }
+            ProviderLossSignal::FailedTurnThenSessionExit => CLOSED.to_owned(),
+        };
+        let expected_class = if matches!(signal, ProviderLossSignal::FailedTurnThenSessionExit) {
+            "provider_error"
+        } else {
+            "transport_error"
+        };
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let session = engine
+                    .repositories()
+                    .get_thread_session("t1".into())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if session.status == "error" && state.lock().unwrap().shutdowns > 0 {
+                    assert_eq!(session.last_error.as_deref(), Some(expected_error.as_str()));
+                    assert_eq!(session.last_error_class.as_deref(), Some(expected_class));
+                    assert_eq!(session.active_turn_id, None);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("provider loss settles the active turn");
+        assert!(
+            retained_sender
+                .as_ref()
+                .is_none_or(|sender| !sender.is_closed()),
+            "process loss must be detected while the driver's event channel stays open"
+        );
+        let events = engine.read_events(0).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event.event_type == "thread.session-set"
+                    && event.event.payload["session"]["status"] == "error")
+                .count(),
+            1,
+            "provider loss must not project a second failure after the provider settles"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event.event_type == "thread.activity-appended"
+                    && event.event.payload["activity"]["summary"] == "session.exited")
+                .count(),
+            usize::from(retained_sender.is_some()),
+            "session.exited remains projected exactly once"
+        );
+
+        if durable {
+            let mut steer = delivery_row("codex", "steer-after-provider-loss");
+            let command = freeze_row_route(&engine, &settings, &mut steer).await;
+            seed_sending_delivery(&database, steer.clone()).await;
+            database
+                .call(move |connection| {
+                    connection.execute(
+                        "UPDATE provider_turn_outbox SET mode = 'steer' WHERE command_id = ?",
+                        [&steer.command_id],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            let outcome = deliver_durable_orchestration_turn(
+                &supervisor,
+                &engine,
+                &settings.path().to_path_buf(),
+                command,
+                steer.delivery_key,
+            )
+            .await;
+            assert!(
+                matches!(outcome, ProviderDeliveryOutcome::Rejected { ref detail }
+                    if detail == "Steering requires an existing running provider session."),
+                "{outcome:?}"
+            );
+            assert_eq!(
+                state.lock().unwrap().launches.len(),
+                1,
+                "steer must never relaunch"
+            );
+        }
+
+        let command = durable_turn_command("after-provider-loss", "continue after loss");
+        let outcome = if durable {
+            let mut row = delivery_row("codex", "start-after-provider-loss");
+            row.command_id = "after-provider-loss".into();
+            row.provider_session_id = Some("provider-session-1".into());
+            row.payload = serde_json::to_value(&command).unwrap();
+            let command = freeze_row_route(&engine, &settings, &mut row).await;
+            seed_sending_delivery(&database, row.clone()).await;
+            deliver_durable_orchestration_turn(
+                &supervisor,
+                &engine,
+                &settings.path().to_path_buf(),
+                command,
+                row.delivery_key,
+            )
+            .await
+        } else {
+            deliver_orchestration_turn(
+                &supervisor,
+                &engine,
+                &settings.path().to_path_buf(),
+                command,
+                "start-after-provider-loss".into(),
+            )
+            .await
+        };
+        assert!(
+            matches!(outcome, ProviderDeliveryOutcome::Accepted { .. }),
+            "{outcome:?}"
+        );
+        {
+            let state = state.lock().unwrap();
+            assert_eq!(state.launches.len(), 2, "a dead driver must be replaced");
+            assert_eq!(state.starts, 2);
+            assert_eq!(
+                state.launches[1].resume_cursor,
+                Some(json!({"threadId":"provider-session-1"})),
+                "replacement must retain native conversation context"
+            );
+            assert_eq!(state.sends, ["first turn", "continue after loss"]);
+        }
+        let session = engine
+            .repositories()
+            .get_thread_session("t1".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.status, "running");
+        assert_eq!(session.last_error, None);
+        supervisor.shutdown().await.unwrap();
+        engine.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn provider_stream_end_fences_starts_during_error_projection() {
+    let hooks = TestHooks::default();
+    let (engine, _) = engine_and_database_with_options(EngineOptions {
+        test_hooks: hooks.clone(),
+        ..EngineOptions::default()
+    })
+    .await;
+    let (events_tx, events_rx) = mpsc::channel(1);
+    let state = Arc::new(StdMutex::new(DriverState::default()));
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(VecDeque::from([events_rx])),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+    supervisor.launch(launch()).await.unwrap();
+    let abandoned = durable_turn_command("before-projection-race", "first turn");
+    engine.dispatch(abandoned.clone()).await.unwrap();
+    supervisor.handle_orchestration(abandoned).await.unwrap();
+    let session_pause = hooks.pause_before_next_command_persist();
+    drop(events_tx);
+    timeout(Duration::from_secs(2), session_pause.wait_until_entered())
+        .await
+        .unwrap();
+    let terminal_pause = hooks.pause_before_next_command_persist();
+    session_pause.release();
+    timeout(Duration::from_secs(2), terminal_pause.wait_until_entered())
+        .await
+        .unwrap();
+    let session = engine
+        .repositories()
+        .get_thread_session("t1".into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        session.status, "error",
+        "error is visible while EOF projection is still settling"
+    );
+    assert_eq!(state.lock().unwrap().shutdowns, 0);
+
+    let delivery = supervisor.deliver_turn(
+        durable_turn_command("during-error-projection", "continue"),
+        "projection-race-key".into(),
+    );
+    tokio::pin!(delivery);
+    let early = timeout(Duration::from_millis(100), &mut delivery).await;
+    terminal_pause.release();
+    let result = match early {
+        Ok(result) => result,
+        Err(_) => timeout(Duration::from_secs(2), delivery).await.unwrap(),
+    };
+    let missing = matches!(result, Err(ProviderRuntimeError::SessionNotFound { .. }));
+    if let Ok(handle) = result {
+        let _ = handle.completion().await;
+    }
+    assert!(
+        missing,
+        "a start observing the EOF error must reach the relaunch path"
+    );
+    assert_eq!(state.lock().unwrap().sends, ["first turn"]);
+    supervisor.shutdown().await.unwrap();
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn provider_session_exit_fences_starts_until_its_projection_finishes() {
+    let hooks = TestHooks::default();
+    let (engine, _) = engine_and_database_with_options(EngineOptions {
+        test_hooks: hooks.clone(),
+        ..EngineOptions::default()
+    })
+    .await;
+    let (events_tx, events_rx) = mpsc::channel(1);
+    let state = Arc::new(StdMutex::new(DriverState::default()));
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(VecDeque::from([events_rx])),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+    supervisor.launch(launch()).await.unwrap();
+    let abandoned = durable_turn_command("before-exit-projection", "first turn");
+    engine.dispatch(abandoned.clone()).await.unwrap();
+    supervisor.handle_orchestration(abandoned).await.unwrap();
+    let exit_pause = hooks.pause_before_next_command_persist();
+    events_tx
+        .send(ProviderEvent {
+            native_event_id: None,
+            event_type: "session.exited".into(),
+            thread_id: "t1".into(),
+            turn_id: None,
+            item_id: None,
+            request_id: None,
+            payload: json!({"reason":"provider process exited"}),
+            activity: Vec::new(),
+            activity_controls: Default::default(),
+        })
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(2), exit_pause.wait_until_entered())
+        .await
+        .unwrap();
+    let delivery = supervisor.deliver_turn(
+        durable_turn_command("during-exit-projection", "continue"),
+        "exit-projection-key".into(),
+    );
+    tokio::pin!(delivery);
+    let early = timeout(Duration::from_millis(100), &mut delivery).await;
+    exit_pause.release();
+    let result = match early {
+        Ok(result) => result,
+        Err(_) => timeout(Duration::from_secs(2), delivery).await.unwrap(),
+    };
+    let missing = matches!(result, Err(ProviderRuntimeError::SessionNotFound { .. }));
+    if let Ok(handle) = result {
+        let _ = handle.completion().await;
+    }
+    supervisor.shutdown().await.unwrap();
+    engine.shutdown().await;
+    assert!(
+        missing,
+        "session.exited projection must fence delivery before cleanup and relaunch"
+    );
+    assert_eq!(state.lock().unwrap().sends, ["first turn"]);
+}
+
+#[tokio::test]
+async fn provider_stream_end_fence_timeout_releases_other_thread_control() {
+    let hooks = TestHooks::default();
+    let (engine, database) = engine_and_database_with_options(EngineOptions {
+        test_hooks: hooks.clone(),
+        ..EngineOptions::default()
+    })
+    .await;
+    add_delivery_thread_for(&engine, "t2", "codex", "gpt-5").await;
+    let (events_tx, events_rx) = mpsc::channel(1);
+    let (_other_tx, other_rx) = mpsc::channel(1);
+    let state = Arc::new(StdMutex::new(DriverState::default()));
+    let supervisor = Arc::new(ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(VecDeque::from([events_rx, other_rx])),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    ));
+    supervisor.launch(launch()).await.unwrap();
+    supervisor
+        .launch(launch_for_provider("t2", "codex", "gpt-5"))
+        .await
+        .unwrap();
+    let abandoned = durable_turn_command("before-stuck-projection", "first turn");
+    engine.dispatch(abandoned.clone()).await.unwrap();
+    supervisor.handle_orchestration(abandoned).await.unwrap();
+    for message_id in ["timeout-partial-1", "timeout-partial-2"] {
+        engine.dispatch(serde_json::from_value(json!({
+            "type":"thread.message.assistant.delta", "commandId":message_id, "threadId":"t1",
+            "messageId":message_id, "delta":"Partial response", "turnId":"provider-turn-1", "createdAt":NOW
+        })).unwrap()).await.unwrap();
+    }
+    let session_pause = hooks.pause_before_next_command_persist();
+    drop(events_tx);
+    timeout(Duration::from_secs(2), session_pause.wait_until_entered())
+        .await
+        .unwrap();
+    let terminal_pause = hooks.pause_before_next_command_persist();
+    session_pause.release();
+    timeout(Duration::from_secs(2), terminal_pause.wait_until_entered())
+        .await
+        .unwrap();
+    assert_eq!(
+        engine
+            .repositories()
+            .get_thread_session("t1".into())
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "error"
+    );
+    let control_supervisor = supervisor.clone();
+    let mut control =
+        tokio::spawn(async move { control_supervisor.capture_session_identity("t2").await });
+    let waiting = timeout(Duration::from_millis(100), &mut control)
+        .await
+        .is_err();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let bounded_result = if waiting {
+        timeout(Duration::from_secs(1), &mut control).await.ok()
+    } else {
+        None
+    };
+    tokio::time::resume();
+    let start = supervisor
+        .deliver_turn(
+            durable_turn_command("during-timed-out-projection", "retry once settled"),
+            "timed-out-projection-start".into(),
+        )
+        .await;
+    let start_outcome = match start {
+        Ok(handle) => Some(handle.completion().await),
+        Err(_) => None,
+    };
+    let mut steer = delivery_row("codex", "timed-out-projection-steer");
+    steer.mode = bibcode_server::orchestration::TurnDeliveryMode::Steer;
+    let command = serde_json::from_value(steer.payload.clone()).unwrap();
+    seed_sending_delivery(&database, steer.clone()).await;
+    database
+        .call(move |connection| {
+            connection.execute(
+                "UPDATE provider_turn_outbox SET mode = 'steer' WHERE command_id = ?",
+                [&steer.command_id],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let settings = TempDir::new().unwrap();
+    let steer_outcome = deliver_durable_orchestration_turn(
+        &supervisor,
+        &engine,
+        &settings.path().to_path_buf(),
+        command,
+        steer.delivery_key,
+    )
+    .await;
+    terminal_pause.release();
+    if waiting && bounded_result.is_none() {
+        control.await.unwrap().unwrap();
+    }
+    let settled = timeout(Duration::from_secs(2), async {
+        loop {
+            let messages = engine
+                .repositories()
+                .list_messages_by_thread("t1".into())
+                .await
+                .unwrap();
+            if messages
+                .iter()
+                .filter(|message| message.role == "assistant" && !message.is_streaming)
+                .count()
+                == 2
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    supervisor.shutdown().await.unwrap();
+    engine.shutdown().await;
+    assert!(waiting, "terminal projection is fenced before the deadline");
+    assert!(bounded_result.expect("a stuck EOF projection must release other threads' supervisor traffic after five seconds").unwrap().unwrap().is_some(), "the other thread retains its live provider identity");
+    assert!(
+        matches!(
+            start_outcome,
+            Some(ProviderDeliveryOutcome::DefinitelyNotSent { .. })
+        ),
+        "start must remain retryable without aborting unfinished settlement"
+    );
+    assert!(
+        matches!(steer_outcome, ProviderDeliveryOutcome::Rejected { .. }),
+        "steer must be rejected without relaunching or aborting settlement"
+    );
+    assert!(
+        settled.is_ok(),
+        "every partial assistant message must settle after persistence resumes"
+    );
+    assert_eq!(state.lock().unwrap().sends, ["first turn"]);
+}
+
 #[tokio::test]
 async fn unexpected_provider_stream_end_settles_partial_turn_as_failed() {
     let engine = engine().await;
@@ -5117,6 +5783,7 @@ async fn unexpected_provider_stream_end_settles_partial_turn_as_failed() {
         interaction_mode: "default".to_owned(),
         bootstrap: None,
         source_proposed_plan: None,
+        queued: None,
         created_at: NOW.to_owned(),
     };
     engine.dispatch(start.clone()).await.unwrap();
@@ -5277,6 +5944,7 @@ async fn restart_recovers_eof_partial_after_terminal_settlement_retry_exhaustion
             interaction_mode: "default".to_owned(),
             bootstrap: None,
             source_proposed_plan: None,
+            queued: None,
             created_at: NOW.to_owned(),
         };
         engine.dispatch(start.clone()).await.unwrap();
@@ -9590,6 +10258,7 @@ async fn first_turn_autostarts_the_projected_native_provider() {
         interaction_mode: "default".to_owned(),
         bootstrap: None,
         source_proposed_plan: None,
+        queued: None,
         created_at: NOW.to_owned(),
     };
     engine.dispatch(command.clone()).await.unwrap();
@@ -9842,6 +10511,7 @@ async fn projects_distinct_provider_messages_and_settles_the_completed_turn() {
         interaction_mode: "default".to_owned(),
         bootstrap: None,
         source_proposed_plan: None,
+        queued: None,
         created_at: NOW.to_owned(),
     };
     engine.dispatch(start.clone()).await.unwrap();
@@ -10052,6 +10722,7 @@ async fn unidentified_provider_chunks_share_one_settled_turn_message() {
         interaction_mode: "default".to_owned(),
         bootstrap: None,
         source_proposed_plan: None,
+        queued: None,
         created_at: NOW.to_owned(),
     };
     engine.dispatch(start.clone()).await.unwrap();
@@ -10169,6 +10840,7 @@ async fn completion_without_assistant_text_does_not_create_a_message() {
         interaction_mode: "default".to_owned(),
         bootstrap: None,
         source_proposed_plan: None,
+        queued: None,
         created_at: NOW.to_owned(),
     };
     engine.dispatch(start.clone()).await.unwrap();
@@ -10271,6 +10943,7 @@ async fn failed_and_interrupted_turns_settle_existing_assistant_messages() {
             interaction_mode: "default".to_owned(),
             bootstrap: None,
             source_proposed_plan: None,
+            queued: None,
             created_at: NOW.to_owned(),
         };
         engine.dispatch(start.clone()).await.unwrap();
@@ -10421,6 +11094,7 @@ async fn project_terminal_with_completion_failures(
         interaction_mode: "default".to_owned(),
         bootstrap: None,
         source_proposed_plan: None,
+        queued: None,
         created_at: NOW.to_owned(),
     };
     engine.dispatch(start.clone()).await.unwrap();
@@ -10679,6 +11353,7 @@ async fn failed_provider_completion_clears_running_state_and_preserves_the_error
         interaction_mode: "default".to_owned(),
         bootstrap: None,
         source_proposed_plan: None,
+        queued: None,
         created_at: NOW.to_owned(),
     };
     engine.dispatch(start.clone()).await.unwrap();
@@ -14515,4 +15190,231 @@ done
         Err(ProviderRuntimeError::Provider { provider, .. }) if provider == "grok"
     ));
     grok.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn default_driver_steer_is_rejected() {
+    // A driver without native steering must never fall through to send/start.
+    let state = Arc::new(StdMutex::new(DriverState::default()));
+    let driver = FakeDriver {
+        provider: "cursor".into(),
+        provider_instance_id: Some("cursor".into()),
+        state: state.clone(),
+        events: tokio::sync::Mutex::new(mpsc::channel(1).1),
+    };
+    assert_eq!(
+        driver
+            .steer("follow up".into(), vec![], "active".into(), "key".into())
+            .await,
+        ProviderDeliveryOutcome::Rejected {
+            detail: "provider does not support steering".into()
+        }
+    );
+    assert!(state.lock().unwrap().sends.is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_steer_sends_turn_steer_with_expected_turn_id() {
+    // Catch turn/start substitution, missing reconciliation identity/input, and active-ID resets.
+    let temp = TempDir::new().unwrap();
+    let capture = temp.path().join("requests.jsonl");
+    let executable = executable_fixture(
+        &temp,
+        "codex-steer",
+        r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$BIBCODE_TEST_CAPTURE"
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"id":%s,"result":{"userAgent":"fixture"}}\n' "$id" ;;
+    *'"method":"thread/start"'*) printf '{"id":%s,"result":{"thread":{"id":"provider-thread"}}}\n' "$id" ;;
+    *'"method":"mcpServerStatus/list"'*) printf '{"id":%s,"result":{"data":[],"nextCursor":null}}\n' "$id" ;;
+    *'"method":"turn/start"'*) printf '{"id":%s,"result":{"turn":{"id":"active"}}}\n' "$id" ;;
+    *'"method":"turn/steer"'*)
+      case "$line" in
+        *'"expectedTurnId":"stale"'*) printf '{"id":%s,"error":{"code":-32600,"message":"expectedTurnId does not match the active turn"}}\n' "$id" ;;
+        *) printf '{"id":%s,"result":{"turnId":"accepted-turn"}}\n' "$id" ;;
+      esac ;;
+    *'"method":"turn/interrupt"'*|*'"method":"shutdown"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
+  esac
+done
+"#,
+        "",
+    );
+    let mut request = launch();
+    request.binary_path = executable.to_string_lossy().into_owned();
+    request.cwd = temp.path().into();
+    request.environment.insert(
+        "BIBCODE_TEST_CAPTURE".into(),
+        capture.to_string_lossy().into_owned(),
+    );
+    let driver = NativeProviderDriverFactory::new(temp.path().join("attachments"))
+        .create(request)
+        .await
+        .unwrap();
+    driver.start().await.unwrap();
+    driver
+        .send("start".into(), vec![], "default".into())
+        .await
+        .unwrap();
+    let outcome = driver
+        .steer(
+            "follow up".into(),
+            vec![image_attachment(&temp)],
+            "active".into(),
+            "steer-key".into(),
+        )
+        .await;
+    let rejected = driver
+        .steer("stale".into(), vec![], "stale".into(), "stale-key".into())
+        .await;
+    driver.interrupt(None).await.unwrap();
+    driver.shutdown().await.unwrap();
+    assert_eq!(
+        outcome,
+        ProviderDeliveryOutcome::Accepted {
+            turn_id: Some("accepted-turn".into())
+        }
+    );
+    assert!(
+        matches!(rejected, ProviderDeliveryOutcome::Rejected { detail } if detail.contains("expectedTurnId"))
+    );
+    let requests: Vec<Value> = std::fs::read_to_string(capture)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let steer = requests
+        .iter()
+        .find(|value| value["method"] == "turn/steer")
+        .unwrap();
+    assert_eq!(
+        steer["params"],
+        json!({
+            "threadId":"provider-thread", "expectedTurnId":"active", "clientUserMessageId":"steer-key",
+            "input":[{"type":"text","text":"follow up"}, {"type":"image","url":"data:image/png;base64,aW1hZ2UgYnl0ZXM="}]
+        })
+    );
+    let interrupt = requests
+        .iter()
+        .find(|value| value["method"] == "turn/interrupt")
+        .unwrap();
+    assert_eq!(interrupt["params"]["turnId"], "active");
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|value| value["method"] == "turn/start")
+            .count(),
+        1
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_steer_writes_user_line_without_turn_started() {
+    // A tool-result user line cannot acknowledge steer or reset its running turn attribution.
+    let temp = TempDir::new().unwrap();
+    let capture = temp.path().join("requests.jsonl");
+    let gate = temp.path().join("release-echo");
+    let executable = executable_fixture(
+        &temp,
+        "claude-steer",
+        r#"#!/bin/sh
+case "$1" in --version|--help) exit 1 ;; esac
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$BIBCODE_TEST_CAPTURE"
+  case "$line" in
+    *'follow up'*)
+      printf '%s\n' '{"type":"user","session_id":"claude-session","uuid":"result-1","parent_tool_use_id":null,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-1","content":"done"}]}}'
+      printf '%s\n' '{"type":"stream_event","session_id":"claude-session","uuid":"barrier","parent_tool_use_id":null,"event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"tool-result-seen"}}}'
+      while [ ! -f "$BIBCODE_TEST_ECHO_GATE" ]; do sleep 0.01; done
+      printf '%s\n' "$line"
+      printf '%s\n' '{"type":"stream_event","session_id":"claude-session","uuid":"after-steer","parent_tool_use_id":null,"event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"after-steer"}}}'
+      ;;
+  esac
+done
+"#,
+        "",
+    );
+    let mut request = launch();
+    request.provider = "claudeAgent".into();
+    request.binary_path = executable.to_string_lossy().into_owned();
+    request.cwd = temp.path().into();
+    request.resume_cursor = Some(json!({"sessionId":"claude-session"}));
+    request.environment.insert(
+        "BIBCODE_TEST_CAPTURE".into(),
+        capture.to_string_lossy().into_owned(),
+    );
+    request.environment.insert(
+        "BIBCODE_TEST_ECHO_GATE".into(),
+        gate.to_string_lossy().into_owned(),
+    );
+    let driver = NativeProviderDriverFactory::new(temp.path().join("attachments"))
+        .create(request)
+        .await
+        .unwrap();
+    driver.start().await.unwrap();
+    let active = driver
+        .send("start".into(), vec![], "default".into())
+        .await
+        .unwrap()
+        .unwrap();
+    let sender = driver.clone();
+    let expected = active.clone();
+    let mut steer = tokio::spawn(async move {
+        sender
+            .steer("follow up".into(), vec![], expected, "key".into())
+            .await
+    });
+    let observed = timeout(Duration::from_secs(10), async {
+        loop {
+            let event = driver.next_event().await.unwrap();
+            assert_ne!(event.event_type, "turn.started");
+            if event.payload.to_string().contains("tool-result-seen") {
+                assert_eq!(event.turn_id.as_deref(), Some(active.as_str()));
+                break;
+            }
+        }
+    })
+    .await;
+    let premature = timeout(Duration::from_millis(100), &mut steer).await;
+    let was_pending = premature.is_err();
+    std::fs::write(gate, "release").unwrap();
+    let outcome = match premature {
+        Ok(result) => result.unwrap(),
+        Err(_) => timeout(Duration::from_secs(10), steer)
+            .await
+            .unwrap()
+            .unwrap(),
+    };
+    let after = timeout(Duration::from_secs(10), async {
+        loop {
+            let event = driver.next_event().await.unwrap();
+            assert_ne!(event.event_type, "turn.started");
+            if event.payload.to_string().contains("after-steer") {
+                break event;
+            }
+        }
+    })
+    .await;
+    driver.shutdown().await.unwrap();
+    observed.expect("tool-result barrier");
+    assert!(was_pending, "tool_result must not acknowledge a user steer");
+    assert_eq!(
+        outcome,
+        ProviderDeliveryOutcome::Accepted {
+            turn_id: Some(active.clone())
+        }
+    );
+    assert_eq!(after.unwrap().turn_id.as_deref(), Some(active.as_str()));
+    let requests: Vec<Value> = std::fs::read_to_string(capture)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        requests[1],
+        json!({"type":"user","session_id":"claude-session","message":{"role":"user","content":[{"type":"text","text":"follow up"}]},"parent_tool_use_id":null})
+    );
 }

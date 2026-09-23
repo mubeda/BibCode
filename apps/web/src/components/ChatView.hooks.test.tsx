@@ -187,6 +187,8 @@ vi.mock("../state/threads", () => ({
     setRuntimeMode: { key: "thread.setRuntimeMode" },
     setInteractionMode: { key: "thread.setInteractionMode" },
     startTurn: { key: "thread.startTurn" },
+    steerTurn: { key: "thread.steerTurn" },
+    promoteTurn: { key: "thread.promoteTurn" },
     interruptTurn: { key: "thread.interruptTurn" },
     resolveDelivery: { key: "thread.resolveDelivery" },
     respondToApproval: { key: "thread.respondToApproval" },
@@ -5997,4 +5999,312 @@ describe("ChatView banners and dialogs", () => {
     expect(commandCallsFor("terminal.close")).toHaveLength(0);
     expect(commandCallsFor("thread.delete")).toHaveLength(1);
   });
+});
+
+describe("ChatView durable message queue", () => {
+  const queued = (
+    id: string,
+    overrides: Partial<Thread["messages"][number]> = {},
+  ): Thread["messages"][number] => ({
+    id: MessageId.make(id),
+    role: "user",
+    text: id,
+    turnId: null,
+    createdAt: now,
+    updatedAt: now,
+    streaming: false,
+    delivery: { state: "queued", provider: ProviderDriverKind.make("codex"), mode: "start" },
+    ...overrides,
+  });
+  function seedQueue(
+    messages = [queued("head"), queued("tail")],
+    status: NonNullable<Thread["session"]>["status"] = "running",
+    supportsTurnSteer = true,
+  ) {
+    seedConnectedServerThread(
+      makeThread({
+        messages,
+        session: makeSession({
+          status,
+          activeTurnId: status === "running" ? TurnId.make("active-turn") : null,
+        }),
+      }),
+    );
+    seedEnvironment(
+      makeEnvironmentPresentation({
+        serverConfig: {
+          providers: [{ ...codexProvider, supportsTurnSteer }],
+          environment: { label: "Local" },
+        },
+      }),
+    );
+    renderServerRoute();
+    return installComposerHandle();
+  }
+  const cancel = (id: string) =>
+    (
+      capturedProps("messagesTimeline")["onCancelQueuedMessage"] as (id: MessageId) => Promise<void>
+    )(MessageId.make(id));
+
+  it.each(["running", "starting"] as const)(
+    "enqueues while %s without local dispatch or an optimistic row and clears the draft",
+    async (status) => {
+      const { promptRef } = seedQueue(undefined, status);
+      promptRef.current = "another message";
+      useComposerDraftStore.getState().setPrompt(threadRef, "another message");
+      h.setStateCalls.length = 0;
+      await (capturedProps("chatComposer")["onSend"] as () => Promise<void>)();
+      expect(commandCallsFor("thread.startTurn")[0]?.input).toMatchObject({
+        input: {
+          queued: true,
+          message: { text: "another message" },
+          modelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" },
+        },
+      });
+      expect(promptRef.current).toBe("");
+      expect(useComposerDraftStore.getState().getComposerDraft(threadRef)?.prompt ?? "").toBe("");
+      expect(setStateCallsFor("optimisticUserMessages")).toHaveLength(0);
+      expect(
+        h.setStateCalls.some(
+          (call) =>
+            call.applied &&
+            typeof call.applied === "object" &&
+            "messageId" in call.applied &&
+            "startedAt" in call.applied,
+        ),
+      ).toBe(false);
+      promptRef.current = "one more";
+      await (capturedProps("chatComposer")["onSend"] as () => Promise<void>)();
+      expect(commandCallsFor("thread.startTurn")).toHaveLength(2);
+    },
+  );
+
+  it.each(["pending", "sending"] as const)(
+    "enqueues behind the initial %s delivery before the provider is running",
+    async (state) => {
+      const { promptRef } = seedQueue(
+        [
+          queued("initial", {
+            delivery: { state, mode: "start", provider: ProviderDriverKind.make("codex") },
+          }),
+        ],
+        "idle",
+      );
+      expect(capturedProps("chatComposer")["isSendBusy"]).toBe(true);
+      promptRef.current = "follow-up during launch";
+      h.setStateCalls.length = 0;
+      await (capturedProps("chatComposer")["onSend"] as () => Promise<void>)();
+      expect(commandCallsFor("thread.startTurn")[0]?.input).toMatchObject({
+        input: {
+          queued: true,
+          message: { text: "follow-up during launch" },
+        },
+      });
+      expect(promptRef.current).toBe("");
+      expect(setStateCallsFor("optimisticUserMessages")).toHaveLength(0);
+      expect(
+        h.setStateCalls.some(
+          (call) =>
+            call.applied &&
+            typeof call.applied === "object" &&
+            "messageId" in call.applied &&
+            "startedAt" in call.applied,
+        ),
+      ).toBe(false);
+    },
+  );
+
+  it("keeps a second Enter inert while an enqueue request is still in flight", async () => {
+    const { promptRef } = seedQueue();
+    let release!: (value: unknown) => void;
+    h.commandResults["thread.startTurn"] = () =>
+      new Promise((resolve) => {
+        release = resolve;
+      });
+    const send = capturedProps("chatComposer")["onSend"] as () => Promise<void>;
+    promptRef.current = "first enqueue";
+    const pending = send();
+    await vi.waitFor(() => expect(commandCallsFor("thread.startTurn")).toHaveLength(1));
+    promptRef.current = "still composing";
+    await send();
+    expect(commandCallsFor("thread.startTurn")).toHaveLength(1);
+    expect(promptRef.current).toBe("still composing");
+    release(AsyncResult.success(undefined));
+    await pending;
+  });
+
+  it("retains the actual enqueued File until cancellation and restores it after the receipt", async () => {
+    class FakeFileReader {
+      result = "data:image/png;base64,ZmFrZQ==";
+      onLoad = () => {};
+      addEventListener(type: string, callback: () => void) {
+        if (type === "load") this.onLoad = callback;
+      }
+      readAsDataURL() {
+        this.onLoad();
+      }
+    }
+    vi.stubGlobal("FileReader", FakeFileReader);
+    seedQueue([]);
+    const image = makeOwnedComposerContexts("enqueued").image;
+    const { promptRef } = installComposerHandle({
+      getSendContext: () => ({ ...composerHandle().getSendContext(), attachments: [image] }),
+    });
+    promptRef.current = "with image";
+    await (capturedProps("chatComposer")["onSend"] as () => Promise<void>)();
+    const sent = (
+      commandCallsFor("thread.startTurn")[0]!.input as {
+        input: { message: { messageId: MessageId } };
+      }
+    ).input.message;
+    seedQueue([queued(sent.messageId, { text: "with image", attachments: [image] })]);
+    await cancel(sent.messageId);
+    expect(useComposerDraftStore.getState().getComposerDraft(threadRef)?.attachments[0]?.file).toBe(
+      image.file,
+    );
+  });
+
+  it("appends a rejected enqueue to newer draft text instead of losing either prompt", async () => {
+    const { promptRef } = seedQueue([]);
+    promptRef.current = "original queued text";
+    h.commandResults["thread.startTurn"] = () => {
+      promptRef.current = "new draft";
+      useComposerDraftStore.getState().setPrompt(threadRef, "new draft");
+      return AsyncResult.failure(Cause.fail(new Error("Enqueue rejected")));
+    };
+    await (capturedProps("chatComposer")["onSend"] as () => Promise<void>)();
+    expect(useComposerDraftStore.getState().getComposerDraft(threadRef)?.prompt).toBe(
+      "new draft\n\noriginal queued text",
+    );
+    expect(promptRef.current).toBe("new draft\n\noriginal queued text");
+  });
+
+  it("does not interrupt until an already pending cancel finishes or restore the same message twice", async () => {
+    seedQueue();
+    let release!: (value: unknown) => void;
+    const deferred = new Promise((resolve) => {
+      release = resolve;
+    });
+    h.commandResults["thread.resolveDelivery"] = (command) =>
+      (command as { input: { messageId: string } }).input.messageId === "head"
+        ? deferred
+        : AsyncResult.success(undefined);
+    const pendingCancel = cancel("head");
+    const pendingStop = (capturedProps("chatComposer")["onInterrupt"] as () => Promise<void>)();
+    expect(commandCallsFor("thread.interruptTurn")).toHaveLength(0);
+    release(AsyncResult.success(undefined));
+    await pendingCancel;
+    await pendingStop;
+    expect(commandCallsFor("thread.resolveDelivery")).toHaveLength(2);
+    expect(useComposerDraftStore.getState().getComposerDraft(threadRef)?.prompt).toBe(
+      "head\n\ntail",
+    );
+    expect(commandCallsFor("thread.interruptTurn")).toHaveLength(1);
+  });
+
+  it("Stop cancels head to tail, restores in order, then interrupts", async () => {
+    const { promptRef } = seedQueue([queued("head", { createdAt: later }), queued("tail")]);
+    promptRef.current = "draft";
+    useComposerDraftStore.getState().setPrompt(threadRef, "draft");
+    const draftsAtCommand: string[] = [];
+    h.commandResults["thread.resolveDelivery"] = () => {
+      draftsAtCommand.push(
+        useComposerDraftStore.getState().getComposerDraft(threadRef)?.prompt ?? "",
+      );
+      return AsyncResult.success(undefined);
+    };
+    h.commandResults["thread.interruptTurn"] = () => {
+      draftsAtCommand.push(
+        useComposerDraftStore.getState().getComposerDraft(threadRef)?.prompt ?? "",
+      );
+      return AsyncResult.success(undefined);
+    };
+    await (capturedProps("chatComposer")["onInterrupt"] as () => Promise<void>)();
+    expect(h.commandCalls.map((c) => c.key)).toEqual([
+      "thread.resolveDelivery",
+      "thread.resolveDelivery",
+      "thread.interruptTurn",
+    ]);
+    expect(commandCallsFor("thread.resolveDelivery").map((c) => c.input)).toEqual([
+      { environmentId, input: { threadId, messageId: MessageId.make("head"), action: "cancel" } },
+      { environmentId, input: { threadId, messageId: MessageId.make("tail"), action: "cancel" } },
+    ]);
+    expect(draftsAtCommand).toEqual(["draft", "draft\n\nhead", "draft\n\nhead\n\ntail"]);
+    expect(promptRef.current).toBe("draft\n\nhead\n\ntail");
+  });
+
+  it("a failed cancel preserves the card error and still drains the tail before interrupt", async () => {
+    seedQueue();
+    h.commandResults["thread.resolveDelivery"] = (command) =>
+      (command as { input: { messageId: string } }).input.messageId === "head"
+        ? AsyncResult.failure(Cause.fail(new Error("Cancel rejected")))
+        : AsyncResult.success(undefined);
+    await (capturedProps("chatComposer")["onInterrupt"] as () => Promise<void>)();
+    expect(h.commandCalls.map((c) => c.key)).toEqual([
+      "thread.resolveDelivery",
+      "thread.resolveDelivery",
+      "thread.interruptTurn",
+    ]);
+    expect(useComposerDraftStore.getState().getComposerDraft(threadRef)?.prompt).toBe("tail");
+    expect(h.setStateCalls.some((c) => JSON.stringify(c.applied).includes("Cancel rejected"))).toBe(
+      true,
+    );
+  });
+
+  it("cancel restores cached Files and reports attachments from another client", async () => {
+    const { queuedMessageCache } = await import("./chat/queuedMessageCache");
+    const image = makeOwnedComposerContexts("queue").image;
+    const remote = { ...image, id: "remote-file" as ChatAttachmentId };
+    seedQueue([queued("head", { attachments: [image, remote] })]);
+    queuedMessageCache.remember(MessageId.make("head"), { attachments: [image] });
+    await cancel("head");
+    const draft = useComposerDraftStore.getState().getComposerDraft(threadRef);
+    expect(draft?.prompt).toBe("head");
+    expect(draft?.attachments[0]?.file).toBe(image.file);
+    expect(
+      h.toasts.some(
+        (t) =>
+          JSON.stringify(t).includes("1 attachment") && JSON.stringify(t).includes("not restored"),
+      ),
+    ).toBe(true);
+    expect(queuedMessageCache.take(MessageId.make("head"))).toBeUndefined();
+  });
+
+  it("Send now promotes a held head and never steers it", async () => {
+    seedQueue(
+      [
+        queued("head", {
+          delivery: { state: "queued", provider: ProviderDriverKind.make("codex"), held: true },
+        }),
+      ],
+      "interrupted",
+    );
+    expect(capturedProps("messagesTimeline")["queuedStatuses"]).toMatchObject([
+      { label: "Waiting for you", primaryAction: "send-now", canSteer: false },
+    ]);
+    await (
+      capturedProps("messagesTimeline")["onSendNowQueuedMessage"] as (
+        id: MessageId,
+      ) => Promise<void>
+    )(MessageId.make("head"));
+    expect(commandCallsFor("thread.promoteTurn")[0]?.input).toEqual({
+      environmentId,
+      input: { threadId, messageId: MessageId.make("head") },
+    });
+    expect(commandCallsFor("thread.steerTurn")).toHaveLength(0);
+  });
+
+  it.each([true, false])(
+    "composer steer targets the head only when the bound snapshot supports it (%s)",
+    async (supports) => {
+      seedQueue(undefined, "running", supports);
+      await (capturedProps("chatComposer")["onSteerQueuedMessage"] as () => Promise<void>)();
+      expect(commandCallsFor("thread.steerTurn")).toHaveLength(supports ? 1 : 0);
+      if (supports)
+        expect(commandCallsFor("thread.steerTurn")[0]?.input).toEqual({
+          environmentId,
+          input: { threadId, messageId: MessageId.make("head") },
+        });
+    },
+  );
 });

@@ -17,7 +17,7 @@ use serde_json::Value;
 
 use crate::{
     auth::limits::{MAX_ACTIVE_PAIRING_OFFERS, MAX_ACTIVE_PAIRING_OFFERS_PER_PRINCIPAL},
-    orchestration::{ProviderTurnDelivery, TurnDeliveryState},
+    orchestration::{ProviderTurnDelivery, TurnDeliveryMode, TurnDeliveryState},
 };
 
 use super::{Database, PersistenceError, Result};
@@ -587,13 +587,13 @@ impl Repositories {
         self.database.call(move |connection| {
             let attachments = row.attachments.as_ref().map(encode_json).transpose()?;
             connection.execute(
-                "INSERT INTO projection_thread_messages (message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, delivery_state, delivery_provider, delivery_detail, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, COALESCE(?, (SELECT attachments_json FROM projection_thread_messages WHERE message_id = ?)), ?, ?, ?, ?, ?, ?) \
+                "INSERT INTO projection_thread_messages (message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, delivery_state, delivery_provider, delivery_detail, created_at, updated_at, delivery_mode, delivery_held) \
+                 VALUES (?, ?, ?, ?, ?, COALESCE(?, (SELECT attachments_json FROM projection_thread_messages WHERE message_id = ?)), ?, ?, ?, ?, ?, ?, ?, ?) \
                  ON CONFLICT (message_id) DO UPDATE SET \
                    thread_id=excluded.thread_id, turn_id=excluded.turn_id, role=excluded.role, text=excluded.text, \
                    attachments_json=COALESCE(excluded.attachments_json, projection_thread_messages.attachments_json), \
-                   is_streaming=excluded.is_streaming, delivery_state=excluded.delivery_state, delivery_provider=excluded.delivery_provider, delivery_detail=excluded.delivery_detail, created_at=excluded.created_at, updated_at=excluded.updated_at",
-                params![row.message_id,row.thread_id,row.turn_id,row.role,row.text,attachments,row.message_id,i64::from(row.is_streaming),row.delivery_state,row.delivery_provider,row.delivery_detail,row.created_at,row.updated_at],
+                   is_streaming=excluded.is_streaming, delivery_state=excluded.delivery_state, delivery_provider=excluded.delivery_provider, delivery_detail=excluded.delivery_detail, delivery_mode=excluded.delivery_mode, delivery_held=excluded.delivery_held, created_at=excluded.created_at, updated_at=excluded.updated_at",
+                params![row.message_id,row.thread_id,row.turn_id,row.role,row.text,attachments,row.message_id,i64::from(row.is_streaming),row.delivery_state,row.delivery_provider,row.delivery_detail,row.created_at,row.updated_at,row.delivery_mode,row.delivery_held],
             )?; Ok(())
         }).await
     }
@@ -666,6 +666,95 @@ impl Repositories {
         result
     }
 
+    pub async fn get_provider_turn_delivery_for_message(
+        &self,
+        thread_id: String,
+        message_id: String,
+    ) -> Result<Option<ProviderTurnDelivery>> {
+        self.database
+            .call(move |connection| {
+                connection
+                    .query_row(
+                        &(PROVIDER_TURN_DELIVERY_SELECT.to_owned()
+                            + " WHERE thread_id = ? AND message_id = ?"),
+                        params![thread_id, message_id],
+                        decode_provider_turn_delivery,
+                    )
+                    .optional()
+                    .map_err(Into::into)
+            })
+            .await
+    }
+
+    pub(crate) async fn get_queued_provider_turn_head(
+        &self,
+        thread_id: String,
+    ) -> Result<Option<ProviderTurnDelivery>> {
+        self.database
+            .call(move |connection| queued_provider_turn_head_on(connection, &thread_id))
+            .await
+    }
+
+    pub async fn can_promote_queued_provider_turn(
+        &self,
+        thread_id: String,
+        message_id: String,
+        automatic: bool,
+    ) -> Result<bool> {
+        self.database
+            .call(move |connection| {
+                can_promote_queued_provider_turn_on(connection, &thread_id, &message_id, automatic)
+            })
+            .await
+    }
+
+    pub async fn list_queued_provider_turn_heads(&self) -> Result<Vec<ProviderTurnDelivery>> {
+        self.database.call(|connection| {
+            // Rank identifiers once, then load only each thread's head payload.
+            let query = "WITH queued_order AS (
+                SELECT queued.command_id,
+                  ROW_NUMBER() OVER (PARTITION BY queued.thread_id ORDER BY receipt.result_sequence, queued.created_at, queued.command_id) AS position
+                FROM provider_turn_outbox AS queued
+                JOIN orchestration_command_receipts AS receipt ON receipt.command_id = queued.command_id
+                WHERE queued.state = 'queued'
+            ) ".to_owned() + PROVIDER_TURN_DELIVERY_SELECT
+                + " AS queued WHERE command_id IN (SELECT command_id FROM queued_order WHERE position = 1) ORDER BY (SELECT result_sequence FROM orchestration_command_receipts WHERE command_id = queued.command_id), created_at, command_id";
+            collect(connection, &query, [], decode_provider_turn_delivery)
+        }).await
+    }
+
+    /// Return an unaccepted steer to the durable queue without changing its identity or payload.
+    pub async fn requeue_provider_turn(
+        &self,
+        command_id: String,
+        expected_attempt: i64,
+        updated_at: String,
+    ) -> Result<Option<ProviderTurnDelivery>> {
+        self.database
+            .call(move |connection| {
+                requeue_provider_turn_on(connection, &command_id, expected_attempt, &updated_at)
+            })
+            .await
+    }
+
+    pub(crate) async fn get_running_provider_steer_target(
+        &self,
+        thread_id: String,
+        message_id: String,
+    ) -> Result<Option<String>> {
+        self.database.call(move |connection| {
+            let target = provider_turn_steer_target_on(connection, &thread_id, &message_id)?;
+            let active: Option<String> = connection.query_row(
+                "SELECT session.active_turn_id FROM projection_thread_sessions AS session
+                 JOIN provider_turn_outbox AS delivery ON delivery.thread_id = session.thread_id
+                 WHERE session.thread_id = ? AND session.status = 'running' AND delivery.message_id = ?
+                   AND delivery.mode = 'steer' AND delivery.state IN ('pending', 'sending') AND delivery.held = 0",
+                params![thread_id, message_id], |row| row.get::<_, Option<String>>(0),
+            ).optional()?.flatten();
+            Ok(target.filter(|id| Some(id) == active.as_ref()))
+        }).await
+    }
+
     pub async fn list_referenced_attachment_ids(&self) -> Result<Vec<String>> {
         self.database.call(|connection| collect(connection, "SELECT DISTINCT attachment_id FROM orchestration_attachment_refs ORDER BY attachment_id ASC", [], |row| row.get(0))).await
     }
@@ -680,7 +769,7 @@ impl Repositories {
             .claim_calls
             .fetch_add(1, Ordering::SeqCst);
         let result = self.database.call(move |connection| connection.query_row(
-            "UPDATE provider_turn_outbox SET state = 'sending', attempts = attempts + 1, updated_at = ? WHERE command_id = ? AND state = 'pending' RETURNING command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at",
+            "UPDATE provider_turn_outbox SET state = 'sending', attempts = attempts + 1, updated_at = ? WHERE command_id = ? AND state = 'pending' AND (mode <> 'start' OR NOT EXISTS(SELECT 1 FROM projection_thread_sessions WHERE thread_id = provider_turn_outbox.thread_id AND status IN ('running', 'starting'))) RETURNING command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at, mode, held",
             params![updated_at, command_id], decode_provider_turn_delivery).optional().map_err(Into::into)).await;
         #[cfg(test)]
         if result.as_ref().is_ok_and(Option::is_some) {
@@ -715,7 +804,7 @@ impl Repositories {
                          WHERE command_id = ? AND state = 'sending' AND attempts = ? \
                            AND provider_instance_id = ? AND provider_kind = ? \
                            AND (provider_session_id IS NULL OR provider_session_id = ?) \
-                         RETURNING command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at",
+                         RETURNING command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at, mode, held",
                         params![
                             provider_session_id,
                             updated_at,
@@ -746,7 +835,7 @@ impl Repositories {
                     .query_row(
                         "UPDATE provider_turn_outbox SET payload_json = ?, updated_at = ? \
                          WHERE command_id = ? AND state = 'pending' AND attempts = ? \
-                         RETURNING command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at",
+                         RETURNING command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at, mode, held",
                         params![
                             encode_json(&payload)?,
                             updated_at,
@@ -824,7 +913,7 @@ impl Repositories {
                 collect(
                     connection,
                     &(MESSAGE_SELECT.to_owned()
-                        + " WHERE thread_id = ? ORDER BY created_at ASC, message_id ASC"),
+                        + " WHERE thread_id = ? ORDER BY CASE WHEN delivery_state = 'queued' THEN (SELECT receipt.result_sequence FROM provider_turn_outbox AS queued JOIN orchestration_command_receipts AS receipt ON receipt.command_id = queued.command_id WHERE queued.message_id = projection_thread_messages.message_id) END ASC, created_at ASC, message_id ASC"),
                     [thread_id],
                     decode_message,
                 )
@@ -871,6 +960,25 @@ impl Repositories {
         thread_id: String,
     ) -> Result<Option<ProjectionThreadSession>> {
         self.database.call(move |connection| connection.query_row("SELECT thread_id, status, provider_name, provider_instance_id, runtime_mode, active_turn_id, last_error, last_error_class, updated_at FROM projection_thread_sessions WHERE thread_id = ?", [thread_id], decode_thread_session).optional().map_err(Into::into)).await
+    }
+    pub async fn list_thread_sessions_by_status(
+        &self,
+        statuses: Vec<String>,
+    ) -> Result<Vec<ProjectionThreadSession>> {
+        if statuses.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.database.call(move |connection| {
+            let placeholders = std::iter::repeat_n("?", statuses.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            collect(
+                connection,
+                &format!("SELECT thread_id, status, provider_name, provider_instance_id, runtime_mode, active_turn_id, last_error, last_error_class, updated_at FROM projection_thread_sessions WHERE status IN ({placeholders}) ORDER BY updated_at ASC, thread_id ASC"),
+                rusqlite::params_from_iter(statuses),
+                decode_thread_session,
+            )
+        }).await
     }
     pub async fn delete_thread_session(&self, thread_id: String) -> Result<()> {
         self.delete(
@@ -1866,6 +1974,8 @@ pub struct ProjectionThreadMessage {
     pub delivery_state: Option<String>,
     pub delivery_provider: Option<String>,
     pub delivery_detail: Option<String>,
+    pub delivery_mode: Option<String>,
+    pub delivery_held: Option<bool>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
 }
@@ -2091,8 +2201,8 @@ pub struct AuthSession {
 }
 
 const THREAD_SELECT: &str = "SELECT thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, unresolved_delivery_state, unresolved_delivery_detail, deleted_at FROM projection_threads";
-const MESSAGE_SELECT: &str = "SELECT message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, delivery_state, delivery_provider, delivery_detail, created_at, updated_at FROM projection_thread_messages";
-const PROVIDER_TURN_DELIVERY_SELECT: &str = "SELECT command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at FROM provider_turn_outbox";
+const MESSAGE_SELECT: &str = "SELECT message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, delivery_state, delivery_provider, delivery_detail, created_at, updated_at, delivery_mode, delivery_held FROM projection_thread_messages";
+const PROVIDER_TURN_DELIVERY_SELECT: &str = "SELECT command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at, mode, held FROM provider_turn_outbox";
 const TURN_SELECT: &str = "SELECT thread_id, turn_id, pending_message_id, source_proposed_plan_thread_id, source_proposed_plan_id, assistant_message_id, state, requested_at, started_at, completed_at, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json FROM projection_turns";
 const TURN_UPSERT_SQL: &str = "INSERT INTO projection_turns (thread_id, turn_id, pending_message_id, source_proposed_plan_thread_id, source_proposed_plan_id, assistant_message_id, state, requested_at, started_at, completed_at, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (thread_id, turn_id) DO UPDATE SET pending_message_id=excluded.pending_message_id, source_proposed_plan_thread_id=excluded.source_proposed_plan_thread_id, source_proposed_plan_id=excluded.source_proposed_plan_id, assistant_message_id=excluded.assistant_message_id, state=excluded.state, requested_at=excluded.requested_at, started_at=excluded.started_at, completed_at=excluded.completed_at, checkpoint_turn_count=excluded.checkpoint_turn_count, checkpoint_ref=excluded.checkpoint_ref, checkpoint_status=excluded.checkpoint_status, checkpoint_files_json=excluded.checkpoint_files_json";
 const PAIRING_SELECT: &str = "SELECT id, credential, method, scopes, subject, label, proof_key_thumbprint, created_at, expires_at, consumed_at, revoked_at, reach, off_host FROM auth_pairing_links";
@@ -2331,13 +2441,132 @@ fn decode_message(row: &Row<'_>) -> rusqlite::Result<ProjectionThreadMessage> {
         delivery_state: row.get(7)?,
         delivery_provider: row.get(8)?,
         delivery_detail: row.get(9)?,
+        delivery_mode: row.get(12)?,
+        delivery_held: row.get(13)?,
         created_at: row.get(10)?,
         updated_at: row.get(11)?,
     })
 }
 
+/// The caller owns the transaction that also appends and projects the hold events.
+pub(crate) fn hold_queued_provider_turns(
+    connection: &Connection,
+    thread_id: &str,
+    updated_at: &str,
+) -> Result<Vec<String>> {
+    let command_ids = collect(
+        connection,
+        "SELECT command_id FROM provider_turn_outbox WHERE thread_id = ? AND (state = 'queued' OR (mode = 'steer' AND state IN ('pending', 'sending'))) ORDER BY created_at, command_id",
+        [thread_id],
+        |row| row.get(0),
+    )?;
+    connection.execute("UPDATE provider_turn_outbox SET held = 1, updated_at = ? WHERE thread_id = ? AND (state = 'queued' OR (mode = 'steer' AND state IN ('pending', 'sending')))", params![updated_at, thread_id])?;
+    Ok(command_ids)
+}
+
+pub(crate) fn requeue_provider_turn_on(
+    connection: &Connection,
+    command_id: &str,
+    expected_attempt: i64,
+    updated_at: &str,
+) -> Result<Option<ProviderTurnDelivery>> {
+    connection.query_row(
+        "UPDATE provider_turn_outbox SET state = 'queued', mode = 'start', attempts = 0, last_error = NULL, updated_at = ? WHERE command_id = ? AND mode = 'steer' AND state IN ('pending', 'sending') AND attempts = ? RETURNING command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at, mode, held",
+        params![updated_at, command_id, expected_attempt], decode_provider_turn_delivery,
+    ).optional().map_err(Into::into)
+}
+
+pub(crate) fn provider_turn_steer_target_on(
+    connection: &Connection,
+    thread_id: &str,
+    message_id: &str,
+) -> Result<Option<String>> {
+    // The accepted steer event owns the target; never retarget a later running turn.
+    Ok(connection
+        .query_row(
+            "SELECT json_extract(payload_json, '$.turnId') FROM orchestration_events
+         WHERE stream_id = ? AND event_type = 'thread.turn-steer-requested'
+           AND json_extract(payload_json, '$.messageId') = ? ORDER BY sequence DESC LIMIT 1",
+            params![thread_id, message_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten()
+        .filter(|id| !id.trim().is_empty()))
+}
+
+pub(crate) fn queued_provider_turn_head_on(
+    connection: &Connection,
+    thread_id: &str,
+) -> Result<Option<ProviderTurnDelivery>> {
+    connection
+        .query_row(
+            &(PROVIDER_TURN_DELIVERY_SELECT.to_owned()
+                + " WHERE command_id = (
+            SELECT queued.command_id FROM provider_turn_outbox AS queued
+            JOIN orchestration_command_receipts AS receipt ON receipt.command_id = queued.command_id
+            WHERE queued.thread_id = ? AND queued.state = 'queued'
+            ORDER BY receipt.result_sequence, queued.created_at, queued.command_id LIMIT 1
+        )"),
+            [thread_id],
+            decode_provider_turn_delivery,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+pub(crate) fn can_promote_queued_provider_turn_on(
+    connection: &Connection,
+    thread_id: &str,
+    message_id: &str,
+    automatic: bool,
+) -> Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM provider_turn_outbox AS queued
+           JOIN projection_threads AS thread ON thread.thread_id = queued.thread_id AND thread.deleted_at IS NULL
+           LEFT JOIN projection_thread_sessions AS session ON session.thread_id = queued.thread_id
+           WHERE queued.thread_id = ? AND queued.message_id = ? AND queued.state = 'queued'
+             AND COALESCE(session.status, 'idle') NOT IN ('running', 'starting')
+             AND (? = 0 OR (
+               session.status = 'ready' AND queued.held = 0
+               AND NOT EXISTS(SELECT 1 FROM projection_turns AS turn WHERE turn.thread_id = queued.thread_id AND turn.state = 'running'
+                 AND NOT (turn.turn_id IS NULL AND EXISTS(SELECT 1 FROM provider_turn_outbox AS dismissed
+                   WHERE dismissed.thread_id = turn.thread_id AND dismissed.message_id = turn.pending_message_id AND dismissed.state = 'dismissed'
+                     AND EXISTS(SELECT 1 FROM orchestration_events AS resolution
+                       WHERE resolution.aggregate_kind = 'thread' AND resolution.stream_id = dismissed.thread_id
+                         AND resolution.event_type = 'thread.turn-delivery-updated'
+                         AND json_extract(resolution.metadata_json, '$.deliveryCommandId') = dismissed.command_id
+                         AND json_extract(resolution.payload_json, '$.state') = 'dismissed'
+                         AND json_extract(resolution.metadata_json, '$.deliveryPreviousState') IN ('pending', 'failed')))))
+               AND NOT EXISTS(SELECT 1 FROM projection_pending_approvals WHERE thread_id = queued.thread_id AND status = 'pending')
+               AND NOT EXISTS(
+                 SELECT 1 FROM (
+                   SELECT kind, lower(COALESCE(json_extract(payload_json, '$.detail'), '')) AS detail,
+                     ROW_NUMBER() OVER (PARTITION BY json_extract(payload_json, '$.requestId') ORDER BY COALESCE(sequence, 0) DESC, created_at DESC, activity_id DESC) AS position
+                   FROM projection_thread_activities WHERE thread_id = queued.thread_id
+                     AND json_extract(payload_json, '$.requestId') IS NOT NULL
+                     AND kind IN ('user-input.requested', 'user-input.resolved', 'provider.user-input.respond.failed')
+                 ) WHERE position = 1 AND (kind = 'user-input.requested' OR (kind = 'provider.user-input.respond.failed'
+                   AND detail NOT LIKE '%stale pending user-input request%' AND detail NOT LIKE '%unknown pending user-input request%'))
+               )
+             ))
+             AND NOT EXISTS(SELECT 1 FROM provider_turn_outbox AS active
+               WHERE active.thread_id = queued.thread_id AND active.state IN ('pending', 'sending'))
+             AND queued.command_id = (
+               SELECT next.command_id FROM provider_turn_outbox AS next
+               JOIN orchestration_command_receipts AS receipt ON receipt.command_id = next.command_id
+               WHERE next.thread_id = queued.thread_id AND next.state = 'queued'
+               ORDER BY receipt.result_sequence, next.created_at, next.command_id LIMIT 1
+             )
+         )",
+        params![thread_id, message_id, automatic], |row| row.get(0),
+    ).map_err(Into::into)
+}
+
 fn decode_provider_turn_delivery(row: &Row<'_>) -> rusqlite::Result<ProviderTurnDelivery> {
     let state = match row.get::<_, String>(8)?.as_str() {
+        "queued" => TurnDeliveryState::Queued,
         "pending" => TurnDeliveryState::Pending,
         "sending" => TurnDeliveryState::Sending,
         "delivered" => TurnDeliveryState::Delivered,
@@ -2362,6 +2591,18 @@ fn decode_provider_turn_delivery(row: &Row<'_>) -> rusqlite::Result<ProviderTurn
         delivery_key: row.get(6)?,
         payload: decode_json(row.get(7)?, "payload_json")?,
         state,
+        mode: match row.get::<_, String>(13)?.as_str() {
+            "start" => TurnDeliveryMode::Start,
+            "steer" => TurnDeliveryMode::Steer,
+            mode => {
+                return Err(rusqlite::Error::FromSqlConversionFailure(
+                    13,
+                    rusqlite::types::Type::Text,
+                    format!("unknown turn delivery mode: {mode}").into(),
+                ));
+            }
+        },
+        held: row.get(14)?,
         attempts: row.get(9)?,
         last_error: row.get(10)?,
         created_at: row.get(11)?,
@@ -2372,6 +2613,7 @@ fn decode_provider_turn_delivery(row: &Row<'_>) -> rusqlite::Result<ProviderTurn
 impl TurnDeliveryState {
     fn as_str(&self) -> &'static str {
         match self {
+            Self::Queued => "queued",
             Self::Pending => "pending",
             Self::Sending => "sending",
             Self::Delivered => "delivered",

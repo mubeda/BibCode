@@ -16,30 +16,11 @@
         "metadata": {
           "providerTurnId": "to"
         },
-        "type": "project.created",
+        "type": "thread.checkpoint-revert-requested",
         "payload": {
-          "projectId": "Um9$Tt2_E",
-          "title": "k",
-          "workspaceRoot": "s<db0e<~",
-          "repositoryIdentity": null,
-          "defaultModelSelection": null,
-          "scripts": [],
-          "worktreeDiscovery": {
-            "visibility": "hidden",
-            "initialPromptDismissedAt": "W11,)Z3Gv^",
-            "baselinePaths": [
-              "M",
-              "!NV",
-              "7F_d_Zl<8OnN",
-              "[Z)PJ|tUwZ!<",
-              "Wo<",
-              "\"~itr",
-              "\"Jnm-(N",
-              ".-4E^2"
-            ]
-          },
-          "createdAt": "[",
-          "updatedAt": "wm0"
+          "threadId": "Um9$Tt2_E",
+          "turnCount": 17,
+          "createdAt": "snam"
         }
       }
     }

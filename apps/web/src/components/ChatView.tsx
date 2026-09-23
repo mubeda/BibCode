@@ -24,8 +24,17 @@ import {
   ProviderInteractionMode,
   ProviderDriverKind,
   PROVIDER_DISPLAY_NAMES,
+  PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
   RuntimeMode,
 } from "@bibcode/contracts";
+import {
+  selectQueuedMessages,
+  deriveQueuedCardStatus,
+  shouldEnqueueOnSend,
+  isQueuedTimelineMessage,
+} from "./ChatView.logic";
+import { queuedMessageCache } from "./chat/queuedMessageCache";
+import { mergeQueuedMessageIntoDraft } from "./chat/restoreQueuedMessage";
 import type { TimestampFormat } from "@bibcode/contracts/settings";
 import {
   connectionStatusText,
@@ -948,6 +957,13 @@ interface PersistentTerminalLaunchContext {
   worktreePath: string | null;
 }
 
+function resetRestoredComposerCursor(
+  composer: RefObject<ChatComposerHandle | null>,
+  prompt: string,
+) {
+  composer.current?.resetCursorState({ cursor: prompt.length, prompt, detectTrigger: true });
+}
+
 function useLocalDispatchState(input: {
   activeThread: Thread | undefined;
   activeLatestTurn: Thread["latestTurn"] | null;
@@ -1387,6 +1403,8 @@ function ChatViewContent(props: ChatViewProps) {
     reportFailure: false,
   });
   const startThreadTurn = useAtomCommand(threadEnvironment.startTurn, { reportFailure: false });
+  const steerThreadTurn = useAtomCommand(threadEnvironment.steerTurn, { reportFailure: false });
+  const promoteThreadTurn = useAtomCommand(threadEnvironment.promoteTurn, { reportFailure: false });
   const interruptThreadTurn = useAtomCommand(threadEnvironment.interruptTurn, {
     reportFailure: false,
   });
@@ -2519,6 +2537,63 @@ function ChatViewContent(props: ChatViewProps) {
     activePendingUserInput: activePendingUserInput?.requestId ?? null,
     localError: isServerThread ? localServerError : localDraftError,
   });
+  const queuedMessages = useMemo(
+    () => selectQueuedMessages(activeThread?.messages ?? []),
+    [activeThread?.messages],
+  );
+  const supportsTurnSteer = providerBinding.status?.supportsTurnSteer === true;
+  const hasPendingApproval = activePendingApproval !== null;
+  const hasPendingUserInput = activePendingUserInput !== null;
+  const queueSessionStatus = activeThread?.session?.status ?? null;
+  const queuedStatuses = useMemo(
+    () =>
+      queuedMessages.map((message, index) =>
+        deriveQueuedCardStatus({
+          index,
+          phase,
+          sessionStatus: queueSessionStatus,
+          supportsTurnSteer,
+          delivery: message.delivery!,
+          hasPendingApproval,
+          hasPendingUserInput,
+        }),
+      ),
+    [
+      queuedMessages,
+      phase,
+      queueSessionStatus,
+      supportsTurnSteer,
+      hasPendingApproval,
+      hasPendingUserInput,
+    ],
+  );
+  const [resolvingQueuedMessageId, setResolvingQueuedMessageId] = useState<MessageId | null>(null);
+  const [queuedMessageErrors, setQueuedMessageErrors] = useState<Record<string, string>>({});
+  const queuedActionsInFlightRef = useRef(new Set<MessageId>());
+  const stoppingQueueRef = useRef(false);
+  const currentQueueThreadKeyRef = useRef<string | null>(routeThreadKey);
+  useLayoutEffect(() => {
+    currentQueueThreadKeyRef.current = routeThreadKey;
+    return () => {
+      currentQueueThreadKeyRef.current = null;
+    };
+  }, [routeThreadKey]);
+  const previousQueueMessagesRef = useRef({ threadKey: routeThreadKey, messages: queuedMessages });
+  useEffect(() => {
+    const previous = previousQueueMessagesRef.current;
+    if (previous.threadKey === routeThreadKey) {
+      const currentIds = new Set(queuedMessages.map((message) => message.id));
+      for (const message of previous.messages) {
+        if (!currentIds.has(message.id)) queuedMessageCache.forget(message.id);
+      }
+    }
+    for (const message of activeThread?.messages ?? []) {
+      if (message.delivery?.state === "delivered" || message.delivery?.state === "dismissed") {
+        queuedMessageCache.forget(message.id);
+      }
+    }
+    previousQueueMessagesRef.current = { threadKey: routeThreadKey, messages: queuedMessages };
+  }, [activeThread?.messages, queuedMessages, routeThreadKey]);
   const isWorking =
     phase === "running" || isSendActivelyWorking || isConnecting || isRevertingCheckpoint;
   const sendStartedAt = localDispatchStartedAt ?? activeDeliveryStartedAt;
@@ -2770,7 +2845,11 @@ function ChatViewContent(props: ChatViewProps) {
   }, [attachmentPreviewHandoffByMessageId, displayServerMessages, optimisticUserMessages]);
   const timelineEntries = useMemo(
     () =>
-      deriveTimelineEntries(timelineMessages, activeThread?.proposedPlans ?? [], workLogEntries),
+      deriveTimelineEntries(
+        timelineMessages.filter((message) => !isQueuedTimelineMessage(message)),
+        activeThread?.proposedPlans ?? [],
+        workLogEntries,
+      ),
     [activeThread?.proposedPlans, timelineMessages, workLogEntries],
   );
   const { turnDiffSummaries, inferredCheckpointTurnCountByTurnId } =
@@ -4739,15 +4818,196 @@ function ChatViewContent(props: ChatViewProps) {
     ],
   );
 
+  const restoreQueuedMessageToComposer = useCallback(
+    (message: ChatMessage, cachedAttachments?: ReadonlyArray<ComposerAttachment>) => {
+      const store = useComposerDraftStore.getState();
+      const storedDraft = store.getComposerDraft(composerDraftTarget);
+      const isCurrentComposer = currentQueueThreadKeyRef.current === routeThreadKey;
+      const draft = {
+        prompt: isCurrentComposer ? promptRef.current : (storedDraft?.prompt ?? ""),
+        attachments: storedDraft?.attachments ?? [],
+      };
+      const restored = mergeQueuedMessageIntoDraft(
+        draft,
+        { ...message, cachedAttachments },
+        {
+          maxAttachments: PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
+        },
+      );
+      const attachmentsToAdd = restored.draft.attachments
+        .slice(draft.attachments.length)
+        .map(cloneComposerAttachmentForRetry);
+      store.setPrompt(composerDraftTarget, restored.draft.prompt);
+      store.addAttachments(composerDraftTarget, attachmentsToAdd, {
+        maxAttachments: PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
+      });
+      if (isCurrentComposer) {
+        promptRef.current = restored.draft.prompt;
+        composerAttachmentsRef.current =
+          store.getComposerDraft(composerDraftTarget)?.attachments ?? [];
+        resetRestoredComposerCursor(composerRef, restored.draft.prompt);
+      }
+      if (restored.droppedAttachmentCount > 0) {
+        const count = restored.droppedAttachmentCount;
+        toastManager.add(
+          stackedThreadToast({
+            type: "warning",
+            title: `${count} ${count === 1 ? "attachment" : "attachments"} not restored`,
+            description:
+              "The composer attachment limit was reached. Reattach the remaining files after sending this draft.",
+          }),
+        );
+      }
+      if (restored.unrestoredAttachmentCount > 0) {
+        const count = restored.unrestoredAttachmentCount;
+        toastManager.add(
+          stackedThreadToast({
+            type: "warning",
+            title: `${count} ${count === 1 ? "attachment" : "attachments"} not restored`,
+            description:
+              "These files were queued in another client or before a reload. Your text was restored; attach the files again.",
+          }),
+        );
+      }
+    },
+    [composerDraftTarget, composerRef, routeThreadKey],
+  );
+
+  const setQueuedMessageError = useCallback(
+    (messageId: MessageId, error: string | null) => {
+      const key = `${routeThreadKey}:${messageId}`;
+      setQueuedMessageErrors((current) => {
+        const next = { ...current };
+        if (error === null) delete next[key];
+        else next[key] = error;
+        return next;
+      });
+    },
+    [routeThreadKey],
+  );
+  const queuedCancellationsRef = useRef(new Map<MessageId, Promise<void>>());
+  const onCancelQueuedMessage = useCallback(
+    async (messageId: MessageId) => {
+      const existing = queuedCancellationsRef.current.get(messageId);
+      if (existing) return existing;
+      const message = queuedMessages.find((message) => message.id === messageId);
+      if (
+        !activeThread ||
+        message?.delivery?.state !== "queued" ||
+        queuedActionsInFlightRef.current.has(messageId)
+      )
+        return;
+      const cancel = async () => {
+        queuedActionsInFlightRef.current.add(messageId);
+        setResolvingQueuedMessageId(messageId);
+        setQueuedMessageError(messageId, null);
+        // Retain Files across the withdrawal snapshot arriving before the command receipt.
+        const cached = queuedMessageCache.take(messageId);
+        try {
+          const result = await resolveTurnDelivery({
+            environmentId,
+            input: { threadId: activeThread.id, messageId, action: "cancel" },
+          });
+          if (result._tag === "Failure") throw squashAtomCommandFailure(result);
+          restoreQueuedMessageToComposer(message, cached?.attachments);
+        } catch (error) {
+          if (cached) queuedMessageCache.remember(messageId, cached);
+          setQueuedMessageError(
+            messageId,
+            `Could not cancel. ${error instanceof Error ? error.message : "The request failed."} Try again.`,
+          );
+        } finally {
+          queuedActionsInFlightRef.current.delete(messageId);
+          setResolvingQueuedMessageId((current) => (current === messageId ? null : current));
+        }
+      };
+      const pending = cancel();
+      queuedCancellationsRef.current.set(messageId, pending);
+      try {
+        await pending;
+      } finally {
+        queuedCancellationsRef.current.delete(messageId);
+      }
+    },
+    [
+      activeThread,
+      environmentId,
+      queuedMessages,
+      resolveTurnDelivery,
+      restoreQueuedMessageToComposer,
+      setQueuedMessageError,
+    ],
+  );
+
+  const runQueuedHeadAction = useCallback(
+    async (messageId: MessageId, action: "steer" | "send-now") => {
+      if (
+        !activeThread ||
+        queuedMessages[0]?.id !== messageId ||
+        stoppingQueueRef.current ||
+        queuedActionsInFlightRef.current.has(messageId)
+      )
+        return;
+      const status = queuedStatuses[0];
+      if (action === "steer" ? !status?.canSteer : !status?.canSendNow) return;
+      queuedActionsInFlightRef.current.add(messageId);
+      setResolvingQueuedMessageId(messageId);
+      setQueuedMessageError(messageId, null);
+      try {
+        const command = action === "steer" ? steerThreadTurn : promoteThreadTurn;
+        const result = await command({
+          environmentId,
+          input: { threadId: activeThread.id, messageId },
+        });
+        if (result._tag === "Failure") throw squashAtomCommandFailure(result);
+      } catch (error) {
+        setQueuedMessageError(
+          messageId,
+          `Could not ${action === "steer" ? "steer" : "send"} this message. ${error instanceof Error ? error.message : "The request failed."} Try again.`,
+        );
+      } finally {
+        queuedActionsInFlightRef.current.delete(messageId);
+        setResolvingQueuedMessageId((current) => (current === messageId ? null : current));
+      }
+    },
+    [
+      activeThread,
+      environmentId,
+      promoteThreadTurn,
+      queuedMessages,
+      queuedStatuses,
+      setQueuedMessageError,
+      steerThreadTurn,
+    ],
+  );
+  const onSteerQueuedMessage = useCallback(
+    (messageId: MessageId) => runQueuedHeadAction(messageId, "steer"),
+    [runQueuedHeadAction],
+  );
+  const onSendNowQueuedMessage = useCallback(
+    (messageId: MessageId) => runQueuedHeadAction(messageId, "send-now"),
+    [runQueuedHeadAction],
+  );
+  const onSteerHeadQueuedMessage = useCallback(async () => {
+    const head = queuedMessages[0];
+    if (head) await onSteerQueuedMessage(head.id);
+  }, [onSteerQueuedMessage, queuedMessages]);
+
   const onSend = async (e?: { preventDefault: () => void }) => {
     e?.preventDefault();
+    const enqueue = shouldEnqueueOnSend({
+      phase,
+      sessionStatus: activeThread?.session?.status ?? null,
+      hasPendingDelivery: canCancelPendingSend,
+    });
     if (
       !activeThread ||
-      isSendBusy ||
+      (isSendBusy && !enqueue) ||
       isConnecting ||
       activeEnvironmentUnavailable ||
       workspaceUnavailable !== null ||
       providerBinding.conflict !== null ||
+      stoppingQueueRef.current ||
       sendInFlightRef.current
     )
       return;
@@ -4841,11 +5101,12 @@ function ChatViewContent(props: ChatViewProps) {
 
     const messageIdForSend = newMessageId();
     sendInFlightRef.current = true;
-    beginLocalDispatch({
-      preparingWorktree: Boolean(baseBranchForWorktree),
-      threadId: threadIdForSend,
-      messageId: messageIdForSend,
-    });
+    if (!enqueue)
+      beginLocalDispatch({
+        preparingWorktree: Boolean(baseBranchForWorktree),
+        threadId: threadIdForSend,
+        messageId: messageIdForSend,
+      });
 
     const composerAttachmentsSnapshot = [...composerAttachments];
     const composerTerminalContextsSnapshot = [...sendableComposerTerminalContexts];
@@ -4900,33 +5161,40 @@ function ChatViewContent(props: ChatViewProps) {
             sizeBytes: attachment.sizeBytes,
           },
     );
-    // Sending always returns to the live edge. The new row becomes the
-    // anchored end-space target so it lands near the top while the response
-    // streams into the reserved space below it.
-    isAtEndRef.current = true;
-    timelineScrollModeRef.current = "anchoring-new-turn";
-    liveFollowUserScrollGenerationRef.current = anchorUserScrollGenerationRef.current;
-    pendingTimelineAnchorRef.current = messageIdForSend;
-    activeTimelineAnchorIndexRef.current = null;
-    showScrollDebouncer.current.cancel();
-    setShowScrollToBottom(false);
-    setTimelineAnchor({
-      threadKey: scopedThreadKey(scopeThreadRef(activeThread.environmentId, threadIdForSend)),
-      messageId: messageIdForSend,
-    });
-    setOptimisticUserMessages((existing) => [
-      ...existing,
-      {
-        id: messageIdForSend,
-        role: "user",
-        text: outgoingMessageText,
-        ...(optimisticAttachments.length > 0 ? { attachments: optimisticAttachments } : {}),
-        turnId: null,
-        createdAt: messageCreatedAt,
-        updatedAt: messageCreatedAt,
-        streaming: false,
-      },
-    ]);
+    if (enqueue) {
+      queuedMessageCache.remember(messageIdForSend, { attachments: composerAttachmentsSnapshot });
+      isAtEndRef.current = true;
+      timelineScrollModeRef.current = "following-end";
+      void legendListRef.current?.scrollToEnd?.({ animated: false });
+    } else {
+      // Sending always returns to the live edge. The new row becomes the
+      // anchored end-space target so it lands near the top while the response
+      // streams into the reserved space below it.
+      isAtEndRef.current = true;
+      timelineScrollModeRef.current = "anchoring-new-turn";
+      liveFollowUserScrollGenerationRef.current = anchorUserScrollGenerationRef.current;
+      pendingTimelineAnchorRef.current = messageIdForSend;
+      activeTimelineAnchorIndexRef.current = null;
+      showScrollDebouncer.current.cancel();
+      setShowScrollToBottom(false);
+      setTimelineAnchor({
+        threadKey: scopedThreadKey(scopeThreadRef(activeThread.environmentId, threadIdForSend)),
+        messageId: messageIdForSend,
+      });
+      setOptimisticUserMessages((existing) => [
+        ...existing,
+        {
+          id: messageIdForSend,
+          role: "user",
+          text: outgoingMessageText,
+          ...(optimisticAttachments.length > 0 ? { attachments: optimisticAttachments } : {}),
+          turnId: null,
+          createdAt: messageCreatedAt,
+          updatedAt: messageCreatedAt,
+          streaming: false,
+        },
+      ]);
+    }
     setThreadError(threadIdForSend, null);
     if (expiredTerminalContextCount > 0) {
       const toastCopy = buildExpiredTerminalContextToastCopy(
@@ -5032,11 +5300,12 @@ function ChatViewContent(props: ChatViewProps) {
                 : {}),
             }
           : undefined;
-      beginLocalDispatch({
-        preparingWorktree: false,
-        threadId: threadIdForSend,
-        messageId: messageIdForSend,
-      });
+      if (!enqueue)
+        beginLocalDispatch({
+          preparingWorktree: false,
+          threadId: threadIdForSend,
+          messageId: messageIdForSend,
+        });
       const legacyDraftFallback = fallbackDraftResolution?.fallback ?? null;
       const warningKey = routeThreadKey;
       if (
@@ -5063,6 +5332,7 @@ function ChatViewContent(props: ChatViewProps) {
             attachments: turnAttachmentsResult.value,
           },
           modelSelection: ctxSelectedModelSelection,
+          ...(enqueue ? { queued: true } : {}),
           titleSeed: title,
           runtimeMode,
           interactionMode,
@@ -5078,7 +5348,22 @@ function ChatViewContent(props: ChatViewProps) {
     }
 
     if (failure !== null) {
-      if (
+      if (enqueue) {
+        const cache = queuedMessageCache.take(messageIdForSend);
+        restoreQueuedMessageToComposer(
+          {
+            id: messageIdForSend,
+            role: "user",
+            text: messageTextForSend,
+            attachments: optimisticAttachments,
+            turnId: null,
+            streaming: false,
+            createdAt: messageCreatedAt,
+            updatedAt: messageCreatedAt,
+          },
+          cache?.attachments,
+        );
+      } else if (
         promptRef.current.length === 0 &&
         composerAttachmentsRef.current.length === 0 &&
         composerTerminalContextsRef.current.length === 0 &&
@@ -5123,44 +5408,58 @@ function ChatViewContent(props: ChatViewProps) {
         );
       }
     }
+    if (enqueue) {
+      for (const attachment of composerAttachmentsSnapshot) {
+        if (attachment.type === "image") revokeBlobPreviewUrl(attachment.previewUrl);
+      }
+    }
     sendInFlightRef.current = false;
-    if (!turnStartSucceeded) {
+    if (!turnStartSucceeded && !enqueue) {
       resetLocalDispatch();
     }
   };
 
   const onInterrupt = async () => {
-    if (phase !== "running" && cancellableDeliveryThreadId && cancellableDeliveryMessageId) {
-      const result = await resolveTurnDelivery({
+    if (!activeThread || stoppingQueueRef.current) return;
+    stoppingQueueRef.current = true;
+    try {
+      for (const message of queuedMessages) {
+        if (message.delivery?.state === "queued") await onCancelQueuedMessage(message.id);
+      }
+
+      if (phase !== "running" && cancellableDeliveryThreadId && cancellableDeliveryMessageId) {
+        const result = await resolveTurnDelivery({
+          environmentId,
+          input: {
+            threadId: cancellableDeliveryThreadId,
+            messageId: cancellableDeliveryMessageId,
+            action: "dismiss",
+          },
+        });
+        if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+          const error = squashAtomCommandFailure(result);
+          setThreadError(
+            cancellableDeliveryThreadId,
+            error instanceof Error ? error.message : "Failed to cancel message delivery.",
+          );
+        } else {
+          resetLocalDispatch();
+        }
+        return;
+      }
+      const result = await interruptThreadTurn({
         environmentId,
-        input: {
-          threadId: cancellableDeliveryThreadId,
-          messageId: cancellableDeliveryMessageId,
-          action: "dismiss",
-        },
+        input: buildThreadTurnInterruptInput(activeThread),
       });
       if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
         const error = squashAtomCommandFailure(result);
         setThreadError(
-          cancellableDeliveryThreadId,
-          error instanceof Error ? error.message : "Failed to cancel message delivery.",
+          activeThread.id,
+          error instanceof Error ? error.message : "Failed to interrupt the current turn.",
         );
-      } else {
-        resetLocalDispatch();
       }
-      return;
-    }
-    if (!activeThread) return;
-    const result = await interruptThreadTurn({
-      environmentId,
-      input: buildThreadTurnInterruptInput(activeThread),
-    });
-    if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
-      const error = squashAtomCommandFailure(result);
-      setThreadError(
-        activeThread.id,
-        error instanceof Error ? error.message : "Failed to interrupt the current turn.",
-      );
+    } finally {
+      stoppingQueueRef.current = false;
     }
   };
 
@@ -5997,6 +6296,13 @@ function ChatViewContent(props: ChatViewProps) {
                       activeTurnStartedAt={activeWorkStartedAt}
                       listRef={legendListRef}
                       timelineEntries={timelineEntries}
+                      queuedMessages={queuedMessages}
+                      queuedStatuses={queuedStatuses}
+                      onSteerQueuedMessage={onSteerQueuedMessage}
+                      onSendNowQueuedMessage={onSendNowQueuedMessage}
+                      onCancelQueuedMessage={onCancelQueuedMessage}
+                      resolvingQueuedMessageId={resolvingQueuedMessageId}
+                      queuedMessageErrors={queuedMessageErrors}
                       latestTurn={activeLatestTurn}
                       runningTurnId={
                         activeThread.session?.status === "running"
@@ -6124,6 +6430,7 @@ function ChatViewContent(props: ChatViewProps) {
                             composerElementContextsRef={composerElementContextsRef}
                             onSend={onSend}
                             onInterrupt={onInterrupt}
+                            onSteerQueuedMessage={onSteerHeadQueuedMessage}
                             onImplementPlanInNewThread={onImplementPlanInNewThread}
                             onRespondToApproval={onRespondToApproval}
                             onSelectActivePendingUserInputOption={

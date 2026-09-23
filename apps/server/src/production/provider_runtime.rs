@@ -28,7 +28,7 @@ use crate::{
         RegistrationSource,
     },
     orchestration::{
-        ProviderTurnDelivery, TurnDeliveryState, canonical_command_digest,
+        ProviderTurnDelivery, TurnDeliveryMode, TurnDeliveryState, canonical_command_digest,
         engine::{
             ActivityInput, OrchestrationCommand, OrchestrationEngine, ProposedPlanInput,
             SessionInput,
@@ -101,6 +101,7 @@ pub type BoxRuntimeFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 const MAX_PARALLEL_PROVIDER_SESSION_SHUTDOWNS: usize = 8;
 const CODEX_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+const PROVIDER_STREAM_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 const DEFAULT_QUEUE_CAPACITY: usize = 32;
 const DEFAULT_EVENT_QUEUE_CAPACITY: usize = 128;
@@ -303,6 +304,19 @@ pub trait ProviderDriver: Send + Sync {
             }
         })
     }
+    fn steer(
+        &self,
+        _text: String,
+        _attachments: Vec<Value>,
+        _expected_turn_id: String,
+        _delivery_key: String,
+    ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
+        Box::pin(async {
+            ProviderDeliveryOutcome::Rejected {
+                detail: "provider does not support steering".to_owned(),
+            }
+        })
+    }
     fn reconcile(
         &self,
         _delivery_key: String,
@@ -461,6 +475,10 @@ enum SupervisorMessage {
         identity: ProviderSessionIdentity,
         response: oneshot::Sender<Result<(), ProviderRuntimeError>>,
     },
+    SessionStreamEnded {
+        identity: ProviderSessionIdentity,
+        settled: oneshot::Receiver<()>,
+    },
     Deliver {
         command: Box<OrchestrationCommand>,
         delivery_key: String,
@@ -583,6 +601,7 @@ struct SessionEntry {
     activity_compensation_key: String,
     event_task: JoinHandle<()>,
     event_cancellation: CancellationToken,
+    pending_stream_settlement: Option<oneshot::Receiver<()>>,
     idle_generation: Arc<AtomicU64>,
     terminal_sender: mpsc::UnboundedSender<SupervisorMessage>,
     activity_dispatch_sender: mpsc::Sender<ActivityDispatchEnvelope>,
@@ -1404,6 +1423,15 @@ async fn deliver_orchestration_turn_with_identity(
     };
     let handle = match first {
         Ok(handle) => handle,
+        Err(ProviderRuntimeError::SessionNotFound { .. })
+            if frozen_delivery
+                .as_ref()
+                .is_some_and(|row| row.mode == TurnDeliveryMode::Steer) =>
+        {
+            return ProviderDeliveryOutcome::Rejected {
+                detail: "Steering requires an existing running provider session.".to_owned(),
+            };
+        }
         Err(ProviderRuntimeError::SessionNotFound { .. }) => {
             let request = match launch_request_for_command(
                 engine,
@@ -1551,9 +1579,26 @@ pub async fn reconcile_abandoned_provider_sessions(
     for runtime in runtimes {
         let thread_id = runtime.thread_id.clone();
         let result = match runtime.status.as_str() {
-            "connecting" | "ready" | "running" => {
-                reconcile_abandoned_provider_session(engine, &repositories, runtime, RESTART_ERROR)
-                    .await
+            "starting" | "connecting" | "ready" | "running" => {
+                let session = SessionInput {
+                    thread_id: runtime.thread_id.clone(),
+                    status: runtime.status.clone(),
+                    provider_name: Some(runtime.provider_name.clone()),
+                    provider_instance_id: runtime.provider_instance_id.clone(),
+                    runtime_mode: runtime.runtime_mode.clone(),
+                    active_turn_id: None,
+                    last_error: None,
+                    last_error_class: None,
+                    updated_at: runtime.last_seen_at.clone(),
+                };
+                reconcile_abandoned_provider_session(
+                    engine,
+                    &repositories,
+                    session,
+                    Some(runtime),
+                    RESTART_ERROR,
+                )
+                .await
             }
             "error" => {
                 reconcile_failed_provider_session_messages(engine, &repositories, &runtime).await
@@ -1566,6 +1611,56 @@ pub async fn reconcile_abandoned_provider_sessions(
                 %error,
                 "provider session remains eligible for startup reconciliation retry"
             );
+        }
+    }
+    // Graceful shutdown removes runtime rows without settling the session projection.
+    // Read after runtime recovery so a completed reconciliation is never dispatched twice.
+    let sessions = repositories
+        .list_thread_sessions_by_status(vec![
+            "starting".into(),
+            "connecting".into(),
+            "running".into(),
+        ])
+        .await
+        .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?;
+    for session in sessions {
+        let thread_id = session.thread_id.clone();
+        let result = async {
+            let runtime = repositories
+                .get_provider_session_runtime(thread_id.clone())
+                .await
+                .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?;
+            if runtime.as_ref().is_some_and(|runtime| {
+                matches!(
+                    runtime.status.as_str(),
+                    "starting" | "connecting" | "ready" | "running"
+                )
+            }) {
+                // A failed runtime reconciliation remains eligible for the next startup.
+                return Ok(());
+            }
+            reconcile_abandoned_provider_session(
+                engine,
+                &repositories,
+                SessionInput {
+                    thread_id: session.thread_id,
+                    status: session.status,
+                    provider_name: session.provider_name,
+                    provider_instance_id: session.provider_instance_id,
+                    runtime_mode: session.runtime_mode,
+                    active_turn_id: session.active_turn_id,
+                    last_error: session.last_error,
+                    last_error_class: session.last_error_class,
+                    updated_at: session.updated_at,
+                },
+                runtime,
+                RESTART_ERROR,
+            )
+            .await
+        }
+        .await;
+        if let Err(error) = result {
+            tracing::warn!(thread_id, %error, "projected provider session remains eligible for startup reconciliation retry");
         }
     }
     Ok(())
@@ -1607,30 +1702,32 @@ async fn reconcile_failed_provider_session_messages(
 async fn reconcile_abandoned_provider_session(
     engine: &OrchestrationEngine,
     repositories: &Repositories,
-    mut runtime: ProviderSessionRuntime,
+    mut session: SessionInput,
+    runtime: Option<ProviderSessionRuntime>,
     restart_error: &str,
 ) -> Result<(), ProviderRuntimeError> {
-    let projected_at = runtime.last_seen_at.clone();
+    let projected_at = session.updated_at.clone();
     let projected_session = repositories
-        .get_thread_session(runtime.thread_id.clone())
+        .get_thread_session(session.thread_id.clone())
         .await
         .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?;
     let abandoned_turn_id = projected_session
         .as_ref()
         .and_then(|session| session.active_turn_id.clone());
-    let projection_is_complete = projected_session.is_some_and(|session| {
-        session.status == "error"
-            && session.provider_name.as_deref() == Some(runtime.provider_name.as_str())
-            && session.provider_instance_id == runtime.provider_instance_id
-            && session.runtime_mode == runtime.runtime_mode
-            && session.active_turn_id.is_none()
-            && session.last_error.as_deref() == Some(restart_error)
-            && session.updated_at == projected_at
+    let projection_is_complete = projected_session.is_some_and(|projected| {
+        projected.status == "error"
+            && projected.provider_name == session.provider_name
+            && projected.provider_instance_id == session.provider_instance_id
+            && projected.runtime_mode == session.runtime_mode
+            && projected.active_turn_id.is_none()
+            && projected.last_error.as_deref() == Some(restart_error)
+            && projected.last_error_class.as_deref() == Some("transport_error")
+            && projected.updated_at == projected_at
     });
     if let Some(turn_id) = abandoned_turn_id {
         settle_streaming_assistant_messages(
             engine,
-            &runtime.thread_id,
+            &session.thread_id,
             Some(turn_id),
             &format!("provider-restart-reconcile:{}", Uuid::new_v4()),
             &projected_at,
@@ -1638,34 +1735,31 @@ async fn reconcile_abandoned_provider_session(
         .await?;
     }
     if !projection_is_complete {
+        session.status = "error".to_owned();
+        session.active_turn_id = None;
+        session.last_error = Some(restart_error.to_owned());
+        // BiBCode restarted; the provider did not fail.
+        session.last_error_class = Some("transport_error".to_owned());
         engine
             .dispatch(OrchestrationCommand::ThreadSessionSet {
                 command_id: format!("provider-restart-reconcile:{}", Uuid::new_v4()),
-                thread_id: runtime.thread_id.clone(),
-                session: SessionInput {
-                    thread_id: runtime.thread_id.clone(),
-                    status: "error".to_owned(),
-                    provider_name: Some(runtime.provider_name.clone()),
-                    provider_instance_id: runtime.provider_instance_id.clone(),
-                    runtime_mode: runtime.runtime_mode.clone(),
-                    active_turn_id: None,
-                    last_error: Some(restart_error.to_owned()),
-                    // BiBCode restarted; the provider did not fail.
-                    last_error_class: Some("transport_error".to_owned()),
-                    updated_at: projected_at.clone(),
-                },
+                thread_id: session.thread_id.clone(),
+                session,
                 created_at: projected_at,
             })
             .await
             .map_err(|error| ProviderRuntimeError::Orchestration(error.to_string()))?;
     }
 
-    runtime.status = "error".to_owned();
-    runtime.last_seen_at = now();
-    repositories
-        .upsert_provider_session_runtime(runtime)
-        .await
-        .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))
+    if let Some(mut runtime) = runtime {
+        runtime.status = "error".to_owned();
+        runtime.last_seen_at = now();
+        repositories
+            .upsert_provider_session_runtime(runtime)
+            .await
+            .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?;
+    }
+    Ok(())
 }
 
 async fn launch_request_for_command(
@@ -2263,6 +2357,30 @@ async fn run_supervisor(
                 };
                 let _ = response.send(result);
             }
+            SupervisorMessage::SessionStreamEnded {
+                identity,
+                mut settled,
+            } => {
+                if let Some(entry) = sessions.get_mut(&identity.thread_id)
+                    && Arc::ptr_eq(&entry.driver, &identity.driver)
+                {
+                    // An error is visible before terminal projection finishes. Do not let
+                    // a subsequent delivery overtake that projection or abort its settlement.
+                    if tokio::time::timeout(PROVIDER_STREAM_SETTLEMENT_TIMEOUT, &mut settled)
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!(
+                            thread_id = %identity.thread_id,
+                            provider = %entry.launch.provider,
+                            "provider stream-end projection exceeded its settlement deadline"
+                        );
+                        entry.pending_stream_settlement = Some(settled);
+                    } else {
+                        entry.event_cancellation.cancel();
+                    }
+                }
+            }
             SupervisorMessage::Deliver {
                 command,
                 delivery_key,
@@ -2289,11 +2407,47 @@ async fn run_supervisor(
                             ),
                         });
                     }
+                    if let Some(entry) = sessions.get_mut(&thread_id)
+                        && let Some(settled) = entry.pending_stream_settlement.as_mut()
+                    {
+                        if matches!(settled.try_recv(), Err(oneshot::error::TryRecvError::Empty)) {
+                            // Keep only this thread waiting while its terminal projection finishes.
+                            // No driver I/O or delivery generation has started, so starts can retry.
+                            let detail = "Provider session is still settling after its event stream ended.".to_owned();
+                            let outcome = if frozen_delivery.as_ref().is_some_and(|row| row.mode == TurnDeliveryMode::Steer) {
+                                ProviderDeliveryOutcome::Rejected { detail }
+                            } else {
+                                ProviderDeliveryOutcome::DefinitelyNotSent { detail }
+                            };
+                            let (response, completion) = oneshot::channel();
+                            let _ = response.send(outcome);
+                            return Ok(ProviderDeliveryHandle { completion });
+                        }
+                        entry.pending_stream_settlement = None;
+                        entry.event_cancellation.cancel();
+                    }
+                    if sessions.get(&thread_id).is_some_and(|entry| {
+                        entry.event_task.is_finished() || entry.event_cancellation.is_cancelled()
+                    }) {
+                        let entry = detach_session(&activity, &mut sessions, &thread_id).await?;
+                        if let Err(error) = entry.driver.shutdown().await {
+                            tracing::debug!(
+                                %error,
+                                thread_id,
+                                provider = %entry.launch.provider,
+                                "failed to shut down already-ended provider session"
+                            );
+                        }
+                        // Retain the error runtime's cursor for native conversation resumption.
+                        // The caller may relaunch starts; steers require the original live turn.
+                        return Err(ProviderRuntimeError::SessionNotFound { thread_id });
+                    }
                     if let OrchestrationCommand::ThreadTurnStart {
                         thread_id,
                         model_selection: Some(selection),
                         ..
                     } = command.as_ref()
+                        && !frozen_delivery.as_ref().is_some_and(|row| row.mode == TurnDeliveryMode::Steer)
                     {
                         reconcile_model_selection(
                             &engine,
@@ -2845,6 +2999,9 @@ async fn spawn_delivery(
             detail: "provider configuration is unavailable after failed restoration".to_owned(),
         });
     }
+    let steer_delivery = frozen_delivery
+        .filter(|row| row.mode == TurnDeliveryMode::Steer)
+        .cloned();
     let frozen_session = frozen_delivery
         .map(|row| {
             validate_active_delivery_identity(entry, row)?;
@@ -2897,6 +3054,23 @@ async fn spawn_delivery(
         };
         let outcome = if let Some(outcome) = freeze_failure {
             outcome
+        } else if let Some(row) = steer_delivery.as_ref() {
+            match repositories
+                .get_running_provider_steer_target(row.thread_id.clone(), row.message_id.clone())
+                .await
+            {
+                Ok(Some(turn_id)) => {
+                    driver
+                        .steer(message.text, message.attachments, turn_id, delivery_key)
+                        .await
+                }
+                Ok(None) => ProviderDeliveryOutcome::Rejected {
+                    detail: "The selected turn is no longer available for steering.".to_owned(),
+                },
+                Err(error) => ProviderDeliveryOutcome::DefinitelyNotSent {
+                    detail: error.to_string(),
+                },
+            }
         } else {
             driver
                 .deliver(
@@ -2907,7 +3081,10 @@ async fn spawn_delivery(
                 )
                 .await
         };
-        if let ProviderDeliveryOutcome::Accepted { turn_id } = &outcome {
+        // Steer acceptance does not start a turn or overwrite a concurrent settle.
+        if let ProviderDeliveryOutcome::Accepted { turn_id } = &outcome
+            && steer_delivery.is_none()
+        {
             if let Err(error) = persist_runtime(
                 &repositories,
                 &launch,
@@ -3401,6 +3578,7 @@ async fn launch_session(
             activity_compensation_key: format!("supervisor:cancelled-live:{activity_lifecycle_id}"),
             event_task,
             event_cancellation: cancellation,
+            pending_stream_settlement: None,
             idle_generation,
             terminal_sender,
             activity_dispatch_sender,
@@ -4029,127 +4207,37 @@ fn spawn_event_pump(
 ) -> JoinHandle<()> {
     let activity_controller = activity.agent_activity_controller();
     tokio::spawn(async move {
-        // Providers announce why they are going away in `session.exited` just
-        // before their stream ends. Remember it so the synthesized stream-end
-        // failure can say what actually happened instead of a fixed string.
+        // Native runtimes can retain their event sender after announcing process loss.
+        // EOF and a fatal session.exited share one terminal settlement and cleanup path.
+        let begin_settlement = || {
+            let (settled_tx, settled) = oneshot::channel();
+            let _ = terminal_sender.send(SupervisorMessage::SessionStreamEnded {
+                identity: ProviderSessionIdentity {
+                    thread_id: launch.thread_id.clone(),
+                    driver: driver.clone(),
+                },
+                settled,
+            });
+            settled_tx
+        };
         let mut last_exit_reason: Option<String> = None;
-        loop {
+        let settled_tx = loop {
             tokio::select! {
                 biased;
                 () = cancellation.cancelled() => return,
                 event = driver.next_event() => {
-                    let Some(event) = event else {
-                        if activity_capable && activity_controller.snapshot().enabled {
-                            if cancellation.is_cancelled() {
-                                return;
-                            }
-                            let lifecycle = activity_lifecycle
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .clone();
-                            let activity_scope_id = format!("thread:{}", launch.thread_id);
-                            let stale_apply = activity.apply(
-                                &activity_scope_id,
-                                stream_ended_event_key.clone(),
-                                activity_scope_mutations(
-                                    &lifecycle.capabilities,
-                                    ActivityObservationState::Stale,
-                                    lifecycle.retained,
-                                ),
-                                now(),
-                            );
-                            tokio::select! {
-                                biased;
-                                () = cancellation.cancelled() => return,
-                                result = stale_apply => {
-                                    if let Err(error) = result {
-                                        tracing::warn!(
-                                            %error,
-                                            provider = %launch.provider,
-                                            thread_id = %launch.thread_id,
-                                            "failed to mark provider activity scope stale"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        if !cancellation.is_cancelled() {
-                            const STREAM_END_ERROR: &str =
-                                "Provider event stream ended unexpectedly.";
-                            let stream_end_message = last_exit_reason.as_deref().map_or_else(
-                                || STREAM_END_ERROR.to_owned(),
-                                |reason| {
-                                    format!(
-                                        "Provider event stream ended unexpectedly: {reason}"
-                                    )
-                                },
-                            );
-                            let active_turn_id = match engine
-                                .repositories()
-                                .get_thread_session(launch.thread_id.clone())
-                                .await
-                            {
-                                Ok(session) => session.and_then(|session| session.active_turn_id),
-                                Err(error) => {
-                                    tracing::warn!(
-                                        %error,
-                                        provider = %launch.provider,
-                                        thread_id = %launch.thread_id,
-                                        "failed to read provider session after its event stream ended"
-                                    );
-                                    None
-                                }
-                            };
-                            let failure = ProviderEvent {
-                                native_event_id: None,
-                                event_type: "turn.completed".to_owned(),
-                                thread_id: launch.thread_id.clone(),
-                                turn_id: active_turn_id,
-                                item_id: None,
-                                request_id: None,
-                                payload: json!({
-                                    "state": "failed",
-                                    "errorMessage": stream_end_message,
-                                    // The provider's stream died under BiBCode;
-                                    // that is our transport, not a fault the
-                                    // provider reported about the work itself.
-                                    "errorClass": "transport_error",
-                                }),
-                                activity: Vec::new(),
-                                activity_controls: Default::default(),
-                            };
-                            if let Err(error) = project_provider_event(
-                                &engine,
-                                &launch,
-                                resume_cursor.clone(),
-                                runtime_payload.clone(),
-                                failure,
-                            )
-                            .await
-                            {
-                                tracing::warn!(
-                                    %error,
-                                    provider = %launch.provider,
-                                    thread_id = %launch.thread_id,
-                                    "failed to project provider stream-end failure"
-                                );
-                            }
-                        }
-                        if let Err(error) = driver.shutdown().await {
-                            tracing::debug!(
-                                %error,
-                                provider = %launch.provider,
-                                thread_id = %launch.thread_id,
-                                "failed to shut down provider after its event stream ended"
-                            );
-                        }
-                        return;
+                    let Some(mut event) = event else {
+                        break begin_settlement();
                     };
-                    let mut event = event;
                     if let Some(log) = &operational_log {
                         let _ = log.record(&event);
                     }
-                    if event.event_type == "session.exited" {
+                    let session_exited = event.event_type == "session.exited"
+                        && event.thread_id == launch.thread_id
+                        && !(launch.provider == "opencode"
+                            && event.payload.get("reason").and_then(Value::as_str)
+                                .is_some_and(|reason| reason.trim() == "Session stopped."));
+                    if session_exited {
                         last_exit_reason = event
                             .payload
                             .get("reason")
@@ -4303,6 +4391,9 @@ fn spawn_event_pump(
                     if event.event_type == ACTIVITY_ONLY_PROVIDER_EVENT_TYPE {
                         continue;
                     }
+                    // Start the fence after activity-control acknowledgements, before the
+                    // final event becomes visible, so projection cannot deadlock on the supervisor.
+                    let session_settlement = session_exited.then(&begin_settlement);
                     let completed = event.event_type == "turn.completed"
                         && event.payload.get("state").and_then(Value::as_str) != Some("failed");
                     if let Err(error) = project_provider_event(
@@ -4329,8 +4420,117 @@ fn spawn_event_pump(
                             idle_deadline_test_observer.clone(),
                         );
                     }
+                    if let Some(settled_tx) = session_settlement {
+                        break settled_tx;
+                    }
                 }
             }
+        };
+        if activity_capable && activity_controller.snapshot().enabled {
+            if cancellation.is_cancelled() {
+                return;
+            }
+            let lifecycle = activity_lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let activity_scope_id = format!("thread:{}", launch.thread_id);
+            let stale_apply = activity.apply(
+                &activity_scope_id,
+                stream_ended_event_key.clone(),
+                activity_scope_mutations(
+                    &lifecycle.capabilities,
+                    ActivityObservationState::Stale,
+                    lifecycle.retained,
+                ),
+                now(),
+            );
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return,
+                result = stale_apply => {
+                    if let Err(error) = result {
+                        tracing::warn!(
+                            %error,
+                            provider = %launch.provider,
+                            thread_id = %launch.thread_id,
+                            "failed to mark provider activity scope stale"
+                        );
+                    }
+                }
+            }
+        }
+        if !cancellation.is_cancelled() {
+            const STREAM_END_ERROR: &str = "Provider event stream ended unexpectedly.";
+            let stream_end_message = last_exit_reason.as_deref().map_or_else(
+                || STREAM_END_ERROR.to_owned(),
+                |reason| format!("Provider event stream ended unexpectedly: {reason}"),
+            );
+            let active_turn_id = match engine
+                .repositories()
+                .get_thread_session(launch.thread_id.clone())
+                .await
+            {
+                Ok(session) => session.and_then(|session| session.active_turn_id),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        provider = %launch.provider,
+                        thread_id = %launch.thread_id,
+                        "failed to read provider session after its event stream ended"
+                    );
+                    None
+                }
+            };
+            // A provider may already have settled its turn before announcing exit.
+            if let Some(turn_id) = active_turn_id {
+                let failure = ProviderEvent {
+                    native_event_id: None,
+                    event_type: "turn.completed".to_owned(),
+                    thread_id: launch.thread_id.clone(),
+                    turn_id: Some(turn_id),
+                    item_id: None,
+                    request_id: None,
+                    payload: json!({
+                        "state": "failed",
+                        "errorMessage": stream_end_message,
+                        // The provider's stream died under BiBCode;
+                        // that is our transport, not a fault the
+                        // provider reported about the work itself.
+                        "errorClass": "transport_error",
+                    }),
+                    activity: Vec::new(),
+                    activity_controls: Default::default(),
+                };
+                if let Err(error) = project_provider_event(
+                    &engine,
+                    &launch,
+                    resume_cursor.clone(),
+                    runtime_payload.clone(),
+                    failure,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        %error,
+                        provider = %launch.provider,
+                        thread_id = %launch.thread_id,
+                        "failed to project provider stream-end failure"
+                    );
+                }
+            }
+        }
+        // Projection has settled. Signal that this entry cannot accept delivery
+        // even while the driver's shutdown is still draining.
+        cancellation.cancel();
+        let _ = settled_tx.send(());
+        if let Err(error) = driver.shutdown().await {
+            tracing::debug!(
+                %error,
+                provider = %launch.provider,
+                thread_id = %launch.thread_id,
+                "failed to shut down provider after its event stream ended"
+            );
         }
     })
 }
@@ -5692,6 +5892,55 @@ impl ProviderDriver for CodexDriver {
             }
         })
     }
+    fn steer(
+        &self,
+        text: String,
+        attachments: Vec<Value>,
+        expected_turn_id: String,
+        delivery_key: String,
+    ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
+        Box::pin(async move {
+            let (text, attachments) = match self.prepare_turn_input(text, attachments).await {
+                Ok(input) => input,
+                Err(error) => {
+                    return ProviderDeliveryOutcome::Rejected {
+                        detail: error.to_string(),
+                    };
+                }
+            };
+            match self
+                .runtime
+                .steer_turn(
+                    Some(text),
+                    attachments,
+                    expected_turn_id,
+                    Some(delivery_key),
+                )
+                .await
+            {
+                Ok(turn_id) => ProviderDeliveryOutcome::Accepted {
+                    turn_id: Some(turn_id),
+                },
+                Err(crate::provider::codex::runtime::RuntimeError::MissingProviderThreadId) => {
+                    ProviderDeliveryOutcome::DefinitelyNotSent {
+                        detail: "Codex session is missing a provider thread id".to_owned(),
+                    }
+                }
+                Err(crate::provider::codex::runtime::RuntimeError::Protocol(
+                    crate::provider::codex::protocol::ProtocolError::RemoteRequest {
+                        method,
+                        message,
+                        ..
+                    },
+                )) if method == "turn/steer" => {
+                    ProviderDeliveryOutcome::Rejected { detail: message }
+                }
+                Err(error) => ProviderDeliveryOutcome::Ambiguous {
+                    detail: error.to_string(),
+                },
+            }
+        })
+    }
     fn reconcile(
         &self,
         delivery_key: String,
@@ -6629,53 +6878,107 @@ impl ProviderDriver for OpenCodeDriver {
 #[derive(Default)]
 struct ClaudeAcknowledgementState {
     next_id: u64,
-    pending: Option<(u64, oneshot::Sender<()>)>,
+    pending: BTreeMap<Arc<str>, VecDeque<ClaudePendingAcknowledgement>>,
+}
+
+struct ClaudePendingAcknowledgement {
+    id: u64,
+    sender: oneshot::Sender<Option<String>>,
+    session_cancellation: CancellationToken,
 }
 
 #[derive(Clone, Default)]
-struct ClaudeAcknowledgementSlot {
+struct ClaudeAcknowledgements {
     state: Arc<StdMutex<ClaudeAcknowledgementState>>,
 }
 
-impl ClaudeAcknowledgementSlot {
-    fn register(&self, sender: oneshot::Sender<()>) -> Option<ClaudeAcknowledgementRegistration> {
+impl ClaudeAcknowledgements {
+    fn register(
+        &self,
+        text: &str,
+        sender: oneshot::Sender<Option<String>>,
+        session_cancellation: CancellationToken,
+    ) -> ClaudeAcknowledgementRegistration {
         let mut state = self.state.lock().expect("Claude acknowledgement lock");
-        if state.pending.is_some() {
-            return None;
-        }
         state.next_id = state.next_id.wrapping_add(1);
         let id = state.next_id;
-        state.pending = Some((id, sender));
-        Some(ClaudeAcknowledgementRegistration {
+        let text: Arc<str> = Arc::from(text);
+        state
+            .pending
+            .entry(text.clone())
+            .or_default()
+            .push_back(ClaudePendingAcknowledgement {
+                id,
+                sender,
+                session_cancellation,
+            });
+        ClaudeAcknowledgementRegistration {
             id,
+            text,
             state: self.state.clone(),
-        })
+        }
     }
 
-    fn acknowledge(&self) {
-        if let Some((_, sender)) = self
-            .state
-            .lock()
-            .expect("Claude acknowledgement lock")
-            .pending
-            .take()
-        {
-            let _ = sender.send(());
+    fn acknowledge(&self, text: &str, turn_id: Option<String>) {
+        let mut state = self.state.lock().expect("Claude acknowledgement lock");
+        let Some(pending) = state.pending.get_mut(text) else {
+            return;
+        };
+        while let Some(entry) = pending.pop_front() {
+            if !entry.session_cancellation.is_cancelled()
+                && entry.sender.send(turn_id.clone()).is_ok()
+            {
+                break;
+            }
+        }
+        if pending.is_empty() {
+            state.pending.remove(text);
         }
     }
 }
 
 struct ClaudeAcknowledgementRegistration {
     id: u64,
+    text: Arc<str>,
     state: Arc<StdMutex<ClaudeAcknowledgementState>>,
 }
 
 impl Drop for ClaudeAcknowledgementRegistration {
     fn drop(&mut self) {
         let mut state = self.state.lock().expect("Claude acknowledgement lock");
-        if state.pending.as_ref().map(|(id, _)| *id) == Some(self.id) {
-            state.pending.take();
+        if let Some(pending) = state.pending.get_mut(self.text.as_ref()) {
+            pending.retain(|entry| entry.id != self.id);
+            if pending.is_empty() {
+                state.pending.remove(self.text.as_ref());
+            }
         }
+    }
+}
+
+fn claude_replayed_user_text(value: &Value) -> Option<&str> {
+    if value.get("type").and_then(Value::as_str) != Some("user") {
+        return None;
+    }
+    match value.pointer("/message/content")? {
+        Value::String(text) => Some(text),
+        Value::Array(blocks) => {
+            if blocks
+                .iter()
+                .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+            {
+                return None;
+            }
+            match blocks
+                .iter()
+                .find(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            {
+                Some(block) => block.get("text")?.as_str(),
+                // prompt_parts omits an empty text block for image-only input;
+                // the acknowledgement was registered with the same empty key.
+                None => Some(""),
+            }
+        }
+        _ => None,
     }
 }
 
@@ -7831,7 +8134,7 @@ struct ClaudeDriver {
     targeted_activity_control_supported: AtomicBool,
     sequence: Mutex<u64>,
     attachments: AttachmentMaterializer,
-    pending_acknowledgement: ClaudeAcknowledgementSlot,
+    pending_acknowledgement: ClaudeAcknowledgements,
     hook_sink: Option<Arc<ClaudeHookSinkHandle>>,
     output: Arc<ClaudeOutputHandle>,
 }
@@ -8607,7 +8910,7 @@ impl ClaudeDriver {
             Some(sink) => (Some(sink.receiver), Some(Arc::new(sink.handle))),
             None => (None, None),
         };
-        let pending_acknowledgement = ClaudeAcknowledgementSlot::default();
+        let pending_acknowledgement = ClaudeAcknowledgements::default();
         let control_responses = ClaudeControlResponseRouter::default();
         let output = spawn_claude_output(
             runtime.clone(),
@@ -8661,6 +8964,46 @@ impl ClaudeDriver {
         writer.flush().await.map_err(provider_error(&self.provider))
     }
 
+    async fn write_delivery_bytes(
+        &self,
+        writer: &mut (dyn AsyncWrite + Send + Unpin),
+        bytes: &[u8],
+        turn_cancellation: &CancellationToken,
+        session_cancellation: &CancellationToken,
+    ) -> Result<(), ProviderDeliveryOutcome> {
+        // Before the first byte, cancellation proves nothing was sent. Once a
+        // prefix is written, finish the frame so later input cannot be corrupted.
+        let written = tokio::select! {
+            biased;
+            () = turn_cancellation.cancelled() => return Err(ProviderDeliveryOutcome::Rejected {
+                detail: "Claude turn is no longer available for steering".to_owned(),
+            }),
+            () = self.output.cancellation.cancelled() => return Err(ProviderDeliveryOutcome::DefinitelyNotSent {
+                detail: "Claude output closed before delivery".to_owned(),
+            }),
+            () = session_cancellation.cancelled() => return Err(ProviderDeliveryOutcome::DefinitelyNotSent {
+                detail: "Claude session retired before delivery".to_owned(),
+            }),
+            result = writer.write(bytes) => result.map_err(|error| ProviderDeliveryOutcome::DefinitelyNotSent { detail: error.to_string() })?,
+        };
+        if written == 0 {
+            return Err(ProviderDeliveryOutcome::DefinitelyNotSent {
+                detail: "Claude input closed before delivery write".to_owned(),
+            });
+        }
+        writer.write_all(&bytes[written..]).await.map_err(|error| {
+            ProviderDeliveryOutcome::Ambiguous {
+                detail: error.to_string(),
+            }
+        })?;
+        writer
+            .flush()
+            .await
+            .map_err(|error| ProviderDeliveryOutcome::Ambiguous {
+                detail: error.to_string(),
+            })
+    }
+
     async fn write_json(&self, value: Value) -> Result<(), ProviderRuntimeError> {
         let bytes = self.encode_json_line(value)?;
         self.write_bytes(&bytes).await
@@ -8698,6 +9041,121 @@ impl ClaudeDriver {
         );
         self.write_json(serde_json::to_value(request).map_err(provider_error(&self.provider))?)
             .await
+    }
+}
+
+impl ClaudeDriver {
+    async fn deliver_user_line(
+        &self,
+        text: String,
+        attachments: Vec<Value>,
+        expected_turn_id: Option<String>,
+    ) -> ProviderDeliveryOutcome {
+        let (steer_cancellation, acknowledgement_cancellation) = {
+            let runtime = self.runtime.lock().await;
+            let steer_cancellation = if let Some(expected) = expected_turn_id.as_deref() {
+                let Some(token) = runtime.turn_steer_cancellation(expected) else {
+                    return ProviderDeliveryOutcome::Rejected {
+                        detail: "Claude turn is no longer available for steering".to_owned(),
+                    };
+                };
+                Some(token)
+            } else {
+                None
+            };
+            (
+                steer_cancellation,
+                runtime.delivery_acknowledgement_cancellation(),
+            )
+        };
+        let (text, attachments) = match self.prepare_turn_input(text, attachments).await {
+            Ok(input) => input,
+            Err(error) => {
+                return ProviderDeliveryOutcome::Rejected {
+                    detail: error.to_string(),
+                };
+            }
+        };
+        let turn_id = expected_turn_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let content = crate::provider::attachments::prompt_parts(Some(&text), attachments);
+        let bytes = match self.encode_json_line(json!({
+            "type":"user",
+            "session_id":self.session_id,
+            "message":{"role":"user","content":content},
+            "parent_tool_use_id":null
+        })) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return ProviderDeliveryOutcome::Rejected {
+                    detail: error.to_string(),
+                };
+            }
+        };
+        let write_cancellation = steer_cancellation.unwrap_or_default();
+        let mut writer = tokio::select! {
+            biased;
+            () = write_cancellation.cancelled() => return ProviderDeliveryOutcome::Rejected {
+                detail: "Claude turn is no longer available for steering".to_owned(),
+            },
+            () = self.output.cancellation.cancelled() => return ProviderDeliveryOutcome::DefinitelyNotSent {
+                detail: "Claude output closed before delivery".to_owned(),
+            },
+            () = acknowledgement_cancellation.cancelled() => return ProviderDeliveryOutcome::DefinitelyNotSent {
+                detail: "Claude session retired before delivery".to_owned(),
+            },
+            writer = self.writer.lock() => writer,
+        };
+        // Register under the writer lock: identical-text waiters must have the
+        // same FIFO order as the actual input writes, not preparation completion.
+        let (acknowledgement_tx, acknowledgement_rx) = oneshot::channel();
+        let acknowledgement_registration = self.pending_acknowledgement.register(
+            &text,
+            acknowledgement_tx,
+            acknowledgement_cancellation.clone(),
+        );
+        if expected_turn_id.is_none() {
+            self.runtime
+                .lock()
+                .await
+                .start_turn(crate::provider::claude::TurnInput {
+                    turn_id: turn_id.clone(),
+                    input: text,
+                });
+        }
+        if let Err(outcome) = self
+            .write_delivery_bytes(
+                writer.as_mut(),
+                &bytes,
+                &write_cancellation,
+                &acknowledgement_cancellation,
+            )
+            .await
+        {
+            return outcome;
+        }
+        drop(writer);
+        drop(bytes);
+        let outcome = tokio::select! {
+            biased;
+            result = acknowledgement_rx => match result {
+                Ok(turn_id) => ProviderDeliveryOutcome::Accepted { turn_id },
+                Err(_) => ProviderDeliveryOutcome::Ambiguous {
+                    detail: "Claude acknowledgement waiter closed after delivery write".to_owned(),
+                },
+            },
+            () = acknowledgement_cancellation.cancelled() => ProviderDeliveryOutcome::Ambiguous {
+                detail: "Claude session retired after delivery write before acknowledgement".to_owned(),
+            },
+            () = self.output.cancellation.cancelled() => {
+                ProviderDeliveryOutcome::Ambiguous {
+                    detail: "Claude output closed after delivery write before acknowledgement".to_owned(),
+                }
+            }
+        };
+        drop(acknowledgement_registration);
+        outcome
     }
 }
 
@@ -8755,86 +9213,23 @@ impl ProviderDriver for ClaudeDriver {
         _: String,
         _: String,
     ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
-        Box::pin(async move {
-            let (text, attachments) = match self.prepare_turn_input(text, attachments).await {
-                Ok(input) => input,
-                Err(error) => {
-                    return ProviderDeliveryOutcome::Rejected {
-                        detail: error.to_string(),
-                    };
-                }
-            };
-            let turn_id = Uuid::new_v4().to_string();
-            let content = crate::provider::attachments::prompt_parts(Some(&text), attachments);
-            let bytes = match self.encode_json_line(json!({
-                "type":"user",
-                "session_id":self.session_id,
-                "message":{"role":"user","content":content},
-                "parent_tool_use_id":null
-            })) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    return ProviderDeliveryOutcome::Rejected {
-                        detail: error.to_string(),
-                    };
-                }
-            };
-            if self.output.cancellation.is_cancelled() {
-                return ProviderDeliveryOutcome::DefinitelyNotSent {
-                    detail: "Claude output closed before delivery".to_owned(),
-                };
-            }
-            let (acknowledgement_tx, acknowledgement_rx) = oneshot::channel();
-            let acknowledgement_registration =
-                match self.pending_acknowledgement.register(acknowledgement_tx) {
-                    Some(registration) => registration,
-                    None => {
-                        return ProviderDeliveryOutcome::DefinitelyNotSent {
-                            detail: "Claude already has a pending delivery acknowledgement"
-                                .to_owned(),
-                        };
-                    }
-                };
-            if self.output.cancellation.is_cancelled() {
-                return ProviderDeliveryOutcome::DefinitelyNotSent {
-                    detail: "Claude output closed before delivery".to_owned(),
-                };
-            }
-            self.runtime
-                .lock()
-                .await
-                .start_turn(crate::provider::claude::TurnInput {
-                    turn_id: turn_id.clone(),
-                    input: text,
-                });
-            if let Err(error) = self.write_bytes(&bytes).await {
-                return ProviderDeliveryOutcome::Ambiguous {
-                    detail: error.to_string(),
-                };
-            }
-            let outcome = tokio::select! {
-                biased;
-                result = acknowledgement_rx => match result {
-                    Ok(()) => ProviderDeliveryOutcome::Accepted { turn_id: Some(turn_id) },
-                    Err(_) => ProviderDeliveryOutcome::Ambiguous {
-                        detail: "Claude acknowledgement waiter closed after delivery write".to_owned(),
-                    },
-                },
-                () = self.output.cancellation.cancelled() => {
-                    ProviderDeliveryOutcome::Ambiguous {
-                        detail: "Claude output closed after delivery write before acknowledgement".to_owned(),
-                    }
-                }
-            };
-            drop(acknowledgement_registration);
-            outcome
-        })
+        Box::pin(self.deliver_user_line(text, attachments, None))
+    }
+    fn steer(
+        &self,
+        text: String,
+        attachments: Vec<Value>,
+        expected_turn_id: String,
+        _: String,
+    ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
+        Box::pin(self.deliver_user_line(text, attachments, Some(expected_turn_id)))
     }
     fn interrupt(
         &self,
         _: Option<String>,
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
+            self.runtime.lock().await.stop_turn_input();
             let control = ClaudeControlRequest::interrupt(self.next_sequence().await);
             self.write_json(serde_json::to_value(control).map_err(provider_error(&self.provider))?)
                 .await
@@ -9128,7 +9523,7 @@ fn spawn_claude_output(
     hook_receiver: Option<mpsc::Receiver<Value>>,
     hook_sink: Option<Arc<ClaudeHookSinkHandle>>,
     sender: mpsc::Sender<ProviderEvent>,
-    pending_acknowledgement: ClaudeAcknowledgementSlot,
+    pending_acknowledgement: ClaudeAcknowledgements,
     control_responses: ClaudeControlResponseRouter,
 ) -> Arc<ClaudeOutputHandle> {
     let cancellation = CancellationToken::new();
@@ -9296,7 +9691,7 @@ pub async fn claude_output_shutdown_with_open_stream_for_test() -> bool {
         None,
         None,
         sender,
-        ClaudeAcknowledgementSlot::default(),
+        ClaudeAcknowledgements::default(),
         ClaudeControlResponseRouter::default(),
     );
     let completed = tokio::time::timeout(Duration::from_millis(150), output.shutdown())
@@ -9633,11 +10028,8 @@ async fn emit_claude_value(
     authenticated_hook: bool,
     recovery_sender: &mpsc::Sender<ClaudeTranscriptRecoveryRequest>,
     cancellation: &CancellationToken,
-    pending_acknowledgement: &ClaudeAcknowledgementSlot,
+    pending_acknowledgement: &ClaudeAcknowledgements,
 ) -> bool {
-    if !authenticated_hook && value.get("type").and_then(Value::as_str) == Some("user") {
-        pending_acknowledgement.acknowledge();
-    }
     let emitted_at_ms = u64::try_from(
         OffsetDateTime::now_utc()
             .unix_timestamp_nanos()
@@ -9646,6 +10038,9 @@ async fn emit_claude_value(
     .unwrap_or_default();
     let mut output = {
         let mut runtime = runtime.lock().await;
+        if !authenticated_hook && let Some(text) = claude_replayed_user_text(&value) {
+            pending_acknowledgement.acknowledge(text, runtime.current_turn_id().map(str::to_owned));
+        }
         if authenticated_hook {
             runtime.handle_authenticated_hook_value(&value, emitted_at_ms)
         } else {
@@ -11562,6 +11957,564 @@ done
     }
 
     #[tokio::test]
+    async fn claude_steer_settle_or_interrupt_while_waiting_to_write_sends_nothing() {
+        for interrupted in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let capture = temp.path().join("steer-fence.jsonl");
+            let driver = claude_delivery_fixture(
+                &temp,
+                "claude-steer-fence",
+                CLAUDE_FIXTURE,
+                &capture,
+                None,
+                None,
+            )
+            .await;
+            driver.start().await.unwrap();
+            let active = driver
+                .send("initial".into(), vec![], "default".into())
+                .await
+                .unwrap()
+                .unwrap();
+            captured_request(ProviderFixtureDeadline::integration(), &capture, |value| {
+                value.to_string().contains("initial")
+            })
+            .await
+            .unwrap();
+            let writer = driver.writer.lock().await;
+            let mut steer = driver.steer("follow up".into(), vec![], active, "key".into());
+            // Poll preparation while holding the writer, then cross the turn
+            // boundary before any byte can be written. No private slot sentinel.
+            assert!(
+                std::future::poll_fn(|cx| Poll::Ready(steer.as_mut().poll(cx)))
+                    .await
+                    .is_pending()
+            );
+            let interrupt = if interrupted {
+                let sender = driver.clone();
+                let task = tokio::spawn(async move { sender.interrupt(None).await });
+                timeout(std::time::Duration::from_secs(5), async {
+                    while *driver.sequence.lock().await == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                Some(task)
+            } else {
+                driver.runtime.lock().await.handle_raw_value(&json!({"type":"result","session_id":"fixture-session","uuid":"settled","subtype":"success","is_error":false,"errors":[],"stop_reason":"end_turn"}), 1);
+                None
+            };
+            drop(writer);
+            let early = timeout(std::time::Duration::from_millis(100), &mut steer).await;
+            if let Some(interrupt) = interrupt {
+                interrupt.await.unwrap().unwrap();
+            }
+            driver.shutdown().await.unwrap();
+            let outcome = match early {
+                Ok(result) => result,
+                Err(_) => steer.await,
+            };
+            assert!(
+                matches!(outcome, super::ProviderDeliveryOutcome::Rejected { .. }),
+                "no bytes may follow a known settle/interrupt: {outcome:?}"
+            );
+            assert!(
+                !std::fs::read_to_string(&capture)
+                    .unwrap()
+                    .contains("follow up")
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    const CLAUDE_STEER_ACK_FIXTURE: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$BIBCODE_TEST_REQUEST_CAPTURE"
+  case "$line" in
+    *'"fixtureAction":"settle"'*)
+      printf '%s\n' '{"type":"result","session_id":"fixture-session","uuid":"settled","subtype":"success","is_error":false,"errors":[],"stop_reason":"end_turn"}'
+      printf '%s\n' '{"type":"system","subtype":"init","session_id":"fixture-session"}'
+      ;;
+    *'"fixtureAction":"echo-string"'*)
+      printf '%s\n' '{"type":"user","message":{"role":"user","content":"follow up"}}'
+      ;;
+    *'"fixtureAction":"echo-block"'*)
+      printf '%s\n' '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"follow up"}]}}'
+      ;;
+    *'"fixtureAction":"tool-result"'*)
+      printf '%s\n' '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-a","content":"follow up"}]}}'
+      ;;
+    *'"fixtureAction":"mixed-result"'*)
+      printf '%s\n' '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"follow up"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aW1hZ2U="}},{"type":"tool_result","tool_use_id":"tool-a","content":"done"}]}}'
+      ;;
+    *'"fixtureAction":"unrelated"'*)
+      printf '%s\n' '{"type":"user","message":{"role":"user","content":"another input"}}'
+      ;;
+    *'"fixtureAction":"multiple-text-blocks"'*)
+      printf '%s\n' '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"other"},{"type":"text","text":"follow up"}]}}'
+      ;;
+    *'"fixtureAction":"barrier"'*)
+      printf '%s\n' '{"type":"stream_event","session_id":"fixture-session","uuid":"noise-barrier","parent_tool_use_id":null,"event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"noise processed"}}}'
+      ;;
+    *'"fixtureAction":"exit"'*) exit 0;;
+    *'normal delivery'*) printf '%s\n' "$line";;
+  esac
+done
+"#;
+
+    #[test]
+    fn claude_attachment_replay_uses_first_text_and_rejects_every_tool_result_array() {
+        let image = json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"aW1hZ2U="}});
+        for (content, expected) in [
+            (json!("prompt"), Some("prompt")),
+            (
+                json!([{"type":"text","text":"prompt"}, image.clone()]),
+                Some("prompt"),
+            ),
+            (
+                json!([image.clone(), {"type":"text","text":"prompt"}]),
+                Some("prompt"),
+            ),
+            (
+                json!([{"type":"text","text":"first"}, {"type":"text","text":"second"}]),
+                Some("first"),
+            ),
+            (json!([image.clone()]), Some("")),
+            (json!([]), Some("")),
+            (
+                json!([{"type":"tool_result","tool_use_id":"tool-a","content":"prompt"}, {"type":"text","text":"prompt"}, image.clone()]),
+                None,
+            ),
+            (
+                json!([{"type":"text","text":"prompt"}, image.clone(), {"type":"tool_result","tool_use_id":"tool-a","content":"prompt"}]),
+                None,
+            ),
+            (
+                json!([image, {"type":"tool_result","tool_use_id":"tool-a","content":""}]),
+                None,
+            ),
+        ] {
+            let echo = json!({"type":"user","message":{"role":"user","content":content}});
+            assert_eq!(super::claude_replayed_user_text(&echo), expected, "{echo}");
+        }
+    }
+
+    #[cfg(unix)]
+    async fn claude_attachment_replay_fixture(
+        text: &str,
+        steer: bool,
+    ) -> (super::ProviderDeliveryOutcome, Value, Option<String>) {
+        let temp = TempDir::new().unwrap();
+        let capture = temp.path().join("attachment-replay.jsonl");
+        let fixture = r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$BIBCODE_TEST_REQUEST_CAPTURE"
+  case "$line" in
+    *'"type":"image"'*) printf '%s\n' "$line"; exit 0;;
+  esac
+done
+"#;
+        let driver = claude_delivery_fixture(
+            &temp,
+            "claude-attachment-replay",
+            fixture,
+            &capture,
+            None,
+            None,
+        )
+        .await;
+        driver.start().await.unwrap();
+        let active = if steer {
+            driver
+                .send("initial".into(), vec![], "default".into())
+                .await
+                .unwrap()
+        } else {
+            None
+        };
+        let prepared = driver.attachments.prepare(vec![json!({"type":"image","id":"image-replay","name":"image.png","mimeType":"image/png","sizeBytes":5,"dataUrl":"data:image/png;base64,aW1hZ2U="})]).await.unwrap();
+        let attachments = prepared.attachments().to_vec();
+        prepared.commit();
+        let outcome = timeout(Duration::from_secs(5), async {
+            if let Some(active) = &active {
+                driver
+                    .steer(
+                        text.into(),
+                        attachments,
+                        active.clone(),
+                        "attachment-steer".into(),
+                    )
+                    .await
+            } else {
+                driver
+                    .deliver(
+                        text.into(),
+                        attachments,
+                        "default".into(),
+                        "attachment-start".into(),
+                    )
+                    .await
+            }
+        })
+        .await;
+        driver.shutdown().await.unwrap();
+        let outcome = outcome.expect("replay or process exit resolves the delivery");
+        assert!(
+            !matches!(
+                outcome,
+                super::ProviderDeliveryOutcome::Rejected { .. }
+                    | super::ProviderDeliveryOutcome::DefinitelyNotSent { .. }
+            ),
+            "attachment fixture must reach the write: {outcome:?}"
+        );
+        let request = captured_request(ProviderFixtureDeadline::integration(), &capture, |value| {
+            value
+                .pointer("/message/content")
+                .and_then(Value::as_array)
+                .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "image"))
+        })
+        .await
+        .unwrap();
+        (outcome, request["message"]["content"].clone(), active)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_attachment_replay_accepts_a_start_with_text_and_image() {
+        let (outcome, content, _) =
+            claude_attachment_replay_fixture("inspect this image", false).await;
+        assert_eq!(
+            content,
+            json!([
+                {"type":"text","text":"inspect this image"},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"aW1hZ2U="}}
+            ])
+        );
+        assert!(
+            matches!(
+                outcome,
+                super::ProviderDeliveryOutcome::Accepted { turn_id: Some(_) }
+            ),
+            "image replay must acknowledge the start: {outcome:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_attachment_replay_accepts_a_steer_with_text_and_image() {
+        let (outcome, content, active) =
+            claude_attachment_replay_fixture("inspect this image", true).await;
+        assert_eq!(
+            content,
+            json!([
+                {"type":"text","text":"inspect this image"},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"aW1hZ2U="}}
+            ])
+        );
+        assert!(
+            matches!(outcome, super::ProviderDeliveryOutcome::Accepted { ref turn_id } if turn_id == &active),
+            "image replay must acknowledge the original turn: {outcome:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_attachment_replay_accepts_image_only_input_with_an_empty_text_key() {
+        let (outcome, content, _) = claude_attachment_replay_fixture("", false).await;
+        assert_eq!(
+            content,
+            json!([
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"aW1hZ2U="}}
+            ])
+        );
+        assert!(
+            matches!(
+                outcome,
+                super::ProviderDeliveryOutcome::Accepted { turn_id: Some(_) }
+            ),
+            "attachment-only replay must match the empty registration key: {outcome:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    async fn claude_pending_steer_fixture() -> (
+        TempDir,
+        Arc<super::ClaudeDriver>,
+        String,
+        tokio::task::JoinHandle<super::ProviderDeliveryOutcome>,
+    ) {
+        let temp = TempDir::new().unwrap();
+        let capture = temp.path().join("steer-ack.jsonl");
+        let driver = claude_delivery_fixture(
+            &temp,
+            "claude-steer-ack",
+            CLAUDE_STEER_ACK_FIXTURE,
+            &capture,
+            None,
+            None,
+        )
+        .await;
+        driver.start().await.unwrap();
+        let active = driver
+            .send("initial".into(), vec![], "default".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let sender = driver.clone();
+        let expected = active.clone();
+        let steer = tokio::spawn(async move {
+            sender
+                .steer("follow up".into(), vec![], expected, "key".into())
+                .await
+        });
+        captured_request(ProviderFixtureDeadline::integration(), &capture, |value| {
+            value.to_string().contains("follow up")
+        })
+        .await
+        .unwrap();
+        (temp, driver, active, steer)
+    }
+
+    #[cfg(unix)]
+    async fn claude_fixture_action(driver: &super::ClaudeDriver, action: &str) {
+        driver
+            .write_json(json!({"fixtureAction": action}))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    async fn claude_fixture_output(
+        driver: &super::ClaudeDriver,
+        event_type: &str,
+    ) -> super::ProviderEvent {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let event = driver
+                    .events
+                    .lock()
+                    .await
+                    .recv()
+                    .await
+                    .expect("Claude fixture output");
+                if event.event_type == event_type {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("Claude fixture event arrives")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_steer_echo_after_result_is_accepted_in_the_current_turn() {
+        for echo in ["echo-string", "echo-block"] {
+            let (_temp, driver, active, steer) = claude_pending_steer_fixture().await;
+            claude_fixture_action(&driver, "settle").await;
+            let result = claude_fixture_output(&driver, "turn.completed").await;
+            assert_eq!(result.turn_id.as_deref(), Some(active.as_str()));
+            claude_fixture_action(&driver, echo).await;
+            let outcome = timeout(Duration::from_secs(5), steer)
+                .await
+                .unwrap()
+                .unwrap();
+            let current = driver.runtime.lock().await.snapshot().turn_id;
+            driver.shutdown().await.unwrap();
+            assert_eq!(current.as_deref(), Some(active.as_str()));
+            assert!(
+                matches!(outcome, super::ProviderDeliveryOutcome::Accepted { turn_id: Some(ref id) } if id == &active),
+                "late replay must acknowledge the same runtime turn: {outcome:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_steer_ignores_tool_results_and_nonmatching_user_replays() {
+        for noise in [
+            "tool-result",
+            "mixed-result",
+            "unrelated",
+            "multiple-text-blocks",
+        ] {
+            let (_temp, driver, active, mut steer) = claude_pending_steer_fixture().await;
+            claude_fixture_action(&driver, noise).await;
+            claude_fixture_action(&driver, "barrier").await;
+            claude_fixture_output(&driver, "content.delta").await;
+            let early = timeout(Duration::from_millis(50), &mut steer).await.ok();
+            claude_fixture_action(&driver, "echo-string").await;
+            let outcome = if let Some(outcome) = early.as_ref() {
+                format!("{outcome:?}")
+            } else {
+                let outcome = timeout(Duration::from_secs(5), steer)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    matches!(outcome, super::ProviderDeliveryOutcome::Accepted { turn_id: Some(ref id) } if id == &active)
+                );
+                String::new()
+            };
+            driver.shutdown().await.unwrap();
+            assert!(
+                early.is_none(),
+                "{noise} must not acknowledge the steer: {outcome}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_start_delivery_is_accepted_while_a_steer_echo_is_pending() {
+        for settle in [false, true] {
+            let (_temp, driver, _active, mut steer) = claude_pending_steer_fixture().await;
+            if settle {
+                claude_fixture_action(&driver, "settle").await;
+                claude_fixture_output(&driver, "turn.completed").await;
+            }
+            let started = timeout(
+                Duration::from_secs(5),
+                driver.deliver(
+                    "normal delivery".into(),
+                    vec![],
+                    "default".into(),
+                    "next-key".into(),
+                ),
+            )
+            .await
+            .unwrap();
+            let early = timeout(Duration::from_millis(50), &mut steer).await.ok();
+            claude_fixture_action(&driver, "echo-block").await;
+            let steered = if early.is_none() {
+                Some(
+                    timeout(Duration::from_secs(5), steer)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            let current = driver.runtime.lock().await.snapshot().turn_id;
+            driver.shutdown().await.unwrap();
+            assert!(
+                matches!(started, super::ProviderDeliveryOutcome::Accepted { turn_id: Some(ref id) } if Some(id) == current.as_ref()),
+                "normal delivery must not be refused by an outstanding steer: {started:?}"
+            );
+            assert!(
+                early.is_none(),
+                "a start echo must not acknowledge or cancel the steer: {early:?}"
+            );
+            assert!(
+                matches!(steered, Some(super::ProviderDeliveryOutcome::Accepted { turn_id: Some(ref id) }) if Some(id) == current.as_ref()),
+                "the steer echo attributes the runtime turn current at replay: {steered:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_steer_process_or_session_retirement_after_write_is_ambiguous() {
+        for retirement in ["exit", "stream-failure", "session-replacement"] {
+            let (_temp, driver, _active, steer) = claude_pending_steer_fixture().await;
+            match retirement {
+                "exit" => claude_fixture_action(&driver, "exit").await,
+                "stream-failure" => {
+                    driver
+                        .runtime
+                        .lock()
+                        .await
+                        .handle_stream_failure("stream failed");
+                }
+                _ => {
+                    let mut runtime = driver.runtime.lock().await;
+                    let mut snapshot = runtime.snapshot();
+                    snapshot.session_id = "replacement".into();
+                    runtime.restore_from_snapshot(snapshot);
+                }
+            }
+            let outcome = timeout(Duration::from_secs(5), steer)
+                .await
+                .unwrap()
+                .unwrap();
+            driver.shutdown().await.unwrap();
+            assert!(
+                matches!(outcome, super::ProviderDeliveryOutcome::Ambiguous { .. }),
+                "{retirement}: {outcome:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn claude_steer_first_write_failure_is_definitely_not_sent() {
+        struct RejectWrite {
+            _owner: Box<dyn AsyncWrite + Send + Unpin>,
+        }
+        impl AsyncWrite for RejectWrite {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                _: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "before the first byte",
+                )))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        let temp = TempDir::new().unwrap();
+        let capture = temp.path().join("unwritten.jsonl");
+        let driver = claude_delivery_fixture(
+            &temp,
+            "claude-unwritten",
+            CLAUDE_FIXTURE,
+            &capture,
+            None,
+            None,
+        )
+        .await;
+        driver.start().await.unwrap();
+        let active = driver
+            .send("initial".into(), vec![], "default".into())
+            .await
+            .unwrap()
+            .unwrap();
+        {
+            let mut writer = driver.writer.lock().await;
+            let original = std::mem::replace(&mut *writer, Box::new(tokio::io::sink()));
+            *writer = Box::new(RejectWrite { _owner: original });
+        }
+        let outcome = driver
+            .steer("follow up".into(), vec![], active, "key".into())
+            .await;
+        driver.shutdown().await.unwrap();
+        assert!(
+            matches!(
+                outcome,
+                super::ProviderDeliveryOutcome::DefinitelyNotSent { .. }
+            ),
+            "an error from the first write proves no bytes were sent: {outcome:?}"
+        );
+        assert!(
+            driver
+                .pending_acknowledgement
+                .state
+                .lock()
+                .unwrap()
+                .pending
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn claude_delivery_waits_for_the_replayed_user_message_before_accepting() {
         let temp = TempDir::new().expect("provider fixture directory");
         let capture_path = temp.path().join("claude-delivery.jsonl");
@@ -11895,28 +12848,58 @@ done
     }
 
     #[test]
-    fn claude_delivery_cancellation_releases_the_pending_acknowledgement() {
-        let slot = super::ClaudeAcknowledgementSlot::default();
-        let (first_sender, _first_receiver) = tokio::sync::oneshot::channel();
-        let first = slot
-            .register(first_sender)
-            .expect("first delivery registers");
-        slot.acknowledge();
-        let (retry_sender, _retry_receiver) = tokio::sync::oneshot::channel();
-        let retry = slot
-            .register(retry_sender)
-            .expect("acknowledgement releases the first registration");
-
-        drop(first);
-
-        let (overlap_sender, _overlap_receiver) = tokio::sync::oneshot::channel();
-        assert!(
-            slot.register(overlap_sender).is_none(),
-            "an older delivery guard must not clear a newer acknowledgement slot"
+    fn claude_delivery_cancellation_releases_only_its_own_acknowledgement() {
+        let slot = super::ClaudeAcknowledgements::default();
+        let session = tokio_util::sync::CancellationToken::new();
+        let (first_sender, mut first_receiver) = tokio::sync::oneshot::channel();
+        let first = slot.register("same text", first_sender, session.clone());
+        let (next_sender, mut next_receiver) = tokio::sync::oneshot::channel();
+        let next = slot.register("same text", next_sender, session.clone());
+        slot.acknowledge("same text", Some("first-turn".into()));
+        assert_eq!(
+            first_receiver.try_recv().unwrap().as_deref(),
+            Some("first-turn")
         );
-        drop(retry);
-        let (next_sender, _next_receiver) = tokio::sync::oneshot::channel();
-        assert!(slot.register(next_sender).is_some());
+        assert!(matches!(
+            next_receiver.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        drop(first);
+        slot.acknowledge("same text", Some("next-turn".into()));
+        assert_eq!(
+            next_receiver.try_recv().unwrap().as_deref(),
+            Some("next-turn")
+        );
+        drop(next);
+        let (cancelled_sender, mut cancelled_receiver) = tokio::sync::oneshot::channel();
+        let cancelled = slot.register("cancelled", cancelled_sender, session.clone());
+        let (live_sender, mut live_receiver) = tokio::sync::oneshot::channel();
+        let _live = slot.register("live", live_sender, session);
+        drop(cancelled);
+        assert!(matches!(
+            cancelled_receiver.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+        slot.acknowledge("live", Some("live-turn".into()));
+        assert_eq!(
+            live_receiver.try_recv().unwrap().as_deref(),
+            Some("live-turn")
+        );
+        assert!(slot.state.lock().unwrap().pending.is_empty());
+    }
+
+    #[test]
+    fn claude_retired_session_echo_cannot_acknowledge_an_old_write() {
+        let slot = super::ClaudeAcknowledgements::default();
+        let session = tokio_util::sync::CancellationToken::new();
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
+        let _registration = slot.register("old input", sender, session.clone());
+        session.cancel();
+        slot.acknowledge("old input", Some("replacement-turn".into()));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
     }
 
     #[tokio::test]
@@ -11931,12 +12914,10 @@ done
         let (event_sender, _event_receiver) = tokio::sync::mpsc::channel(4);
         let (recovery_sender, _recovery_receiver) = tokio::sync::mpsc::channel(1);
         let cancellation = tokio_util::sync::CancellationToken::new();
-        let slot = super::ClaudeAcknowledgementSlot::default();
+        let slot = super::ClaudeAcknowledgements::default();
         let (acknowledgement_sender, mut acknowledgement_receiver) =
             tokio::sync::oneshot::channel();
-        let _registration = slot
-            .register(acknowledgement_sender)
-            .expect("delivery acknowledgement registers");
+        let _registration = slot.register("hello", acknowledgement_sender, cancellation.clone());
 
         assert!(
             super::emit_claude_value(
@@ -11970,7 +12951,7 @@ done
         let (event_sender, mut event_receiver) = tokio::sync::mpsc::channel(8);
         let (recovery_sender, _recovery_receiver) = tokio::sync::mpsc::channel(1);
         let cancellation = tokio_util::sync::CancellationToken::new();
-        let slot = super::ClaudeAcknowledgementSlot::default();
+        let slot = super::ClaudeAcknowledgements::default();
         let facts = [
             (
                 false,
@@ -12134,7 +13115,7 @@ done
         );
         let (recovery_sender, _recovery_receiver) = mpsc::channel(1);
         let cancellation = tokio_util::sync::CancellationToken::new();
-        let slot = super::ClaudeAcknowledgementSlot::default();
+        let slot = super::ClaudeAcknowledgements::default();
         let scope = ActivityScopeRef::Thread {
             thread_id: "t1".to_owned(),
         };
@@ -12388,7 +13369,7 @@ done
         );
         let (recovery_sender, _recovery_receiver) = mpsc::channel(1);
         let cancellation = tokio_util::sync::CancellationToken::new();
-        let slot = super::ClaudeAcknowledgementSlot::default();
+        let slot = super::ClaudeAcknowledgements::default();
         let mut runtimes = Vec::new();
         for index in 0..2 {
             let session = format!("claude-poison-session-{index}");
@@ -12580,7 +13561,7 @@ done
         );
         let (recovery_sender, _recovery_receiver) = mpsc::channel(1);
         let cancellation = tokio_util::sync::CancellationToken::new();
-        let slot = super::ClaudeAcknowledgementSlot::default();
+        let slot = super::ClaudeAcknowledgements::default();
         for (index, (status, _)) in [
             ("stopped", ActivityLifecycle::Cancelled),
             ("failed", ActivityLifecycle::Failed),
@@ -15127,7 +16108,7 @@ done
             send_gate: Some(gate.clone()),
             ..SupervisorDriverState::default()
         }));
-        let (_, events) = mpsc::channel(1);
+        let (_events_tx, events) = mpsc::channel(1);
         let supervisor = super::ProviderRuntimeSupervisor::start(
             engine.clone(),
             Arc::new(SupervisorFactory {
@@ -15394,7 +16375,7 @@ done
             send_gate: Some(gate.clone()),
             ..SupervisorDriverState::default()
         }));
-        let (_, events) = mpsc::channel(1);
+        let (_events_tx, events) = mpsc::channel(1);
         let supervisor = super::ProviderRuntimeSupervisor::start(
             engine.clone(),
             Arc::new(SupervisorFactory {
@@ -15483,7 +16464,7 @@ done
     async fn stale_owned_delivery_cas_conflict_never_calls_the_provider() {
         let engine = supervisor_engine().await;
         let state = Arc::new(StdMutex::new(SupervisorDriverState::default()));
-        let (_, events) = mpsc::channel(1);
+        let (_events_tx, events) = mpsc::channel(1);
         let supervisor = super::ProviderRuntimeSupervisor::start(
             engine.clone(),
             Arc::new(SupervisorFactory {
@@ -15602,6 +16583,8 @@ done
             tokio::spawn(async move {
                 supervisor
                     .reconcile_turn(crate::orchestration::ProviderTurnDelivery {
+                        mode: crate::orchestration::TurnDeliveryMode::Start,
+                        held: false,
                         command_id: "reconcile".to_owned(),
                         thread_id: "t1".to_owned(),
                         message_id: "message".to_owned(),

@@ -116,6 +116,19 @@ workspace meter can therefore explain that Codex compacts context automatically
 when needed, while still showing the current active usage and maximum
 independently.
 
+## Steering a running turn
+
+While Codex is working, Enter adds a queued message. **Steer** on the first
+card, or `Mod+Shift+Enter` in the composer, sends it through Codex `turn/steer`
+with the active turn ID. Codex injects it at that turn's next boundary. The
+message joins the running turn, and Stop continues to target that same turn.
+
+If steering is rejected or the turn is no longer available, the message returns
+to the queue with the reason on its card. It can start normally when the session
+is ready; interruptions and errors keep queued messages on hold until you use
+**Send now**. See [Queued messages](../user/workspace-ui.md#queued-messages) for
+cancellation, attachments, and reload behavior.
+
 ## Activity observation
 
 Structured Codex chats run through `codex app-server`. BiBCode uses App Server

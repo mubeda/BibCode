@@ -70,6 +70,73 @@ const makeSupervisor = Effect.fn("TestEnvironmentCommands.makeSupervisor")(funct
 });
 
 describe("environment commands", () => {
+  it.effect("dispatches steer and promote with stable command metadata", () =>
+    Effect.gen(function* () {
+      const dispatched: ClientOrchestrationCommand[] = [];
+      const supervisor = yield* makeSupervisor(dispatched);
+      for (const [operation, type] of [
+        ["steerThreadTurn", "thread.turn.steer"],
+        ["promoteThreadTurn", "thread.turn.promote"],
+      ] as const) {
+        const input = {
+          commandId: CommandId.make(type),
+          threadId: ThreadId.make("thread-1"),
+          messageId: MessageId.make("message-1"),
+          createdAt: "2026-09-22T12:00:00.000Z",
+        };
+        yield* EnvironmentCommands[operation](input).pipe(
+          Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+        );
+        expect(dispatched.at(-1)).toEqual({ ...input, type });
+      }
+    }).pipe(Effect.provide(TEST_CRYPTO_LAYER)),
+  );
+
+  it.effect("preserves queued start flags and accepts cancel through the typed RPC", () =>
+    Effect.gen(function* () {
+      const dispatched: ClientOrchestrationCommand[] = [];
+      const supervisor = yield* makeSupervisor(dispatched);
+      const metadata = {
+        threadId: ThreadId.make("thread-1"),
+        createdAt: "2026-09-22T12:00:00.000Z",
+      };
+      for (const flags of [{}, { queued: true }, { queued: false }]) {
+        const input = {
+          ...metadata,
+          ...flags,
+          message: {
+            messageId: MessageId.make("message-1"),
+            role: "user" as const,
+            text: "next task",
+            attachments: [],
+          },
+          runtimeMode: "full-access" as const,
+          interactionMode: "default" as const,
+        };
+        yield* EnvironmentCommands.startThreadTurn(input).pipe(
+          Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+        );
+        expect(dispatched.at(-1)).toEqual({
+          ...input,
+          type: "thread.turn.start",
+          commandId: "00000000-0000-4000-8000-000000000000",
+        });
+      }
+      yield* EnvironmentCommands.resolveTurnDelivery({
+        ...metadata,
+        messageId: MessageId.make("message-1"),
+        action: "cancel",
+      }).pipe(Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor));
+      expect(dispatched.at(-1)).toEqual({
+        ...metadata,
+        type: "thread.turn-delivery.resolve",
+        commandId: "00000000-0000-4000-8000-000000000000",
+        messageId: "message-1",
+        action: "cancel",
+      });
+    }).pipe(Effect.provide(TEST_CRYPTO_LAYER)),
+  );
+
   it.effect("adds generated command metadata", () =>
     Effect.gen(function* () {
       const dispatched: ClientOrchestrationCommand[] = [];

@@ -1591,6 +1591,9 @@ fn snapshot_owned_message(
     if let Some(message) = message {
         result["message"] = json!(message);
     }
+    if crate::provider::supports_turn_steer(&definition.driver) {
+        result["supportsTurnSteer"] = json!(true);
+    }
     if matches!(definition.driver.as_str(), "codex" | "claudeAgent") {
         result["supportsMcpStatus"] = json!(true);
     }
@@ -1969,6 +1972,11 @@ mod tests {
         let grok = snapshot_for("grok");
         let opencode = snapshot_for("opencode");
 
+        assert_eq!(codex["supportsTurnSteer"], true);
+        assert_eq!(claude["supportsTurnSteer"], true);
+        assert!(cursor.get("supportsTurnSteer").is_none());
+        assert!(grok.get("supportsTurnSteer").is_none());
+        assert!(opencode.get("supportsTurnSteer").is_none());
         assert_eq!(codex["supportsMcpStatus"], true);
         assert_eq!(claude["supportsMcpStatus"], true);
         assert!(cursor.get("supportsMcpStatus").is_none());
