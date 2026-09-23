@@ -16,6 +16,7 @@ current behavior.
 
 ## User guides
 
+- [Linux desktop and AppImage](./user/linux-desktop.md)
 - [Workspace UI](./user/workspace-ui.md)
 - [Keybindings](./user/keybindings.md)
 - [Remote access](./user/remote-access.md)
