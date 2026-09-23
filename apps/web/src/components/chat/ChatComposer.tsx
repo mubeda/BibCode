@@ -12,6 +12,7 @@ import type {
   ThreadId,
   TurnId,
 } from "@bibcode/contracts";
+import { isSteerQueuedMessageShortcut } from "../../keybindings";
 import {
   ProviderDriverKind,
   ProviderInstanceId,
@@ -251,8 +252,8 @@ const ComposerFooterModeControls = memo(function ComposerFooterModeControls(prop
               props.interactionModeAvailability.state === "supported"
                 ? props.interactionMode === "plan"
                   ? ACTIVE_CONTROL_CLASSNAME
-                  : "text-muted-foreground/70 hover:text-foreground/80"
-                : "border border-input bg-background text-muted-foreground/70",
+                  : "text-muted-foreground hover:text-foreground/80"
+                : "border border-input bg-background text-muted-foreground",
             )}
             size="sm"
             type="button"
@@ -348,7 +349,7 @@ const ComposerFooterModeControls = memo(function ComposerFooterModeControls(prop
                     "shrink-0 whitespace-nowrap px-2 sm:px-3",
                     props.planSidebarOpen
                       ? ACTIVE_CONTROL_CLASSNAME
-                      : "text-muted-foreground/70 hover:text-foreground/80",
+                      : "text-muted-foreground hover:text-foreground/80",
                   )}
                   size="sm"
                   type="button"
@@ -422,7 +423,7 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
         <TooltipPopup side="top">Attach files</TooltipPopup>
       </Tooltip>
       {props.isPreparingWorktree ? (
-        <span className="text-muted-foreground/70 text-xs">Preparing worktree...</span>
+        <span className="text-muted-foreground text-xs">Preparing worktree...</span>
       ) : null}
       <McpStatusPopover supported={props.supportsMcpStatus} snapshot={props.activeMcpStatus} />
       {props.showContextWindowMeter ? (
@@ -586,6 +587,7 @@ export interface ChatComposerProps {
   // Callbacks
   onSend: (e?: { preventDefault: () => void }) => void;
   onInterrupt: () => void;
+  onSteerQueuedMessage?: () => void;
   onImplementPlanInNewThread: () => void;
   onRespondToApproval: (
     requestId: ApprovalRequestId,
@@ -674,6 +676,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     composerElementContextsRef,
     onSend,
     onInterrupt,
+    onSteerQueuedMessage,
     onImplementPlanInNewThread,
     onRespondToApproval,
     onSelectActivePendingUserInputOption,
@@ -1852,6 +1855,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     key: "ArrowDown" | "ArrowUp" | "Enter" | "Tab",
     event: KeyboardEvent,
   ) => {
+    if (isSteerQueuedMessageShortcut(event, keybindings, { context: { editableFocus: true } })) {
+      event.preventDefault();
+      if (!isProviderBindingConflicted) onSteerQueuedMessage?.();
+      return true;
+    }
     if (isProviderBindingConflicted) return true;
     if (key === "Tab" && event.shiftKey) {
       toggleInteractionMode();
@@ -2335,7 +2343,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                       "min-w-0 flex-1 truncate bg-transparent py-1.5 text-left text-sm",
                       activePendingProgress?.customAnswer
                         ? "text-foreground"
-                        : "text-muted-foreground/60",
+                        : "text-muted-foreground",
                       !activePendingProgress?.activeQuestion?.multiSelect && "px-3 py-2",
                     )}
                     onPointerDown={(event) => event.preventDefault()}
@@ -2376,7 +2384,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                   "min-w-0 flex-1 truncate bg-transparent p-0 text-left text-[14px] focus:outline-none",
                   (activePendingProgress ? activePendingProgress.customAnswer : prompt.trim())
                     ? "text-foreground"
-                    : "text-muted-foreground/35",
+                    : "text-muted-foreground",
                 )}
                 onPointerDown={(event) => event.preventDefault()}
                 onClick={expandMobileComposer}
@@ -2523,7 +2531,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                               />
                             </button>
                           ) : (
-                            <div className="flex h-full w-full items-center justify-center px-1 text-center text-[10px] text-muted-foreground/70">
+                            <div className="flex h-full w-full items-center justify-center px-1 text-center text-xs text-muted-foreground">
                               {attachment.name}
                             </div>
                           )}
@@ -2568,7 +2576,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                           <FileIcon className="size-4 shrink-0 text-muted-foreground" />
                           <div className="min-w-0">
                             <p className="truncate text-xs text-foreground">{attachment.name}</p>
-                            <p className="text-[10px] text-muted-foreground">
+                            <p className="text-xs text-muted-foreground">
                               {formatBytes(attachment.sizeBytes)}
                             </p>
                           </div>

@@ -48,25 +48,41 @@ if [[ -z "$appdir" || ! -d "$appdir" ]]; then
   exit 1
 fi
 
-shopt -s nullglob
-library_roots=("$appdir"/usr/lib*)
-if ((${#library_roots[@]} == 0)); then
-  exit 0
+gtk_hook="$appdir/apprun-hooks/linuxdeploy-plugin-gtk.sh"
+if [[ ! -f "$gtk_hook" ]]; then
+  printf 'BiBCode AppImage packaging error: missing GTK AppRun hook: %s\n' \
+    "$gtk_hook" >&2
+  exit 1
 fi
 
-find "${library_roots[@]}" \
-  \( -type f -o -type l \) \
-  -name 'libwayland-client.so*' \
-  -delete
+# Validate the pinned upstream hook before changing any AppDir contents.
+backend_line_count="$(grep -c '^export GDK_BACKEND=x11' "$gtk_hook" || true)"
+if [[ "$backend_line_count" != 1 ]]; then
+  printf 'BiBCode AppImage packaging error: expected exactly one export GDK_BACKEND=x11 line in %s; found %s.\n' \
+    "$gtk_hook" "$backend_line_count" >&2
+  exit 1
+fi
 
-remaining_library="$(
+shopt -s nullglob
+library_roots=("$appdir"/usr/lib*)
+if ((${#library_roots[@]} > 0)); then
   find "${library_roots[@]}" \
     \( -type f -o -type l \) \
     -name 'libwayland-client.so*' \
-    -print -quit
-)"
-if [[ -n "$remaining_library" ]]; then
-  printf 'BiBCode AppImage packaging error: failed to remove bundled Wayland client: %s\n' \
-    "$remaining_library" >&2
-  exit 1
+    -delete
+
+  remaining_library="$(
+    find "${library_roots[@]}" \
+      \( -type f -o -type l \) \
+      -name 'libwayland-client.so*' \
+      -print -quit
+  )"
+  if [[ -n "$remaining_library" ]]; then
+    printf 'BiBCode AppImage packaging error: failed to remove bundled Wayland client: %s\n' \
+      "$remaining_library" >&2
+    exit 1
+  fi
 fi
+
+sed -i 's/^export GDK_BACKEND=x11.*/export GDK_BACKEND="${BIBCODE_GDK_BACKEND:-wayland,x11}"/' \
+  "$gtk_hook"

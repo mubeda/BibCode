@@ -1,0 +1,14 @@
+{
+  "_tag": "Request",
+  "id": "900719925474099312345",
+  "tag": "orchestration.dispatchCommand",
+  "payload": {
+    "type": "thread.turn-delivery.resolve",
+    "commandId": "queue-command-1",
+    "threadId": "thread-1",
+    "messageId": "message-1",
+    "action": "cancel",
+    "createdAt": "2026-09-22T12:00:00.000Z"
+  },
+  "headers": []
+}

@@ -39,6 +39,18 @@ const baseProviderSnapshot = {
 };
 
 describe("ServerProvider", () => {
+  it("keeps older snapshots compatible with the optional turn-steer capability", () => {
+    expect(decodeServerProvider(baseProviderSnapshot).supportsTurnSteer).toBeUndefined();
+    for (const supportsTurnSteer of [true, false]) {
+      expect(
+        decodeServerProvider({ ...baseProviderSnapshot, supportsTurnSteer }).supportsTurnSteer,
+      ).toBe(supportsTurnSteer);
+    }
+    expect(() =>
+      decodeServerProvider({ ...baseProviderSnapshot, supportsTurnSteer: "true" }),
+    ).toThrow();
+  });
+
   it("defaults capability arrays when decoding provider snapshots", () => {
     const parsed = decodeServerProvider({
       instanceId: "codex",

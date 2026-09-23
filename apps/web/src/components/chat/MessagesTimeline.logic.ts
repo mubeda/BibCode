@@ -8,6 +8,7 @@ import {
 } from "../../session-logic";
 import { type ChatMessage, type ProposedPlan, type TurnDiffSummary } from "../../types";
 import { type MessageId, type OrchestrationLatestTurn, type TurnId } from "@bibcode/contracts";
+import { isQueuedTimelineMessage, type QueuedCardStatus } from "../ChatView.logic";
 
 export const MAX_VISIBLE_WORK_LOG_ENTRIES = 1;
 export const TIMELINE_MINIMAP_ITEM_SPACING = 8;
@@ -95,6 +96,14 @@ export type TimelineLatestTurn = Pick<
 >;
 
 export type MessagesTimelineRow =
+  | {
+      kind: "queued-message";
+      id: string;
+      createdAt: string;
+      message: ChatMessage;
+      isHead: boolean;
+      status: QueuedCardStatus;
+    }
   | {
       kind: "work";
       id: string;
@@ -278,6 +287,13 @@ function deriveTurnFolds(input: {
   let pendingUserBoundary: string | null = null;
   for (const entry of input.timelineEntries) {
     if (entry.kind === "message" && entry.message.role === "user") {
+      const existingGroup = entry.message.turnId
+        ? groupsByTurnId.get(entry.message.turnId)
+        : undefined;
+      if (existingGroup) {
+        existingGroup.entries.push(entry);
+        continue;
+      }
       pendingUserBoundary = entry.message.createdAt;
       continue;
     }
@@ -377,6 +393,8 @@ function deriveTurnFolds(input: {
 
 export function deriveMessagesTimelineRows(input: {
   timelineEntries: ReadonlyArray<TimelineEntry>;
+  queuedMessages?: ReadonlyArray<ChatMessage>;
+  queuedStatuses?: ReadonlyArray<QueuedCardStatus>;
   latestTurn?: TimelineLatestTurn | null;
   runningTurnId?: TurnId | null;
   expandedTurnIds?: ReadonlySet<TurnId>;
@@ -386,17 +404,20 @@ export function deriveMessagesTimelineRows(input: {
   turnDiffSummaryByAssistantMessageId: ReadonlyMap<MessageId, TurnDiffSummary>;
   revertTurnCountByUserMessageId: ReadonlyMap<MessageId, number>;
 }): MessagesTimelineRow[] {
+  const timelineEntries = input.timelineEntries.filter(
+    (entry) => entry.kind !== "message" || !isQueuedTimelineMessage(entry.message),
+  );
   const nextRows: MessagesTimelineRow[] = [];
   const durationStartByMessageId = computeMessageDurationStart(
-    input.timelineEntries.flatMap((entry) => (entry.kind === "message" ? [entry.message] : [])),
+    timelineEntries.flatMap((entry) => (entry.kind === "message" ? [entry.message] : [])),
   );
-  const terminalAssistantMessageIds = deriveTerminalAssistantMessageIds(input.timelineEntries);
+  const terminalAssistantMessageIds = deriveTerminalAssistantMessageIds(timelineEntries);
   const unsettledTurnId = deriveUnsettledTurnId(
     input.latestTurn ?? null,
     input.runningTurnId ?? null,
   );
   const foldsByAnchorEntryId = deriveTurnFolds({
-    timelineEntries: input.timelineEntries,
+    timelineEntries,
     terminalAssistantMessageIds,
     latestTurn: input.latestTurn ?? null,
     unsettledTurnId,
@@ -410,8 +431,8 @@ export function deriveMessagesTimelineRows(input: {
     }
   }
 
-  for (let index = 0; index < input.timelineEntries.length; index += 1) {
-    const timelineEntry = input.timelineEntries[index];
+  for (let index = 0; index < timelineEntries.length; index += 1) {
+    const timelineEntry = timelineEntries[index];
     if (!timelineEntry) {
       continue;
     }
@@ -435,8 +456,8 @@ export function deriveMessagesTimelineRows(input: {
     if (timelineEntry.kind === "work") {
       const groupedEntries = [timelineEntry.entry];
       let cursor = index + 1;
-      while (cursor < input.timelineEntries.length) {
-        const nextEntry = input.timelineEntries[cursor];
+      while (cursor < timelineEntries.length) {
+        const nextEntry = timelineEntries[cursor];
         if (
           !nextEntry ||
           nextEntry.kind !== "work" ||
@@ -539,7 +560,7 @@ export function deriveMessagesTimelineRows(input: {
   if (input.isWorking) {
     const answerDelivered =
       unsettledTurnId !== null &&
-      input.timelineEntries.some(
+      timelineEntries.some(
         (entry) =>
           entry.kind === "message" &&
           entry.message.role === "assistant" &&
@@ -555,6 +576,18 @@ export function deriveMessagesTimelineRows(input: {
     });
   }
 
+  for (const [index, message] of (input.queuedMessages ?? []).entries()) {
+    const status = input.queuedStatuses?.[index];
+    if (!status) continue;
+    nextRows.push({
+      kind: "queued-message",
+      id: `queued-message:${message.id}`,
+      createdAt: message.createdAt,
+      message,
+      isHead: index === 0,
+      status,
+    });
+  }
   return nextRows;
 }
 
@@ -583,6 +616,12 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
   if (a.kind !== b.kind || a.id !== b.id) return false;
 
   switch (a.kind) {
+    case "queued-message": {
+      const bq = b as typeof a;
+      return (
+        a.message === bq.message && a.isHead === bq.isHead && Equal.equals(a.status, bq.status)
+      );
+    }
     case "working": {
       const bw = b as typeof a;
       return a.createdAt === bw.createdAt && a.answerDelivered === bw.answerDelivered;

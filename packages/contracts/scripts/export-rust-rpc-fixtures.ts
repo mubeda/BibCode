@@ -16,7 +16,11 @@ import {
   ActivityCancelSubtreeInput,
   ActivityRetrySubtreeCancellationInput,
 } from "../src/activity.ts";
-import { OrchestrationEvent, ORCHESTRATION_WS_METHODS } from "../src/orchestration.ts";
+import {
+  ClientOrchestrationCommand,
+  OrchestrationEvent,
+  ORCHESTRATION_WS_METHODS,
+} from "../src/orchestration.ts";
 import { WS_METHODS, WsRpcGroup } from "../src/rpc.ts";
 import {
   ServerProcessDiagnosticsResult,
@@ -689,6 +693,110 @@ dynamicFixtures.set(
     headers: [],
   } satisfies RpcMessage.RequestEncoded),
 );
+const queueCommandFields = {
+  commandId: "queue-command-1",
+  threadId: "thread-1",
+  createdAt: "2026-09-22T12:00:00.000Z",
+};
+const queueCommands = [
+  {
+    ...queueCommandFields,
+    type: "thread.turn.start",
+    queued: true,
+    message: { messageId: "message-1", role: "user", text: "next task", attachments: [] },
+    runtimeMode: "full-access",
+    interactionMode: "default",
+  },
+  { ...queueCommandFields, type: "thread.turn.steer", messageId: "message-1" },
+  { ...queueCommandFields, type: "thread.turn.promote", messageId: "message-1" },
+  {
+    ...queueCommandFields,
+    type: "thread.turn-delivery.resolve",
+    messageId: "message-1",
+    action: "cancel",
+  },
+];
+for (const command of queueCommands) {
+  dynamicFixtures.set(
+    `contract-shapes/orchestration__${command.type.replaceAll(".", "__")}-request.json`,
+    serializeWireFixture({
+      _tag: "Request",
+      id: requestId,
+      tag: ORCHESTRATION_WS_METHODS.dispatchCommand,
+      payload: compileUnknownEncoder(ClientOrchestrationCommand)(command),
+      headers: [],
+    } satisfies RpcMessage.RequestEncoded),
+  );
+}
+const queueEventPayload = {
+  threadId: "thread-1",
+  messageId: "message-1",
+  updatedAt: queueCommandFields.createdAt,
+};
+const queueEvents = {
+  "steer-requested": {
+    type: "thread.turn-steer-requested",
+    payload: {
+      threadId: "thread-1",
+      messageId: "message-1",
+      turnId: "turn-1",
+      createdAt: queueCommandFields.createdAt,
+    },
+  },
+  "delivery-held": {
+    type: "thread.turn-delivery-updated",
+    payload: {
+      ...queueEventPayload,
+      delivery: { state: "queued", provider: "codex", mode: "start", held: true },
+      held: true,
+      mode: "start",
+    },
+  },
+  "delivery-steered": {
+    type: "thread.turn-delivery-updated",
+    payload: {
+      ...queueEventPayload,
+      delivery: { state: "delivered", provider: "codex", mode: "steer", held: false },
+      turnId: "turn-1",
+      held: false,
+      mode: "steer",
+    },
+  },
+  "delivery-withdrawn": {
+    type: "thread.turn-delivery-updated",
+    payload: {
+      ...queueEventPayload,
+      delivery: { state: "dismissed", provider: "codex" },
+      withdrawn: true,
+    },
+  },
+};
+for (const [name, event] of Object.entries(queueEvents)) {
+  dynamicFixtures.set(
+    `contract-shapes/orchestration__${name}-event.json`,
+    serializeWireFixture({
+      _tag: "Exit",
+      requestId,
+      exit: {
+        _tag: "Success",
+        value: [
+          compileUnknownEncoder(OrchestrationEvent)({
+            sequence: 1,
+            eventId: "queue-event-1",
+            aggregateKind: "thread",
+            aggregateId: "thread-1",
+            occurredAt: queueCommandFields.createdAt,
+            commandId: queueCommandFields.commandId,
+            causationEventId: null,
+            correlationId: null,
+            metadata: {},
+            ...event,
+          }),
+        ],
+      },
+    } satisfies RpcMessage.ResponseExitEncoded),
+  );
+}
 const schemaFingerprints: Record<string, string> = {};
 const streamShapeFixtures: Array<string> = [];
 const typedFailureFixtures: Array<string> = [];
@@ -770,8 +878,8 @@ if (streamShapeFixtures.length !== topLevelStreamShapeCount) {
 if (typedFailureFixtures.length !== 288) {
   throw new Error(`Expected 288 typed failure fixtures, found ${typedFailureFixtures.length}.`);
 }
-if (orchestrationEventShapeCount !== 23) {
-  throw new Error(`Expected 23 orchestration event shapes, found ${orchestrationEventShapeCount}.`);
+if (orchestrationEventShapeCount !== 24) {
+  throw new Error(`Expected 24 orchestration event shapes, found ${orchestrationEventShapeCount}.`);
 }
 const expectedStale = ["projects.add", "projects.list", "projects.remove"];
 if (JSON.stringify(staleMethodIdentifiers) !== JSON.stringify(expectedStale)) {
@@ -832,3 +940,24 @@ if (formatResult.error !== undefined) {
 if (formatResult.status !== 0) {
   throw new Error(`Failed to format RPC fixtures (exit ${formatResult.status ?? "unknown"}).`);
 }
+
+process.stdout.write(
+  JSON.stringify(
+    {
+      rpcMethods: methods.length,
+      streamMethods: streamMethodCount,
+      topLevelStreamShapes: topLevelStreamShapeCount,
+      orchestrationEventShapes: orchestrationEventShapeCount,
+      streamShapeFixtures: streamShapeFixtures.length,
+      typedFailureFixtures: typedFailureFixtures.length,
+      contractShapeFixtures: [...dynamicFixtures.keys()].filter((path) =>
+        path.startsWith("contract-shapes/"),
+      ).length,
+      fixtures: Object.keys(fixtures).length + dynamicFixtures.size,
+      schemaFingerprints: Object.keys(schemaFingerprints).length,
+      staleMethodIdentifiers: staleMethodIdentifiers.length,
+    },
+    null,
+    2,
+  ) + "\n",
+);

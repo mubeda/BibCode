@@ -1227,14 +1227,43 @@ sequenceDiagram
   participant Delivery as TurnDeliveryService
   participant Provider as ProviderRuntimeSupervisor
 
-  UI->>RPC: orchestration.dispatchCommand
+  UI->>RPC: thread.turn.start
   RPC->>Engine: validate and admit command
+  alt queued requested while session is running or starting
+    Engine->>Engine: persist user message and queued/start outbox row
+    Note over Engine,Delivery: queued rows create no turn or Working state
+  else ordinary start
+    Engine->>Delivery: pending/start delivery
+    Delivery->>Provider: provider-native turn start
+  end
   Engine-->>RPC: durable command result
   RPC-->>UI: typed Exit
-  Engine->>Delivery: admitted turn
-  Delivery->>Provider: provider-native delivery
-  Provider->>Engine: canonical runtime event
-  Engine-->>UI: subscribeThread / subscribeShell chunks
+  Engine-->>UI: subscribeThread / subscribeShell snapshots
+
+  opt Steer queued head while running, with provider capability
+    UI->>RPC: thread.turn.steer(messageId)
+    RPC->>Engine: validate head and active turn
+    Engine->>Delivery: pending/steer with expected turn ID
+    Delivery->>Provider: ProviderDriver.steer
+    alt provider acknowledges input
+      Provider->>Engine: delivered with runtime turn ID
+      Engine-->>UI: user message belongs to that turn
+    else definite rejection or unavailable turn
+      Provider->>Engine: return to queued/start with delivery.detail
+    end
+  end
+
+  Provider->>Engine: canonical turn settle
+  alt ready, unheld head, no pending approval/question or delivery
+    Engine->>Delivery: wake after committed ready
+    Delivery->>Engine: thread.turn.promote(oldest messageId)
+    Engine->>Engine: stamp promotion time and persist pending/start
+    Engine->>Delivery: one promoted turn
+    Delivery->>Provider: provider-native turn start
+  else interrupted or error
+    Engine->>Engine: hold queued rows until explicit Send now
+  end
+  Engine-->>UI: durable turn, delivery and queue updates
 ```
 
 Unary command acceptance is not a promise that an external provider process
@@ -1262,6 +1291,142 @@ and therefore cleared — by every later transition to pending, delivered or
 dismissed. Deriving it keeps the projection owner unchanged: no delivery
 component writes the provider session, and the field never alters session
 `status`, provider identity, runtime mode, the active turn, or any turn row.
+
+### Durable message queue
+
+The server owns the queue through durable outbox rows and projected user
+messages. Delivery metadata includes state `queued`, optional `mode` (`start`
+or `steer`, absent means `start`), and optional `held`. Turn-start commands accept an
+optional boolean `queued`; steer and promote commands address an existing
+message by `threadId` and `messageId`. Promote is available to both client and
+internal callers. Delivery resolution recognizes `cancel`. Provider snapshots
+may advertise `supportsTurnSteer`; omission does not advertise support.
+
+The client runtime exposes steer/promote commands through the existing typed
+RPC and serial per-thread command scheduler. A `thread.turn-steer-requested`
+event marks the existing message's delivery pending with mode `steer` without
+changing the session or latest turn. Delivery updates replace delivery data,
+apply optional `held`/`mode` payload overrides, bind an optional `turnId`, and
+remove the addressed message when `withdrawn` is true. Missing messages are
+not recreated by these updates.
+
+The web composer requests queued admission while a turn is running, the
+session is starting, or an earlier non-queued start delivery remains pending or
+sending. It decides this before the local dispatch/busy guard and creates no
+new local dispatch or optimistic message for the enqueue. The request-in-flight,
+provider-conflict, workspace, and environment guards still apply.
+Cards derive from the thread snapshot in its durable FIFO order, after the
+working indicator; queued messages and pending/sending steers are excluded from
+normal message rows and busy delivery state. Once delivered, a steered user
+message belongs to its attributed turn, including that turn's fold.
+
+Only the head can steer, using the bound provider instance's advertised
+capability. Held heads and non-running sessions offer Send now; it waits for
+running/starting sessions and pending approvals/questions to clear. Cancel
+withdraws through the existing command and restores text to the cancelling
+client's current draft. A session-local file cache holds only locally enqueued
+Files; missing files and attachment-limit overflow are reported. Stop cancels
+and restores queued messages head to tail before interrupting, continuing past
+individual cancellation failures. Failed queue actions remain visible on the
+card. The composer consumes the configured steer shortcut before submit,
+menu selection, or Shift+Enter newline handling.
+
+Queue admission and delivery are owned by the Rust server. Admission resolves
+`queued: true` against the projected session: running or starting retains the
+flag and persists a queued outbox row; other states rewrite it to false and use
+normal pending delivery. The original request digest still owns command replay.
+Admission stores the model selection even when the request omitted it, together
+with the turn's modes and provider route. Queued admission records the user
+message and complete delivery metadata without a turn-start event, pending turn,
+or session-status change.
+
+The outbox persists `queued`, delivery `mode`, and `held` alongside the original
+command receipt and payload. The message projection stores delivery state, mode
+and hold metadata for snapshots and event replay; it is a view of the outbox,
+which remains the queue's source of truth.
+
+The delivery worker examines the oldest queued row per thread before filling
+its available slots. Queue FIFO uses the original command receipt's durable
+result sequence, so equal client timestamps or clock skew cannot reorder
+admitted messages. Thread snapshots retain that same order for queued messages;
+clients rendering queue cards preserve it instead of sorting their timestamps.
+
+Automatic promotion requires an unheld head, a ready session, no pending/sending
+delivery, no running projected turn, and no pending approval or user-input
+request. The gate reads approvals and the latest durable user-input activity
+for each request, rather than the thread summary's input counter. A running
+turn placeholder continues to block the next promotion after provider acceptance
+releases the worker slot, until the provider's running and ready cycle settles
+that turn. An unbound placeholder for a delivery dismissed while pending or
+failed does not block promotion; resolution metadata records that prior state
+so a rejected head can be dismissed without stranding its tail. Dismissal of
+sending or uncertain work does not prove the provider received nothing, so
+those placeholders and bound running turns continue to block automatic
+promotion. Explicit Send now remains available under its client gate.
+
+Pending start deliveries from older clients also wait while the session is
+running or starting; the SQLite claim repeats this check so a stale worker read
+cannot claim through it.
+
+`ThreadTurnPromote` reconstructs the normal turn-start event from the stored
+payload, clears that row's hold, and moves it to pending in the same transaction
+as the start/delivery events and projections. It rechecks eligibility inside
+that transaction. Server-originated promotions use the existing `server:`
+command-id convention and require the automatic gate. Client **Send now** may
+promote the head when the session is neither running nor starting and no
+pending/sending row exists, including a held head. It clears only that hold.
+The delivery service registers its existing `Arc<Notify>` with the engine;
+after committed ready, steer, promote, resolve, and relevant request-resolution
+commands, the engine wakes the worker without retaining the service itself.
+The event's `createdAt` is the promote command's time. Its message projector
+stamps the addressed user message's `created_at` and `updated_at` to that time
+in the same transaction, so the promoted prompt appears after the preceding
+turn's later reply. Replay and the client reducer apply that event time as well.
+Still-queued rows retain their enqueue timestamps and durable receipt FIFO;
+steering emits no turn-start event and preserves the message's enqueue time.
+
+Interrupt requests and error/interrupted session updates atomically hold every
+queued row and emit a complete delivery update per message. A later ready event preserves
+those holds. Cancelling accepts only queued rows: the row becomes dismissed,
+the delivery event carries `withdrawn: true`, and its projector deletes only
+the addressed message. The row and original payload remain durable, while
+same-command replay remains idempotent. Queued rows never enter crash
+reconciliation or provider claiming; restart preserves their queued state and
+payload until an eligible promotion or explicit user action. Before delivery
+starts, startup reconciles abandoned live runtime rows and every projected
+session still starting, connecting, or running without a live runtime row,
+including rows removed by graceful shutdown. It settles the abandoned turn's
+streaming assistant messages, clears the active turn, and projects the existing
+restart error as `transport_error`. That error settlement holds queued messages
+for explicit **Send now** and releases the pending-start claim gate. Completed
+reconciliation does not dispatch again on a later startup; ready/idle/stopped
+projections without live runtimes retain their existing state.
+
+`ThreadTurnSteer` validates the queued head, a running session with an active
+turn, and the driver-owned capability shared with inventory. It atomically
+moves the row to pending/steer, clears its hold, and emits
+`thread.turn-steer-requested { turnId }` plus a complete nested delivery update.
+It creates no turn-start event or pending turn and never changes session state.
+The requested turn ID remains durable in that event; delivery rechecks it against
+the active session instead of retargeting a newer turn.
+
+The existing provider supervisor preserves frozen route/session identity and
+per-thread serialization while dispatching `ProviderDriver::steer`. It does not
+reconfigure or launch a replacement runtime for steering. Acceptance sets the
+message's `turn_id` through delivery-updated `turnId`; it does not restore running
+state if the turn settled while acknowledgement was in flight. A stale/settled
+turn or definite rejection atomically returns the row to queued/start, resets
+attempts, retains the reason in `delivery.detail`, and wakes normal promotion. Other outcomes retain
+the existing retry/uncertain behavior. A target lookup failure after claim is
+known not sent and returns to pending, so transient database failures cannot
+strand a newly claimed steer in sending.
+
+Interrupt, error and provider-reported interrupted updates also latch the hold
+on pending/sending steer rows. Their delivery updates retain the actual state;
+if steering is then rejected, the requeued message stays held even after ready.
+Recovery applies each driver's existing crash truth table to steer rows. Codex
+reconciles the same delivery key and uses the requested turn event for attribution
+when acceptance was lost; Claude sending rows become uncertain.
 
 ### Assistant message identity
 
@@ -1557,6 +1722,24 @@ replacement that now occupies the old path.
 
 ## Invariants
 
+- The server owns one durable FIFO per thread. Reloads, disconnects, and server
+  restarts preserve queued rows in order; queued rows never become uncertain
+  merely because the server restarted.
+- Queued messages never look like work: no turn-start event, pending turn,
+  session-status change, or sidebar Working state is created by enqueueing.
+- Automatic promotion sends only the oldest unheld message into a `ready`
+  session, with no outstanding approval, question, or active delivery. Interrupt
+  and error settles hold queued rows; a later ready event does not clear holds.
+- Promotion snapshots no new user choices: the enqueued model and modes are
+  retained, while the message timestamp becomes the promotion time.
+- Steering uses the provider's native operation and attributes the message to
+  its runtime turn without starting a second BiBCode turn. Codex preserves the
+  active turn ID; Claude attributes its matching echo to the runtime turn
+  current when that echo arrives.
+- Cancel never discards user text. It withdraws the queued message and restores
+  it to the cancelling client's draft. Stop drains queued text in FIFO order
+  before interrupting; unavailable attachments and failed cancellations remain
+  visible to the user.
 - Contracts define the wire; server and client fixtures guard compatibility.
 - One connection supervisor owns reconnects. The Effect RPC protocol does not
   retry sockets independently.

@@ -9,6 +9,15 @@ import { afterEach, describe, expect, it } from "vite-plus/test";
 const REPOSITORY_ROOT = NodePath.resolve(import.meta.dirname, "..");
 const WRAPPER_SOURCE = NodePath.join(REPOSITORY_ROOT, "scripts/tauri/linuxdeploy-plugin-gtk.sh");
 const UPSTREAM_FILENAME = "bibcode-linuxdeploy-gtk-upstream.sh";
+const UPSTREAM_BACKEND_LINE =
+  "export GDK_BACKEND=x11 # Crash with Wayland backend on Wayland - https://github.com/tauri-apps/tauri/issues/8541";
+const BACKEND_LINE = 'export GDK_BACKEND="${BIBCODE_GDK_BACKEND:-wayland,x11}"';
+const UPSTREAM_HOOK = `#!/usr/bin/env bash
+export GTK_DATA_PREFIX="$APPDIR/usr"
+${UPSTREAM_BACKEND_LINE}
+
+export GTK_THEME="Adwaita"
+`;
 const temporaryDirectories: Array<string> = [];
 
 function makeToolDirectory(): string {
@@ -68,6 +77,9 @@ mkdir -p "$appdir/usr/lib/x86_64-linux-gnu"
 printf 'bundled wayland' > "$appdir/usr/lib/x86_64-linux-gnu/libwayland-client.so.0"
 ln -s libwayland-client.so.0 "$appdir/usr/lib/x86_64-linux-gnu/libwayland-client.so"
 printf 'keep me' > "$appdir/usr/lib/x86_64-linux-gnu/libunrelated.so.1"
+mkdir -p "$appdir/apprun-hooks"
+cat > "$appdir/apprun-hooks/linuxdeploy-plugin-gtk.sh" <<'HOOK'
+${UPSTREAM_HOOK}HOOK
 `,
       );
       const appdirArguments =
@@ -102,8 +114,86 @@ printf 'keep me' > "$appdir/usr/lib/x86_64-linux-gnu/libunrelated.so.1"
           "utf8",
         ),
       ).toBe("keep me");
+      const hook = NodeFS.readFileSync(
+        NodePath.join(appDirectory, "apprun-hooks/linuxdeploy-plugin-gtk.sh"),
+        "utf8",
+      );
+      expect(hook.split("\n").filter((line) => line === BACKEND_LINE)).toHaveLength(1);
+      expect(hook).toBe(UPSTREAM_HOOK.replace(UPSTREAM_BACKEND_LINE, BACKEND_LINE));
     },
   );
+
+  it("rewrites the hook even when the AppDir has no library directories", () => {
+    const toolDirectory = makeToolDirectory();
+    const appDirectory = NodePath.join(toolDirectory, "BiBCode.AppDir");
+    const hookPath = NodePath.join(appDirectory, "apprun-hooks/linuxdeploy-plugin-gtk.sh");
+    NodeFS.mkdirSync(NodePath.dirname(hookPath), { recursive: true });
+    NodeFS.writeFileSync(hookPath, UPSTREAM_HOOK);
+    writeUpstream(toolDirectory, "#!/usr/bin/env bash\nexit 0\n");
+
+    const result = NodeChildProcess.spawnSync(
+      NodePath.join(toolDirectory, "linuxdeploy-plugin-gtk.sh"),
+      ["--appdir", appDirectory],
+      { encoding: "utf8" },
+    );
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(NodeFS.readFileSync(hookPath, "utf8")).toBe(
+      UPSTREAM_HOOK.replace(UPSTREAM_BACKEND_LINE, BACKEND_LINE),
+    );
+  });
+
+  it.each([
+    { name: "missing", hook: undefined, diagnostic: "missing GTK AppRun hook" },
+    {
+      name: "without the X11 export",
+      hook: UPSTREAM_HOOK.replace(UPSTREAM_BACKEND_LINE, "# No backend override"),
+      diagnostic: "found 0",
+    },
+    {
+      name: "with duplicate X11 exports",
+      hook: `${UPSTREAM_HOOK}${UPSTREAM_BACKEND_LINE}\n`,
+      diagnostic: "found 2",
+    },
+  ])("rejects a hook $name without mutating the AppDir", ({ hook, diagnostic }) => {
+    const toolDirectory = makeToolDirectory();
+    const appDirectory = NodePath.join(toolDirectory, "BiBCode.AppDir");
+    const hookPath = NodePath.join(appDirectory, "apprun-hooks/linuxdeploy-plugin-gtk.sh");
+    const libraryDirectory = NodePath.join(appDirectory, "usr/lib");
+    NodeFS.mkdirSync(libraryDirectory, { recursive: true });
+    NodeFS.writeFileSync(NodePath.join(libraryDirectory, "libwayland-client.so.0"), "preexisting");
+    NodeFS.symlinkSync(
+      "libwayland-client.so.0",
+      NodePath.join(libraryDirectory, "libwayland-client.so"),
+    );
+    NodeFS.writeFileSync(NodePath.join(libraryDirectory, "libunrelated.so.1"), "keep me");
+    NodeFS.mkdirSync(NodePath.dirname(hookPath), { recursive: true });
+    if (hook !== undefined) NodeFS.writeFileSync(hookPath, hook);
+    writeUpstream(toolDirectory, "#!/usr/bin/env bash\nexit 0\n");
+    const entriesBefore = NodeFS.readdirSync(appDirectory, { recursive: true }).sort();
+
+    const result = NodeChildProcess.spawnSync(
+      NodePath.join(toolDirectory, "linuxdeploy-plugin-gtk.sh"),
+      ["--appdir", appDirectory],
+      { encoding: "utf8" },
+    );
+
+    expect(result.status, result.stderr).toBe(1);
+    expect(result.stderr).toContain("BiBCode AppImage packaging error");
+    expect(result.stderr).toContain(diagnostic);
+    expect(result.stderr).toContain(hookPath);
+    expect(NodeFS.readdirSync(appDirectory, { recursive: true }).sort()).toEqual(entriesBefore);
+    expect(
+      NodeFS.readFileSync(NodePath.join(libraryDirectory, "libwayland-client.so.0"), "utf8"),
+    ).toBe("preexisting");
+    expect(NodeFS.readlinkSync(NodePath.join(libraryDirectory, "libwayland-client.so"))).toBe(
+      "libwayland-client.so.0",
+    );
+    expect(NodeFS.readFileSync(NodePath.join(libraryDirectory, "libunrelated.so.1"), "utf8")).toBe(
+      "keep me",
+    );
+    if (hook !== undefined) expect(NodeFS.readFileSync(hookPath, "utf8")).toBe(hook);
+  });
 
   it("preserves plugin discovery output when no AppDir argument is present", () => {
     const toolDirectory = makeToolDirectory();

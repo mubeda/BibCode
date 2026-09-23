@@ -1,3 +1,5 @@
+import { QueuedMessageTimelineRow } from "./QueuedMessageTimelineRow";
+import type { QueuedCardStatus } from "../ChatView.logic";
 import {
   type EnvironmentId,
   type MessageId,
@@ -135,6 +137,11 @@ interface TimelineRowSharedState {
   onRevertUserMessage: (messageId: MessageId) => void;
   onResolveTurnDelivery: (messageId: MessageId, action: TurnDeliveryResolutionAction) => void;
   resolvingTurnDeliveryMessageId: MessageId | null;
+  onSteerQueuedMessage: (messageId: MessageId) => void;
+  onSendNowQueuedMessage: (messageId: MessageId) => void;
+  onCancelQueuedMessage: (messageId: MessageId) => void;
+  resolvingQueuedMessageId: MessageId | null;
+  queuedMessageErrors: Readonly<Record<string, string>>;
   onImageExpand: (preview: ExpandedImagePreview) => void;
   onOpenTurnDiff: (turnId: TurnId, filePath?: string) => void;
   onToggleTurnFold: (turnId: TurnId) => void;
@@ -163,6 +170,8 @@ interface MessagesTimelineProps {
   activeTurnStartedAt: string | null;
   listRef: React.RefObject<LegendListRef | null>;
   timelineEntries: ReturnType<typeof deriveTimelineEntries>;
+  queuedMessages: ReadonlyArray<TimelineMessage>;
+  queuedStatuses: ReadonlyArray<QueuedCardStatus>;
   latestTurn: TimelineLatestTurn | null;
   runningTurnId: TurnId | null;
   turnDiffSummaryByAssistantMessageId: Map<MessageId, TurnDiffSummary>;
@@ -172,6 +181,11 @@ interface MessagesTimelineProps {
   onRevertUserMessage: (messageId: MessageId) => void;
   onResolveTurnDelivery: (messageId: MessageId, action: TurnDeliveryResolutionAction) => void;
   resolvingTurnDeliveryMessageId: MessageId | null;
+  onSteerQueuedMessage: (messageId: MessageId) => void;
+  onSendNowQueuedMessage: (messageId: MessageId) => void;
+  onCancelQueuedMessage: (messageId: MessageId) => void;
+  resolvingQueuedMessageId: MessageId | null;
+  queuedMessageErrors: Readonly<Record<string, string>>;
   isRevertingCheckpoint: boolean;
   onImageExpand: (preview: ExpandedImagePreview) => void;
   activeThreadEnvironmentId: EnvironmentId;
@@ -198,6 +212,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   activeTurnStartedAt,
   listRef,
   timelineEntries,
+  queuedMessages,
+  queuedStatuses,
   latestTurn,
   runningTurnId,
   turnDiffSummaryByAssistantMessageId,
@@ -207,6 +223,11 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   onRevertUserMessage,
   onResolveTurnDelivery,
   resolvingTurnDeliveryMessageId,
+  onSteerQueuedMessage,
+  onSendNowQueuedMessage,
+  onCancelQueuedMessage,
+  resolvingQueuedMessageId,
+  queuedMessageErrors,
   isRevertingCheckpoint,
   onImageExpand,
   activeThreadEnvironmentId,
@@ -304,6 +325,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     () =>
       deriveMessagesTimelineRows({
         timelineEntries,
+        queuedMessages,
+        queuedStatuses,
         latestTurn,
         runningTurnId,
         expandedTurnIds,
@@ -315,6 +338,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       }),
     [
       timelineEntries,
+      queuedMessages,
+      queuedStatuses,
       latestTurn,
       runningTurnId,
       expandedTurnIds,
@@ -428,6 +453,11 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onRevertUserMessage,
       onResolveTurnDelivery,
       resolvingTurnDeliveryMessageId,
+      onSteerQueuedMessage,
+      onSendNowQueuedMessage,
+      onCancelQueuedMessage,
+      resolvingQueuedMessageId,
+      queuedMessageErrors,
       onImageExpand,
       onOpenTurnDiff,
       onToggleTurnFold,
@@ -444,6 +474,11 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onRevertUserMessage,
       onResolveTurnDelivery,
       resolvingTurnDeliveryMessageId,
+      onSteerQueuedMessage,
+      onSendNowQueuedMessage,
+      onCancelQueuedMessage,
+      resolvingQueuedMessageId,
+      queuedMessageErrors,
       onImageExpand,
       onOpenTurnDiff,
       onToggleTurnFold,
@@ -477,9 +512,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   if (rows.length === 0 && !isWorking) {
     return (
       <div className="flex h-full items-center justify-center">
-        <p className="text-sm text-muted-foreground/30">
-          Send a message to start the conversation.
-        </p>
+        <p className="text-sm text-muted-foreground">Send a message to start the conversation.</p>
       </div>
     );
   }
@@ -839,7 +872,37 @@ const TimelineRowContent = memo(function TimelineRowContent({ row }: { row: Time
       ) : null}
       {row.kind === "proposed-plan" ? <ProposedPlanTimelineRow row={row} /> : null}
       {row.kind === "working" ? <WorkingTimelineRow row={row} /> : null}
+      {row.kind === "queued-message" ? <QueuedTimelineRow row={row} /> : null}
     </div>
+  );
+});
+
+const QueuedTimelineRow = memo(function QueuedTimelineRow({
+  row,
+}: {
+  row: Extract<TimelineRow, { kind: "queued-message" }>;
+}) {
+  const ctx = use(TimelineRowCtx);
+  const displayed = deriveDisplayedUserMessageState(row.message.text);
+  return (
+    <QueuedMessageTimelineRow
+      message={row.message}
+      status={row.status}
+      isHead={row.isHead}
+      timestampFormat={ctx.timestampFormat}
+      resolving={ctx.resolvingQueuedMessageId === row.message.id}
+      error={ctx.queuedMessageErrors[`${ctx.routeThreadKey}:${row.message.id}`] ?? null}
+      onSteer={ctx.onSteerQueuedMessage}
+      onSendNow={ctx.onSendNowQueuedMessage}
+      onCancel={ctx.onCancelQueuedMessage}
+    >
+      <CollapsibleUserMessageBody
+        text={displayed.visibleText}
+        terminalContexts={displayed.contexts}
+        skills={ctx.skills}
+        markdownCwd={ctx.markdownCwd}
+      />
+    </QueuedMessageTimelineRow>
   );
 });
 
@@ -908,7 +971,7 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
                     />
                   </button>
                 ) : (
-                  <div className="flex min-h-[72px] items-center justify-center px-2 py-3 text-center text-[11px] text-muted-foreground/70">
+                  <div className="flex min-h-[72px] items-center justify-center px-2 py-3 text-center text-xs text-muted-foreground">
                     {image.name}
                   </div>
                 )}
@@ -1139,7 +1202,7 @@ function WorkingIndicatorIcon() {
 function WorkingTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "working" }> }) {
   return (
     <div className="py-0.5 pl-1.5">
-      <div className="flex items-center gap-2 pt-1 text-[11px] text-muted-foreground/70 tabular-nums">
+      <div className="flex items-center gap-2 pt-1 text-xs text-muted-foreground tabular-nums">
         <WorkingIndicatorIcon />
         <span>
           {row.answerDelivered
@@ -1224,9 +1287,7 @@ const WorkGroupSection = memo(function WorkGroupSection({
   return (
     <section className="-mx-1 space-y-0.5 px-1 py-0.5" aria-label={groupLabel}>
       {!onlyToolEntries && (
-        <p className="px-0.5 pb-0.5 font-medium text-[11px] text-muted-foreground/65">
-          {groupLabel}
-        </p>
+        <p className="px-0.5 pb-0.5 font-medium text-xs text-muted-foreground">{groupLabel}</p>
       )}
       <div className="space-y-px">
         {nonEmptyEntries.map((workEntry) => (
@@ -1260,7 +1321,7 @@ function WorkGroupToggleTimelineRow({
         ctx.onToggleWorkGroup(row.groupId, anchorElement);
       }}
     >
-      <span className="flex size-5 shrink-0 items-center justify-center text-muted-foreground/65">
+      <span className="flex size-5 shrink-0 items-center justify-center text-muted-foreground">
         <ChevronDownIcon
           className={cn(
             "size-3.5 shrink-0 opacity-70 transition-transform duration-200",
@@ -1536,7 +1597,7 @@ const CollapsibleUserMessageBody = memo(function CollapsibleUserMessageBody(prop
               aria-expanded={expanded}
               data-scroll-anchor-ignore
               onClick={() => setExpanded((value) => !value)}
-              className="-ml-1 h-6 rounded-md px-1.5 text-xs text-muted-foreground/72 hover:bg-muted/55 hover:text-foreground/85"
+              className="-ml-1 h-6 rounded-md px-1.5 text-xs text-muted-foreground hover:bg-muted/55 hover:text-foreground/85"
             >
               {expanded ? "Show less" : "Show full message"}
             </Button>
@@ -1730,7 +1791,7 @@ function UserMessageReviewCommentCard({ comment }: { comment: ReviewCommentConte
         <div className="text-xs font-medium text-foreground">
           {formatWorkspaceRelativePath(comment.filePath, ctx.workspaceRoot)}
         </div>
-        <div className="text-[11px] text-muted-foreground">
+        <div className="text-xs text-muted-foreground">
           {comment.sectionTitle} · {comment.rangeLabel}
         </div>
       </div>
@@ -2027,7 +2088,7 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
       : showDestructiveRowStyle
         ? "text-destructive"
         : workEntry.tone === "tool" || showFailedIndicator
-          ? "text-muted-foreground/65"
+          ? "text-muted-foreground"
           : iconConfig.className,
   );
   const headingClass = showWarningIndicator
@@ -2076,11 +2137,11 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
             <p className="flex min-w-0 w-full items-baseline gap-1.5 text-[12px] leading-5">
               <span className={cn("min-w-0 shrink truncate", headingClass)}>{heading}</span>
               {preview && (
-                <span className="min-w-0 flex-1 truncate text-muted-foreground/55">{preview}</span>
+                <span className="min-w-0 flex-1 truncate text-muted-foreground">{preview}</span>
               )}
             </p>
           </div>
-          <div className="flex shrink-0 items-center gap-px text-muted-foreground/55">
+          <div className="flex shrink-0 items-center gap-px text-muted-foreground">
             <span
               className="flex size-4 shrink-0 items-center justify-center"
               aria-hidden={!canExpand}
@@ -2145,7 +2206,7 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
           onClick={stopRowToggle}
           onPointerDown={stopRowToggle}
         >
-          <pre className="max-h-64 cursor-text overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed text-muted-foreground select-text">
+          <pre className="max-h-64 cursor-text overflow-auto whitespace-pre-wrap break-words font-mono text-xs leading-relaxed text-muted-foreground select-text">
             {expandedBody}
           </pre>
         </div>

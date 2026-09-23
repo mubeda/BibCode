@@ -677,6 +677,31 @@ WebGL without abandoning input already accepted by the scheduler. A later
 renderer retargets error presentation, while the retained writer cannot keep
 the departed renderer or its terminal buffers reachable.
 
+### Linux AppImage GTK packaging
+
+The desktop build's `beforeBuildCommand` runs
+`scripts/prepare-tauri-appimage-tools.ts`, which prepares the repository GTK
+plugin wrapper in `target/.tauri` alongside the upstream plugin pinned by URL
+and SHA-256. Linux Tauri configuration uses that project-local tools directory
+for local, release, and packaged UI builds.
+
+`scripts/tauri/linuxdeploy-plugin-gtk.sh` delegates to the pinned plugin and
+preserves discovery calls without an AppDir. After a successful deployment it
+validates that `apprun-hooks/linuxdeploy-plugin-gtk.sh` exists and contains
+exactly one line beginning `export GDK_BACKEND=x11`. A missing hook, absent
+export, or duplicate export fails packaging before post-processing changes the
+AppDir, making upstream drift visible.
+
+The wrapper removes bundled `libwayland-client.so*` files and symlinks under
+`usr/lib*` and verifies their absence, keeping the system Wayland client with
+the system Mesa/EGL stack. It then rewrites the hook's export to
+`export GDK_BACKEND="${BIBCODE_GDK_BACKEND:-wayland,x11}"`. GTK tries Wayland
+first and falls back to X11; the override is evaluated when the AppImage
+launches. `BIBCODE_GDK_BACKEND=x11` restores the previous backend selection.
+Preferring native Wayland avoids oversized rendering from integer GTK scaling
+under Xwayland on fractionally scaled Hyprland/Omarchy desktops. Both packaging
+steps run before AppImage assembly and updater signing.
+
 ### Linux webview text rendering
 
 The Linux host and the web UI share responsibility for text quality in
@@ -729,6 +754,15 @@ wrapper. Any new scrollable reading surface must add one.
 5. Orchestration commands are admitted and persisted before provider delivery.
 6. Provider runtimes translate commands to provider-native protocols and feed
    normalized events back into durable projections.
+
+Messages submitted while a turn runs enter a durable, server-owned FIFO and
+appear as queued cards without marking new work active. When the session settles
+to ready, the oldest eligible message starts the next turn with its saved model
+and modes and a new promotion timestamp. Codex and Claude support explicit
+steering through their native protocols; Cancel restores queued text to the
+cancelling client's composer, and Stop drains the queue before interrupting.
+Pending approvals/questions block automatic sending, interrupt/error settles
+hold the queue, and queued rows survive reloads and server restarts.
 
 See [RPC and orchestration](./rpc-and-orchestration.md) and
 [Connection runtime](./connection-runtime.md) for the detailed boundaries.

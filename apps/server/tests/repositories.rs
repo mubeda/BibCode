@@ -306,6 +306,7 @@ fn public_repository_api_inventory_is_explicit() {
     let mut expected = vec![
         "append_event",
         "auth_authority_revision",
+        "can_promote_queued_provider_turn",
         "claim_provider_turn",
         "clear_checkpoint_turn_conflict",
         "consume_auth_pairing_link",
@@ -339,6 +340,7 @@ fn public_repository_api_inventory_is_explicit() {
         "get_projection_state",
         "get_provider_session_runtime",
         "get_provider_turn_delivery",
+        "get_provider_turn_delivery_for_message",
         "get_thread",
         "get_thread_session",
         "get_turn_by_id",
@@ -355,7 +357,9 @@ fn public_repository_api_inventory_is_explicit() {
         "list_proposed_plans_by_thread",
         "list_provider_session_runtimes",
         "list_provider_turn_deliveries",
+        "list_queued_provider_turn_heads",
         "list_referenced_attachment_ids",
+        "list_thread_sessions_by_status",
         "list_threads_by_project",
         "load_worktree_catalog_projection",
         "list_turns_by_thread",
@@ -372,6 +376,7 @@ fn public_repository_api_inventory_is_explicit() {
         "release_reserved_command_receipt",
         "reserve_command_receipt",
         "replace_pending_provider_turn_payload",
+        "requeue_provider_turn",
         "replace_pending_turn_start",
         "prepare_worktree_removal_receipt",
         "revoke_auth_pairing_link",
@@ -1038,10 +1043,78 @@ async fn runtime_project_and_thread_repositories_upsert_order_and_delete() {
 }
 
 #[tokio::test]
+async fn thread_sessions_by_status_filter_and_order_complete_rows() {
+    let repositories = migrated_repositories().await;
+    let mut expected = Vec::new();
+    for (thread_id, status, updated_at) in [
+        ("later", "running", T2),
+        ("b", "connecting", T1),
+        ("ready", "ready", T0),
+        ("error", "error", T0),
+        ("idle", "idle", T0),
+        ("stopped", "stopped", T0),
+        ("a", "starting", T1),
+    ] {
+        let session = ProjectionThreadSession {
+            thread_id: thread_id.into(),
+            status: status.into(),
+            provider_name: Some("codex".into()),
+            provider_instance_id: Some("custom-codex".into()),
+            runtime_mode: "approval-required".into(),
+            active_turn_id: Some(format!("turn-{thread_id}")),
+            last_error: Some("previous failure".into()),
+            last_error_class: Some("transport_error".into()),
+            updated_at: updated_at.into(),
+        };
+        repositories
+            .upsert_thread_session(session.clone())
+            .await
+            .unwrap();
+        if matches!(status, "starting" | "connecting" | "running") {
+            expected.push(session);
+        }
+    }
+    let sessions = repositories
+        .list_thread_sessions_by_status(vec![
+            "starting".into(),
+            "connecting".into(),
+            "running".into(),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(
+        sessions
+            .iter()
+            .map(|session| session.thread_id.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "b", "later"]
+    );
+    for (actual, expected) in sessions.iter().zip(expected.iter().rev()) {
+        assert_row_eq(actual, expected);
+    }
+    assert!(
+        repositories
+            .list_thread_sessions_by_status(vec![])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        repositories
+            .list_thread_sessions_by_status(vec!["running' OR 1=1 --".into()])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn conversation_projection_repositories_round_trip_order_and_delete() {
     let repositories = migrated_repositories().await;
 
     let message_a = ProjectionThreadMessage {
+        delivery_mode: None,
+        delivery_held: None,
         message_id: "message-a".to_owned(),
         thread_id: "thread-conversation".to_owned(),
         turn_id: Some("turn-a".to_owned()),
@@ -2457,5 +2530,45 @@ async fn pending_auth_sessions_confirm_by_id_and_startup_cleanup_is_selective() 
             .revoked_at
             .as_deref(),
         Some(TIME_3),
+    );
+}
+
+#[tokio::test]
+async fn requeue_provider_turn_is_attempt_conditioned_and_preserves_payload() {
+    let repositories = migrated_repositories().await;
+    repositories.database().call(|connection| {
+        connection.execute("INSERT INTO orchestration_command_receipts (command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status) VALUES ('steer', 'thread', 'thread', ?, 0, 'accepted')", [T0])?;
+        connection.execute("INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, delivery_key, payload_json, state, mode, held, attempts, last_error, created_at, updated_at) VALUES ('steer', 'thread', 'message', 'codex', 'codex', 'key', '{\"saved\":true}', 'sending', 'steer', 0, 2, 'no active turn', ?, ?)", [T0, T1])?;
+        Ok(())
+    }).await.unwrap();
+    assert!(
+        repositories
+            .requeue_provider_turn("steer".into(), 1, T2.into())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let row = repositories
+        .requeue_provider_turn("steer".into(), 2, T2.into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, TurnDeliveryState::Queued);
+    assert_eq!(
+        row.mode,
+        bibcode_server::orchestration::TurnDeliveryMode::Start
+    );
+    assert_eq!(row.payload, json!({"saved":true}));
+    assert_eq!(row.message_id, "message");
+    assert_eq!(row.delivery_key, "key");
+    assert_eq!(row.created_at, T0);
+    assert_eq!(row.attempts, 0);
+    assert_eq!(row.last_error, None);
+    assert!(
+        repositories
+            .requeue_provider_turn("steer".into(), 0, T2.into())
+            .await
+            .unwrap()
+            .is_none()
     );
 }

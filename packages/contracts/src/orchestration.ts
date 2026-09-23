@@ -288,6 +288,7 @@ export const OrchestrationMessageRole = Schema.Literals(["user", "assistant", "s
 export type OrchestrationMessageRole = typeof OrchestrationMessageRole.Type;
 
 export const TurnDeliveryState = Schema.Literals([
+  "queued",
   "pending",
   "sending",
   "delivered",
@@ -297,14 +298,20 @@ export const TurnDeliveryState = Schema.Literals([
 ]);
 export type TurnDeliveryState = typeof TurnDeliveryState.Type;
 
+export const TurnDeliveryMode = Schema.Literals(["start", "steer"]);
+export type TurnDeliveryMode = typeof TurnDeliveryMode.Type;
+
 export const TurnDelivery = Schema.Struct({
   state: TurnDeliveryState,
   provider: ProviderDriverKind,
+  // An absent mode means "start" for deliveries from older servers.
+  mode: Schema.optional(TurnDeliveryMode),
+  held: Schema.optional(Schema.Boolean),
   detail: Schema.optional(TrimmedNonEmptyString),
 });
 export type TurnDelivery = typeof TurnDelivery.Type;
 
-export const TurnDeliveryResolutionAction = Schema.Literals(["retry", "dismiss"]);
+export const TurnDeliveryResolutionAction = Schema.Literals(["retry", "dismiss", "cancel"]);
 export type TurnDeliveryResolutionAction = typeof TurnDeliveryResolutionAction.Type;
 
 export const OrchestrationMessage = Schema.Struct({
@@ -788,6 +795,7 @@ export const ThreadTurnStartCommand = Schema.Struct({
   ),
   bootstrap: Schema.optional(ThreadTurnStartBootstrap),
   sourceProposedPlan: Schema.optional(SourceProposedPlanReference),
+  queued: Schema.optional(Schema.Boolean),
   createdAt: IsoDateTime,
 });
 
@@ -809,6 +817,23 @@ const ClientThreadTurnStartCommand = Schema.Struct({
   interactionMode: ProviderInteractionMode,
   bootstrap: Schema.optional(ClientThreadTurnStartBootstrap),
   sourceProposedPlan: Schema.optional(SourceProposedPlanReference),
+  queued: Schema.optional(Schema.Boolean),
+  createdAt: IsoDateTime,
+});
+
+const ThreadTurnSteerCommand = Schema.Struct({
+  type: Schema.Literal("thread.turn.steer"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  messageId: MessageId,
+  createdAt: IsoDateTime,
+});
+
+const ThreadTurnPromoteCommand = Schema.Struct({
+  type: Schema.Literal("thread.turn.promote"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  messageId: MessageId,
   createdAt: IsoDateTime,
 });
 
@@ -874,6 +899,8 @@ const DispatchableClientOrchestrationCommand = Schema.Union([
   ThreadRuntimeModeSetCommand,
   ThreadInteractionModeSetCommand,
   ThreadTurnStartCommand,
+  ThreadTurnSteerCommand,
+  ThreadTurnPromoteCommand,
   ThreadTurnInterruptCommand,
   ThreadTurnDeliveryResolveCommand,
   ThreadApprovalRespondCommand,
@@ -896,6 +923,8 @@ export const ClientOrchestrationCommand = Schema.Union([
   ThreadRuntimeModeSetCommand,
   ThreadInteractionModeSetCommand,
   ClientThreadTurnStartCommand,
+  ThreadTurnSteerCommand,
+  ThreadTurnPromoteCommand,
   ThreadTurnInterruptCommand,
   ThreadTurnDeliveryResolveCommand,
   ThreadApprovalRespondCommand,
@@ -971,6 +1000,7 @@ const ThreadRevertCompleteCommand = Schema.Struct({
 });
 
 const InternalOrchestrationCommand = Schema.Union([
+  ThreadTurnPromoteCommand,
   ThreadSessionSetCommand,
   ThreadMessageAssistantDeltaCommand,
   ThreadMessageAssistantCompleteCommand,
@@ -993,6 +1023,7 @@ export const OrchestrationCommand = Schema.Union([
   ThreadRuntimeModeSetCommand,
   ThreadInteractionModeSetCommand,
   ThreadTurnStartCommand,
+  ThreadTurnSteerCommand,
   ThreadTurnInterruptCommand,
   ThreadTurnDeliveryResolveCommand,
   ThreadApprovalRespondCommand,
@@ -1016,6 +1047,7 @@ export const OrchestrationEventType = Schema.Literals([
   "thread.interaction-mode-set",
   "thread.message-sent",
   "thread.turn-start-requested",
+  "thread.turn-steer-requested",
   "thread.turn-interrupt-requested",
   "thread.turn-delivery-updated",
   "thread.approval-response-requested",
@@ -1150,6 +1182,13 @@ export const ThreadTurnStartRequestedPayload = Schema.Struct({
   createdAt: IsoDateTime,
 });
 
+export const ThreadTurnSteerRequestedPayload = Schema.Struct({
+  threadId: ThreadId,
+  messageId: MessageId,
+  turnId: TurnId,
+  createdAt: IsoDateTime,
+});
+
 export const ThreadTurnInterruptRequestedPayload = Schema.Struct({
   threadId: ThreadId,
   turnId: Schema.optional(TurnId),
@@ -1160,6 +1199,10 @@ export const ThreadTurnDeliveryUpdatedPayload = Schema.Struct({
   threadId: ThreadId,
   messageId: MessageId,
   delivery: TurnDelivery,
+  withdrawn: Schema.optional(Schema.Boolean),
+  turnId: Schema.optional(TurnId),
+  held: Schema.optional(Schema.Boolean),
+  mode: Schema.optional(TurnDeliveryMode),
   updatedAt: IsoDateTime,
 });
 
@@ -1300,6 +1343,11 @@ export const OrchestrationEvent = Schema.Union([
     ...EventBaseFields,
     type: Schema.Literal("thread.turn-start-requested"),
     payload: ThreadTurnStartRequestedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.turn-steer-requested"),
+    payload: ThreadTurnSteerRequestedPayload,
   }),
   Schema.Struct({
     ...EventBaseFields,
