@@ -1,4 +1,4 @@
-use bibcode_server::process::configure_background_command;
+use bibcode_server::process::{configure_background_command, isolate_appimage_environment};
 use serde_json::Value;
 use std::{
     path::{Path, PathBuf},
@@ -135,6 +135,7 @@ async fn read_tailscale_status_with(
     let mut command = Command::new(command_path);
     configure_background_command(&mut command);
     command.kill_on_drop(true);
+    isolate_appimage_environment(&mut command);
     let child = command
         .args(["status", "--json"])
         .stdout(std::process::Stdio::piped())
@@ -488,6 +489,40 @@ mod tests {
                 .unwrap_err()
                 .contains("Failed to spawn")
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn status_command_ignores_appimage_environment() {
+        crate::test_support::with_appimage_test_environment_async(
+            "tailscale::tests::status_command_ignores_appimage_environment",
+            async {
+                let directory = tempfile::tempdir().expect("Tailscale fixture directory");
+                let executable = executable_script(
+                    directory.path(),
+                    "tailscale",
+                    &format!(
+                        r#"[ "$1" = status ] && [ "$2" = --json ] || exit 80
+[ -z "${{APPIMAGE+x}}" ] && [ -z "${{PYTHONHOME+x}}" ] || exit 81
+[ "$LD_LIBRARY_PATH" = /usr/lib ] || exit 82
+[ "$BIBCODE_FUTURE_PATH" = /opt/host/future ] || exit 83
+[ "$SSH_AUTH_SOCK" = /run/user/1000/bibcode-test-agent.sock ] || exit 84
+printf '%s' '{TAILSCALE_STATUS_JSON}'"#
+                    ),
+                    "",
+                );
+
+                let status = read_tailscale_status_with(&executable, Duration::from_secs(15))
+                    .await
+                    .expect("Tailscale status must run with the host environment");
+
+                assert_eq!(
+                    status.magic_dns_name.as_deref(),
+                    Some("desktop.tail.ts.net")
+                );
+            },
+        )
+        .await;
     }
 
     #[cfg(unix)]

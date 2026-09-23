@@ -21,10 +21,8 @@ use tokio::{
 
 use crate::{
     process::configure_background_command,
-    production::provider_runtime::{
-        prepare_provider_launch, resolve_provider_executable,
-        sanitize_provider_subprocess_environment,
-    },
+    production::provider_runtime::{prepare_provider_launch, resolve_provider_executable},
+    provider::environment::sanitize_provider_subprocess_environment,
 };
 
 mod codex_backend;
@@ -1212,6 +1210,66 @@ mod tests {
 
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn codex_usage_app_server_ignores_appimage_environment() {
+        use crate::test_support::{
+            ISOLATING_AND_NO_OP_CASES, TestSandbox,
+            appimage_environment::{assert_child_environment, check_inherited_environment},
+            reexec, run_on_current_thread,
+        };
+
+        const TEST_NAME: &str =
+            "provider_usage::tests::codex_usage_app_server_ignores_appimage_environment";
+        const PHASE: &str = "codex-usage-app-server";
+
+        if let Some(child) = reexec::enter(TEST_NAME, PHASE) {
+            let parent = std::env::vars_os().collect::<BTreeMap<_, _>>();
+            let snapshot =
+                run_on_current_thread(fetch_codex_usage_via_app_server(OffsetDateTime::UNIX_EPOCH))
+                    .expect("Codex app-server fixture usage");
+            assert_eq!(snapshot.status, ProviderUsageStatus::Ok);
+            assert_eq!(snapshot.session.expect("session window").used_percent, 7);
+            assert_eq!(snapshot.weekly.expect("weekly window").used_percent, 41);
+            assert_eq!(std::env::vars_os().collect::<BTreeMap<_, _>>(), parent);
+            child.complete();
+            return;
+        }
+
+        check_inherited_environment(TEST_NAME, ISOLATING_AND_NO_OP_CASES, |expected| {
+            let sandbox = TestSandbox::new("codex-usage-appimage-environment");
+            let output_path = sandbox.path("environment");
+            let executable = sandbox.executable_script(
+                "codex-app-server",
+                r#"/usr/bin/env -0 > "$BIBCODE_TEST_PROVIDER_ENVIRONMENT_FILE"
+while IFS= read -r request; do
+    case "$request" in
+        *'"method":"initialize"'*)
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+            ;;
+        *'"method":"initialized"'*) ;;
+        *'"method":"account/rateLimits/read"'*)
+            printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"rateLimits":{"primary":{"usedPercent":7},"secondary":{"usedPercent":41}}}}'
+            ;;
+        *) exit 1 ;;
+    esac
+done"#,
+                "",
+            );
+            // A second phase supplies the configured executable without
+            // mutating this process's inherited AppImage environment.
+            reexec::run(TEST_NAME, PHASE, None, |command| {
+                command
+                    .env("CODEX_BIN", &executable)
+                    .env("BIBCODE_TEST_PROVIDER_ENVIRONMENT_FILE", &output_path);
+            });
+            assert_child_environment(
+                &std::fs::read(output_path).expect("Codex usage child environment"),
+                expected,
+            );
+        });
+    }
 
     struct ActiveFetchGuard(Arc<AtomicUsize>);
 

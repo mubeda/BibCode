@@ -75,6 +75,7 @@ use crate::{
             AcpJsonRpcConnection as CursorConnection, CursorSessionOptions, CursorSessionRuntime,
             runtime::CursorRuntimeError,
         },
+        environment::sanitize_provider_subprocess_environment,
         grok::{
             AcpConnectionConfig as GrokConnectionConfig, AcpJsonRpcConnection as GrokConnection,
             GrokSessionOptions, GrokSessionRuntime,
@@ -112,11 +113,6 @@ const DELIVERY_ROUTE_FINGERPRINT_FIELD: &str = "_bibcodeProviderRouteFingerprint
 const DELIVERY_ROUTE_CWD_PENDING_FIELD: &str = "_bibcodeProviderRouteCwdPending";
 const DELIVERY_ROUTE_FINGERPRINT_VERSION: &str = "provider-route-v4";
 const DELIVERY_ROUTE_CWD_FINGERPRINT_VERSION: &str = "provider-route-cwd-v1";
-
-/// Prevent host diagnostics settings from turning provider stderr into a high-volume event stream.
-pub(crate) fn sanitize_provider_subprocess_environment(command: &mut tokio::process::Command) {
-    command.env_remove("RUST_LOG");
-}
 
 #[derive(Clone, Debug)]
 pub struct ProviderLaunchRequest {
@@ -18316,18 +18312,116 @@ done
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn provider_commands_do_not_inherit_host_rust_logging() {
-        let mut command = tokio::process::Command::new("provider-fixture");
-        command.env("RUST_LOG", "info");
+    fn provider_chat_launch_ignores_appimage_environment() {
+        use crate::test_support::{
+            ISOLATING_AND_NO_OP_CASES,
+            appimage_environment::{assert_child_environment, check_inherited_environment},
+        };
 
-        super::sanitize_provider_subprocess_environment(&mut command);
+        check_inherited_environment(
+            "production::provider_runtime::tests::provider_chat_launch_ignores_appimage_environment",
+            ISOLATING_AND_NO_OP_CASES,
+            |expected| {
+                let temp = TempDir::new().expect("chat provider AppImage fixture");
+                let environment_path = temp.path().join("environment");
+                let ready_path = temp.path().join("ready");
+                let executable = executable_fixture(
+                    &temp,
+                    "chat-provider",
+                    r#"#!/bin/sh
+set -eu
+/usr/bin/env -0 > "$1"
+printf ready > "$2"
+read -r release || :
+"#,
+                );
+                let mut request = native_launch(&temp, "claudeAgent");
+                request.binary_path = executable.to_string_lossy().into_owned();
+                let args = [
+                    environment_path.to_string_lossy().into_owned(),
+                    ready_path.to_string_lossy().into_owned(),
+                ];
+                crate::test_support::run_on_current_thread(async {
+                    let mut ready = false;
+                    let mut child = super::spawn_child_after_spawn(
+                        &request,
+                        &args,
+                        false,
+                        ProcessAttributionRegistry::new(),
+                        |_| async {
+                            // Admit the live script after exec, while stdin keeps it
+                            // alive until the test owns the attributed child handle.
+                            ready = timeout(Duration::from_secs(10), async {
+                                while !ready_path.exists() {
+                                    tokio::time::sleep(Duration::from_millis(10)).await;
+                                }
+                            })
+                            .await
+                            .is_ok();
+                        },
+                    )
+                    .await
+                    .expect("chat provider fixture launches");
+                    drop(child.stdin().take());
+                    let exit = timeout(Duration::from_secs(10), child.wait()).await;
+                    if !matches!(&exit, Ok(Ok(_))) {
+                        super::terminate_and_wait(&mut *child).await;
+                    }
+                    assert!(ready, "chat provider fixture became ready");
+                    assert!(
+                        exit.expect("chat provider fixture exits")
+                            .expect("chat provider fixture is reaped")
+                            .success()
+                    );
+                });
+                assert_child_environment(
+                    &std::fs::read(environment_path).expect("chat provider child environment"),
+                    expected,
+                );
+            },
+        );
+    }
 
-        assert!(
-            command
-                .as_std()
-                .get_envs()
-                .any(|(name, value)| { name == "RUST_LOG" && value.is_none() })
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn claude_probe_command_ignores_appimage_environment() {
+        use crate::test_support::{
+            ISOLATING_AND_NO_OP_CASES,
+            appimage_environment::{assert_child_environment, check_inherited_environment},
+        };
+
+        check_inherited_environment(
+            "production::provider_runtime::tests::claude_probe_command_ignores_appimage_environment",
+            ISOLATING_AND_NO_OP_CASES,
+            |expected| {
+                let temp = TempDir::new().expect("Claude probe AppImage fixture");
+                let executable = executable_fixture(
+                    &temp,
+                    "claude-probe",
+                    r#"#!/bin/sh
+set -eu
+[ "$1" = --version ]
+/usr/bin/env -0 > "$0.environment"
+printf '2.1.0 (Claude Code)\n'
+"#,
+                );
+                let output =
+                    crate::test_support::run_on_current_thread(super::run_claude_probe_command(
+                        &executable,
+                        "--version",
+                        tokio::time::Instant::now() + Duration::from_secs(10),
+                        super::ClaudeProbeLaunchPolicy::Direct,
+                    ))
+                    .expect("Claude probe completes");
+                assert_eq!(output.lines().next(), Some("2.1.0 (Claude Code)"));
+                assert_child_environment(
+                    &std::fs::read(executable.with_extension("environment"))
+                        .expect("Claude probe child environment"),
+                    expected,
+                );
+            },
         );
     }
 

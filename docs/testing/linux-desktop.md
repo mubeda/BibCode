@@ -142,26 +142,59 @@ set.
 
 ## AppImage build and inspection
 
-### Git subprocess library isolation
+### User-facing child environment isolation
 
-The Git runner must exclude AppImage directories from child
-`LD_LIBRARY_PATH` values while retaining custom host library directories and
-credential configuration. Cover extracted AppImages, paths containing spaces,
-stale `.mount_*` entries inherited across updates, and both text and binary
-process output. The parent desktop environment must remain unchanged.
+Validate the [AppImage child environment policy](../architecture/overview.md#appimage-child-environments).
+The regressions must cover:
 
-Run the production-runner regression on Linux with a C compiler and system Git:
+- Each covered production launch class, including chat-mode providers, Claude
+  runtime probes, provider inventory probes including Codex, the Codex usage
+  app-server helper, Codex/OpenCode helpers, both review Git commands,
+  editor/file-manager launches, and desktop-owned SSH, Tailscale, and `kill`.
+  Removing a site's isolation call must make its regression fail.
+- Library, executable, GTK, Python, Qt, GStreamer, and unknown plugin variables;
+  launcher markers and forced settings; mixed and bundled-only values; real
+  launcher trailing colons; host credentials; non-path lists; and raw-byte
+  values and command overrides. Include colon/semicolon library paths and
+  space/colon preloads, plus a planted working-directory library that must not
+  load.
+- Extracted AppDirs, paths containing spaces, stale absolute `.mount_*` paths,
+  the five ordinary-launch no-op cases (`unset-appimage`, `empty-appimage`,
+  `relative-appdir`, `root-appdir`, and `unset-appdir`), and the positive and
+  negative extracted AppDir gate cases. Exercise both text and binary Git
+  output and a real PTY shell and Python process.
+- An unchanged complete parent environment and the login-shell PATH-probe
+  exemption, including its AppDir-first PATH and original launcher values.
+  Each re-executed test phase must prove entry and completion; a successful
+  zero-test exit is insufficient.
+- File-manager prompt return, survival after the launch call returns, a
+  separate process group, eventual reaping, typed spawn errors, and candidate
+  fallback order after spawn failure.
+
+Run on Linux with a C compiler and system Git:
 
 ```sh
-cargo test --locked -p bibcode-server --test linux_appimage_git_environment -j 2
+cargo test --locked -p bibcode-server --test linux_appimage_git_environment -j 2 -- --nocapture
+cargo test --locked -p bibcode-server --test linux_appimage_child_environment -j 2 -- --nocapture
+cargo test --locked -p bibcode-server --lib appimage -j 2 -- --nocapture
+cargo test --locked -p bibcode-server --lib file_manager_launch -j 2 -- --nocapture
+cargo test --locked -p bibcode-desktop --lib appimage -j 2 -- --nocapture
 ```
 
-The test compiles an incompatible library into a disposable AppImage fixture,
-first proves that the system HTTPS helper fails when it loads that library,
-then exercises the real Git runner in an isolated child process. It does not
-contact an external Git host or change application data.
+The Git regression must first demonstrate the incompatible fixture library's
+loader failure, then pass through the real Git runner. The Python regression
+requires a real PTY child to exit zero and print `ok`. Capture its completion
+marker with `--nocapture`; to run it separately:
 
-`.github/workflows/linux-git-compatibility.yml` builds that test on Ubuntu 22.04
+```sh
+cargo test --locked -p bibcode-server --test linux_appimage_child_environment python_in_appimage_terminal_uses_host_standard_library -- --nocapture
+```
+
+Require `BIBCODE_PYTHON_PTY_RAN` and absence of `BIBCODE_PYTHON_PTY_SKIP` in the
+captured stdout. A skip is **unavailable evidence, not a pass**; record it and
+rerun on a host with Python.
+
+`.github/workflows/linux-git-compatibility.yml` builds the Git regression on Ubuntu 22.04
 and runs the executable with each distribution's system Git in Debian 12/13,
 Ubuntu 22.04/24.04, Fedora 44, and Arch rolling containers. The build baseline
 matters: a test built against a newer glibc cannot qualify older distributions.
@@ -181,9 +214,26 @@ container has a bounded timeout and is removed after its result. Record every
 distribution result separately, including failures.
 
 For release qualification, also use the packaged app to fetch from a disposable
-HTTPS repository on each target distribution. Record the Git Manager result,
-library-loader diagnostics, and desktop/update checks separately from this
-subprocess regression.
+HTTPS repository on each target distribution, both through Git Manager and a
+BiBCode terminal (`git ls-remote origin HEAD`). Confirm the terminal resolves
+`xdg-open` and `xdg-mime` to host copies, then run
+`python3 -c 'print("ok")'` and require exit zero and `ok` output. Confirm a
+configured Claude Code status line whose script invokes Python renders normally.
+Open a configured Flatpak editor and a file manager from the app and check for
+GLib symbol errors and AppImage-rooted `xdg-open` selection. Repeat terminal
+Git/Python and tool launch checks from an extracted `squashfs-root/AppRun`
+without `APPIMAGE`, including Ubuntu without libfuse2. Record desktop URL/path
+opening, Linux file reveal, deep-link registration, and the GTK hook's
+`XDG_DATA_DIRS` limitation separately against the
+[current limitations](../architecture/overview.md#appimage-child-environments).
+Verify that the server's file-manager launch returns promptly, the running
+file manager survives the RPC return, and its exited child is eventually
+reaped.
+Inspect a running provider's environment for the same isolation and confirm the
+desktop still retains its bundled paths and renders correctly. Record the Git
+Manager, terminal Git/Python, status line, and provider results, library-loader
+diagnostics, and desktop/update checks separately from these subprocess
+regressions.
 
 ### Native artifact
 

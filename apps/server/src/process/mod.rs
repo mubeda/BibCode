@@ -1,3 +1,4 @@
+mod appimage;
 mod background;
 mod cleanup;
 mod executable;
@@ -6,6 +7,8 @@ mod shell;
 pub(crate) mod supervised;
 #[cfg(windows)]
 mod windows_job;
+
+pub use appimage::{ChildCommand, EnvironmentInheritance, isolate_appimage_environment};
 
 #[cfg(windows)]
 pub(crate) use windows_job::WindowsJob;

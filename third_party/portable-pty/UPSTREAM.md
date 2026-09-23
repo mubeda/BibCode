@@ -33,6 +33,12 @@ The intended source deviations from portable-pty 0.9.0 are limited to:
   Windows child-killer implementations. Upstream 0.9.0 reverses the Win32
   result check and `WinChild::kill` discards the result, which makes bounded
   cleanup unable to distinguish a terminated child from a failed fallback.
+- `CommandBuilder::iter_full_env` exposes the complete captured environment as
+  `(&OsStr, &OsStr)` pairs. The upstream `iter_full_env_as_str` filters out any
+  entry whose name or value is not UTF-8. BiBCode's Linux AppImage child policy
+  must inspect every effective PTY entry, including non-UTF-8 command-local
+  overrides, so the text-only iterator would leave bundled paths behind. The
+  accessor adds no environment filtering or AppImage policy to this crate.
 
 ## Updating
 
@@ -40,10 +46,17 @@ The intended source deviations from portable-pty 0.9.0 are limited to:
 2. Download and verify that exact crates.io release.
 3. Replace `Cargo.toml`, `LICENSE.md`, and `src/` from Cargo's verified registry
    source; do not copy examples, lockfiles, or Cargo registry metadata.
-4. Reapply only the deviations documented above.
+4. Reapply each deviation above unless the new upstream release supplies its
+   equivalent. Preserve a complete raw environment iterator when updating the
+   command builder; if upstream provides one under another name, migrate the
+   server's AppImage adapter and then remove the local accessor.
 5. Update the version and checksum above from the workspace `Cargo.lock`.
-6. Run the Windows cross-compile harness, target-gated Windows tests, and all
+6. Run the Windows cross-compile harness, target-gated Windows tests, the Linux
+   AppImage PTY tests (including non-UTF-8 environment overrides), and all
    repository checks.
 
 Remove this fork and the workspace `[patch.crates-io]` entry once an upstream
-portable-pty release provides an equivalent at-creation Job-list API.
+portable-pty release provides equivalent at-creation Job-list support, correct
+child-killer result propagation, and access to every raw effective environment
+entry. Retire individual deviations as their equivalents become available;
+the Job-list API alone is not sufficient to remove the remaining fixes.

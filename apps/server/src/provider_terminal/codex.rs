@@ -1859,6 +1859,7 @@ impl CodexCapabilityProbeRunner for SystemCodexCapabilityProbeRunner {
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
+            crate::provider::environment::sanitize_provider_subprocess_environment(&mut command);
             let request = SupervisedRunRequest {
                 command,
                 stdin: None,
@@ -2043,6 +2044,7 @@ impl CodexHelperLauncher for SystemCodexHelperLauncher {
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null());
+                crate::provider::environment::sanitize_provider_subprocess_environment(command);
             });
             configure_supervised_background_command_wrap(&mut command);
             let child = command
@@ -2713,6 +2715,71 @@ impl CodexRemoteClient for SystemCodexRemoteClient {
 mod tests {
     use super::*;
     use crate::test_support::{FixtureEvent, TestSandbox};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn system_capability_probe_ignores_appimage_environment() {
+        crate::test_support::check_capability_probe_appimage_environment(
+            "provider_terminal::codex::tests::system_capability_probe_ignores_appimage_environment",
+            |executable, args| async move {
+                let output = SystemCodexCapabilityProbeRunner::default()
+                    .run(&executable, args)
+                    .await?;
+                Ok((output.success, output.stdout))
+            },
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn system_helper_launcher_ignores_appimage_environment() {
+        use crate::test_support::{
+            ISOLATING_AND_NO_OP_CASES,
+            appimage_environment::{assert_child_environment, check_inherited_environment},
+        };
+
+        check_inherited_environment(
+            "provider_terminal::codex::tests::system_helper_launcher_ignores_appimage_environment",
+            ISOLATING_AND_NO_OP_CASES,
+            |expected| {
+                let sandbox = TestSandbox::new("codex-helper-appimage-environment");
+                let output_path = sandbox.path("environment");
+                let socket_path = sandbox.path("helper.sock");
+                let executable = sandbox.executable_script(
+                    "helper",
+                    "/usr/bin/env -0 > \"$4\"\nsocket=${3#unix://}\n: > \"$socket\"\nexec /bin/sleep 3600",
+                    "",
+                );
+                crate::test_support::run_on_current_thread(async {
+                    let launcher = SystemCodexHelperLauncher::default();
+                    let endpoint = format!("unix://{}", socket_path.to_string_lossy());
+                    let process = launcher
+                        .start(CodexHelperLaunch {
+                            executable: executable.to_string_lossy().into_owned(),
+                            args: vec![
+                                "app-server".to_owned(),
+                                "--listen".to_owned(),
+                                endpoint.clone(),
+                                output_path.to_string_lossy().into_owned(),
+                            ],
+                            cwd: sandbox.root().to_path_buf(),
+                            env: BTreeMap::new(),
+                            endpoint,
+                            socket_path,
+                            process_attribution: ProcessAttributionRegistry::new(),
+                        })
+                        .await
+                        .expect("Codex system helper launcher");
+                    process.terminate();
+                    launcher.shutdown().await;
+                });
+                assert_child_environment(
+                    &std::fs::read(output_path).expect("Codex helper child environment"),
+                    expected,
+                );
+            },
+        );
+    }
 
     #[derive(Debug)]
     struct CodexHelperFixture {

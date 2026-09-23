@@ -1,4 +1,4 @@
-use bibcode_server::process::configure_background_command;
+use bibcode_server::process::{configure_background_command, isolate_appimage_environment};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -1172,6 +1172,7 @@ fn spawn_managed_ssh_child(
     operation: &str,
 ) -> Result<ManagedSshChild, String> {
     let reaper_permit = askpass_launcher.reserve_child()?;
+    isolate_appimage_environment(&mut command);
     let child = command
         .spawn()
         .map_err(|error| format!("Failed to {operation}: {error}"))?;
@@ -2055,6 +2056,78 @@ pub fn discover_ssh_hosts(home_dir: Option<PathBuf>) -> Result<Vec<DiscoveredSsh
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn managed_ssh_child_ignores_appimage_environment() {
+        crate::test_support::with_appimage_test_environment_async(
+            "ssh::tests::managed_ssh_child_ignores_appimage_environment",
+            async {
+                let temporary_base = tempfile::tempdir().expect("askpass temporary base");
+                let manager = SshEnvironmentManager::with_askpass_temp_base(
+                    temporary_base.path().to_path_buf(),
+                );
+                let launcher = manager.askpass_launcher().expect("askpass launcher");
+                let askpass_path = launcher.path().to_string_lossy().into_owned();
+                let auth = SshAuthOptions::with_secret("fixture-password".to_string());
+                let mut command = Command::new("/usr/bin/env");
+                command
+                    .args(["-0"])
+                    .envs(build_ssh_child_environment(&auth, launcher.path()))
+                    .env("PYTHONHOME", "/opt/host/python")
+                    .env_remove("BIBCODE_FUTURE_PATH")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .kill_on_drop(true);
+
+                let mut child =
+                    spawn_managed_ssh_child(command, launcher, "probe SSH child environment")
+                        .expect("SSH child should start");
+                let output = child.wait_with_output().await.expect("SSH child output");
+                assert!(output.status.success());
+                let environment = output
+                    .stdout
+                    .split(|byte| *byte == 0)
+                    .filter_map(|entry| {
+                        let separator = entry.iter().position(|byte| *byte == b'=')?;
+                        Some((&entry[..separator], &entry[separator + 1..]))
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                for name in [
+                    "APPDIR",
+                    "APPIMAGE",
+                    "ARGV0",
+                    "OWD",
+                    "GTK_THEME",
+                    "GDK_BACKEND",
+                    "PYTHONDONTWRITEBYTECODE",
+                    "BIBCODE_FUTURE_PATH",
+                ] {
+                    assert!(
+                        !environment.contains_key(name.as_bytes()),
+                        "{name} leaked into SSH"
+                    );
+                }
+                for (name, expected) in [
+                    ("LD_LIBRARY_PATH", "/usr/lib"),
+                    ("PYTHONHOME", "/opt/host/python"),
+                    ("SSH_AUTH_SOCK", "/run/user/1000/bibcode-test-agent.sock"),
+                    ("SSH_ASKPASS", askpass_path.as_str()),
+                    ("SSH_ASKPASS_REQUIRE", "force"),
+                    ("BIBCODE_SSH_AUTH_SECRET", "fixture-password"),
+                ] {
+                    assert_eq!(
+                        environment.get(name.as_bytes()).copied(),
+                        Some(expected.as_bytes()),
+                        "{name}"
+                    );
+                }
+                manager.shutdown().await;
+            },
+        )
+        .await;
+    }
 
     fn unique_temp_home() -> PathBuf {
         std::env::temp_dir().join(format!(
