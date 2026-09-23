@@ -1,19 +1,60 @@
 # Changelog
 
-## Unreleased
+## [v0.6.1] - 2026-09-23
 
-- Keep composing while an agent works: messages appear in a durable queue and
-  send in order when the current turn ends. Steer the first queued message on
-  Codex or Claude, or Cancel to return it to your draft. Stop restores queued
-  messages before interrupting, and the queue survives reloads and restarts.
-  After a restart interrupts a turn, queued messages wait for explicit Send now.
+BiBCode v0.6.1 lets you keep typing while an agent is working. Messages you
+send during a turn join a durable queue, send themselves in order when the
+turn ends, or go straight into the running turn when you steer them. The
+release also makes the Linux AppImage use the native Wayland backend, and
+hardens provider and terminal recovery after a crash or a restart.
+
+### Message queue
+
+- Send a message while an agent is working and it becomes a queued card in
+  the conversation instead of waiting behind a disabled composer. Cards keep
+  their order, and the first one starts the next turn automatically when the
+  current turn finishes.
+- **Steer** on the first queued card delivers it into the turn that is still
+  running, on Codex and on Claude, without starting a second turn. **Cancel**
+  takes the message back out of the queue and returns its text to the
+  composer, attachments included.
+- **Stop** drains the queue back into your draft before it interrupts the
+  turn, so nothing is sent by surprise and nothing is lost.
+- The queue lives on the server, so every window sees the same queue: a
+  browser tab, the desktop app and a remote client stay in step, and a reload
+  or a server restart never double-sends or drops a queued message.
+- Queued messages never send themselves into an approval prompt, a question,
+  or a turn that ended in an error or an interruption. Those cards say
+  **Waiting for you** and offer **Send now**.
+- `Mod+Shift+Enter` steers the first queued message from the composer.
 
 ### Fixed
 
-- Sending after a provider process exits mid-turn now launches a new provider
-  session, including Send now on a held queued message.
+- Sending after a provider process exits mid-turn now starts a new provider
+  session instead of failing against the dead connection. This includes
+  **Send now** on a queued message that is waiting for you.
+- A server restart while a turn was running no longer leaves the conversation
+  stuck as if it were still working. The interrupted turn is settled, queued
+  messages are held, and **Send now** resumes the conversation.
+- Closing or restarting a terminal while it is still opening no longer starts
+  the original command a second time. Terminal processes are also spawned off
+  the async runtime, so a busy machine cannot stall unrelated work while a
+  terminal starts.
+- The Linux AppImage prefers the native Wayland backend on a Wayland session
+  and falls back to X11 elsewhere. This fixes the window rendering about a
+  third too large on Hyprland and Omarchy with fractional scaling (#15). Set
+  `BIBCODE_GDK_BACKEND=x11` to force the previous behaviour.
 
-- Linux AppImage prefers the native Wayland backend on Wayland sessions (falls back to X11); fixes oversized rendering on Hyprland/Omarchy with fractional scaling (#15). Set `BIBCODE_GDK_BACKEND=x11` to force the previous behaviour.
+### Downloads
+
+On macOS, copy BiBCode.app from the DMG to Applications before launching it.
+
+Desktop installers and standalone server distributions are provided for macOS,
+Linux, and Windows on ARM64 and x64. Linux server `.deb` and `.rpm` packages are
+included for both architectures. Stable desktop updater payloads and signatures
+remain available through `latest.json`.
+
+**Full Changelog**: https://github.com/mubeda/BibCode/compare/v0.6.0...v0.6.1
 
 ## [v0.6.0] - 2026-09-21
 
