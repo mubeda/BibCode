@@ -1760,7 +1760,7 @@ fn open_in_editor_with(
 
     let input: LaunchEditorInput = decode(payload, "shell.openInEditor")?;
     if input.editor == "file-manager" {
-        return open::that_detached(&input.cwd)
+        return launch_file_manager(&input.cwd)
             .map(|()| Value::Null)
             .map_err(|error| {
                 json!({
@@ -1806,6 +1806,53 @@ fn open_in_editor_with(
     })
 }
 
+#[cfg(not(target_os = "linux"))]
+fn launch_file_manager(target: &Path) -> std::io::Result<()> {
+    open::that_detached(target)
+}
+
+#[cfg(target_os = "linux")]
+fn launch_file_manager(target: &Path) -> std::io::Result<()> {
+    let mut last_error = None;
+    for mut command in open::commands(target) {
+        crate::process::isolate_appimage_environment(&mut command);
+        match launch_file_manager_command(command) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.expect("open::commands provides at least one launcher"))
+}
+
+#[cfg(target_os = "linux")]
+fn launch_file_manager_command(mut command: std::process::Command) -> std::io::Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    command
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    let (spawned, result) = std::sync::mpsc::sync_channel(1);
+    // Create the owner before spawning: thread creation failure cannot orphan a
+    // child. The caller waits only for spawn, while this thread always reaps it.
+    std::thread::Builder::new()
+        .name("file-manager-reaper".to_owned())
+        .spawn(move || match command.spawn() {
+            Ok(mut child) => {
+                let _ = spawned.send(Ok(()));
+                if let Err(error) = child.wait() {
+                    tracing::warn!(%error, "could not reap file-manager launcher");
+                }
+            }
+            Err(error) => {
+                let _ = spawned.send(Err(error));
+            }
+        })?;
+    result.recv().map_err(std::io::Error::other)?
+}
+
 fn launch_editor(strategy: &EditorLaunchStrategy) -> std::io::Result<()> {
     match strategy {
         #[cfg(windows)]
@@ -1814,14 +1861,17 @@ fn launch_editor(strategy: &EditorLaunchStrategy) -> std::io::Result<()> {
             target,
         } => open::with_detached(target, application.clone()),
         #[cfg(not(windows))]
-        EditorLaunchStrategy::Process { command, args } => Command::new(command)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(false)
-            .spawn()
-            .map(|_| ()),
+        EditorLaunchStrategy::Process { command, args } => {
+            let mut command = Command::new(command);
+            command
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(false);
+            crate::process::isolate_appimage_environment(&mut command);
+            command.spawn().map(|_| ())
+        }
     }
 }
 
@@ -4774,6 +4824,239 @@ esac
                 "{method} unexpectedly accepted a string payload"
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_launch_capture(path: &Path) -> Vec<u8> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match std::fs::read(path) {
+                Ok(environment) => return environment,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "launcher did not finish"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("read launcher environment: {error}"),
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn editor_launch_ignores_appimage_environment() {
+        use crate::test_support::appimage_environment::{
+            ENVIRONMENT_CASES, assert_child_environment, check_inherited_environment,
+        };
+
+        check_inherited_environment(
+            "production::git_vcs::tests::editor_launch_ignores_appimage_environment",
+            ENVIRONMENT_CASES,
+            |expected| {
+                let directory = tempfile::tempdir().expect("editor capture directory");
+                let capture = directory.path().join("environment");
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("editor launch runtime");
+                {
+                    let _entered = runtime.enter();
+                    launch_editor(&EditorLaunchStrategy::Process {
+                        command: "/bin/sh".to_owned(),
+                        args: vec![
+                            "-c".to_owned(),
+                            "/usr/bin/env -0 > \"$1.tmp\" && /bin/mv \"$1.tmp\" \"$1\"".to_owned(),
+                            "editor-fixture".to_owned(),
+                            capture.to_string_lossy().into_owned(),
+                        ],
+                    })
+                    .expect("editor starts");
+                }
+                assert_child_environment(&read_launch_capture(&capture), expected);
+            },
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_manager_launch_ignores_appimage_environment() {
+        use crate::test_support::appimage_environment::{
+            ENVIRONMENT_CASES, assert_child_environment, check_inherited_environment,
+        };
+        use crate::test_support::reexec;
+        use std::os::unix::fs::PermissionsExt;
+
+        const CAPTURE: &str = "BIBCODE_FILE_MANAGER_ENVIRONMENT_CAPTURE";
+        const TEST: &str =
+            "production::git_vcs::tests::file_manager_launch_ignores_appimage_environment";
+        if let Some(child) = reexec::enter(TEST, "file-manager") {
+            let capture =
+                PathBuf::from(std::env::var_os(CAPTURE).expect("file-manager capture path"));
+            let env = crate::production::editor_launch::EditorProbeEnv {
+                path_entries: Vec::new(),
+                home: None,
+                flatpak_export_dirs: Vec::new(),
+                local_app_data: None,
+            };
+            open_in_editor_with(
+                json!({ "cwd": capture, "editor": "file-manager" }),
+                &env,
+                |_| panic!("file manager must use its own launcher"),
+            )
+            .expect("file manager starts");
+            let pid = String::from_utf8(read_launch_capture(&capture.with_extension("pid")))
+                .expect("opener fixture PID text")
+                .parse::<u32>()
+                .expect("numeric opener fixture PID");
+            let process = PathBuf::from(format!("/proc/{pid}"));
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while process.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "opener was not reaped"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            child.complete();
+            return;
+        }
+
+        check_inherited_environment(TEST, ENVIRONMENT_CASES, |expected| {
+            // Only this nested process sees the fixture PATH; the parallel harness and
+            // the shared AppImage fixture both keep their complete original environment.
+            for opener in ["xdg-open", "gio"] {
+                let directory = tempfile::tempdir().expect("file-manager fixture directory");
+                let executable = directory.path().join(opener);
+                std::fs::write(
+                    &executable,
+                    "#!/bin/sh\nfor target; do :; done\nprintf '%s' \"$$\" > \"$target.pid.tmp\" && /bin/mv \"$target.pid.tmp\" \"$target.pid\"\n/usr/bin/env -0 > \"$target.tmp\" && /bin/mv \"$target.tmp\" \"$target\"\nexit 9\n",
+                )
+                .expect("opener fixture");
+                std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+                    .expect("executable opener fixture");
+                let capture = directory.path().join("environment");
+                reexec::run(TEST, "file-manager", None, |command| {
+                    command.env(CAPTURE, &capture).env("PATH", directory.path());
+                });
+                let mut expected = expected.clone();
+                expected.insert("PATH", Some(directory.path().as_os_str().to_owned()));
+                assert_child_environment(&read_launch_capture(&capture), &expected);
+            }
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_manager_launch_returns_typed_spawn_error() {
+        use crate::test_support::reexec;
+
+        const TEST: &str =
+            "production::git_vcs::tests::file_manager_launch_returns_typed_spawn_error";
+        if let Some(child) = reexec::enter(TEST, "missing-opener") {
+            let env = crate::production::editor_launch::EditorProbeEnv {
+                path_entries: Vec::new(),
+                home: None,
+                flatpak_export_dirs: Vec::new(),
+                local_app_data: None,
+            };
+            let error = open_in_editor_with(
+                json!({ "cwd": "/repo", "editor": "file-manager" }),
+                &env,
+                |_| panic!("file manager must use its own launcher"),
+            )
+            .expect_err("every opener is missing");
+            assert_eq!(error["_tag"], "ExternalLauncherEditorSpawnError");
+            assert_eq!(error["editor"], "file-manager");
+            assert_eq!(error["target"], "/repo");
+            assert_eq!(error["command"], "open");
+            assert_eq!(error["args"], json!([]));
+            assert!(
+                !error["cause"]
+                    .as_str()
+                    .expect("spawn error detail")
+                    .is_empty()
+            );
+            child.complete();
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("empty opener path");
+        reexec::run(TEST, "missing-opener", None, |command| {
+            command.env("PATH", directory.path());
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_manager_launch_returns_while_running_and_reaps_its_child() {
+        use crate::test_support::reexec;
+
+        const TEST: &str = "production::git_vcs::tests::file_manager_launch_returns_while_running_and_reaps_its_child";
+        let Some(child) = reexec::enter(TEST, "lifecycle") else {
+            reexec::run(TEST, "lifecycle", None, |_| {});
+            return;
+        };
+
+        // Only this isolated fixture adopts detached grandchildren. That lets the
+        // regression clean up a double-forked opener when its ownership check fails.
+        // SAFETY: prctl has no pointer arguments here and changes only this process.
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+        let directory = tempfile::tempdir().expect("file-manager lifecycle fixture");
+        let pid_path = directory.path().join("pid");
+        let release_path = directory.path().join("release");
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "printf '%s' \"$$\" > \"$1.tmp\" && /bin/mv \"$1.tmp\" \"$1\"; while [ ! -f \"$2\" ]; do /bin/sleep 0.01; done; exit 17",
+                "file-manager-fixture",
+            ])
+            .arg(&pid_path)
+            .arg(&release_path);
+        let (returned, received) = std::sync::mpsc::sync_channel(1);
+        let launcher = std::thread::spawn(move || {
+            let _ = returned.send(launch_file_manager_command(command));
+        });
+        let result = received.recv_timeout(Duration::from_secs(5));
+        if result.is_err() {
+            std::fs::write(&release_path, "exit").expect("release blocked opener");
+        }
+        launcher.join().expect("file-manager launch thread");
+        result
+            .expect("launch must return before the file manager exits")
+            .expect("file-manager fixture starts");
+
+        let pid = String::from_utf8(read_launch_capture(&pid_path))
+            .expect("fixture PID text")
+            .parse::<libc::pid_t>()
+            .expect("numeric fixture PID");
+        // SAFETY: getpgid reads the process group of the live fixture child.
+        let process_group = unsafe { libc::getpgid(pid) };
+        let process_path = PathBuf::from(format!("/proc/{pid}"));
+        let was_running = std::fs::read_to_string(process_path.join("stat"))
+            .expect("live fixture process")
+            .split_once(") ")
+            .expect("process state")
+            .1
+            .starts_with(|state: char| state != 'Z');
+        std::fs::write(&release_path, "exit").expect("release opener");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while process_path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut status = 0;
+        // SAFETY: waitpid targets only the fixture PID and writes a valid status.
+        // It also cleans up a zombie if the production launcher failed to reap it.
+        let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        let error = std::io::Error::last_os_error();
+        assert!(was_running, "launch returned only after the opener exited");
+        assert_eq!(process_group, pid, "opener must have its own process group");
+        assert_eq!(waited, -1, "launcher must reap its exited child");
+        assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
+        child.complete();
     }
 
     #[cfg(not(windows))]

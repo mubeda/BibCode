@@ -1,6 +1,79 @@
+#[cfg(target_os = "linux")]
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::Notify;
+
+// Share the server's re-execution harness.
+#[cfg(target_os = "linux")]
+#[path = "../../../server/tests/support/reexec.rs"]
+mod reexec;
+
+#[cfg(target_os = "linux")]
+fn appimage_test_child(test_name: &str) -> Option<reexec::ChildPhase> {
+    const PHASE: &str = "desktop-appimage";
+    if let Some(child) = reexec::enter(test_name, PHASE) {
+        return Some(child);
+    }
+
+    let directory = tempfile::tempdir().expect("AppImage fixture directory");
+    let appdir = directory.path().join(".mount_BiBCode");
+    let host_bin = directory.path().join("host-bin");
+    std::fs::create_dir_all(&host_bin).expect("host executable fixture directory");
+    reexec::run(test_name, PHASE, None, |command| {
+        command
+            .env("APPIMAGE", directory.path().join("BiBCode.AppImage"))
+            .env("APPDIR", &appdir)
+            .env("ARGV0", "BiBCode.AppImage")
+            .env("OWD", directory.path())
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}:/usr/bin:/bin",
+                    appdir.join("usr/bin").display(),
+                    host_bin.display()
+                ),
+            )
+            .env(
+                "LD_LIBRARY_PATH",
+                format!("{}:/usr/lib", appdir.join("usr/lib").display()),
+            )
+            .env("PYTHONHOME", appdir.join("usr"))
+            .env(
+                "BIBCODE_FUTURE_PATH",
+                format!("{}:/opt/host/future", appdir.join("future").display()),
+            )
+            .env("SSH_AUTH_SOCK", "/run/user/1000/bibcode-test-agent.sock")
+            .env("GTK_THEME", "Adwaita")
+            .env("GDK_BACKEND", "x11")
+            .env("PYTHONDONTWRITEBYTECODE", "1");
+    });
+    None
+}
+
+/// Run assertions in an isolated harness with an AppImage launcher environment.
+#[cfg(target_os = "linux")]
+pub(crate) fn with_appimage_test_environment(test_name: &str, body: impl FnOnce()) {
+    if let Some(child) = appimage_test_child(test_name) {
+        let parent_environment = std::env::vars_os().collect::<BTreeMap<_, _>>();
+        body();
+        assert!(parent_environment == std::env::vars_os().collect::<BTreeMap<_, _>>());
+        child.complete();
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) async fn with_appimage_test_environment_async(
+    test_name: &str,
+    body: impl std::future::Future<Output = ()>,
+) {
+    if let Some(child) = appimage_test_child(test_name) {
+        let parent_environment = std::env::vars_os().collect::<BTreeMap<_, _>>();
+        body.await;
+        assert!(parent_environment == std::env::vars_os().collect::<BTreeMap<_, _>>());
+        child.complete();
+    }
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct FixtureEvent {

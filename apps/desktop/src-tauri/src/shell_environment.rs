@@ -423,6 +423,8 @@ fn run_shell_probe(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    // This probe hydrates the desktop's own PATH before startup. Keep its
+    // original AppImage environment so bundled executable ordering is preserved.
     // SAFETY: after `fork` and before `exec`, the closure invokes only the
     // async-signal-safe `setsid` syscall. The child cannot already be a process
     // group leader, so this both detaches any inherited controlling terminal
@@ -591,6 +593,42 @@ __BIBCODE_PATH_END__\nlogout";
         assert_eq!(
             parse_captured_path(output, false).unwrap(),
             OsString::from("/opt/homebrew/bin:/usr/bin")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shell_probe_preserves_desktop_appimage_environment() {
+        crate::test_support::with_appimage_test_environment(
+            "shell_environment::tests::shell_probe_preserves_desktop_appimage_environment",
+            || {
+                let appdir = PathBuf::from(std::env::var_os("APPDIR").expect("fixture APPDIR"));
+                let host_bin = appdir.parent().expect("fixture parent").join("host-bin");
+                let result = probe_shell_path_with_command(
+                    Path::new("/bin/sh"),
+                    r#"[ "$APPIMAGE" = "$OWD/BiBCode.AppImage" ] || exit 81
+[ "$APPDIR" = "$OWD/.mount_BiBCode" ] || exit 82
+[ "$ARGV0" = BiBCode.AppImage ] || exit 83
+[ "$LD_LIBRARY_PATH" = "$APPDIR/usr/lib:/usr/lib" ] || exit 84
+[ "$PYTHONHOME" = "$APPDIR/usr" ] || exit 85
+[ "$BIBCODE_FUTURE_PATH" = "$APPDIR/future:/opt/host/future" ] || exit 86
+[ "$GTK_THEME" = Adwaita ] && [ "$GDK_BACKEND" = x11 ] || exit 87
+[ "$PYTHONDONTWRITEBYTECODE" = 1 ] || exit 88
+[ "$SSH_AUTH_SOCK" = /run/user/1000/bibcode-test-agent.sock ] || exit 89
+printf '%s%s%s' '__BIBCODE_PATH_START__' "$PATH" '__BIBCODE_PATH_END__'"#,
+                    Duration::from_secs(5),
+                    4096,
+                );
+
+                assert_eq!(
+                    result,
+                    Ok(OsString::from(format!(
+                        "{}:{}:/usr/bin:/bin",
+                        appdir.join("usr/bin").display(),
+                        host_bin.display()
+                    )))
+                );
+            },
         );
     }
 

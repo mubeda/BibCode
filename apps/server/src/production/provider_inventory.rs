@@ -18,9 +18,12 @@ use crate::{
     production::provider_maintenance::{ProviderMaintenance, ProviderMaintenanceTarget},
     production::provider_runtime::{
         normalize_provider_environment, prepare_provider_launch,
-        resolve_provider_executable_with_environment, sanitize_provider_subprocess_environment,
+        resolve_provider_executable_with_environment,
     },
-    provider::{claude, codex, cursor, grok, opencode},
+    provider::{
+        claude, codex, cursor, environment::sanitize_provider_subprocess_environment, grok,
+        opencode,
+    },
 };
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1051,6 +1054,7 @@ async fn probe_claude_metadata(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    sanitize_provider_subprocess_environment(&mut command);
     let mut child = supervised_command(command).spawn().ok()?;
     let mut stdin = child.stdin().take()?;
     let stdout = child.stdout().take()?;
@@ -1231,6 +1235,7 @@ async fn probe_cursor_models(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    sanitize_provider_subprocess_environment(&mut command);
     let mut child = supervised_command(command).spawn().ok()?;
     let stdout = child.stdout().take()?;
     let stdin = child.stdin().take()?;
@@ -1378,6 +1383,7 @@ async fn probe_local_opencode(
         .stderr(Stdio::null());
     let local_password = uuid::Uuid::new_v4().to_string();
     command.env("OPENCODE_SERVER_PASSWORD", &local_password);
+    sanitize_provider_subprocess_environment(&mut command);
     let mut child = supervised_command(command).spawn().ok()?;
     let mut ready = false;
     for _ in 0..LOCAL_OPENCODE_STARTUP_ATTEMPTS {
@@ -1617,6 +1623,103 @@ mod tests {
     #[cfg(unix)]
     use crate::test_support::TestSandbox;
     use axum::{Json, Router, routing::get};
+
+    #[cfg(target_os = "linux")]
+    fn check_inventory_probe_appimage_environment<F, R>(test_name: &str, run_probe: F)
+    where
+        F: FnOnce(std::path::PathBuf, std::path::PathBuf, Vec<(OsString, OsString)>) -> R,
+        R: std::future::Future<Output = bool>,
+    {
+        use crate::test_support::{
+            ISOLATING_AND_NO_OP_CASES,
+            appimage_environment::{assert_child_environment, check_inherited_environment},
+        };
+
+        check_inherited_environment(test_name, ISOLATING_AND_NO_OP_CASES, |expected| {
+            let sandbox = TestSandbox::new("inventory-appimage-environment");
+            let output_path = sandbox.path("environment");
+            // Read a protocol request before closing the pipes. OpenCode uses
+            // null stdin, so its read completes immediately without a request.
+            let executable = sandbox.executable_script(
+                "inventory-probe",
+                "IFS= read -r request\n/usr/bin/env -0 > \"$BIBCODE_TEST_PROVIDER_ENVIRONMENT_FILE\"",
+                "",
+            );
+            let environment = vec![(
+                OsString::from("BIBCODE_TEST_PROVIDER_ENVIRONMENT_FILE"),
+                output_path.as_os_str().to_owned(),
+            )];
+            // The fixture records the launched environment, then closes the
+            // native discovery protocol without advertising provider data.
+            let discovered = crate::test_support::run_on_current_thread(run_probe(
+                executable,
+                sandbox.root().to_owned(),
+                environment,
+            ));
+            assert!(!discovered, "fixture cannot supply inventory: {test_name}");
+            let environment = std::fs::read(&output_path)
+                .unwrap_or_else(|error| panic!("inventory probe did not run: {error}"));
+            assert_child_environment(&environment, expected);
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn claude_inventory_probe_ignores_appimage_environment() {
+        check_inventory_probe_appimage_environment(
+            "production::provider_inventory::tests::claude_inventory_probe_ignores_appimage_environment",
+            |executable, cwd, environment| async move {
+                probe_claude_metadata(&executable, &cwd, &environment, &[])
+                    .await
+                    .is_some()
+            },
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn codex_inventory_probe_ignores_appimage_environment() {
+        check_inventory_probe_appimage_environment(
+            "production::provider_inventory::tests::codex_inventory_probe_ignores_appimage_environment",
+            |executable, cwd, environment| async move {
+                probe_codex(&executable, &cwd, &[], &environment)
+                    .await
+                    .is_some()
+            },
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cursor_inventory_probe_ignores_appimage_environment() {
+        check_inventory_probe_appimage_environment(
+            "production::provider_inventory::tests::cursor_inventory_probe_ignores_appimage_environment",
+            |executable, cwd, environment| async move {
+                probe_cursor_models(&executable, None, &[], &cwd, &environment)
+                    .await
+                    .is_some()
+            },
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opencode_inventory_probe_ignores_appimage_environment() {
+        check_inventory_probe_appimage_environment(
+            "production::provider_inventory::tests::opencode_inventory_probe_ignores_appimage_environment",
+            |executable, cwd, environment| async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("OpenCode inventory probe requires a loopback listener: {error:?}")
+                    });
+                drop(listener);
+                probe_local_opencode(&executable, &cwd, &[], &environment)
+                    .await
+                    .is_some()
+            },
+        );
+    }
 
     #[cfg(unix)]
     fn write_version_fixture(directory: &Path, name: &str, version: &str) -> std::path::PathBuf {

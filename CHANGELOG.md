@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Running Git and other system tools in a BiBCode terminal on the Linux
+  AppImage no longer fails against bundled libraries. Claude Code status line
+  scripts and other Python tools also run correctly in these terminals.
+  Providers, their probes and helpers, and server-launched editors and file
+  managers also use the host environment without AppImage paths or forced
+  launcher settings. Extracted AppDirs are supported too. Empty launcher paths
+  no longer make commands search the working directory for libraries.
+
 ## [v0.6.1] - 2026-09-23
 
 BiBCode v0.6.1 lets you keep typing while an agent is working. Messages you

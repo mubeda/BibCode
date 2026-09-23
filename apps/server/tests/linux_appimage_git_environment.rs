@@ -11,7 +11,11 @@ use std::{
 use bibcode_server::git::{OutputPolicy, ProcessRequest, ProcessRunner};
 use tokio_util::sync::CancellationToken;
 
-const CHILD: &str = "BIBCODE_APPIMAGE_GIT_TEST_CHILD";
+#[path = "support/reexec.rs"]
+mod reexec;
+
+const TEST: &str = "git_subprocesses_ignore_appimage_libraries";
+const PHASE: &str = "git-loader";
 const HELPER_ARGS: [&str; 2] = ["origin", "https://127.0.0.1:1/bibcode-test.git"];
 
 fn request(command: impl Into<PathBuf>, args: &[&str]) -> ProcessRequest {
@@ -35,10 +39,11 @@ fn request(command: impl Into<PathBuf>, args: &[&str]) -> ProcessRequest {
 // the packaged libnghttp2, without depending on one distro's curl ABI/version.
 #[test]
 fn git_subprocesses_ignore_appimage_libraries() {
-    if std::env::var_os(CHILD).is_some() {
+    if let Some(child) = reexec::enter(TEST, PHASE) {
         tokio::runtime::Runtime::new()
             .expect("Tokio runtime")
             .block_on(assert_git_children());
+        child.complete();
         return;
     }
 
@@ -106,30 +111,18 @@ fn git_subprocesses_ignore_appimage_libraries() {
         String::from_utf8_lossy(&broken.stderr)
     );
 
-    let output = Command::new(std::env::current_exe().expect("test executable"))
-        .args([
-            "--exact",
-            "git_subprocesses_ignore_appimage_libraries",
-            "--nocapture",
-        ])
-        .env(CHILD, "1")
-        .env("APPIMAGE", fixture.path().join("bibcode.AppImage"))
-        .env("APPDIR", &appdir)
-        .env("LD_LIBRARY_PATH", &library_path)
-        .env("BIBCODE_TEST_GIT_HELPER", &helper)
-        .env("BIBCODE_TEST_BUNDLED_LIBRARY", bundled.join(curl_library))
-        .env("BIBCODE_TEST_CUSTOM_LIBRARY_PATH", &custom)
-        .env("SSH_AUTH_SOCK", fixture.path().join("agent.sock"))
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .output()
-        .expect("isolated regression child");
-    assert!(
-        output.status.success(),
-        "isolated regression failed:\n{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    reexec::run(TEST, PHASE, None, |command| {
+        command
+            .env("APPIMAGE", fixture.path().join("bibcode.AppImage"))
+            .env("APPDIR", &appdir)
+            .env("LD_LIBRARY_PATH", &library_path)
+            .env("BIBCODE_TEST_GIT_HELPER", &helper)
+            .env("BIBCODE_TEST_BUNDLED_LIBRARY", bundled.join(curl_library))
+            .env("BIBCODE_TEST_CUSTOM_LIBRARY_PATH", &custom)
+            .env("SSH_AUTH_SOCK", fixture.path().join("agent.sock"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null");
+    });
 }
 
 async fn assert_git_children() {
@@ -165,12 +158,13 @@ async fn assert_git_children() {
     );
 
     // Preserve a custom library directory whose name merely shares APPDIR's
-    // prefix, and preserve credentials/desktop state in both parent and child.
+    // prefix and credentials in both processes. Launcher markers belong only
+    // to the parent, so APPDIR must be absent from the child.
     let echo = request(
         "/bin/sh",
         &[
             "-c",
-            "printf '%s\\n' \"$LD_LIBRARY_PATH\" \"$APPDIR\" \"$SSH_AUTH_SOCK\"",
+            "printf '%s\\n' \"$LD_LIBRARY_PATH\" \"${APPDIR+present}\" \"$SSH_AUTH_SOCK\"",
         ],
     );
     let output = ProcessRunner
@@ -180,8 +174,7 @@ async fn assert_git_children() {
     assert_eq!(
         output.stdout,
         format!(
-            "{custom}\n{}\n{}\n",
-            appdir.to_string_lossy(),
+            "{custom}\n\n{}\n",
             std::env::var("SSH_AUTH_SOCK").expect("agent socket")
         )
     );
@@ -222,9 +215,10 @@ async fn assert_git_children() {
         .expect("non-AppImage environment");
     assert_eq!(output.stdout, original.to_string_lossy());
 
-    // A trailing separator requests libraries from the command's cwd. Preserve
-    // that search even when all nonempty AppImage entries were removed. Use the
-    // actual loader to distinguish an empty variable (disabled) from cwd.
+    // AppRun appends ':' even when the original value is empty. A sole empty
+    // survivor must not become '.', which would allow repository libraries to
+    // load. The actual loader must ignore a planted cwd library when stripping
+    // leaves no nonempty host entry.
     let library = PathBuf::from(
         std::env::var_os("BIBCODE_TEST_BUNDLED_LIBRARY").expect("bundled fixture library"),
     );
@@ -234,8 +228,6 @@ async fn assert_git_children() {
     )
     .expect("working-directory library fixture");
     let mut cwd_library = https_request;
-    // The intentionally crashing helper need not receive a capability query.
-    cwd_library.stdin = None;
     cwd_library.cwd = PathBuf::from(&custom);
     cwd_library.env.push((
         "LD_LIBRARY_PATH".into(),
@@ -244,10 +236,12 @@ async fn assert_git_children() {
     let output = ProcessRunner
         .run(cwd_library, &cancellation)
         .await
-        .expect("working-directory library search");
+        .expect("working-directory libraries stay isolated");
+    assert_eq!(output.exit_code, 0, "{}", output.stderr);
+    assert!(output.stdout.lines().any(|line| line == "fetch"));
     assert!(
-        output.stderr.contains("symbol lookup error"),
-        "cwd library search was lost: {}",
+        !output.stderr.contains("symbol lookup error"),
+        "a planted cwd library was loaded: {}",
         output.stderr
     );
 

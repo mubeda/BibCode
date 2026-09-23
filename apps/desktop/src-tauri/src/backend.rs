@@ -1,4 +1,6 @@
 use bibcode_server::diagnostics::{DesktopUiProcessObserver, UnavailableDesktopUiProcessObserver};
+#[cfg(unix)]
+use bibcode_server::process::isolate_appimage_environment;
 use bibcode_server::process::{configure_background_command, configure_background_std_command};
 use bibcode_server::{
     DESKTOP_SHUTDOWN_PATH as SERVER_BACKEND_SHUTDOWN_PATH,
@@ -1841,6 +1843,9 @@ async fn start_managed_backend(
             bootstrap_line,
             ..
         } => {
+            // BiBCode backend binaries need the AppImage's bundled libraries.
+            // Keep this launch and the desktop/WebKitGTK environment intact;
+            // the server isolates only its user-facing child commands.
             let mut command = Command::new(program);
             configure_background_command(&mut command);
             command
@@ -2090,7 +2095,9 @@ fn request_child_soft_termination(child: &mut Child) -> bool {
     let Some(pid) = child.id() else {
         return false;
     };
-    std::process::Command::new("kill")
+    let mut command = std::process::Command::new("kill");
+    isolate_appimage_environment(&mut command);
+    command
         .args(["-TERM", &pid.to_string()])
         .status()
         .map(|status| status.success())
@@ -2939,6 +2946,55 @@ mod tests {
         connect_async,
         tungstenite::{Message, client::IntoClientRequest},
     };
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn soft_termination_command_ignores_appimage_environment() {
+        use std::os::unix::fs::PermissionsExt;
+
+        crate::test_support::with_appimage_test_environment_async(
+            "backend::tests::soft_termination_command_ignores_appimage_environment",
+            async {
+                let appdir = PathBuf::from(std::env::var_os("APPDIR").expect("fixture APPDIR"));
+                let kill = appdir
+                    .parent()
+                    .expect("fixture parent")
+                    .join("host-bin/kill");
+                fs::write(
+                    &kill,
+                    r#"#!/bin/sh
+[ -z "${APPIMAGE+x}" ] && [ -z "${PYTHONHOME+x}" ] || exit 81
+[ "$LD_LIBRARY_PATH" = /usr/lib ] || exit 82
+[ "$1" = -TERM ] || exit 83
+exec /bin/kill "$@"
+"#,
+                )
+                .expect("host kill fixture");
+                fs::set_permissions(&kill, fs::Permissions::from_mode(0o755))
+                    .expect("host kill fixture permissions");
+                let mut child = Command::new("/bin/sleep")
+                    .arg("60")
+                    .kill_on_drop(true)
+                    .spawn()
+                    .expect("child to terminate");
+
+                let requested = request_child_soft_termination(&mut child);
+                if !requested {
+                    child.start_kill().expect("failed soft-termination cleanup");
+                }
+                tokio::time::timeout(Duration::from_secs(5), child.wait())
+                    .await
+                    .expect("child must terminate")
+                    .expect("terminated child must be reaped");
+
+                assert!(
+                    requested,
+                    "host kill command must receive the isolated environment"
+                );
+            },
+        )
+        .await;
+    }
 
     #[derive(Debug)]
     struct TestBackendPortResolver {
