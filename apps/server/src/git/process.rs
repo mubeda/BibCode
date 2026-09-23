@@ -8,6 +8,7 @@ use crate::process::supervised::{
     SupervisedOverflow, SupervisedRunError, SupervisedRunRequest, SupervisedStreamOutput,
     run_supervised,
 };
+use crate::process::{ChildCommand, EnvironmentInheritance};
 
 const TRUNCATION_MARKER: &str = "\n\n[truncated]";
 
@@ -119,7 +120,7 @@ impl ProcessRunner {
         request: ProcessRequest,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, ProcessError> {
-        self.run_with_environment(request, cancellation, false)
+        self.run_with_environment(request, cancellation, EnvironmentInheritance::Inherit)
             .await
     }
 
@@ -129,7 +130,7 @@ impl ProcessRunner {
         cancellation: &CancellationToken,
     ) -> Result<ProcessBytesOutput, ProcessError> {
         let command_label = request.command.to_string_lossy().into_owned();
-        let command = process_command(&request, false);
+        let command = process_command(&request, EnvironmentInheritance::Inherit);
         let output = run_supervised(
             SupervisedRunRequest {
                 command,
@@ -184,17 +185,18 @@ impl ProcessRunner {
         request: ProcessRequest,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, ProcessError> {
-        self.run_with_environment(request, cancellation, true).await
+        self.run_with_environment(request, cancellation, EnvironmentInheritance::Cleared)
+            .await
     }
 
     async fn run_with_environment(
         &self,
         request: ProcessRequest,
         cancellation: &CancellationToken,
-        clear_environment: bool,
+        inheritance: EnvironmentInheritance,
     ) -> Result<ProcessOutput, ProcessError> {
         let command_label = request.command.to_string_lossy().into_owned();
-        let command = process_command(&request, clear_environment);
+        let command = process_command(&request, inheritance);
         let output = run_supervised(
             SupervisedRunRequest {
                 command,
@@ -246,9 +248,9 @@ impl ProcessRunner {
     }
 }
 
-fn process_command(request: &ProcessRequest, clear_environment: bool) -> Command {
+fn process_command(request: &ProcessRequest, inheritance: EnvironmentInheritance) -> Command {
     let mut command = Command::new(&request.command);
-    if clear_environment {
+    if inheritance == EnvironmentInheritance::Cleared {
         command.env_clear();
     }
     command
@@ -258,73 +260,11 @@ fn process_command(request: &ProcessRequest, clear_environment: bool) -> Command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    #[cfg(target_os = "linux")]
-    isolate_appimage_libraries(&mut command, !clear_environment);
+    crate::process::isolate_appimage_environment(ChildCommand::Process {
+        command: command.as_std_mut(),
+        inheritance,
+    });
     command
-}
-
-#[cfg(target_os = "linux")]
-fn isolate_appimage_libraries(command: &mut Command, inherit_environment: bool) {
-    use std::{ffi::OsStr, os::unix::ffi::OsStrExt, path::Path};
-
-    // Read the effective child environment, including command-local overrides.
-    // Never mutate process-global state in the multithreaded desktop runtime.
-    let variable = |name: &str| match command.as_std().get_envs().find(|(key, _)| *key == name) {
-        Some((_, value)) => value.map(std::ffi::OsStr::to_owned),
-        None if inherit_environment => std::env::var_os(name),
-        None => None,
-    };
-    if variable("APPIMAGE").is_none_or(|value| value.is_empty()) {
-        return;
-    }
-    let Some(appdir) = variable("APPDIR").map(PathBuf::from) else {
-        return;
-    };
-    if !appdir.is_absolute() || appdir.parent().is_none() {
-        return;
-    }
-    let Some(library_path) = variable("LD_LIBRARY_PATH") else {
-        return;
-    };
-    let mut removed = false;
-    // glibc accepts both separators in LD_LIBRARY_PATH; split_paths only
-    // understands colons and would discard host entries after a semicolon.
-    let host_paths: Vec<_> = library_path
-        .as_bytes()
-        .split(|byte| matches!(byte, b':' | b';'))
-        .map(|entry| Path::new(OsStr::from_bytes(entry)))
-        .filter(|path| {
-            // AppImage restarts can retain mount paths from older versions.
-            // APPDIR also handles extraction mode and arbitrary bundle names.
-            let bundled = path.starts_with(&appdir)
-                || (path.is_absolute()
-                    && path.components().any(|component| {
-                        component
-                            .as_os_str()
-                            .as_encoded_bytes()
-                            .starts_with(b".mount_")
-                    }));
-            removed |= bundled;
-            !bundled
-        })
-        .collect();
-    if !removed {
-        return;
-    }
-    if host_paths.is_empty() {
-        command.env_remove("LD_LIBRARY_PATH");
-    } else if host_paths.len() == 1 && host_paths[0].as_os_str().is_empty() {
-        // An empty entry means cwd, but an entirely empty variable disables
-        // this search. Keep the caller's cwd entry when it is the sole survivor.
-        command.env("LD_LIBRARY_PATH", ".");
-    } else {
-        // Entries obtained by splitting a Unix path list cannot contain its
-        // separator, so joining this subset cannot fail.
-        command.env(
-            "LD_LIBRARY_PATH",
-            std::env::join_paths(host_paths).expect("split Unix library paths can be rejoined"),
-        );
-    }
 }
 
 fn map_supervised_error(

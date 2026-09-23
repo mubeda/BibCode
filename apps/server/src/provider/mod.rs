@@ -3,6 +3,7 @@ pub(crate) mod attachments;
 pub mod claude;
 pub mod codex;
 pub mod cursor;
+pub(crate) mod environment;
 pub mod grok;
 pub mod opencode;
 

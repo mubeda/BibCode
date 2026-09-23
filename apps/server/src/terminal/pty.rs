@@ -648,6 +648,7 @@ fn build_pty_command_from_launch(
         }
         command.env(key, value);
     }
+    crate::process::isolate_appimage_environment(&mut command);
     command
 }
 

@@ -202,6 +202,8 @@ impl ProcessRunner {
         F: FnOnce(Option<u32>) + Send,
     {
         let resolved = resolve_command(&input);
+        // This generic runner may launch BiBCode's own binaries, which need the
+        // AppImage environment. Isolation belongs at user-facing spawn sites.
         let mut command = Command::new(&resolved.command);
         command
             .args(&resolved.args)

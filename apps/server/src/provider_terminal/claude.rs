@@ -1817,6 +1817,7 @@ impl ClaudeCapabilityProbeRunner for SystemClaudeCapabilityProbeRunner {
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
+            crate::provider::environment::sanitize_provider_subprocess_environment(&mut command);
             let request = SupervisedRunRequest {
                 command,
                 stdin: None,
@@ -1880,6 +1881,20 @@ mod tests {
         persistence::{Database, run_migrations},
         test_support::TestSandbox,
     };
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn system_capability_probe_ignores_appimage_environment() {
+        crate::test_support::check_capability_probe_appimage_environment(
+            "provider_terminal::claude::tests::system_capability_probe_ignores_appimage_environment",
+            |executable, args| async move {
+                let output = SystemClaudeCapabilityProbeRunner::default()
+                    .run(&executable, args)
+                    .await?;
+                Ok((output.success, output.stdout))
+            },
+        );
+    }
 
     #[test]
     fn hook_authorization_accepts_canonical_and_legacy_correlation_headers() {

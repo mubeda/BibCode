@@ -1,8 +1,30 @@
+#[cfg(target_os = "linux")]
+#[path = "../../tests/support/appimage_environment.rs"]
+pub(crate) mod appimage_environment;
+#[cfg(target_os = "linux")]
+mod capability_probe;
 mod event;
+#[cfg(target_os = "linux")]
+#[path = "../../tests/support/reexec.rs"]
+pub(crate) mod reexec;
 mod sandbox;
 
+#[cfg(target_os = "linux")]
+pub(crate) use capability_probe::check_capability_probe_appimage_environment;
 pub(crate) use event::FixtureEvent;
 pub(crate) use sandbox::{FixtureLease, TestSandbox};
+
+#[cfg(target_os = "linux")]
+pub(crate) const ISOLATING_AND_NO_OP_CASES: &[&str] = &["mixed", "unset-appimage"];
+
+#[cfg(target_os = "linux")]
+pub(crate) fn run_on_current_thread<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime")
+        .block_on(future)
+}
 
 #[cfg(test)]
 mod tests {
