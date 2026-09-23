@@ -1,16 +1,42 @@
 # Changelog
 
-## Unreleased
+## [v0.6.2] - 2026-09-23
+
+BiBCode v0.6.2 fixes terminals and tools on the Linux AppImage. Git, Python and
+other system tools work again in BiBCode terminals, and so do Claude Code
+status line scripts and the commands your agents run, on Fedora, Ubuntu,
+Omarchy and other distributions.
 
 ### Fixed
 
-- Running Git and other system tools in a BiBCode terminal on the Linux
-  AppImage no longer fails against bundled libraries. Claude Code status line
-  scripts and other Python tools also run correctly in these terminals.
-  Providers, their probes and helpers, and server-launched editors and file
-  managers also use the host environment without AppImage paths or forced
-  launcher settings. Extracted AppDirs are supported too. Empty launcher paths
-  no longer make commands search the working directory for libraries.
+- `git pull`, `git fetch` and other HTTPS Git commands in a BiBCode terminal
+  on the Linux AppImage no longer fail with a `libcurl` "symbol lookup error",
+  and system tools no longer print `libpcre2` "no version information
+  available" warnings. BiBCode was handing the AppImage's own bundled
+  libraries and paths to every program it started; terminals, agents and
+  tools now get your normal system environment, as they would in an SSH
+  session.
+- Claude Code status line scripts and other tools that run the system Python
+  start normally in BiBCode terminals on the AppImage instead of failing with
+  "Failed to import encodings".
+- Chat-mode and terminal-mode agents, their probes and helper processes, Git
+  and source-control commands, and editors and file managers opened from
+  BiBCode also run without AppImage paths or the launcher's forced GTK theme,
+  display backend and Python settings. Extracted AppImages
+  (`squashfs-root/AppRun`) are covered too.
+- Commands started from BiBCode no longer search the current directory for
+  libraries when the AppImage launcher left an empty library path.
+
+### Downloads
+
+On macOS, copy BiBCode.app from the DMG to Applications before launching it.
+
+Desktop installers and standalone server distributions are provided for macOS,
+Linux, and Windows on ARM64 and x64. Linux server `.deb` and `.rpm` packages are
+included for both architectures. Stable desktop updater payloads and signatures
+remain available through `latest.json`.
+
+**Full Changelog**: https://github.com/mubeda/BibCode/compare/v0.6.1...v0.6.2
 
 ## [v0.6.1] - 2026-09-23
 
