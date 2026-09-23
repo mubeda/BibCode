@@ -210,7 +210,9 @@ vp run test:ui:desktop:build
 vp run test:ui:desktop
 ```
 
-Follow the native runbook to select the worktree-built `BIBCODE_E2E_APP_PATH`.
+Follow the native runbook to select the worktree-built `BIBCODE_E2E_APP_PATH`
+and, on Linux, for the headless `xvfb-run` invocation and its Wayland-socket
+guard.
 The default suite includes `composer-message-queue.e2e.ts`. To isolate it, set
 `BIBCODE_E2E_SPEC=./specs/composer-message-queue.e2e.ts` for the test invocation
 using the native shell's environment syntax, then clear that selection before

@@ -677,6 +677,31 @@ WebGL without abandoning input already accepted by the scheduler. A later
 renderer retargets error presentation, while the retained writer cannot keep
 the departed renderer or its terminal buffers reachable.
 
+### Linux AppImage GTK packaging
+
+The desktop build's `beforeBuildCommand` runs
+`scripts/prepare-tauri-appimage-tools.ts`, which prepares the repository GTK
+plugin wrapper in `target/.tauri` alongside the upstream plugin pinned by URL
+and SHA-256. Linux Tauri configuration uses that project-local tools directory
+for local, release, and packaged UI builds.
+
+`scripts/tauri/linuxdeploy-plugin-gtk.sh` delegates to the pinned plugin and
+preserves discovery calls without an AppDir. After a successful deployment it
+validates that `apprun-hooks/linuxdeploy-plugin-gtk.sh` exists and contains
+exactly one line beginning `export GDK_BACKEND=x11`. A missing hook, absent
+export, or duplicate export fails packaging before post-processing changes the
+AppDir, making upstream drift visible.
+
+The wrapper removes bundled `libwayland-client.so*` files and symlinks under
+`usr/lib*` and verifies their absence, keeping the system Wayland client with
+the system Mesa/EGL stack. It then rewrites the hook's export to
+`export GDK_BACKEND="${BIBCODE_GDK_BACKEND:-wayland,x11}"`. GTK tries Wayland
+first and falls back to X11; the override is evaluated when the AppImage
+launches. `BIBCODE_GDK_BACKEND=x11` restores the previous backend selection.
+Preferring native Wayland avoids oversized rendering from integer GTK scaling
+under Xwayland on fractionally scaled Hyprland/Omarchy desktops. Both packaging
+steps run before AppImage assembly and updater signing.
+
 ### Linux webview text rendering
 
 The Linux host and the web UI share responsibility for text quality in

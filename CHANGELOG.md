@@ -13,6 +13,8 @@
 - Sending after a provider process exits mid-turn now launches a new provider
   session, including Send now on a held queued message.
 
+- Linux AppImage prefers the native Wayland backend on Wayland sessions (falls back to X11); fixes oversized rendering on Hyprland/Omarchy with fractional scaling (#15). Set `BIBCODE_GDK_BACKEND=x11` to force the previous behaviour.
+
 ## [v0.6.0] - 2026-09-21
 
 BiBCode v0.6.0 adds a Pull Requests module: a project-scoped view, next to
