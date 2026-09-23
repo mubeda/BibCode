@@ -17,8 +17,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     orchestration::{
-        OrchestrationCommand, OrchestrationEngine, ProviderTurnDelivery, TurnDeliveryState,
-        TurnDeliveryTransition, engine::OptionalNullable,
+        OrchestrationCommand, OrchestrationEngine, ProviderTurnDelivery, TurnDeliveryMode,
+        TurnDeliveryState, TurnDeliveryTransition, engine::OptionalNullable,
     },
     production::provider_runtime::{
         ProviderDeliveryOutcome, ProviderReconciliationOutcome, ProviderRuntimeSupervisor,
@@ -257,6 +257,7 @@ impl TurnDeliveryService {
         let shutdown = CancellationToken::new();
         let force_cancel = CancellationToken::new();
         let wake = Arc::new(Notify::new());
+        engine.set_turn_delivery_waker(wake.clone());
         let permits = Arc::new(Semaphore::new(capacity));
         #[cfg(test)]
         let retry_probe = Arc::new(DeliveryRetryProbe::default());
@@ -718,6 +719,7 @@ async fn recover_sending(
         let command_id = row.command_id.clone();
         let transitioned = engine
             .transition_turn_delivery(TurnDeliveryTransition {
+                turn_id: None,
                 command_id: row.command_id,
                 expected_states: vec![TurnDeliveryState::Sending],
                 expected_attempt: row.attempts,
@@ -750,6 +752,7 @@ async fn fill_available_slots(
     if stop_claiming.is_cancelled() {
         return Ok(FillResult { retry_delay: None });
     }
+    promote_settled_threads(engine, stop_claiming).await?;
     let available = max_concurrent_threads.saturating_sub(tasks.len());
     if available == 0 {
         return Ok(FillResult { retry_delay: None });
@@ -778,7 +781,21 @@ async fn fill_available_slots(
             .entry(row.command_id.clone())
             .or_insert_with(|| persisted_delivery_retry(row, now));
     }
-    let candidates = claimable_oldest_per_thread(rows);
+    // There is only one candidate per thread, so each session is read once per fill.
+    let mut candidates = Vec::new();
+    for row in claimable_oldest_per_thread(rows) {
+        if row.mode == TurnDeliveryMode::Start
+            && engine
+                .repositories()
+                .get_thread_session(row.thread_id.clone())
+                .await
+                .map_err(|error| error.to_string())?
+                .is_some_and(|session| matches!(session.status.as_str(), "running" | "starting"))
+        {
+            continue;
+        }
+        candidates.push(row);
+    }
     let retry_delay = candidates
         .iter()
         .filter(|row| {
@@ -829,6 +846,47 @@ async fn fill_available_slots(
         });
     }
     Ok(FillResult { retry_delay })
+}
+
+async fn promote_settled_threads(
+    engine: &OrchestrationEngine,
+    shutdown: &CancellationToken,
+) -> Result<(), String> {
+    let repositories = engine.repositories();
+    let heads = repositories
+        .list_queued_provider_turn_heads()
+        .await
+        .map_err(|error| error.to_string())?;
+    for head in heads {
+        if shutdown.is_cancelled() {
+            break;
+        }
+        if head.held
+            || !repositories
+                .can_promote_queued_provider_turn(
+                    head.thread_id.clone(),
+                    head.message_id.clone(),
+                    true,
+                )
+                .await
+                .map_err(|error| error.to_string())?
+        {
+            continue;
+        }
+        match engine
+            .dispatch(OrchestrationCommand::ThreadTurnPromote {
+                command_id: format!("server:turn-promote:{}", uuid::Uuid::new_v4()),
+                thread_id: head.thread_id,
+                message_id: head.message_id,
+                created_at: now(),
+            })
+            .await
+        {
+            Ok(_) | Err(crate::orchestration::OrchestrationError::Invariant { .. }) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(())
 }
 
 struct DeliveryCompletion {
@@ -939,7 +997,9 @@ async fn prepare_claim_and_deliver(
     let command_id = row.command_id.clone();
     let thread_id = row.thread_id.clone();
     let result = async {
-        execute_bootstrap_prerequisites(&engine, &row, &force_cancel).await?;
+        if row.mode == TurnDeliveryMode::Start {
+            execute_bootstrap_prerequisites(&engine, &row, &force_cancel).await?;
+        }
         if stop_claiming.is_cancelled() {
             return Err("provider delivery claim cancelled".to_owned());
         }
@@ -1059,15 +1119,46 @@ async fn deliver_claimed(
     row: ProviderTurnDelivery,
     shutdown: &CancellationToken,
 ) -> Result<DeliveryTaskOutcome, String> {
-    let command = serde_json::from_value::<OrchestrationCommand>(row.payload.clone());
-    let route_result = match command {
-        Ok(command) => router(command, row.delivery_key.clone()).await,
-        Err(error) => ProviderDeliveryOutcome::Rejected {
-            detail: format!("durable turn payload is invalid: {error}"),
+    let is_steer = row.mode == TurnDeliveryMode::Steer;
+    let active_turn_id = if is_steer {
+        engine
+            .repositories()
+            .get_running_provider_steer_target(row.thread_id.clone(), row.message_id.clone())
+            .await
+            .map_err(|error| error.to_string())
+    } else {
+        Ok(None)
+    };
+    let route_result = match &active_turn_id {
+        Err(detail) => ProviderDeliveryOutcome::DefinitelyNotSent {
+            detail: detail.clone(),
+        },
+        Ok(None) if is_steer => ProviderDeliveryOutcome::Rejected {
+            detail: "The selected turn is no longer available for steering.".to_owned(),
+        },
+        _ => match serde_json::from_value::<OrchestrationCommand>(row.payload.clone()) {
+            Ok(command) => router(command, row.delivery_key.clone()).await,
+            Err(error) => ProviderDeliveryOutcome::Rejected {
+                detail: format!("durable turn payload is invalid: {error}"),
+            },
         },
     };
-    let (next_state, detail, task_outcome) = provider_delivery_outcome(route_result);
+    let turn_id = match &route_result {
+        ProviderDeliveryOutcome::Accepted { turn_id } if is_steer => {
+            turn_id.clone().or(active_turn_id.ok().flatten())
+        }
+        _ => None,
+    };
+    let (next_state, detail, task_outcome) = match route_result {
+        ProviderDeliveryOutcome::Rejected { detail } if is_steer => (
+            TurnDeliveryState::Queued,
+            Some(detail),
+            DeliveryTaskOutcome::Finished,
+        ),
+        outcome => provider_delivery_outcome(outcome),
+    };
     let transition = TurnDeliveryTransition {
+        turn_id,
         command_id: row.command_id.clone(),
         expected_states: vec![TurnDeliveryState::Sending],
         expected_attempt: row.attempts,
@@ -1224,8 +1315,10 @@ mod tests {
         }
     }
 
-    fn row(command_id: &str, thread_id: &str) -> ProviderTurnDelivery {
+    pub(super) fn row(command_id: &str, thread_id: &str) -> ProviderTurnDelivery {
         ProviderTurnDelivery {
+            mode: crate::orchestration::TurnDeliveryMode::Start,
+            held: false,
             command_id: command_id.to_owned(),
             thread_id: thread_id.to_owned(),
             message_id: format!("message-{command_id}"),
@@ -1432,6 +1525,7 @@ mod tests {
         let delivery_key = delivery_key.to_owned();
         let payload = turn_payload(&command_id, &thread_id).to_string();
         let state = match state {
+            TurnDeliveryState::Queued => "queued",
             TurnDeliveryState::Pending => "pending",
             TurnDeliveryState::Sending => "sending",
             TurnDeliveryState::Delivered => "delivered",
@@ -1859,6 +1953,7 @@ mod tests {
             &engine,
             &CancellationToken::new(),
             TurnDeliveryTransition {
+                turn_id: None,
                 command_id: "accepted-conflict".to_owned(),
                 expected_states: vec![TurnDeliveryState::Sending],
                 expected_attempt: 1,
@@ -1906,6 +2001,7 @@ mod tests {
             &engine,
             &CancellationToken::new(),
             TurnDeliveryTransition {
+                turn_id: None,
                 command_id: "accepted-later-attempt".to_owned(),
                 expected_states: vec![TurnDeliveryState::Sending],
                 expected_attempt: 1,
@@ -2909,6 +3005,7 @@ mod tests {
             assert!(
                 engine
                     .transition_turn_delivery(TurnDeliveryTransition {
+                        turn_id: None,
                         command_id: blocker.command_id,
                         expected_states: vec![blocker.state],
                         expected_attempt: blocker.attempts,
@@ -3523,3 +3620,7 @@ mod tests {
         engine.shutdown().await;
     }
 }
+
+#[cfg(test)]
+#[path = "turn_delivery_queue_tests.rs"]
+mod queue_tests;

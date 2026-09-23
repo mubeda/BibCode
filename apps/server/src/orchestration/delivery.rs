@@ -1,15 +1,33 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TurnDeliveryState {
+    Queued,
+    #[default]
     Pending,
     Sending,
     Delivered,
     Uncertain,
     Dismissed,
     Failed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TurnDeliveryMode {
+    Start,
+    Steer,
+}
+
+impl TurnDeliveryMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Steer => "steer",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -29,6 +47,8 @@ pub struct NewProviderTurnDelivery {
     pub provider_session_id: Option<String>,
     pub delivery_key: String,
     pub payload: Value,
+    pub state: TurnDeliveryState,
+    pub mode: TurnDeliveryMode,
     pub created_at: String,
 }
 
@@ -50,6 +70,8 @@ pub struct ProviderTurnDelivery {
     pub delivery_key: String,
     pub payload: Value,
     pub state: TurnDeliveryState,
+    pub mode: TurnDeliveryMode,
+    pub held: bool,
     pub attempts: i64,
     pub last_error: Option<String>,
     pub created_at: String,
@@ -58,6 +80,7 @@ pub struct ProviderTurnDelivery {
 
 #[derive(Clone, Debug)]
 pub struct TurnDeliveryTransition {
+    pub turn_id: Option<String>,
     pub command_id: String,
     pub expected_states: Vec<TurnDeliveryState>,
     pub expected_attempt: i64,

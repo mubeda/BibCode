@@ -1,3 +1,4 @@
+import { DEFAULT_RESOLVED_KEYBINDINGS } from "@bibcode/shared/keybindings";
 import { assert, describe, it } from "vite-plus/test";
 
 import {
@@ -9,6 +10,7 @@ import {
 import {
   formatShortcutLabel,
   isChatNewShortcut,
+  isSteerQueuedMessageShortcut,
   isChatNewLocalShortcut,
   isDiffToggleShortcut,
   modelPickerJumpCommandForIndex,
@@ -967,4 +969,39 @@ describe("plus key parsing", () => {
       }),
     );
   });
+});
+
+describe("queued message steering shortcut", () => {
+  it.each(["Linux", "MacIntel"])(
+    "uses the shipped Mod+Shift+Enter only with editable focus on %s",
+    (platform) => {
+      const chord = event({
+        key: "Enter",
+        shiftKey: true,
+        ctrlKey: platform === "Linux",
+        metaKey: platform === "MacIntel",
+      });
+      assert.strictEqual(
+        isSteerQueuedMessageShortcut(chord, DEFAULT_RESOLVED_KEYBINDINGS, {
+          platform,
+          context: { editableFocus: true },
+        }),
+        true,
+      );
+      assert.strictEqual(
+        isSteerQueuedMessageShortcut(chord, DEFAULT_RESOLVED_KEYBINDINGS, {
+          platform,
+          context: { editableFocus: false },
+        }),
+        false,
+      );
+      assert.strictEqual(
+        isSteerQueuedMessageShortcut({ ...chord, shiftKey: false }, DEFAULT_RESOLVED_KEYBINDINGS, {
+          platform,
+          context: { editableFocus: true },
+        }),
+        false,
+      );
+    },
+  );
 });

@@ -117,6 +117,16 @@ Run the shared focused tests and sequential broad/static gate set. Confirm
 Linux-only tests are not filtered unexpectedly and record any AppImage,
 WebKitGTK, X11, or Wayland diagnostic.
 
+Run the AppImage GTK wrapper regression on Linux:
+
+```sh
+vp test scripts/tauri-linuxdeploy-plugin-gtk.test.ts
+```
+
+It covers Wayland library removal, the generated backend export, missing and
+drifted hooks failing without post-processing mutations, discovery passthrough,
+and upstream failure propagation.
+
 Do not run `vp run test` and a separate broad Cargo command concurrently. Do
 not replace the normal Rust test harness with a serial harness.
 
@@ -193,18 +203,68 @@ Build and run packaged E2E with:
 ```sh
 export BIBCODE_E2E_PLATFORM=linux
 vp run test:ui:desktop:build
-export BIBCODE_E2E_APP_PATH="$(find "$PWD/target/release/bundle/appimage" -maxdepth 1 -name '*.AppImage' -print -quit)"
+export BIBCODE_E2E_APP_PATH="$(find "$PWD/target/$(rustc -vV | sed -n 's/^host: //p')/release/bundle/appimage" -maxdepth 1 -name '*.AppImage' -print -quit)"
 test -n "$BIBCODE_E2E_APP_PATH"
-xvfb-run --auto-servernum vp run test:ui:desktop
+WAYLAND_DISPLAY=bibcode-no-wayland xvfb-run --auto-servernum vp run test:ui:desktop
 ```
 
+The packaged AppImage prefers the Wayland backend, and libwayland connects to
+`$XDG_RUNTIME_DIR/wayland-0` even when `WAYLAND_DISPLAY` is unset. On a host
+with a live Wayland session the app would therefore open on the real desktop
+instead of Xvfb, and document reloads fail the suite. Pointing
+`WAYLAND_DISPLAY` at a socket that does not exist makes the Wayland connection
+fail and exercises the X11 fallback inside Xvfb; `BIBCODE_GDK_BACKEND=x11`
+is the alternative and skips the fallback path.
+
 `BIBCODE_E2E_APP_PATH` deliberately selects the AppImage produced by the E2E
-build in the current worktree, not an installed production copy.
+build in the current worktree, not an installed production copy. The E2E build
+always passes the host target triple to Tauri, so the bundle lands under
+`target/<host triple>/release/bundle/appimage/`, not `target/release/`.
 
 Use the direct E2E command instead of Xvfb when a verified interactive display
 is required and available. Isolate BiBCode application data and XDG config,
 cache, and data roots for the test process without changing the parent shell or
 user profile globally.
+
+### GTK backend and fractional scaling
+
+Inspect an extracted copy of the built AppImage: no `libwayland-client.so*`
+files or symlinks may remain under `usr/lib*`, and
+`apprun-hooks/linuxdeploy-plugin-gtk.sh` must contain exactly one
+`export GDK_BACKEND="${BIBCODE_GDK_BACKEND:-wayland,x11}"` line.
+
+Record the backend actually used by the packaged BiBCode window, alongside the
+desktop session, monitor scale, `GDK_SCALE`, `GDK_DPI_SCALE`, and any
+`BIBCODE_GDK_BACKEND` override:
+
+- On Hyprland, capture `hyprctl clients -j` and identify BiBCode by its PID,
+  class, and title. Its `xwayland` field must be `false` for native Wayland and
+  `true` for Xwayland. Record monitor scaling with `hyprctl monitors -j`.
+- Elsewhere, record `WAYLAND_DISPLAY` and `DISPLAY`, then use
+  `xprop WM_CLASS _NET_WM_PID` to identify an X11 BiBCode window (Xwayland on a
+  Wayland session). For native Wayland, use the compositor's window inspector
+  to confirm the app's backend. `WAYLAND_DISPLAY` alone only shows that Wayland
+  is available; it does not prove BiBCode used it. If the backend cannot be
+  established, record that evidence as unavailable.
+
+On Hyprland/Omarchy, launch with `BIBCODE_GDK_BACKEND` unset at a fractional
+monitor scale such as 1.5×. Verify native Wayland and capture normal and minimum
+window sizes: text and controls must no longer render about 1.33× too large.
+Record the compositor's Xwayland scaling configuration, including
+`xwayland:force_zero_scaling` when present.
+
+Close the test instance and repeat with the override, using the same isolated
+application and XDG roots:
+
+```sh
+BIBCODE_GDK_BACKEND=x11 /absolute/path/to/BiBCode.AppImage
+```
+
+Confirm X11/Xwayland through the window evidence above; the override restores
+the previous behavior and may reproduce the oversized rendering. Also launch
+without the override on an X11-only session (or Xvfb with `WAYLAND_DISPLAY`
+unset) to verify automatic X11 fallback. Report unavailable desktop sessions
+separately; Xvfb evidence alone does not validate native Wayland scaling.
 
 ## Packaged UI scenarios
 
@@ -350,5 +410,6 @@ compatibility evidence only.
 
 Complete [the execution report template](./execution-report-template.md), then
 perform the shared cleanup and final Git audit. Include distribution, display
-protocol, AppImage execution mode, unsupported host differences, screenshot
+protocol, the app's verified GTK backend and override, monitor and GTK scaling,
+AppImage execution mode, unsupported host differences, screenshot
 paths, zero-survivor evidence, and whether anything was pushed.

@@ -7,6 +7,8 @@ import {
   PROVIDER_DISPLAY_NAMES,
   ProjectId,
   type ModelSelection,
+  type OrchestrationSessionStatus,
+  type TurnDelivery,
   type ProviderDriverKind,
   type ServerProvider,
   type ScopedThreadRef,
@@ -516,7 +518,9 @@ export function findLastCancellableDeliveryMessage(
 ): ChatMessage | null {
   return (
     messages.findLast(
-      (message) => message.delivery?.state === "pending" || message.delivery?.state === "sending",
+      (message) =>
+        !isQueuedTimelineMessage(message) &&
+        (message.delivery?.state === "pending" || message.delivery?.state === "sending"),
     ) ?? null
   );
 }
@@ -525,6 +529,7 @@ export function findActiveDeliveryMessage(
   messages: ReadonlyArray<ChatMessage>,
 ): ChatMessage | null {
   const oldestUnresolved = messages.find((message) => {
+    if (isQueuedTimelineMessage(message)) return false;
     const state = message.delivery?.state;
     return (
       state === "pending" || state === "sending" || state === "uncertain" || state === "failed"
@@ -532,6 +537,98 @@ export function findActiveDeliveryMessage(
   });
   const state = oldestUnresolved?.delivery?.state;
   return state === "pending" || state === "sending" ? (oldestUnresolved ?? null) : null;
+}
+
+export function isQueuedTimelineMessage(message: ChatMessage): boolean {
+  const delivery = message.delivery;
+  return (
+    delivery?.state === "queued" ||
+    (delivery?.mode === "steer" && (delivery.state === "pending" || delivery.state === "sending"))
+  );
+}
+
+export function selectQueuedMessages(messages: ReadonlyArray<ChatMessage>): ChatMessage[] {
+  // The snapshot preserves durable FIFO order, even when timestamps disagree.
+  return messages.filter(isQueuedTimelineMessage);
+}
+
+export function shouldEnqueueOnSend(input: {
+  phase: SessionPhase;
+  sessionStatus: OrchestrationSessionStatus | null;
+  hasPendingDelivery: boolean;
+}): boolean {
+  return (
+    input.phase === "running" || input.sessionStatus === "starting" || input.hasPendingDelivery
+  );
+}
+
+export interface QueuedCardStatus {
+  label: string;
+  canSteer: boolean;
+  steerDisabledReason: string | null;
+  canCancel: boolean;
+  steering: boolean;
+  primaryAction: "steer" | "send-now" | null;
+  canSendNow: boolean;
+  sendNowDisabledReason: string | null;
+}
+
+export function deriveQueuedCardStatus(input: {
+  index: number;
+  phase: SessionPhase;
+  sessionStatus: OrchestrationSessionStatus | null;
+  supportsTurnSteer: boolean;
+  delivery: TurnDelivery;
+  hasPendingApproval: boolean;
+  hasPendingUserInput: boolean;
+}): QueuedCardStatus {
+  const steering =
+    input.delivery.mode === "steer" &&
+    (input.delivery.state === "pending" || input.delivery.state === "sending");
+  const running = input.phase === "running";
+  const waiting = input.delivery.held === true || !running;
+  const blockedReason = steering
+    ? "Steering…"
+    : input.index > 0
+      ? "Send the messages above first"
+      : input.hasPendingApproval
+        ? "Respond to the pending approval first"
+        : input.hasPendingUserInput
+          ? "Answer the pending question first"
+          : null;
+  const steerDisabledReason =
+    blockedReason ??
+    (!input.supportsTurnSteer
+      ? "This provider cannot steer a running turn"
+      : waiting
+        ? "Waiting for you"
+        : null);
+  const sendNowDisabledReason =
+    blockedReason ??
+    (running
+      ? "Wait for the running turn to end"
+      : input.sessionStatus === "starting"
+        ? "Wait for the session to finish starting"
+        : null);
+  return {
+    label: steering
+      ? "Steering…"
+      : input.index > 0
+        ? "Sends after the messages above."
+        : waiting
+          ? "Waiting for you"
+          : input.supportsTurnSteer
+            ? "Sends when the turn ends. Steer to send it now."
+            : "Sends when the turn ends.",
+    canSteer: steerDisabledReason === null,
+    steerDisabledReason,
+    canCancel: input.delivery.state === "queued",
+    steering,
+    primaryAction:
+      input.index > 0 ? null : waiting ? "send-now" : input.supportsTurnSteer ? "steer" : null,
+    canSendNow: sendNowDisabledReason === null,
+    sendNowDisabledReason,
+  };
 }
 
 export function createLocalDispatchSnapshot(

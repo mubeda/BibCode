@@ -49,6 +49,7 @@ const EXPECTED_STATIC_KEYBINDING_COMMANDS = [
   "chat.new",
   "chat.newLocal",
   "editor.openFavorite",
+  "thread.steerQueuedMessage",
   "modelPicker.toggle",
   "modelPicker.jump.1",
   "modelPicker.jump.2",

@@ -2,6 +2,7 @@ use bibcode_server::orchestration::engine::{
     EngineOptions, OrchestrationCommand, OrchestrationEngine, OrchestrationError, TestHooks,
     load_snapshot,
 };
+use bibcode_server::orchestration::{TurnDeliveryMode, TurnDeliveryState};
 use bibcode_server::persistence::{Database, NewOrchestrationEvent, Repositories, run_migrations};
 use serde_json::{Value, json};
 
@@ -44,6 +45,10 @@ fn command_values() -> Vec<Value> {
         json!({"type":"thread.turn.diff.complete","commandId":"c17","threadId":"t1","turnId":"turn-1","completedAt":CREATED_AT,"checkpointRef":"ref-1","status":"ready","files":[{"path":"a.rs","kind":"modified","additions":2,"deletions":1}],"assistantMessageId":"m-assistant","checkpointTurnCount":1,"createdAt":CREATED_AT}),
         json!({"type":"thread.activity.append","commandId":"c18","threadId":"t1","activity":{"id":"activity-1","tone":"tool","kind":"command","summary":"ran","payload":{"requestId":"r3"},"turnId":"turn-1","createdAt":CREATED_AT},"createdAt":CREATED_AT}),
         json!({"type":"thread.revert.complete","commandId":"c19","threadId":"t1","turnCount":0,"createdAt":CREATED_AT}),
+        json!({"type":"thread.turn.start","commandId":"c24","threadId":"t1","message":{"messageId":"m-queued","role":"user","text":"next task","attachments":[]},"runtimeMode":"full-access","interactionMode":"default","queued":true,"createdAt":CREATED_AT}),
+        json!({"type":"thread.turn.steer","commandId":"c25","threadId":"t1","messageId":"m-queued","createdAt":CREATED_AT}),
+        json!({"type":"thread.turn.promote","commandId":"c26","threadId":"t1","messageId":"m-queued","createdAt":CREATED_AT}),
+        json!({"type":"thread.turn-delivery.resolve","commandId":"c27","threadId":"t1","messageId":"m-queued","action":"cancel","createdAt":CREATED_AT}),
     ]
 }
 
@@ -52,19 +57,48 @@ fn decode(value: Value) -> OrchestrationCommand {
 }
 
 #[test]
+fn queued_delivery_state_and_modes_round_trip() {
+    let queued: TurnDeliveryState = serde_json::from_value(json!("queued")).unwrap();
+    assert_eq!(queued, TurnDeliveryState::Queued);
+    assert_eq!(serde_json::to_value(queued).unwrap(), json!("queued"));
+    for (value, mode) in [
+        ("start", TurnDeliveryMode::Start),
+        ("steer", TurnDeliveryMode::Steer),
+    ] {
+        assert_eq!(
+            serde_json::from_value::<TurnDeliveryMode>(json!(value)).unwrap(),
+            mode
+        );
+        assert_eq!(serde_json::to_value(mode).unwrap(), json!(value));
+        assert_eq!(mode.as_str(), value);
+    }
+}
+
+#[test]
 fn all_contract_command_variants_round_trip_with_canonical_defaults() {
     let values = command_values();
-    assert_eq!(values.len(), 23);
+    assert_eq!(values.len(), 27);
     for value in values {
         let expected_type = value["type"].clone();
-        let encoded = serde_json::to_value(decode(value)).expect("command encodes");
+        let command = decode(value.clone());
+        assert_eq!(command.command_type(), expected_type.as_str().unwrap());
+        let encoded = serde_json::to_value(command).expect("command encodes");
         assert_eq!(encoded["type"], expected_type);
+        if value["queued"] == true
+            || matches!(
+                expected_type.as_str(),
+                Some("thread.turn.steer" | "thread.turn.promote" | "thread.turn-delivery.resolve")
+            )
+        {
+            assert_eq!(encoded, value);
+        }
     }
 
     let thread_create = serde_json::to_value(decode(command_values()[3].clone())).unwrap();
     assert_eq!(thread_create["interactionMode"], "default");
     assert!(thread_create.get("kind").is_none());
     let turn_start = serde_json::to_value(decode(command_values()[10].clone())).unwrap();
+    assert!(turn_start.get("queued").is_none());
     assert_eq!(turn_start["runtimeMode"], "full-access");
     assert_eq!(turn_start["interactionMode"], "default");
     let session_set = serde_json::to_value(decode(command_values()[16].clone())).unwrap();
@@ -1038,4 +1072,299 @@ async fn bootstrap_preserves_legacy_unmarked_message_sent_projection() {
         ("t1", Some("turn-legacy"), "assistant", "legacy text", false,)
     );
     restarted.shutdown().await;
+}
+
+#[path = "support/turn_queue.rs"]
+mod turn_queue;
+use turn_queue::{queue_engine, seed_queued_message};
+
+#[tokio::test]
+async fn promote_replays_the_stored_turn_start() {
+    let engine = queue_engine(TestHooks::default()).await;
+    seed_queued_message(&engine, "saved-queue").await;
+    engine
+        .dispatch(decode(command_values()[8].clone()))
+        .await
+        .unwrap();
+    engine
+        .dispatch(decode(command_values()[9].clone()))
+        .await
+        .unwrap();
+    let before = engine
+        .read_events(0)
+        .await
+        .unwrap()
+        .last()
+        .unwrap()
+        .sequence;
+    let promote = json!({"type":"thread.turn.promote", "commandId":"promote-first", "threadId":"t1", "messageId":"saved-queue", "createdAt":"2026-07-10T10:01:00.000Z"});
+    let result = engine
+        .dispatch(decode(promote.clone()))
+        .await
+        .expect("queued row promotes");
+    let events = engine.read_events(before).await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.event.event_type.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "thread.turn-start-requested",
+            "thread.turn-delivery-updated"
+        ]
+    );
+    assert_eq!(
+        events[0].event.payload,
+        json!({
+            "threadId":"t1", "messageId":"saved-queue", "modelSelection":{"instanceId":"codex", "model":"saved-model", "options":{"reasoningEffort":"high"}},
+            "runtimeMode":"full-access", "interactionMode":"default", "titleSeed":"Saved title", "createdAt":"2026-07-10T10:01:00.000Z"
+        })
+    );
+    assert_eq!(
+        events[1].event.payload["delivery"],
+        json!({"state":"pending", "provider":"codex", "mode":"start", "held":false})
+    );
+    let row = engine
+        .repositories()
+        .get_provider_turn_delivery("saved-queue".into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, TurnDeliveryState::Pending);
+    assert!(!row.held);
+    assert_eq!(
+        engine
+            .dispatch(decode(promote.clone()))
+            .await
+            .unwrap()
+            .sequence,
+        result.sequence
+    );
+    let mut second = promote;
+    second["commandId"] = json!("promote-second");
+    assert!(matches!(
+        engine.dispatch(decode(second)).await,
+        Err(OrchestrationError::Invariant { .. })
+    ));
+    assert_eq!(engine.read_events(before).await.unwrap().len(), 2);
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn cancel_withdraws_a_queued_message() {
+    let engine = queue_engine(TestHooks::default()).await;
+    seed_queued_message(&engine, "cancel-queue").await;
+    let before = engine
+        .read_events(0)
+        .await
+        .unwrap()
+        .last()
+        .unwrap()
+        .sequence;
+    let cancel = json!({"type":"thread.turn-delivery.resolve", "commandId":"cancel-first", "threadId":"t1", "messageId":"cancel-queue", "action":"cancel", "createdAt":CREATED_AT});
+    engine
+        .dispatch(decode(cancel.clone()))
+        .await
+        .expect("queued cancellation");
+    let row = engine
+        .repositories()
+        .get_provider_turn_delivery("cancel-queue".into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, TurnDeliveryState::Dismissed);
+    let events = engine.read_events(before).await.unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event.event_type, "thread.turn-delivery-updated");
+    assert_eq!(events[0].event.payload["withdrawn"], true);
+    assert_eq!(
+        events[0].event.payload["delivery"],
+        json!({"state":"dismissed", "provider":"codex", "mode":"start", "held":true})
+    );
+    assert!(
+        !load_snapshot(&engine.repositories())
+            .await
+            .unwrap()
+            .messages
+            .iter()
+            .any(|message| message.message_id == "cancel-queue")
+    );
+    engine
+        .dispatch(decode(cancel))
+        .await
+        .expect("same cancellation is idempotent");
+    assert_eq!(engine.read_events(before).await.unwrap().len(), 1);
+    seed_queued_message(&engine, "cancel-pending").await;
+    engine.repositories().database().call(|connection| {
+        connection.execute("UPDATE provider_turn_outbox SET state = 'pending' WHERE command_id = 'cancel-pending'", [])?;
+        Ok(())
+    }).await.unwrap();
+    assert!(matches!(engine.dispatch(decode(json!({"type":"thread.turn-delivery.resolve", "commandId":"cancel-refused", "threadId":"t1", "messageId":"cancel-pending", "action":"cancel", "createdAt":CREATED_AT}))).await,
+        Err(OrchestrationError::Invariant { .. })));
+    assert_eq!(
+        engine
+            .repositories()
+            .get_provider_turn_delivery("cancel-pending".into())
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        TurnDeliveryState::Pending
+    );
+    assert!(
+        engine
+            .repositories()
+            .get_message("cancel-pending".into())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    engine.shutdown().await;
+}
+
+async fn steer_session(engine: &OrchestrationEngine, status: &str, active: Option<&str>, id: &str) {
+    engine.dispatch(serde_json::from_value(json!({
+        "type":"thread.session.set", "commandId":id, "threadId":"t1", "createdAt":CREATED_AT,
+        "session":{"threadId":"t1", "status":status, "providerName":"codex", "activeTurnId":active,
+          "lastError":null, "updatedAt":CREATED_AT}
+    })).unwrap()).await.unwrap();
+}
+fn steer_command(id: &str, message: &str) -> OrchestrationCommand {
+    serde_json::from_value(json!({"type":"thread.turn.steer", "commandId":id, "threadId":"t1", "messageId":message, "createdAt":CREATED_AT})).unwrap()
+}
+
+#[tokio::test]
+async fn steer_requires_head_running_and_capability() {
+    let engine = turn_queue::queue_engine(TestHooks::default()).await;
+    for id in ["head", "tail"] {
+        turn_queue::seed_queued_message(&engine, id).await;
+    }
+    steer_session(&engine, "running", Some("active"), "running").await;
+    let error = engine
+        .dispatch(steer_command("non-head", "tail"))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("queued head"), "{error}");
+    for (status, active) in [("ready", None), ("starting", None), ("running", None)] {
+        steer_session(&engine, status, active, &format!("session-{status}")).await;
+        let error = engine
+            .dispatch(steer_command(&format!("steer-{status}"), "head"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("running turn"), "{error}");
+    }
+    steer_session(&engine, "running", Some("active"), "running-again").await;
+    engine.repositories().database().call(|connection| {
+        connection.execute("UPDATE provider_turn_outbox SET provider_kind = 'cursor' WHERE command_id = 'head'", [])?;
+        Ok(())
+    }).await.unwrap();
+    let error = engine
+        .dispatch(steer_command("unsupported", "head"))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("does not support steering"),
+        "{error}"
+    );
+    for id in ["head", "tail"] {
+        assert_eq!(
+            engine
+                .repositories()
+                .get_provider_turn_delivery(id.into())
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            TurnDeliveryState::Queued
+        );
+    }
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn steer_emits_turn_steer_requested_and_flips_row() {
+    let engine = turn_queue::queue_engine(TestHooks::default()).await;
+    turn_queue::seed_queued_message(&engine, "head").await;
+    steer_session(&engine, "running", Some("active"), "running").await;
+    let before = engine
+        .read_events(0)
+        .await
+        .unwrap()
+        .last()
+        .unwrap()
+        .sequence;
+    let command = steer_command("steer", "head");
+    engine.dispatch(command.clone()).await.unwrap();
+    engine.dispatch(command).await.unwrap();
+    let events = engine.read_events(before).await.unwrap();
+    assert_eq!(events.len(), 2, "duplicate steer must not emit twice");
+    assert_eq!(events[0].event.event_type, "thread.turn-steer-requested");
+    assert_eq!(
+        events[0].event.payload,
+        json!({"threadId":"t1","messageId":"head","turnId":"active","createdAt":CREATED_AT})
+    );
+    assert_eq!(events[1].event.event_type, "thread.turn-delivery-updated");
+    assert_eq!(
+        events[1].event.payload["delivery"],
+        json!({"state":"pending","provider":"codex","mode":"steer","held":false})
+    );
+    let row = engine
+        .repositories()
+        .get_provider_turn_delivery("head".into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, TurnDeliveryState::Pending);
+    assert_eq!(row.mode, TurnDeliveryMode::Steer);
+    assert!(!row.held);
+    let message = engine
+        .repositories()
+        .get_message("head".into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(message.delivery_state.as_deref(), Some("pending"));
+    assert_eq!(message.delivery_mode.as_deref(), Some("steer"));
+    assert_eq!(message.turn_id, None, "bind only on provider acceptance");
+    let session = engine
+        .repositories()
+        .get_thread_session("t1".into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(session.status, "running");
+    assert_eq!(session.active_turn_id.as_deref(), Some("active"));
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn steer_rolls_back_with_its_delivery_projection() {
+    let hooks = TestHooks::default();
+    let engine = turn_queue::queue_engine(hooks.clone()).await;
+    turn_queue::seed_queued_message(&engine, "head").await;
+    steer_session(&engine, "running", Some("active"), "running").await;
+    let before = engine.read_events(0).await.unwrap().len();
+    hooks.fail_next_projector(
+        "projection.thread-messages",
+        Some("thread.turn-delivery-updated"),
+    );
+    let error = engine
+        .dispatch(steer_command("steer", "head"))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("projection.thread-messages"),
+        "{error}"
+    );
+    let row = engine
+        .repositories()
+        .get_provider_turn_delivery("head".into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, TurnDeliveryState::Queued);
+    assert_eq!(row.mode, TurnDeliveryMode::Start);
+    assert!(row.held);
+    assert_eq!(engine.read_events(0).await.unwrap().len(), before);
+    engine.shutdown().await;
 }

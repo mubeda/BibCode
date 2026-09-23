@@ -3237,3 +3237,42 @@ describe("ChatComposer effects", () => {
     runCleanups();
   });
 });
+
+describe("queued steer shortcut", () => {
+  it.each([false, true])(
+    "consumes Mod+Shift+Enter before menu selection or newline (menu %s)",
+    (menu) => {
+      seedPrompt(menu ? ":model" : "draft unchanged");
+      const onSteerQueuedMessage = vi.fn();
+      const keybindings: ResolvedKeybindingsConfig = [
+        {
+          command: "thread.steerQueuedMessage",
+          shortcut: {
+            key: "enter",
+            modKey: true,
+            shiftKey: true,
+            metaKey: false,
+            ctrlKey: false,
+            altKey: false,
+          },
+          whenAst: { type: "identifier", name: "editableFocus" },
+        },
+      ];
+      const { spies } = renderComposer({ onSteerQueuedMessage, keybindings });
+      const onKey = editorProps()["onCommandKeyDown"] as CommandKey;
+      const event = {
+        key: "Enter",
+        shiftKey: true,
+        ctrlKey: true,
+        metaKey: false,
+        altKey: false,
+        preventDefault: vi.fn(),
+      } as unknown as KeyboardEvent;
+      expect(onKey("Enter", event)).toBe(true);
+      expect(event.preventDefault).toHaveBeenCalled();
+      expect(onSteerQueuedMessage).toHaveBeenCalledOnce();
+      expect(spies.onSend).not.toHaveBeenCalled();
+      expect(draftOf(threadRef)?.prompt).toBe(menu ? ":model" : "draft unchanged");
+    },
+  );
+});

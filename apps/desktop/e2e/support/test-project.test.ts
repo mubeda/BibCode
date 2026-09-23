@@ -10,10 +10,12 @@ import * as NodeReadline from "node:readline";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 
 import { desktopActivityFixture, desktopActivitySessionCommands } from "./activity-events.ts";
+import { readProviderInputLog } from "./provider-input-log.ts";
 import {
   archiveAndCleanupDesktopUiTestContext,
   clearDesktopActivityMarker,
   composerProviderProfiles,
+  completeDesktopUiSlowTurn,
   deferDesktopUiTestContextCleanupUntilExit,
   prepareDesktopUiTestContext,
   type DesktopUiDirectoryRemover,
@@ -27,6 +29,7 @@ const hostTemporaryDirectories: string[] = [];
 const isNativeWindowsHost = process.platform === "win32";
 
 interface FixtureProtocol {
+  readonly notifications: Array<{ method: string; params: Record<string, unknown> }>;
   readonly close: () => Promise<void>;
   readonly request: (method: string, params?: Record<string, unknown>) => Promise<unknown>;
 }
@@ -38,6 +41,7 @@ function startCodexFixture(fixtureScript: string, environment: NodeJS.ProcessEnv
   });
   const lines = NodeReadline.createInterface({ input: child.stdout });
   let sequence = 0;
+  const notifications: FixtureProtocol["notifications"] = [];
   const pending = new Map<
     number,
     { readonly reject: (error: Error) => void; readonly resolve: (value: unknown) => void }
@@ -47,8 +51,14 @@ function startCodexFixture(fixtureScript: string, environment: NodeJS.ProcessEnv
       readonly id?: number;
       readonly error?: unknown;
       readonly result?: unknown;
+      readonly method?: string;
+      readonly params?: Record<string, unknown>;
     };
-    if (typeof message.id !== "number") return;
+    if (typeof message.id !== "number") {
+      if (message.method)
+        notifications.push({ method: message.method, params: message.params ?? {} });
+      return;
+    }
     const waiter = pending.get(message.id);
     if (!waiter) return;
     pending.delete(message.id);
@@ -65,6 +75,7 @@ function startCodexFixture(fixtureScript: string, environment: NodeJS.ProcessEnv
     pending.clear();
   });
   return {
+    notifications,
     request: (method, params = {}) =>
       new Promise((resolve, reject) => {
         const id = sequence++;
@@ -269,6 +280,127 @@ describe.each(["mac", "linux"])("prepareDesktopUiTestContext on %s", (platform) 
 });
 
 describe("packaged provider composer fixture", () => {
+  it("keeps a slow Codex turn running through steer and completes it only on its release marker", async () => {
+    const environment: NodeJS.ProcessEnv = { PATH: process.env.PATH, BIBCODE_E2E_PLATFORM: "mac" };
+    const context = prepareDesktopUiTestContext(environment);
+    contexts.push(context);
+    const protocol = startCodexFixture(
+      NodePath.join(context.shimDirectory, "codex-fixture.mjs"),
+      environment,
+    );
+    try {
+      const started = (await protocol.request("turn/start", {
+        input: [{ type: "text", text: "first [[slow]]" }],
+      })) as { turn: { id: string } };
+      await protocol.request("account/read");
+      expect(protocol.notifications.map(({ method }) => method)).toEqual([
+        "turn/started",
+        "item/agentMessage/delta",
+      ]);
+      await expect(
+        protocol.request("turn/steer", {
+          expectedTurnId: "stale-turn",
+          input: [{ type: "text", text: "wrong" }],
+        }),
+      ).rejects.toThrow(/active turn/);
+      await expect(
+        protocol.request("turn/steer", {
+          expectedTurnId: started.turn.id,
+          input: [{ type: "text", text: "second" }],
+        }),
+      ).resolves.toEqual({ turnId: started.turn.id });
+      expect(protocol.notifications.filter(({ method }) => method === "turn/started")).toHaveLength(
+        1,
+      );
+      expect(protocol.notifications.some(({ method }) => method === "turn/completed")).toBe(false);
+      expect(readProviderInputLog(context.providerInputLogPath)).toMatchObject([
+        { provider: "codex", kind: "start", prompt: "first [[slow]]", turnId: started.turn.id },
+        { provider: "codex", kind: "steer", prompt: "second", turnId: started.turn.id },
+      ]);
+      completeDesktopUiSlowTurn(context.projectPath, started.turn.id);
+      await expect
+        .poll(() => protocol.notifications.filter(({ method }) => method === "turn/completed"))
+        .toEqual([
+          {
+            method: "turn/completed",
+            params: {
+              threadId: "bibcode-ui-provider-thread",
+              turn: { id: started.turn.id, status: "completed" },
+            },
+          },
+        ]);
+      const next = (await protocol.request("turn/start", {
+        input: [{ type: "text", text: "fourth" }],
+      })) as { turn: { id: string } };
+      await protocol.request("account/read");
+      expect(next.turn.id).not.toBe(started.turn.id);
+      expect(
+        protocol.notifications.filter(({ method }) => method === "turn/completed"),
+      ).toHaveLength(2);
+      expect(readProviderInputLog(context.providerInputLogPath).at(-1)).toMatchObject({
+        kind: "start",
+        prompt: "fourth",
+        turnId: next.turn.id,
+      });
+    } finally {
+      await protocol.close();
+    }
+  });
+
+  it.each(["complete", "interrupt"])(
+    "bounds slow turns and clears timers after %s",
+    async (settle) => {
+      const environment: NodeJS.ProcessEnv = {
+        PATH: process.env.PATH,
+        BIBCODE_E2E_PLATFORM: "mac",
+        BIBCODE_E2E_SLOW_TURN_MS: "200",
+      };
+      const context = prepareDesktopUiTestContext(environment);
+      contexts.push(context);
+      const protocol = startCodexFixture(
+        NodePath.join(context.shimDirectory, "codex-fixture.mjs"),
+        environment,
+      );
+      try {
+        const started = (await protocol.request("turn/start", {
+          input: [{ type: "text", text: "[[slow]]" }],
+        })) as { turn: { id: string } };
+        await protocol.request("account/read");
+        expect(protocol.notifications.some(({ method }) => method === "turn/completed")).toBe(
+          false,
+        );
+        if (settle === "interrupt")
+          await protocol.request("turn/interrupt", { turnId: started.turn.id });
+        await expect
+          .poll(() => protocol.notifications.filter(({ method }) => method === "turn/completed"))
+          .toEqual([
+            {
+              method: "turn/completed",
+              params: {
+                threadId: "bibcode-ui-provider-thread",
+                turn: {
+                  id: started.turn.id,
+                  status: settle === "interrupt" ? "interrupted" : "completed",
+                },
+              },
+            },
+          ]);
+        await expect(
+          protocol.request("turn/steer", {
+            expectedTurnId: started.turn.id,
+            input: [{ type: "text", text: "late" }],
+          }),
+        ).rejects.toThrow(/active turn/);
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        expect(
+          protocol.notifications.filter(({ method }) => method === "turn/completed"),
+        ).toHaveLength(1);
+      } finally {
+        await protocol.close();
+      }
+    },
+  );
+
   it("replays the Claude user message before acknowledging the completed turn", async () => {
     const environment: NodeJS.ProcessEnv = {
       PATH: process.env.PATH,

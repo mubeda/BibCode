@@ -1257,6 +1257,7 @@ mod tests {
             runtime
                 .orchestration
                 .transition_turn_delivery(TurnDeliveryTransition {
+                    turn_id: None,
                     command_id: "provider-no-git-delivery".to_owned(),
                     expected_states: vec![TurnDeliveryState::Sending],
                     expected_attempt: 1,

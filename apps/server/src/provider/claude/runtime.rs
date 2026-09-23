@@ -7,6 +7,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use tokio_util::sync::CancellationToken;
 
 use super::activity::{ClaudeActivityInputSource, ClaudeActivityTracker, canonical_actor_id};
 use super::canonical::CanonicalEvent;
@@ -1458,6 +1459,8 @@ pub struct ClaudeProviderRuntime {
     session_id: String,
     runtime_mode: Option<RuntimeMode>,
     current_turn_id: Option<String>,
+    turn_input_cancellation: CancellationToken,
+    delivery_acknowledgement_cancellation: CancellationToken,
     active_assistant_item_id: Option<String>,
     pending_approvals: BTreeMap<String, PendingApproval>,
     pending_user_inputs: BTreeMap<String, PendingUserInput>,
@@ -1496,6 +1499,8 @@ impl ClaudeProviderRuntime {
             session_id,
             runtime_mode: None,
             current_turn_id: None,
+            turn_input_cancellation: CancellationToken::new(),
+            delivery_acknowledgement_cancellation: CancellationToken::new(),
             active_assistant_item_id: None,
             pending_approvals: BTreeMap::new(),
             pending_user_inputs: BTreeMap::new(),
@@ -1559,6 +1564,8 @@ impl ClaudeProviderRuntime {
         runtime_mode: RuntimeMode,
         cwd: Option<String>,
     ) -> Vec<CanonicalEvent> {
+        self.stop_turn_input();
+        self.reset_delivery_acknowledgements();
         self.runtime_mode = Some(runtime_mode);
         vec![
             self.event(
@@ -1592,6 +1599,8 @@ impl ClaudeProviderRuntime {
     }
 
     pub fn start_turn(&mut self, input: TurnInput) -> Vec<CanonicalEvent> {
+        self.stop_turn_input();
+        self.turn_input_cancellation = CancellationToken::new();
         self.token_usage.start_turn();
         self.active_assistant_item_id = None;
         // Scoped to the turn: a retry observed two turns ago must not be
@@ -1605,6 +1614,34 @@ impl ClaudeProviderRuntime {
             None,
             json!({ "input": input.input }),
         )]
+    }
+
+    pub(crate) fn turn_steer_cancellation(
+        &self,
+        expected_turn_id: &str,
+    ) -> Option<CancellationToken> {
+        (self.current_turn_id.as_deref() == Some(expected_turn_id)
+            && !self.turn_input_cancellation.is_cancelled())
+        .then(|| self.turn_input_cancellation.clone())
+    }
+
+    pub(crate) fn stop_turn_input(&self) {
+        self.turn_input_cancellation.cancel();
+    }
+
+    pub(crate) fn current_turn_id(&self) -> Option<&str> {
+        self.current_turn_id.as_deref()
+    }
+
+    // A result ends admission of new steers, but a written message may only be
+    // replayed by Claude after that result. Its receipt belongs to the session.
+    pub(crate) fn delivery_acknowledgement_cancellation(&self) -> CancellationToken {
+        self.delivery_acknowledgement_cancellation.clone()
+    }
+
+    fn reset_delivery_acknowledgements(&mut self) {
+        self.delivery_acknowledgement_cancellation.cancel();
+        self.delivery_acknowledgement_cancellation = CancellationToken::new();
     }
 
     pub fn handle_message(&mut self, message: ClaudeMessage) -> Vec<CanonicalEvent> {
@@ -2194,6 +2231,8 @@ impl ClaudeProviderRuntime {
     }
 
     pub fn handle_stream_failure(&mut self, error: &str) -> Vec<CanonicalEvent> {
+        self.stop_turn_input();
+        self.delivery_acknowledgement_cancellation.cancel();
         let error_message = if is_interrupted_error(error) {
             "Claude runtime interrupted.".to_owned()
         } else {
@@ -2240,6 +2279,8 @@ impl ClaudeProviderRuntime {
     }
 
     pub fn restore_from_snapshot(&mut self, snapshot: ReconnectSnapshot) {
+        self.stop_turn_input();
+        self.reset_delivery_acknowledgements();
         self.session_id = snapshot.session_id;
         self.thread_id = snapshot.thread_id;
         self.current_turn_id = snapshot.turn_id;
@@ -2422,6 +2463,7 @@ impl ClaudeProviderRuntime {
     }
 
     fn handle_result_message(&mut self, message: ResultMessage) -> Vec<CanonicalEvent> {
+        self.stop_turn_input();
         let mut events = self.flush_incomplete_tools();
         let interrupted = is_interrupted_result(&message);
         let failed = message.is_error && !interrupted;

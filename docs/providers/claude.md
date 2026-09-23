@@ -155,6 +155,31 @@ configured Claude home. Prefer the provider instance that created the thread;
 the UI does not guarantee that switching to another Claude instance can resume
 the same provider session.
 
+## Steering a running turn
+
+Steer sends the head queued message to Claude while it is working. Claude can
+consume it at the next tool boundary. If no tool boundary is available, Claude
+finishes the current reply first, then immediately consumes the message as its
+next turn.
+Steer therefore does not guarantee that a reply without tool calls will change
+before it finishes.
+
+BiBCode marks the message delivered when the running Claude process replays the
+same input text, including when that replay arrives after the current reply's
+`result`. Image blocks alongside the text do not prevent acknowledgement;
+image-only messages are acknowledged too. A replay containing any tool-result
+block, or different text, is not an acknowledgement.
+The acknowledgement remains pending for the lifetime of that process, even
+across turn completion. The message is attributed to the BiBCode runtime turn
+current when the echo arrives, without allocating a new turn for the steer.
+The card can remain **Steering…** while Claude finishes the earlier reply. You can
+keep composing and queueing messages while it waits. If the process or session
+is replaced before a matching replay arrives, delivery is uncertain; BiBCode
+does not automatically resend it. A steer rejected before writing, or whose turn
+is unavailable, returns to the queue with its reason on the card. Interrupts and
+errors keep queued messages on hold until you use **Send now**. See
+[Queued messages](../user/workspace-ui.md#queued-messages) for queue controls.
+
 ## Activity observation
 
 BiBCode detects Claude activity features from the configured executable instead

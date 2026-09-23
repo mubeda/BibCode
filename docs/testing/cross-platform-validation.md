@@ -115,6 +115,184 @@ server without `terminalOrderedInput` to prove the negotiated legacy path.
 Record network round-trip, client queue, and paint measurements separately;
 an improved simulated queue time is not proof of an improved live network.
 
+### Durable message queue
+
+The durable queue is shared by browser, desktop, and remote clients. Validate
+server ownership, renderer behavior, packaged controls, and real provider timing
+separately. When admission, promotion, steering, hold, cancellation, claiming, or
+recovery changes, run the server owner and integration seams before broad gates:
+
+```sh
+cargo test -p bibcode-server --lib production::turn_delivery:: -j 2
+cargo test -p bibcode-server --lib production::provider_runtime -j 2
+cargo test -p bibcode-server --lib production::orchestration_rpc::tests:: -j 2
+cargo test -p bibcode-server --lib queued_turn_start_records_message_without_turn_start_requested -j 2
+cargo test -p bibcode-server --test orchestration --test turn_delivery_queue --test turn_delivery_recovery --test production_orchestration_rpc -j 2
+cargo test -p bibcode-server --lib steer_ -j 2
+cargo test -p bibcode-server --test production_provider_runtime steer -j 2
+cargo test -p bibcode-server --test production_provider_runtime provider_stream_end_ -j 2
+cargo test -p bibcode-server --test production_provider_runtime provider_session_exit_ -j 2
+cargo test -p bibcode-server codex::runtime -j 2
+cargo test -p bibcode-server --test repositories -j 2
+cargo test -p bibcode-server migrations -j 2
+```
+
+Verify enqueue without a turn-start event or working projection, oldest-first
+promotion once per settle, explicit Send now clearing only its row's hold,
+interrupt/error holds, approval and user-input gates, and withdrawal without
+message resurrection after replay. Use tied timestamps and skewed client clocks
+to verify admission FIFO and matching snapshot order. Promote a message enqueued
+before the prior turn's final reply: its projected and client-cached timestamps
+must become the promotion time and place it after that reply, including after
+projection replay. Transaction rollback must preserve the original timestamps;
+steering and still-queued messages retain enqueue times. Dismissing a rejected head
+must unblock its tail; dismissing sending or uncertain work must preserve the
+barrier against automatic delivery before settlement. Exercise an older-client pending start
+while running/starting and prove it is claimed only after ready, including
+the SQLite claim boundary. Migration coverage must preserve rows and indexes;
+recovery must preserve queued state, payload, mode, and existing holds without
+launching a provider. A starting/connecting/running projection without a live
+runtime, including after graceful shutdown, must become an error with no active
+turn, settle its partial assistant messages, and hold every queued message.
+Repeat startup to verify no duplicate events, then promote the head and prove
+the pending start is claimable. Keep original request digests stable when
+admission resolves the queued flag.
+
+Verify steer head/running/capability admission, atomic pending/steer projection,
+native steer routing with the active turn ID and durable delivery key, and
+accepted-message turn attribution. Settle and provider rejection must return
+unaccepted steers to queued/start with the reason in `delivery.detail`; ambiguous writes remain uncertain. Codex
+recovery reconciles steer keys as for starts; Claude sending steers become
+uncertain. Confirm Stop retains Codex's original active turn ID after a follow-up.
+Claude content arrays containing any tool-result block, including mixed
+text/image/tool-result arrays, and unrelated first text blocks must not
+acknowledge steering or start a runtime turn. Test exact string, text/image,
+and image-only replays for starts and steers; image-only input uses an empty
+text key on registration and replay. Also test replays after the original
+result/system-init continuation without allocating a new runtime turn, attributing
+the message to the runtime turn current at replay. A normal delivery must be
+accepted while a steer echo is still pending; correlate each echo to its own input. Turn completion must not
+retire a written acknowledgement, while process exit, stream failure, and
+session replacement still make an unacknowledged write ambiguous.
+Interrupt/error during an in-flight steer must hold any subsequent requeue; a
+late acceptance must not restore a session that has already settled. Test local
+Claude settlement/interrupt during writer contention, late user echoes, and a
+failed target lookup after a durable claim. Unwritten input returns to the
+queue or pending; input that may have reached the provider stays uncertain.
+
+The native Codex and Claude steer fixtures use subprocess pipes, not real
+providers or sockets. They currently run on Unix; record Windows native-protocol
+coverage separately. The fake-router and queue projection tests need no listener.
+The full production provider-runtime suite also includes Claude hook-sink and
+OpenCode HTTP fixtures that require loopback listeners. Production RPC and
+subprocess crash-recovery cases need loopback sockets as well; a denied bind
+is unavailable evidence and must be rerun on a capable host. A crash fixture
+must reach its intentional abort boundary, rather than treating a setup panic
+as a successful crash probe. Run the recovery suite in the foreground with
+Cargo jobs bounded by `-j 2`; retain child diagnostics and report pipe/resource
+failures without weakening delivery assertions or production deadlines.
+
+For web queue behavior, run the focused renderer seams and then the web gates:
+
+```sh
+vp run --filter @bibcode/web test ChatView ChatComposer MessagesTimeline QueuedMessage restoreQueuedMessage queuedMessageCache Sidebar.logic keybindings
+vp run --filter @bibcode/web test
+vp check
+vp run typecheck
+```
+
+For the desktop fixture support and the packaged queue scenario, use the current
+package scripts:
+
+```sh
+node scripts/run-local-vp.mjs test run apps/desktop/e2e/support/test-project.test.ts apps/desktop/e2e/support/provider-input-log.test.ts
+vp run test:ui:desktop:build
+vp run test:ui:desktop
+```
+
+Follow the native runbook to select the worktree-built `BIBCODE_E2E_APP_PATH`
+and, on Linux, for the headless `xvfb-run` invocation and its Wayland-socket
+guard.
+The default suite includes `composer-message-queue.e2e.ts`. To isolate it, set
+`BIBCODE_E2E_SPEC=./specs/composer-message-queue.e2e.ts` for the test invocation
+using the native shell's environment syntax, then clear that selection before
+the full suite. The Codex fixture keeps a `[[slow]]` prompt running until a
+turn-specific file marker releases it, with a bounded timeout for failed runs.
+The scenario releases it only after reload assertions. Support tests cover
+steer/start log discrimination, turn identity, release, timeout, and interrupt
+cleanup without requiring provider accounts or listeners.
+
+The packaged scenario must show two Queued cards in FIFO order below the working
+row while the provider log still contains only the initial start. Steer the head
+and verify exactly one `kind: "steer"` log entry for its text and the original
+turn ID. Cancel the remaining card and verify its text returns to the composer.
+Queue another message, refresh the document with the fixture's native page-load
+helper (`browser.refresh()`), and verify the same card ID returns before any
+new provider input. Release the slow turn, then require exactly one
+`kind: "start"` entry for the promoted text with a new turn ID and no queued
+cards. Retain `provider-input.jsonl`, the named `message-queue-*.png` screenshots,
+and any failure screenshot/page source from the artifact directory. This stub
+scenario proves the packaged controls; record real-provider behavior separately.
+
+On a host that can start the development server, use `vp run dev` and perform
+the following live acceptance on both Codex and Claude, capturing and viewing
+screenshots:
+
+1. Queue two messages while a turn runs. Verify FIFO cards below the working
+   row, an empty composer after each Enter, and no new Working transition.
+2. Let the turn settle normally. Only the first queued message starts; the
+   second waits for that new turn to settle. The promoted timestamp places the
+   message after the preceding reply.
+3. Steer the head. Observe Codex `turn/steer` with the active turn ID. Claude
+   consumes a user line at the next tool boundary, or immediately after a
+   tool-free reply as the next Claude turn. Its matching text echo may include
+   attachments and arrive after completion; tool-result lines cannot acknowledge
+   it. Verify attribution to the runtime turn current at acknowledgement.
+4. On Cursor, Grok, and OpenCode where available, verify the explanation that
+   steering is unsupported and confirm automatic sending still works. Record
+   unavailable providers explicitly.
+5. Cancel a queued card with another client connected: it disappears in both,
+   while only the cancelling client's draft receives its text and locally cached
+   attachments. Preserve an existing draft and report unavailable or excess files.
+6. Stop with multiple queued messages: return their text in order before
+   interrupting, preserve existing draft text, and verify no automatic send.
+   Failed cancellations remain visible and held after the interrupt.
+7. Reload mid-queue, then separately restart the server mid-queue. Both preserve
+   queued state and FIFO order. After restart, the abandoned active session
+   becomes an error and the held head shows **Waiting for you**; **Send now**
+   must start it. Report unavailable attachment restoration after reload or
+   from another client without losing text.
+8. Hold a pending approval or question and verify no automatic sending. After
+   interrupt and error settles, verify **Waiting for you**, persistent holds
+   through ready, and explicit **Send now** starting only the head.
+   End the provider child mid-turn and verify the next composer send or
+   **Send now** launches a replacement driver with its saved native resume
+   cursor and delivers. Automated fixtures must cover both EOF and the native
+   `turn.completed failed` followed by `session.exited` while the event sender
+   remains open; the latter must not overwrite the existing error or project
+   another failed turn. Also cover an exit with an active turn still to settle,
+   and exclude OpenCode's explicit-stop notice from fatal-exit recovery.
+   A send during terminal-event projection must wait for
+   terminal projection to settle. In automated coverage, hold that projection
+   and verify the five-second deadline releases other threads' supervisor
+   controls. Starts on the affected thread must remain definitely-not-sent and
+   retryable, steers must be rejected, and all partial assistant messages must
+   settle once persistence resumes. A dead driver's shutdown error must not
+   block start recovery.
+   A steer against the dead session must be
+   rejected/requeued without a replacement launch.
+
+Also press Enter while the first delivery is pending/sending: the next prompt
+must queue and clear the composer. Repeated Enter during the same client request
+preserves the unsent draft without duplication. Check pending/sending
+**Steering…**, visible rejection detail, and `Mod+Shift+Enter` without a newline.
+Review changed components/hooks against the React guidance and `UI.md`.
+
+If the environment cannot launch the server, packaged app, listener, or provider
+subprocess fixture, record that evidence as unavailable with its exact blocker
+and assign the missing run to a capable host. Never infer a packaged or native
+provider pass from static checks or unit tests.
+
 ### Selecting other focused coverage
 
 For the Pull Requests web shell/detail/review, settings, and auth-host display, run:
@@ -1474,6 +1652,9 @@ sizes. Cover relevant:
   [read-only list/detail/files smoke](#pull-requests-web-shell-validation) with
   route, selected tab and real patch evidence;
 - thread creation, switching, persistence, and streaming;
+- the [durable message queue](#durable-message-queue): FIFO cards, native steer,
+  Cancel restoration, reload and restart persistence, promotion, Stop drain,
+  holds, and unsupported-provider explanations;
 - terminal input/output and panel switching, including reopening the global right panel after a
   sibling chat suppresses a previously active Activity surface;
 - Files tree nesting, mutations, and moves: one row per directory with its own

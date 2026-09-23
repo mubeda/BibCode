@@ -103,7 +103,7 @@ describe("RPC wire fixture exporter", () => {
     expect(manifest.methods.filter(({ mode }) => mode === "stream")).toHaveLength(20);
     expect(manifest.streamMethodCount).toBe(20);
     expect(manifest.expectedTopLevelStreamShapes).toBe(70);
-    expect(manifest.expectedOrchestrationEventShapes).toBe(23);
+    expect(manifest.expectedOrchestrationEventShapes).toBe(24);
     expect(manifest.streamShapeFixtures).toHaveLength(70);
     expect(manifest.typedFailureFixtures).toHaveLength(288);
     expect(manifest.staleMethodIdentifiers).toEqual([
@@ -111,7 +111,7 @@ describe("RPC wire fixture exporter", () => {
       "projects.list",
       "projects.remove",
     ]);
-    expect(manifest.fixtures).toHaveLength(380);
+    expect(manifest.fixtures).toHaveLength(388);
     expect(manifest.fixtures).toEqual([...manifest.fixtures].toSorted());
     expect(Object.keys(manifest.schemaFingerprints)).toHaveLength(358);
 
@@ -163,6 +163,40 @@ describe("RPC wire fixture exporter", () => {
       tag: "terminal.beginInput",
       payload: { threadId: "thread-1", terminalId: "terminal-1", attachmentSequence: 0 },
     });
+  });
+
+  it("exports queued commands and delivery events with their optional fields", async () => {
+    await runExporter();
+    for (const [name, payload] of [
+      ["thread__turn__start", { type: "thread.turn.start", queued: true }],
+      ["thread__turn__steer", { type: "thread.turn.steer", messageId: "message-1" }],
+      ["thread__turn__promote", { type: "thread.turn.promote", messageId: "message-1" }],
+      [
+        "thread__turn-delivery__resolve",
+        { type: "thread.turn-delivery.resolve", action: "cancel" },
+      ],
+    ] as const) {
+      const contents = io.writes.get(
+        NodePath.join(outputDirectory, `contract-shapes/orchestration__${name}-request.json`),
+      );
+      expect(contents).toBeDefined();
+      expect(JSON.parse(contents!)).toMatchObject({
+        tag: "orchestration.dispatchCommand",
+        payload,
+      });
+    }
+    for (const [name, event] of [
+      ["steer-requested", { type: "thread.turn-steer-requested", payload: { turnId: "turn-1" } }],
+      ["delivery-held", { payload: { held: true, mode: "start", delivery: { state: "queued" } } }],
+      ["delivery-steered", { payload: { turnId: "turn-1", held: false, mode: "steer" } }],
+      ["delivery-withdrawn", { payload: { withdrawn: true } }],
+    ] as const) {
+      const contents = io.writes.get(
+        NodePath.join(outputDirectory, `contract-shapes/orchestration__${name}-event.json`),
+      );
+      expect(contents).toBeDefined();
+      expect(JSON.parse(contents!)).toMatchObject({ exit: { _tag: "Success", value: [event] } });
+    }
   });
 
   it.each([

@@ -42,6 +42,7 @@ const desktopUiSpecFiles =
         "./specs/platform-capabilities.e2e.ts",
         "./specs/terminal-font.e2e.ts",
         "./specs/composer-native-triggers.e2e.ts",
+        "./specs/composer-message-queue.e2e.ts",
         "./specs/chat-activity-panel.e2e.ts",
         "./specs/pierre-diffs.e2e.ts",
       ];

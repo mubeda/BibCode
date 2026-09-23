@@ -678,6 +678,7 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::new(47, "AuthPairingOfferIdempotency", migration_047),
     Migration::new(48, "AuthAuthorityRevision", migration_048),
     Migration::new(49, "AuthPairingDeliveryState", migration_049),
+    Migration::new(50, "QueuedTurnDeliveries", migration_050),
 ];
 
 impl Migration {
@@ -2457,6 +2458,41 @@ fn migration_049(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+fn migration_050(transaction: &Transaction<'_>) -> Result<()> {
+    if !table_exists(transaction, "provider_turn_outbox")? {
+        return Ok(());
+    }
+    transaction.execute_batch(
+        "CREATE TABLE provider_turn_outbox_queued (
+           command_id TEXT PRIMARY KEY REFERENCES orchestration_command_receipts(command_id) ON DELETE CASCADE,
+           thread_id TEXT NOT NULL,
+           message_id TEXT NOT NULL,
+           provider_instance_id TEXT NOT NULL,
+           provider_kind TEXT NOT NULL,
+           provider_session_id TEXT,
+           delivery_key TEXT NOT NULL,
+           payload_json TEXT NOT NULL,
+           state TEXT NOT NULL CHECK(state IN ('queued', 'pending', 'sending', 'delivered', 'uncertain', 'dismissed', 'failed')),
+           attempts INTEGER NOT NULL DEFAULT 0,
+           last_error TEXT,
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL,
+           mode TEXT NOT NULL DEFAULT 'start' CHECK(mode IN ('start', 'steer')),
+           held INTEGER NOT NULL DEFAULT 0
+         );
+         INSERT INTO provider_turn_outbox_queued
+           (command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at)
+           SELECT command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at FROM provider_turn_outbox;
+         DROP TABLE provider_turn_outbox;
+         ALTER TABLE provider_turn_outbox_queued RENAME TO provider_turn_outbox;
+         CREATE INDEX idx_provider_turn_outbox_thread_state ON provider_turn_outbox(thread_id, state, created_at, command_id);
+         CREATE UNIQUE INDEX idx_provider_turn_outbox_message ON provider_turn_outbox(message_id);
+         ALTER TABLE projection_thread_messages ADD COLUMN delivery_mode TEXT;
+         ALTER TABLE projection_thread_messages ADD COLUMN delivery_held INTEGER;",
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2855,6 +2891,20 @@ mod tests {
                 ("last_error".to_owned(), "TEXT".to_owned(), 0, None, 0),
                 ("created_at".to_owned(), "TEXT".to_owned(), 1, None, 0),
                 ("updated_at".to_owned(), "TEXT".to_owned(), 1, None, 0),
+                (
+                    "mode".to_owned(),
+                    "TEXT".to_owned(),
+                    1,
+                    Some("'start'".to_owned()),
+                    0
+                ),
+                (
+                    "held".to_owned(),
+                    "INTEGER".to_owned(),
+                    1,
+                    Some("0".to_owned()),
+                    0
+                ),
             ]
         );
         assert_eq!(
@@ -2883,6 +2933,8 @@ mod tests {
                     "last_error",
                     "created_at",
                     "updated_at",
+                    "mode",
+                    "held",
                 ],
             ),
             (
@@ -2971,13 +3023,87 @@ mod tests {
     }
 
     #[test]
+    fn migration_50_preserves_deliveries_and_accepts_queued_modes() -> rusqlite::Result<()> {
+        for upgrade in [false, true] {
+            let mut connection = rusqlite::Connection::open_in_memory()?;
+            connection.execute_batch("PRAGMA foreign_keys = ON")?;
+            run_migrations(&mut connection, if upgrade { Some(49) } else { None })?;
+            connection.execute_batch(
+                r#"INSERT INTO orchestration_command_receipts (command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status)
+                 VALUES ('queue-command', 'thread', 'queue-thread', 'created', 7, 'accepted');
+                 INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at)
+                 VALUES ('queue-command', 'queue-thread', 'queue-message', 'instance', 'codex', 'session', 'delivery-key', '{"text":"preserved"}', 'pending', 3, 'detail', 'created', 'updated');"#,
+            )?;
+            run_migrations(&mut connection, None)?;
+            let stored = connection.query_row(
+                "SELECT json_array(command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at, mode, held) FROM provider_turn_outbox",
+                [], |row| row.get::<_, String>(0),
+            )?;
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&stored).unwrap(),
+                serde_json::json!([
+                    "queue-command",
+                    "queue-thread",
+                    "queue-message",
+                    "instance",
+                    "codex",
+                    "session",
+                    "delivery-key",
+                    "{\"text\":\"preserved\"}",
+                    "pending",
+                    3,
+                    "detail",
+                    "created",
+                    "updated",
+                    "start",
+                    0
+                ])
+            );
+            connection.execute(
+                "UPDATE provider_turn_outbox SET state = 'queued', mode = 'steer', held = 1",
+                [],
+            )?;
+            assert!(
+                connection
+                    .execute("UPDATE provider_turn_outbox SET mode = 'x'", [])
+                    .is_err()
+            );
+            assert!(
+                connection
+                    .execute("UPDATE provider_turn_outbox SET state = 'x'", [])
+                    .is_err()
+            );
+            for index in [
+                "idx_provider_turn_outbox_thread_state",
+                "idx_provider_turn_outbox_message",
+            ] {
+                assert!(connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?)",
+                    [index],
+                    |row| row.get::<_, bool>(0)
+                )?);
+            }
+            connection.execute(
+                "DELETE FROM orchestration_command_receipts WHERE command_id = 'queue-command'",
+                [],
+            )?;
+            assert_eq!(
+                connection.query_row("SELECT COUNT(*) FROM provider_turn_outbox", [], |row| row
+                    .get::<_, i64>(0))?,
+                0
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn exposes_all_ordered_migration_metadata() {
         let ids = MIGRATIONS
             .iter()
             .map(|migration| migration.id)
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, (1..=49).collect::<Vec<_>>());
+        assert_eq!(ids, (1..=50).collect::<Vec<_>>());
         assert_eq!(MIGRATIONS[0].name, "OrchestrationEvents");
         assert_eq!(MIGRATIONS[33].name, "ActivityProjection");
         assert_eq!(MIGRATIONS[34].name, "ActivityJournalEventKeyNamespace");
@@ -3023,7 +3149,10 @@ mod tests {
                 .iter()
                 .map(|migration| (migration.id, migration.name))
                 .collect::<Vec<_>>(),
-            vec![(49, "AuthPairingDeliveryState")],
+            vec![
+                (49, "AuthPairingDeliveryState"),
+                (50, "QueuedTurnDeliveries")
+            ],
         );
         assert_eq!(
             connection.query_row(
@@ -3119,9 +3248,9 @@ mod tests {
         assert_eq!(first[15].id, 16);
 
         let second = run_migrations(&mut connection, None)?;
-        assert_eq!(second.len(), 33);
+        assert_eq!(second.len(), 34);
         assert_eq!(second[0].id, 17);
-        assert_eq!(second[32].id, 49);
+        assert_eq!(second[33].id, 50);
 
         let third = run_migrations(&mut connection, None)?;
         assert!(third.is_empty());
@@ -3228,7 +3357,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [40, 41, 42, 43, 44, 45, 46, 47, 48, 49]
+            [40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50]
         );
         let policy = connection.query_row(
             "SELECT worktree_discovery_json FROM projection_projects WHERE project_id = 'project-1'",
@@ -3265,7 +3394,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [41, 42, 43, 44, 45, 46, 47, 48, 49]
+            [41, 42, 43, 44, 45, 46, 47, 48, 49, 50]
         );
         let pin = connection.query_row(
             "SELECT worktree_repository_key FROM projection_projects WHERE project_id = 'project-legacy'",
@@ -3293,7 +3422,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [42, 43, 44, 45, 46, 47, 48, 49]
+            [42, 43, 44, 45, 46, 47, 48, 49, 50]
         );
         let pin = connection.query_row(
             "SELECT repository_key FROM project_worktree_repository_pins WHERE project_id = 'project-pinned'",
@@ -3433,7 +3562,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [48, 49]
+            [48, 49, 50]
         );
         assert_eq!(
             connection.query_row(
@@ -3462,7 +3591,7 @@ mod tests {
         )?;
 
         let applied = run_migrations(&mut connection, None)?;
-        assert_eq!(applied.len(), 16);
+        assert_eq!(applied.len(), 17);
         assert_eq!(applied[0].id, 34);
         assert_eq!(applied[1].id, 35);
         assert_eq!(applied[2].id, 36);
@@ -3479,6 +3608,7 @@ mod tests {
         assert_eq!(applied[13].id, 47);
         assert_eq!(applied[14].id, 48);
         assert_eq!(applied[15].id, 49);
+        assert_eq!(applied[16].id, 50);
         let value = connection.query_row("SELECT value FROM legacy_user_data", [], |row| {
             row.get::<_, String>(0)
         })?;

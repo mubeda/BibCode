@@ -538,13 +538,54 @@ async fn dispatch_reserved_turn_command(
     workspace_admission: Option<crate::worktree_catalog::WorkspaceAdmissionLease>,
     command_claim: crate::orchestration::engine::CommandAdmissionClaim,
 ) -> RpcResult {
-    let (command, prepared_batch) = prepare_attachments(&provider.attachments, command)
-        .await
-        .map_err(|error| invalid_request(&request_tag, error.to_string()))?;
+    let (mut command, prepared_batch) =
+        prepare_attachments(&provider.attachments, command)
+            .await
+            .map_err(|error| invalid_request(&request_tag, error.to_string()))?;
     let attachment_refs = prepared_batch
         .as_ref()
         .map(|batch| batch.references().to_vec())
         .unwrap_or_default();
+    let mut delivery_state = crate::orchestration::TurnDeliveryState::Pending;
+    if let OrchestrationCommand::ThreadTurnStart {
+        thread_id,
+        queued,
+        model_selection,
+        bootstrap,
+        ..
+    } = &mut command
+    {
+        if *queued == Some(true) {
+            let session = dispatch
+                .repositories()
+                .get_thread_session(thread_id.clone())
+                .await
+                .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
+            let resolved = session
+                .is_some_and(|session| matches!(session.status.as_str(), "running" | "starting"));
+            *queued = Some(resolved);
+            if resolved {
+                delivery_state = crate::orchestration::TurnDeliveryState::Queued;
+            }
+        }
+        // Freeze even an omitted selection before a later thread configuration can change it.
+        if model_selection.is_none() {
+            *model_selection = bootstrap
+                .as_deref()
+                .and_then(|bootstrap| bootstrap.create_thread.as_ref())
+                .map(|create| create.model_selection.clone());
+            if model_selection.is_none() {
+                *model_selection = dispatch
+                    .repositories()
+                    .get_thread(thread_id.clone())
+                    .await
+                    .map_err(|error| {
+                        orchestration_error("OrchestrationDispatchCommandError", error)
+                    })?
+                    .map(|thread| thread.model_selection);
+            }
+        }
+    }
     let (thread_id, message_id, instance_id, provider_kind, created_at) =
         turn_identity(&dispatch, &provider.settings_root, &command)
             .await
@@ -563,6 +604,8 @@ async fn dispatch_reserved_turn_command(
         payload_digest,
         attachment_refs,
         provider_turn: Some(NewProviderTurnDelivery {
+            state: delivery_state,
+            mode: crate::orchestration::TurnDeliveryMode::Start,
             command_id: command.command_id().to_owned(),
             thread_id,
             message_id,
@@ -923,6 +966,12 @@ async fn thread_snapshot(engine: &OrchestrationEngine, thread_id: &str) -> RpcRe
                         (&row.delivery_state, &row.delivery_provider)
                     {
                         let mut delivery = json!({"state": state, "provider": provider});
+                        if let Some(mode) = &row.delivery_mode {
+                            delivery["mode"] = json!(mode);
+                        }
+                        if let Some(held) = row.delivery_held {
+                            delivery["held"] = json!(held);
+                        }
                         if let Some(detail) = &row.delivery_detail {
                             delivery["detail"] = json!(detail);
                         }
@@ -1343,6 +1392,8 @@ mod tests {
                     delivery_state: None,
                     delivery_provider: None,
                     delivery_detail: None,
+                    delivery_mode: None,
+                    delivery_held: None,
                     created_at: "2026-07-11T00:00:00.000Z".to_owned(),
                     updated_at: "2026-07-11T00:00:00.000Z".to_owned(),
                 },
@@ -1357,6 +1408,8 @@ mod tests {
                     delivery_state: None,
                     delivery_provider: None,
                     delivery_detail: None,
+                    delivery_mode: None,
+                    delivery_held: None,
                     created_at: "2026-07-11T00:00:00.001Z".to_owned(),
                     updated_at: "2026-07-11T00:00:00.001Z".to_owned(),
                 },
@@ -1371,6 +1424,8 @@ mod tests {
                     delivery_state: None,
                     delivery_provider: None,
                     delivery_detail: None,
+                    delivery_mode: None,
+                    delivery_held: None,
                     created_at: "2026-07-11T00:00:00.002Z".to_owned(),
                     updated_at: "2026-07-11T00:00:00.002Z".to_owned(),
                 },
@@ -1385,6 +1440,8 @@ mod tests {
                     delivery_state: None,
                     delivery_provider: None,
                     delivery_detail: None,
+                    delivery_mode: None,
+                    delivery_held: None,
                     created_at: "2026-07-11T00:00:00.003Z".to_owned(),
                     updated_at: "2026-07-11T00:00:00.003Z".to_owned(),
                 },
@@ -1399,6 +1456,8 @@ mod tests {
                     delivery_state: None,
                     delivery_provider: None,
                     delivery_detail: None,
+                    delivery_mode: None,
+                    delivery_held: None,
                     created_at: "2026-07-11T00:00:00.004Z".to_owned(),
                     updated_at: "2026-07-11T00:00:00.004Z".to_owned(),
                 },
@@ -1413,6 +1472,8 @@ mod tests {
                     delivery_state: None,
                     delivery_provider: None,
                     delivery_detail: None,
+                    delivery_mode: None,
+                    delivery_held: None,
                     created_at: "2026-07-11T00:00:00.005Z".to_owned(),
                     updated_at: "2026-07-11T00:00:00.005Z".to_owned(),
                 },
@@ -1723,6 +1784,7 @@ mod tests {
         message_id: &str,
         state: TurnDeliveryState,
     ) {
+        let queued = state == TurnDeliveryState::Queued;
         let command = decode_command(json!({
             "type": "thread.turn.start",
             "commandId": command_id,
@@ -1734,6 +1796,7 @@ mod tests {
                 "attachments": [],
             },
             "modelSelection": {"instanceId": "codex", "model": "gpt-5"},
+            "queued": queued,
             "createdAt": CREATED_AT,
         }));
         engine
@@ -1743,6 +1806,12 @@ mod tests {
                     payload_digest: canonical_command_digest(&command).expect("command digest"),
                     attachment_refs: Vec::<AttachmentReference>::new(),
                     provider_turn: Some(NewProviderTurnDelivery {
+                        state: if queued {
+                            TurnDeliveryState::Queued
+                        } else {
+                            TurnDeliveryState::Pending
+                        },
+                        mode: crate::orchestration::TurnDeliveryMode::Start,
                         command_id: command_id.to_owned(),
                         thread_id: thread_id.to_owned(),
                         message_id: message_id.to_owned(),
@@ -1758,10 +1827,12 @@ mod tests {
             )
             .await
             .expect("delivery admitted");
-        if state != TurnDeliveryState::Pending {
+        // Queued starts are admitted directly; requeue transitions are reserved for steers.
+        if !queued && state != TurnDeliveryState::Pending {
             assert!(
                 engine
                     .transition_turn_delivery(TurnDeliveryTransition {
+                        turn_id: None,
                         command_id: command_id.to_owned(),
                         expected_states: vec![TurnDeliveryState::Pending],
                         expected_attempt: 0,
@@ -1841,6 +1912,154 @@ mod tests {
             },
             provider,
         )
+    }
+
+    #[tokio::test]
+    async fn queued_admission_resolves_status_and_preserves_original_receipt_digest() {
+        for (status, requested, expected) in [
+            ("running", Some(true), TurnDeliveryState::Queued),
+            ("starting", Some(true), TurnDeliveryState::Queued),
+            ("ready", Some(true), TurnDeliveryState::Pending),
+            ("idle", Some(true), TurnDeliveryState::Pending),
+            ("stopped", Some(true), TurnDeliveryState::Pending),
+            ("error", Some(true), TurnDeliveryState::Pending),
+            ("running", None, TurnDeliveryState::Pending),
+            ("running", Some(false), TurnDeliveryState::Pending),
+        ] {
+            let (database, engine, thread_id) = delivery_engine(TestHooks::default()).await;
+            engine.dispatch(decode_command(json!({"type":"thread.session.set", "commandId":"session", "threadId":thread_id, "session":{"threadId":thread_id, "status":status, "providerName":"codex", "activeTurnId":null, "lastError":null, "updatedAt":CREATED_AT}, "createdAt":CREATED_AT}))).await.unwrap();
+            let service = Arc::new(TurnDeliveryService::start_with_router(
+                engine.clone(),
+                1,
+                Arc::new(|_| Box::pin(async { Ok(()) })),
+            ));
+            service.shutdown().await;
+            let state = tempfile::tempdir().unwrap();
+            let (registration, provider) =
+                provider_registration(database, &engine, state.path().to_path_buf(), service);
+            let mut payload = json!({"type":"thread.turn.start", "commandId":"queued-admission", "threadId":thread_id, "message":{"messageId":"queued-admission-message", "role":"user", "text":"saved", "attachments":[]}, "createdAt":CREATED_AT});
+            if let Some(queued) = requested {
+                payload["queued"] = json!(queued);
+            }
+            let command = decode_command(payload);
+            let digest = canonical_command_digest(&command).unwrap();
+            let before = engine
+                .read_events(0)
+                .await
+                .unwrap()
+                .last()
+                .unwrap()
+                .sequence;
+            dispatch_turn_for_test(
+                engine.clone(),
+                registration.clone(),
+                command.clone(),
+                digest.clone(),
+                "orchestration.dispatchCommand".into(),
+                None,
+            )
+            .await
+            .unwrap();
+            let row = engine
+                .repositories()
+                .get_provider_turn_delivery("queued-admission".into())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                row.state, expected,
+                "status {status}, requested {requested:?}"
+            );
+            assert_eq!(
+                row.payload["queued"],
+                requested
+                    .map(|_| json!(expected == TurnDeliveryState::Queued))
+                    .unwrap_or(Value::Null)
+            );
+            assert_eq!(
+                row.payload["modelSelection"],
+                json!({"instanceId":"codex", "model":"gpt-5"})
+            );
+            let events = engine.read_events(before).await.unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.event.event_type == "thread.turn-start-requested")
+                    .count(),
+                usize::from(expected == TurnDeliveryState::Pending)
+            );
+            let snapshot = thread_snapshot(&engine, &thread_id).await.unwrap();
+            assert_eq!(
+                snapshot["thread"]["messages"][0]["delivery"]["state"],
+                if expected == TurnDeliveryState::Queued {
+                    "queued"
+                } else {
+                    "pending"
+                }
+            );
+            assert_eq!(
+                snapshot["thread"]["messages"][0]["delivery"]["mode"],
+                "start"
+            );
+            assert_eq!(snapshot["thread"]["messages"][0]["delivery"]["held"], false);
+            assert_eq!(
+                engine
+                    .repositories()
+                    .get_command_receipt("queued-admission".into())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .payload_digest,
+                Some(digest.clone())
+            );
+            dispatch_turn_for_test(
+                engine.clone(),
+                registration,
+                command,
+                digest,
+                "orchestration.dispatchCommand".into(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                engine.read_events(before).await.unwrap().len(),
+                events.len()
+            );
+            provider.shutdown().await.unwrap();
+            engine.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn thread_snapshot_keeps_queued_messages_in_admission_order() {
+        let (_, engine, thread_id) = delivery_engine(TestHooks::default()).await;
+        seed_delivery(
+            &engine,
+            "z-first",
+            &thread_id,
+            "z-message",
+            TurnDeliveryState::Queued,
+        )
+        .await;
+        seed_delivery(
+            &engine,
+            "a-second",
+            &thread_id,
+            "a-message",
+            TurnDeliveryState::Queued,
+        )
+        .await;
+        let snapshot = thread_snapshot(&engine, &thread_id).await.unwrap();
+        let messages = snapshot["thread"]["messages"].as_array().unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["z-message", "a-message"]
+        );
+        engine.shutdown().await;
     }
 
     async fn wait_for_delivery_state(
