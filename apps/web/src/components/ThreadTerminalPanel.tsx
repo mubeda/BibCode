@@ -10,6 +10,7 @@ import {
   createTerminalInputSchedulerRegistry,
   type TerminalInputScheduler,
   type TerminalInputSendResult,
+  type TerminalRenderSignal,
   terminalInputKey,
 } from "@bibcode/client-runtime/state/terminal";
 import {
@@ -23,6 +24,8 @@ import {
   type ResolvedKeybindingsConfig,
   type ScopedThreadRef,
   type TerminalLaunchCommand,
+  type TerminalSize,
+  type TerminalResizeInput,
   type ThreadId,
   type ProjectId,
 } from "@bibcode/contracts";
@@ -40,6 +43,7 @@ import {
 import { Popover, PopoverPopup, PopoverTrigger } from "~/components/ui/popover";
 import { Button } from "~/components/ui/button";
 import { type TerminalContextSelection } from "~/lib/terminalContext";
+import { randomUUID } from "~/lib/utils";
 import { useOpenInPreferredEditor } from "../editorPreferences";
 import {
   collectWrappedTerminalLinkLine,
@@ -70,6 +74,17 @@ import { previewEnvironment } from "../state/preview";
 import { terminalEnvironment } from "../state/terminal";
 import { openTerminalLinkInPreview } from "./preview/openTerminalLinkInPreview";
 import { createTerminalOutputSink } from "./terminalOutputSink";
+import { installTerminalReplyGuard } from "./terminalReplyGuard";
+import { proposeTerminalDimensions, registerTerminalSizeReader } from "./terminalSizing";
+import {
+  shouldClaimTerminalSize,
+  terminalDimensionsEqual,
+  terminalSizesEqual,
+  hasForeignTerminalSizeOwner,
+  shouldShowTerminalSizeNotice,
+  type TerminalDimensions,
+  type TerminalSizeTrigger,
+} from "./terminalSizePolicy";
 import { observeCanvasDevicePixelSize } from "./terminalDevicePixelCorrection";
 import {
   loadTerminalWebglAddon,
@@ -96,6 +111,9 @@ import { ProviderTerminalActivityDock } from "./activity/ProviderTerminalActivit
 const MULTI_CLICK_SELECTION_ACTION_DELAY_MS = 260;
 const terminalInputRegistry = createTerminalInputSchedulerRegistry();
 const terminalInputBindings = new Map<string, TerminalInputBinding>();
+// Retain dismissal across renderer/component remounts; terminal retirement
+// releases it alongside the retained input resources below.
+const dismissedTerminalSizes = new Map<string, TerminalSize>();
 const TERMINAL_WRITE_INTERRUPTED = Symbol("terminal-write-interrupted");
 
 interface TerminalInputBinding {
@@ -203,7 +221,8 @@ function createWebglLifecycle(addon: WebglAddonInstance, terminal: Terminal): We
   };
 }
 
-export function releaseTerminalInputScheduler(
+/** Retire the retained input binding and size-notice dismissal together. */
+export function releaseTerminalUiResources(
   environmentId: string,
   threadId: string,
   terminalId: string,
@@ -217,6 +236,7 @@ export function releaseTerminalInputScheduler(
     binding.pendingFallbacks.length = 0;
   }
   terminalInputBindings.delete(key);
+  dismissedTerminalSizes.delete(key);
 }
 
 function atomCommandTerminalInputResult(
@@ -417,13 +437,6 @@ function acquireTerminalInputBinding(inputKey: string): {
   });
 
   return { binding: keyedBinding, scheduler };
-}
-
-export function writeTerminalBuffer(terminal: Terminal, buffer: string): void {
-  terminal.write("\u001bc");
-  if (buffer.length > 0) {
-    terminal.write(buffer);
-  }
 }
 
 export function fitTerminalSafely(fitAddon: FitAddon): boolean {
@@ -741,6 +754,26 @@ export function TerminalViewport({
   const environmentId = threadRef.environmentId;
   const serverConfig = useAtomValue(serverEnvironment.configValueAtom(environmentId));
   const orderedInput = serverConfig?.environment.capabilities?.terminalOrderedInput === true;
+  const sizeOwnership = serverConfig?.environment.capabilities?.terminalSizeOwnership === true;
+  const terminalTargetKey = terminalInputKey(environmentId, threadId, terminalId);
+  const [rendererAttachmentInput, setRendererAttachmentInput] = useState<{
+    readonly target: string;
+    readonly sizeClaim: string;
+    readonly sizeOwnership: boolean;
+    readonly dimensions: TerminalDimensions | null;
+  } | null>(null);
+  const readyRenderer =
+    rendererAttachmentInput?.target === terminalTargetKey &&
+    rendererAttachmentInput.sizeOwnership === sizeOwnership
+      ? rendererAttachmentInput
+      : null;
+  const [mirroringSize, setMirroringSize] = useState(false);
+  const rendererRef = useRef<{
+    readonly sizeClaim: string;
+    dismissSizeNotice(): void;
+    render(signal: TerminalRenderSignal, claimOnAttach: boolean): void;
+    size(trigger: TerminalSizeTrigger): void;
+  } | null>(null);
   const [inputError, setInputError] = useState<string | null>(null);
   const [inputReattaching, setInputReattaching] = useState(false);
   const openInPreferredEditor = useOpenInPreferredEditor(
@@ -779,19 +812,16 @@ export function TerminalViewport({
   const resizeRendererGenerationRef = useRef(0);
   const lastRequestedSizeRef = useRef<{
     readonly generation: number;
-    readonly cols: number;
-    readonly rows: number;
+    readonly dimensions: TerminalDimensions;
   } | null>(null);
   const webglGenerationRef = useRef(0);
   const webglLifecycleRef = useRef<WebglLifecycle | null>(null);
   const webglFailedRef = useRef(false);
   const webglDiagnosticRecordedRef = useRef(false);
-  // Bumped whenever the main renderer effect creates a new Terminal, so the
-  // webgl effect re-runs for the replacement instance instead of leaving it on
-  // the DOM renderer. The ref lets stale renders be skipped until the state
-  // update commits.
-  const webglTerminalEpochRef = useRef(0);
-  const [webglTerminalEpoch, setWebglTerminalEpoch] = useState(0);
+  // Terminal creation precedes attach. The committed renderer epoch lets the
+  // transcript and WebGL effects attach once to the same current instance.
+  const rendererEpochRef = useRef(0);
+  const [rendererEpoch, setRendererEpoch] = useState(0);
   const [documentVisible, setDocumentVisible] = useState(isDocumentVisible);
   const shouldRender = visible && isDocumentVisible() && documentVisible;
   const enableTerminalAgentActivity = useEnvironmentSettings(
@@ -820,7 +850,6 @@ export function TerminalViewport({
   const readTerminalLabel = useEffectEvent(() => terminalLabel);
   const hasAuthoritativeHostConfig = serverConfig !== null;
   const hasPersistentWindowsConsoleTheme = usesPersistentWindowsConsoleTheme(command);
-  const attachmentThemeTargetKey = `${environmentId}\u0000${threadId}\u0000${terminalId}`;
   const attachmentLaunchThemeRef = useRef<{
     readonly targetKey: string;
     readonly theme: TerminalThemeMode;
@@ -828,15 +857,15 @@ export function TerminalViewport({
   } | null>(null);
   const canAttachTerminal = command === undefined || hasAuthoritativeHostConfig;
   const shouldPinAttachmentTheme = shouldRender && canAttachTerminal;
-  if (attachmentLaunchThemeRef.current?.targetKey !== attachmentThemeTargetKey) {
+  if (attachmentLaunchThemeRef.current?.targetKey !== terminalTargetKey) {
     attachmentLaunchThemeRef.current = {
-      targetKey: attachmentThemeTargetKey,
+      targetKey: terminalTargetKey,
       theme: resolvedTheme,
       pinned: shouldPinAttachmentTheme,
     };
   } else if (!attachmentLaunchThemeRef.current.pinned) {
     attachmentLaunchThemeRef.current = {
-      targetKey: attachmentThemeTargetKey,
+      targetKey: terminalTargetKey,
       theme: resolvedTheme,
       pinned: shouldPinAttachmentTheme,
     };
@@ -860,47 +889,14 @@ export function TerminalViewport({
       threadId,
       terminalId,
       cwd,
+      ...readyRenderer?.dimensions,
+      ...(sizeOwnership && readyRenderer ? { sizeClaim: readyRenderer.sizeClaim } : {}),
       ...(worktreePath !== undefined ? { worktreePath } : {}),
       ...(spawnEnv ? { env: spawnEnv } : {}),
       ...(command ? { command } : {}),
     },
-    attach: shouldRender && canAttachTerminal,
+    attach: shouldRender && canAttachTerminal && readyRenderer !== null,
   });
-  const resizeTerminal = useEffectEvent((cols: number, rows: number) =>
-    runTerminalResize({
-      environmentId,
-      input: { threadId, terminalId, cols, rows },
-    }),
-  );
-  const requestTerminalResize = useEffectEvent(
-    (rendererGeneration: number, cols: number, rows: number) => {
-      if (resizeRendererGenerationRef.current !== rendererGeneration) return;
-      const current = lastRequestedSizeRef.current;
-      if (
-        current?.generation === rendererGeneration &&
-        current.cols === cols &&
-        current.rows === rows
-      ) {
-        return;
-      }
-
-      const request = {
-        generation: rendererGeneration,
-        cols,
-        rows,
-      };
-      lastRequestedSizeRef.current = request;
-      void resizeTerminal(cols, rows).then((result) => {
-        if (
-          result._tag === "Failure" &&
-          resizeRendererGenerationRef.current === rendererGeneration &&
-          lastRequestedSizeRef.current === request
-        ) {
-          lastRequestedSizeRef.current = null;
-        }
-      });
-    },
-  );
   const terminalError = terminalSession.error;
   const terminalStatus = terminalSession.status;
   const terminalGeneration = terminalSession.generation;
@@ -924,7 +920,7 @@ export function TerminalViewport({
     hasPersistentWindowsConsoleTheme &&
     activeThemeRestartRequest !== null &&
     terminalGeneration > activeThemeRestartRequest.sourceGeneration &&
-    attachmentLaunchThemeRef.current.targetKey === attachmentThemeTargetKey &&
+    attachmentLaunchThemeRef.current.targetKey === terminalTargetKey &&
     attachmentLaunchThemeRef.current.theme !== activeThemeRestartRequest.targetTheme
   ) {
     attachmentLaunchThemeRef.current = {
@@ -1085,7 +1081,7 @@ export function TerminalViewport({
 
   useEffect(() => {
     const mount = containerRef.current;
-    if (!mount || !shouldRender || transcriptRuntime === null) return;
+    if (!mount || !shouldRender || !canAttachTerminal) return;
 
     const localApi = readLocalApi();
 
@@ -1096,25 +1092,71 @@ export function TerminalViewport({
       fontSize: 12,
       scrollback: 5_000,
       fontFamily: readTerminalFontFamily(),
-      theme: terminalThemeFromApp(effectiveTerminalTheme, mount),
+      theme: terminalThemeFromApp(effectiveTerminalThemeRef.current, mount),
     });
     terminal.loadAddon(fitAddon);
     terminal.open(mount);
     fitTerminalSafely(fitAddon);
+    const sizeClaim = randomUUID();
+    let fittedDimensions = proposeTerminalDimensions(fitAddon);
+    const updateFittedDimensions = () => (fittedDimensions = proposeTerminalDimensions(fitAddon));
+    setRendererAttachmentInput({
+      target: terminalTargetKey,
+      sizeClaim,
+      sizeOwnership,
+      dimensions: fittedDimensions,
+    });
+    let mirroringSizeVisible = false;
+    const updateMirroringSize = (next: boolean) => {
+      if (mirroringSizeVisible === next) return;
+      mirroringSizeVisible = next;
+      setMirroringSize(next);
+    };
+    let appliedSize: TerminalSize | null = null;
+    let claimInFlight: TerminalSize | null = null;
+    let layoutChangedWhileClaimPending = false;
+    let claimNoticeSuppressed = false;
+    let oscColorResponderActive = false;
+    let disposed = false;
+    const resizeTerminal = (size: Pick<TerminalResizeInput, "cols" | "rows" | "sizeClaim">) =>
+      runTerminalResize({ environmentId, input: { threadId, terminalId, ...size } });
+    const requestTerminalResize = (rendererGeneration: number, dimensions: TerminalDimensions) => {
+      if (resizeRendererGenerationRef.current !== rendererGeneration) return;
+      const current = lastRequestedSizeRef.current;
+      if (
+        current?.generation === rendererGeneration &&
+        terminalDimensionsEqual(current.dimensions, dimensions)
+      )
+        return;
+      const request = { generation: rendererGeneration, dimensions };
+      lastRequestedSizeRef.current = request;
+      void resizeTerminal(dimensions).then((result) => {
+        if (
+          result._tag === "Failure" &&
+          resizeRendererGenerationRef.current === rendererGeneration &&
+          lastRequestedSizeRef.current === request
+        ) {
+          lastRequestedSizeRef.current = null;
+        }
+      });
+    };
 
     const resizeRendererGeneration = resizeRendererGenerationRef.current + 1;
     resizeRendererGenerationRef.current = resizeRendererGeneration;
     lastRequestedSizeRef.current = null;
     terminalRef.current = terminal;
     fitAddonRef.current = fitAddon;
-    webglTerminalEpochRef.current += 1;
-    setWebglTerminalEpoch(webglTerminalEpochRef.current);
-    const inputKey = terminalInputKey(environmentId, threadId, terminalId);
+    rendererEpochRef.current += 1;
+    setRendererEpoch(rendererEpochRef.current);
     const rendererOwner = {};
     const { binding: inputBinding, scheduler: inputScheduler } =
-      acquireTerminalInputBinding(inputKey);
+      acquireTerminalInputBinding(terminalTargetKey);
     inputSchedulerRef.current = inputScheduler;
     inputBinding.renderer = { owner: rendererOwner, terminal, onInputError: setInputError };
+    const unregisterSizeReader = registerTerminalSizeReader(
+      terminalTargetKey,
+      updateFittedDimensions,
+    );
     inputBinding.ordered = orderedInput;
     inputBinding.resetInput = () => {
       void runResetInput({ environmentId, input: { threadId, terminalId } });
@@ -1128,12 +1170,112 @@ export function TerminalViewport({
     });
     const createOutputSink = () =>
       createTerminalOutputSink({
-        write: (data) => terminal.write(data),
+        write: (data, onParsed) => terminal.write(data, onParsed),
       });
     let outputSink = createOutputSink();
-    const rendererAttachment = transcriptRuntime.attachRenderer((signal) => {
+    const replyGuard = installTerminalReplyGuard(
+      terminal,
+      () => !sizeOwnership || !hasForeignTerminalSizeOwner(appliedSize, sizeClaim),
+      () => oscColorResponderActive,
+    );
+    const updateSizeNotice = (fitted = updateFittedDimensions()) => {
+      updateMirroringSize(
+        !dismissedTerminalSizes.has(terminalTargetKey) &&
+          !claimNoticeSuppressed &&
+          sizeOwnership &&
+          shouldShowTerminalSizeNotice({
+            sizeClaim,
+            applied: appliedSize,
+            fitted,
+            claimInFlight: claimInFlight !== null,
+          }),
+      );
+    };
+    const handleSizeTrigger = (trigger: TerminalSizeTrigger) => {
+      if (disposed || resizeRendererGenerationRef.current !== resizeRendererGeneration) return;
+      if (!sizeOwnership) {
+        if (trigger !== "layout") return;
+        const wasAtBottom = terminal.buffer.active.viewportY >= terminal.buffer.active.baseY;
+        fitTerminalSafely(fitAddon);
+        if (wasAtBottom) terminal.scrollToBottom();
+        requestTerminalResize(resizeRendererGeneration, {
+          cols: terminal.cols,
+          rows: terminal.rows,
+        });
+        return;
+      }
+      const shouldClaim = (fitted: TerminalDimensions | null) =>
+        shouldClaimTerminalSize({
+          sizeClaim,
+          applied: appliedSize,
+          fitted,
+          trigger,
+          documentFocused: document.hasFocus(),
+          claimInFlight: claimInFlight !== null,
+        });
+      // Use the same policy with cached geometry before measuring on keydown.
+      if (trigger === "keypress" && fittedDimensions !== null && !shouldClaim(fittedDimensions))
+        return;
+      const fitted = updateFittedDimensions();
+      if (
+        trigger === "layout" &&
+        claimInFlight !== null &&
+        fitted !== null &&
+        !terminalDimensionsEqual(claimInFlight, fitted)
+      ) {
+        layoutChangedWhileClaimPending = true;
+      }
+      if (fitted && shouldClaim(fitted)) {
+        const request = { ...fitted, sizeClaim };
+        claimInFlight = request;
+        claimNoticeSuppressed = true;
+        const finishClaim = (succeeded: boolean) => {
+          if (
+            disposed ||
+            resizeRendererGenerationRef.current !== resizeRendererGeneration ||
+            claimInFlight !== request
+          )
+            return;
+          claimInFlight = null;
+          if (!succeeded) claimNoticeSuppressed = false;
+          const refit = layoutChangedWhileClaimPending;
+          layoutChangedWhileClaimPending = false;
+          if (refit) handleSizeTrigger("layout");
+          else updateSizeNotice();
+        };
+        void resizeTerminal(request).then(
+          (result) => finishClaim(result._tag === "Success"),
+          () => finishClaim(false),
+        );
+      }
+      updateSizeNotice(fitted);
+    };
+    const applySize = (size: TerminalSize | undefined, claimOnAttach = false) => {
+      if (disposed) return;
+      if (!terminalSizesEqual(appliedSize, size)) claimNoticeSuppressed = false;
+      const dismissed = dismissedTerminalSizes.get(terminalTargetKey);
+      if (size && dismissed && !terminalSizesEqual(dismissed, size))
+        dismissedTerminalSizes.delete(terminalTargetKey);
+      appliedSize = size ?? null;
+      if (size && !terminalDimensionsEqual(terminal, size)) {
+        const wasAtBottom = terminal.buffer.active.viewportY >= terminal.buffer.active.baseY;
+        terminal.resize(size.cols, size.rows);
+        if (wasAtBottom) terminal.scrollToBottom();
+      }
+      if (size?.sizeClaim === null) handleSizeTrigger("attach");
+      else if (claimOnAttach)
+        handleSizeTrigger(size?.sizeClaim === sizeClaim ? "layout" : "attach");
+      else if (size?.sizeClaim === sizeClaim) handleSizeTrigger("layout");
+      else updateSizeNotice();
+    };
+    const render = (signal: TerminalRenderSignal, claimOnAttach: boolean) => {
+      if (disposed) return;
       if (signal.type === "delta") {
         outputSink.push(signal.data);
+        return;
+      }
+      if (signal.type === "resized") {
+        if (sizeOwnership) outputSink.barrier(() => applySize(signal.size));
         return;
       }
 
@@ -1141,9 +1283,39 @@ export function TerminalViewport({
       // a frame before replacing xterm's display with the bounded snapshot.
       outputSink.dispose();
       outputSink = createOutputSink();
-      writeTerminalBuffer(terminal, signal.snapshot);
+      outputSink.barrier(() => {
+        // A new attachment/process generation supersedes its old claim request.
+        // Its late RPC completion is ignored by the request-identity guard.
+        if (claimOnAttach) {
+          claimInFlight = null;
+          layoutChangedWhileClaimPending = false;
+          claimNoticeSuppressed = false;
+        }
+        oscColorResponderActive = signal.oscColorResponderActive ?? false;
+        if (sizeOwnership) applySize(signal.size, claimOnAttach);
+        else {
+          lastRequestedSizeRef.current = null;
+          handleSizeTrigger("layout");
+        }
+      });
+      replyGuard.replay(
+        signal.snapshot,
+        sizeOwnership &&
+          signal.firstAttachmentGrant === true &&
+          signal.size?.sizeClaim === sizeClaim,
+      );
       terminal.clearSelection();
-    });
+    };
+    const renderer = {
+      sizeClaim,
+      render,
+      size: handleSizeTrigger,
+      dismissSizeNotice() {
+        if (appliedSize) dismissedTerminalSizes.set(terminalTargetKey, appliedSize);
+        updateSizeNotice();
+      },
+    };
+    rendererRef.current = renderer;
 
     const clearSelectionAction = () => {
       selectionActionRequestIdRef.current += 1;
@@ -1229,6 +1401,7 @@ export function TerminalViewport({
     };
 
     const sendTerminalInput = (data: string, fallbackError: string) => {
+      if (!replyGuard.acceptInput()) return;
       if (
         readWorkspaceUnavailable() ||
         (inputBinding.ordered && inputBinding.error !== null) ||
@@ -1266,6 +1439,7 @@ export function TerminalViewport({
     };
 
     terminal.attachCustomKeyEventHandler((event) => {
+      if (event.type === "keydown") handleSizeTrigger("keypress");
       const currentKeybindings = keybindingsRef.current;
       const options = { context: { terminalFocus: true, terminalOpen: true } };
       if (
@@ -1452,12 +1626,19 @@ export function TerminalViewport({
       }, delay);
     };
     const handlePointerDown = (event: PointerEvent) => {
+      handleSizeTrigger("pointer");
       clearSelectionAction();
       selectionGestureActiveRef.current = event.button === 0;
       terminal.focus();
     };
     window.addEventListener("mouseup", handleMouseUp);
     mount.addEventListener("pointerdown", handlePointerDown);
+    const handleFocus = () => handleSizeTrigger("focus");
+    const handleWindowFocus = () => {
+      if (mount.contains(document.activeElement)) handleFocus();
+    };
+    mount.addEventListener("focusin", handleFocus);
+    window.addEventListener("focus", handleWindowFocus);
 
     const themeObserver = new MutationObserver(() => {
       const activeTerminal = terminalRef.current;
@@ -1476,31 +1657,30 @@ export function TerminalViewport({
       const activeTerminal = terminalRef.current;
       const activeFitAddon = fitAddonRef.current;
       if (!activeTerminal || !activeFitAddon) return;
-      const wasAtBottom =
-        activeTerminal.buffer.active.viewportY >= activeTerminal.buffer.active.baseY;
-      fitTerminalSafely(activeFitAddon);
-      if (wasAtBottom) {
-        activeTerminal.scrollToBottom();
-      }
-      requestTerminalResize(resizeRendererGeneration, activeTerminal.cols, activeTerminal.rows);
+      handleSizeTrigger("layout");
     }, 30);
 
-    let disposed = false;
     return () => {
       if (disposed) return;
       disposed = true;
+      updateMirroringSize(false);
 
       resizeRendererGenerationRef.current += 1;
       lastRequestedSizeRef.current = null;
       window.clearTimeout(fitTimer);
       outputSink.dispose();
-      rendererAttachment.detach();
+      replyGuard.dispose();
+      if (rendererRef.current === renderer) rendererRef.current = null;
+      setRendererAttachmentInput(null);
+      unregisterSizeReader();
       inputDisposable.dispose();
       selectionDisposable.dispose();
       terminalLinksDisposable.dispose();
       clearSelectionAction();
       window.removeEventListener("mouseup", handleMouseUp);
       mount.removeEventListener("pointerdown", handlePointerDown);
+      mount.removeEventListener("focusin", handleFocus);
+      window.removeEventListener("focus", handleWindowFocus);
       themeObserver.disconnect();
       if (inputBinding.renderer?.owner === rendererOwner) {
         inputBinding.renderer = null;
@@ -1526,6 +1706,9 @@ export function TerminalViewport({
     };
     // Focus is handled by a separate activation effect so it never tears down this renderer.
   }, [
+    terminalTargetKey,
+    runTerminalResize,
+    canAttachTerminal,
     command,
     cwd,
     environmentId,
@@ -1533,10 +1716,29 @@ export function TerminalViewport({
     shouldRender,
     terminalId,
     threadId,
-    transcriptRuntime,
+    sizeOwnership,
     orderedInput,
     worktreePath,
   ]);
+
+  useEffect(() => {
+    const renderer = rendererRef.current;
+    if (
+      !shouldRender ||
+      !renderer ||
+      transcriptRuntime === null ||
+      rendererEpoch !== rendererEpochRef.current
+    )
+      return;
+    let generation: number | null = null;
+    const attachment = transcriptRuntime.attachRenderer((signal) => {
+      const nextGeneration = transcriptRuntime.metadata().generation;
+      const claimOnAttach = signal.type === "reset" && generation !== nextGeneration;
+      generation = nextGeneration;
+      renderer.render(signal, claimOnAttach);
+    }, renderer.sizeClaim);
+    return () => attachment.detach();
+  }, [shouldRender, transcriptRuntime, rendererEpoch]);
 
   useEffect(() => {
     const activeTerminal = terminalRef.current;
@@ -1563,14 +1765,9 @@ export function TerminalViewport({
         return;
       }
 
-      const wasAtBottom = terminal.buffer.active.viewportY >= terminal.buffer.active.baseY;
       terminal.clearTextureAtlas();
-      fitTerminalSafely(fitAddon);
-      if (wasAtBottom) {
-        terminal.scrollToBottom();
-      }
+      rendererRef.current?.size("layout");
       terminal.refresh(0, terminal.rows - 1);
-      requestTerminalResize(rendererGeneration, terminal.cols, terminal.rows);
     });
 
     return () => {
@@ -1583,7 +1780,7 @@ export function TerminalViewport({
     if (
       !shouldRender ||
       !webglEnabled ||
-      transcriptRuntime === null ||
+      !hasAuthoritativeTerminalState ||
       terminal === null ||
       webglFailedRef.current
     ) {
@@ -1592,7 +1789,7 @@ export function TerminalViewport({
     // A stale render's epoch means a fresh terminal was just created and this
     // effect will re-run once the epoch state commits — attaching now would
     // create a second context for the same terminal.
-    if (webglTerminalEpoch !== webglTerminalEpochRef.current) {
+    if (rendererEpoch !== rendererEpochRef.current) {
       return;
     }
 
@@ -1672,9 +1869,9 @@ export function TerminalViewport({
   }, [
     recordWebglDiagnosticOnce,
     shouldRender,
-    transcriptRuntime,
+    hasAuthoritativeTerminalState,
     webglEnabled,
-    webglTerminalEpoch,
+    rendererEpoch,
   ]);
 
   useEffect(() => {
@@ -1765,7 +1962,12 @@ export function TerminalViewport({
   useEffect(() => {
     const generation = focusGenerationRef.current + 1;
     focusGenerationRef.current = generation;
-    if (!autoFocus || !shouldRender || fulfilledFocusRequestIdRef.current === focusRequestId) {
+    if (
+      !autoFocus ||
+      !shouldRender ||
+      transcriptRuntime === null ||
+      fulfilledFocusRequestIdRef.current === focusRequestId
+    ) {
       return;
     }
     const terminal = terminalRef.current;
@@ -1806,15 +2008,10 @@ export function TerminalViewport({
       const fitAddon = fitAddonRef.current;
       if (!terminal || !fitAddon) return;
       const resizeRendererGeneration = resizeRendererGenerationRef.current;
-      const wasAtBottom = terminal.buffer.active.viewportY >= terminal.buffer.active.baseY;
       frame = window.requestAnimationFrame(() => {
         frame = null;
         if (terminalRef.current !== terminal || fitAddonRef.current !== fitAddon) return;
-        fitTerminalSafely(fitAddon);
-        if (wasAtBottom) {
-          terminal.scrollToBottom();
-        }
-        requestTerminalResize(resizeRendererGeneration, terminal.cols, terminal.rows);
+        rendererRef.current?.size("layout");
         refreshTimer = window.setTimeout(() => {
           refreshTimer = null;
           if (
@@ -1847,13 +2044,13 @@ export function TerminalViewport({
     const fitAddon = fitAddonRef.current;
     if (!shouldRender || !terminal || !fitAddon) return;
     const resizeRendererGeneration = resizeRendererGenerationRef.current;
-    const wasAtBottom = terminal.buffer.active.viewportY >= terminal.buffer.active.baseY;
     const frame = window.requestAnimationFrame(() => {
-      fitTerminalSafely(fitAddon);
-      if (wasAtBottom) {
-        terminal.scrollToBottom();
-      }
-      requestTerminalResize(resizeRendererGeneration, terminal.cols, terminal.rows);
+      if (
+        resizeRendererGenerationRef.current !== resizeRendererGeneration ||
+        terminalRef.current !== terminal
+      )
+        return;
+      rendererRef.current?.size("layout");
     });
     return () => {
       window.cancelAnimationFrame(frame);
@@ -1866,6 +2063,28 @@ export function TerminalViewport({
         className="h-full w-full overflow-hidden"
         data-terminal-xterm-mount={terminalId}
       />
+      {shouldRender && sizeOwnership && mirroringSize ? (
+        <div className="absolute inset-x-2 top-10 z-20 flex max-w-sm flex-wrap items-center gap-2 rounded-md border bg-popover px-3 py-2 text-xs text-popover-foreground shadow-md">
+          <span>Sized for another window.</span>
+          <Button
+            type="button"
+            size="xs"
+            variant="outline"
+            onClick={() => rendererRef.current?.size("fit")}
+          >
+            Fit to this window
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            aria-label="Dismiss terminal size notice"
+            onClick={() => rendererRef.current?.dismissSizeNotice()}
+          >
+            <XIcon className="size-3.5" />
+          </Button>
+        </div>
+      ) : null}
       {enableTerminalAgentActivity && shouldRender && command?.activity !== undefined ? (
         <div
           className="pointer-events-none absolute inset-x-0 top-7 bottom-0 z-10"
@@ -2478,7 +2697,7 @@ export default function ThreadTerminalPanel({
                       {showGroupHeaders && (
                         <button
                           type="button"
-                          className={`flex w-full items-center rounded px-1 py-0.5 text-[10px] uppercase tracking-[0.08em] ${
+                          className={`flex w-full items-center rounded px-1 py-0.5 text-xs uppercase tracking-[0.08em] ${
                             isGroupActive
                               ? "bg-accent/70 text-foreground"
                               : "text-muted-foreground hover:bg-accent/50 hover:text-foreground"
@@ -2500,14 +2719,14 @@ export default function ThreadTerminalPanel({
                           return (
                             <div
                               key={terminalId}
-                              className={`group flex items-center gap-1 rounded px-1 py-0.5 text-[11px] ${
+                              className={`group flex items-center gap-1 rounded px-1 py-0.5 text-xs ${
                                 isActive
                                   ? "bg-accent text-foreground"
                                   : "text-muted-foreground hover:bg-accent/50 hover:text-foreground"
                               }`}
                             >
                               {showGroupHeaders && (
-                                <span className="text-[10px] text-muted-foreground/80">└</span>
+                                <span className="text-xs text-muted-foreground">└</span>
                               )}
                               <button
                                 type="button"

@@ -25,6 +25,8 @@ const snapshotData = (
   status,
   pid: 1,
   history,
+  oscColorResponderActive: false,
+  firstAttachmentGrant: false,
   exitCode: null,
   exitSignal: null,
   label: "Terminal 1",
@@ -61,6 +63,12 @@ describe("projectTerminalMetadataStream", () => {
         } satisfies TerminalAttachStreamEvent,
         snapshot("boot\n"),
         output("a"),
+        {
+          type: "resized",
+          threadId: "thread-1",
+          terminalId: "terminal-1",
+          size: { cols: 91, rows: 42, sizeClaim: "renderer" },
+        } satisfies TerminalAttachStreamEvent,
         {
           type: "cleared",
           threadId: "thread-1",

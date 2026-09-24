@@ -9,8 +9,8 @@ import {
   runtimeEnvSignature,
   shouldHandleTerminalSelectionMouseUp,
   terminalSelectionActionDelayForClickCount,
-  writeTerminalBuffer,
 } from "./ThreadTerminalPanel";
+import { writeTerminalBuffer } from "./terminalReplyGuard";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -22,10 +22,10 @@ describe("terminal panel utilities", () => {
 
     writeTerminalBuffer(terminal as never, "");
     expect(terminal.write).toHaveBeenCalledTimes(1);
-    expect(terminal.write).toHaveBeenLastCalledWith("\u001bc");
+    expect(terminal.write).toHaveBeenLastCalledWith("\u001bc", undefined);
 
     writeTerminalBuffer(terminal as never, "saved output");
-    expect(terminal.write).toHaveBeenLastCalledWith("saved output");
+    expect(terminal.write).toHaveBeenLastCalledWith("saved output", undefined);
   });
 
   it("contains fit-addon failures", () => {

@@ -354,6 +354,7 @@ struct EnvironmentCapabilities {
     repository_identity: bool,
     remote_update_control: bool,
     terminal_ordered_input: bool,
+    terminal_size_ownership: bool,
 }
 
 async fn environment_descriptor(State(state): State<AppState>) -> Json<EnvironmentDescriptor> {
@@ -377,6 +378,7 @@ async fn environment_descriptor(State(state): State<AppState>) -> Json<Environme
             repository_identity: true,
             remote_update_control: true,
             terminal_ordered_input: true,
+            terminal_size_ownership: true,
         },
     })
 }

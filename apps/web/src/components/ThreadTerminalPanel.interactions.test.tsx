@@ -35,11 +35,14 @@ interface FakeTerminalInstance {
   readonly open: ReturnType<typeof vi.fn>;
   readonly focus: ReturnType<typeof vi.fn>;
   readonly refresh: ReturnType<typeof vi.fn>;
+  readonly resize: ReturnType<typeof vi.fn>;
   readonly scrollToBottom: ReturnType<typeof vi.fn>;
   readonly clearTextureAtlas: ReturnType<typeof vi.fn>;
   readonly dispose: ReturnType<typeof vi.fn>;
   readonly loadAddon: ReturnType<typeof vi.fn>;
   readonly clearSelection: ReturnType<typeof vi.fn>;
+  readonly csiHandlers: Map<string, (params: (number | number[])[]) => boolean>;
+  readonly oscHandlers: Map<number, (data: string) => boolean>;
   readonly inputDisposable: { readonly dispose: ReturnType<typeof vi.fn> };
   readonly selectionDisposable: { readonly dispose: ReturnType<typeof vi.fn> };
   readonly linkDisposable: { readonly dispose: ReturnType<typeof vi.fn> };
@@ -97,8 +100,15 @@ interface FakeWebglAddonInstance {
 
 const xtermState = vi.hoisted(() => ({
   terminals: [] as FakeTerminalInstance[],
-  fitAddons: [] as Array<{ fit: ReturnType<typeof vi.fn> }>,
+  fitAddons: [] as Array<{
+    fit: ReturnType<typeof vi.fn>;
+    proposeDimensions: ReturnType<typeof vi.fn>;
+  }>,
+  answerQueriesOnWrite: false,
+  deferWrites: false,
+  pendingWrites: [] as Array<() => void>,
   fitShouldThrow: false,
+  proposedDimensions: { cols: 80, rows: 24 } as { cols: number; rows: number } | null,
   loadWebglShouldThrow: false,
 }));
 
@@ -133,6 +143,7 @@ const webglState = vi.hoisted(() => ({
 vi.mock("@xterm/addon-fit", () => ({
   FitAddon: class FitAddon {
     readonly fit = vi.fn();
+    readonly proposeDimensions = vi.fn(() => xtermState.proposedDimensions ?? undefined);
     constructor() {
       if (xtermState.fitShouldThrow) {
         this.fit.mockImplementation(() => {
@@ -305,6 +316,27 @@ vi.mock("@xterm/xterm", () => ({
     readonly open = vi.fn();
     readonly focus = vi.fn();
     readonly refresh = vi.fn();
+    readonly resize = vi.fn((cols: number, rows: number) => {
+      this.cols = cols;
+      this.rows = rows;
+    });
+    readonly csiHandlers = new Map<string, (params: (number | number[])[]) => boolean>();
+    readonly oscHandlers = new Map<number, (data: string) => boolean>();
+    readonly parser = {
+      registerCsiHandler: (
+        id: { prefix?: string; intermediates?: string; final: string },
+        handler: (params: (number | number[])[]) => boolean,
+      ) => {
+        const key = `${id.prefix ?? ""}${id.intermediates ?? ""}${id.final}`;
+        this.csiHandlers.set(key, handler);
+        return { dispose: () => this.csiHandlers.delete(key) };
+      },
+      registerOscHandler: (code: number, handler: (data: string) => boolean) => {
+        this.oscHandlers.set(code, handler);
+        return { dispose: () => this.oscHandlers.delete(code) };
+      },
+      registerDcsHandler: () => ({ dispose() {} }),
+    };
     readonly scrollToBottom = vi.fn();
     readonly clearTextureAtlas = vi.fn();
     readonly loadedAddons: Array<{ dispose?: () => void }> = [];
@@ -393,20 +425,30 @@ vi.mock("@xterm/xterm", () => ({
       return this.selectionPosition;
     }
 
-    write(value: string) {
+    write(value: string, callback?: () => void) {
       if (this.disposed) {
         this.writesAfterDispose.push(value);
         return;
       }
-      this.writes.push(value);
-      const resetParts = value.split("\u001bc");
-      if (resetParts.length === 1) {
-        this.displayedText += value;
-        return;
-      }
-
-      this.resetCount += resetParts.length - 1;
-      this.displayedText = resetParts.at(-1) ?? "";
+      const parse = () => {
+        if (this.disposed) return;
+        this.writes.push(value);
+        if (xtermState.answerQueriesOnWrite) {
+          if (value.includes("\x1b[6n") && !this.csiHandlers.get("n")?.([6]))
+            this.dataHandler?.("\x1b[1;1R");
+          if (value.includes("\x1b[c") && !this.csiHandlers.get("c")?.([0]))
+            this.dataHandler?.("\x1b[?1;2c");
+        }
+        const resetParts = value.split("\u001bc");
+        if (resetParts.length === 1) this.displayedText += value;
+        else {
+          this.resetCount += resetParts.length - 1;
+          this.displayedText = resetParts.at(-1) ?? "";
+        }
+        callback?.();
+      };
+      if (xtermState.deferWrites) xtermState.pendingWrites.push(parse);
+      else parse();
     }
   },
 }));
@@ -417,7 +459,10 @@ const testState = vi.hoisted(() => ({
     environment: { platform: { os: "windows" } },
   } as {
     availableEditors: string[];
-    environment: { platform: { os: string }; capabilities?: { terminalOrderedInput?: boolean } };
+    environment: {
+      platform: { os: string };
+      capabilities?: { terminalOrderedInput?: boolean; terminalSizeOwnership?: boolean };
+    };
   } | null,
   session: {
     buffer: "",
@@ -569,7 +614,7 @@ vi.mock("~/components/ui/popover", () => ({
 
 import ThreadTerminalPanel, {
   enqueueTerminalInput,
-  releaseTerminalInputScheduler,
+  releaseTerminalUiResources,
   TerminalViewport,
 } from "./ThreadTerminalPanel";
 import { decodeTerminalLaunchCommand } from "../lib/terminalLaunchCommand";
@@ -789,6 +834,8 @@ function terminalSnapshot(
     status,
     pid: 1,
     history,
+    oscColorResponderActive: false,
+    firstAttachmentGrant: false,
     exitCode: null,
     exitSignal: null,
     label: "Terminal 1",
@@ -840,8 +887,8 @@ function trackedTranscriptRuntime(initialSnapshot: string): {
   return {
     runtime: {
       ingest: (event) => source.ingest(event),
-      attachRenderer: (sink) => {
-        const attachment = source.attachRenderer(sink);
+      attachRenderer: (sink, sizeClaim) => {
+        const attachment = source.attachRenderer(sink, sizeClaim);
         let detached = false;
         return {
           detach() {
@@ -866,6 +913,15 @@ async function flushAnimationFrames(): Promise<void> {
       const callbacks = Array.from(animationFrames.values());
       animationFrames.clear();
       for (const callback of callbacks) callback(0);
+      await Promise.resolve();
+    }
+  });
+}
+
+async function flushTerminalWrites(): Promise<void> {
+  await act(async () => {
+    while (xtermState.pendingWrites.length > 0) {
+      xtermState.pendingWrites.shift()!();
       await Promise.resolve();
     }
   });
@@ -1107,6 +1163,10 @@ beforeEach(() => {
   xtermState.terminals = [];
   xtermState.fitAddons = [];
   xtermState.fitShouldThrow = false;
+  xtermState.answerQueriesOnWrite = false;
+  xtermState.deferWrites = false;
+  xtermState.pendingWrites = [];
+  xtermState.proposedDimensions = { cols: 80, rows: 24 };
   xtermState.loadWebglShouldThrow = false;
   webglState.instances = [];
   webglState.importCount = 0;
@@ -1278,7 +1338,7 @@ afterEach(async () => {
     "term-split-a",
     "term-split-b",
   ]) {
-    releaseTerminalInputScheduler(ENVIRONMENT_ID, THREAD_ID, terminalId);
+    releaseTerminalUiResources(ENVIRONMENT_ID, THREAD_ID, terminalId);
   }
   assertComponentTimerCleanup();
   expect(animationFrames.size).toBe(0);
@@ -1556,6 +1616,646 @@ describe("TerminalViewport mounted lifecycle", () => {
     expect(view.resizeSpy).toHaveBeenCalledOnce();
   });
 
+  it("measures a renderer before attaching and supplies its fitted dimensions", async () => {
+    const view = await mountViewport({ publishRuntime: false });
+    expect(view.fakeTerminal).not.toBeNull();
+    expect(testState.attachedSessionInputs.at(-1)).toMatchObject({
+      attach: true,
+      terminal: { cols: 80, rows: 24 },
+    });
+  });
+
+  it("attaches without dimensions when geometry is not measurable", async () => {
+    xtermState.proposedDimensions = null;
+    await mountViewport({ publishRuntime: false });
+    const attached = testState.attachedSessionInputs.at(-1) as {
+      attach: boolean;
+      terminal: { cols?: number; rows?: number };
+    };
+    expect(attached.attach).toBe(true);
+    expect(attached.terminal.cols).toBeUndefined();
+    expect(attached.terminal.rows).toBeUndefined();
+  });
+
+  it("mirrors the broadcast size, ignores layout changes, and offers an explicit fit claim", async () => {
+    testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    const view = await mountViewport();
+    await act(async () =>
+      view.runtime.ingest({
+        type: "snapshot",
+        snapshot: {
+          ...terminalSnapshot("prompt"),
+          size: { cols: 151, rows: 50, sizeClaim: "another-window" },
+        },
+      }),
+    );
+    expect(view.fakeTerminal?.cols).toBe(151);
+    expect(view.fakeTerminal?.rows).toBe(50);
+    expect(view.resizeSpy).not.toHaveBeenCalled();
+    const observer = resizeObserverInstances[0]!;
+    await act(async () => {
+      observer.callback([], observer as never);
+    });
+    await view.flushFrame();
+    expect(view.resizeSpy).not.toHaveBeenCalled();
+    const fit = Array.from(view.mounted.container.querySelectorAll("button")).find(
+      (button) => button.textContent === "Fit to this window",
+    );
+    expect(fit).toBeDefined();
+    await act(async () => fit!.click());
+    expect(view.resizeSpy).toHaveBeenCalledWith({
+      environmentId: ENVIRONMENT_ID,
+      input: {
+        threadId: THREAD_ID,
+        terminalId: "term-1",
+        cols: 80,
+        rows: 24,
+        sizeClaim: expect.any(String),
+      },
+    });
+  });
+
+  it("claims focused attachments at equal size and resizes on layout only while the broadcast owner", async () => {
+    testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+    vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    const view = await mountViewport();
+    await act(async () =>
+      view.runtime.ingest({
+        type: "snapshot",
+        snapshot: {
+          ...terminalSnapshot("prompt"),
+          size: { cols: 80, rows: 24, sizeClaim: "previous-owner" },
+        },
+      }),
+    );
+    const claim = view.resizeSpy.mock.calls.at(-1)![0].input.sizeClaim as string;
+    expect(claim).toEqual(expect.any(String));
+    expect(claim).not.toBe("previous-owner");
+    await act(async () =>
+      view.runtime.ingest({
+        type: "resized",
+        threadId: THREAD_ID,
+        terminalId: "term-1",
+        size: { cols: 80, rows: 24, sizeClaim: claim },
+      }),
+    );
+    expect(view.mounted.container.textContent).not.toContain("Fit to this window");
+    xtermState.proposedDimensions = { cols: 91, rows: 42 };
+    view.resizeSpy.mockClear();
+    await view.triggerResizeEpoch();
+    await view.flushFrame();
+    expect(view.resizeSpy).toHaveBeenCalledWith({
+      environmentId: ENVIRONMENT_ID,
+      input: { threadId: THREAD_ID, terminalId: "term-1", cols: 91, rows: 42, sizeClaim: claim },
+    });
+    await act(async () =>
+      view.runtime.ingest({
+        type: "resized",
+        threadId: THREAD_ID,
+        terminalId: "term-1",
+        size: { cols: 151, rows: 50, sizeClaim: "next-owner" },
+      }),
+    );
+    view.resizeSpy.mockClear();
+    await view.triggerResizeEpoch();
+    await view.flushFrame();
+    expect(view.resizeSpy).not.toHaveBeenCalled();
+    expect(view.fakeTerminal?.cols).toBe(151);
+  });
+
+  it.each(["focus", "pointer", "keypress"] as const)(
+    "claims an equal-size mirror on terminal %s and deduplicates while the resize RPC is pending",
+    async (trigger) => {
+      testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+      vi.spyOn(document, "hasFocus").mockReturnValue(false);
+      const view = await mountViewport();
+      await act(async () =>
+        view.runtime.ingest({
+          type: "snapshot",
+          snapshot: {
+            ...terminalSnapshot("prompt"),
+            size: { cols: 80, rows: 24, sizeClaim: "other" },
+          },
+        }),
+      );
+      const mount = view.mounted.container.querySelector<HTMLElement>(
+        "[data-terminal-xterm-mount]",
+      )!;
+      const interact = () => {
+        if (trigger === "focus") mount.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
+        if (trigger === "pointer")
+          mount.dispatchEvent(new PointerEvent("pointerdown", { button: 0, bubbles: true }));
+        if (trigger === "keypress")
+          view.fakeTerminal!.keyHandler?.(new KeyboardEvent("keydown", { key: "a" }));
+      };
+      expect(view.mounted.container.textContent).not.toContain("Fit to this window");
+      await act(async () => {
+        interact();
+        interact();
+        interact();
+      });
+      expect(view.resizeSpy).toHaveBeenCalledTimes(1);
+      const claim = view.resizeSpy.mock.calls[0]![0].input.sizeClaim as string;
+      expect(claim).toBe(
+        (testState.attachedSessionInputs.at(-1) as { terminal: { sizeClaim: string } }).terminal
+          .sizeClaim,
+      );
+      await act(async () =>
+        view.runtime.ingest({
+          type: "resized",
+          threadId: THREAD_ID,
+          terminalId: "term-1",
+          size: { cols: 80, rows: 24, sizeClaim: claim },
+        }),
+      );
+      await act(async () => interact());
+      expect(view.resizeSpy).toHaveBeenCalledTimes(1);
+      await act(async () =>
+        view.runtime.ingest({
+          type: "resized",
+          threadId: THREAD_ID,
+          terminalId: "term-1",
+          size: { cols: 80, rows: 24, sizeClaim: "other-again" },
+        }),
+      );
+      await act(async () => interact());
+      expect(view.resizeSpy).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it("claims null ownership immediately without focus and keeps replying before its echo", async () => {
+    testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    const view = await mountViewport();
+    let settle!: (value: unknown) => void;
+    view.resizeSpy.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          settle = resolve;
+        }),
+    );
+    await act(async () =>
+      view.runtime.ingest({
+        type: "snapshot",
+        snapshot: { ...terminalSnapshot("prompt"), size: { cols: 151, rows: 50, sizeClaim: null } },
+      }),
+    );
+    expect(view.resizeSpy).toHaveBeenCalledTimes(1);
+    expect(view.fakeTerminal!.csiHandlers.get("n")!([6])).toBe(false);
+    expect(view.mounted.container.textContent).not.toContain("Fit to this window");
+    await act(async () =>
+      view.runtime.ingest({
+        type: "resized",
+        threadId: THREAD_ID,
+        terminalId: "term-1",
+        size: { cols: 151, rows: 50, sizeClaim: null },
+      }),
+    );
+    expect(view.resizeSpy).toHaveBeenCalledTimes(1);
+    const claim = view.resizeSpy.mock.calls[0]![0].input.sizeClaim as string;
+    await act(async () =>
+      view.runtime.ingest({
+        type: "resized",
+        threadId: THREAD_ID,
+        terminalId: "term-1",
+        size: { cols: 80, rows: 24, sizeClaim: claim },
+      }),
+    );
+    await act(async () => settle(AsyncResult.success(undefined)));
+    await act(async () =>
+      view.runtime.ingest({
+        type: "resized",
+        threadId: THREAD_ID,
+        terminalId: "term-1",
+        size: { cols: 80, rows: 24, sizeClaim: null },
+      }),
+    );
+    expect(view.resizeSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("clears a failed claim slot and restores the different-size mirror action", async () => {
+    testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    const view = await mountViewport();
+    await act(async () =>
+      view.runtime.ingest({
+        type: "snapshot",
+        snapshot: {
+          ...terminalSnapshot("prompt"),
+          size: { cols: 151, rows: 50, sizeClaim: "other" },
+        },
+      }),
+    );
+    let settle!: (value: unknown) => void;
+    view.resizeSpy.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          settle = resolve;
+        }),
+    );
+    const mount = view.mounted.container.querySelector<HTMLElement>("[data-terminal-xterm-mount]")!;
+    await act(async () => mount.dispatchEvent(new FocusEvent("focusin", { bubbles: true })));
+    expect(view.mounted.container.textContent).not.toContain("Fit to this window");
+    await act(async () =>
+      mount.dispatchEvent(new PointerEvent("pointerdown", { button: 0, bubbles: true })),
+    );
+    expect(view.resizeSpy).toHaveBeenCalledTimes(1);
+    await act(async () => settle(AsyncResult.failure(Cause.fail(new Error("resize failed")))));
+    expect(view.mounted.container.textContent).toContain("Fit to this window");
+    await act(async () =>
+      view.fakeTerminal!.keyHandler?.(new KeyboardEvent("keydown", { key: "a" })),
+    );
+    expect(view.resizeSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("retires a stale pending claim when a restarted snapshot begins a new generation", async () => {
+    testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    const view = await mountViewport();
+    let finishOld!: (value: unknown) => void;
+    view.resizeSpy.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishOld = resolve;
+        }),
+    );
+    await act(async () =>
+      view.runtime.ingest({
+        type: "snapshot",
+        snapshot: { ...terminalSnapshot("old"), size: { cols: 151, rows: 50, sizeClaim: null } },
+      }),
+    );
+    expect(view.resizeSpy).toHaveBeenCalledTimes(1);
+    view.resizeSpy.mockImplementationOnce(() => new Promise(() => {}));
+    await act(async () =>
+      view.runtime.ingest({
+        type: "restarted",
+        threadId: THREAD_ID,
+        terminalId: "term-1",
+        snapshot: { ...terminalSnapshot("new"), size: { cols: 151, rows: 50, sizeClaim: null } },
+      }),
+    );
+    expect(view.resizeSpy).toHaveBeenCalledTimes(2);
+    await act(async () => finishOld(AsyncResult.failure(Cause.fail(new Error("old connection")))));
+    await act(async () =>
+      view.fakeTerminal!.keyHandler?.(new KeyboardEvent("keydown", { key: "a" })),
+    );
+    expect(view.resizeSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("answers first-attachment history queries once and guards a later remount", async () => {
+    testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    xtermState.answerQueriesOnWrite = true;
+    const view = await mountViewport();
+    const claim = (testState.attachedSessionInputs.at(-1) as { terminal: { sizeClaim: string } })
+      .terminal.sizeClaim;
+    await act(async () =>
+      view.runtime.ingest({
+        type: "snapshot",
+        snapshot: {
+          ...terminalSnapshot("\x1b[6n\x1b[c"),
+          firstAttachmentGrant: true,
+          size: { cols: 80, rows: 24, sizeClaim: claim },
+        },
+      }),
+    );
+    await view.flushFrame();
+    const written = () =>
+      testState.writeCommand.mock.calls.map(([request]) => request.input.data).join("");
+    expect(written()).toBe("\x1b[1;1R\x1b[?1;2c");
+    await view.setTranscriptRuntime(null);
+    await view.setTranscriptRuntime(view.runtime);
+    await view.flushFrame();
+    expect(written()).toBe("\x1b[1;1R\x1b[?1;2c");
+    await view.setVisible(false);
+    await view.setVisible(true);
+    await view.flushFrame();
+    expect(written()).toBe("\x1b[1;1R\x1b[?1;2c");
+  });
+
+  it("sends keystrokes through the input scheduler before the first snapshot", async () => {
+    const view = await mountViewport({ publishRuntime: false });
+    await act(async () => view.fakeTerminal!.dataHandler!("echo ready\r"));
+    await view.flushFrame();
+    expect(testState.writeCommand.mock.calls.map(([request]) => request.input.data).join("")).toBe(
+      "echo ready\r",
+    );
+  });
+
+  it("releases a successful claim without waiting for an echo and keeps a pending RPC through an echo", async () => {
+    testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    const view = await mountViewport();
+    await act(async () =>
+      view.runtime.ingest({
+        type: "snapshot",
+        snapshot: {
+          ...terminalSnapshot(""),
+          size: { cols: 151, rows: 50, sizeClaim: "other" },
+        },
+      }),
+    );
+    let settle!: (value: unknown) => void;
+    view.resizeSpy.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          settle = resolve;
+        }),
+    );
+    const keypress = () =>
+      view.fakeTerminal!.keyHandler?.(new KeyboardEvent("keydown", { key: "a" }));
+    await act(async () => keypress());
+    await act(async () => keypress());
+    expect(view.resizeSpy).toHaveBeenCalledTimes(1);
+    await act(async () => settle(AsyncResult.success(undefined)));
+    await act(async () => keypress());
+    expect(view.resizeSpy).toHaveBeenCalledTimes(2);
+    const claim = view.resizeSpy.mock.calls[1]![0].input.sizeClaim as string;
+    await act(async () =>
+      view.runtime.ingest({
+        type: "resized",
+        threadId: THREAD_ID,
+        terminalId: "term-1",
+        size: { cols: 80, rows: 24, sizeClaim: claim },
+      }),
+    );
+    xtermState.proposedDimensions = { cols: 91, rows: 42 };
+    await view.triggerResizeEpoch();
+    await view.flushFrame();
+    expect(view.resizeSpy).toHaveBeenCalledTimes(2);
+    await act(async () => settle(AsyncResult.success(undefined)));
+    expect(view.resizeSpy).toHaveBeenCalledTimes(3);
+    expect(view.resizeSpy.mock.calls[2]![0].input).toMatchObject({
+      cols: 91,
+      rows: 42,
+      sizeClaim: claim,
+    });
+  });
+
+  it("does not flash the notice between successful claim completion and asynchronous echo parsing", async () => {
+    testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    xtermState.deferWrites = true;
+    const view = await mountViewport();
+    await act(async () =>
+      view.runtime.ingest({
+        type: "snapshot",
+        snapshot: {
+          ...terminalSnapshot(""),
+          size: { cols: 151, rows: 50, sizeClaim: "other" },
+        },
+      }),
+    );
+    await flushTerminalWrites();
+    expect(view.mounted.container.textContent).toContain("Sized for another window.");
+    let settle!: (value: unknown) => void;
+    view.resizeSpy.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          settle = resolve;
+        }),
+    );
+    await act(async () => view.pointerDownOnSurface());
+    const claim = view.resizeSpy.mock.calls.at(-1)![0].input.sizeClaim as string;
+    await act(async () =>
+      view.runtime.ingest({
+        type: "resized",
+        threadId: THREAD_ID,
+        terminalId: "term-1",
+        size: { cols: 80, rows: 24, sizeClaim: claim },
+      }),
+    );
+    await act(async () => settle(AsyncResult.success(undefined)));
+    // The RPC is settled, but xterm's ordered size barrier has not parsed yet.
+    expect(view.fakeTerminal!.cols).toBe(151);
+    expect(view.mounted.container.textContent).not.toContain("Sized for another window.");
+    await flushTerminalWrites();
+    expect(view.fakeTerminal!.cols).toBe(80);
+    expect(view.mounted.container.textContent).not.toContain("Sized for another window.");
+  });
+
+  it.each(["size", "owner", "generation"] as const)(
+    "clears no-echo claim notice suppression on the next %s change",
+    async (change) => {
+      testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+      vi.spyOn(document, "hasFocus").mockReturnValue(false);
+      xtermState.deferWrites = true;
+      const view = await mountViewport();
+      const size = { cols: 151, rows: 50, sizeClaim: "other" };
+      await act(async () =>
+        view.runtime.ingest({ type: "snapshot", snapshot: { ...terminalSnapshot(""), size } }),
+      );
+      await flushTerminalWrites();
+      await act(async () => view.pointerDownOnSurface());
+      expect(view.resizeSpy).toHaveBeenCalledTimes(1);
+      expect(view.mounted.container.textContent).not.toContain("Sized for another window.");
+      await act(async () =>
+        view.runtime.ingest({ type: "resized", threadId: THREAD_ID, terminalId: "term-1", size }),
+      );
+      await flushTerminalWrites();
+      expect(view.mounted.container.textContent).not.toContain("Sized for another window.");
+      await act(async () =>
+        view.runtime.ingest(
+          change === "generation"
+            ? {
+                type: "restarted",
+                threadId: THREAD_ID,
+                terminalId: "term-1",
+                snapshot: { ...terminalSnapshot(""), size },
+              }
+            : {
+                type: "resized",
+                threadId: THREAD_ID,
+                terminalId: "term-1",
+                size: {
+                  ...size,
+                  ...(change === "size" ? { cols: 152 } : { sizeClaim: "next-owner" }),
+                },
+              },
+        ),
+      );
+      await flushTerminalWrites();
+      expect(view.mounted.container.textContent).toContain("Sized for another window.");
+    },
+  );
+
+  it("keeps dismissal through visibility changes and component remount, then clears it on retirement", async () => {
+    testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    const view = await mountViewport();
+    await act(async () =>
+      view.runtime.ingest({
+        type: "snapshot",
+        snapshot: {
+          ...terminalSnapshot(""),
+          size: { cols: 151, rows: 50, sizeClaim: "other" },
+        },
+      }),
+    );
+    const dismiss = view.mounted.container.querySelector<HTMLButtonElement>(
+      '[aria-label="Dismiss terminal size notice"]',
+    )!;
+    await act(async () => dismiss.click());
+    await view.setVisible(false);
+    await view.setVisible(true);
+    expect(view.mounted.container.textContent).not.toContain("Sized for another window.");
+    await view.setDocumentVisible(false);
+    await view.setDocumentVisible(true);
+    expect(view.mounted.container.textContent).not.toContain("Sized for another window.");
+    await unmount(view.mounted);
+    const remounted = await mountViewport({ publishRuntime: false });
+    await remounted.setTranscriptRuntime(view.runtime);
+    expect(remounted.mounted.container.textContent).not.toContain("Sized for another window.");
+    await unmount(remounted.mounted);
+    releaseTerminalUiResources(ENVIRONMENT_ID, THREAD_ID, "term-1");
+    const reopened = await mountViewport({ publishRuntime: false });
+    await reopened.setTranscriptRuntime(view.runtime);
+    expect(reopened.mounted.container.textContent).toContain("Sized for another window.");
+  });
+
+  it("a surviving renderer answers restarted startup queries live and guards the later remount", async () => {
+    testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    xtermState.answerQueriesOnWrite = true;
+    xtermState.deferWrites = true;
+    const view = await mountViewport();
+    await flushTerminalWrites();
+    await act(async () =>
+      view.runtime.ingest({
+        type: "restarted",
+        threadId: THREAD_ID,
+        terminalId: "term-1",
+        snapshot: {
+          ...terminalSnapshot(""),
+          size: { cols: 80, rows: 24, sizeClaim: null },
+        },
+      }),
+    );
+    await flushTerminalWrites();
+    await act(async () => view.emitOutput("\x1b[6n\x1b[c"));
+    await view.flushFrame();
+    await flushTerminalWrites();
+    await view.flushFrame();
+    const written = () =>
+      testState.writeCommand.mock.calls.map(([request]) => request.input.data).join("");
+    expect(written()).toBe("\x1b[1;1R\x1b[?1;2c");
+    await view.setVisible(false);
+    await view.setVisible(true);
+    await flushTerminalWrites();
+    await view.flushFrame();
+    expect(written()).toBe("\x1b[1;1R\x1b[?1;2c");
+  });
+
+  it("keeps a dismissed size notice hidden until the applied size or owner changes", async () => {
+    testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    const view = await mountViewport();
+    const resized = async (cols: number, sizeClaim: string) =>
+      act(async () =>
+        view.runtime.ingest({
+          type: "resized",
+          threadId: THREAD_ID,
+          terminalId: "term-1",
+          size: { cols, rows: 50, sizeClaim },
+        }),
+      );
+    await resized(151, "other");
+    const dismiss = () =>
+      view.mounted.container.querySelector<HTMLButtonElement>(
+        '[aria-label="Dismiss terminal size notice"]',
+      );
+    expect(dismiss()).not.toBeNull();
+    await act(async () => dismiss()!.click());
+    expect(view.mounted.container.textContent).not.toContain("Sized for another window.");
+    await view.triggerResizeEpoch();
+    await view.flushFrame();
+    await resized(151, "other");
+    expect(dismiss()).toBeNull();
+    await resized(150, "other");
+    expect(dismiss()).not.toBeNull();
+    await act(async () => dismiss()!.click());
+    await resized(150, "next-owner");
+    expect(dismiss()).not.toBeNull();
+  });
+
+  it("skips measuring and resize requests for owner keypresses at the applied size", async () => {
+    testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+    const view = await mountViewport();
+    const claim = (testState.attachedSessionInputs.at(-1) as { terminal: { sizeClaim: string } })
+      .terminal.sizeClaim;
+    await act(async () =>
+      view.runtime.ingest({
+        type: "snapshot",
+        snapshot: {
+          ...terminalSnapshot(""),
+          size: { cols: 80, rows: 24, sizeClaim: claim },
+        },
+      }),
+    );
+    xtermState.fitAddons[0]!.proposeDimensions.mockClear();
+    await act(async () => {
+      for (let index = 0; index < 100; index += 1)
+        view.fakeTerminal!.keyHandler?.(new KeyboardEvent("keydown", { key: "a" }));
+    });
+    expect(xtermState.fitAddons[0]!.proposeDimensions).not.toHaveBeenCalled();
+    expect(view.resizeSpy).not.toHaveBeenCalled();
+  });
+
+  it("answers startup DSR and DA immediately when its attach snapshot names this renderer", async () => {
+    testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    const view = await mountViewport();
+    const claim = (testState.attachedSessionInputs.at(-1) as { terminal: { sizeClaim: string } })
+      .terminal.sizeClaim;
+    await act(async () =>
+      view.runtime.ingest({
+        type: "snapshot",
+        snapshot: { ...terminalSnapshot(""), size: { cols: 80, rows: 24, sizeClaim: claim } },
+      }),
+    );
+    const terminal = view.fakeTerminal!;
+    expect(terminal.csiHandlers.get("n")!([6])).toBe(false);
+    expect(terminal.csiHandlers.get("c")!([0])).toBe(false);
+    await act(async () => {
+      terminal.dataHandler!("\x1b[1;1R");
+      terminal.dataHandler!("\x1b[?1;2c");
+    });
+    await view.flushFrame();
+    expect(testState.writeCommand.mock.calls.map(([request]) => request.input.data).join("")).toBe(
+      "\x1b[1;1R\x1b[?1;2c",
+    );
+    expect(view.resizeSpy).not.toHaveBeenCalled();
+    expect(view.mounted.container.textContent).not.toContain("Fit to this window");
+  });
+
+  it.each([true, false])(
+    "uses snapshot OSC responder activity with ownership capability %s",
+    async (enabled) => {
+      testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: enabled };
+      const view = await mountViewport();
+      const claim =
+        (testState.attachedSessionInputs.at(-1) as { terminal: { sizeClaim?: string } }).terminal
+          .sizeClaim ?? "legacy";
+      for (const active of [true, false]) {
+        await act(async () =>
+          view.runtime.ingest({
+            type: "snapshot",
+            snapshot: {
+              ...terminalSnapshot(""),
+              oscColorResponderActive: active,
+              size: { cols: 80, rows: 24, sizeClaim: claim },
+            },
+          }),
+        );
+        for (const code of [10, 11, 12])
+          expect(view.fakeTerminal!.oscHandlers.get(code)!("?")).toBe(active);
+        expect(view.fakeTerminal!.csiHandlers.get("?n")!([996])).toBe(true);
+      }
+    },
+  );
+
   it("refits when the terminal element changes size without a window resize", async () => {
     const view = await mountViewport({ visible: true });
     await view.flushFrame();
@@ -1817,7 +2517,7 @@ describe("TerminalViewport mounted lifecycle", () => {
       autoFocus: true,
       publishRuntime: false,
     });
-    expect(view.fakeTerminal).toBeNull();
+    expect(view.fakeTerminal?.displayedText).toBe("");
 
     await view.publishRuntime();
     const terminal = view.fakeTerminal!;
@@ -1827,6 +2527,20 @@ describe("TerminalViewport mounted lifecycle", () => {
 
     await view.flushFrame();
     expect(terminal.focus).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the same WebGL context when the transcript reattaches to the mounted terminal", async () => {
+    const view = await mountViewport({ webglEnabled: true });
+    await view.settleWebgl();
+    const terminal = view.fakeTerminal;
+    const addon = view.webglAddon!;
+    expect(webglState.instances).toHaveLength(1);
+    await view.replaceRuntime();
+    await view.settleWebgl();
+    expect(view.fakeTerminal).toBe(terminal);
+    expect(view.webglAddon).toBe(addon);
+    expect(webglState.instances).toHaveLength(1);
+    expect(addon.disposeSpy).not.toHaveBeenCalled();
   });
 
   it("does not refocus a fulfilled activation when the transcript runtime reconnects", async () => {
@@ -1842,7 +2556,7 @@ describe("TerminalViewport mounted lifecycle", () => {
 
     await view.replaceRuntime();
     const replacementTerminal = view.fakeTerminal!;
-    expect(replacementTerminal).not.toBe(initialTerminal);
+    expect(replacementTerminal).toBe(initialTerminal);
     await view.flushFrame();
 
     expect(initialTerminal.focus).not.toHaveBeenCalled();
@@ -2631,13 +3345,16 @@ describe("TerminalViewport mounted lifecycle", () => {
     expect(testState.attachedSessionInputs.at(-1)).toMatchObject({ attach: true });
   });
 
-  it("waits for the attach producer to publish its runtime before creating xterm", async () => {
+  it("measures xterm before attach and waits for the producer before hydrating it", async () => {
     const view = await mountViewport({ visible: true, publishRuntime: false });
-    expect(view.fakeTerminal).toBeNull();
+    const terminal = view.fakeTerminal!;
+    expect(terminal.open).toHaveBeenCalledOnce();
+    expect(terminal.writes).toEqual([]);
 
     await view.publishRuntime();
 
-    expect(view.fakeTerminal?.open).toHaveBeenCalled();
+    expect(view.fakeTerminal).toBe(terminal);
+    expect(terminal.resetCount).toBe(1);
   });
 
   it("renders attach failures even when no transcript runtime was published", async () => {
@@ -2653,7 +3370,7 @@ describe("TerminalViewport mounted lifecycle", () => {
 
     const alert = view.mounted.container.querySelector('[role="alert"]');
     expect(alert?.textContent).toContain("attach failed");
-    expect(view.fakeTerminal).toBeNull();
+    expect(view.fakeTerminal?.displayedText).toBe("");
   });
 
   it("disposes xterm and the renderer attachment when hidden without closing the session", async () => {
@@ -2726,7 +3443,7 @@ describe("TerminalViewport mounted lifecycle", () => {
     expect(view.closeSessionSpy).not.toHaveBeenCalled();
 
     await view.setVisible(true);
-    expect(view.fakeTerminal).toBeNull();
+    expect(view.fakeTerminal?.displayedText).toBe("");
 
     const replacementRuntime = createTerminalTranscriptRuntime();
     replacementRuntime.ingest(snapshotEvent(serverHistory));
@@ -3136,7 +3853,7 @@ describe("TerminalViewport mounted lifecycle", () => {
       <TerminalViewport {...viewportProps({ terminalId: "term-release" })} />,
     );
     await unmount(first);
-    releaseTerminalInputScheduler(ENVIRONMENT_ID, THREAD_ID, "term-release");
+    releaseTerminalUiResources(ENVIRONMENT_ID, THREAD_ID, "term-release");
 
     testState.writeCommand.mockResolvedValueOnce(
       AsyncResult.failure(Cause.fail(new Error("new scheduler failure"))),
@@ -3170,7 +3887,7 @@ describe("TerminalViewport mounted lifecycle", () => {
     oldTerminal.dataHandler?.("old");
     await act(async () => Promise.resolve());
     await unmount(first);
-    releaseTerminalInputScheduler(ENVIRONMENT_ID, THREAD_ID, "term-release-stale");
+    releaseTerminalUiResources(ENVIRONMENT_ID, THREAD_ID, "term-release-stale");
 
     await mount(<TerminalViewport {...viewportProps({ terminalId: "term-release-stale" })} />);
     const newTerminal = xtermState.terminals[1]!;

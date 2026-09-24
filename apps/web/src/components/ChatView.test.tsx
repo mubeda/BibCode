@@ -505,7 +505,7 @@ vi.mock("./ThreadTerminalPanel", () => ({
       }
     });
   },
-  releaseTerminalInputScheduler: (environmentId: string, threadId: string, terminalId: string) => {
+  releaseTerminalUiResources: (environmentId: string, threadId: string, terminalId: string) => {
     h.releasedTerminalInputs.push({ environmentId, threadId, terminalId });
   },
 }));

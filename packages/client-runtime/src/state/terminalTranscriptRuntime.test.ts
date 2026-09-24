@@ -19,6 +19,8 @@ const snapshotData = (
   status,
   pid: 1,
   history,
+  oscColorResponderActive: false,
+  firstAttachmentGrant: false,
   exitCode: null,
   exitSignal: null,
   ...(consoleTheme === undefined ? {} : { consoleTheme }),
@@ -55,6 +57,116 @@ const output = (data: string): TerminalAttachStreamEvent => ({
 });
 
 describe("createTerminalTranscriptRuntime", () => {
+  it("delivers applied size and claim in stream order and hydrates the latest size", () => {
+    const runtime = createTerminalTranscriptRuntime();
+    runtime.ingest({
+      type: "snapshot",
+      snapshot: { ...snapshotData("boot"), size: { cols: 151, rows: 50, sizeClaim: "a" } },
+    });
+    const signals: TerminalRenderSignal[] = [];
+    runtime.attachRenderer((signal) => signals.push(signal));
+    runtime.ingest(output("before"));
+    runtime.ingest({
+      type: "resized",
+      threadId: "thread-1",
+      terminalId: "terminal-1",
+      size: { cols: 91, rows: 42, sizeClaim: "b" },
+    });
+    runtime.ingest(output("after"));
+    expect(signals).toEqual([
+      { type: "reset", snapshot: "boot", size: { cols: 151, rows: 50, sizeClaim: "a" } },
+      { type: "delta", data: "before" },
+      { type: "resized", size: { cols: 91, rows: 42, sizeClaim: "b" } },
+      { type: "delta", data: "after" },
+    ]);
+    const hydration: TerminalRenderSignal[] = [];
+    runtime.attachRenderer((signal) => hydration.push(signal));
+    expect(hydration).toEqual([
+      { type: "reset", snapshot: "bootbeforeafter", size: { cols: 91, rows: 42, sizeClaim: "b" } },
+    ]);
+    runtime.ingest({ type: "cleared", threadId: "thread-1", terminalId: "terminal-1" });
+    expect(hydration.at(-1)).toEqual({
+      type: "reset",
+      snapshot: "",
+      size: { cols: 91, rows: 42, sizeClaim: "b" },
+    });
+    runtime.ingest(restarted("fresh"));
+    expect(hydration.at(-1)).toEqual({ type: "reset", snapshot: "fresh" });
+  });
+
+  it("broadcasts claim-only changes without lifecycle notifications", () => {
+    const runtime = createTerminalTranscriptRuntime();
+    runtime.ingest(snapshot(""));
+    const metadata = runtime.metadata();
+    const signals: TerminalRenderSignal[] = [];
+    runtime.attachRenderer((signal) => signals.push(signal));
+    for (const sizeClaim of ["a", "b"]) {
+      runtime.ingest({
+        type: "resized",
+        threadId: "thread-1",
+        terminalId: "terminal-1",
+        size: { cols: 80, rows: 24, sizeClaim },
+      });
+    }
+    expect(signals.slice(1)).toEqual([
+      { type: "resized", size: { cols: 80, rows: 24, sizeClaim: "a" } },
+      { type: "resized", size: { cols: 80, rows: 24, sizeClaim: "b" } },
+    ]);
+    expect(runtime.metadata()).toBe(metadata);
+  });
+  it("hydrates the server color responder flag and clears it for legacy snapshots", () => {
+    const runtime = createTerminalTranscriptRuntime();
+    runtime.ingest({
+      type: "snapshot",
+      snapshot: { ...snapshotData("colors"), oscColorResponderActive: true },
+    });
+    const signals: TerminalRenderSignal[] = [];
+    runtime.attachRenderer((signal) => signals.push(signal));
+    expect(signals[0]).toMatchObject({ type: "reset", oscColorResponderActive: true });
+    runtime.ingest(snapshot("legacy"));
+    const reset = signals.at(-1)!;
+    expect(reset.type === "reset" && (reset.oscColorResponderActive ?? false)).toBe(false);
+  });
+
+  it("grants startup replay only once to the snapshot owner, including delayed hydration", () => {
+    const runtime = createTerminalTranscriptRuntime();
+    runtime.ingest({
+      type: "snapshot",
+      snapshot: {
+        ...snapshotData("\x1b[6n\x1b[c"),
+        firstAttachmentGrant: true,
+        size: { cols: 80, rows: 24, sizeClaim: "owner" },
+      },
+    });
+    const mirror: TerminalRenderSignal[] = [];
+    runtime.attachRenderer((signal) => mirror.push(signal), "mirror");
+    expect(mirror[0]).not.toHaveProperty("firstAttachmentGrant", true);
+    const owner: TerminalRenderSignal[] = [];
+    const first = runtime.attachRenderer((signal) => owner.push(signal), "owner");
+    expect(owner[0]).toMatchObject({ type: "reset", firstAttachmentGrant: true });
+    first.detach();
+    const later: TerminalRenderSignal[] = [];
+    runtime.attachRenderer((signal) => later.push(signal), "owner");
+    expect(later[0]).not.toHaveProperty("firstAttachmentGrant", true);
+  });
+
+  it("delivers a first-attachment grant once to an already attached owner", () => {
+    const runtime = createTerminalTranscriptRuntime();
+    const signals: TerminalRenderSignal[] = [];
+    runtime.attachRenderer((signal) => signals.push(signal), "owner");
+    runtime.ingest({
+      type: "snapshot",
+      snapshot: {
+        ...snapshotData("query"),
+        firstAttachmentGrant: true,
+        size: { cols: 80, rows: 24, sizeClaim: "owner" },
+      },
+    });
+    expect(signals.at(-1)).toHaveProperty("firstAttachmentGrant", true);
+    runtime.ingest({ type: "cleared", threadId: "thread-1", terminalId: "terminal-1" });
+    expect(signals.at(-1)).not.toHaveProperty("firstAttachmentGrant", true);
+  });
+
   it("starts closed with one stable metadata object", () => {
     const runtime = createTerminalTranscriptRuntime();
 
@@ -93,7 +205,8 @@ describe("createTerminalTranscriptRuntime", () => {
     const signals: TerminalRenderSignal[] = [];
     const renderer = runtime.attachRenderer((signal) => {
       signals.push(signal);
-      reconstructed = signal.type === "reset" ? signal.snapshot : `${reconstructed}${signal.data}`;
+      if (signal.type === "reset") reconstructed = signal.snapshot;
+      if (signal.type === "delta") reconstructed += signal.data;
     });
 
     expect(signals).toEqual([{ type: "reset", snapshot: "boot\na" }]);

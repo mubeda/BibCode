@@ -115,6 +115,73 @@ server without `terminalOrderedInput` to prove the negotiated legacy path.
 Record network round-trip, client queue, and paint measurements separately;
 an improved simulated queue time is not proof of an improved live network.
 
+### Terminal size and reply ownership
+
+When changing terminal attachment, sizing, or query replies, also run:
+
+```sh
+vp test run packages/contracts/src/terminal.test.ts packages/contracts/src/environment.test.ts packages/contracts/src/rpcRustParity.test.ts packages/contracts/scripts/export-rust-rpc-fixtures.test.ts
+vp test run packages/client-runtime/src/state/terminalTranscriptRuntime.test.ts packages/client-runtime/src/state/terminalAttachAdapter.test.ts
+vp test run apps/web/src/components/ThreadTerminalPanel apps/web/src/components/terminalSizePolicy.test.ts apps/web/src/components/terminalSizing.test.ts apps/web/src/components/terminalReplyGuard.test.ts apps/web/src/components/terminalOutputSink.test.ts apps/web/src/components/ChatView.hooks.test.tsx apps/web/src/centerTerminalActions.test.ts
+cargo test -p bibcode-server --lib terminal -j 2
+cargo test -p bibcode-server --test production_server_terminal_rpc -j 2
+```
+
+Open the same disposable terminal in two windows with different sizes, including
+a desktop host and remote browser when available. Use tmux and a supported
+provider TUI (Claude Code for the original attach regression). The first attach
+owns an unclaimed terminal even without document focus. On Windows, verify that
+live startup cursor-position/device queries (for example from PowerShell) are
+answered immediately, before any resize round trip. Include DSR/DA in startup
+history: a new PTY with no previously attached windows gets one history reply
+pass. Later/concurrent windows and cached remounts must not answer it again.
+Restart with windows still attached: startup queries are answered live, and an
+additional unfocused window must neither resend the replies nor take ownership.
+Restart without attached windows: one new history reply pass is allowed.
+Reopen an exited terminal (for example by rerunning a script) while a window is
+still attached: the next newly attached window answers the startup queries
+once, and later windows do not answer them again.
+
+A lone window and an equal-size mirror must show no size notice. A
+different-size mirror explains that it is **Sized for another window** and
+offers **Fit to this window**. Dismiss the notice with its labeled button using
+pointer and keyboard. It must remain hidden through layout changes, unchanged
+size events, hide/show, tab visibility changes, and panel remounts while
+size/owner remain the same. A changed applied size/owner makes it eligible to
+reappear. Closing the terminal and creating a new one must not inherit its
+dismissal.
+
+Resize the mirror's container: it must not resize the program. Focus, click, or
+type in a mirror, including an equal-size mirror, to transfer ownership. After
+a click or keypress, the notice must stay hidden without flashing back while
+the terminal catches up. Try **Fit to this window** on an exited terminal,
+then reopen or restart it: the window must remain usable, with the notice and
+fit action available when another window owns a different size.
+Close or disconnect the owner: other windows receive a null claim, immediately
+attempt a claim, and may answer queries while unowned. Repeat through reconnect
+and process restart; a departed stream cannot clear the replacement's claim. An
+older attach without `sizeClaim` and the general `subscribeTerminalEvents`
+stream must never receive `resized`.
+
+Check separators, right-aligned notices, and input borders in both windows:
+clipping or extra space is allowed, but rendering must use the PTY width. New
+opens and attaches include available fitted dimensions; unavailable geometry
+must still allow opening at server defaults, followed by the owner's first fit.
+Create a right-panel terminal, then exercise a controlled launch failure: the
+usual error must remain visible without a stuck retry indicator. Type while
+waiting for the first terminal snapshot and verify that the text reaches the
+shell. Reconnect the visible terminal and verify its output stays intact with no
+extra blank or flickering redraw.
+
+Repeat attach, hide/show, reconnect, and reload at a bash prompt; queries from
+guarded replays must not enter the command line. Test snapshots with the OSC
+responder flag on and off: the owner answers color queries only when the server
+does not. With a server lacking `terminalSizeOwnership`, local fit-and-resize
+and live replies still work, but every history replay is guarded and
+startup-history queries receive no client reply on that transitional path.
+Capture native screenshots and record program/server versions in the execution
+report, not this runbook.
+
 ### Durable message queue
 
 The durable queue is shared by browser, desktop, and remote clients. Validate

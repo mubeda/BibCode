@@ -754,6 +754,112 @@ WebGL without abandoning input already accepted by the scheduler. A later
 renderer retargets error presentation, while the retained writer cannot keep
 the departed renderer or its terminal buffers reachable.
 
+### Terminal attachment fidelity
+
+Servers advertise `terminalSizeOwnership` (decoded as false for older servers).
+The terminal manager owns the applied PTY size. Snapshots carry one optional
+`size { cols, rows, sizeClaim }` object, so absent size is distinct from a
+complete size with a null owner. They also carry `oscColorResponderActive`,
+defaulting to false when absent; the PTY backend reports whether its actual
+spawned color responder is active. `firstAttachmentGrant` also defaults to false
+and permits one startup-history replay with replies enabled.
+
+Each renderer mount sends a fresh random claim with `terminal.attach`. Under the
+generation publication lock, an attachment atomically acquires ownership only if
+the session is unowned. It receives `firstAttachmentGrant: true` only when no
+claim has been applied in this generation and no claim-carrying stream survived
+a restart into it. The grant latch is consumed by a claimed attach, an applied
+resize claim, or claimed streams surviving a restart. Later/concurrent attaches
+never renew the grant or displace a live owner.
+
+Restart publishes `Restarted`, which resets surviving streams' sequence cursors.
+Those renderers see the restarted process's startup output live and may answer
+while unowned. Restart without such streams allows one new grant. Reopening an
+exited session through `terminal.open` instead publishes a `Started` event with
+sequence 1. That event does not reset surviving streams' cursors, so they drop
+it and early output (a known limitation of surviving streams). A reopen
+therefore leaves the first-attachment grant available for the next
+claim-carrying attach.
+
+Resize requests publish `resized { size }` after the PTY accepts the size,
+before subsequent output can publish. Claim-only changes publish; exact no-ops
+do not. Failed resizes preserve the prior state. Legacy resizes without a claim
+clear the owner. Open/attach dimensions initialize new PTYs; attaching to an
+existing process preserves its dimensions.
+
+Attachment lifetime owns claim eligibility. Dropping the owner unregisters its
+claim and signals a manager-tracked cleanup worker to publish null ownership
+under the current generation's publication lock, preserving PTY dimensions.
+Attachment identities prevent an old stream from clearing a replacement that
+reuses its claim, including across process restarts. Queued requests from an
+unregistered claim cannot resurrect it. Manager shutdown fences new claim
+registrations, cancels and awaits these cleanup workers, then drains sessions.
+
+A single internal ordered bus carries output and size changes. Public event
+receivers filter `resized`, so `subscribeTerminalEvents` retains its original
+variant set and resize events are not operational-log records. Attach streams
+also filter it unless their request carried a claim. Older clients therefore
+never receive the new event; optional snapshot fields remain additive.
+
+The window in use owns size. It claims on focused attach; on terminal focus,
+click, or keypress whenever it is a mirror or its fitted size differs; on its
+own layout changes while already owner; and through **Fit to this window**. A
+null-claim snapshot or event prompts an immediate claim even without focus.
+While ownership is null, renderers permit live replies until a claim wins. Each
+renderer keeps at most one claim pending until its resize RPC completes, whether
+successfully or with failure; the echo updates the applied size. A layout change
+deferred during a pending claim is reconsidered on completion; a new
+attachment/process snapshot retires the prior generation's request.
+
+The notice stays hidden while claiming and after success until applied size,
+ownership, or generation changes, avoiding a flash before xterm parses the echo.
+Failure releases that suppression immediately. Mirrors resize xterm to the PTY
+dimensions instead of fitting their container; only a different-size mirror
+shows **Sized for another window** with fit and dismiss actions. Manual
+dismissal is retained by terminal identity and applied dimensions/owner across
+renderer and component remounts. It is cleared by a changed applied size/owner
+or terminal retirement, alongside the retained input resources. Equal-size
+mirrors and the owner show no notice. Clipping or extra space is intentional;
+all windows render at the program's width.
+
+The viewport measures before subscribing and includes available fitted
+`cols`/`rows` on attach. UI creation uses `terminal.open` with its workspace
+admission lease and workspace-loss fence. Newly reserved right-panel terminals
+have no mounted renderer and open without dimensions. Center/script opens can
+read an existing mounted renderer's fit on demand. Unavailable geometry uses
+server defaults, followed by the owner's first measured layout/claim.
+Separately, an attach carrying `cwd` can still create a missing session without
+the open command's admission lease and workspace-loss fence (a known gap);
+attach may arrive before open or recreate a missing session after a server
+restart. No extra measuring terminal
+or font-settings subscription is needed.
+
+The shared transcript runtime hydrates size and responder activity, and carries
+size changes in stream order with raw output. The output sink's xterm write
+callbacks apply size/claim after preceding output has parsed and before later
+output. Resize signals do not publish lifecycle metadata or allocate a new
+transcript. The runtime consumes the first-attachment grant once for the
+matching renderer claim; cached remounts cannot reuse it. Raw bounded transcript
+replay is retained.
+
+During ordinary reset/history writes, a replay guard drops xterm `onData` until
+the final write callback; input typed during this brief interval is also
+dropped. The granted first-attachment history pass allows replies. Input before
+the first snapshot uses the existing bounded input scheduler and lease instead
+of being silently dropped. Reattaching the transcript to the same renderer
+preserves its WebGL context. Parser hooks let only the current reply owner
+answer CSI device/status/mode queries, DCS status-string queries, and OSC
+palette/color queries. OSC 10/11/12 queries are swallowed by every renderer only
+when the snapshot says the server color responder is active; otherwise the owner
+lets xterm answer. `CSI ? 996 n` stays swallowed (xterm does not implement it).
+The PTY reader keeps its synchronous answers and original transcript bytes.
+Input is never filtered by reply shape.
+
+Without `terminalSizeOwnership`, clients retain local fit-and-resize behavior
+and live replies, with conditional server-color-query suppression. Every replay
+is guarded on that transitional path, so startup-history queries are not
+answered by those clients.
+
 ### Linux AppImage GTK packaging
 
 See the [AppImage child environment policy](#appimage-child-environments).

@@ -203,7 +203,7 @@ import { resolveShortcutCommand, shortcutLabelForCommand } from "../keybindings"
 import PlanSidebar from "./PlanSidebar";
 import ThreadTerminalPanel, {
   enqueueTerminalInput,
-  releaseTerminalInputScheduler,
+  releaseTerminalUiResources,
 } from "./ThreadTerminalPanel";
 import { ChevronDownIcon, TriangleAlertIcon, WifiOffIcon } from "lucide-react";
 import { cn, randomHex } from "~/lib/utils";
@@ -218,6 +218,7 @@ import {
 import { newCommandId, newDraftId, newMessageId, newThreadId } from "~/lib/utils";
 import { getProviderModelCapabilities, resolveSelectableProvider } from "../providerModels";
 import { useEnvironmentSettings } from "../hooks/useSettings";
+import { readTerminalFittedSize } from "./terminalSizing";
 import { worktreeEnvironment } from "../state/worktrees";
 import { resolveAppModelSelectionForInstance } from "../modelSelection";
 import { resolveThreadProviderBinding } from "../threadProviderBinding";
@@ -910,8 +911,6 @@ function formatOutgoingPrompt(params: {
   const promptEffort = resolvePromptInjectedEffort(caps, params.effort);
   return applyClaudePromptEffortPrefix(params.text, promptEffort);
 }
-const SCRIPT_TERMINAL_COLS = 120;
-const SCRIPT_TERMINAL_ROWS = 30;
 
 type ChatViewRouteProps =
   | {
@@ -1719,7 +1718,7 @@ function ChatViewContent(props: ChatViewProps) {
           });
         },
         releaseInput: ({ environmentId, threadId, terminalId }) => {
-          releaseTerminalInputScheduler(environmentId, threadId, terminalId);
+          releaseTerminalUiResources(environmentId, threadId, terminalId);
         },
       }),
     [closeTerminalMutation, writeTerminal],
@@ -4259,9 +4258,14 @@ function ChatViewContent(props: ChatViewProps) {
             canSplit: (groupId, direction) =>
               isOriginCurrent() && (originWorkspace?.canSplitGroup(groupId, direction) ?? false),
             openSession: async (input): Promise<CenterTerminalSessionCommandResult> => {
+              const dimensions = readTerminalFittedSize(
+                activeThreadRef.environmentId,
+                input.threadId,
+                input.terminalId,
+              );
               const openResult = await openTerminal({
                 environmentId: activeThreadRef.environmentId,
-                input,
+                input: { ...input, ...dimensions },
               });
               if (openResult._tag === "Success") {
                 return { ok: true };
@@ -4286,7 +4290,7 @@ function ChatViewContent(props: ChatViewProps) {
                 input,
               });
               if (closeResult._tag === "Success") {
-                releaseTerminalInputScheduler(
+                releaseTerminalUiResources(
                   activeThreadRef.environmentId,
                   input.threadId,
                   input.terminalId ?? terminalId,
@@ -4418,11 +4422,17 @@ function ChatViewContent(props: ChatViewProps) {
           resolvedTheme: scriptTerminalTheme,
           windowsConsoleTheme: false,
         });
+        const dimensions = readTerminalFittedSize(
+          environmentId,
+          activeThreadId,
+          reusableTerminal.terminalId,
+        );
         const openResult = await openTerminal({
           environmentId,
           input: {
             threadId: activeThreadId,
             terminalId: reusableTerminal.terminalId,
+            ...dimensions,
             cwd: targetCwd,
             worktreePath: targetWorktreePath,
             env: scriptSpawnEnv,
@@ -4451,8 +4461,6 @@ function ChatViewContent(props: ChatViewProps) {
             worktreePath: targetWorktreePath,
             env: runtimeEnv,
             label: script.name,
-            cols: SCRIPT_TERMINAL_COLS,
-            rows: SCRIPT_TERMINAL_ROWS,
           },
         );
         if (creationResult.status !== "opened") {

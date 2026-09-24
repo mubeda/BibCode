@@ -60,6 +60,7 @@ fn connect_environment_descriptor(config: &ServerConfig) -> serde_json::Value {
             "repositoryIdentity": true,
             "remoteUpdateControl": true,
             "terminalOrderedInput": true,
+            "terminalSizeOwnership": true,
         },
     })
 }
@@ -814,6 +815,7 @@ mod tests {
         assert_eq!(descriptor["capabilities"]["repositoryIdentity"], true);
         assert_eq!(descriptor["capabilities"]["remoteUpdateControl"], true);
         assert_eq!(descriptor["capabilities"]["terminalOrderedInput"], true);
+        assert_eq!(descriptor["capabilities"]["terminalSizeOwnership"], true);
         assert_eq!(
             descriptor["remoteUpdateSupport"],
             serde_json::json!({ "installMode": "manual", "reason": "manual-update-required" })

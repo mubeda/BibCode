@@ -56,6 +56,9 @@ function decodes<S extends Schema.Top>(schema: S, input: unknown): boolean {
 }
 
 const encodeTerminalRestartInput = Schema.encodeSync(TerminalRestartInput);
+const encodeTerminalSnapshot = Schema.encodeSync(TerminalSessionSnapshot);
+const encodeTerminalResize = Schema.encodeSync(TerminalResizeInput);
+const encodeTerminalAttachEvent = Schema.encodeSync(TerminalAttachStreamEvent);
 const decodeTerminalError = Schema.decodeUnknownSync(TerminalError);
 const encodeTerminalError = Schema.encodeUnknownSync(TerminalError);
 
@@ -221,6 +224,15 @@ describe("TerminalOpenInput", () => {
 });
 
 describe("TerminalAttachInput", () => {
+  it("preserves an optional attachment claim and rejects an empty claim", () => {
+    const input = { threadId: "thread", terminalId: "term", sizeClaim: "renderer" };
+    expect(decodeSync(TerminalAttachInput, input)).toEqual(input);
+    expect(() => decodeSync(TerminalAttachInput, { ...input, sizeClaim: " " })).toThrow();
+    expect(() =>
+      decodeSync(TerminalAttachInput, { ...input, sizeClaim: "x".repeat(129) }),
+    ).toThrow();
+  });
+
   it("accepts explicit inactive-session restart intent", () => {
     const parsed = decodeSync(TerminalAttachInput, {
       threadId: "thread-1",
@@ -568,6 +580,39 @@ describe("TerminalCloseInput", () => {
 describe("TerminalSessionSnapshot", () => {
   const isoTimestamp = "2026-01-01T00:00:00.000Z";
 
+  it("round-trips applied size and claim while accepting older snapshots", () => {
+    const legacy = {
+      threadId: "thread-1",
+      terminalId: "term-1",
+      cwd: "/repo",
+      worktreePath: null,
+      status: "running",
+      pid: 1,
+      history: "",
+      exitCode: null,
+      exitSignal: null,
+      label: "Terminal 1",
+      updatedAt: isoTimestamp,
+    };
+    expect(decodeSync(TerminalSessionSnapshot, legacy)).toEqual({
+      ...legacy,
+      oscColorResponderActive: false,
+      firstAttachmentGrant: false,
+    });
+    for (const size of [{ cols: 151 }, { rows: 50 }, { cols: 151, rows: 50 }]) {
+      expect(() => decodeSync(TerminalSessionSnapshot, { ...legacy, size })).toThrow();
+    }
+    for (const sizeClaim of [null, "renderer-a"]) {
+      const current = {
+        ...legacy,
+        size: { cols: 151, rows: 50, sizeClaim },
+        oscColorResponderActive: true,
+        firstAttachmentGrant: true,
+      };
+      expect(encodeTerminalSnapshot(decodeSync(TerminalSessionSnapshot, current))).toEqual(current);
+    }
+  });
+
   it("accepts running snapshots", () => {
     expect(
       decodes(TerminalSessionSnapshot, {
@@ -608,6 +653,36 @@ describe("TerminalSessionSnapshot", () => {
 
 describe("TerminalEvent", () => {
   const isoTimestamp = "2026-01-01T00:00:00.000Z";
+
+  it("round-trips resized events and optional bounded resize claims", () => {
+    const input = {
+      threadId: "thread-1",
+      terminalId: "term-1",
+      cols: 91,
+      rows: 42,
+      sizeClaim: "renderer-b",
+    };
+    expect(encodeTerminalResize(decodeSync(TerminalResizeInput, input))).toEqual(input);
+    for (const sizeClaim of [null, "renderer-b"]) {
+      const event = {
+        threadId: input.threadId,
+        terminalId: input.terminalId,
+        type: "resized",
+        sequence: 12,
+        size: { cols: input.cols, rows: input.rows, sizeClaim },
+      };
+      expect(() => decodeSync(TerminalEvent, event)).toThrow();
+      expect(encodeTerminalAttachEvent(decodeSync(TerminalAttachStreamEvent, event))).toEqual(
+        event,
+      );
+    }
+    for (const sizeClaim of ["", " ", "x".repeat(129), null]) {
+      expect(() => decodeSync(TerminalResizeInput, { ...input, sizeClaim })).toThrow();
+    }
+    expect(() =>
+      decodeSync(TerminalAttachStreamEvent, { ...input, type: "resized", cols: 0 }),
+    ).toThrow();
+  });
 
   it("accepts output events", () => {
     expect(
