@@ -2079,11 +2079,15 @@ async fn clone_rejects_an_existing_non_repository_destination() {
     let error = failure_value(server.socket(), "408").await;
 
     assert_eq!(error["_tag"], "GitCommandError");
+    let detail = error["detail"].as_str().expect("clone rejection detail");
+    // The message names the folder, where it is, and the next step.
     assert!(
-        error["detail"]
-            .as_str()
-            .expect("clone rejection detail")
-            .contains("not a Git repository")
+        detail.starts_with("A folder named consumer already exists at ")
+            && detail.contains("clones")
+            && detail.ends_with(
+                " and is not a Git repository. Remove it or choose another parent folder."
+            ),
+        "unexpected clone rejection: {detail}"
     );
     assert!(!destination.join(".git").exists());
 
@@ -2229,6 +2233,120 @@ async fn clone_resolves_a_home_relative_parent_before_running_git() {
     assert!(backslash_cloned.join(".git").is_dir());
 
     server.shutdown().await;
+}
+
+#[tokio::test]
+async fn interrupting_a_clone_stops_git_and_removes_the_destination_it_created() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
+    if relaunch_with_isolated_git_config(
+        "interrupting_a_clone_stops_git_and_removes_the_destination_it_created",
+    ) {
+        return;
+    }
+
+    let temp = TempDir::new().expect("temporary server directory");
+    let root = TempDir::new().expect("temporary fixture root");
+    // An explicit empty proxy keeps Git on the loopback remote even when the host sets one.
+    run_git_in(root.path(), &["config", "--global", "http.proxy", ""]);
+    let clone_parent = root.path().join("clones");
+    fs::create_dir(&clone_parent).expect("clone parent");
+    // The remote accepts Git's connection and never answers, so the clone runs until the
+    // client interrupts it.
+    let remote = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("stalled remote listener");
+    let url = format!(
+        "http://{}/stalled.git",
+        remote.local_addr().expect("stalled remote address")
+    );
+    let vcs_destination = clone_parent.join("interrupted");
+    let source_control_destination = clone_parent.join("interrupted-source-control");
+
+    let mut server = GitServerHarness::start(&temp, parallelism_permit).await;
+    for (ids, method, payload, destination) in [
+        (
+            ["421", "423"],
+            "vcs.clone",
+            json!({ "url": url, "parentDir": clone_parent, "directoryName": "interrupted" }),
+            &vcs_destination,
+        ),
+        (
+            ["422", "424"],
+            "sourceControl.cloneRepository",
+            json!({ "remoteUrl": url, "destinationPath": source_control_destination }),
+            &source_control_destination,
+        ),
+    ] {
+        let [id, retry_id] = ids;
+        request(server.socket(), id, method, payload.clone()).await;
+        let (mut connection, _) = timeout(GIT_RPC_RESPONSE_DEADLOCK_BOUND, remote.accept())
+            .await
+            .expect("Git connects to the remote")
+            .expect("accept Git's connection");
+        assert!(destination.is_dir(), "{method} created its destination");
+
+        interrupt_clone(server.socket(), id, method).await;
+        // Clone again right after Cancel: the retry waits for the interrupted clone's
+        // cleanup and then starts its own transfer instead of finding a half-removed folder.
+        request(server.socket(), retry_id, method, payload).await;
+        let (mut retry_connection, _) = tokio::select! {
+            accepted = timeout(GIT_RPC_RESPONSE_DEADLOCK_BOUND, remote.accept()) => accepted
+                .unwrap_or_else(|_| panic!("the {method} retry never reached its transfer"))
+                .expect("accept the retry's connection"),
+            reply = next_server_message(server.socket()) => {
+                panic!("the {method} retry must reach its own transfer, got {reply:?}")
+            }
+        };
+        // Git holds the connection until the runner stops its process group.
+        wait_for_connection_close(&mut connection, method).await;
+        assert!(
+            destination.is_dir(),
+            "the {method} retry owns the destination"
+        );
+
+        interrupt_clone(server.socket(), retry_id, method).await;
+        wait_for_connection_close(&mut retry_connection, method).await;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while destination.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "{method} left its destination behind"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    assert!(clone_parent.is_dir());
+
+    server.shutdown().await;
+}
+
+async fn interrupt_clone(socket: &mut TestSocket, id: &str, method: &str) {
+    send_json(socket, json!({ "_tag": "Interrupt", "requestId": id })).await;
+    let interrupted = next_server_message(socket).await;
+    assert!(
+        matches!(
+            &interrupted,
+            ServerMessage::Exit { request_id, exit: RpcExit::Failure { cause } }
+                if request_id.as_str() == id
+                    && cause == &vec![CauseItem::Interrupt { fiber_id: None }]
+        ),
+        "{method} request {id} must end as interrupted, got {interrupted:?}"
+    );
+}
+
+async fn wait_for_connection_close(connection: &mut tokio::net::TcpStream, method: &str) {
+    use tokio::io::AsyncReadExt;
+
+    timeout(Duration::from_secs(20), async {
+        let mut buffer = [0_u8; 4096];
+        while let Ok(read) = connection.read(&mut buffer).await {
+            if read == 0 {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("interrupting {method} did not stop Git"));
 }
 
 #[tokio::test]

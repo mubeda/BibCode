@@ -3366,10 +3366,25 @@ mod mutation_ownership_tests {
         assert_eq!(git_requests.len(), 2);
         assert_eq!(
             git_requests[1].args,
-            ["push", "--set-upstream", "--", "upstream", "main"]
-                .into_iter()
-                .map(OsString::from)
-                .collect::<Vec<_>>()
+            [
+                "-c",
+                "http.lowSpeedLimit=1000",
+                "-c",
+                "http.lowSpeedTime=60",
+                "push",
+                "--set-upstream",
+                "--",
+                "upstream",
+                "main"
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            git_requests[1].timeout,
+            crate::git::BOUNDED_TRANSFER_TIMEOUT,
+            "publishing has no Cancel, so its push keeps the bounded deadline"
         );
     }
 

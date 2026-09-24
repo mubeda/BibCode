@@ -615,6 +615,16 @@ mod tests {
                 .cwd
                 .clone()
         }
+
+        fn request_timeout(&self, operation: &str) -> Duration {
+            self.requests
+                .lock()
+                .expect("request log lock")
+                .iter()
+                .find(|request| request.operation == operation)
+                .expect("recorded Git request")
+                .timeout
+        }
     }
 
     impl GitProcessRunner for RecordingFetchRunner {
@@ -931,10 +941,40 @@ mod tests {
         assert_eq!(harness.runner.fetch_count(), 1);
         assert_eq!(
             harness.runner.fetch_args(),
-            ["fetch", "--quiet", "--multiple", "--", "backup", "origin"]
-                .into_iter()
-                .map(OsString::from)
-                .collect::<Vec<_>>()
+            [
+                "-c",
+                "http.lowSpeedLimit=1000",
+                "-c",
+                "http.lowSpeedTime=60",
+                "fetch",
+                "--quiet",
+                "--multiple",
+                "--",
+                "backup",
+                "origin"
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            harness
+                .runner
+                .request_timeout("GitVcsDriver.automaticFetch.fetch"),
+            crate::git::BOUNDED_TRANSFER_TIMEOUT,
+            "the automatic fetch has no Cancel and keeps the bounded deadline"
+        );
+        assert_eq!(
+            crate::git::BOUNDED_TRANSFER_TIMEOUT,
+            Duration::from_secs(600)
+        );
+        assert!(crate::git::BOUNDED_TRANSFER_TIMEOUT < crate::git::NETWORK_TRANSFER_TIMEOUT);
+        assert_eq!(
+            harness
+                .runner
+                .request_timeout("GitVcsDriver.automaticFetch.upstreams"),
+            Duration::from_secs(30),
+            "the upstream discovery read keeps the ordinary deadline"
         );
         assert_eq!(
             harness
@@ -983,10 +1023,19 @@ mod tests {
 
         assert_eq!(
             harness.runner.fetch_args(),
-            ["fetch", "--quiet", "--", "--all"]
-                .into_iter()
-                .map(OsString::from)
-                .collect::<Vec<_>>()
+            [
+                "-c",
+                "http.lowSpeedLimit=1000",
+                "-c",
+                "http.lowSpeedTime=60",
+                "fetch",
+                "--quiet",
+                "--",
+                "--all"
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
         );
     }
 

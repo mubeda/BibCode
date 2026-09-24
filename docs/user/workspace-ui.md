@@ -81,6 +81,14 @@ directories; **Type a path instead** switches to manual entry of an absolute
 or home-relative path. Selecting a folder adds that folder as one project and
 does not scan for nested repositories.
 
+While a clone runs, the clone form stays open with **Cancel clone**. Cancelling
+stops Git, shows "Clone cancelled.", and removes the folder the clone created;
+if the clone had already finished, the folder stays and the next **Clone** into
+it adds it. A failed clone shows the reason in the form, including a stalled
+transfer or an incomplete earlier clone in the chosen folder (remove it or
+choose another folder). The dialog closes once the project has been added and
+opened.
+
 Clicking a project header selects it and toggles its thread list; the header
 stays highlighted as the selected node until you open a thread, and it is also
 highlighted while that project's Git Manager or Pull Requests route is open.

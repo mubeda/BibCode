@@ -215,6 +215,7 @@ pub async fn push_tag(
         return Err(GitManagerTagError::InvalidName);
     }
     repository
+        .for_network_transfer()
         .run(
             "GitManager.tags.push",
             cwd,
@@ -540,11 +541,21 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(
             requests[0].args,
-            ["push", "origin", "refs/tags/release/v1"]
-                .into_iter()
-                .map(OsString::from)
-                .collect::<Vec<_>>()
+            [
+                "-c",
+                "http.lowSpeedLimit=1000",
+                "-c",
+                "http.lowSpeedTime=60",
+                "push",
+                "origin",
+                "refs/tags/release/v1"
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>(),
+            "a tag push is a network transfer with Git's stall guard"
         );
+        assert_eq!(requests[0].timeout, crate::git::NETWORK_TRANSFER_TIMEOUT);
         assert!(requests[0].args.iter().all(|argument| {
             argument != "--force" && argument != "-f" && argument != "--force-with-lease"
         }));

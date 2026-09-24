@@ -80,6 +80,7 @@ async function renderDropdown(
         currentBranchName="main"
         branchDisabledReason={null}
         mergeDisabledReason={null}
+        noBranchLabel="Detached HEAD"
         projectRef={projectRef}
         recentNames={[]}
         refs={refs}

@@ -211,6 +211,13 @@ Delete the unused result values above. Do not leave an ambiguous status.
 - Hide/remove non-destructive result:
 - Final on-disk verification:
 
+## Clone from URL network scenario
+
+- Throttled remote size, rate, and clone duration (> 30 s) with dialog close after registration:
+- Cancel: notice, destination removal, immediate retry result:
+- Stalled transfer: failure time and exact message, destination removal:
+- Incomplete-clone refusal message, folder kept, Git Manager "No commits yet":
+
 ## Process and temporary-root cleanup
 
 - Before snapshot:

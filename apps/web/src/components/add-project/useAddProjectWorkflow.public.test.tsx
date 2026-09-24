@@ -3,6 +3,7 @@
 import {
   DEFAULT_SERVER_SETTINGS,
   EnvironmentId,
+  GitCommandError,
   ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
@@ -11,6 +12,7 @@ import {
 } from "@bibcode/contracts";
 import { scopeThreadRef } from "@bibcode/client-runtime/environment";
 import type { ConnectionTarget } from "@bibcode/client-runtime/connection";
+import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/unstable/reactivity";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -102,7 +104,7 @@ vi.mock("~/state/use-atom-command", () => ({
       return (input: unknown) => harness.createProject(input);
     }
     if (command.key === "vcs.clone") {
-      return (input: unknown) => harness.cloneRepository(input);
+      return (input: unknown, runOptions?: unknown) => harness.cloneRepository(input, runOptions);
     }
     if (command.key === "thread.create") {
       return (input: unknown) => harness.createThread(input);
@@ -483,6 +485,77 @@ describe("useAddProjectWorkflow public adapter", () => {
       expect(harness.onOpenChange).toHaveBeenCalledWith(false);
     },
   );
+
+  it("interrupts the clone command when the clone is cancelled", async () => {
+    let signal: AbortSignal | undefined;
+    harness.cloneRepository.mockImplementation(
+      (_input: unknown, runOptions?: { readonly signal?: AbortSignal }) =>
+        new Promise((resolve) => {
+          signal = runOptions?.signal;
+          signal?.addEventListener("abort", () => resolve(AsyncResult.failure(Cause.interrupt())), {
+            once: true,
+          });
+        }),
+    );
+    await mountWorkflow();
+    act(() => currentWorkflow.openClone());
+    act(() => currentWorkflow.setCloneUrl("https://example.test/repository.git"));
+    act(() => currentWorkflow.setCloneParent("/code"));
+    let submission!: Promise<void>;
+    act(() => {
+      submission = currentWorkflow.submitClone();
+    });
+
+    expect(harness.cloneRepository).toHaveBeenCalledWith(
+      {
+        environmentId,
+        input: { url: "https://example.test/repository.git", parentDir: "/code" },
+      },
+      { signal: expect.any(AbortSignal) },
+    );
+    expect(currentWorkflow.cloneProgress).toBe("cloning");
+
+    await act(async () => {
+      currentWorkflow.cancelClone();
+      await submission;
+    });
+
+    expect(signal?.aborted).toBe(true);
+    expect(currentWorkflow.notice).toBe("Clone cancelled.");
+    expect(currentWorkflow.error).toBeNull();
+    expect(currentWorkflow.busy).toBe(false);
+    expect(harness.createProject).not.toHaveBeenCalled();
+    expect(harness.onOpenChange).not.toHaveBeenCalledWith(false);
+  });
+
+  it("shows the server's clone failure detail without the RPC wrapper", async () => {
+    // Test-owned text: the form shows whatever detail the server sends, unchanged.
+    const detail = "Synthetic server detail: the destination needs attention.";
+    harness.cloneRepository.mockResolvedValueOnce(
+      AsyncResult.failure(
+        Cause.fail(
+          new GitCommandError({
+            operation: "GitVcsDriver.cloneRepository",
+            command: "git clone",
+            cwd: "/code",
+            detail,
+          }),
+        ),
+      ),
+    );
+    await mountWorkflow();
+    act(() => currentWorkflow.openClone());
+    act(() => currentWorkflow.setCloneUrl("https://example.test/repository.git"));
+    act(() => currentWorkflow.setCloneParent("/code"));
+
+    await act(async () => currentWorkflow.submitClone());
+
+    expect(currentWorkflow.error).toBe(`Clone failed: ${detail}`);
+    expect(currentWorkflow.busy).toBe(false);
+    expect(currentWorkflow.step).toBe("clone");
+    expect(harness.createProject).not.toHaveBeenCalled();
+    expect(harness.onOpenChange).not.toHaveBeenCalledWith(false);
+  });
 
   it("replaces canonical Main with the selected terminal default", async () => {
     const environment = harness.environments[0] as {

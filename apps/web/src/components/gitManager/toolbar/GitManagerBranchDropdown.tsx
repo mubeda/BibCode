@@ -194,12 +194,12 @@ const GitManagerBranchRow = memo(function GitManagerBranchRow({
           </span>
           <span className="min-w-0 shrink truncate font-mono">{refEntry.name}</span>
           {displayReason === null ? null : (
-            <span className="min-w-0 flex-1 truncate text-[10px] text-muted-foreground">
+            <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
               {displayReason}
             </span>
           )}
           {redirectPath === null ? null : (
-            <span className="ml-auto flex shrink-0 items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+            <span className="ml-auto flex shrink-0 items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
               <span>Switch to worktree</span>
               <span className="max-w-28 truncate font-mono">{redirectPath}</span>
             </span>
@@ -208,7 +208,7 @@ const GitManagerBranchRow = memo(function GitManagerBranchRow({
         <button
           aria-describedby={branchActionDescriptionId}
           aria-label={`Rename ${refEntry.name}`}
-          className="pointer-events-none h-full shrink-0 px-1.5 text-[10px] text-muted-foreground opacity-0 hover:bg-accent group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100 focus:pointer-events-auto focus:opacity-100 pointer-coarse:pointer-events-auto pointer-coarse:opacity-100"
+          className="pointer-events-none h-full shrink-0 px-1.5 text-xs text-muted-foreground opacity-0 hover:bg-accent group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100 focus:pointer-events-auto focus:opacity-100 pointer-coarse:pointer-events-auto pointer-coarse:opacity-100"
           disabled={branchDisabledReason !== null}
           title={branchDisabledReason ?? undefined}
           type="button"
@@ -219,7 +219,7 @@ const GitManagerBranchRow = memo(function GitManagerBranchRow({
         <button
           aria-describedby={branchActionDescriptionId}
           aria-label={`Delete ${refEntry.name}`}
-          className="pointer-events-none h-full shrink-0 px-1.5 text-[10px] text-destructive opacity-0 hover:bg-destructive/10 group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100 focus:pointer-events-auto focus:opacity-100 pointer-coarse:pointer-events-auto pointer-coarse:opacity-100"
+          className="pointer-events-none h-full shrink-0 px-1.5 text-xs text-destructive opacity-0 hover:bg-destructive/10 group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100 focus:pointer-events-auto focus:opacity-100 pointer-coarse:pointer-events-auto pointer-coarse:opacity-100"
           disabled={branchDisabledReason !== null}
           title={branchDisabledReason ?? undefined}
           type="button"
@@ -247,6 +247,8 @@ export interface GitManagerBranchDropdownProps {
   readonly refs: ReadonlyArray<GitManagerRefEntry>;
   readonly recentNames: ReadonlyArray<string>;
   readonly currentBranchName: string | null;
+  /** Shown instead of a branch name when none is checked out. */
+  readonly noBranchLabel: string;
   readonly selectedWorktreeCwd: string;
   readonly branchDisabledReason: string | null;
   readonly mergeDisabledReason: string | null;
@@ -263,6 +265,7 @@ export const GitManagerBranchDropdown = memo(function GitManagerBranchDropdown({
   refs,
   recentNames,
   currentBranchName,
+  noBranchLabel,
   selectedWorktreeCwd,
   branchDisabledReason,
   mergeDisabledReason,
@@ -373,7 +376,7 @@ export const GitManagerBranchDropdown = memo(function GitManagerBranchDropdown({
   const renderItem = useCallback(
     ({ item }: { item: BranchListItem; index: number }) =>
       item.kind === "header" ? (
-        <div className="flex h-[30px] items-end px-2 pb-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+        <div className="flex h-[30px] items-end px-2 pb-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">
           {item.label}
         </div>
       ) : (
@@ -410,7 +413,7 @@ export const GitManagerBranchDropdown = memo(function GitManagerBranchDropdown({
         className="inline-flex min-w-0 flex-1 items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm outline-none hover:bg-accent focus-visible:ring-2"
       >
         <GitBranchIcon aria-hidden="true" className="size-4 shrink-0" />
-        <span className="min-w-0 flex-1 truncate">{currentBranchName ?? "Detached HEAD"}</span>
+        <span className="min-w-0 flex-1 truncate">{currentBranchName ?? noBranchLabel}</span>
         <ChevronDownIcon aria-hidden="true" className="size-3.5 shrink-0 opacity-60" />
       </PopoverTrigger>
       <PopoverPopup align="start" className="w-[32rem] max-w-[calc(100vw-2rem)] p-0" sideOffset={2}>

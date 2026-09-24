@@ -283,6 +283,32 @@ describe("GitManagerToolbar", () => {
     }
   });
 
+  it("treats an interrupted clone's placeholder HEAD as a repository without commits", () => {
+    h.snapshot = {
+      ...refsSnapshot(),
+      headRef: null,
+      detachedSha: null,
+      defaultBranch: null,
+      localBranches: [],
+      remoteBranches: [],
+    };
+    const placeholder = renderToolbar();
+    expect(placeholder).toContain("No commits yet");
+    expect(placeholder).not.toContain("Detached HEAD");
+    expect(placeholder).toContain("Fetch origin");
+    expect(placeholder).not.toContain("Publish branch");
+
+    h.snapshot = {
+      ...refsSnapshot(),
+      headRef: null,
+      detachedSha: "b".repeat(40),
+      localBranches: [ref("main", { isDefault: true })],
+    };
+    const detached = renderToolbar();
+    expect(detached).toContain("Detached HEAD");
+    expect(detached).not.toContain("No commits yet");
+  });
+
   it("does not advertise local tags as pending pushes without remote tag state", () => {
     h.snapshot = refsSnapshot([ref("already-published")]);
 
