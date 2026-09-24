@@ -568,7 +568,10 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
         Layer.succeed(Connectivity.Connectivity, connectivity),
         Layer.succeed(
           ConnectionWakeups.ConnectionWakeups,
-          ConnectionWakeups.ConnectionWakeups.of({ changes: Stream.never }),
+          ConnectionWakeups.ConnectionWakeups.of({
+            focusVisibility: Stream.never,
+            changes: Stream.never,
+          }),
         ),
         Layer.succeed(ConnectionDriver.ConnectionDriver, driver),
         cacheLayer,

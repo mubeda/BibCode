@@ -90,30 +90,90 @@ const connectivityLayer = Connectivity.layer({
   ),
 });
 
-const wakeupsLayer = Wakeups.layer({
-  changes: Stream.merge(
-    Stream.callback<"application-active">((queue) =>
+/**
+ * Running totals of browser wakeups. Every frame carries both totals, so a
+ * frame dropped by the sliding buffer is still represented by any later one.
+ */
+interface BrowserWakeupCounts {
+  /** Visible `visibilitychange` events: the supervisor's `application-active`. */
+  readonly applicationActive: number;
+  /** Returns to an inactive window by focus or visibility: view refreshes. */
+  readonly focusReturn: number;
+}
+
+const wakeupsLayer = Layer.effect(
+  Wakeups.ConnectionWakeups,
+  Effect.gen(function* () {
+    // Totals outlive listener restarts so a new consumer can start from them.
+    const counts = { applicationActive: 0, focusReturn: 0 };
+    const browserWakeups = Stream.callback<BrowserWakeupCounts>((queue) =>
       Effect.acquireRelease(
         Effect.sync(() => {
-          const listener = () => {
-            if (document.visibilityState === "visible") {
-              Queue.offerUnsafe(queue, "application-active");
-            }
+          let active = document.visibilityState === "visible" && document.hasFocus();
+          const publish = () => Queue.offerUnsafe(queue, { ...counts });
+          const leave = () => {
+            active = false;
           };
-          document.addEventListener("visibilitychange", listener);
-          return listener;
+          const enter = () => {
+            if (active || document.visibilityState !== "visible") return false;
+            active = true;
+            counts.focusReturn += 1;
+            return true;
+          };
+          const focus = () => {
+            if (enter()) publish();
+          };
+          const visibility = () => {
+            if (document.visibilityState === "visible") {
+              // Keep the supervisor's original visibility-only wakeup semantics.
+              enter();
+              counts.applicationActive += 1;
+              publish();
+            } else leave();
+          };
+          window.addEventListener("blur", leave);
+          window.addEventListener("focus", focus);
+          document.addEventListener("visibilitychange", visibility);
+          return { leave, focus, visibility };
         }),
-        (listener) =>
+        ({ leave, focus, visibility }) =>
           Effect.sync(() => {
-            document.removeEventListener("visibilitychange", listener);
+            window.removeEventListener("blur", leave);
+            window.removeEventListener("focus", focus);
+            document.removeEventListener("visibilitychange", visibility);
           }),
       ).pipe(Effect.asVoid),
-    ),
-    managedRelayAccountChanges(appAtomRegistry).pipe(
-      Stream.map(() => "credentials-changed" as const),
-    ),
-  ),
-});
+    );
+    const browserChanges = yield* browserWakeups.pipe(
+      Stream.share({ capacity: 1, strategy: "sliding", idleTimeToLive: 0 }),
+    );
+    // Emits once for each frame in which the selected total has passed what
+    // this consumer has seen, starting from the total when it subscribes.
+    const advancesOf = (total: (frame: BrowserWakeupCounts) => number) =>
+      Stream.suspend(() => {
+        let seen = total(counts);
+        return browserChanges.pipe(
+          Stream.filter((frame) => {
+            const next = total(frame);
+            if (next <= seen) return false;
+            seen = next;
+            return true;
+          }),
+        );
+      });
+    return Wakeups.make({
+      focusVisibility: advancesOf((frame) => frame.focusReturn).pipe(Stream.map(() => undefined)),
+      changes: Stream.merge(
+        advancesOf((frame) => frame.applicationActive).pipe(
+          Stream.map(() => "application-active" as const),
+        ),
+        managedRelayAccountChanges(appAtomRegistry).pipe(
+          Stream.map(() => "credentials-changed" as const),
+        ),
+      ),
+    });
+  }),
+);
 
 function clientMetadata() {
   const desktop = window.desktopBridge !== undefined;

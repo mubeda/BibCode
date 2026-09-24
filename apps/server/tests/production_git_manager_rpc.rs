@@ -57,12 +57,41 @@ fn phase_13_history_rewrite_sources_do_not_log_repository_operands() {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with_fetch_interval(Duration::from_millis(50)).await
+    }
+
+    async fn with_fetch_interval(fetch_interval: Duration) -> Self {
+        Self::build(fetch_interval, false)
+            .await
+            .expect("default Git fixture")
+    }
+
+    async fn new_reftable(fetch_interval: Duration) -> Option<Self> {
+        Self::build(fetch_interval, true).await
+    }
+
+    async fn build(fetch_interval: Duration, reftable: bool) -> Option<Self> {
         let root = TempDir::new().expect("temporary Git Manager fixture");
         let repository_path = root.path().join("main");
         let remote_path = root.path().join("remote.git");
         fs::create_dir(&repository_path).expect("main checkout directory");
         git(root.path(), &["init", "-q", "--bare", path(&remote_path)]);
-        git(&repository_path, &["init", "-q", "-b", "main"]);
+        if reftable {
+            if !git_output(
+                &repository_path,
+                &["init", "-q", "-b", "main", "--ref-format=reftable"],
+            )
+            .status
+            .success()
+            {
+                eprintln!(
+                    "reftable coverage skipped: installed Git does not support reftable initialization"
+                );
+                return None;
+            }
+        } else {
+            git(&repository_path, &["init", "-q", "-b", "main"]);
+        }
         git(&repository_path, &["config", "core.autocrlf", "false"]);
         configure_identity(&repository_path);
         fs::write(repository_path.join("tracked.txt"), "base\n").expect("base file");
@@ -99,7 +128,7 @@ impl Fixture {
             .await
             .expect("project projection");
         let repository = Arc::new(GitRepository::default());
-        let (remote_refresh_interval, _) = tokio::sync::watch::channel(Duration::from_millis(50));
+        let (remote_refresh_interval, _) = tokio::sync::watch::channel(fetch_interval);
         let broadcaster = StatusBroadcaster::with_automatic_remote_refresh_interval(
             repository.clone(),
             Duration::from_secs(3_600),
@@ -120,12 +149,12 @@ impl Fixture {
             availability,
             Arc::new(NativeFileTrash::default()),
         );
-        Self {
+        Some(Self {
             _root: root,
             repository_path,
             remote_path,
             services,
-        }
+        })
     }
 
     fn operation(&self, id: &str, payload: Value) -> mpsc::Receiver<Result<Vec<Value>, Value>> {
@@ -1097,6 +1126,370 @@ async fn git_manager_signal_generation_bumps_after_an_external_commit() {
     let second = next_generation_after(&mut stream, first).await;
 
     assert!(second > first);
+    cancellation.cancel();
+}
+
+#[tokio::test]
+async fn git_manager_signal_external_changes_use_the_default_fetch_interval() {
+    let fixture = Fixture::with_fetch_interval(Duration::from_secs(180)).await;
+    let cwd = &fixture.repository_path;
+    let cancellation = CancellationToken::new();
+    let mut stream = fixture.services.git_manager_signal_stream(
+        rpc_request("95", "subscribeGitManagerSignal", json!({ "cwd": cwd })),
+        cancellation.clone(),
+    );
+    let initial = next_event(&mut stream).await;
+    let mut generation = initial["generation"].as_u64().expect("initial generation");
+    if generation == 0 {
+        generation = next_generation_after(&mut stream, generation).await;
+    }
+    struct ExternalChange {
+        name: &'static str,
+        apply: fn(&Fixture),
+    }
+    for change in [
+        ExternalChange {
+            name: "commit",
+            apply: |fixture| {
+                fs::write(
+                    fixture.repository_path.join("tracked.txt"),
+                    "external commit\n",
+                )
+                .expect("commit content");
+                git(&fixture.repository_path, &["commit", "-qam", "external"]);
+            },
+        },
+        ExternalChange {
+            name: "stash",
+            apply: |fixture| {
+                fs::write(
+                    fixture.repository_path.join("tracked.txt"),
+                    "external stash\n",
+                )
+                .expect("stash content");
+                git(
+                    &fixture.repository_path,
+                    &["stash", "push", "-q", "-m", "external"],
+                );
+            },
+        },
+        ExternalChange {
+            name: "tag",
+            apply: |fixture| git(&fixture.repository_path, &["tag", "external-tag"]),
+        },
+        ExternalChange {
+            name: "update-ref",
+            apply: |fixture| {
+                git(
+                    &fixture.repository_path,
+                    &["update-ref", "refs/heads/external-branch", "HEAD"],
+                )
+            },
+        },
+        ExternalChange {
+            name: "fetch",
+            apply: |fixture| {
+                publish_remote_change(&fixture.remote_path, fixture._root.path());
+                git(&fixture.repository_path, &["fetch", "-q", "origin"]);
+            },
+        },
+    ] {
+        (change.apply)(&fixture);
+        generation = timeout(
+            Duration::from_secs(5),
+            next_generation_after(&mut stream, generation),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "external {} waited for the automatic fetch tick",
+                change.name
+            )
+        });
+    }
+    cancellation.cancel();
+}
+
+async fn initialized_signal(
+    fixture: &Fixture,
+    cwd: &Path,
+) -> (
+    mpsc::Receiver<Result<Vec<Value>, Value>>,
+    CancellationToken,
+    u64,
+) {
+    let cancellation = CancellationToken::new();
+    let mut stream = fixture.services.git_manager_signal_stream(
+        rpc_request("96", "subscribeGitManagerSignal", json!({ "cwd": cwd })),
+        cancellation.clone(),
+    );
+    let mut generation = next_event(&mut stream).await["generation"]
+        .as_u64()
+        .expect("generation");
+    if generation == 0 {
+        generation = next_generation_after(&mut stream, generation).await;
+    }
+    (stream, cancellation, generation)
+}
+
+#[tokio::test]
+async fn signal_tracks_a_repository_whose_head_is_a_clone_placeholder() {
+    let fixture = Fixture::with_fetch_interval(Duration::from_secs(180)).await;
+    let cwd = &fixture.repository_path;
+    // An interrupted clone leaves HEAD on Git's placeholder, which names no valid ref.
+    fs::write(cwd.join(".git/HEAD"), "ref: refs/heads/.invalid\n").expect("placeholder HEAD");
+    let (mut stream, cancellation, generation) =
+        timeout(Duration::from_secs(5), initialized_signal(&fixture, cwd))
+            .await
+            .expect("a placeholder HEAD still yields a signature");
+    // Repairing HEAD is an ordinary ref change.
+    fs::write(cwd.join(".git/HEAD"), "ref: refs/heads/main\n").expect("repaired HEAD");
+    timeout(
+        Duration::from_secs(3),
+        next_generation_after(&mut stream, generation),
+    )
+    .await
+    .expect("repairing a placeholder HEAD bumps the signal");
+    cancellation.cancel();
+}
+
+#[tokio::test]
+async fn main_checkout_stash_push_pop_and_drop_refresh_after_idle() {
+    for existing_stash in [false, true] {
+        let fixture = Fixture::with_fetch_interval(Duration::from_secs(180)).await;
+        let cwd = &fixture.repository_path;
+        if existing_stash {
+            fs::write(cwd.join("tracked.txt"), "older stash\n").expect("older stash content");
+            git(cwd, &["stash", "push", "-q", "-m", "older"]);
+        }
+        let (mut stream, cancellation, generation) = initialized_signal(&fixture, cwd).await;
+        let mut generation = wait_until_signal_idle(&mut stream, generation).await;
+        for (operation, expected_count) in [("push", 1), ("pop", 0), ("push", 1), ("drop", 0)] {
+            if operation == "push" {
+                fs::write(cwd.join("tracked.txt"), "external stash change\n")
+                    .expect("stash content");
+            }
+            if operation == "drop" && existing_stash {
+                git(cwd, &["stash", "drop", "-q", "stash@{1}"]);
+            } else {
+                git(cwd, &["stash", operation, "-q"]);
+            }
+            generation = timeout(
+                Duration::from_secs(3),
+                next_generation_after(&mut stream, generation),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!("main checkout stash {operation} did not refresh after idle")
+            });
+            let stashes = fixture
+                .read("97", "gitManager.getStashes", json!({ "cwd": cwd }))
+                .await
+                .expect("refreshed stash list");
+            assert_eq!(
+                stashes.as_array().expect("stash entries").len(),
+                expected_count + usize::from(existing_stash)
+            );
+            generation = wait_until_signal_idle(&mut stream, generation).await;
+        }
+        cancellation.cancel();
+    }
+}
+
+#[tokio::test]
+async fn git_manager_signal_detects_non_top_stash_drop_and_pop_in_both_ref_stores() {
+    for ref_format in ["files", "reftable"] {
+        for operation in ["drop", "pop"] {
+            let fixture = if ref_format == "reftable" {
+                let Some(fixture) = Fixture::new_reftable(Duration::from_secs(180)).await else {
+                    continue;
+                };
+                fixture
+            } else {
+                Fixture::with_fetch_interval(Duration::from_secs(180)).await
+            };
+            let cwd = &fixture.repository_path;
+            for index in 0..3 {
+                fs::write(cwd.join("tracked.txt"), format!("stash {index}\n"))
+                    .expect("stash content");
+                git(
+                    cwd,
+                    &["stash", "push", "-q", "-m", &format!("stash {index}")],
+                );
+            }
+            let (mut stream, cancellation, generation) = initialized_signal(&fixture, cwd).await;
+            let tip = git_stdout(cwd, &["rev-parse", "refs/stash"]);
+            git(cwd, &["stash", operation, "-q", "stash@{1}"]);
+            assert_eq!(
+                git_stdout(cwd, &["rev-parse", "refs/stash"]),
+                tip,
+                "non-top removal preserves the ref tip"
+            );
+            timeout(
+                Duration::from_secs(5),
+                next_generation_after(&mut stream, generation),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!("{ref_format} stash {operation} did not invalidate the signal")
+            });
+            cancellation.cancel();
+        }
+    }
+}
+
+#[tokio::test]
+async fn git_manager_signal_observes_a_sibling_worktree_head_switch() {
+    assert_sibling_worktree_head_signal(
+        Fixture::with_fetch_interval(Duration::from_secs(180)).await,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn git_manager_signal_observes_a_reftable_sibling_worktree_head_switch() {
+    let Some(fixture) = Fixture::new_reftable(Duration::from_secs(180)).await else {
+        return;
+    };
+    assert_sibling_worktree_head_signal(fixture).await;
+}
+
+async fn assert_sibling_worktree_head_signal(fixture: Fixture) {
+    let observed = fixture._root.path().join("observed-worktree");
+    let sibling = fixture._root.path().join("sibling-worktree");
+    git(
+        &fixture.repository_path,
+        &["worktree", "add", "-q", "-b", "observed", path(&observed)],
+    );
+    git(
+        &fixture.repository_path,
+        &["worktree", "add", "-q", "-b", "sibling", path(&sibling)],
+    );
+    git(&fixture.repository_path, &["branch", "alternate", "HEAD"]);
+    let (mut stream, cancellation, generation) = initialized_signal(&fixture, &observed).await;
+    git(&sibling, &["switch", "-q", "alternate"]);
+    timeout(
+        Duration::from_secs(5),
+        next_generation_after(&mut stream, generation),
+    )
+    .await
+    .expect("sibling HEAD change must refresh worktree occupancy");
+    cancellation.cancel();
+}
+
+#[tokio::test]
+async fn git_manager_signal_refreshes_during_a_continuous_working_tree_writer() {
+    let fixture = Fixture::with_fetch_interval(Duration::from_secs(180)).await;
+    let (mut stream, cancellation, generation) =
+        initialized_signal(&fixture, &fixture.repository_path).await;
+    let writer_stop = CancellationToken::new();
+    let writer_cancellation = writer_stop.clone();
+    let file = fixture.repository_path.join("build-output.txt");
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let writer = tokio::spawn(async move {
+        tokio::fs::write(&file, b"starting")
+            .await
+            .expect("writer starts");
+        let _ = started.send(());
+        let mut interval = tokio::time::interval(Duration::from_millis(25));
+        let mut sequence = 0;
+        loop {
+            tokio::select! {
+                biased;
+                () = writer_cancellation.cancelled() => break,
+                _ = interval.tick() => {
+                    sequence += 1;
+                    tokio::fs::write(&file, sequence.to_string()).await.expect("continuous write");
+                }
+            }
+        }
+    });
+    ready.await.expect("writer ready");
+    git(&fixture.repository_path, &["tag", "during-build"]);
+    let observed = timeout(
+        Duration::from_secs(2),
+        next_generation_after(&mut stream, generation),
+    )
+    .await;
+    writer_stop.cancel();
+    writer.await.expect("writer joins");
+    cancellation.cancel();
+    observed.expect("continuous working-tree writes must not defer ref refresh until they stop");
+}
+
+#[tokio::test]
+async fn retained_history_decorations_match_git_log_before_and_after_external_ref_changes() {
+    let fixture = Fixture::new().await;
+    let cwd = &fixture.repository_path;
+    git(
+        cwd,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    git(cwd, &["tag", "v1"]);
+    git(cwd, &["branch", "feature"]);
+    let old_tip = git_stdout(cwd, &["rev-parse", "HEAD"]);
+    let initial = fixture
+        .read(
+            "98",
+            "gitManager.getCommits",
+            json!({ "cwd": cwd, "limit": 100 }),
+        )
+        .await
+        .expect("history page");
+    let expected = git_stdout(
+        cwd,
+        &["log", "--decorate=short", "-1", "--format=%D", &old_tip],
+    );
+    assert_eq!(
+        initial["commits"][0]["decorations"],
+        json!(expected.split(", ").collect::<Vec<_>>())
+    );
+    assert!(expected.contains("origin/HEAD"));
+    fs::write(cwd.join("new-commit.txt"), "external\n").expect("new file");
+    git(cwd, &["add", "new-commit.txt"]);
+    git(cwd, &["commit", "-q", "-m", "external"]);
+    git(cwd, &["branch", "-m", "feature", "renamed"]);
+    git(cwd, &["tag", "-d", "v1"]);
+    git(cwd, &["tag", "v2", &old_tip]);
+    let retained = fixture
+        .read(
+            "99",
+            "gitManager.getCommits",
+            json!({ "cwd": cwd, "pinnedTips": [old_tip], "offset": 0, "limit": 100 }),
+        )
+        .await
+        .expect("retained pinned page");
+    let expected = git_stdout(
+        cwd,
+        &["log", "--decorate=short", "-1", "--format=%D", &old_tip],
+    );
+    assert_eq!(retained["commits"][0]["sha"], old_tip);
+    assert_eq!(
+        retained["commits"][0]["decorations"],
+        json!(expected.split(", ").collect::<Vec<_>>())
+    );
+    assert!(!expected.contains("HEAD ->"));
+    assert!(expected.contains("origin/HEAD"));
+}
+
+#[tokio::test]
+async fn git_manager_signal_observes_reftable_ref_updates() {
+    let Some(fixture) = Fixture::new_reftable(Duration::from_secs(180)).await else {
+        return;
+    };
+    let (mut stream, cancellation, generation) =
+        initialized_signal(&fixture, &fixture.repository_path).await;
+    git(&fixture.repository_path, &["tag", "external-reftable"]);
+    timeout(
+        Duration::from_secs(5),
+        next_generation_after(&mut stream, generation),
+    )
+    .await
+    .expect("reftable tag must refresh");
     cancellation.cancel();
 }
 
@@ -2154,6 +2547,21 @@ fn rpc_request(id: &str, tag: &str, payload: Value) -> RpcRequest {
         span_id: None,
         sampled: None,
     }
+}
+
+/// Waits until the signal has been quiet for longer than the ref debounce and
+/// returns the last generation seen. The quiet window is part of the "after
+/// idle" scenario: the next external change must still bump the signal. It
+/// also drains a late bump from the previous step, so the next assertion can
+/// only be satisfied by the next operation.
+async fn wait_until_signal_idle(
+    stream: &mut mpsc::Receiver<Result<Vec<Value>, Value>>,
+    mut generation: u64,
+) -> u64 {
+    while let Ok(event) = timeout(Duration::from_millis(300), next_event(stream)).await {
+        generation = event["generation"].as_u64().expect("signal generation");
+    }
+    generation
 }
 
 async fn next_generation_after(

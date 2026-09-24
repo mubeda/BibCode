@@ -4,7 +4,8 @@
   "values": [
     {
       "cwd": "_,@u^TnBc",
-      "generation": 22
+      "generation": 22,
+      "watcherDegraded": false
     }
   ]
 }

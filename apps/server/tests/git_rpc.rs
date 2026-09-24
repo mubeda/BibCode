@@ -19,6 +19,12 @@ use git::{
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
+#[path = "support/isolated_git_config.rs"]
+mod isolated_git_config;
+#[path = "support/reexec.rs"]
+mod reexec;
+use isolated_git_config::IsolatedGitConfig;
+
 #[derive(Clone)]
 struct StaticWorktreeBaseDirectory(Option<PathBuf>);
 
@@ -1706,6 +1712,118 @@ async fn status_subscription_watcher_observes_external_branch_changes_without_fu
     .await
     .expect("watcher should observe an external branch change");
     assert_eq!(local.ref_name.as_deref(), Some("feature/external"));
+}
+
+const SUBMODULE_WATCHER_TEST: &str =
+    "status_subscription_watcher_observes_commits_and_checkouts_inside_a_submodule";
+
+// Re-exec with an isolated global Git configuration, which the server's status
+// reads inherit: host commit signing, hooks, or `diff.ignoreSubmodules` must not
+// decide what this test observes.
+#[test]
+fn status_subscription_watcher_observes_commits_and_checkouts_inside_a_submodule() {
+    if let Some(isolated) = reexec::enter(SUBMODULE_WATCHER_TEST, "isolated-git-config") {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Tokio runtime")
+            .block_on(submodule_commits_and_checkouts_refresh_superproject_status());
+        isolated.complete();
+        return;
+    }
+    let config = IsolatedGitConfig::new();
+    reexec::run(
+        SUBMODULE_WATCHER_TEST,
+        "isolated-git-config",
+        None,
+        |command| {
+            command
+                .env("GIT_CONFIG_GLOBAL", config.path())
+                .env("GIT_CONFIG_NOSYSTEM", "1");
+        },
+    );
+}
+
+async fn submodule_commits_and_checkouts_refresh_superproject_status() {
+    let child = init_repo();
+    commit_file(child.path(), "lib.txt", "base\n", "child initial");
+    let parent = init_repo();
+    commit_file(parent.path(), "README.md", "parent\n", "parent initial");
+    git(
+        parent.path(),
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            &child.path().to_string_lossy(),
+            "sub",
+        ],
+    );
+    git(parent.path(), &["commit", "-m", "add submodule"]);
+    let submodule = parent.path().join("sub");
+    // The local safety read is an hour away, so every update below is watcher-driven.
+    let broadcaster = StatusBroadcaster::new(
+        Arc::new(GitRepository::default()),
+        Duration::from_secs(3600),
+        4,
+    );
+    let mut subscription = broadcaster
+        .subscribe(parent.path().to_path_buf(), cancellation())
+        .await
+        .expect("status subscription");
+    match subscription.recv().await {
+        Some(VcsStatusStreamEvent::Snapshot { local, .. }) => {
+            assert!(!local.has_working_tree_changes, "{local:?}");
+        }
+        event => panic!("expected the initial snapshot, got {event:?}"),
+    }
+
+    // Both Git commands below write only inside the submodule's Git directory
+    // (`.git/modules/sub`), never in the superproject's working tree.
+    git(
+        &submodule,
+        &[
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "submodule commit",
+        ],
+    );
+    let moved = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(VcsStatusStreamEvent::LocalUpdated { local }) = subscription.recv().await
+                && local
+                    .working_tree
+                    .files
+                    .iter()
+                    .any(|file| file.path == "sub")
+            {
+                break local;
+            }
+        }
+    })
+    .await
+    .expect("a commit inside the submodule refreshes the superproject status");
+    assert!(moved.working_tree.files.iter().any(|file| {
+        file.path == "sub"
+            && file.area == Some(VcsStagingArea::Unstaged)
+            && file.status == Some(VcsWorkingTreeFileStatus::Modified)
+    }));
+
+    git(&submodule, &["checkout", "--quiet", "--detach", "HEAD~1"]);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(VcsStatusStreamEvent::LocalUpdated { local }) = subscription.recv().await
+                && !local.has_working_tree_changes
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("a checkout inside the submodule refreshes the superproject status");
 }
 
 #[tokio::test]

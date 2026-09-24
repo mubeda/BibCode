@@ -31,6 +31,24 @@ public package has no root export; callers use focused subpaths such as
 - Domain modules under `state/*` consume the registry and expose focused Atom
   constructors. React presentation does not own sockets or retry loops.
 
+`ConnectionWakeups` exposes two streams. `changes` carries credential changes
+and `application-active`, which the browser emits only on `visibilitychange`
+to a visible document. Window focus alone does not emit it or trigger the
+supervisor's environment probes. `focusVisibility` carries coalesced visible
+focus/visibility returns for Git Manager's explicit degraded-focus subscription;
+the supervisor does not consume this stream. The web adapter shares one
+focus/blur/visibility listener set and releases it after its final consumer.
+Credential notifications retain their separate stream. Only a server watcher
+reporting fallback-required health enables Git Manager query invalidation;
+client-runtime does not access browser globals.
+
+Browser wakeups share a sliding buffer of one frame. A slow consumer cannot
+backpressure delivery to supervisors. Every frame carries running totals
+(application-active count and focus-return sequence), and each consumer tracks
+progress from where it subscribed, so coalescing can drop intermediate frames
+but never an `application-active` wakeup or a focus return. Intermediate wakeups may coalesce while a
+consumer is stalled; wakeups request current-state reconciliation, not replay.
+
 Terminal input preparation, sequenced writes, and cancellation retain the exact
 `RpcSession` object. A replacement session cannot inherit queued input. The
 physical session owns request admission, including long-lived subscriptions,

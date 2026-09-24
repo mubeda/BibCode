@@ -86,7 +86,7 @@ vi.mock("../../state/worktrees", () => ({
 
 vi.mock("../../state/gitManager", () => ({
   gitManagerEnvironment: {
-    signal: h.signalAtom,
+    signalWithDegradedFocusRefresh: h.signalAtom,
     getRefs: h.refsAtom,
     getStashes: h.stashesAtom,
     getDiff: h.diffAtom,

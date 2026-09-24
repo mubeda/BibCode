@@ -351,7 +351,13 @@ export type GitManagerOperationEvent = typeof GitManagerOperationEvent.Type;
 
 export const GitManagerSignalEvent = Schema.Struct({
   cwd: TrimmedNonEmptyStringSchema,
+  /**
+   * Advances once per changed repository signature. Generation 0 means no
+   * signature has been computed yet; the first computed signature always
+   * advances it, so clients can treat that step as initialization.
+   */
   generation: NonNegativeInt,
+  watcherDegraded: Schema.optional(Schema.Boolean),
 });
 export type GitManagerSignalEvent = typeof GitManagerSignalEvent.Type;
 

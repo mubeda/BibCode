@@ -25,6 +25,10 @@ use bibcode_server::production::git_vcs::{
     GIT_VCS_STREAM_METHODS, GIT_VCS_UNARY_METHODS, GitVcsRpcServices, register_git_vcs_rpc,
 };
 
+#[path = "support/isolated_git_config.rs"]
+mod isolated_git_config;
+use isolated_git_config::IsolatedGitConfig;
+
 const ISOLATED_GIT_TEST: &str = "BIBCODE_PRODUCTION_GIT_VCS_RPC_ISOLATED";
 static ISOLATED_GIT_TEST_LOCK: Mutex<()> = Mutex::new(());
 const GIT_STATUS_INTEGRATION_DEADLINE: Duration = Duration::from_secs(15);
@@ -2600,18 +2604,7 @@ fn relaunch_with_isolated_git_config(test_name: &str) -> bool {
     let _relaunch_guard = ISOLATED_GIT_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let fixture = tempfile::tempdir().expect("isolated Git config fixture");
-    let hooks = fixture.path().join("hooks");
-    fs::create_dir(&hooks).expect("isolated hooks directory");
-    let config = fixture.path().join("global.gitconfig");
-    fs::write(
-        &config,
-        format!(
-            "[commit]\n\tgpgSign = false\n[core]\n\thooksPath = {}\n",
-            hooks.to_string_lossy().replace('\\', "/")
-        ),
-    )
-    .expect("isolated global config");
+    let config = IsolatedGitConfig::new();
 
     let mut command = Command::new(std::env::current_exe().expect("current test executable"));
     for (name, _) in std::env::vars_os() {
@@ -2625,7 +2618,7 @@ fn relaunch_with_isolated_git_config(test_name: &str) -> bool {
     }
     let output = command
         .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
-        .env("GIT_CONFIG_GLOBAL", &config)
+        .env("GIT_CONFIG_GLOBAL", config.path())
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env(ISOLATED_GIT_TEST, "1")

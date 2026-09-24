@@ -26,7 +26,7 @@ const h = vi.hoisted(() => ({
 vi.mock("../../state/gitManager", () => ({
   gitManagerEnvironment: {
     getRefs: h.refsAtom,
-    signal: h.signalAtom,
+    signalWithDegradedFocusRefresh: h.signalAtom,
   },
 }));
 
@@ -315,6 +315,18 @@ describe("GitManagerToolbar", () => {
     expect(markup).toContain(reason);
     expect(markup).toContain('aria-label="Choose branch"');
     expect(markup).toContain("Fetch origin");
+  });
+
+  it("renders tag menu reasons at the smallest app text size", () => {
+    const reason = "This environment does not support Git Manager tag operations.";
+    h.snapshot = refsSnapshot([ref("release/v1")]);
+    const disabled = renderToolbar({ tagDisabledReason: reason });
+    h.snapshot = refsSnapshot();
+    const empty = renderToolbar();
+
+    for (const markup of [disabled, empty]) expect(markup).not.toMatch(/text-\[\d+px\]/);
+    expect(disabled).toContain(`<span class="text-xs text-muted-foreground">${reason}</span>`);
+    expect(empty).toContain('<span class="text-xs text-muted-foreground">No local tags.</span>');
   });
 
   it("skips the live signal subscription without disabling explicit repository reads", () => {

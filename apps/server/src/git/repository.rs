@@ -38,6 +38,7 @@ const WATCH_ROOTS_OUTPUT_LIMIT: usize = 16 * 1024;
 const WORKTREE_INVENTORY_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 const GIT_MANAGER_HISTORY_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
 const GIT_MANAGER_TIPS_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
+const GIT_MANAGER_STASH_REFLOG_LIMIT: usize = 4 * 1024 * 1024;
 const WORKTREE_REMOVAL_STATUS_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 const WORKTREE_PRUNE_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 const WORKTREE_PRUNE_GITDIR_LIMIT: u64 = 64 * 1024;
@@ -147,9 +148,14 @@ pub(crate) struct GitWatchRoots {
     pub common_dir: PathBuf,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct GitManagerSignalHead {
+    pub reference: Option<String>,
+    pub oid: Option<String>,
+}
+
 pub(crate) struct ObservedRemoteStatus {
     pub ref_name: Option<String>,
-    pub head_signature: String,
     pub remote: Option<VcsStatusRemoteResult>,
 }
 
@@ -933,12 +939,137 @@ impl GitRepository {
                 "refs/heads",
                 "refs/remotes",
                 "refs/tags",
+                "refs/stash",
             ]),
             false,
             GIT_MANAGER_TIPS_OUTPUT_LIMIT,
             cancellation,
         )
         .await
+    }
+
+    pub(crate) async fn git_manager_signal_head(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<GitManagerSignalHead, GitCommandError> {
+        let head_args = strings(&["symbolic-ref", "--quiet", "--short", "HEAD"]);
+        let oid_args = strings(&["rev-parse", "--verify", "--quiet", "HEAD"]);
+        let (head, oid) = tokio::try_join!(
+            self.git_manager_bounded_read(
+                "GitManager.signal.headRef",
+                cwd,
+                &head_args,
+                true,
+                64 * 1024,
+                cancellation,
+            ),
+            self.git_manager_bounded_read(
+                "GitManager.signal.headSha",
+                cwd,
+                &oid_args,
+                true,
+                64 * 1024,
+                cancellation,
+            ),
+        )?;
+        // `symbolic-ref --quiet` exits 1 for a detached HEAD and 128 when HEAD names
+        // no valid ref, such as Git's clone placeholder `refs/heads/.invalid`;
+        // `rev-parse --verify --quiet` exits 1 when HEAD has no commit. A HEAD with
+        // neither (an interrupted clone, on files or reftable) is a stable state.
+        let ref_name = match head.exit_code {
+            0 if !head.stdout.trim().is_empty() => Some(head.stdout.trim().to_owned()),
+            1 => None,
+            128 if oid.exit_code == 1 => None,
+            _ => {
+                return Err(simple_error(
+                    "GitManager.signal.headRef",
+                    cwd,
+                    "Could not read HEAD's symbolic ref.",
+                ));
+            }
+        };
+        let sha = match oid.exit_code {
+            0 if !oid.stdout.trim().is_empty() => Some(oid.stdout.trim().to_owned()),
+            1 => None,
+            _ => {
+                return Err(simple_error(
+                    "GitManager.signal.headSha",
+                    cwd,
+                    "Could not resolve HEAD.",
+                ));
+            }
+        };
+        Ok(GitManagerSignalHead {
+            reference: ref_name,
+            oid: sha,
+        })
+    }
+
+    pub(crate) async fn git_manager_signal_stash_reflog(
+        &self,
+        cwd: &Path,
+        common_dir: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<u8>, GitCommandError> {
+        let operation = "GitManager.signal.stashReflog";
+        let observation = async {
+            let path = common_dir.join("logs/refs/stash");
+            let file = match git_metadata_open_options().open(path).await {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    // Reftable keeps reflogs in its tables rather than loose log files.
+                    let tables = tokio::fs::try_exists(common_dir.join("reftable/tables.list"))
+                        .await
+                        .map_err(|error| simple_error(operation, cwd, &error.to_string()))?;
+                    return if tables {
+                        self.git_manager_bounded_read(
+                            operation,
+                            cwd,
+                            &strings(&["stash", "list", "--format=%H%x00%gs%x00"]),
+                            false,
+                            GIT_MANAGER_STASH_REFLOG_LIMIT,
+                            cancellation,
+                        )
+                        .await
+                        .map(|output| output.stdout.into_bytes())
+                    } else {
+                        Ok(Vec::new())
+                    };
+                }
+                Err(error) => return Err(simple_error(operation, cwd, &error.to_string())),
+            };
+            if !file
+                .metadata()
+                .await
+                .map_err(|error| simple_error(operation, cwd, &error.to_string()))?
+                .is_file()
+            {
+                return Err(simple_error(
+                    operation,
+                    cwd,
+                    "The stash reflog must be a regular file.",
+                ));
+            }
+            let mut bytes = Vec::new();
+            file.take(GIT_MANAGER_STASH_REFLOG_LIMIT as u64 + 1)
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|error| simple_error(operation, cwd, &error.to_string()))?;
+            if bytes.len() > GIT_MANAGER_STASH_REFLOG_LIMIT {
+                return Err(simple_error(
+                    operation,
+                    cwd,
+                    "The stash reflog exceeded its byte limit.",
+                ));
+            }
+            Ok(bytes)
+        };
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Err(simple_error(operation, cwd, "Stash reflog observation was cancelled.")),
+            result = tokio::time::timeout(DEFAULT_TIMEOUT, observation) => result.unwrap_or_else(|_| Err(simple_error(operation, cwd, "Stash reflog observation timed out."))),
+        }
     }
 
     pub(crate) async fn git_manager_default_ref(
@@ -2175,7 +2306,6 @@ impl GitRepository {
         if !self.is_repository(cwd, cancellation).await? {
             return Ok(ObservedRemoteStatus {
                 ref_name: None,
-                head_signature: "not-repository".to_owned(),
                 remote: None,
             });
         }
@@ -2212,7 +2342,6 @@ impl GitRepository {
             .await?;
         Ok(ObservedRemoteStatus {
             ref_name: branch,
-            head_signature: parse_head_signature(&status.stdout),
             remote: Some(remote),
         })
     }
@@ -6967,6 +7096,154 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn git_manager_stash_reflog_observation_is_bounded_and_cancellable() {
+        let root = tempfile::tempdir().expect("reflog fixture");
+        let repository = GitRepository::default();
+        let cancellation = CancellationToken::new();
+        let observe =
+            || repository.git_manager_signal_stash_reflog(root.path(), root.path(), &cancellation);
+        assert!(observe().await.expect("absent reflog").is_empty());
+        let path = root.path().join("logs/refs/stash");
+        fs::create_dir_all(path.parent().expect("reflog parent")).expect("reflog directory");
+        fs::write(&path, b"first entry\nsecond entry\n").expect("reflog");
+        assert_eq!(
+            observe().await.expect("reflog bytes"),
+            b"first entry\nsecond entry\n"
+        );
+        fs::write(&path, b"second entry\n").expect("non-top rewrite");
+        assert_eq!(
+            observe().await.expect("rewritten reflog"),
+            b"second entry\n"
+        );
+        fs::write(&path, vec![0; super::GIT_MANAGER_STASH_REFLOG_LIMIT + 1])
+            .expect("oversized reflog");
+        assert!(
+            observe()
+                .await
+                .expect_err("bounded reflog")
+                .detail
+                .contains("byte limit")
+        );
+        fs::remove_file(&path).expect("remove file");
+        fs::create_dir(&path).expect("non-file reflog");
+        assert!(observe().await.is_err());
+        cancellation.cancel();
+        assert!(
+            observe()
+                .await
+                .expect_err("cancelled")
+                .detail
+                .contains("cancelled")
+        );
+    }
+
+    #[tokio::test]
+    async fn git_manager_signal_head_distinguishes_named_detached_and_unborn() {
+        for (head, oid, expected_ref, expected_oid) in [
+            (
+                process_result(0, "main\n", ""),
+                process_result(0, "deadbeef\n", ""),
+                Some("main"),
+                Some("deadbeef"),
+            ),
+            (
+                process_result(1, "", ""),
+                process_result(0, "deadbeef\n", ""),
+                None,
+                Some("deadbeef"),
+            ),
+            (
+                process_result(0, "main\n", ""),
+                process_result(1, "", ""),
+                Some("main"),
+                None,
+            ),
+            // An interrupted clone's placeholder HEAD, on files and on reftable.
+            (
+                process_result(128, "", "fatal: No such ref: HEAD"),
+                process_result(1, "", ""),
+                None,
+                None,
+            ),
+            (
+                process_result(1, "", ""),
+                process_result(1, "", ""),
+                None,
+                None,
+            ),
+        ] {
+            let runner = Arc::new(RecordingGitRunner {
+                outputs: HashMap::from([
+                    ("GitManager.signal.headRef".into(), head),
+                    ("GitManager.signal.headSha".into(), oid),
+                ]),
+                requests: Mutex::new(Vec::new()),
+            });
+            let head = GitRepository::with_runner_for_test(runner.clone())
+                .git_manager_signal_head(Path::new("/repo"), &CancellationToken::new())
+                .await
+                .expect("HEAD observation");
+            assert_eq!(head.reference.as_deref(), expected_ref);
+            assert_eq!(head.oid.as_deref(), expected_oid);
+            assert!(
+                runner
+                    .requests
+                    .lock()
+                    .expect("requests")
+                    .iter()
+                    .all(|request| request
+                        .env
+                        .iter()
+                        .any(|(name, value)| name == "GIT_OPTIONAL_LOCKS" && value == "0"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn git_manager_signal_head_rejects_invalid_or_failed_reads() {
+        for (head, oid, expected_operation) in [
+            (
+                process_result(128, "", "fatal"),
+                process_result(0, "deadbeef\n", ""),
+                "GitManager.signal.headRef",
+            ),
+            (
+                process_result(0, "", ""),
+                process_result(0, "deadbeef\n", ""),
+                "GitManager.signal.headRef",
+            ),
+            (
+                process_result(0, "main\n", ""),
+                process_result(128, "", "fatal"),
+                "GitManager.signal.headSha",
+            ),
+            (
+                process_result(128, "", "fatal"),
+                process_result(128, "", "fatal"),
+                "GitManager.signal.headRef",
+            ),
+            (
+                process_result(0, "main\n", ""),
+                process_result(0, "", ""),
+                "GitManager.signal.headSha",
+            ),
+        ] {
+            let runner = Arc::new(RecordingGitRunner {
+                outputs: HashMap::from([
+                    ("GitManager.signal.headRef".into(), head),
+                    ("GitManager.signal.headSha".into(), oid),
+                ]),
+                requests: Mutex::new(Vec::new()),
+            });
+            let error = GitRepository::with_runner_for_test(runner)
+                .git_manager_signal_head(Path::new("/repo"), &CancellationToken::new())
+                .await
+                .expect_err("HEAD failure must not become a signature");
+            assert_eq!(error.operation.as_ref(), expected_operation);
+        }
+    }
+
     #[test]
     fn background_git_reads_disable_optional_locks() {
         let environment = git_read_environment();
@@ -8794,7 +9071,7 @@ async fn resolve_worktree_prune_path(
         ));
     }
 
-    let file = prune_gitdir_open_options().open(&gitdir_path).await?;
+    let file = git_metadata_open_options().open(&gitdir_path).await?;
     let opened = file.metadata().await?;
     if !opened.is_file() || !same_prune_file_identity(&before, &opened) {
         return Err(io::Error::new(
@@ -8834,7 +9111,7 @@ async fn resolve_worktree_prune_path(
     parse_prune_gitdir_path(bytes)
 }
 
-fn prune_gitdir_open_options() -> tokio::fs::OpenOptions {
+fn git_metadata_open_options() -> tokio::fs::OpenOptions {
     let mut options = tokio::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -9092,14 +9369,6 @@ fn parse_branch_headers(stdout: &str) -> (Option<String>, Option<String>, u64, u
         upstream = None;
     }
     (branch, upstream, ahead, behind)
-}
-
-fn parse_head_signature(stdout: &str) -> String {
-    stdout
-        .lines()
-        .filter(|line| line.starts_with("# branch.oid ") || line.starts_with("# branch.head "))
-        .collect::<Vec<_>>()
-        .join("\0")
 }
 
 fn parse_summary_identity(

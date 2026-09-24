@@ -1,3 +1,4 @@
+import type { GitManagerCommitEntry } from "@bibcode/contracts";
 import { LRUCache } from "../../../lib/lruCache";
 
 interface CommitIdentity {
@@ -26,11 +27,36 @@ export function spliceCommitGeneration<T extends CommitIdentity>({
     loadedShas.add(commit.sha);
     return true;
   });
-  const incomingShas = new Set(incoming.map((commit) => commit.sha));
+  const incomingBySha = new Map(incoming.map((commit) => [commit.sha, commit]));
+  const incomingShas = new Set(incomingBySha.keys());
   return {
-    commits: [...incomingAdditions, ...loaded],
+    commits: [
+      ...incomingAdditions,
+      ...loaded.map((commit) => incomingBySha.get(commit.sha) ?? commit),
+    ],
     requiresReset: pinnedTips.length > 0 && !pinnedTips.some((tipSha) => incomingShas.has(tipSha)),
   };
+}
+
+/** Replace only server-owned decorations while retaining pinned rows and order. */
+export function mergeCommitDecorations(
+  loaded: ReadonlyArray<GitManagerCommitEntry>,
+  refreshed: ReadonlyArray<GitManagerCommitEntry>,
+): ReadonlyArray<GitManagerCommitEntry> {
+  const bySha = new Map(refreshed.map((commit) => [commit.sha, commit.decorations]));
+  let changed = false;
+  const result = loaded.map((commit) => {
+    const decorations = bySha.get(commit.sha);
+    if (
+      decorations === undefined ||
+      (decorations.length === commit.decorations.length &&
+        decorations.every((value, index) => value === commit.decorations[index]))
+    )
+      return commit;
+    changed = true;
+    return { ...commit, decorations };
+  });
+  return changed ? result : loaded;
 }
 
 interface ShouldLoadNextPageInput {

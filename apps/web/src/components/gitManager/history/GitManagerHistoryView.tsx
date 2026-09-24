@@ -11,7 +11,16 @@ import * as Cause from "effect/Cause";
 import * as Schema from "effect/Schema";
 import { AsyncResult } from "effect/unstable/reactivity";
 import { RefreshCwIcon } from "lucide-react";
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  type MouseEvent,
+} from "react";
 
 import { DEFAULT_GIT_MANAGER_VIEW_STATE, useGitManagerStore } from "../../../gitManagerStore";
 import { readLocalApi } from "../../../localApi";
@@ -22,9 +31,10 @@ import {
   type GitManagerCommitMenuItemId,
 } from "../rewrite/GitManagerCommitContextMenu.logic";
 import type { GitManagerCommitDropResolution } from "../rewrite/gitManagerCommitDrag";
-import { createCommitLookup, spliceCommitGeneration } from "./commitPaging";
+import { createCommitLookup, spliceCommitGeneration, mergeCommitDecorations } from "./commitPaging";
 import { GitManagerCommitDetail } from "./GitManagerCommitDetail";
 import { GitManagerCommitList } from "./GitManagerCommitList";
+import { Button } from "../../ui/button";
 
 const HISTORY_PAGE_SIZE = 100;
 const COMMIT_LOOKUP_MAX_ENTRIES = 1_000;
@@ -62,13 +72,56 @@ interface GitManagerHistoryViewProps {
   readonly rewriteDisabledReason: string | null;
   readonly tagDisabledReason: string | null;
   /**
-   * The repository generation the panel's refs snapshot last observed. The
-   * history page shares that counter, so a generation ahead of the loaded page
-   * means a commit landed (app-authored or external) and the first page must be
-   * refreshed and spliced.
+   * The repository generation the panel's refs snapshot last observed. History
+   * pages share that counter, so a generation past the loaded pages means a
+   * commit landed and, once no first-page read is in flight, the first page is
+   * refreshed and spliced. This covers in-app operations while the watcher is
+   * degraded and clients without a signal. The panel refreshes refs on every
+   * signal change, so this value also reports a change carried by a signal
+   * change that History deferred instead of reading.
    */
   readonly repositoryGeneration: number | null;
+  /** The live signal generation, or null without a live signal. Each change refreshes the first page. */
+  readonly signalGeneration: number | null;
+  /**
+   * True while a live signal is expected but its first generation has not
+   * arrived. The first read waits for it, so one read serves both triggers.
+   */
+  readonly signalPending: boolean;
   readonly onAction: (action: GitManagerHistoryAction) => void;
+}
+
+/** What the current first-page read accounts for; advanced during render. */
+interface FirstPageRefresh {
+  /** Monotonic first-page read number, null until the first read is decided. */
+  readonly sequence: number | null;
+  /** The signal generation the current read accounts for. */
+  readonly signalGeneration: number | null;
+  /** The newest repository generation that requested a read. */
+  readonly repositoryGeneration: number | null;
+  /**
+   * The next signal change is expected to repeat what the current read covers:
+   * the watcher's echo of a repository-triggered read, or the server's first
+   * signature after generation 0. It defers to the repository generation
+   * instead of reading.
+   */
+  readonly deferNextSignal: boolean;
+}
+
+/**
+ * Local query-cache identity for History reads: unique per mounted view and
+ * never reused, so a refresh can never be answered from an earlier read.
+ */
+function historyRefreshCacheKey(viewId: string, sequence: number): string {
+  return `${viewId}${sequence}`;
+}
+
+const SENTENCE_END = /[.!?…]$/;
+
+/** Ends a failure cause as a sentence, so the banner's next sentence reads correctly. */
+function asSentence(text: string): string {
+  const trimmed = text.trimEnd();
+  return SENTENCE_END.test(trimmed) ? trimmed : `${trimmed}.`;
 }
 
 interface HistoryPagesState {
@@ -78,7 +131,14 @@ interface HistoryPagesState {
   readonly nextOffset: number | null;
   readonly exhausted: boolean;
   readonly degradedToAllPaging: boolean;
-  readonly processedFirstPageSignature: string | null;
+  readonly processedFirstPage: GitManagerCommitPage | null;
+  readonly retainedRefresh: {
+    /** The first-page response that captured this batch; the batch runs only while it is current. */
+    readonly firstPage: GitManagerCommitPage;
+    readonly pinnedTips: ReadonlyArray<string>;
+    readonly offsets: ReadonlyArray<number>;
+    readonly refreshCacheKey: string;
+  } | null;
 }
 
 function emptyHistoryPages(): HistoryPagesState {
@@ -89,7 +149,8 @@ function emptyHistoryPages(): HistoryPagesState {
     nextOffset: null,
     exhausted: false,
     degradedToAllPaging: false,
-    processedFirstPageSignature: null,
+    processedFirstPage: null,
+    retainedRefresh: null,
   };
 }
 
@@ -105,10 +166,11 @@ function pageSignature(page: GitManagerCommitPage | null, requestOffset = 0): st
     page.commits.length,
     page.commits[0]?.sha ?? "empty",
     page.commits.at(-1)?.sha ?? "empty",
+    JSON.stringify(page.commits.map((commit) => commit.decorations)),
   ].join(":");
 }
 
-function historyFromFirstPage(page: GitManagerCommitPage, signature: string): HistoryPagesState {
+function historyFromFirstPage(page: GitManagerCommitPage): HistoryPagesState {
   return {
     generation: page.generation,
     pinnedTips: page.pinnedTips,
@@ -116,7 +178,8 @@ function historyFromFirstPage(page: GitManagerCommitPage, signature: string): Hi
     nextOffset: page.nextOffset,
     exhausted: page.exhausted,
     degradedToAllPaging: page.degradedToAllPaging,
-    processedFirstPageSignature: signature,
+    processedFirstPage: page,
+    retainedRefresh: null,
   };
 }
 
@@ -147,24 +210,33 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
   rewriteDisabledReason,
   tagDisabledReason,
   repositoryGeneration,
+  signalGeneration,
+  signalPending,
   onAction,
 }: GitManagerHistoryViewProps) {
   const { environmentId, cwd } = scope;
   const projectEnvironmentId = projectRef.environmentId;
   const projectId = projectRef.projectId;
   const storeKey = projectKey(projectRef);
+  const viewId = useId();
   const [pages, setPages] = useState<HistoryPagesState>(emptyHistoryPages);
   const [loadingOffset, setLoadingOffset] = useState<number | null>(null);
   const [loadMoreError, setLoadMoreError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [refreshEpoch, setRefreshEpoch] = useState(0);
+  const [refresh, setRefresh] = useState<FirstPageRefresh>(() => ({
+    sequence: signalPending ? null : 0,
+    signalGeneration,
+    repositoryGeneration: null,
+    deferNextSignal: signalGeneration === 0,
+  }));
   const pagesRef = useRef(pages);
   const loadingOffsetRef = useRef(loadingOffset);
   const firstPageRef = useRef<GitManagerCommitPage | null>(null);
   const nextPageRef = useRef<GitManagerCommitPage | null>(null);
   const processedNextPageSignatureRef = useRef<string | null>(null);
   const explicitRefreshRef = useRef(false);
-  const requestedGenerationRef = useRef<number | null>(null);
+  const retainedSequenceRef = useRef(0);
   const [commitLookup] = useState(() =>
     createCommitLookup<GitManagerCommitEntry>(
       COMMIT_LOOKUP_MAX_ENTRIES,
@@ -218,17 +290,67 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
   loadedPageCursorsRef.current = loadedPageCursors;
   const loadedPageCursorSignature = loadedPageCursors.join(",");
 
+  // Advance the first-page read from the triggers during render (React's
+  // "store information from previous renders" pattern), so a new read starts in
+  // the same commit that observes the trigger. The first read waits until the
+  // signal's availability is known; after that every signal change starts a
+  // read unless it is deferred (see `deferNextSignal`). Deferring is safe: the
+  // panel re-reads refs on every signal change, so a real change still arrives
+  // as a repository generation past the loaded pages.
+  let firstPageRefresh = refresh;
+  if (firstPageRefresh.sequence === null) {
+    if (!signalPending) {
+      firstPageRefresh = {
+        ...firstPageRefresh,
+        sequence: 0,
+        signalGeneration,
+        deferNextSignal: signalGeneration === 0,
+      };
+    }
+  } else if (signalGeneration !== null && signalGeneration !== firstPageRefresh.signalGeneration) {
+    firstPageRefresh = firstPageRefresh.deferNextSignal
+      ? { ...firstPageRefresh, signalGeneration, deferNextSignal: false }
+      : { ...firstPageRefresh, sequence: firstPageRefresh.sequence + 1, signalGeneration };
+  }
+  if (firstPageRefresh !== refresh) setRefresh(firstPageRefresh);
+  const firstPageSequence = firstPageRefresh.sequence;
   const firstPageAtom = useMemo(
     () =>
-      gitManagerEnvironment.getCommits({
-        environmentId,
-        input: { cwd, limit: HISTORY_PAGE_SIZE },
-      }),
-    [cwd, environmentId],
+      firstPageSequence === null
+        ? null
+        : gitManagerEnvironment.getHistoryFirstPage({
+            environmentId,
+            input: {
+              cwd,
+              limit: HISTORY_PAGE_SIZE,
+              refreshCacheKey: historyRefreshCacheKey(viewId, firstPageSequence),
+            },
+          }),
+    [cwd, environmentId, firstPageSequence, viewId],
   );
   const firstPageQuery = useEnvironmentQuery(firstPageAtom);
+  const refreshFirstPage = firstPageQuery.refresh;
   firstPageRef.current = firstPageQuery.data;
-  const firstPageSignature = pageSignature(firstPageQuery.data);
+  const firstPage = firstPageQuery.data;
+  // A repository generation past everything loaded or returned (the loaded
+  // pages lag the latest response by one effect) refreshes once no first-page
+  // read is in flight. Each repository generation requests at most one read.
+  const loadedGeneration = Math.max(pages.generation ?? -1, firstPage?.generation ?? -1);
+  if (
+    firstPageSequence !== null &&
+    !firstPageQuery.emission.waiting &&
+    loadedGeneration >= 0 &&
+    repositoryGeneration !== null &&
+    repositoryGeneration > loadedGeneration &&
+    repositoryGeneration !== firstPageRefresh.repositoryGeneration
+  ) {
+    setRefresh({
+      ...firstPageRefresh,
+      sequence: firstPageSequence + 1,
+      repositoryGeneration,
+      deferNextSignal: signalGeneration !== null,
+    });
+  }
 
   const nextPageAtom = useMemo(() => {
     if (loadingOffset === null) return null;
@@ -245,37 +367,63 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
   }, [cwd, environmentId, loadingOffset, pages.pinnedTips]);
   const nextPageQuery = useEnvironmentQuery(nextPageAtom);
   nextPageRef.current = nextPageQuery.data;
-  const nextPageSignature = pageSignature(nextPageQuery.data, loadingOffset ?? 0);
+  const nextPageSignature = useMemo(
+    () => pageSignature(nextPageQuery.data, loadingOffset ?? 0),
+    [nextPageQuery.data, loadingOffset],
+  );
   const nextPageTipsUnresolvable = isTipsUnresolvableFailure(nextPageQuery.emission);
 
-  const loadedGeneration = pages.generation;
+  const retainedRefresh = pages.retainedRefresh;
+  const retainedAtom = useMemo(
+    () =>
+      retainedRefresh === null || retainedRefresh.firstPage !== firstPage
+        ? null
+        : gitManagerEnvironment.getRetainedCommitPages({
+            environmentId,
+            input: {
+              cwd,
+              pinnedTips: retainedRefresh.pinnedTips,
+              offsets: retainedRefresh.offsets,
+              limit: HISTORY_PAGE_SIZE,
+              refreshCacheKey: retainedRefresh.refreshCacheKey,
+            },
+          }),
+    [cwd, environmentId, firstPage, retainedRefresh],
+  );
+  const retainedQuery = useEnvironmentQuery(retainedAtom);
+  const retainedPages = retainedQuery.data;
   useEffect(() => {
-    if (
-      repositoryGeneration === null ||
-      loadedGeneration === null ||
-      repositoryGeneration <= loadedGeneration ||
-      requestedGenerationRef.current === repositoryGeneration
-    ) {
-      return;
-    }
-    requestedGenerationRef.current = repositoryGeneration;
-    firstPageQuery.refresh();
-  }, [firstPageQuery.refresh, loadedGeneration, repositoryGeneration]);
+    if (retainedPages === null || retainedQuery.emission.waiting) return;
+    const current = pagesRef.current;
+    const commits = mergeCommitDecorations(
+      current.commits,
+      retainedPages.flatMap((page) =>
+        current.generation === null || page.generation >= current.generation ? page.commits : [],
+      ),
+    );
+    if (commits === current.commits) return;
+    for (const commit of commits) commitLookup.set(commit);
+    const next = { ...current, commits };
+    pagesRef.current = next;
+    setPages(next);
+  }, [commitLookup, retainedPages, retainedQuery.emission.waiting]);
 
   useEffect(() => {
     const page = firstPageRef.current;
-    if (page === null || firstPageSignature === null) return;
+    if (page === null) return;
     const current = pagesRef.current;
-    if (current.processedFirstPageSignature === firstPageSignature && !explicitRefreshRef.current) {
+    if (current.processedFirstPage === page && !explicitRefreshRef.current) {
       return;
     }
-    for (const commit of page.commits) commitLookup.set(commit);
+    if (current.generation === null || page.generation >= current.generation) {
+      for (const commit of page.commits) commitLookup.set(commit);
+    }
 
     let next: HistoryPagesState;
     let resetCursors = false;
     let preserveStoredCursors = false;
     if (explicitRefreshRef.current || current.generation === null || current.commits.length === 0) {
-      next = historyFromFirstPage(page, firstPageSignature);
+      next = historyFromFirstPage(page);
       resetCursors = true;
       preserveStoredCursors = current.generation === null && !explicitRefreshRef.current;
     } else if (page.generation < current.generation) {
@@ -283,7 +431,7 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
       // in-flight response (an older read completing after a newer one).
       // Record it as seen without letting it regress the tip or the counter;
       // the newer page already holds the post-mutation history.
-      next = { ...current, processedFirstPageSignature: firstPageSignature };
+      next = { ...current, processedFirstPage: page };
     } else if (page.generation !== current.generation) {
       const spliced = spliceCommitGeneration({
         loaded: current.commits,
@@ -291,20 +439,49 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
         pinnedTips: current.pinnedTips,
       });
       if (current.degradedToAllPaging || page.degradedToAllPaging) {
-        next = historyFromFirstPage(page, firstPageSignature);
+        next = historyFromFirstPage(page);
         resetCursors = true;
       } else {
         next = {
           ...current,
           generation: page.generation,
           commits: spliced.commits,
-          processedFirstPageSignature: firstPageSignature,
+          processedFirstPage: page,
         };
       }
     } else {
-      next = { ...current, processedFirstPageSignature: firstPageSignature };
+      next = {
+        ...current,
+        commits: mergeCommitDecorations(current.commits, page.commits),
+        processedFirstPage: page,
+      };
     }
 
+    if (!resetCursors && current.generation !== null && page.generation >= current.generation) {
+      const sameTips =
+        page.pinnedTips.length === current.pinnedTips.length &&
+        page.pinnedTips.every((tip, index) => tip === current.pinnedTips[index]);
+      const refreshedShas = new Set(page.commits.map((commit) => commit.sha));
+      const coversLoadedHistory = current.commits.every((commit) => refreshedShas.has(commit.sha));
+      const offsets = coversLoadedHistory
+        ? []
+        : (loadedPageCursorsRef.current.length === 0 ? [0] : loadedPageCursorsRef.current).filter(
+            (offset) => offset !== 0 || !sameTips,
+          );
+      // Capture the loaded pages when a fresh server response completes. This
+      // snapshot stays fixed while the user loads more pages or refs catch up.
+      let retained: HistoryPagesState["retainedRefresh"] = null;
+      if (offsets.length > 0) {
+        retainedSequenceRef.current += 1;
+        retained = {
+          firstPage: page,
+          pinnedTips: current.pinnedTips,
+          offsets,
+          refreshCacheKey: historyRefreshCacheKey(viewId, retainedSequenceRef.current),
+        };
+      }
+      next = { ...next, retainedRefresh: retained };
+    }
     explicitRefreshRef.current = false;
     pagesRef.current = next;
     setPages(next);
@@ -322,12 +499,13 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
     }
   }, [
     commitLookup,
-    firstPageSignature,
+    firstPage,
     projectEnvironmentId,
     projectId,
     refreshEpoch,
     setLoadedPageCount,
     setLoadedPageCursors,
+    viewId,
   ]);
 
   useEffect(() => {
@@ -388,12 +566,12 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
       setLoadedPageCursors(currentProjectRef, []);
       setLoadedPageCount(currentProjectRef, 0);
       setRefreshEpoch((epoch) => epoch + 1);
-      firstPageQuery.refresh();
+      refreshFirstPage();
       return;
     }
     setLoadMoreError(nextPageQuery.error);
   }, [
-    firstPageQuery.refresh,
+    refreshFirstPage,
     loadingOffset,
     nextPageQuery.error,
     nextPageTipsUnresolvable,
@@ -417,10 +595,30 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
     setLoadingOffset(nextOffset);
   }, [loadedPageCursorSignature, loadingOffset, pages.exhausted, pages.nextOffset]);
 
+  const loadedCommitIndex = useMemo(
+    () => new Map(pages.commits.map((commit) => [commit.sha, commit])),
+    [pages.commits],
+  );
+  // A failed first page outranks a failed retained batch: its successful retry
+  // captures a fresh batch. Retrying keeps the failure visible until it settles.
+  const refreshFailure =
+    pages.commits.length > 0 && firstPageQuery.error !== null
+      ? {
+          cause: firstPageQuery.error,
+          retrying: firstPageQuery.emission.waiting,
+          retry: refreshFirstPage,
+        }
+      : retainedQuery.error !== null
+        ? {
+            cause: retainedQuery.error,
+            retrying: retainedQuery.emission.waiting,
+            retry: retainedQuery.refresh,
+          }
+        : null;
   const selectedSha = selectedCommitSha ?? scrollAnchor;
   const selectedCommit =
+    (selectedSha === null ? null : loadedCommitIndex.get(selectedSha)) ??
     (selectedSha === null ? null : commitLookup.get(selectedSha)) ??
-    pages.commits.find((commit) => commit.sha === selectedSha) ??
     pages.commits[0] ??
     null;
   const effectiveSelectedSha = selectedCommit?.sha ?? null;
@@ -660,10 +858,10 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
     setLoadedPageCursors(currentProjectRef, []);
     setLoadedPageCount(currentProjectRef, 0);
     setRefreshEpoch((epoch) => epoch + 1);
-    firstPageQuery.refresh();
+    refreshFirstPage();
   }, [
     commitLookup,
-    firstPageQuery.refresh,
+    refreshFirstPage,
     projectEnvironmentId,
     projectId,
     setLoadedPageCount,
@@ -673,7 +871,7 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
     setSelectedFile,
   ]);
 
-  if (firstPageQuery.isPending && pages.commits.length === 0) {
+  if ((firstPageAtom === null || firstPageQuery.isPending) && pages.commits.length === 0) {
     return (
       <p role="status" className="p-4 text-sm text-muted-foreground">
         Loading commit history…
@@ -683,14 +881,10 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
   if (firstPageQuery.error !== null && pages.commits.length === 0) {
     return (
       <div className="space-y-2 p-4">
-        <p className="text-sm text-destructive">{firstPageQuery.error}</p>
-        <button
-          type="button"
-          className="rounded-md border border-border px-2.5 py-1.5 text-xs hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring"
-          onClick={handleRefresh}
-        >
-          Retry history
-        </button>
+        <p className="text-sm text-destructive">Couldn’t load history: {firstPageQuery.error}</p>
+        <Button size="xs" variant="outline" onClick={handleRefresh}>
+          Retry
+        </Button>
       </div>
     );
   }
@@ -722,6 +916,25 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
           limit.
         </p>
       ) : null}
+      {refreshFailure === null ? null : (
+        <div
+          role="status"
+          className="flex shrink-0 items-center gap-2 border-b border-destructive/30 px-3 py-2 text-xs text-destructive"
+        >
+          <span className="min-w-0 flex-1">
+            Couldn’t refresh history: {asSentence(refreshFailure.cause)} Your loaded commits are
+            still available.
+          </span>
+          <Button
+            disabled={refreshFailure.retrying}
+            size="xs"
+            variant="outline"
+            onClick={refreshFailure.retry}
+          >
+            {refreshFailure.retrying ? "Retrying…" : "Retry"}
+          </Button>
+        </div>
+      )}
       {loadMoreError !== null ? (
         <p
           role="status"
