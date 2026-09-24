@@ -2,6 +2,7 @@ import type {
   TerminalAttachStreamEvent,
   TerminalConsoleTheme,
   TerminalSessionSnapshot,
+  TerminalSize,
 } from "@bibcode/contracts";
 
 import {
@@ -10,7 +11,14 @@ import {
 } from "./terminalTranscript.ts";
 
 export type TerminalRenderSignal =
-  | { readonly type: "reset"; readonly snapshot: string }
+  | {
+      readonly type: "reset";
+      readonly snapshot: string;
+      readonly size?: TerminalSize;
+      readonly oscColorResponderActive?: boolean;
+      readonly firstAttachmentGrant?: boolean;
+    }
+  | { readonly type: "resized"; readonly size: TerminalSize }
   | { readonly type: "delta"; readonly data: string };
 
 export interface TerminalMetadataSnapshot {
@@ -19,7 +27,7 @@ export interface TerminalMetadataSnapshot {
   readonly consoleTheme: TerminalConsoleTheme | null;
   /** Bumps whenever a server snapshot replaces the transcript. */
   readonly generation: number;
-  /** Bumps for lifecycle metadata changes, never for output or activity. */
+  /** Bumps for lifecycle metadata changes, never for output, activity, or resizing. */
   readonly revision: number;
 }
 
@@ -33,7 +41,10 @@ export const EMPTY_TERMINAL_METADATA_SNAPSHOT = Object.freeze<TerminalMetadataSn
 
 export interface TerminalTranscriptRuntime {
   ingest(event: TerminalAttachStreamEvent): void;
-  attachRenderer(sink: (signal: TerminalRenderSignal) => void): { detach(): void };
+  attachRenderer(
+    sink: (signal: TerminalRenderSignal) => void,
+    sizeClaim?: string,
+  ): { detach(): void };
   snapshot(): string;
   metadata(): TerminalMetadataSnapshot;
   subscribeMetadata(listener: (metadata: TerminalMetadataSnapshot) => void): () => void;
@@ -45,19 +56,24 @@ export function createTerminalTranscriptRuntime(
   const transcript = createTerminalTranscript(
     options.maxBufferBytes ?? DEFAULT_MAX_TERMINAL_BUFFER_BYTES,
   );
-  const rendererSet = new Set<(signal: TerminalRenderSignal) => void>();
+  const rendererClaims = new Map<(signal: TerminalRenderSignal) => void, string | undefined>();
   const metadataListeners = new Set<(metadata: TerminalMetadataSnapshot) => void>();
   const pendingEvents: Array<TerminalAttachStreamEvent> = [];
   let pendingHead = 0;
   let processingEvents = false;
   let metadata = EMPTY_TERMINAL_METADATA_SNAPSHOT;
-  let renderers: ReadonlyArray<(signal: TerminalRenderSignal) => void> = [];
+  let size: TerminalSize | undefined;
+  let oscColorResponderActive = false;
+  let firstAttachmentGrantClaim: string | null = null;
+  let renderers: ReadonlyArray<
+    readonly [(signal: TerminalRenderSignal) => void, string | undefined]
+  > = [];
 
-  const fanRender = (signal: TerminalRenderSignal) => {
+  const fanRender = (signal: TerminalRenderSignal | ((claim?: string) => TerminalRenderSignal)) => {
     const currentRenderers = renderers;
-    for (const sink of currentRenderers) {
+    for (const [sink, claim] of currentRenderers) {
       try {
-        sink(signal);
+        sink(typeof signal === "function" ? signal(claim) : signal);
       } catch {
         // Renderer failures are isolated from transcript ingestion and other renderers.
       }
@@ -89,14 +105,36 @@ export function createTerminalTranscriptRuntime(
     });
   };
 
+  const createResetSignalAndConsumeGrant = (
+    snapshot: string,
+    rendererClaim?: string,
+  ): TerminalRenderSignal => {
+    const firstAttachmentGrant =
+      firstAttachmentGrantClaim !== null && firstAttachmentGrantClaim === rendererClaim;
+    // A cached transcript can hydrate many mounts. The first-attachment grant
+    // is consumed only by its owner, once, rather than replayed with the cache.
+    if (firstAttachmentGrant) firstAttachmentGrantClaim = null;
+    return {
+      type: "reset",
+      snapshot,
+      ...(size ? { size } : {}),
+      ...(oscColorResponderActive ? { oscColorResponderActive: true } : {}),
+      ...(firstAttachmentGrant ? { firstAttachmentGrant: true } : {}),
+    };
+  };
+
   const resetTranscript = (snapshot: TerminalSessionSnapshot) => {
     transcript.clear();
     transcript.append(snapshot.history);
+    size = snapshot.size;
+    oscColorResponderActive = snapshot.oscColorResponderActive ?? false;
+    firstAttachmentGrantClaim = snapshot.firstAttachmentGrant ? (size?.sizeClaim ?? null) : null;
     updateMetadata(
       { status: snapshot.status, error: null, consoleTheme: snapshot.consoleTheme ?? null },
       true,
     );
-    fanRender({ type: "reset", snapshot: transcript.snapshot() });
+    const history = transcript.snapshot();
+    fanRender((claim) => createResetSignalAndConsumeGrant(history, claim));
     notifyMetadata();
   };
 
@@ -110,10 +148,16 @@ export function createTerminalTranscriptRuntime(
         transcript.append(event.data);
         fanRender({ type: "delta", data: event.data });
         return;
+      case "resized":
+        size = event.size;
+        if (size.sizeClaim !== firstAttachmentGrantClaim) firstAttachmentGrantClaim = null;
+        fanRender({ type: "resized", size });
+        return;
       case "cleared":
         transcript.clear();
+        firstAttachmentGrantClaim = null;
         updateMetadata({ status: metadata.status, error: null }, false);
-        fanRender({ type: "reset", snapshot: "" });
+        fanRender((claim) => createResetSignalAndConsumeGrant("", claim));
         notifyMetadata();
         return;
       case "exited":
@@ -150,12 +194,12 @@ export function createTerminalTranscriptRuntime(
         processingEvents = false;
       }
     },
-    attachRenderer(sink) {
+    attachRenderer(sink, rendererClaim) {
       let attached = true;
-      rendererSet.add(sink);
-      renderers = Array.from(rendererSet);
+      rendererClaims.set(sink, rendererClaim);
+      renderers = Array.from(rendererClaims);
       try {
-        sink({ type: "reset", snapshot: transcript.snapshot() });
+        sink(createResetSignalAndConsumeGrant(transcript.snapshot(), rendererClaim));
       } catch {
         // Initial hydration obeys the same observer isolation as live fan-out.
       }
@@ -163,8 +207,8 @@ export function createTerminalTranscriptRuntime(
         detach() {
           if (!attached) return;
           attached = false;
-          rendererSet.delete(sink);
-          renderers = Array.from(rendererSet);
+          rendererClaims.delete(sink);
+          renderers = Array.from(rendererClaims);
         },
       };
     },

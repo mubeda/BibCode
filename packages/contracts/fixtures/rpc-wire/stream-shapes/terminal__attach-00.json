@@ -17,7 +17,9 @@
         "consoleTheme": "light",
         "label": "\"f",
         "updatedAt": "G",
-        "sequence": 2147483622
+        "sequence": 2147483622,
+        "oscColorResponderActive": false,
+        "firstAttachmentGrant": false
       }
     }
   ]

@@ -1,0 +1,16 @@
+{
+  "_tag": "Chunk",
+  "requestId": "900719925474099312345",
+  "values": [
+    {
+      "threadId": "pJf?w?moB+_",
+      "terminalId": "_I+s?z\"_p",
+      "size": {
+        "cols": 768,
+        "rows": 497,
+        "sizeClaim": null
+      },
+      "type": "resized"
+    }
+  ]
+}

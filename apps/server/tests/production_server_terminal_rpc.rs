@@ -1286,12 +1286,17 @@ async fn terminal_rpc_clear_resize_restart_exit_and_restart_if_not_running_round
                     "threadId": "thread-restart",
                     "terminalId": "term-restart",
                     "cwd": temp.path().to_string_lossy(),
+                    "cols": 151,
+                    "rows": 50,
                     "env": {}
                 }),
             )
             .await,
         );
         assert_eq!(opened["status"], "running");
+        assert_eq!(opened["size"]["cols"], 151);
+        assert_eq!(opened["size"]["rows"], 50);
+        assert!(opened["size"]["sizeClaim"].is_null());
         let first_pid = opened["pid"].as_u64().expect("terminal pid");
 
         let started = next_terminal_event_and_ack(events, "1", "started", |value| {
@@ -1313,6 +1318,7 @@ async fn terminal_rpc_clear_resize_restart_exit_and_restart_if_not_running_round
             json!({
                 "threadId": "thread-restart",
                 "terminalId": "term-restart",
+                "sizeClaim": "rpc-renderer",
             }),
         )
         .await;
@@ -1408,10 +1414,17 @@ async fn terminal_rpc_clear_resize_restart_exit_and_restart_if_not_running_round
                     "terminalId": "term-restart",
                     "cols": 100,
                     "rows": 24,
+                    "sizeClaim": "rpc-renderer",
                 }),
             )
             .await,
         );
+        let resized =
+            next_terminal_event_and_ack(attach, "1", "resized", |value| value["type"] == "resized")
+                .await;
+        assert_eq!(resized["size"]["cols"], 100);
+        assert_eq!(resized["size"]["rows"], 24);
+        assert_eq!(resized["size"]["sizeClaim"], "rpc-renderer");
         assert_error_tag(
             request(
                 control,

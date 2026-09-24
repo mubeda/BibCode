@@ -1650,6 +1650,74 @@ offers **Reconnect input**, which refreshes the attachment to the same running
 process and never replays discarded text. This removes acknowledgement queuing
 during ordinary typing; remote echo still includes network round-trip latency.
 
+## Terminal size and reply ownership
+
+`terminalSizeOwnership` is negotiated from the environment capability set and is
+decoded as false when absent. The terminal manager owns PTY dimensions and one
+optional attachment owner; renderers mirror that applied state.
+
+| Protocol surface        | Additions and behavior                                                                                                                                                    |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `terminal.attach` input | Optional `sizeClaim`, a fresh random token for each renderer mount; optional fitted `cols`/`rows` initialize a missing PTY and never resize an existing one.              |
+| `terminal.resize` input | Optional `sizeClaim`; a registered claim transfers ownership, including at equal dimensions. Omitting it clears ownership for legacy callers.                             |
+| Attach snapshot         | Optional `size { cols, rows, sizeClaim }`; the whole object may be absent for older servers and `sizeClaim: null` means an unowned current size.                          |
+| Attach snapshot         | `oscColorResponderActive`, default false when absent, reports whether the actual spawned PTY color responder is active.                                                   |
+| Attach snapshot         | `firstAttachmentGrant`, default false when absent, grants one startup-history reply pass only before any claim, or a claimed stream surviving a restart, has consumed it. |
+| Attach event            | `resized { threadId, terminalId, size }`, only on streams opened with `sizeClaim`; never on `subscribeTerminalEvents` or operational-log records.                         |
+
+First-attachment grant selection and ownership assignment are atomic under the
+PTY generation publication lock. Attach assigns an owner only when unowned; it
+grants startup-history replies only when no claim has been applied and no
+claim-carrying stream survived a restart into this generation. A claimed attach
+or applied resize claim consumes the latch. Surviving claimed streams consume
+it only on the restart path: `Restarted` resets their sequence cursors, so they
+answer the restarted process's startup queries live as owner or under the
+null-claim rule. Restart without those streams permits one new grant.
+
+A non-restart `terminal.open` on an exited session publishes `Started` at
+sequence 1. Surviving streams do not reset their cursors for that event and drop
+it and early output, so those registrations do not consume the new generation's
+first-attachment grant. The next claim-carrying attach can receive it once.
+Dropping that `Started` event is a known limitation of surviving streams. Later
+and concurrent
+attaches neither renew a consumed grant nor displace a live owner. Claim
+eligibility ends with the exact attachment lifetime; dropping the owner
+publishes a null owner without changing dimensions, and stale resize requests
+cannot reclaim it. Manager shutdown cancels and drains attachment cleanup
+workers.
+
+Accepted resize/claim changes publish before subsequent PTY output under the
+same lock; failed resizes preserve state and exact no-ops emit nothing. A
+renderer retains one pending claim until RPC completion, on success or failure.
+The ordered echo updates applied dimensions and reply ownership. Notice
+suppression persists through successful RPC completion until applied size,
+ownership, or generation changes, including when success emits no echo. Input
+and reply decisions do not treat a pending claim as applied ownership. Null
+ownership permits live replies while attached renderers immediately try to claim
+it; mirrors suppress device/status/palette query replies. OSC 10/11/12 are
+suppressed for all renderers when the server responder is active; otherwise the
+owner can answer. The server continues handling `CSI ? 996 n`.
+
+The transcript runtime delivers the first-attachment grant once to the renderer
+with the matching claim. Its history replay may answer startup DSR/DA; ordinary
+replay drops xterm `onData` through the final parse callback, including cached
+remounts. Input before the first snapshot uses the existing bounded scheduler
+and negotiated lease. No reply-shaped input filtering is used.
+
+UI creation uses `terminal.open`, retaining its workspace admission lease and
+workspace-loss fence. An attach carrying `cwd` can still create a missing
+session without that lease/fence, for example when it arrives before open or
+recreates a terminal after a server restart (a known gap). Open and attach send fitted dimensions only when a mounted renderer can
+supply them; new right-panel reservations have none and use server defaults.
+
+Against a server without `terminalSizeOwnership`, every replay is guarded;
+startup-history queries are not answered on that transitional path. Live replies
+and legacy fit-and-resize behavior remain available. See [terminal attachment
+fidelity](overview.md#terminal-attachment-fidelity) for interaction and
+dismissal behavior, and the [validation
+runbook](../testing/cross-platform-validation.md#terminal-size-and-reply-ownership)
+for replay, multi-window, and legacy-client checks.
+
 ## Provider usage refresh
 
 `server.getProviderUsage` reads the server's current provider-usage snapshots.

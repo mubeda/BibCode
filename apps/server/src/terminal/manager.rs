@@ -13,13 +13,14 @@ use std::sync::Mutex as StdMutex;
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{Mutex, RwLock, broadcast};
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use super::model::{TerminalConsoleTheme, terminal_console_theme_from_env};
 use super::{
     PortablePtyBackend, PtyBackend, PtyExit, PtyProcess, PtySpawnInput, TerminalAttachInput,
     TerminalEvent, TerminalMetadataEvent, TerminalOpenInput, TerminalRestartInput,
-    TerminalSessionSnapshot, TerminalStatus, TerminalSummary, history::TerminalHistory,
+    TerminalSessionSnapshot, TerminalSize, TerminalStatus, TerminalSummary,
+    history::TerminalHistory,
 };
 use crate::{
     diagnostics::{
@@ -183,6 +184,11 @@ pub enum TerminalError {
     WorktreeRemovalInProgress { thread_id: String },
 }
 
+struct SizeOwner {
+    claim: String,
+    attachment: uuid::Uuid,
+}
+
 struct Session {
     generation: Arc<SessionGeneration>,
     thread_id: String,
@@ -202,6 +208,9 @@ struct Session {
     sequence: u64,
     cols: u16,
     rows: u16,
+    size_owner: Option<SizeOwner>,
+    first_attachment_grant_used: bool,
+    osc_color_responder_active: bool,
     process: Option<Arc<dyn PtyProcess>>,
     attribution_registration: Option<ProcessRegistration>,
     observer: Option<PreparedObserverHandle>,
@@ -1485,6 +1494,24 @@ struct PublisherBarrier {
 }
 
 impl Session {
+    fn size(&self) -> TerminalSize {
+        TerminalSize {
+            cols: self.cols,
+            rows: self.rows,
+            size_claim: self.size_owner.as_ref().map(|owner| owner.claim.clone()),
+        }
+    }
+
+    fn resized(&mut self) -> TerminalEvent {
+        let sequence = self.advance();
+        TerminalEvent::Resized {
+            thread_id: self.thread_id.clone(),
+            terminal_id: self.terminal_id.clone(),
+            sequence,
+            size: self.size(),
+        }
+    }
+
     fn snapshot(&self) -> TerminalSessionSnapshot {
         TerminalSessionSnapshot {
             thread_id: self.thread_id.clone(),
@@ -1500,6 +1527,10 @@ impl Session {
             label: self.display_label(),
             updated_at: self.updated_at.clone(),
             sequence: self.sequence,
+            size: Some(self.size()),
+            osc_color_responder_active: self.osc_color_responder_active,
+            // Only attach can issue the first-attachment grant.
+            first_attachment_grant: false,
         }
     }
 
@@ -1574,6 +1605,8 @@ struct Inner {
     worktree_removals: Arc<WorktreeRemovalRegistry>,
     generations: SessionGenerationRegistry,
     input: super::input::TerminalInputRegistry,
+    size_claim_attachments: std::sync::Mutex<HashMap<SessionKey, HashMap<String, uuid::Uuid>>>,
+    attachment_tasks: TaskTracker,
     sessions: RwLock<HashMap<SessionKey, SharedSession>>,
     events: broadcast::Sender<TerminalEvent>,
     metadata: broadcast::Sender<TerminalMetadataEvent>,
@@ -1636,6 +1669,8 @@ impl TerminalManager {
                     tokio::runtime::Handle::try_current().ok(),
                 ),
                 input: super::input::TerminalInputRegistry::default(),
+                size_claim_attachments: std::sync::Mutex::new(HashMap::new()),
+                attachment_tasks: TaskTracker::new(),
                 sessions: RwLock::new(HashMap::new()),
                 events,
                 metadata,
@@ -1881,25 +1916,11 @@ impl TerminalManager {
         let key = (input.thread_id.clone(), input.terminal_id.clone());
         let console_theme = terminal_console_theme_from_env(&input.env);
         if let Some(existing) = self.inner.sessions.read().await.get(&key).cloned() {
-            let (process, snapshot, needs_resize) = {
-                let session = existing.lock().await;
-                (
-                    session.process.clone(),
-                    session.snapshot(),
-                    session.cols != input.cols || session.rows != input.rows,
-                )
-            };
-            if let Some(process) = process {
-                if needs_resize {
-                    process
-                        .resize(input.cols, input.rows)
-                        .map_err(TerminalError::Io)?;
-                    let mut session = existing.lock().await;
-                    session.cols = input.cols;
-                    session.rows = input.rows;
-                    session.updated_at = now_iso();
-                }
-                return Ok(snapshot);
+            let session = existing.lock().await;
+            // Open dimensions initialize a new PTY. Existing sessions change
+            // size only through resize, which publishes the applied size/claim.
+            if session.process.is_some() {
+                return Ok(session.snapshot());
             }
         }
 
@@ -2234,6 +2255,9 @@ impl TerminalManager {
             sequence: 1,
             cols: input.cols,
             rows: input.rows,
+            size_owner: None,
+            first_attachment_grant_used: false,
+            osc_color_responder_active: process.osc_color_responder_active(),
             process: Some(process.clone()),
             attribution_registration,
             observer: generation.observer(),
@@ -2272,6 +2296,17 @@ impl TerminalManager {
                 .await;
             return Ok(existing.lock().await.snapshot());
         }
+        // Only Restarted resets surviving attachments' sequence cursors.
+        // A non-restart reopen leaves the first-attachment grant available.
+        let first_attachment_grant_used = restarted
+            && self
+                .inner
+                .size_claim_attachments
+                .lock()
+                .expect("terminal attachment claims")
+                .get(&key)
+                .is_some_and(|claims| !claims.is_empty());
+        session.lock().await.first_attachment_grant_used = first_attachment_grant_used;
         self.inner
             .sessions
             .write()
@@ -2696,11 +2731,10 @@ impl TerminalManager {
             }
         };
         tokio::task::yield_now().await;
-        let (session_generation, process, status, current_cols, current_rows) = {
+        let (session_generation, status, current_cols, current_rows) = {
             let session = session.lock().await;
             (
                 session.generation.clone(),
-                session.process.clone(),
                 session.status,
                 session.cols,
                 session.rows,
@@ -2734,30 +2768,93 @@ impl TerminalManager {
             session = self
                 .require_session(&input.thread_id, &input.terminal_id)
                 .await?;
-        } else if let (Some(process), Some(cols), Some(rows)) = (process, input.cols, input.rows)
-            && (cols != current_cols || rows != current_rows)
-        {
-            process.resize(cols, rows).map_err(TerminalError::Io)?;
-            let mut session = session.lock().await;
-            session.cols = cols;
-            session.rows = rows;
-            session.updated_at = now_iso();
         }
         let session_generation = session.lock().await.generation.clone();
+        if self.inner.cancellation.is_cancelled() {
+            return Err(TerminalError::Shutdown);
+        }
         let _publication = session_generation.publication.lock().await;
-        let initial = session.lock().await.snapshot();
-        if initial.status == TerminalStatus::Running && session_generation.is_invalidated() {
+        let mut current = session.lock().await;
+        if current.status == TerminalStatus::Running && session_generation.is_invalidated() {
             return Err(TerminalError::NotFound {
                 thread_id: input.thread_id,
                 terminal_id: input.terminal_id,
             });
         }
+        let size_claim = input
+            .size_claim
+            .map(|claim| {
+                let id = uuid::Uuid::new_v4();
+                // Registration and tracker closure share this synchronous gate.
+                // Never hold the global lifecycle lock while waiting for publication.
+                let mut attachments = self
+                    .inner
+                    .size_claim_attachments
+                    .lock()
+                    .expect("terminal attachment claims");
+                if self.inner.cancellation.is_cancelled() || self.inner.attachment_tasks.is_closed()
+                {
+                    return Err(TerminalError::Shutdown);
+                }
+                attachments
+                    .entry(key.clone())
+                    .or_default()
+                    .insert(claim.clone(), id);
+                let first_attachment_grant =
+                    current.size_owner.is_none() && !current.first_attachment_grant_used;
+                current.first_attachment_grant_used = true;
+                if current.size_owner.is_none() {
+                    current.size_owner = Some(SizeOwner {
+                        claim: claim.clone(),
+                        attachment: id,
+                    });
+                    let _ = self.inner.events.send(current.resized());
+                } else if let Some(owner) = current
+                    .size_owner
+                    .as_mut()
+                    .filter(|owner| owner.claim == claim)
+                {
+                    // A reconnect may reuse a renderer's claim. Its departed stream
+                    // must not clear ownership from this replacement attachment.
+                    owner.attachment = id;
+                }
+                let dropped = CancellationToken::new();
+                let inner = self.inner.clone();
+                let cleanup_key = key.clone();
+                let cleanup_drop = dropped.clone();
+                self.inner.attachment_tasks.spawn(async move {
+                    tokio::select! {
+                        () = inner.cancellation.cancelled() => {},
+                        () = cleanup_drop.cancelled() => {
+                            Self::release_size_claim(&inner, &cleanup_key, id).await;
+                        }
+                    }
+                });
+                Ok((
+                    TerminalAttachmentClaim {
+                        inner: Arc::downgrade(&self.inner),
+                        key,
+                        claim,
+                        id,
+                        dropped,
+                    },
+                    first_attachment_grant,
+                ))
+            })
+            .transpose()?;
+        let (size_claim, first_attachment_grant) = size_claim
+            .map_or((None, false), |(claim, first_attachment_grant)| {
+                (Some(claim), first_attachment_grant)
+            });
+        let mut initial = current.snapshot();
+        initial.first_attachment_grant = first_attachment_grant;
         Ok(TerminalAttachment {
             thread_id: input.thread_id,
             terminal_id: input.terminal_id,
             next_sequence: initial.sequence,
             initial,
-            events,
+            events: TerminalEventReceiver::new(events, size_claim.is_some()),
+            _size_claim: size_claim,
         })
     }
 
@@ -2872,6 +2969,7 @@ impl TerminalManager {
         terminal_id: &str,
         cols: u16,
         rows: u16,
+        size_claim: Option<String>,
     ) -> Result<(), TerminalError> {
         validate_dimensions(cols, rows)?;
         let Some(session) = self
@@ -2889,16 +2987,73 @@ impl TerminalManager {
         if generation.is_invalidated() {
             return Ok(());
         }
-        let process = session.lock().await.process.clone();
-        let Some(process) = process else {
+        let mut session = session.lock().await;
+        let size_owner = match size_claim {
+            Some(claim) => {
+                let attachments = self
+                    .inner
+                    .size_claim_attachments
+                    .lock()
+                    .expect("terminal attachment claims");
+                let Some(id) = attachments
+                    .get(&(thread_id.to_owned(), terminal_id.to_owned()))
+                    .and_then(|claims| claims.get(&claim))
+                else {
+                    // A queued resize from a departed renderer must not resurrect its claim.
+                    return Ok(());
+                };
+                Some(SizeOwner {
+                    claim,
+                    attachment: *id,
+                })
+            }
+            None => None,
+        };
+        let Some(process) = session.process.as_ref() else {
             return Ok(());
         };
-        process.resize(cols, rows).map_err(TerminalError::Io)?;
-        let mut session = session.lock().await;
+        let size_changed = session.cols != cols || session.rows != rows;
+        let owner_changed = session.size_owner.as_ref().map(|owner| &owner.claim)
+            != size_owner.as_ref().map(|owner| &owner.claim);
+        if size_changed {
+            process.resize(cols, rows).map_err(TerminalError::Io)?;
+        }
+        // Applying a claim consumes the grant even if no dimensions changed.
+        session.first_attachment_grant_used |= size_owner.is_some();
+        if !size_changed && !owner_changed {
+            return Ok(());
+        }
         session.cols = cols;
         session.rows = rows;
-        session.updated_at = now_iso();
+        session.size_owner = size_owner;
+        let _ = self.inner.events.send(session.resized());
         Ok(())
+    }
+
+    async fn release_size_claim(inner: &Inner, key: &SessionKey, attachment_id: uuid::Uuid) {
+        let Some(session) = inner.sessions.read().await.get(key).cloned() else {
+            return;
+        };
+        let generation = session.lock().await.generation.clone();
+        let _publication = tokio::select! {
+            () = inner.cancellation.cancelled() => return,
+            guard = generation.publication.lock() => guard,
+        };
+        if !inner
+            .sessions
+            .read()
+            .await
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, &session))
+        {
+            return;
+        }
+        let mut session = session.lock().await;
+        if session.size_owner.as_ref().map(|owner| owner.attachment) != Some(attachment_id) {
+            return;
+        }
+        session.size_owner = None;
+        let _ = inner.events.send(session.resized());
     }
 
     pub async fn clear(&self, thread_id: &str, terminal_id: &str) -> Result<(), TerminalError> {
@@ -3259,8 +3414,8 @@ impl TerminalManager {
         TerminalMetadataAttachment { initial, events }
     }
 
-    pub fn subscribe_events(&self) -> broadcast::Receiver<TerminalEvent> {
-        self.inner.events.subscribe()
+    pub fn subscribe_events(&self) -> TerminalEventReceiver {
+        TerminalEventReceiver::new(self.inner.events.subscribe(), false)
     }
 
     pub async fn shutdown(&self) {
@@ -3270,6 +3425,15 @@ impl TerminalManager {
 
     async fn shutdown_with_report(&self) -> ProcessCleanupReport {
         self.inner.cancellation.cancel();
+        {
+            let _registrations = self
+                .inner
+                .size_claim_attachments
+                .lock()
+                .expect("terminal attachment claims");
+            self.inner.attachment_tasks.close();
+        }
+        self.inner.attachment_tasks.wait().await;
         for generation in self.inner.generations.remove_all() {
             generation.stop_output().await;
             generation
@@ -3391,12 +3555,81 @@ fn log_terminal_cleanup(operation: &'static str, report: &ProcessCleanupReport) 
     }
 }
 
+/// Filters size events for public subscriptions and legacy attachments, while
+/// claim-carrying attach streams receive them in order with output.
+pub struct TerminalEventReceiver {
+    events: broadcast::Receiver<TerminalEvent>,
+    include_resized: bool,
+}
+
+impl TerminalEventReceiver {
+    fn new(events: broadcast::Receiver<TerminalEvent>, include_resized: bool) -> Self {
+        Self {
+            events,
+            include_resized,
+        }
+    }
+
+    fn accepts(&self, event: &TerminalEvent) -> bool {
+        self.include_resized || !matches!(event, TerminalEvent::Resized { .. })
+    }
+
+    pub async fn recv(&mut self) -> Result<TerminalEvent, broadcast::error::RecvError> {
+        loop {
+            let event = self.events.recv().await?;
+            if self.accepts(&event) {
+                return Ok(event);
+            }
+        }
+    }
+
+    pub fn try_recv(&mut self) -> Result<TerminalEvent, broadcast::error::TryRecvError> {
+        loop {
+            let event = self.events.try_recv()?;
+            if self.accepts(&event) {
+                return Ok(event);
+            }
+        }
+    }
+}
+
+struct TerminalAttachmentClaim {
+    inner: std::sync::Weak<Inner>,
+    key: SessionKey,
+    claim: String,
+    id: uuid::Uuid,
+    dropped: CancellationToken,
+}
+
+impl Drop for TerminalAttachmentClaim {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.upgrade() {
+            let mut attachments = inner
+                .size_claim_attachments
+                .lock()
+                .expect("terminal attachment claims");
+            if let Some(claims) = attachments.get_mut(&self.key) {
+                if claims.get(&self.claim) == Some(&self.id) {
+                    claims.remove(&self.claim);
+                }
+                if claims.is_empty() {
+                    attachments.remove(&self.key);
+                }
+            }
+        }
+        // The manager-owned worker performs asynchronous publication even when
+        // the stream is dropped outside the Tokio runtime's thread.
+        self.dropped.cancel();
+    }
+}
+
 pub struct TerminalAttachment {
     pub initial: TerminalSessionSnapshot,
     thread_id: String,
     terminal_id: String,
     next_sequence: u64,
-    events: broadcast::Receiver<TerminalEvent>,
+    events: TerminalEventReceiver,
+    _size_claim: Option<TerminalAttachmentClaim>,
 }
 
 impl TerminalAttachment {
@@ -3922,6 +4155,9 @@ mod tests {
         kill_error: std::sync::Mutex<Option<String>>,
         write_error: std::sync::Mutex<Option<String>>,
         writes: std::sync::Mutex<Vec<String>>,
+        resize_error: std::sync::Mutex<Option<String>>,
+        resizes: std::sync::Mutex<Vec<(u16, u16)>>,
+        output_on_resize: std::sync::Mutex<Option<String>>,
     }
 
     impl HistoryTestPty {
@@ -3941,6 +4177,9 @@ mod tests {
                 kill_error: std::sync::Mutex::new(None),
                 write_error: std::sync::Mutex::new(None),
                 writes: std::sync::Mutex::new(Vec::new()),
+                resize_error: std::sync::Mutex::new(None),
+                resizes: std::sync::Mutex::new(Vec::new()),
+                output_on_resize: std::sync::Mutex::new(None),
             }
         }
 
@@ -4025,7 +4264,14 @@ mod tests {
                 .map_or(Ok(()), Err)
         }
 
-        fn resize(&self, _cols: u16, _rows: u16) -> Result<(), String> {
+        fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
+            if let Some(error) = self.resize_error.lock().unwrap().clone() {
+                return Err(error);
+            }
+            self.resizes.lock().unwrap().push((cols, rows));
+            if let Some(output) = self.output_on_resize.lock().unwrap().as_ref() {
+                self.emit(output);
+            }
             Ok(())
         }
 
@@ -4067,6 +4313,645 @@ mod tests {
         fn subscribe_exit(&self) -> tokio::sync::watch::Receiver<Option<PtyExit>> {
             self.exit.subscribe()
         }
+    }
+
+    #[tokio::test]
+    async fn terminal_snapshot_reports_native_osc_responder_activity_through_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = TerminalManager::new(
+            Arc::new(PortablePtyBackend),
+            TerminalManagerOptions {
+                preferred_shell: Some(if cfg!(windows) { "cmd.exe" } else { "/bin/sh" }.to_owned()),
+                subprocess_poll_interval: Duration::ZERO,
+                ..TerminalManagerOptions::default()
+            },
+        );
+        let mut input = TerminalOpenInput::new("colors", "term", root.path().to_path_buf(), 80, 24);
+        let plain = manager.open(input.clone()).await.unwrap();
+        assert!(!plain.osc_color_responder_active);
+        input.env.insert(
+            super::super::osc::OSC_BACKGROUND_ENV.to_owned(),
+            "10,20,30".to_owned(),
+        );
+        let colored = manager.restart(input.clone()).await.unwrap();
+        assert!(colored.osc_color_responder_active);
+        let attached = manager
+            .attach(TerminalAttachInput::existing("colors", "term"))
+            .await
+            .unwrap();
+        assert!(attached.initial.osc_color_responder_active);
+        input.env.clear();
+        assert!(
+            !manager
+                .restart(input)
+                .await
+                .unwrap()
+                .osc_color_responder_active
+        );
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_legacy_attachments_and_general_events_never_receive_resized() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let manager = TerminalManager::new(
+            backend.clone(),
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::ZERO,
+                ..TerminalManagerOptions::default()
+            },
+        );
+        manager
+            .open(TerminalOpenInput::new(
+                "compat",
+                "term",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .unwrap();
+        let mut legacy = manager
+            .attach(TerminalAttachInput::existing("compat", "term"))
+            .await
+            .unwrap();
+        let mut general = manager.subscribe_events();
+        manager
+            .resize("compat", "term", 91, 42, None)
+            .await
+            .unwrap();
+        backend.latest().emit("after resize");
+        let legacy_event = tokio::time::timeout(Duration::from_secs(2), legacy.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(legacy_event, TerminalEvent::Output { ref data, .. } if data == "after resize")
+        );
+        let general_event = tokio::time::timeout(Duration::from_secs(2), general.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(general_event, TerminalEvent::Output { ref data, .. } if data == "after resize")
+        );
+        manager.shutdown().await;
+    }
+
+    fn size_attachment(claim: &str) -> TerminalAttachInput {
+        TerminalAttachInput {
+            size_claim: Some(claim.to_owned()),
+            ..TerminalAttachInput::existing("sizing", "term")
+        }
+    }
+
+    async fn size_fixture(
+        cols: u16,
+        rows: u16,
+    ) -> (tempfile::TempDir, Arc<HistoryTestBackend>, TerminalManager) {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let manager = TerminalManager::new(
+            backend.clone(),
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::ZERO,
+                ..TerminalManagerOptions::default()
+            },
+        );
+        manager
+            .open(TerminalOpenInput::new(
+                "sizing",
+                "term",
+                root.path().to_path_buf(),
+                cols,
+                rows,
+            ))
+            .await
+            .unwrap();
+        (root, backend, manager)
+    }
+
+    async fn next_attachment_event(attachment: &mut TerminalAttachment) -> TerminalEvent {
+        tokio::time::timeout(Duration::from_secs(2), attachment.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn wait_for_attachment_workers(manager: &TerminalManager, count: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while manager.inner.attachment_tasks.len() != count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("attachment cleanup completed");
+    }
+
+    #[tokio::test]
+    async fn terminal_resize_publishes_size_before_later_output_and_suppresses_noops() {
+        let (_root, backend, manager) = size_fixture(151, 50).await;
+        let mut attachment = manager.attach(size_attachment("owner")).await.unwrap();
+        assert_eq!(
+            attachment.initial.size,
+            Some(TerminalSize {
+                cols: 151,
+                rows: 50,
+                size_claim: Some("owner".to_owned())
+            })
+        );
+        *backend.latest().output_on_resize.lock().unwrap() = Some("after resize".to_owned());
+        manager
+            .resize("sizing", "term", 91, 42, Some("owner".to_owned()))
+            .await
+            .unwrap();
+        let resized = next_attachment_event(&mut attachment).await;
+        assert!(
+            matches!(&resized, TerminalEvent::Resized { size, .. } if size.cols == 91 && size.rows == 42 && size.size_claim.as_deref() == Some("owner"))
+        );
+        let output = next_attachment_event(&mut attachment).await;
+        assert!(matches!(&output, TerminalEvent::Output { data, .. } if data == "after resize"));
+        assert!(output.sequence() > resized.sequence());
+        manager
+            .resize("sizing", "term", 91, 42, Some("owner".to_owned()))
+            .await
+            .unwrap();
+        backend.latest().emit("after noop");
+        assert!(
+            matches!(next_attachment_event(&mut attachment).await, TerminalEvent::Output { ref data, .. } if data == "after noop")
+        );
+        assert_eq!(*backend.latest().resizes.lock().unwrap(), [(91, 42)]);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_open_and_attach_spawn_at_requested_size_without_resizing_existing_sessions() {
+        let (root, backend, manager) = size_fixture(151, 50).await;
+        let mut input = TerminalAttachInput::existing("sizing", "new");
+        input.cwd = Some(root.path().to_path_buf());
+        input.cols = Some(91);
+        input.rows = Some(42);
+        input.size_claim = Some("new-owner".to_owned());
+        let attachment = manager.attach(input.clone()).await.unwrap();
+        assert_eq!(
+            (backend.spawns()[0].cols, backend.spawns()[0].rows),
+            (151, 50)
+        );
+        assert_eq!(
+            (backend.spawns()[1].cols, backend.spawns()[1].rows),
+            (91, 42)
+        );
+        assert_eq!(
+            attachment.initial.size.unwrap(),
+            TerminalSize {
+                cols: 91,
+                rows: 42,
+                size_claim: Some("new-owner".to_owned())
+            }
+        );
+        input.terminal_id = "term".to_owned();
+        let attached = manager.attach(input).await.unwrap();
+        assert_eq!(attached.initial.size.unwrap().cols, 151);
+        manager
+            .open(TerminalOpenInput::new(
+                "sizing",
+                "term",
+                root.path().to_path_buf(),
+                70,
+                20,
+            ))
+            .await
+            .unwrap();
+        let reopened = manager
+            .attach(TerminalAttachInput::existing("sizing", "term"))
+            .await
+            .unwrap();
+        assert_eq!(reopened.initial.size.unwrap().cols, 151);
+        assert_eq!(backend.spawns().len(), 2);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_resize_claim_only_change_publishes_and_is_in_snapshot() {
+        let (_root, backend, manager) = size_fixture(80, 24).await;
+        let mut attachment = manager.attach(size_attachment("watcher")).await.unwrap();
+        let _first = manager.attach(size_attachment("first")).await.unwrap();
+        let _second = manager.attach(size_attachment("second")).await.unwrap();
+        for claim in [Some("first".to_owned()), Some("second".to_owned()), None] {
+            manager
+                .resize("sizing", "term", 80, 24, claim.clone())
+                .await
+                .unwrap();
+            assert!(
+                matches!(next_attachment_event(&mut attachment).await, TerminalEvent::Resized { ref size, .. } if size.size_claim == claim && (size.cols, size.rows) == (80, 24))
+            );
+            let snapshot = manager
+                .attach(TerminalAttachInput::existing("sizing", "term"))
+                .await
+                .unwrap()
+                .initial;
+            assert_eq!(
+                snapshot.size.unwrap(),
+                TerminalSize {
+                    cols: 80,
+                    rows: 24,
+                    size_claim: claim.clone()
+                }
+            );
+            manager
+                .resize("sizing", "term", 80, 24, claim)
+                .await
+                .unwrap();
+            backend.latest().emit("after noop");
+            assert!(matches!(
+                next_attachment_event(&mut attachment).await,
+                TerminalEvent::Output { .. }
+            ));
+        }
+        assert!(backend.latest().resizes.lock().unwrap().is_empty());
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_resize_failure_preserves_size_claim_and_stream() {
+        let (_root, backend, manager) = size_fixture(80, 24).await;
+        let mut attachment = manager.attach(size_attachment("owner")).await.unwrap();
+        let _failed = manager.attach(size_attachment("failed")).await.unwrap();
+        *backend.latest().resize_error.lock().unwrap() = Some("resize failed".to_owned());
+        assert!(
+            manager
+                .resize("sizing", "term", 91, 42, Some("failed".to_owned()))
+                .await
+                .is_err()
+        );
+        let snapshot = manager
+            .attach(TerminalAttachInput::existing("sizing", "term"))
+            .await
+            .unwrap()
+            .initial;
+        assert_eq!(
+            snapshot.size.unwrap(),
+            TerminalSize {
+                cols: 80,
+                rows: 24,
+                size_claim: Some("owner".to_owned())
+            }
+        );
+        backend.latest().emit("unchanged");
+        assert!(
+            matches!(next_attachment_event(&mut attachment).await, TerminalEvent::Output { ref data, .. } if data == "unchanged")
+        );
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_attachment_waiting_for_publication_does_not_block_another_terminal() {
+        let (root, _backend, manager) = size_fixture(80, 24).await;
+        let generation = manager
+            .require_session("sizing", "term")
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .generation
+            .clone();
+        let publication = generation.publication.lock().await;
+        let attaching = manager.attach(size_attachment("owner"));
+        tokio::pin!(attaching);
+        assert!(futures_util::poll!(&mut attaching).is_pending()); // attach's initial yield
+        assert!(futures_util::poll!(&mut attaching).is_pending()); // publication is held
+        let unrelated = tokio::time::timeout(
+            Duration::from_secs(2),
+            manager.open(TerminalOpenInput::new(
+                "other",
+                "term",
+                root.path().to_path_buf(),
+                80,
+                24,
+            )),
+        )
+        .await;
+        drop(publication);
+        assert!(
+            unrelated.is_ok(),
+            "one terminal's publication blocked another terminal's open"
+        );
+        drop(attaching.await.unwrap());
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_first_attachment_grant_is_used_once_without_surviving_attachments() {
+        let (root, _backend, manager) = size_fixture(80, 24).await;
+        let legacy = manager
+            .attach(TerminalAttachInput::existing("sizing", "term"))
+            .await
+            .unwrap();
+        assert!(!legacy.initial.first_attachment_grant);
+        let (first, concurrent) = tokio::join!(
+            manager.attach(size_attachment("first")),
+            manager.attach(size_attachment("concurrent"))
+        );
+        let first = first.unwrap();
+        let concurrent = concurrent.unwrap();
+        let flags = [
+            first.initial.first_attachment_grant,
+            concurrent.initial.first_attachment_grant,
+        ];
+        assert_eq!(flags.into_iter().filter(|flag| *flag).count(), 1);
+        let flagged = if flags[0] { &first } else { &concurrent };
+        let claim = if flags[0] { "first" } else { "concurrent" };
+        assert_eq!(
+            flagged.initial.size.as_ref().unwrap().size_claim.as_deref(),
+            Some(claim)
+        );
+        drop(first);
+        drop(concurrent);
+        // Regaining an unowned session must not renew an already used grant.
+        let later = manager.attach(size_attachment("later")).await.unwrap();
+        assert!(!later.initial.first_attachment_grant);
+        drop(later);
+        // Only the legacy stream survives. It did not negotiate reply ownership.
+        let restarted = manager
+            .restart(TerminalOpenInput::new(
+                "sizing",
+                "term",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .unwrap();
+        assert!(!restarted.first_attachment_grant);
+        let after_restart = manager
+            .attach(size_attachment("after-restart"))
+            .await
+            .unwrap();
+        assert!(after_restart.initial.first_attachment_grant);
+        let after_first = manager
+            .attach(size_attachment("after-first"))
+            .await
+            .unwrap();
+        assert!(!after_first.initial.first_attachment_grant);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_first_attachment_grant_remains_available_after_reopen_with_a_surviving_stream()
+     {
+        let (root, backend, manager) = size_fixture(80, 24).await;
+        let mut survivor = manager.attach(size_attachment("survivor")).await.unwrap();
+        backend.latest().exit(0);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    survivor.recv().await.expect("surviving attachment"),
+                    TerminalEvent::Exited { .. }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("old process exited");
+
+        let mut events = manager.subscribe_events();
+        let reopened = manager
+            .open(TerminalOpenInput::new(
+                "sizing",
+                "term",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(reopened.status, TerminalStatus::Running);
+        assert_ne!(reopened.pid, survivor.initial.pid);
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            TerminalEvent::Started { sequence: 1, .. }
+        ));
+        backend.latest().emit("\x1b[6n\x1b[c");
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            TerminalEvent::Output { .. }
+        ));
+
+        // The old stream remains registered, but Started does not reset its
+        // sequence cursor. A new attachment must answer the startup history.
+        let first = manager
+            .attach(size_attachment("first-after-open"))
+            .await
+            .unwrap();
+        assert!(first.initial.first_attachment_grant);
+        assert_eq!(first.initial.history, "\x1b[6n\x1b[c");
+        assert_eq!(
+            first.initial.size.as_ref().unwrap().size_claim.as_deref(),
+            Some("first-after-open")
+        );
+        let later = manager
+            .attach(size_attachment("later-after-open"))
+            .await
+            .unwrap();
+        assert!(!later.initial.first_attachment_grant);
+        assert_eq!(later.initial.size, first.initial.size);
+        drop(survivor);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_first_attachment_grant_is_used_when_claim_attachments_survive_restart() {
+        let (root, _backend, manager) = size_fixture(80, 24).await;
+        let survivor = manager.attach(size_attachment("survivor")).await.unwrap();
+        manager
+            .restart(TerminalOpenInput::new(
+                "sizing",
+                "term",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .unwrap();
+        // A surviving renderer can answer live queries even before reclaiming.
+        let before_resize = manager
+            .attach(size_attachment("before-resize"))
+            .await
+            .unwrap();
+        assert!(!before_resize.initial.first_attachment_grant);
+        manager
+            .resize("sizing", "term", 91, 42, Some("survivor".to_owned()))
+            .await
+            .unwrap();
+        let after_resize = manager
+            .attach(size_attachment("after-resize"))
+            .await
+            .unwrap();
+        assert!(!after_resize.initial.first_attachment_grant);
+        assert_eq!(
+            after_resize
+                .initial
+                .size
+                .as_ref()
+                .unwrap()
+                .size_claim
+                .as_deref(),
+            Some("survivor")
+        );
+        assert_eq!(after_resize.initial.size.as_ref().unwrap().cols, 91);
+        drop(survivor);
+        drop(before_resize);
+        drop(after_resize);
+        let later = manager.attach(size_attachment("later")).await.unwrap();
+        assert!(!later.initial.first_attachment_grant);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_first_attachment_grant_does_not_override_a_surviving_resize_owner() {
+        let (root, _backend, manager) = size_fixture(80, 24).await;
+        let _survivor = manager.attach(size_attachment("survivor")).await.unwrap();
+        manager
+            .restart(TerminalOpenInput::new(
+                "sizing",
+                "term",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .unwrap();
+        manager
+            .resize("sizing", "term", 91, 42, Some("survivor".to_owned()))
+            .await
+            .unwrap();
+        let later = manager.attach(size_attachment("later")).await.unwrap();
+        assert_eq!(
+            later.initial.size.as_ref().unwrap().size_claim.as_deref(),
+            Some("survivor")
+        );
+        assert!(!later.initial.first_attachment_grant);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_attach_assigns_one_owner_atomically_before_startup_queries() {
+        let (_root, backend, manager) = size_fixture(80, 24).await;
+        let (first, second) = tokio::join!(
+            manager.attach(size_attachment("first")),
+            manager.attach(size_attachment("second"))
+        );
+        let mut first = first.unwrap();
+        let second = second.unwrap();
+        let owner = first
+            .initial
+            .size
+            .as_ref()
+            .unwrap()
+            .size_claim
+            .as_deref()
+            .unwrap();
+        assert!(matches!(owner, "first" | "second"));
+        assert_eq!(first.initial.size, second.initial.size);
+        assert!(backend.latest().resizes.lock().unwrap().is_empty());
+        backend.latest().emit("\x1b[6n\x1b[c");
+        assert!(
+            matches!(next_attachment_event(&mut first).await, TerminalEvent::Output { ref data, .. } if data == "\x1b[6n\x1b[c")
+        );
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_owner_drop_publishes_null_but_mirror_drop_keeps_the_owner() {
+        let (_root, backend, manager) = size_fixture(80, 24).await;
+        let mut owner = manager.attach(size_attachment("owner")).await.unwrap();
+        let mirror = manager.attach(size_attachment("mirror")).await.unwrap();
+        drop(mirror);
+        wait_for_attachment_workers(&manager, 1).await;
+        backend.latest().emit("still owned");
+        assert!(matches!(
+            next_attachment_event(&mut owner).await,
+            TerminalEvent::Output { .. }
+        ));
+        let mut mirror = manager.attach(size_attachment("mirror")).await.unwrap();
+        drop(owner);
+        assert!(
+            matches!(next_attachment_event(&mut mirror).await, TerminalEvent::Resized { ref size, .. } if size.size_claim.is_none() && (size.cols, size.rows) == (80, 24))
+        );
+        manager
+            .resize("sizing", "term", 91, 42, Some("mirror".to_owned()))
+            .await
+            .unwrap();
+        assert!(
+            matches!(next_attachment_event(&mut mirror).await, TerminalEvent::Resized { ref size, .. } if size.size_claim.as_deref() == Some("mirror"))
+        );
+        manager.shutdown().await;
+        assert!(manager.inner.attachment_tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn terminal_departed_attachment_cannot_release_a_reused_claim_or_resize_late() {
+        let (_root, backend, manager) = size_fixture(80, 24).await;
+        let old = manager.attach(size_attachment("reconnect")).await.unwrap();
+        let mut replacement = manager.attach(size_attachment("reconnect")).await.unwrap();
+        drop(old);
+        wait_for_attachment_workers(&manager, 1).await;
+        backend.latest().emit("replacement owns");
+        assert!(matches!(
+            next_attachment_event(&mut replacement).await,
+            TerminalEvent::Output { .. }
+        ));
+        let mut watcher = manager.attach(size_attachment("watcher")).await.unwrap();
+        drop(replacement);
+        assert!(
+            matches!(next_attachment_event(&mut watcher).await, TerminalEvent::Resized { ref size, .. } if size.size_claim.is_none())
+        );
+        manager
+            .resize("sizing", "term", 10, 10, Some("reconnect".to_owned()))
+            .await
+            .unwrap();
+        backend.latest().emit("late resize ignored");
+        assert!(matches!(
+            next_attachment_event(&mut watcher).await,
+            TerminalEvent::Output { .. }
+        ));
+        assert!(backend.latest().resizes.lock().unwrap().is_empty());
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_attachment_release_tracks_ownership_across_process_restart() {
+        let (root, _backend, manager) = size_fixture(80, 24).await;
+        let owner = manager.attach(size_attachment("owner")).await.unwrap();
+        let mut watcher = manager.attach(size_attachment("watcher")).await.unwrap();
+        manager
+            .restart(TerminalOpenInput::new(
+                "sizing",
+                "term",
+                root.path().to_path_buf(),
+                91,
+                42,
+            ))
+            .await
+            .unwrap();
+        assert!(
+            matches!(next_attachment_event(&mut watcher).await, TerminalEvent::Restarted { ref snapshot, .. } if snapshot.size.as_ref().unwrap().size_claim.is_none())
+        );
+        manager
+            .resize("sizing", "term", 91, 42, Some("owner".to_owned()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_attachment_event(&mut watcher).await,
+            TerminalEvent::Resized { .. }
+        ));
+        drop(owner);
+        assert!(
+            matches!(next_attachment_event(&mut watcher).await, TerminalEvent::Resized { ref size, .. } if size.size_claim.is_none())
+        );
+        manager.shutdown().await;
     }
 
     #[derive(Debug, Default)]
@@ -5039,6 +5924,7 @@ mod tests {
         );
         let attachment = manager
             .attach(TerminalAttachInput {
+                size_claim: None,
                 thread_id: "thread-provider".to_owned(),
                 terminal_id: "term-provider".to_owned(),
                 cwd: Some(root.path().to_path_buf()),
@@ -5084,6 +5970,7 @@ mod tests {
             attach_started_task.notify_one();
             attach_manager
                 .attach(TerminalAttachInput {
+                    size_claim: None,
                     thread_id: "thread-attach-close".to_owned(),
                     terminal_id: "term-attach-close".to_owned(),
                     cwd: Some(attach_root.clone()),
@@ -5189,6 +6076,7 @@ mod tests {
         let attach_task = tokio::spawn(async move {
             attach_manager
                 .attach(TerminalAttachInput {
+                    size_claim: None,
                     thread_id: "thread-spawn-close".to_owned(),
                     terminal_id: "term-spawn-close".to_owned(),
                     cwd: Some(attach_root),
@@ -5368,6 +6256,7 @@ mod tests {
 
         let attach = manager
             .attach(TerminalAttachInput {
+                size_claim: None,
                 thread_id: "server-known-thread".to_owned(),
                 terminal_id: "terminal-existing".to_owned(),
                 cwd: None,
@@ -6092,6 +6981,7 @@ mod tests {
 
         let attachment = manager
             .attach(TerminalAttachInput {
+                size_claim: None,
                 thread_id: "thread-provider".to_owned(),
                 terminal_id: "term-provider".to_owned(),
                 cwd: Some(root.path().to_path_buf()),
@@ -6467,7 +7357,12 @@ mod tests {
 
         let mut metadata = manager.subscribe_metadata().await;
         assert!(metadata.initial.is_empty());
-        assert!(manager.resize("missing", "missing", 80, 24).await.is_ok());
+        assert!(
+            manager
+                .resize("missing", "missing", 80, 24, None)
+                .await
+                .is_ok()
+        );
         assert!(matches!(
             manager
                 .attach(TerminalAttachInput::existing("missing", "missing"))
@@ -6497,7 +7392,7 @@ mod tests {
         let mut attachment = manager.attach(attach_input).await.unwrap();
         manager.write("thread-unit", "term-unit", "").await.unwrap();
         manager
-            .resize("thread-unit", "term-unit", 120, 40)
+            .resize("thread-unit", "term-unit", 120, 40, None)
             .await
             .unwrap();
         manager.clear("thread-unit", "term-unit").await.unwrap();

@@ -251,6 +251,7 @@ impl TerminalOperationalLog {
                 "sequence": sequence,
                 "hasRunningSubprocess": has_running_subprocess,
             }),
+            TerminalEvent::Resized { .. } => return true,
             TerminalEvent::Exited {
                 thread_id,
                 terminal_id,
@@ -627,6 +628,9 @@ mod tests {
         .await
         .expect("terminal log starts");
         let snapshot = TerminalSessionSnapshot {
+            size: None,
+            osc_color_responder_active: false,
+            first_attachment_grant: false,
             thread_id: "thread-1".to_owned(),
             terminal_id: "terminal-1".to_owned(),
             cwd: "PRIVATE_PATH".to_owned(),
@@ -681,6 +685,9 @@ mod tests {
         .await
         .expect("terminal log starts");
         let snapshot = TerminalSessionSnapshot {
+            size: None,
+            osc_color_responder_active: false,
+            first_attachment_grant: false,
             thread_id: "thread-1".to_owned(),
             terminal_id: "terminal-1".to_owned(),
             cwd: "PRIVATE_CWD".to_owned(),
@@ -733,6 +740,16 @@ mod tests {
                 terminal_id: "terminal-1".to_owned(),
                 sequence: 7,
             },
+            TerminalEvent::Resized {
+                thread_id: "thread-1".to_owned(),
+                terminal_id: "terminal-1".to_owned(),
+                sequence: 8,
+                size: crate::terminal::TerminalSize {
+                    cols: 91,
+                    rows: 42,
+                    size_claim: Some("PRIVATE_CLAIM".to_owned()),
+                },
+            },
         ] {
             assert!(log.record(&event));
         }
@@ -765,6 +782,7 @@ mod tests {
             "PRIVATE_UPDATED_AT",
             "PRIVATE_ACTIVITY_LABEL",
             "PRIVATE_ERROR_MESSAGE",
+            "PRIVATE_CLAIM",
         ] {
             assert!(!contents.contains(private_value));
         }
