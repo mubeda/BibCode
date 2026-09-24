@@ -1,3 +1,11 @@
+mod layout;
+mod registration;
+
+use layout::{component_matches, metadata_layout};
+use registration::{
+    Coverage, DirectoryChange, PendingPath, PendingRegistrations, WatchRegistration,
+};
+
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -43,8 +51,15 @@ pub(crate) struct GitWatchRequest {
 pub(crate) enum GitWatchEvent {
     WorkingTree,
     Metadata,
+    RefMetadata,
     Overflow,
     Unavailable,
+}
+
+#[derive(Clone, Copy, Default)]
+struct GitWatchSignal {
+    event: Option<GitWatchEvent>,
+    ref_version: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,6 +116,7 @@ struct State {
     next_generation: u64,
     next_subscriber_id: u64,
     entries: HashMap<GitWatchIdentity, WatchEntry>,
+    retiring: HashMap<GitWatchIdentity, Arc<SetupCompletion>>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -113,13 +129,40 @@ struct GitWatchIdentity {
 struct WatchEntry {
     generation: u64,
     subscribers: HashSet<u64>,
-    sender: watch::Sender<Option<GitWatchEvent>>,
+    sender: watch::Sender<GitWatchSignal>,
     health: Arc<AtomicU8>,
-    backend: Option<Box<dyn GitWatcherBackend>>,
+    backend: Option<InstalledWatcher>,
+    registration_requests: PendingRegistrations,
+    registration_event: Option<GitWatchEvent>,
+    cancellation: CancellationToken,
     roots: GitWatchIdentity,
     root_aliases: Vec<GitWatchIdentity>,
     registered_roots: Vec<(String, RecursiveMode)>,
     setup: Arc<SetupCompletion>,
+}
+
+struct InstalledWatcher {
+    backend: Box<dyn GitWatcherBackend>,
+    registration: WatchRegistration,
+}
+
+enum BackendUpdate {
+    Installed {
+        watcher: InstalledWatcher,
+        refresh: Option<GitWatchEvent>,
+    },
+    Unavailable {
+        watcher: Option<InstalledWatcher>,
+        refresh: Option<GitWatchEvent>,
+    },
+}
+
+struct RegistrationWork {
+    watcher: InstalledWatcher,
+    requests: PendingRegistrations,
+    event: GitWatchEvent,
+    cancellation: CancellationToken,
+    setup: SetupGuard,
 }
 
 struct AdmittedRoots {
@@ -135,7 +178,8 @@ pub(crate) struct GitWatchSubscription {
     identity: GitWatchIdentity,
     generation: u64,
     subscriber_id: u64,
-    receiver: watch::Receiver<Option<GitWatchEvent>>,
+    receiver: watch::Receiver<GitWatchSignal>,
+    ref_version: u64,
     health: Arc<AtomicU8>,
     setup: Arc<SetupCompletion>,
 }
@@ -324,84 +368,110 @@ impl GitWatchService {
         request: GitWatchRequest,
     ) -> Result<GitWatchSubscription, GitWatchError> {
         let roots = admit_roots(request).await?;
-        let (subscription, install) = {
-            let mut state = self.inner.lock_state();
-            if state.shutdown {
+        loop {
+            let retired = self
+                .inner
+                .lock_state()
+                .retiring
+                .get(&roots.identity)
+                .cloned();
+            if let Some(retired) = retired {
+                retired.wait().await;
+                self.inner.clear_retired(&roots.identity, &retired);
+                continue;
+            }
+            let (subscription, install) = {
+                let mut state = self.inner.lock_state();
+                if state.shutdown {
+                    return Err(GitWatchError::Shutdown);
+                }
+                if state.retiring.contains_key(&roots.identity) {
+                    continue;
+                }
+                let subscriber_id = state.next_subscriber_id;
+                state.next_subscriber_id = state.next_subscriber_id.wrapping_add(1);
+                if let Some(entry) = state.entries.get_mut(&roots.identity) {
+                    if !entry.root_aliases.contains(&roots.alias) {
+                        entry.root_aliases.push(roots.alias.clone());
+                    }
+                    entry.subscribers.insert(subscriber_id);
+                    (
+                        GitWatchSubscription::new(
+                            Arc::downgrade(&self.inner),
+                            roots.identity.clone(),
+                            entry,
+                            subscriber_id,
+                        ),
+                        None,
+                    )
+                } else {
+                    let generation = state.next_generation;
+                    state.next_generation = state.next_generation.wrapping_add(1);
+                    let (sender, receiver) = watch::channel(GitWatchSignal::default());
+                    let health = Arc::new(AtomicU8::new(0));
+                    let setup = Arc::new(SetupCompletion::default());
+                    let watch_roots = watch_roots(&roots);
+                    let registration = WatchRegistration::new(watch_roots.clone());
+                    let cancellation = self.inner.setup_cancellation.child_token();
+                    let registered_roots = normalize_registered_roots(&watch_roots);
+                    let mut root_aliases = vec![roots.identity.clone()];
+                    if roots.alias != roots.identity {
+                        root_aliases.push(roots.alias.clone());
+                    }
+                    state.entries.insert(
+                        roots.identity.clone(),
+                        WatchEntry {
+                            generation,
+                            subscribers: HashSet::from([subscriber_id]),
+                            sender,
+                            health: Arc::clone(&health),
+                            backend: None,
+                            registration_requests: PendingRegistrations::default(),
+                            registration_event: None,
+                            cancellation: cancellation.clone(),
+                            roots: roots.identity.clone(),
+                            root_aliases,
+                            registered_roots,
+                            setup: Arc::clone(&setup),
+                        },
+                    );
+                    (
+                        GitWatchSubscription {
+                            inner: Arc::downgrade(&self.inner),
+                            identity: roots.identity.clone(),
+                            generation,
+                            subscriber_id,
+                            receiver,
+                            ref_version: 0,
+                            health,
+                            setup: Arc::clone(&setup),
+                        },
+                        Some((
+                            generation,
+                            watch_roots,
+                            registration,
+                            cancellation,
+                            SetupGuard::reserve(Arc::clone(&self.inner.setups), setup),
+                        )),
+                    )
+                }
+            };
+            if let Some((generation, watch_roots, registration, cancellation, setup)) = install {
+                self.install_backend(
+                    subscription.identity.clone(),
+                    generation,
+                    watch_roots,
+                    registration,
+                    cancellation,
+                    setup,
+                );
+            }
+            subscription.setup.wait().await;
+            if self.inner.lock_state().shutdown {
                 return Err(GitWatchError::Shutdown);
             }
-            let subscriber_id = state.next_subscriber_id;
-            state.next_subscriber_id = state.next_subscriber_id.wrapping_add(1);
-            if let Some(entry) = state.entries.get_mut(&roots.identity) {
-                if !entry.root_aliases.contains(&roots.alias) {
-                    entry.root_aliases.push(roots.alias.clone());
-                }
-                entry.subscribers.insert(subscriber_id);
-                (
-                    GitWatchSubscription::new(
-                        Arc::downgrade(&self.inner),
-                        roots.identity,
-                        entry,
-                        subscriber_id,
-                    ),
-                    None,
-                )
-            } else {
-                let generation = state.next_generation;
-                state.next_generation = state.next_generation.wrapping_add(1);
-                let (sender, receiver) = watch::channel(None);
-                let health = Arc::new(AtomicU8::new(0));
-                let setup = Arc::new(SetupCompletion::default());
-                let watch_roots = watch_roots(&roots);
-                let registered_roots = normalize_registered_roots(&watch_roots);
-                let mut root_aliases = vec![roots.identity.clone()];
-                if roots.alias != roots.identity {
-                    root_aliases.push(roots.alias.clone());
-                }
-                state.entries.insert(
-                    roots.identity.clone(),
-                    WatchEntry {
-                        generation,
-                        subscribers: HashSet::from([subscriber_id]),
-                        sender,
-                        health: Arc::clone(&health),
-                        backend: None,
-                        roots: roots.identity.clone(),
-                        root_aliases,
-                        registered_roots,
-                        setup: Arc::clone(&setup),
-                    },
-                );
-                (
-                    GitWatchSubscription {
-                        inner: Arc::downgrade(&self.inner),
-                        identity: roots.identity.clone(),
-                        generation,
-                        subscriber_id,
-                        receiver,
-                        health,
-                        setup: Arc::clone(&setup),
-                    },
-                    Some((
-                        generation,
-                        watch_roots,
-                        SetupGuard::reserve(Arc::clone(&self.inner.setups), setup),
-                    )),
-                )
-            }
-        };
-        if let Some((generation, watch_roots, setup)) = install {
-            self.install_backend(
-                subscription.identity.clone(),
-                generation,
-                watch_roots,
-                setup,
-            );
+            return Ok(subscription);
         }
-        subscription.setup.wait().await;
-        if self.inner.lock_state().shutdown {
-            return Err(GitWatchError::Shutdown);
-        }
-        Ok(subscription)
     }
 
     #[cfg(test)]
@@ -464,6 +534,10 @@ impl GitWatchService {
         let entries = {
             let mut state = self.inner.lock_state();
             state.shutdown = true;
+            state.retiring.clear();
+            for entry in state.entries.values() {
+                entry.cancellation.cancel();
+            }
             std::mem::take(&mut state.entries)
         };
         drop(entries);
@@ -475,14 +549,17 @@ impl GitWatchService {
         identity: GitWatchIdentity,
         generation: u64,
         watch_roots: Vec<(PathBuf, RecursiveMode)>,
+        registration: WatchRegistration,
+        setup_cancellation: CancellationToken,
         setup: SetupGuard,
     ) {
         let inner = Arc::clone(&self.inner);
         let blocking_inner = Arc::clone(&inner);
         let blocking_identity = identity.clone();
-        let setup_cancellation = inner.setup_cancellation.clone();
         let readiness_timeout = inner.readiness_timeout;
         let runtime = tokio::runtime::Handle::current();
+        let callback_runtime = runtime.clone();
+        let completion_runtime = runtime.clone();
         let blocking_task = tokio::task::spawn_blocking(move || {
             let callback_inner = Arc::downgrade(&blocking_inner);
             let callback_identity = blocking_identity;
@@ -490,13 +567,19 @@ impl GitWatchService {
                 let Some(inner) = callback_inner.upgrade() else {
                     return;
                 };
-                inner.handle_backend_event(&callback_identity, generation, event);
+                inner.handle_backend_event(
+                    &callback_identity,
+                    generation,
+                    event,
+                    &callback_runtime,
+                );
             });
             let backend = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 install_backend(
                     blocking_inner.backend_factory.as_ref(),
                     normal_callback,
                     &watch_roots,
+                    registration,
                     &setup_cancellation,
                     readiness_timeout,
                     &runtime,
@@ -507,8 +590,24 @@ impl GitWatchService {
         });
         drop(tokio::spawn(async move {
             if let Ok((setup, backend)) = blocking_task.await {
-                inner.commit_backend(&identity, generation, backend);
+                let completion = setup.completion.clone();
+                inner.commit_backend(
+                    &identity,
+                    generation,
+                    match backend {
+                        Ok(watcher) => BackendUpdate::Installed {
+                            watcher,
+                            refresh: None,
+                        },
+                        Err(_) => BackendUpdate::Unavailable {
+                            watcher: None,
+                            refresh: None,
+                        },
+                    },
+                    &completion_runtime,
+                );
                 drop(setup);
+                inner.clear_retired(&identity, &completion);
             }
         }));
     }
@@ -579,67 +678,218 @@ impl Inner {
                 return;
             }
             entry.subscribers.remove(&subscriber_id);
+            if !entry.subscribers.is_empty() {
+                return;
+            }
+            let entry = state.entries.remove(identity).expect("admitted watcher");
+            entry.cancellation.cancel();
+            if entry.backend.is_none() && !entry.setup.finished.load(Ordering::Acquire) {
+                state.retiring.insert(identity.clone(), entry.setup.clone());
+            }
             entry
-                .subscribers
-                .is_empty()
-                .then(|| state.entries.remove(identity))
-                .flatten()
         };
         drop(removed);
     }
 
-    fn handle_backend_event(
-        &self,
-        identity: &GitWatchIdentity,
-        generation: u64,
-        event: notify::Result<Event>,
-    ) {
+    fn clear_retired(&self, identity: &GitWatchIdentity, completion: &Arc<SetupCompletion>) {
         let mut state = self.lock_state();
-        let Some(entry) = state.entries.get_mut(identity) else {
-            return;
-        };
-        if entry.generation != generation {
-            return;
-        }
-        let event = match event {
-            Ok(event) => {
-                #[cfg(windows)]
-                if entry.backend.is_none()
-                    && windows_installing_nested_root_artifact(&event, &entry.registered_roots)
-                {
-                    return;
-                }
-                classify_event(
-                    &event,
-                    &entry.roots,
-                    &entry.root_aliases,
-                    &entry.registered_roots,
-                    host_path_platform(),
-                )
-            }
-            Err(_) => Some(GitWatchEvent::Unavailable),
-        };
-        if let Some(event) = event {
-            publish(entry, event);
+        if state
+            .retiring
+            .get(identity)
+            .is_some_and(|current| Arc::ptr_eq(current, completion))
+            && completion.finished.load(Ordering::Acquire)
+        {
+            state.retiring.remove(identity);
         }
     }
 
-    fn commit_backend(
-        &self,
+    fn handle_backend_event(
+        self: &Arc<Self>,
         identity: &GitWatchIdentity,
         generation: u64,
-        backend: notify::Result<Box<dyn GitWatcherBackend>>,
+        event: notify::Result<Event>,
+        runtime: &tokio::runtime::Handle,
     ) {
-        let mut state = self.lock_state();
-        match state.entries.get_mut(identity) {
-            Some(entry) if entry.generation == generation => match backend {
-                Ok(backend) => entry.backend = Some(backend),
-                Err(_) => publish(entry, GitWatchEvent::Unavailable),
-            },
-            _ => {
-                drop(state);
-                drop(backend);
+        let work = {
+            let mut state = self.lock_state();
+            let Some(entry) = state.entries.get_mut(identity) else {
+                return;
+            };
+            if entry.generation != generation {
+                return;
             }
+            let invalidation = match event {
+                Ok(event) => {
+                    // The backend is out while it installs or registers watches.
+                    if host_path_platform() == super::HostPathPlatform::Windows
+                        && entry.backend.is_none()
+                        && windows_installing_nested_root_artifact(
+                            &event,
+                            &entry.roots,
+                            &entry.root_aliases,
+                            &entry.registered_roots,
+                            host_path_platform(),
+                        )
+                    {
+                        return;
+                    }
+                    let invalidation = classify_event(
+                        &event,
+                        &entry.roots,
+                        &entry.root_aliases,
+                        &entry.registered_roots,
+                        host_path_platform(),
+                    );
+                    if event.need_rescan() {
+                        entry.registration_requests.rescan();
+                        entry.registration_event = Some(GitWatchEvent::RefMetadata);
+                    } else if event_changes_directories(event.kind) {
+                        for path in &event.paths {
+                            let key = normalize_event_path_key(
+                                path,
+                                &entry.roots,
+                                &entry.root_aliases,
+                                host_path_platform(),
+                            );
+                            // Native recursion covers everything below a store root, so
+                            // file renames and nested directories need no registration.
+                            if registration::coverage(
+                                &entry.registered_roots,
+                                &key,
+                                host_path_platform(),
+                            ) == Coverage::StoreRoot
+                            {
+                                entry.registration_requests.add(
+                                    key,
+                                    PendingPath {
+                                        native_path: path.clone(),
+                                        change: if matches!(event.kind, EventKind::Create(_)) {
+                                            DirectoryChange::Created
+                                        } else {
+                                            DirectoryChange::Replaced
+                                        },
+                                    },
+                                );
+                                let refresh = invalidation.unwrap_or(GitWatchEvent::RefMetadata);
+                                if entry.registration_event != Some(GitWatchEvent::RefMetadata) {
+                                    entry.registration_event = Some(refresh);
+                                }
+                            }
+                        }
+                    }
+                    invalidation
+                }
+                Err(_) => Some(GitWatchEvent::Unavailable),
+            };
+            if let Some(event) = invalidation {
+                publish(entry, event);
+            }
+            self.take_registration_work(entry)
+        };
+        if let Some(work) = work {
+            self.start_registration(identity.clone(), generation, work, runtime);
+        }
+    }
+
+    fn take_registration_work(&self, entry: &mut WatchEntry) -> Option<RegistrationWork> {
+        if entry.registration_requests.is_empty() || entry.cancellation.is_cancelled() {
+            return None;
+        }
+        let watcher = entry.backend.take()?;
+        let completion = Arc::new(SetupCompletion::default());
+        entry.setup = completion.clone();
+        Some(RegistrationWork {
+            watcher,
+            requests: std::mem::take(&mut entry.registration_requests),
+            event: entry
+                .registration_event
+                .take()
+                .unwrap_or(GitWatchEvent::WorkingTree),
+            cancellation: entry.cancellation.clone(),
+            setup: SetupGuard::reserve(self.setups.clone(), completion),
+        })
+    }
+
+    fn start_registration(
+        self: &Arc<Self>,
+        identity: GitWatchIdentity,
+        generation: u64,
+        work: RegistrationWork,
+        runtime: &tokio::runtime::Handle,
+    ) {
+        let inner = self.clone();
+        let runtime = runtime.clone();
+        runtime.clone().spawn_blocking(move || {
+            let RegistrationWork {
+                mut watcher,
+                requests,
+                event,
+                cancellation,
+                setup,
+            } = work;
+            let full_rescan = requests.is_full_rescan();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                watcher
+                    .registration
+                    .refresh(watcher.backend.as_mut(), requests, &cancellation)
+            }))
+            .unwrap_or_else(|_| Err(notify::Error::generic("Git watch registration panicked")));
+            let refresh = if full_rescan {
+                Some(GitWatchEvent::RefMetadata)
+            } else {
+                result
+                    .as_ref()
+                    .is_ok_and(|changed| *changed)
+                    .then_some(event)
+            };
+            let update = match result {
+                Ok(_) => BackendUpdate::Installed { watcher, refresh },
+                Err(_) => BackendUpdate::Unavailable {
+                    watcher: Some(watcher),
+                    refresh,
+                },
+            };
+            let completion = setup.completion.clone();
+            inner.commit_backend(&identity, generation, update, &runtime);
+            drop(setup);
+            inner.clear_retired(&identity, &completion);
+        });
+    }
+
+    fn commit_backend(
+        self: &Arc<Self>,
+        identity: &GitWatchIdentity,
+        generation: u64,
+        update: BackendUpdate,
+        runtime: &tokio::runtime::Handle,
+    ) {
+        let work = {
+            let mut state = self.lock_state();
+            let Some(entry) = state.entries.get_mut(identity).filter(|entry| {
+                entry.generation == generation && !entry.cancellation.is_cancelled()
+            }) else {
+                drop(state);
+                drop(update);
+                return;
+            };
+            let refresh = match update {
+                BackendUpdate::Installed { watcher, refresh } => {
+                    entry.backend = Some(watcher);
+                    refresh
+                }
+                BackendUpdate::Unavailable { watcher, refresh } => {
+                    entry.backend = watcher;
+                    publish(entry, GitWatchEvent::Unavailable);
+                    refresh
+                }
+            };
+            if let Some(event) = refresh {
+                publish(entry, event);
+            }
+            self.take_registration_work(entry)
+        };
+        if let Some(work) = work {
+            self.start_registration(identity.clone(), generation, work, runtime);
         }
     }
 }
@@ -677,6 +927,7 @@ impl GitWatchSubscription {
             generation: entry.generation,
             subscriber_id,
             receiver: entry.sender.subscribe(),
+            ref_version: entry.sender.borrow().ref_version,
             health: Arc::clone(&entry.health),
             setup: Arc::clone(&entry.setup),
         }
@@ -687,7 +938,7 @@ impl GitWatchSubscription {
             if self.receiver.changed().await.is_err() {
                 return None;
             }
-            if let Some(event) = *self.receiver.borrow_and_update() {
+            if let Some(event) = self.take_signal() {
                 return Some(event);
             }
         }
@@ -711,7 +962,19 @@ impl GitWatchSubscription {
         if !self.receiver.has_changed().unwrap_or(false) {
             return None;
         }
-        *self.receiver.borrow_and_update()
+        self.take_signal()
+    }
+
+    fn take_signal(&mut self) -> Option<GitWatchEvent> {
+        let signal = *self.receiver.borrow_and_update();
+        if signal.ref_version != self.ref_version {
+            self.ref_version = signal.ref_version;
+            // Ordinary events cannot overwrite an unconsumed ref invalidation.
+            // Fallback health is sticky and observed separately by the scheduler.
+            Some(GitWatchEvent::RefMetadata)
+        } else {
+            signal.event
+        }
     }
 }
 
@@ -719,10 +982,11 @@ fn install_backend(
     factory: &dyn GitWatcherBackendFactory,
     normal_callback: BackendCallback,
     watch_roots: &[(PathBuf, RecursiveMode)],
+    mut registration: WatchRegistration,
     cancellation: &CancellationToken,
     readiness_timeout: Duration,
     runtime: &tokio::runtime::Handle,
-) -> notify::Result<Box<dyn GitWatcherBackend>> {
+) -> notify::Result<InstalledWatcher> {
     let readiness = Arc::new(ReadinessAcknowledgement::default());
     let probe = create_readiness_probe(watch_roots)?;
     let sentinel_key = normalize_worktree_path_key(&probe.sentinel, host_path_platform());
@@ -747,21 +1011,13 @@ fn install_backend(
             return Err(error);
         }
     };
-    let mut installed = Vec::<PathBuf>::new();
-    for (path, recursive_mode) in watch_roots {
-        if let Err(error) = backend.watch(path, *recursive_mode) {
-            for path in installed.iter().rev() {
-                let _ = backend.unwatch(path);
-            }
-            cleanup_readiness_files(&probe)?;
-            return Err(error);
-        }
-        installed.push(path.clone());
+    if let Err(error) = registration.install(backend.as_mut(), cancellation) {
+        let _ = registration.remove_subtree(backend.as_mut(), None);
+        cleanup_readiness_files(&probe)?;
+        return Err(error);
     }
     if let Err(error) = backend.watch(&probe.root, RecursiveMode::NonRecursive) {
-        for path in installed.iter().rev() {
-            let _ = backend.unwatch(path);
-        }
+        let _ = registration.remove_subtree(backend.as_mut(), None);
         cleanup_readiness_files(&probe)?;
         return Err(error);
     }
@@ -795,12 +1051,13 @@ fn install_backend(
         .and(readiness_unwatch)
         .and(readiness_cleanup)
     {
-        for path in installed.iter().rev() {
-            let _ = backend.unwatch(path);
-        }
+        let _ = registration.remove_subtree(backend.as_mut(), None);
         return Err(error);
     }
-    Ok(backend)
+    Ok(InstalledWatcher {
+        backend,
+        registration,
+    })
 }
 
 #[derive(Default)]
@@ -937,7 +1194,12 @@ fn publish(entry: &mut WatchEntry, event: GitWatchEvent) {
     if matches!(event, GitWatchEvent::Overflow | GitWatchEvent::Unavailable) {
         entry.health.store(1, Ordering::Release);
     }
-    entry.sender.send_replace(Some(event));
+    entry.sender.send_modify(|signal| {
+        signal.event = Some(event);
+        if event == GitWatchEvent::RefMetadata {
+            signal.ref_version = signal.ref_version.wrapping_add(1);
+        }
+    });
 }
 
 async fn admit_roots(request: GitWatchRequest) -> Result<AdmittedRoots, GitWatchError> {
@@ -992,35 +1254,48 @@ fn classify_event(
         return Some(GitWatchEvent::Unavailable);
     }
     let mut working_tree = false;
+    let mut metadata = false;
+    let mut ref_metadata = false;
     for path in &event.paths {
         let path = normalize_event_path_key(path, roots, root_aliases, platform);
-        let registered_mode = registered_roots
-            .iter()
-            .find_map(|(registered, mode)| (registered == &path).then_some(*mode));
+        let registered_root = registered_roots.iter().any(|(root, _)| *root == path);
         if matches!(
             event.kind,
             EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
-        ) && registered_mode.is_some()
+        ) && (registered_root || path == roots.git_dir || path == roots.common_dir)
         {
             return Some(GitWatchEvent::Unavailable);
         }
-        if let Some(relative) = relative_to_root(&path, &roots.git_dir)
+        let relative = match relative_to_root(&path, &roots.git_dir)
             .or_else(|| relative_to_root(&path, &roots.common_dir))
         {
-            if metadata_relative_is_relevant(relative) {
-                return Some(GitWatchEvent::Metadata);
+            Some(relative) => relative,
+            None => {
+                let Some(relative) = relative_to_root(&path, &roots.worktree_root) else {
+                    continue;
+                };
+                match relative.split_once('/').unwrap_or((relative, "")) {
+                    (first, remaining) if component_matches(first, ".git", platform) => remaining,
+                    _ => {
+                        working_tree = true;
+                        continue;
+                    }
+                }
             }
-            continue;
-        }
-        let Some(relative) = relative_to_root(&path, &roots.worktree_root) else {
-            continue;
         };
-        if relative == ".git" || relative.starts_with(".git/") {
-            return Some(GitWatchEvent::Metadata);
+        match metadata_layout(relative, platform).event(event.kind) {
+            Some(GitWatchEvent::RefMetadata) => ref_metadata = true,
+            Some(GitWatchEvent::Metadata) => metadata = true,
+            _ => {}
         }
-        working_tree = true;
     }
-    working_tree.then_some(GitWatchEvent::WorkingTree)
+    if ref_metadata {
+        Some(GitWatchEvent::RefMetadata)
+    } else if metadata {
+        Some(GitWatchEvent::Metadata)
+    } else {
+        working_tree.then_some(GitWatchEvent::WorkingTree)
+    }
 }
 
 fn normalize_event_path_key(
@@ -1048,24 +1323,25 @@ fn normalize_event_path_key(
     path
 }
 
-#[cfg(windows)]
+/// Windows reports installing a store's native recursive watch beneath the
+/// non-recursive metadata root as a `Modify(Any)` of the store itself. While the
+/// backend is out installing or registering watches, that event is the
+/// watcher's own: the store's recursive watch reports real changes inside it,
+/// and the identical event after the backend returns stays observable.
 fn windows_installing_nested_root_artifact(
     event: &Event,
+    roots: &GitWatchIdentity,
+    root_aliases: &[GitWatchIdentity],
     registered_roots: &[(String, RecursiveMode)],
+    platform: super::HostPathPlatform,
 ) -> bool {
-    if event.kind != EventKind::Modify(ModifyKind::Any) || event.paths.len() != 1 {
-        return false;
-    }
-    let path = normalize_worktree_path_key(&event.paths[0], host_path_platform());
-    registered_roots.iter().any(|(registered, mode)| {
-        *mode == RecursiveMode::Recursive
-            && registered == &path
-            && registered_roots.iter().any(|(parent, parent_mode)| {
-                *parent_mode == RecursiveMode::NonRecursive
-                    && parent != registered
-                    && relative_to_root(registered, parent).is_some()
-            })
-    })
+    event.kind == EventKind::Modify(ModifyKind::Any)
+        && event.paths.len() == 1
+        && registration::coverage(
+            registered_roots,
+            &normalize_event_path_key(&event.paths[0], roots, root_aliases, platform),
+            platform,
+        ) == Coverage::StoreRoot
 }
 
 fn event_may_change_status(kind: EventKind) -> bool {
@@ -1086,13 +1362,6 @@ fn relative_to_root<'a>(path: &'a str, root: &str) -> Option<&'a str> {
     remainder.strip_prefix('/')
 }
 
-fn metadata_relative_is_relevant(relative: &str) -> bool {
-    relative
-        .split('/')
-        .next()
-        .is_none_or(|component| !component.eq_ignore_ascii_case("objects"))
-}
-
 async fn canonical_root(path: PathBuf) -> Result<PathBuf, GitWatchError> {
     tokio::fs::canonicalize(&path)
         .await
@@ -1101,23 +1370,30 @@ async fn canonical_root(path: PathBuf) -> Result<PathBuf, GitWatchError> {
 
 fn watch_roots(roots: &AdmittedRoots) -> Vec<(PathBuf, RecursiveMode)> {
     let mut watched = vec![(roots.worktree_root.clone(), RecursiveMode::Recursive)];
-    for metadata_root in [&roots.git_dir, &roots.common_dir] {
-        if watch_root_is_covered(metadata_root, &watched) {
-            continue;
+    for root in [&roots.common_dir, &roots.git_dir] {
+        let key = normalize_worktree_path_key(root, host_path_platform());
+        // Worktree recursion covers a main checkout's `.git`, and the common
+        // directory's `worktrees` store covers a linked worktree's administrative
+        // directory.
+        if registration::coverage(
+            &normalize_registered_roots(&watched),
+            &key,
+            host_path_platform(),
+        ) == Coverage::Uncovered
+        {
+            watched.push((root.clone(), RecursiveMode::NonRecursive));
         }
-        watched.push((metadata_root.clone(), RecursiveMode::NonRecursive));
-    }
-    let refs_root = roots.common_dir.join("refs");
-    if !watch_root_is_covered(&refs_root, &watched) {
-        watched.push((refs_root, RecursiveMode::Recursive));
     }
     watched
 }
 
-fn watch_root_is_covered(candidate: &Path, watched: &[(PathBuf, RecursiveMode)]) -> bool {
-    watched.iter().any(|(root, mode)| {
-        candidate == root || (*mode == RecursiveMode::Recursive && candidate.starts_with(root))
-    })
+fn event_changes_directories(kind: EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Create(notify::event::CreateKind::Folder | notify::event::CreateKind::Any)
+            | EventKind::Remove(notify::event::RemoveKind::Folder | notify::event::RemoveKind::Any)
+            | EventKind::Modify(ModifyKind::Name(_))
+    )
 }
 
 fn normalize_registered_roots(
@@ -1144,6 +1420,457 @@ mod tests {
 
     use super::*;
     use crate::git::HostPathPlatform;
+
+    #[test]
+    fn ref_metadata_is_distinct_from_index_and_config() {
+        let roots =
+            identity_for_paths("/repo", "/repo/.git", "/repo/.git", HostPathPlatform::Posix);
+        let classify = |relative: &str| {
+            classify_event(
+                &Event::new(
+                    if relative == "worktrees" || relative == "worktrees/topic" {
+                        EventKind::Create(notify::event::CreateKind::Folder)
+                    } else {
+                        EventKind::Any
+                    },
+                )
+                .add_path(PathBuf::from(format!("/repo/.git/{relative}"))),
+                &roots,
+                &[],
+                &[],
+                HostPathPlatform::Posix,
+            )
+        };
+        for relative in [
+            "HEAD",
+            "FETCH_HEAD",
+            "ORIG_HEAD",
+            "MERGE_HEAD",
+            "CHERRY_PICK_HEAD",
+            "REVERT_HEAD",
+            "packed-refs",
+            "refs/heads/main",
+            "refs/remotes/origin/main",
+            "refs/tags/v1",
+            "refs/stash",
+            "logs",
+            "logs/refs",
+            "logs/refs/stash",
+            "worktrees",
+            "worktrees/topic",
+            "worktrees/topic/HEAD",
+            "reftable/tables.list",
+            "reftable/0x000000000001.ref",
+        ] {
+            assert_eq!(
+                classify(relative),
+                Some(GitWatchEvent::RefMetadata),
+                "{relative} must invalidate refs"
+            );
+        }
+        for relative in [
+            "index",
+            "config",
+            "logs/HEAD",
+            "logs/refs/heads/main",
+            // A submodule's Git directory: its commit or checkout changes the
+            // superproject's status, not the superproject's refs.
+            "modules/sub",
+            "modules/sub/HEAD",
+            "modules/sub/index",
+            "modules/sub/refs/heads/main",
+            "modules/sub/logs/HEAD",
+        ] {
+            assert_eq!(
+                classify(relative),
+                Some(GitWatchEvent::Metadata),
+                "{relative} must refresh local status only"
+            );
+        }
+        for relative in [
+            "objects/ab/cdef",
+            "objects/pack/pack-1.pack",
+            "lfs/objects/ab/cd/data",
+            "modules/sub/objects",
+            "modules/sub/objects/ab/cdef",
+        ] {
+            assert_eq!(classify(relative), None, "{relative} is an object store");
+        }
+    }
+
+    #[test]
+    fn sibling_metadata_only_invalidates_head_and_reftable() {
+        let roots = identity_for_paths(
+            "/linked",
+            "/repo/.git/worktrees/current",
+            "/repo/.git",
+            HostPathPlatform::Posix,
+        );
+        for (relative, expected) in [
+            ("worktrees/sibling/index", None),
+            ("worktrees/sibling/logs/HEAD", None),
+            ("worktrees/sibling/HEAD", Some(GitWatchEvent::RefMetadata)),
+            (
+                "worktrees/sibling/reftable/tables.list",
+                Some(GitWatchEvent::RefMetadata),
+            ),
+            ("worktrees/current/index", Some(GitWatchEvent::Metadata)),
+            // Submodule Git directories are per worktree.
+            (
+                "worktrees/current/modules/sub/HEAD",
+                Some(GitWatchEvent::Metadata),
+            ),
+            ("worktrees/current/modules/sub/objects/ab/cd", None),
+            ("worktrees/sibling/modules/sub/HEAD", None),
+            ("lfs/objects/data", None),
+            ("modules/sub/objects/data", None),
+        ] {
+            let event = Event::new(EventKind::Any)
+                .add_path(PathBuf::from(format!("/repo/.git/{relative}")));
+            assert_eq!(
+                classify_event(&event, &roots, &[], &[], HostPathPlatform::Posix),
+                expected,
+                "{relative}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_watch_plan_keeps_worktree_recursion_and_targets_external_metadata() {
+        for linked in [false, true] {
+            let root = tempfile::tempdir().expect("watch exclusion fixture");
+            let worktree = root.path().join("worktree");
+            let common = if linked {
+                root.path().join("common.git")
+            } else {
+                worktree.join(".git")
+            };
+            let git_dir = if linked {
+                common.join("worktrees/current")
+            } else {
+                common.clone()
+            };
+            for path in [
+                &worktree.join("src/nested"),
+                &git_dir,
+                &common.join("refs/heads"),
+                &common.join("logs/refs"),
+                &common.join("objects/ab"),
+                &common.join("lfs/objects"),
+                &common.join("modules/sub/objects/ab"),
+            ] {
+                std::fs::create_dir_all(path).expect("fixture directory");
+            }
+            let backend = FakeWatcherBackendFactory::default();
+            let service = GitWatchService::with_backend_factory(Arc::new(backend.clone()));
+            let subscription = service
+                .subscribe(request(&worktree, &git_dir, &common))
+                .await
+                .expect("watch subscription");
+            let watches = backend.state.watches.lock().expect("watches").clone();
+            assert!(watches.iter().any(|(_, path, mode)| path
+                == &std::fs::canonicalize(&worktree).unwrap()
+                && *mode == RecursiveMode::Recursive));
+            if !linked {
+                assert_eq!(
+                    watches.len(),
+                    1,
+                    "main .git is covered by native worktree recursion"
+                );
+                drop(subscription);
+                service.shutdown().await;
+                continue;
+            }
+            for excluded in [
+                common.join("objects/ab"),
+                common.join("lfs/objects"),
+                common.join("modules/sub/objects/ab"),
+            ] {
+                let excluded = std::fs::canonicalize(excluded).expect("excluded directory");
+                assert!(
+                    !watches.iter().any(|(_, path, mode)| path == &excluded
+                        || (*mode == RecursiveMode::Recursive && excluded.starts_with(path))),
+                    "object store received a native watch: {}",
+                    excluded.display()
+                );
+            }
+            drop(subscription);
+            service.shutdown().await;
+        }
+    }
+
+    #[test]
+    fn windows_metadata_layout_uses_normalized_component_case() {
+        for store in ["REFS", "LOGS", "REFTABLE", "WORKTREES"] {
+            assert!(
+                metadata_layout(store, HostPathPlatform::Windows)
+                    .store
+                    .is_some(),
+                "{store} must register recursively"
+            );
+        }
+        for store in ["OBJECTS", "LFS", "MODULES"] {
+            assert!(
+                metadata_layout(store, HostPathPlatform::Windows)
+                    .store
+                    .is_none(),
+                "{store} must not register recursively"
+            );
+        }
+
+        let roots = identity_for_paths(
+            "C:/repo",
+            "C:/repo/.git",
+            "C:/repo/.git",
+            HostPathPlatform::Windows,
+        );
+        for (relative, expected) in [
+            ("REFS/HEADS/MAIN", Some(GitWatchEvent::RefMetadata)),
+            ("LOGS/REFS/STASH", Some(GitWatchEvent::RefMetadata)),
+            ("REFTABLE/TABLES.LIST", Some(GitWatchEvent::RefMetadata)),
+            ("WORKTREES/X/HEAD", Some(GitWatchEvent::RefMetadata)),
+            (
+                "WORKTREES/X/REFTABLE/TABLES.LIST",
+                Some(GitWatchEvent::RefMetadata),
+            ),
+            ("WORKTREES/X/INDEX", None),
+            ("OBJECTS/AB/123", None),
+            ("LFS/OBJECTS/123", None),
+            ("MODULES/SUB/OBJECTS/123", None),
+            ("MODULES/SUB/HEAD", Some(GitWatchEvent::Metadata)),
+            ("MODULES/SUB/REFS/HEADS/MAIN", Some(GitWatchEvent::Metadata)),
+        ] {
+            let event = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+                .add_path(PathBuf::from(format!("C:/repo/.GIT/{relative}")));
+            assert_eq!(
+                classify_event(&event, &roots, &[], &[], HostPathPlatform::Windows),
+                expected,
+                "{relative}"
+            );
+        }
+        let event = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+            .add_path(PathBuf::from("C:/repo/.GIT"));
+        assert_eq!(
+            classify_event(&event, &roots, &[], &[], HostPathPlatform::Windows),
+            Some(GitWatchEvent::Metadata)
+        );
+    }
+
+    #[test]
+    fn windows_setup_artifact_is_only_a_store_modify_any_beneath_a_non_recursive_root() {
+        let roots = identity_for_paths(
+            r"C:\linked",
+            r"C:\repo.git\worktrees\topic",
+            r"C:\repo.git",
+            HostPathPlatform::Windows,
+        );
+        let registered = vec![
+            (roots.worktree_root.clone(), RecursiveMode::Recursive),
+            (roots.common_dir.clone(), RecursiveMode::NonRecursive),
+        ];
+        let artifact = |kind: EventKind, paths: &[&str]| {
+            let event = paths
+                .iter()
+                .fold(Event::new(kind), |event, path| event.add_path(path.into()));
+            windows_installing_nested_root_artifact(
+                &event,
+                &roots,
+                std::slice::from_ref(&roots),
+                &registered,
+                HostPathPlatform::Windows,
+            )
+        };
+        let modify_any = EventKind::Modify(ModifyKind::Any);
+        for store in [
+            r"C:\repo.git\refs",
+            r"C:\REPO.GIT\LOGS",
+            r"c:\repo.git\Reftable",
+            r"C:\repo.git\worktrees",
+        ] {
+            assert!(artifact(modify_any, &[store]), "{store}");
+        }
+        let not_artifacts: [(EventKind, &[&str], &str); 7] = [
+            (modify_any, &[r"C:\repo.git\refs\heads"], "inside a store"),
+            (modify_any, &[r"C:\repo.git\index"], "plain root entry"),
+            (modify_any, &[r"C:\repo.git\objects"], "object store"),
+            (modify_any, &[r"C:\repo.git"], "the root itself"),
+            (modify_any, &[r"C:\linked\refs"], "recursive worktree"),
+            (
+                EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+                &[r"C:\repo.git\refs"],
+                "another change kind",
+            ),
+            (
+                modify_any,
+                &[r"C:\repo.git\refs", r"C:\repo.git\logs"],
+                "more than one path",
+            ),
+        ];
+        for (kind, paths, context) in not_artifacts {
+            assert!(!artifact(kind, paths), "{context}");
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_root_modify_any_is_suppressed_only_during_windows_installation() {
+        let root = tempfile::tempdir().expect("watch fixture");
+        let worktree = root.path().join("worktree");
+        let git_dir = root.path().join("main.git/worktrees/topic");
+        let common_dir = root.path().join("main.git");
+        let refs_dir = common_dir.join("refs");
+        for path in [&worktree, &git_dir, &refs_dir] {
+            std::fs::create_dir_all(path).expect("watch root");
+        }
+        let backend = FakeWatcherBackendFactory::emitting_nested_root_modify_any_during_watch();
+        let service = GitWatchService::with_backend_factory(Arc::new(backend.clone()));
+        let mut subscription = service
+            .subscribe(request(&worktree, &git_dir, &common_dir))
+            .await
+            .expect("watch subscription");
+        let refs_root = std::fs::canonicalize(&refs_dir).expect("canonical refs store");
+        assert!(
+            backend
+                .state
+                .watches
+                .lock()
+                .expect("watches lock")
+                .iter()
+                .any(|(_, path, mode)| path == &refs_root && *mode == RecursiveMode::Recursive),
+            "the refs store is watched recursively beneath the non-recursive common root"
+        );
+
+        #[cfg(windows)]
+        assert_eq!(
+            subscription.try_recv(),
+            None,
+            "the synchronous Windows setup artifact is private"
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            subscription.try_recv(),
+            Some(GitWatchEvent::RefMetadata),
+            "non-Windows platforms never suppress the event"
+        );
+
+        let event = Event::new(EventKind::Modify(ModifyKind::Any)).add_path(refs_root.clone());
+        backend.emit(0, Ok(event.clone()));
+        assert_eq!(
+            subscription.try_recv(),
+            Some(GitWatchEvent::RefMetadata),
+            "the identical event after backend commit remains observable"
+        );
+
+        let aliases = identity_for_paths(&worktree, &git_dir, &common_dir, host_path_platform());
+        let roots = identity_for_paths(
+            std::fs::canonicalize(&worktree).expect("canonical worktree"),
+            std::fs::canonicalize(&git_dir).expect("canonical Git directory"),
+            std::fs::canonicalize(&common_dir).expect("canonical common directory"),
+            host_path_platform(),
+        );
+        let root_aliases = [roots.clone(), aliases];
+        let registered = vec![
+            (roots.worktree_root.clone(), RecursiveMode::Recursive),
+            (roots.common_dir.clone(), RecursiveMode::NonRecursive),
+        ];
+        assert_eq!(
+            classify_event(
+                &event,
+                &roots,
+                &root_aliases,
+                &registered,
+                host_path_platform(),
+            ),
+            Some(GitWatchEvent::RefMetadata),
+            "the classifier never permanently suppresses this metadata shape"
+        );
+        for event in [
+            Event::new(EventKind::Create(notify::event::CreateKind::File))
+                .add_path(refs_root.join("heads/new")),
+            Event::new(EventKind::Remove(notify::event::RemoveKind::File))
+                .add_path(refs_root.join("heads/old")),
+            Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+                .add_path(refs_root.join("heads/main")),
+            Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+                .add_path(refs_root.join("heads/main.lock"))
+                .add_path(refs_root.join("heads/main")),
+        ] {
+            assert_eq!(
+                classify_event(
+                    &event,
+                    &roots,
+                    &root_aliases,
+                    &registered,
+                    host_path_platform(),
+                ),
+                Some(GitWatchEvent::RefMetadata),
+                "child create, delete, content, and rename changes remain invalidating"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn registration_queue_overflow_always_publishes_ref_metadata() {
+        for fail_rescan in [false, true] {
+            let root = tempfile::tempdir().expect("overflow fixture");
+            let worktree = root.path().join("worktree");
+            let git_dir = root.path().join("common");
+            for path in [&worktree, &git_dir.join("logs/other")] {
+                fs::create_dir_all(path).unwrap();
+            }
+            let backend = FakeWatcherBackendFactory::default();
+            let service = GitWatchService::with_backend_factory(Arc::new(backend.clone()));
+            let mut subscription = service
+                .subscribe(request(&worktree, &git_dir, &git_dir))
+                .await
+                .unwrap();
+            if fail_rescan {
+                let next_watch = backend.state.all_watches.lock().unwrap().len() + 1;
+                backend
+                    .state
+                    .fail_watch_at
+                    .store(next_watch, Ordering::Relaxed);
+            }
+            // Only store roots are queued (at most four per non-recursive metadata
+            // root), so backend events cannot fill the bounded queue: fill it here.
+            let work = {
+                let mut state = service.inner.lock_state();
+                let entry = state.entries.get_mut(&subscription.identity).unwrap();
+                for index in 0..257 {
+                    let path = git_dir.join(format!("logs/other/{index}"));
+                    entry.registration_requests.add(
+                        path.to_string_lossy().into_owned(),
+                        PendingPath {
+                            native_path: path,
+                            change: DirectoryChange::Created,
+                        },
+                    );
+                }
+                entry.registration_event = Some(GitWatchEvent::Metadata);
+                service
+                    .inner
+                    .take_registration_work(entry)
+                    .expect("overflow registration")
+            };
+            service.inner.start_registration(
+                subscription.identity.clone(),
+                subscription.generation,
+                work,
+                &tokio::runtime::Handle::current(),
+            );
+            service.inner.setups.wait_until_idle().await;
+            assert_eq!(subscription.try_recv(), Some(GitWatchEvent::RefMetadata));
+            assert_eq!(
+                subscription.health(),
+                if fail_rescan {
+                    GitWatcherHealth::FallbackRequired
+                } else {
+                    GitWatcherHealth::Healthy
+                }
+            );
+            drop(subscription);
+            service.shutdown().await;
+        }
+    }
 
     #[derive(Clone, Default)]
     struct FakeWatcherBackendFactory {
@@ -1174,6 +1901,14 @@ mod tests {
         entered_notify: tokio::sync::Notify,
         released: Mutex<bool>,
         release_notify: std::sync::Condvar,
+    }
+
+    struct ReleaseSetupBarrier(Arc<SetupBarrier>);
+
+    impl Drop for ReleaseSetupBarrier {
+        fn drop(&mut self) {
+            self.0.release();
+        }
     }
 
     impl SetupBarrier {
@@ -1296,6 +2031,8 @@ mod tests {
             (factory, barrier)
         }
 
+        /// Mimics Windows: installing a recursive watch beneath a watched parent
+        /// reports a `Modify(Any)` of the newly watched directory.
         fn emitting_nested_root_modify_any_during_watch() -> Self {
             let factory = Self::default();
             factory
@@ -1351,13 +2088,12 @@ mod tests {
     impl GitWatcherBackend for FakeWatcherBackend {
         fn watch(&mut self, path: &Path, recursive_mode: RecursiveMode) -> notify::Result<()> {
             self.watch_calls += 1;
-            if self.watch_calls == 1
-                && let Some(barrier) = self
-                    .state
-                    .watch_barrier
-                    .lock()
-                    .expect("watch barrier lock")
-                    .clone()
+            if let Some(barrier) = self
+                .state
+                .watch_barrier
+                .lock()
+                .expect("watch barrier lock")
+                .clone()
             {
                 barrier.block();
             }
@@ -1664,7 +2400,16 @@ mod tests {
                 .await
                 .expect("native watch subscription");
             let registrations = readiness.registrations();
-            assert_eq!(registrations.len(), 4, "every actual root is probed");
+            for root in [&worktree, &git_dir, &common_dir, &common_dir.join("refs")] {
+                let canonical = std::fs::canonicalize(root).expect("canonical watched directory");
+                assert!(
+                    registrations
+                        .iter()
+                        .any(|registration| registration.root == canonical),
+                    "missing native directory watch: {}",
+                    root.display()
+                );
+            }
             for registration in &registrations {
                 assert_eq!(
                     registration.sentinel.parent(),
@@ -1723,8 +2468,11 @@ mod tests {
     #[tokio::test]
     async fn native_readiness_probes_every_registered_root_without_publication() {
         let mut fixture = NativeFixture::new(None).await;
-        assert_eq!(fixture.readiness_registration_count(), 4);
-        assert_eq!(fixture.readiness_acknowledgement_count(), 4);
+        assert!(fixture.readiness_registration_count() >= 3);
+        assert_eq!(
+            fixture.readiness_acknowledgement_count(),
+            fixture.readiness_registration_count()
+        );
         assert_eq!(fixture.subscription.try_recv(), None);
         assert_eq!(fixture.subscription.health(), GitWatcherHealth::Healthy);
     }
@@ -1753,7 +2501,7 @@ mod tests {
         assert_eq!(
             backend.state.watches.lock().expect("watches lock").len(),
             1,
-            "the recursive worktree watch covers an in-tree main-checkout Git directory"
+            "aliases share one native recursive worktree watch"
         );
         drop(first);
         assert_eq!(service.active_count_for_test(), 1);
@@ -1909,7 +2657,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_linked_registered_root_loss_requires_fallback_but_child_removal_does_not() {
+    async fn admitted_root_loss_requires_fallback_but_child_removal_does_not() {
         let root = tempfile::tempdir().expect("watch fixture");
         let worktree = root.path().join("worktree");
         let git_dir = root.path().join("main.git/worktrees/topic");
@@ -1923,10 +2671,8 @@ mod tests {
             .subscribe(request(&worktree, &git_dir, &common_dir))
             .await
             .expect("linked watch subscription");
-        let watches = backend.state.watches.lock().expect("watches lock").clone();
-        assert_eq!(watches.len(), 4);
-
-        for (index, (_, registered_root, _)) in watches.iter().enumerate() {
+        for (index, root) in [&worktree, &git_dir, &common_dir].into_iter().enumerate() {
+            let registered_root = std::fs::canonicalize(root).expect("canonical admitted root");
             let event = if index % 2 == 0 {
                 Event::new(EventKind::Remove(notify::event::RemoveKind::Folder))
                     .add_path(registered_root.clone())
@@ -1961,107 +2707,207 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nested_root_modify_any_is_suppressed_only_during_windows_installation() {
+    async fn recursive_metadata_coverage_observes_new_stores_and_keeps_child_events() {
         let root = tempfile::tempdir().expect("watch fixture");
         let worktree = root.path().join("worktree");
         let git_dir = root.path().join("main.git/worktrees/topic");
         let common_dir = root.path().join("main.git");
-        let refs_dir = common_dir.join("refs");
-        for path in [&worktree, &git_dir, &refs_dir] {
-            std::fs::create_dir_all(path).expect("watch root");
+        for path in [&worktree, &git_dir] {
+            std::fs::create_dir_all(path).expect("root");
         }
-        let backend = FakeWatcherBackendFactory::emitting_nested_root_modify_any_during_watch();
+        let backend = FakeWatcherBackendFactory::default();
         let service = GitWatchService::with_backend_factory(Arc::new(backend.clone()));
         let mut subscription = service
             .subscribe(request(&worktree, &git_dir, &common_dir))
             .await
             .expect("watch subscription");
-        let registered = backend.state.watches.lock().expect("watches lock").clone();
-        let refs_root = registered
-            .iter()
-            .find_map(|(_, path, mode)| {
-                (*mode == RecursiveMode::Recursive && path.ends_with("refs")).then(|| path.clone())
-            })
-            .expect("recursive refs registration");
-
-        #[cfg(windows)]
-        assert_eq!(
-            subscription.try_recv(),
-            None,
-            "the synchronous Windows setup artifact is private"
+        let canonical_common = std::fs::canonicalize(&common_dir).expect("common root");
+        assert!(
+            backend
+                .state
+                .watches
+                .lock()
+                .expect("watches")
+                .iter()
+                .any(|(_, path, mode)| path == &canonical_common
+                    && *mode == RecursiveMode::NonRecursive)
         );
-        #[cfg(not(windows))]
-        assert_eq!(
-            subscription.try_recv(),
-            Some(GitWatchEvent::Metadata),
-            "non-Windows platforms never suppress the event"
-        );
-
-        let event = Event::new(EventKind::Modify(ModifyKind::Any)).add_path(refs_root.clone());
-        backend.emit(0, Ok(event.clone()));
-        assert_eq!(
-            subscription.try_recv(),
-            Some(GitWatchEvent::Metadata),
-            "the identical event after backend commit remains observable"
-        );
-
-        let aliases = identity_for_paths(&worktree, &git_dir, &common_dir, host_path_platform());
-        let roots = identity_for_paths(
-            std::fs::canonicalize(&worktree).expect("canonical worktree"),
-            std::fs::canonicalize(&git_dir).expect("canonical Git directory"),
-            std::fs::canonicalize(&common_dir).expect("canonical common directory"),
-            host_path_platform(),
-        );
-        let root_aliases = [roots.clone(), aliases];
-        let registered = registered
-            .into_iter()
-            .map(|(_, path, mode)| {
-                (
-                    normalize_worktree_path_key(&path, host_path_platform()),
-                    mode,
-                )
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            classify_event(
-                &event,
-                &roots,
-                &root_aliases,
-                &registered,
-                host_path_platform(),
-            ),
-            Some(GitWatchEvent::Metadata),
-            "the classifier never permanently suppresses this metadata shape"
-        );
-
-        for event in [
-            Event::new(EventKind::Create(notify::event::CreateKind::File))
-                .add_path(refs_root.join("heads/new")),
-            Event::new(EventKind::Remove(notify::event::RemoveKind::File))
-                .add_path(refs_root.join("heads/old")),
-            Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
-                .add_path(refs_root.join("heads/main")),
-            Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
-                .add_path(refs_root.join("heads/main.lock"))
-                .add_path(refs_root.join("heads/main")),
+        for relative in [
+            "logs/refs/stash",
+            "worktrees/sibling/HEAD",
+            "reftable/tables.list",
+            "refs/heads/new",
         ] {
-            assert_eq!(
-                classify_event(
-                    &event,
-                    &roots,
-                    &root_aliases,
-                    &registered,
-                    host_path_platform(),
+            let parent = common_dir
+                .join(relative)
+                .parent()
+                .expect("metadata parent")
+                .to_path_buf();
+            let store = common_dir.join(relative.split('/').next().expect("store component"));
+            // A new store is reported by the non-recursive common root as its own
+            // entry; directories inside an existing store by that store's watch.
+            let created = if store.exists() {
+                parent.clone()
+            } else {
+                store
+            };
+            std::fs::create_dir_all(&parent).expect("late metadata parent");
+            backend.emit(
+                0,
+                Ok(
+                    Event::new(EventKind::Create(notify::event::CreateKind::Folder))
+                        .add_path(created),
                 ),
-                Some(GitWatchEvent::Metadata),
-                "child create, delete, content, and rename changes remain invalidating"
+            );
+            service.inner.setups.wait_until_idle().await;
+            let canonical_parent = std::fs::canonicalize(&parent).expect("canonical parent");
+            assert!(
+                backend
+                    .state
+                    .watches
+                    .lock()
+                    .expect("watches")
+                    .iter()
+                    .any(|(_, path, mode)| path == &canonical_parent
+                        || (*mode == RecursiveMode::Recursive
+                            && canonical_parent.starts_with(path)))
+            );
+            backend.emit(
+                0,
+                Ok(Event::new(EventKind::Modify(ModifyKind::Any))
+                    .add_path(common_dir.join(relative))),
+            );
+            assert_eq!(
+                subscription.recv().await,
+                Some(GitWatchEvent::RefMetadata),
+                "{relative}"
             );
         }
+        backend.emit(
+            0,
+            Ok(Event::new(EventKind::Any).add_path(common_dir.join("objects/ab/object"))),
+        );
+        assert_eq!(subscription.try_recv(), None);
+    }
+
+    fn linked_fixture(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let worktree = root.join("worktree");
+        let common_dir = root.join("main.git");
+        let git_dir = common_dir.join("worktrees/topic");
+        for path in [
+            &worktree,
+            &git_dir,
+            &common_dir.join("worktrees/sibling"),
+            &common_dir.join("refs/remotes/origin"),
+            &common_dir.join("logs/refs/remotes/origin"),
+            &common_dir.join("reftable"),
+        ] {
+            std::fs::create_dir_all(path).expect("linked fixture directory");
+        }
+        (worktree, git_dir, common_dir)
     }
 
     #[tokio::test]
-    async fn removed_and_recreated_refs_root_stays_fallback_until_reattachment() {
+    async fn nested_ref_directories_rely_on_native_recursion_without_a_full_rescan() {
+        let root = tempfile::tempdir().expect("nested ref fixture");
+        let (worktree, git_dir, common_dir) = linked_fixture(root.path());
+        let backend = FakeWatcherBackendFactory::default();
+        let service = GitWatchService::with_backend_factory(Arc::new(backend.clone()));
+        let mut subscription = service
+            .subscribe(request(&worktree, &git_dir, &common_dir))
+            .await
+            .expect("linked watch subscription");
+        let installed = backend.state.watches.lock().expect("watches").clone();
+
+        // A large fetch creates many remote-tracking namespaces and their reflogs,
+        // more than the registration queue holds.
+        for index in 0..300 {
+            for store in ["refs", "logs/refs"] {
+                let directory = common_dir.join(format!("{store}/remotes/origin/topic-{index}"));
+                std::fs::create_dir(&directory).expect("nested ref directory");
+                backend.emit(
+                    0,
+                    Ok(
+                        Event::new(EventKind::Create(notify::event::CreateKind::Folder))
+                            .add_path(directory),
+                    ),
+                );
+                assert_eq!(
+                    service.setup_count_for_test(),
+                    0,
+                    "native recursion already covers {store}/remotes/origin/topic-{index}"
+                );
+            }
+        }
+        service.inner.setups.wait_until_idle().await;
+
+        assert!(
+            backend
+                .state
+                .unwatches
+                .lock()
+                .expect("unwatches")
+                .is_empty(),
+            "nested ref directories must not force a full rescan"
+        );
+        assert_eq!(
+            *backend.state.watches.lock().expect("watches"),
+            installed,
+            "no watch is added for directories inside a recursive store"
+        );
+        assert_eq!(subscription.try_recv(), Some(GitWatchEvent::RefMetadata));
+        assert_eq!(subscription.health(), GitWatcherHealth::Healthy);
+    }
+
+    #[tokio::test]
+    async fn ref_lock_renames_invalidate_refs_without_registration_work() {
+        let root = tempfile::tempdir().expect("lock rename fixture");
+        let (worktree, git_dir, common_dir) = linked_fixture(root.path());
+        let backend = FakeWatcherBackendFactory::default();
+        let service = GitWatchService::with_backend_factory(Arc::new(backend.clone()));
+        let mut subscription = service
+            .subscribe(request(&worktree, &git_dir, &common_dir))
+            .await
+            .expect("linked watch subscription");
+
+        for (lock, target) in [
+            ("refs/heads/main.lock", "refs/heads/main"),
+            ("refs/remotes/origin/main.lock", "refs/remotes/origin/main"),
+            ("reftable/tables.list.lock", "reftable/tables.list"),
+            ("worktrees/sibling/HEAD.lock", "worktrees/sibling/HEAD"),
+            ("worktrees/topic/HEAD.lock", "worktrees/topic/HEAD"),
+            ("packed-refs.lock", "packed-refs"),
+        ] {
+            let (lock, target) = (common_dir.join(lock), common_dir.join(target));
+            for event in [
+                Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::From)))
+                    .add_path(lock.clone()),
+                Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::To)))
+                    .add_path(target.clone()),
+                Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+                    .add_path(lock.clone())
+                    .add_path(target.clone()),
+            ] {
+                backend.emit(0, Ok(event));
+                assert_eq!(
+                    service.setup_count_for_test(),
+                    0,
+                    "a file rename inside {} needs no registration",
+                    target.display()
+                );
+            }
+            expect_fake_event(
+                &mut subscription,
+                GitWatchEvent::RefMetadata,
+                &target.display().to_string(),
+            )
+            .await;
+        }
+        assert_eq!(subscription.health(), GitWatcherHealth::Healthy);
+    }
+
+    #[tokio::test]
+    async fn removed_and_recreated_refs_remain_observed_under_the_common_root() {
         let root = tempfile::tempdir().expect("watch fixture");
         let worktree = root.path().join("worktree");
         let git_dir = root.path().join("main.git/worktrees/topic");
@@ -2076,16 +2922,7 @@ mod tests {
             .subscribe(request(&worktree, &git_dir, &common_dir))
             .await
             .expect("first watch generation");
-        let registered_refs = backend
-            .state
-            .watches
-            .lock()
-            .expect("watches lock")
-            .iter()
-            .find_map(|(_, path, mode)| {
-                (*mode == RecursiveMode::Recursive && path.ends_with("refs")).then(|| path.clone())
-            })
-            .expect("registered refs root");
+        let registered_refs = std::fs::canonicalize(&refs_dir).expect("refs path");
 
         std::fs::remove_dir_all(&refs_dir).expect("remove refs root");
         backend.emit(
@@ -2095,7 +2932,7 @@ mod tests {
                     .add_path(registered_refs.clone()),
             ),
         );
-        assert_eq!(first.recv().await, Some(GitWatchEvent::Unavailable));
+        assert_eq!(first.recv().await, Some(GitWatchEvent::RefMetadata));
         std::fs::create_dir_all(&refs_dir).expect("recreate refs root");
         backend.emit(
             0,
@@ -2104,8 +2941,8 @@ mod tests {
                     .add_path(registered_refs.clone()),
             ),
         );
-        assert_eq!(first.recv().await, Some(GitWatchEvent::Metadata));
-        assert_eq!(first.health(), GitWatcherHealth::FallbackRequired);
+        assert_eq!(first.recv().await, Some(GitWatchEvent::RefMetadata));
+        assert_eq!(first.health(), GitWatcherHealth::Healthy);
         drop(first);
 
         let mut replacement = service
@@ -2129,8 +2966,97 @@ mod tests {
                     .add_path(refs_dir.join("heads/main")),
             ),
         );
-        assert_eq!(replacement.recv().await, Some(GitWatchEvent::Metadata));
+        assert_eq!(replacement.recv().await, Some(GitWatchEvent::RefMetadata));
         assert_eq!(replacement.health(), GitWatcherHealth::Healthy);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn late_registration_is_retired_before_a_replacement_backend_is_admitted() {
+        let root = tempfile::tempdir().expect("registration lifetime fixture");
+        let worktree = root.path().join("worktree");
+        let git_dir = root.path().join("common");
+        std::fs::create_dir_all(&worktree).expect("worktree");
+        std::fs::create_dir_all(&git_dir).expect("Git root");
+        let backend = FakeWatcherBackendFactory::default();
+        let service = GitWatchService::with_backend_factory(Arc::new(backend.clone()));
+        let first = service
+            .subscribe(request(&worktree, &git_dir, &git_dir))
+            .await
+            .expect("first watch");
+        let barrier = Arc::new(SetupBarrier::default());
+        let _release = ReleaseSetupBarrier(barrier.clone());
+        *backend.state.watch_barrier.lock().expect("barrier lock") = Some(barrier.clone());
+        let late = git_dir.join("reftable");
+        std::fs::create_dir(&late).expect("late directory");
+        backend.emit(
+            0,
+            Ok(Event::new(EventKind::Create(notify::event::CreateKind::Folder)).add_path(late)),
+        );
+        tokio::time::timeout(Duration::from_secs(5), barrier.wait_until_entered())
+            .await
+            .expect("late registration enters the backend");
+        drop(first);
+        assert_eq!(
+            backend.dropped(),
+            0,
+            "registration still owns the retired backend"
+        );
+        let next = {
+            let service = service.clone();
+            let request = request(&worktree, &git_dir, &git_dir);
+            tokio::spawn(async move { service.subscribe(request).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!next.is_finished());
+        assert_eq!(backend.created(), 1);
+        barrier.release();
+        let next = next
+            .await
+            .expect("replacement task")
+            .expect("replacement watch");
+        assert_eq!(backend.dropped(), 1);
+        assert_eq!(backend.created(), 2);
+        drop(next);
+        service.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_waits_for_late_directory_registration() {
+        let root = tempfile::tempdir().expect("registration shutdown fixture");
+        let worktree = root.path().join("worktree");
+        let git_dir = root.path().join("common");
+        std::fs::create_dir_all(&worktree).expect("worktree");
+        std::fs::create_dir_all(&git_dir).expect("Git root");
+        let backend = FakeWatcherBackendFactory::default();
+        let service = GitWatchService::with_backend_factory(Arc::new(backend.clone()));
+        let _subscription = service
+            .subscribe(request(&worktree, &git_dir, &git_dir))
+            .await
+            .expect("watch");
+        let barrier = Arc::new(SetupBarrier::default());
+        let _release = ReleaseSetupBarrier(barrier.clone());
+        *backend.state.watch_barrier.lock().expect("barrier lock") = Some(barrier.clone());
+        let late = git_dir.join("reftable");
+        std::fs::create_dir(&late).expect("late directory");
+        backend.emit(
+            0,
+            Ok(Event::new(EventKind::Create(notify::event::CreateKind::Folder)).add_path(late)),
+        );
+        tokio::time::timeout(Duration::from_secs(5), barrier.wait_until_entered())
+            .await
+            .expect("late registration enters the backend");
+        let shutdown = {
+            let service = service.clone();
+            tokio::spawn(async move { service.shutdown().await })
+        };
+        service.wait_for_setup_cancellation_for_test().await;
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown must await the owned registration"
+        );
+        barrier.release();
+        shutdown.await.expect("shutdown task");
+        assert_eq!(backend.dropped(), 1);
     }
 
     #[tokio::test]
@@ -2249,7 +3175,11 @@ mod tests {
                     .add_path(git_dir.join("HEAD")),
             ),
         );
-        assert_eq!(subscription.recv().await, Some(GitWatchEvent::Metadata));
+        backend.emit(
+            0,
+            Ok(Event::new(EventKind::Any).add_path(git_dir.join("index"))),
+        );
+        assert_eq!(subscription.recv().await, Some(GitWatchEvent::RefMetadata));
         assert_eq!(subscription.try_recv(), None);
 
         backend.emit(
@@ -2259,7 +3189,7 @@ mod tests {
                     .add_path(git_dir.join("HEAD")),
             ),
         );
-        assert_eq!(subscription.recv().await, Some(GitWatchEvent::Metadata));
+        assert_eq!(subscription.recv().await, Some(GitWatchEvent::RefMetadata));
     }
 
     #[tokio::test]
@@ -2276,12 +3206,18 @@ mod tests {
             .expect("first subscriber");
 
         backend.emit(0, Ok(Event::new(EventKind::Other).set_flag(Flag::Rescan)));
-        expect_fake_event(
-            &mut first,
-            GitWatchEvent::Overflow,
-            "overflow signal is observable before later ordinary events",
-        )
-        .await;
+        // The overflow's background rescan publishes a ref invalidation once it
+        // reinstalls the watches. A pending ref invalidation has priority in the
+        // latest-value channel, so it can supersede the Overflow event; fallback
+        // health is what records the overflow. Let the rescan settle, then consume
+        // its invalidation so the ordinary event below is the next one observed.
+        service.inner.setups.wait_until_idle().await;
+        assert_eq!(first.health(), GitWatcherHealth::FallbackRequired);
+        assert_eq!(
+            first.try_recv(),
+            Some(GitWatchEvent::RefMetadata),
+            "the overflow rescan invalidates refs after reinstalling watches"
+        );
         backend.emit(
             0,
             Ok(
@@ -2341,8 +3277,15 @@ mod tests {
             .expect("watch subscription");
 
         backend.emit(0, Ok(Event::new(EventKind::Other).set_flag(Flag::Rescan)));
-        assert_eq!(subscription.recv().await, Some(GitWatchEvent::Overflow));
+        // The rescan's ref invalidation can supersede the Overflow event in the
+        // latest-value channel; fallback health records the overflow.
+        service.inner.setups.wait_until_idle().await;
         assert_eq!(subscription.health(), GitWatcherHealth::FallbackRequired);
+        assert_eq!(
+            subscription.try_recv(),
+            Some(GitWatchEvent::RefMetadata),
+            "native overflow rescan invalidates refs after reinstalling watches"
+        );
 
         backend.emit(0, Err(notify::Error::generic("backend interrupted")));
         assert_eq!(subscription.recv().await, Some(GitWatchEvent::Unavailable));
@@ -2469,22 +3412,31 @@ mod tests {
 
         let watches = backend.state.watches.lock().expect("watches lock").clone();
         let canonical_worktree = std::fs::canonicalize(&worktree).expect("canonical worktree");
-        let canonical_git_dir = std::fs::canonicalize(&git_dir).expect("canonical Git directory");
         let canonical_common_dir =
             std::fs::canonicalize(&common_dir).expect("canonical common directory");
+        let expected = [
+            (canonical_worktree, RecursiveMode::Recursive),
+            (canonical_common_dir.clone(), RecursiveMode::NonRecursive),
+            (
+                canonical_common_dir.join("worktrees"),
+                RecursiveMode::Recursive,
+            ),
+            (canonical_common_dir.join("refs"), RecursiveMode::Recursive),
+        ];
         assert_eq!(
-            watches,
-            vec![
-                (0, canonical_worktree, RecursiveMode::Recursive),
-                (0, canonical_git_dir, RecursiveMode::NonRecursive),
-                (0, canonical_common_dir.clone(), RecursiveMode::NonRecursive),
-                (
-                    0,
-                    canonical_common_dir.join("refs"),
-                    RecursiveMode::Recursive,
-                ),
-            ]
+            watches.len(),
+            expected.len(),
+            "no duplicate native registrations"
         );
+        for (expected_path, expected_mode) in expected {
+            assert!(
+                watches
+                    .iter()
+                    .any(|(_, path, mode)| path == &expected_path && *mode == expected_mode),
+                "{}",
+                expected_path.display()
+            );
+        }
         backend.emit(
             0,
             Ok(
@@ -2494,7 +3446,7 @@ mod tests {
         );
         expect_fake_event(
             &mut subscription,
-            GitWatchEvent::Metadata,
+            GitWatchEvent::RefMetadata,
             "nested common ref changes publish metadata",
         )
         .await;
@@ -2618,7 +3570,7 @@ mod tests {
         assert_eq!(
             registrations.len(),
             1,
-            "recursive worktree covers nested Git roots"
+            "native worktree recursion includes its Git directory and refs"
         );
         std::fs::write(&registrations[0].sentinel, b"ready").expect("native readiness sentinel");
         tokio::time::timeout(
@@ -2659,11 +3611,39 @@ mod tests {
 
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     #[tokio::test]
+    async fn native_backend_observes_metadata_stores_created_after_attachment() {
+        for relative in [
+            "logs/refs/stash",
+            "worktrees/new/HEAD",
+            "reftable/tables.list",
+        ] {
+            let mut fixture = NativeFixture::new(None).await;
+            let path = fixture.common_dir.join(relative);
+            std::fs::create_dir_all(path.parent().expect("metadata parent"))
+                .expect("new metadata directory");
+            std::fs::write(path, b"new ref state\n").expect("new metadata file");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match fixture.subscription.recv().await {
+                        Some(GitWatchEvent::Metadata) => {}
+                        Some(GitWatchEvent::RefMetadata) => break,
+                        event => panic!("unexpected new metadata event for {relative}: {event:?}"),
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("new metadata store {relative} was missed"));
+            assert_eq!(fixture.subscription.health(), GitWatcherHealth::Healthy);
+        }
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
     async fn native_backend_observes_head() {
         let mut fixture = NativeFixture::new(None).await;
         std::fs::write(fixture.git_dir.join("HEAD"), b"ref: refs/heads/main\n")
             .expect("HEAD write");
-        fixture.expect(GitWatchEvent::Metadata).await;
+        fixture.expect(GitWatchEvent::RefMetadata).await;
     }
 
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
@@ -2682,7 +3662,17 @@ mod tests {
         std::fs::write(&lock, b"# pack-refs with: peeled fully-peeled\n")
             .expect("packed refs lock write");
         std::fs::rename(lock, fixture.common_dir.join("packed-refs")).expect("packed refs commit");
-        fixture.expect(GitWatchEvent::Metadata).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match fixture.subscription.recv().await {
+                    Some(GitWatchEvent::Metadata) => {} // Earlier lock-file notifications.
+                    Some(GitWatchEvent::RefMetadata) => break,
+                    event => panic!("unexpected packed-refs event: {event:?}"),
+                }
+            }
+        })
+        .await
+        .expect("packed-refs rename invalidates the signal");
     }
 
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
@@ -2691,7 +3681,7 @@ mod tests {
         let mut fixture = NativeFixture::new(None).await;
         std::fs::write(fixture.upstream_dir.join("main"), b"0123456789abcdef\n")
             .expect("nested upstream ref write");
-        fixture.expect(GitWatchEvent::Metadata).await;
+        fixture.expect(GitWatchEvent::RefMetadata).await;
     }
 
     #[cfg(unix)]
@@ -2750,19 +3740,11 @@ mod tests {
             (linux.worktree_root.clone(), RecursiveMode::Recursive),
             (linux.git_dir.clone(), RecursiveMode::NonRecursive),
             (linux.common_dir.clone(), RecursiveMode::NonRecursive),
-            (
-                format!("{}/refs", linux.common_dir),
-                RecursiveMode::Recursive,
-            ),
         ];
         let macos_registered = vec![
             (macos.worktree_root.clone(), RecursiveMode::Recursive),
             (macos.git_dir.clone(), RecursiveMode::NonRecursive),
             (macos.common_dir.clone(), RecursiveMode::NonRecursive),
-            (
-                format!("{}/refs", macos.common_dir),
-                RecursiveMode::Recursive,
-            ),
         ];
 
         assert_eq!(
@@ -2786,7 +3768,7 @@ mod tests {
                 &linux_registered,
                 HostPathPlatform::Posix,
             ),
-            Some(GitWatchEvent::Metadata)
+            Some(GitWatchEvent::RefMetadata)
         );
         assert_eq!(
             classify_event(
@@ -2821,7 +3803,7 @@ mod tests {
                 &macos_registered,
                 HostPathPlatform::Posix,
             ),
-            Some(GitWatchEvent::Metadata)
+            Some(GitWatchEvent::RefMetadata)
         );
         assert_eq!(
             classify_event(

@@ -142,6 +142,7 @@ const makeHarness = Effect.fn("TestConnectionHarness.make")(function* (options?:
     sequence: 0,
     reason: "application-active",
   });
+  const focusWakeups = yield* SubscriptionRef.make(0);
   const closedSessions = yield* Ref.make<
     ReadonlyArray<Deferred.Deferred<never, ConnectionTransientError>>
   >([]);
@@ -194,6 +195,10 @@ const makeHarness = Effect.fn("TestConnectionHarness.make")(function* (options?:
     Layer.succeed(
       ConnectionWakeups.ConnectionWakeups,
       ConnectionWakeups.ConnectionWakeups.of({
+        focusVisibility: SubscriptionRef.changes(focusWakeups).pipe(
+          Stream.drop(1),
+          Stream.map(() => undefined),
+        ),
         changes: SubscriptionRef.changes(wakeups).pipe(
           Stream.drop(1),
           Stream.map((event) => event.reason),
@@ -209,6 +214,7 @@ const makeHarness = Effect.fn("TestConnectionHarness.make")(function* (options?:
   return {
     dependencies,
     prepareCount,
+    focus: SubscriptionRef.update(focusWakeups, (count) => count + 1),
     sessionCount,
     releaseCount,
     setNetworkStatus: (status: NetworkStatus) => SubscriptionRef.set(networkStatus, status),
@@ -375,7 +381,10 @@ const makeStorageIdentityHarness = Effect.fn("TestStorageIdentityHarness.make")(
     ),
     Layer.succeed(
       ConnectionWakeups.ConnectionWakeups,
-      ConnectionWakeups.ConnectionWakeups.of({ changes: Stream.never }),
+      ConnectionWakeups.ConnectionWakeups.of({
+        focusVisibility: Stream.never,
+        changes: Stream.never,
+      }),
     ),
     Layer.succeed(ConnectionDriver.ConnectionDriver, driver),
   );
@@ -929,6 +938,29 @@ describe("EnvironmentSupervisor", () => {
       );
       expect(yield* Ref.get(harness.sessionCount)).toBe(3);
     }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("does not probe connected sessions for Git Manager focus wakeups", () =>
+    Effect.gen(function* () {
+      const probes = yield* Ref.make(0);
+      const probed = yield* Deferred.make<void>();
+      const harness = yield* makeHarness({
+        probe: () =>
+          Ref.update(probes, (count) => count + 1).pipe(
+            Effect.andThen(Deferred.succeed(probed, undefined)),
+          ),
+      });
+      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+        initiallyDesired: true,
+      }).pipe(Effect.provide(harness.dependencies));
+      yield* awaitState(supervisor.state, (state) => state.phase === "connected");
+      yield* harness.focus;
+      for (let i = 0; i < 20; i += 1) yield* Effect.yieldNow;
+      expect(yield* Ref.get(probes)).toBe(0);
+      yield* harness.wake("application-active");
+      yield* Deferred.await(probed);
+      expect(yield* Ref.get(probes)).toBe(1);
+    }),
   );
 
   it.effect("keeps a healthy session when the application becomes active", () =>

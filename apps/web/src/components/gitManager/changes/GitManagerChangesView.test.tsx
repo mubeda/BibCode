@@ -60,7 +60,7 @@ vi.mock("../../../state/gitManager", () => ({
   gitManagerEnvironment: {
     getRefs: h.refsAtom,
     getCommits: h.commitsAtom,
-    signal: h.signalAtom,
+    signalWithDegradedFocusRefresh: h.signalAtom,
     commit: "cmd:commit",
     undoCommit: "cmd:undo-commit",
     discard: "cmd:discard",

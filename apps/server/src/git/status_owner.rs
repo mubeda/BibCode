@@ -19,23 +19,41 @@ use super::{
 };
 
 const STATUS_SIGNAL_DEBOUNCE: Duration = Duration::from_millis(125);
+const REF_SIGNAL_MAX_DELAY: Duration = Duration::from_secs(1);
 pub(crate) const STATUS_SAFETY_INTERVAL: Duration = Duration::from_secs(60);
 const STATUS_SAFETY_MAX_INTERVAL: Duration = Duration::from_secs(300);
 
-trait StatusSignalSource: Send {
+pub(crate) trait StatusSignalSource: Send {
     fn health(&self) -> GitWatcherHealth;
+
+    fn require_fallback(&mut self);
 
     fn recv(&mut self) -> impl Future<Output = Option<GitWatchEvent>> + Send;
 }
 
-struct WatcherSignalSource {
+pub(crate) struct WatcherSignalSource {
     watcher: Option<GitWatchSubscription>,
-    setup_fallback: bool,
+    fallback_required: bool,
 }
 
-impl StatusSignalSource for WatcherSignalSource {
-    fn health(&self) -> GitWatcherHealth {
-        if self.setup_fallback
+impl WatcherSignalSource {
+    pub(crate) fn new(watcher: Option<GitWatchSubscription>) -> Self {
+        Self {
+            fallback_required: watcher.is_none(),
+            watcher,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn healthy_source_for_test() -> Self {
+        Self {
+            watcher: None,
+            fallback_required: false,
+        }
+    }
+
+    pub(crate) fn current_health(&self) -> GitWatcherHealth {
+        if self.fallback_required
             || self
                 .watcher
                 .as_ref()
@@ -46,6 +64,15 @@ impl StatusSignalSource for WatcherSignalSource {
             GitWatcherHealth::Healthy
         }
     }
+}
+
+impl StatusSignalSource for WatcherSignalSource {
+    fn health(&self) -> GitWatcherHealth {
+        self.current_health()
+    }
+    fn require_fallback(&mut self) {
+        self.fallback_required = true;
+    }
 
     async fn recv(&mut self) -> Option<GitWatchEvent> {
         match self.watcher.as_mut() {
@@ -55,51 +82,25 @@ impl StatusSignalSource for WatcherSignalSource {
     }
 }
 
-pub(crate) async fn run_status_signal_scheduler<F, Fut, T>(
-    watcher: Option<GitWatchSubscription>,
-    setup_fallback: bool,
-    immediate_refreshes: watch::Receiver<u64>,
-    cancellation: CancellationToken,
-    initial_read_duration: Duration,
-    safety_interval: Duration,
-    refresh: F,
-) -> bool
-where
-    F: FnMut() -> Fut + Send,
-    Fut: Future<Output = T> + Send,
-{
-    run_status_signal_scheduler_with_source(
-        WatcherSignalSource {
-            watcher,
-            setup_fallback,
-        },
-        setup_fallback,
-        immediate_refreshes,
-        cancellation,
-        initial_read_duration,
-        safety_interval,
-        refresh,
-    )
-    .await
+pub(crate) trait StatusSignalCallbacks: Send + Sync {
+    fn refresh_local(&self) -> impl Future<Output = ()> + Send;
+    fn refresh_refs(&self) -> impl Future<Output = ()> + Send;
+    fn on_health_change(&self, health: GitWatcherHealth);
 }
 
-async fn run_status_signal_scheduler_with_source<S, F, Fut, T>(
+pub(crate) async fn run_status_signal_scheduler<S, C>(
     mut source: S,
-    setup_fallback: bool,
     mut immediate_refreshes: watch::Receiver<u64>,
     cancellation: CancellationToken,
     initial_read_duration: Duration,
     safety_interval: Duration,
-    mut refresh: F,
+    callbacks: C,
 ) -> bool
 where
     S: StatusSignalSource,
-    F: FnMut() -> Fut,
-    Fut: Future<Output = T>,
+    C: StatusSignalCallbacks,
 {
     let mut watcher_alive = true;
-    let mut fallback_required =
-        setup_fallback || source.health() == GitWatcherHealth::FallbackRequired;
     let mut signal_version = 0_u64;
     let mut read_signal_version = 0_u64;
     let mut signal_deadline = None;
@@ -107,11 +108,24 @@ where
         Instant::now() + status_safety_delay(initial_read_duration, safety_interval);
     let mut immediate_pending = false;
     let mut read_started_at = None;
-    let mut read: Option<Pin<Box<Fut>>> = None;
+    let mut read = None;
+    let mut ref_deadline = None;
+    let mut ref_burst_started = None;
+    let mut ref_read = None;
+    let mut reported_health = None;
 
     loop {
-        fallback_required |= source.health() == GitWatcherHealth::FallbackRequired;
+        let health = source.health();
+        if reported_health != Some(health) {
+            callbacks.on_health_change(health);
+            reported_health = Some(health);
+        }
         let now = Instant::now();
+        if ref_read.is_none() && ref_deadline.is_some_and(|deadline| deadline <= now) {
+            ref_deadline = None;
+            ref_burst_started = None;
+            ref_read = Some(Box::pin(callbacks.refresh_refs()));
+        }
         if read.is_none() {
             if immediate_refreshes.has_changed().unwrap_or(false) {
                 immediate_refreshes.borrow_and_update();
@@ -124,7 +138,7 @@ where
                 signal_deadline = None;
                 read_signal_version = signal_version;
                 read_started_at = Some(now);
-                read = Some(Box::pin(refresh()));
+                read = Some(Box::pin(callbacks.refresh_local()));
                 continue;
             }
         }
@@ -139,23 +153,30 @@ where
                 immediate_refreshes.borrow_and_update();
                 immediate_pending = true;
             }
+            () = wait_for_status_read(&mut ref_read), if ref_read.is_some() => {
+                ref_read = None;
+            }
             event = source.recv(), if watcher_alive => {
                 match event {
-                    Some(GitWatchEvent::WorkingTree | GitWatchEvent::Metadata) => {
+                    Some(event @ (GitWatchEvent::WorkingTree | GitWatchEvent::Metadata | GitWatchEvent::RefMetadata)) => {
                         signal_version = signal_version.wrapping_add(1);
                         signal_deadline = Some(Instant::now() + STATUS_SIGNAL_DEBOUNCE);
+                        if event == GitWatchEvent::RefMetadata {
+                            let now = Instant::now();
+                            let first = *ref_burst_started.get_or_insert(now);
+                            ref_deadline = Some((now + STATUS_SIGNAL_DEBOUNCE).min(first + REF_SIGNAL_MAX_DELAY));
+                        }
                     }
                     Some(GitWatchEvent::Overflow | GitWatchEvent::Unavailable) => {
-                        fallback_required = true;
+                        source.require_fallback();
                     }
                     None => {
                         watcher_alive = false;
-                        fallback_required = true;
+                        source.require_fallback();
                     }
                 }
             }
-            result = wait_for_status_read(&mut read), if read.is_some() => {
-                drop(result);
+            () = wait_for_status_read(&mut read), if read.is_some() => {
                 let duration = Instant::now().saturating_duration_since(
                     read_started_at.take().expect("active status read has a start time"),
                 );
@@ -165,12 +186,13 @@ where
                     signal_deadline = None;
                 }
             }
+            () = wait_for_status_deadline(ref_deadline), if ref_read.is_none() && ref_deadline.is_some() => {}
             () = wait_for_status_deadline(signal_deadline), if read.is_none() && signal_deadline.is_some() => {}
             () = tokio::time::sleep_until(safety_deadline), if read.is_none() => {}
         }
     }
 
-    fallback_required
+    source.health() == GitWatcherHealth::FallbackRequired
 }
 
 async fn wait_for_status_read<Fut>(read: &mut Option<Pin<Box<Fut>>>) -> Fut::Output
@@ -1241,6 +1263,10 @@ mod tests {
             event
         }
 
+        fn require_fallback(&mut self) {
+            self.health.store(1, Ordering::SeqCst);
+        }
+
         fn health(&self) -> GitWatcherHealth {
             if self.health.load(Ordering::SeqCst) == 0 {
                 GitWatcherHealth::Healthy
@@ -1261,12 +1287,52 @@ mod tests {
         }
     }
 
+    struct TestSignalCallbacks {
+        local_count: AtomicUsize,
+        local_started: mpsc::UnboundedSender<usize>,
+        local_outcome: mpsc::UnboundedSender<bool>,
+        local_release: Arc<Semaphore>,
+        refs_started: mpsc::UnboundedSender<()>,
+        refs_outcome: mpsc::UnboundedSender<bool>,
+        refs_release: Arc<Semaphore>,
+        health: mpsc::UnboundedSender<GitWatcherHealth>,
+    }
+
+    async fn finish_test_read(release: &Semaphore, sender: mpsc::UnboundedSender<bool>) {
+        let mut outcome = ReadOutcome {
+            completed: false,
+            sender,
+        };
+        release.acquire().await.expect("read release").forget();
+        outcome.completed = true;
+    }
+
+    impl StatusSignalCallbacks for TestSignalCallbacks {
+        async fn refresh_local(&self) {
+            self.local_started
+                .send(self.local_count.fetch_add(1, Ordering::SeqCst) + 1)
+                .expect("local start receiver");
+            finish_test_read(&self.local_release, self.local_outcome.clone()).await;
+        }
+        async fn refresh_refs(&self) {
+            self.refs_started.send(()).expect("refs start receiver");
+            finish_test_read(&self.refs_release, self.refs_outcome.clone()).await;
+        }
+        fn on_health_change(&self, health: GitWatcherHealth) {
+            let _ = self.health.send(health);
+        }
+    }
+
     struct StatusSignalHarness {
         signals: mpsc::UnboundedSender<GitWatchEvent>,
         immediate_refreshes: watch::Sender<u64>,
         health: Arc<AtomicU8>,
         observed: mpsc::UnboundedReceiver<GitWatchEvent>,
         read_started: mpsc::UnboundedReceiver<usize>,
+        ref_started: mpsc::UnboundedReceiver<()>,
+        ref_outcome: mpsc::UnboundedReceiver<bool>,
+        release_refs: Arc<Semaphore>,
+        health_reported: mpsc::UnboundedReceiver<GitWatcherHealth>,
         read_outcome: mpsc::UnboundedReceiver<bool>,
         release_read: Arc<Semaphore>,
         cancellation: CancellationToken,
@@ -1280,6 +1346,11 @@ mod tests {
             let (observed_sender, observed) = mpsc::unbounded_channel();
             let (read_started_sender, read_started) = mpsc::unbounded_channel();
             let (read_outcome_sender, read_outcome) = mpsc::unbounded_channel();
+            let (ref_started_sender, ref_started) = mpsc::unbounded_channel();
+            let (ref_outcome_sender, ref_outcome) = mpsc::unbounded_channel();
+            let (health_sender, health_reported) = mpsc::unbounded_channel();
+            let release_refs = Arc::new(Semaphore::new(0));
+            let task_release_refs = release_refs.clone();
             let release_read = Arc::new(Semaphore::new(0));
             let cancellation = CancellationToken::new();
             let (immediate_refreshes, immediate_refresh_receiver) = watch::channel(0);
@@ -1291,38 +1362,23 @@ mod tests {
             };
             let task_cancellation = cancellation.clone();
             let task_release = Arc::clone(&release_read);
-            let mut read_id = 0usize;
             let task = tokio::spawn(async move {
                 ready_sender.send(()).expect("scheduler ready receiver");
-                run_status_signal_scheduler_with_source(
+                run_status_signal_scheduler(
                     source,
-                    setup_fallback,
                     immediate_refresh_receiver,
                     task_cancellation,
                     initial_read_duration,
                     STATUS_SAFETY_INTERVAL,
-                    move || {
-                        read_id += 1;
-                        let read_id = read_id;
-                        let read_started_sender = read_started_sender.clone();
-                        let read_outcome_sender = read_outcome_sender.clone();
-                        let release_read = Arc::clone(&task_release);
-                        async move {
-                            let mut outcome = ReadOutcome {
-                                completed: false,
-                                sender: read_outcome_sender,
-                            };
-                            read_started_sender
-                                .send(read_id)
-                                .expect("read start receiver");
-                            release_read
-                                .acquire()
-                                .await
-                                .expect("read release remains open")
-                                .forget();
-                            outcome.completed = true;
-                            outcome
-                        }
+                    TestSignalCallbacks {
+                        local_count: AtomicUsize::new(0),
+                        local_started: read_started_sender,
+                        local_outcome: read_outcome_sender,
+                        local_release: task_release,
+                        refs_started: ref_started_sender,
+                        refs_outcome: ref_outcome_sender,
+                        refs_release: task_release_refs,
+                        health: health_sender,
                     },
                 )
                 .await
@@ -1334,6 +1390,10 @@ mod tests {
                 health,
                 observed,
                 read_started,
+                ref_started,
+                ref_outcome,
+                release_refs,
+                health_reported,
                 read_outcome,
                 release_read,
                 cancellation,
@@ -1401,6 +1461,110 @@ mod tests {
             assert!(self.read_started.try_recv().is_err());
             fallback
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn continuous_working_tree_writes_cannot_postpone_a_ref_read() {
+        let mut harness = StatusSignalHarness::new(Duration::ZERO, false).await;
+        harness.signal_and_wait(GitWatchEvent::RefMetadata).await;
+        for _ in 0..20 {
+            tokio::time::advance(Duration::from_millis(50)).await;
+            harness.signal_and_wait(GitWatchEvent::WorkingTree).await;
+            harness.signal_and_wait(GitWatchEvent::Metadata).await;
+        }
+        assert!(
+            harness.ref_started.try_recv().is_ok(),
+            "continuous file/index writes delayed the ref read past one second"
+        );
+        assert!(!harness.cancel().await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn continuous_ref_events_have_a_one_second_debounce_cap() {
+        let mut harness = StatusSignalHarness::new(Duration::ZERO, false).await;
+        harness.signal_and_wait(GitWatchEvent::RefMetadata).await;
+        for _ in 0..20 {
+            tokio::time::advance(Duration::from_millis(50)).await;
+            harness.signal_and_wait(GitWatchEvent::RefMetadata).await;
+        }
+        assert!(
+            harness.ref_started.try_recv().is_ok(),
+            "ref burst exceeded its one-second cap"
+        );
+        assert!(!harness.cancel().await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ref_bursts_keep_one_trailing_signal_read_without_blocking_local_status() {
+        let mut harness = StatusSignalHarness::new(Duration::ZERO, false).await;
+        for _ in 0..10 {
+            harness.signal(GitWatchEvent::RefMetadata);
+        }
+        tokio::time::advance(Duration::from_millis(124)).await;
+        assert!(harness.ref_started.try_recv().is_err());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        harness
+            .ref_started
+            .recv()
+            .await
+            .expect("debounced ref read");
+        harness.read_started(1).await;
+        harness.finish_read().await;
+        for _ in 0..10 {
+            harness.signal(GitWatchEvent::RefMetadata);
+        }
+        tokio::time::advance(STATUS_SIGNAL_DEBOUNCE).await;
+        harness.read_started(2).await;
+        harness.finish_read().await;
+        assert!(
+            harness.ref_started.try_recv().is_err(),
+            "ref reads must be serialized"
+        );
+        harness.release_refs.add_permits(1);
+        assert_eq!(harness.ref_outcome.recv().await, Some(true));
+        harness
+            .ref_started
+            .recv()
+            .await
+            .expect("one trailing ref read");
+        harness.cancellation.cancel();
+        assert_eq!(
+            harness.ref_outcome.recv().await,
+            Some(false),
+            "cancellation drops the ref read"
+        );
+        assert!(!harness.cancel().await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn index_and_working_tree_signals_never_start_a_ref_read() {
+        let mut harness = StatusSignalHarness::new(Duration::ZERO, false).await;
+        harness.signal(GitWatchEvent::Metadata);
+        harness.signal(GitWatchEvent::WorkingTree);
+        tokio::time::advance(STATUS_SIGNAL_DEBOUNCE).await;
+        harness.read_started(1).await;
+        harness.finish_read().await;
+        assert!(harness.ref_started.try_recv().is_err());
+        assert!(!harness.cancel().await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn degraded_health_is_reported_immediately_without_a_ref_or_local_read() {
+        let mut harness = StatusSignalHarness::new(Duration::ZERO, false).await;
+        assert_eq!(
+            harness.health_reported.recv().await,
+            Some(GitWatcherHealth::Healthy)
+        );
+        harness.signal_and_wait(GitWatchEvent::Overflow).await;
+        assert_eq!(
+            harness.health_reported.recv().await,
+            Some(GitWatcherHealth::FallbackRequired)
+        );
+        harness.signal_and_wait(GitWatchEvent::WorkingTree).await;
+        harness.assert_no_read();
+        assert!(harness.ref_started.try_recv().is_err());
+        assert!(harness.health_reported.try_recv().is_err());
+        assert!(harness.cancel().await);
     }
 
     #[tokio::test(start_paused = true)]

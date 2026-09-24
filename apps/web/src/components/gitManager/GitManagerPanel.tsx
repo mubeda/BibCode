@@ -172,6 +172,8 @@ interface GitManagerRepositorySurfacesProps {
   };
   readonly projectRef: ScopedProjectRef;
   readonly signalGeneration: number | null;
+  /** True while the live signal is expected but has not delivered its first generation. */
+  readonly signalPending: boolean;
   readonly branchSyncDisabledReason: string | null;
   readonly stashMergeDisabledReason: string | null;
   readonly rewriteDisabledReason: string | null;
@@ -186,6 +188,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
   scope,
   projectRef,
   signalGeneration,
+  signalPending,
   branchSyncDisabledReason,
   stashMergeDisabledReason,
   rewriteDisabledReason,
@@ -261,6 +264,9 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
     () => vcsEnvironment.status({ environmentId, input: { cwd } }),
     [cwd, environmentId],
   );
+  // The stash list costs one reflog read plus one `git stash show` per entry,
+  // so it is read only while the Stashes pane is open; opening the pane and
+  // each signal change while it is open read the current list.
   const stashesAtom = useMemo(
     () =>
       !stashPaneOpen || stashMergeDisabledReason !== null
@@ -276,11 +282,22 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
   const stashesQuery = useEnvironmentQuery(stashesAtom);
   const refreshRefs = refsQuery.refresh;
   const refreshStashes = stashesQuery.refresh;
+  // History relies on this refs refresh: every signal change re-reads refs, so
+  // the repository generation it receives reports any change the signal carries.
   useEffect(() => {
     if (signalGeneration === null) return;
     refreshRefs();
-    if (stashPaneOpen) refreshStashes();
-  }, [refreshRefs, refreshStashes, signalGeneration, stashPaneOpen]);
+  }, [refreshRefs, signalGeneration]);
+  // Opening the pane mounts a fresh stash query, and a signal that (re)subscribes
+  // starts from null while the mounted query reads anyway, so only a step from
+  // one signal generation to the next while the pane is open re-reads the list.
+  const stashSignalGenerationRef = useRef(signalGeneration);
+  useEffect(() => {
+    const previous = stashSignalGenerationRef.current;
+    stashSignalGenerationRef.current = signalGeneration;
+    if (!stashPaneOpen || previous === null || signalGeneration === null) return;
+    if (signalGeneration !== previous) refreshStashes();
+  }, [refreshStashes, signalGeneration, stashPaneOpen]);
 
   const snapshot: GitManagerRefsSnapshot | null = refsQuery.data ?? null;
   const localBranches = snapshot?.localBranches ?? EMPTY_REFS;
@@ -877,7 +894,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
           onClick={toggleStashPane}
         >
           <ArchiveIcon aria-hidden="true" />
-          Stashes{stashPaneOpen && !stashesQuery.isPending ? ` (${stashes.length})` : ""}
+          Stashes{stashesQuery.data === null ? "" : ` (${stashes.length})`}
         </Button>
         {stashMergeDisabledReason === null ? null : (
           <span className="sr-only" id="git-manager-stash-disabled-reason">
@@ -950,7 +967,8 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
             </p>
           ) : (
             <>
-              <div className="min-h-0 border-r border-panel-separator">
+              {/* A flex column gives the virtualized list a bounded height to scroll in. */}
+              <div className="flex min-h-0 flex-col border-r border-panel-separator">
                 {stashesQuery.error !== null && stashes.length === 0 ? (
                   <p className="p-3 text-xs text-destructive">{stashesQuery.error}</p>
                 ) : (
@@ -1015,6 +1033,8 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
               blockedReasons={repositoryBlockedReasons}
               branchSyncDisabledReason={branchSyncDisabledReason}
               repositoryGeneration={snapshot?.generation ?? null}
+              signalGeneration={signalGeneration}
+              signalPending={signalPending}
               projectRef={projectRef}
               rewriteDisabledReason={rewriteDisabledReason}
               scope={scope}
@@ -1144,7 +1164,7 @@ export const GitManagerPanel = memo(function GitManagerPanel({ projectRef }: Git
       availability.kind === "ready" &&
       activeCwd !== null &&
       capabilityDisabledReasons.liveSignal === null
-        ? gitManagerEnvironment.signal({
+        ? gitManagerEnvironment.signalWithDegradedFocusRefresh({
             environmentId,
             input: { cwd: activeCwd },
           })
@@ -1153,6 +1173,9 @@ export const GitManagerPanel = memo(function GitManagerPanel({ projectRef }: Git
   );
   const signalQuery = useEnvironmentQuery(signalAtom);
   const signalGeneration = signalQuery.data?.generation ?? null;
+  // A failed subscription is not pending: History then reads without a signal.
+  const signalPending =
+    signalAtom !== null && signalQuery.data === null && signalQuery.error === null;
 
   const handleTabChange = useCallback(
     (value: string | number | null) => {
@@ -1202,6 +1225,7 @@ export const GitManagerPanel = memo(function GitManagerPanel({ projectRef }: Git
           rewriteDisabledReason={capabilityDisabledReasons.rewrite}
           scope={activeScope}
           signalGeneration={signalGeneration}
+          signalPending={signalPending}
           stashMergeDisabledReason={capabilityDisabledReasons.stashMerge}
           tagDisabledReason={capabilityDisabledReasons.tag}
           onTabChange={handleTabChange}

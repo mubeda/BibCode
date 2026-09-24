@@ -212,13 +212,68 @@ and publishes its own branch-specific remote result. The default interval is
 remain supported, and the last attachment cancels the owner.
 
 The same subscriber-owned broadcaster lifecycle carries the Git Manager's
-repository-change signal; it does not start another poller or watcher. On the
-existing remote/ref reconciliation tick, the server hashes the bounded
-`for-each-ref` output for heads, remotes, and tags—including each branch's
-`worktreepath`—together with the porcelain-v2 `branch.oid` and `branch.head`
-identity. A changed refs/HEAD/worktree signature increments the repository's
-Git Manager generation. `subscribeGitManagerSignal` receives that generation,
-and a completed in-app mutation requests the existing immediate refresh path.
+repository-change signal; it does not start another poller or watcher. The
+worktree root keeps its native recursive watch, including nested `.git` entries.
+Linux notify/inotify expands recursion internally; macOS uses FSEvents and
+Windows uses native subtree watching. Application code does not register every
+worktree directory. Events for the top-level `objects/` and `lfs/` stores and
+for submodule object stores (`modules/<name>/objects/`) are filtered after
+delivery from worktree recursion; other submodule metadata still refreshes
+status. Git metadata outside that root is watched
+non-recursively at its root and recursively only at `refs/`, `logs/`,
+`reftable/`, and `worktrees/`. The common directory's own object stores are
+never watched; the recursive `worktrees/` watch does reach linked worktrees'
+submodule Git directories (`worktrees/<name>/modules/`), whose object-store
+events are filtered.
+Only a sibling's `HEAD`, `reftable/**`, and administrative-directory
+creation/removal invalidate this worktree; sibling index and log churn is
+ignored. A shared metadata-layout classifier supplies both watch admission and
+event classification, respecting uppercase-normalized Windows path keys.
+
+Ref-shaped metadata includes `refs/**`, `logs/refs/stash`, `packed-refs`, root
+`HEAD`/`*_HEAD`, `reftable/**`, and sibling `worktrees/<name>/HEAD` and
+`worktrees/<name>/reftable/**`. New metadata containers invalidate refs. Only
+first-level store roots (`refs/`, `logs/`, `reftable/`, `worktrees/`) are
+queued for native recursive registration, outside the native callback; deeper
+directories and ref lock renames never start registration work, so a large
+fetch cannot overflow the queue. The queue stays bounded and would coalesce to a
+rescan on overflow. On Linux, every directory under the recursive `worktrees/`
+watch, including those submodule object folders, costs one inotify watch. Every
+full rescan
+publishes `RefMetadata` after reinstallation, even if reinstallation fails;
+both native-overflow and registration-queue-overflow gaps therefore reconcile
+refs. Cancellation, retirement, and shutdown await in-flight registration. A retained ref version
+prevents a later index or working-tree event from overwriting an unconsumed ref
+change.
+
+Ref events alone use a 125 ms trailing debounce with a one-second cap from the
+first ref event. Continuous working-tree/index writes do not postpone that
+lane. Local and ref reads remain independent and each retains one trailing
+refresh. The lightweight signature hashes bounded `for-each-ref` output for
+heads, remotes, tags, and `refs/stash` (including `worktreepath`), structured
+symbolic/object HEAD identity from `symbolic-ref` and `rev-parse`, and the stash
+reflog. Loose stash logs are read as bounded regular files; reftable stores use
+a bounded `git stash list` observation because they have no `logs/refs/stash`
+file. This covers non-top stash drop/pop even when the stash tip is unchanged.
+No full remote-status read runs for a ref burst. Signature observations share a
+per-lifecycle lock, only changed hashes increment generation, and a read rejected
+by a mutation fence waits for settlement and retries within the same lifecycle.
+Retirement and cancellation prevent publication into a replacement lifecycle.
+Remote-status publication and pending local reconciliation complete before
+signature I/O. A failed HEAD or stash-reflog observation is logged without
+changing the signature or suppressing remote status, and is retried on the next
+trigger. Automatic fetch keeps its independent remote-tracking role.
+
+`subscribeGitManagerSignal` carries cwd, generation, and optional
+`watcherDegraded`. The watcher source owns sticky degraded health; health changes
+publish without incrementing generation. Client-runtime consumes the platform's
+shared `ConnectionWakeups.focusVisibility` stream, whose browser adapter coalesces focus/visibility
+returns. The explicit `signalWithDegradedFocusRefresh` atom enables one shared
+fallback per environment/worktree: only a true degraded flag invalidates active
+refs, commit-page, and stash queries on these returns. Supervisor
+`application-active` wakeups remain limited to visible-document transitions. Healthy
+watchers and older servers omitting the field do not enable it. Plain signal
+access starts no focus subscription, and no query polling is added.
 
 The client runtime keeps mutations on the serial `(environmentId, cwd)` lane.
 Only `vcs.refreshStatus` uses a separate `latest` lane with the same key: callers
@@ -242,7 +297,7 @@ application surface. Its unary methods are:
 | `gitManager.commit`, `gitManager.undoCommit`, `gitManager.discard`                                            | `orchestration:operate` | Commit or amend selected paths, undo the latest eligible local commit, or discard whole-file changes.                                                                                                                   |
 | `gitManager.stagePartial`, `gitManager.unstagePartial`, `gitManager.discardPartial`                           | `orchestration:operate` | Apply a generation-checked patch to the index or working tree.                                                                                                                                                          |
 
-`subscribeGitManagerSignal` is the read-scoped generation stream described in
+`subscribeGitManagerSignal` is the read-scoped generation/health stream described in
 the VCS section above. `gitManager.runOperation` is the one operate-scoped
 streaming command for branch lifecycle, fetch/pull/push, stash, merge, history
 rewrite, conflict continuation or resolution, and tag operations. It emits one
@@ -250,6 +305,32 @@ rewrite, conflict continuation or resolution, and tag operations. It emits one
 command in the current supervised-process implementation—and exactly one
 `finished` or `failed` event. Client interrupt and socket cancellation reach the
 supervised child process.
+
+History preserves pinned pages, ordering, selection, and scroll context while
+splicing new commits. Overlapping entries take the fresh page data. The first
+page is read once the signal's availability is known, then on a signal change
+or when the repository generation moves past the loaded pages (in-app
+operations while the watcher is degraded), each time under a never-reused key;
+the watcher's echo of a repository-triggered read is absorbed, so one change
+never causes two reads. Absorption relies on generation 0 meaning "no signature
+yet": the server's first computed signature always advances it. A name-only ref
+change (for example renaming a branch that is not checked out) leaves the
+repository generation unchanged, so if its signal is absorbed as an echo, its
+decorations update on the next refresh. Each completed first-page response captures one
+retained-page batch through the existing `getCommits` RPC, with original pinned
+tips/offsets and at most two reads in flight. Offset zero is omitted when its
+tips match the fresh first page, and a first page covering all loaded rows
+needs no retained read. Changed tips require the old pinned graph only to
+update rows outside the new page. Retained responses from older generations
+cannot overwrite newer decorations. Completed first-page reads, including
+degraded-focus refreshes, own this batch; there is no independent retained-page
+focus refresh. The key is local cache identity and is never
+sent over RPC. Responses update decoration arrays without replacing retained
+rows or cursors. Git's `%D` output is the only decoration source, preserving
+`origin/HEAD` and Git's ordering; the client does not reconstruct labels from
+refs. Same-tip ref renames also refresh decorations. Query lifetimes cancel
+obsolete or unmounted batches, and selected-row lookup uses a SHA index.
+Background failures preserve loaded commits and offer a Retry action.
 
 Every Git Manager mutation revalidates the selected checkout after admission;
 operations with server-authored blocked conditions recompute those reasons

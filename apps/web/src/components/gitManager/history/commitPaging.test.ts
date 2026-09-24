@@ -3,6 +3,25 @@ import { describe, expect, it } from "vite-plus/test";
 import { createCommitLookup, shouldLoadNextPage, spliceCommitGeneration } from "./commitPaging";
 
 describe("spliceCommitGeneration", () => {
+  it("refreshes overlapping loaded rows when ref decorations move", () => {
+    const result = spliceCommitGeneration({
+      loaded: [
+        { sha: "b", decorations: ["HEAD -> main"] },
+        { sha: "a", decorations: ["tag: v1"] },
+      ],
+      incoming: [
+        { sha: "c", decorations: ["HEAD -> main"] },
+        { sha: "b", decorations: [] },
+      ],
+      pinnedTips: ["b"],
+    });
+    expect(result.commits).toEqual([
+      { sha: "c", decorations: ["HEAD -> main"] },
+      { sha: "b", decorations: [] },
+      { sha: "a", decorations: ["tag: v1"] },
+    ]);
+  });
+
   it("prepends new commits above the pinned pages and keeps loaded rows and their order", () => {
     const loaded = [{ sha: "b" }, { sha: "a" }];
     const result = spliceCommitGeneration({

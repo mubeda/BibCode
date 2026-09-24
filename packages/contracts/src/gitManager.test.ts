@@ -245,6 +245,15 @@ describe("Git Manager wire schemas", () => {
     });
   });
 
+  it("preserves degraded watcher health without requiring it from older servers", () => {
+    expect(
+      decodeGitManagerSignalEvent({ cwd: "/repo", generation: 10, watcherDegraded: true }),
+    ).toEqual({ cwd: "/repo", generation: 10, watcherDegraded: true });
+    expect(
+      decodeGitManagerSignalEvent({ cwd: "/repo", generation: 10 }).watcherDegraded,
+    ).toBeUndefined();
+  });
+
   it("preserves operation error messages and nullable blocked reasons", () => {
     const decoded = decodeGitManagerOperationError({
       _tag: "GitManagerOperationError",

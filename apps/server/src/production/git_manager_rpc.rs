@@ -342,11 +342,12 @@ impl ConfiguredGitManagerRpcServices {
                     return;
                 }
             };
-            while let Some(generation) = subscription.recv().await {
+            while let Some(signal) = subscription.recv().await {
                 if sender
                     .send(Ok(vec![json!({
                         "cwd": cwd,
-                        "generation": generation,
+                        "generation": signal.generation,
+                        "watcherDegraded": signal.watcher_degraded,
                     })]))
                     .await
                     .is_err()

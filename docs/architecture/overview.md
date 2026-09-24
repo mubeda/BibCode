@@ -187,6 +187,68 @@ flowchart TB
   owners to the typed RPC registry and the worktree catalog's existing mutation
   arbitration.
 
+  Git Manager signals reuse the status watcher's lifecycle. The worktree root
+  retains one native recursive watch, including its `.git` tree. The notify
+  backend owns recursion: inotify directory watches on Linux, FSEvents on
+  macOS, and subtree watching on Windows. Events from the top-level `objects/`
+  and `lfs/` stores and from submodule object stores (`modules/<name>/objects/`)
+  are filtered; the rest of a submodule's Git directory still refreshes status.
+  Git metadata outside the worktree has non-recursive root watches and native
+  recursive watches only on `refs/`, `logs/`, `reftable/`, and `worktrees/`,
+  registering stores as they appear. Its own object stores are not watched; the
+  recursive `worktrees/` watch does reach linked worktrees' submodule Git
+  directories (`worktrees/<name>/modules/`), whose object-store events are
+  filtered, and on Linux each of those directories costs an inotify watch.
+  Sibling events invalidate only
+  HEAD/reftable state and administrative-directory creation/removal. One
+  metadata classifier handles registration and event routing, including
+  Windows keys normalized to uppercase. Every full rescan, whether caused by
+  native overflow or the bounded registration queue, invalidates refs after
+  reinstallation, including failed rescans.
+  Only ref-shaped events reset the 125 ms ref debounce, capped at one second
+  from the first event, so continuous file/index writes cannot starve it.
+  Local and ref reads remain independent and retain one trailing refresh.
+
+  The lightweight signature hashes heads, remotes, tags, `refs/stash`, worktree
+  occupancy, structured symbolic/object HEAD identity, and the stash reflog. A
+  HEAD that names no valid ref and no commit (an interrupted clone's
+  placeholder) is hashed as its own state rather than failing the read.
+  Each burst uses bounded `for-each-ref`, `symbolic-ref`, and `rev-parse` reads
+  plus a bounded loose reflog read; reftable repositories require a bounded
+  `git stash list` read for their table-backed reflog. Only a changed hash bumps
+  generation. It does not run full remote status, and index-only events do not
+  start signal reads. Signature reads serialize, retry after a mutation fence
+  settles, and cannot publish after repository retirement. Remote status
+  publishes before signature I/O; a failed signature input is logged, leaves
+  the signature unchanged, and retries on the next trigger.
+
+  Signals also carry optional `watcherDegraded` without changing generation on
+  health-only updates. The explicit client-runtime
+  `signalWithDegradedFocusRefresh` accessor consumes the existing platform
+  `ConnectionWakeups.focusVisibility` stream. Its browser adapter shares
+  listeners and coalesces focus/visibility returns; only degraded repositories refetch active refs,
+  commits, and stashes. Healthy/legacy signals and plain signal subscriptions
+  do not enable this fallback. No polling is added; automatic fetch retains
+  its independent role and default 180 s interval. History reads its first page
+  once the signal's availability is known (one read on open) and again on
+  either trigger: a signal change, or a repository generation that moves past
+  the loaded pages (in-app operations while the watcher is degraded). Each read
+  uses a never-reused key, and the watcher's echo of a repository-triggered
+  read is absorbed, so one change never causes two reads. The absorption relies
+  on the server advancing a signal from generation 0 at its first computed
+  signature. The stash list (a reflog read plus one `git stash show` per entry)
+  is read only while the Stashes panel is open: once on opening, and on each
+  signal change or in-app operation while open. Closing the panel drops the
+  query, so a closed panel reads nothing (not even on reconnect) and shows no
+  count.
+  A completed response captures one retained-page batch with at most two reads
+  in flight. The same-tip first page already supplies offset zero, so that page
+  is omitted from the batch. A first page covering all loaded rows needs no
+  retained batch; otherwise changed tips require reading the old pinned graph.
+  Older-generation replies cannot regress newer decorations. Git decorations
+  remain verbatim. Loaded pages, selection, and scroll
+  survive background errors, which offer Retry.
+
   On Unix the supervised process runner retries a spawn that fails with
   `ETXTBSY` (the executable is still open for writing, typically a helper
   that was just installed or rewritten, or a fork of this process that has

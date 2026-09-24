@@ -64,8 +64,9 @@ vi.mock("../../state/worktrees", () => ({
 
 vi.mock("../../state/gitManager", () => ({
   gitManagerEnvironment: {
-    signal: h.signalAtom,
+    signalWithDegradedFocusRefresh: h.signalAtom,
     getCommits: () => ({ kind: "commits" }),
+    getHistoryFirstPage: () => ({ kind: "commits" }),
     commit: { label: "test:commit" },
     undoCommit: { label: "test:undo-commit" },
     discard: { label: "test:discard" },

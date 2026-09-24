@@ -4,7 +4,12 @@ import {
   AVAILABLE_CONNECTION_STATE,
   type SupervisorConnectionState,
 } from "@bibcode/client-runtime/connection";
-import type { GitManagerRefsSnapshot, ServerConfig, VcsStatusResult } from "@bibcode/contracts";
+import type {
+  GitManagerRefsSnapshot,
+  GitManagerStashEntry,
+  ServerConfig,
+  VcsStatusResult,
+} from "@bibcode/contracts";
 import { makeTestExecutionEnvironmentCapabilities } from "@bibcode/shared/testSupport";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
@@ -57,7 +62,9 @@ const h = vi.hoisted(() => ({
   tagsViewProps: [] as Array<Record<string, unknown>>,
   refsSnapshot: null as GitManagerRefsSnapshot | null,
   status: null as VcsStatusResult | null,
-  signalGeneration: 1,
+  stashes: null as ReadonlyArray<GitManagerStashEntry> | null,
+  refreshed: [] as string[],
+  signalGeneration: 1 as number | null,
   runOperation: vi.fn((_registry: unknown, _target: unknown, _onEvent: unknown) => ({
     result: new Promise(() => undefined),
     cancel: vi.fn(),
@@ -102,12 +109,16 @@ vi.mock("../../state/query", () => ({
             ? h.status
             : atom?.kind === "signal"
               ? { generation: h.signalGeneration }
-              : null;
+              : atom?.kind === "stashes"
+                ? h.stashes
+                : null;
     return {
       data,
       error: null,
       isPending: atom?.kind === "catalog" && h.catalogPending,
-      refresh: () => undefined,
+      refresh: () => {
+        if (atom !== null) h.refreshed.push(atom.kind);
+      },
       emission: data === null ? { _tag: "Initial" } : { _tag: "Success", value: data },
     };
   },
@@ -128,7 +139,7 @@ vi.mock("../../state/vcs", () => ({
 
 vi.mock("../../state/gitManager", () => ({
   gitManagerEnvironment: {
-    signal: h.signalAtom,
+    signalWithDegradedFocusRefresh: h.signalAtom,
     getRefs: h.refsAtom,
     getStashes: h.stashesAtom,
     getCommits: () => ({ kind: "commits" }),
@@ -317,6 +328,8 @@ beforeEach(() => {
   h.activeSubscriptions = 0;
   h.refsSnapshot = refsSnapshot();
   h.status = vcsStatus(false);
+  h.stashes = null;
+  h.refreshed.length = 0;
   h.signalGeneration = 1;
   h.catalogAtom.mockClear();
   h.signalAtom.mockClear();
@@ -589,6 +602,127 @@ describe("GitManagerPanel", () => {
       container.remove();
       (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
     }
+  });
+
+  it("reads stashes only while the Stashes pane is open, then on each signal change", async () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    const stash = (index: number): GitManagerStashEntry => ({
+      index,
+      sha: String(index).repeat(40),
+      message: `WIP ${index}`,
+      committedAtMs: index,
+      parents: [],
+      files: [],
+    });
+    h.effects.length = 0;
+    h.stashes = [stash(1), stash(2)];
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const stashButton = () =>
+      container.querySelector<HTMLButtonElement>('[aria-label="Toggle repository stashes"]');
+    const flushEffects = () =>
+      act(async () => {
+        for (const effect of h.effects.splice(0)) effect();
+      });
+    const bumpSignal = async (generation: number) => {
+      h.signalGeneration = generation;
+      await act(async () =>
+        root.render(
+          <GitManagerPanel
+            projectRef={{ environmentId: "environment-1", projectId: "project-1" } as never}
+          />,
+        ),
+      );
+      await flushEffects();
+    };
+
+    try {
+      await act(async () => root.render(<GitManagerPanel projectRef={projectRef} />));
+      await flushEffects();
+      // A closed pane reads no stashes and shows no count, even across a signal change.
+      expect(useGitManagerStore.getState().selectViewState(projectRef).stashPaneOpen).toBe(false);
+      expect(stashButton()?.textContent).toBe("Stashes");
+      h.refreshed.length = 0;
+      await bumpSignal(2);
+      expect(h.refreshed).toEqual(["refs"]);
+      expect(h.stashesAtom).not.toHaveBeenCalled();
+
+      // Opening the pane mounts the stash query, which reads the current list;
+      // no extra refresh follows. (The React mock runs every effect on each
+      // render, so the unguarded refs refresh repeats here; the stash guard
+      // compares generations and still holds.)
+      h.refreshed.length = 0;
+      await act(async () => stashButton()?.click());
+      await flushEffects();
+      expect(h.stashesAtom).toHaveBeenCalledWith(
+        expect.objectContaining({ input: { cwd: "/opaque/main" } }),
+      );
+      expect(h.refreshed).not.toContain("stashes");
+      expect(stashButton()?.textContent).toBe("Stashes (2)");
+
+      // An external `git stash push` bumps the signal while the pane is open.
+      h.refreshed.length = 0;
+      h.stashes = [stash(3), stash(1), stash(2)];
+      await bumpSignal(3);
+      expect(h.refreshed).toEqual(expect.arrayContaining(["refs", "stashes"]));
+      expect(stashButton()?.textContent).toBe("Stashes (3)");
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
+    }
+  });
+
+  it("does not re-read a just-mounted stash list when the signal (re)subscribes", async () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    h.effects.length = 0;
+    h.stashes = [];
+    h.signalGeneration = null;
+    useGitManagerStore.getState().setStashPaneOpen(projectRef, true);
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const flushEffects = () =>
+      act(async () => {
+        for (const effect of h.effects.splice(0)) effect();
+      });
+    const renderWithSignal = async (generation: number) => {
+      h.signalGeneration = generation;
+      await act(async () =>
+        root.render(
+          <GitManagerPanel
+            projectRef={{ environmentId: "environment-1", projectId: "project-1" } as never}
+          />,
+        ),
+      );
+      await flushEffects();
+    };
+
+    try {
+      await act(async () => root.render(<GitManagerPanel projectRef={projectRef} />));
+      await flushEffects();
+      expect(h.stashesAtom).toHaveBeenCalled();
+      // The first generation after (re)subscribing is covered by the mount read.
+      h.refreshed.length = 0;
+      await renderWithSignal(5);
+      expect(h.refreshed).not.toContain("stashes");
+      // The next generation is a real change and re-reads the open list.
+      await renderWithSignal(6);
+      expect(h.refreshed).toContain("stashes");
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
+    }
+  });
+
+  it("shows no Stashes count while the pane is closed or stashes are unavailable", () => {
+    h.stashes = [];
+    expect(renderPanel()).toContain(">Stashes</button>");
+    expect(h.stashesAtom).not.toHaveBeenCalled();
+    h.serverConfig = config(true, { gitManagerStashMergeOperations: false });
+    expect(renderPanel()).not.toContain("Stashes (");
   });
 
   it("mounts the conflict list for an externally conflicted history operation", async () => {

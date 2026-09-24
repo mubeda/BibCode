@@ -198,7 +198,7 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
   const signalAtom = useMemo(
     () =>
       readsAvailable && liveSignalAvailable
-        ? gitManagerEnvironment.signal({ environmentId, input: { cwd } })
+        ? gitManagerEnvironment.signalWithDegradedFocusRefresh({ environmentId, input: { cwd } })
         : null,
     [cwd, environmentId, liveSignalAvailable, readsAvailable],
   );

@@ -772,7 +772,7 @@ node scripts/run-msvc.mjs cargo test -p bibcode-server --test git_manager_reads 
 node scripts/run-msvc.mjs cargo test -p bibcode-server --test git_manager_commit -- --nocapture
 node scripts/run-msvc.mjs cargo test -p bibcode-server --test production_git_manager_rpc -- --nocapture
 node scripts/run-msvc.mjs cargo test -p bibcode-server --test git_rpc -- --nocapture
-vp test run packages/client-runtime/src/state/vcs.test.ts apps/web/src/components/GitActionsControl.test.tsx
+vp test run packages/client-runtime/src/state/vcs.test.ts packages/client-runtime/src/state/gitManager.test.ts packages/client-runtime/src/state/gitManagerRefresh.test.ts apps/web/src/connection/platform.test.ts apps/web/src/components/GitActionsControl.test.tsx
 ```
 
 `vp run check:contracts` regenerates the RPC wire fixtures and ends by failing
@@ -808,6 +808,64 @@ catalog mutation with `operation-in-flight`;
 server-authored blocked copy rendered unchanged; stream cancellation reaching
 the Git child; and one explicit provider refresh after an idle interval that
 produced no provider process or browser network request.
+
+For external Git Manager refresh, keep the automatic fetch interval at its
+180-second default. Default fixtures use ordinary `git init` without
+`--ref-format`, so supported older Git installations can run them. Reftable
+tests probe `git init --ref-format=reftable` and print a skip when unsupported;
+record that skip as unavailable coverage and run on a Git installation with
+reftable support before claiming reftable validation. In disposable file-ref
+and reftable fixtures, run commit,
+stash push and non-top `stash@{1}` pop/drop, tag,
+and fetch or update-ref commands from both a companion terminal and BiBCode's
+terminal while the manager stays focused. Refs, History, and the open stash pane
+should converge within about one second without pressing **Refresh**. Index-only
+`git add` must update Changes without an extra Git Manager signal read. Retain
+coverage for unchanged signatures, retirement fencing, sticky watcher health,
+and one degraded-only refetch per focus/visibility return. Also retain evidence
+for sibling-worktree HEAD switches with both file and reftable storage, metadata directories created after
+attachment, continuous file/index writes while a ref changes (the ref debounce
+has a one-second cap), and a ref observation retried after an in-app mutation
+fence settles. After external and in-app commits, exactly one loaded row should
+carry the current HEAD decoration; moved/deleted refs must update older rows
+without losing selection, pinned cursors, or scroll context. Compare decoration
+arrays and ordering to `git log --decorate=short --format=%D` using HEAD, a tag,
+`origin/main`, `origin/HEAD`, and a second branch, including after an external
+ref change. Healthy watchers must not refetch these queries merely because the
+window regains focus, and alt-tab alone must not probe environment supervisors.
+Retain watch-plan evidence for native recursive worktree coverage, including
+its `.git` tree: notify/inotify manages Linux recursion, FSEvents manages macOS
+recursion, and Windows uses native subtree watching. Events from top-level
+`objects/`/`lfs/` and submodule `modules/<name>/objects/` stores are filtered,
+while a commit or checkout inside a submodule still refreshes the superproject.
+Only external Git metadata uses non-recursive roots plus recursive
+refs/logs/reftable/worktrees stores; its own object stores are not watched, and
+events from linked worktrees' submodule object stores under the recursive
+`worktrees/` watch are filtered. Confirm sibling index/log churn does not invalidate the
+current worktree and Windows uppercase metadata paths register/classify
+correctly. Exercise native overflow (every full rescan must publish a ref
+invalidation after reinstallation, even on failure) and confirm that creating
+hundreds of nested ref directories, as a large fetch does, starts no
+registration work and no rescan.
+In a main checkout, make stash push the first external ref change after startup
+settles, with both an empty stash list and an existing stash reflog, then pop,
+push, and drop (including a non-top entry) while Stashes stays open; a prior commit signal
+must not satisfy the stash assertion. Verify one retained History batch per
+external change, no duplicate same-tip offset-zero read and no retained read
+when the first page covers all loaded rows, preserved selection and scroll,
+older-response fencing, and actionable background errors with Retry, including
+a cause without final punctuation. With the Stashes panel closed, an external
+stash push must start no stash-list read and the button shows no count; opening
+the panel then lists the new entry. Opening History reads the first page once; an in-app History operation
+while the watcher is degraded still refreshes History, and one change never
+causes two first-page reads. A stalled focus consumer must not delay supervisor
+visibility wakeups, and an `application-active` wakeup must survive a following
+focus return.
+Exercise signature-input failures without losing remote-status publication.
+For remote/local reconciliation ordering changes, run
+`git::broadcaster::tests::local_error_keeps_one_pending_remote_reconcile_until_later_success`
+in at least 300 separate test-process runs with `--exact --test-threads 1` and
+record the pass/fail count.
 
 Host-independent event-shape and routing tests are compatibility evidence, not
 native evidence for another operating system or remote host. Record unavailable
