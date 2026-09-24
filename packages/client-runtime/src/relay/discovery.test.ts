@@ -145,6 +145,7 @@ const makeHarness = Effect.fn("RelayDiscoveryTest.makeHarness")(function* () {
         Layer.succeed(
           ConnectionWakeups.ConnectionWakeups,
           ConnectionWakeups.ConnectionWakeups.of({
+            focusVisibility: Stream.never,
             changes: SubscriptionRef.changes(wakeups).pipe(
               Stream.drop(1),
               Stream.map((event) => event.reason),
@@ -401,7 +402,10 @@ describe("RelayEnvironmentDiscovery", () => {
             }),
             Layer.succeed(
               ConnectionWakeups.ConnectionWakeups,
-              ConnectionWakeups.ConnectionWakeups.of({ changes: Stream.never }),
+              ConnectionWakeups.ConnectionWakeups.of({
+                focusVisibility: Stream.never,
+                changes: Stream.never,
+              }),
             ),
           ),
         ),

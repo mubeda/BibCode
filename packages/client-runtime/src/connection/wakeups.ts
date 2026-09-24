@@ -8,6 +8,8 @@ export class ConnectionWakeups extends Context.Service<
   ConnectionWakeups,
   {
     readonly changes: Stream.Stream<ConnectionWakeup>;
+    /** Coalesced focus/visibility returns for view refreshes, never liveness probes. */
+    readonly focusVisibility: Stream.Stream<void>;
   }
 >()("@bibcode/client-runtime/connection/wakeups/ConnectionWakeups") {}
 

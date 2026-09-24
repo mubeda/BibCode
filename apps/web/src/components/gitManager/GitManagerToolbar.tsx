@@ -100,7 +100,7 @@ const TagActionMenuItem = memo(function TagActionMenuItem({
           {entry.name}
         </span>
         {disabledReason === null ? null : (
-          <span className="text-[10px] text-muted-foreground">{disabledReason}</span>
+          <span className="text-xs text-muted-foreground">{disabledReason}</span>
         )}
       </span>
     </MenuItem>
@@ -223,7 +223,7 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
   const signalAtom = useMemo(
     () =>
       liveSignalAvailable
-        ? gitManagerEnvironment.signal({
+        ? gitManagerEnvironment.signalWithDegradedFocusRefresh({
             environmentId,
             input: { cwd: selectedWorktreeCwd },
           })
@@ -248,11 +248,10 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
   const existingTags = snapshot?.tags.map((tag) => tag.name) ?? EMPTY_TAG_NAMES;
   const tagTargetSha = currentBranch?.tipSha ?? snapshot?.detachedSha ?? null;
   const remote = remoteForBranch(currentBranch, snapshot?.remotes ?? []);
-  const isUnborn =
-    snapshot !== null &&
-    snapshot.headRef !== null &&
-    snapshot.detachedSha === null &&
-    currentBranch === null;
+  // No commit behind HEAD: an unborn branch, or a HEAD naming no valid ref (an
+  // interrupted clone's placeholder), which has no branch name to show either.
+  const isUnborn = snapshot !== null && snapshot.detachedSha === null && currentBranch === null;
+  const noBranchLabel = isUnborn && currentBranchName === null ? "No commits yet" : "Detached HEAD";
   const ahead = currentBranch?.ahead ?? 0;
   const behind = currentBranch?.behind ?? 0;
   const hasUpstream = currentBranch?.upstream !== null && currentBranch?.upstream !== undefined;
@@ -639,6 +638,7 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
             branchDisabledReason={branchSyncDisabledReason}
             currentBranchName={currentBranchName}
             mergeDisabledReason={stashMergeDisabledReason}
+            noBranchLabel={noBranchLabel}
             projectRef={stableProjectRef}
             recentNames={recentNames}
             refs={localBranches}
@@ -672,9 +672,7 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
                 <span className="flex min-w-0 flex-col">
                   <span>Create Tag…</span>
                   {createTagDisabledReason === null ? null : (
-                    <span className="text-[10px] text-muted-foreground">
-                      {createTagDisabledReason}
-                    </span>
+                    <span className="text-xs text-muted-foreground">{createTagDisabledReason}</span>
                   )}
                 </span>
               </MenuItem>
@@ -703,7 +701,7 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
                 <MenuItem disabled title="Create a local tag before deleting one">
                   <span className="flex flex-col">
                     <span>Delete Tag</span>
-                    <span className="text-[10px] text-muted-foreground">No local tags.</span>
+                    <span className="text-xs text-muted-foreground">No local tags.</span>
                   </span>
                 </MenuItem>
               )}
@@ -738,7 +736,7 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
                 >
                   <span className="flex flex-col">
                     <span>Push Tag</span>
-                    <span className="text-[10px] text-muted-foreground">
+                    <span className="text-xs text-muted-foreground">
                       {snapshot !== null && snapshot.tags.length === 0
                         ? "No local tags."
                         : "No remote is configured."}

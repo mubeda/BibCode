@@ -17,7 +17,14 @@
         "exitCode": null,
         "exitSignal": 14,
         "label": "1~`YDE",
-        "updatedAt": "~~"
+        "updatedAt": "~~",
+        "size": {
+          "cols": 21,
+          "rows": 348,
+          "sizeClaim": null
+        },
+        "oscColorResponderActive": false,
+        "firstAttachmentGrant": false
       }
     }
   ]

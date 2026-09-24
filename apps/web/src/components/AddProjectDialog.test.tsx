@@ -132,12 +132,14 @@ beforeEach(() => {
     selectedHost,
     step: "start",
     busy: false,
+    cloneProgress: "idle",
     hostPath: "~/",
     cloneUrl: "",
     cloneParent: "~/",
     createName: "",
     createParent: "~/",
     error: null,
+    notice: null,
     canPickParent: true,
     selectHost: vi.fn(),
     back: vi.fn(),
@@ -151,6 +153,7 @@ beforeEach(() => {
     setCloneParent: vi.fn(),
     pickCloneParent: vi.fn(async () => {}),
     submitClone: vi.fn(async () => {}),
+    cancelClone: vi.fn(),
     openCreate: vi.fn(),
     setCreateName: vi.fn(),
     setCreateParent: vi.fn(),
@@ -230,6 +233,35 @@ describe("AddProjectDialog mounted interactions", () => {
     expect(document.querySelector('[role="combobox"]')).toBeNull();
     expect(document.body.textContent).not.toContain("Host");
     expect(document.body.textContent).not.toContain("Location");
+  });
+
+  it("keeps the clone form open with Cancel wired to the workflow while cloning", async () => {
+    testState.workflow.step = "clone";
+    testState.workflow.cloneUrl = "https://example.test/demo.git";
+    testState.workflow.busy = true;
+    testState.workflow.cloneProgress = "cloning";
+    const onOpenChange = vi.fn();
+    await mount(<AddProjectDialog open onOpenChange={onOpenChange} />);
+
+    const urlInput = document.querySelector<HTMLInputElement>("#add-project-clone-url");
+    expect(urlInput?.value).toBe("https://example.test/demo.git");
+    expect(buttonWithText("Cloning…").disabled).toBe(true);
+    expect(buttonWithText("Back").disabled).toBe(true);
+    await pressEscape();
+    expect(onOpenChange).not.toHaveBeenCalledWith(false);
+
+    await click(buttonWithText("Cancel clone"));
+    expect(testState.workflow.cancelClone).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows a cancelled clone notice on the clone form", async () => {
+    testState.workflow.step = "clone";
+    testState.workflow.cloneUrl = "https://example.test/demo.git";
+    testState.workflow.notice = "Clone cancelled.";
+    await mount(<AddProjectDialog open onOpenChange={vi.fn()} />);
+
+    expect(document.querySelector('[role="status"]')?.textContent).toBe("Clone cancelled.");
+    expect(buttonWithText("Clone").disabled).toBe(false);
   });
 
   it("prevents dismissal while a mutation is pending", async () => {

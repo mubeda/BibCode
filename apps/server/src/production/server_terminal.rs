@@ -561,7 +561,7 @@ fn register_terminal_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalS
                     Err(error) => { let _ = sender.send(Err(error)).await; return; }
                 }
             } else { None };
-            let input = match input.into_attach() {
+            let input = match input.into_attach(request.payload.get("sizeClaim")) {
                 Ok(input) => input,
                 Err(error) => { let _ = sender.send(Err(error)).await; return; }
             };
@@ -623,7 +623,13 @@ fn register_terminal_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalS
             Box::pin(async move {
                 let input: TerminalResizePayload = decode_payload(&payload)?;
                 terminal
-                    .resize(&input.thread_id, &input.terminal_id, input.cols, input.rows)
+                    .resize(
+                        &input.thread_id,
+                        &input.terminal_id,
+                        input.cols,
+                        input.rows,
+                        validate_terminal_size_claim(payload.get("sizeClaim"))?,
+                    )
                     .await
                     .map_err(terminal_error)?;
                 Ok(Value::Null)
@@ -950,6 +956,7 @@ const TERMINAL_LAUNCH_EXECUTABLE_MAX_LENGTH: usize = 4_096;
 const TERMINAL_LAUNCH_ARGUMENT_MAX_LENGTH: usize = 8_192;
 const TERMINAL_LAUNCH_ARGUMENT_MAX_COUNT: usize = 64;
 const TERMINAL_LAUNCH_LABEL_MAX_LENGTH: usize = 128;
+const TERMINAL_SIZE_CLAIM_MAX_LENGTH: usize = 128;
 const PROVIDER_TERMINAL_ACTIVITY_SLUG_MAX_LENGTH: usize = 64;
 
 fn is_ecmascript_trim_character(character: char) -> bool {
@@ -985,6 +992,23 @@ fn is_provider_terminal_activity_slug(value: &str) -> bool {
         .is_some_and(|character| character.is_ascii_alphabetic())
         && characters
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
+fn validate_terminal_size_claim(value: Option<&Value>) -> Result<Option<String>, Value> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let claim = value
+        .as_str()
+        .ok_or_else(|| invalid_request("sizeClaim must be a string"))?;
+    let claim = trim_ecmascript(claim);
+    if claim.is_empty() {
+        return Err(invalid_request("sizeClaim must not be empty"));
+    }
+    if claim.encode_utf16().count() > TERMINAL_SIZE_CLAIM_MAX_LENGTH {
+        return Err(invalid_request("sizeClaim is too long"));
+    }
+    Ok(Some(claim.to_owned()))
 }
 
 fn validate_terminal_launch_command(
@@ -1095,8 +1119,9 @@ struct TerminalAttachPayload {
 }
 
 impl TerminalAttachPayload {
-    fn into_attach(self) -> Result<TerminalAttachInput, Value> {
+    fn into_attach(self, size_claim: Option<&Value>) -> Result<TerminalAttachInput, Value> {
         Ok(TerminalAttachInput {
+            size_claim: validate_terminal_size_claim(size_claim)?,
             thread_id: self.thread_id,
             terminal_id: self.terminal_id,
             cwd: self.cwd.map(PathBuf::from),
@@ -1825,7 +1850,7 @@ mod tests {
     }
 
     async fn wait_for_probe(
-        events: &mut tokio::sync::broadcast::Receiver<TerminalEvent>,
+        events: &mut crate::terminal::TerminalEventReceiver,
         thread_id: &str,
         terminal_id: &str,
         value: &str,
@@ -1956,7 +1981,7 @@ mod tests {
         }
 
         let error = terminal_attach_payload(command)
-            .into_attach()
+            .into_attach(None)
             .expect_err("attach must reject invalid commands");
         assert_eq!(error["_tag"], "RpcRequestInvalid");
     }
@@ -2034,7 +2059,7 @@ mod tests {
         }
 
         let attach = terminal_attach_payload(command)
-            .into_attach()
+            .into_attach(None)
             .expect("valid attach command");
         assert_eq!(
             attach.command,
@@ -2373,6 +2398,29 @@ mod tests {
         assert!(decode_payload::<TerminalSessionPayload>(&invalid).is_err());
         assert!(decode_payload::<TerminalWritePayload>(&invalid).is_err());
         assert_eq!(format_epoch_ms(i128::MAX), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn terminal_resize_claim_decoding_accepts_legacy_and_bounds_new_claims() {
+        assert!(validate_terminal_size_claim(None).unwrap().is_none());
+        assert_eq!(
+            validate_terminal_size_claim(Some(&json!(" \u{feff}renderer\u{feff} ")))
+                .unwrap()
+                .as_deref(),
+            Some("renderer")
+        );
+        for invalid in [
+            Value::Null,
+            json!(""),
+            json!(" "),
+            json!("x".repeat(TERMINAL_SIZE_CLAIM_MAX_LENGTH + 1)),
+            json!(false),
+        ] {
+            assert_eq!(
+                validate_terminal_size_claim(Some(&invalid)).unwrap_err()["_tag"],
+                "RpcRequestInvalid"
+            );
+        }
     }
 
     #[test]
@@ -2874,7 +2922,9 @@ mod tests {
             }
         }))
         .expect("terminal attach payload");
-        let attach = attach.into_attach().expect("valid terminal attach payload");
+        let attach = attach
+            .into_attach(None)
+            .expect("valid terminal attach payload");
         assert_eq!(attach.cols, Some(80));
         assert!(attach.restart_if_not_running);
         assert_eq!(

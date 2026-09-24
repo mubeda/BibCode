@@ -74,7 +74,7 @@ async fn default_windows_shell_inherits_the_path_needed_to_launch() {
     };
     tokio::time::timeout(
         Duration::from_secs(2),
-        manager.resize("thread-1", "terminal-1", 100, 24),
+        manager.resize("thread-1", "terminal-1", 100, 24, None),
     )
     .await
     .expect("terminal resize does not block while PowerShell awaits a cursor response")
@@ -127,6 +127,7 @@ async fn attaching_a_missing_terminal_opens_it_without_deadlocking() {
     let attachment = tokio::time::timeout(
         Duration::from_secs(3),
         manager.attach(TerminalAttachInput {
+            size_claim: None,
             thread_id: "thread-attach".to_string(),
             terminal_id: "terminal-attach".to_string(),
             cwd: Some(workspace.path().to_path_buf()),
@@ -159,6 +160,7 @@ async fn concurrent_open_and_attach_share_one_native_process() {
         30,
     );
     let input = TerminalAttachInput {
+        size_claim: None,
         thread_id: "thread-concurrent".to_string(),
         terminal_id: "terminal-concurrent".to_string(),
         cwd: Some(workspace.path().to_path_buf()),

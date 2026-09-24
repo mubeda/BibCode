@@ -41,6 +41,48 @@ afterEach(() => {
 });
 
 describe("createTerminalOutputSink", () => {
+  it("orders size and ownership changes after parsed earlier output and before later output", () => {
+    const frames = createFrameHarness();
+    const pending: Array<() => void> = [];
+    const rendered: string[] = [];
+    let width = 151;
+    const sink = createTerminalOutputSink({
+      write: (data, callback) => {
+        pending.push(() => {
+          if (data) rendered.push(`${width}:${data}`);
+          callback?.();
+        });
+      },
+      scheduleFrame: frames.scheduleFrame,
+      cancelFrame: frames.cancelFrame,
+    });
+    sink.push("before");
+    sink.barrier(() => {
+      width = 91;
+    });
+    sink.push("after");
+    sink.flush();
+    expect(width).toBe(151);
+    for (const parse of pending) parse();
+    expect(rendered).toEqual(["151:before", "91:after"]);
+    sink.dispose();
+  });
+
+  it("ignores a queued size change after the renderer is disposed", () => {
+    let complete: (() => void) | undefined;
+    let changed = false;
+    const sink = createTerminalOutputSink({
+      write: (_data, callback) => {
+        complete = callback;
+      },
+    });
+    sink.barrier(() => {
+      changed = true;
+    });
+    sink.dispose();
+    complete?.();
+    expect(changed).toBe(false);
+  });
   it("exports the 256 KiB default flush threshold", () => {
     expect(DEFAULT_OUTPUT_FLUSH_THRESHOLD_BYTES).toBe(256 * 1024);
   });

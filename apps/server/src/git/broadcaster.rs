@@ -6,16 +6,18 @@ use std::{
     time::Duration,
 };
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use super::{
     GitCommandError, GitRepository, GitWatchError, GitWatchRequest, GitWatchService,
-    VcsStatusLocalResult, VcsStatusRemoteResult, VcsStatusResult, VcsStatusStreamEvent,
+    GitWatcherHealth, VcsStatusLocalResult, VcsStatusRemoteResult, VcsStatusResult,
+    VcsStatusStreamEvent,
     fetch_owner::RepositoryFetchOwner,
+    repository::GitManagerSignalHead,
     status_owner::{
         StatusMutationGuard, StatusOutputKind, StatusReadFence, StatusReadKey, StatusReadOwner,
-        run_status_signal_scheduler,
+        StatusSignalCallbacks, WatcherSignalSource, run_status_signal_scheduler,
     },
 };
 
@@ -78,7 +80,9 @@ struct RepositoryState {
     pending_local_reconcile: bool,
     remote_refresh_requests: watch::Sender<u64>,
     git_manager_signature: Option<u64>,
-    git_manager_generation: watch::Sender<u64>,
+    git_manager_signal: watch::Sender<GitManagerSignal>,
+    git_manager_read_lock: Arc<AsyncMutex<()>>,
+    git_manager_common_dir: Option<PathBuf>,
     subscribers: HashMap<u64, RepositorySubscriber>,
     poller_cancellation: CancellationToken,
     retirement_cancellation: CancellationToken,
@@ -109,11 +113,6 @@ impl Drop for RepositoryRetirementFence {
     }
 }
 
-struct StatusWatcherAttachment {
-    subscription: Option<super::GitWatchSubscription>,
-    setup_fallback: bool,
-}
-
 pub struct StatusSubscription {
     receiver: mpsc::Receiver<StatusPublication<VcsStatusStreamEvent>>,
     cancellation: CancellationToken,
@@ -123,7 +122,7 @@ pub struct StatusSubscription {
 }
 
 pub struct GitManagerSignalSubscription {
-    receiver: watch::Receiver<u64>,
+    receiver: watch::Receiver<GitManagerSignal>,
     pending_initial: bool,
     cancellation: CancellationToken,
     broadcaster: StatusBroadcaster,
@@ -131,11 +130,55 @@ pub struct GitManagerSignalSubscription {
     subscriber_id: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GitManagerSignal {
+    pub generation: u64,
+    pub watcher_degraded: bool,
+}
+
 #[derive(Clone)]
 pub(crate) struct StatusPublication<T> {
     pub value: T,
     pub local: VcsStatusLocalResult,
     pub fence: StatusReadFence,
+}
+
+struct StatusRefreshTarget {
+    broadcaster: StatusBroadcaster,
+    cwd: PathBuf,
+    lifecycle_id: u64,
+    cancellation: CancellationToken,
+}
+
+impl StatusSignalCallbacks for StatusRefreshTarget {
+    async fn refresh_local(&self) {
+        let _ = self
+            .broadcaster
+            .refresh_local_for_lifecycle(&self.cwd, Some(self.lifecycle_id), &self.cancellation)
+            .await;
+    }
+    async fn refresh_refs(&self) {
+        if let Err(error) = self
+            .broadcaster
+            .refresh_git_manager_signal_for_lifecycle(
+                &self.cwd,
+                Some(self.lifecycle_id),
+                &self.cancellation,
+            )
+            .await
+            && !self.cancellation.is_cancelled()
+        {
+            log_signature_failure(&error);
+        }
+    }
+    fn on_health_change(&self, health: GitWatcherHealth) {
+        self.broadcaster
+            .publish_watcher_health(&self.cwd, self.lifecycle_id, health);
+    }
+}
+
+fn log_signature_failure(error: &GitCommandError) {
+    tracing::warn!(operation = %error.operation, "Git Manager signature observation failed; retaining the previous signature");
 }
 
 impl StatusBroadcaster {
@@ -324,20 +367,11 @@ impl StatusBroadcaster {
                     })
                     .await
                 {
-                    Ok(subscription) => StatusWatcherAttachment {
-                        subscription: Some(subscription),
-                        setup_fallback: false,
-                    },
+                    Ok(subscription) => WatcherSignalSource::new(Some(subscription)),
                     Err(GitWatchError::Shutdown) => return Err(broadcaster_shutdown_error(&cwd)),
-                    Err(GitWatchError::Root { .. }) => StatusWatcherAttachment {
-                        subscription: None,
-                        setup_fallback: true,
-                    },
+                    Err(GitWatchError::Root { .. }) => WatcherSignalSource::new(None),
                 },
-                Err(_) => StatusWatcherAttachment {
-                    subscription: None,
-                    setup_fallback: true,
-                },
+                Err(_) => WatcherSignalSource::new(None),
             };
             let repository = Arc::clone(&self.inner.repository);
             let load_cwd = cwd.clone();
@@ -381,7 +415,11 @@ impl StatusBroadcaster {
                     let start_poller = !state.repositories.contains_key(&cwd);
                     let entry = state.repositories.entry(cwd.clone()).or_insert_with(|| {
                         let (remote_refresh_requests, _) = watch::channel(0);
-                        let (git_manager_generation, _) = watch::channel(0);
+                        let (git_manager_signal, _) = watch::channel(GitManagerSignal {
+                            generation: 0,
+                            watcher_degraded: watcher.current_health()
+                                == GitWatcherHealth::FallbackRequired,
+                        });
                         let tasks = TaskTracker::new();
                         let retirement_cancellation = CancellationToken::new();
                         let retirement_wait = retirement_cancellation.clone();
@@ -400,7 +438,9 @@ impl StatusBroadcaster {
                             pending_local_reconcile: false,
                             remote_refresh_requests,
                             git_manager_signature: None,
-                            git_manager_generation,
+                            git_manager_signal,
+                            git_manager_read_lock: Arc::new(AsyncMutex::new(())),
+                            git_manager_common_dir: resolved_common_dir.clone(),
                             subscribers: HashMap::new(),
                             poller_cancellation: CancellationToken::new(),
                             retirement_cancellation,
@@ -454,7 +494,7 @@ impl StatusBroadcaster {
                         local_refresh_requests,
                         entry.remote_refresh_requests.subscribe(),
                         entry.remote_refresh_requests.clone(),
-                        entry.git_manager_generation.subscribe(),
+                        entry.git_manager_signal.subscribe(),
                         entry.lifecycle_id,
                         entry.repository_key.clone(),
                         entry.tasks.clone(),
@@ -497,7 +537,7 @@ impl StatusBroadcaster {
                 local_refresh_requests,
                 remote_refresh_requests,
                 remote_reconcile,
-                git_manager_generation,
+                git_manager_signal,
                 lifecycle_id,
                 repository_key,
                 lifecycle_tasks,
@@ -592,7 +632,7 @@ impl StatusBroadcaster {
                 }),
                 SubscriptionKind::GitManager => {
                     BroadcasterSubscription::GitManager(GitManagerSignalSubscription {
-                        receiver: git_manager_generation,
+                        receiver: git_manager_signal,
                         pending_initial: true,
                         cancellation: subscriber_cancellation,
                         broadcaster: self.clone(),
@@ -927,6 +967,116 @@ impl StatusBroadcaster {
         publish(entry, event, &fence);
     }
 
+    async fn refresh_git_manager_signal_for_lifecycle(
+        &self,
+        cwd: &Path,
+        lifecycle_id: Option<u64>,
+        cancellation: &CancellationToken,
+    ) -> Result<(), GitCommandError> {
+        let (read_lock, common_dir) = {
+            let state = self.lock_state();
+            let Some(entry) = state
+                .repositories
+                .get(cwd)
+                .filter(|entry| Some(entry.lifecycle_id) == lifecycle_id)
+            else {
+                return Ok(());
+            };
+            (
+                Arc::clone(&entry.git_manager_read_lock),
+                entry.git_manager_common_dir.clone(),
+            )
+        };
+        let _read = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Ok(()),
+            guard = read_lock.lock() => guard,
+        };
+        let common_dir = match common_dir {
+            Some(common_dir) => common_dir,
+            None => {
+                let common_dir = self
+                    .inner
+                    .repository
+                    .resolve_common_dir(cwd, cancellation)
+                    .await?;
+                if let Some(entry) = self
+                    .lock_state()
+                    .repositories
+                    .get_mut(cwd)
+                    .filter(|entry| Some(entry.lifecycle_id) == lifecycle_id)
+                {
+                    entry.git_manager_common_dir = Some(common_dir.clone());
+                }
+                common_dir
+            }
+        };
+        loop {
+            let fence = self
+                .inner
+                .status_owner
+                .acquire_read_fence(cwd, cancellation)
+                .await?;
+            let (refs, head, stash_reflog) = tokio::try_join!(
+                self.inner
+                    .repository
+                    .git_manager_signal_refs(cwd, cancellation),
+                self.inner
+                    .repository
+                    .git_manager_signal_head(cwd, cancellation),
+                self.inner.repository.git_manager_signal_stash_reflog(
+                    cwd,
+                    &common_dir,
+                    cancellation
+                ),
+            )?;
+            let signature = hash_git_manager_signature(&refs.stdout, &head, &stash_reflog);
+            let publication = self
+                .inner
+                .status_owner
+                .publish_if_fence_current(&fence, || {
+                    let mut state = self.lock_state();
+                    if let Some(entry) = state.repositories.get_mut(cwd).filter(|entry| {
+                        Some(entry.lifecycle_id) == lifecycle_id && !cancellation.is_cancelled()
+                    }) {
+                        update_git_manager_signature(
+                            &mut entry.git_manager_signature,
+                            &entry.git_manager_signal,
+                            signature,
+                        );
+                    }
+                });
+            if publication.is_ok()
+                || cancellation.is_cancelled()
+                || !self
+                    .lock_state()
+                    .repositories
+                    .get(cwd)
+                    .is_some_and(|entry| Some(entry.lifecycle_id) == lifecycle_id)
+            {
+                return publication;
+            }
+            // The mutation epoch changed during this read. Re-admission waits for
+            // settlement and retains this invalidation without another watcher event.
+        }
+    }
+
+    fn publish_watcher_health(&self, cwd: &Path, lifecycle_id: u64, health: GitWatcherHealth) {
+        let state = self.lock_state();
+        if let Some(entry) = state.repositories.get(cwd).filter(|entry| {
+            entry.lifecycle_id == lifecycle_id && !entry.poller_cancellation.is_cancelled()
+        }) {
+            entry.git_manager_signal.send_if_modified(|signal| {
+                let degraded = health == GitWatcherHealth::FallbackRequired;
+                if signal.watcher_degraded == degraded {
+                    return false;
+                }
+                signal.watcher_degraded = degraded;
+                true
+            });
+        }
+    }
+
     async fn refresh_remote_for_lifecycle(
         &self,
         cwd: &Path,
@@ -938,16 +1088,11 @@ impl StatusBroadcaster {
             .status_owner
             .acquire_read_fence(cwd, cancellation)
             .await?;
-        let (observed, refs) = tokio::try_join!(
-            self.inner
-                .repository
-                .observed_remote_status(cwd, cancellation),
-            self.inner
-                .repository
-                .git_manager_signal_refs(cwd, cancellation),
-        )?;
-        let git_manager_signature =
-            hash_git_manager_signature(&refs.stdout, &observed.head_signature);
+        let observed = self
+            .inner
+            .repository
+            .observed_remote_status(cwd, cancellation)
+            .await?;
         let (retirement, request_local_refresh) = self
             .inner
             .status_owner
@@ -957,11 +1102,6 @@ impl StatusBroadcaster {
                     .repositories
                     .get_mut(cwd)
                     .filter(|entry| Some(entry.lifecycle_id) == lifecycle_id)?;
-                update_git_manager_signature(
-                    &mut entry.git_manager_signature,
-                    &entry.git_manager_generation,
-                    git_manager_signature,
-                );
                 if entry.local.ref_name != observed.ref_name {
                     let request_local_refresh = !entry.pending_local_reconcile;
                     entry.pending_local_reconcile = true;
@@ -996,6 +1136,16 @@ impl StatusBroadcaster {
             self.inner.status_owner.request_local_refresh(cwd);
         }
         self.finish_repository_retirement(cwd, retirement);
+        // Reconciliation must settle before independent signature I/O can yield.
+        // Otherwise a successful local read can consume the pending mismatch,
+        // then the delayed remote result reopens it and requests a duplicate read.
+        if let Err(error) = self
+            .refresh_git_manager_signal_for_lifecycle(cwd, lifecycle_id, cancellation)
+            .await
+            && !cancellation.is_cancelled()
+        {
+            log_signature_failure(&error);
+        }
         Ok(())
     }
 
@@ -1317,7 +1467,7 @@ impl StatusBroadcaster {
         lifecycle_id: u64,
         cancellation: CancellationToken,
         local_refresh_requests: watch::Receiver<u64>,
-        watcher_startup: (StatusWatcherAttachment, Duration),
+        watcher_startup: (WatcherSignalSource, Duration),
         tasks: &TaskTracker,
     ) {
         let (watcher, initial_read_duration) = watcher_startup;
@@ -1338,21 +1488,16 @@ impl StatusBroadcaster {
             let refresh_cancellation = cancellation.clone();
             let safety_interval = broadcaster.inner.local_status_refresh_interval;
             let _ = run_status_signal_scheduler(
-                watcher.subscription,
-                watcher.setup_fallback,
+                watcher,
                 local_refresh_requests,
                 cancellation,
                 initial_read_duration,
                 safety_interval,
-                move || {
-                    let broadcaster = broadcaster.clone();
-                    let cwd = cwd.clone();
-                    let cancellation = refresh_cancellation.clone();
-                    async move {
-                        let _ = broadcaster
-                            .refresh_local_for_lifecycle(&cwd, Some(lifecycle_id), &cancellation)
-                            .await;
-                    }
+                StatusRefreshTarget {
+                    broadcaster,
+                    cwd,
+                    lifecycle_id,
+                    cancellation: refresh_cancellation,
                 },
             )
             .await;
@@ -1802,7 +1947,7 @@ impl Drop for StatusSubscription {
 }
 
 impl GitManagerSignalSubscription {
-    pub async fn recv(&mut self) -> Option<u64> {
+    pub async fn recv(&mut self) -> Option<GitManagerSignal> {
         if self.cancellation.is_cancelled() {
             return None;
         }
@@ -1826,23 +1971,24 @@ impl Drop for GitManagerSignalSubscription {
     }
 }
 
-fn hash_git_manager_signature(refs: &str, head: &str) -> u64 {
+fn hash_git_manager_signature(refs: &str, head: &GitManagerSignalHead, stash_reflog: &[u8]) -> u64 {
     let mut hasher = DefaultHasher::new();
     refs.hash(&mut hasher);
     head.hash(&mut hasher);
+    stash_reflog.hash(&mut hasher);
     hasher.finish()
 }
 
 fn update_git_manager_signature(
     current: &mut Option<u64>,
-    generation: &watch::Sender<u64>,
+    signal: &watch::Sender<GitManagerSignal>,
     observed: u64,
 ) {
     if *current == Some(observed) {
         return;
     }
     *current = Some(observed);
-    generation.send_modify(|value| *value = value.saturating_add(1));
+    signal.send_modify(|value| value.generation = value.generation.saturating_add(1));
 }
 
 fn clear_remote_for_ref_change(entry: &mut RepositoryState) {
@@ -1910,6 +2056,21 @@ mod tests {
         sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use tokio::sync::{Notify, Semaphore, mpsc};
+
+    fn signal_head_output(operation: &str) -> Option<ProcessOutput> {
+        let stdout = match operation {
+            "GitManager.signal.headRef" => "main\n",
+            "GitManager.signal.headSha" => "deadbeef\n",
+            _ => return None,
+        };
+        Some(ProcessOutput {
+            exit_code: 0,
+            stdout: stdout.to_owned(),
+            stderr: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        })
+    }
 
     struct BlockingRemoteGitRunner {
         command: PathBuf,
@@ -2016,6 +2177,9 @@ mod tests {
                 .push(request.operation.clone());
             self.operation_changed.notify_waiters();
             Box::pin(async move {
+                if let Some(output) = signal_head_output(&request.operation) {
+                    return Ok(output);
+                }
                 let (exit_code, stdout) = match request.operation.as_str() {
                     "GitVcsDriver.detectRepository" => (0, "true\n".to_owned()),
                     "GitVcsDriver.resolveWatchRoots" => (0, self.roots.clone()),
@@ -2055,6 +2219,9 @@ mod tests {
             _cancellation: &'a CancellationToken,
         ) -> BoxGitProcessFuture<'a> {
             Box::pin(async move {
+                if let Some(output) = signal_head_output(&request.operation) {
+                    return Ok(output);
+                }
                 if request.operation == self.blocked_operation {
                     let _ = self.started.send(());
                     self.release
@@ -2112,6 +2279,9 @@ mod tests {
             _cancellation: &'a CancellationToken,
         ) -> BoxGitProcessFuture<'a> {
             Box::pin(async move {
+                if let Some(output) = signal_head_output(&request.operation) {
+                    return Ok(output);
+                }
                 let branch = self.branch();
                 let (exit_code, stdout) = match request.operation.as_str() {
                     "GitVcsDriver.detectRepository" => (0, "true\n".to_owned()),
@@ -2170,6 +2340,93 @@ mod tests {
         }
     }
 
+    struct DelayedSignalRunner {
+        inner: RemoteMismatchGitRunner,
+        started: Notify,
+        release: Semaphore,
+        fail_head: bool,
+    }
+
+    impl GitProcessRunner for DelayedSignalRunner {
+        fn run<'a>(
+            &'a self,
+            request: ProcessRequest,
+            cancellation: &'a CancellationToken,
+        ) -> BoxGitProcessFuture<'a> {
+            Box::pin(async move {
+                if request.operation == "GitManager.signal.headRef" {
+                    self.started.notify_one();
+                    self.release
+                        .acquire()
+                        .await
+                        .expect("signature release")
+                        .forget();
+                    if self.fail_head {
+                        return Ok(RemoteMismatchGitRunner::output(128, String::new()));
+                    }
+                }
+                self.inner.run(request, cancellation).await
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_status_publishes_before_slow_or_failed_signature_inputs() {
+        for (fail_head, fail_reflog) in [(false, false), (true, false), (false, true)] {
+            let root = tempfile::tempdir().expect("remote publication fixture");
+            let cwd = fs::canonicalize(root.path()).expect("canonical fixture");
+            if fail_reflog {
+                fs::create_dir_all(cwd.join(".git/logs/refs/stash"))
+                    .expect("invalid reflog directory");
+            }
+            let runner = Arc::new(DelayedSignalRunner {
+                inner: RemoteMismatchGitRunner::new(0, 0),
+                started: Notify::new(),
+                release: Semaphore::new(0),
+                fail_head,
+            });
+            let broadcaster = StatusBroadcaster::new(
+                Arc::new(GitRepository::with_runner_for_test(runner.clone())),
+                Duration::from_secs(180),
+                4,
+            );
+            let mut events =
+                install_epoch_repository_for_lifecycle(&broadcaster, &cwd, 1, "main", 9);
+            let previous_signature = Some(0x5a17);
+            broadcaster
+                .lock_state()
+                .repositories
+                .get_mut(&cwd)
+                .unwrap()
+                .git_manager_signature = previous_signature;
+            let pending = {
+                let broadcaster = broadcaster.clone();
+                let cwd = cwd.clone();
+                tokio::spawn(async move {
+                    broadcaster
+                        .refresh_remote(&cwd, &CancellationToken::new())
+                        .await
+                })
+            };
+            runner.started.notified().await;
+            let publication = events.try_recv();
+            runner.release.add_permits(1);
+            let result = pending.await.expect("remote refresh joins");
+            assert!(
+                matches!(publication, Ok(StatusPublication { value: VcsStatusStreamEvent::RemoteUpdated { remote: Some(remote) }, .. }) if remote.ahead_count == 1),
+                "signature I/O delayed remote publication"
+            );
+            result.expect("signature failure must not fail remote refresh");
+            if fail_head || fail_reflog {
+                assert_eq!(
+                    broadcaster.lock_state().repositories[&cwd].git_manager_signature,
+                    previous_signature
+                );
+            }
+            broadcaster.shutdown().await;
+        }
+    }
+
     impl RemoteMismatchGitRunner {
         fn new(local_failures: usize, remote_mismatches: usize) -> Self {
             Self {
@@ -2221,6 +2478,9 @@ mod tests {
             _cancellation: &'a CancellationToken,
         ) -> BoxGitProcessFuture<'a> {
             Box::pin(async move {
+                if let Some(output) = signal_head_output(&request.operation) {
+                    return Ok(output);
+                }
                 match request.operation.as_str() {
                     "GitVcsDriver.statusDetailsLocal.status" => {
                         self.local_calls.fetch_add(1, Ordering::SeqCst);
@@ -2465,6 +2725,9 @@ mod tests {
                 self.remote_status_changed.notify_waiters();
             }
             Box::pin(async move {
+                if let Some(output) = signal_head_output(&request.operation) {
+                    return Ok(output);
+                }
                 let branch = Self::branch(&request.cwd);
                 let remote = Self::remote(&request.cwd);
                 let branch_status = || {
@@ -4800,10 +5063,7 @@ mod tests {
             cancellation.clone(),
             local_refresh_requests,
             (
-                StatusWatcherAttachment {
-                    subscription: None,
-                    setup_fallback: false,
-                },
+                WatcherSignalSource::healthy_source_for_test(),
                 Duration::ZERO,
             ),
             &tasks,
@@ -4828,7 +5088,7 @@ mod tests {
     ) -> mpsc::Receiver<StatusPublication<VcsStatusStreamEvent>> {
         let (sender, receiver) = mpsc::channel(4);
         let (remote_refresh_requests, _) = watch::channel(0);
-        let (git_manager_generation, _) = watch::channel(0);
+        let (git_manager_signal, _) = watch::channel(GitManagerSignal::default());
         let mut local = VcsStatusLocalResult::non_repository();
         local.is_repo = true;
         local.ref_name = Some(ref_name.to_owned());
@@ -4857,7 +5117,9 @@ mod tests {
                 pending_local_reconcile: false,
                 remote_refresh_requests,
                 git_manager_signature: None,
-                git_manager_generation,
+                git_manager_signal,
+                git_manager_read_lock: Arc::new(AsyncMutex::new(())),
+                git_manager_common_dir: Some(cwd.join(".git")),
                 subscribers: HashMap::from([(lifecycle_id, RepositorySubscriber::Status(sender))]),
                 poller_cancellation: CancellationToken::new(),
                 retirement_cancellation,
@@ -4867,29 +5129,306 @@ mod tests {
         receiver
     }
 
+    #[derive(Default)]
+    struct RecordingSignalRunner {
+        operations: Mutex<Vec<String>>,
+    }
+
+    impl GitProcessRunner for RecordingSignalRunner {
+        fn run<'a>(
+            &'a self,
+            request: ProcessRequest,
+            cancellation: &'a CancellationToken,
+        ) -> BoxGitProcessFuture<'a> {
+            self.operations
+                .lock()
+                .expect("recorded operations")
+                .push(request.operation.clone());
+            Box::pin(async move { ProcessRunner.run(request, cancellation).await })
+        }
+    }
+
+    #[tokio::test]
+    async fn external_git_add_does_not_read_signal_and_watcher_loss_only_changes_health() {
+        let _native_watcher_permit = super::super::acquire_native_watcher_test_permit().await;
+        let root = tempfile::tempdir().expect("signal index fixture");
+        let cwd = fs::canonicalize(root.path()).expect("canonical fixture");
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(&cwd)
+                .output()
+                .expect("fixture Git");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.name", "Signal Test"]);
+        git(&["config", "user.email", "signal@example.test"]);
+        fs::write(cwd.join("tracked.txt"), "base\n").expect("base file");
+        git(&["add", "tracked.txt"]);
+        git(&["-c", "commit.gpgSign=false", "commit", "-q", "-m", "base"]);
+        let runner = Arc::new(RecordingSignalRunner::default());
+        let (fetch_interval, _) = watch::channel(Duration::from_secs(180));
+        let broadcaster = StatusBroadcaster::with_automatic_remote_refresh_interval(
+            Arc::new(GitRepository::with_runner_for_test(runner.clone())),
+            Duration::from_secs(60),
+            fetch_interval,
+            4,
+        );
+        let mut subscription = broadcaster
+            .subscribe_git_manager_signal(cwd.clone(), CancellationToken::new())
+            .await
+            .expect("signal subscription");
+        let initial = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let signal = subscription.recv().await.expect("signal");
+                if signal.generation > 0 {
+                    break signal;
+                }
+            }
+        })
+        .await
+        .expect("initial signature");
+        assert!(!initial.watcher_degraded);
+        let operations = || {
+            runner
+                .operations
+                .lock()
+                .expect("recorded operations")
+                .clone()
+        };
+        let before = operations()
+            .iter()
+            .filter(|operation| operation.starts_with("GitManager.signal."))
+            .count();
+        let local_before = broadcaster.physical_local_read_count_for_test(&cwd).await;
+        fs::write(cwd.join("tracked.txt"), "staged\n").expect("staged file");
+        git(&["add", "tracked.txt"]);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            broadcaster.wait_for_physical_local_read_after_for_test(&cwd, local_before),
+        )
+        .await
+        .expect("index local invalidation");
+        assert_eq!(
+            operations()
+                .iter()
+                .filter(|operation| operation.starts_with("GitManager.signal."))
+                .count(),
+            before
+        );
+        broadcaster.shut_down_watcher_for_test().await;
+        let degraded = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let signal = subscription.recv().await.expect("degraded signal");
+                if signal.watcher_degraded {
+                    break signal;
+                }
+            }
+        })
+        .await
+        .expect("health notification without waiting for a fetch tick");
+        assert_eq!(degraded.generation, initial.generation);
+        drop(subscription);
+        broadcaster.shutdown().await;
+    }
+
+    struct SignalReadRunner {
+        reads: AtomicUsize,
+        started: Notify,
+        release: Semaphore,
+    }
+
+    impl GitProcessRunner for SignalReadRunner {
+        fn run<'a>(
+            &'a self,
+            request: ProcessRequest,
+            _cancellation: &'a CancellationToken,
+        ) -> BoxGitProcessFuture<'a> {
+            Box::pin(async move {
+                if let Some(output) = signal_head_output(&request.operation) {
+                    return Ok(output);
+                }
+                let stdout = match request.operation.as_str() {
+                    "GitManager.signal.refs" => {
+                        assert!(request.args.contains(&OsString::from("refs/stash")));
+                        assert!(request.env.contains(&(
+                            OsString::from("GIT_OPTIONAL_LOCKS"),
+                            OsString::from("0")
+                        )));
+                        self.reads.fetch_add(1, Ordering::SeqCst);
+                        self.started.notify_one();
+                        // Deliberately ignore cancellation to exercise the publication fence.
+                        self.release
+                            .acquire()
+                            .await
+                            .expect("signal read gate")
+                            .forget();
+                        "deadbeef\trefs/heads/main\t/repository\n"
+                    }
+                    operation => {
+                        panic!("lightweight signal read ran unexpected operation {operation}")
+                    }
+                };
+                Ok(ProcessOutput {
+                    exit_code: 0,
+                    stdout: stdout.to_owned(),
+                    stderr: String::new(),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn lightweight_signal_read_deduplicates_and_fences_retired_repositories() {
+        let root = tempfile::tempdir().expect("signal fixture");
+        let cwd = fs::canonicalize(root.path()).expect("canonical fixture");
+        let runner = Arc::new(SignalReadRunner {
+            reads: AtomicUsize::new(0),
+            started: Notify::new(),
+            release: Semaphore::new(2),
+        });
+        let broadcaster = StatusBroadcaster::new(
+            Arc::new(GitRepository::with_runner_for_test(runner.clone())),
+            Duration::from_secs(180),
+            4,
+        );
+        let _status = install_epoch_repository(&broadcaster, &cwd);
+        let signal = broadcaster.lock_state().repositories[&cwd]
+            .git_manager_signal
+            .clone();
+        for _ in 0..2 {
+            broadcaster
+                .refresh_git_manager_signal_for_lifecycle(&cwd, Some(1), &CancellationToken::new())
+                .await
+                .expect("signal read");
+        }
+        assert_eq!(runner.reads.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            signal.borrow().generation,
+            1,
+            "unchanged refs must not bump"
+        );
+        // Drain the earlier read's notification before admitting the blocked read.
+        runner.started.notified().await;
+        let pending = {
+            let broadcaster = broadcaster.clone();
+            let cwd = cwd.clone();
+            tokio::spawn(async move {
+                broadcaster
+                    .refresh_git_manager_signal_for_lifecycle(
+                        &cwd,
+                        Some(1),
+                        &CancellationToken::new(),
+                    )
+                    .await
+            })
+        };
+        runner.started.notified().await;
+        broadcaster.release(&cwd, 1);
+        // A fresh generation must not receive the retired read either.
+        broadcaster.await_retired_lifecycle(&cwd).await;
+        let _replacement = install_epoch_repository_for_lifecycle(&broadcaster, &cwd, 2, "main", 0);
+        let replacement = broadcaster.lock_state().repositories[&cwd]
+            .git_manager_signal
+            .clone();
+        runner.release.add_permits(1);
+        assert!(pending.await.expect("signal task").is_err());
+        assert_eq!(signal.borrow().generation, 1);
+        assert_eq!(replacement.borrow().generation, 0);
+        broadcaster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn signal_read_retries_after_an_in_app_mutation_fence_settles() {
+        let root = tempfile::tempdir().expect("signal fixture");
+        let cwd = fs::canonicalize(root.path()).expect("canonical fixture");
+        let runner = Arc::new(SignalReadRunner {
+            reads: AtomicUsize::new(0),
+            started: Notify::new(),
+            release: Semaphore::new(0),
+        });
+        let broadcaster = StatusBroadcaster::new(
+            Arc::new(GitRepository::with_runner_for_test(runner.clone())),
+            Duration::from_secs(180),
+            4,
+        );
+        let _status = install_epoch_repository(&broadcaster, &cwd);
+        let signal = broadcaster.lock_state().repositories[&cwd]
+            .git_manager_signal
+            .clone();
+        let pending = {
+            let broadcaster = broadcaster.clone();
+            let cwd = cwd.clone();
+            tokio::spawn(async move {
+                broadcaster
+                    .refresh_git_manager_signal_for_lifecycle(
+                        &cwd,
+                        Some(1),
+                        &CancellationToken::new(),
+                    )
+                    .await
+            })
+        };
+        runner.started.notified().await;
+        let mutation = broadcaster.begin_mutation(&cwd).await;
+        runner.release.add_permits(1);
+        assert_eq!(signal.borrow().generation, 0);
+        mutation.finish().await;
+        tokio::time::timeout(Duration::from_secs(5), runner.started.notified())
+            .await
+            .expect("fenced read must retry after settlement");
+        assert_eq!(runner.reads.load(Ordering::SeqCst), 2);
+        runner.release.add_permits(1);
+        pending
+            .await
+            .expect("signal task")
+            .expect("retry publishes");
+        assert_eq!(signal.borrow().generation, 1);
+        broadcaster.shutdown().await;
+    }
+
     #[test]
     fn identical_ref_ticks_bump_once_and_a_changed_ref_bumps_again() {
-        let (generation, _) = watch::channel(0_u64);
+        let (signal, _) = watch::channel(GitManagerSignal::default());
         let mut signature = None;
         let first = hash_git_manager_signature(
             "aaaaaaaa\trefs/heads/main\t/repository\n",
-            "# branch.oid aaaaaaaa\0# branch.head main",
+            &GitManagerSignalHead {
+                reference: Some("main".into()),
+                oid: Some("aaaaaaaa".into()),
+            },
+            &[],
         );
         let unchanged = hash_git_manager_signature(
             "aaaaaaaa\trefs/heads/main\t/repository\n",
-            "# branch.oid aaaaaaaa\0# branch.head main",
+            &GitManagerSignalHead {
+                reference: Some("main".into()),
+                oid: Some("aaaaaaaa".into()),
+            },
+            &[],
         );
         let changed = hash_git_manager_signature(
             "bbbbbbbb\trefs/heads/main\t/repository\n",
-            "# branch.oid bbbbbbbb\0# branch.head main",
+            &GitManagerSignalHead {
+                reference: Some("main".into()),
+                oid: Some("bbbbbbbb".into()),
+            },
+            &[],
         );
 
-        update_git_manager_signature(&mut signature, &generation, first);
-        assert_eq!(*generation.borrow(), 1);
-        update_git_manager_signature(&mut signature, &generation, unchanged);
-        assert_eq!(*generation.borrow(), 1);
-        update_git_manager_signature(&mut signature, &generation, changed);
-        assert_eq!(*generation.borrow(), 2);
+        update_git_manager_signature(&mut signature, &signal, first);
+        assert_eq!(signal.borrow().generation, 1);
+        update_git_manager_signature(&mut signature, &signal, unchanged);
+        assert_eq!(signal.borrow().generation, 1);
+        update_git_manager_signature(&mut signature, &signal, changed);
+        assert_eq!(signal.borrow().generation, 2);
     }
 
     #[tokio::test]

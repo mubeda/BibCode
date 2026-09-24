@@ -456,6 +456,7 @@ async fn terminal_attach_restart_if_not_running_uses_fresh_session_snapshot() {
 
     let attachment = manager
         .attach(TerminalAttachInput {
+            size_claim: None,
             thread_id: "thread-1".to_string(),
             terminal_id: "term-1".to_string(),
             cwd: Some(cwd),

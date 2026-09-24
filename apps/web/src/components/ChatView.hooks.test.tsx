@@ -524,7 +524,7 @@ vi.mock("./ThreadTerminalPanel", () => ({
       }
     });
   },
-  releaseTerminalInputScheduler: vi.fn(),
+  releaseTerminalUiResources: vi.fn(),
 }));
 
 vi.mock("./CenterPanelWorkspace", async () => {
@@ -1918,6 +1918,19 @@ describe("ChatView keydown shortcuts", () => {
     });
   }
 
+  it("opens a center terminal without dimensions when no renderer can measure it", async () => {
+    const { handler } = renderWithKeydown();
+    h.shortcutCommandByKey.set("F1", "terminal.newCenter");
+    handler(makeKeyEvent({ key: "F1" }));
+    await flushTerminalAction();
+    expect(commandCallsFor("terminal.open")).toHaveLength(1);
+    const request = commandCallsFor("terminal.open")[0]!.input as {
+      input: { cols?: number; rows?: number };
+    };
+    expect(request.input.cols).toBeUndefined();
+    expect(request.input.rows).toBeUndefined();
+  });
+
   it("routes printable keys into the composer (type-to-focus)", () => {
     const inserted: string[] = [];
     seedConnectedServerThread();
@@ -3087,9 +3100,12 @@ describe("ChatView project script handlers", () => {
 
     const openCalls = commandCallsFor("terminal.open");
     expect(openCalls).toHaveLength(1);
-    const openInput = openCalls[0]!.input as { input: { terminalId: string; cols?: number } };
+    const openInput = openCalls[0]!.input as {
+      input: { terminalId: string; cols?: number; rows?: number };
+    };
     expect(openInput.input.terminalId).not.toBe("terminal-1");
-    expect(openInput.input.cols).toBe(120);
+    expect(openInput.input.cols).toBeUndefined();
+    expect(openInput.input.rows).toBeUndefined();
     expect(
       useCenterPanelStore
         .getState()

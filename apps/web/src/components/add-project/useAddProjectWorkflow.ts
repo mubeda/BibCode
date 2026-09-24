@@ -55,10 +55,15 @@ import {
   validateGitCloneParentPath,
   validateGitCloneUrl,
   validateProjectName,
+  type AddProjectCloneProgress,
   type AddProjectHostOption,
   type AddProjectStep,
 } from "./AddProjectDialog.logic";
-import { createAddProjectOperations, type AddProjectCommandResult } from "./addProjectOperations";
+import {
+  createAddProjectOperations,
+  type AddProjectCommandResult,
+  type AddProjectOutcome,
+} from "./addProjectOperations";
 import { readPrimaryRunningDistro } from "../hostFolderPicker";
 import { pickAddProjectFolder, type PickAddProjectFolderResult } from "./pickAddProjectFolder";
 
@@ -70,12 +75,15 @@ export interface AddProjectWorkflow {
   readonly selectedHost: AddProjectHostOption;
   readonly step: AddProjectStep;
   readonly busy: boolean;
+  readonly cloneProgress: AddProjectCloneProgress;
   readonly hostPath: string;
   readonly cloneUrl: string;
   readonly cloneParent: string;
   readonly createName: string;
   readonly createParent: string;
   readonly error: string | null;
+  /** Informational feedback, such as a cancelled clone. Never an error. */
+  readonly notice: string | null;
   readonly canPickParent: boolean;
   readonly selectHost: (environmentId: EnvironmentId) => void;
   readonly back: () => void;
@@ -89,6 +97,8 @@ export interface AddProjectWorkflow {
   readonly setCloneParent: (path: string) => void;
   readonly pickCloneParent: () => Promise<void>;
   readonly submitClone: () => Promise<void>;
+  /** Interrupts a running clone; a clone that is already being registered finishes. */
+  readonly cancelClone: () => void;
   readonly openCreate: () => void;
   readonly setCreateName: (name: string) => void;
   readonly setCreateParent: (path: string) => void;
@@ -146,6 +156,32 @@ function unexpectedErrorMessage(error: unknown): string {
     : "An error occurred.";
 }
 
+const CLONE_CANCELLED_NOTICE = "Clone cancelled.";
+// An interrupted clone request (for example by a reconnect) makes the server stop Git and, when it
+// can, remove the folder that clone created; the copy does not promise the removal.
+const CLONE_STOPPED_ERROR = "The clone stopped before it finished. Try again.";
+const CLONE_REGISTRATION_STOPPED_ERROR =
+  "Adding the project stopped before it finished. Try again.";
+
+/**
+ * A Git failure's `detail` is the server's actionable text; its `message` also names the internal
+ * operation and working directory.
+ */
+function addProjectFailureMessage(error: unknown): string {
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "_tag" in error &&
+    error._tag === "GitCommandError" &&
+    "detail" in error &&
+    typeof error.detail === "string" &&
+    error.detail.trim().length > 0
+  ) {
+    return error.detail;
+  }
+  return unexpectedErrorMessage(error);
+}
+
 export function useAddProjectWorkflowState(
   input: AddProjectWorkflowStateInput,
 ): AddProjectWorkflow {
@@ -162,10 +198,14 @@ export function useAddProjectWorkflowState(
   const [createName, setCreateNameState] = useState("");
   const [createParent, setCreateParentState] = useState(initialHost.baseDirectory);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [cloneProgress, setCloneProgress] = useState<AddProjectCloneProgress>("idle");
   const generationRef = useRef(0);
   const busyRef = useRef(false);
   const openRef = useRef(input.open);
   const previousOpenRef = useRef(false);
+  /** Set only while the clone request itself runs, so Cancel cannot interrupt registration. */
+  const cloneAbortRef = useRef<AbortController | null>(null);
   openRef.current = input.open;
 
   const catalogSelectedHost = input.hosts.find(
@@ -179,12 +219,14 @@ export function useAddProjectWorkflowState(
       setStep("start");
       setBusy(false);
       busyRef.current = false;
+      setCloneProgress("idle");
       setHostPathState(host.baseDirectory);
       setCloneUrlState("");
       setCloneParentState(host.baseDirectory);
       setCreateNameState("");
       setCreateParentState(host.baseDirectory);
       setError(nextError);
+      setNotice(null);
     },
     [],
   );
@@ -201,6 +243,7 @@ export function useAddProjectWorkflowState(
       generationRef.current += 1;
       setBusy(false);
       busyRef.current = false;
+      setCloneProgress("idle");
     }
   }, [initialHost, input.open, resetForHost]);
 
@@ -216,6 +259,8 @@ export function useAddProjectWorkflowState(
     () => () => {
       generationRef.current += 1;
       openRef.current = false;
+      // Nothing can register the result after unmount, so stop the server-side clone too.
+      cloneAbortRef.current?.abort();
     },
     [],
   );
@@ -232,6 +277,7 @@ export function useAddProjectWorkflowState(
     busyRef.current = true;
     setBusy(true);
     setError(null);
+    setNotice(null);
     return generationRef.current;
   }, []);
 
@@ -301,8 +347,10 @@ export function useAddProjectWorkflowState(
     generationRef.current += 1;
     busyRef.current = false;
     setBusy(false);
+    setCloneProgress("idle");
     setStep("start");
     setError(null);
+    setNotice(null);
   }, []);
 
   const browse = useCallback(async () => {
@@ -397,6 +445,7 @@ export function useAddProjectWorkflowState(
   const openClone = useCallback(() => {
     setStep("clone");
     setError(null);
+    setNotice(null);
   }, []);
 
   const openCreate = useCallback(() => {
@@ -480,23 +529,68 @@ export function useAddProjectWorkflowState(
     if (generation === null) {
       return;
     }
-    await completeOperation(generation, (shouldContinue) =>
-      input.operations.clone({
+    const controller = new AbortController();
+    cloneAbortRef.current = controller;
+    setCloneProgress("cloning");
+    const attempt = { cloned: false };
+    let outcome: AddProjectOutcome;
+    try {
+      outcome = await input.operations.clone({
         environmentId: selectedHost.environmentId,
         url: cloneUrl.trim(),
         parentDir: cloneParent.trim(),
-        shouldContinue,
-      }),
-    );
+        shouldContinue: () => isCurrent(generation),
+        signal: controller.signal,
+        onCloned: () => {
+          attempt.cloned = true;
+          if (cloneAbortRef.current === controller) {
+            cloneAbortRef.current = null;
+          }
+          if (isCurrent(generation)) {
+            setCloneProgress("registering");
+          }
+        },
+      });
+    } catch (cause) {
+      outcome = { _tag: "Failed", title: "Clone failed", error: cause };
+    } finally {
+      if (cloneAbortRef.current === controller) {
+        cloneAbortRef.current = null;
+      }
+    }
+    if (!isCurrent(generation)) {
+      return;
+    }
+    setCloneProgress("idle");
+    if (outcome._tag === "Opened") {
+      closeAfterSuccess(generation);
+      return;
+    }
+    finishAsync(generation);
+    if (outcome._tag === "Failed") {
+      setError(`${outcome.title}: ${addProjectFailureMessage(outcome.error)}`);
+    } else if (controller.signal.aborted) {
+      setNotice(CLONE_CANCELLED_NOTICE);
+    } else {
+      // Interrupted by something other than Cancel; never re-enable the form silently, and name
+      // the step that stopped.
+      setError(attempt.cloned ? CLONE_REGISTRATION_STOPPED_ERROR : CLONE_STOPPED_ERROR);
+    }
   }, [
     beginAsync,
     cloneParent,
     cloneUrl,
-    completeOperation,
+    closeAfterSuccess,
+    finishAsync,
     input.operations,
+    isCurrent,
     selectedHost.environmentId,
     selectedHost.platform,
   ]);
+
+  const cancelClone = useCallback(() => {
+    cloneAbortRef.current?.abort();
+  }, []);
 
   const submitCreate = useCallback(async () => {
     const platform = selectedHost.platform;
@@ -530,10 +624,12 @@ export function useAddProjectWorkflowState(
   const setCloneUrl = useCallback((url: string) => {
     setCloneUrlState(url);
     setError(null);
+    setNotice(null);
   }, []);
   const setCloneParent = useCallback((path: string) => {
     setCloneParentState(path);
     setError(null);
+    setNotice(null);
   }, []);
   const setCreateName = useCallback((name: string) => {
     setCreateNameState(name);
@@ -550,12 +646,14 @@ export function useAddProjectWorkflowState(
     selectedHost,
     step,
     busy,
+    cloneProgress,
     hostPath,
     cloneUrl,
     cloneParent,
     createName,
     createParent,
     error,
+    notice,
     canPickParent: shouldUseNativePicker(selectedHost),
     selectHost,
     back,
@@ -569,6 +667,7 @@ export function useAddProjectWorkflowState(
     setCloneParent,
     pickCloneParent: () => pickParent("clone"),
     submitClone,
+    cancelClone,
     openCreate,
     setCreateName,
     setCreateParent,
@@ -718,13 +817,17 @@ export function useAddProjectWorkflow(input: {
         },
         cloneRepository: async (commandInput) =>
           adaptAtomResult(
-            await cloneRepository({
-              environmentId: commandInput.environmentId,
-              input: {
-                url: commandInput.url,
-                parentDir: commandInput.parentDir,
+            await cloneRepository(
+              {
+                environmentId: commandInput.environmentId,
+                input: {
+                  url: commandInput.url,
+                  parentDir: commandInput.parentDir,
+                },
               },
-            }),
+              // Aborting interrupts the RPC; the server stops Git and removes a folder it created.
+              { signal: commandInput.signal },
+            ),
           ),
         openProject: async (commandInput) => {
           let defaultThreadId =

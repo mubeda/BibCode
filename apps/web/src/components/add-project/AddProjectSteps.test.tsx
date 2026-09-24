@@ -10,6 +10,7 @@ import {
   AddProjectCreateStep,
   AddProjectHostPathStep,
   AddProjectStartStep,
+  type AddProjectCloneStepProps,
   type AddProjectStartStepProps,
 } from "./AddProjectSteps";
 import type { AddProjectHostOption } from "./AddProjectDialog.logic";
@@ -22,6 +23,12 @@ async function mount(element: ReactElement): Promise<void> {
   const root = createRoot(container);
   roots.push({ root, container });
   await act(async () => root.render(element));
+}
+
+async function rerender(element: ReactElement): Promise<void> {
+  const mounted = roots.at(-1);
+  if (mounted === undefined) throw new Error("Nothing is mounted");
+  await act(async () => mounted.root.render(element));
 }
 
 function buttonWithText(text: string): HTMLButtonElement {
@@ -67,6 +74,27 @@ const remoteHost: AddProjectHostOption = {
   desktopInstanceId: null,
   nativePickerAvailable: true,
 };
+
+function cloneStepProps(
+  overrides: Partial<AddProjectCloneStepProps> = {},
+): AddProjectCloneStepProps {
+  return {
+    url: "https://github.com/openai/codex.git",
+    parentDir: "~/projects/",
+    platform: "Linux",
+    error: null,
+    notice: null,
+    busy: false,
+    progress: "idle",
+    canPickParent: true,
+    onUrlChange: vi.fn(),
+    onParentDirChange: vi.fn(),
+    onPickParent: vi.fn(),
+    onClone: vi.fn(),
+    onCancel: vi.fn(),
+    ...overrides,
+  };
+}
 
 async function mountLauncher(overrides: Partial<AddProjectStartStepProps> = {}): Promise<void> {
   await mount(
@@ -244,12 +272,15 @@ describe("Add Project presentational steps", () => {
         parentDir="~/"
         platform="Linux"
         error={null}
+        notice={null}
         busy={false}
+        progress="idle"
         canPickParent
         onUrlChange={vi.fn()}
         onParentDirChange={vi.fn()}
         onPickParent={vi.fn()}
         onClone={onClone}
+        onCancel={vi.fn()}
       />,
     );
     expect(buttonWithText("Clone").disabled).toBe(true);
@@ -263,12 +294,15 @@ describe("Add Project presentational steps", () => {
         parentDir="~/projects/"
         platform="Linux"
         error="Remote clone failed."
+        notice={null}
         busy={false}
+        progress="idle"
         canPickParent
         onUrlChange={vi.fn()}
         onParentDirChange={vi.fn()}
         onPickParent={vi.fn()}
         onClone={onClone}
+        onCancel={vi.fn()}
       />,
     );
 
@@ -290,12 +324,15 @@ describe("Add Project presentational steps", () => {
         parentDir="projects"
         platform="Linux"
         error={null}
+        notice={null}
         busy={false}
+        progress="idle"
         canPickParent
         onUrlChange={vi.fn()}
         onParentDirChange={vi.fn()}
         onPickParent={vi.fn()}
         onClone={onClone}
+        onCancel={vi.fn()}
       />,
     );
 
@@ -316,12 +353,15 @@ describe("Add Project presentational steps", () => {
         parentDir="~/projects/"
         platform="Linux"
         error={null}
+        notice={null}
         busy={false}
+        progress="idle"
         canPickParent={false}
         onUrlChange={vi.fn()}
         onParentDirChange={vi.fn()}
         onPickParent={vi.fn()}
         onClone={onClone}
+        onCancel={vi.fn()}
       />,
     );
     const urlInput = document.querySelector("input");
@@ -338,12 +378,15 @@ describe("Add Project presentational steps", () => {
         parentDir="~/projects/"
         platform="Linux"
         error={null}
+        notice={null}
         busy={false}
+        progress="idle"
         canPickParent={false}
         onUrlChange={vi.fn()}
         onParentDirChange={vi.fn()}
         onPickParent={vi.fn()}
         onClone={vi.fn()}
+        onCancel={vi.fn()}
       />,
     );
 
@@ -358,12 +401,15 @@ describe("Add Project presentational steps", () => {
         parentDir="~/projects/"
         platform={null}
         error={null}
+        notice={null}
         busy={false}
+        progress="idle"
         canPickParent={false}
         onUrlChange={vi.fn()}
         onParentDirChange={vi.fn()}
         onPickParent={vi.fn()}
         onClone={onClone}
+        onCancel={vi.fn()}
       />,
     );
 
@@ -379,12 +425,15 @@ describe("Add Project presentational steps", () => {
         parentDir="~/projects/"
         platform="Linux"
         error={null}
+        notice={null}
         busy
+        progress="cloning"
         canPickParent
         onUrlChange={vi.fn()}
         onParentDirChange={vi.fn()}
         onPickParent={vi.fn()}
         onClone={onClone}
+        onCancel={vi.fn()}
       />,
     );
     const form = document.querySelector("form");
@@ -395,6 +444,112 @@ describe("Add Project presentational steps", () => {
     await keyDown(urlInput, "Enter");
     await submit(form);
     expect(onClone).not.toHaveBeenCalled();
+  });
+
+  it("keeps the clone form visible with a Cancel action while cloning", async () => {
+    const onCancel = vi.fn();
+    const onClone = vi.fn();
+    await mount(
+      <AddProjectCloneStep
+        {...cloneStepProps({ busy: true, progress: "cloning", onCancel, onClone })}
+      />,
+    );
+    const urlInput = document.querySelector<HTMLInputElement>("#add-project-clone-url");
+    if (!urlInput) throw new Error("Missing Git URL input");
+
+    expect(urlInput.value).toBe("https://github.com/openai/codex.git");
+    expect(urlInput.disabled).toBe(true);
+    expect(buttonWithText("Cloning…").disabled).toBe(true);
+    const cancel = buttonWithText("Cancel clone");
+    expect(cancel.disabled).toBe(false);
+    expect(cancel.type).toBe("button");
+
+    await click(cancel);
+    expect(onCancel).toHaveBeenCalledTimes(1);
+    expect(onClone).not.toHaveBeenCalled();
+  });
+
+  it("keeps focus in the form on Cancel and returns it to the Git URL field", async () => {
+    const onCancel = vi.fn();
+    await mount(
+      <AddProjectCloneStep {...cloneStepProps({ busy: true, progress: "cloning", onCancel })} />,
+    );
+    const form = document.querySelector("form");
+    const cancel = buttonWithText("Cancel clone");
+    cancel.focus();
+
+    await click(cancel);
+
+    expect(onCancel).toHaveBeenCalledTimes(1);
+    // Focus stays inside the form while Cancel is about to unmount.
+    expect(document.activeElement).toBe(form);
+
+    await rerender(
+      <AddProjectCloneStep {...cloneStepProps({ notice: "Clone cancelled.", onCancel })} />,
+    );
+
+    expect(document.body.textContent).not.toContain("Cancel clone");
+    expect(document.activeElement).toBe(document.querySelector("#add-project-clone-url"));
+  });
+
+  it("returns focus to the Git URL field when a running clone fails", async () => {
+    await mount(<AddProjectCloneStep {...cloneStepProps({ busy: true, progress: "cloning" })} />);
+    buttonWithText("Cancel clone").focus();
+
+    await rerender(
+      <AddProjectCloneStep {...cloneStepProps({ error: "Clone failed: synthetic detail." })} />,
+    );
+
+    expect(document.activeElement).toBe(document.querySelector("#add-project-clone-url"));
+  });
+
+  it("leaves focus alone when a clone ends without feedback", async () => {
+    await mount(
+      <AddProjectCloneStep {...cloneStepProps({ busy: true, progress: "registering" })} />,
+    );
+    const elsewhere = document.createElement("button");
+    document.body.append(elsewhere);
+    elsewhere.focus();
+
+    await rerender(<AddProjectCloneStep {...cloneStepProps()} />);
+
+    expect(document.activeElement).toBe(elsewhere);
+  });
+
+  it("offers no Cancel action once the clone is being added as a project", async () => {
+    await mount(
+      <AddProjectCloneStep {...cloneStepProps({ busy: true, progress: "registering" })} />,
+    );
+
+    expect(buttonWithText("Adding project…").disabled).toBe(true);
+    expect(document.body.textContent).not.toContain("Cancel clone");
+  });
+
+  it("offers no Cancel action while the form is idle or picking a folder", async () => {
+    await mount(<AddProjectCloneStep {...cloneStepProps({ busy: true })} />);
+
+    expect(buttonWithText("Clone").disabled).toBe(true);
+    expect(document.body.textContent).not.toContain("Cloning…");
+    expect(document.body.textContent).not.toContain("Cancel clone");
+  });
+
+  it("shows a cancelled clone as a status notice with Clone available again", async () => {
+    await mount(<AddProjectCloneStep {...cloneStepProps({ notice: "Clone cancelled." })} />);
+
+    expect(document.querySelector('[role="status"]')?.textContent).toBe("Clone cancelled.");
+    expect(document.querySelector('[role="alert"]')).toBeNull();
+    expect(buttonWithText("Clone").disabled).toBe(false);
+  });
+
+  it("shows a clone failure as an alert beside an enabled Clone button", async () => {
+    const failure = "Clone failed: synthetic server detail.";
+    await mount(
+      <AddProjectCloneStep {...cloneStepProps({ error: failure, notice: "Clone cancelled." })} />,
+    );
+
+    expect(document.querySelector('[role="alert"]')?.textContent).toBe(failure);
+    expect(document.body.textContent).not.toContain("Clone cancelled.");
+    expect(buttonWithText("Clone").disabled).toBe(false);
   });
 
   it("shows BiBCode create copy and target summary", async () => {

@@ -26,7 +26,7 @@ const h = vi.hoisted(() => ({
 vi.mock("../../state/gitManager", () => ({
   gitManagerEnvironment: {
     getRefs: h.refsAtom,
-    signal: h.signalAtom,
+    signalWithDegradedFocusRefresh: h.signalAtom,
   },
 }));
 
@@ -283,6 +283,32 @@ describe("GitManagerToolbar", () => {
     }
   });
 
+  it("treats an interrupted clone's placeholder HEAD as a repository without commits", () => {
+    h.snapshot = {
+      ...refsSnapshot(),
+      headRef: null,
+      detachedSha: null,
+      defaultBranch: null,
+      localBranches: [],
+      remoteBranches: [],
+    };
+    const placeholder = renderToolbar();
+    expect(placeholder).toContain("No commits yet");
+    expect(placeholder).not.toContain("Detached HEAD");
+    expect(placeholder).toContain("Fetch origin");
+    expect(placeholder).not.toContain("Publish branch");
+
+    h.snapshot = {
+      ...refsSnapshot(),
+      headRef: null,
+      detachedSha: "b".repeat(40),
+      localBranches: [ref("main", { isDefault: true })],
+    };
+    const detached = renderToolbar();
+    expect(detached).toContain("Detached HEAD");
+    expect(detached).not.toContain("No commits yet");
+  });
+
   it("does not advertise local tags as pending pushes without remote tag state", () => {
     h.snapshot = refsSnapshot([ref("already-published")]);
 
@@ -315,6 +341,18 @@ describe("GitManagerToolbar", () => {
     expect(markup).toContain(reason);
     expect(markup).toContain('aria-label="Choose branch"');
     expect(markup).toContain("Fetch origin");
+  });
+
+  it("renders tag menu reasons at the smallest app text size", () => {
+    const reason = "This environment does not support Git Manager tag operations.";
+    h.snapshot = refsSnapshot([ref("release/v1")]);
+    const disabled = renderToolbar({ tagDisabledReason: reason });
+    h.snapshot = refsSnapshot();
+    const empty = renderToolbar();
+
+    for (const markup of [disabled, empty]) expect(markup).not.toMatch(/text-\[\d+px\]/);
+    expect(disabled).toContain(`<span class="text-xs text-muted-foreground">${reason}</span>`);
+    expect(empty).toContain('<span class="text-xs text-muted-foreground">No local tags.</span>');
   });
 
   it("skips the live signal subscription without disabling explicit repository reads", () => {

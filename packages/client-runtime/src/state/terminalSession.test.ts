@@ -28,6 +28,8 @@ const TARGET = {
 } as const;
 
 const BASE_SNAPSHOT: TerminalSessionSnapshot = {
+  oscColorResponderActive: false,
+  firstAttachmentGrant: false,
   threadId: TARGET.threadId,
   terminalId: TARGET.terminalId,
   cwd: "/repo",

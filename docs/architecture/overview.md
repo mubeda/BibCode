@@ -148,6 +148,28 @@ flowchart TB
   `vcs.refreshStatus` on a separate latest-per-environment/worktree lane, so
   focus, visible-document, menu-open, and post-action freshness cannot queue a
   mutation behind an active read.
+
+  The Git driver's clone, fetch, pull, and push carry Git's HTTP stall guard
+  (`-c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60`); a stall is reported
+  as "The transfer stalled…" (Git Manager failure code `network-stalled`).
+  Transfers a user can cancel (clone, and the Git Manager operation stream's
+  fetch, pull, push, remote-branch deletion, and tag push) run on the
+  network-transfer variant with a 24-hour safety bound. Transfers nobody can
+  cancel run on the bounded variant, capped at 10 minutes: automatic fetch,
+  `vcs.pull`, and the stacked-action and publish pushes, wherever they start
+  (chat header, Sidebar Update, Source Control panel, or the Git Manager's
+  Create PR dialog). SSH transports have no stall guard, so a dead SSH link ends
+  only by cancellation, those bounds, or the connection's own keepalive
+  settings. The orchestration bootstrap fetch and the Pull Requests checkout
+  fetch run outside the driver with their own budgets and no stall guard. Clone
+  reserves its
+  destination before Git runs, and an owned task removes only a destination
+  that clone created after a failure, timeout, stall, or cancellation
+  (including an interrupted RPC); a new clone into a destination still being
+  cleaned up waits for that cleanup. Reusing an existing destination requires a
+  `HEAD` that resolves to a commit; otherwise the error names the incomplete
+  clone and asks the user to remove it or choose another folder.
+
   Shared observations never bypass per-caller anchor validation, and final
   view/repository ownership release is atomic against concurrent attachment. A
   scan leader moves the repository single-flight guard into repository-owned
@@ -186,6 +208,68 @@ flowchart TB
   primitives. `apps/server/src/production/git_manager_rpc.rs` adapts those
   owners to the typed RPC registry and the worktree catalog's existing mutation
   arbitration.
+
+  Git Manager signals reuse the status watcher's lifecycle. The worktree root
+  retains one native recursive watch, including its `.git` tree. The notify
+  backend owns recursion: inotify directory watches on Linux, FSEvents on
+  macOS, and subtree watching on Windows. Events from the top-level `objects/`
+  and `lfs/` stores and from submodule object stores (`modules/<name>/objects/`)
+  are filtered; the rest of a submodule's Git directory still refreshes status.
+  Git metadata outside the worktree has non-recursive root watches and native
+  recursive watches only on `refs/`, `logs/`, `reftable/`, and `worktrees/`,
+  registering stores as they appear. Its own object stores are not watched; the
+  recursive `worktrees/` watch does reach linked worktrees' submodule Git
+  directories (`worktrees/<name>/modules/`), whose object-store events are
+  filtered, and on Linux each of those directories costs an inotify watch.
+  Sibling events invalidate only
+  HEAD/reftable state and administrative-directory creation/removal. One
+  metadata classifier handles registration and event routing, including
+  Windows keys normalized to uppercase. Every full rescan, whether caused by
+  native overflow or the bounded registration queue, invalidates refs after
+  reinstallation, including failed rescans.
+  Only ref-shaped events reset the 125 ms ref debounce, capped at one second
+  from the first event, so continuous file/index writes cannot starve it.
+  Local and ref reads remain independent and retain one trailing refresh.
+
+  The lightweight signature hashes heads, remotes, tags, `refs/stash`, worktree
+  occupancy, structured symbolic/object HEAD identity, and the stash reflog. A
+  HEAD that names no valid ref and no commit (an interrupted clone's
+  placeholder) is hashed as its own state rather than failing the read.
+  Each burst uses bounded `for-each-ref`, `symbolic-ref`, and `rev-parse` reads
+  plus a bounded loose reflog read; reftable repositories require a bounded
+  `git stash list` read for their table-backed reflog. Only a changed hash bumps
+  generation. It does not run full remote status, and index-only events do not
+  start signal reads. Signature reads serialize, retry after a mutation fence
+  settles, and cannot publish after repository retirement. Remote status
+  publishes before signature I/O; a failed signature input is logged, leaves
+  the signature unchanged, and retries on the next trigger.
+
+  Signals also carry optional `watcherDegraded` without changing generation on
+  health-only updates. The explicit client-runtime
+  `signalWithDegradedFocusRefresh` accessor consumes the existing platform
+  `ConnectionWakeups.focusVisibility` stream. Its browser adapter shares
+  listeners and coalesces focus/visibility returns; only degraded repositories refetch active refs,
+  commits, and stashes. Healthy/legacy signals and plain signal subscriptions
+  do not enable this fallback. No polling is added; automatic fetch retains
+  its independent role and default 180 s interval. History reads its first page
+  once the signal's availability is known (one read on open) and again on
+  either trigger: a signal change, or a repository generation that moves past
+  the loaded pages (in-app operations while the watcher is degraded). Each read
+  uses a never-reused key, and the watcher's echo of a repository-triggered
+  read is absorbed, so one change never causes two reads. The absorption relies
+  on the server advancing a signal from generation 0 at its first computed
+  signature. The stash list (a reflog read plus one `git stash show` per entry)
+  is read only while the Stashes panel is open: once on opening, and on each
+  signal change or in-app operation while open. Closing the panel drops the
+  query, so a closed panel reads nothing (not even on reconnect) and shows no
+  count.
+  A completed response captures one retained-page batch with at most two reads
+  in flight. The same-tip first page already supplies offset zero, so that page
+  is omitted from the batch. A first page covering all loaded rows needs no
+  retained batch; otherwise changed tips require reading the old pinned graph.
+  Older-generation replies cannot regress newer decorations. Git decorations
+  remain verbatim. Loaded pages, selection, and scroll
+  survive background errors, which offer Retry.
 
   On Unix the supervised process runner retries a spawn that fails with
   `ETXTBSY` (the executable is still open for writing, typically a helper
@@ -753,6 +837,112 @@ terminal identity. Teardown detaches the transcript and disposes xterm and
 WebGL without abandoning input already accepted by the scheduler. A later
 renderer retargets error presentation, while the retained writer cannot keep
 the departed renderer or its terminal buffers reachable.
+
+### Terminal attachment fidelity
+
+Servers advertise `terminalSizeOwnership` (decoded as false for older servers).
+The terminal manager owns the applied PTY size. Snapshots carry one optional
+`size { cols, rows, sizeClaim }` object, so absent size is distinct from a
+complete size with a null owner. They also carry `oscColorResponderActive`,
+defaulting to false when absent; the PTY backend reports whether its actual
+spawned color responder is active. `firstAttachmentGrant` also defaults to false
+and permits one startup-history replay with replies enabled.
+
+Each renderer mount sends a fresh random claim with `terminal.attach`. Under the
+generation publication lock, an attachment atomically acquires ownership only if
+the session is unowned. It receives `firstAttachmentGrant: true` only when no
+claim has been applied in this generation and no claim-carrying stream survived
+a restart into it. The grant latch is consumed by a claimed attach, an applied
+resize claim, or claimed streams surviving a restart. Later/concurrent attaches
+never renew the grant or displace a live owner.
+
+Restart publishes `Restarted`, which resets surviving streams' sequence cursors.
+Those renderers see the restarted process's startup output live and may answer
+while unowned. Restart without such streams allows one new grant. Reopening an
+exited session through `terminal.open` instead publishes a `Started` event with
+sequence 1. That event does not reset surviving streams' cursors, so they drop
+it and early output (a known limitation of surviving streams). A reopen
+therefore leaves the first-attachment grant available for the next
+claim-carrying attach.
+
+Resize requests publish `resized { size }` after the PTY accepts the size,
+before subsequent output can publish. Claim-only changes publish; exact no-ops
+do not. Failed resizes preserve the prior state. Legacy resizes without a claim
+clear the owner. Open/attach dimensions initialize new PTYs; attaching to an
+existing process preserves its dimensions.
+
+Attachment lifetime owns claim eligibility. Dropping the owner unregisters its
+claim and signals a manager-tracked cleanup worker to publish null ownership
+under the current generation's publication lock, preserving PTY dimensions.
+Attachment identities prevent an old stream from clearing a replacement that
+reuses its claim, including across process restarts. Queued requests from an
+unregistered claim cannot resurrect it. Manager shutdown fences new claim
+registrations, cancels and awaits these cleanup workers, then drains sessions.
+
+A single internal ordered bus carries output and size changes. Public event
+receivers filter `resized`, so `subscribeTerminalEvents` retains its original
+variant set and resize events are not operational-log records. Attach streams
+also filter it unless their request carried a claim. Older clients therefore
+never receive the new event; optional snapshot fields remain additive.
+
+The window in use owns size. It claims on focused attach; on terminal focus,
+click, or keypress whenever it is a mirror or its fitted size differs; on its
+own layout changes while already owner; and through **Fit to this window**. A
+null-claim snapshot or event prompts an immediate claim even without focus.
+While ownership is null, renderers permit live replies until a claim wins. Each
+renderer keeps at most one claim pending until its resize RPC completes, whether
+successfully or with failure; the echo updates the applied size. A layout change
+deferred during a pending claim is reconsidered on completion; a new
+attachment/process snapshot retires the prior generation's request.
+
+The notice stays hidden while claiming and after success until applied size,
+ownership, or generation changes, avoiding a flash before xterm parses the echo.
+Failure releases that suppression immediately. Mirrors resize xterm to the PTY
+dimensions instead of fitting their container; only a different-size mirror
+shows **Sized for another window** with fit and dismiss actions. Manual
+dismissal is retained by terminal identity and applied dimensions/owner across
+renderer and component remounts. It is cleared by a changed applied size/owner
+or terminal retirement, alongside the retained input resources. Equal-size
+mirrors and the owner show no notice. Clipping or extra space is intentional;
+all windows render at the program's width.
+
+The viewport measures before subscribing and includes available fitted
+`cols`/`rows` on attach. UI creation uses `terminal.open` with its workspace
+admission lease and workspace-loss fence. Newly reserved right-panel terminals
+have no mounted renderer and open without dimensions. Center/script opens can
+read an existing mounted renderer's fit on demand. Unavailable geometry uses
+server defaults, followed by the owner's first measured layout/claim.
+Separately, an attach carrying `cwd` can still create a missing session without
+the open command's admission lease and workspace-loss fence (a known gap);
+attach may arrive before open or recreate a missing session after a server
+restart. No extra measuring terminal
+or font-settings subscription is needed.
+
+The shared transcript runtime hydrates size and responder activity, and carries
+size changes in stream order with raw output. The output sink's xterm write
+callbacks apply size/claim after preceding output has parsed and before later
+output. Resize signals do not publish lifecycle metadata or allocate a new
+transcript. The runtime consumes the first-attachment grant once for the
+matching renderer claim; cached remounts cannot reuse it. Raw bounded transcript
+replay is retained.
+
+During ordinary reset/history writes, a replay guard drops xterm `onData` until
+the final write callback; input typed during this brief interval is also
+dropped. The granted first-attachment history pass allows replies. Input before
+the first snapshot uses the existing bounded input scheduler and lease instead
+of being silently dropped. Reattaching the transcript to the same renderer
+preserves its WebGL context. Parser hooks let only the current reply owner
+answer CSI device/status/mode queries, DCS status-string queries, and OSC
+palette/color queries. OSC 10/11/12 queries are swallowed by every renderer only
+when the snapshot says the server color responder is active; otherwise the owner
+lets xterm answer. `CSI ? 996 n` stays swallowed (xterm does not implement it).
+The PTY reader keeps its synchronous answers and original transcript bytes.
+Input is never filtered by reply shape.
+
+Without `terminalSizeOwnership`, clients retain local fit-and-resize behavior
+and live replies, with conditional server-color-query suppression. Every replay
+is guarded on that transitional path, so startup-history queries are not
+answered by those clients.
 
 ### Linux AppImage GTK packaging
 

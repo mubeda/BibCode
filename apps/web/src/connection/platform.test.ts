@@ -8,6 +8,7 @@ import {
 import { describe, expect, it } from "@effect/vitest";
 import { afterEach, vi } from "vite-plus/test";
 import * as Data from "effect/Data";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -215,6 +216,7 @@ function stubBrowser(options: { desktopBridge?: DesktopBridge; platform?: string
   });
   vi.stubGlobal("document", {
     visibilityState: "visible",
+    hasFocus: () => true,
     addEventListener: () => undefined,
     removeEventListener: () => undefined,
   });
@@ -248,6 +250,7 @@ function makeDomStubs(options: { desktopBridge?: DesktopBridge } = {}): DomStubs
   });
   vi.stubGlobal("document", {
     visibilityState: "visible",
+    hasFocus: () => true,
     addEventListener: add(documentListeners),
     removeEventListener: remove(documentListeners),
   });
@@ -719,6 +722,191 @@ describe("connectionPlatformLayer connectivity and wakeups", () => {
       // The release finalizer removed the listeners.
       expect(dom.windowListeners("online").length).toBe(0);
       expect(dom.windowListeners("offline").length).toBe(0);
+    }).pipe(Effect.provide(connectionPlatformLayer));
+  });
+
+  it.effect("window focus does not emit a supervisor application-active wakeup", () => {
+    const dom = makeDomStubs();
+    return Effect.gen(function* () {
+      const wakeups = yield* Wakeups.ConnectionWakeups;
+      const seen: string[] = [];
+      const fiber = yield* Effect.forkChild(
+        Stream.runForEach(wakeups.changes, (event) =>
+          Effect.sync(() => {
+            seen.push(event);
+          }),
+        ),
+      );
+      yield* waitFor(() => dom.windowListeners("focus").length === 1);
+      dom.fireWindow("blur");
+      dom.fireWindow("focus");
+      for (let i = 0; i < 20; i += 1) yield* Effect.yieldNow;
+      expect(seen).toEqual([]);
+      dom.fireDocument("visibilitychange");
+      yield* waitFor(() => seen.length === 1);
+      expect(seen).toEqual(["application-active"]);
+      yield* Fiber.interrupt(fiber);
+    }).pipe(Effect.provide(connectionPlatformLayer));
+  });
+
+  it.effect("shares and coalesces focus and visibility wakeups across subscribers", () => {
+    const dom = makeDomStubs();
+    return Effect.gen(function* () {
+      const wakeups = yield* Wakeups.ConnectionWakeups;
+      const seen: void[] = [];
+      const first = yield* Effect.forkChild(
+        Stream.runForEach(wakeups.focusVisibility, (event) =>
+          Effect.sync(() => {
+            seen.push(event);
+          }),
+        ),
+      );
+      const second = yield* Effect.forkChild(Stream.runDrain(wakeups.focusVisibility));
+      yield* waitFor(() => dom.windowListeners("focus").length === 1);
+      expect(dom.documentListeners("visibilitychange")).toHaveLength(1);
+      dom.fireWindow("blur");
+      Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
+      dom.fireDocument("visibilitychange");
+      Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+      dom.fireDocument("visibilitychange");
+      dom.fireWindow("focus");
+      dom.fireDocument("visibilitychange");
+      yield* waitFor(() => seen.length === 1);
+      dom.fireWindow("blur");
+      dom.fireWindow("focus");
+      yield* waitFor(() => seen.length === 2);
+      expect(seen).toHaveLength(2);
+      yield* Fiber.interrupt(first);
+      expect(dom.windowListeners("focus")).toHaveLength(1);
+      yield* Fiber.interrupt(second);
+      yield* waitFor(() => dom.windowListeners("focus").length === 0);
+      expect(dom.documentListeners("visibilitychange")).toHaveLength(0);
+    }).pipe(Effect.provide(connectionPlatformLayer));
+  });
+
+  it.effect("a stalled focus consumer cannot delay supervisor visibility wakeups", () => {
+    const dom = makeDomStubs();
+    return Effect.gen(function* () {
+      const wakeups = yield* Wakeups.ConnectionWakeups;
+      let stalled = false;
+      const seen: string[] = [];
+      const focus = yield* Effect.forkChild(
+        Stream.runForEach(wakeups.focusVisibility, () => {
+          stalled = true;
+          return Effect.never;
+        }),
+      );
+      const supervisor = yield* Effect.forkChild(
+        Stream.runForEach(wakeups.changes, (event) =>
+          Effect.sync(() => {
+            seen.push(event);
+          }),
+        ),
+      );
+      yield* waitFor(() => dom.windowListeners("focus").length === 1);
+      dom.fireWindow("blur");
+      dom.fireWindow("focus");
+      yield* waitFor(() => stalled);
+      for (let index = 0; index < 40; index += 1) {
+        dom.fireWindow("blur");
+        dom.fireWindow("focus");
+        yield* Effect.yieldNow;
+      }
+      Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
+      dom.fireDocument("visibilitychange");
+      Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+      dom.fireDocument("visibilitychange");
+      yield* waitFor(() => seen.length === 1);
+      expect(seen).toEqual(["application-active"]);
+      yield* Fiber.interrupt(focus);
+      yield* Fiber.interrupt(supervisor);
+    }).pipe(Effect.provide(connectionPlatformLayer));
+  });
+
+  it.effect("a focus frame cannot displace an unread application-active wakeup", () => {
+    const dom = makeDomStubs();
+    const settle = Effect.gen(function* () {
+      for (let index = 0; index < 40; index += 1) yield* Effect.yieldNow;
+    });
+    const returnToWindow = () => {
+      Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
+      dom.fireDocument("visibilitychange");
+      Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+      dom.fireDocument("visibilitychange");
+    };
+    return Effect.gen(function* () {
+      const wakeups = yield* Wakeups.ConnectionWakeups;
+      const release = yield* Deferred.make<void>();
+      const seen: string[] = [];
+      const supervisor = yield* Effect.forkChild(
+        Stream.runForEach(wakeups.changes, (event) =>
+          Effect.gen(function* () {
+            seen.push(event);
+            // The supervisor is still handling its first wakeup.
+            if (seen.length === 1) yield* Deferred.await(release);
+          }),
+        ),
+      );
+      yield* waitFor(() => dom.windowListeners("focus").length === 1);
+      returnToWindow();
+      yield* waitFor(() => seen.length === 1);
+      // The next wakeup waits in the merge hand-off, so the one after it stays
+      // unread in the one-frame sliding buffer until a focus frame replaces it.
+      returnToWindow();
+      yield* settle;
+      returnToWindow();
+      yield* settle;
+      dom.fireWindow("blur");
+      dom.fireWindow("focus");
+      yield* settle;
+      yield* Deferred.succeed(release, undefined);
+      for (let index = 0; index < 2_000 && seen.length < 3; index += 1) yield* Effect.yieldNow;
+      yield* settle;
+      expect(seen).toEqual(["application-active", "application-active", "application-active"]);
+      yield* Fiber.interrupt(supervisor);
+    }).pipe(Effect.provide(connectionPlatformLayer));
+  });
+
+  it.effect("a late subscriber is not woken by activity from before it subscribed", () => {
+    const dom = makeDomStubs();
+    return Effect.gen(function* () {
+      const wakeups = yield* Wakeups.ConnectionWakeups;
+      const focusReturns: void[] = [];
+      const focus = yield* Effect.forkChild(
+        Stream.runForEach(wakeups.focusVisibility, (event) =>
+          Effect.sync(() => {
+            focusReturns.push(event);
+          }),
+        ),
+      );
+      yield* waitFor(() => dom.windowListeners("focus").length === 1);
+      Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
+      dom.fireDocument("visibilitychange");
+      Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+      dom.fireDocument("visibilitychange");
+      yield* waitFor(() => focusReturns.length === 1);
+
+      // The shared listeners are already running and have counted one
+      // application-active wakeup; a supervisor subscribing now starts from it.
+      const seen: string[] = [];
+      const supervisor = yield* Effect.forkChild(
+        Stream.runForEach(wakeups.changes, (event) =>
+          Effect.sync(() => {
+            seen.push(event);
+          }),
+        ),
+      );
+      for (let index = 0; index < 20; index += 1) yield* Effect.yieldNow;
+      dom.fireWindow("blur");
+      dom.fireWindow("focus");
+      yield* waitFor(() => focusReturns.length === 2);
+      for (let index = 0; index < 20; index += 1) yield* Effect.yieldNow;
+      expect(seen).toEqual([]);
+      dom.fireDocument("visibilitychange");
+      yield* waitFor(() => seen.length === 1);
+      expect(seen).toEqual(["application-active"]);
+      yield* Fiber.interrupt(supervisor);
+      yield* Fiber.interrupt(focus);
     }).pipe(Effect.provide(connectionPlatformLayer));
   });
 
