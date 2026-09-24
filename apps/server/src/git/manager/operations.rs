@@ -16,8 +16,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::git::{
     GitCommandError, GitManagerBlockedReason, GitManagerInProgressKind, GitManagerRefsSnapshot,
-    GitRepository, OutputPolicy, ProcessOutput, ProcessRequest, ProcessRunner, StatusBroadcaster,
-    validate_pathspecs,
+    GitRepository, NETWORK_TRANSFER_STALLED, OutputPolicy, ProcessOutput, ProcessRequest,
+    ProcessRunner, StatusBroadcaster, reports_stalled_transfer, validate_pathspecs,
 };
 use crate::worktree_catalog::{ProjectMutationAttempt, WorktreeCatalogService};
 
@@ -156,6 +156,7 @@ pub enum GitManagerFailureCode {
     NoUpstream,
     Cancelled,
     TimedOut,
+    NetworkStalled,
     Unknown,
 }
 
@@ -175,6 +176,7 @@ impl GitManagerFailureCode {
             Self::NoUpstream => "no-upstream",
             Self::Cancelled => "cancelled",
             Self::TimedOut => "timed-out",
+            Self::NetworkStalled => "network-stalled",
             Self::Unknown => "unknown",
         }
     }
@@ -182,13 +184,16 @@ impl GitManagerFailureCode {
 
 #[must_use]
 pub fn classify_operation_failure(exit_code: i32, stderr: &str) -> GitManagerFailureCode {
-    let stderr = stderr.to_ascii_lowercase();
+    let output = stderr;
+    let stderr = output.to_ascii_lowercase();
     if exit_code == 0 && stderr.contains("is up to date") {
         GitManagerFailureCode::AlreadyUpToDate
     } else if exit_code == 0 {
         GitManagerFailureCode::Completed
     } else if stderr.contains("was interrupted") || stderr.contains("cancelled") {
         GitManagerFailureCode::Cancelled
+    } else if reports_stalled_transfer(output) {
+        GitManagerFailureCode::NetworkStalled
     } else if stderr.contains("timed out") {
         GitManagerFailureCode::TimedOut
     } else if [
@@ -1825,6 +1830,7 @@ const fn failure_message(code: GitManagerFailureCode) -> &'static str {
         GitManagerFailureCode::NoUpstream => "The current branch has no configured upstream.",
         GitManagerFailureCode::Cancelled => "The Git Manager operation was cancelled.",
         GitManagerFailureCode::TimedOut => "The Git Manager operation timed out.",
+        GitManagerFailureCode::NetworkStalled => NETWORK_TRANSFER_STALLED,
         GitManagerFailureCode::Unknown => "Git could not complete the requested operation.",
     }
 }
@@ -2270,6 +2276,30 @@ mod tests {
     #[test]
     fn classifies_stale_info_failures() {
         assert_failure_code("rejected: stale info", GitManagerFailureCode::StaleInfo);
+    }
+
+    #[test]
+    fn classifies_stalled_network_transfers_with_an_actionable_message() {
+        for stderr in [
+            "error: RPC failed; curl 28 Operation too slow. Less than 1000 bytes/sec transferred the last 60 seconds\nfatal: expected flush after ref listing",
+            "fatal: unable to access 'https://example.test/repository.git/': Operation too slow. Less than 1000 bytes/sec transferred the last 60 seconds",
+            crate::git::NETWORK_TRANSFER_STALLED,
+        ] {
+            assert_failure_code(stderr, GitManagerFailureCode::NetworkStalled);
+        }
+        let error = require_last_success(
+            "fetch",
+            vec![ProcessOutput {
+                exit_code: 128,
+                stdout: String::new(),
+                stderr: "error: RPC failed; curl 28 Operation too slow. Less than 1000 bytes/sec transferred the last 60 seconds".to_owned(),
+                stdout_truncated: false,
+                stderr_truncated: false,
+            }],
+        )
+        .expect_err("a stalled fetch fails");
+        assert_eq!(error.code, "network-stalled");
+        assert_eq!(error.message, crate::git::NETWORK_TRANSFER_STALLED);
     }
 
     #[test]

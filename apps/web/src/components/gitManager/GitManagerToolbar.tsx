@@ -248,11 +248,10 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
   const existingTags = snapshot?.tags.map((tag) => tag.name) ?? EMPTY_TAG_NAMES;
   const tagTargetSha = currentBranch?.tipSha ?? snapshot?.detachedSha ?? null;
   const remote = remoteForBranch(currentBranch, snapshot?.remotes ?? []);
-  const isUnborn =
-    snapshot !== null &&
-    snapshot.headRef !== null &&
-    snapshot.detachedSha === null &&
-    currentBranch === null;
+  // No commit behind HEAD: an unborn branch, or a HEAD naming no valid ref (an
+  // interrupted clone's placeholder), which has no branch name to show either.
+  const isUnborn = snapshot !== null && snapshot.detachedSha === null && currentBranch === null;
+  const noBranchLabel = isUnborn && currentBranchName === null ? "No commits yet" : "Detached HEAD";
   const ahead = currentBranch?.ahead ?? 0;
   const behind = currentBranch?.behind ?? 0;
   const hasUpstream = currentBranch?.upstream !== null && currentBranch?.upstream !== undefined;
@@ -639,6 +638,7 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
             branchDisabledReason={branchSyncDisabledReason}
             currentBranchName={currentBranchName}
             mergeDisabledReason={stashMergeDisabledReason}
+            noBranchLabel={noBranchLabel}
             projectRef={stableProjectRef}
             recentNames={recentNames}
             refs={localBranches}

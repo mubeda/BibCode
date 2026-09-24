@@ -447,6 +447,14 @@ one bulk lane per environment. These are responsiveness bounds, not correctness
 locks: the server's command receipts, mutation locks, generation checks,
 physical identity, and repository verification remain authoritative.
 
+Atom commands accept an optional per-call abort signal. Aborting a running
+command disposes its atom, which interrupts its fiber; the RPC client then
+sends `Interrupt`, which the server maps to the request's cancellation token.
+An invocation aborted while still queued settles when its turn comes and never
+starts. On `singleFlight`, a caller that joins a running execution cannot abort
+it; on `latest`, the newest caller's abort interrupts the shared run. Add
+Project's **Cancel clone** uses this on the `serial` clone command.
+
 ## Git Manager capability negotiation
 
 The negotiated environment descriptor carries nine additive Git Manager

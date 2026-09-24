@@ -7,8 +7,12 @@ import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Latch from "effect/Latch";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
+import * as Rpc from "effect/unstable/rpc/Rpc";
+import * as RpcClient from "effect/unstable/rpc/RpcClient";
+import * as RpcGroup from "effect/unstable/rpc/RpcGroup";
 
 import {
   environmentRpcKey,
@@ -439,6 +443,289 @@ describe("runtime command runner", () => {
   it.effect("settles an interrupted command when its registry disposes", () =>
     expectRegistryCancellationToSettle("dispose"),
   );
+
+  const hasNodeLabeled = (registry: AtomRegistry.AtomRegistry, label: string) =>
+    [...registry.getNodes().values()].some((node) => node.atom.label?.[0] === label);
+
+  it.effect("interrupts a running command when its abort signal fires", () =>
+    Effect.gen(function* () {
+      const acquired = yield* Deferred.make<void>();
+      const finalized = yield* Deferred.make<void>();
+      let finalizers = 0;
+      const runtime = Atom.runtime(Layer.empty);
+      const command = createRuntimeCommand(runtime, {
+        label: "test.abort-running",
+        execute: () =>
+          Effect.acquireUseRelease(
+            Deferred.succeed(acquired, undefined),
+            () => Effect.never,
+            () =>
+              Effect.sync(() => {
+                finalizers += 1;
+              }).pipe(Effect.andThen(Deferred.succeed(finalized, undefined))),
+          ),
+      });
+      const registry = AtomRegistry.make();
+      const controller = new AbortController();
+      const settled = yield* Deferred.make<Awaited<ReturnType<typeof command.run>>>();
+      void command.run(registry, undefined, { signal: controller.signal }).then((result) => {
+        Deferred.doneUnsafe(settled, Effect.succeed(result));
+      });
+      yield* Deferred.await(acquired);
+
+      controller.abort();
+      const result = yield* Deferred.await(settled);
+      yield* Deferred.await(finalized);
+
+      expect(isAtomCommandInterrupted(result)).toBe(true);
+      expect(finalizers).toBe(1);
+      expect(hasNodeLabeled(registry, "test.abort-running")).toBe(false);
+      registry.dispose();
+    }),
+  );
+
+  it.effect("sends an RPC interrupt for an in-flight request when the signal aborts", () =>
+    Effect.gen(function* () {
+      const requested = yield* Deferred.make<void>();
+      const interruptSent = yield* Deferred.make<void>();
+      const group = RpcGroup.make(Rpc.make("slow", { success: Schema.String }));
+      const runtime = Atom.runtime(Layer.empty);
+      const command = createRuntimeCommand(runtime, {
+        label: "test.abort-rpc",
+        execute: () =>
+          Effect.gen(function* () {
+            const { client } = yield* RpcClient.makeNoSerialization(group, {
+              onFromClient: ({ message }) =>
+                message._tag === "Request"
+                  ? Deferred.succeed(requested, undefined).pipe(Effect.asVoid)
+                  : message._tag === "Interrupt"
+                    ? Deferred.succeed(interruptSent, undefined).pipe(Effect.asVoid)
+                    : Effect.void,
+            });
+            return yield* client.slow();
+          }).pipe(Effect.scoped),
+      });
+      const registry = AtomRegistry.make();
+      const controller = new AbortController();
+      const settled = yield* Deferred.make<Awaited<ReturnType<typeof command.run>>>();
+      void command.run(registry, undefined, { signal: controller.signal }).then((result) => {
+        Deferred.doneUnsafe(settled, Effect.succeed(result));
+      });
+      yield* Deferred.await(requested);
+
+      controller.abort();
+      const result = yield* Deferred.await(settled);
+      yield* Deferred.await(interruptSent);
+
+      expect(isAtomCommandInterrupted(result)).toBe(true);
+      registry.dispose();
+    }),
+  );
+
+  it("does not start a command whose signal already aborted", async () => {
+    let executions = 0;
+    const runtime = Atom.runtime(Layer.empty);
+    const command = createRuntimeCommand(runtime, {
+      label: "test.abort-before-start",
+      execute: () =>
+        Effect.sync(() => {
+          executions += 1;
+        }),
+    });
+    const registry = AtomRegistry.make();
+    const controller = new AbortController();
+    controller.abort();
+
+    const result = await command.run(registry, undefined, { signal: controller.signal });
+
+    expect(isAtomCommandInterrupted(result)).toBe(true);
+    expect(executions).toBe(0);
+    expect(hasNodeLabeled(registry, "test.abort-before-start")).toBe(false);
+    registry.dispose();
+  });
+
+  it("skips a queued serial invocation whose signal aborts before its turn", async () => {
+    const firstLatch = Latch.makeUnsafe();
+    const started: string[] = [];
+    const runtime = Atom.runtime(Layer.empty);
+    const command = createRuntimeCommand(runtime, {
+      label: "test.abort-queued",
+      concurrency: { mode: "serial", key: () => "shared" },
+      execute: (id: "first" | "second") =>
+        Effect.sync(() => started.push(id)).pipe(
+          Effect.andThen(id === "first" ? firstLatch.await : Effect.void),
+          Effect.as(id),
+        ),
+    });
+    const registry = AtomRegistry.make();
+    const controller = new AbortController();
+
+    const first = command.run(registry, "first");
+    const second = command.run(registry, "second", { signal: controller.signal });
+    let secondSettled = false;
+    void second.then(() => {
+      secondSettled = true;
+    });
+    controller.abort();
+    for (let tick = 0; tick < 5; tick += 1) {
+      await Promise.resolve();
+    }
+    // The aborted invocation waits for its turn in the lane before it settles.
+    expect(secondSettled).toBe(false);
+    firstLatch.openUnsafe();
+
+    expect(await first).toMatchObject({ _tag: "Success", value: "first", waiting: false });
+    expect(isAtomCommandInterrupted(await second)).toBe(true);
+    expect(started).toEqual(["first"]);
+    registry.dispose();
+  });
+
+  it("ignores the signal of a caller that joins a running single-flight execution", async () => {
+    const latch = Latch.makeUnsafe();
+    let executions = 0;
+    const runtime = Atom.runtime(Layer.empty);
+    const command = createRuntimeCommand(runtime, {
+      label: "test.abort-single-flight-joiner",
+      concurrency: { mode: "singleFlight", key: () => "shared" },
+      execute: () =>
+        Effect.sync(() => executions++).pipe(Effect.andThen(latch.await), Effect.as("done")),
+    });
+    const registry = AtomRegistry.make();
+    const joiner = new AbortController();
+
+    const started = command.run(registry, undefined);
+    const joined = command.run(registry, undefined, { signal: joiner.signal });
+    joiner.abort();
+    latch.openUnsafe();
+
+    expect(await started).toMatchObject({ _tag: "Success", value: "done" });
+    expect(await joined).toMatchObject({ _tag: "Success", value: "done" });
+    expect(executions).toBe(1);
+    registry.dispose();
+  });
+
+  it("interrupts a single-flight execution for every joined caller when its starter aborts", async () => {
+    const runtime = Atom.runtime(Layer.empty);
+    const command = createRuntimeCommand(runtime, {
+      label: "test.abort-single-flight-starter",
+      concurrency: { mode: "singleFlight", key: () => "shared" },
+      execute: () => Effect.never,
+    });
+    const registry = AtomRegistry.make();
+    const starter = new AbortController();
+
+    const started = command.run(registry, undefined, { signal: starter.signal });
+    const joined = command.run(registry, undefined);
+    starter.abort();
+
+    expect(isAtomCommandInterrupted(await started)).toBe(true);
+    expect(isAtomCommandInterrupted(await joined)).toBe(true);
+    registry.dispose();
+  });
+
+  it.each([
+    { aborted: "newest" as const, expected: "skipped" as const },
+    { aborted: "older" as const, expected: "ran" as const },
+  ])(
+    "follows only the newest caller's signal in a coalesced latest run ($aborted aborts)",
+    async ({ aborted, expected }) => {
+      const firstLatch = Latch.makeUnsafe();
+      const executed: number[] = [];
+      const runtime = Atom.runtime(Layer.empty);
+      const command = createRuntimeCommand(runtime, {
+        label: `test.abort-latest-${aborted}`,
+        concurrency: { mode: "latest", key: () => "shared" },
+        execute: (value: number) =>
+          Effect.sync(() => executed.push(value)).pipe(
+            Effect.andThen(value === 1 ? firstLatch.await : Effect.void),
+            Effect.as(value),
+          ),
+      });
+      const registry = AtomRegistry.make();
+      const older = new AbortController();
+      const newest = new AbortController();
+
+      const first = command.run(registry, 1);
+      await Promise.resolve();
+      const second = command.run(registry, 2, { signal: older.signal });
+      const third = command.run(registry, 3, { signal: newest.signal });
+      (aborted === "newest" ? newest : older).abort();
+      firstLatch.openUnsafe();
+
+      expect(await first).toMatchObject({ _tag: "Success", value: 1 });
+      if (expected === "skipped") {
+        expect(isAtomCommandInterrupted(await second)).toBe(true);
+        expect(isAtomCommandInterrupted(await third)).toBe(true);
+        expect(executed).toEqual([1]);
+      } else {
+        expect(await second).toMatchObject({ _tag: "Success", value: 3 });
+        expect(await third).toMatchObject({ _tag: "Success", value: 3 });
+        expect(executed).toEqual([1, 3]);
+      }
+      registry.dispose();
+    },
+  );
+
+  it("interrupts a running coalesced latest run for every caller when its newest caller aborts", async () => {
+    const firstLatch = Latch.makeUnsafe();
+    const executed: number[] = [];
+    let markCoalescedStarted!: () => void;
+    const coalescedStarted = new Promise<void>((resolve) => {
+      markCoalescedStarted = resolve;
+    });
+    const runtime = Atom.runtime(Layer.empty);
+    const command = createRuntimeCommand(runtime, {
+      label: "test.abort-latest-running",
+      concurrency: { mode: "latest", key: () => "shared" },
+      execute: (value: number) =>
+        Effect.sync(() => executed.push(value)).pipe(
+          Effect.andThen(
+            value === 1
+              ? firstLatch.await
+              : Effect.sync(markCoalescedStarted).pipe(Effect.andThen(Effect.never)),
+          ),
+          Effect.as(value),
+        ),
+    });
+    const registry = AtomRegistry.make();
+    const newest = new AbortController();
+
+    const first = command.run(registry, 1);
+    await Promise.resolve();
+    const second = command.run(registry, 2);
+    const third = command.run(registry, 3, { signal: newest.signal });
+    firstLatch.openUnsafe();
+    expect(await first).toMatchObject({ _tag: "Success", value: 1 });
+    await coalescedStarted;
+    newest.abort();
+
+    expect(isAtomCommandInterrupted(await second)).toBe(true);
+    expect(isAtomCommandInterrupted(await third)).toBe(true);
+    expect(executed).toEqual([1, 3]);
+    registry.dispose();
+  });
+
+  it("forwards the abort signal from runAtomCommand to the command", async () => {
+    const controller = new AbortController();
+    const registry = AtomRegistry.make();
+    let received: AbortSignal | undefined;
+
+    await runAtomCommand(
+      registry,
+      {
+        label: "test.forward-signal",
+        run: async (_registry, _input, options) => {
+          received = options?.signal;
+          return AsyncResult.success(undefined);
+        },
+      },
+      undefined,
+      { signal: controller.signal },
+    );
+
+    expect(received).toBe(controller.signal);
+    registry.dispose();
+  });
 
   it("encodes custom command rejections as defects", async () => {
     const defect = new Error("custom command rejected");

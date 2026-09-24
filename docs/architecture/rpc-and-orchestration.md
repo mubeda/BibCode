@@ -1933,7 +1933,11 @@ replacement that now occupies the old path.
   server-owned lifecycle continues to a terminal receipt while only the caller
   wait is canceled.
 - Cancellation flows from client interrupt or socket closure into registered
-  handlers and supervised processes.
+  handlers and supervised processes. On Unix, a handler that runs Git inline
+  is dropped on interrupt, which kills only the top-level `git` process, so a
+  transport helper can outlive it (on Windows the job object kills the tree);
+  clone runs its transfer in an owned task so cancellation stops the whole
+  process group and cleans up.
 - Git Manager mutations use the worktree catalog's project-then-repository lock
   order and fail a competing operation with `operation-in-flight`; they do not
   introduce an independent repository lock.

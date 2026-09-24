@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 
-import { EnvironmentId, ThreadId, type ProjectId } from "@bibcode/contracts";
+import { EnvironmentId, GitCommandError, ThreadId, type ProjectId } from "@bibcode/contracts";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
@@ -10,6 +10,7 @@ import {
   createAddProjectOperations,
   type AddProjectCommandResult,
   type AddProjectOperationsDependencies,
+  type AddProjectOutcome,
 } from "./addProjectOperations";
 import type { PickAddProjectFolderResult } from "./pickAddProjectFolder";
 import { useAddProjectWorkflowState, type AddProjectWorkflow } from "./useAddProjectWorkflow";
@@ -23,6 +24,7 @@ const ENV_PRIMARY = EnvironmentId.make("primary");
 const ENV_REMOTE = EnvironmentId.make("remote");
 const ENV_WSL = EnvironmentId.make("wsl");
 const DEFAULT_THREAD_ID = ThreadId.make("default-thread");
+const OPENED: AddProjectOutcome = { _tag: "Opened" };
 
 const primaryHost: AddProjectHostOption = {
   environmentId: ENV_PRIMARY,
@@ -59,7 +61,7 @@ const testState = {
   pickFolder: vi.fn(async () => testState.pickResult),
   operations: {
     addFolder: vi.fn(async () => true),
-    clone: vi.fn(async () => true),
+    clone: vi.fn(async (): Promise<AddProjectOutcome> => OPENED),
     create: vi.fn(async () => true),
   },
   operationOverride: null as WorkflowOperations | null,
@@ -152,13 +154,28 @@ function makeIntegratedOperations() {
   };
 }
 
+/** Clone requests stay pending until their signal aborts, like an interrupted RPC. */
+function interruptibleClone(harness: ReturnType<typeof makeIntegratedOperations>) {
+  const signals: Array<AbortSignal | undefined> = [];
+  harness.cloneRepository.mockImplementation(
+    (input) =>
+      new Promise((resolve) => {
+        signals.push(input.signal);
+        input.signal?.addEventListener("abort", () => resolve({ _tag: "Failure", error: null }), {
+          once: true,
+        });
+      }),
+  );
+  return signals;
+}
+
 beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   testState.hosts = [primaryHost, remoteHost, wslHost];
   testState.pickResult = { _tag: "Cancelled" };
   testState.pickFolder.mockReset().mockImplementation(async () => testState.pickResult);
   testState.operations.addFolder.mockReset().mockResolvedValue(true);
-  testState.operations.clone.mockReset().mockResolvedValue(true);
+  testState.operations.clone.mockReset().mockResolvedValue(OPENED);
   testState.operations.create.mockReset().mockResolvedValue(true);
   testState.operationOverride = null;
   testState.onOpenChange.mockReset();
@@ -276,7 +293,7 @@ describe("useAddProjectWorkflowState", () => {
   });
 
   it("resets and invalidates work when the selected host disconnects", async () => {
-    const cloneResult = deferredResult<boolean>();
+    const cloneResult = deferredResult<AddProjectOutcome>();
     testState.operations.clone.mockReturnValue(cloneResult.promise);
     const view = await mountWorkflow({ open: true });
     act(() => view.current.selectHost(ENV_REMOTE));
@@ -294,6 +311,7 @@ describe("useAddProjectWorkflowState", () => {
     expect(view.current.selectedHost.environmentId).toBe(ENV_PRIMARY);
     expect(view.current.step).toBe("start");
     expect(view.current.busy).toBe(false);
+    expect(view.current.cloneProgress).toBe("idle");
     expect(view.current.hostPath).toBe("~/");
     expect(view.current.cloneUrl).toBe("");
     expect(view.current.cloneParent).toBe("~/");
@@ -301,7 +319,7 @@ describe("useAddProjectWorkflowState", () => {
     expect(view.current.createParent).toBe("~/");
     expect(view.current.error).toBe("The selected host disconnected. Choose a host and try again.");
 
-    cloneResult.resolve(true);
+    cloneResult.resolve(OPENED);
     await act(async () => submission);
     expect(testState.onOpenChange).not.toHaveBeenCalledWith(false);
   });
@@ -467,10 +485,18 @@ describe("useAddProjectWorkflowState", () => {
 
       await act(async () => view.current.submitClone());
       expect(view.current.step).toBe("clone");
+      expect(view.current.busy).toBe(false);
+      expect(view.current.error).toBe(
+        failure === "registration"
+          ? "Failed to add cloned project: registration unavailable"
+          : "Failed to open project: navigation unavailable",
+      );
+      expect(harness.reportFailure).not.toHaveBeenCalled();
       expect(testState.onOpenChange).not.toHaveBeenCalledWith(false);
 
       await act(async () => view.current.submitClone());
 
+      expect(view.current.error).toBeNull();
       expect(harness.cloneRepository).toHaveBeenCalledTimes(2);
       expect(harness.openProject).toHaveBeenCalledTimes(failure === "registration" ? 1 : 2);
       expect(testState.onOpenChange).toHaveBeenCalledWith(false);
@@ -719,5 +745,208 @@ describe("useAddProjectWorkflowState", () => {
     expect(view.current.selectedHost.environmentId).toBe(ENV_WSL);
     expect(view.current.cloneUrl).toBe("https://example.test/demo.git");
     expect(view.current.cloneParent).toBe("/home/me/code");
+  });
+
+  it("keeps a running clone on the form until Cancel interrupts it", async () => {
+    const harness = makeIntegratedOperations();
+    const signals = interruptibleClone(harness);
+    testState.operationOverride = harness.operations;
+    const view = await mountWorkflow({ open: true });
+    act(() => view.current.openClone());
+    act(() => view.current.setCloneUrl("https://example.test/demo.git"));
+    act(() => view.current.setCloneParent("/code"));
+    let submission!: Promise<void>;
+    act(() => {
+      submission = view.current.submitClone();
+    });
+
+    expect(view.current.step).toBe("clone");
+    expect(view.current.busy).toBe(true);
+    expect(view.current.cloneProgress).toBe("cloning");
+    expect(signals).toHaveLength(1);
+    expect(signals[0]?.aborted).toBe(false);
+
+    await act(async () => {
+      view.current.cancelClone();
+      await submission;
+    });
+
+    expect(signals[0]?.aborted).toBe(true);
+    expect(view.current.step).toBe("clone");
+    expect(view.current.busy).toBe(false);
+    expect(view.current.cloneProgress).toBe("idle");
+    expect(view.current.cloneUrl).toBe("https://example.test/demo.git");
+    expect(view.current.cloneParent).toBe("/code");
+    expect(view.current.notice).toBe("Clone cancelled.");
+    expect(view.current.error).toBeNull();
+    expect(harness.createProject).not.toHaveBeenCalled();
+    expect(harness.reportFailure).not.toHaveBeenCalled();
+    expect(testState.onOpenChange).not.toHaveBeenCalledWith(false);
+
+    act(() => view.current.setCloneParent("/code/"));
+    expect(view.current.notice).toBeNull();
+  });
+
+  it("starts a fresh clone after a cancelled one", async () => {
+    const harness = makeIntegratedOperations();
+    const signals = interruptibleClone(harness);
+    testState.operationOverride = harness.operations;
+    const view = await mountWorkflow({ open: true });
+    act(() => view.current.openClone());
+    act(() => view.current.setCloneUrl("https://example.test/demo.git"));
+    let submission!: Promise<void>;
+    act(() => {
+      submission = view.current.submitClone();
+    });
+    await act(async () => {
+      view.current.cancelClone();
+      await submission;
+    });
+
+    harness.cloneRepository.mockResolvedValueOnce({
+      _tag: "Success",
+      value: { path: "/code/demo" },
+    });
+    await act(async () => view.current.submitClone());
+
+    expect(harness.cloneRepository).toHaveBeenCalledTimes(2);
+    expect(harness.cloneRepository.mock.calls[1]?.[0].signal).not.toBe(signals[0]);
+    expect(harness.cloneRepository.mock.calls[1]?.[0].signal?.aborted).toBe(false);
+    expect(view.current.notice).toBeNull();
+    expect(testState.onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("shows the server's clone failure on the form and keeps Clone available", async () => {
+    const harness = makeIntegratedOperations();
+    // Test-owned text: the form shows whatever detail the server sends, unchanged.
+    const detail = "Synthetic server detail: the destination needs attention.";
+    harness.cloneRepository.mockResolvedValueOnce({
+      _tag: "Failure",
+      error: new GitCommandError({
+        operation: "GitVcsDriver.cloneRepository",
+        command: "git clone",
+        cwd: "/code",
+        detail,
+      }),
+    });
+    testState.operationOverride = harness.operations;
+    const view = await mountWorkflow({ open: true });
+    act(() => view.current.openClone());
+    act(() => view.current.setCloneUrl("https://example.test/demo.git"));
+    act(() => view.current.setCloneParent("/code"));
+
+    await act(async () => view.current.submitClone());
+
+    expect(view.current.error).toBe(`Clone failed: ${detail}`);
+    expect(view.current.notice).toBeNull();
+    expect(view.current.step).toBe("clone");
+    expect(view.current.busy).toBe(false);
+    expect(view.current.cloneProgress).toBe("idle");
+    expect(harness.reportFailure).not.toHaveBeenCalled();
+    expect(harness.createProject).not.toHaveBeenCalled();
+    expect(testState.onOpenChange).not.toHaveBeenCalledWith(false);
+  });
+
+  it("names the clone when an interruption the user did not request stops it", async () => {
+    const harness = makeIntegratedOperations();
+    harness.cloneRepository.mockResolvedValueOnce({ _tag: "Failure", error: null });
+    testState.operationOverride = harness.operations;
+    const view = await mountWorkflow({ open: true });
+    act(() => view.current.openClone());
+    act(() => view.current.setCloneUrl("https://example.test/demo.git"));
+
+    await act(async () => view.current.submitClone());
+
+    expect(view.current.error).toBe("The clone stopped before it finished. Try again.");
+    expect(view.current.notice).toBeNull();
+    expect(view.current.busy).toBe(false);
+    expect(view.current.cloneProgress).toBe("idle");
+    expect(harness.createProject).not.toHaveBeenCalled();
+    expect(testState.onOpenChange).not.toHaveBeenCalledWith(false);
+  });
+
+  it("names adding the project when an interruption stops registration of a finished clone", async () => {
+    const harness = makeIntegratedOperations();
+    harness.createProject.mockResolvedValueOnce({ _tag: "Failure", error: null });
+    testState.operationOverride = harness.operations;
+    const view = await mountWorkflow({ open: true });
+    act(() => view.current.openClone());
+    act(() => view.current.setCloneUrl("https://example.test/demo.git"));
+
+    await act(async () => view.current.submitClone());
+
+    expect(harness.cloneRepository).toHaveBeenCalledTimes(1);
+    expect(harness.createProject).toHaveBeenCalledTimes(1);
+    expect(view.current.error).toBe("Adding the project stopped before it finished. Try again.");
+    expect(view.current.notice).toBeNull();
+    expect(view.current.busy).toBe(false);
+    expect(view.current.cloneProgress).toBe("idle");
+    expect(harness.openProject).not.toHaveBeenCalled();
+    expect(testState.onOpenChange).not.toHaveBeenCalledWith(false);
+  });
+
+  it("closes only after the cloned repository is registered", async () => {
+    const harness = makeIntegratedOperations();
+    const registration = deferredResult<
+      AddProjectCommandResult<{
+        readonly projectId: ProjectId;
+        readonly defaultThreadId: ThreadId;
+      }>
+    >();
+    harness.createProject.mockReturnValueOnce(registration.promise);
+    testState.operationOverride = harness.operations;
+    const view = await mountWorkflow({ open: true });
+    act(() => view.current.openClone());
+    act(() => view.current.setCloneUrl("https://example.test/demo.git"));
+    let submission!: Promise<void>;
+    act(() => {
+      submission = view.current.submitClone();
+    });
+    await flushPromises();
+
+    expect(harness.createProject).toHaveBeenCalledTimes(1);
+    expect(view.current.cloneProgress).toBe("registering");
+    expect(view.current.busy).toBe(true);
+    expect(testState.onOpenChange).not.toHaveBeenCalled();
+
+    // The repository is on disk now, so Cancel no longer applies.
+    act(() => view.current.cancelClone());
+    expect(view.current.cloneProgress).toBe("registering");
+
+    await act(async () => {
+      const command = harness.createProject.mock.calls[0]?.[0];
+      if (command === undefined) throw new Error("Missing project command");
+      registration.resolve({
+        _tag: "Success",
+        value: { projectId: command.projectId, defaultThreadId: DEFAULT_THREAD_ID },
+      });
+      await submission;
+    });
+
+    expect(harness.openProject).toHaveBeenCalledTimes(1);
+    expect(testState.onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("interrupts a running clone when the workflow unmounts", async () => {
+    const harness = makeIntegratedOperations();
+    const signals = interruptibleClone(harness);
+    testState.operationOverride = harness.operations;
+    const view = await mountWorkflow({ open: true });
+    act(() => view.current.openClone());
+    act(() => view.current.setCloneUrl("https://example.test/demo.git"));
+    let submission!: Promise<void>;
+    act(() => {
+      submission = view.current.submitClone();
+    });
+
+    await act(async () => {
+      workflowRoot?.unmount();
+      await submission;
+    });
+    workflowRoot = null;
+
+    expect(signals[0]?.aborted).toBe(true);
+    expect(harness.createProject).not.toHaveBeenCalled();
+    expect(testState.onOpenChange).not.toHaveBeenCalledWith(false);
   });
 });

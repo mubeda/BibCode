@@ -2,7 +2,7 @@
 
 import type { EnvironmentId } from "@bibcode/contracts";
 import { ChevronDownIcon, FolderOpenIcon, GitBranchIcon, GlobeIcon, PlusIcon } from "lucide-react";
-import { type KeyboardEvent, type ReactNode, useState } from "react";
+import { type KeyboardEvent, type ReactNode, useEffect, useRef, useState } from "react";
 
 import { RemoteDirectoryBrowser } from "~/components/RemoteDirectoryBrowser";
 import { cn } from "~/lib/utils";
@@ -13,6 +13,7 @@ import {
   validateGitCloneParentPath,
   validateGitCloneUrl,
   validateProjectName,
+  type AddProjectCloneProgress,
   type AddProjectHostOption,
 } from "./AddProjectDialog.logic";
 import type { AddProjectLocationLabel } from "./useAddProjectWorkflow";
@@ -20,6 +21,7 @@ import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Kbd } from "../ui/kbd";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
+import { Spinner } from "../ui/spinner";
 
 export interface AddProjectStartStepProps {
   readonly hosts: ReadonlyArray<AddProjectHostOption>;
@@ -47,12 +49,15 @@ export interface AddProjectCloneStepProps {
   readonly parentDir: string;
   readonly platform: string | null;
   readonly error: string | null;
+  readonly notice: string | null;
   readonly busy: boolean;
+  readonly progress: AddProjectCloneProgress;
   readonly canPickParent: boolean;
   readonly onUrlChange: (url: string) => void;
   readonly onParentDirChange: (path: string) => void;
   readonly onPickParent: () => void;
   readonly onClone: () => void;
+  readonly onCancel: () => void;
 }
 
 export interface AddProjectCreateStepProps {
@@ -86,6 +91,14 @@ function StepHeading({
 function ErrorMessage({ children }: { readonly children: ReactNode }) {
   return (
     <p className="text-destructive text-xs" role="alert">
+      {children}
+    </p>
+  );
+}
+
+function StatusMessage({ children }: { readonly children: ReactNode }) {
+  return (
+    <p className="text-muted-foreground text-xs" role="status">
       {children}
     </p>
   );
@@ -464,17 +477,26 @@ export function AddProjectRemoteBrowseStep({
   );
 }
 
+const CLONE_SUBMIT_LABELS: Record<AddProjectCloneProgress, string> = {
+  idle: "Clone",
+  cloning: "Cloning…",
+  registering: "Adding project…",
+};
+
 export function AddProjectCloneStep({
   url,
   parentDir,
   platform,
   error,
+  notice,
   busy,
+  progress,
   canPickParent,
   onUrlChange,
   onParentDirChange,
   onPickParent,
   onClone,
+  onCancel,
 }: AddProjectCloneStepProps) {
   const urlError = validateGitCloneUrl(url);
   const parentError = validateGitCloneParentPath(parentDir, platform);
@@ -483,14 +505,31 @@ export function AddProjectCloneStep({
   const canSubmit = urlError === null && parentError === null && !busy;
   const onEnter = (event: KeyboardEvent<HTMLInputElement>) =>
     handleInputEnter(event, canSubmit, onClone);
+  const formRef = useRef<HTMLFormElement>(null);
+  const urlInputRef = useRef<HTMLInputElement>(null);
+  const wasRunningRef = useRef(progress !== "idle");
+  const hasFeedback = error !== null || notice !== null;
+
+  useEffect(() => {
+    const wasRunning = wasRunningRef.current;
+    wasRunningRef.current = progress !== "idle";
+    // A clone that ends in a notice or an error keeps the form open, so give the first field
+    // focus back. A successful clone closes the dialog, which restores focus itself.
+    if (wasRunning && progress === "idle" && hasFeedback) {
+      urlInputRef.current?.focus();
+    }
+  }, [hasFeedback, progress]);
 
   return (
     <form
-      className="space-y-5"
+      aria-busy={busy}
+      className="space-y-5 outline-none"
       onSubmit={(event) => {
         event.preventDefault();
         if (canSubmit) onClone();
       }}
+      ref={formRef}
+      tabIndex={-1}
     >
       <StepHeading
         description="Enter the Git URL and choose where to clone it."
@@ -512,6 +551,7 @@ export function AddProjectCloneStep({
           onChange={(event) => onUrlChange(event.currentTarget.value)}
           onKeyDown={onEnter}
           placeholder="https://github.com/user/repo.git"
+          ref={urlInputRef}
           spellCheck={false}
           value={url}
         />
@@ -528,10 +568,33 @@ export function AddProjectCloneStep({
         onPick={onPickParent}
         value={parentDir}
       />
-      {error ? <ErrorMessage>{error}</ErrorMessage> : null}
-      <Button className="w-full" disabled={!canSubmit} size="lg" type="submit">
-        {busy ? "Cloning…" : "Clone"}
-      </Button>
+      {error ? (
+        <ErrorMessage>{error}</ErrorMessage>
+      ) : notice ? (
+        <StatusMessage>{notice}</StatusMessage>
+      ) : null}
+      <div className="space-y-2">
+        <Button className="w-full" disabled={!canSubmit} size="lg" type="submit">
+          {progress === "idle" ? null : <Spinner aria-hidden className="size-3.5" />}
+          {CLONE_SUBMIT_LABELS[progress]}
+        </Button>
+        {/* Below the submit button, so a repeated click on Clone cannot land on Cancel. */}
+        {progress === "cloning" ? (
+          <Button
+            className="w-full"
+            onClick={() => {
+              // Cancel unmounts once the clone stops. Holding focus on the form keeps it from
+              // falling back to the document until the Git URL field is enabled again.
+              formRef.current?.focus();
+              onCancel();
+            }}
+            size="lg"
+            variant="outline"
+          >
+            Cancel clone
+          </Button>
+        ) : null}
+      </div>
     </form>
   );
 }

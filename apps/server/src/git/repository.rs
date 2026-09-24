@@ -44,6 +44,18 @@ const WORKTREE_PRUNE_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 const WORKTREE_PRUNE_GITDIR_LIMIT: u64 = 64 * 1024;
 const COMMIT_FIELD_SEPARATOR: char = '\x1f';
 const CLONE_OPERATION: &str = "GitVcsDriver.clone";
+/// Git's HTTP(S) stall guard for network transfers: stop when fewer than 1000 bytes/s are
+/// transferred for 60 seconds. `-c` reaches Git's transport helpers through the
+/// environment; transports without HTTP (SSH, local paths) ignore it.
+const NETWORK_TRANSFER_CONFIG: &[&str] = &[
+    "-c",
+    "http.lowSpeedLimit=1000",
+    "-c",
+    "http.lowSpeedTime=60",
+];
+/// The fixed start of curl's low-speed abort, which Git relays on stderr.
+const CURL_LOW_SPEED_ABORT: &str = "Operation too slow";
+pub(crate) const NETWORK_TRANSFER_STALLED: &str = "The transfer stalled (under 1 KB/s for 60 seconds). Check the connection to the remote and try again.";
 const MAX_AUTOMATIC_WORKTREE_SUFFIX_ATTEMPTS: usize = 100;
 const WORKTREE_REMOVE_RETRY_ATTEMPTS: usize = 20;
 const WORKTREE_REMOVE_RETRY_DELAY: Duration = Duration::from_millis(50);
@@ -135,6 +147,8 @@ pub struct GitRepository {
     worktree_settings: Arc<dyn WorktreeBaseDirectoryProvider>,
     worktree_porcelain_z_supported: Arc<Mutex<Option<bool>>>,
     command_timeout: Duration,
+    /// `-c` configuration placed before the subcommand of every command this variant runs.
+    command_config: &'static [&'static str],
 }
 
 pub(crate) struct StatusObservation {
@@ -172,6 +186,7 @@ impl Default for GitRepository {
             worktree_settings: Arc::new(DefaultWorktreeBaseDirectory),
             worktree_porcelain_z_supported: Arc::new(Mutex::new(None)),
             command_timeout: DEFAULT_TIMEOUT,
+            command_config: &[],
         }
     }
 }
@@ -301,6 +316,30 @@ impl GitRepository {
         }
     }
 
+    /// Transfers the user can cancel (clone and the Git Manager's fetch, pull, push,
+    /// remote-branch delete and tag push) run on this variant: a long safety bound replaces
+    /// the read deadline and Git's HTTP stall guard is on, so a slow transfer that keeps
+    /// moving finishes while a stalled one fails, and Cancel stops it. Credentials and the
+    /// non-interactive environment are unchanged.
+    pub(crate) fn for_network_transfer(&self) -> Self {
+        Self {
+            command_timeout: super::NETWORK_TRANSFER_TIMEOUT,
+            command_config: NETWORK_TRANSFER_CONFIG,
+            ..self.clone()
+        }
+    }
+
+    /// Transfers no user can cancel (the automatic fetch, and the pull, stacked-action push
+    /// and publish push that have no Cancel) keep the HTTP stall guard with a bounded
+    /// deadline, because SSH transfers have no stall detection.
+    pub(crate) fn for_bounded_transfer(&self) -> Self {
+        Self {
+            command_timeout: super::BOUNDED_TRANSFER_TIMEOUT,
+            command_config: NETWORK_TRANSFER_CONFIG,
+            ..self.clone()
+        }
+    }
+
     pub fn with_worktree_settings(
         worktree_settings: Arc<dyn WorktreeBaseDirectoryProvider>,
     ) -> Self {
@@ -309,6 +348,7 @@ impl GitRepository {
             worktree_settings,
             worktree_porcelain_z_supported: Arc::new(Mutex::new(None)),
             command_timeout: DEFAULT_TIMEOUT,
+            command_config: &[],
         }
     }
 
@@ -319,6 +359,16 @@ impl GitRepository {
             worktree_settings: Arc::new(DefaultWorktreeBaseDirectory),
             worktree_porcelain_z_supported: Arc::new(Mutex::new(None)),
             command_timeout: DEFAULT_TIMEOUT,
+            command_config: &[],
+        }
+    }
+
+    /// Shortens the ordinary command deadline so a test can prove which commands outlive it.
+    #[cfg(test)]
+    pub(crate) fn with_command_timeout_for_test(self, command_timeout: Duration) -> Self {
+        Self {
+            command_timeout,
+            ..self
         }
     }
 
@@ -462,12 +512,19 @@ impl GitRepository {
         input: GitExecutionInput,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, GitCommandError> {
+        let args = self
+            .command_config
+            .iter()
+            .map(OsString::from)
+            .chain(args.iter().map(OsString::from))
+            .collect::<Vec<_>>();
+        let argument_count = args.len();
         self.runner
             .run(
                 ProcessRequest {
                     operation: operation.to_owned(),
                     command: PathBuf::from("git"),
-                    args: args.iter().map(OsString::from).collect(),
+                    args,
                     cwd: cwd.to_path_buf(),
                     env: input.environment,
                     stdin: input.stdin,
@@ -480,7 +537,7 @@ impl GitRepository {
                 cancellation,
             )
             .await
-            .map_err(|error| git_error(operation, cwd, args.len(), error))
+            .map_err(|error| git_error(operation, cwd, argument_count, error))
     }
 
     pub(crate) async fn git_manager_resolve_tips(
@@ -2418,13 +2475,14 @@ impl GitRepository {
                 .into_iter()
                 .find(|remote| upstream.starts_with(&format!("{remote}/")))
             {
-                self.run(
-                    "GitVcsDriver.refreshRemoteStatus.fetch",
-                    cwd,
-                    &["fetch".into(), "--quiet".into(), remote.into()],
-                    cancellation,
-                )
-                .await?;
+                self.for_network_transfer()
+                    .run(
+                        "GitVcsDriver.refreshRemoteStatus.fetch",
+                        cwd,
+                        &["fetch".into(), "--quiet".into(), remote.into()],
+                        cancellation,
+                    )
+                    .await?;
             }
         }
         self.remote_status(cwd, cancellation).await
@@ -2467,13 +2525,14 @@ impl GitRepository {
         }
         args.push("--".to_owned());
         args.extend(remotes);
-        self.run(
-            "GitVcsDriver.automaticFetch.fetch",
-            cwd,
-            &args,
-            cancellation,
-        )
-        .await?;
+        self.for_bounded_transfer()
+            .run(
+                "GitVcsDriver.automaticFetch.fetch",
+                cwd,
+                &args,
+                cancellation,
+            )
+            .await?;
         Ok(())
     }
 
@@ -4100,14 +4159,15 @@ impl GitRepository {
         name: &str,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, GitCommandError> {
-        self.execute(
-            "GitManager.remoteBranchDelete",
-            cwd,
-            &["push".into(), remote.into(), format!(":{name}")],
-            true,
-            cancellation,
-        )
-        .await
+        self.for_network_transfer()
+            .execute(
+                "GitManager.remoteBranchDelete",
+                cwd,
+                &["push".into(), remote.into(), format!(":{name}")],
+                true,
+                cancellation,
+            )
+            .await
     }
 
     pub(crate) async fn git_manager_fetch(
@@ -4116,19 +4176,20 @@ impl GitRepository {
         remote: &str,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, GitCommandError> {
-        self.execute(
-            "GitManager.fetch",
-            cwd,
-            &[
-                "fetch".into(),
-                "--prune".into(),
-                "--recurse-submodules=on-demand".into(),
-                remote.into(),
-            ],
-            true,
-            cancellation,
-        )
-        .await
+        self.for_network_transfer()
+            .execute(
+                "GitManager.fetch",
+                cwd,
+                &[
+                    "fetch".into(),
+                    "--prune".into(),
+                    "--recurse-submodules=on-demand".into(),
+                    remote.into(),
+                ],
+                true,
+                cancellation,
+            )
+            .await
     }
 
     /// Lists the tags a remote currently advertises. Network-bound like fetch,
@@ -4180,6 +4241,7 @@ impl GitRepository {
         }
         args.extend(strings(&["--recurse-submodules", remote]));
         let pull = self
+            .for_network_transfer()
             .execute("GitManager.pull", cwd, &args, true, cancellation)
             .await?;
         Ok(vec![pull_ff, pull_rebase, pull])
@@ -4214,7 +4276,8 @@ impl GitRepository {
             args.push("--tags".into());
             args.push("--atomic".into());
         }
-        self.execute("GitManager.push", cwd, &args, true, cancellation)
+        self.for_network_transfer()
+            .execute("GitManager.push", cwd, &args, true, cancellation)
             .await
     }
 
@@ -4751,36 +4814,145 @@ impl GitRepository {
             str::to_owned,
         );
         let destination = parent_dir.join(&derived);
-        match tokio::fs::symlink_metadata(&destination).await {
-            Ok(metadata) => {
-                if !metadata.is_dir() {
-                    return Err(simple_error(
-                        CLONE_OPERATION,
-                        parent_dir,
-                        "Existing clone destination is not a Git repository.",
-                    ));
-                }
+        // A retry right after Cancel waits here until the cancelled clone of the same
+        // destination has stopped Git and removed its folder, then reserves normally.
+        let Some(destination_lease) = CloneDestinationRegistry::global()
+            .acquire(&destination, cancellation)
+            .await
+        else {
+            return Err(simple_error(
+                CLONE_OPERATION,
+                parent_dir,
+                "The clone was cancelled before it started.",
+            ));
+        };
+        // Creating the destination atomically records that it did not exist before: only a
+        // directory this call created is removed when the clone fails, times out, stalls, or
+        // is cancelled. An existing destination is never cloned into or deleted.
+        let owned_destination = match OwnedWorktreePath::reserve(destination.clone()) {
+            Ok(owned_destination) => owned_destination,
+            Err(error) if error.is_destination_collision() => {
                 return self
-                    .reuse_existing_clone(url, &destination, cancellation)
+                    .reuse_existing_destination(url, parent_dir, &destination, cancellation)
                     .await;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(simple_error(
                     CLONE_OPERATION,
                     parent_dir,
-                    &format!("Failed to inspect the existing clone destination: {error}"),
+                    &format!(
+                        "Could not create {} ({}). Check that the parent folder exists and is writable, or choose another folder.",
+                        display_path(&destination),
+                        error.source
+                    ),
                 ));
             }
+        };
+        // The transfer and its cleanup run as one owned task. An RPC interrupt drops this
+        // future; the drop guard then cancels the transfer, and the task still stops Git and
+        // removes the destination it created before it finishes.
+        let transfer_cancellation = cancellation.child_token();
+        let _cancel_transfer_on_drop = transfer_cancellation.clone().drop_guard();
+        let transfer = self.for_network_transfer();
+        let task_url = url.to_owned();
+        let task_parent_dir = parent_dir.to_path_buf();
+        let task = tokio::spawn(async move {
+            // Released only after the transfer and its cleanup have finished.
+            let _destination_lease = destination_lease;
+            transfer
+                .clone_into_owned_destination(
+                    &task_url,
+                    &task_parent_dir,
+                    &derived,
+                    owned_destination,
+                    &transfer_cancellation,
+                )
+                .await
+        });
+        match task.await {
+            Ok(result) => result,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => Err(simple_error(
+                CLONE_OPERATION,
+                parent_dir,
+                &format!("The clone stopped before it finished: {error}"),
+            )),
         }
-        self.run(
-            CLONE_OPERATION,
-            parent_dir,
-            &["clone".into(), "--".into(), url.into(), derived.clone()],
-            cancellation,
-        )
-        .await?;
-        Ok(destination)
+    }
+
+    async fn clone_into_owned_destination(
+        &self,
+        url: &str,
+        parent_dir: &Path,
+        directory_name: &str,
+        destination: OwnedWorktreePath,
+        cancellation: &CancellationToken,
+    ) -> Result<PathBuf, GitCommandError> {
+        let cloned = self
+            .run(
+                CLONE_OPERATION,
+                parent_dir,
+                &[
+                    "clone".into(),
+                    "--".into(),
+                    url.into(),
+                    directory_name.into(),
+                ],
+                cancellation,
+            )
+            .await;
+        match cloned {
+            Ok(_) => Ok(destination.path().to_path_buf()),
+            Err(mut error) => {
+                // The runner has already stopped and reaped Git's process group.
+                if let Err(cleanup_error) = remove_owned_clone_destination(&destination).await {
+                    error.detail = format!(
+                        "{}\nThe incomplete clone at {} could not be removed ({cleanup_error}). Remove it before trying again.",
+                        error.detail,
+                        display_path(destination.path()),
+                    )
+                    .into();
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn reuse_existing_destination(
+        &self,
+        url: &str,
+        parent_dir: &Path,
+        destination: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<PathBuf, GitCommandError> {
+        match tokio::fs::symlink_metadata(destination).await {
+            Ok(metadata) if metadata.is_dir() => {
+                self.reuse_existing_clone(url, destination, cancellation)
+                    .await
+            }
+            Ok(metadata) => {
+                let kind = if metadata.file_type().is_symlink() {
+                    "A link"
+                } else if metadata.is_file() {
+                    "A file"
+                } else {
+                    "An item"
+                };
+                let (name, location) = destination_name_and_location(destination);
+                Err(simple_error(
+                    CLONE_OPERATION,
+                    parent_dir,
+                    &format!(
+                        "{kind} named {name} already exists at {location}. Remove it or choose another parent folder."
+                    ),
+                ))
+            }
+            Err(error) => Err(simple_error(
+                CLONE_OPERATION,
+                parent_dir,
+                &format!("Failed to inspect the existing clone destination: {error}"),
+            )),
+        }
     }
 
     async fn reuse_existing_clone(
@@ -4790,10 +4962,13 @@ impl GitRepository {
         cancellation: &CancellationToken,
     ) -> Result<PathBuf, GitCommandError> {
         let Some(repository_root) = self.repository_root(destination, cancellation).await? else {
+            let (name, location) = destination_name_and_location(destination);
             return Err(simple_error(
                 CLONE_OPERATION,
                 destination,
-                "Existing clone destination is not a Git repository.",
+                &format!(
+                    "A folder named {name} already exists at {location} and is not a Git repository. Remove it or choose another parent folder."
+                ),
             ));
         };
         let canonical_destination =
@@ -4817,10 +4992,14 @@ impl GitRepository {
                     )
                 })?;
         if canonical_destination != canonical_repository_root {
+            // The folder belongs to another repository, so removing it is not suggested.
+            let (name, location) = destination_name_and_location(destination);
             return Err(simple_error(
                 CLONE_OPERATION,
                 destination,
-                "Existing clone destination is not a Git repository root.",
+                &format!(
+                    "A folder named {name} already exists at {location} inside another Git repository. Choose another parent folder."
+                ),
             ));
         }
         let origin = self
@@ -4833,17 +5012,44 @@ impl GitRepository {
             )
             .await?;
         if origin.exit_code != 0 {
+            let (name, location) = destination_name_and_location(destination);
             return Err(simple_error(
                 CLONE_OPERATION,
                 destination,
-                "Existing Git repository does not have an origin remote.",
+                &format!(
+                    "A Git repository named {name} already exists at {location} without an origin remote. Choose another parent folder, or add that folder as a project instead."
+                ),
             ));
         }
         if origin.stdout.trim() != url {
+            let (name, location) = destination_name_and_location(destination);
             return Err(simple_error(
                 CLONE_OPERATION,
                 destination,
-                "Existing Git repository has a different origin.",
+                &format!(
+                    "A Git repository named {name} already exists at {location} with a different origin. Choose another parent folder."
+                ),
+            ));
+        }
+        // An interrupted clone keeps its origin but never checks out a commit: HEAD stays
+        // Git's `refs/heads/.invalid` placeholder, or names a branch without commits.
+        let head = self
+            .execute_read(
+                "GitVcsDriver.clone.inspectHead",
+                destination,
+                &strings(&["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]),
+                true,
+                cancellation,
+            )
+            .await?;
+        if head.exit_code != 0 || head.stdout.trim().is_empty() {
+            return Err(simple_error(
+                CLONE_OPERATION,
+                destination,
+                &format!(
+                    "An incomplete clone exists at {}. Remove it or choose another folder.",
+                    display_path(destination)
+                ),
             ));
         }
         Ok(destination.to_path_buf())
@@ -4888,13 +5094,14 @@ impl GitRepository {
                 cancellation,
             )
             .await?;
-        self.run(
-            "GitVcsDriver.pullCurrentBranch",
-            cwd,
-            &strings(&["pull", "--ff-only"]),
-            cancellation,
-        )
-        .await?;
+        self.for_bounded_transfer()
+            .run(
+                "GitVcsDriver.pullCurrentBranch",
+                cwd,
+                &strings(&["pull", "--ff-only"]),
+                cancellation,
+            )
+            .await?;
         let after = self
             .run(
                 "GitVcsDriver.pullCurrentBranch.after",
@@ -5167,7 +5374,8 @@ impl GitRepository {
                 branch.clone(),
             ]
         };
-        self.run("GitVcsDriver.pushCurrentBranch", cwd, &args, cancellation)
+        self.for_bounded_transfer()
+            .run("GitVcsDriver.pushCurrentBranch", cwd, &args, cancellation)
             .await?;
         Ok(branch)
     }
@@ -5185,19 +5393,20 @@ impl GitRepository {
                 "Cannot push from detached HEAD.",
             )
         })?;
-        self.run(
-            "GitVcsDriver.pushCurrentBranchToRemote",
-            cwd,
-            &[
-                "push".into(),
-                "--set-upstream".into(),
-                "--".into(),
-                remote_name.into(),
-                branch.clone(),
-            ],
-            cancellation,
-        )
-        .await?;
+        self.for_bounded_transfer()
+            .run(
+                "GitVcsDriver.pushCurrentBranchToRemote",
+                cwd,
+                &[
+                    "push".into(),
+                    "--set-upstream".into(),
+                    "--".into(),
+                    remote_name.into(),
+                    branch.clone(),
+                ],
+                cancellation,
+            )
+            .await?;
         Ok(branch)
     }
 
@@ -6637,6 +6846,121 @@ async fn remove_bound_owned_directory_with_lease(
     .map_err(|error| io::Error::other(format!("owned directory cleanup task failed: {error}")))?
 }
 
+/// Serializes clones into one destination. A clone waits until every earlier clone of the
+/// same destination, including its cleanup, has finished before it reserves the path, so a
+/// retry right after Cancel never finds the cancelled clone's folder mid-removal. Different
+/// destinations never wait for each other.
+#[derive(Default)]
+struct CloneDestinationRegistry {
+    destinations: Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+}
+
+/// Held for the whole life of one clone: its reservation, transfer, and cleanup.
+struct CloneDestinationLease {
+    registry: &'static CloneDestinationRegistry,
+    key: String,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for CloneDestinationLease {
+    fn drop(&mut self) {
+        let mut destinations = self.registry.lock_destinations();
+        // Releasing the guard wakes the next clone of this destination, if any.
+        drop(self.guard.take());
+        if destinations
+            .get(&self.key)
+            .is_some_and(|slot| slot.strong_count() == 0)
+        {
+            destinations.remove(&self.key);
+        }
+    }
+}
+
+impl CloneDestinationRegistry {
+    fn global() -> &'static Self {
+        static REGISTRY: std::sync::OnceLock<CloneDestinationRegistry> = std::sync::OnceLock::new();
+        REGISTRY.get_or_init(Self::default)
+    }
+
+    fn lock_destinations(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>> {
+        self.destinations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Waits for earlier clones into `destination` to finish. Returns `None` when
+    /// `cancellation` fires first. The key is the reservation path, normalized the way
+    /// worktree paths are compared on this host.
+    async fn acquire(
+        &'static self,
+        destination: &Path,
+        cancellation: &CancellationToken,
+    ) -> Option<CloneDestinationLease> {
+        let key = normalize_worktree_path_key(destination, host_path_platform());
+        let slot = {
+            let mut destinations = self.lock_destinations();
+            // A waiter that was cancelled leaves an entry nobody holds; drop those here.
+            destinations.retain(|_, slot| slot.strong_count() > 0);
+            if let Some(slot) = destinations.get(&key).and_then(std::sync::Weak::upgrade) {
+                slot
+            } else {
+                let slot = Arc::new(tokio::sync::Mutex::new(()));
+                destinations.insert(key.clone(), Arc::downgrade(&slot));
+                slot
+            }
+        };
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => None,
+            guard = slot.lock_owned() => Some(CloneDestinationLease {
+                registry: self,
+                key,
+                guard: Some(guard),
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn tracks(&self, destination: &Path) -> bool {
+        self.lock_destinations()
+            .contains_key(&normalize_worktree_path_key(
+                destination,
+                host_path_platform(),
+            ))
+    }
+}
+
+/// The destination's own name and the folder that holds it, as a user would look for them.
+fn destination_name_and_location(destination: &Path) -> (String, String) {
+    let name = destination.file_name().map_or_else(
+        || display_path(destination),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let location = destination
+        .parent()
+        .map_or_else(|| display_path(destination), display_path);
+    (name, location)
+}
+
+/// Removes a clone destination this call created, after proving that the directory at the
+/// path is still the one it created.
+async fn remove_owned_clone_destination(destination: &OwnedWorktreePath) -> Result<(), io::Error> {
+    match tokio::fs::symlink_metadata(destination.path()).await {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+        Ok(_) => {}
+    }
+    let lease = open_removal_directory_lease_async(destination.path()).await?;
+    if owned_worktree_path_identity(&lease)? != destination.identity() {
+        return Err(io::Error::other(
+            "the folder was replaced after the clone started",
+        ));
+    }
+    remove_bound_owned_directory_with_lease(destination.path(), lease).await
+}
+
 fn clear_bound_identity_directory_once(
     lease: &RemovalDirectoryLease,
     path: &Path,
@@ -7077,6 +7401,57 @@ mod tests {
         }
     }
 
+    /// The arguments a network transfer receives: Git's stall guard, then the command.
+    fn network_args(args: &[&str]) -> Vec<OsString> {
+        [
+            "-c",
+            "http.lowSpeedLimit=1000",
+            "-c",
+            "http.lowSpeedTime=60",
+        ]
+        .iter()
+        .chain(args)
+        .map(OsString::from)
+        .collect()
+    }
+
+    fn assert_network_transfer(request: &ProcessRequest, args: &[&str]) {
+        assert_eq!(request.args, network_args(args), "{}", request.operation);
+        assert_eq!(
+            request.timeout,
+            crate::git::NETWORK_TRANSFER_TIMEOUT,
+            "{} can be cancelled and runs on the network-transfer budget",
+            request.operation
+        );
+    }
+
+    fn assert_bounded_transfer(request: &ProcessRequest, args: &[&str]) {
+        assert_eq!(request.args, network_args(args), "{}", request.operation);
+        assert_eq!(
+            request.timeout,
+            crate::git::BOUNDED_TRANSFER_TIMEOUT,
+            "{} has no Cancel and keeps the bounded deadline",
+            request.operation
+        );
+    }
+
+    fn assert_default_budget(request: &ProcessRequest) {
+        assert_eq!(
+            request.timeout,
+            super::DEFAULT_TIMEOUT,
+            "{} keeps the ordinary deadline",
+            request.operation
+        );
+        assert!(
+            !request
+                .args
+                .iter()
+                .any(|argument| argument.to_string_lossy().starts_with("http.lowSpeed")),
+            "{} has no stall guard",
+            request.operation
+        );
+    }
+
     impl GitProcessRunner for RecordingGitRunner {
         fn run<'a>(
             &'a self,
@@ -7439,13 +7814,8 @@ mod tests {
                 .map(OsString::from)
                 .collect::<Vec<_>>()
         );
-        assert_eq!(
-            requests[1].args,
-            ["push", "origin", ":topic"]
-                .into_iter()
-                .map(OsString::from)
-                .collect::<Vec<_>>()
-        );
+        assert_default_budget(&requests[0]);
+        assert_network_transfer(&requests[1], &["push", "origin", ":topic"]);
     }
 
     #[tokio::test]
@@ -7462,17 +7832,14 @@ mod tests {
             .expect("fetch succeeds");
 
         let request = &runner.requests()[0];
-        assert_eq!(
-            request.args,
-            [
+        assert_network_transfer(
+            request,
+            &[
                 "fetch",
                 "--prune",
                 "--recurse-submodules=on-demand",
-                "origin"
-            ]
-            .into_iter()
-            .map(OsString::from)
-            .collect::<Vec<_>>()
+                "origin",
+            ],
         );
         for (key, expected) in [
             ("GIT_TERMINAL_PROMPT", "0"),
@@ -7509,19 +7876,19 @@ mod tests {
             .expect("pull succeeds");
 
         assert_eq!(outputs.len(), 3);
-        assert_eq!(
-            runner.requests()[2].args,
-            [
+        let requests = runner.requests();
+        assert_default_budget(&requests[0]);
+        assert_default_budget(&requests[1]);
+        assert_network_transfer(
+            &requests[2],
+            &[
                 "-c",
                 "rebase.backend=merge",
                 "pull",
                 "--ff",
                 "--recurse-submodules",
-                "origin"
-            ]
-            .into_iter()
-            .map(OsString::from)
-            .collect::<Vec<_>>()
+                "origin",
+            ],
         );
     }
 
@@ -7562,27 +7929,21 @@ mod tests {
 
         let requests = runner.requests();
         let args = &requests[0].args;
-        assert_eq!(
-            args,
+        assert_network_transfer(
+            &requests[0],
             &[
                 "push",
                 "origin",
                 "topic:review/topic",
                 "--set-upstream",
-                "--force-with-lease"
-            ]
-            .into_iter()
-            .map(OsString::from)
-            .collect::<Vec<_>>()
+                "--force-with-lease",
+            ],
         );
         assert!(!args.iter().any(|argument| argument == "--force"));
-        assert_eq!(
-            requests[1].args,
-            ["push", "origin", "topic", "--tags", "--atomic"]
-                .into_iter()
-                .map(OsString::from)
-                .collect::<Vec<_>>(),
-            "pushing tags travels with the branch atomically"
+        // Pushing tags travels with the branch atomically.
+        assert_network_transfer(
+            &requests[1],
+            &["push", "origin", "topic", "--tags", "--atomic"],
         );
     }
 
@@ -8358,13 +8719,106 @@ mod tests {
         );
         let requests = runner.requests();
         assert_eq!(requests.len(), 2);
-        assert_eq!(
-            requests[1].args,
-            ["push", "--set-upstream", "--", "upstream", "feature/test"]
-                .into_iter()
-                .map(OsString::from)
-                .collect::<Vec<_>>()
+        assert_default_budget(&requests[0]);
+        // Publishing pushes this way and offers no Cancel, so the push stays bounded.
+        assert_bounded_transfer(
+            &requests[1],
+            &["push", "--set-upstream", "--", "upstream", "feature/test"],
         );
+    }
+
+    #[tokio::test]
+    async fn current_branch_pull_and_push_run_only_the_transfer_on_the_bounded_budget() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([
+                ("GitVcsDriver.currentRef".into(), process_output("main\n")),
+                (
+                    "GitVcsDriver.pullCurrentBranch.upstream".into(),
+                    process_output("origin/main\n"),
+                ),
+                (
+                    "GitVcsDriver.pullCurrentBranch.before".into(),
+                    process_output("1111111111111111111111111111111111111111\n"),
+                ),
+                ("GitVcsDriver.pullCurrentBranch".into(), process_output("")),
+                (
+                    "GitVcsDriver.pullCurrentBranch.after".into(),
+                    process_output("2222222222222222222222222222222222222222\n"),
+                ),
+                (
+                    "GitVcsDriver.pushCurrentBranch.upstream".into(),
+                    process_result(128, "", "fatal: no upstream configured"),
+                ),
+                ("GitVcsDriver.pushCurrentBranch".into(), process_output("")),
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+        let cancellation = CancellationToken::new();
+
+        repository
+            .pull_current_branch(Path::new("/repo"), &cancellation)
+            .await
+            .expect("pull succeeds");
+        repository
+            .push_current_branch(Path::new("/repo"), &cancellation)
+            .await
+            .expect("push succeeds");
+
+        let requests = runner.requests();
+        let mut transfers = 0;
+        for request in &requests {
+            match request.operation.as_str() {
+                "GitVcsDriver.pullCurrentBranch" => {
+                    transfers += 1;
+                    assert_bounded_transfer(request, &["pull", "--ff-only"]);
+                }
+                "GitVcsDriver.pushCurrentBranch" => {
+                    transfers += 1;
+                    assert_bounded_transfer(request, &["push", "--set-upstream", "origin", "main"]);
+                }
+                _ => assert_default_budget(request),
+            }
+        }
+        assert_eq!(transfers, 2);
+    }
+
+    #[test]
+    fn stalled_transfer_output_maps_to_the_stall_message() {
+        let error = super::git_error(
+            "GitVcsDriver.clone",
+            Path::new("/parent"),
+            9,
+            ProcessError::NonZeroExit {
+                operation: "GitVcsDriver.clone".to_owned(),
+                exit_code: 128,
+                stdout_length: 0,
+                stderr_length: 120,
+                stdout: "".into(),
+                stderr: "Cloning into 'repo'...\nerror: RPC failed; curl 28 Operation too slow. Less than 1000 bytes/sec transferred the last 60 seconds\nfatal: expected flush after ref listing\n".into(),
+            },
+        );
+
+        assert_eq!(
+            error.detail.as_ref(),
+            "The transfer stalled (under 1 KB/s for 60 seconds). Check the connection to the remote and try again."
+        );
+        assert_eq!(error.detail.as_ref(), super::NETWORK_TRANSFER_STALLED);
+        assert!(super::reports_stalled_transfer(&error.detail));
+        let other = super::git_error(
+            "GitVcsDriver.clone",
+            Path::new("/parent"),
+            9,
+            ProcessError::NonZeroExit {
+                operation: "GitVcsDriver.clone".to_owned(),
+                exit_code: 128,
+                stdout_length: 0,
+                stderr_length: 40,
+                stdout: "".into(),
+                stderr: "fatal: repository 'x' not found\n".into(),
+            },
+        );
+        assert_eq!(other.detail.as_ref(), "fatal: repository 'x' not found");
     }
 
     #[tokio::test]
@@ -9573,7 +10027,16 @@ fn git_error(
     }
 }
 
+/// Whether Git's output, or an error detail already mapped from it, reports that the
+/// HTTP stall guard stopped a network transfer.
+pub(crate) fn reports_stalled_transfer(text: &str) -> bool {
+    text.contains(CURL_LOW_SPEED_ABORT) || text.contains(NETWORK_TRANSFER_STALLED)
+}
+
 fn actionable_git_failure(stderr: &str, stdout: &str) -> String {
+    if reports_stalled_transfer(stderr) || reports_stalled_transfer(stdout) {
+        return NETWORK_TRANSFER_STALLED.to_owned();
+    }
     let output = if stderr.trim().is_empty() {
         stdout
     } else {
@@ -10569,6 +11032,852 @@ mod worktree_ownership_tests {
             !git(repo.path(), &["worktree", "list", "--porcelain"])
                 .replace('\\', "/")
                 .contains(&display_path(&path))
+        );
+    }
+}
+
+#[cfg(test)]
+mod clone_tests {
+    use std::{
+        ffi::OsString,
+        fs,
+        path::{Path, PathBuf},
+        process::Command,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    };
+
+    use tokio::{
+        io::AsyncReadExt,
+        net::{TcpListener, TcpStream},
+        sync::{Notify, Semaphore, mpsc},
+        time::{Instant, timeout},
+    };
+    use tokio_util::sync::CancellationToken;
+
+    use super::{
+        BoxGitProcessFuture, CLONE_OPERATION, DEFAULT_TIMEOUT, GitProcessRunner, GitRepository,
+        NETWORK_TRANSFER_CONFIG, NETWORK_TRANSFER_STALLED, ProcessError, ProcessRequest,
+        ProcessRunner, display_path,
+    };
+    use crate::test_support::TestSandbox;
+
+    const CLONE_FIXTURE_DEADLINE: Duration = Duration::from_secs(20);
+
+    /// Runs real Git. When the first clone is cancelled it keeps that clone's result until
+    /// the test releases it, standing in for a slow kill and reap: the cancelled clone's
+    /// folder then still exists, and its cleanup has not started.
+    struct HeldCancellationRunner {
+        armed: AtomicBool,
+        held: Notify,
+        release: Semaphore,
+        environment: Vec<(OsString, OsString)>,
+    }
+
+    impl HeldCancellationRunner {
+        fn new(environment: &[(&str, &str)]) -> Self {
+            Self {
+                armed: AtomicBool::new(true),
+                held: Notify::new(),
+                release: Semaphore::new(0),
+                environment: environment
+                    .iter()
+                    .map(|(key, value)| ((*key).into(), (*value).into()))
+                    .collect(),
+            }
+        }
+    }
+
+    impl GitProcessRunner for HeldCancellationRunner {
+        fn run<'a>(
+            &'a self,
+            mut request: ProcessRequest,
+            cancellation: &'a CancellationToken,
+        ) -> BoxGitProcessFuture<'a> {
+            request.env.extend(self.environment.iter().cloned());
+            let clone = request.operation == CLONE_OPERATION;
+            Box::pin(async move {
+                let result = ProcessRunner.run(request, cancellation).await;
+                if clone
+                    && matches!(result, Err(ProcessError::Cancelled { .. }))
+                    && self.armed.swap(false, Ordering::SeqCst)
+                {
+                    self.held.notify_one();
+                    if let Ok(permit) = self.release.acquire().await {
+                        permit.forget();
+                    }
+                }
+                result
+            })
+        }
+    }
+
+    /// Runs real Git with extra environment, optionally through a slow wrapper for `clone`.
+    struct FixtureGitRunner {
+        slow_clone: Option<PathBuf>,
+        environment: Vec<(OsString, OsString)>,
+        requests: Mutex<Vec<ProcessRequest>>,
+    }
+
+    impl FixtureGitRunner {
+        fn new(environment: &[(&str, &str)]) -> Self {
+            Self {
+                slow_clone: None,
+                environment: environment
+                    .iter()
+                    .map(|(key, value)| ((*key).into(), (*value).into()))
+                    .collect(),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_slow_clone(mut self, script: PathBuf) -> Self {
+            self.slow_clone = Some(script);
+            self
+        }
+
+        fn clone_request(&self) -> ProcessRequest {
+            self.requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .find(|request| request.operation == super::CLONE_OPERATION)
+                .cloned()
+                .expect("a clone request was issued")
+        }
+    }
+
+    impl GitProcessRunner for FixtureGitRunner {
+        fn run<'a>(
+            &'a self,
+            mut request: ProcessRequest,
+            cancellation: &'a CancellationToken,
+        ) -> BoxGitProcessFuture<'a> {
+            if let Some(script) = self.slow_clone.as_ref()
+                && request.args.iter().any(|argument| argument == "clone")
+            {
+                request.command = script.clone();
+            }
+            request.env.extend(self.environment.iter().cloned());
+            self.requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(request.clone());
+            Box::pin(async move { ProcessRunner.run(request, cancellation).await })
+        }
+    }
+
+    /// Writes part of a clone into the destination, then fails the way the runner reports
+    /// a timeout or a cancellation after it stopped Git.
+    struct PartialCloneRunner {
+        failure: fn(String) -> ProcessError,
+        requests: Mutex<Vec<ProcessRequest>>,
+    }
+
+    impl GitProcessRunner for PartialCloneRunner {
+        fn run<'a>(
+            &'a self,
+            request: ProcessRequest,
+            _cancellation: &'a CancellationToken,
+        ) -> BoxGitProcessFuture<'a> {
+            let destination = request
+                .cwd
+                .join(request.args.last().expect("clone destination"));
+            fs::create_dir_all(destination.join(".git/objects/pack")).expect("partial clone");
+            fs::write(destination.join(".git/HEAD"), "ref: refs/heads/.invalid\n")
+                .expect("placeholder HEAD");
+            let pack = destination.join(".git/objects/pack/tmp_pack_partial");
+            fs::write(&pack, b"partial pack").expect("partial pack");
+            // Git creates its temporary pack read-only, as in the field snapshot.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+
+                fs::set_permissions(&pack, fs::Permissions::from_mode(0o444))
+                    .expect("read-only partial pack");
+            }
+            let error = (self.failure)(request.operation.clone());
+            self.requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(request);
+            Box::pin(async move { Err(error) })
+        }
+    }
+
+    /// Accepts HTTP connections and never answers them, like a remote whose link died.
+    async fn stalling_remote() -> (String, mpsc::UnboundedReceiver<TcpStream>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("stalling remote listener");
+        let url = format!(
+            "http://{}/stalled.git",
+            listener.local_addr().expect("stalling remote address")
+        );
+        let (connections, accepted) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                if connections.send(stream).is_err() {
+                    break;
+                }
+            }
+        });
+        (url, accepted)
+    }
+
+    /// Returns once the peer closed the connection; Git holds it until its process exits.
+    async fn wait_for_close(stream: &mut TcpStream) {
+        let mut buffer = [0_u8; 4096];
+        while let Ok(read) = stream.read(&mut buffer).await {
+            if read == 0 {
+                return;
+            }
+        }
+    }
+
+    async fn wait_until_removed(path: &Path) {
+        let deadline = Instant::now() + CLONE_FIXTURE_DEADLINE;
+        while path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "{} was not removed",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    fn no_proxy() -> [(&'static str, &'static str); 2] {
+        [("no_proxy", "*"), ("NO_PROXY", "*")]
+    }
+
+    fn git(cwd: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "Clone Test")
+            .env("GIT_AUTHOR_EMAIL", "clone@example.test")
+            .env("GIT_COMMITTER_NAME", "Clone Test")
+            .env("GIT_COMMITTER_EMAIL", "clone@example.test")
+            .output()
+            .expect("git fixture starts");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn file_url(path: &Path) -> String {
+        let normalized = path.to_string_lossy().replace('\\', "/");
+        format!("file:///{}", normalized.trim_start_matches('/'))
+    }
+
+    /// A repository with one commit, cloneable through a `file://` URL.
+    fn source_repository(sandbox: &TestSandbox) -> String {
+        let source = sandbox.path("source");
+        fs::create_dir(&source).expect("source repository");
+        git(&source, &["init", "-q", "-b", "main"]);
+        fs::write(source.join("tracked.txt"), "tracked\n").expect("tracked file");
+        git(&source, &["add", "tracked.txt"]);
+        git(
+            &source,
+            &[
+                "-c",
+                "commit.gpgSign=false",
+                "commit",
+                "-q",
+                "-m",
+                "initial",
+            ],
+        );
+        file_url(&source)
+    }
+
+    fn clone_parent(sandbox: &TestSandbox) -> PathBuf {
+        let parent = sandbox.path("clones");
+        fs::create_dir(&parent).expect("clone parent");
+        parent
+    }
+
+    fn network_args(args: &[&str]) -> Vec<OsString> {
+        NETWORK_TRANSFER_CONFIG
+            .iter()
+            .chain(args)
+            .map(OsString::from)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_clone_transfer_outliving_the_ordinary_deadline_succeeds() {
+        let sandbox = TestSandbox::new("git-clone-slow-transfer");
+        let url = source_repository(&sandbox);
+        let parent = clone_parent(&sandbox);
+        // The transfer takes about a second while the ordinary deadline is shortened to
+        // 250 ms, standing in for a large clone against the 30-second read deadline.
+        let slow_git = sandbox.executable_script(
+            "slow-git",
+            "sleep 1\nexec git \"$@\"",
+            "@echo off\r\nping -n 2 127.0.0.1 >nul\r\ngit %*\r\nexit /b %ERRORLEVEL%",
+        );
+        let runner = Arc::new(FixtureGitRunner::new(&[]).with_slow_clone(slow_git));
+        let repository = GitRepository::with_runner_for_test(runner.clone())
+            .with_command_timeout_for_test(Duration::from_millis(250));
+
+        let ordinary = repository
+            .run(
+                "GitVcsDriver.clone.control",
+                &parent,
+                &["clone".into(), "--".into(), url.clone(), "control".into()],
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("the ordinary deadline stops the slow transfer");
+        assert_eq!(ordinary.detail.as_ref(), "Git command timed out.");
+
+        let cloned = repository
+            .clone_repository(&url, &parent, Some("slow"), &CancellationToken::new())
+            .await
+            .expect("the network-transfer budget lets a moving transfer finish");
+
+        assert_eq!(cloned, parent.join("slow"));
+        assert_eq!(
+            fs::read_to_string(cloned.join("tracked.txt"))
+                .expect("cloned file")
+                .replace("\r\n", "\n"),
+            "tracked\n"
+        );
+        let request = runner.clone_request();
+        assert_eq!(request.args[..4], network_args(&[])[..]);
+        assert_eq!(request.timeout, crate::git::NETWORK_TRANSFER_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn a_stalled_clone_fails_with_the_stall_message_and_removes_its_destination() {
+        let sandbox = TestSandbox::new("git-clone-stalled");
+        let parent = clone_parent(&sandbox);
+        let (url, _connections) = stalling_remote().await;
+        // Git's environment override shortens the 60-second stall window for the fixture;
+        // the production command line still carries the 60-second setting asserted below.
+        let mut environment = no_proxy().to_vec();
+        environment.push(("GIT_HTTP_LOW_SPEED_TIME", "1"));
+        let runner = Arc::new(FixtureGitRunner::new(&environment));
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+
+        let error = timeout(
+            CLONE_FIXTURE_DEADLINE,
+            repository.clone_repository(&url, &parent, Some("stalled"), &CancellationToken::new()),
+        )
+        .await
+        .expect("the stall guard ends the transfer")
+        .expect_err("a stalled transfer fails");
+
+        assert_eq!(error.detail.as_ref(), NETWORK_TRANSFER_STALLED);
+        assert!(!parent.join("stalled").exists());
+        assert!(parent.is_dir());
+        let request = runner.clone_request();
+        assert_eq!(
+            request.args,
+            network_args(&["clone", "--", &url, "stalled"])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_clone_stops_git_and_removes_its_destination() {
+        let sandbox = TestSandbox::new("git-clone-cancelled");
+        let parent = clone_parent(&sandbox);
+        let destination = parent.join("cancelled");
+        let (url, mut connections) = stalling_remote().await;
+        let repository =
+            GitRepository::with_runner_for_test(Arc::new(FixtureGitRunner::new(&no_proxy())));
+        let cancellation = CancellationToken::new();
+
+        let clone = repository.clone_repository(&url, &parent, Some("cancelled"), &cancellation);
+        tokio::pin!(clone);
+        let mut connection = tokio::select! {
+            result = &mut clone => panic!("a stalled clone cannot finish: {result:?}"),
+            connection = connections.recv() => connection.expect("Git connects to the remote"),
+        };
+        assert!(destination.is_dir(), "the clone created its destination");
+        cancellation.cancel();
+        let error = timeout(CLONE_FIXTURE_DEADLINE, clone)
+            .await
+            .expect("cancellation ends the clone")
+            .expect_err("a cancelled clone fails");
+
+        assert_eq!(error.detail.as_ref(), "Git command was interrupted.");
+        assert!(!destination.exists(), "cleanup finished before the result");
+        timeout(CLONE_FIXTURE_DEADLINE, wait_for_close(&mut connection))
+            .await
+            .expect("the Git process holding the connection was stopped");
+    }
+
+    #[tokio::test]
+    async fn dropping_a_clone_still_stops_git_and_removes_its_destination() {
+        let sandbox = TestSandbox::new("git-clone-dropped");
+        let parent = clone_parent(&sandbox);
+        let destination = parent.join("dropped");
+        let (url, mut connections) = stalling_remote().await;
+        let repository =
+            GitRepository::with_runner_for_test(Arc::new(FixtureGitRunner::new(&no_proxy())));
+        let never_cancelled = CancellationToken::new();
+
+        let mut clone =
+            Box::pin(repository.clone_repository(&url, &parent, Some("dropped"), &never_cancelled));
+        let mut connection = tokio::select! {
+            result = &mut clone => panic!("a stalled clone cannot finish: {result:?}"),
+            connection = connections.recv() => connection.expect("Git connects to the remote"),
+        };
+        assert!(destination.is_dir(), "the clone created its destination");
+        // An RPC interrupt drops the handler future instead of awaiting it.
+        drop(clone);
+
+        timeout(CLONE_FIXTURE_DEADLINE, wait_for_close(&mut connection))
+            .await
+            .expect("the Git process holding the connection was stopped");
+        wait_until_removed(&destination).await;
+        assert!(parent.is_dir());
+    }
+
+    #[tokio::test]
+    async fn a_retry_right_after_cancel_waits_for_the_cancelled_clone_to_clean_up() {
+        let sandbox = TestSandbox::new("git-clone-retry-after-cancel");
+        let parent = clone_parent(&sandbox);
+        let destination = parent.join("retried");
+        let (url, mut connections) = stalling_remote().await;
+        let runner = Arc::new(HeldCancellationRunner::new(&no_proxy()));
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+
+        let first_cancellation = CancellationToken::new();
+        let mut first = Box::pin(repository.clone_repository(
+            &url,
+            &parent,
+            Some("retried"),
+            &first_cancellation,
+        ));
+        let _first_connection = tokio::select! {
+            result = &mut first => panic!("a stalled clone cannot finish: {result:?}"),
+            connection = connections.recv() => connection.expect("the first clone connects"),
+        };
+        // Cancel the way an RPC interrupt does: cancel and drop the request.
+        first_cancellation.cancel();
+        drop(first);
+        timeout(CLONE_FIXTURE_DEADLINE, runner.held.notified())
+            .await
+            .expect("the cancelled clone's Git exited");
+        assert!(
+            destination.join(".git").is_dir(),
+            "the cancelled clone's folder is still there"
+        );
+        fs::write(destination.join("cancelled-clone-leftover"), "leftover\n")
+            .expect("leftover marker");
+
+        // Retry the same clone immediately.
+        let second_cancellation = CancellationToken::new();
+        let mut second = Box::pin(repository.clone_repository(
+            &url,
+            &parent,
+            Some("retried"),
+            &second_cancellation,
+        ));
+        if let Ok(result) = timeout(Duration::from_millis(200), &mut second).await {
+            panic!(
+                "the retry finished while the cancelled clone was still cleaning up: {result:?}"
+            );
+        }
+        runner.release.add_permits(1);
+        let _second_connection = tokio::select! {
+            result = &mut second => panic!("the retry must reach its own transfer: {result:?}"),
+            connection = connections.recv() => connection.expect("the retry connects"),
+        };
+        assert!(destination.is_dir(), "the retry reserved the folder again");
+        assert!(
+            !destination.join("cancelled-clone-leftover").exists(),
+            "the retry reserved only after the cancelled clone removed its folder"
+        );
+
+        second_cancellation.cancel();
+        let error = timeout(CLONE_FIXTURE_DEADLINE, second)
+            .await
+            .expect("cancellation ends the retry")
+            .expect_err("the retry was cancelled");
+        assert_eq!(error.detail.as_ref(), "Git command was interrupted.");
+        assert!(!error.detail.contains("incomplete clone"));
+        assert!(!destination.exists());
+    }
+
+    #[tokio::test]
+    async fn a_waiting_retry_honours_its_own_cancellation_and_leaves_the_folder() {
+        let sandbox = TestSandbox::new("git-clone-waiting-retry-cancelled");
+        let parent = clone_parent(&sandbox);
+        let destination = parent.join("busy");
+        let (url, mut connections) = stalling_remote().await;
+        let repository =
+            GitRepository::with_runner_for_test(Arc::new(FixtureGitRunner::new(&no_proxy())));
+
+        let first_cancellation = CancellationToken::new();
+        let mut first =
+            Box::pin(repository.clone_repository(&url, &parent, Some("busy"), &first_cancellation));
+        let _first_connection = tokio::select! {
+            result = &mut first => panic!("a stalled clone cannot finish: {result:?}"),
+            connection = connections.recv() => connection.expect("the first clone connects"),
+        };
+
+        let second_cancellation = CancellationToken::new();
+        let mut second = Box::pin(repository.clone_repository(
+            &url,
+            &parent,
+            Some("busy"),
+            &second_cancellation,
+        ));
+        tokio::select! {
+            result = &mut first => panic!("a stalled clone cannot finish: {result:?}"),
+            result = &mut second => panic!("the retry must wait for the running clone: {result:?}"),
+            () = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+        second_cancellation.cancel();
+        let waiting = tokio::select! {
+            result = &mut first => panic!("a stalled clone cannot finish: {result:?}"),
+            result = timeout(CLONE_FIXTURE_DEADLINE, &mut second) => {
+                result.expect("cancellation ends the wait")
+            }
+        };
+        assert_eq!(
+            waiting
+                .expect_err("the waiting retry was cancelled")
+                .detail
+                .as_ref(),
+            "The clone was cancelled before it started."
+        );
+        assert!(
+            destination.join(".git").is_dir(),
+            "the running clone keeps its folder"
+        );
+
+        first_cancellation.cancel();
+        timeout(CLONE_FIXTURE_DEADLINE, first)
+            .await
+            .expect("cancellation ends the first clone")
+            .expect_err("the first clone was cancelled");
+        assert!(!destination.exists());
+    }
+
+    #[tokio::test]
+    async fn clones_into_different_folders_do_not_wait_for_each_other() {
+        let sandbox = TestSandbox::new("git-clone-independent-destinations");
+        let url = source_repository(&sandbox);
+        let parent = clone_parent(&sandbox);
+        let (stalled_url, mut connections) = stalling_remote().await;
+        let repository =
+            GitRepository::with_runner_for_test(Arc::new(FixtureGitRunner::new(&no_proxy())));
+
+        let stalled_cancellation = CancellationToken::new();
+        let mut stalled = Box::pin(repository.clone_repository(
+            &stalled_url,
+            &parent,
+            Some("stalled"),
+            &stalled_cancellation,
+        ));
+        let _connection = tokio::select! {
+            result = &mut stalled => panic!("a stalled clone cannot finish: {result:?}"),
+            connection = connections.recv() => connection.expect("the stalled clone connects"),
+        };
+
+        let other_cancellation = CancellationToken::new();
+        let cloned = tokio::select! {
+            result = &mut stalled => panic!("a stalled clone cannot finish: {result:?}"),
+            result = timeout(
+                CLONE_FIXTURE_DEADLINE,
+                repository.clone_repository(&url, &parent, Some("other"), &other_cancellation),
+            ) => result.expect("another folder clones while the first is running"),
+        };
+        assert_eq!(
+            cloned.expect("the other clone succeeds"),
+            parent.join("other")
+        );
+
+        stalled_cancellation.cancel();
+        timeout(CLONE_FIXTURE_DEADLINE, stalled)
+            .await
+            .expect("cancellation ends the stalled clone")
+            .expect_err("the stalled clone was cancelled");
+    }
+
+    #[tokio::test]
+    async fn a_finished_clone_leaves_no_destination_entry_behind() {
+        let sandbox = TestSandbox::new("git-clone-destination-registry");
+        let destination = sandbox.path("clones/registered");
+        let registry = super::CloneDestinationRegistry::global();
+
+        let first = registry
+            .acquire(&destination, &CancellationToken::new())
+            .await
+            .expect("a free destination is acquired at once");
+        assert!(registry.tracks(&destination));
+        // Lexical aliases of the reservation path share the entry.
+        let alias = sandbox.path("clones/./other/../registered");
+        let waiting_cancellation = CancellationToken::new();
+        let mut waiting = Box::pin(registry.acquire(&alias, &waiting_cancellation));
+        assert!(
+            timeout(Duration::from_millis(50), &mut waiting)
+                .await
+                .is_err(),
+            "an alias of a busy destination waits"
+        );
+        waiting_cancellation.cancel();
+        assert!(waiting.await.is_none(), "a cancelled wait gives up");
+        assert!(registry.tracks(&destination), "the holder keeps the entry");
+
+        drop(first);
+        assert!(
+            !registry.tracks(&destination),
+            "the last holder removes the entry"
+        );
+        let again = registry
+            .acquire(&destination, &CancellationToken::new())
+            .await
+            .expect("the destination is free again");
+        drop(again);
+        assert!(!registry.tracks(&destination));
+    }
+
+    #[tokio::test]
+    async fn timed_out_and_cancelled_transfers_remove_the_partial_clone() {
+        fn timed_out(operation: String) -> ProcessError {
+            ProcessError::Timeout {
+                operation,
+                timeout_ms: 1,
+            }
+        }
+        fn cancelled(operation: String) -> ProcessError {
+            ProcessError::Cancelled { operation }
+        }
+
+        for (failure, detail) in [
+            (
+                timed_out as fn(String) -> ProcessError,
+                "Git command timed out.",
+            ),
+            (cancelled, "Git command was interrupted."),
+        ] {
+            let sandbox = TestSandbox::new("git-clone-partial");
+            let parent = clone_parent(&sandbox);
+            let runner = Arc::new(PartialCloneRunner {
+                failure,
+                requests: Mutex::new(Vec::new()),
+            });
+            let repository = GitRepository::with_runner_for_test(runner.clone());
+            let url = "https://example.test/repository.git";
+
+            let error = repository
+                .clone_repository(url, &parent, Some("partial"), &CancellationToken::new())
+                .await
+                .expect_err("the transfer failed");
+
+            assert_eq!(error.detail.as_ref(), detail);
+            assert!(!parent.join("partial").exists());
+            let requests = runner
+                .requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(
+                requests[0].args,
+                network_args(&["clone", "--", url, "partial"])
+            );
+            assert_eq!(requests[0].timeout, crate::git::NETWORK_TRANSFER_TIMEOUT);
+            assert_ne!(requests[0].timeout, DEFAULT_TIMEOUT);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_clone_removes_only_a_destination_it_created() {
+        let sandbox = TestSandbox::new("git-clone-failed");
+        let parent = clone_parent(&sandbox);
+        let missing = file_url(&sandbox.path("missing.git"));
+        let repository = GitRepository::default();
+
+        let created = repository
+            .clone_repository(
+                &missing,
+                &parent,
+                Some("created"),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("a missing remote cannot be cloned");
+        assert!(!created.detail.is_empty());
+        assert!(!parent.join("created").exists());
+
+        let existing = parent.join("existing");
+        fs::create_dir(&existing).expect("pre-existing folder");
+        fs::write(existing.join("notes.txt"), "keep me\n").expect("user file");
+        let rejected = repository
+            .clone_repository(
+                &missing,
+                &parent,
+                Some("existing"),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("an existing folder is never cloned into");
+        assert_eq!(
+            rejected.detail.as_ref(),
+            format!(
+                "A folder named existing already exists at {} and is not a Git repository. Remove it or choose another parent folder.",
+                display_path(&parent)
+            )
+        );
+        assert_eq!(
+            fs::read_to_string(existing.join("notes.txt")).expect("user file survives"),
+            "keep me\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn clone_destination_errors_name_the_folder_and_the_next_step() {
+        let sandbox = TestSandbox::new("git-clone-destination-errors");
+        let parent = clone_parent(&sandbox);
+        let url = "https://example.test/repository.git";
+        let repository = GitRepository::default();
+
+        fs::write(parent.join("taken"), "a file\n").expect("file in the way");
+        let file = repository
+            .clone_repository(url, &parent, Some("taken"), &CancellationToken::new())
+            .await
+            .expect_err("a file is never replaced");
+        assert_eq!(
+            file.detail.as_ref(),
+            format!(
+                "A file named taken already exists at {}. Remove it or choose another parent folder.",
+                display_path(&parent)
+            )
+        );
+        assert_eq!(
+            fs::read_to_string(parent.join("taken")).expect("the file survives"),
+            "a file\n"
+        );
+
+        let outer = parent.join("outer");
+        fs::create_dir(&outer).expect("outer repository");
+        git(&outer, &["init", "-q", "-b", "main"]);
+        fs::create_dir(outer.join("inner")).expect("folder inside the repository");
+        let nested = repository
+            .clone_repository(url, &outer, Some("inner"), &CancellationToken::new())
+            .await
+            .expect_err("a folder inside another repository is not reused");
+        assert_eq!(
+            nested.detail.as_ref(),
+            format!(
+                "A folder named inner already exists at {} inside another Git repository. Choose another parent folder.",
+                display_path(&outer)
+            )
+        );
+        assert!(outer.join("inner").is_dir());
+
+        // A parent path that runs through a file cannot hold the new folder.
+        let blocked_parent = parent.join("taken");
+        let blocked = repository
+            .clone_repository(
+                url,
+                &blocked_parent,
+                Some("repo"),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("the destination cannot be created");
+        let prefix = format!(
+            "Could not create {} (",
+            display_path(&blocked_parent.join("repo"))
+        );
+        assert!(
+            blocked.detail.starts_with(&prefix)
+                && blocked.detail.ends_with(
+                    "). Check that the parent folder exists and is writable, or choose another folder."
+                ),
+            "unexpected creation error: {}",
+            blocked.detail
+        );
+
+        // An existing repository is reused only when its origin is the requested URL.
+        let no_origin = parent.join("no-origin");
+        fs::create_dir(&no_origin).expect("repository without origin");
+        git(&no_origin, &["init", "-q", "-b", "main"]);
+        let missing = repository
+            .clone_repository(url, &parent, Some("no-origin"), &CancellationToken::new())
+            .await
+            .expect_err("a repository without origin is not reused");
+        assert_eq!(
+            missing.detail.as_ref(),
+            format!(
+                "A Git repository named no-origin already exists at {} without an origin remote. Choose another parent folder, or add that folder as a project instead.",
+                display_path(&parent)
+            )
+        );
+        git(
+            &no_origin,
+            &["remote", "add", "origin", "https://example.test/other.git"],
+        );
+        let other = repository
+            .clone_repository(url, &parent, Some("no-origin"), &CancellationToken::new())
+            .await
+            .expect_err("a repository with another origin is not reused");
+        assert_eq!(
+            other.detail.as_ref(),
+            format!(
+                "A Git repository named no-origin already exists at {} with a different origin. Choose another parent folder.",
+                display_path(&parent)
+            )
+        );
+        assert!(no_origin.join(".git").is_dir());
+    }
+
+    #[tokio::test]
+    async fn reuse_rejects_a_placeholder_or_commitless_clone_and_keeps_it() {
+        let sandbox = TestSandbox::new("git-clone-incomplete");
+        let parent = clone_parent(&sandbox);
+        let url = "https://example.test/repository.git";
+        let placeholder = parent.join("placeholder");
+        fs::create_dir(&placeholder).expect("placeholder clone");
+        git(&placeholder, &["init", "-q", "-b", "main"]);
+        git(&placeholder, &["config", "remote.origin.url", url]);
+        fs::write(placeholder.join(".git/HEAD"), "ref: refs/heads/.invalid\n")
+            .expect("placeholder HEAD");
+        fs::create_dir_all(placeholder.join(".git/objects/pack")).expect("pack directory");
+        fs::write(
+            placeholder.join(".git/objects/pack/tmp_pack_partial"),
+            b"partial",
+        )
+        .expect("partial pack");
+        let commitless = parent.join("commitless");
+        fs::create_dir(&commitless).expect("commitless clone");
+        git(&commitless, &["init", "-q", "-b", "main"]);
+        git(&commitless, &["config", "remote.origin.url", url]);
+        let repository = GitRepository::default();
+
+        for (name, destination) in [("placeholder", &placeholder), ("commitless", &commitless)] {
+            let error = repository
+                .clone_repository(url, &parent, Some(name), &CancellationToken::new())
+                .await
+                .expect_err("an incomplete clone is not adopted");
+            assert_eq!(
+                error.detail.as_ref(),
+                format!(
+                    "An incomplete clone exists at {}. Remove it or choose another folder.",
+                    display_path(destination)
+                )
+            );
+            assert!(destination.join(".git").is_dir(), "{name} is kept");
+        }
+        assert!(
+            placeholder
+                .join(".git/objects/pack/tmp_pack_partial")
+                .exists()
         );
     }
 }

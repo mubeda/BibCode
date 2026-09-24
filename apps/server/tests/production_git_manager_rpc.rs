@@ -2532,6 +2532,46 @@ async fn concurrent_operation_is_rejected_and_cancellation_terminates_the_child(
     assert!(stopped.is_ok(), "cancelled Git child remained alive");
 }
 
+#[tokio::test]
+async fn refs_render_an_unborn_or_placeholder_head_as_a_repository_without_commits() {
+    let fixture = Fixture::new().await;
+    let unborn = fixture._root.path().join("unborn");
+    fs::create_dir(&unborn).expect("unborn repository directory");
+    git(&unborn, &["init", "-q", "-b", "main"]);
+    // `git clone` writes this placeholder before the remote HEAD is known; an
+    // interrupted clone leaves it behind with no refs.
+    let placeholder = fixture._root.path().join("placeholder");
+    fs::create_dir(&placeholder).expect("placeholder repository directory");
+    git(&placeholder, &["init", "-q", "-b", "main"]);
+    fs::write(placeholder.join(".git/HEAD"), "ref: refs/heads/.invalid\n")
+        .expect("placeholder HEAD");
+    git(
+        &placeholder,
+        &["config", "remote.origin.url", path(&fixture.remote_path)],
+    );
+
+    let unborn_refs = fixture
+        .read("901", "gitManager.getRefs", json!({ "cwd": unborn }))
+        .await
+        .expect("an unborn branch has no commits yet");
+    assert_eq!(unborn_refs["headRef"], "main");
+    assert_eq!(unborn_refs["detachedSha"], Value::Null);
+    assert_eq!(unborn_refs["localBranches"], json!([]));
+    assert_eq!(unborn_refs["worktrees"][0]["isDetached"], false);
+
+    let placeholder_refs = fixture
+        .read("902", "gitManager.getRefs", json!({ "cwd": placeholder }))
+        .await
+        .expect("a placeholder HEAD has no commits yet");
+    assert_eq!(placeholder_refs["headRef"], Value::Null);
+    assert_eq!(placeholder_refs["detachedSha"], Value::Null);
+    assert_eq!(placeholder_refs["localBranches"], json!([]));
+    assert_eq!(placeholder_refs["remoteBranches"], json!([]));
+    assert_eq!(placeholder_refs["remotes"], json!(["origin"]));
+    assert_eq!(placeholder_refs["worktrees"][0]["branch"], Value::Null);
+    assert_eq!(placeholder_refs["worktrees"][0]["isDetached"], false);
+}
+
 #[cfg(unix)]
 fn operation_request(id: &str, payload: Value) -> RpcRequest {
     rpc_request(id, "gitManager.runOperation", payload)

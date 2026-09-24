@@ -1069,6 +1069,34 @@ packaged application:
 
 Do not run destructive worktree scenarios against a user repository.
 
+## Clone from URL network scenario
+
+Create a disposable bare repository large enough that a clone at about
+600 KB/s takes well over 30 seconds (for example 20 MB or more of
+incompressible files). Serve it over smart HTTP (`git http-backend` behind a
+local HTTP server) in two modes: throttled to about 600 KB/s, and one that stops
+sending after a few megabytes while keeping the connection open. Clone through
+**Add Project → Clone from URL** into disposable parent folders:
+
+1. Throttled clone: the form stays visible with **Cloning…** and **Cancel
+   clone**; the clone completes after more than 30 seconds; the dialog closes
+   only once the project appears; the new checkout's `HEAD` is a real branch.
+2. Cancel during a throttled clone: the form returns to an editable state with
+   "Clone cancelled.", the destination folder the clone created disappears,
+   and pressing **Clone** again at once starts a new clone instead of reporting
+   an incomplete clone.
+3. Stalling server: the clone fails after about 60 seconds with "The
+   transfer stalled…", shown in the form, and its destination folder is
+   removed.
+4. Pre-existing half clone (a folder with `git init`, the same `origin`, and
+   `HEAD` set to `ref: refs/heads/.invalid`): the clone is refused with "An
+   incomplete clone exists at <path>. Remove it or choose another folder." and
+   the folder is kept. Opening that repository in the Git Manager shows **No
+   commits yet** and offers Fetch.
+
+Record each duration and the exact messages. SSH remotes have no stall guard;
+record SSH coverage separately if tested.
+
 ## Git Manager validation scenario
 
 Run this scenario only against the exact packaged application and disposable

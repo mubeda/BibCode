@@ -38,6 +38,7 @@ pub use repository::{
     BoxWorktreeBaseDirectoryFuture, GitManagerCommitOutcome, GitManagerHeadCommit, GitRepository,
     WorktreeBaseDirectoryProvider,
 };
+pub(crate) use repository::{NETWORK_TRANSFER_STALLED, reports_stalled_transfer};
 #[allow(unused_imports)]
 pub(crate) use repository::{StatusObservation, validate_pathspecs};
 pub use status_owner::StatusMutationGuard;
@@ -62,3 +63,17 @@ pub use worktree::{
 /// A started write must retain its lock and owner throughout this window.
 pub(crate) const CHECKOUT_WRITE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Safety bound for network transfers the user can cancel: clone and the Git Manager's
+/// fetch, pull, push, remote-branch delete and tag push. A slow transfer that keeps moving
+/// may take hours; Git's HTTP low-speed guard stops a stalled one, and Cancel stops any of
+/// them. This bound only ends a runaway process.
+pub(crate) const NETWORK_TRANSFER_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Bound for network transfers no user can cancel: the background automatic fetch and the
+/// pull, stacked-action push and publish push, which have no Cancel. SSH has no stall
+/// detection, so a dead link must not hold them for hours; a timed-out automatic fetch backs
+/// off and retries on a later interval.
+pub(crate) const BOUNDED_TRANSFER_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10 * 60);

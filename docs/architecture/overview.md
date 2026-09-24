@@ -148,6 +148,28 @@ flowchart TB
   `vcs.refreshStatus` on a separate latest-per-environment/worktree lane, so
   focus, visible-document, menu-open, and post-action freshness cannot queue a
   mutation behind an active read.
+
+  The Git driver's clone, fetch, pull, and push carry Git's HTTP stall guard
+  (`-c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60`); a stall is reported
+  as "The transfer stalled…" (Git Manager failure code `network-stalled`).
+  Transfers a user can cancel (clone, and the Git Manager operation stream's
+  fetch, pull, push, remote-branch deletion, and tag push) run on the
+  network-transfer variant with a 24-hour safety bound. Transfers nobody can
+  cancel run on the bounded variant, capped at 10 minutes: automatic fetch,
+  `vcs.pull`, and the stacked-action and publish pushes, wherever they start
+  (chat header, Sidebar Update, Source Control panel, or the Git Manager's
+  Create PR dialog). SSH transports have no stall guard, so a dead SSH link ends
+  only by cancellation, those bounds, or the connection's own keepalive
+  settings. The orchestration bootstrap fetch and the Pull Requests checkout
+  fetch run outside the driver with their own budgets and no stall guard. Clone
+  reserves its
+  destination before Git runs, and an owned task removes only a destination
+  that clone created after a failure, timeout, stall, or cancellation
+  (including an interrupted RPC); a new clone into a destination still being
+  cleaned up waits for that cleanup. Reusing an existing destination requires a
+  `HEAD` that resolves to a commit; otherwise the error names the incomplete
+  clone and asks the user to remove it or choose another folder.
+
   Shared observations never bypass per-caller anchor validation, and final
   view/repository ownership release is atomic against concurrent attachment. A
   scan leader moves the repository single-flight guard into repository-owned
