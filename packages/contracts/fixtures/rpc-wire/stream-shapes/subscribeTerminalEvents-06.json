@@ -18,7 +18,14 @@
         "exitSignal": null,
         "consoleTheme": "light",
         "label": "::kL.6",
-        "updatedAt": "@Kv2JM/W!"
+        "updatedAt": "@Kv2JM/W!",
+        "size": {
+          "cols": 83,
+          "rows": 9,
+          "sizeClaim": "&7o"
+        },
+        "oscColorResponderActive": true,
+        "firstAttachmentGrant": true
       }
     }
   ]

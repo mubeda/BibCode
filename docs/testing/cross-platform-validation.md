@@ -115,6 +115,73 @@ server without `terminalOrderedInput` to prove the negotiated legacy path.
 Record network round-trip, client queue, and paint measurements separately;
 an improved simulated queue time is not proof of an improved live network.
 
+### Terminal size and reply ownership
+
+When changing terminal attachment, sizing, or query replies, also run:
+
+```sh
+vp test run packages/contracts/src/terminal.test.ts packages/contracts/src/environment.test.ts packages/contracts/src/rpcRustParity.test.ts packages/contracts/scripts/export-rust-rpc-fixtures.test.ts
+vp test run packages/client-runtime/src/state/terminalTranscriptRuntime.test.ts packages/client-runtime/src/state/terminalAttachAdapter.test.ts
+vp test run apps/web/src/components/ThreadTerminalPanel apps/web/src/components/terminalSizePolicy.test.ts apps/web/src/components/terminalSizing.test.ts apps/web/src/components/terminalReplyGuard.test.ts apps/web/src/components/terminalOutputSink.test.ts apps/web/src/components/ChatView.hooks.test.tsx apps/web/src/centerTerminalActions.test.ts
+cargo test -p bibcode-server --lib terminal -j 2
+cargo test -p bibcode-server --test production_server_terminal_rpc -j 2
+```
+
+Open the same disposable terminal in two windows with different sizes, including
+a desktop host and remote browser when available. Use tmux and a supported
+provider TUI (Claude Code for the original attach regression). The first attach
+owns an unclaimed terminal even without document focus. On Windows, verify that
+live startup cursor-position/device queries (for example from PowerShell) are
+answered immediately, before any resize round trip. Include DSR/DA in startup
+history: a new PTY with no previously attached windows gets one history reply
+pass. Later/concurrent windows and cached remounts must not answer it again.
+Restart with windows still attached: startup queries are answered live, and an
+additional unfocused window must neither resend the replies nor take ownership.
+Restart without attached windows: one new history reply pass is allowed.
+Reopen an exited terminal (for example by rerunning a script) while a window is
+still attached: the next newly attached window answers the startup queries
+once, and later windows do not answer them again.
+
+A lone window and an equal-size mirror must show no size notice. A
+different-size mirror explains that it is **Sized for another window** and
+offers **Fit to this window**. Dismiss the notice with its labeled button using
+pointer and keyboard. It must remain hidden through layout changes, unchanged
+size events, hide/show, tab visibility changes, and panel remounts while
+size/owner remain the same. A changed applied size/owner makes it eligible to
+reappear. Closing the terminal and creating a new one must not inherit its
+dismissal.
+
+Resize the mirror's container: it must not resize the program. Focus, click, or
+type in a mirror, including an equal-size mirror, to transfer ownership. After
+a click or keypress, the notice must stay hidden without flashing back while
+the terminal catches up. Try **Fit to this window** on an exited terminal,
+then reopen or restart it: the window must remain usable, with the notice and
+fit action available when another window owns a different size.
+Close or disconnect the owner: other windows receive a null claim, immediately
+attempt a claim, and may answer queries while unowned. Repeat through reconnect
+and process restart; a departed stream cannot clear the replacement's claim. An
+older attach without `sizeClaim` and the general `subscribeTerminalEvents`
+stream must never receive `resized`.
+
+Check separators, right-aligned notices, and input borders in both windows:
+clipping or extra space is allowed, but rendering must use the PTY width. New
+opens and attaches include available fitted dimensions; unavailable geometry
+must still allow opening at server defaults, followed by the owner's first fit.
+Create a right-panel terminal, then exercise a controlled launch failure: the
+usual error must remain visible without a stuck retry indicator. Type while
+waiting for the first terminal snapshot and verify that the text reaches the
+shell. Reconnect the visible terminal and verify its output stays intact with no
+extra blank or flickering redraw.
+
+Repeat attach, hide/show, reconnect, and reload at a bash prompt; queries from
+guarded replays must not enter the command line. Test snapshots with the OSC
+responder flag on and off: the owner answers color queries only when the server
+does not. With a server lacking `terminalSizeOwnership`, local fit-and-resize
+and live replies still work, but every history replay is guarded and
+startup-history queries receive no client reply on that transitional path.
+Capture native screenshots and record program/server versions in the execution
+report, not this runbook.
+
 ### Durable message queue
 
 The durable queue is shared by browser, desktop, and remote clients. Validate
@@ -705,7 +772,7 @@ node scripts/run-msvc.mjs cargo test -p bibcode-server --test git_manager_reads 
 node scripts/run-msvc.mjs cargo test -p bibcode-server --test git_manager_commit -- --nocapture
 node scripts/run-msvc.mjs cargo test -p bibcode-server --test production_git_manager_rpc -- --nocapture
 node scripts/run-msvc.mjs cargo test -p bibcode-server --test git_rpc -- --nocapture
-vp test run packages/client-runtime/src/state/vcs.test.ts apps/web/src/components/GitActionsControl.test.tsx
+vp test run packages/client-runtime/src/state/vcs.test.ts packages/client-runtime/src/state/gitManager.test.ts packages/client-runtime/src/state/gitManagerRefresh.test.ts apps/web/src/connection/platform.test.ts apps/web/src/components/GitActionsControl.test.tsx
 ```
 
 `vp run check:contracts` regenerates the RPC wire fixtures and ends by failing
@@ -741,6 +808,64 @@ catalog mutation with `operation-in-flight`;
 server-authored blocked copy rendered unchanged; stream cancellation reaching
 the Git child; and one explicit provider refresh after an idle interval that
 produced no provider process or browser network request.
+
+For external Git Manager refresh, keep the automatic fetch interval at its
+180-second default. Default fixtures use ordinary `git init` without
+`--ref-format`, so supported older Git installations can run them. Reftable
+tests probe `git init --ref-format=reftable` and print a skip when unsupported;
+record that skip as unavailable coverage and run on a Git installation with
+reftable support before claiming reftable validation. In disposable file-ref
+and reftable fixtures, run commit,
+stash push and non-top `stash@{1}` pop/drop, tag,
+and fetch or update-ref commands from both a companion terminal and BiBCode's
+terminal while the manager stays focused. Refs, History, and the open stash pane
+should converge within about one second without pressing **Refresh**. Index-only
+`git add` must update Changes without an extra Git Manager signal read. Retain
+coverage for unchanged signatures, retirement fencing, sticky watcher health,
+and one degraded-only refetch per focus/visibility return. Also retain evidence
+for sibling-worktree HEAD switches with both file and reftable storage, metadata directories created after
+attachment, continuous file/index writes while a ref changes (the ref debounce
+has a one-second cap), and a ref observation retried after an in-app mutation
+fence settles. After external and in-app commits, exactly one loaded row should
+carry the current HEAD decoration; moved/deleted refs must update older rows
+without losing selection, pinned cursors, or scroll context. Compare decoration
+arrays and ordering to `git log --decorate=short --format=%D` using HEAD, a tag,
+`origin/main`, `origin/HEAD`, and a second branch, including after an external
+ref change. Healthy watchers must not refetch these queries merely because the
+window regains focus, and alt-tab alone must not probe environment supervisors.
+Retain watch-plan evidence for native recursive worktree coverage, including
+its `.git` tree: notify/inotify manages Linux recursion, FSEvents manages macOS
+recursion, and Windows uses native subtree watching. Events from top-level
+`objects/`/`lfs/` and submodule `modules/<name>/objects/` stores are filtered,
+while a commit or checkout inside a submodule still refreshes the superproject.
+Only external Git metadata uses non-recursive roots plus recursive
+refs/logs/reftable/worktrees stores; its own object stores are not watched, and
+events from linked worktrees' submodule object stores under the recursive
+`worktrees/` watch are filtered. Confirm sibling index/log churn does not invalidate the
+current worktree and Windows uppercase metadata paths register/classify
+correctly. Exercise native overflow (every full rescan must publish a ref
+invalidation after reinstallation, even on failure) and confirm that creating
+hundreds of nested ref directories, as a large fetch does, starts no
+registration work and no rescan.
+In a main checkout, make stash push the first external ref change after startup
+settles, with both an empty stash list and an existing stash reflog, then pop,
+push, and drop (including a non-top entry) while Stashes stays open; a prior commit signal
+must not satisfy the stash assertion. Verify one retained History batch per
+external change, no duplicate same-tip offset-zero read and no retained read
+when the first page covers all loaded rows, preserved selection and scroll,
+older-response fencing, and actionable background errors with Retry, including
+a cause without final punctuation. With the Stashes panel closed, an external
+stash push must start no stash-list read and the button shows no count; opening
+the panel then lists the new entry. Opening History reads the first page once; an in-app History operation
+while the watcher is degraded still refreshes History, and one change never
+causes two first-page reads. A stalled focus consumer must not delay supervisor
+visibility wakeups, and an `application-active` wakeup must survive a following
+focus return.
+Exercise signature-input failures without losing remote-status publication.
+For remote/local reconciliation ordering changes, run
+`git::broadcaster::tests::local_error_keeps_one_pending_remote_reconcile_until_later_success`
+in at least 300 separate test-process runs with `--exact --test-threads 1` and
+record the pass/fail count.
 
 Host-independent event-shape and routing tests are compatibility evidence, not
 native evidence for another operating system or remote host. Record unavailable
@@ -943,6 +1068,34 @@ packaged application:
 8. prove every external worktree still exists on disk.
 
 Do not run destructive worktree scenarios against a user repository.
+
+## Clone from URL network scenario
+
+Create a disposable bare repository large enough that a clone at about
+600 KB/s takes well over 30 seconds (for example 20 MB or more of
+incompressible files). Serve it over smart HTTP (`git http-backend` behind a
+local HTTP server) in two modes: throttled to about 600 KB/s, and one that stops
+sending after a few megabytes while keeping the connection open. Clone through
+**Add Project → Clone from URL** into disposable parent folders:
+
+1. Throttled clone: the form stays visible with **Cloning…** and **Cancel
+   clone**; the clone completes after more than 30 seconds; the dialog closes
+   only once the project appears; the new checkout's `HEAD` is a real branch.
+2. Cancel during a throttled clone: the form returns to an editable state with
+   "Clone cancelled.", the destination folder the clone created disappears,
+   and pressing **Clone** again at once starts a new clone instead of reporting
+   an incomplete clone.
+3. Stalling server: the clone fails after about 60 seconds with "The
+   transfer stalled…", shown in the form, and its destination folder is
+   removed.
+4. Pre-existing half clone (a folder with `git init`, the same `origin`, and
+   `HEAD` set to `ref: refs/heads/.invalid`): the clone is refused with "An
+   incomplete clone exists at <path>. Remove it or choose another folder." and
+   the folder is kept. Opening that repository in the Git Manager shows **No
+   commits yet** and offers Fetch.
+
+Record each duration and the exact messages. SSH remotes have no stall guard;
+record SSH coverage separately if tested.
 
 ## Git Manager validation scenario
 

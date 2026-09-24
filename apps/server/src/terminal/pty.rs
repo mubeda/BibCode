@@ -151,6 +151,9 @@ pub trait PtyProcess: fmt::Debug + Send + Sync {
     /// Returns the stable process identity captured by the backend at spawn.
     /// A live PTY must provide this identity before the manager can publish it.
     fn process_identity(&self) -> Option<ProcessIdentity>;
+    fn osc_color_responder_active(&self) -> bool {
+        false
+    }
     fn write(&self, data: &str) -> Result<(), String>;
     fn resize(&self, cols: u16, rows: u16) -> Result<(), String>;
     fn kill(&self) -> Result<(), String>;
@@ -434,6 +437,7 @@ impl PortablePtyBackend {
             let colors = colors_from_env(&input.env);
             (!colors.is_empty()).then(|| (OscColorResponder::new(colors), Arc::clone(&writer)))
         };
+        let osc_color_responder_active = osc_responder.is_some();
 
         let output_sender = output.clone();
         if let Err(error) = thread::Builder::new()
@@ -539,6 +543,7 @@ impl PortablePtyBackend {
         Ok(Arc::new(PortablePtyProcess {
             pid,
             process_identity,
+            osc_color_responder_active,
             resize,
             writer,
             #[cfg(not(windows))]
@@ -852,6 +857,7 @@ fn retain_captured_identity_if_child_live(
 struct PortablePtyProcess {
     pid: u32,
     process_identity: Option<ProcessIdentity>,
+    osc_color_responder_active: bool,
     resize: mpsc::Sender<PtySize>,
     writer: SharedPtyWriter,
     #[cfg(not(windows))]
@@ -883,6 +889,10 @@ impl PtyProcess for PortablePtyProcess {
 
     fn process_identity(&self) -> Option<ProcessIdentity> {
         self.process_identity
+    }
+
+    fn osc_color_responder_active(&self) -> bool {
+        self.osc_color_responder_active
     }
 
     fn write(&self, data: &str) -> Result<(), String> {
@@ -2531,6 +2541,7 @@ mod tests {
         let (output, initial_output) = broadcast::channel(1);
         let (exit, _) = watch::channel(None);
         let process = PortablePtyProcess {
+            osc_color_responder_active: false,
             pid: 44,
             process_identity: None,
             resize,
@@ -2563,6 +2574,7 @@ mod tests {
         let (output, initial_output) = broadcast::channel(1);
         let (exit, _) = watch::channel(None);
         let process = PortablePtyProcess {
+            osc_color_responder_active: false,
             pid: 42,
             process_identity: None,
             resize,
@@ -2609,6 +2621,7 @@ mod tests {
         let (output, initial_output) = broadcast::channel(1);
         let (exit, _) = watch::channel(None);
         let process = PortablePtyProcess {
+            osc_color_responder_active: false,
             pid: 43,
             process_identity: None,
             resize,

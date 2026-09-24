@@ -2,7 +2,7 @@ export const DEFAULT_OUTPUT_FLUSH_THRESHOLD_BYTES = 256 * 1024;
 
 export interface TerminalOutputSinkOptions {
   /** Writes coalesced output to xterm. */
-  readonly write: (data: string) => void;
+  readonly write: (data: string, onParsed?: () => void) => void;
   /** Force an immediate flush once queued bytes reach this size (bounds latency + memory). */
   readonly flushThresholdBytes?: number;
   readonly scheduleFrame?: (callback: () => void) => number;
@@ -12,6 +12,8 @@ export interface TerminalOutputSinkOptions {
 export interface TerminalOutputSink {
   push(delta: string): void;
   flush(): void;
+  /** Runs after earlier writes parse and before any subsequently pushed output. */
+  barrier(action: () => void): void;
   dispose(): void;
 }
 
@@ -119,6 +121,15 @@ export function createTerminalOutputSink(options: TerminalOutputSinkOptions): Te
       if (!disposed) {
         flushPending();
       }
+    },
+    barrier(action) {
+      if (disposed) return;
+      flushPending();
+      // xterm's write queue includes callbacks on empty writes. A synchronous
+      // resize here would race its asynchronous parser and reflow older output.
+      options.write("", () => {
+        if (!disposed) action();
+      });
     },
     dispose() {
       if (disposed) return;

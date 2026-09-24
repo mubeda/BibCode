@@ -14,6 +14,7 @@ function eventChangesMetadata(event: TerminalAttachStreamEvent): boolean {
   switch (event.type) {
     case "output":
     case "activity":
+    case "resized":
       return false;
     case "snapshot":
     case "restarted":

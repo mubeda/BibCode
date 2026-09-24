@@ -22,6 +22,8 @@ const target = {
 };
 const lifecycleTarget = { ...target, input: { ...target.input, cwd: "/repo", cols: 80, rows: 24 } };
 const snapshot: TerminalSessionSnapshot = {
+  oscColorResponderActive: false,
+  firstAttachmentGrant: false,
   ...target.input,
   cwd: "/repo",
   worktreePath: null,

@@ -86,12 +86,15 @@ export function AddProjectDialog({ open, onOpenChange }: AddProjectDialogProps) 
               parentDir={workflow.cloneParent}
               platform={workflow.selectedHost.platform}
               error={workflow.error}
+              notice={workflow.notice}
               busy={workflow.busy}
+              progress={workflow.cloneProgress}
               canPickParent={workflow.canPickParent}
               onUrlChange={workflow.setCloneUrl}
               onParentDirChange={workflow.setCloneParent}
               onPickParent={() => void workflow.pickCloneParent()}
               onClone={() => void workflow.submitClone()}
+              onCancel={workflow.cancelClone}
             />
           ) : null}
           {workflow.step === "create" ? (

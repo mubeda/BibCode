@@ -865,9 +865,9 @@ const streamMethodCount = methods.filter(({ mode }) => mode === "stream").length
 if (streamMethodCount !== 20) {
   throw new Error(`Expected 20 streaming RPC methods, found ${streamMethodCount}.`);
 }
-if (topLevelStreamShapeCount !== 70) {
+if (topLevelStreamShapeCount !== 71) {
   throw new Error(
-    `Expected 70 top-level streaming item shapes, found ${topLevelStreamShapeCount}.`,
+    `Expected 71 top-level streaming item shapes, found ${topLevelStreamShapeCount}.`,
   );
 }
 if (streamShapeFixtures.length !== topLevelStreamShapeCount) {

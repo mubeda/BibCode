@@ -12,6 +12,9 @@ export { getEnvironmentBrowsePlatform } from "../hostFolderPicker";
 
 export type AddProjectStep = "start" | "host-path" | "remote-browse" | "clone" | "create";
 
+/** `cloning` can be cancelled; `registering` adds the finished clone as a project. */
+export type AddProjectCloneProgress = "idle" | "cloning" | "registering";
+
 export interface AddProjectHostOption {
   readonly environmentId: EnvironmentId;
   readonly label: string;

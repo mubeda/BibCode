@@ -18,7 +18,14 @@
         "exitSignal": null,
         "label": "<?\"$r\"px%",
         "updatedAt": "Vexk",
-        "sequence": 2147483624
+        "sequence": 2147483624,
+        "size": {
+          "cols": 5,
+          "rows": 207,
+          "sizeClaim": "@N/"
+        },
+        "oscColorResponderActive": false,
+        "firstAttachmentGrant": true
       }
     }
   ]

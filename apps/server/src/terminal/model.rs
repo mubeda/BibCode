@@ -123,6 +123,7 @@ pub struct TerminalAttachInput {
     pub env: BTreeMap<String, String>,
     pub restart_if_not_running: bool,
     pub command: Option<TerminalLaunchCommand>,
+    pub size_claim: Option<String>,
 }
 
 impl TerminalAttachInput {
@@ -137,11 +138,20 @@ impl TerminalAttachInput {
             env: BTreeMap::new(),
             restart_if_not_running: false,
             command: None,
+            size_claim: None,
         }
     }
 }
 
 pub type TerminalRestartInput = TerminalOpenInput;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalSize {
+    pub cols: u16,
+    pub rows: u16,
+    pub size_claim: Option<String>,
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -160,6 +170,12 @@ pub struct TerminalSessionSnapshot {
     pub label: String,
     pub updated_at: String,
     pub sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<TerminalSize>,
+    #[serde(default)]
+    pub osc_color_responder_active: bool,
+    #[serde(default)]
+    pub first_attachment_grant: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -198,6 +214,14 @@ pub enum TerminalEvent {
         terminal_id: String,
         sequence: u64,
         data: String,
+    },
+    Resized {
+        #[serde(rename = "threadId")]
+        thread_id: String,
+        #[serde(rename = "terminalId")]
+        terminal_id: String,
+        sequence: u64,
+        size: TerminalSize,
     },
     Exited {
         #[serde(rename = "threadId")]
@@ -271,6 +295,7 @@ impl TerminalEvent {
         match self {
             Self::Started { sequence, .. }
             | Self::Output { sequence, .. }
+            | Self::Resized { sequence, .. }
             | Self::Exited { sequence, .. }
             | Self::Closed { sequence, .. }
             | Self::Error { sequence, .. }
@@ -288,6 +313,11 @@ impl TerminalEvent {
                 ..
             }
             | Self::Output {
+                thread_id,
+                terminal_id,
+                ..
+            }
+            | Self::Resized {
                 thread_id,
                 terminal_id,
                 ..

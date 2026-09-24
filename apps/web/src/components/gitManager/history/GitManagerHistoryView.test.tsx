@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 
-import type { GitManagerCommitEntry } from "@bibcode/contracts";
+import type { GitManagerCommitEntry, GitManagerCommitPage } from "@bibcode/contracts";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
@@ -15,6 +15,14 @@ const h = vi.hoisted(() => ({
     exhausted: boolean;
     degradedToAllPaging: boolean;
   } | null,
+  retainedPages: null as ReadonlyArray<GitManagerCommitPage> | null,
+  retainedInputs: [] as unknown[],
+  firstPageInputs: [] as Array<{ input: { refreshCacheKey: string } }>,
+  firstPageWaiting: false,
+  firstPageError: null as string | null,
+  retainedError: null as string | null,
+  retainedWaiting: false,
+  retryRetained: vi.fn(),
   contextMenuShow: vi.fn(),
   dndProps: null as Record<string, unknown> | null,
   refreshCommits: vi.fn(),
@@ -44,16 +52,38 @@ vi.mock("../../../localApi", () => ({
 vi.mock("../../../state/gitManager", () => ({
   gitManagerEnvironment: {
     getCommits: vi.fn(() => ({ kind: "commits" })),
+    getHistoryFirstPage: vi.fn((input: { input: { refreshCacheKey: string } }) => {
+      h.firstPageInputs.push(input);
+      return { kind: "commits" };
+    }),
+    getRetainedCommitPages: vi.fn((input: unknown) => {
+      h.retainedInputs.push(input);
+      return { kind: "retained" };
+    }),
   },
 }));
 
 vi.mock("../../../state/query", () => ({
   useEnvironmentQuery: (atom: { kind: string } | null) => ({
-    data: atom?.kind === "commits" ? h.commitPage : null,
-    emission: { _tag: "Initial", waiting: false },
-    error: null,
+    data:
+      atom?.kind === "commits" ? h.commitPage : atom?.kind === "retained" ? h.retainedPages : null,
+    emission: {
+      _tag: "Initial",
+      waiting:
+        atom?.kind === "commits"
+          ? h.firstPageWaiting
+          : atom?.kind === "retained"
+            ? h.retainedWaiting
+            : false,
+    },
+    error:
+      atom?.kind === "retained"
+        ? h.retainedError
+        : atom?.kind === "commits"
+          ? h.firstPageError
+          : null,
     isPending: false,
-    refresh: atom?.kind === "commits" ? h.refreshCommits : vi.fn(),
+    refresh: atom?.kind === "commits" ? h.refreshCommits : h.retryRetained,
   }),
 }));
 
@@ -101,6 +131,14 @@ beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   h.listProps = null;
   h.commitPage = null;
+  h.retainedPages = null;
+  h.retainedInputs.length = 0;
+  h.firstPageInputs.length = 0;
+  h.firstPageWaiting = false;
+  h.firstPageError = null;
+  h.retainedError = null;
+  h.retainedWaiting = false;
+  h.retryRetained.mockReset();
   h.contextMenuShow.mockReset();
   h.dndProps = null;
   h.refreshCommits.mockReset();
@@ -203,6 +241,8 @@ describe("GitManagerHistoryView rewrite reachability", () => {
             },
           ]}
           repositoryGeneration={null}
+          signalGeneration={null}
+          signalPending={false}
           projectRef={{ environmentId: "environment-1", projectId: "project-1" } as never}
           rewriteDisabledReason={null}
           scope={{ environmentId: "environment-1" as never, cwd: "/opaque/repository" }}
@@ -264,6 +304,8 @@ describe("GitManagerHistoryView rewrite reachability", () => {
           branchSyncDisabledReason={null}
           blockedReasons={[]}
           repositoryGeneration={null}
+          signalGeneration={null}
+          signalPending={false}
           projectRef={{ environmentId: "environment-1", projectId: "project-1" } as never}
           rewriteDisabledReason={null}
           scope={{ environmentId: "environment-1" as never, cwd: "/opaque/repository" }}
@@ -308,6 +350,8 @@ describe("GitManagerHistoryView rewrite reachability", () => {
           branchSyncDisabledReason={null}
           blockedReasons={[]}
           repositoryGeneration={null}
+          signalGeneration={null}
+          signalPending={false}
           projectRef={{ environmentId: "environment-1", projectId: "project-1" } as never}
           rewriteDisabledReason={null}
           scope={{ environmentId: "environment-1" as never, cwd: "/opaque/repository" }}
@@ -357,6 +401,8 @@ describe("GitManagerHistoryView rewrite reachability", () => {
           branchSyncDisabledReason={null}
           blockedReasons={[]}
           repositoryGeneration={null}
+          signalGeneration={null}
+          signalPending={false}
           projectRef={{ environmentId: "environment-1", projectId: "project-1" } as never}
           rewriteDisabledReason={reason}
           scope={{ environmentId: "environment-1" as never, cwd: "/opaque/repository" }}
@@ -410,6 +456,8 @@ describe("GitManagerHistoryView rewrite reachability", () => {
           branchSyncDisabledReason={null}
           blockedReasons={[]}
           repositoryGeneration={null}
+          signalGeneration={null}
+          signalPending={false}
           projectRef={{ environmentId: "environment-1", projectId: "project-1" } as never}
           rewriteDisabledReason={null}
           scope={{ environmentId: "environment-1" as never, cwd: "/opaque/repository" }}
@@ -428,13 +476,19 @@ describe("GitManagerHistoryView rewrite reachability", () => {
 });
 
 describe("GitManagerHistoryView repository generation tracking", () => {
-  function renderHistory(repositoryGeneration: number | null) {
+  function renderHistory(
+    repositoryGeneration: number | null,
+    signalGeneration: number | null = null,
+    signalPending = false,
+  ) {
     return act(async () =>
       root?.render(
         <GitManagerHistoryView
           branchSyncDisabledReason={null}
           blockedReasons={[]}
           repositoryGeneration={repositoryGeneration}
+          signalGeneration={signalGeneration}
+          signalPending={signalPending}
           projectRef={{ environmentId: "environment-1", projectId: "project-1" } as never}
           rewriteDisabledReason={null}
           scope={{ environmentId: "environment-1" as never, cwd: "/opaque/repository" }}
@@ -445,20 +499,238 @@ describe("GitManagerHistoryView repository generation tracking", () => {
     );
   }
 
-  it("refreshes a cached page that is behind the repository generation on mount", async () => {
-    const tip = commit(20);
-    h.commitPage = {
-      generation: 1,
-      pinnedTips: [tip.sha],
-      commits: [tip, commit(19), commit(18), commit(17)],
+  function page(generation: number, commits: ReadonlyArray<GitManagerCommitEntry>) {
+    return {
+      generation,
+      pinnedTips: commits.length === 0 ? [] : [commits[0]!.sha],
+      commits,
       nextOffset: null,
       exhausted: true,
       degradedToAllPaging: false,
     };
+  }
 
+  /** Every first-page read so far; each must use a cache key never used before. */
+  function firstPageReads(): ReadonlyArray<string> {
+    const keys = h.firstPageInputs.map((target) => target.input.refreshCacheKey);
+    expect(new Set(keys).size).toBe(keys.length);
+    return keys;
+  }
+
+  function renderedShas(): ReadonlyArray<string | undefined> {
+    return [...container.querySelectorAll<HTMLButtonElement>("button[data-commit-sha]")].map(
+      (row) => row.dataset.commitSha,
+    );
+  }
+
+  it("moves HEAD decorations on retained rows after an external commit", async () => {
+    const oldTip = { ...commit(10), decorations: ["HEAD -> main"] };
+    const oldRows = [oldTip, { ...commit(9), decorations: ["tag: removed"] }];
+    h.commitPage = {
+      generation: 1,
+      pinnedTips: [oldTip.sha],
+      commits: oldRows,
+      nextOffset: null,
+      exhausted: true,
+      degradedToAllPaging: false,
+    };
+    await renderHistory(1);
+    await act(async () =>
+      container
+        .querySelector<HTMLButtonElement>(`button[data-commit-sha="${oldTip.sha}"]`)
+        ?.click(),
+    );
+    const newTip = { ...commit(11), decorations: ["HEAD -> main"] };
+    h.commitPage = {
+      generation: 2,
+      pinnedTips: [newTip.sha],
+      commits: [newTip],
+      nextOffset: null,
+      exhausted: true,
+      degradedToAllPaging: false,
+    };
+    h.retainedPages = [
+      {
+        generation: 2,
+        pinnedTips: [oldTip.sha],
+        commits: oldRows.map((entry) => ({ ...entry, decorations: [] })),
+        nextOffset: null,
+        exhausted: true,
+        degradedToAllPaging: false,
+      },
+    ];
+    await renderHistory(2, 2);
+    const rows = [...container.querySelectorAll<HTMLButtonElement>("button[data-commit-sha]")];
+    expect(rows.map((row) => row.dataset.commitSha)).toEqual([
+      newTip.sha,
+      ...oldRows.map((entry) => entry.sha),
+    ]);
+    expect(rows.filter((row) => row.textContent?.includes("HEAD -> main"))).toHaveLength(1);
+    expect(rows[0]?.textContent).toContain("HEAD -> main");
+    expect(rows[1]?.textContent).not.toContain("HEAD ->");
+    expect(rows[1]?.getAttribute("aria-selected")).toBe("true");
+    expect(rows[2]?.textContent).not.toContain("tag: removed");
+    expect(h.retainedInputs).toHaveLength(1);
+    expect(firstPageReads()).toHaveLength(2);
+    // The refs snapshot catching up to the signal read's generation is the
+    // same change: no second first-page or retained read.
+    await renderHistory(2, 2);
+    expect(firstPageReads()).toHaveLength(2);
+    expect(h.retainedInputs).toHaveLength(1);
+  });
+
+  it("refreshes after an in-app operation advances the repository generation without a signal change", async () => {
+    // A degraded watcher reports no signal change for History's own
+    // operations; the refs refresh after the operation still advances the
+    // repository generation.
+    const tip = { ...commit(40), decorations: ["HEAD -> main"] };
+    h.commitPage = page(2, [tip, commit(39)]);
+    await renderHistory(2, 7);
+    expect(firstPageReads()).toHaveLength(1);
+
+    await renderHistory(3, 7);
+    expect(firstPageReads()).toHaveLength(2);
+    // The new read returns the revert.
+    const revert = { ...commit(41), decorations: ["HEAD -> main"] };
+    h.commitPage = page(3, [revert, { ...tip, decorations: [] }, commit(39)]);
+    await renderHistory(3, 7);
+    expect(firstPageReads()).toHaveLength(2);
+    expect(renderedShas()).toEqual([revert.sha, tip.sha, commit(39).sha]);
+    expect(container.textContent).toContain("3 commits loaded");
+
+    await renderHistory(3, 7);
+    expect(firstPageReads()).toHaveLength(2);
+  });
+
+  it("waits for an in-flight first-page read instead of starting another", async () => {
+    h.commitPage = page(4, [commit(50)]);
+    await renderHistory(4, 1);
+    h.firstPageWaiting = true;
+    await renderHistory(4, 2);
+    expect(firstPageReads()).toHaveLength(2);
+    // The signal read is still in flight when the refs snapshot advances.
+    await renderHistory(5, 2);
+    expect(firstPageReads()).toHaveLength(2);
+    // It returns that generation, so the advance needs no read of its own.
+    h.commitPage = page(5, [commit(51), commit(50)]);
+    h.firstPageWaiting = false;
+    await renderHistory(5, 2);
+    expect(firstPageReads()).toHaveLength(2);
+    expect(renderedShas()).toEqual([commit(51).sha, commit(50).sha]);
+  });
+
+  it("reads again once an in-flight read returns behind the repository generation", async () => {
+    h.commitPage = page(4, [commit(60)]);
+    await renderHistory(4, 1);
+    h.firstPageWaiting = true;
+    await renderHistory(4, 2);
+    await renderHistory(5, 2);
+    expect(firstPageReads()).toHaveLength(2);
+    // The in-flight read observed the repository before the operation landed.
+    h.firstPageWaiting = false;
+    await renderHistory(5, 2);
+    expect(firstPageReads()).toHaveLength(3);
+    // One read per repository generation, even if it answers behind again.
+    await renderHistory(5, 2);
+    expect(firstPageReads()).toHaveLength(3);
+  });
+
+  it("treats the watcher echo of a repository-triggered read as the same change", async () => {
+    h.commitPage = page(1, [commit(70)]);
+    await renderHistory(1, 10);
+    expect(firstPageReads()).toHaveLength(1);
+    // The refs refresh after an in-app operation arrives before the watcher's
+    // signal for that same operation.
+    await renderHistory(2, 10);
+    expect(firstPageReads()).toHaveLength(2);
+    h.commitPage = page(2, [commit(71), commit(70)]);
+    await renderHistory(2, 10);
+    await renderHistory(2, 11);
+    expect(firstPageReads()).toHaveLength(2);
+    // A later signal is a new change and reads immediately.
+    await renderHistory(2, 12);
+    expect(firstPageReads()).toHaveLength(3);
+  });
+
+  it("refreshes retained server decorations when a signal changes without a page generation change", async () => {
+    const old = {
+      ...commit(15),
+      decorations: ["HEAD -> main", "tag: v1", "origin/main", "origin/HEAD", "feature"],
+    };
+    h.commitPage = {
+      generation: 1,
+      pinnedTips: [old.sha],
+      commits: [old],
+      nextOffset: null,
+      exhausted: true,
+      degradedToAllPaging: false,
+    };
+    await renderHistory(1, 10);
+    h.commitPage = {
+      ...h.commitPage,
+      commits: [
+        {
+          ...old,
+          decorations: ["HEAD -> main", "tag: v2", "origin/main", "origin/HEAD", "renamed"],
+        },
+      ],
+    };
+    await renderHistory(1, 11);
+    const data = h.listProps?.data as ReadonlyArray<GitManagerCommitEntry>;
+    expect(data[0]?.decorations).toEqual([
+      "HEAD -> main",
+      "tag: v2",
+      "origin/main",
+      "origin/HEAD",
+      "renamed",
+    ]);
+    expect(h.retainedInputs).toEqual([]); // No duplicate pinned offset-zero read.
+    expect(firstPageReads()).toHaveLength(2);
+    expect(h.refreshCommits).not.toHaveBeenCalled();
+  });
+
+  it("makes one first-page read when History mounts before refs and the signal load", async () => {
+    const tip = commit(20);
+    h.commitPage = page(3, [tip, commit(19)]);
+
+    await renderHistory(null, null, true);
+    expect(firstPageReads()).toHaveLength(0);
+    expect(container.textContent).toContain("Loading commit history…");
+    await renderHistory(3, null, true);
+    expect(firstPageReads()).toHaveLength(0);
+    await renderHistory(3, 9);
+    expect(firstPageReads()).toHaveLength(1);
+    expect(container.textContent).toContain("Commit 20");
+    await renderHistory(3, 9);
+    expect(firstPageReads()).toHaveLength(1);
+  });
+
+  it("does not read again for the server's first signature after generation 0", async () => {
+    // A repository's first subscriber sees generation 0 until the server
+    // computes its baseline signature; that bump is not a repository change.
+    h.commitPage = page(3, [commit(21), commit(20)]);
+    await renderHistory(null, null, true);
+    await renderHistory(3, 0);
+    expect(firstPageReads()).toHaveLength(1);
+    await renderHistory(3, 1);
+    expect(firstPageReads()).toHaveLength(1);
+    // A real change hidden in that bump still arrives through the refs the
+    // panel re-reads on every signal change.
+    await renderHistory(4, 1);
+    expect(firstPageReads()).toHaveLength(2);
+    await renderHistory(4, 2);
+    await renderHistory(4, 3);
+    expect(firstPageReads()).toHaveLength(3);
+  });
+
+  it("reads without waiting when the environment has no signal", async () => {
+    const tip = commit(20);
+    h.commitPage = page(1, [tip, commit(19), commit(18), commit(17)]);
+
+    await renderHistory(null);
+    expect(firstPageReads()).toHaveLength(1);
     await renderHistory(2);
-
-    expect(h.refreshCommits).toHaveBeenCalledOnce();
+    expect(firstPageReads()).toHaveLength(2);
     expect(container.textContent).toContain("Commit 20");
   });
 
@@ -475,11 +747,12 @@ describe("GitManagerHistoryView repository generation tracking", () => {
 
     await renderHistory(4);
     expect(h.refreshCommits).not.toHaveBeenCalled();
+    expect(firstPageReads()).toHaveLength(1);
 
     await renderHistory(5);
-    expect(h.refreshCommits).toHaveBeenCalledOnce();
+    expect(firstPageReads()).toHaveLength(2);
     await renderHistory(5);
-    expect(h.refreshCommits).toHaveBeenCalledOnce();
+    expect(firstPageReads()).toHaveLength(2);
 
     const newTip = commit(24);
     h.commitPage = {
@@ -492,20 +765,30 @@ describe("GitManagerHistoryView repository generation tracking", () => {
     };
     await renderHistory(5);
 
-    expect(h.refreshCommits).toHaveBeenCalledOnce();
-    const rows = [...container.querySelectorAll<HTMLButtonElement>("button[data-commit-sha]")].map(
-      (row) => row.dataset.commitSha,
-    );
-    expect(rows).toEqual([newTip.sha, ...commits.map((entry) => entry.sha)]);
+    expect(firstPageReads()).toHaveLength(2);
+    expect(renderedShas()).toEqual([newTip.sha, ...commits.map((entry) => entry.sha)]);
+
+    await renderHistory(5);
+    expect(firstPageReads()).toHaveLength(2);
+  });
+
+  it("does not read when the repository generation goes backwards without a signal", async () => {
+    const commits = [commit(26), commit(25)];
+    h.commitPage = page(5, commits);
+    await renderHistory(5);
+    expect(firstPageReads()).toHaveLength(1);
 
     await renderHistory(3);
-    expect(h.refreshCommits).toHaveBeenCalledOnce();
+    expect(firstPageReads()).toHaveLength(1);
+    await renderHistory(5);
+    expect(firstPageReads()).toHaveLength(1);
+    expect(renderedShas()).toEqual(commits.map((entry) => entry.sha));
   });
 
   it("shows the committed tip after remount without an explicit refresh click", async () => {
     // History was loaded at generation 1, the user committed from Changes while
     // History was unmounted, and the panel's refs snapshot now reports 2.
-    const preCommit = [commit(31), commit(30)];
+    const preCommit = [{ ...commit(31), decorations: ["HEAD -> main"] }, commit(30)];
     h.commitPage = {
       generation: 1,
       pinnedTips: [preCommit[0]!.sha],
@@ -514,28 +797,33 @@ describe("GitManagerHistoryView repository generation tracking", () => {
       exhausted: true,
       degradedToAllPaging: false,
     };
-    h.refreshCommits.mockImplementation(() => {
-      const committed = commit(32);
+    // The first-page atom has zero idle TTL and reads the current server page.
+    {
+      const committed = { ...commit(32), decorations: ["HEAD -> main"] };
       h.commitPage = {
         generation: 2,
         pinnedTips: [committed.sha],
-        commits: [committed, ...preCommit],
+        commits: [committed, ...preCommit.map((entry) => ({ ...entry, decorations: [] }))],
         nextOffset: null,
         exhausted: true,
         degradedToAllPaging: false,
       };
-    });
+    }
 
     await renderHistory(2);
-    expect(h.refreshCommits).toHaveBeenCalledOnce();
+    expect(firstPageReads()).toHaveLength(1);
     await renderHistory(2);
 
-    const rows = [...container.querySelectorAll<HTMLButtonElement>("button[data-commit-sha]")].map(
-      (row) => row.dataset.commitSha,
-    );
-    expect(rows).toEqual([commit(32).sha, ...preCommit.map((entry) => entry.sha)]);
+    expect(renderedShas()).toEqual([commit(32).sha, ...preCommit.map((entry) => entry.sha)]);
     expect(container.textContent).toContain("3 commits loaded");
-    expect(h.refreshCommits).toHaveBeenCalledOnce();
+    const decoratedRows = [
+      ...container.querySelectorAll<HTMLButtonElement>("button[data-commit-sha]"),
+    ];
+    expect(decoratedRows.filter((row) => row.textContent?.includes("HEAD -> main"))).toHaveLength(
+      1,
+    );
+    expect(decoratedRows[0]?.textContent).toContain("HEAD -> main");
+    expect(firstPageReads()).toHaveLength(1);
   });
 
   it("ignores a stale first page that resolves behind the loaded generation", async () => {
@@ -564,17 +852,117 @@ describe("GitManagerHistoryView repository generation tracking", () => {
     };
     await renderHistory(6);
 
-    const rows = [...container.querySelectorAll<HTMLButtonElement>("button[data-commit-sha]")].map(
-      (row) => row.dataset.commitSha,
-    );
-    expect(rows).toEqual([newTip.sha, ...older.map((entry) => entry.sha)]);
+    expect(renderedShas()).toEqual([newTip.sha, ...older.map((entry) => entry.sha)]);
     expect(container.textContent).toContain("3 commits loaded");
     expect(h.refreshCommits).not.toHaveBeenCalled();
+    expect(firstPageReads()).toHaveLength(1);
+  });
+
+  /** Loads a page, then a signal read whose first page misses the old rows, capturing a retained batch. */
+  async function loadWithRetainedBatch() {
+    const oldTip = { ...commit(90), decorations: ["HEAD -> main"] };
+    const older = commit(89);
+    h.commitPage = page(1, [oldTip, older]);
+    await renderHistory(1, 1);
+    const newTip = { ...commit(91), decorations: ["HEAD -> main"] };
+    h.commitPage = page(2, [newTip]);
+    h.retainedPages = [{ ...page(2, [{ ...oldTip, decorations: [] }, older]) }];
+    await renderHistory(2, 2);
+    expect(h.retainedInputs).toHaveLength(1);
+  }
+
+  function retryButton(): HTMLButtonElement | undefined {
+    return [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) =>
+      button.textContent?.startsWith("Retry"),
+    );
+  }
+
+  it("explains a failed background refresh, shows the retry in progress, and clears on success", async () => {
+    h.commitPage = page(1, [commit(80)]);
+    await renderHistory(1, 1);
+    h.firstPageError = "The environment request failed.";
+    await renderHistory(1, 1);
+    expect(container.textContent).toContain(
+      "Couldn’t refresh history: The environment request failed. Your loaded commits are still available.",
+    );
+    expect(retryButton()?.textContent).toBe("Retry");
+    expect(retryButton()?.disabled).toBe(false);
+    await act(async () => retryButton()?.click());
+    expect(h.refreshCommits).toHaveBeenCalledOnce();
+
+    h.firstPageWaiting = true;
+    await renderHistory(1, 1);
+    expect(retryButton()?.textContent).toBe("Retrying…");
+    expect(retryButton()?.disabled).toBe(true);
+    expect(container.textContent).toContain("Commit 80");
+
+    h.firstPageWaiting = false;
+    h.firstPageError = null;
+    await renderHistory(1, 1);
+    expect(container.textContent).not.toContain("Couldn’t refresh history");
+    expect(retryButton()).toBeUndefined();
+    expect(firstPageReads()).toHaveLength(1);
+  });
+
+  it("retries a failed retained batch with its cause and progress", async () => {
+    await loadWithRetainedBatch();
+    h.retainedError = "Git returned malformed commit history.";
+    await renderHistory(2, 2);
+    expect(container.textContent).toContain(
+      "Couldn’t refresh history: Git returned malformed commit history. Your loaded commits are still available.",
+    );
+    await act(async () => retryButton()?.click());
+    expect(h.retryRetained).toHaveBeenCalledOnce();
+    expect(h.refreshCommits).not.toHaveBeenCalled();
+    h.retainedWaiting = true;
+    await renderHistory(2, 2);
+    expect(retryButton()?.textContent).toBe("Retrying…");
+    h.retainedWaiting = false;
+    h.retainedError = null;
+    await renderHistory(2, 2);
+    expect(retryButton()).toBeUndefined();
+  });
+
+  it("ends a cause without final punctuation before the banner's next sentence", async () => {
+    h.commitPage = page(1, [commit(80)]);
+    await renderHistory(1, 1);
+    h.firstPageError = "connection reset by peer";
+    await renderHistory(1, 1);
+    expect(container.textContent).toContain(
+      "Couldn’t refresh history: connection reset by peer. Your loaded commits are still available.",
+    );
+  });
+
+  it("retries a failed first page ahead of a failed retained batch", async () => {
+    await loadWithRetainedBatch();
+    h.retainedError = "Git returned malformed commit history.";
+    h.firstPageError = "The environment request failed.";
+    await renderHistory(2, 2);
+    expect(container.textContent).toContain(
+      "Couldn’t refresh history: The environment request failed.",
+    );
+    await act(async () => retryButton()?.click());
+    expect(h.refreshCommits).toHaveBeenCalledOnce();
+    expect(h.retryRetained).not.toHaveBeenCalled();
+  });
+
+  it("names the cause when history cannot load at all", async () => {
+    h.firstPageError = "Git returned malformed commit history.";
+    await renderHistory(1);
+    expect(container.textContent).toContain(
+      "Couldn’t load history: Git returned malformed commit history.",
+    );
+    const retry = [...container.querySelectorAll<HTMLButtonElement>("button")].find(
+      (button) => button.textContent === "Retry",
+    );
+    expect(retry).toBeDefined();
+    await act(async () => retry?.click());
+    expect(h.refreshCommits).toHaveBeenCalledOnce();
   });
 
   it("requests history only for the scoped repository", async () => {
     const getCommits = vi.mocked(
-      (await import("../../../state/gitManager")).gitManagerEnvironment.getCommits,
+      (await import("../../../state/gitManager")).gitManagerEnvironment.getHistoryFirstPage,
     );
     getCommits.mockClear();
     h.commitPage = {
@@ -592,6 +980,8 @@ describe("GitManagerHistoryView repository generation tracking", () => {
           branchSyncDisabledReason={null}
           blockedReasons={[]}
           repositoryGeneration={1}
+          signalGeneration={null}
+          signalPending={false}
           projectRef={{ environmentId: "environment-1", projectId: "project-a" } as never}
           rewriteDisabledReason={null}
           scope={{ environmentId: "environment-1" as never, cwd: "/repositories/a" }}

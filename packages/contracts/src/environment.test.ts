@@ -60,6 +60,12 @@ const legacyClientDecoders = {
 const decodeTerminalCapabilities = Schema.decodeUnknownSync(ExecutionEnvironmentCapabilities);
 
 describe("execution environment contracts", () => {
+  it("defaults terminal size ownership off and preserves advertised support", () => {
+    expect(decodeTerminalCapabilities({}).terminalSizeOwnership).toBe(false);
+    expect(decodeTerminalCapabilities({ terminalSizeOwnership: true }).terminalSizeOwnership).toBe(
+      true,
+    );
+  });
   it("defaults Pull Requests capabilities off for older servers and preserves advertised support", () => {
     const legacy = decodeExecutionEnvironmentDescriptor({
       environmentId: "env-1",

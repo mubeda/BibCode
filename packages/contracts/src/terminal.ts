@@ -1,3 +1,4 @@
+import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { TrimmedNonEmptyString } from "./baseSchemas.ts";
 import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
@@ -9,14 +10,30 @@ import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
  */
 export const DEFAULT_TERMINAL_ID = "term-1";
 
+export const TERMINAL_COLS_MIN = 1;
+export const TERMINAL_COLS_MAX = 1000;
+export const TERMINAL_ROWS_MIN = 1;
+export const TERMINAL_ROWS_MAX = 500;
+export const TERMINAL_SIZE_CLAIM_MAX_LENGTH = 128;
+
 const TrimmedNonEmptyStringSchema = TrimmedNonEmptyString;
-const TerminalColsSchema = Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(
-  Schema.isLessThanOrEqualTo(1000),
+const TerminalColsSchema = Schema.Int.check(Schema.isGreaterThanOrEqualTo(TERMINAL_COLS_MIN)).check(
+  Schema.isLessThanOrEqualTo(TERMINAL_COLS_MAX),
 );
-const TerminalRowsSchema = Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(
-  Schema.isLessThanOrEqualTo(500),
+const TerminalRowsSchema = Schema.Int.check(Schema.isGreaterThanOrEqualTo(TERMINAL_ROWS_MIN)).check(
+  Schema.isLessThanOrEqualTo(TERMINAL_ROWS_MAX),
 );
 const TerminalIdSchema = TrimmedNonEmptyStringSchema.check(Schema.isMaxLength(128));
+const TerminalSizeClaimSchema = TrimmedNonEmptyStringSchema.check(
+  Schema.isMaxLength(TERMINAL_SIZE_CLAIM_MAX_LENGTH),
+);
+
+export const TerminalSize = Schema.Struct({
+  cols: TerminalColsSchema,
+  rows: TerminalRowsSchema,
+  sizeClaim: Schema.NullOr(TerminalSizeClaimSchema),
+});
+export type TerminalSize = typeof TerminalSize.Type;
 const TerminalEnvKeySchema = Schema.String.check(
   Schema.isPattern(/^[A-Za-z_][A-Za-z0-9_]*$/),
 ).check(Schema.isMaxLength(128));
@@ -84,6 +101,7 @@ export const TerminalAttachInput = Schema.Struct({
   env: Schema.optional(TerminalEnvSchema),
   command: Schema.optional(TerminalLaunchCommand),
   restartIfNotRunning: Schema.optional(Schema.Boolean),
+  sizeClaim: Schema.optional(TerminalSizeClaimSchema),
 });
 export type TerminalAttachInput = typeof TerminalAttachInput.Type;
 
@@ -130,6 +148,7 @@ export const TerminalResizeInput = Schema.Struct({
   ...TerminalSessionInput.fields,
   cols: TerminalColsSchema,
   rows: TerminalRowsSchema,
+  sizeClaim: Schema.optional(TerminalSizeClaimSchema),
 });
 export type TerminalResizeInput = Schema.Codec.Encoded<typeof TerminalResizeInput>;
 
@@ -176,6 +195,11 @@ export const TerminalSessionSnapshot = Schema.Struct({
   label: Schema.String.check(Schema.isMaxLength(128)),
   updatedAt: Schema.String,
   sequence: Schema.optional(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  /** Applied PTY size; absent on older servers. */
+  size: Schema.optional(TerminalSize),
+  oscColorResponderActive: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /** First-attachment grant: one startup-history reply pass, issued only before any claim, or a claimed stream surviving a restart, has consumed it. */
+  firstAttachmentGrant: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
 });
 export type TerminalSessionSnapshot = typeof TerminalSessionSnapshot.Type;
 
@@ -236,6 +260,12 @@ const TerminalOutputEvent = Schema.Struct({
   ...TerminalEventBaseSchema.fields,
   type: Schema.Literal("output"),
   data: Schema.String,
+});
+
+const TerminalResizedEvent = Schema.Struct({
+  ...TerminalEventBaseSchema.fields,
+  size: TerminalSize,
+  type: Schema.Literal("resized"),
 });
 
 const TerminalExitedEvent = Schema.Struct({
@@ -300,6 +330,7 @@ export const TerminalAttachStreamEvent = Schema.Union([
   TerminalClearedEvent,
   TerminalRestartedEvent,
   TerminalActivityEvent,
+  TerminalResizedEvent,
 ]);
 export type TerminalAttachStreamEvent = typeof TerminalAttachStreamEvent.Type;
 

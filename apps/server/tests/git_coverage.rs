@@ -17,6 +17,10 @@ use bibcode_server::git::{
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
+#[path = "support/isolated_git_config.rs"]
+mod isolated_git_config;
+use isolated_git_config::IsolatedGitConfig;
+
 const PROCESS_FIXTURE_MODE: &str = "BIBCODE_GIT_COVERAGE_PROCESS_MODE";
 const PROCESS_FIXTURE_ROLE: &str = "BIBCODE_GIT_COVERAGE_PROCESS_ROLE";
 const PROCESS_FIXTURE_ROOT_READY: &str = "BIBCODE_GIT_COVERAGE_ROOT_READY";
@@ -235,22 +239,11 @@ fn relaunch_with_isolated_git_config(test_name: &str) -> bool {
     let _relaunch_guard = ISOLATED_GIT_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let fixture = tempfile::tempdir().expect("isolated Git config fixture");
-    let hooks = fixture.path().join("hooks");
-    fs::create_dir(&hooks).expect("isolated hooks directory");
-    let config = fixture.path().join("global.gitconfig");
-    fs::write(
-        &config,
-        format!(
-            "[commit]\n\tgpgSign = false\n[core]\n\thooksPath = {}\n",
-            hooks.to_string_lossy().replace('\\', "/")
-        ),
-    )
-    .expect("isolated global config");
+    let config = IsolatedGitConfig::new();
 
     let output = Command::new(std::env::current_exe().expect("current test executable"))
         .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
-        .env("GIT_CONFIG_GLOBAL", &config)
+        .env("GIT_CONFIG_GLOBAL", config.path())
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env(ISOLATED_GIT_TEST, "1")
         .output()
