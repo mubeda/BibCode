@@ -55,6 +55,8 @@ const OPERAND: &AsciiSet = &CONTROLS
 pub struct GitLabHost {
     runner: Arc<HostCommandRunner>,
     contexts: super::cache::ContextCache<(String, String), HostContext>,
+    /// Repository-wide tab totals, reused across filter changes and pages.
+    totals: super::cache::ContextCache<(String, String), ListCounts>,
 }
 
 impl GitLabHost {
@@ -62,6 +64,7 @@ impl GitLabHost {
         Self {
             runner,
             contexts: Default::default(),
+            totals: Default::default(),
         }
     }
 
@@ -180,8 +183,7 @@ impl GitLabHost {
     }
 
     async fn counts(&self, scope: &HostScope, c: &CancellationToken) -> Option<ListCounts> {
-        let mut totals = Vec::new();
-        for state in ["opened", "closed", "merged"] {
+        let total = |state: &'static str| async move {
             let path = format!(
                 "{}/merge_requests?state={state}&per_page=1",
                 project_path(scope)
@@ -191,12 +193,15 @@ impl GitLabHost {
                 .glab(scope, &["api", "-i", &path], Budget::Read, None, c)
                 .await
                 .ok()?;
-            totals.push(parse::total(&output.stdout)?);
-        }
+            parse::total(&output.stdout)
+        };
+        // Independent host round trips: read the three totals together.
+        let (open, closed, merged) =
+            tokio::join!(total("opened"), total("closed"), total("merged"));
         Some(ListCounts {
-            open: Some(totals[0]),
-            closed: Some(totals[1]),
-            merged: Some(totals[2]),
+            open: Some(open?),
+            closed: Some(closed?),
+            merged: Some(merged?),
         })
     }
 }
@@ -204,6 +209,10 @@ impl GitLabHost {
 impl PullRequestHost for GitLabHost {
     fn invalidate_context(&self) {
         self.contexts.clear();
+        self.totals.clear();
+    }
+    fn invalidate_totals(&self, scope: &HostScope) {
+        self.totals.remove(&scope.context_key());
     }
     fn kind(&self) -> ProviderKind {
         ProviderKind::Gitlab
@@ -258,9 +267,15 @@ impl PullRequestHost for GitLabHost {
             || PullRequestsOperationError::new("pullRequests.getContext", "timeout"),
             async move {
                 let operation = "pullRequests.getContext";
-                let user = self.api(scope, "user", operation, c).await?;
-                let project = self.api(scope, &project_path(scope), operation, c).await?;
-                let version = match self.api(scope, "version", operation, c).await {
+                let path = project_path(scope);
+                // Independent host round trips: issue them together, keep the error order.
+                let (user, project, version) = tokio::join!(
+                    self.api(scope, "user", operation, c),
+                    self.api(scope, &path, operation, c),
+                    self.api(scope, "version", operation, c),
+                );
+                let (user, project) = (user?, project?);
+                let version = match version {
                     Ok(value) => value["version"].as_str().map(str::to_owned),
                     Err(error) if error.code == "timeout" => return Err(error),
                     Err(_) => None,
@@ -385,13 +400,26 @@ impl PullRequestHost for GitLabHost {
                     .into(),
                 );
             }
-            let output = self
-                .runner
-                .glab(scope, &args, Budget::Mutation, None, c)
-                .await
-                .map_err(|failure| {
-                    from_process_error(operation, "glab", &failure.error, &failure.stderr)
-                })?;
+            // The tab totals do not depend on the page or its filters: reuse the bounded
+            // copy (30 s, successful answers only) unless this is an explicit Refresh.
+            if query.refresh_totals {
+                self.totals.remove(&scope.context_key());
+            }
+            let totals = async {
+                self.totals
+                    .get_or_load(scope.context_key(), c, || (), async {
+                        self.counts(scope, c).await.ok_or(())
+                    })
+                    .await
+                    .ok()
+            };
+            let (output, counts) = tokio::join!(
+                self.runner.glab(scope, &args, Budget::Mutation, None, c),
+                totals,
+            );
+            let output = output.map_err(|failure| {
+                from_process_error(operation, "glab", &failure.error, &failure.stderr)
+            })?;
             let value: Value =
                 serde_json::from_str(&output.stdout).map_err(|_| parse::invalid(operation))?;
             let values = value.as_array().ok_or_else(|| parse::invalid(operation))?;
@@ -400,7 +428,6 @@ impl PullRequestHost for GitLabHost {
                 .take(30)
                 .map(parse::row)
                 .collect::<Result<Vec<_>, _>>()?;
-            let counts = self.counts(scope, c).await;
             if c.is_cancelled() {
                 return Err(PullRequestsOperationError::new(operation, "timeout"));
             }
@@ -865,9 +892,12 @@ esac"#, "");
         assert_eq!(error.code, "unavailable");
         query.review_status = None;
         fs::write(s.path("no-counts"), "").unwrap();
+        // An explicit Refresh re-reads the totals; a failed read yields none.
+        query.refresh_totals = true;
         let page = host.list(&scope, &query, &c).await.unwrap();
         assert!(page.counts.is_none());
         assert!(page.total_count.is_none());
+        query.refresh_totals = false;
         fs::write(s.path("unknown-version"), "").unwrap();
         host.invalidate_context(); // Explicit Rescan bypasses the bounded context cache.
         let context = host.context(&scope, &c).await.unwrap();
@@ -890,6 +920,137 @@ esac"#, "");
                 .filter(|line| line.contains("|api "))
                 .all(|line| line.contains("--hostname git.acme.example"))
         );
+    }
+
+    /// Each fake read waits until every independent sibling read is running, so a
+    /// sequential adapter times out instead of answering (no wall-clock threshold).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pull_requests_gitlab_context_and_list_run_independent_reads_together() {
+        use crate::test_support::TestSandbox;
+        use std::fs;
+        use tokio_util::sync::CancellationToken;
+        let s = TestSandbox::new("pr-gitlab-concurrent");
+        fs::write(
+            s.path("project.json"),
+            include_str!("../../../tests/fixtures/pull_requests/gitlab_project.json"),
+        )
+        .unwrap();
+        let script = s.executable_script(
+            "glab",
+            r#"arrive() {
+  : > "$1.$$"; i=0
+  while [ "$(ls "$1".* 2>/dev/null | wc -l)" -lt "$2" ]; do
+    i=$((i + 1)); if [ "$i" -gt 60 ]; then rm -f "$1.$$"; echo "$1 read ran alone" >&2; exit 75; fi
+    sleep 0.05
+  done
+}
+case "$1 $2" in
+  'api user') arrive context 3; echo '{"username":"alice","name":"Alice","id":7}' ;;
+  'api version') arrive context 3; echo '{"version":"17.9.1"}' ;;
+  'api projects/team%2Fsub%2Frepo') arrive context 3; cat project.json ;;
+  'mr list') arrive list 4; echo '[]' ;;
+  'api -i') arrive list 4; printf 'HTTP/2 200 OK\r\nx-total: 5\r\n\r\n[]' ;;
+  *) exit 64 ;;
+esac"#,
+            "",
+        );
+        let host = GitLabHost::new(Arc::new(
+            HostCommandRunner::new(s.path("state")).with_commands(&script, &script, &script),
+        ));
+        let scope = HostScope {
+            cwd: s.root().into(),
+            ..scope()
+        };
+        let c = CancellationToken::new();
+        let context = host.context(&scope, &c).await.unwrap();
+        assert_eq!(context.host_version.as_deref(), Some("17.9.1"));
+        let query: ListQuery = serde_json::from_value(json!({"cwd":s.root(),"state":"open","search":null,"author":null,"assignee":null,"reviewer":null,"reviewStatus":null,"draft":null,"labels":[],"milestone":null,"targetBranch":null,"sort":"newest","cursor":null})).unwrap();
+        let page = host.list(&scope, &query, &c).await.unwrap();
+        assert!(page.rows.is_empty());
+        assert_eq!(page.total_count, Some(5));
+        let counts = page.counts.unwrap();
+        assert_eq!(
+            (counts.open, counts.closed, counts.merged),
+            (Some(5), Some(5), Some(5))
+        );
+    }
+
+    /// The tab totals are reused across filters and pages; an explicit Refresh, a
+    /// successful mutation, Rescan and the 30 s expiry read them again. Every page
+    /// still reads its own rows.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pull_requests_gitlab_list_reuses_totals_until_refresh_mutation_rescan_or_expiry() {
+        use crate::test_support::TestSandbox;
+        use std::fs;
+        use tokio_util::sync::CancellationToken;
+        let s = TestSandbox::new("pr-gitlab-totals");
+        let script = s.executable_script(
+            "glab",
+            r#"printf '%s\n' "$*" >> calls
+case "$1 $2" in
+  'mr list') echo '[]' ;;
+  'api -i') printf 'HTTP/2 200 OK\r\nx-total: 3\r\n\r\n[]' ;;
+  *) exit 64 ;;
+esac"#,
+            "",
+        );
+        let host = GitLabHost::new(Arc::new(
+            HostCommandRunner::new(s.path("state")).with_commands(&script, &script, &script),
+        ));
+        let scope = HostScope {
+            cwd: s.root().into(),
+            ..scope()
+        };
+        let c = CancellationToken::new();
+        let mut query: ListQuery = serde_json::from_value(json!({"cwd":s.root(),"state":"open","search":null,"author":null,"assignee":null,"reviewer":null,"reviewStatus":null,"draft":null,"labels":[],"milestone":null,"targetBranch":null,"sort":"newest","cursor":null})).unwrap();
+        let reads = |prefix: &str| {
+            fs::read_to_string(s.path("calls"))
+                .unwrap()
+                .lines()
+                .filter(|line| line.starts_with(prefix))
+                .count()
+        };
+        let page = host.list(&scope, &query, &c).await.unwrap();
+        let counts = page.counts.unwrap();
+        assert_eq!(
+            (counts.open, counts.closed, counts.merged),
+            (Some(3), Some(3), Some(3))
+        );
+        assert_eq!((reads("api -i"), reads("mr list")), (3, 1));
+        query.target_branch = Some("main".into());
+        let page = host.list(&scope, &query, &c).await.unwrap();
+        assert_eq!(page.counts.as_ref().and_then(|counts| counts.open), Some(3));
+        assert_eq!(
+            (reads("api -i"), reads("mr list")),
+            (3, 2),
+            "a filter reuses the totals"
+        );
+        query.cursor = Some("2".into());
+        host.list(&scope, &query, &c).await.unwrap();
+        assert_eq!(
+            (reads("api -i"), reads("mr list")),
+            (3, 3),
+            "a later page reuses the totals"
+        );
+        query.cursor = None;
+        query.refresh_totals = true;
+        host.list(&scope, &query, &c).await.unwrap();
+        assert_eq!(reads("api -i"), 6, "an explicit Refresh re-reads them");
+        query.refresh_totals = false;
+        host.invalidate_totals(&scope);
+        host.list(&scope, &query, &c).await.unwrap();
+        assert_eq!(reads("api -i"), 9, "a successful mutation re-reads them");
+        host.invalidate_context();
+        host.list(&scope, &query, &c).await.unwrap();
+        assert_eq!(reads("api -i"), 12, "Rescan re-reads them");
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        tokio::time::resume();
+        host.list(&scope, &query, &c).await.unwrap();
+        assert_eq!(reads("api -i"), 15, "they expire after 30 s");
+        assert_eq!(reads("mr list"), 7);
     }
 }
 

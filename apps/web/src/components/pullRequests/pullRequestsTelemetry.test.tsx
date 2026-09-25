@@ -2,7 +2,7 @@
 import { AVAILABLE_CONNECTION_STATE } from "@bibcode/client-runtime/connection";
 import type { ScopedProjectRef, ServerConfig } from "@bibcode/contracts";
 import { makeTestExecutionEnvironmentCapabilities } from "@bibcode/shared/testSupport";
-import { act, useReducer, type ReactNode } from "react";
+import { act, StrictMode, Suspense, useReducer, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
@@ -17,28 +17,34 @@ const h = vi.hoisted(() => ({
   checkout: vi.fn(),
   navigate: vi.fn(),
   atom: vi.fn((kind: string, args: unknown) => ({ kind, args })),
+  listSuspension: null as Promise<void> | null,
 }));
 
 // Keep the real panels, renderers, draft store, query revalidation and action owner.
 // Only the environment/transport boundary and viewport layout are substituted.
 vi.mock("../../state/pullRequests", () => ({
-  pullRequestsEnvironment: Object.fromEntries(
-    [
-      "getContext",
-      "list",
-      "get",
-      "getTimeline",
-      "getCommits",
-      "getChecks",
-      "getFiles",
-      "getVocabulary",
-    ]
-      .map((kind) => [kind, (args: unknown) => h.atom(kind, args)])
-      .concat([
-        ["runAction", "runAction"],
-        ["checkout", "checkout"],
-      ]),
-  ),
+  pullRequestsEnvironment: {
+    ...Object.fromEntries(
+      [
+        "getContext",
+        "list",
+        "get",
+        "getTimeline",
+        "getCommits",
+        "getChecks",
+        "getFiles",
+        "getVocabulary",
+      ]
+        .map((kind) => [kind, (args: unknown) => h.atom(kind, args)])
+        .concat([
+          ["runAction", "runAction"],
+          ["checkout", "checkout"],
+        ]),
+    ),
+    // Marking the next read to bypass server caches is not a request by itself.
+    requestContextRescan: () => undefined,
+    requestListTotalsRefresh: () => undefined,
+  },
 }));
 vi.mock("../../state/worktrees", () => ({
   worktreeEnvironment: { catalog: (args: unknown) => h.atom("catalog", args) },
@@ -102,15 +108,18 @@ vi.mock("@legendapp/list/react", () => ({
     renderItem: (input: { item: unknown; index: number }) => ReactNode;
     ListHeaderComponent?: ReactNode;
     ListFooterComponent?: ReactNode;
-  }) => (
-    <div>
-      {ListHeaderComponent}
-      {data.map((item, index) => (
-        <div key={keyExtractor(item)}>{renderItem({ item, index })}</div>
-      ))}
-      {ListFooterComponent}
-    </div>
-  ),
+  }) => {
+    if (h.listSuspension) throw h.listSuspension;
+    return (
+      <div>
+        {ListHeaderComponent}
+        {data.map((item, index) => (
+          <div key={keyExtractor(item)}>{renderItem({ item, index })}</div>
+        ))}
+        {ListFooterComponent}
+      </div>
+    );
+  },
 }));
 
 import { PullRequestsPanel } from "./PullRequestsPanel";
@@ -184,6 +193,7 @@ beforeAll(async () => {
 beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   vi.clearAllMocks();
+  h.listSuspension = null;
   vi.stubGlobal("fetch", deniedFetch);
   vi.stubGlobal("Image", deniedImage);
   vi.stubGlobal("WebSocket", deniedWebSocket);
@@ -277,6 +287,40 @@ afterEach(async () => {
 });
 
 describe("Pull Requests zero-telemetry runtime", () => {
+  it("reuses the prefetched page through StrictMode double rendering and a suspended first open", async () => {
+    h.data.getContext = null;
+    const ui = (
+      <StrictMode>
+        <Suspense fallback={<span>Opening list…</span>}>
+          <PullRequestsPanel projectRef={projectRef} />
+        </Suspense>
+      </StrictMode>
+    );
+    await act(async () => root.render(ui));
+    expect(h.atom.mock.calls.some(([kind]) => kind === "list")).toBe(true);
+
+    let release!: () => void;
+    h.listSuspension = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    h.data.getContext = context;
+    await act(async () =>
+      root.render(
+        <StrictMode>
+          <Suspense fallback={<span>Opening list…</span>}>
+            <PullRequestsPanel projectRef={projectRef} />
+          </Suspense>
+        </StrictMode>,
+      ),
+    );
+    await act(async () => {
+      h.listSuspension = null;
+      release();
+    });
+    expect(container.textContent).toContain(row.title);
+    expect(h.dispatch.mock.calls.filter(([kind]) => kind === "list")).toHaveLength(0);
+  });
+
   it("renders list actors as local initials even when payloads contain avatar URLs", async () => {
     await render();
     expect(container.textContent).toContain(row.title);

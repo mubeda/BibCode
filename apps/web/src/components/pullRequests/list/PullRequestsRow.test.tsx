@@ -54,6 +54,7 @@ describe("PullRequestsRow", () => {
         projectRef={projectRef}
         context={{
           ...context,
+          provider: "gitlab",
           capabilities: { ...context.capabilities, closedTabIncludesMerged: false },
         }}
       />,

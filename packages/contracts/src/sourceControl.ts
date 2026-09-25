@@ -153,6 +153,15 @@ export const SourceControlProviderDiscoveryItem = Schema.Struct({
 });
 export type SourceControlProviderDiscoveryItem = typeof SourceControlProviderDiscoveryItem.Type;
 
+/**
+ * Settings → Source Control's scan sets `recordHosts`, so the server's recorded hosts
+ * become exactly the authenticated hosts each CLI lists. Background reads omit it.
+ */
+export const SourceControlDiscoveryInput = Schema.Struct({
+  recordHosts: Schema.optional(Schema.Boolean),
+});
+export type SourceControlDiscoveryInput = typeof SourceControlDiscoveryInput.Type;
+
 export const SourceControlDiscoveryResult = Schema.Struct({
   versionControlSystems: Schema.Array(VcsDiscoveryItem),
   sourceControlProviders: Schema.Array(SourceControlProviderDiscoveryItem),

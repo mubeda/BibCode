@@ -4,9 +4,17 @@ import type {
   GitManagerCommitEntry,
   GitManagerPullRequestsResult,
   GitRunStackedActionResult,
+  PullRequestsProviderKind,
   SourceControlProviderInfo,
+  SourceControlProviderKind,
   VcsStatusResult,
 } from "@bibcode/contracts";
+import {
+  formatChangeRequestNumber,
+  getChangeRequestTerminology,
+  resolveChangeRequestPresentationForKind,
+} from "@bibcode/shared/sourceControl";
+import { capitalize } from "effect/String";
 
 export type ProviderPanePresentation =
   | { readonly kind: "not-loaded"; readonly message: string }
@@ -16,19 +24,22 @@ export type ProviderPanePresentation =
   | { readonly kind: "loaded"; readonly message: string };
 
 export function resolveProviderPanePresentation(input: {
+  readonly providerKind: SourceControlProviderKind | null;
   readonly requested: boolean;
   readonly pending: boolean;
   readonly error: string | null;
   readonly result: GitManagerPullRequestsResult | null;
 }): ProviderPanePresentation {
+  const changeRequest = resolveChangeRequestPresentationForKind(input.providerKind ?? "github");
+  const pluralTitle = capitalize(changeRequest.pluralLongName);
   if (!input.requested) {
     return {
       kind: "not-loaded",
-      message: "Pull requests and checks load only when you choose Refresh.",
+      message: `${pluralTitle} and checks load only when you choose Refresh.`,
     };
   }
   if (input.pending) {
-    return { kind: "loading", message: "Loading pull requests and checks…" };
+    return { kind: "loading", message: `Loading ${changeRequest.pluralLongName} and checks…` };
   }
   if (input.error !== null) {
     return { kind: "error", message: input.error };
@@ -36,15 +47,15 @@ export function resolveProviderPanePresentation(input: {
   if (input.result?.status === "unavailable") {
     return {
       kind: "unavailable",
-      message: "Pull requests or checks are unavailable for this repository provider.",
+      message: `${pluralTitle} or checks are unavailable for this repository provider.`,
     };
   }
   return {
     kind: "loaded",
     message:
       input.result?.pullRequests.length === 0
-        ? "No open pull request was found for the current branch."
-        : "Pull requests and checks loaded.",
+        ? `No open ${changeRequest.longName} was found for the current branch.`
+        : `${pluralTitle} and checks loaded.`,
   };
 }
 
@@ -74,6 +85,28 @@ export interface ExistingPullRequestSummary {
   readonly url: string;
 }
 
+/** A host the caller already identified: the Pull Requests panel's context. */
+export interface CreatePullRequestProviderHint {
+  readonly kind: PullRequestsProviderKind;
+  readonly host: string;
+}
+
+/** The hinted host as a provider, the way status names a GitHub or GitLab host. */
+export function hintedProvider(
+  hint: CreatePullRequestProviderHint | null,
+): SourceControlProviderInfo | null {
+  return hint === null
+    ? null
+    : {
+        kind: hint.kind,
+        name: resolveChangeRequestPresentationForKind(hint.kind).providerName,
+        baseUrl: `https://${hint.host}`,
+      };
+}
+
+export const UNIDENTIFIED_HOST_REASON =
+  "BiBCode hasn't identified this repository's host yet. Open Pull Requests for this project or run Rescan in Settings → Source Control.";
+
 /**
  * Everything the review surface shows before anything is published: where the
  * pull request goes, which branches it joins, whether the branch must be
@@ -93,9 +126,13 @@ export interface CreatePullRequestReview {
 export function resolveCreatePullRequestReview(input: {
   readonly status: VcsStatusResult;
   readonly latestCommit: GitManagerCommitEntry | null;
+  readonly providerHint?: CreatePullRequestProviderHint | null;
 }): CreatePullRequestReview {
   const { status, latestCommit } = input;
-  const provider = status.sourceControlProvider ?? null;
+  // A cold or stale status may not name a host the caller already identified; the
+  // hint stands in for it, and the server validates the provider when creating.
+  const provider = status.sourceControlProvider ?? hintedProvider(input.providerHint ?? null);
+  const noun = getChangeRequestTerminology(provider).singular;
   const head = status.refName;
   const base = status.defaultRefName ?? "main";
   const existingPullRequest =
@@ -105,11 +142,13 @@ export function resolveCreatePullRequestReview(input: {
   const blockedReason = !status.isRepo
     ? "This folder is not a Git repository."
     : head === null
-      ? "Check out a branch before creating a pull request."
+      ? `Check out a branch before creating a ${noun}.`
       : provider === null
-        ? "No supported source-control provider was found for this repository's remote."
+        ? status.hasPrimaryRemote
+          ? UNIDENTIFIED_HOST_REASON
+          : `Add an origin remote to create a ${noun}.`
         : status.hasWorkingTreeChanges
-          ? "Commit local changes before creating a pull request."
+          ? `Commit local changes before creating a ${noun}.`
           : null;
   const defaultTitle = latestCommit?.subject.trim() ?? "";
   return {
@@ -204,16 +243,16 @@ export interface CreatePullRequestProgressPresentation {
 
 export function presentCreatePullRequestProgress(
   state: CreatePullRequestProgress,
-  review: Pick<CreatePullRequestReview, "publishRequired" | "head">,
+  review: Pick<CreatePullRequestReview, "publishRequired" | "head" | "provider">,
 ): CreatePullRequestProgressPresentation {
+  const kind = review.provider?.kind ?? null;
+  const noun = getChangeRequestTerminology(review.provider).singular;
   switch (state.kind) {
     case "review":
       return {
         status: null,
         tone: "neutral",
-        primaryLabel: review.publishRequired
-          ? "Publish and create pull request"
-          : "Create pull request",
+        primaryLabel: review.publishRequired ? `Publish and create ${noun}` : `Create ${noun}`,
         busy: false,
         settled: false,
       };
@@ -223,7 +262,7 @@ export function presentCreatePullRequestProgress(
           state.phase === "push"
             ? `Publishing ${review.head ?? "the branch"}…`
             : state.phase === "pr"
-              ? "Creating the pull request…"
+              ? `Creating the ${noun}…`
               : "Starting…",
         tone: "neutral",
         primaryLabel: "Working…",
@@ -236,8 +275,8 @@ export function presentCreatePullRequestProgress(
           state.phase === "push"
             ? `Publishing ${review.head ?? "the branch"} failed: ${state.message}`
             : state.branchPublished
-              ? `${review.head ?? "The branch"} was published, but creating the pull request failed: ${state.message}`
-              : `Creating the pull request failed: ${state.message}`,
+              ? `${review.head ?? "The branch"} was published, but creating the ${noun} failed: ${state.message}`
+              : `Creating the ${noun} failed: ${state.message}`,
         tone: "error",
         primaryLabel: "Retry",
         busy: false,
@@ -247,8 +286,8 @@ export function presentCreatePullRequestProgress(
       return {
         status:
           state.number === null
-            ? "Pull request created."
-            : `Pull request #${String(state.number)} created.`,
+            ? `${capitalize(noun)} created.`
+            : `${capitalize(noun)} ${formatChangeRequestNumber(kind, state.number)} created.`,
         tone: "success",
         primaryLabel: "Done",
         busy: false,
@@ -258,8 +297,8 @@ export function presentCreatePullRequestProgress(
       return {
         status:
           state.number === null
-            ? "A pull request already exists for this branch, so none was created."
-            : `Pull request #${String(state.number)} already exists for this branch, so none was created.`,
+            ? `A ${noun} already exists for this branch, so none was created.`
+            : `${capitalize(noun)} ${formatChangeRequestNumber(kind, state.number)} already exists for this branch, so none was created.`,
         tone: "success",
         primaryLabel: "Done",
         busy: false,

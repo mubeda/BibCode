@@ -9,10 +9,7 @@ import {
   AlertDialogFooter,
 } from "../../ui/alert-dialog";
 import { Button } from "../../ui/button";
-import {
-  PullRequestsPermissionButton,
-  constrainPermission,
-} from "../shared/PullRequestsPermissionButton";
+import { PermissionButton, constrainPermission } from "../../ui/permission-button";
 import { usePullRequestsActions } from "../usePullRequestsAction";
 export function PullRequestsDismissReview({
   review,
@@ -56,7 +53,7 @@ export function PullRequestsDismissReview({
   }
   return (
     <>
-      <PullRequestsPermissionButton
+      <PermissionButton
         mutation
         permission={available}
         variant="outline"
@@ -64,7 +61,7 @@ export function PullRequestsDismissReview({
         onClick={() => setOpen(true)}
       >
         Dismiss review
-      </PullRequestsPermissionButton>
+      </PermissionButton>
       <AlertDialog
         open={open}
         onOpenChange={(value) => {
@@ -99,7 +96,7 @@ export function PullRequestsDismissReview({
             <Button variant="outline" disabled={dismissing} onClick={() => setOpen(false)}>
               Cancel
             </Button>
-            <PullRequestsPermissionButton
+            <PermissionButton
               mutation
               permission={constrainPermission(
                 available,
@@ -109,7 +106,7 @@ export function PullRequestsDismissReview({
               onClick={() => void dismiss()}
             >
               {dismissing ? "Dismissing…" : "Dismiss review"}
-            </PullRequestsPermissionButton>
+            </PermissionButton>
           </AlertDialogFooter>
         </AlertDialogPopup>
       </AlertDialog>

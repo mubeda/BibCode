@@ -10,9 +10,9 @@ import {
   PullRequestsChecks,
   PullRequestsCommits,
   PullRequestsContext,
-  PullRequestsCwdInput,
   PullRequestsDetail,
   PullRequestsFiles,
+  PullRequestsGetContextInput,
   PullRequestsListInput,
   PullRequestsListPage,
   PullRequestsNumberInput,
@@ -251,6 +251,7 @@ import {
 import {
   SourceControlCloneRepositoryInput,
   SourceControlCloneRepositoryResult,
+  SourceControlDiscoveryInput,
   SourceControlDiscoveryResult,
   SourceControlPublishRepositoryInput,
   SourceControlPublishRepositoryResult,
@@ -587,7 +588,7 @@ export const WsServerUpdateSettingsRpc = Rpc.make(WS_METHODS.serverUpdateSetting
 });
 
 export const WsServerDiscoverSourceControlRpc = Rpc.make(WS_METHODS.serverDiscoverSourceControl, {
-  payload: Schema.Struct({}),
+  payload: SourceControlDiscoveryInput,
   success: SourceControlDiscoveryResult,
   error: EnvironmentRpcError,
 });
@@ -1217,7 +1218,7 @@ export const WsSubscribeGitManagerSignalRpc = Rpc.make(WS_METHODS.subscribeGitMa
 });
 
 export const WsPullRequestsGetContextRpc = Rpc.make(WS_METHODS.pullRequestsGetContext, {
-  payload: PullRequestsCwdInput,
+  payload: PullRequestsGetContextInput,
   success: PullRequestsContext,
   error: PullRequestsOperationError,
 });

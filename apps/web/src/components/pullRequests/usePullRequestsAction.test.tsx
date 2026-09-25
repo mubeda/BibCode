@@ -14,7 +14,7 @@ import {
   type PullRequestsActions,
   type PullRequestsAction,
 } from "./usePullRequestsAction";
-import { PullRequestsPermissionButton } from "./shared/PullRequestsPermissionButton";
+import { PermissionButton } from "../ui/permission-button";
 let root: Root;
 let container: HTMLDivElement;
 let actions: PullRequestsActions;
@@ -130,9 +130,9 @@ describe("useRunPullRequestsAction", () => {
           disabledReason="This environment does not support Pull Requests mutations"
         >
           <Probe />
-          <PullRequestsPermissionButton mutation permission={{ allowed: true, reason: null }}>
+          <PermissionButton mutation permission={{ allowed: true, reason: null }}>
             Comment
-          </PullRequestsPermissionButton>
+          </PermissionButton>
         </PullRequestsActionProvider>,
       ),
     );

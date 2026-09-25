@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::diagnostics::redact_sensitive_text;
+use crate::source_control::{self, ProviderHosts};
 
 use super::manager::graph::MAX_DIFF_BUFFER_SIZE;
 use super::worktree::{WorktreePruneDryRunRecord, parse_worktree_prune_dry_run};
@@ -23,12 +24,12 @@ use super::{
     ChangeRequest, CreateWorktreeInput, GitCommandDiagnostics, GitCommandError,
     GitPrunableWorktree, GitWorktreeInventory, GitWorktreeRecord, GitWorktreeRemovalInspection,
     ManagedWorktreeRollback, OutputPolicy, ProcessError, ProcessOutput, ProcessRequest,
-    ProcessRunner, ProviderKind, PullStatus, SourceControlProviderInfo, VcsCommit,
-    VcsCreateWorktreeResult, VcsListCommitsResult, VcsListRefsResult, VcsPullResult, VcsRef,
-    VcsStagingArea, VcsStatusLocalResult, VcsStatusRemoteResult, VcsStatusResult, VcsStatusSummary,
-    VcsWorkingTree, VcsWorkingTreeFile, VcsWorkingTreeFileStatus, VcsWorktree,
-    canonical_worktree_path_key, git_worktree_prune_impact_digest, host_path_platform,
-    normalize_worktree_path_key, parse_numstat, parse_porcelain_v2_line, parse_worktree_porcelain,
+    ProcessRunner, PullStatus, SourceControlProviderInfo, VcsCommit, VcsCreateWorktreeResult,
+    VcsListCommitsResult, VcsListRefsResult, VcsPullResult, VcsRef, VcsStagingArea,
+    VcsStatusLocalResult, VcsStatusRemoteResult, VcsStatusResult, VcsStatusSummary, VcsWorkingTree,
+    VcsWorkingTreeFile, VcsWorkingTreeFileStatus, VcsWorktree, canonical_worktree_path_key,
+    git_worktree_prune_impact_digest, host_path_platform, normalize_worktree_path_key,
+    parse_numstat, parse_porcelain_v2_line, parse_worktree_porcelain,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -149,6 +150,8 @@ pub struct GitRepository {
     command_timeout: Duration,
     /// `-c` configuration placed before the subcommand of every command this variant runs.
     command_config: &'static [&'static str],
+    /// Hosts identified by explicit provider probes; status reads only read it.
+    provider_hosts: Arc<ProviderHosts>,
 }
 
 pub(crate) struct StatusObservation {
@@ -187,6 +190,7 @@ impl Default for GitRepository {
             worktree_porcelain_z_supported: Arc::new(Mutex::new(None)),
             command_timeout: DEFAULT_TIMEOUT,
             command_config: &[],
+            provider_hosts: Arc::default(),
         }
     }
 }
@@ -349,7 +353,15 @@ impl GitRepository {
             worktree_porcelain_z_supported: Arc::new(Mutex::new(None)),
             command_timeout: DEFAULT_TIMEOUT,
             command_config: &[],
+            provider_hosts: Arc::default(),
         }
+    }
+
+    /// Shares the server's host observation, which provider probes fill elsewhere.
+    #[must_use]
+    pub fn with_provider_hosts(mut self, provider_hosts: Arc<ProviderHosts>) -> Self {
+        self.provider_hosts = provider_hosts;
+        self
     }
 
     #[cfg(test)]
@@ -360,6 +372,7 @@ impl GitRepository {
             worktree_porcelain_z_supported: Arc::new(Mutex::new(None)),
             command_timeout: DEFAULT_TIMEOUT,
             command_config: &[],
+            provider_hosts: Arc::default(),
         }
     }
 
@@ -5508,6 +5521,30 @@ impl GitRepository {
         cwd: &Path,
         cancellation: &CancellationToken,
     ) -> Result<Option<SourceControlProviderInfo>, GitCommandError> {
+        Ok(self
+            .origin_url(cwd, cancellation)
+            .await?
+            .and_then(|url| provider_info(&self.provider_hosts, &url)))
+    }
+
+    /// The origin's host name, for messages that name the host.
+    pub async fn origin_host(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<String>, GitCommandError> {
+        Ok(self
+            .origin_url(cwd, cancellation)
+            .await?
+            .as_deref()
+            .and_then(source_control::remote_host))
+    }
+
+    pub(crate) async fn origin_url(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<String>, GitCommandError> {
         let remote = self
             .execute_read(
                 "GitVcsDriver.remoteProvider",
@@ -5527,7 +5564,7 @@ impl GitRepository {
             ));
         }
         if remote.exit_code == 0 {
-            return Ok(provider_info(remote.stdout.trim()));
+            return Ok(Some(remote.stdout.trim().to_owned()));
         }
         if remote.exit_code == 1
             && remote.stdout.trim().is_empty()
@@ -9031,6 +9068,47 @@ mod tests {
         }
     }
 
+    /// A self-hosted origin has no provider until an explicit probe records its host;
+    /// then status reads classify it with its own base URL, still spawning only Git.
+    #[tokio::test]
+    async fn status_provider_uses_recorded_hosts_with_their_own_base_url() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([
+                (
+                    "GitVcsDriver.summaryStatus.status".into(),
+                    process_output(
+                        "# branch.oid 0123456789abcdef0123456789abcdef01234567\n# branch.head main\n",
+                    ),
+                ),
+                (
+                    "GitVcsDriver.remoteProvider".into(),
+                    process_output("https://luna.tripunkt.de/tripunkt/customer-portal.git\n"),
+                ),
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let hosts = Arc::new(crate::source_control::ProviderHosts::default());
+        let repository =
+            GitRepository::with_runner_for_test(runner.clone()).with_provider_hosts(hosts.clone());
+        let cancellation = CancellationToken::new();
+        let read = || repository.summary_status(Path::new("/repo"), &cancellation);
+
+        assert_eq!(read().await.unwrap().source_control_provider, None);
+        hosts.record(
+            "luna.tripunkt.de",
+            crate::source_control::ProviderKind::Gitlab,
+        );
+        assert_eq!(
+            read().await.unwrap().source_control_provider,
+            Some(super::SourceControlProviderInfo {
+                kind: crate::git::ProviderKind::Gitlab,
+                name: "GitLab".into(),
+                base_url: "https://luna.tripunkt.de".into(),
+            })
+        );
+        assert_eq!(runner.count_arg("status"), 2, "only Git ran");
+    }
+
     #[tokio::test]
     async fn summary_provider_absence_is_distinct_from_operational_or_truncated_failure() {
         let status = process_output(
@@ -9954,31 +10032,18 @@ fn ref_priority(reference: &VcsRef) -> u8 {
     }
 }
 
-fn provider_info(remote: &str) -> Option<SourceControlProviderInfo> {
-    let normalized = remote.to_lowercase();
-    let (kind, name, base_url) = if normalized.contains("github.com") {
-        (ProviderKind::Github, "GitHub", "https://github.com")
-    } else if normalized.contains("gitlab") {
-        (ProviderKind::Gitlab, "GitLab", "https://gitlab.com")
-    } else if normalized.contains("dev.azure.com") || normalized.contains("visualstudio.com") {
-        (
-            ProviderKind::AzureDevops,
-            "Azure DevOps",
-            "https://dev.azure.com",
-        )
-    } else if normalized.contains("bitbucket") {
-        (
-            ProviderKind::Bitbucket,
-            "Bitbucket",
-            "https://bitbucket.org",
-        )
-    } else {
-        return None;
+/// The origin's provider under the shared classification: well-known host names
+/// first, then hosts that explicit provider probes identified (never a spawn here).
+fn provider_info(hosts: &ProviderHosts, remote: &str) -> Option<SourceControlProviderInfo> {
+    let info = match hosts.identify(remote) {
+        source_control::IdentifiedProvider::Named(info)
+        | source_control::IdentifiedProvider::Recorded(info) => info,
+        source_control::IdentifiedProvider::Unknown => return None,
     };
     Some(SourceControlProviderInfo {
-        kind,
-        name: name.into(),
-        base_url: base_url.into(),
+        kind: info.kind.into(),
+        name: info.name,
+        base_url: info.base_url,
     })
 }
 

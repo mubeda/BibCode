@@ -1,3 +1,4 @@
+import { getChangeRequestTerminologyForKind } from "@bibcode/shared/sourceControl";
 import type {
   PullRequestsContext,
   PullRequestsDetail,
@@ -12,11 +13,8 @@ import { Button } from "../../ui/button";
 import { Input } from "../../ui/input";
 import { Menu, MenuTrigger, MenuPopup, MenuItem } from "../../ui/menu";
 import { Select, SelectTrigger, SelectValue, SelectPopup, SelectItem } from "../../ui/select";
-import {
-  PullRequestsPermissionButton,
-  constrainPermission,
-} from "../shared/PullRequestsPermissionButton";
-import { PullRequestsMutationsDisabledContext } from "../pullRequestsMutationAvailability";
+import { PermissionButton, constrainPermission } from "../../ui/permission-button";
+import { MutationsDisabledContext } from "../../ui/mutationAvailability";
 import { usePullRequestsActions, type PullRequestsAction } from "../usePullRequestsAction";
 import { PullRequestsConfirmAction } from "./PullRequestsConfirmAction";
 
@@ -66,7 +64,7 @@ export function PullRequestsUpdateBranch({
 }) {
   const { run, pending } = usePullRequestsActions();
   const [skipCi, setSkipCi] = useState(false);
-  const disabledReason = useContext(PullRequestsMutationsDisabledContext);
+  const disabledReason = useContext(MutationsDisabledContext);
   const permission = constrainPermission(
     detail.permissions.updateBranch,
     disabledReason ?? (pending ? "Wait for the current action to finish" : null),
@@ -93,7 +91,7 @@ export function PullRequestsUpdateBranch({
         />
       ) : null}
       <div className="flex items-center gap-1">
-        <PullRequestsPermissionButton
+        <PermissionButton
           mutation
           permission={constrainPermission(
             permission,
@@ -106,7 +104,7 @@ export function PullRequestsUpdateBranch({
           }}
         >
           {label}
-        </PullRequestsPermissionButton>
+        </PermissionButton>
         {methods.length > 1 ? (
           <Menu>
             <MenuTrigger
@@ -128,7 +126,7 @@ export function PullRequestsUpdateBranch({
                   key={value}
                   nativeButton
                   render={
-                    <PullRequestsPermissionButton
+                    <PermissionButton
                       mutation
                       permission={permission}
                       variant="ghost"
@@ -157,7 +155,7 @@ export function PullRequestsMergeControls({
   projectRef: ScopedProjectRef;
 }) {
   const { run, pending, error } = usePullRequestsActions();
-  const disabledReason = useContext(PullRequestsMutationsDisabledContext);
+  const disabledReason = useContext(MutationsDisabledContext);
   const edited = usePullRequestsStore(
     (s) => s.selectDraft(projectRef, detail.number).mergeDraftEdited,
   );
@@ -203,7 +201,7 @@ export function PullRequestsMergeControls({
   const methodReason = !method
     ? "Choose a merge method"
     : !detail.headSha
-      ? `Reload this ${context.capabilities.vocabulary.pullRequest} before merging`
+      ? `Reload this ${getChangeRequestTerminologyForKind(context.provider).singular} before merging`
       : null;
   function actionPermission(action: { auto: boolean; bypass: boolean }, reason: string | null) {
     let permission = action.bypass
@@ -332,7 +330,7 @@ export function PullRequestsMergeControls({
       {activeAuto ? (
         <div className="flex flex-wrap items-center gap-2">
           <span>Auto-merge enabled</span>
-          <PullRequestsPermissionButton
+          <PermissionButton
             mutation
             permission={constrainPermission(detail.permissions.disableAutoMerge, busyReason)}
             variant="outline"
@@ -342,20 +340,20 @@ export function PullRequestsMergeControls({
             }}
           >
             Disable auto-merge
-          </PullRequestsPermissionButton>
+          </PermissionButton>
         </div>
       ) : null}
       <div className="flex flex-wrap gap-2">
-        <PullRequestsPermissionButton
+        <PermissionButton
           mutation
           permission={primaryPermission}
           size="sm"
           onClick={() => confirm(false)}
         >
           Merge
-        </PullRequestsPermissionButton>
+        </PermissionButton>
         {detail.permissions.mergeBypass.allowed ? (
-          <PullRequestsPermissionButton
+          <PermissionButton
             mutation
             permission={bypassPermission}
             variant="outline"
@@ -363,7 +361,7 @@ export function PullRequestsMergeControls({
             onClick={() => confirm(true)}
           >
             {bypassLabel}
-          </PullRequestsPermissionButton>
+          </PermissionButton>
         ) : null}
       </div>
       {error ? (
@@ -378,7 +376,7 @@ export function PullRequestsMergeControls({
               ? bypassLabel
               : confirmation.action.auto
                 ? "Enable auto-merge"
-                : `Merge ${context.capabilities.vocabulary.pullRequest}`
+                : `Merge ${getChangeRequestTerminologyForKind(context.provider).singular}`
           }
           confirmLabel={
             confirmation.action.bypass

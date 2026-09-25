@@ -307,19 +307,30 @@ impl ProductionRuntime {
             .await;
         let transfer_access = TransferAccess::new(asset_secret.clone());
         let asset_access = AssetAccess::new(asset_secret, state_paths.attachments_dir.clone());
-        let git_repository = Arc::new(GitRepository::with_worktree_settings(control.clone()));
+        // One host observation: Pull Requests scope resolution and Settings discovery
+        // write it, status reads (and the create path) only read it.
+        let provider_hosts = Arc::new(crate::source_control::ProviderHosts::default());
+        let git_repository = Arc::new(
+            GitRepository::with_worktree_settings(control.clone())
+                .with_provider_hosts(provider_hosts.clone()),
+        );
         let workspace_availability = WorkspaceAvailabilityRegistry::new();
         let worktree_catalog = WorktreeCatalogService::new_with_availability_registry(
             Arc::new(repositories.clone()),
             git_repository.clone(),
             workspace_availability.clone(),
         );
+        let pull_requests =
+            PullRequestsRpcServices::with_dependencies(config.state_dir(), repositories.clone())
+                .with_provider_hosts(provider_hosts.clone());
         let git_vcs = GitVcsRpcServices::with_production_dependencies(
             git_repository.clone(),
             terminal_manager.clone(),
             repositories.clone(),
             control.automatic_git_fetch_interval_signal(),
+            provider_hosts,
         )
+        .with_created_request_observer(Arc::new(pull_requests.service.clone()))
         .with_availability_registry(workspace_availability.clone());
         let worktree_removal_tasks = git_vcs.worktree_removal_tasks();
         let status_broadcaster = git_vcs.status_broadcaster();
@@ -439,8 +450,7 @@ impl ProductionRuntime {
                 .with_removal_quiescer(Arc::new(worktree_runtime.clone()));
         register_pull_requests_rpc(
             &mut registry,
-            PullRequestsRpcServices::with_dependencies(config.state_dir(), repositories.clone())
-                .with_worktrees(worktree_catalog_rpc.clone()),
+            pull_requests.with_worktrees(worktree_catalog_rpc.clone()),
         );
         let worktree_catalog_operations = worktree_catalog_rpc.operation_runtime();
         register_worktree_catalog_rpc(&mut registry, worktree_catalog_rpc);

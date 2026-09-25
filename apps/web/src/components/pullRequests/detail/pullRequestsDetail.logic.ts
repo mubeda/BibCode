@@ -4,11 +4,15 @@ import type {
   PullRequestsFile,
   PullRequestsHostCapabilities,
   PullRequestsMergeReadiness,
+  PullRequestsProviderKind,
   PullRequestsTimelineItem,
 } from "@bibcode/contracts";
 type Vocabulary = PullRequestsHostCapabilities["vocabulary"];
-export function headerSentence(detail: PullRequestsDetail, vocabulary: Vocabulary): string {
-  return vocabulary.pullRequest === "merge request"
+export function headerSentence(
+  detail: PullRequestsDetail,
+  provider: PullRequestsProviderKind,
+): string {
+  return provider === "gitlab"
     ? `${detail.author.login} requested to merge ${detail.headBranch} into ${detail.baseBranch}`
     : `${detail.author.login} wants to merge ${detail.commitCount} commit${detail.commitCount === 1 ? "" : "s"} into ${detail.baseBranch} from ${detail.headBranch}`;
 }

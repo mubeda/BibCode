@@ -360,6 +360,13 @@ Eight unary reads (`pullRequests.getContext`, `getVocabulary`, `list`, `get`,
 require `orchestration:operate`. Every request carries the selected checkout's
 `cwd`; the client does not resolve repository paths or compute permissions.
 
+`capabilities.vocabulary.pullRequest` and `pullRequests` are compatibility-only
+request nouns. Both remain required and are sent by the GitHub and GitLab
+adapters so older clients can decode context. Current clients ignore those two
+fields and derive nouns and number prefixes from the provider kind through
+`@bibcode/shared/sourceControl`; the remaining vocabulary fields still describe
+host-specific controls.
+
 ### Pull Requests flow
 
 | Method                       | Required scope          | Responsibility                                                          |
@@ -379,7 +386,22 @@ Browser and desktop clients use these same typed unary RPCs; native actions such
 as opening a host URL retain the existing DesktopBridge/local API boundary.
 Reads begin on route/tab/picker open, user filters/pagination, Refresh, Rescan,
 or successful-action invalidation. No timer, window focus, constructor, or idle
-worker initiates provider traffic. The five-second Undo lifetime and 300 ms
+worker initiates provider traffic. `pullRequests.getContext` accepts an optional
+`rescan`: without it the server reuses its bounded 30 s probe and host-context
+answers (the origin is still read); with it the server clears those caches and
+forgets the origin host's recorded provider before resolving. Only Rescan and
+authentication recovery set it. `pullRequests.list` accepts an optional
+`refreshTotals`, set only by an explicit list Refresh: GitLab's three
+repository-wide totals are otherwise reused for 30 s per host and repository
+across filters and pages, and cleared by Rescan, auth/permission failures, any
+successful `runAction`, and a request created through `git.runStackedAction`
+(the Git VCS service reports it through `CreatedRequestObserver`).
+`server.discoverSourceControl` accepts an optional `recordHosts`: only
+**Settings → Source Control** (and its Rescan) sets it, making each CLI's
+authenticated host list the recorded hosts. Recognized full GitLab logout
+reports Unauthenticated with an empty list and clears recorded GitLab hosts;
+unrecognized output reports Unknown without a host list and retains them.
+Background reads such as the publish dialog's never write them. The five-second Undo lifetime and 300 ms
 input debounce do not poll. Detail mounts `get` plus the active tab's query;
 Files also mounts timeline for line-anchored threads. Inactive atom invalidation
 does not mount extra reads.
@@ -567,10 +589,23 @@ The web shell uses project-scoped `/pull-requests` and `/pull-requests/$number`
 routes inside the chat route inset. Availability checks the client preference,
 passive connection state, and read capability before mounting context or
 catalog queries; it never dials a disconnected environment. Context and list
-reads use only the client-runtime atom families. A list or detail/tab authentication failure
-invalidates context once through the panel's existing refresh callback. There
-are no provider timers or focus refreshes; the 300 ms text-input debounce is
-scheduled only by typing.
+reads use only the client-runtime atom families; `getContext` stays keyed by
+`{ cwd }`, and Rescan or recovery registers a one-shot `rescan` for that key
+(likewise `refreshTotals` for the list's first page). Reads of the key send it
+until one is answered, a success or the server's typed failure; an interrupted
+read or a lost connection keeps it. The current value stays visible while it
+runs. A list or detail/tab authentication failure rescans context once through
+the panel's existing refresh callback. While the context is pending on the
+list route, the panel mounts the first list page for the stored filters when
+the stored tab is Open or Closed, so the two reads overlap. It remembers that
+page's `environmentRpcKey` as a value, capturing a changed prefetch key through
+a guarded state adjustment during render. The list treats the page as fresh
+on its first open only. Consumption occurs after the list commits, so
+StrictMode or suspended renders cannot consume it; the key is dropped once the list opened, on a detail
+route, or when the context settles unavailable. Any other open refreshes a cached page or failure
+and shows loading until the new read answers.
+There are no provider timers or focus refreshes; the 300 ms text-input debounce
+is scheduled only by typing.
 
 `apps/web/src/pullRequestsStore.ts` owns version-1 local view state under
 `bibcode:pull-requests-state:v1`, keyed by the physical environment/project
@@ -584,7 +619,8 @@ at 56 px. Navigation back to a saved offset reopens only enough cursor pages
 to restore that viewport. Scroll is saved on navigation and pagehide without
 writing storage on every scroll event. Because a checkout path can acquire a
 new origin/account, each explicit list/picker/detail/tab open refreshes a cached value
-before displaying it (without restarting an already-pending mount read).
+before displaying it (without restarting an already-pending mount read, and
+without re-reading the first page the panel loaded during the same open).
 Rescan identity changes remount repository-bound UI, clearing open dialogs and
 picker state before new data appears. Creation uses the existing Git Manager
 dialog and mutation capability reason.
@@ -703,9 +739,21 @@ persisted or logged.
 Concurrent loads of the same key share a cancellable lock; unrelated keys load
 independently. Failures and cancelled loads are not cached. Invalidating or
 evicting an entry detaches its in-flight load, so late completion cannot restore
-a superseded cache entry. An explicit `pullRequests.getContext` (including
-Rescan/auth recovery) clears context/probe caches before reading. Authentication,
+a superseded cache entry. Only `pullRequests.getContext` with `rescan`
+(Rescan/auth recovery) clears context/probe caches before reading. Authentication,
 repository-denial/missing and CLI-availability failures also invalidate them.
+
+Once the provider and remote scope are resolved, context and list reads share
+one authenticated-read helper that runs the login recheck concurrently with
+the host read. A failed login cancels the host read and awaits its supervised
+child cleanup before returning the login error, discarding any host response.
+Unknown hosts still require discovery before any adapter is selected. Mutation paths
+finish authentication before host reads or writes. Created-request totals
+invalidation reuses the same remote-to-scope decoder and only selects GitHub
+or GitLab adapters. After a successful login check, both context and list
+recheck checkout availability before accepting the host response or its error,
+including when all provider children started before the directory disappeared
+and returned successful responses.
 
 GitLab timeline reads reuse an available context viewer; reaction mutations use
 the viewer carried by their fresh permission observations. Neither needs a

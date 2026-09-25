@@ -88,6 +88,7 @@ vi.mock("~/lib/utils", async (importOriginal) => {
 });
 
 import { GitManagerCreatePullRequestDialog } from "./GitManagerCreatePullRequestDialog";
+import type { CreatePullRequestProviderHint } from "./GitManagerPullRequestPanel.logic";
 
 let container: HTMLDivElement;
 let root: Root;
@@ -154,7 +155,11 @@ function finished(prStatus: "created" | "opened_existing"): GitActionProgressEve
   return { ...base, kind: "action_finished", result };
 }
 
-async function renderDialog(onSettled = vi.fn(), onOpenChange = vi.fn()) {
+async function renderDialog(
+  onSettled = vi.fn(),
+  onOpenChange = vi.fn(),
+  providerHint: CreatePullRequestProviderHint | null = null,
+) {
   await act(async () =>
     root.render(
       <GitManagerCreatePullRequestDialog
@@ -162,6 +167,7 @@ async function renderDialog(onSettled = vi.fn(), onOpenChange = vi.fn()) {
         scope={{ environmentId: "env-a" as never, cwd: "/repo" }}
         onOpenChange={onOpenChange}
         onSettled={onSettled}
+        providerHint={providerHint}
       />,
     ),
   );
@@ -273,6 +279,79 @@ describe("GitManagerCreatePullRequestDialog", () => {
     expect(input("git-manager-create-pr-title").value).toBe("feat: reviewed change");
     expect(input("git-manager-create-pr-body").value).toBe("Body from commit");
     expect(button("Publish and create pull request").disabled).toBe(false);
+  });
+
+  it("says merge request and shows the self-hosted GitLab address", async () => {
+    h.status = status({
+      sourceControlProvider: {
+        kind: "gitlab",
+        name: "GitLab",
+        baseUrl: "https://luna.tripunkt.de",
+      },
+    });
+    await renderDialog();
+
+    expect(document.body.textContent).toContain("Create merge request");
+    expect(document.body.textContent).toContain(
+      "Review the merge request before anything is published.",
+    );
+    expect(text("create-pr-repository")).toBe("GitLab · https://luna.tripunkt.de");
+    expect(
+      document.querySelector('[data-testid="create-pr-summary"]')?.getAttribute("aria-label"),
+    ).toBe("Merge request details");
+    expect(button("Publish and create merge request").disabled).toBe(false);
+  });
+
+  it("tells an unidentified host how to get identified, and asks for a missing origin", async () => {
+    h.status = status({ sourceControlProvider: undefined });
+    await renderDialog();
+    const reason =
+      "BiBCode hasn't identified this repository's host yet. Open Pull Requests for this project or run Rescan in Settings → Source Control.";
+    expect(text("create-pr-repository")).toBe("Not identified yet");
+    expect(text("create-pr-status")).toBe(reason);
+    const blocked = button("Publish and create pull request");
+    expect(blocked.disabled).toBe(true);
+    // A disabled button gets no pointer events: its wrapper carries the tooltip, and
+    // assistive technology reads the reason through aria-describedby.
+    expect(blocked.parentElement?.getAttribute("title")).toBe(reason);
+    const described = document.getElementById(blocked.getAttribute("aria-describedby") ?? "");
+    expect(described?.textContent).toBe(reason);
+
+    h.status = status({ sourceControlProvider: undefined, hasPrimaryRemote: false });
+    await renderDialog();
+    expect(text("create-pr-repository")).toBe("No origin remote");
+    expect(text("create-pr-status")).toBe("Add an origin remote to create a pull request.");
+    expect(h.runs).toEqual([]);
+  });
+
+  it("uses shared change-request wording for an explicitly unknown provider", async () => {
+    h.status = status({
+      sourceControlProvider: { kind: "unknown", name: "forge", baseUrl: "https://forge.test" },
+      hasWorkingTreeChanges: true,
+    });
+    await renderDialog();
+    expect(document.body.textContent).toContain("Create change request");
+    expect(button("Publish and create change request").disabled).toBe(true);
+    expect(text("create-pr-status")).toBe("Commit local changes before creating a change request.");
+  });
+
+  it("shows the host Pull Requests identified while the status has not named it", async () => {
+    const providerHint = { kind: "gitlab", host: "luna.tripunkt.de" } as const;
+    h.status = null;
+    await renderDialog(vi.fn(), vi.fn(), providerHint);
+    expect(text("create-pr-repository")).toBe("GitLab · https://luna.tripunkt.de");
+    expect(button("Create merge request").parentElement?.getAttribute("title")).toBe(
+      "Reading repository status…",
+    );
+
+    h.status = status({ sourceControlProvider: undefined });
+    await renderDialog(vi.fn(), vi.fn(), providerHint);
+    expect(text("create-pr-repository")).toBe("GitLab · https://luna.tripunkt.de");
+    // The server validates the provider when creating, so the review does not block.
+    const primary = button("Publish and create merge request");
+    expect(primary.disabled).toBe(false);
+    expect(primary.getAttribute("aria-describedby")).toBeNull();
+    expect(primary.parentElement?.getAttribute("title")).toBeNull();
   });
 
   it("requires a title and explains why creation is unavailable", async () => {

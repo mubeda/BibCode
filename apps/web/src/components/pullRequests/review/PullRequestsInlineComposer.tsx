@@ -4,10 +4,7 @@ import { useId, useMemo, useRef, useState } from "react";
 import { usePullRequestsStore, type PendingInlineComment } from "../../../pullRequestsStore";
 import { Button } from "../../ui/button";
 import { PullRequestsMarkdown } from "../shared/PullRequestsMarkdown";
-import {
-  PullRequestsPermissionButton,
-  constrainPermission,
-} from "../shared/PullRequestsPermissionButton";
+import { PermissionButton, constrainPermission } from "../../ui/permission-button";
 import { usePullRequestsActions } from "../usePullRequestsAction";
 import { insertSuggestion, sourceLinesForSelection } from "./inlineCommentGutter.logic";
 export function PullRequestsInlineComposer({
@@ -150,7 +147,7 @@ export function PullRequestsInlineComposer({
         </p>
       ) : null}
       <div className="flex flex-wrap gap-2">
-        <PullRequestsPermissionButton
+        <PermissionButton
           permission={constrainPermission(
             permission,
             pending || sending
@@ -172,11 +169,11 @@ export function PullRequestsInlineComposer({
           }}
         >
           Insert suggestion
-        </PullRequestsPermissionButton>
-        <PullRequestsPermissionButton permission={available} onClick={addPending} size="sm">
+        </PermissionButton>
+        <PermissionButton permission={available} onClick={addPending} size="sm">
           Add review comment
-        </PullRequestsPermissionButton>
-        <PullRequestsPermissionButton
+        </PermissionButton>
+        <PermissionButton
           mutation
           permission={available}
           variant="outline"
@@ -184,7 +181,7 @@ export function PullRequestsInlineComposer({
           onClick={() => void addSingle()}
         >
           {sending ? "Posting…" : "Add single comment"}
-        </PullRequestsPermissionButton>
+        </PermissionButton>
         <Button variant="ghost" size="sm" disabled={pending || sending} onClick={discard}>
           Discard draft
         </Button>
@@ -212,7 +209,7 @@ export function PullRequestsPendingComment({
       <p className="text-sm font-medium">Pending review comment</p>
       <PullRequestsMarkdown text={comment.body} />
       <div className="flex gap-2">
-        <PullRequestsPermissionButton
+        <PermissionButton
           permission={constrainPermission(
             permission,
             pending ? "Wait for the current action to finish" : null,
@@ -228,7 +225,7 @@ export function PullRequestsPendingComment({
           }}
         >
           Edit
-        </PullRequestsPermissionButton>
+        </PermissionButton>
         <Button
           variant="ghost"
           size="sm"

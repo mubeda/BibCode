@@ -17,6 +17,10 @@ const decodePullRequestsActionRequest = Schema.decodeUnknownSync(PullRequestsAct
 const decodePullRequestsActor = Schema.decodeUnknownSync(PullRequests.PullRequestsActor);
 const decodePullRequestsListRow = Schema.decodeUnknownSync(PullRequests.PullRequestsListRow);
 const decodePullRequestsCwdInput = Schema.decodeUnknownSync(PullRequests.PullRequestsCwdInput);
+const decodePullRequestsGetContextInput = Schema.decodeUnknownSync(
+  PullRequests.PullRequestsGetContextInput,
+);
+const decodePullRequestsListInput = Schema.decodeUnknownSync(PullRequests.PullRequestsListInput);
 const decodePullRequestsDetail = Schema.decodeUnknownSync(PullRequests.PullRequestsDetail);
 const encodePullRequestsActionRequest = Schema.encodeSync(PullRequestsActionRequest);
 const encodePullRequestsActionResult = Schema.encodeSync(PullRequests.PullRequestsActionResult);
@@ -514,6 +518,32 @@ describe("PullRequests schema round trips", () => {
     expect(() => decodePullRequestsListRow({ ...row, title: " " })).toThrow();
     expect(() => decodePullRequestsCwdInput({ cwd: " " })).toThrow();
     expect(decodePullRequestsDetail(detail).body).toBe("");
+  });
+
+  it("keeps the context rescan and list totals refresh optional", () => {
+    expect(decodePullRequestsGetContextInput({ cwd: "/repo" })).toEqual({ cwd: "/repo" });
+    expect(decodePullRequestsGetContextInput({ cwd: "/repo", rescan: true })).toEqual({
+      cwd: "/repo",
+      rescan: true,
+    });
+    expect(() => decodePullRequestsGetContextInput({ cwd: "/repo", rescan: "yes" })).toThrow();
+    const list = {
+      cwd: "/repo",
+      state: "open",
+      search: null,
+      author: null,
+      assignee: null,
+      reviewer: null,
+      reviewStatus: null,
+      draft: null,
+      labels: [],
+      milestone: null,
+      targetBranch: null,
+      sort: "newest",
+      cursor: null,
+    };
+    expect(decodePullRequestsListInput(list)).toEqual(list);
+    expect(decodePullRequestsListInput({ ...list, refreshTotals: true }).refreshTotals).toBe(true);
   });
 
   it("rejects missing permission reasons and invalid merge methods", () => {

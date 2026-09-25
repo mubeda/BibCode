@@ -1,7 +1,7 @@
 import type { PullRequestsPermission, PullRequestsReactionSummary } from "@bibcode/contracts";
 import { memo, useRef, useState } from "react";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../../ui/menu";
-import { PullRequestsPermissionButton, constrainPermission } from "./PullRequestsPermissionButton";
+import { PermissionButton, constrainPermission } from "../../ui/permission-button";
 const EMOJI = {
   "+1": "👍",
   "-1": "👎",
@@ -53,7 +53,7 @@ export const PullRequestsReactions = memo(function PullRequestsReactions({
       {reactions.map((reaction) => {
         const label = `${reaction.content}: ${reaction.count}${reaction.viewerReacted ? ", You reacted" : ""}`;
         return interactive && currentPermission ? (
-          <PullRequestsPermissionButton
+          <PermissionButton
             mutation
             key={reaction.content}
             permission={currentPermission}
@@ -64,7 +64,7 @@ export const PullRequestsReactions = memo(function PullRequestsReactions({
             size="sm"
           >
             {EMOJI[reaction.content]} {reaction.count}
-          </PullRequestsPermissionButton>
+          </PermissionButton>
         ) : (
           <span
             key={reaction.content}
@@ -81,7 +81,7 @@ export const PullRequestsReactions = memo(function PullRequestsReactions({
           <MenuTrigger
             disabled={!currentPermission.allowed}
             render={
-              <PullRequestsPermissionButton
+              <PermissionButton
                 mutation
                 permission={currentPermission}
                 variant="outline"
@@ -98,7 +98,7 @@ export const PullRequestsReactions = memo(function PullRequestsReactions({
                 nativeButton
                 disabled={!currentPermission.allowed}
                 render={
-                  <PullRequestsPermissionButton
+                  <PermissionButton
                     mutation
                     permission={currentPermission}
                     variant="ghost"

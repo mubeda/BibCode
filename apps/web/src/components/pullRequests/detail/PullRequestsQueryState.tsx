@@ -5,7 +5,7 @@ import { useContext, useEffect, type ReactNode } from "react";
 import type { EnvironmentQueryView } from "../../../state/query";
 import { Skeleton } from "../../ui/skeleton";
 import { PullRequestsContextRefresh } from "../pullRequestsContextRefresh";
-import { PullRequestsPermissionButton } from "../shared/PullRequestsPermissionButton";
+import { PermissionButton } from "../../ui/permission-button";
 const isOperationError = Schema.is(PullRequestsOperationError);
 
 export function PullRequestsQueryState({
@@ -30,14 +30,14 @@ export function PullRequestsQueryState({
       <div role="alert" className="space-y-3 p-4 text-sm">
         <p>{message}</p>
         {error?.hostDetail ? <p className="text-muted-foreground">{error.hostDetail}</p> : null}
-        <PullRequestsPermissionButton
+        <PermissionButton
           permission={{ allowed: !query.isPending, reason: query.isPending ? "Loading…" : null }}
           onClick={query.refresh}
           variant="outline"
           size="sm"
         >
           Retry
-        </PullRequestsPermissionButton>
+        </PermissionButton>
       </div>
     );
   if (query.data === null)

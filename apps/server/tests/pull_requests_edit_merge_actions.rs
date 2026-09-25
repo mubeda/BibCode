@@ -1,18 +1,59 @@
 #![cfg(unix)]
 //! Mutations are exercised only against recording CLI stubs, never live hosts.
-use bibcode_server::pull_requests::{
-    github::GitHubHost,
-    gitlab::GitLabHost,
-    host::{HostCommandRunner, HostScope, PullRequestHost},
-    model::{ActionRequest, ActionResult},
-};
+#[path = "support/pull_request_action_fixture.rs"]
+mod pull_request_action_fixture;
+
+use bibcode_server::pull_requests::model::ActionResult;
 use bibcode_server::source_control::ProviderKind;
+use pull_request_action_fixture::Fixture;
 use serde_json::{Value, json};
-use std::{fs, path::Path, sync::Arc};
-use tempfile::TempDir;
+use std::fs;
 use tokio_util::sync::CancellationToken;
 
 const BODY: &str = "private edit or merge body\nquotes ' \" ` $() \\ and unicode é";
+
+#[tokio::test]
+async fn pull_requests_context_auth_probes_can_follow_all_context_reads() {
+    use bibcode_server::pull_requests::{ContextRead, PullRequestsService};
+
+    for gitlab in [false, true] {
+        let mut f = Fixture::new(gitlab);
+        if gitlab {
+            f.gitlab_precheck(true);
+        } else {
+            f.github_precheck(true);
+        }
+        // Force the three context processes ahead of both login probes. Arrival
+        // order must not change which prepared response each command receives.
+        let script = f.root.path().join("cli");
+        let source = fs::read_to_string(&script).unwrap();
+        fs::write(
+            script,
+            source.replacen(
+                "#!/bin/sh\n",
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then\n  until [ -f call-4.argv ]; do sleep 0.01; done\nfi\n",
+                1,
+            ),
+        )
+        .unwrap();
+
+        let service = PullRequestsService::with_runner(f.runner.clone());
+        let context = service
+            .context(f.root.path(), ContextRead::Open, &CancellationToken::new())
+            .await
+            .unwrap();
+        let context = serde_json::to_value(context).unwrap();
+        assert_eq!(context["status"], "available", "{context}");
+        assert_eq!(
+            context["provider"],
+            if gitlab { "gitlab" } else { "github" }
+        );
+        assert_eq!(context["account"]["login"], "viewer");
+        assert_eq!(f.count(), 6);
+        f.assert_args(5, &["--version"]);
+        assert_eq!(&f.args(6)[..2], ["auth", "status"]);
+    }
+}
 
 #[tokio::test]
 async fn pull_requests_gitlab_action_process_counts() {
@@ -60,18 +101,27 @@ async fn pull_requests_gitlab_action_process_counts() {
 #[tokio::test]
 async fn pull_requests_gitlab_unavailable_context_invalidates_successful_auth_probes() {
     use bibcode_server::pull_requests::{
-        PullRequestsService,
+        ContextRead, PullRequestsService,
         model::{Context, UnavailableCode},
     };
     let mut f = Fixture::new(true);
     f.raw_response("https://gitlab.com/team/repo.git");
     f.raw_response("glab version 1.114.0");
+    f.role("cli-version");
     f.raw_response("gitlab.com\n  ✓ Logged in to gitlab.com as viewer");
-    f.failure("HTTP 401: authentication required");
+    f.role("auth");
+    // The three context reads run together; a revoked token rejects each of them.
+    for role in ["user", "project", "version"] {
+        f.failure("HTTP 401: authentication required");
+        f.role(role);
+    }
     let service = PullRequestsService::with_runner(f.runner.clone());
     let c = CancellationToken::new();
     assert!(matches!(
-        service.context(f.root.path(), &c).await.unwrap(),
+        service
+            .context(f.root.path(), ContextRead::Rescan, &c)
+            .await
+            .unwrap(),
         Context::Unavailable {
             code: UnavailableCode::NotAuthenticated,
             ..
@@ -97,7 +147,7 @@ async fn pull_requests_gitlab_unavailable_context_invalidates_successful_auth_pr
 
 #[tokio::test]
 async fn pull_requests_gitlab_warm_actions_reuse_context_but_refresh_permissions_and_ui_reads() {
-    use bibcode_server::pull_requests::PullRequestsService;
+    use bibcode_server::pull_requests::{ContextRead, PullRequestsService};
     let mut f = Fixture::new(true);
     f.gitlab_precheck(true);
     f.response(json!({}));
@@ -246,11 +296,19 @@ async fn pull_requests_gitlab_warm_actions_reuse_context_but_refresh_permissions
     let before = f.count();
     f.raw_response("https://gitlab.com/team/repo.git");
     f.raw_response("glab version 1.114.0");
+    f.role("cli-version");
     f.raw_response("gitlab.com\n  ✓ Logged in to gitlab.com as viewer");
+    f.role("auth");
     f.response(json!({"username":"viewer","name":null}));
+    f.role("user");
     f.response(project);
+    f.role("project");
     f.response(json!({"version":"19.3.2"}));
-    service.context(f.root.path(), &c).await.unwrap();
+    f.role("version");
+    service
+        .context(f.root.path(), ContextRead::Rescan, &c)
+        .await
+        .unwrap();
     assert_eq!(
         f.count() - before,
         6,
@@ -616,7 +674,7 @@ async fn pull_requests_gitlab_revert_creates_branch_then_commit_then_merge_reque
         );
         assert_eq!(&args[8..], ["--hostname", "gitlab.com"]);
         assert_eq!(f.json_input(call), body);
-        f.assert_body_private(call);
+        f.assert_body_private(call, BODY);
     }
     assert_eq!(f.count(), 14);
 }
@@ -624,7 +682,7 @@ async fn pull_requests_gitlab_revert_creates_branch_then_commit_then_merge_reque
 #[tokio::test]
 async fn pull_requests_phase07_rpc_github_dispatches_after_fresh_precheck() {
     let mut f = Fixture::new(false);
-    f.github_precheck(false);
+    f.github_edit_precheck();
     f.raw_response("");
     assert_eq!(
         f.rpc(json!({"action":"close"})).await.unwrap(),
@@ -632,14 +690,6 @@ async fn pull_requests_phase07_rpc_github_dispatches_after_fresh_precheck() {
     );
     f.assert_args(9, &["pr", "close", "14", "--repo", "github.com/team/repo"]);
     assert_eq!(f.count(), 9);
-}
-
-struct Fixture {
-    root: TempDir,
-    scope: HostScope,
-    host: Box<dyn PullRequestHost>,
-    runner: HostCommandRunner,
-    responses: usize,
 }
 
 #[tokio::test]
@@ -759,7 +809,7 @@ async fn pull_requests_github_metadata_and_state_exact_commands() {
         args.extend(["--repo", "github.example.test/team/repo"]);
         f.assert_args(1, &args);
         assert_eq!(f.input(1), input.unwrap_or_default());
-        f.assert_body_private(1);
+        f.assert_body_private(1, BODY);
         assert_eq!(f.count(), 1);
     }
 }
@@ -831,7 +881,7 @@ async fn pull_requests_github_merge_pins_head_and_transports_body_on_stdin() {
             ],
         );
         assert_eq!(f.input(1), BODY);
-        f.assert_body_private(1);
+        f.assert_body_private(1, BODY);
         assert_eq!(f.count(), 1);
     }
 }
@@ -958,247 +1008,13 @@ async fn pull_requests_github_milestone_lookup_and_revert_parse_failures_are_typ
 }
 
 impl Fixture {
-    fn new(gitlab: bool) -> Self {
-        let root = TempDir::new().unwrap();
-        let script = root.path().join("cli");
-        fs::write(
-            &script,
-            r#"#!/bin/sh
-n=0
-if [ -f count ]; then n=$(cat count); fi
-n=$((n+1))
-printf '%s' "$n" > count
-printf '%s\000' "$@" > "call-$n.argv"
-printf '%s|%s|%s' "$GH_HOST" "$GITLAB_HOST" "$NO_COLOR" > "call-$n.env"
-cat > "call-$n.stdin"
-while [ "$#" -gt 0 ]; do
-  if [ "$1" = --input ] && [ "$2" != - ]; then
-    printf '%s' "$2" > "call-$n.path"
-    (stat -c '%a' "$2" 2>/dev/null || stat -f '%Lp' "$2") > "call-$n.mode"
-    cp "$2" "call-$n.body"
-  fi
-  shift
-done
-if [ ! -f "response-$n" ]; then echo 'Unexpected process call' >&2; exit 64; fi
-cat "response-$n"
-if [ -f "error-$n" ]; then cat "error-$n" >&2; exit 1; fi
-"#,
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-        let runner = Arc::new(
-            HostCommandRunner::new(root.path().join("state"))
-                .with_commands(&script, &script, &script),
-        );
-        let host: Box<dyn PullRequestHost> = if gitlab {
-            Box::new(GitLabHost::new(runner.clone()))
-        } else {
-            Box::new(GitHubHost::new(runner.clone()))
-        };
-        let scope = HostScope {
-            cwd: root.path().to_owned(),
-            host: if gitlab {
-                "gitlab.example.test"
-            } else {
-                "github.example.test"
-            }
-            .into(),
-            repository: "team/repo".into(),
-            provider: if gitlab {
-                ProviderKind::Gitlab
-            } else {
-                ProviderKind::Github
-            },
-        };
-        Self {
-            root,
-            scope,
-            host,
-            runner: (*runner).clone(),
-            responses: 0,
-        }
-    }
-    fn response(&mut self, value: Value) {
-        self.raw_response(&value.to_string());
-    }
-    fn raw_response(&mut self, value: &str) {
-        self.responses += 1;
-        fs::write(
-            self.root
-                .path()
-                .join(format!("response-{}", self.responses)),
-            value,
-        )
-        .unwrap();
-    }
-    fn failure(&mut self, message: &str) {
-        self.raw_response("");
-        fs::write(
-            self.root.path().join(format!("error-{}", self.responses)),
-            message,
-        )
-        .unwrap();
-    }
-    fn request(&self, mut value: Value) -> ActionRequest {
-        value["cwd"] = json!(self.scope.cwd);
-        value["number"] = json!(14);
-        serde_json::from_value(value).unwrap()
-    }
-    async fn run(
-        &self,
-        value: Value,
-    ) -> Result<ActionResult, bibcode_server::pull_requests::error::PullRequestsOperationError>
-    {
-        self.host
-            .run_action(
-                &self.scope,
-                &self.request(value),
-                &Default::default(),
-                &CancellationToken::new(),
-            )
-            .await
-    }
-    fn count(&self) -> usize {
-        fs::read_to_string(self.root.path().join("count"))
-            .unwrap_or_default()
-            .parse()
-            .unwrap_or(0)
-    }
-    fn args(&self, call: usize) -> Vec<String> {
-        fs::read_to_string(self.root.path().join(format!("call-{call}.argv")))
-            .unwrap()
-            .split('\0')
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .collect()
-    }
-    fn input(&self, call: usize) -> String {
-        let path = self.root.path().join(format!("call-{call}.body"));
-        fs::read_to_string(if path.exists() {
-            path
-        } else {
-            self.root.path().join(format!("call-{call}.stdin"))
-        })
-        .unwrap()
-    }
-    fn assert_args(&self, call: usize, expected: &[&str]) {
-        assert_eq!(self.args(call), expected);
-    }
-    fn assert_body_private(&self, call: usize) {
-        let args = self.args(call);
-        assert!(!args.iter().any(|a| a.contains(BODY) || a == "--body"));
-        if self.scope.provider == ProviderKind::Gitlab {
-            let path =
-                fs::read_to_string(self.root.path().join(format!("call-{call}.path"))).unwrap();
-            assert!(Path::new(&path).starts_with(self.root.path().join("state/pull-requests")));
-            assert!(!Path::new(&path).exists());
-            assert_eq!(
-                fs::read_to_string(self.root.path().join(format!("call-{call}.mode")))
-                    .unwrap()
-                    .trim(),
-                "600"
-            );
-        }
-    }
-}
-
-impl Fixture {
-    async fn rpc(&self, mut payload: Value) -> Result<Value, Value> {
-        use bibcode_server::{
-            RequestId, RpcRequest,
-            production::pull_requests_rpc::ConfiguredPullRequestsRpcServices,
-            pull_requests::PullRequestsService,
-        };
-        if payload.get("cwd").is_none() {
-            payload["cwd"] = json!(self.scope.cwd);
-        }
-        if payload.get("number").is_none() {
-            payload["number"] = json!(14);
-        }
-        let rpc = ConfiguredPullRequestsRpcServices {
-            service: PullRequestsService::with_runner(self.runner.clone()),
-            repositories: None,
-            worktrees: None,
-        };
-        rpc.mutation_unary(
-            RpcRequest {
-                id: RequestId::try_from("1").unwrap(),
-                tag: "pullRequests.runAction".into(),
-                payload,
-                headers: vec![],
-                trace_id: None,
-                span_id: None,
-                sampled: None,
-            },
-            CancellationToken::new(),
-        )
-        .await
-    }
-    fn github_precheck(&mut self, own: bool) {
-        self.raw_response("https://github.com/team/repo.git");
-        self.raw_response("gh version 2.97.0");
-        self.response(json!({"hosts":{"github.com":[{"state":"success","active":true,"host":"github.com","login":"viewer"}]}}));
-        self.response(json!({"login":"viewer"}));
-        self.response(
-            serde_json::from_str(include_str!(
-                "fixtures/pull_requests/github_repository.json"
-            ))
-            .unwrap(),
-        );
-        self.response(json!({"data":{"repository":{"viewerPermission":"ADMIN"}}}));
-        let mut detail: Value =
-            serde_json::from_str(include_str!("fixtures/pull_requests/github_detail.json"))
-                .unwrap();
-        detail["number"] = json!(14);
-        if own {
-            detail["author"]["login"] = json!("viewer");
-        }
-        self.response(detail);
-        let mut metadata: Value = serde_json::from_str(include_str!(
-            "fixtures/pull_requests/github_detail_viewer.json"
-        ))
-        .unwrap();
-        metadata["data"]["repository"]["pullRequest"]["viewerDidAuthor"] = json!(own);
-        metadata["data"]["repository"]["pullRequest"]["viewerCanUpdate"] = json!(true);
-        metadata["data"]["repository"]["viewerPermission"] = json!("ADMIN");
-        self.response(metadata);
-    }
-    fn gitlab_precheck(&mut self, can_approve: bool) {
-        self.raw_response("https://gitlab.com/team/repo.git");
-        self.raw_response("glab version 1.114.0");
-        self.raw_response("gitlab.com\n  ✓ Logged in to gitlab.com as viewer");
-        self.response(json!({"username":"viewer","name":null}));
-        self.response(
-            serde_json::from_str(include_str!("fixtures/pull_requests/gitlab_project.json"))
-                .unwrap(),
-        );
-        self.response(json!({"version":"17.9.0"}));
-        let mut detail: Value =
-            serde_json::from_str(include_str!("fixtures/pull_requests/gitlab_detail.json"))
-                .unwrap();
-        detail["iid"] = json!(14);
-        self.response(detail);
-        let mut approvals: Value =
-            serde_json::from_str(include_str!("fixtures/pull_requests/gitlab_approvals.json"))
-                .unwrap();
-        approvals["user_can_approve"] = json!(can_approve);
-        self.response(approvals);
-        self.response(
-            serde_json::from_str(include_str!("fixtures/pull_requests/gitlab_reviewers.json"))
-                .unwrap(),
-        );
-        self.response(json!({"data":{"project":{"mergeRequest":{"commitCount":2,"resolvableDiscussionsCount":1,"diffStatsSummary":{"fileCount":2,"additions":2,"deletions":1},"sourceProject":{"fullPath":"fork/repo"},"userPermissions":{"createNote":true,"pushToSourceBranch":true}}}}}));
-        self.response(
-            serde_json::from_str(include_str!("fixtures/pull_requests/gitlab_project.json"))
-                .unwrap(),
-        );
-    }
-}
-
-impl Fixture {
-    fn json_input(&self, call: usize) -> Value {
-        serde_json::from_str(&self.input(call)).unwrap()
+    /// Edits need update rights on the pull request.
+    fn github_edit_precheck(&mut self) {
+        self.github_precheck(false);
+        self.change_response(8, |metadata| {
+            metadata["data"]["repository"]["pullRequest"]["viewerCanUpdate"] = json!(true);
+            metadata["data"]["repository"]["viewerPermission"] = json!("ADMIN");
+        });
     }
     fn assert_api(&self, call: usize, method: &str, path: &str) {
         self.assert_api_host(call, method, path, &self.scope.host);
@@ -1211,7 +1027,7 @@ impl Fixture {
             ["-H", "Content-Type: application/json", "--input"]
         );
         assert_eq!(&actual[8..], ["--hostname", host]);
-        self.assert_body_private(call);
+        self.assert_body_private(call, BODY);
     }
     fn change_response(&self, call: usize, change: impl FnOnce(&mut Value)) {
         let path = self.root.path().join(format!("response-{call}"));
@@ -1230,7 +1046,7 @@ impl Fixture {
                 v["detailed_merge_status"] = json!("mergeable");
             });
         } else {
-            self.github_precheck(false);
+            self.github_edit_precheck();
             self.change_response(7, |v| {
                 v["mergeStateStatus"] = json!("CLEAN");
                 v["mergeable"] = json!("MERGEABLE");
@@ -1437,7 +1253,7 @@ async fn pull_requests_gitlab_revert_stops_at_each_failure_with_partial_progress
         }
         assert_eq!(f.count(), 11 + fail_at);
         for call in 12..=11 + fail_at {
-            f.assert_body_private(call);
+            f.assert_body_private(call, BODY);
         }
     }
 }
@@ -1455,7 +1271,7 @@ async fn pull_requests_gitlab_bypass_then_failed_merge_reports_applied_override(
     assert!(error.message.contains("Requested changes were overridden"));
     assert!(!error.retryable);
     assert_eq!(f.count(), 2);
-    f.assert_body_private(2);
+    f.assert_body_private(2, BODY);
 }
 
 #[tokio::test]

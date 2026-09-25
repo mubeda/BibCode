@@ -29,6 +29,13 @@ use bibcode_server::production::git_vcs::{
 mod isolated_git_config;
 use isolated_git_config::IsolatedGitConfig;
 
+fn git_vcs_services() -> GitVcsRpcServices {
+    let hosts = Arc::new(bibcode_server::source_control::ProviderHosts::default());
+    let repository =
+        Arc::new(bibcode_server::git::GitRepository::default().with_provider_hosts(hosts.clone()));
+    GitVcsRpcServices::with_repository(repository, hosts)
+}
+
 const ISOLATED_GIT_TEST: &str = "BIBCODE_PRODUCTION_GIT_VCS_RPC_ISOLATED";
 static ISOLATED_GIT_TEST_LOCK: Mutex<()> = Mutex::new(());
 const GIT_STATUS_INTEGRATION_DEADLINE: Duration = Duration::from_secs(15);
@@ -67,7 +74,7 @@ async fn workspace_unavailable_rejects_git_status_and_mutation_before_process_la
             .await
             .expect("physical identity resolves")
     );
-    let services = GitVcsRpcServices::default().with_availability_registry(availability);
+    let services = git_vcs_services().with_availability_registry(availability);
     let mut registry = RpcRegistry::empty();
     register_git_vcs_rpc(&mut registry, services);
     let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
@@ -113,7 +120,7 @@ async fn workspace_unavailable_rejects_git_status_and_mutation_before_process_la
 impl GitServerHarness {
     async fn start(temp: &TempDir, parallelism_permit: OwnedSemaphorePermit) -> Self {
         let mut registry = RpcRegistry::empty();
-        register_git_vcs_rpc(&mut registry, GitVcsRpcServices::default());
+        register_git_vcs_rpc(&mut registry, git_vcs_services());
         let handle = ServerRuntime::start_with_registry(test_config(temp), registry)
             .await
             .expect("server starts");
@@ -236,7 +243,7 @@ async fn registers_native_vcs_handlers_with_unchanged_wire_shapes() {
     let temp = TempDir::new().expect("temporary server directory");
     let repository = TempDir::new().expect("temporary repository");
     let mut registry = RpcRegistry::empty();
-    register_git_vcs_rpc(&mut registry, GitVcsRpcServices::default());
+    register_git_vcs_rpc(&mut registry, git_vcs_services());
     let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
         .await
         .expect("server starts");
@@ -304,7 +311,7 @@ async fn vcs_status_stream_is_bounded_and_cancellable() {
         .expect("git init succeeds");
 
     let mut registry = RpcRegistry::empty();
-    register_git_vcs_rpc(&mut registry, GitVcsRpcServices::default());
+    register_git_vcs_rpc(&mut registry, git_vcs_services());
     let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
         .await
         .expect("server starts");
@@ -356,7 +363,7 @@ async fn vcs_summary_stream_publishes_the_lightweight_shape_and_is_cancellable()
     fs::write(repository.path().join("tracked.txt"), "changed\n").expect("dirty fixture");
 
     let mut registry = RpcRegistry::empty();
-    register_git_vcs_rpc(&mut registry, GitVcsRpcServices::default());
+    register_git_vcs_rpc(&mut registry, git_vcs_services());
     let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
         .await
         .expect("server starts");
@@ -820,7 +827,7 @@ async fn stacked_commit_stream_finishes_with_a_decodable_success_event() {
     );
 
     let mut registry = RpcRegistry::empty();
-    register_git_vcs_rpc(&mut registry, GitVcsRpcServices::default());
+    register_git_vcs_rpc(&mut registry, git_vcs_services());
     let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
         .await
         .expect("server starts");
@@ -908,7 +915,7 @@ async fn stacked_commit_generates_a_message_when_the_ui_leaves_it_empty() {
     );
 
     let mut registry = RpcRegistry::empty();
-    register_git_vcs_rpc(&mut registry, GitVcsRpcServices::default());
+    register_git_vcs_rpc(&mut registry, git_vcs_services());
     let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
         .await
         .expect("server starts");
@@ -1023,7 +1030,7 @@ async fn stacked_feature_branch_commit_creates_and_switches_the_branch_first() {
     );
 
     let mut registry = RpcRegistry::empty();
-    register_git_vcs_rpc(&mut registry, GitVcsRpcServices::default());
+    register_git_vcs_rpc(&mut registry, git_vcs_services());
     let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
         .await
         .expect("server starts");
@@ -1132,7 +1139,7 @@ async fn stacked_commit_as_is_preserves_newer_unstaged_edits() {
     std::fs::write(&tracked, "unstaged\n").expect("write unstaged fixture");
 
     let mut registry = RpcRegistry::empty();
-    register_git_vcs_rpc(&mut registry, GitVcsRpcServices::default());
+    register_git_vcs_rpc(&mut registry, git_vcs_services());
     let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
         .await
         .expect("server starts");
@@ -2760,7 +2767,7 @@ async fn start_git_server(
     WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
 ) {
     let mut registry = RpcRegistry::empty();
-    register_git_vcs_rpc(&mut registry, GitVcsRpcServices::default());
+    register_git_vcs_rpc(&mut registry, git_vcs_services());
     let handle = ServerRuntime::start_with_registry(test_config(temp), registry)
         .await
         .expect("server starts");
