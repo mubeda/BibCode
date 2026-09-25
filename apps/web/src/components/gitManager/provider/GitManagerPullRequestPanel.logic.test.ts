@@ -276,7 +276,7 @@ describe("resolveCreatePullRequestReview", () => {
   });
 
   it("lets the Pull Requests panel's identified host stand in for a status without one", () => {
-    const providerHint = { kind: "gitlab", host: "luna.tripunkt.de" } as const;
+    const providerHint = { kind: "gitlab", baseUrl: "https://luna.tripunkt.de" } as const;
     const hinted = resolveCreatePullRequestReview({
       status: status({ sourceControlProvider: undefined }),
       latestCommit: null,

@@ -200,7 +200,7 @@ describe("PullRequestsPanel", () => {
     expect(h.dialogProps).toMatchObject({
       scope: { environmentId: "env", cwd: "Z:\\opaque\\worktree" },
       open: true,
-      providerHint: { kind: context.provider, host: context.host },
+      providerHint: { kind: context.provider, baseUrl: "https://github.com" },
     });
   });
   it("shows loading and actionable unavailable context with Rescan", async () => {

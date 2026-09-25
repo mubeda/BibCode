@@ -336,7 +336,7 @@ describe("GitManagerCreatePullRequestDialog", () => {
   });
 
   it("shows the host Pull Requests identified while the status has not named it", async () => {
-    const providerHint = { kind: "gitlab", host: "luna.tripunkt.de" } as const;
+    const providerHint = { kind: "gitlab", baseUrl: "https://luna.tripunkt.de" } as const;
     h.status = null;
     await renderDialog(vi.fn(), vi.fn(), providerHint);
     expect(text("create-pr-repository")).toBe("GitLab · https://luna.tripunkt.de");
