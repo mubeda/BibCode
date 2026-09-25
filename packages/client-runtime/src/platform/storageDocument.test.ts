@@ -24,6 +24,7 @@ import {
   relabelConnectionInCatalog,
   removeConnectionFromCatalog,
   removeConnectionRegistrationFromCatalog,
+  replaceSavedConnectionCredential,
 } from "./storageDocument.ts";
 
 const ENVIRONMENT_ID = EnvironmentId.make("environment-1");
@@ -257,14 +258,46 @@ describe("ConnectionCatalogDocument", () => {
         port: 22,
       },
     });
+    const credential = new BearerConnectionCredential({ token: "ssh-bearer" });
     const document = registerConnectionInCatalog(
       EMPTY_CONNECTION_CATALOG_DOCUMENT,
-      new SshConnectionRegistration({ target, profile }),
+      new SshConnectionRegistration({ target, profile, credential }),
     );
 
     expect(document.targets).toEqual([target]);
     expect(document.profiles).toEqual([profile]);
-    expect(document.credentials).toEqual([]);
+    expect(document.credentials).toEqual([{ connectionId: target.connectionId, credential }]);
+  });
+
+  it("replaces a saved SSH bearer only while its environment is saved", () => {
+    const target = new SshConnectionTarget({
+      environmentId: ENVIRONMENT_ID,
+      label: "SSH",
+      connectionId: "ssh-1",
+    });
+    const profile = new SshConnectionProfile({
+      connectionId: target.connectionId,
+      environmentId: target.environmentId,
+      label: target.label,
+      target: { alias: "devbox", hostname: "devbox", username: null, port: null },
+    });
+    const registered = registerConnectionInCatalog(
+      EMPTY_CONNECTION_CATALOG_DOCUMENT,
+      new SshConnectionRegistration({
+        target,
+        profile,
+        credential: new BearerConnectionCredential({ token: "first" }),
+      }),
+    );
+    const refreshed = new BearerConnectionCredential({ token: "second" });
+
+    expect(replaceSavedConnectionCredential(registered, "ssh-1", refreshed)?.credentials).toEqual([
+      { connectionId: "ssh-1", credential: refreshed },
+    ]);
+
+    const removed = removeConnectionFromCatalog(registered, target);
+    expect(removed.credentials).toEqual([]);
+    expect(replaceSavedConnectionCredential(removed, "ssh-1", refreshed)).toBeNull();
   });
 
   it("renames one saved target in place and leaves every other record alone", () => {

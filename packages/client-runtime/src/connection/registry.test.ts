@@ -513,6 +513,7 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
         next.delete(connectionId);
         return next;
       }),
+    putIfSaved: () => Effect.die(new Error("SSH credential refresh is not used.")),
   });
   const tokenStore = TokenStore.RemoteDpopAccessTokenStore.of({
     get: (environmentId) =>
@@ -534,7 +535,8 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
   });
   const sshGateway = ClientCapabilities.SshEnvironmentGateway.of({
     provision: () => Effect.die(new Error("SSH provisioning is not used.")),
-    prepare: () => Effect.die(new Error("SSH preparation is not used.")),
+    ensureTunnel: () => Effect.die(new Error("SSH tunnels are not used.")),
+    mintBearer: () => Effect.die(new Error("SSH minting is not used.")),
     disconnect: (target) => Ref.update(disconnectedSshTargets, (current) => [...current, target]),
   });
   const driver = ConnectionDriver.ConnectionDriver.of({

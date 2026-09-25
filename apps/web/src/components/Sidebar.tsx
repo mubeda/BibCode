@@ -147,7 +147,12 @@ import {
 } from "../state/shell";
 import { threadEnvironment, useEnvironmentThread } from "../state/threads";
 import { vcsEnvironment } from "../state/vcs";
-import { useEnvironment, useEnvironments, usePrimaryEnvironmentId } from "../state/environments";
+import {
+  type EnvironmentPresentation,
+  useEnvironment,
+  useEnvironments,
+  usePrimaryEnvironmentId,
+} from "../state/environments";
 import {
   buildThreadRouteParams,
   resolveProjectRouteRef,
@@ -317,6 +322,7 @@ import { WorktreeAvailabilityWarning } from "./WorktreeAvailabilityWarning";
 import { WorktreeRemovalDialog, type WorktreeRemovalTarget } from "./WorktreeRemovalDialog";
 import { SidebarProjectAvailability } from "./sidebar/SidebarProjectAvailability";
 import { readCurrentEnvironmentPresentationPolicy } from "../connection/currentEnvironmentPresentation";
+import { environmentConnectionActions } from "../connection/environmentPresentationPolicy";
 
 function SidebarEnvironmentContextCard() {
   const activeEnvironmentId = useActiveEnvironmentId();
@@ -3844,8 +3850,10 @@ interface SidebarProjectsContentProps {
   suppressProjectClickForContextMenuRef: React.RefObject<boolean>;
   attachProjectListAutoAnimateRef: (node: HTMLElement | null) => void;
   projectAvailability: ReturnType<typeof resolveSidebarProjectAvailability>;
+  projectAvailabilityEnvironment: EnvironmentPresentation | null;
   showProjectAvailabilityRetry: boolean;
   showProjectAvailabilityConnectionSettings: boolean;
+  showProjectAvailabilityOpenRemoteServers: boolean;
   onRetryProjectEnvironment: (environmentId: EnvironmentId) => void;
   onOpenProjectSettings: () => void;
   onViewProjectDiagnostics: () => void;
@@ -3895,8 +3903,10 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
     suppressProjectClickForContextMenuRef,
     attachProjectListAutoAnimateRef,
     projectAvailability,
+    projectAvailabilityEnvironment,
     showProjectAvailabilityRetry,
     showProjectAvailabilityConnectionSettings,
+    showProjectAvailabilityOpenRemoteServers,
     onRetryProjectEnvironment,
     onOpenProjectSettings,
     onViewProjectDiagnostics,
@@ -4095,8 +4105,10 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
 
         <SidebarProjectAvailability
           view={projectAvailability}
+          environment={projectAvailabilityEnvironment}
           showRetry={showProjectAvailabilityRetry}
           showConnectionSettings={showProjectAvailabilityConnectionSettings}
+          showOpenRemoteServers={showProjectAvailabilityOpenRemoteServers}
           onRetry={onRetryProjectEnvironment}
           onOpenSettings={onOpenProjectSettings}
           onViewDiagnostics={onViewProjectDiagnostics}
@@ -4246,19 +4258,23 @@ export default function Sidebar() {
       }),
     [projects.length, shellSummary.catalogHealth, shellSummary.catalogReady, shellSummary.statuses],
   );
-  const projectAvailabilityTarget = useMemo(() => {
+  const projectAvailabilityEnvironment = useMemo(() => {
     if (projectAvailability.environmentId === null) {
       return null;
     }
     return (
       environments.find(
         (environment) => environment.environmentId === projectAvailability.environmentId,
-      )?.entry.target ?? null
+      ) ?? null
     );
   }, [environments, projectAvailability.environmentId]);
-  const showProjectAvailabilityRetry =
-    projectAvailabilityTarget !== null &&
-    presentation.permitsConnectionAction(projectAvailabilityTarget);
+  const projectAvailabilityTarget = projectAvailabilityEnvironment?.entry.target ?? null;
+  const projectAvailabilityActions = environmentConnectionActions(
+    presentation,
+    projectAvailabilityTarget,
+  );
+  const showProjectAvailabilityRetry = projectAvailabilityActions.reconnect;
+  const showProjectAvailabilityOpenRemoteServers = projectAvailabilityActions.openRemoteServers;
   const showProjectAvailabilityConnectionSettings =
     presentation.showRemoteDeviceControls ||
     (presentation.showLocalEnvironmentSettings &&
@@ -4919,8 +4935,10 @@ export default function Sidebar() {
             suppressProjectClickForContextMenuRef={suppressProjectClickForContextMenuRef}
             attachProjectListAutoAnimateRef={attachProjectListAutoAnimateRef}
             projectAvailability={projectAvailability}
+            projectAvailabilityEnvironment={projectAvailabilityEnvironment}
             showProjectAvailabilityRetry={showProjectAvailabilityRetry}
             showProjectAvailabilityConnectionSettings={showProjectAvailabilityConnectionSettings}
+            showProjectAvailabilityOpenRemoteServers={showProjectAvailabilityOpenRemoteServers}
             onRetryProjectEnvironment={handleRetryProjectEnvironment}
             onOpenProjectSettings={handleOpenProjectSettings}
             onViewProjectDiagnostics={handleViewProjectDiagnostics}

@@ -43,17 +43,30 @@ export class PrimaryEnvironmentAuth extends Context.Service<
   }
 >()("@bibcode/client-runtime/platform/capabilities/PrimaryEnvironmentAuth") {}
 
+export interface SshEnvironmentConnectionInput {
+  readonly connectionId: string;
+  readonly expectedEnvironmentId: EnvironmentId;
+  readonly target: DesktopSshEnvironmentTarget;
+}
+
 export class SshEnvironmentGateway extends Context.Service<
   SshEnvironmentGateway,
   {
+    /** Add: launch, tunnel, mint, fetch the descriptor, then exchange. */
     readonly provision: (
       target: DesktopSshEnvironmentTarget,
     ) => Effect.Effect<ProvisionedSshEnvironment, ConnectionAttemptError>;
-    readonly prepare: (input: {
-      readonly connectionId: string;
-      readonly expectedEnvironmentId: EnvironmentId;
-      readonly target: DesktopSshEnvironmentTarget;
-    }) => Effect.Effect<PreparedSshEnvironment, ConnectionAttemptError>;
+    /**
+     * Reconnect: reuses a live tunnel (no SSH command) or launches and
+     * tunnels again. The bootstrap never carries a pairing token.
+     */
+    readonly ensureTunnel: (
+      input: SshEnvironmentConnectionInput,
+    ) => Effect.Effect<DesktopSshEnvironmentBootstrap, ConnectionAttemptError>;
+    /** Mints a fresh one-time credential over SSH and exchanges it for a bearer. */
+    readonly mintBearer: (
+      input: SshEnvironmentConnectionInput,
+    ) => Effect.Effect<PreparedSshEnvironment, ConnectionAttemptError>;
     readonly disconnect: (
       target: DesktopSshEnvironmentTarget,
     ) => Effect.Effect<void, ConnectionAttemptError>;

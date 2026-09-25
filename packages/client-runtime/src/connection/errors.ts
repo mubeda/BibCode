@@ -22,6 +22,26 @@ export function credentialMissingError(connectionId: string): ConnectionBlockedE
   });
 }
 
+/** Whether `error` is the host refusing the credential it was shown. */
+export function isAuthenticationRejection(
+  error: ConnectionAttemptError,
+): error is ConnectionBlockedError {
+  return error._tag === "ConnectionBlockedError" && error.reason === "authentication";
+}
+
+/**
+ * The SSH host refused a bearer minted for this very connection attempt.
+ * Another automatic mint would only repeat that, so the supervisor waits for
+ * the user to connect again.
+ */
+export function sshCredentialRejectedError(host: string, traceId?: string): ConnectionBlockedError {
+  return new ConnectionBlockedError({
+    reason: "authentication",
+    detail: `${host} rejected a new pairing credential. Connect again; if it keeps failing, remove the environment and add it again.`,
+    ...(traceId === undefined ? {} : { traceId }),
+  });
+}
+
 export function environmentMismatchError(input: {
   readonly expected: EnvironmentId;
   readonly actual: EnvironmentId;

@@ -1870,6 +1870,24 @@ describe("connectionStorageLayer", () => {
     }).pipe(Effect.provide(connectionStorageLayer));
   });
 
+  it.effect("refreshes a credential only while its environment is saved", () => {
+    installFakeIndexedDb();
+    return Effect.gen(function* () {
+      const registrationStore = yield* ConnectionRegistrationStore;
+      const credentialStore = yield* CredentialStore.ConnectionCredentialStore;
+      const refreshed = new BearerConnectionCredential({ token: "refreshed-token" });
+
+      yield* registrationStore.register(bearerRegistration());
+      expect(yield* credentialStore.putIfSaved(connectionId, refreshed)).toBe(true);
+      expect(yield* credentialStore.get(connectionId)).toEqual(Option.some(refreshed));
+
+      yield* registrationStore.remove(bearerRegistration().target);
+      expect(yield* credentialStore.get(connectionId)).toEqual(Option.none());
+      expect(yield* credentialStore.putIfSaved(connectionId, refreshed)).toBe(false);
+      expect(yield* credentialStore.get(connectionId)).toEqual(Option.none());
+    }).pipe(Effect.provide(connectionStorageLayer));
+  });
+
   it.effect("preserves a replacement written by another registration store", () => {
     installFakeIndexedDb();
     const first = bearerRegistration();

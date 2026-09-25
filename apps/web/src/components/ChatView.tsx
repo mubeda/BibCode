@@ -28,6 +28,7 @@ import {
   RuntimeMode,
 } from "@bibcode/contracts";
 import {
+  describeUnavailableEnvironment,
   selectQueuedMessages,
   deriveQueuedCardStatus,
   shouldEnqueueOnSend,
@@ -37,8 +38,8 @@ import { queuedMessageCache } from "./chat/queuedMessageCache";
 import { mergeQueuedMessageIntoDraft } from "./chat/restoreQueuedMessage";
 import type { TimestampFormat } from "@bibcode/contracts/settings";
 import {
-  connectionStatusText,
   type EnvironmentConnectionPresentation,
+  isConnectionUnavailable,
 } from "@bibcode/client-runtime/connection";
 import {
   scopedProjectKey,
@@ -250,6 +251,7 @@ import { appendPreviewAnnotationPrompt } from "../lib/previewAnnotation";
 import { appendReviewCommentsToPrompt, type ReviewCommentContext } from "../reviewCommentContext";
 import { environmentCatalog } from "../connection/catalog";
 import { readCurrentEnvironmentPresentationPolicy } from "../connection/currentEnvironmentPresentation";
+import { environmentConnectionActions } from "../connection/environmentPresentationPolicy";
 import { useKnownTerminalSessions, useThreadRunningTerminalIds } from "../state/terminalSessions";
 import { projectEnvironment } from "../state/projects";
 import { useEnvironmentQuery } from "../state/query";
@@ -2083,9 +2085,8 @@ function ChatViewContent(props: ChatViewProps) {
 
   const activeEnvironment =
     activeThread == null ? null : (environmentById.get(activeThread.environmentId) ?? null);
-  const activeEnvironmentConnectionPhase = activeEnvironment?.connection.phase ?? "available";
   const activeEnvironmentUnavailable =
-    activeEnvironment !== null && activeEnvironmentConnectionPhase !== "connected";
+    activeEnvironment !== null && isConnectionUnavailable(activeEnvironment.connection);
   const activeEnvironmentUnavailableLabel = activeEnvironment?.label ?? null;
   const activeEnvironmentUnavailableState = useMemo<EnvironmentUnavailableState | null>(() => {
     if (!activeEnvironmentUnavailable || !activeEnvironmentUnavailableLabel || !activeEnvironment) {
@@ -2342,7 +2343,8 @@ function ChatViewContent(props: ChatViewProps) {
       const connection = activeEnvironmentUnavailableState.connection;
       const target = environmentById.get(activeEnvironmentUnavailableState.environmentId)?.entry
         ?.target;
-      const permitsReconnect = target !== undefined && presentation.permitsConnectionAction(target);
+      const connectionActions = environmentConnectionActions(presentation, target);
+      const permitsReconnect = connectionActions.reconnect;
       const showConnections = presentation.showRemoteDeviceControls;
       const isReconnecting =
         connection.phase === "connecting" || connection.phase === "reconnecting";
@@ -2350,13 +2352,15 @@ function ChatViewContent(props: ChatViewProps) {
         id: `environment-unavailable:${activeEnvironmentUnavailableState.environmentId}`,
         variant: connection.phase === "error" ? "error" : "warning",
         icon: <WifiOffIcon />,
-        title: `${activeEnvironmentUnavailableState.label}: ${connectionStatusText(connection)}`,
-        description:
-          connection.error ??
-          "Reconnect this environment before sending messages or running actions.",
+        ...describeUnavailableEnvironment(activeEnvironmentUnavailableState),
         actions:
-          permitsReconnect || showConnections ? (
+          permitsReconnect || connectionActions.openRemoteServers || showConnections ? (
             <>
+              {connectionActions.openRemoteServers ? (
+                <Button size="xs" onClick={() => void navigate({ to: "/settings/remote-servers" })}>
+                  Open Remote Servers
+                </Button>
+              ) : null}
               {permitsReconnect ? (
                 <Button
                   size="xs"

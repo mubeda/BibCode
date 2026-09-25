@@ -35,6 +35,7 @@ import {
   createLocalDispatchSnapshot,
   deriveComposerSendState,
   deriveLockedProvider,
+  describeUnavailableEnvironment,
   findActiveDeliveryMessage,
   findLastCancellableDeliveryMessage,
   selectQueuedMessages,
@@ -1326,5 +1327,42 @@ describe("queued messages", () => {
     ["disconnected", null, false],
   ] as const)("enqueues for phase %s / session %s", (phase, sessionStatus, expected) => {
     expect(shouldEnqueueOnSend({ phase, sessionStatus, hasPendingDelivery: false })).toBe(expected);
+  });
+});
+
+describe("describeUnavailableEnvironment", () => {
+  it("keeps the title short and states the reason once, in the body", () => {
+    const reason =
+      "devbox rejected a new pairing credential. Connect again; if it keeps failing, remove the environment and add it again.";
+    const copy = describeUnavailableEnvironment({
+      label: "devbox",
+      connection: { phase: "error", error: reason, traceId: null },
+    });
+
+    expect(copy).toEqual({ title: "devbox: Connection failed", description: reason });
+    expect(`${copy.title} ${copy.description}`.split(reason)).toHaveLength(2);
+  });
+
+  it("keeps a retrying failure's reason out of the title", () => {
+    const reason =
+      "The remote host did not issue a pairing credential within 30 seconds. Check the connection; BiBCode keeps trying.";
+    const copy = describeUnavailableEnvironment({
+      label: "devbox",
+      connection: { phase: "reconnecting", error: reason, traceId: null },
+    });
+
+    expect(copy).toEqual({ title: "devbox: Reconnecting...", description: reason });
+  });
+
+  it("explains what is blocked when there is no reason", () => {
+    expect(
+      describeUnavailableEnvironment({
+        label: "Laptop",
+        connection: { phase: "offline", error: null, traceId: null },
+      }),
+    ).toEqual({
+      title: "Laptop: Offline",
+      description: "Reconnect this environment before sending messages or running actions.",
+    });
   });
 });

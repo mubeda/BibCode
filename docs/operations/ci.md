@@ -16,6 +16,11 @@ four job groups:
   test binaries use the default parallel harness threads. Exact subprocess
   tests may still select `--test-threads=1` inside an isolated child process
   that intentionally owns process-global state.
+  The job then builds `bibcode` (`cargo build -p bibcode-server --bin bibcode`)
+  and runs the ignored desktop SSH integration test
+  (`cargo test -p bibcode-desktop --test ssh_environment -- --ignored`), which
+  needs that fresh binary and fakes only the SSH hop; see
+  [Desktop-managed SSH environments](../testing/ssh-environments.md).
 - **Release Smoke** runs `scripts/release-smoke.ts` to exercise release-only
   version rewriting, nightly metadata, and lockfile generation without
   publishing.

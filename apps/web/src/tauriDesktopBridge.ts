@@ -526,8 +526,12 @@ function createTauriDesktopBridge(
       tauriInvokeOr("desktop_bridge_disconnect_ssh_environment", { target }, () => undefined),
     fetchSshEnvironmentDescriptor: (httpBaseUrl: string) =>
       tauriInvoke("desktop_bridge_fetch_environment_descriptor", { httpBaseUrl }),
-    bootstrapSshBearerSession: (httpBaseUrl: string, credential: string) =>
-      tauriInvoke("desktop_bridge_bootstrap_ssh_bearer_session", { httpBaseUrl, credential }),
+    bootstrapSshBearerSession: (httpBaseUrl, credential, scopes) =>
+      tauriInvoke("desktop_bridge_bootstrap_ssh_bearer_session", {
+        httpBaseUrl,
+        credential,
+        ...(scopes === undefined ? {} : { scopes }),
+      }),
     fetchSshSessionState: (httpBaseUrl: string, bearerToken: string) =>
       tauriInvoke("desktop_bridge_fetch_ssh_session_state", { httpBaseUrl, bearerToken }),
     issueSshWebSocketTicket: (httpBaseUrl: string, bearerToken: string) =>

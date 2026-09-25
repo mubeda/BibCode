@@ -110,6 +110,14 @@ export function presentConnectionState(
   }
 }
 
+/**
+ * Whether an environment's connection is unusable: every phase but
+ * "connected". The chat banner and the sidebar notice share this rule.
+ */
+export function isConnectionUnavailable(connection: EnvironmentConnectionPresentation): boolean {
+  return connection.phase !== "connected";
+}
+
 export function connectionStatusText(connection: EnvironmentConnectionPresentation): string {
   switch (connection.phase) {
     case "available":

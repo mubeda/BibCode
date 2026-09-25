@@ -1220,21 +1220,28 @@ pub async fn desktop_bridge_fetch_environment_descriptor(
 pub async fn desktop_bridge_bootstrap_ssh_bearer_session(
     http_base_url: String,
     credential: String,
+    scopes: Option<Vec<String>>,
 ) -> Result<Value, String> {
     let client = remote_api_client()?;
+    let mut form = vec![
+        ("grant_type", AUTH_TOKEN_EXCHANGE_GRANT_TYPE.to_string()),
+        ("subject_token", credential),
+        (
+            "subject_token_type",
+            AUTH_ENVIRONMENT_BOOTSTRAP_TOKEN_TYPE.to_string(),
+        ),
+        ("requested_token_type", AUTH_ACCESS_TOKEN_TYPE.to_string()),
+        ("client_label", "BiBCode Tauri Desktop".to_string()),
+        ("client_device_type", "desktop".to_string()),
+    ];
+    // Without `scope` the exchange grants everything the bootstrap allows,
+    // administrative scopes included; the renderer narrows it explicitly.
+    if let Some(scopes) = scopes.filter(|scopes| !scopes.is_empty()) {
+        form.push(("scope", scopes.join(" ")));
+    }
     let response = client
         .post(environment_endpoint_url(&http_base_url, "/oauth/token")?)
-        .form(&[
-            ("grant_type", AUTH_TOKEN_EXCHANGE_GRANT_TYPE.to_string()),
-            ("subject_token", credential),
-            (
-                "subject_token_type",
-                AUTH_ENVIRONMENT_BOOTSTRAP_TOKEN_TYPE.to_string(),
-            ),
-            ("requested_token_type", AUTH_ACCESS_TOKEN_TYPE.to_string()),
-            ("client_label", "BiBCode Tauri Desktop".to_string()),
-            ("client_device_type", "desktop".to_string()),
-        ])
+        .form(&form)
         .send()
         .await
         .map_err(|error| bridge_error("Could not reach the environment API", error))?;
@@ -3862,7 +3869,7 @@ mod tests {
                 .is_err()
         );
         assert!(
-            desktop_bridge_bootstrap_ssh_bearer_session(base_url, "credential".to_string())
+            desktop_bridge_bootstrap_ssh_bearer_session(base_url, "credential".to_string(), None)
                 .await
                 .is_err()
         );
@@ -3888,10 +3895,16 @@ mod tests {
         let (base_url, requests) =
             spawn_json_test_server(r#"{"access_token":"bearer-token","token_type":"Bearer"}"#);
 
-        let session =
-            desktop_bridge_bootstrap_ssh_bearer_session(base_url, "bootstrap-token".to_string())
-                .await
-                .expect("bootstrap request should succeed");
+        let session = desktop_bridge_bootstrap_ssh_bearer_session(
+            base_url,
+            "bootstrap-token".to_string(),
+            Some(vec![
+                "orchestration:read".to_string(),
+                "terminal:operate".to_string(),
+            ]),
+        )
+        .await
+        .expect("bootstrap request should succeed");
 
         assert_eq!(
             session,
@@ -3905,6 +3918,23 @@ mod tests {
                 .contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange")
         );
         assert!(request.contains("client_label=BiBCode+Tauri+Desktop"));
+        assert!(
+            request.contains("scope=orchestration%3Aread+terminal%3Aoperate"),
+            "{request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_ssh_bearer_session_omits_scope_when_none_is_requested() {
+        let (base_url, requests) =
+            spawn_json_test_server(r#"{"access_token":"bearer-token","token_type":"Bearer"}"#);
+
+        desktop_bridge_bootstrap_ssh_bearer_session(base_url, "bootstrap-token".to_string(), None)
+            .await
+            .expect("bootstrap request should succeed");
+
+        let request = requests.recv().expect("request should be captured");
+        assert!(!request.contains("scope="), "{request}");
     }
 
     #[tokio::test]

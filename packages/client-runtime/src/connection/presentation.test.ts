@@ -22,6 +22,7 @@ import {
   connectionPhaseMessage,
   connectionStatusText,
   connectionTransportSecurity,
+  isConnectionUnavailable,
   isDesktopLocalConnectionId,
   presentEnvironmentConnection,
   presentConnectionState,
@@ -193,6 +194,13 @@ describe("connection presentation", () => {
       error: "Relay connection timed out.",
       traceId: "trace-retry",
     });
+  });
+
+  it("counts every phase but connected as unavailable", () => {
+    for (const phase of ["available", "offline", "connecting", "reconnecting", "error"] as const) {
+      expect(isConnectionUnavailable({ phase, error: null, traceId: null })).toBe(true);
+    }
+    expect(isConnectionUnavailable({ phase: "connected", error: null, traceId: null })).toBe(false);
   });
 
   it("gives offline status precedence in global messaging", () => {

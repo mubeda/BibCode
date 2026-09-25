@@ -27,6 +27,10 @@ import {
   type TerminalContextDraft,
 } from "../lib/terminalContext";
 import type { DraftThreadEnvMode } from "../composerDraftStore";
+import {
+  connectionStatusText,
+  type EnvironmentConnectionPresentation,
+} from "@bibcode/client-runtime/connection";
 
 export const LAST_INVOKED_SCRIPT_BY_PROJECT_KEY = "bibcode:last-invoked-script-by-project";
 export const MAX_HIDDEN_MOUNTED_PREVIEW_THREADS = 3;
@@ -756,4 +760,20 @@ export function threadErrorAttribution(input: {
       // than guess. An unattributed banner is better than a wrong attribution.
       return null;
   }
+}
+
+/**
+ * The composer banner for an environment that is not connected: a short
+ * state in the title, and the connection's reason, once, in the body.
+ */
+export function describeUnavailableEnvironment(input: {
+  readonly label: string;
+  readonly connection: EnvironmentConnectionPresentation;
+}): { readonly title: string; readonly description: string } {
+  return {
+    title: `${input.label}: ${connectionStatusText({ ...input.connection, error: null })}`,
+    description:
+      input.connection.error ??
+      "Reconnect this environment before sending messages or running actions.",
+  };
 }

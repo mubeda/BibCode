@@ -60,12 +60,12 @@ environment identity.
 The connection runtime defines four target types in
 [`connection/model.ts`](../../packages/client-runtime/src/connection/model.ts).
 
-| Target                    | Use                                                                                    |
-| ------------------------- | -------------------------------------------------------------------------------------- |
-| `PrimaryConnectionTarget` | The server supplied by the current browser or desktop host.                            |
-| `BearerConnectionTarget`  | A manually saved HTTP/WSS endpoint plus a separately stored pairing credential.        |
-| `RelayConnectionTarget`   | An environment discovered through BiBCode Connect and authorized with Clerk plus DPoP. |
-| `SshConnectionTarget`     | A desktop-managed SSH profile that prepares a remote server and local forwarding.      |
+| Target                    | Use                                                                                                    |
+| ------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `PrimaryConnectionTarget` | The server supplied by the current browser or desktop host.                                            |
+| `BearerConnectionTarget`  | A manually saved HTTP/WSS endpoint plus a separately stored pairing credential.                        |
+| `RelayConnectionTarget`   | An environment discovered through BiBCode Connect and authorized with Clerk plus DPoP.                 |
+| `SshConnectionTarget`     | A desktop-managed SSH profile plus a saved standard-scope bearer, used through a desktop-owned tunnel. |
 
 Only bearer, relay, and SSH targets are persisted as saved connection targets.
 `EnvironmentRegistry` creates one scoped supervisor per catalog entry and keeps
@@ -776,18 +776,73 @@ provider state. See [BiBCode Connect auth flow](../cloud/bibcode-connect-auth-fl
 
 The Tauri host owns SSH, not the server or React app. It validates the SSH
 profile, probes or launches `bibcode` remotely, establishes local forwarding,
-and returns a local HTTP/WSS bootstrap plus bearer credential to the connection
-runtime. The resulting `SshConnectionTarget` enters the same authorization and
+and returns a local HTTP/WSS bootstrap to the connection runtime. The bootstrap
+carries a one-time pairing credential only when the caller asks for one
+(`issuePairingToken: true`); the renderer exchanges it at `/oauth/token` for a
+bearer. The resulting `SshConnectionTarget` enters the same authorization and
 RPC pipeline as other targets.
 
-Fresh setup mints its bootstrap credential by running
-`bibcode pairing issue --base-dir "$HOME/.bibcode" --json` on the remote host
-(the same data root the launched `serve` uses). The command writes a one-time
-administrative pairing link into that root's auth store and prints one JSON
-line whose `credential` field the desktop exchanges at `/oauth/token`. Because
-the server consumes pairing links from the database and the store runtime lock
-is shared, the command works beside the already-running remote server without
-a restart.
+Every remote step is a script written to the stdin of `ssh … sh -s --`, so the
+remote login shell parses only `sh -s --` (OpenSSH joins the remote argv with
+spaces and hands it to that shell, whatever it is). The launch script starts
+`serve` as `nohup "$RUNNER_FILE" serve …` with no environment assignments;
+`serve` already implies no browser. Each script has a deadline — pairing 30 s,
+launch 60 s, stop 30 s — after which the desktop terminates and reaps the SSH
+child and fails with a `[ssh_timeout:<operation>]` error the renderer treats as
+transient: the supervisor keeps retrying, so its message ends "Check the
+connection; BiBCode keeps trying." and asks the user for nothing. Remote API refusals reach the renderer as `[ssh_http:<status>]`:
+401 blocks with `authentication`, 403 with `permission`, 400 with
+`configuration`; network failures and 5xx stay transient.
+
+**Credentials.** Add runs launch, tunnel, and the pairing script
+`REMOTE_PAIRING_SCRIPT` (`bibcode pairing issue --base-dir "$HOME/.bibcode"
+--json`, the data root the launched `serve` uses), fetches the descriptor, and
+only then exchanges the credential, requesting `AuthStandardClientScopes`. The
+command writes a one-time pairing link into that root's auth store; the server
+consumes pairing links from the database and shares the store runtime lock, so
+it works beside the running remote server without a restart. The resulting
+bearer is saved in the connection catalog beside the SSH profile, in the same
+update, and removed with the entry.
+
+A reconnect calls `ensureTunnel` (no token) and authorizes with the saved
+bearer, like a bearer target; no SSH command runs while the tunnel lives.
+When the credential is missing, or the host rejects it (authentication), the
+runtime mints once: pairing script, exchange, save, retry. A refreshed
+credential is written only while the entry still exists. A rejection of the
+freshly minted bearer blocks with `authentication` ("<host> rejected a new
+pairing credential. Connect again; …") instead of looping.
+
+The desktop never caches a pairing token: a live tunnel's bootstrap has none,
+and `issuePairingToken: true` on a live tunnel always mints a fresh one. On a
+cache hit it probes `/.well-known/bibcode/environment` through the tunnel
+(2 s); if that fails it drops the tunnel and takes the full launch-or-reuse
+path, which relaunches a managed server that stopped under a live SSH session.
+
+Preparation is serialised per target. The desktop holds one async lock per
+target connection key for the whole probe, launch-or-reuse, tunnel, and publish
+sequence, and disconnect takes the same lock, so two preparations never launch
+twice or overwrite each other's remote pid and port files, and a stop never
+interleaves with a preparation. A second caller waits and then takes the
+cache-hit path (probe, reuse, and a fresh mint if it asked for a token). The
+wait is bounded by the holder's own limits: the 2 s probe; each script's
+deadline, which also covers draining its output; 30 s of tunnel readiness
+polling (each request at most 2 s); 1.5 s per terminate-and-reap before the
+retained reaper takes over; and the 3-minute password prompt, at most twice
+per step. After `ssh` exits, its output is read until end of file or until
+the pipes have been idle for 2 s (a remote script's deadline bounds that
+drain; an exited tunnel's stderr gets at most 10 s), and only the last 64 KiB
+is kept, because a descendant that inherited the pipes (a ProxyCommand helper,
+a ControlPersist master on older OpenSSH, a backgrounded process) can keep
+them open indefinitely. Errors built from such output end with
+`[output cut off]`.
+
+**Revocation.** SSH access is the authority for a desktop-managed environment.
+A bearer revoked on the host's Share tab is replaced on the next connection by
+a new mint over SSH; to cut a desktop off, remove its SSH access or remove the
+environment on that desktop. The bearer has standard scopes only, so a leaked
+saved credential cannot create pairing links or offers, manage access, or
+install relay clients; an SSH connection therefore cannot use those host
+features either.
 
 `bibcode pairing offer` uses the same database-as-authority pattern for
 encrypted offers: it writes a share-shaped grant (`one-time-token` subject,
@@ -834,11 +889,16 @@ separate steps internally:
 
 ```mermaid
 flowchart LR
-  Profile["SSH profile"] --> Probe["probe or launch remote bibcode"]
+  Profile["SSH profile"] --> Tunnel["live tunnel responds?"]
+  Tunnel -- no --> Probe["launch or reuse remote bibcode"]
   Probe --> Forward["establish local forwarding"]
-  Forward --> Bootstrap["return endpoint + bootstrap"]
-  Bootstrap --> Auth["environment token exchange"]
-  Auth --> RPC["Effect RPC session"]
+  Tunnel -- yes --> Endpoint["local endpoint (no token)"]
+  Forward --> Endpoint
+  Endpoint --> Saved["authorize with saved bearer"]
+  Saved -- missing or rejected --> Mint["mint once over SSH, exchange, save"]
+  Mint --> Auth["authorize"]
+  Saved -- accepted --> RPC["Effect RPC session"]
+  Auth --> RPC
 ```
 
 Keeping launch separate prevents connection code from assuming that every
@@ -879,7 +939,22 @@ performed on the machine that owns that server and filesystem.
 ## Current limitations
 
 - OS-backed protection for the desktop connection catalog is implemented on
-  Windows; other platforms currently use renderer storage fallback.
+  Windows; other platforms currently use renderer storage fallback, which also
+  holds saved SSH bearers.
+- Desktop-managed SSH still runs its first preparation after a desktop restart
+  (launch and tunnel, possibly a password prompt) inside the supervisor's
+  attempt window, and the bridge command cannot be cancelled. Preparation is
+  serialised per target, but two windows that both see a rejected bearer still
+  each ask for a token, so each mints once on the live tunnel (one extra host
+  session). Sessions
+  minted for SSH expire after 30 days; a standard-scope bearer cannot revoke
+  them.
+- On Windows, Tokio reads child pipes on its blocking thread pool, so a
+  starved pool can still delay output past the 2 s idle window; that path has
+  no automated test.
+- An SSH script deadline terminates only the local `ssh` child. There is no
+  remote watchdog, so a remote `bibcode pairing issue` that hangs after the
+  connection drops keeps running on the host until sshd or the host ends it.
 - Desktop SSH and some advertised endpoint providers are host capabilities and
   are unavailable in an ordinary browser.
 - Endpoint availability is advisory. The connection supervisor still verifies

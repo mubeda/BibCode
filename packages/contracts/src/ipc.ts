@@ -97,7 +97,12 @@ import type {
   OrchestrationThreadStreamItem,
 } from "./orchestration.ts";
 import { EnvironmentId, NonNegativeInt } from "./baseSchemas.ts";
-import { AuthAccessTokenResult, AuthSessionState, AuthWebSocketTicketResult } from "./auth.ts";
+import {
+  AuthAccessTokenResult,
+  type AuthEnvironmentScope,
+  AuthSessionState,
+  AuthWebSocketTicketResult,
+} from "./auth.ts";
 import { AdvertisedEndpoint } from "./remoteAccess.ts";
 import { EditorId } from "./editor.ts";
 import { ExecutionEnvironmentDescriptor } from "./environment.ts";
@@ -1265,9 +1270,15 @@ export interface DesktopBridge {
   ) => Promise<DesktopSshEnvironmentBootstrap>;
   disconnectSshEnvironment: (target: DesktopSshEnvironmentTarget) => Promise<void>;
   fetchSshEnvironmentDescriptor: (httpBaseUrl: string) => Promise<ExecutionEnvironmentDescriptor>;
+  /**
+   * Exchanges a one-time SSH pairing credential for a bearer. `scopes` is
+   * sent as the OAuth `scope`; without it the host grants every scope the
+   * bootstrap allows, administrative ones included.
+   */
   bootstrapSshBearerSession: (
     httpBaseUrl: string,
     credential: string,
+    scopes?: ReadonlyArray<AuthEnvironmentScope>,
   ) => Promise<AuthAccessTokenResult>;
   fetchSshSessionState: (httpBaseUrl: string, bearerToken: string) => Promise<AuthSessionState>;
   issueSshWebSocketTicket: (

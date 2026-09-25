@@ -1,0 +1,125 @@
+# Desktop-managed SSH environments
+
+This runbook validates adding and reconnecting a desktop-managed SSH
+environment: the remote launch, the pairing script, the saved standard-scope
+bearer, and the relaunch of a remote server that stopped under a live tunnel.
+The behavior it checks is described in
+[Remote access architecture](../architecture/remote.md#desktop-managed-ssh) and
+the [user guide](../user/remote-access.md#desktop-managed-ssh).
+
+Record results in a report created from the
+[execution report template](./execution-report-template.md), including its
+**SSH environment evidence** section.
+
+## Automated harness (Linux and macOS)
+
+`apps/desktop/src-tauri/tests/ssh_environment.rs` drives the production
+`SshEnvironmentManager`, launch, stop, and pairing scripts, a real `bibcode`,
+and the production `/oauth/token` exchange. Only the SSH hop is faked: the
+stand-in client `tests/fixtures/ssh/fake_ssh.py` (Python 3) runs remote
+commands locally with OpenSSH semantics (argv joined with spaces, run by
+`/bin/sh -c`) under a private temporary "remote" home. It never contacts a
+host and never reads `~/.ssh`.
+
+The tests are `#[ignore]`d because they need a fresh `bibcode`, which
+`cargo test -p bibcode-desktop` neither builds nor checks. From the repository
+root:
+
+```sh
+cargo build -p bibcode-server --bin bibcode
+cargo test -p bibcode-desktop --test ssh_environment -- --ignored
+```
+
+CI's **Test** job runs the same two commands. Prerequisites: `python3`, `curl`
+or `wget`, `ps`, and `/bin/sh`. `BIBCODE_SSH_FIXTURE_BIBCODE` selects another
+binary; `BIBCODE_SSH_FIXTURE_PORT_START` moves the fake remote's port scan
+(default 47310, away from a local BiBCode on 3773). Each scenario stops the
+remote servers and tunnels it started; after a run, no `fake_ssh.py`,
+`bibcode serve --base-dir …/remote-home/.bibcode`, or `sleep 600` process
+should remain.
+
+The harness is compatibility evidence for OpenSSH join semantics. It does not
+exercise askpass, a real `sshd`, a remote login shell other than `/bin/sh`, or
+Windows `ssh.exe`; the live procedure below covers those.
+
+## Live procedure (Windows, Linux, and macOS desktops)
+
+Use a host you control. Do not change its SSH or system configuration for the
+test.
+
+### Prerequisites
+
+- A remote Linux or macOS host with a native `bibcode` matching the desktop's
+  version on non-interactive `sh`'s `PATH`, plus `curl` or `wget`. Check with
+  `ssh <host> 'command -v bibcode && bibcode --version'`.
+- Two ways in: key authentication, and password authentication (a second
+  account or alias that offers only `password`/`keyboard-interactive`). Run the
+  scenarios once per method.
+- A way to see the host's devices: the host's **Settings → Remote Servers →
+  Share** tab, opened from an administrative client of that host.
+- Before starting, note the host's device list and remove leftovers from
+  earlier runs, so the count below is meaningful.
+
+### Scenarios
+
+Run in order on the desktop under test. For each, record the evidence class,
+the environment row's state, and any exact error text.
+
+| #   | Scenario                     | Steps                                                                                                                        | Expected                                                                                                               |
+| --- | ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| 1   | Add                          | **Settings → Remote Servers → Connect → Add environment → SSH**, enter the host, add.                                        | Toast **Environment added**, "<label> is connecting over SSH."; the row reaches connected. Password auth prompts once. |
+| 2   | Remote restart, tunnel alive | Stop the managed server for this environment only; see [Stopping the remote server](#stopping-the-remote-server). Then wait. | The row reconnects on its own; that environment's `pid` file holds a new pid. No new device appears on the host.       |
+| 3   | Disconnect, then Connect     | Choose **Disconnect** on the row, then **Connect**.                                                                          | Connects without a pairing prompt or error. No new device.                                                             |
+| 4   | Reload                       | Reload the window (or open a second window).                                                                                 | Connects with the saved credential. No new device.                                                                     |
+| 5   | Desktop restart              | Quit the desktop app and start it again.                                                                                     | Connects (launch and tunnel run again; password auth prompts again). No new device.                                    |
+| 6   | Dead link (optional)         | Cut the network path to the host for over 45 s, then restore it.                                                             | The tunnel ends after keepalive; the row reconnects after the link returns.                                            |
+| 7   | Revocation (optional)        | Revoke the desktop's device on the host's Share tab, then wait for the desktop to reconnect.                                 | The desktop pairs again over SSH and connects; the old device is gone and one new device appears.                      |
+
+### Stopping the remote server
+
+Each environment has its own launch directory,
+`~/.bibcode-ssh-launch/<state-key>`, and a host can hold several. The state key
+is the first 16 hex digits of the SHA-256 of the environment's alias, hostname,
+user name, and port, joined by NUL bytes, with an empty field for an unset user
+or port. Use the values the desktop saved for the environment (an alias
+without a separate host name uses the alias for both). On the desktop machine:
+
+```sh
+# Linux
+printf '%s\0%s\0%s\0%s' '<alias>' '<hostname>' '<user>' '<port>' | sha256sum | cut -c1-16
+# macOS
+printf '%s\0%s\0%s\0%s' '<alias>' '<hostname>' '<user>' '<port>' | shasum -a 256 | cut -c1-16
+```
+
+Then, on the remote host, confirm that the recorded pid is that environment's
+`bibcode serve` before stopping only that pid (`ps -p <pid> -o command=` works
+on Linux and macOS):
+
+```sh
+ssh <host>
+dir=~/.bibcode-ssh-launch/<state-key>
+pid=$(cat "$dir/pid")
+ps -p "$pid" -o command=   # must show: …bibcode serve --host 127.0.0.1 --port … --base-dir …/.bibcode
+kill "$pid"
+```
+
+If `ps` shows anything other than `bibcode serve`, stop: the pid file is stale
+and the pid may belong to another process. Record that and skip scenario 2.
+
+After scenario 5 (or 7), the host must list exactly **one** device for this
+desktop, labelled **BiBCode Tauri Desktop**, with standard access (not
+administrative). Record the device count and access before and after.
+
+A stuck scenario is a failure: record the environment row's message. A pairing
+step that exceeds its limit reads "The remote host did not issue a pairing
+credential within 30 seconds. Check the connection; BiBCode keeps trying." and
+the row stays **Connecting…** while BiBCode retries.
+
+### Cleanup
+
+1. Remove the environment on the desktop (row menu → **Remove server…**). This stops the
+   tunnel and the managed remote server.
+2. Revoke the test device on the host's Share tab.
+3. Check that the host has no leftover managed server:
+   `ssh <host> 'ls ~/.bibcode-ssh-launch/*/pid 2>/dev/null; pgrep -fl "bibcode serve"'`.
+   Stop only a server this test started.
