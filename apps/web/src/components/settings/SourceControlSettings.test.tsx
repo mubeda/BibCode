@@ -66,6 +66,7 @@ const ui = vi.hoisted(() => {
 
 const testState = vi.hoisted(() => ({
   environmentId: null as unknown,
+  queriedAtom: undefined as unknown,
   discovery: {
     data: null as SourceControlDiscoveryResult | null,
     error: null as string | null,
@@ -106,7 +107,10 @@ vi.mock("../../state/environments", () => ({
 }));
 
 vi.mock("../../state/query", () => ({
-  useEnvironmentQuery: () => testState.discovery,
+  useEnvironmentQuery: (atom: unknown) => {
+    testState.queriedAtom = atom;
+    return testState.discovery;
+  },
 }));
 
 vi.mock("../../state/sourceControl", () => ({
@@ -352,6 +356,14 @@ describe("panel-level states", () => {
     testState.discovery = { data: result(), error: null, isPending: false, refresh: vi.fn() };
     const markup = render();
     expect(markup).toContain("Nothing detected yet");
+    expect(testState.queriedAtom).toBeNull();
+  });
+
+  it("asks the server to record the hosts this explicit scan lists", () => {
+    render();
+    expect(testState.queriedAtom).toEqual({
+      __discovery: { environmentId: ENV, input: { recordHosts: true } },
+    });
   });
 
   it("rescans from the section header scan button", () => {

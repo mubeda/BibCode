@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     git::{OutputPolicy, ProcessError, ProcessRequest, ProcessRunner, git_environment},
-    source_control::{ProviderCommandSpec, ProviderKind},
+    source_control::{ProviderCommandSpec, ProviderHosts, ProviderKind},
 };
 
 #[derive(Clone, Debug)]
@@ -43,6 +43,8 @@ pub struct HostCommandRunner {
     git: ProviderCommandSpec,
     state_dir: PathBuf,
     probes: Arc<super::cache::ContextCache<ProbeKey, CommandOutput>>,
+    /// The server's host observation: scope resolution records and forgets hosts here.
+    provider_hosts: Arc<ProviderHosts>,
 }
 
 #[cfg(test)]
@@ -116,7 +118,19 @@ impl HostCommandRunner {
             git: ProviderCommandSpec::new("git", []),
             state_dir,
             probes: Arc::default(),
+            provider_hosts: Arc::default(),
         }
+    }
+
+    /// Shares the host observation that status reads and Settings discovery also use.
+    #[must_use]
+    pub fn with_provider_hosts(mut self, provider_hosts: Arc<ProviderHosts>) -> Self {
+        self.provider_hosts = provider_hosts;
+        self
+    }
+
+    pub(super) fn provider_hosts(&self) -> &ProviderHosts {
+        &self.provider_hosts
     }
 
     #[must_use]
@@ -142,7 +156,7 @@ impl HostCommandRunner {
         c: &CancellationToken,
     ) -> Result<CommandOutput, ProcessFailure> {
         self.execute(
-            self.provider_request(scope, ProviderKind::Github, args, budget, stdin),
+            self.provider_request(scope, PullRequestsProvider::Github, args, budget, stdin),
             c,
         )
         .await
@@ -157,23 +171,24 @@ impl HostCommandRunner {
         c: &CancellationToken,
     ) -> Result<CommandOutput, ProcessFailure> {
         self.execute(
-            self.provider_request(scope, ProviderKind::Gitlab, args, budget, stdin),
+            self.provider_request(scope, PullRequestsProvider::Gitlab, args, budget, stdin),
             c,
         )
         .await
     }
 
     /// Discovery and presence/auth probes retain the read cap with a shorter deadline.
-    pub async fn probe(
+    pub(super) async fn probe(
         &self,
         scope: &HostScope,
+        provider: PullRequestsProvider,
         args: &[impl AsRef<OsStr>],
         c: &CancellationToken,
     ) -> Result<CommandOutput, ProcessFailure> {
-        let mut request = self.provider_request(scope, scope.provider, args, Budget::Read, None);
+        let mut request = self.provider_request(scope, provider, args, Budget::Read, None);
         request.timeout = Duration::from_secs(5);
         let key = (
-            scope.provider == ProviderKind::Github,
+            provider == PullRequestsProvider::Github,
             scope.host.to_ascii_lowercase(),
             scope.repository.clone(),
             request.args.clone(),
@@ -287,15 +302,16 @@ impl HostCommandRunner {
     fn provider_request(
         &self,
         scope: &HostScope,
-        provider: ProviderKind,
+        provider: PullRequestsProvider,
         args: &[impl AsRef<OsStr>],
         budget: Budget,
         stdin: Option<&[u8]>,
     ) -> ProcessRequest {
         let mut args: Vec<OsString> = args.iter().map(|arg| arg.as_ref().to_owned()).collect();
-        let github = provider == ProviderKind::Github;
-        let cli = if github { "gh" } else { "glab" };
-        let command = if github { &self.gh } else { &self.glab };
+        let (github, cli, command) = match provider {
+            PullRequestsProvider::Github => (true, "gh", &self.gh),
+            PullRequestsProvider::Gitlab => (false, "glab", &self.glab),
+        };
         if args
             .first()
             .is_some_and(|arg| arg == if github { "pr" } else { "mr" })
@@ -441,6 +457,8 @@ pub type HostFuture<'a, T> =
 
 pub trait PullRequestHost: Send + Sync {
     fn invalidate_context(&self) {}
+    /// A successful mutation can change the repository-wide list totals.
+    fn invalidate_totals(&self, _scope: &HostScope) {}
     fn kind(&self) -> ProviderKind;
     fn capabilities(&self, version: Option<&HostVersion>) -> HostCapabilities;
     fn context<'a>(
@@ -732,7 +750,7 @@ mod tests {
         let c = CancellationToken::new();
         let mut request = runner.provider_request(
             &scope(&s),
-            ProviderKind::Github,
+            PullRequestsProvider::Github,
             &["pr", "list"],
             Budget::Read,
             None,
@@ -753,7 +771,7 @@ mod tests {
         let runner = runner.with_commands(&script, &script, &script);
         let mut request = runner.provider_request(
             &scope(&s),
-            ProviderKind::Github,
+            PullRequestsProvider::Github,
             &["api", "user"],
             Budget::Read,
             None,
@@ -824,7 +842,10 @@ mod tests {
             HostCommandRunner::new(s.path("state")).with_commands(&script, &script, &script);
         let c = CancellationToken::new();
         for _ in 0..2 {
-            runner.probe(&scope(&s), &["--version"], &c).await.unwrap();
+            runner
+                .probe(&scope(&s), PullRequestsProvider::Github, &["--version"], &c)
+                .await
+                .unwrap();
         }
         assert_eq!(
             std::fs::read_to_string(s.path("calls"))
@@ -835,7 +856,10 @@ mod tests {
         );
         c.cancel();
         assert!(
-            runner.probe(&scope(&s), &["--version"], &c).await.is_err(),
+            runner
+                .probe(&scope(&s), PullRequestsProvider::Github, &["--version"], &c)
+                .await
+                .is_err(),
             "cached probes still respect cancellation"
         );
     }

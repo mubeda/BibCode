@@ -275,7 +275,11 @@ flowchart TB
   `ETXTBSY` (the executable is still open for writing, typically a helper
   that was just installed or rewritten, or a fork of this process that has
   not exec'd yet) every 25 ms for at most one second and never past the run's
-  own deadline. Every other spawn error is returned immediately.
+  own deadline. Every other spawn error is returned immediately. A run whose
+  future is dropped before it settles (an interrupted inline RPC, an aborted
+  task, runtime shutdown, or a panic) kills its whole process group or Windows
+  job while the root is unreaped, without waiting; see the cancellation
+  invariants in [RPC and orchestration](./rpc-and-orchestration.md).
 
 - **Contracts (`packages/contracts`)** contains Effect schemas and TypeScript
   contracts only. It defines persisted models, RPC methods, HTTP APIs, desktop
@@ -284,7 +288,9 @@ flowchart TB
   connection supervision, authorization, RPC sessions, and shared client state.
   It is used by browser and desktop clients.
 - **Shared runtime (`packages/shared`)** contains runtime utilities used by
-  multiple packages through explicit subpath exports.
+  multiple packages through explicit subpath exports. `sourceControl` owns
+  common request nouns, provider display names, and number prefixes (`!` for
+  GitLab, `#` otherwise) used by the PR UI and Git actions.
 
 ## AppImage child environments
 
@@ -1133,10 +1139,21 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
   list, detail, timeline, commit, check/pipeline, and file reads through typed RPC and a single bounded `ProcessRunner`
   wrapper. Host detection, authentication, and capabilities are server-owned;
   permissions and merge readiness are computed only on the server, and reads
-  start only on explicit requests. Successful CLI probes and GitLab context
-  observations use bounded 30-second caches (32 entries each); mutations still
-  re-read repository access/policy and request permission/head observations.
-  Rescan/auth failures invalidate the caches, and no worker polls them.
+  start only on explicit requests. Successful CLI probes, GitLab context
+  observations and GitLab tab totals use bounded 30-second caches (32 entries
+  each); opening the module reuses them, while Rescan (`getContext` with
+  `rescan`) and auth failures invalidate them, and mutations still re-read
+  repository access/policy and request permission/head observations. No worker
+  polls them. `source_control::ProviderHosts` is the server's in-memory record of
+  authenticated hosts that explicit probes identified (Pull Requests scope
+  resolution, and Settings discovery only when it sends `recordHosts`; at most
+  64, forgotten on Rescan, `unknown_host` and `not_authenticated`). One shared
+  instance serves Git status, summaries, Settings discovery and Pull Requests,
+  which classify origins by host name first and then through it, without
+  spawning a provider CLI. The `create_pr`/`commit_push_pr` stacked actions
+  resolve the provider before any branch, commit or push, and report a created
+  request to the Pull Requests service (`CreatedRequestObserver`) so its cached
+  GitLab totals for that repository are read again.
   The web module adds project-scoped
   list/detail routes, capability/connection gating, and a two-project persisted
   view-state cache. The detail surface mounts the header and active tab's query

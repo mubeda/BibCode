@@ -10,6 +10,7 @@ import {
   EMPTY_CONNECTION_CATALOG_DOCUMENT,
   EnvironmentCacheStore,
   registerConnectionInCatalog,
+  relabelConnectionInCatalog,
   removeCatalogValue,
   removeConnectionFromCatalog,
   removeConnectionRegistrationFromCatalog,
@@ -84,6 +85,7 @@ function persistenceError(
     | "list-targets"
     | "register-connection"
     | "remove-connection"
+    | "rename-connection"
     | "load-shell"
     | "save-shell"
     | "load-thread"
@@ -694,6 +696,18 @@ export const connectionStorageLayer = Layer.effectContext(
         catalog
           .update((document) => removeConnectionFromCatalog(document, target))
           .pipe(Effect.mapError((cause) => persistenceError("remove-connection", cause))),
+      relabel: (environmentId, label) =>
+        catalog
+          .modify((document) => {
+            const renamed = relabelConnectionInCatalog(document, environmentId, label);
+            return renamed === null
+              ? { mutation: { _tag: "Keep" }, result: Option.none() }
+              : {
+                  mutation: { _tag: "Set", document: renamed.document },
+                  result: Option.some(renamed.target),
+                };
+          })
+          .pipe(Effect.mapError((cause) => persistenceError("rename-connection", cause))),
     });
     const profileStore = ProfileStore.make({
       get: (connectionId) =>

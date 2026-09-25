@@ -8,12 +8,16 @@ vi.mock("../../../localApi", () => ({ readLocalApi: () => ({ shell: { openExtern
 import { PullRequestsChecks } from "./PullRequestsChecks";
 import { context, gitlabContext } from "./testFixtures";
 describe("PullRequestsChecks", () => {
-  it("uses the supplied request vocabulary in the pipeline empty state", () => {
+  it("ignores server singular and plural request nouns in the pipeline empty state", () => {
     const host = {
       ...gitlabContext,
       capabilities: {
         ...gitlabContext.capabilities,
-        vocabulary: { ...gitlabContext.capabilities.vocabulary, pullRequest: "review request" },
+        vocabulary: {
+          ...gitlabContext.capabilities.vocabulary,
+          pullRequest: "review request",
+          pullRequests: "review requests",
+        },
       },
     };
     const html = renderToStaticMarkup(
@@ -22,7 +26,8 @@ describe("PullRequestsChecks", () => {
         context={host}
       />,
     );
-    expect(html).toContain("No pipeline for this review request");
+    expect(html).toContain("No pipeline for this merge request");
+    expect(html).not.toContain("review request");
   });
   it.each([
     [context, "No checks reported"],

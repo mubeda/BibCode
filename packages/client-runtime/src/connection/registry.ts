@@ -25,12 +25,16 @@ import {
 import * as ConnectionCredentialStore from "./credentialStore.ts";
 import * as ConnectionProfileStore from "./profileStore.ts";
 import * as Connectivity from "./connectivity.ts";
-import type {
-  ConnectionAttemptError,
-  ConnectionTarget,
-  NetworkStatus,
-  SupervisorConnectionState,
+import {
+  type ConnectionAttemptError,
+  ConnectionBlockedError,
+  type ConnectionTarget,
+  type NetworkStatus,
+  type SupervisorConnectionState,
+  isPersistedConnectionTarget,
+  withPersistedTargetLabel,
 } from "./model.ts";
+import { PLATFORM_ENVIRONMENT_NAME_MESSAGE, SERVER_NAME_REQUIRED_MESSAGE } from "./presentation.ts";
 import * as Persistence from "../platform/persistence.ts";
 import * as EnvironmentSupervisor from "./supervisor.ts";
 import * as ConnectionDriver from "./driver.ts";
@@ -99,6 +103,20 @@ export class EnvironmentRegistry extends Context.Service<
       | ConnectionAttemptError
       | PlatformEnvironmentRemovalError
     >;
+    /**
+     * Saves a new client-local name for a saved environment. Only the catalog
+     * label changes: the live runtime, its session, desired intent, and every
+     * followed stream stay as they are.
+     */
+    readonly rename: (
+      environmentId: EnvironmentId,
+      label: string,
+    ) => Effect.Effect<
+      void,
+      | Persistence.ConnectionPersistenceError
+      | ConnectionAttemptError
+      | EnvironmentNotRegisteredError
+    >;
     readonly retryNow: (environmentId: EnvironmentId) => Effect.Effect<void>;
     readonly connect: (environmentId: EnvironmentId) => Effect.Effect<void>;
     readonly disconnect: (environmentId: EnvironmentId) => Effect.Effect<void>;
@@ -138,6 +156,7 @@ export class EnvironmentRegistry extends Context.Service<
 >()("@bibcode/client-runtime/connection/registry/EnvironmentRegistry") {}
 
 interface EnvironmentServiceScope {
+  readonly targetRef: Ref.Ref<ConnectionTarget>;
   readonly entry: ConnectionCatalogEntry;
   readonly supervisor: EnvironmentSupervisor.EnvironmentSupervisor["Service"];
   readonly scope: Scope.Closeable;
@@ -174,6 +193,16 @@ export const make = Effect.gen(function* () {
   );
   const entries =
     yield* SubscriptionRef.make<ReadonlyMap<EnvironmentId, ConnectionCatalogEntry>>(initialEntries);
+  // One token per environment, replaced whenever the registry installs a new
+  // runtime for it and removed with the environment. Followed streams re-bind
+  // on token changes rather than on entry changes, so a rename (which
+  // republishes `entries` with a new label) leaves them and their live
+  // subscriptions alone, while every installation, even of an identical
+  // entry, moves them to the new supervisor.
+  const installations = yield* SubscriptionRef.make<ReadonlyMap<EnvironmentId, number>>(
+    new Map(persistedTargets.map((target) => [target.environmentId, 0])),
+  );
+  const nextInstallation = yield* Ref.make(1);
   const networkStatus = yield* SubscriptionRef.make(yield* connectivity.status);
   const serviceScopes = yield* SubscriptionRef.make<
     ReadonlyMap<EnvironmentId, EnvironmentServiceScope>
@@ -240,6 +269,41 @@ export const make = Effect.gen(function* () {
         ),
     ).pipe(Effect.withSpan("EnvironmentRegistry.withLeaseLock"));
 
+  // Called under the environment lease lock. These publication helpers own
+  // catalog metadata and installation identity; metadata alone never rebinds followers.
+  const relabelEntryLocked = Effect.fn("EnvironmentRegistry.relabelEntryLocked")(function* (
+    entry: ConnectionCatalogEntry,
+  ) {
+    yield* SubscriptionRef.update(entries, (current) =>
+      new Map(current).set(entry.target.environmentId, entry),
+    );
+  });
+
+  const publishInstallationLocked = Effect.fn("EnvironmentRegistry.publishInstallationLocked")(
+    function* (entry: ConnectionCatalogEntry) {
+      yield* relabelEntryLocked(entry);
+      const installation = yield* Ref.getAndUpdate(nextInstallation, (value) => value + 1);
+      yield* SubscriptionRef.update(installations, (current) =>
+        new Map(current).set(entry.target.environmentId, installation),
+      );
+    },
+  );
+
+  const removeEntryLocked = Effect.fn("EnvironmentRegistry.removeEntryLocked")(function* (
+    environmentId: EnvironmentId,
+  ) {
+    yield* SubscriptionRef.update(entries, (current) => {
+      const next = new Map(current);
+      next.delete(environmentId);
+      return next;
+    });
+    yield* SubscriptionRef.update(installations, (current) => {
+      const next = new Map(current);
+      next.delete(environmentId);
+      return next;
+    });
+  });
+
   const getEntry = Effect.fn("EnvironmentRegistry.getEntry")(function* (
     environmentId: EnvironmentId,
   ) {
@@ -272,7 +336,9 @@ export const make = Effect.gen(function* () {
         Effect.gen(function* () {
           const environmentId = entry.target.environmentId;
           const scope = yield* Scope.make();
+          const targetRef = yield* Ref.make(entry.target);
           const supervisor = yield* EnvironmentSupervisor.make(entry, {
+            targetRef,
             initiallyDesired: false,
           }).pipe(
             Effect.provideService(Connectivity.Connectivity, connectivity),
@@ -286,13 +352,36 @@ export const make = Effect.gen(function* () {
           }
           yield* SubscriptionRef.update(serviceScopes, (current) => {
             const next = new Map(current);
-            next.set(environmentId, { entry, supervisor, scope });
+            next.set(environmentId, { entry, supervisor, scope, targetRef });
             return next;
           });
           return supervisor;
         }),
       ),
   );
+
+  const installEntryLocked = Effect.fn("EnvironmentRegistry.installEntryLocked")(function* (
+    entry: ConnectionCatalogEntry,
+    options?: { readonly retainEquivalentRuntime?: boolean },
+  ) {
+    const target = entry.target;
+    const previous = (yield* SubscriptionRef.get(entries)).get(target.environmentId);
+    const existingScope = (yield* SubscriptionRef.get(serviceScopes)).get(target.environmentId);
+    if (
+      options?.retainEquivalentRuntime === true &&
+      previous !== undefined &&
+      Equal.equals(previous, entry) &&
+      existingScope !== undefined &&
+      Equal.equals(existingScope.entry, entry)
+    ) {
+      return existingScope.supervisor;
+    }
+
+    yield* closeServiceScope(target.environmentId);
+    yield* publishInstallationLocked(entry);
+    const desired = (yield* Ref.get(desiredStates)).get(target.environmentId) ?? false;
+    return yield* createServiceScope(entry, desired);
+  });
 
   const acquireSupervisorLocked = Effect.fn("EnvironmentRegistry.acquireSupervisorLocked")(
     function* (environmentId: EnvironmentId): Effect.fn.Return<
@@ -308,13 +397,11 @@ export const make = Effect.gen(function* () {
         if (Equal.equals(existing.entry, entry)) {
           return { created: false, supervisor: existing.supervisor };
         }
-        yield* closeServiceScope(environmentId);
+        return { created: true, supervisor: yield* installEntryLocked(entry) };
       }
       const desired = (yield* Ref.get(desiredStates)).get(environmentId) ?? false;
-      return {
-        created: true,
-        supervisor: yield* createServiceScope(entry, desired),
-      };
+      const supervisor = yield* createServiceScope(entry, desired);
+      return { created: true, supervisor };
     },
   );
 
@@ -355,8 +442,8 @@ export const make = Effect.gen(function* () {
     stream: Stream.Stream<A, E, R>,
   ) =>
     Stream.concat(
-      Stream.fromEffect(SubscriptionRef.get(entries)),
-      SubscriptionRef.changes(entries),
+      Stream.fromEffect(SubscriptionRef.get(installations)),
+      SubscriptionRef.changes(installations),
     ).pipe(
       Stream.map((current) => Option.fromUndefinedOr(current.get(environmentId))),
       Stream.changes,
@@ -397,33 +484,6 @@ export const make = Effect.gen(function* () {
       },
     );
   }).pipe(Effect.withSpan("EnvironmentRegistry.start"));
-
-  const installEntryLocked = Effect.fn("EnvironmentRegistry.installEntryLocked")(function* (
-    entry: ConnectionCatalogEntry,
-    options?: { readonly retainEquivalentRuntime?: boolean },
-  ) {
-    const target = entry.target;
-    const previous = (yield* SubscriptionRef.get(entries)).get(target.environmentId);
-    const existingScope = (yield* SubscriptionRef.get(serviceScopes)).get(target.environmentId);
-    if (
-      options?.retainEquivalentRuntime === true &&
-      previous !== undefined &&
-      Equal.equals(previous, entry) &&
-      existingScope !== undefined &&
-      Equal.equals(existingScope.entry, entry)
-    ) {
-      return;
-    }
-
-    yield* closeServiceScope(target.environmentId);
-    yield* SubscriptionRef.update(entries, (current) => {
-      const next = new Map(current);
-      next.set(target.environmentId, entry);
-      return next;
-    });
-    const desired = (yield* Ref.get(desiredStates)).get(target.environmentId) ?? false;
-    yield* createServiceScope(entry, desired);
-  });
 
   const register = Effect.fn("EnvironmentRegistry.register")(function* (
     registration: ConnectionRegistration,
@@ -551,11 +611,7 @@ export const make = Effect.gen(function* () {
             return next;
           });
           yield* closeServiceScope(environmentId);
-          yield* SubscriptionRef.update(entries, (current) => {
-            const next = new Map(current);
-            next.delete(environmentId);
-            return next;
-          });
+          yield* removeEntryLocked(environmentId);
           if (
             entry !== undefined &&
             (entry.target._tag === "BearerConnectionTarget" ||
@@ -628,11 +684,7 @@ export const make = Effect.gen(function* () {
         return next;
       });
       yield* closeServiceScope(target.environmentId);
-      yield* SubscriptionRef.update(entries, (current) => {
-        const next = new Map(current);
-        next.delete(target.environmentId);
-        return next;
-      });
+      yield* removeEntryLocked(target.environmentId);
       yield* Effect.all(
         [
           cache.clear(target.environmentId).pipe(
@@ -756,6 +808,70 @@ export const make = Effect.gen(function* () {
       );
     },
   );
+
+  const renameBlocked = (detail: string) =>
+    new ConnectionBlockedError({ reason: "configuration", detail });
+
+  const rename = Effect.fn("EnvironmentRegistry.rename")(function* (
+    environmentId: EnvironmentId,
+    label: string,
+  ) {
+    const name = label.trim();
+    if (name === "") {
+      return yield* renameBlocked(SERVER_NAME_REQUIRED_MESSAGE);
+    }
+    yield* withLeaseLock(
+      environmentId,
+      Effect.uninterruptible(
+        Effect.gen(function* () {
+          if ((yield* Ref.get(platformEnvironmentIds)).has(environmentId)) {
+            return yield* renameBlocked(PLATFORM_ENVIRONMENT_NAME_MESSAGE);
+          }
+          const entry = yield* getEntry(environmentId);
+          const target = entry.target;
+          if (!isPersistedConnectionTarget(target)) {
+            return yield* renameBlocked(PLATFORM_ENVIRONMENT_NAME_MESSAGE);
+          }
+          if (target.label === name) {
+            return;
+          }
+          const saved = yield* registrations.relabel(environmentId, name);
+          if (Option.isNone(saved)) {
+            return yield* new EnvironmentNotRegisteredError({ environmentId });
+          }
+          // Relabel the in-memory entry rather than adopting the durable
+          // target, so a registration changed by another store can never be
+          // passed off as the runtime installed here.
+          const renamed: ConnectionCatalogEntry = {
+            target: withPersistedTargetLabel(target, name),
+            profile: entry.profile,
+          };
+          yield* Ref.update(persistedTargetsByEnvironment, (current) => {
+            const next = new Map(current);
+            next.set(environmentId, renamed.target);
+            return next;
+          });
+          // The live runtime now serves the renamed entry. Recording that keeps
+          // later acquisitions from mistaking the label change for catalog
+          // drift and replacing (reconnecting) the supervisor.
+          const lease = (yield* SubscriptionRef.get(serviceScopes)).get(environmentId);
+          if (lease !== undefined) {
+            yield* Ref.set(lease.targetRef, renamed.target);
+          }
+          yield* SubscriptionRef.update(serviceScopes, (current) => {
+            const lease = current.get(environmentId);
+            if (lease === undefined) {
+              return current;
+            }
+            const next = new Map(current);
+            next.set(environmentId, { ...lease, entry: renamed });
+            return next;
+          });
+          yield* relabelEntryLocked(renamed);
+        }),
+      ),
+    );
+  });
 
   const retryNow = (environmentId: EnvironmentId) =>
     withLeaseLock(
@@ -911,6 +1027,7 @@ export const make = Effect.gen(function* () {
     reconcilePlatform,
     remove,
     removeRelayEnvironments,
+    rename,
     retryNow,
     connect,
     disconnect,

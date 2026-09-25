@@ -9,7 +9,7 @@ import { memo, useState } from "react";
 import { writeTextToClipboard } from "../../../hooks/useCopyToClipboard";
 import { Button } from "../../ui/button";
 import { PullRequestsExternalLink } from "../shared/PullRequestsMarkdown";
-import { PullRequestsPermissionButton } from "../shared/PullRequestsPermissionButton";
+import { PermissionButton } from "../../ui/permission-button";
 import { PullRequestsStateIcon } from "../shared/PullRequestsStateIcon";
 import { headerSentence } from "./pullRequestsDetail.logic";
 export interface PullRequestsHeaderProps {
@@ -36,8 +36,7 @@ export const PullRequestsHeader = memo(function PullRequestsHeader({
 }: PullRequestsHeaderProps) {
   const [copyStatus, setCopyStatus] = useState<string | null>(null);
   const state = detail.state === "open" && detail.isDraft ? "draft" : detail.state;
-  const vocabulary = context.capabilities.vocabulary;
-  const gitlabSentence = vocabulary.pullRequest === "merge request";
+  const gitlabSentence = context.provider === "gitlab";
   const branch = (name: string) => (
     <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">{name}</code>
   );
@@ -46,7 +45,7 @@ export const PullRequestsHeader = memo(function PullRequestsHeader({
       <PullRequestsTitleEditor
         detail={detail}
         projectRef={projectRef}
-        numberPrefix={context.capabilities.closedTabIncludesMerged ? "#" : "!"}
+        provider={context.provider}
       />
       <div className="flex flex-wrap items-center gap-2 text-sm">
         <span
@@ -57,7 +56,7 @@ export const PullRequestsHeader = memo(function PullRequestsHeader({
         </span>
         <div
           className="min-w-0 break-words text-muted-foreground"
-          aria-label={headerSentence(detail, vocabulary)}
+          aria-label={headerSentence(detail, context.provider)}
         >
           <span className="font-medium text-foreground">{detail.author.login}</span>{" "}
           {gitlabSentence ? (
@@ -110,7 +109,7 @@ export const PullRequestsHeader = memo(function PullRequestsHeader({
           headBranch={detail.headBranch}
           permission={detail.permissions.checkout}
         />
-        <PullRequestsPermissionButton
+        <PermissionButton
           permission={{ allowed: !refreshing, reason: refreshing ? "Refreshing…" : null }}
           onClick={onRefresh}
           variant="outline"
@@ -118,7 +117,7 @@ export const PullRequestsHeader = memo(function PullRequestsHeader({
         >
           <RefreshCwIcon aria-hidden="true" />
           Refresh
-        </PullRequestsPermissionButton>
+        </PermissionButton>
         <PullRequestsSecondaryActions detail={detail} context={context} />
       </div>
     </header>

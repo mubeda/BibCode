@@ -20,17 +20,17 @@ import {
 } from "./testFixtures";
 describe("headerSentence", () => {
   it("uses GitHub's author, count and base/head order", () =>
-    expect(headerSentence(detail, context.capabilities.vocabulary)).toBe(
+    expect(headerSentence(detail, context.provider)).toBe(
       "mubeda wants to merge 3 commits into main from feature",
     ));
   it("uses GitLab's source/target order", () =>
-    expect(headerSentence(detail, gitlabContext.capabilities.vocabulary)).toBe(
+    expect(headerSentence(detail, gitlabContext.provider)).toBe(
       "mubeda requested to merge feature into main",
     ));
   it("uses singular commit", () =>
-    expect(
-      headerSentence({ ...detail, commitCount: 1 }, context.capabilities.vocabulary),
-    ).toContain("1 commit into"));
+    expect(headerSentence({ ...detail, commitCount: 1 }, context.provider)).toContain(
+      "1 commit into",
+    ));
 });
 describe("readinessPresentation", () => {
   it.each(["1 approving review required.", "  1 approving review required.\n"])(

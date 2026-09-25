@@ -178,6 +178,24 @@ pub enum PullRequestsProvider {
     Gitlab,
 }
 
+impl PullRequestsProvider {
+    /// The single admission policy for providers implemented by this module.
+    pub(super) fn from_kind(provider: ProviderKind) -> Option<Self> {
+        match provider {
+            ProviderKind::Github => Some(Self::Github),
+            ProviderKind::Gitlab => Some(Self::Gitlab),
+            ProviderKind::AzureDevops | ProviderKind::Bitbucket | ProviderKind::Unknown => None,
+        }
+    }
+
+    pub(super) fn kind(self) -> ProviderKind {
+        match self {
+            Self::Github => ProviderKind::Github,
+            Self::Gitlab => ProviderKind::Gitlab,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum RepositoryPermission {
@@ -325,6 +343,9 @@ pub struct ListQuery {
     pub target_branch: Option<String>,
     pub sort: ListSort,
     pub cursor: Option<String>,
+    /// Explicit Refresh: re-read the repository-wide totals instead of reusing them.
+    #[serde(default)]
+    pub refresh_totals: bool,
 }
 
 impl ListQuery {

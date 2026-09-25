@@ -70,7 +70,7 @@ describe("createEnvironmentCatalogAtoms", () => {
         expect.objectContaining({ _tag: "Some", value: AVAILABLE_CONNECTION_STATE }),
       );
       expect(harness.followStream).toHaveBeenCalledWith(environmentId, expect.anything());
-      expect(harness.commandConfigs).toHaveLength(7);
+      expect(harness.commandConfigs).toHaveLength(8);
       for (const config of harness.commandConfigs) {
         expect(config.scheduler).toBe(harness.scheduler);
         expect(config.concurrency).toMatchObject({ mode: "serial" });
@@ -87,6 +87,7 @@ describe("createEnvironmentCatalogAtoms", () => {
         removeRelayEnvironments: vi.fn(() => Effect.void),
         retryNow: vi.fn((input: unknown) => Effect.succeed(input)),
         acceptStorageIdentity: vi.fn((input: unknown) => Effect.succeed(input)),
+        rename: vi.fn((id: unknown, label: unknown) => Effect.succeed({ id, label })),
       };
       const inputs = [
         { id: "target" },
@@ -96,6 +97,7 @@ describe("createEnvironmentCatalogAtoms", () => {
         undefined,
         environmentId,
         environmentId,
+        { environmentId, label: "GPU box" },
       ];
       for (const [index, input] of inputs.entries()) {
         const execute = harness.commandConfigs[index]!.execute as (
@@ -110,6 +112,7 @@ describe("createEnvironmentCatalogAtoms", () => {
       expect(service.removeRelayEnvironments).toHaveBeenCalled();
       expect(service.retryNow).toHaveBeenCalledWith(environmentId);
       expect(service.acceptStorageIdentity).toHaveBeenCalledWith(environmentId);
+      expect(service.rename).toHaveBeenCalledWith(environmentId, "GPU box");
       registry.dispose();
     }),
   );

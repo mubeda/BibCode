@@ -4,8 +4,15 @@ import type {
   GitManagerCheckEntry,
   GitManagerPullRequestEntry,
   GitManagerPullRequestsResult,
+  SourceControlProviderInfo,
+  SourceControlProviderKind,
 } from "@bibcode/contracts";
+import {
+  formatChangeRequestNumber,
+  resolveChangeRequestPresentation,
+} from "@bibcode/shared/sourceControl";
 import { Link } from "@tanstack/react-router";
+import { capitalize } from "effect/String";
 import { CheckCircle2Icon, GitPullRequestIcon, RefreshCwIcon } from "lucide-react";
 import { memo, useCallback, useMemo, useState } from "react";
 
@@ -30,12 +37,14 @@ function safeExternalUrl(value: string): string | null {
 
 interface PullRequestRowProps {
   readonly pullRequest: GitManagerPullRequestEntry;
+  readonly providerKind: SourceControlProviderKind | null;
   readonly cwd: string;
   readonly projectRef?: ScopedProjectRef;
 }
 
 const PullRequestRow = memo(function PullRequestRow({
   pullRequest,
+  providerKind,
   cwd,
   projectRef,
 }: PullRequestRowProps) {
@@ -58,7 +67,8 @@ const PullRequestRow = memo(function PullRequestRow({
             </a>
           )}
           <p className="mt-1 text-xs text-muted-foreground">
-            #{pullRequest.number} · {pullRequest.headBranch} → {pullRequest.baseBranch} ·{` `}
+            {formatChangeRequestNumber(providerKind, pullRequest.number)} · {pullRequest.headBranch}{" "}
+            → {pullRequest.baseBranch} ·{` `}
             {pullRequest.state}
           </p>
           {projectRef ? (
@@ -114,6 +124,7 @@ const CheckRow = memo(function CheckRow({ check }: CheckRowProps) {
 
 export interface GitManagerPullRequestPanelProps {
   readonly projectRef?: ScopedProjectRef;
+  readonly provider?: SourceControlProviderInfo | null;
   readonly scope: { readonly environmentId: EnvironmentId; readonly cwd: string };
   readonly disabledReason?: string | null;
   readonly onRefresh: () => void;
@@ -122,6 +133,7 @@ export interface GitManagerPullRequestPanelProps {
 export const GitManagerPullRequestPanel = memo(function GitManagerPullRequestPanel({
   scope,
   projectRef,
+  provider = null,
   disabledReason = null,
   onRefresh,
 }: GitManagerPullRequestPanelProps) {
@@ -138,12 +150,16 @@ export const GitManagerPullRequestPanel = memo(function GitManagerPullRequestPan
   );
   const query = useEnvironmentQuery(queryAtom);
   const result: GitManagerPullRequestsResult | null = query.data ?? null;
+  const providerKind = provider?.kind ?? null;
   const presentation = resolveProviderPanePresentation({
+    providerKind,
     requested,
     pending: query.isPending,
     error: query.error,
     result,
   });
+  const changeRequest = resolveChangeRequestPresentation(provider);
+  const heading = `${capitalize(changeRequest.pluralLongName)} and checks`;
   const pullRequests = result?.pullRequests ?? EMPTY_PULL_REQUESTS;
   const checks = result?.checks ?? EMPTY_CHECKS;
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
@@ -166,10 +182,10 @@ export const GitManagerPullRequestPanel = memo(function GitManagerPullRequestPan
     disabledReason === null ? undefined : "git-manager-pull-request-panel-disabled-reason";
 
   return (
-    <section aria-label="Pull requests and checks" className="flex min-h-0 flex-col gap-3 p-3">
+    <section aria-label={heading} className="flex min-h-0 flex-col gap-3 p-3">
       <header className="flex items-center justify-between gap-3">
         <div>
-          <h2 className="text-sm font-semibold">Pull requests and checks</h2>
+          <h2 className="text-sm font-semibold">{heading}</h2>
           <p className="text-xs text-muted-foreground">Provider data refreshes only on demand.</p>
         </div>
         <div className="flex gap-2">
@@ -183,7 +199,7 @@ export const GitManagerPullRequestPanel = memo(function GitManagerPullRequestPan
             onClick={create}
           >
             <GitPullRequestIcon aria-hidden="true" />
-            Create pull request
+            Create {changeRequest.longName}
           </Button>
           <Button
             aria-describedby={disabledReasonId}
@@ -212,12 +228,13 @@ export const GitManagerPullRequestPanel = memo(function GitManagerPullRequestPan
       </p>
       {requested && pullRequests.length > 0 ? (
         <div className="space-y-2">
-          <h3 className="text-xs font-semibold">Current pull request</h3>
+          <h3 className="text-xs font-semibold">Current {changeRequest.longName}</h3>
           <ul className="space-y-2">
             {pullRequests.map((pullRequest) => (
               <PullRequestRow
                 key={pullRequest.number}
                 pullRequest={pullRequest}
+                providerKind={providerKind}
                 cwd={scope.cwd}
                 {...(projectRef ? { projectRef } : {})}
               />

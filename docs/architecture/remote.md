@@ -25,6 +25,18 @@ environment identity.
   the fallback resolves them unchanged. SSH and desktop-local targets keep
   taking their ids from the desktop bridge. See
   `docs/plans/remote-servers/2026-09-04-paired-remote-environment-identity.md`.
+- A server's declared label is only the default name for a saved entry. A
+  headless web-mode server (`bibcode serve`, including one the desktop launches
+  over SSH) declares its machine's trimmed hostname, making it recognizable on
+  other devices. If the host reports no usable hostname, it falls back to
+  "Local". Browser-launching `bibcode start` and bare `bibcode` keep "Local",
+  including when `--no-browser` suppresses opening the browser.
+  Desktop-mode servers (the desktop's in-process backend and WSL backends
+  launched with a bootstrap envelope) keep declaring "Local", and embedders
+  that build a `ServerConfig` directly keep its "Local" default. A client saves
+  the name when it adds the server (alias, offer name, or descriptor label) and
+  may rename that saved entry locally; the saved name never refreshes from, or
+  changes, the server.
 - Current servers expose the persistent store UUID as `storageInstanceId` on
   direct and BiBCode Connect descriptors. New clients decode an omitted field
   from an older or third-party server as `null`.
@@ -478,9 +490,55 @@ in flight. Each environment check has one 30-second Effect deadline around the
 whole lazy operation, including supervisor acquisition, readiness, and RPC
 execution. Timeout interrupts that work and releases its fan-out worker.
 Disconnecting a registered but cold environment is a no-op and never creates a
-supervisor merely to disconnect it. One failed or offline environment remains **Status unavailable**
-without cancelling or blocking the rest of the batch. A last-known
-`update-available` snapshot also turns that environment's rail dot amber.
+supervisor merely to disconnect it. One failed or offline environment never
+cancels or blocks the rest of the batch. A last-known `update-available`
+snapshot also turns that environment's rail dot amber.
+
+Each environment's update badge
+(`apps/web/src/components/settings/ServerUpdateBadge.tsx`) combines the
+`updater.status` query with the environment's shared check state, and keeps
+apart the states that used to share one label:
+
+- **Checking…** while a check runs (started from any view), while the first read
+  is in flight, or while the host is checking its feed.
+- **Not checked yet** for an `interactive` or `supervised` host still at `idle`.
+  A desktop host starts every launch at `idle` and runs its own first check about
+  15 seconds later. The card's **Check for updates** and the settings row's
+  **Check** remain the explicit next step.
+- **Can't reach updater** when a status read failed over a live connection, with
+  the error as a tooltip and a **Retry** that re-runs the read.
+- **Check failed** when the latest check failed over the current connection,
+  with the reason as a tooltip. The card offers **Check again** beside the badge;
+  a settings row relabels its own **Check** button **Check again**. The host's own
+  activity (checking, downloading, installing) shows instead while it lasts.
+- **Update status error** for an error the host's updater recorded, with the
+  host's message as a tooltip and the same **Check again**.
+- **Manual updates** for a `manual` host, and **Up to date**, **Update to v…**,
+  or **Updating…** (downloading or installing) for the rest.
+
+`createRemoteUpdateEnvironmentAtoms` in
+`packages/client-runtime/src/state/remoteUpdates.ts` owns the check state: the
+`check` command records its own progress and, stamped with the connection
+generation it started on, a failure that arrived over a live connection. The
+next successful check clears it, and a failure is shown only while that
+connection generation is still the live one, so it disappears while the
+environment is offline and after a reconnect. A read or check that only lost
+its connection (`RpcClientError`, `EnvironmentRpcUnavailableError`, or an
+interruption; see `isRemoteUpdateConnectionFailure`) brings no news: the badge
+keeps its last snapshot instead of flashing a failure during a host restart,
+when the session is cleared before the connection phase changes. While an
+environment is not connected the badge likewise keeps its last snapshot, or
+shows nothing, because the connection status already says why nothing can run.
+
+The query atom re-reads itself while any view observes it, with one timer per
+environment (`remoteUpdateStatusRefreshIntervalMs`): every 2.5 seconds while
+the host is `checking`, `downloading`, or `installing`, and every 30 seconds
+while an automatic host is `idle`. Terminal states, manual hosts, and failed
+reads are never polled; a reconnect re-reads at once through the connection
+generation. The environment rail observes the status of every update-capable
+remote for its amber dot, so those hosts are polled while the sidebar is open
+even when no badge is visible; that is bounded, because a desktop host leaves
+`idle` about 15 seconds after it launches.
 
 The update feed URL is baked into the desktop release configuration only
 (`apps/desktop/src-tauri/tauri.release.conf.json`); the server binary has no
@@ -493,7 +551,17 @@ On a desktop-integrated server, every call to the hosting updater delegate is
 bounded to 30 seconds. A delegate that does not answer produces a successful
 typed snapshot with `state: "error"` and the updater-timeout message, including
 for an install request; it cannot pin an environment's single-flight update
-operation indefinitely. Plain authenticated WebSockets enter the live-client
+operation indefinitely. An install request starts the host's check, download,
+and install flow in the background and answers with the host updater's current
+state, never a predicted `installing`. If the feed has nothing newer the host
+records `up-to-date`, and a failed download records `error` with the updater's
+message; clients see both through `updater.status`
+(`apps/desktop/src-tauri/src/remote_update_delegate.rs`). Known gap: when the
+update is already downloaded, the client's first status read after an install
+request can still report `update-available` before the host enters update
+protection, and that state is not polled; the badge catches up when the
+restarted host reconnects.
+Plain authenticated WebSockets enter the live-client
 registry only after the HTTP upgrade completes, and unregister from the same
 upgrade-owned lifecycle.
 

@@ -3,7 +3,7 @@
 use bibcode_server::{
     RequestId, RpcRequest,
     production::pull_requests_rpc::ConfiguredPullRequestsRpcServices,
-    pull_requests::{PullRequestsService, host::HostCommandRunner},
+    pull_requests::{ContextRead, PullRequestsService, host::HostCommandRunner},
 };
 use serde_json::{Value, json};
 use std::{
@@ -395,7 +395,7 @@ async fn pull_requests_gitlab_3941_host_answers_reviewers_pipeline_and_version_g
     fs::write(f.root.path().join("version"), "16.11.0").unwrap();
     f.rpc
         .service
-        .context(&f.cwd, &CancellationToken::new())
+        .context(&f.cwd, ContextRead::Rescan, &CancellationToken::new())
         .await
         .unwrap();
     assert_eq!(

@@ -8,7 +8,7 @@ import type {
   PullRequestsPermission,
   ScopedProjectRef,
 } from "@bibcode/contracts";
-import { PullRequestsMutationsDisabledContext } from "./pullRequestsMutationAvailability";
+import { MutationsDisabledContext } from "../ui/mutationAvailability";
 import { PullRequestsActionsContext } from "./usePullRequestsAction";
 import { projectKey } from "@bibcode/client-runtime/state/entities";
 import { useGitManagerStore } from "../../gitManagerStore";
@@ -64,7 +64,7 @@ async function render(
       <PullRequestsActionsContext
         value={{ run: vi.fn(), pending: h.pendingAction, error: null, requestKind }}
       >
-        <PullRequestsMutationsDisabledContext value={disabled}>
+        <MutationsDisabledContext value={disabled}>
           <PullRequestsCheckoutMenu
             scope={scope}
             projectRef={projectRef}
@@ -72,7 +72,7 @@ async function render(
             headBranch="feature"
             permission={permission}
           />
-        </PullRequestsMutationsDisabledContext>
+        </MutationsDisabledContext>
       </PullRequestsActionsContext>,
     ),
   );

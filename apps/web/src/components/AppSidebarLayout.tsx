@@ -1,26 +1,91 @@
 import { useAtomValue } from "@effect/atom-react";
-import { useEffect, type CSSProperties, type ReactNode } from "react";
+import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
 import * as TanStackRouter from "@tanstack/react-router";
 
 import { resolveShortcutCommand, shortcutLabelForCommand } from "../keybindings";
 import { primaryServerKeybindingsAtom } from "../state/server";
 import ThreadSidebar from "./Sidebar";
 import { EnvironmentRail } from "./sidebar/EnvironmentRail";
-import { Sidebar, SidebarProvider, SidebarRail, SidebarTrigger, useSidebar } from "./ui/sidebar";
+import {
+  readStoredSidebarWidth,
+  Sidebar,
+  SidebarProvider,
+  SidebarRail,
+  SidebarTrigger,
+  useSidebar,
+  type SidebarResizableOptions,
+} from "./ui/sidebar";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
 
 // v2: widths stored under the retired key belong to the 256px default era.
 const THREAD_SIDEBAR_WIDTH_STORAGE_KEY = "bibcode:sidebar-width:v2";
 const ENVIRONMENT_RAIL_WIDTH = 52;
 const THREAD_SIDEBAR_MIN_WIDTH = 13 * 16 + ENVIRONMENT_RAIL_WIDTH;
-// Wider than the shared primitive's 16rem default: 13px titles and 12px badges
-// truncate in a 204px content column, and 268px matches the reference app's rows.
-// A width the user has dragged to is stored under the storage key and wins.
-const THREAD_SIDEBAR_DEFAULT_WIDTH = 268 + ENVIRONMENT_RAIL_WIDTH;
-const THREAD_SIDEBAR_PROVIDER_STYLE = {
-  "--sidebar-width": `${THREAD_SIDEBAR_DEFAULT_WIDTH}px`,
-} as CSSProperties;
+// Measured from the user's screenshot: a 370px projects panel beside the 52px
+// rail (422px total). A width the user has dragged to is stored under the
+// storage key and wins over this default.
+const THREAD_SIDEBAR_DEFAULT_WIDTH = 370 + ENVIRONMENT_RAIL_WIDTH;
 const THREAD_MAIN_CONTENT_MIN_WIDTH = 40 * 16;
+// No configured ceiling: matches how `ui/sidebar.tsx` resolves an omitted
+// `maxWidth`. Shared between the resizable options below and
+// `readStoredSidebarWidth`, so both clamp a width the same way.
+const THREAD_SIDEBAR_WIDTH_BOUNDS = {
+  minWidth: THREAD_SIDEBAR_MIN_WIDTH,
+  maxWidth: Number.POSITIVE_INFINITY,
+};
+
+// The largest sidebar width that leaves THREAD_MAIN_CONTENT_MIN_WIDTH for the
+// main area, given the total width available (a window or the sidebar
+// wrapper). The one place that rule is expressed; `shouldAcceptWidth` below
+// and `fitDefaultSidebarWidth` both build on it instead of restating it.
+function maxSidebarWidthFor(availableWidth: number): number {
+  return availableWidth - THREAD_MAIN_CONTENT_MIN_WIDTH;
+}
+
+// Fits THREAD_SIDEBAR_DEFAULT_WIDTH into what maxSidebarWidthFor allows,
+// never below THREAD_SIDEBAR_MIN_WIDTH. Shared by the first-launch default
+// and the double-click "reset to default" target below, so neither can open
+// a sidebar that leaves the main area squeezed.
+function fitDefaultSidebarWidth(availableWidth: number): number {
+  return Math.max(
+    THREAD_SIDEBAR_MIN_WIDTH,
+    Math.min(THREAD_SIDEBAR_DEFAULT_WIDTH, maxSidebarWidthFor(availableWidth)),
+  );
+}
+
+// A stable, module-level reference: passed as-is to `Sidebar`'s `resizable`
+// prop so its internal `useMemo([resizable])` — and the storage-restore
+// effect that depends on the memoized result — only recompute when
+// collapsible/isMobile actually change, not on every AppSidebarLayout
+// render (e.g. every navigation). None of these fields close over anything
+// per-render, so there is nothing to lose by hoisting them.
+const THREAD_SIDEBAR_RESIZABLE_OPTIONS: SidebarResizableOptions = {
+  ...THREAD_SIDEBAR_WIDTH_BOUNDS,
+  // Fit the reset target to the window at reset time too, so double-clicking
+  // on a narrow window can't reopen the main-area squeeze the first-launch
+  // clamp already avoids.
+  defaultWidth: ({ wrapper }) => fitDefaultSidebarWidth(wrapper.clientWidth),
+  shouldAcceptWidth: ({ nextWidth, wrapper }) =>
+    nextWidth <= maxSidebarWidthFor(wrapper.clientWidth),
+  storageKey: THREAD_SIDEBAR_WIDTH_STORAGE_KEY,
+};
+
+// First launch only: computed once, synchronously, so the sidebar never
+// visibly resizes after its first paint. If a width is already saved, seed
+// it here too (clamped exactly as the sidebar primitive itself clamps it,
+// via the same `readStoredSidebarWidth`), so there is no flash of the
+// default before the primitive's own restore effect corrects it — that
+// effect still runs, but writing the same value back is harmless.
+function resolveInitialSidebarWidth(): number {
+  if (typeof window === "undefined") {
+    return THREAD_SIDEBAR_DEFAULT_WIDTH;
+  }
+  const savedWidth = readStoredSidebarWidth(
+    THREAD_SIDEBAR_WIDTH_STORAGE_KEY,
+    THREAD_SIDEBAR_WIDTH_BOUNDS,
+  );
+  return savedWidth ?? fitDefaultSidebarWidth(window.innerWidth);
+}
 
 const useAppPathname =
   "useLocation" in TanStackRouter
@@ -68,6 +133,7 @@ function SidebarControl() {
 export function AppSidebarLayout({ children }: { children: ReactNode }) {
   const navigate = TanStackRouter.useNavigate();
   const pathname = useAppPathname();
+  const [initialSidebarWidth] = useState(resolveInitialSidebarWidth);
   useEffect(() => {
     const onMenuAction = window.desktopBridge?.onMenuAction;
     if (typeof onMenuAction !== "function") {
@@ -102,19 +168,13 @@ export function AppSidebarLayout({ children }: { children: ReactNode }) {
     <SidebarProvider
       className="h-dvh! min-h-0! border-t border-panel-separator"
       defaultOpen
-      style={THREAD_SIDEBAR_PROVIDER_STYLE}
+      style={{ "--sidebar-width": `${initialSidebarWidth}px` } as CSSProperties}
     >
       <Sidebar
         side="left"
         collapsible="offcanvas"
         className="border-t border-r border-panel-separator bg-card text-foreground"
-        resizable={{
-          defaultWidth: THREAD_SIDEBAR_DEFAULT_WIDTH,
-          minWidth: THREAD_SIDEBAR_MIN_WIDTH,
-          shouldAcceptWidth: ({ nextWidth, wrapper }) =>
-            wrapper.clientWidth - nextWidth >= THREAD_MAIN_CONTENT_MIN_WIDTH,
-          storageKey: THREAD_SIDEBAR_WIDTH_STORAGE_KEY,
-        }}
+        resizable={THREAD_SIDEBAR_RESIZABLE_OPTIONS}
       >
         <div className="flex h-full min-h-0 flex-row">
           <EnvironmentRail />

@@ -19,7 +19,7 @@ describe("request editors", () => {
     async (field) => {
       mounted = await mount(
         field === "title" ? (
-          <PullRequestsTitleEditor detail={editable} projectRef={projectRef} />
+          <PullRequestsTitleEditor provider="github" detail={editable} projectRef={projectRef} />
         ) : (
           <PullRequestsBodyEditor
             detail={editable}
@@ -58,7 +58,7 @@ describe("request editors", () => {
     async (field) => {
       const ui =
         field === "title" ? (
-          <PullRequestsTitleEditor detail={editable} projectRef={projectRef} />
+          <PullRequestsTitleEditor provider="github" detail={editable} projectRef={projectRef} />
         ) : (
           <PullRequestsBodyEditor detail={editable} projectRef={projectRef} />
         );
@@ -92,7 +92,9 @@ describe("request editors", () => {
     },
   );
   it("rejects blank titles and allows clearing the description", async () => {
-    mounted = await mount(<PullRequestsTitleEditor detail={editable} projectRef={projectRef} />);
+    mounted = await mount(
+      <PullRequestsTitleEditor provider="github" detail={editable} projectRef={projectRef} />,
+    );
     await click("Edit title");
     await input(document.querySelector("input")!, "  ");
     expect(button("Save").disabled).toBe(true);
@@ -110,7 +112,7 @@ describe("request editors", () => {
   it("shows server permission reasons and never opens a denied editor", async () => {
     mounted = await mount(
       <>
-        <PullRequestsTitleEditor detail={detail} projectRef={projectRef} />
+        <PullRequestsTitleEditor provider="github" detail={detail} projectRef={projectRef} />
         <PullRequestsBodyEditor detail={detail} projectRef={projectRef} />
       </>,
     );

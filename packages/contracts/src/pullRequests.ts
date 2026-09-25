@@ -9,6 +9,13 @@ const TrimmedNonEmptyStringSchema = TrimmedNonEmptyString;
 export const PullRequestsCwdInput = Schema.Struct({ cwd: TrimmedNonEmptyStringSchema });
 export type PullRequestsCwdInput = typeof PullRequestsCwdInput.Type;
 
+/** `rescan` bypasses the server's bounded context caches; only Rescan and auth recovery set it. */
+export const PullRequestsGetContextInput = Schema.Struct({
+  ...PullRequestsCwdInput.fields,
+  rescan: Schema.optional(Schema.Boolean),
+});
+export type PullRequestsGetContextInput = typeof PullRequestsGetContextInput.Type;
+
 export const PullRequestsNumberInput = Schema.Struct({
   ...PullRequestsCwdInput.fields,
   number: Schema.Number,
@@ -112,6 +119,9 @@ export type PullRequestsPermissions = typeof PullRequestsPermissions.Type;
 
 export const PullRequestsHostCapabilities = Schema.Struct({
   vocabulary: Schema.Struct({
+    // Compatibility-only request nouns: both fields remain required for older
+    // clients. Current clients derive them from the provider kind through
+    // @bibcode/shared/sourceControl instead of using this server copy.
     pullRequest: TrimmedNonEmptyStringSchema,
     pullRequests: TrimmedNonEmptyStringSchema,
     checks: TrimmedNonEmptyStringSchema,
@@ -216,6 +226,8 @@ export const PullRequestsListInput = Schema.Struct({
   targetBranch: Schema.NullOr(Schema.String),
   sort: Schema.Literals(["newest", "oldest", "recently_updated", "most_commented"]),
   cursor: Schema.NullOr(Schema.String),
+  /** Re-read the repository-wide tab totals instead of reusing the server's bounded copy. */
+  refreshTotals: Schema.optional(Schema.Boolean),
 });
 export type PullRequestsListInput = typeof PullRequestsListInput.Type;
 

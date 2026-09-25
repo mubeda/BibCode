@@ -6,7 +6,7 @@ use std::{
 };
 
 use bibcode_server::pull_requests::{
-    PullRequestsService,
+    ContextRead, PullRequestsService,
     host::HostCommandRunner,
     model::{ListQuery, VocabularyKind},
 };
@@ -64,7 +64,7 @@ impl Fixture {
     async fn context(&self) -> Value {
         serde_json::to_value(
             self.service
-                .context(&self.cwd, &CancellationToken::new())
+                .context(&self.cwd, ContextRead::Rescan, &CancellationToken::new())
                 .await
                 .unwrap(),
         )
@@ -254,6 +254,148 @@ async fn pull_requests_custom_gitlab_host_is_discovered_and_every_call_has_gitla
     );
 }
 
+/// Opening the panel or switching checkout reuses the bounded answers (probes, the
+/// recorded host and the host context); Rescan clears them and asks every probe again.
+#[tokio::test]
+async fn pull_requests_opening_reuses_context_answers_and_rescan_rereads_them() {
+    let f = Fixture::new(Some(GITLAB_ORIGIN)).await;
+    let c = CancellationToken::new();
+    let count = |provider: &str| f.calls(provider).lines().count();
+    let first = f
+        .service
+        .context(&f.cwd, ContextRead::Open, &c)
+        .await
+        .unwrap();
+    // Cold: gh and glab discovery, `glab --version`, then user, project and version.
+    // Discovery already proved the login, so no `auth status --hostname` follows.
+    let cold = (count("gh"), count("glab"));
+    assert_eq!(
+        cold,
+        (1, 5),
+        "gh:\n{}\nglab:\n{}",
+        f.calls("gh"),
+        f.calls("glab")
+    );
+    let warm = f
+        .service
+        .context(&f.cwd, ContextRead::Open, &c)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&warm).unwrap(),
+        serde_json::to_value(&first).unwrap()
+    );
+    assert_eq!(
+        (count("gh"), count("glab")),
+        cold,
+        "a warm open starts no provider process"
+    );
+    f.service
+        .context(&f.cwd, ContextRead::Rescan, &c)
+        .await
+        .unwrap();
+    assert_eq!(
+        (count("gh"), count("glab")),
+        (cold.0 + 1, cold.1 + 5),
+        "Rescan re-reads discovery, the CLI and the host context"
+    );
+}
+
+#[tokio::test]
+async fn pull_requests_expired_gitlab_login_overlaps_reads_and_keeps_auth_error_precedence() {
+    for (read, fail, page_fails) in [
+        ("list", false, false),
+        ("context", false, false),
+        ("list", true, false),
+        ("context", true, false),
+        ("list", true, true),
+        ("context", true, true),
+    ] {
+        let f = Fixture::new(Some(GITLAB_ORIGIN)).await;
+        fs::write(f.root.path().join("read"), read).unwrap();
+        let glab = ProviderStub::script(
+            f.root.path(),
+            "glab-barrier",
+            r#"
+wait_for() {
+  i=0
+  while [ ! -e "$FIXTURE_DIR/$1" ]; do
+    i=$((i + 1)); if [ "$i" -gt 40 ]; then echo 'read ran alone' >&2; exit 75; fi
+    sleep 0.025
+  done
+}
+if [ -e "$FIXTURE_DIR/recheck" ]; then
+  case "$1 $2" in
+    'auth status')
+      : > "$FIXTURE_DIR/auth-started"
+      wait_for page-finished
+      if [ -e "$FIXTURE_DIR/fail" ]; then echo 'No GitLab instances have been authenticated with glab; run glab auth login to authenticate.' >&2; exit 1; fi ;;
+    'mr list'|'api user')
+      if [ "$1 $2" = 'mr list' ] && [ "$(cat "$FIXTURE_DIR/read")" != list ]; then exit 64; fi
+      wait_for auth-started
+      : > "$FIXTURE_DIR/page-finished"
+      if [ -e "$FIXTURE_DIR/page-fails" ]; then echo 'HTTP 403 forbidden' >&2; exit 1; fi ;;
+  esac
+fi
+exec "$FIXTURE_DIR/glab" "$@"
+"#,
+        );
+        let hosts = std::sync::Arc::new(bibcode_server::source_control::ProviderHosts::default());
+        let service = PullRequestsService::with_runner(
+            f.runner
+                .clone()
+                .with_provider_hosts(hosts.clone())
+                .with_commands(f.root.path().join("gh"), glab, "git"),
+        );
+        let c = CancellationToken::new();
+        service
+            .context(&f.cwd, ContextRead::Open, &c)
+            .await
+            .unwrap();
+        service.list(&f.cwd, f.query(), &c).await.unwrap();
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        tokio::time::resume();
+        f.mark("recheck");
+        if fail {
+            f.mark("fail");
+        }
+        if page_fails {
+            f.mark("page-fails");
+        }
+        if read == "list" {
+            let page = service.list(&f.cwd, f.query(), &c).await;
+            if fail {
+                assert_eq!(page.unwrap_err().code, "not_authenticated");
+            } else {
+                assert_eq!(page.unwrap().rows.len(), 30);
+            }
+        } else {
+            let context = serde_json::to_value(
+                service
+                    .context(&f.cwd, ContextRead::Open, &c)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                context["status"],
+                if fail { "unavailable" } else { "available" }
+            );
+            if fail {
+                assert_eq!(context["code"], "not_authenticated");
+            }
+        }
+        assert!(
+            f.root.path().join("page-finished").exists(),
+            "{read}: page and login must overlap"
+        );
+        if fail {
+            assert_eq!(hosts.provider("git.acme.example"), None);
+        }
+    }
+}
+
 #[tokio::test]
 async fn pull_requests_unconfigured_custom_host_has_the_required_auth_command() {
     let f = Fixture::new(Some(GITLAB_ORIGIN)).await;
@@ -269,6 +411,130 @@ async fn pull_requests_unconfigured_custom_host_has_the_required_auth_command() 
         context["authCommand"],
         "glab auth login --hostname git.acme.example"
     );
+}
+
+#[tokio::test]
+async fn pull_requests_failed_login_cancels_and_reaps_inflight_context_and_list_reads() {
+    for read in ["context", "list"] {
+        let f = Fixture::new(Some("https://github.com/example/repository.git")).await;
+        let gh = ProviderStub::script(
+            f.root.path(),
+            "gh-login-cancels-read",
+            r#"
+case "$1 $2" in
+  'auth status')
+    i=0
+    while [ ! -e "$FIXTURE_DIR/read-pid" ]; do
+      i=$((i + 1)); if [ "$i" -gt 80 ]; then exit 75; fi
+      sleep 0.025
+    done
+    echo 'You are not logged into any GitHub hosts' >&2
+    exit 1 ;;
+  'api user'|'api graphql')
+    if [ "$1 $2" = 'api user' ] || [ -e "$FIXTURE_DIR/list-read" ]; then
+      printf '%s' "$$" > "$FIXTURE_DIR/read-pid"
+      exec sleep 20
+    fi ;;
+esac
+exec "$FIXTURE_DIR/gh" "$@"
+"#,
+        );
+        if read == "list" {
+            f.mark("list-read");
+        }
+        let service = PullRequestsService::with_runner(f.runner.clone().with_commands(
+            gh,
+            f.root.path().join("glab"),
+            "git",
+        ));
+        let cancellation = CancellationToken::new();
+        let operation = async {
+            if read == "context" {
+                match service
+                    .context(&f.cwd, ContextRead::Open, &cancellation)
+                    .await
+                {
+                    Ok(context) => serde_json::to_value(context).unwrap()["code"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                    Err(error) => error.code.to_owned(),
+                }
+            } else {
+                service
+                    .list(&f.cwd, f.query(), &cancellation)
+                    .await
+                    .unwrap_err()
+                    .code
+                    .to_owned()
+            }
+        };
+        tokio::pin!(operation);
+        let completed = tokio::select! {
+            result = &mut operation => Some(result),
+            () = tokio::time::sleep(std::time::Duration::from_secs(3)) => None,
+        };
+        if completed.is_none() {
+            // Drain this test's child even on the regression path.
+            cancellation.cancel();
+            let _ = operation.await;
+        }
+        assert_eq!(
+            completed.as_deref(),
+            Some("not_authenticated"),
+            "{read}: login failure must not wait for the provider read"
+        );
+        let pid: libc::pid_t = fs::read_to_string(f.root.path().join("read-pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "{read}: provider child was not reaped before returning"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        assert!(
+            !cancellation.is_cancelled(),
+            "the parent request token stays usable"
+        );
+    }
+}
+
+#[tokio::test]
+async fn pull_requests_list_rechecks_checkout_after_successful_provider_read() {
+    let f = Fixture::new(Some(GITHUB_ORIGIN)).await;
+    let gh = ProviderStub::script(
+        f.root.path(),
+        "gh-list-removes-checkout",
+        r#"
+case "$1 $2" in
+  'api graphql')
+    i=0
+    while [ ! -e "$FIXTURE_DIR/auth-finished" ]; do
+      i=$((i + 1)); if [ "$i" -gt 80 ]; then exit 75; fi
+      sleep 0.025
+    done
+    mv "$FIXTURE_DIR/checkout" "$FIXTURE_DIR/moved-checkout" ;;
+  'auth status') : > "$FIXTURE_DIR/auth-finished" ;;
+esac
+exec "$FIXTURE_DIR/gh" "$@"
+"#,
+    );
+    let service = PullRequestsService::with_runner(f.runner.clone().with_commands(
+        gh,
+        f.root.path().join("glab"),
+        "git",
+    ));
+    let error = service
+        .list(&f.cwd, f.query(), &CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "unavailable");
+    assert!(error.message.contains("no longer exists"));
 }
 
 #[tokio::test]
@@ -316,7 +582,7 @@ async fn pull_requests_non_directory_checkout_is_context_data() {
     for cwd in [f.cwd.clone(), f.cwd.join("nested")] {
         let context = serde_json::to_value(
             f.service
-                .context(&cwd, &CancellationToken::new())
+                .context(&cwd, ContextRead::Rescan, &CancellationToken::new())
                 .await
                 .unwrap(),
         )
@@ -353,7 +619,7 @@ printf '%s\n' 'https://github.com/example/repository.git'
     ));
     let context = serde_json::to_value(
         service
-            .context(&f.cwd, &CancellationToken::new())
+            .context(&f.cwd, ContextRead::Rescan, &CancellationToken::new())
             .await
             .unwrap(),
     )
@@ -371,16 +637,16 @@ printf '%s\n' 'https://github.com/example/repository.git'
 #[tokio::test]
 async fn pull_requests_checkout_removed_during_host_context_is_not_a_missing_cli() {
     let f = Fixture::new(Some(GITHUB_ORIGIN)).await;
+    // The host context reads start together, so the checkout disappears during the
+    // login check that precedes them: each of them then fails to start.
     let gh = ProviderStub::script(
         f.root.path(),
         "gh-removes-checkout",
         r#"
-if [ "$1 $2" = 'api user' ]; then
+if [ "$1 $2 $3" = 'auth status --hostname' ]; then
   mv "$FIXTURE_DIR/checkout" "$FIXTURE_DIR/moved-checkout"
-  echo '{"login":"mubeda","name":""}'
-else
-  exec "$FIXTURE_DIR/gh" "$@"
 fi
+exec "$FIXTURE_DIR/gh" "$@"
 "#,
     );
     let service = PullRequestsService::with_runner(f.runner.clone().with_commands(
@@ -390,7 +656,7 @@ fi
     ));
     let context = serde_json::to_value(
         service
-            .context(&f.cwd, &CancellationToken::new())
+            .context(&f.cwd, ContextRead::Rescan, &CancellationToken::new())
             .await
             .unwrap(),
     )
@@ -401,6 +667,68 @@ fi
             .as_str()
             .unwrap()
             .contains("no longer exists on this environment")
+    );
+    assert!(context["installHint"].is_null());
+}
+
+#[tokio::test]
+async fn pull_requests_github_checkout_disappearing_mid_joined_context_is_unavailable() {
+    let f = Fixture::new(Some(GITHUB_ORIGIN)).await;
+    let gh = ProviderStub::script(
+        f.root.path(),
+        "gh-mid-read-removal",
+        r#"
+wait_for() {
+  i=0
+  while [ ! -e "$FIXTURE_DIR/$1" ]; do
+    i=$((i + 1)); if [ "$i" -gt 80 ]; then echo 'context reads did not overlap' >&2; exit 75; fi
+    sleep 0.025
+  done
+}
+if [ -e "$FIXTURE_DIR/remove-during-read" ]; then
+  case "$1 $2" in
+    'api user')
+      : > "$FIXTURE_DIR/user-started"
+      wait_for repository-started
+      wait_for viewer-started
+      mv "$FIXTURE_DIR/checkout" "$FIXTURE_DIR/moved-checkout"
+      : > "$FIXTURE_DIR/checkout-removed" ;;
+    'api repos/example/repository')
+      : > "$FIXTURE_DIR/repository-started"
+      wait_for checkout-removed ;;
+    'api graphql')
+      : > "$FIXTURE_DIR/viewer-started"
+      wait_for checkout-removed ;;
+  esac
+fi
+exec "$FIXTURE_DIR/gh" "$@"
+"#,
+    );
+    let service = PullRequestsService::with_runner(f.runner.clone().with_commands(
+        gh,
+        f.root.path().join("glab"),
+        "git",
+    ));
+    let c = CancellationToken::new();
+    service
+        .context(&f.cwd, ContextRead::Open, &c)
+        .await
+        .unwrap();
+    f.mark("remove-during-read");
+    let context = serde_json::to_value(
+        service
+            .context(&f.cwd, ContextRead::Open, &c)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(f.root.path().join("checkout-removed").exists());
+    assert_eq!(context["code"], "repository_unreachable");
+    assert!(
+        context["message"]
+            .as_str()
+            .unwrap()
+            .contains("no longer exists")
     );
     assert!(context["installHint"].is_null());
 }
@@ -438,7 +766,7 @@ async fn pull_requests_github_auth_missing_cli_and_repository_access_failures_ar
     assert_eq!(
         serde_json::to_value(
             service
-                .context(&f.cwd, &CancellationToken::new())
+                .context(&f.cwd, ContextRead::Rescan, &CancellationToken::new())
                 .await
                 .unwrap()
         )

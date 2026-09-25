@@ -112,11 +112,15 @@ failed state without showing why.
 - **Residuals:** SSH transfers have no stall guard; a clone in flight at server
   shutdown is not cleaned up (the reuse check refuses the leftover); on
   Windows, removing a partial clone with read-only pack files may fail (the
-  error names the folder); interrupting other inline Git RPCs kills only the
-  top-level `git` process, so transport helpers can outlive the interrupt
-  (pre-existing); a WebSocket reconnect cancels an in-flight clone and removes
-  its folder, so long clones over flaky links must be retried; a pull or push
-  still moving after 10 minutes fails with the generic timeout message.
+  error names the folder); interrupting other inline Git RPCs killed only the
+  top-level `git` process, so transport helpers could outlive the interrupt
+  (pre-existing; resolved on 2026-09-24 by the supervised runner's drop guard
+  in `apps/server/src/process/supervised.rs`, which stops the whole process
+  group or job when a run is dropped, per Alternative A in
+  `docs/plans/git-transfer-lifecycle/research.md` §4); a WebSocket reconnect
+  cancels an in-flight clone and removes its folder, so long clones over flaky
+  links must be retried; a pull or push still moving after 10 minutes fails
+  with the generic timeout message.
 
 ## Side finding (not in scope)
 

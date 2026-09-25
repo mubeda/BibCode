@@ -1,8 +1,10 @@
 pub mod checks;
 mod discovery;
+mod hosts;
 mod pull_request;
 
 pub(crate) use discovery::provider_install_hint;
+pub use hosts::{IdentifiedProvider, ProviderHosts};
 
 #[allow(unused_imports)]
 pub use discovery::{
@@ -145,21 +147,35 @@ pub fn parse_gitlab_auth_status(text: &str) -> Vec<GitLabAuthStatusHost> {
     result
 }
 
+/// Recognize glab's full-logout answer independently of wrapping or its login hint.
+pub(crate) fn gitlab_auth_status_is_logged_out(text: &str) -> bool {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+        .contains("no gitlab instances have been authenticated with glab")
+}
+
+/// The provider a remote's host name identifies on its own. Only the host is
+/// inspected, so `github.company.example` or a `/gitlab/` path segment is not
+/// mistaken for a hosted service; other hosts come from [`ProviderHosts`].
 #[must_use]
 pub fn provider_from_remote(remote: &str) -> ProviderInfo {
-    let normalized = remote.trim().to_lowercase();
-    if normalized.contains("github.com") {
+    let host = remote_host(remote).unwrap_or_default();
+    if host == "github.com" || host.ends_with(".github.com") {
         provider(ProviderKind::Github, "GitHub", "https://github.com")
-    } else if normalized.contains("gitlab") {
-        let host = remote_host(remote).unwrap_or_else(|| "gitlab.com".into());
+    } else if host.contains("gitlab") {
         provider(ProviderKind::Gitlab, "GitLab", &format!("https://{host}"))
-    } else if normalized.contains("dev.azure.com") || normalized.contains("visualstudio.com") {
+    } else if host == "dev.azure.com"
+        || host.ends_with(".dev.azure.com")
+        || host.ends_with(".visualstudio.com")
+    {
         provider(
             ProviderKind::AzureDevops,
             "Azure DevOps",
             "https://dev.azure.com",
         )
-    } else if normalized.contains("bitbucket") {
+    } else if host.contains("bitbucket") {
         provider(
             ProviderKind::Bitbucket,
             "Bitbucket",
@@ -208,12 +224,22 @@ pub fn remote_host(remote: &str) -> Option<String> {
             .and_then(non_empty)
             .map(|host| host.to_lowercase());
     }
-    value
-        .split_once('@')
-        .map(|(_, value)| value)
-        .and_then(|value| value.split([':', '/']).next())
-        .and_then(non_empty)
-        .map(|host| host.to_lowercase())
+    scp_host_and_path(value).map(|(host, _)| host.to_lowercase())
+}
+
+/// Git's scp-like remote, `[user@]host:path` or `[user@][host]:path`: a colon
+/// before any slash. A lone letter before the colon is a Windows drive
+/// (`C:\repo`), and anything with a slash before the colon is a local path.
+fn scp_host_and_path(remote: &str) -> Option<(&str, &str)> {
+    let host_start = remote.find('@').map_or(0, |at| at + 1);
+    let (user, rest) = remote.split_at(host_start);
+    let (host, path) = match rest.strip_prefix('[') {
+        Some(bracketed) => bracketed.split_once("]:")?,
+        None => rest.split_once(':')?,
+    };
+    let drive = user.is_empty() && host.len() == 1 && host.as_bytes()[0].is_ascii_alphabetic();
+    (!host.is_empty() && !drive && !host.contains(['/', '\\']) && !user.contains(['/', '\\', ':']))
+        .then_some((host, path))
 }
 
 /// The repository path from an HTTP/SSH URL or an scp-style Git remote.
@@ -224,12 +250,7 @@ pub fn remote_repository_path(remote: &str) -> Option<String> {
         url.host_str()?;
         url.path().to_owned()
     } else {
-        let (_, host_and_path) = remote.rsplit_once('@')?;
-        let (host, path) = host_and_path.split_once(':')?;
-        if host.is_empty() {
-            return None;
-        }
-        path.to_owned()
+        scp_host_and_path(remote)?.1.to_owned()
     };
     let path = path.trim_matches('/');
     let path = path.strip_suffix(".git").unwrap_or(path);
@@ -247,7 +268,13 @@ mod tests {
             ("git@host:a/b.git", Some("a/b")),
             ("ssh://git@host:2222/a/b/c.git", Some("a/b/c")),
             ("https://user@host:8443/a/b/c.git/", Some("a/b/c")),
+            ("host:a/b.git", Some("a/b")),
+            ("git@[fe80::1]:a/b.git", Some("a/b")),
             ("/local/repo", None),
+            ("/local/repo:with-colon", None),
+            ("./relative:repo", None),
+            ("C:\\work\\repo", None),
+            ("C:/work/repo", None),
             ("https://host/", None),
         ] {
             assert_eq!(
@@ -303,6 +330,47 @@ mod tests {
             ProviderKind::Bitbucket
         );
         assert_eq!(provider_from_remote("local").kind, ProviderKind::Unknown);
+        // Only the host counts: an Enterprise host or a path segment is not a hosted service.
+        for remote in [
+            "https://github.company.example/team/repo.git",
+            "https://git.example.test/gitlab/repo.git",
+            "/srv/gitlab/repo.git",
+            "https://git.example.test/bitbucket/repo.git",
+        ] {
+            assert_eq!(
+                provider_from_remote(remote).kind,
+                ProviderKind::Unknown,
+                "{remote}"
+            );
+        }
+        assert_eq!(
+            provider_from_remote("git@ssh.github.com:team/repo.git").kind,
+            ProviderKind::Github
+        );
+        // scp-like remotes may omit the user.
+        assert_eq!(
+            provider_from_remote("github.com:team/repo.git").kind,
+            ProviderKind::Github
+        );
+        let gitlab = provider_from_remote("gitlab.example.test:team/sub/repo.git");
+        assert_eq!(
+            (gitlab.kind, gitlab.base_url.as_str()),
+            (ProviderKind::Gitlab, "https://gitlab.example.test")
+        );
+        for (remote, host) in [
+            ("github.com:team/repo.git", Some("github.com")),
+            ("git@Host.Example:team/repo.git", Some("host.example")),
+            ("[fe80::1]:team/repo.git", Some("fe80::1")),
+            ("C:\\work\\repo", None),
+            ("./relative:repo", None),
+            ("local", None),
+        ] {
+            assert_eq!(remote_host(remote).as_deref(), host, "{remote}");
+        }
+        assert_eq!(
+            provider_from_remote("git@ssh.dev.azure.com:v3/org/project/repo").kind,
+            ProviderKind::AzureDevops
+        );
         assert_eq!(
             provider_from_remote("https://user@gitlab.example.test:8443/team/repo.git").base_url,
             "https://gitlab.example.test"

@@ -29,7 +29,7 @@ import { safeErrorLogAttributes } from "../errors/safeLog.ts";
 import * as ConnectionWakeups from "./wakeups.ts";
 
 const RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 16_000] as const;
-const CONNECTION_ESTABLISHMENT_TIMEOUT = "15 seconds";
+export const CONNECTION_ESTABLISHMENT_TIMEOUT = "15 seconds";
 const CONNECTION_PROBE_TIMEOUT = "15 seconds";
 const BACKOFF_RESET_AFTER_MS = 30_000;
 
@@ -96,6 +96,8 @@ function exitUnlessInterrupted<A, E, R>(
 
 export interface EnvironmentSupervisorOptions {
   readonly initiallyDesired?: boolean;
+  /** Registry-owned target metadata; label changes preserve this supervisor. */
+  readonly targetRef: Ref.Ref<ConnectionTarget>;
 }
 
 function retryDelayMs(failureCount: number): number {
@@ -207,7 +209,7 @@ export class EnvironmentSupervisor extends Context.Service<
 
 export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
   entry: ConnectionCatalogEntry,
-  options?: EnvironmentSupervisorOptions,
+  options: EnvironmentSupervisorOptions,
 ): Effect.fn.Return<
   EnvironmentSupervisor["Service"],
   never,
@@ -217,13 +219,15 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
   | ConnectionWakeups.ConnectionWakeups
 > {
   const target = entry.target;
+  const targetRef = options.targetRef;
+  const currentTarget = () => Ref.getUnsafe(targetRef);
   yield* annotateTarget(target);
 
   const connectivity = yield* Connectivity.Connectivity;
   const driver = yield* ConnectionDriver.ConnectionDriver;
   const wakeups = yield* ConnectionWakeups.ConnectionWakeups;
   const initialIntent: SupervisorIntent = {
-    desired: options?.initiallyDesired ?? false,
+    desired: options.initiallyDesired ?? false,
     network: yield* connectivity.status,
   };
   const intent = yield* Ref.make(initialIntent);
@@ -253,13 +257,13 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     yield* Queue.offer(signals, next);
   });
 
-  const logManagedRelayAccountChange = Effect.logInfo(
-    "Managed relay account changed; restarting the environment connection.",
-  ).pipe(
-    Effect.annotateLogs({
-      "environment.id": target.environmentId,
-      "environment.label": target.label,
-    }),
+  const logManagedRelayAccountChange = Effect.suspend(() =>
+    Effect.logInfo("Managed relay account changed; restarting the environment connection.").pipe(
+      Effect.annotateLogs({
+        "environment.id": target.environmentId,
+        "environment.label": currentTarget().label,
+      }),
+    ),
   );
 
   const reportProgress = Effect.fn("EnvironmentSupervisor.reportProgress")(function* (
@@ -281,7 +285,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     generation: number,
     lastFailure: ConnectionAttemptError | null,
   ) {
-    return yield* driver.connect(entry, (progress) =>
+    return yield* driver.connect({ ...entry, target: currentTarget() }, (progress) =>
       reportProgress(attempt, generation, lastFailure, progress),
     );
   });
@@ -298,7 +302,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
   ) => {
     const traced = Effect.gen(function* () {
       const attemptSpan = yield* Effect.currentSpan.pipe(Effect.orDie);
-      yield* annotateTarget(target);
+      yield* annotateTarget(currentTarget());
       yield* Effect.annotateCurrentSpan({
         "connection.attempt": attempt,
         "connection.generation": generation,
@@ -405,7 +409,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
                   Effect.fail(
                     new ConnectionTransientError({
                       reason: "timeout",
-                      detail: `${target.label} did not respond to a connection health check.`,
+                      detail: `${currentTarget().label} did not respond to a connection health check.`,
                     }),
                   ),
               }),
@@ -485,7 +489,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
         failure: {
           error: new ConnectionTransientError({
             reason: "timeout",
-            detail: `${target.label} did not respond during connection setup.`,
+            detail: `${currentTarget().label} did not respond during connection setup.`,
           }),
           attemptSpan: Option.none(),
         },
@@ -495,13 +499,13 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
       const isUnexpectedDefect =
         !Cause.hasInterruptsOnly(establishment.exit.cause) &&
         !establishment.exit.cause.reasons.some(Cause.isFailReason);
-      const outcome = failureFromExit(target, establishment.exit, false, false);
+      const outcome = failureFromExit(currentTarget(), establishment.exit, false, false);
       if (isUnexpectedDefect) {
         const defect = establishment.exit.cause.reasons.find(Cause.isDieReason)?.defect;
         yield* Effect.logError("Connection attempt failed with an unexpected defect.").pipe(
           Effect.annotateLogs({
             "environment.id": target.environmentId,
-            "environment.label": target.label,
+            "environment.label": currentTarget().label,
             "cause.reason_count": establishment.exit.cause.reasons.length,
             ...safeErrorLogAttributes(defect),
           }),
@@ -549,7 +553,12 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
       ),
     ).pipe(exitUnlessInterrupted);
     const connectedForMs = (yield* Clock.currentTimeMillis) - connectedAt;
-    return failureFromExit(target, connectedExit, true, connectedForMs >= BACKOFF_RESET_AFTER_MS);
+    return failureFromExit(
+      currentTarget(),
+      connectedExit,
+      true,
+      connectedForMs >= BACKOFF_RESET_AFTER_MS,
+    );
   }, Effect.ensuring(clearLease));
 
   const waitForRetrySignal = Effect.fnUntraced(function* (delayMs: number) {
@@ -700,7 +709,9 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
   yield* Effect.addFinalizer(() => Queue.shutdown(signals).pipe(Effect.andThen(clearLease)));
 
   return EnvironmentSupervisor.of({
-    target,
+    get target() {
+      return currentTarget();
+    },
     state,
     session,
     prepared,
@@ -712,11 +723,18 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
 
 export const layer = (
   entry: ConnectionCatalogEntry,
-  options?: EnvironmentSupervisorOptions,
+  options?: Partial<EnvironmentSupervisorOptions>,
 ): Layer.Layer<
   EnvironmentSupervisor,
   never,
   | Connectivity.Connectivity
   | ConnectionDriver.ConnectionDriver
   | ConnectionWakeups.ConnectionWakeups
-> => Layer.effect(EnvironmentSupervisor, make(entry, options));
+> =>
+  Layer.effect(
+    EnvironmentSupervisor,
+    Effect.gen(function* () {
+      const targetRef = options?.targetRef ?? (yield* Ref.make(entry.target));
+      return yield* make(entry, { ...options, targetRef });
+    }),
+  );

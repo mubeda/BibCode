@@ -466,33 +466,56 @@ describe("GitManagerPanel", () => {
     expect(h.listPullRequests).not.toHaveBeenCalled();
   });
 
-  it("mounts the enabled provider pane without requesting provider data", async () => {
-    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-    useGitManagerStore.getState().setProviderPaneOpen(projectRef, true);
-    const container = document.createElement("div");
-    document.body.append(container);
-    const root = createRoot(container);
+  it.each([
+    ["github", "pull requests", "Pull requests"],
+    ["gitlab", "merge requests", "Merge requests"],
+  ] as const)(
+    "toggles the %s provider pane using its vocabulary without requesting data",
+    async (kind, plural, title) => {
+      (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+      h.status = {
+        ...vcsStatus(false),
+        sourceControlProvider: { kind, name: "Forge", baseUrl: "https://forge.invalid" },
+      };
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
 
-    try {
-      await act(async () => root.render(<GitManagerPanel projectRef={projectRef} />));
+      try {
+        await act(async () => root.render(<GitManagerPanel projectRef={projectRef} />));
 
-      expect(container.textContent).toContain("Pull requests and checks");
-      expect(container.textContent).toContain("load only when you choose Refresh");
-      expect(h.listPullRequests).not.toHaveBeenCalled();
+        const toggle = container.querySelector<HTMLButtonElement>(
+          `button[aria-label="Show ${plural} and checks"]`,
+        );
+        expect(toggle?.textContent).toBe(`Show ${plural}`);
+        expect(container.querySelector(`section[aria-label="${title} and checks"]`)).toBeNull();
+        expect(h.listPullRequests).not.toHaveBeenCalled();
+        await act(async () => toggle!.click());
 
-      const refresh = [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) =>
-        button.textContent?.includes("Refresh"),
-      );
-      expect(refresh).toBeDefined();
-      await act(async () => refresh?.click());
+        expect(toggle?.textContent).toBe(`Hide ${plural}`);
+        expect(toggle?.getAttribute("aria-label")).toBe(`Hide ${plural} and checks`);
+        expect(container.textContent).toContain(`${title} and checks`);
+        expect(container.textContent).toContain("load only when you choose Refresh");
+        expect(h.listPullRequests).not.toHaveBeenCalled();
 
-      expect(h.listPullRequests).toHaveBeenCalledOnce();
-    } finally {
-      await act(async () => root.unmount());
-      container.remove();
-      (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
-    }
-  });
+        const refresh = [...container.querySelectorAll<HTMLButtonElement>("button")].find(
+          (button) => button.textContent?.includes("Refresh"),
+        );
+        expect(refresh).toBeDefined();
+        await act(async () => refresh?.click());
+
+        expect(h.listPullRequests).toHaveBeenCalledOnce();
+        await act(async () => toggle!.click());
+        expect(toggle?.textContent).toBe(`Show ${plural}`);
+        expect(container.querySelector(`section[aria-label="${title} and checks"]`)).toBeNull();
+        expect(h.listPullRequests).toHaveBeenCalledOnce();
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+        (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
+      }
+    },
+  );
 
   it("opens the multi-commit dialog when History chooses an operation", async () => {
     (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;

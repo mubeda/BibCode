@@ -61,6 +61,11 @@ export const activeEnvironmentIdAtom = Atom.make<EnvironmentId | null>(null).pip
   Atom.withLabel("web-active-environment-id"),
 );
 
+const previousPrimaryEnvironmentIdAtom = Atom.make<EnvironmentId | null>(null).pipe(
+  Atom.keepAlive,
+  Atom.withLabel("web-previous-primary-environment-id"),
+);
+
 export function useActiveEnvironmentId(): EnvironmentId | null {
   return useAtomValue(activeEnvironmentIdAtom);
 }
@@ -71,6 +76,27 @@ export function readActiveEnvironmentId(): EnvironmentId | null {
 
 export function setActiveEnvironmentId(environmentId: EnvironmentId | null): void {
   appAtomRegistry.set(activeEnvironmentIdAtom, environmentId);
+}
+
+/** Read selection at write time; primary history survives auth-gate remounts. */
+export function reconcileEnvironmentSelection(
+  environmentId: EnvironmentId,
+  policy: "follow-primary-identity" | "if-unselected",
+): void {
+  const selected = readActiveEnvironmentId();
+  const previousEnvironmentId =
+    policy === "follow-primary-identity"
+      ? appAtomRegistry.get(previousPrimaryEnvironmentIdAtom)
+      : null;
+  if (policy === "follow-primary-identity" && environmentId !== previousEnvironmentId) {
+    appAtomRegistry.set(previousPrimaryEnvironmentIdAtom, environmentId);
+  }
+  if (
+    selected === null ||
+    (environmentId !== previousEnvironmentId && selected === previousEnvironmentId)
+  ) {
+    setActiveEnvironmentId(environmentId);
+  }
 }
 
 export function useProjectRefs(): ReadonlyArray<ScopedProjectRef> {

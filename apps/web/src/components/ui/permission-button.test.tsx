@@ -1,17 +1,17 @@
 // @vitest-environment happy-dom
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vite-plus/test";
-import { PullRequestsPermissionButton } from "./PullRequestsPermissionButton";
-describe("PullRequestsPermissionButton", () => {
+import { PermissionButton } from "./permission-button";
+describe("PermissionButton", () => {
   it("exposes the server reason on a disabled button and to assistive technology", () => {
     const container = document.createElement("div");
     container.innerHTML = renderToStaticMarkup(
-      <PullRequestsPermissionButton
+      <PermissionButton
         permission={{ allowed: false, reason: "Write access required" }}
         onClick={() => {}}
       >
         Edit
-      </PullRequestsPermissionButton>,
+      </PermissionButton>,
     );
     const button = container.querySelector("button")!;
     expect(button.disabled).toBe(true);
@@ -23,14 +23,14 @@ describe("PullRequestsPermissionButton", () => {
   });
   it("allows a permitted action without a disabled description", () => {
     const html = renderToStaticMarkup(
-      <PullRequestsPermissionButton
+      <PermissionButton
         permission={{ allowed: true, reason: null }}
         onClick={() => {}}
         variant="outline"
         size="sm"
       >
         Refresh
-      </PullRequestsPermissionButton>,
+      </PermissionButton>,
     );
     expect(html).not.toContain('disabled=""');
     expect(html).not.toContain("aria-describedby");

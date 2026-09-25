@@ -4,6 +4,9 @@ import * as Option from "effect/Option";
 import type { ConnectionCatalogEntry } from "./catalog.ts";
 import type { NetworkStatus, SupervisorConnectionState } from "./model.ts";
 
+export const SERVER_NAME_REQUIRED_MESSAGE = "Enter a name for this server.";
+export const PLATFORM_ENVIRONMENT_NAME_MESSAGE = "This device names its own environments.";
+
 function failureTraceId(state: SupervisorConnectionState): string | null {
   return state.lastFailure !== null && "traceId" in state.lastFailure
     ? (state.lastFailure.traceId ?? null)

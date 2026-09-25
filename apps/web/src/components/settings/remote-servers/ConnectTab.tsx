@@ -13,7 +13,6 @@ import type {
   DesktopDiscoveredSshHost,
   DesktopSshEnvironmentTarget,
   EnvironmentId,
-  RemoteUpdateSnapshot,
 } from "@bibcode/contracts";
 import { REMOTE_UPDATE_MANUAL_REQUIRED } from "@bibcode/contracts";
 import {
@@ -47,7 +46,7 @@ import {
   connectSshEnvironment as connectSshEnvironmentAtom,
 } from "~/connection/onboarding";
 import { desktopSshHostsStateAtom } from "~/state/desktopSshHosts";
-import { remoteUpdateEnvironment } from "~/state/remoteUpdates";
+import { remoteUpdateEnvironment, useRemoteUpdateCheckState } from "~/state/remoteUpdates";
 import {
   type EnvironmentPresentation,
   useEnvironments,
@@ -84,7 +83,7 @@ import {
 } from "../../ui/alert-dialog";
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "../../ui/empty";
 import { Input } from "../../ui/input";
-import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../../ui/menu";
+import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuTrigger } from "../../ui/menu";
 import { ScrollArea } from "../../ui/scroll-area";
 import { Skeleton } from "../../ui/skeleton";
 import { Textarea } from "../../ui/textarea";
@@ -93,8 +92,10 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "../../ui/tooltip";
 import { SettingsSection } from "../settingsLayout";
 import {
   ServerUpdateBadge,
+  type ServerUpdateStatus,
   manualUpdateInstructions,
   serverUpdateBadgeVariant,
+  serverUpdateStatusFromQuery,
 } from "../ServerUpdateBadge";
 import {
   ConnectionStatusDot,
@@ -107,11 +108,13 @@ import {
   parseRemotePairingFields,
   tryResolveRemotePairingHostInput,
 } from "./shared";
+import { RenameServerDialog, type RenameServerRequest } from "./RenameServerDialog";
 import {
   ADD_SERVER_FAILURE_REASONS,
   countRunningThreadsForEnvironment,
   describeAddServerFailure,
   describeCompatBadge,
+  describeRenameServerFailure,
   formatServerVersionLabel,
   isLoopbackAcknowledgementRequired,
   normalizePairingCodeInput,
@@ -124,28 +127,37 @@ type RemoteServerRowProps = {
   environment: EnvironmentPresentation;
   compat: CompatVerdict | null;
   remoteUpdateControl: boolean;
-  updateSnapshot: RemoteUpdateSnapshot | null;
-  updatePending: boolean;
+  updateStatus: ServerUpdateStatus;
+  /** A check, or the first status read, is running: Check reads "Checking…" and waits. */
+  checkInFlight: boolean;
+  /** An install request is being sent: Check and Update wait for it. */
+  installInFlight: boolean;
   removingEnvironmentId: EnvironmentId | null;
   onConnect: (environmentId: EnvironmentId) => void;
   onDisconnect: (environmentId: EnvironmentId) => void;
   onRequestRemove: (environmentId: EnvironmentId, label: string) => void;
+  onRequestRename: (request: RenameServerRequest) => void;
   onCheckForUpdate: () => void;
   onInstallUpdate: () => void;
+  /** Re-reads a failed update status. */
+  onRetryUpdate: () => void;
 };
 
 function RemoteServerRow({
   environment,
   compat,
   remoteUpdateControl,
-  updateSnapshot,
-  updatePending,
+  updateStatus,
+  checkInFlight,
+  installInFlight,
   removingEnvironmentId,
   onConnect,
   onDisconnect,
   onRequestRemove,
+  onRequestRename,
   onCheckForUpdate,
   onInstallUpdate,
+  onRetryUpdate,
 }: RemoteServerRowProps) {
   const environmentId = environment.environmentId;
   const connectionState = environment.connection.phase;
@@ -213,7 +225,8 @@ function RemoteServerRow({
   );
   const compatBadge = describeCompatBadge(compat);
   const transportBadge = resolveTransportBadge(environment);
-  const updateVariant = serverUpdateBadgeVariant(updateSnapshot);
+  const updateSnapshot = updateStatus.snapshot;
+  const updateVariant = serverUpdateBadgeVariant(updateStatus);
   const updateInstructions =
     updateSnapshot?.support.installMode === "manual"
       ? manualUpdateInstructions(updateSnapshot.serverVersion)
@@ -253,7 +266,7 @@ function RemoteServerRow({
             />
             <h3 className="text-sm font-medium text-foreground">{environment.label}</h3>
             {isDisconnected ? (
-              <span className="text-xs text-muted-foreground/70">Disconnected</span>
+              <span className="text-xs text-muted-foreground">Disconnected</span>
             ) : null}
           </div>
           <div className="flex flex-wrap items-center gap-1.5">
@@ -261,7 +274,7 @@ function RemoteServerRow({
               <span className="text-xs text-muted-foreground">{versionLabel}</span>
             ) : null}
             {statusUnavailable ? (
-              <span className="text-xs text-muted-foreground/70">Status unavailable</span>
+              <span className="text-xs text-muted-foreground">Status unavailable</span>
             ) : null}
             {compatBadge ? (
               <Badge variant={compatBadge.tone === "destructive" ? "destructive" : "warning"}>
@@ -280,7 +293,9 @@ function RemoteServerRow({
                 <Badge variant="outline">{transportBadge.label}</Badge>
               )
             ) : null}
-            {remoteUpdateControl ? <ServerUpdateBadge snapshot={updateSnapshot} /> : null}
+            {remoteUpdateControl ? (
+              <ServerUpdateBadge {...updateStatus} onRetry={onRetryUpdate} />
+            ) : null}
             {metadataBits.length > 0 ? (
               <span className="text-xs text-muted-foreground">{metadataBits.join(" · ")}</span>
             ) : null}
@@ -332,14 +347,23 @@ function RemoteServerRow({
         </div>
         <div className="flex w-full shrink-0 items-center gap-2 sm:w-auto sm:justify-end">
           {remoteUpdateControl ? (
-            <Button size="xs" variant="ghost" disabled={updatePending} onClick={onCheckForUpdate}>
-              {updatePending ? "Checking…" : "Check"}
+            <Button
+              size="xs"
+              variant="ghost"
+              disabled={checkInFlight || installInFlight}
+              onClick={onCheckForUpdate}
+            >
+              {checkInFlight
+                ? "Checking…"
+                : updateVariant === "check-failed" || updateVariant === "error"
+                  ? "Check again"
+                  : "Check"}
             </Button>
           ) : null}
           {remoteUpdateControl &&
           updateSnapshot?.support.installMode === "interactive" &&
           updateVariant === "update-available" ? (
-            <Button size="xs" disabled={updatePending} onClick={onInstallUpdate}>
+            <Button size="xs" disabled={checkInFlight || installInFlight} onClick={onInstallUpdate}>
               Update
             </Button>
           ) : null}
@@ -383,6 +407,18 @@ function RemoteServerRow({
                 />
                 <MenuPopup align="end">
                   <MenuItem
+                    onClick={() =>
+                      onRequestRename({
+                        environmentId,
+                        label: environment.label,
+                        serverLabel: environment.serverConfig?.environment.label ?? null,
+                      })
+                    }
+                  >
+                    Rename…
+                  </MenuItem>
+                  <MenuSeparator />
+                  <MenuItem
                     variant="destructive"
                     onClick={() => onRequestRemove(environmentId, environment.label)}
                   >
@@ -403,16 +439,17 @@ function RemoteServerRowFromSession(
     RemoteServerRowProps,
     | "compat"
     | "remoteUpdateControl"
-    | "updateSnapshot"
-    | "updatePending"
+    | "updateStatus"
+    | "checkInFlight"
+    | "installInFlight"
     | "onCheckForUpdate"
     | "onInstallUpdate"
+    | "onRetryUpdate"
   > & {
-    readonly updateCheckFailed: boolean;
     readonly updateRefreshEpoch: number;
-    readonly onUpdateCheckResult: (environmentId: EnvironmentId, succeeded: boolean) => void;
   },
 ) {
+  const { updateRefreshEpoch, ...rowProps } = props;
   const compat = useAtomValue(
     environmentSession.compatVerdictAtom(props.environment.environmentId),
   );
@@ -421,35 +458,32 @@ function RemoteServerRowFromSession(
   const updateQuery = useEnvironmentQuery(
     remoteUpdateControl ? remoteUpdateEnvironment.snapshot({ environmentId, input: {} }) : null,
   );
+  const refreshUpdateStatus = updateQuery.refresh;
+  const updateCheck = useRemoteUpdateCheckState(remoteUpdateControl ? environmentId : null);
   const runCheck = useAtomCommand(remoteUpdateEnvironment.check, { reportFailure: false });
   const runInstall = useAtomCommand(remoteUpdateEnvironment.install, { reportFailure: false });
-  const [commandPending, setCommandPending] = useState(false);
+  const [installPending, setInstallPending] = useState(false);
   const [manualInstallRequired, setManualInstallRequired] = useState(false);
 
   useEffect(() => {
-    if (remoteUpdateControl && props.updateRefreshEpoch > 0) {
-      updateQuery.refresh();
+    if (remoteUpdateControl && updateRefreshEpoch > 0) {
+      refreshUpdateStatus();
     }
-  }, [props.updateRefreshEpoch, remoteUpdateControl, updateQuery.refresh]);
+  }, [refreshUpdateStatus, remoteUpdateControl, updateRefreshEpoch]);
 
   const checkForUpdate = useCallback(async () => {
-    setCommandPending(true);
-    const result = await runCheck({ environmentId, input: {} });
-    setCommandPending(false);
-    props.onUpdateCheckResult(environmentId, result._tag === "Success");
-    if (result._tag === "Success") {
-      updateQuery.refresh();
-    }
-  }, [environmentId, props.onUpdateCheckResult, runCheck, updateQuery.refresh]);
+    // The check records its own progress and failure in the shared check state.
+    await runCheck({ environmentId, input: {} });
+    refreshUpdateStatus();
+  }, [environmentId, refreshUpdateStatus, runCheck]);
 
   const installUpdate = useCallback(async () => {
-    setCommandPending(true);
+    setInstallPending(true);
     const result = await runInstall({ environmentId, input: {} });
-    setCommandPending(false);
+    setInstallPending(false);
     if (result._tag === "Success") {
       setManualInstallRequired(false);
-      props.onUpdateCheckResult(environmentId, true);
-      updateQuery.refresh();
+      refreshUpdateStatus();
       return;
     }
     const error = squashAtomCommandFailure(result);
@@ -460,34 +494,36 @@ function RemoteServerRowFromSession(
       error.code === REMOTE_UPDATE_MANUAL_REQUIRED
     ) {
       setManualInstallRequired(true);
-      props.onUpdateCheckResult(environmentId, true);
-      updateQuery.refresh();
+      refreshUpdateStatus();
     }
-  }, [environmentId, props.onUpdateCheckResult, runInstall, updateQuery.refresh]);
+  }, [environmentId, refreshUpdateStatus, runInstall]);
 
-  const snapshot = props.updateCheckFailed
-    ? null
-    : manualInstallRequired && updateQuery.data !== null
+  const queryStatus = serverUpdateStatusFromQuery(updateQuery, {
+    connected: props.environment.connection.phase === "connected",
+    check: updateCheck,
+  });
+  const updateStatus: ServerUpdateStatus =
+    manualInstallRequired && queryStatus.snapshot !== null
       ? {
-          ...updateQuery.data,
-          support: { installMode: "manual" as const, reason: "manual-update-required" as const },
+          ...queryStatus,
+          snapshot: {
+            ...queryStatus.snapshot,
+            support: { installMode: "manual", reason: "manual-update-required" },
+          },
         }
-      : updateQuery.data;
-  const {
-    onUpdateCheckResult: _onUpdateCheckResult,
-    updateCheckFailed: _updateCheckFailed,
-    updateRefreshEpoch: _updateRefreshEpoch,
-    ...rowProps
-  } = props;
+      : queryStatus;
   return (
     <RemoteServerRow
       {...rowProps}
       compat={compat}
       remoteUpdateControl={remoteUpdateControl}
-      updateSnapshot={snapshot}
-      updatePending={commandPending || updateQuery.isPending}
+      updateStatus={updateStatus}
+      // Background status re-reads keep the known snapshot, so they never flip Check.
+      checkInFlight={serverUpdateBadgeVariant(updateStatus) === "checking"}
+      installInFlight={installPending}
       onCheckForUpdate={() => void checkForUpdate()}
       onInstallUpdate={() => void installUpdate()}
+      onRetryUpdate={refreshUpdateStatus}
     />
   );
 }
@@ -752,6 +788,7 @@ export function ConnectTab({
     reportFailure: false,
   });
   const removeEnvironment = useAtomCommand(environmentCatalog.remove, { reportFailure: false });
+  const renameEnvironment = useAtomCommand(environmentCatalog.rename, { reportFailure: false });
   const runRemoteUpdateCheck = useAtomCommand(remoteUpdateEnvironment.check, {
     reportFailure: false,
   });
@@ -839,6 +876,7 @@ export function ConnectTab({
     readonly environmentId: EnvironmentId;
     readonly label: string;
   } | null>(null);
+  const [renameRequest, setRenameRequest] = useState<RenameServerRequest | null>(null);
   const runningRemovalCount =
     removalCandidate === null
       ? 0
@@ -847,26 +885,11 @@ export function ConnectTab({
   const [updateRefreshEpochs, setUpdateRefreshEpochs] = useState<
     ReadonlyMap<EnvironmentId, number>
   >(new Map());
-  const [updateCheckFailures, setUpdateCheckFailures] = useState<ReadonlySet<EnvironmentId>>(
-    new Set(),
-  );
-  const recordUpdateCheckResult = useCallback(
-    (environmentId: EnvironmentId, succeeded: boolean) => {
-      setUpdateCheckFailures((current) => {
-        const next = new Set(current);
-        if (succeeded) next.delete(environmentId);
-        else next.add(environmentId);
-        return next;
-      });
-    },
-    [],
-  );
   const onCheckForServerUpdates = useCallback(async () => {
     if (checkingAllServerUpdates || updateCapableEnvironmentIds.length === 0) return;
     setCheckingAllServerUpdates(true);
     await fanOutRemoteUpdateChecks(updateCapableEnvironmentIds, async (environmentId) => {
       const result = await runRemoteUpdateCheck({ environmentId, input: {} });
-      recordUpdateCheckResult(environmentId, result._tag === "Success");
       setUpdateRefreshEpochs((current) => {
         const next = new Map(current);
         next.set(environmentId, (current.get(environmentId) ?? 0) + 1);
@@ -875,12 +898,7 @@ export function ConnectTab({
       return result;
     });
     setCheckingAllServerUpdates(false);
-  }, [
-    checkingAllServerUpdates,
-    recordUpdateCheckResult,
-    runRemoteUpdateCheck,
-    updateCapableEnvironmentIds,
-  ]);
+  }, [checkingAllServerUpdates, runRemoteUpdateCheck, updateCapableEnvironmentIds]);
   const consumeInitialPairingCode = useCallback(() => {
     if (initialPairingCode === null || initialPairingCodeConsumedRef.current) return;
     initialPairingCodeConsumedRef.current = true;
@@ -1161,6 +1179,16 @@ export function ConnectTab({
     [removeEnvironment],
   );
 
+  const handleRenameSavedBackend = useCallback(
+    async (environmentId: EnvironmentId, label: string): Promise<string | null> => {
+      const result = await renameEnvironment({ environmentId, label });
+      if (result._tag === "Success" || isAtomCommandInterrupted(result)) return null;
+      return describeRenameServerFailure(squashAtomCommandFailure(result));
+    },
+    [renameEnvironment],
+  );
+  const closeRenameDialog = useCallback(() => setRenameRequest(null), []);
+
   const handleConnectSshHost = useCallback(
     async (target: DesktopSshEnvironmentTarget, label?: string) => {
       setConnectingSshHostAlias(target.alias);
@@ -1283,7 +1311,7 @@ export function ConnectTab({
         </label>
       </div>
       <div>
-        <span className="mt-1 block text-[11px] text-muted-foreground">
+        <span className="mt-1 block text-xs text-muted-foreground">
           Paste a full pairing URL here to fill both fields automatically.
         </span>
       </div>
@@ -1460,7 +1488,7 @@ export function ConnectTab({
         <div className="flex items-center justify-between gap-3 border-b border-border/60 bg-muted/30 px-3 py-2">
           <div className="min-w-0">
             <p className="text-xs font-medium text-foreground">Suggested hosts</p>
-            <p className="text-[11px] text-muted-foreground">From SSH config and known hosts</p>
+            <p className="text-xs text-muted-foreground">From SSH config and known hosts</p>
           </div>
           <Button
             size="xs"
@@ -1508,7 +1536,7 @@ export function ConnectTab({
               <Button
                 size="xs"
                 variant="ghost"
-                className="h-5 gap-1 rounded-sm px-1 text-[11px] font-normal text-muted-foreground/60 hover:text-muted-foreground"
+                className="h-5 gap-1 rounded-sm px-1 text-xs font-normal text-muted-foreground hover:text-foreground"
                 disabled={checkingAllServerUpdates}
                 onClick={() => void onCheckForServerUpdates()}
               >
@@ -1540,7 +1568,7 @@ export function ConnectTab({
                         <Button
                           size="xs"
                           variant="ghost"
-                          className="h-5 gap-1 rounded-sm px-1 text-[11px] font-normal text-muted-foreground/60 hover:text-muted-foreground"
+                          className="h-5 gap-1 rounded-sm px-1 text-xs font-normal text-muted-foreground hover:text-foreground"
                           aria-label="Add Server"
                         >
                           <PlusIcon className="size-3" />
@@ -1593,15 +1621,14 @@ export function ConnectTab({
           <RemoteServerRowFromSession
             key={environment.environmentId}
             environment={environment}
-            updateCheckFailed={updateCheckFailures.has(environment.environmentId)}
             updateRefreshEpoch={updateRefreshEpochs.get(environment.environmentId) ?? 0}
-            onUpdateCheckResult={recordUpdateCheckResult}
             removingEnvironmentId={removingSavedEnvironmentId}
             onConnect={handleConnectSavedBackend}
             onDisconnect={handleDisconnectSavedBackend}
             onRequestRemove={(environmentId, label) =>
               setRemovalCandidate({ environmentId, label })
             }
+            onRequestRename={setRenameRequest}
           />
         ))}
         <CloudRemoteEnvironmentRows
@@ -1643,6 +1670,11 @@ export function ConnectTab({
           </AlertDialogFooter>
         </AlertDialogPopup>
       </AlertDialog>
+      <RenameServerDialog
+        request={renameRequest}
+        onClose={closeRenameDialog}
+        onRename={handleRenameSavedBackend}
+      />
     </>
   );
 }

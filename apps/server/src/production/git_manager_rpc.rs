@@ -889,7 +889,7 @@ impl ConfiguredGitManagerRpcServices {
         };
         let Some(provider) = summary
             .source_control_provider
-            .map(|provider| source_control_provider_kind(provider.kind))
+            .map(|provider| SourceControlProviderKind::from(provider.kind))
         else {
             return Ok(unavailable_pull_requests());
         };
@@ -945,16 +945,6 @@ impl ConfiguredGitManagerRpcServices {
             "pullRequests": [pull_request],
             "checks": checks,
         }))
-    }
-}
-
-fn source_control_provider_kind(provider: crate::git::ProviderKind) -> SourceControlProviderKind {
-    match provider {
-        crate::git::ProviderKind::Github => SourceControlProviderKind::Github,
-        crate::git::ProviderKind::Gitlab => SourceControlProviderKind::Gitlab,
-        crate::git::ProviderKind::AzureDevops => SourceControlProviderKind::AzureDevops,
-        crate::git::ProviderKind::Bitbucket => SourceControlProviderKind::Bitbucket,
-        crate::git::ProviderKind::Unknown => SourceControlProviderKind::Unknown,
     }
 }
 

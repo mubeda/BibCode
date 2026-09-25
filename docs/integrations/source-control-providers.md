@@ -157,9 +157,25 @@ runs the configured provider CLI when that provider is supported.
 **Create pull request** in the Git Manager pane opens a review dialog that
 reads local status only: it shows the detected provider, base and head
 branches, whether the branch must be published first, and a title and
-description seeded from the latest commit. Nothing is pushed or created until
+description seeded from the latest commit. The resolved default branch remains
+the base even when later remote-status updates arrive. Its wording follows the host: a
+GitLab repository gets **Create merge request**, `!N` references and
+"merge request" throughout; a missing provider keeps "pull request", while an
+explicit unknown provider uses "change request". Shared presentation also owns
+the provider name and number prefix. When the
+host is not identified yet, the dialog says so and names the two ways to
+identify it (open Pull Requests for the project, or Rescan in **Settings →
+Source Control**); without an `origin` remote it asks for one. Opened from Pull
+Requests, the dialog shows the host that panel already identified while the
+status has not named it yet, and leaves the provider check to the server. A
+disabled primary button explains why on hover and to screen readers. Nothing is
+pushed or created until
 the dialog's primary action runs the existing `git.runStackedAction`
 `create_pr` route with the reviewed `pullRequestTitle` and `pullRequestBody`.
+That route resolves the provider before it creates a branch, commits or pushes,
+so an unidentified host fails with "Nothing was published." and the same
+guidance. A request it creates makes the Pull Requests list read its GitLab
+totals again.
 The dialog reports publishing and creation as separate phases, keeps a
 published branch visible when creation fails, and offers Retry; a retry never
 duplicates a pull request because the server resolves an existing open pull
@@ -171,10 +187,21 @@ existing action path.
 
 Successful CLI discovery/auth probes and GitLab host contexts have a request-driven
 30-second cache (at most 32 entries per cache, no polling). The origin is still
-read each time. Rescan bypasses cached answers; authentication/repository-access
-failures invalidate them. GitLab writes always re-read project access/merge policy
-and the MR permission/head observations, while omitting UI-only precheck reads.
-Timeline and reaction paths reuse a viewer already available in context.
+read each time. Opening the module and switching checkout reuse cached answers;
+**Rescan** and authentication recovery send `rescan` on `pullRequests.getContext`,
+which bypasses them. Authentication/repository-access failures invalidate them.
+GitLab's repository-wide tab totals are reused for 30 seconds across filter
+changes and pages; an explicit list **Refresh** (`refreshTotals`), a successful
+action (including a request created from the Git Manager or chat), Rescan or
+expiry reads them again. Once the host is identified, the login recheck runs
+alongside the context or list read; a failed login takes precedence and the
+provider read is cancelled and awaited before its result is discarded. Both
+paths recheck that the checkout still exists before accepting a host response.
+The GitHub context reads its user, repository and viewer permission together.
+GitLab writes always re-read project
+access/merge policy and the MR permission/head observations, while omitting
+UI-only precheck reads. Timeline and reaction paths reuse a viewer already
+available in context.
 
 All module host access uses the server's supervised `HostCommandRunner` and
 only `gh`, `glab`, or `git`. No browser HTTP request, avatar lookup, or module
@@ -261,7 +288,19 @@ glab auth login --hostname gitlab.company.example
 
 Use the actual hostname from the checkout's `origin`. BiBCode recognizes
 configured CLI hosts, including GitLab subgroup repository paths; it does not
-guess a provider from an arbitrary hostname. An `unknown_host` state offers the
+guess a provider from an arbitrary hostname. Only the host name counts:
+`github.com`, a host containing `gitlab`, Azure DevOps and Bitbucket hosts are
+recognized by name; any other host must be identified by the CLIs. Remotes may
+use URLs or the scp-like `host:path` form, with or without `user@`. Opening Pull
+Requests for the project, or opening **Settings → Source Control** (and its
+Rescan), records each authenticated configured host in memory; other screens
+that list providers, such as the publish dialog, do not. From then on repository
+status, sidebar summaries, the Git Manager pane and the create dialog use it
+with the host's own address (for example `https://gitlab.company.example`).
+An explicit Settings rescan after full GitLab logout reports **Unauthenticated**
+and forgets recorded GitLab hosts. Unrecognized CLI output reports **Unknown**
+and keeps them. Rescan, `unknown_host` and `not_authenticated` forget a host, and a server
+restart starts empty. An `unknown_host` state offers the
 login advice, while `not_authenticated` names the selected provider and host.
 Open **Settings → Source Control**, leave **Pull requests** enabled and Rescan
 the provider. Check the per-host authentication/account lines (accounts remain

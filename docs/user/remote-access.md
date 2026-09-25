@@ -17,8 +17,18 @@ BiBCode HTTP endpoint directly to the public internet.
 In **Settings → Remote Servers → Connect to a host → Add Server**, enter a
 **Server alias (optional)** along with the pairing code. This name appears in
 the saved-server list and environment rail on this device and persists across
-restarts. Leave it blank to use the name supplied by the server. An alias does
-not rename the server for other clients.
+restarts. Leave it blank to use the name supplied by the server. A headless
+web-mode `bibcode serve` supplies its hostname (for example `ai-server`), or
+"Local" if the machine has no usable hostname. `bibcode start`, bare `bibcode`,
+and desktop-owned servers keep "Local". An alias does not rename the server for
+other clients.
+
+To change the name later, open the server's **⋯** menu in the saved-server list
+and choose **Rename…**. The new name appears in the environment rail, the
+selected server's card, and the saved-server list on this device, and survives
+restarts. **Use the server's name** puts back the name the server reports while
+it is connected. Renaming does not reconnect the server or change anything on
+it.
 
 Loopback pairing through a local connection or SSH tunnel retains the saved
 connection when the server has already activated its standard credential;
@@ -65,7 +75,10 @@ Serve setup flags.
 ## Headless server
 
 `bibcode start` and `bibcode serve` run the same native server. `start` opens the
-startup URL in a browser by default; `serve` does not.
+startup URL in a browser by default; `serve` does not. Only headless web-mode
+`serve` names itself after the machine's hostname, falling back to "Local" if
+no usable hostname is reported. `start` (including `start --no-browser`), bare
+`bibcode`, and the desktop app's own backend keep the name "Local".
 
 Download the signed-release checksum set and the native archive or Linux package for
 your host by following [Standalone server installation](./server-installation.md).

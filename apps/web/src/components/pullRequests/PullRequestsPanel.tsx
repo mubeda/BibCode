@@ -1,7 +1,10 @@
+import { resolveChangeRequestPresentationForKind } from "@bibcode/shared/sourceControl";
 import { projectKey } from "@bibcode/client-runtime/state/entities";
+import { environmentRpcKey } from "@bibcode/client-runtime/state/runtime";
 import type { ScopedProjectRef } from "@bibcode/contracts";
 import { RefreshCwIcon } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useShallow } from "zustand/react/shallow";
 import { usePrimarySettings } from "../../hooks/useSettings";
 import { useOpenPrLink } from "../../lib/openPullRequestLink";
 import { usePullRequestsStore, type PullRequestsDetailTab } from "../../pullRequestsStore";
@@ -20,6 +23,7 @@ import {
   type PullRequestsListViewHandle,
   type PullRequestsListViewProps,
 } from "./list/PullRequestsListView";
+import { firstPagePrefetchInput } from "./list/pullRequestsList.logic";
 import {
   PULL_REQUESTS_DISABLED_IN_SETTINGS_MESSAGE,
   resolvePullRequestsAvailability,
@@ -28,7 +32,7 @@ import {
 import { PullRequestsContextRefresh } from "./pullRequestsContextRefresh";
 import { PullRequestsUnavailableState } from "./PullRequestsUnavailableState";
 import { PullRequestsDetailView } from "./detail/PullRequestsDetailView";
-import { PullRequestsPermissionButton } from "./shared/PullRequestsPermissionButton";
+import { PermissionButton } from "../ui/permission-button";
 
 export interface PullRequestsPanelProps {
   projectRef: ScopedProjectRef;
@@ -46,6 +50,8 @@ function AvailablePullRequests({
   mutationsDisabledReason,
   onRescan,
   isPending,
+  freshPageKey,
+  onFreshPageConsumed,
   children,
 }: PullRequestsPanelProps &
   Omit<PullRequestsListViewProps, "ref"> & {
@@ -57,10 +63,15 @@ function AvailablePullRequests({
   const listRef = useRef<PullRequestsListViewHandle>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const openPrLink = useOpenPrLink();
-  const vocabulary = context.capabilities.vocabulary;
+  const presentation = resolveChangeRequestPresentationForKind(context.provider);
   const Icon = context.provider === "github" ? GitHubIcon : GitLabIcon;
   const customHost = context.host !== "github.com" && context.host !== "gitlab.com";
   const refresh = () => (number === undefined ? listRef.current?.refresh() : onRescan());
+  // This context already identified the host, so the dialog need not wait for status.
+  const providerHint = useMemo(
+    () => ({ kind: context.provider, host: context.host }),
+    [context.host, context.provider],
+  );
   return (
     <section
       aria-label="Pull Requests"
@@ -82,7 +93,7 @@ function AvailablePullRequests({
             Refresh
           </Button>
         ) : null}
-        <PullRequestsPermissionButton
+        <PermissionButton
           variant="outline"
           size="sm"
           onClick={onRescan}
@@ -92,7 +103,7 @@ function AvailablePullRequests({
           }}
         >
           Rescan
-        </PullRequestsPermissionButton>
+        </PermissionButton>
         <span className="inline-flex" title={mutationsDisabledReason ?? undefined}>
           <Button
             size="sm"
@@ -104,7 +115,7 @@ function AvailablePullRequests({
             aria-haspopup="dialog"
             onClick={() => setCreateOpen(true)}
           >
-            New {vocabulary.pullRequest}
+            New {presentation.longName}
           </Button>
         </span>
         <a
@@ -126,6 +137,8 @@ function AvailablePullRequests({
           scope={scope}
           projectRef={projectRef}
           context={context}
+          freshPageKey={freshPageKey}
+          onFreshPageConsumed={onFreshPageConsumed}
         />
       ) : (
         <PullRequestsDetailView
@@ -144,6 +157,7 @@ function AvailablePullRequests({
           scope={scope}
           onOpenChange={setCreateOpen}
           onSettled={refresh}
+          providerHint={providerHint}
         />
       ) : null}
     </section>
@@ -184,6 +198,43 @@ export function PullRequestsPanel({ projectRef, number, tab }: PullRequestsPanel
   );
   const catalog = useEnvironmentQuery(catalogAtom);
   const query = useEnvironmentQuery(contextAtom);
+  const contextPending = query.data === null && query.error === null;
+  // The Open and Closed first pages do not depend on the context, so the list's page
+  // loads alongside it. Subscribe only to that input while the context is pending.
+  const prefetchInput = usePullRequestsStore(
+    useShallow((state) =>
+      contextAtom !== null && contextPending && number === undefined && cwd !== null
+        ? firstPagePrefetchInput(state.byProjectKey[storeKey], cwd)
+        : null,
+    ),
+  );
+  const prefetchKey =
+    prefetchInput === null ? null : environmentRpcKey({ environmentId, input: prefetchInput });
+  const prefetchAtom = useMemo(
+    () =>
+      prefetchInput === null
+        ? null
+        : pullRequestsEnvironment.list({
+            environmentId,
+            input: prefetchInput,
+          }),
+    [environmentId, prefetchInput],
+  );
+  useEnvironmentQuery(prefetchAtom);
+  // Retain the last prefetch through the context transition before children render.
+  // React can replay this guarded adjustment; only the committed list consumes it.
+  const [freshPage, setFreshPage] = useState(() => ({ prefetchKey, key: prefetchKey }));
+  const discardFreshPage =
+    query.error !== null || query.data?.status === "unavailable" || number !== undefined;
+  if (freshPage.prefetchKey !== prefetchKey || (discardFreshPage && freshPage.key !== null)) {
+    setFreshPage({
+      prefetchKey,
+      key: discardFreshPage ? null : (prefetchKey ?? freshPage.key),
+    });
+  }
+  const onFreshPageConsumed = useCallback((key: string) => {
+    setFreshPage((current) => (current.key === key ? { ...current, key: null } : current));
+  }, []);
   const scope = useMemo(() => ({ environmentId, cwd: cwd ?? "" }), [environmentId, cwd]);
   const worktreeOptions = useMemo(() => {
     const main = project?.workspaceRoot;
@@ -203,8 +254,16 @@ export function PullRequestsPanel({ projectRef, number, tab }: PullRequestsPanel
     if (number !== undefined)
       usePullRequestsStore.getState().setLastNumber({ environmentId, projectId }, number);
   }, [environmentId, number, projectId]);
+  const refreshContext = query.refresh;
+  // Rescan and auth recovery bypass the server's bounded context caches; opening the
+  // panel and switching checkout reuse them.
+  const rescanContext = useCallback(() => {
+    if (cwd !== null)
+      pullRequestsEnvironment.requestContextRescan({ environmentId, input: { cwd } });
+    refreshContext();
+  }, [cwd, environmentId, refreshContext]);
   const rescan = () => {
-    query.refresh();
+    rescanContext();
     catalog.refresh();
   };
   const worktreeStatus =
@@ -286,7 +345,7 @@ export function PullRequestsPanel({ projectRef, number, tab }: PullRequestsPanel
       </div>
     );
   return (
-    <PullRequestsContextRefresh value={query.refresh}>
+    <PullRequestsContextRefresh value={rescanContext}>
       <AvailablePullRequests
         key={JSON.stringify([
           storeKey,
@@ -304,6 +363,8 @@ export function PullRequestsPanel({ projectRef, number, tab }: PullRequestsPanel
         mutationsDisabledReason={resolvePullRequestsMutationsDisabledReason(serverConfig)}
         onRescan={rescan}
         isPending={query.isPending}
+        freshPageKey={freshPage.key}
+        onFreshPageConsumed={onFreshPageConsumed}
       >
         {checkoutSelector}
       </AvailablePullRequests>

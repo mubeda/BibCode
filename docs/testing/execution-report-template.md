@@ -133,6 +133,7 @@ Delete the unused result values above. Do not leave an ambiguous status.
 - Remote/local reconciliation stress-loop count and signature-failure publication:
 - Idle interval provider/browser request evidence:
 - Streaming operation event sequence and cancellation result:
+- Interrupted and disconnected inline read against a stalled remote (interrupt exit; transport-helper connection closed):
 - Competing catalog/Git Manager mutation and `operation-in-flight` result:
 
 | Scenario                                                                  | Result | Screenshot, command, or log evidence | Findings and unavailable behavior |

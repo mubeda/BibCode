@@ -384,6 +384,124 @@ async fn process_runner_cancels_in_flight_requests_and_cleans_up_children() {
     .await;
 }
 
+#[tokio::test]
+async fn process_runner_cleans_up_children_when_an_in_flight_run_is_dropped() {
+    let temp = TempDir::new().expect("temporary directory");
+    let script = write_process_tree_script(temp.path());
+    let tree = ProcessTreePaths::new(temp.path(), "dropped");
+    let mut run = Box::pin(
+        ProcessRunner.run_with_cancellation(tree.input(&script), CancellationToken::new()),
+    );
+    tokio::select! {
+        () = tree.wait_until_ready() => {}
+        result = &mut run => panic!("the process tree must still be running, got {result:?}"),
+    }
+
+    // An interrupted inline RPC drops its handler future this way: the token is
+    // never cancelled, so the runner's cancellation branch never runs.
+    drop(run);
+
+    tree.assert_stopped().await;
+}
+
+#[tokio::test]
+async fn process_runner_cleans_up_children_when_its_task_is_aborted() {
+    let temp = TempDir::new().expect("temporary directory");
+    let script = write_process_tree_script(temp.path());
+    let tree = ProcessTreePaths::new(temp.path(), "aborted");
+    let input = tree.input(&script);
+    let task = tokio::spawn(async move {
+        ProcessRunner
+            .run_with_cancellation(input, CancellationToken::new())
+            .await
+    });
+    tree.wait_until_ready().await;
+
+    // Session teardown aborts a request task that outlives its join bound.
+    task.abort();
+    let aborted = task.await.expect_err("the aborted run must not complete");
+    assert!(aborted.is_cancelled());
+
+    tree.assert_stopped().await;
+}
+
+#[test]
+fn process_runner_cleans_up_children_when_the_runtime_shuts_down_mid_run() {
+    let temp = TempDir::new().expect("temporary directory");
+    let script = write_process_tree_script(temp.path());
+    let tree = ProcessTreePaths::new(temp.path(), "shutdown");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("server-like runtime");
+    let input = tree.input(&script);
+    let _run = runtime.spawn(async move {
+        ProcessRunner
+            .run_with_cancellation(input, CancellationToken::new())
+            .await
+    });
+    wait_for_files_blocking(&tree.ready);
+
+    // Shutdown drops every task, including one that is running a process.
+    runtime.shutdown_timeout(Duration::from_secs(5));
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("assertion runtime")
+        .block_on(tree.assert_stopped());
+}
+
+/// A failed run still signals its process group after the root was reaped. A
+/// descendant in the group that keeps the output pipes open also keeps the
+/// group's id reserved, so the kill is exact; skipping it would leave the
+/// descendant running after the run was cancelled.
+#[cfg(unix)]
+#[tokio::test]
+async fn process_runner_cancellation_kills_a_descendant_that_outlives_the_root() {
+    let temp = TempDir::new().expect("temporary directory");
+    let script = write_outliving_descendant_script(temp.path());
+    let root_pid_path = temp.path().join("root.pid");
+    let ready_path = temp.path().join("descendant.ready");
+    let survived_path = temp.path().join("descendant.survived");
+    let release_path = temp.path().join("descendant.release");
+    let cancellation = CancellationToken::new();
+    let task = tokio::spawn({
+        let cancellation = cancellation.clone();
+        let input = script_input(
+            &script,
+            &[
+                root_pid_path.to_string_lossy().as_ref(),
+                ready_path.to_string_lossy().as_ref(),
+                survived_path.to_string_lossy().as_ref(),
+                release_path.to_string_lossy().as_ref(),
+            ],
+        );
+        async move {
+            ProcessRunner
+                .run_with_cancellation(input, cancellation)
+                .await
+        }
+    });
+    wait_for_file(&root_pid_path).await;
+    let root_pid = fs::read_to_string(&root_pid_path).expect("root PID");
+    wait_until_process_is_reaped(root_pid.trim()).await;
+    assert!(
+        !task.is_finished(),
+        "the descendant still holds the output pipes"
+    );
+
+    cancellation.cancel();
+
+    let error = task
+        .await
+        .expect("join cancellation task")
+        .expect_err("cancelled");
+    assert!(error.is_cancelled());
+    assert_cleanup_sentinels_remain_absent(&release_path, &[&survived_path]).await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn process_runner_times_out_and_cleans_up_children() {
     let temp = TempDir::new().expect("temporary directory");
@@ -854,6 +972,48 @@ done
     write_script(directory, "process-tree", "", &unix)
 }
 
+/// The root starts a descendant that inherits the output pipes, records its own
+/// PID once the descendant is ready, and exits.
+#[cfg(unix)]
+fn write_outliving_descendant_script(directory: &Path) -> PathBuf {
+    let unix = r#"root_pid_path=$1
+ready_path=$2
+survived_path=$3
+release_path=$4
+sh -c 'printf ready > "$1"
+while [ ! -f "$3" ]; do
+    sleep 0.05
+done
+printf survived > "$2"
+sleep 30' descendant "$ready_path" "$survived_path" "$release_path" </dev/null &
+while [ ! -f "$ready_path" ]; do
+    sleep 0.05
+done
+printf '%s' "$$" > "$root_pid_path.tmp"
+mv "$root_pid_path.tmp" "$root_pid_path"
+"#;
+    write_script(directory, "outliving-descendant", "", unix)
+}
+
+/// Waits until `pid` is reaped. `kill -0` still succeeds for a zombie.
+#[cfg(unix)]
+async fn wait_until_process_is_reaped(pid: &str) {
+    for _ in 0..400 {
+        let alive = std::process::Command::new("kill")
+            .args(["-0", pid])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("probe the root process")
+            .success();
+        if !alive {
+            return;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    panic!("the runner never reaped root process {pid}");
+}
+
 #[cfg(unix)]
 fn write_broken_stdin_tree_script(directory: &Path) -> PathBuf {
     let process_tree = write_process_tree_script(directory);
@@ -966,6 +1126,61 @@ async fn assert_cleanup_sentinels_remain_absent(release: &Path, sentinels: &[&Pa
             "process remained alive long enough to write {}",
             sentinel.display()
         );
+    }
+}
+
+/// The paths `write_process_tree_script` takes, in its argument order. Each
+/// process marks itself ready, and writes its `survived` sentinel only if it is
+/// still alive once `release` appears.
+struct ProcessTreePaths {
+    ready: [PathBuf; 3],
+    survived: [PathBuf; 3],
+    release: PathBuf,
+}
+
+impl ProcessTreePaths {
+    fn new(directory: &Path, label: &str) -> Self {
+        let path = |name: &str| directory.join(format!("{label}-{name}"));
+        Self {
+            ready: [
+                path("parent.ready"),
+                path("child.ready"),
+                path("grandchild.ready"),
+            ],
+            survived: [
+                path("parent.survived"),
+                path("child.survived"),
+                path("grandchild.survived"),
+            ],
+            release: path("release"),
+        }
+    }
+
+    fn input(&self, script: &Path) -> ProcessRunInput {
+        let arguments = self
+            .ready
+            .iter()
+            .chain(&self.survived)
+            .chain([&self.release])
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+        script_input(script, &arguments)
+    }
+
+    async fn wait_until_ready(&self) {
+        for path in &self.ready {
+            wait_for_file(path).await;
+        }
+    }
+
+    async fn assert_stopped(&self) {
+        let survived = self
+            .survived
+            .iter()
+            .map(PathBuf::as_path)
+            .collect::<Vec<_>>();
+        assert_cleanup_sentinels_remain_absent(&self.release, &survived).await;
     }
 }
 
