@@ -81,6 +81,23 @@ export const PersistedConnectionTarget = Schema.Union([
 ]);
 export type PersistedConnectionTarget = typeof PersistedConnectionTarget.Type;
 
+export const isPersistedConnectionTarget = Schema.is(PersistedConnectionTarget);
+
+/** Returns a real target instance with only its client-local label replaced. */
+export function withPersistedTargetLabel(
+  target: PersistedConnectionTarget,
+  label: string,
+): PersistedConnectionTarget {
+  switch (target._tag) {
+    case "BearerConnectionTarget":
+      return new BearerConnectionTarget({ ...target, label });
+    case "RelayConnectionTarget":
+      return new RelayConnectionTarget({ ...target, label });
+    case "SshConnectionTarget":
+      return new SshConnectionTarget({ ...target, label });
+  }
+}
+
 export type ConnectionTargetKind = ConnectionTarget["_tag"];
 
 export type NetworkStatus = "unknown" | "offline" | "online";

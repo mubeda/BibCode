@@ -1,3 +1,4 @@
+import type { EnvironmentId } from "@bibcode/contracts";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
 import * as Option from "effect/Option";
@@ -9,7 +10,11 @@ import {
   ConnectionCredential,
   ConnectionProfile,
 } from "../connection/catalog.ts";
-import { type ConnectionTarget, PersistedConnectionTarget } from "../connection/model.ts";
+import {
+  type ConnectionTarget,
+  PersistedConnectionTarget,
+  withPersistedTargetLabel,
+} from "../connection/model.ts";
 import * as TokenStore from "../authorization/tokenStore.ts";
 import {
   AcceptedStorageIdentitySchema,
@@ -151,6 +156,37 @@ export function removeConnectionFromCatalog(
   target: ConnectionTarget,
 ): ConnectionCatalogDocument {
   return removeConnectionMetadata(document, target, true);
+}
+
+export interface ConnectionTargetRelabel {
+  readonly document: ConnectionCatalogDocument;
+  readonly target: PersistedConnectionTarget;
+}
+
+/**
+ * Renames one saved environment: replaces only its target's display label, in
+ * place. Profiles, credentials, DPoP tokens, accepted identities, and target
+ * order are untouched. Returns null when the environment is not saved.
+ */
+export function relabelConnectionInCatalog(
+  document: ConnectionCatalogDocument,
+  environmentId: EnvironmentId,
+  label: string,
+): ConnectionTargetRelabel | null {
+  const current = document.targets.find((target) => target.environmentId === environmentId);
+  if (current === undefined) {
+    return null;
+  }
+  const target = withPersistedTargetLabel(current, label);
+  return {
+    document: {
+      ...document,
+      targets: document.targets.map((candidate) =>
+        candidate.environmentId === environmentId ? target : candidate,
+      ),
+    },
+    target,
+  };
 }
 
 export interface ConditionalConnectionRegistrationRemoval extends ConnectionRegistrationRemovalResult {

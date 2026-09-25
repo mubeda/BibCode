@@ -9,8 +9,10 @@ const h = vi.hoisted(() => ({
   navigate: vi.fn(),
   commandCalls: [] as Array<{ label?: string; input: unknown }>,
   menuItems: [] as Array<Record<string, unknown>>,
+  compatVerdict: null as unknown,
   reset() {
     h.environment = null;
+    h.compatVerdict = null;
     h.activeEnvironmentId = null;
     h.navigate.mockReset();
     h.commandCalls = [];
@@ -34,7 +36,7 @@ vi.mock("../../connection/catalog", () => ({
   environmentCatalog: { disconnect: { label: "environment-catalog:disconnect" } },
 }));
 vi.mock("../../connection/environmentCompat", () => ({
-  resolveEnvironmentCompatVerdict: () => null,
+  resolveEnvironmentCompatVerdict: () => h.compatVerdict,
   selectRemoteUpdateControlCapability: (serverConfig: unknown) => serverConfig !== null,
 }));
 vi.mock("@tanstack/react-router", () => ({
@@ -125,6 +127,22 @@ describe("EnvironmentContextCard", () => {
     expect(item).toBeDefined();
     (item!.onClick as () => void)();
     expect(onCheckForUpdates).toHaveBeenCalledWith(ENV_REMOTE);
+  });
+
+  it("keeps its secondary text at the 12 px floor", () => {
+    h.reset();
+    h.compatVerdict = { kind: "legacy" };
+    h.activeEnvironmentId = ENV_REMOTE;
+    h.environment = remoteEnvironment({
+      environment: { serverVersion: "0.4.2", capabilities: {} },
+    });
+    const markup = renderToStaticMarkup(
+      <EnvironmentContextCard updateBadge={<span data-testid="update-badge">Up to date</span>} />,
+    );
+    expect(markup).not.toMatch(/text-\[(?:\d|1[01])px\]/u);
+    expect(markup).not.toMatch(/text-muted-foreground\/\d+/u);
+    expect(markup).toContain("Limited compatibility");
+    expect(markup).toContain("text-xs");
   });
 
   it("renders the update-badge slot verbatim", () => {

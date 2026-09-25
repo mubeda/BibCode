@@ -143,6 +143,16 @@ export function createEnvironmentCatalogAtoms<R, E>(
       ),
   });
 
+  const rename = createRuntimeCommand(runtime, {
+    label: "environment-catalog:rename",
+    scheduler: commandScheduler,
+    concurrency: serial,
+    execute: (input: { readonly environmentId: EnvironmentIdType; readonly label: string }) =>
+      EnvironmentRegistry.EnvironmentRegistry.pipe(
+        Effect.flatMap((registry) => registry.rename(input.environmentId, input.label)),
+      ),
+  });
+
   return {
     catalogAtom,
     catalogValueAtom,
@@ -156,5 +166,6 @@ export function createEnvironmentCatalogAtoms<R, E>(
     removeRelayEnvironments,
     retryNow,
     acceptStorageIdentity,
+    rename,
   };
 }

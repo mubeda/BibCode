@@ -13,6 +13,7 @@ import {
   type EnvironmentRpcInput,
   type EnvironmentRpcStreamFailure,
   type EnvironmentRpcStreamValue,
+  type EnvironmentRpcSuccess,
   type EnvironmentStreamCommandRpcTag,
   type EnvironmentSubscriptionRpcTag,
   type EnvironmentUnaryRpcTag,
@@ -33,6 +34,13 @@ interface EnvironmentAtomOptions<Input, A, E, R> {
   }>;
 }
 
+/**
+ * Background refresh for a query atom: a fixed period in milliseconds, or a policy
+ * that picks the delay before the next read from each settled success and returns
+ * `null` to stop refreshing until the value changes.
+ */
+export type EnvironmentQueryRefreshInterval<A> = number | ((value: A) => number | null);
+
 interface EnvironmentQueryAtomOptions<Input, A, E, R> extends EnvironmentAtomOptions<
   Input,
   A,
@@ -41,7 +49,7 @@ interface EnvironmentQueryAtomOptions<Input, A, E, R> extends EnvironmentAtomOpt
 > {
   readonly staleTimeMs?: number;
   readonly idleTtlMs?: number;
-  readonly refreshIntervalMs?: number;
+  readonly refreshIntervalMs?: EnvironmentQueryRefreshInterval<A>;
 }
 
 interface EnvironmentSubscriptionAtomOptions<Input, A, E, R> {
@@ -564,10 +572,40 @@ export function createEnvironmentQueryAtomFamily<R, ER, Input, A, E>(
     return (
       options.refreshIntervalMs === undefined
         ? queryAtom
-        : queryAtom.pipe(Atom.withRefresh(options.refreshIntervalMs))
+        : withQueryRefreshInterval(queryAtom, options.refreshIntervalMs)
     ).pipe(Atom.setIdleTTL(idleTtlMs), Atom.withLabel(`${options.label}:${key}`));
   });
   return (target) => family(environmentRpcKey(target));
+}
+
+/**
+ * A fixed period re-reads after every emission (`Atom.withRefresh`). A policy arms at
+ * most one timer per settled success: in-flight reads, failures, and a `null` delay arm
+ * nothing, so polling stops until the value changes. The timer lives with the atom, not
+ * with its readers, and re-evaluation or disposal clears it.
+ */
+function withQueryRefreshInterval<A, E>(
+  self: Atom.Atom<AsyncResult.AsyncResult<A, E>>,
+  refreshIntervalMs: EnvironmentQueryRefreshInterval<A>,
+): Atom.Atom<AsyncResult.AsyncResult<A, E>> {
+  if (typeof refreshIntervalMs === "number") {
+    return self.pipe(Atom.withRefresh(refreshIntervalMs));
+  }
+  return Atom.transform(
+    self,
+    (get) => {
+      const result = get(self);
+      const delayMs =
+        AsyncResult.isSuccess(result) && !result.waiting ? refreshIntervalMs(result.value) : null;
+      if (delayMs !== null) {
+        // @effect-diagnostics-next-line globalTimers:off - Atom reads run outside an Effect runtime; like Atom.withRefresh, the atom finalizer clears this timer.
+        const handle = setTimeout(() => get.refresh(self), delayMs);
+        get.addFinalizer(() => clearTimeout(handle));
+      }
+      return result;
+    },
+    { initialValueTarget: self },
+  );
 }
 
 export function createEnvironmentSubscriptionAtomFamily<R, ER, Input, A, E>(
@@ -634,7 +672,7 @@ export function createEnvironmentRpcQueryAtomFamily<R, ER, TTag extends Environm
     readonly tag: TTag;
     readonly staleTimeMs?: number;
     readonly idleTtlMs?: number;
-    readonly refreshIntervalMs?: number;
+    readonly refreshIntervalMs?: EnvironmentQueryRefreshInterval<EnvironmentRpcSuccess<TTag>>;
   },
 ) {
   return createEnvironmentQueryAtomFamily(runtime, {

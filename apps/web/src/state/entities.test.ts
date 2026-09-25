@@ -84,6 +84,7 @@ import {
   readThreadRefs,
   readThreadShell,
   setActiveEnvironmentId,
+  reconcileEnvironmentSelection,
   useActiveEnvironmentId,
   useEnvironmentProjectRefs,
   useEnvironmentThreadRefs,
@@ -236,5 +237,52 @@ describe("web entity selectors", () => {
     expect(readThreadRefs()).toEqual([threadRef]);
     expect(findThreadRef(threadRef.threadId)).toBe(threadRef);
     expect(findThreadRef(ThreadId.make("missing"))).toBeNull();
+  });
+});
+
+describe("environment selection", () => {
+  beforeEach(() => {
+    const values = new Map<unknown, EnvironmentId | null>();
+    harness.registryGet.mockImplementation((atom: unknown) => values.get(atom) ?? null);
+    harness.registrySet.mockImplementation((atom: unknown, value: EnvironmentId | null) => {
+      values.set(atom, value);
+    });
+  });
+
+  it.each([null, "env-remote"])("initializes only an empty selection (%s)", (selected) => {
+    setActiveEnvironmentId(selected === null ? null : EnvironmentId.make(selected));
+    reconcileEnvironmentSelection(environmentId, "if-unselected");
+    expect(readActiveEnvironmentId()).toBe(selected ?? environmentId);
+  });
+
+  it.each([
+    { selected: null, previous: null, moves: true },
+    { selected: "env-old", previous: "env-old", moves: true },
+    { selected: "env-remote", previous: "env-old", moves: false },
+    { selected: "env-remote", previous: null, moves: false },
+    { selected: "env-1", previous: "env-1", moves: false },
+  ])("reconciles primary identity with $selected selected", ({ selected, previous, moves }) => {
+    if (previous !== null) {
+      reconcileEnvironmentSelection(EnvironmentId.make(previous), "follow-primary-identity");
+    }
+    setActiveEnvironmentId(selected === null ? null : EnvironmentId.make(selected));
+    reconcileEnvironmentSelection(environmentId, "follow-primary-identity");
+    expect(readActiveEnvironmentId()).toBe(moves ? environmentId : selected);
+  });
+
+  it("keeps primary history through startup defaults and unrelated selections", () => {
+    const oldPrimary = EnvironmentId.make("env-old");
+    const nextPrimary = EnvironmentId.make("env-next");
+    reconcileEnvironmentSelection(oldPrimary, "follow-primary-identity");
+    reconcileEnvironmentSelection(EnvironmentId.make("env-saved"), "if-unselected");
+    reconcileEnvironmentSelection(environmentId, "follow-primary-identity");
+    expect(readActiveEnvironmentId()).toBe(environmentId);
+
+    setActiveEnvironmentId(EnvironmentId.make("env-remote"));
+    reconcileEnvironmentSelection(nextPrimary, "follow-primary-identity");
+    expect(readActiveEnvironmentId()).toBe("env-remote");
+    setActiveEnvironmentId(nextPrimary);
+    reconcileEnvironmentSelection(environmentId, "follow-primary-identity");
+    expect(readActiveEnvironmentId()).toBe(environmentId);
   });
 });

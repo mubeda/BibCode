@@ -171,6 +171,11 @@ describe("environment RPC factory options", () => {
       idleTtlMs: 2,
       refreshIntervalMs: 3,
     })(target);
+    createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "query-refresh-policy",
+      tag: WS_METHODS.previewList,
+      refreshIntervalMs: () => null,
+    })(target);
 
     createEnvironmentRpcSubscriptionAtomFamily(runtime, {
       label: "subscription-defaults",
