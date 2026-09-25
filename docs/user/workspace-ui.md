@@ -11,8 +11,17 @@ returned usage does not borrow the local server's values.
 
 ## Left Panel
 
-The panel opens 320px wide. Drag its right edge to resize it; the width is
-remembered, and double-clicking the edge restores the default.
+The panel opens 422px wide by default (a 370px projects panel beside the 52px
+rail); on a narrower window it opens narrower so the main area keeps its
+minimum width. Drag its right edge to resize it; the width is remembered, and
+double-clicking the edge restores the default for the current window size.
+
+The rail chooses which environment the panel shows: **Local** (this machine) or
+one of your saved servers. The choice stays until you pick another entry;
+background updates from this machine's server never switch it back to Local. If
+the selected server is removed, the rail returns to Local. Saved servers show
+the name you gave them on this device (see
+[Remote access](./remote-access.md#name-a-saved-server)).
 
 The **Search** row is followed by an **Agents** nav row, then Projects. Its
 unread-count badge covers agents across all connected environments. Selecting

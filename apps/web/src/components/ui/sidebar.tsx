@@ -43,9 +43,18 @@ type SidebarContextProps = {
   toggleSidebar: () => void;
 };
 
-type SidebarResizableOptions = {
+/**
+ * Resolves the width restored by double-clicking the rail, evaluated at
+ * reset time against the wrapper element the reset already looks up. Lets a
+ * caller fit the default to the window's current size instead of a fixed
+ * number (e.g. never opening a sidebar that leaves no room for the main
+ * content).
+ */
+type SidebarDefaultWidthResolver = (context: { wrapper: HTMLElement }) => number;
+
+export type SidebarResizableOptions = {
   /** Width restored by double-clicking the rail; also clears the stored width. */
-  defaultWidth?: number;
+  defaultWidth?: number | SidebarDefaultWidthResolver;
   maxWidth?: number;
   minWidth?: number;
   onResize?: (width: number) => void;
@@ -61,7 +70,7 @@ type SidebarResizableOptions = {
 };
 
 type SidebarResolvedResizableOptions = {
-  defaultWidth: number | null;
+  defaultWidth: number | SidebarDefaultWidthResolver | null;
   maxWidth: number;
   minWidth: number;
   onResize?: (width: number) => void;
@@ -348,8 +357,36 @@ function SidebarTrigger({ className, onClick, ...props }: React.ComponentProps<t
   );
 }
 
-function clampSidebarWidth(width: number, options: SidebarResolvedResizableOptions): number {
+function clampSidebarWidth(
+  width: number,
+  options: Pick<SidebarResolvedResizableOptions, "minWidth" | "maxWidth">,
+): number {
   return Math.max(options.minWidth, Math.min(width, options.maxWidth));
+}
+
+/**
+ * Reads a resizable sidebar's stored width and clamps it to
+ * `[minWidth, maxWidth]` — the same clamp the restore effect below, the drag
+ * handle, and the double-click reset all apply. Returns null if nothing is
+ * stored, no key is configured, or storage is blocked/unavailable (private
+ * browsing, permissions, a host environment with no storage backend):
+ * treated the same as "nothing saved" rather than throwing. Exported so a
+ * caller that mounts before this component (e.g. to seed the initial
+ * `--sidebar-width` and avoid a flash of the default) reads and clamps a
+ * saved width exactly the way the restore effect does, instead of
+ * re-encoding the storage key and schema itself.
+ */
+export function readStoredSidebarWidth(
+  storageKey: string | null | undefined,
+  options: Pick<SidebarResolvedResizableOptions, "minWidth" | "maxWidth">,
+): number | null {
+  if (!storageKey || typeof window === "undefined") return null;
+  try {
+    const storedWidth = getLocalStorageItem(storageKey, Schema.Finite);
+    return storedWidth === null ? null : clampSidebarWidth(storedWidth, options);
+  } catch {
+    return null;
+  }
 }
 
 function SidebarRail({
@@ -575,7 +612,11 @@ function SidebarRail({
       if (!wrapper) return;
 
       event.preventDefault();
-      const width = clampSidebarWidth(resolvedResizable.defaultWidth, resolvedResizable);
+      const targetWidth =
+        typeof resolvedResizable.defaultWidth === "function"
+          ? resolvedResizable.defaultWidth({ wrapper })
+          : resolvedResizable.defaultWidth;
+      const width = clampSidebarWidth(targetWidth, resolvedResizable);
       wrapper.style.setProperty("--sidebar-width", `${width}px`);
       if (resolvedResizable.storageKey && typeof window !== "undefined") {
         removeLocalStorageItem(resolvedResizable.storageKey);
@@ -592,9 +633,8 @@ function SidebarRail({
     const wrapper = rail.closest<HTMLElement>("[data-slot='sidebar-wrapper']");
     if (!wrapper) return;
 
-    const storedWidth = getLocalStorageItem(resolvedResizable.storageKey, Schema.Finite);
-    if (storedWidth === null) return;
-    const clampedWidth = clampSidebarWidth(storedWidth, resolvedResizable);
+    const clampedWidth = readStoredSidebarWidth(resolvedResizable.storageKey, resolvedResizable);
+    if (clampedWidth === null) return;
     wrapper.style.setProperty("--sidebar-width", `${clampedWidth}px`);
     resolvedResizable.onResize?.(clampedWidth);
   }, [resolvedResizable]);
