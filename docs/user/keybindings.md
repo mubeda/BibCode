@@ -100,12 +100,12 @@ surface them.
 - `chat.newLocal`: create a new chat thread for the active project in a new environment (local/worktree determined by app settings (default `local`))
 - `modelPicker.toggle`: open/close the model picker
 - `editor.openFavorite`: open current project/worktree in the last-used editor
-- `thread.previous` / `thread.next`: jump through visible left-panel workspace rows
+- `thread.previous` / `thread.next`: jump through visible left-panel workspace cards
 - `thread.steerQueuedMessage`: steer the first queued message into the running
   turn on Codex or Claude; defaults to `mod+shift+enter` with
   `when: "editableFocus"`. The composer consumes this shortcut without inserting
   a newline; unavailable steering leaves the draft unchanged.
-- `thread.jump.1` through `thread.jump.9`: jump to a visible left-panel workspace row
+- `thread.jump.1` through `thread.jump.9`: jump to a visible left-panel workspace card
 - `modelPicker.jump.1` through `modelPicker.jump.9`: jump to a model/provider row while the model picker is open
 - `script.{id}.run`: run a project script by id (for example `script.test.run`)
 

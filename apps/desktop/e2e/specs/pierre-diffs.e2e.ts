@@ -243,7 +243,7 @@ async function openFixtureWorkspace(): Promise<void> {
   }
   await project.waitForDisplayed();
   const primaryWorkspace = browser.$(
-    '//a[@data-thread-item="true"][.//span[normalize-space()="main"]]',
+    '//*[@data-thread-item="true"][.//span[normalize-space()="main"]]',
   );
   if (!(await primaryWorkspace.isDisplayed())) {
     await project.click();

@@ -112,16 +112,34 @@ import type {
   SourceControlRepositoryLookupInput,
 } from "./sourceControl.ts";
 
+/**
+ * A divider between groups of a context menu. Renderers drop leading, trailing
+ * and repeated separators, so callers can build groups without tracking which
+ * neighbouring items were omitted.
+ */
+export interface ContextMenuSeparator {
+  readonly separator: true;
+}
+
 export interface ContextMenuItem<T extends string = string> {
   id: T;
   label: string;
   destructive?: boolean;
   disabled?: boolean;
+  /** Explains an unavailable action; exposed by renderers to sighted and assistive users. */
+  description?: string;
   /** Renders as a non-interactive section header label. Web fallback only — stripped on desktop native menus. */
   header?: boolean;
   /** Icon keyword resolved by the web fallback. Stripped on desktop native menus. */
   icon?: string;
-  children?: readonly ContextMenuItem<T>[];
+  children?: readonly ContextMenuEntry<T>[];
+}
+
+/** One row of a context menu: an actionable item or a separator. */
+export type ContextMenuEntry<T extends string = string> = ContextMenuItem<T> | ContextMenuSeparator;
+
+export interface ContextMenuSeparatorSchemaType {
+  readonly separator: true;
 }
 
 export interface ContextMenuItemSchemaType {
@@ -129,24 +147,38 @@ export interface ContextMenuItemSchemaType {
   readonly label: string;
   readonly destructive?: boolean;
   readonly disabled?: boolean;
+  readonly description?: string;
   readonly header?: boolean;
   readonly icon?: string;
-  readonly children?: readonly ContextMenuItemSchemaType[];
+  readonly children?: readonly ContextMenuEntrySchemaType[];
 }
+
+export type ContextMenuEntrySchemaType = ContextMenuItemSchemaType | ContextMenuSeparatorSchemaType;
+
+export const ContextMenuSeparatorSchema: Schema.Codec<ContextMenuSeparatorSchemaType> =
+  Schema.Struct({
+    separator: Schema.Literal(true),
+  });
 
 export const ContextMenuItemSchema: Schema.Codec<ContextMenuItemSchemaType> = Schema.Struct({
   id: Schema.String,
   label: Schema.String,
   destructive: Schema.optionalKey(Schema.Boolean),
   disabled: Schema.optionalKey(Schema.Boolean),
+  description: Schema.optionalKey(Schema.String),
   header: Schema.optionalKey(Schema.Boolean),
   icon: Schema.optionalKey(Schema.String),
   children: Schema.optionalKey(
     Schema.Array(
-      Schema.suspend((): Schema.Codec<ContextMenuItemSchemaType> => ContextMenuItemSchema),
+      Schema.suspend((): Schema.Codec<ContextMenuEntrySchemaType> => ContextMenuEntrySchema),
     ),
   ),
 });
+
+export const ContextMenuEntrySchema: Schema.Codec<ContextMenuEntrySchemaType> = Schema.Union([
+  ContextMenuItemSchema,
+  ContextMenuSeparatorSchema,
+]);
 
 export type DesktopUpdateStatus =
   | "disabled"
@@ -1267,7 +1299,7 @@ export interface DesktopBridge {
   confirm: (message: string) => Promise<boolean>;
   setTheme: (theme: DesktopTheme) => Promise<void>;
   showContextMenu: <T extends string>(
-    items: readonly ContextMenuItem<T>[],
+    items: readonly ContextMenuEntry<T>[],
     position?: { x: number; y: number },
   ) => Promise<T | null>;
   openExternal: (url: string) => Promise<boolean>;
@@ -1380,7 +1412,7 @@ export interface LocalApi {
   };
   contextMenu: {
     show: <T extends string>(
-      items: readonly ContextMenuItem<T>[],
+      items: readonly ContextMenuEntry<T>[],
       position?: { x: number; y: number },
     ) => Promise<T | null>;
   };

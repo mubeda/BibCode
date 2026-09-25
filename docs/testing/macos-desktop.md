@@ -355,6 +355,14 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   without Early Access labels and omit Grok/Grok Terminal;
 - external worktree grouping, full paths, actions, physical identity, and
   restart are correct;
+- sidebar menus: right-click a worktree card, the primary card and a project
+  header, and open the header's **⋯** from the keyboard (Tab to it, then
+  **Enter**). Each native menu separates Open in/Pull, the copy actions,
+  Pin/Unread/Rename and the destructive item, with no doubled separator before
+  **Delete Worktree…** or **Remove Project…**, and **⋯** shows the same items
+  as the header's right-click menu. Tab to a card and press **Shift+F10**
+  (and, on Linux, the **Menu** key): exactly one native menu opens at the card,
+  and no error toast reports a second menu;
 - thread creation/switching, terminal I/O, Activity elapsed time, subagent row
   layout, background tasks, keyboard focus, and Shift+Tab work; and
 - narrow panels, menus, overlays, icons, and focus states remain contained.

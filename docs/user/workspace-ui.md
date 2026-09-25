@@ -24,7 +24,7 @@ the name you gave them on this device (see
 [Remote access](./remote-access.md#name-a-saved-server)).
 
 The **Search** row is followed by an **Agents** nav row, then Projects. Its
-unread-count badge covers agents across all connected environments. Selecting
+unread-count badge covers agents across all connected environments and is hidden when nothing is unread. Selecting
 the row opens the full-screen Agents view; its top strip has a back arrow for
 returning to the normal workspace, the title **agents**, and an **N unread**
 badge.
@@ -47,16 +47,44 @@ pane while keeping the list visible. The per-row **Jump to workspace** action
 exits to the normal workspace view and re-points the environment rail to that
 row's environment.
 
-Projects are shown as groups of workspace rows:
+Projects are shown as groups of workspace cards. Each card is outlined, so it
+is clear which lines belong together; the open card has a light fill and a
+stronger outline, and selected cards a tinted one. A card has up to three
+lines:
 
-- The primary row represents the project's live checkout. Its branch label is
-  refreshed from the checkout, not from a stale thread title.
-- The primary row is backed by an undeletable default thread. Attempts to delete
-  it should guide the user to remove the project instead.
-- Worktree rows represent eager worktree threads. Creating a worktree creates
-  both the Git worktree and its thread before the first message.
-- Rows can show pinned/unread state and nested agent activity such as provider,
-  running state, and elapsed time.
+- **Line 1:** a status glyph, the title (bold while unread), a **primary**
+  chip on the main checkout, and a pin when pinned. Hovering or focusing a
+  worktree card shows **Archive**; holding the thread-jump modifier shows its
+  number instead.
+- **Line 2:** the branch (hidden when it equals the title), the pull or merge
+  request number (`#12`, or `!57` on GitLab), coloured by state and opening
+  the request when clicked, a dot for uncommitted changes, a terminal icon
+  while a terminal process runs, and a globe that opens a discovered local
+  server.
+- **Line 3:** the provider icon, what the agent is doing (its current tool
+  while working, otherwise the latest reply or prompt, or **Delivery failed**
+  or **Delivery uncertain** when a message didn't land), the model (its short
+  name, or its identifier such as `sonnet` when the catalog gives it none), and
+  how long ago that was.
+
+The glyph's shape carries the status: a hand (needs approval), a question mark
+(waiting for your answer), a spinner (working or connecting), a warning
+triangle (failed), a checklist (plan ready), a filled dot (finished, not opened
+yet) and a hollow ring (idle). A collapsed project and the **Show more** row
+show the most urgent glyph among the cards they hide.
+
+- The primary card represents the project's live checkout. Its title is the
+  checkout's current branch, refreshed from Git rather than from a stored
+  thread title.
+- The primary card is backed by an undeletable default thread; to remove it,
+  remove the project from its header.
+- Worktree cards represent worktree threads. Creating a worktree creates both
+  the Git worktree and its thread before the first message.
+- Other chats open in a worktree show as **N more chats** under its card;
+  chats in the main checkout count on the primary card.
+
+Tab moves between cards; **Enter** opens one, and **Shift+F10** or the
+**Menu** key opens its menu at the card.
 
 The sidebar says **No projects yet** only after every configured environment
 has connected and returned a successful empty project snapshot. During startup,
@@ -101,12 +129,38 @@ opened.
 Clicking a project header selects it and toggles its thread list; the header
 stays highlighted as the selected node until you open a thread, and it is also
 highlighted while that project's Git Manager or Pull Requests route is open.
+Hovering or focusing a header shows **⋯** (project actions), **+** (New
+worktree), **Git Manager** and, when enabled, **Pull Requests**.
 
-Workspace row context menus include update/open/copy/pin/unread actions, plus
-delete worktree for worktree rows and remove project for primary rows. On the
-local desktop environment, **Open in → File Explorer** opens the repository
-folder for a primary row or the worktree folder for a worktree row. The action
-is omitted for remote environments and browser mode.
+Menus separate their groups:
+
+- **Worktree card:** **Open in ›**, **Pull** · **Copy Path**, **Copy Branch
+  Name**, **Copy Thread ID** · **Pin** or **Unpin**, **Mark as Unread** or
+  **Mark as Read**, **Rename…** · **Delete Worktree…**. A thread without a
+  worktree offers **Delete Thread** instead, with an ellipsis when deletion
+  asks for confirmation.
+- **Primary card (the main checkout):** **Open in ›**, **Pull** · **Copy Path**,
+  **Copy Branch Name** · **Pin** or **Unpin**, **Mark as Unread** or **Mark as
+  Read**. It can't be deleted; remove the project from its header instead.
+- **Project header** (**⋯** or right-click): **New Worktree…** · **Rename…**,
+  **Group into…**, **Copy Path** · **Show Hidden Worktrees (N)** or **Hide
+  Discovered Worktrees**, **Archived Threads** · **Remove Project…**. N appears
+  once the project is expanded. Grouped projects list their members in a
+  submenu for the actions that target one member.
+- **Several selected cards:** **Mark as Unread (N)** · **Delete (N)**.
+
+**Pull** runs `git pull` in that checkout. **Copy Branch Name** copies the
+branch the card shows and is left out when the card shows none. On the local
+desktop environment, **Open in → File Explorer** opens the repository folder
+for a primary card or the worktree folder for a worktree card; it is left out for
+remote environments and browser mode.
+
+The desktop app shows native menus on macOS and Linux. In the browser and on
+Windows the menu opens inside the app: its first enabled item is focused, the
+arrow keys move between items (skipping separators and disabled items),
+**Home** and **End** jump to the ends, **→** and **←** open and close a
+submenu, **Enter** or **Space** chooses, and **Escape** closes the menu and
+returns focus to where you were.
 
 External editors are listed when the server host can find them on `PATH`. Zed
 is additionally detected through the `zeditor` alias, a Flatpak export

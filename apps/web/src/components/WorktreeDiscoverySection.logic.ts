@@ -151,8 +151,16 @@ export function formatWorktreeAddAllSummary(input: {
   };
 }
 
+/**
+ * The project menu's discovery toggle. `hiddenCount` comes from the mounted
+ * discovery section; null (collapsed project, not loaded) omits the count.
+ */
 export function getDiscoveryVisibilityMenuLabel(
   visibility: WorktreeDiscoveryVisibility,
-): "Show hidden worktrees" | "Hide discovered worktrees" {
-  return visibility === "hidden" ? "Show hidden worktrees" : "Hide discovered worktrees";
+  hiddenCount: number | null = null,
+): string {
+  if (visibility !== "hidden") {
+    return "Hide Discovered Worktrees";
+  }
+  return hiddenCount === null ? "Show Hidden Worktrees" : `Show Hidden Worktrees (${hiddenCount})`;
 }

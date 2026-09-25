@@ -1,4 +1,4 @@
-import type { ContextMenuItem, LocalApi } from "@bibcode/contracts";
+import type { ContextMenuEntry, LocalApi } from "@bibcode/contracts";
 
 import { resetRequestLatencyStateForTests } from "./rpc/requestLatencyState";
 import { showContextMenuFallback } from "./contextMenuFallback";
@@ -41,7 +41,7 @@ function createBrowserLocalApi(): LocalApi {
     },
     contextMenu: {
       show: async <T extends string>(
-        items: readonly ContextMenuItem<T>[],
+        items: readonly ContextMenuEntry<T>[],
         position?: { x: number; y: number },
       ): Promise<T | null> => {
         if (window.desktopBridge) {

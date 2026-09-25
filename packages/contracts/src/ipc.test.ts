@@ -2,7 +2,10 @@ import * as Schema from "effect/Schema";
 import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
+  type ContextMenuEntry,
+  ContextMenuEntrySchema,
   ContextMenuItemSchema,
+  ContextMenuSeparatorSchema,
   type DesktopBridge,
   DesktopProjectDataEnvironmentStatusSchema,
   DesktopProjectDataRecoveryResultSchema,
@@ -15,6 +18,9 @@ import { expectDecodeFailure, expectEncodeFailure } from "./test/schemaAssertion
 
 const decodeContextMenuItem = Schema.decodeUnknownSync(ContextMenuItemSchema);
 const encodeContextMenuItem = Schema.encodeSync(ContextMenuItemSchema);
+const decodeContextMenuEntry = Schema.decodeUnknownSync(ContextMenuEntrySchema);
+const encodeContextMenuEntry = Schema.encodeSync(ContextMenuEntrySchema);
+const decodeContextMenuSeparator = Schema.decodeUnknownSync(ContextMenuSeparatorSchema);
 const decodeDesktopEnvironmentBootstrap = Schema.decodeUnknownSync(
   DesktopEnvironmentBootstrapSchema,
 );
@@ -366,7 +372,7 @@ describe("ContextMenuItemSchema", () => {
     };
     const decoded = decodeContextMenuItem(input);
 
-    expect(decoded.children?.[0]?.id).toBe("push");
+    expect(decoded.children?.[0]).toMatchObject({ id: "push" });
     expect(encodeContextMenuItem(decoded)).toEqual(input);
   });
 
@@ -379,5 +385,63 @@ describe("ContextMenuItemSchema", () => {
     };
     expectDecodeFailure(ContextMenuItemSchema, invalid, expected);
     expectEncodeFailure(ContextMenuItemSchema, invalid, expected);
+  });
+});
+
+describe("ContextMenuEntrySchema", () => {
+  it("decodes and encodes a bare separator", () => {
+    expect(decodeContextMenuEntry({ separator: true })).toEqual({ separator: true });
+    expect(encodeContextMenuEntry({ separator: true })).toEqual({ separator: true });
+    expect(decodeContextMenuSeparator({ separator: true })).toEqual({ separator: true });
+  });
+
+  it("round-trips separators between submenu children", () => {
+    const input = {
+      id: "open-in",
+      label: "Open in",
+      children: [
+        { id: "open-in:file-explorer", label: "File Explorer" },
+        { separator: true },
+        { id: "open-in:vscode", label: "VS Code" },
+      ],
+    };
+    expect(encodeContextMenuEntry(decodeContextMenuEntry(input))).toEqual(input);
+  });
+
+  it("round-trips a disabled action's explanation", () => {
+    const input = {
+      id: "pull",
+      label: "Pull",
+      disabled: true,
+      description: "Workspace is unavailable.",
+    };
+    expect(encodeContextMenuEntry(decodeContextMenuEntry(input))).toEqual(input);
+  });
+
+  it("types a mixed list of items and separators", () => {
+    const entries: readonly ContextMenuEntry<"pull" | "copy-path">[] = [
+      { id: "pull", label: "Pull" },
+      { separator: true },
+      { id: "copy-path", label: "Copy Path" },
+    ];
+    expect(entries.filter((entry) => "separator" in entry)).toHaveLength(1);
+  });
+
+  it("rejects a separator flag that is not literally true", () => {
+    const expected = {
+      rootTag: "AnyOf" as const,
+      paths: [["id"]],
+      containsTag: "MissingKey" as const,
+    };
+    expectDecodeFailure(ContextMenuEntrySchema, { separator: false }, expected);
+    expectEncodeFailure(ContextMenuEntrySchema, { separator: false }, expected);
+  });
+
+  it("rejects an invalid separator nested in children", () => {
+    expectDecodeFailure(
+      ContextMenuEntrySchema,
+      { id: "git", label: "Git", children: [{ separator: "yes" }] },
+      { rootTag: "AnyOf", paths: [["children", 0, "id"]], containsTag: "MissingKey" },
+    );
   });
 });

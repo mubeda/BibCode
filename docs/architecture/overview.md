@@ -157,7 +157,7 @@ flowchart TB
   network-transfer variant with a 24-hour safety bound. Transfers nobody can
   cancel run on the bounded variant, capped at 10 minutes: automatic fetch,
   `vcs.pull`, and the stacked-action and publish pushes, wherever they start
-  (chat header, Sidebar Update, Source Control panel, or the Git Manager's
+  (chat header, Sidebar Pull, Source Control panel, or the Git Manager's
   Create PR dialog). SSH transports have no stall guard, so a dead SSH link ends
   only by cancellation, those bounds, or the connection's own keepalive
   settings. The orchestration bootstrap fetch and the Pull Requests checkout

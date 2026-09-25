@@ -1828,7 +1828,8 @@ sizes. Cover relevant:
   context card with its ⋯ menu when a remote environment is selected—verifying
   that switching rail selection filters the projects panel without interrupting
   running sessions on other environments—and the cross-environment **Agents**
-  nav row below Search, whose unread badge aggregates across environments;
+  nav row below Search, whose unread badge aggregates across environments and
+  is hidden when nothing is unread;
   verify that it opens the full Agents view, selecting a row shows its live
   session in the right pane, the back arrow returns to the normal view, and the
   per-row jump-to-workspace action returns to the normal view and re-points the
@@ -1841,6 +1842,22 @@ sizes. Cover relevant:
   while switching to verify that its completion does not replace the new
   selection's usage;
 - discovered and adopted external worktrees;
+- workspace cards and sidebar menus at the 422 px default width, in light and
+  dark: every status glyph (needs approval, waiting for your answer, working,
+  failed, plan ready, finished not opened, idle), the branch line with an open
+  and a merged request, a dirty dot and a running terminal, the session line,
+  **N more chats**, the hidden-worktree line, and the focus ring; **Shift+F10**
+  on a focused card opens exactly one menu at the card; separators between menu
+  groups in the native menus (macOS, Linux) and the in-app menu (Windows,
+  browser), never two in a row and never at an edge; **Pull** and **Copy Branch
+  Name** on worktree and primary cards; **Show Hidden Worktrees (N)** on an
+  expanded project with discovery; and keyboard operation of the in-app menu;
+- the left panel after the typography sweep: an expanded project without
+  worktrees shows only its primary card; a saved server's project headers show
+  no cloud icon, while a WSL project under **Local** keeps its container icon;
+  the **Projects** label is sentence case; **Settings** matches the nav rows;
+  and no left-panel text is smaller than the cards' 12 px lines or letter-spaced
+  (the stage badge stays uppercase);
 - Create Worktree exact local and remote ref selection: the exact value appears
   once, the derived name remains correct, and a remote-to-local race succeeds
   without duplicate branch creation;

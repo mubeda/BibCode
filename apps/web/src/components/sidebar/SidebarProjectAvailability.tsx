@@ -58,7 +58,7 @@ export function SidebarProjectAvailability({
     view.kind === "configuration-error";
 
   return (
-    <div className="px-2 pt-4 text-center text-xs text-muted-foreground/60">
+    <div className="px-2 pt-4 text-center text-xs text-muted-foreground">
       <div>{copy}</div>
       {view.kind !== "empty-confirmed" && view.kind !== "loading" && view.error ? (
         <div className="mt-1 break-words">{view.error}</div>

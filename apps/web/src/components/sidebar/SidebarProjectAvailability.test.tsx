@@ -61,6 +61,8 @@ function render(
 describe("SidebarProjectAvailability", () => {
   it("uses the genuine empty copy only for an authoritative empty catalog", () => {
     expect(render("empty-confirmed")).toContain("No projects yet");
+    // UI.md: muted text uses the solid token, never an alpha-reduced one.
+    expect(render("empty-confirmed")).not.toContain("text-muted-foreground/");
     for (const kind of [
       "loading",
       "degraded",
