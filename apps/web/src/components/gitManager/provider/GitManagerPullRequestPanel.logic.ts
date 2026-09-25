@@ -88,7 +88,8 @@ export interface ExistingPullRequestSummary {
 /** A host the caller already identified: the Pull Requests panel's context. */
 export interface CreatePullRequestProviderHint {
   readonly kind: PullRequestsProviderKind;
-  readonly host: string;
+  /** The host's web address as the server reported it, never built here. */
+  readonly baseUrl: string;
 }
 
 /** The hinted host as a provider, the way status names a GitHub or GitLab host. */
@@ -100,7 +101,7 @@ export function hintedProvider(
     : {
         kind: hint.kind,
         name: resolveChangeRequestPresentationForKind(hint.kind).providerName,
-        baseUrl: `https://${hint.host}`,
+        baseUrl: hint.baseUrl,
       };
 }
 

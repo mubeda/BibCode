@@ -30,6 +30,7 @@ import {
   resolvePullRequestsMutationsDisabledReason,
 } from "./pullRequestsAvailability";
 import { PullRequestsContextRefresh } from "./pullRequestsContextRefresh";
+import { pullRequestsHostAddress } from "./pullRequestsHost.logic";
 import { PullRequestsUnavailableState } from "./PullRequestsUnavailableState";
 import { PullRequestsDetailView } from "./detail/PullRequestsDetailView";
 import { PermissionButton } from "../ui/permission-button";
@@ -69,8 +70,11 @@ function AvailablePullRequests({
   const refresh = () => (number === undefined ? listRef.current?.refresh() : onRescan());
   // This context already identified the host, so the dialog need not wait for status.
   const providerHint = useMemo(
-    () => ({ kind: context.provider, host: context.host }),
-    [context.host, context.provider],
+    () => ({
+      kind: context.provider,
+      baseUrl: pullRequestsHostAddress({ webUrl: context.webUrl, host: context.host }),
+    }),
+    [context.host, context.provider, context.webUrl],
   );
   return (
     <section
