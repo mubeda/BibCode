@@ -448,6 +448,25 @@ the intended hosts separately from recording-stub tests and report blocked
 network/listener execution with the exact error. GitLab multi-line review
 comments currently use the documented end-line fallback.
 
+For supervised process runner changes (spawn, deadline, cancellation, drop,
+or process-tree cleanup), run the owner and the inline Git RPC boundaries:
+
+```sh
+cargo test -p bibcode-server --lib process:: -j 2
+cargo test -p bibcode-server --test process_runner -j 2
+cargo test -p bibcode-server --test production_git_manager_rpc -j 2
+cargo test -p bibcode-server --test production_git_vcs_rpc -j 2
+```
+
+Keep separate evidence that a dropped, aborted, or runtime-shutdown run leaves
+no descendant alive; that interrupting an inline Git read, or closing its
+socket, closes the transport helper's connection to a stalled remote; and that
+a cancelled run still stops a descendant that outlives its root. On Linux the
+subreaper unit test re-executes itself to prove the killed helper ended by
+`SIGKILL` and the dropped run's root was reaped. On Windows the same drop
+terminates the run's Job, with kill-on-close as the backstop; record native
+Windows results for these cases rather than inferring them from Unix.
+
 Run the closest behavioral coverage before broad suites. Discover exact Rust
 targets and filters from manifests and `cargo test -- --list`; do not invent
 test names. When concurrency matters, run the affected owner at its default
@@ -806,7 +825,9 @@ a stale first page that resolves behind the loaded generation is ignored); the
 shared project-then-repository lock rejecting a competing Git Manager or
 catalog mutation with `operation-in-flight`;
 server-authored blocked copy rendered unchanged; stream cancellation reaching
-the Git child; and one explicit provider refresh after an idle interval that
+the Git child; an interrupted or disconnected inline read (such as
+`gitManager.getRemoteTags` against a stalled remote) stopping Git's transport
+helper; and one explicit provider refresh after an idle interval that
 produced no provider process or browser network request.
 
 For external Git Manager refresh, keep the automatic fetch interval at its

@@ -133,7 +133,7 @@ where
     let overall_deadline =
         deadline.unwrap_or_else(|| tokio::time::Instant::now() + execution.timeout);
     #[cfg(windows)]
-    let mut child = {
+    let child = {
         let mut spawn = tokio::task::spawn_blocking(move || spawn_wrapped(&mut command));
         match tokio::time::timeout_at(overall_deadline, &mut spawn).await {
             Ok(joined) => joined
@@ -157,22 +157,95 @@ where
         }
     };
     #[cfg(not(windows))]
-    let mut child = spawn_wrapped_until(&mut command, overall_deadline)
+    let child = spawn_wrapped_until(&mut command, overall_deadline)
         .await
         .map_err(SupervisedRunError::Spawn)?;
-    observer(child.id());
+    let mut guard = SupervisedChildGuard::arm(child);
+    observer(guard.child().id());
 
     let outcome = execute_child(
-        &mut *child,
+        guard.child_mut(),
         &execution,
         cancellation,
         Some(overall_deadline),
     )
     .await;
+    let child = guard.disarm();
     if outcome.is_err() {
+        // A failed run may already have reaped its root while a descendant
+        // still holds the output pipes. The group is still signalled then: a
+        // descendant in the group keeps the group's id reserved, so the kill
+        // reaches exactly the stragglers. Only a group with no members left
+        // could have its id reused, which takes a PID wrap-around in between.
         terminate_and_wait_owned(child, cleanup_timeout, "supervised process").await;
     }
     outcome
+}
+
+/// Owns a spawned child until its supervised run settles.
+///
+/// A run's future can be dropped before it settles: the session drops an
+/// inline RPC handler on interrupt or socket teardown, aborts a request task
+/// that outlives teardown, and runtime shutdown and panics drop whatever is
+/// running. None of these reach the cancellation branch, and dropping the child
+/// alone kills only its root (`kill_on_drop`), so descendants such as Git's
+/// transport helpers would keep running with their connections open.
+///
+/// Dropping an armed guard therefore requests termination of the whole
+/// ownership unit (`killpg(SIGKILL)` on Unix, job termination on Windows), but
+/// only while the root is unreaped: `id()` stays `Some` until tokio reaps the
+/// root, and until then its PID, and so the process-group id, cannot be
+/// reused. A run dropped after the root was reaped (while a descendant still
+/// holds the output pipes) is therefore not signalled.
+///
+/// `Drop` never waits, spawns, or blocks. The dropped child hands its root to
+/// tokio's orphan reaper, and whichever process adopts the killed descendants
+/// reaps them. Callers that must wait for cleanup to finish cancel the run's
+/// token instead.
+struct SupervisedChildGuard {
+    child: Option<Box<dyn ChildWrapper>>,
+}
+
+impl SupervisedChildGuard {
+    fn arm(child: Box<dyn ChildWrapper>) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn child(&self) -> &dyn ChildWrapper {
+        self.child
+            .as_deref()
+            .expect("an armed supervised child guard owns its child")
+    }
+
+    fn child_mut(&mut self) -> &mut dyn ChildWrapper {
+        self.child
+            .as_deref_mut()
+            .expect("an armed supervised child guard owns its child")
+    }
+
+    /// Hands the child to its next owner once the run has settled.
+    fn disarm(mut self) -> Box<dyn ChildWrapper> {
+        self.child
+            .take()
+            .expect("an armed supervised child guard owns its child")
+    }
+}
+
+impl Drop for SupervisedChildGuard {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_deref_mut() {
+            terminate_dropped_child(child);
+        }
+    }
+}
+
+fn terminate_dropped_child(child: &mut dyn ChildWrapper) {
+    if child.id().is_none() {
+        return;
+    }
+    let mut report = ProcessCleanupReport::default();
+    request_termination(child, &mut report);
+    log_cleanup_failures("dropped supervised process", &report);
 }
 
 struct SupervisedExecution {
@@ -615,8 +688,13 @@ mod tests {
         }
     }
 
+    /// A process ID above every supported `pid_max`, so even a misused fake ID
+    /// names no process.
+    const NONEXISTENT_PROCESS_ID: u32 = 2_147_483_647;
+
     #[derive(Debug)]
     struct PendingChild {
+        id: Option<u32>,
         kill_calls: Arc<AtomicUsize>,
         wait_calls: Arc<AtomicUsize>,
     }
@@ -632,6 +710,10 @@ mod tests {
 
         fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
             self
+        }
+
+        fn id(&self) -> Option<u32> {
+            self.id
         }
 
         fn start_kill(&mut self) -> io::Result<()> {
@@ -704,11 +786,12 @@ mod tests {
         ExitStatus::from_raw(0)
     }
 
-    fn pending_child() -> (Box<PendingChild>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    fn pending_child(id: Option<u32>) -> (Box<PendingChild>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let kill_calls = Arc::new(AtomicUsize::new(0));
         let wait_calls = Arc::new(AtomicUsize::new(0));
         (
             Box::new(PendingChild {
+                id,
                 kill_calls: Arc::clone(&kill_calls),
                 wait_calls: Arc::clone(&wait_calls),
             }),
@@ -1032,7 +1115,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_child_with_failed_owner_and_root_kills_returns_bounded_report() {
-        let (mut child, kill_calls, wait_calls) = pending_child();
+        let (mut child, kill_calls, wait_calls) = pending_child(Some(NONEXISTENT_PROCESS_ID));
         let cleanup =
             tokio::time::timeout(Duration::from_secs(3), terminate_and_wait(&mut *child)).await;
         let report = cleanup.expect("cleanup must return within its bounded wait deadline");
@@ -1090,6 +1173,173 @@ mod tests {
         .expect("background reaper must release its owner after wait completes");
         assert_eq!(wait_calls.load(Ordering::SeqCst), 2);
         assert_eq!(drop_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dropping_an_armed_guard_terminates_the_child_once_without_waiting() {
+        let (child, kill_calls, wait_calls) = tracking_child(false);
+
+        drop(SupervisedChildGuard::arm(child));
+
+        assert_eq!(kill_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(wait_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_disarmed_guard_hands_the_child_over_without_signalling_it() {
+        let (child, kill_calls, wait_calls) = tracking_child(false);
+
+        let mut child = SupervisedChildGuard::arm(child).disarm();
+        child
+            .wait()
+            .await
+            .expect("the new owner can still reap the child");
+        drop(child);
+
+        assert_eq!(kill_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(wait_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_guard_whose_root_was_reaped_does_not_signal_its_id() {
+        let (mut child, kill_calls, _wait_calls) = tracking_child(false);
+        child.wait().await.expect("reap the completed root");
+        assert_eq!(child.id(), None, "tokio retires the id once it reaps");
+
+        drop(SupervisedChildGuard::arm(child));
+
+        assert_eq!(kill_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_guard_without_a_root_id_is_not_signalled() {
+        let (child, kill_calls, wait_calls) = pending_child(None);
+
+        drop(SupervisedChildGuard::arm(child));
+
+        assert_eq!(kill_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(wait_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_dropped_guard_falls_back_to_the_root_and_never_waits() {
+        let (child, kill_calls, wait_calls) = pending_child(Some(NONEXISTENT_PROCESS_ID));
+
+        drop(SupervisedChildGuard::arm(child));
+
+        // The ownership-unit kill fails, so the root is killed directly; the
+        // child never exits, so any wait would hang this test.
+        assert_eq!(kill_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(wait_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// As a subreaper, this isolated test process adopts the descendants a
+    /// dropped run leaves behind, so it can observe the whole cleanup: the
+    /// guard kills the process group, tokio reaps the root, and the adopter
+    /// (here the test, in production init or the session subreaper) reaps the
+    /// killed descendant.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_dropped_run_kills_its_process_group_and_leaves_no_zombie_root() {
+        use crate::test_support::{reexec, run_on_current_thread};
+
+        const TEST: &str = "process::supervised::tests::a_dropped_run_kills_its_process_group_and_leaves_no_zombie_root";
+        let Some(phase) = reexec::enter(TEST, "subreaper") else {
+            reexec::run(TEST, "subreaper", None, |_| {});
+            return;
+        };
+        // SAFETY: prctl has no pointer arguments here and changes only this
+        // isolated test process.
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+        let directory = tempfile::tempdir().expect("subreaper fixture");
+        let pids_path = directory.path().join("pids");
+
+        run_on_current_thread(async {
+            let mut command = Command::new("sh");
+            command
+                .args([
+                    "-c",
+                    "sleep 30 & printf '%s %s' \"$$\" \"$!\" > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; wait",
+                    "tree",
+                ])
+                .arg(&pids_path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let request = SupervisedRunRequest {
+                command,
+                stdin: None,
+                timeout: Duration::from_secs(30),
+                cleanup_timeout: PROCESS_CLEANUP_WAIT_TIMEOUT,
+                max_output_bytes: 1024,
+                overflow: SupervisedOverflow::Error,
+            };
+            let cancellation = CancellationToken::new();
+            let mut run = Box::pin(run_supervised(request, &cancellation));
+            tokio::select! {
+                () = async {
+                    while !pids_path.exists() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                } => {}
+                result = &mut run => panic!("the tree must still be running, got {result:?}"),
+            }
+            let pids = std::fs::read_to_string(&pids_path).expect("fixture PIDs");
+            let (root, helper) = pids.split_once(' ').expect("root and helper PIDs");
+            let root = root.parse::<libc::pid_t>().expect("numeric root PID");
+            let helper = helper.parse::<libc::pid_t>().expect("numeric helper PID");
+
+            drop(run);
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let helper_status = loop {
+                let mut status = 0;
+                // SAFETY: waitpid targets only the fixture helper and writes a
+                // valid status. Until the killed root exits, the helper is not
+                // this process's child yet and waitpid reports ECHILD.
+                let waited = unsafe { libc::waitpid(helper, &mut status, libc::WNOHANG) };
+                if waited == helper {
+                    break status;
+                }
+                let error = io::Error::last_os_error();
+                assert!(
+                    waited == 0 || error.raw_os_error() == Some(libc::ECHILD),
+                    "waitpid for the helper failed: {error}"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the helper outlived the dropped run"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            assert!(
+                libc::WIFSIGNALED(helper_status) && libc::WTERMSIG(helper_status) == libc::SIGKILL,
+                "the process-group kill must end the helper, got status {helper_status}"
+            );
+
+            let root_process = std::path::PathBuf::from(format!("/proc/{root}"));
+            while root_process.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "tokio never reaped the dropped run's root"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        phase.complete();
+    }
+
+    #[tokio::test]
+    async fn a_panic_while_the_guard_is_armed_terminates_the_child() {
+        let (child, kill_calls, _wait_calls) = tracking_child(false);
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = SupervisedChildGuard::arm(child);
+            panic!("supervised caller panicked");
+        }));
+
+        assert!(unwound.is_err());
+        assert_eq!(kill_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
