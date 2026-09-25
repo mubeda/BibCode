@@ -21,7 +21,7 @@ use crate::{
         ChangeRequest, CreateWorktreeInput, GitCommandError, GitProcessRunner, GitRepository,
         GitStatusSummaryService, OutputPolicy, ProcessRequest, ProcessRunner,
         STATUS_SAFETY_INTERVAL, StatusBroadcaster, StatusReadFence, VcsStatusLocalResult,
-        VcsStatusRemoteResult, VcsStatusStreamEvent, validate_pathspecs,
+        VcsStatusRemoteResult, VcsStatusStreamEvent, clone_destination_leaf, validate_pathspecs,
     },
     maintenance::RpcPermit,
     persistence::{Repositories, WorktreeRemovalReceipt},
@@ -36,6 +36,7 @@ use crate::{
     worktree_catalog::{WorkspaceAdmissionLease, WorkspaceAvailabilityRegistry},
 };
 
+use super::clone_operations::{CloneRequest, CloneRuntime};
 use super::host_paths::resolve_host_directory;
 
 const STREAM_CAPACITY: usize = 8;
@@ -174,6 +175,7 @@ pub const GIT_VCS_UNARY_METHODS: &[&str] = &[
     "vcs.listRefs",
     "vcs.listCommits",
     "vcs.clone",
+    "vcs.cancelClone",
     "vcs.createRef",
     "vcs.switchRef",
     "vcs.init",
@@ -213,6 +215,8 @@ pub struct GitVcsRpcServices {
     terminal: Option<TerminalManager>,
     repositories: Option<Repositories>,
     worktree_removal_tasks: WorktreeRemovalTaskTracker,
+    /// Server-owned clones, keyed by destination.
+    clone_operations: CloneRuntime,
     #[cfg(test)]
     status_stream_enrichment_test_hook: Option<Arc<StatusStreamEnrichmentTestHook>>,
 }
@@ -363,6 +367,7 @@ impl GitVcsRpcServices {
             let cwd = cwd.to_path_buf();
             handle.spawn(async move { summary.notify_local_change(&cwd).await });
         });
+        let clone_operations = CloneRuntime::new(Arc::clone(&repository));
         Self {
             broadcaster,
             summary,
@@ -377,6 +382,7 @@ impl GitVcsRpcServices {
             terminal,
             repositories,
             worktree_removal_tasks: WorktreeRemovalTaskTracker::default(),
+            clone_operations,
             #[cfg(test)]
             status_stream_enrichment_test_hook: None,
         }
@@ -432,6 +438,10 @@ impl GitVcsRpcServices {
 
     pub(crate) fn worktree_removal_tasks(&self) -> WorktreeRemovalTaskTracker {
         self.worktree_removal_tasks.clone()
+    }
+
+    pub(crate) fn clone_operations(&self) -> CloneRuntime {
+        self.clone_operations.clone()
     }
 
     pub(crate) fn status_broadcaster(&self) -> StatusBroadcaster {
@@ -855,21 +865,51 @@ impl GitVcsRpcServices {
             }
             "vcs.clone" => {
                 let input: CloneInput = decode(request.payload, "vcs.clone")?;
+                // One validated folder name before anything reads the disk or the runtime.
+                let leaf = clone_destination_leaf(&input.url, input.directory_name.as_deref())
+                    .map_err(|error| {
+                        vcs_error("vcs.clone", &input.parent_dir, &error.to_string())
+                    })?;
                 let parent_dir = resolve_host_directory(&input.parent_dir, false)
                     .await
                     .map_err(|error| {
                         vcs_error("vcs.clone", &input.parent_dir, &error.to_string())
                     })?;
-                let result = self
-                    .repository
-                    .clone_repository(
-                        &input.url,
-                        &parent_dir,
-                        input.directory_name.as_deref(),
+                // The starter's permit rides with the clone, so an update drain names a
+                // detached clone until Git has stopped and its cleanup has finished.
+                let path = self
+                    .clone_operations
+                    .start_or_join(
+                        CloneRequest {
+                            url: input.url,
+                            parent_dir,
+                            leaf,
+                            attach: input.attach,
+                            detach: input.detach,
+                        },
+                        context.admission_permit(),
                         &cancellation,
                     )
+                    .await?;
+                Ok(json!({ "path": display_path(path) }))
+            }
+            "vcs.cancelClone" => {
+                let input: CancelCloneInput = decode(request.payload, "vcs.cancelClone")?;
+                // A path as the folder name could alias another clone's destination key.
+                let leaf = clone_destination_leaf(&input.url, input.directory_name.as_deref())
+                    .map_err(|error| {
+                        vcs_error("vcs.cancelClone", &input.parent_dir, &error.to_string())
+                    })?;
+                let parent_dir = resolve_host_directory(&input.parent_dir, false)
+                    .await
+                    .map_err(|error| {
+                        vcs_error("vcs.cancelClone", &input.parent_dir, &error.to_string())
+                    })?;
+                let cancelled = self
+                    .clone_operations
+                    .cancel(&input.url, &parent_dir, &leaf)
                     .await;
-                encode_result(result.map(|path| json!({ "path": display_path(path) })))
+                Ok(json!({ "cancelled": cancelled }))
             }
             "vcs.generateCommitMessage" => {
                 let input: CommitMessageInput =
@@ -909,7 +949,8 @@ impl GitVcsRpcServices {
             "sourceControl.cloneRepository" => {
                 let input: CloneRepositoryInput =
                     decode(request.payload, "sourceControl.cloneRepository")?;
-                self.clone_source_repository(input, &cancellation).await
+                self.clone_source_repository(input, context.admission_permit(), &cancellation)
+                    .await
             }
             _ => Err(request_error(
                 &request.tag,
@@ -1604,6 +1645,7 @@ impl GitVcsRpcServices {
     async fn clone_source_repository(
         &self,
         input: CloneRepositoryInput,
+        admission: Option<RpcPermit>,
         cancellation: &CancellationToken,
     ) -> RpcResult {
         let remote_url = input
@@ -1623,19 +1665,48 @@ impl GitVcsRpcServices {
                 "Destination has no parent directory.",
             )
         })?;
-        tokio::fs::create_dir_all(parent).await.map_err(|error| {
-            source_control_error(
-                input.provider.as_deref().unwrap_or("unknown"),
-                "cloneRepository",
-                &error.to_string(),
-            )
-        })?;
+        let provider = input
+            .provider
+            .clone()
+            .unwrap_or_else(|| "unknown".to_owned());
+        // One validated folder name before the parent folder is created.
         let directory_name = destination.file_name().and_then(|value| value.to_str());
-        let cwd = self
-            .repository
-            .clone_repository(&remote_url, parent, directory_name, cancellation)
+        let leaf = clone_destination_leaf(&remote_url, directory_name).map_err(|error| {
+            source_control_error(&provider, "cloneRepository", &error.to_string())
+        })?;
+        tokio::fs::create_dir_all(parent).await.map_err(|error| {
+            source_control_error(&provider, "cloneRepository", &error.to_string())
+        })?;
+        // Destination keys use the canonical parent, so a symlinked or `..` alias of a running
+        // clone's folder joins it instead of meeting its half-written folder.
+        let parent_dir = resolve_host_directory(parent, false)
             .await
-            .map_err(serialize_error)?;
+            .map_err(|error| {
+                source_control_error(&provider, "cloneRepository", &error.to_string())
+            })?;
+        let cwd = self
+            .clone_operations
+            .start_or_join(
+                CloneRequest {
+                    url: remote_url.clone(),
+                    parent_dir,
+                    leaf,
+                    attach: false,
+                    detach: false,
+                },
+                admission,
+                cancellation,
+            )
+            .await
+            .map_err(|error| {
+                // The declared union is [SourceControlRepositoryError, EnvironmentRpcError], so
+                // every runtime failure travels as a SourceControlRepositoryError.
+                let detail = error["detail"]
+                    .as_str()
+                    .or_else(|| error["message"].as_str())
+                    .unwrap_or("The clone failed.");
+                source_control_error(&provider, "cloneRepository", detail)
+            })?;
         Ok(json!({ "cwd": display_path(cwd), "remoteUrl": remote_url, "repository": Value::Null }))
     }
 
@@ -2001,6 +2072,19 @@ struct RemoveWorktree {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CloneInput {
+    url: String,
+    parent_dir: PathBuf,
+    directory_name: Option<String>,
+    /// Join-only; sent only by clients that saw `vcsCloneReattach`.
+    #[serde(default)]
+    attach: bool,
+    /// The caller leaving does not stop a clone it started.
+    #[serde(default)]
+    detach: bool,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CancelCloneInput {
     url: String,
     parent_dir: PathBuf,
     directory_name: Option<String>,

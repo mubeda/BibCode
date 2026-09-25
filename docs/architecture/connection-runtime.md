@@ -498,8 +498,63 @@ command disposes its atom, which interrupts its fiber; the RPC client then
 sends `Interrupt`, which the server maps to the request's cancellation token.
 An invocation aborted while still queued settles when its turn comes and never
 starts. On `singleFlight`, a caller that joins a running execution cannot abort
-it; on `latest`, the newest caller's abort interrupts the shared run. Add
-Project's **Cancel clone** uses this on the `serial` clone command.
+it; on `latest`, the newest caller's abort interrupts the shared run.
+Add Project's clone command is `serial` per destination. Against a server
+without `vcsCloneReattach`, it is today's single `vcs.clone` call, and **Cancel
+clone**, or the dialog unmounting, aborts it, so the interrupt stops the clone.
+
+With the capability, the command (`state/vcsClone.ts`) owns the re-attach loop;
+React owns no retry loop. It sends `detach: true`. On `RpcClientError`,
+`EnvironmentRpcUnavailableError`, or an interrupt it did not request (the RPC
+client resumes pending calls with an interrupt when the socket closes), it
+reports `reconnecting`, waits for the next session as `subscribe()` does, and
+re-issues with `attach: true`. The wait follows the environment's current
+supervisor through the registry's `followStream`: when the registry replaces
+the supervisor (a changed platform registration, for example), the loop takes
+the replacement's session, and a removed environment ends the wait. Typed
+failures never re-attach. There is no attempt limit and no timer. The loop ends
+at an outcome, at an abort, when the environment is blocked, disconnected by the
+user, or removed, or on a session without the capability; the last two end with
+`VcsCloneStoppedError`. One exception: a user disconnect that lands while the
+registry replaces the supervisor is not seen, because a replacement starts out
+undesired, so the wait lasts until the environment reconnects or is removed.
+The dialog can be closed meanwhile.
+
+**Cancel clone** then sends `vcs.cancelClone` on its own command lane, because
+the clone holds the destination's serial lane. The cancel waits for a session
+that advertises `vcsCloneReattach` (it stops with `VcsCloneStoppedError` on one
+that does not). The form stays in **Cancelling…** until both the clone request
+and that cancel have settled: the cancel is keyed by destination, so a new
+clone into the same folder must not start while a cancel may still be retrying.
+The client runtime enforces this, not the dialog. The cancel command records
+itself in a module-level registry keyed by environment, exact URL, and leaf
+(the parent folder is left out, because only the server can canonicalize its
+spelling), and a clone of that URL into that leaf waits for every pending cancel
+to settle before it dispatches, even after the dialog unmounted and a new one
+mounted. The key compares an explicit `directoryName` exactly, so on a
+case-insensitive file system two spellings of one folder name get separate keys;
+the dialog never sends one, and the leaf derived from one URL is always the
+same. After that wait the clone continues on the environment's current
+supervisor: it still fails at once if that supervisor is not connected, and
+ends with `VcsCloneStoppedError` if the environment was removed. The cancel
+follows the current supervisor the same way the clone does. While the cancel is
+pending, the form stays **Cancelling…** and follows the connection: "The clone
+stops when <host> reconnects." shows while it is down. After the clone request
+settles, a cancel that is still pending no longer moves that line with the
+connection; it keeps re-sending, and the form reports once it settles.
+Only a failed or stopped cancel ends the clone wait early; otherwise the clone
+request reports its own outcome, including a folder that could not be removed.
+A clone that finishes while its cancel is pending is not added as a project;
+the form names its folder and says that the next **Clone** adds it.
+The dialog can be closed while the clone waits for its host, that is while it
+shows the reconnecting line or **Cancelling…**, but not while cloning or adding
+the project. Closing it, like unmounting it, requests `vcs.cancelClone` unless
+**Cancel clone** already did, then ends the wait; the cancel goes out when the
+host is back, and the client runtime keeps it registered until it settles.
+Closing the dialog's window does the same as best effort: a closing or
+disconnected window may never get the cancel out, and then the clone keeps
+running on the host (the orphan policy). An abort alone only stops following
+the clone.
 
 ## Git Manager capability negotiation
 

@@ -128,13 +128,28 @@ directories; **Type a path instead** switches to manual entry of an absolute
 or home-relative path. Selecting a folder adds that folder as one project and
 does not scan for nested repositories.
 
-While a clone runs, the clone form stays open with **Cancel clone**. Cancelling
-stops Git, shows "Clone cancelled.", and removes the folder the clone created;
-if the clone had already finished, the folder stays and the next **Clone** into
-it adds it. A failed clone shows the reason in the form, including a stalled
-transfer or an incomplete earlier clone in the chosen folder (remove it or
-choose another folder). The dialog closes once the project has been added and
-opened.
+While a clone runs, the clone form stays open with **Cancel clone**. If the
+connection to the host drops, the clone keeps running there: the form shows
+"Lost the connection to <host>. The clone continues on the server;
+reconnecting…", and when the connection returns it resumes following the clone
+and adds the project once it finishes. Cancelling stops Git, shows "Clone
+cancelled.", and removes the folder the clone created; while disconnected, the
+form shows **Cancelling…** until the host is back, and it accepts a new clone
+only once the host has confirmed the cancel. If the clone had already finished,
+the form says so and names its folder; the folder stays unregistered, and the
+next **Clone** into it adds it. While the form shows the reconnecting line or
+**Cancelling…**, you can close the dialog: the clone is cancelled once the host
+is back, and a new clone of that URL into that folder waits for the cancel to
+finish. Closing the window
+during a clone asks the host to cancel it, but a closing or disconnected window
+may not reach the host; the clone then keeps running there, and cloning the
+same URL into the same folder later joins it or adds the finished repository.
+A failed clone shows the reason in the form,
+including a stalled transfer or an incomplete earlier clone in the chosen
+folder (remove it or choose another folder). If the host cannot be reached
+again, the form says so; cloning the same URL into the same folder later joins
+the clone or adds the finished repository. The dialog closes once the project
+has been added and opened.
 
 Clicking a project header selects it and toggles its thread list; the header
 stays highlighted as the selected node until you open a thread, and it is also

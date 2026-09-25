@@ -90,6 +90,10 @@ describe("execution environment contracts", () => {
   it("defaults ordered terminal input support to false when omitted", () => {
     expect(decodeTerminalCapabilities({}).terminalOrderedInput).toBe(false);
   });
+  it("defaults clone re-attach off for older servers and preserves advertised support", () => {
+    expect(decodeTerminalCapabilities({}).vcsCloneReattach).toBe(false);
+    expect(decodeTerminalCapabilities({ vcsCloneReattach: true }).vcsCloneReattach).toBe(true);
+  });
   it("pins the remote protocol window constants", () => {
     expect(REMOTE_PROTOCOL_VERSION).toBe(1);
     expect(MIN_COMPATIBLE_REMOTE_PROTOCOL).toBe(1);

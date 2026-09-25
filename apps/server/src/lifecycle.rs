@@ -61,6 +61,7 @@ fn connect_environment_descriptor(config: &ServerConfig) -> serde_json::Value {
             "remoteUpdateControl": true,
             "terminalOrderedInput": true,
             "terminalSizeOwnership": true,
+            "vcsCloneReattach": true,
         },
     })
 }
@@ -816,6 +817,7 @@ mod tests {
         assert_eq!(descriptor["capabilities"]["remoteUpdateControl"], true);
         assert_eq!(descriptor["capabilities"]["terminalOrderedInput"], true);
         assert_eq!(descriptor["capabilities"]["terminalSizeOwnership"], true);
+        assert_eq!(descriptor["capabilities"]["vcsCloneReattach"], true);
         assert_eq!(
             descriptor["remoteUpdateSupport"],
             serde_json::json!({ "installMode": "manual", "reason": "manual-update-required" })

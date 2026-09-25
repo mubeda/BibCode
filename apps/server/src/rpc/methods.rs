@@ -164,6 +164,7 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     mutation_unary("updater.check"),
     mutation_unary("updater.install"),
     read_unary("updater.status"),
+    mutation_unary("vcs.cancelClone"),
     mutation_unary("vcs.clone"),
     mutation_unary("vcs.createRef"),
     mutation_unary("vcs.discardFiles"),

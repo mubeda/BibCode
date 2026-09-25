@@ -4808,6 +4808,10 @@ impl GitRepository {
         Ok(())
     }
 
+    /// Clones `url` into `parent_dir` without serializing against other clones of the same
+    /// destination. Production RPCs go through `CloneRuntime`, which owns one clone per
+    /// destination; this primitive serves tests and the runtime-free coverage suite. Cancelling
+    /// `cancellation` or dropping the future stops Git and removes the folder this call created.
     pub async fn clone_repository(
         &self,
         url: &str,
@@ -4815,73 +4819,18 @@ impl GitRepository {
         directory_name: Option<&str>,
         cancellation: &CancellationToken,
     ) -> Result<PathBuf, GitCommandError> {
-        let derived = directory_name.map_or_else(
-            || {
-                url.trim_end_matches(['/', '\\'])
-                    .rsplit(['/', '\\', ':'])
-                    .next()
-                    .unwrap_or("repository")
-                    .trim_end_matches(".git")
-                    .to_owned()
-            },
-            str::to_owned,
-        );
-        let destination = parent_dir.join(&derived);
-        // A retry right after Cancel waits here until the cancelled clone of the same
-        // destination has stopped Git and removed its folder, then reserves normally.
-        let Some(destination_lease) = CloneDestinationRegistry::global()
-            .acquire(&destination, cancellation)
-            .await
-        else {
-            return Err(simple_error(
-                CLONE_OPERATION,
-                parent_dir,
-                "The clone was cancelled before it started.",
-            ));
+        let leaf = clone_destination_leaf(url, directory_name)
+            .map_err(|error| simple_error(CLONE_OPERATION, parent_dir, &error.to_string()))?;
+        let reserved = match self
+            .reserve_clone_destination(url, parent_dir, &leaf, cancellation)
+            .await?
+        {
+            CloneReservation::Existing(path) => return Ok(path),
+            CloneReservation::Reserved(reserved) => reserved,
         };
-        // Creating the destination atomically records that it did not exist before: only a
-        // directory this call created is removed when the clone fails, times out, stalls, or
-        // is cancelled. An existing destination is never cloned into or deleted.
-        let owned_destination = match OwnedWorktreePath::reserve(destination.clone()) {
-            Ok(owned_destination) => owned_destination,
-            Err(error) if error.is_destination_collision() => {
-                return self
-                    .reuse_existing_destination(url, parent_dir, &destination, cancellation)
-                    .await;
-            }
-            Err(error) => {
-                return Err(simple_error(
-                    CLONE_OPERATION,
-                    parent_dir,
-                    &format!(
-                        "Could not create {} ({}). Check that the parent folder exists and is writable, or choose another folder.",
-                        display_path(&destination),
-                        error.source
-                    ),
-                ));
-            }
-        };
-        // The transfer and its cleanup run as one owned task. An RPC interrupt drops this
-        // future; the drop guard then cancels the transfer, and the task still stops Git and
-        // removes the destination it created before it finishes.
         let transfer_cancellation = cancellation.child_token();
         let _cancel_transfer_on_drop = transfer_cancellation.clone().drop_guard();
-        let transfer = self.for_network_transfer();
-        let task_url = url.to_owned();
-        let task_parent_dir = parent_dir.to_path_buf();
-        let task = tokio::spawn(async move {
-            // Released only after the transfer and its cleanup have finished.
-            let _destination_lease = destination_lease;
-            transfer
-                .clone_into_owned_destination(
-                    &task_url,
-                    &task_parent_dir,
-                    &derived,
-                    owned_destination,
-                    &transfer_cancellation,
-                )
-                .await
-        });
+        let task = tokio::spawn(async move { reserved.run(&transfer_cancellation).await });
         match task.await {
             Ok(result) => result,
             Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
@@ -4893,41 +4842,57 @@ impl GitRepository {
         }
     }
 
-    async fn clone_into_owned_destination(
+    /// Creates the destination atomically, which records that it did not exist before. An
+    /// existing destination is never cloned into or deleted: a finished clone of the same URL
+    /// is returned as [`CloneReservation::Existing`], anything else is an actionable error.
+    pub(crate) async fn reserve_clone_destination(
         &self,
         url: &str,
         parent_dir: &Path,
-        directory_name: &str,
-        destination: OwnedWorktreePath,
+        leaf: &CloneLeaf,
         cancellation: &CancellationToken,
-    ) -> Result<PathBuf, GitCommandError> {
-        let cloned = self
-            .run(
+    ) -> Result<CloneReservation, GitCommandError> {
+        let destination = parent_dir.join(leaf.as_str());
+        match OwnedWorktreePath::reserve(destination.clone()) {
+            Ok(owned) => Ok(CloneReservation::Reserved(ReservedClone {
+                repository: self.for_network_transfer(),
+                url: url.to_owned(),
+                parent_dir: parent_dir.to_path_buf(),
+                leaf: leaf.clone(),
+                destination: owned,
+            })),
+            Err(error) if error.is_destination_collision() => self
+                .reuse_existing_destination(url, parent_dir, &destination, cancellation)
+                .await
+                .map(CloneReservation::Existing),
+            Err(error) => Err(simple_error(
                 CLONE_OPERATION,
                 parent_dir,
-                &[
-                    "clone".into(),
-                    "--".into(),
-                    url.into(),
-                    directory_name.into(),
-                ],
-                cancellation,
-            )
-            .await;
-        match cloned {
-            Ok(_) => Ok(destination.path().to_path_buf()),
-            Err(mut error) => {
-                // The runner has already stopped and reaped Git's process group.
-                if let Err(cleanup_error) = remove_owned_clone_destination(&destination).await {
-                    error.detail = format!(
-                        "{}\nThe incomplete clone at {} could not be removed ({cleanup_error}). Remove it before trying again.",
-                        error.detail,
-                        display_path(destination.path()),
-                    )
-                    .into();
-                }
-                Err(error)
-            }
+                &format!(
+                    "Could not create {} ({}). Check that the parent folder exists and is writable, or choose another folder.",
+                    display_path(&destination),
+                    error.source
+                ),
+            )),
+        }
+    }
+
+    /// The reuse check without reserving: `Ok(None)` when nothing exists at the destination,
+    /// the finished clone's path, or the error that names why the folder cannot be reused.
+    pub(crate) async fn inspect_clone_destination(
+        &self,
+        url: &str,
+        parent_dir: &Path,
+        leaf: &CloneLeaf,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<PathBuf>, GitCommandError> {
+        let destination = parent_dir.join(leaf.as_str());
+        match tokio::fs::symlink_metadata(&destination).await {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            _ => self
+                .reuse_existing_destination(url, parent_dir, &destination, cancellation)
+                .await
+                .map(Some),
         }
     }
 
@@ -5044,6 +5009,16 @@ impl GitRepository {
                 ),
             ));
         }
+        let incomplete = || {
+            simple_error(
+                CLONE_OPERATION,
+                destination,
+                &format!(
+                    "An incomplete clone exists at {}. Remove it or choose another folder.",
+                    display_path(destination)
+                ),
+            )
+        };
         // An interrupted clone keeps its origin but never checks out a commit: HEAD stays
         // Git's `refs/heads/.invalid` placeholder, or names a branch without commits.
         let head = self
@@ -5056,14 +5031,33 @@ impl GitRepository {
             )
             .await?;
         if head.exit_code != 0 || head.stdout.trim().is_empty() {
-            return Err(simple_error(
-                CLONE_OPERATION,
+            return Err(incomplete());
+        }
+        // A clone killed during checkout has a resolvable HEAD but no index: Git writes the
+        // index once, after checkout, even for an empty tree. A stale `index.lock` may belong
+        // to a running Git command, so only the missing index marks the clone incomplete.
+        let index = self
+            .execute_read(
+                "GitVcsDriver.clone.inspectIndex",
                 destination,
-                &format!(
-                    "An incomplete clone exists at {}. Remove it or choose another folder.",
-                    display_path(destination)
-                ),
-            ));
+                &strings(&["rev-parse", "--git-path", "index"]),
+                true,
+                cancellation,
+            )
+            .await?;
+        let index_path = PathBuf::from(index.stdout.trim());
+        let index_path = if index_path.is_absolute() {
+            index_path
+        } else {
+            destination.join(index_path)
+        };
+        let has_index = index.exit_code == 0
+            && !index.stdout.trim().is_empty()
+            && tokio::fs::metadata(&index_path)
+                .await
+                .is_ok_and(|metadata| metadata.is_file());
+        if !has_index {
+            return Err(incomplete());
         }
         Ok(destination.to_path_buf())
     }
@@ -6883,92 +6877,6 @@ async fn remove_bound_owned_directory_with_lease(
     .map_err(|error| io::Error::other(format!("owned directory cleanup task failed: {error}")))?
 }
 
-/// Serializes clones into one destination. A clone waits until every earlier clone of the
-/// same destination, including its cleanup, has finished before it reserves the path, so a
-/// retry right after Cancel never finds the cancelled clone's folder mid-removal. Different
-/// destinations never wait for each other.
-#[derive(Default)]
-struct CloneDestinationRegistry {
-    destinations: Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
-}
-
-/// Held for the whole life of one clone: its reservation, transfer, and cleanup.
-struct CloneDestinationLease {
-    registry: &'static CloneDestinationRegistry,
-    key: String,
-    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
-}
-
-impl Drop for CloneDestinationLease {
-    fn drop(&mut self) {
-        let mut destinations = self.registry.lock_destinations();
-        // Releasing the guard wakes the next clone of this destination, if any.
-        drop(self.guard.take());
-        if destinations
-            .get(&self.key)
-            .is_some_and(|slot| slot.strong_count() == 0)
-        {
-            destinations.remove(&self.key);
-        }
-    }
-}
-
-impl CloneDestinationRegistry {
-    fn global() -> &'static Self {
-        static REGISTRY: std::sync::OnceLock<CloneDestinationRegistry> = std::sync::OnceLock::new();
-        REGISTRY.get_or_init(Self::default)
-    }
-
-    fn lock_destinations(
-        &self,
-    ) -> std::sync::MutexGuard<'_, HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>> {
-        self.destinations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// Waits for earlier clones into `destination` to finish. Returns `None` when
-    /// `cancellation` fires first. The key is the reservation path, normalized the way
-    /// worktree paths are compared on this host.
-    async fn acquire(
-        &'static self,
-        destination: &Path,
-        cancellation: &CancellationToken,
-    ) -> Option<CloneDestinationLease> {
-        let key = normalize_worktree_path_key(destination, host_path_platform());
-        let slot = {
-            let mut destinations = self.lock_destinations();
-            // A waiter that was cancelled leaves an entry nobody holds; drop those here.
-            destinations.retain(|_, slot| slot.strong_count() > 0);
-            if let Some(slot) = destinations.get(&key).and_then(std::sync::Weak::upgrade) {
-                slot
-            } else {
-                let slot = Arc::new(tokio::sync::Mutex::new(()));
-                destinations.insert(key.clone(), Arc::downgrade(&slot));
-                slot
-            }
-        };
-        tokio::select! {
-            biased;
-            () = cancellation.cancelled() => None,
-            guard = slot.lock_owned() => Some(CloneDestinationLease {
-                registry: self,
-                key,
-                guard: Some(guard),
-            }),
-        }
-    }
-
-    #[cfg(test)]
-    fn tracks(&self, destination: &Path) -> bool {
-        self.lock_destinations()
-            .contains_key(&normalize_worktree_path_key(
-                destination,
-                host_path_platform(),
-            ))
-    }
-}
-
 /// The destination's own name and the folder that holds it, as a user would look for them.
 fn destination_name_and_location(destination: &Path) -> (String, String) {
     let name = destination.file_name().map_or_else(
@@ -6979,6 +6887,152 @@ fn destination_name_and_location(destination: &Path) -> (String, String) {
         .parent()
         .map_or_else(|| display_path(destination), display_path);
     (name, location)
+}
+
+/// The folder a clone creates under its parent: exactly one normal path component. Only
+/// [`clone_destination_leaf`] makes one, so no path, `.`, `..`, absolute, or prefixed name reaches
+/// a clone's destination key, the disk check, a cancel, or the reservation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CloneLeaf(String);
+
+impl CloneLeaf {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Why a clone has no valid folder name. The text never names the URL, which may embed
+/// credentials.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum CloneLeafError {
+    /// The caller's `directoryName` is not a single folder name.
+    InvalidName(String),
+    /// The URL's last segment gives no usable folder name.
+    Underivable,
+}
+
+impl fmt::Display for CloneLeafError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidName(name) => write!(
+                formatter,
+                "The folder name \"{name}\" must be a single name, without slashes or \"..\"."
+            ),
+            Self::Underivable => formatter.write_str(
+                "Could not work out a folder name from the repository URL. Check that the URL ends with the repository's name.",
+            ),
+        }
+    }
+}
+
+/// The folder a clone creates under its parent: `directory_name` when given, otherwise the
+/// URL's last path segment without a trailing `.git`. Either must be exactly one normal path
+/// component (no separator, `.`, `..`, root, or prefix), or the destination key, the kernel's
+/// path resolution, and the folder the cleanup removes could disagree.
+pub(crate) fn clone_destination_leaf(
+    url: &str,
+    directory_name: Option<&str>,
+) -> Result<CloneLeaf, CloneLeafError> {
+    let single_folder_name = |leaf: &str| {
+        let mut components = Path::new(leaf).components();
+        matches!(
+            (components.next(), components.next()),
+            (Some(Component::Normal(name)), None) if name == std::ffi::OsStr::new(leaf)
+        )
+    };
+    match directory_name {
+        Some(name) if single_folder_name(name) => Ok(CloneLeaf(name.to_owned())),
+        Some(name) => Err(CloneLeafError::InvalidName(name.to_owned())),
+        None => {
+            let derived = url
+                .trim_end_matches(['/', '\\'])
+                .rsplit(['/', '\\', ':'])
+                .next()
+                .unwrap_or("repository")
+                .trim_end_matches(".git");
+            if single_folder_name(derived) {
+                Ok(CloneLeaf(derived.to_owned()))
+            } else {
+                Err(CloneLeafError::Underivable)
+            }
+        }
+    }
+}
+
+/// What reserving a clone destination found.
+pub(crate) enum CloneReservation {
+    /// The destination did not exist. This clone created it and owns its cleanup.
+    Reserved(ReservedClone),
+    /// A finished clone of the same URL is already there.
+    Existing(PathBuf),
+}
+
+/// A destination one clone created. The transfer and the cleanup are separate steps, so an
+/// owner that runs the transfer in another task keeps the cleanup even if that task panics.
+pub(crate) struct ReservedClone {
+    repository: GitRepository,
+    url: String,
+    parent_dir: PathBuf,
+    leaf: CloneLeaf,
+    destination: OwnedWorktreePath,
+}
+
+impl ReservedClone {
+    /// Runs `git clone` into the reserved folder and nothing else. When it fails, the runner
+    /// has already stopped and reaped Git's process group; removing the folder is the caller's.
+    pub(crate) async fn transfer(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<PathBuf, GitCommandError> {
+        self.repository
+            .run(
+                CLONE_OPERATION,
+                &self.parent_dir,
+                &[
+                    "clone".into(),
+                    "--".into(),
+                    self.url.clone(),
+                    self.leaf.as_str().to_owned(),
+                ],
+                cancellation,
+            )
+            .await?;
+        Ok(self.destination.path().to_path_buf())
+    }
+
+    /// Removes the folder this clone created, after proving it is still that folder.
+    pub(crate) async fn remove_destination(&self) -> Result<(), io::Error> {
+        remove_owned_clone_destination(&self.destination).await
+    }
+
+    /// `error` with the failed removal appended, so the user learns which folder to remove.
+    pub(crate) fn with_cleanup_failure(
+        &self,
+        mut error: GitCommandError,
+        cleanup_error: &io::Error,
+    ) -> GitCommandError {
+        error.detail = format!(
+            "{}\nThe incomplete clone at {} could not be removed ({cleanup_error}). Remove it before trying again.",
+            error.detail,
+            display_path(self.destination.path()),
+        )
+        .into();
+        error
+    }
+
+    /// The transfer, then, on any failure, the removal of the folder this clone created.
+    pub(crate) async fn run(
+        self,
+        cancellation: &CancellationToken,
+    ) -> Result<PathBuf, GitCommandError> {
+        match self.transfer(cancellation).await {
+            Ok(path) => Ok(path),
+            Err(error) => match self.remove_destination().await {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(self.with_cleanup_failure(error, &cleanup_error)),
+            },
+        }
+    }
 }
 
 /// Removes a clone destination this call created, after proving that the directory at the
@@ -11108,77 +11162,26 @@ mod clone_tests {
         fs,
         path::{Path, PathBuf},
         process::Command,
-        sync::{
-            Arc, Mutex,
-            atomic::{AtomicBool, Ordering},
-        },
+        sync::{Arc, Mutex},
         time::Duration,
     };
 
     use tokio::{
         io::AsyncReadExt,
         net::{TcpListener, TcpStream},
-        sync::{Notify, Semaphore, mpsc},
+        sync::mpsc,
         time::{Instant, timeout},
     };
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        BoxGitProcessFuture, CLONE_OPERATION, DEFAULT_TIMEOUT, GitProcessRunner, GitRepository,
+        BoxGitProcessFuture, DEFAULT_TIMEOUT, GitProcessRunner, GitRepository,
         NETWORK_TRANSFER_CONFIG, NETWORK_TRANSFER_STALLED, ProcessError, ProcessRequest,
         ProcessRunner, display_path,
     };
     use crate::test_support::TestSandbox;
 
     const CLONE_FIXTURE_DEADLINE: Duration = Duration::from_secs(20);
-
-    /// Runs real Git. When the first clone is cancelled it keeps that clone's result until
-    /// the test releases it, standing in for a slow kill and reap: the cancelled clone's
-    /// folder then still exists, and its cleanup has not started.
-    struct HeldCancellationRunner {
-        armed: AtomicBool,
-        held: Notify,
-        release: Semaphore,
-        environment: Vec<(OsString, OsString)>,
-    }
-
-    impl HeldCancellationRunner {
-        fn new(environment: &[(&str, &str)]) -> Self {
-            Self {
-                armed: AtomicBool::new(true),
-                held: Notify::new(),
-                release: Semaphore::new(0),
-                environment: environment
-                    .iter()
-                    .map(|(key, value)| ((*key).into(), (*value).into()))
-                    .collect(),
-            }
-        }
-    }
-
-    impl GitProcessRunner for HeldCancellationRunner {
-        fn run<'a>(
-            &'a self,
-            mut request: ProcessRequest,
-            cancellation: &'a CancellationToken,
-        ) -> BoxGitProcessFuture<'a> {
-            request.env.extend(self.environment.iter().cloned());
-            let clone = request.operation == CLONE_OPERATION;
-            Box::pin(async move {
-                let result = ProcessRunner.run(request, cancellation).await;
-                if clone
-                    && matches!(result, Err(ProcessError::Cancelled { .. }))
-                    && self.armed.swap(false, Ordering::SeqCst)
-                {
-                    self.held.notify_one();
-                    if let Ok(permit) = self.release.acquire().await {
-                        permit.forget();
-                    }
-                }
-                result
-            })
-        }
-    }
 
     /// Runs real Git with extra environment, optionally through a slow wrapper for `clone`.
     struct FixtureGitRunner {
@@ -11509,129 +11512,6 @@ mod clone_tests {
     }
 
     #[tokio::test]
-    async fn a_retry_right_after_cancel_waits_for_the_cancelled_clone_to_clean_up() {
-        let sandbox = TestSandbox::new("git-clone-retry-after-cancel");
-        let parent = clone_parent(&sandbox);
-        let destination = parent.join("retried");
-        let (url, mut connections) = stalling_remote().await;
-        let runner = Arc::new(HeldCancellationRunner::new(&no_proxy()));
-        let repository = GitRepository::with_runner_for_test(runner.clone());
-
-        let first_cancellation = CancellationToken::new();
-        let mut first = Box::pin(repository.clone_repository(
-            &url,
-            &parent,
-            Some("retried"),
-            &first_cancellation,
-        ));
-        let _first_connection = tokio::select! {
-            result = &mut first => panic!("a stalled clone cannot finish: {result:?}"),
-            connection = connections.recv() => connection.expect("the first clone connects"),
-        };
-        // Cancel the way an RPC interrupt does: cancel and drop the request.
-        first_cancellation.cancel();
-        drop(first);
-        timeout(CLONE_FIXTURE_DEADLINE, runner.held.notified())
-            .await
-            .expect("the cancelled clone's Git exited");
-        assert!(
-            destination.join(".git").is_dir(),
-            "the cancelled clone's folder is still there"
-        );
-        fs::write(destination.join("cancelled-clone-leftover"), "leftover\n")
-            .expect("leftover marker");
-
-        // Retry the same clone immediately.
-        let second_cancellation = CancellationToken::new();
-        let mut second = Box::pin(repository.clone_repository(
-            &url,
-            &parent,
-            Some("retried"),
-            &second_cancellation,
-        ));
-        if let Ok(result) = timeout(Duration::from_millis(200), &mut second).await {
-            panic!(
-                "the retry finished while the cancelled clone was still cleaning up: {result:?}"
-            );
-        }
-        runner.release.add_permits(1);
-        let _second_connection = tokio::select! {
-            result = &mut second => panic!("the retry must reach its own transfer: {result:?}"),
-            connection = connections.recv() => connection.expect("the retry connects"),
-        };
-        assert!(destination.is_dir(), "the retry reserved the folder again");
-        assert!(
-            !destination.join("cancelled-clone-leftover").exists(),
-            "the retry reserved only after the cancelled clone removed its folder"
-        );
-
-        second_cancellation.cancel();
-        let error = timeout(CLONE_FIXTURE_DEADLINE, second)
-            .await
-            .expect("cancellation ends the retry")
-            .expect_err("the retry was cancelled");
-        assert_eq!(error.detail.as_ref(), "Git command was interrupted.");
-        assert!(!error.detail.contains("incomplete clone"));
-        assert!(!destination.exists());
-    }
-
-    #[tokio::test]
-    async fn a_waiting_retry_honours_its_own_cancellation_and_leaves_the_folder() {
-        let sandbox = TestSandbox::new("git-clone-waiting-retry-cancelled");
-        let parent = clone_parent(&sandbox);
-        let destination = parent.join("busy");
-        let (url, mut connections) = stalling_remote().await;
-        let repository =
-            GitRepository::with_runner_for_test(Arc::new(FixtureGitRunner::new(&no_proxy())));
-
-        let first_cancellation = CancellationToken::new();
-        let mut first =
-            Box::pin(repository.clone_repository(&url, &parent, Some("busy"), &first_cancellation));
-        let _first_connection = tokio::select! {
-            result = &mut first => panic!("a stalled clone cannot finish: {result:?}"),
-            connection = connections.recv() => connection.expect("the first clone connects"),
-        };
-
-        let second_cancellation = CancellationToken::new();
-        let mut second = Box::pin(repository.clone_repository(
-            &url,
-            &parent,
-            Some("busy"),
-            &second_cancellation,
-        ));
-        tokio::select! {
-            result = &mut first => panic!("a stalled clone cannot finish: {result:?}"),
-            result = &mut second => panic!("the retry must wait for the running clone: {result:?}"),
-            () = tokio::time::sleep(Duration::from_millis(100)) => {}
-        }
-        second_cancellation.cancel();
-        let waiting = tokio::select! {
-            result = &mut first => panic!("a stalled clone cannot finish: {result:?}"),
-            result = timeout(CLONE_FIXTURE_DEADLINE, &mut second) => {
-                result.expect("cancellation ends the wait")
-            }
-        };
-        assert_eq!(
-            waiting
-                .expect_err("the waiting retry was cancelled")
-                .detail
-                .as_ref(),
-            "The clone was cancelled before it started."
-        );
-        assert!(
-            destination.join(".git").is_dir(),
-            "the running clone keeps its folder"
-        );
-
-        first_cancellation.cancel();
-        timeout(CLONE_FIXTURE_DEADLINE, first)
-            .await
-            .expect("cancellation ends the first clone")
-            .expect_err("the first clone was cancelled");
-        assert!(!destination.exists());
-    }
-
-    #[tokio::test]
     async fn clones_into_different_folders_do_not_wait_for_each_other() {
         let sandbox = TestSandbox::new("git-clone-independent-destinations");
         let url = source_repository(&sandbox);
@@ -11670,44 +11550,6 @@ mod clone_tests {
             .await
             .expect("cancellation ends the stalled clone")
             .expect_err("the stalled clone was cancelled");
-    }
-
-    #[tokio::test]
-    async fn a_finished_clone_leaves_no_destination_entry_behind() {
-        let sandbox = TestSandbox::new("git-clone-destination-registry");
-        let destination = sandbox.path("clones/registered");
-        let registry = super::CloneDestinationRegistry::global();
-
-        let first = registry
-            .acquire(&destination, &CancellationToken::new())
-            .await
-            .expect("a free destination is acquired at once");
-        assert!(registry.tracks(&destination));
-        // Lexical aliases of the reservation path share the entry.
-        let alias = sandbox.path("clones/./other/../registered");
-        let waiting_cancellation = CancellationToken::new();
-        let mut waiting = Box::pin(registry.acquire(&alias, &waiting_cancellation));
-        assert!(
-            timeout(Duration::from_millis(50), &mut waiting)
-                .await
-                .is_err(),
-            "an alias of a busy destination waits"
-        );
-        waiting_cancellation.cancel();
-        assert!(waiting.await.is_none(), "a cancelled wait gives up");
-        assert!(registry.tracks(&destination), "the holder keeps the entry");
-
-        drop(first);
-        assert!(
-            !registry.tracks(&destination),
-            "the last holder removes the entry"
-        );
-        let again = registry
-            .acquire(&destination, &CancellationToken::new())
-            .await
-            .expect("the destination is free again");
-        drop(again);
-        assert!(!registry.tracks(&destination));
     }
 
     #[tokio::test]
@@ -11943,6 +11785,229 @@ mod clone_tests {
             placeholder
                 .join(".git/objects/pack/tmp_pack_partial")
                 .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn reuse_refuses_an_index_less_leftover_but_reuses_an_empty_tree_clone() {
+        let sandbox = TestSandbox::new("git-clone-index-less");
+        let parent = clone_parent(&sandbox);
+        let url = source_repository(&sandbox);
+        let repository = GitRepository::default();
+
+        // A crash during checkout: HEAD resolves, Git never wrote the index, and a stale lock
+        // is left behind. A lock alone may belong to a running Git command, so it is not the test.
+        let crashed = parent.join("crashed");
+        git(&parent, &["clone", "-q", "--", &url, "crashed"]);
+        fs::remove_file(crashed.join(".git/index")).expect("remove the index");
+        fs::write(crashed.join(".git/index.lock"), b"").expect("stale index lock");
+        let error = repository
+            .clone_repository(&url, &parent, Some("crashed"), &CancellationToken::new())
+            .await
+            .expect_err("an index-less leftover is not adopted");
+        assert_eq!(
+            error.detail.as_ref(),
+            format!(
+                "An incomplete clone exists at {}. Remove it or choose another folder.",
+                display_path(&crashed)
+            )
+        );
+        assert!(crashed.join(".git").is_dir(), "the leftover is kept");
+
+        // Git writes the index even for an empty tree, so such a clone is still reused.
+        let empty_source = sandbox.path("empty-source");
+        fs::create_dir(&empty_source).expect("empty source repository");
+        git(&empty_source, &["init", "-q", "-b", "main"]);
+        git(
+            &empty_source,
+            &[
+                "-c",
+                "commit.gpgSign=false",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "empty",
+            ],
+        );
+        let empty_url = file_url(&empty_source);
+        git(&parent, &["clone", "-q", "--", &empty_url, "empty"]);
+        assert!(parent.join("empty/.git/index").is_file());
+        let reused = repository
+            .clone_repository(
+                &empty_url,
+                &parent,
+                Some("empty"),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("an empty-tree clone is reused");
+        assert_eq!(reused, parent.join("empty"));
+    }
+
+    /// A validated folder name for tests that reserve or inspect a destination directly.
+    fn leaf(name: &str) -> super::CloneLeaf {
+        super::clone_destination_leaf("https://example.test/unused.git", Some(name))
+            .expect("a single folder name")
+    }
+
+    #[test]
+    fn the_destination_leaf_is_the_directory_name_or_the_url_s_last_segment() {
+        use super::clone_destination_leaf;
+        let leaf_of = |url: &str, name: Option<&str>| {
+            clone_destination_leaf(url, name)
+                .expect("a single folder name")
+                .as_str()
+                .to_owned()
+        };
+        assert_eq!(leaf_of("https://example.test/org/demo.git/", None), "demo");
+        assert_eq!(leaf_of("git@example.test:org/demo.git", None), "demo");
+        assert_eq!(leaf_of(r"C:\repos\demo", None), "demo");
+        assert_eq!(
+            leaf_of("https://example.test/org/demo.git", Some("custom")),
+            "custom"
+        );
+        assert_eq!(
+            leaf_of("https://example.test/org/demo.git.git", None),
+            "demo"
+        );
+    }
+
+    #[test]
+    fn the_destination_leaf_must_be_a_single_folder_name() {
+        use super::{CloneLeafError, clone_destination_leaf};
+
+        let url = "https://example.test/org/demo.git";
+        for name in [
+            ".", "..", "../x", "a/b", "a/../b", "/abs", "repo/", "x/.", "",
+        ] {
+            let error =
+                clone_destination_leaf(url, Some(name)).expect_err("a path is not a folder name");
+            assert_eq!(error, CloneLeafError::InvalidName(name.to_owned()));
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "The folder name \"{name}\" must be a single name, without slashes or \"..\"."
+                )
+            );
+        }
+        for nameless in [
+            "https://user:secret@example.test/org/.git",
+            "https://example.test/..",
+            "https://example.test/.",
+        ] {
+            let error = clone_destination_leaf(nameless, None).expect_err("no usable folder name");
+            assert_eq!(error, CloneLeafError::Underivable);
+            assert!(
+                !error.to_string().contains("example.test"),
+                "never echoes the URL: {error}"
+            );
+            assert!(
+                !error.to_string().contains("secret"),
+                "never echoes the URL: {error}"
+            );
+        }
+        #[cfg(windows)]
+        for name in [r"C:x", r"a\b", r"\\?\C:\x"] {
+            clone_destination_leaf(url, Some(name))
+                .expect_err("a Windows path is not a folder name");
+        }
+    }
+
+    #[tokio::test]
+    async fn reserving_a_finished_clone_returns_it_without_a_transfer() {
+        let sandbox = TestSandbox::new("git-clone-reserve-existing");
+        let parent = clone_parent(&sandbox);
+        let url = source_repository(&sandbox);
+        git(&parent, &["clone", "-q", "--", &url, "finished"]);
+        let runner = Arc::new(FixtureGitRunner::new(&[]));
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+
+        let reservation = repository
+            .reserve_clone_destination(&url, &parent, &leaf("finished"), &CancellationToken::new())
+            .await
+            .expect("a finished clone is reused");
+        let super::CloneReservation::Existing(path) = reservation else {
+            panic!("a finished clone must not be reserved again");
+        };
+        assert_eq!(path, parent.join("finished"));
+        assert!(
+            runner
+                .requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .all(|request| request.operation != super::CLONE_OPERATION),
+            "reuse runs no transfer"
+        );
+    }
+
+    #[tokio::test]
+    async fn inspecting_a_destination_reports_nothing_a_finished_clone_or_an_incomplete_one() {
+        let sandbox = TestSandbox::new("git-clone-inspect");
+        let parent = clone_parent(&sandbox);
+        let url = source_repository(&sandbox);
+        let repository = GitRepository::default();
+        let token = CancellationToken::new();
+
+        assert_eq!(
+            repository
+                .inspect_clone_destination(&url, &parent, &leaf("absent"), &token)
+                .await
+                .expect("an absent destination is not an error"),
+            None
+        );
+        assert!(
+            !parent.join("absent").exists(),
+            "inspecting never creates the folder"
+        );
+
+        git(&parent, &["clone", "-q", "--", &url, "finished"]);
+        assert_eq!(
+            repository
+                .inspect_clone_destination(&url, &parent, &leaf("finished"), &token)
+                .await
+                .expect("a finished clone is found"),
+            Some(parent.join("finished"))
+        );
+
+        let incomplete = parent.join("incomplete");
+        fs::create_dir(&incomplete).expect("incomplete clone");
+        git(&incomplete, &["init", "-q", "-b", "main"]);
+        git(&incomplete, &["config", "remote.origin.url", &url]);
+        let error = repository
+            .inspect_clone_destination(&url, &parent, &leaf("incomplete"), &token)
+            .await
+            .expect_err("an incomplete clone is reported");
+        assert!(error.detail.contains("An incomplete clone exists at"));
+        assert!(
+            incomplete.join(".git").is_dir(),
+            "inspecting keeps the folder"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invalid_folder_name_is_refused_before_anything_is_created() {
+        let sandbox = TestSandbox::new("git-clone-invalid-leaf");
+        let parent = clone_parent(&sandbox);
+        let url = source_repository(&sandbox);
+        let repository = GitRepository::default();
+
+        let error = repository
+            .clone_repository(&url, &parent, Some("a/../b"), &CancellationToken::new())
+            .await
+            .expect_err("a path is not a folder name");
+        assert_eq!(
+            error.detail.as_ref(),
+            "The folder name \"a/../b\" must be a single name, without slashes or \"..\"."
+        );
+        assert!(
+            !parent.join("a").exists(),
+            "no folder is created for the name's first part"
+        );
+        assert!(
+            !parent.join("b").exists(),
+            "nothing is cloned where the path leads"
         );
     }
 }

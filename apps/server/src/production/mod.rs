@@ -1,4 +1,5 @@
 pub mod agent_activity;
+pub(crate) mod clone_operations;
 pub mod connect_mcp;
 pub mod control;
 pub(crate) mod editor_launch;

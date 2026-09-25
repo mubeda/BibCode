@@ -1,6 +1,13 @@
 // @vitest-environment happy-dom
 
-import { EnvironmentId, GitCommandError, ThreadId, type ProjectId } from "@bibcode/contracts";
+import { VcsCloneStoppedError } from "@bibcode/client-runtime/state/vcs";
+import {
+  EnvironmentId,
+  GitCloneOperationError,
+  GitCommandError,
+  ThreadId,
+  type ProjectId,
+} from "@bibcode/contracts";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
@@ -17,7 +24,7 @@ import { useAddProjectWorkflowState, type AddProjectWorkflow } from "./useAddPro
 
 type WorkflowOperations = Pick<
   ReturnType<typeof createAddProjectOperations>,
-  "addFolder" | "clone" | "create"
+  "addFolder" | "clone" | "create" | "cancelClone"
 >;
 
 const ENV_PRIMARY = EnvironmentId.make("primary");
@@ -63,6 +70,7 @@ const testState = {
     addFolder: vi.fn(async () => true),
     clone: vi.fn(async (): Promise<AddProjectOutcome> => OPENED),
     create: vi.fn(async () => true),
+    cancelClone: vi.fn(async () => ({ _tag: "Success" as const, value: { cancelled: true } })),
   },
   operationOverride: null as WorkflowOperations | null,
   onOpenChange: vi.fn(),
@@ -138,10 +146,15 @@ function makeIntegratedOperations() {
     value: undefined,
   }));
   const reportFailure = vi.fn<AddProjectOperationsDependencies["reportFailure"]>();
+  const cancelClone = vi.fn<AddProjectOperationsDependencies["cancelClone"]>(async () => ({
+    _tag: "Success",
+    value: { cancelled: true },
+  }));
   const operations = createAddProjectOperations({
     getProjects: () => [],
     createProject,
     cloneRepository,
+    cancelClone,
     openProject,
     reportFailure,
   });
@@ -149,6 +162,7 @@ function makeIntegratedOperations() {
     operations,
     createProject,
     cloneRepository,
+    cancelClone,
     openProject,
     reportFailure,
   };
@@ -177,6 +191,9 @@ beforeEach(() => {
   testState.operations.addFolder.mockReset().mockResolvedValue(true);
   testState.operations.clone.mockReset().mockResolvedValue(OPENED);
   testState.operations.create.mockReset().mockResolvedValue(true);
+  testState.operations.cancelClone
+    .mockReset()
+    .mockResolvedValue({ _tag: "Success", value: { cancelled: true } });
   testState.operationOverride = null;
   testState.onOpenChange.mockReset();
   testState.initialEnvironmentId = null;
@@ -785,6 +802,7 @@ describe("useAddProjectWorkflowState", () => {
 
     act(() => view.current.setCloneParent("/code/"));
     expect(view.current.notice).toBeNull();
+    expect(harness.cancelClone).not.toHaveBeenCalled();
   });
 
   it("starts a fresh clone after a cancelled one", async () => {
@@ -948,5 +966,600 @@ describe("useAddProjectWorkflowState", () => {
     expect(signals[0]?.aborted).toBe(true);
     expect(harness.createProject).not.toHaveBeenCalled();
     expect(testState.onOpenChange).not.toHaveBeenCalledWith(false);
+    expect(harness.cancelClone).not.toHaveBeenCalled();
+  });
+});
+
+const SERVER_CANCELLED = new GitCloneOperationError({
+  reason: "cancelled",
+  destination: "/srv/code/demo",
+  message: "server text",
+});
+
+/** A re-attachable clone: reports progress through the captured callback and waits for its reply or an abort. */
+function reattachingClone(harness: ReturnType<typeof makeIntegratedOperations>) {
+  const calls: Array<Parameters<AddProjectOperationsDependencies["cloneRepository"]>[0]> = [];
+  const replies: Array<(result: AddProjectCommandResult<{ readonly path: string }>) => void> = [];
+  harness.cloneRepository.mockImplementation(
+    (input) =>
+      new Promise((resolve) => {
+        calls.push(input);
+        replies.push(resolve);
+        input.onProgress?.({ phase: "cloning", reattach: true });
+        input.signal?.addEventListener("abort", () => resolve({ _tag: "Failure", error: null }), {
+          once: true,
+        });
+      }),
+  );
+  return { calls, replies };
+}
+
+/** A server cancel whose settlement the test controls. */
+function heldCancel(harness: ReturnType<typeof makeIntegratedOperations>) {
+  let settle!: (result: AddProjectCommandResult<{ readonly cancelled: boolean }>) => void;
+  harness.cancelClone.mockReturnValueOnce(
+    new Promise((resolve) => {
+      settle = resolve;
+    }),
+  );
+  return {
+    acknowledge: () => settle({ _tag: "Success", value: { cancelled: true } }),
+    fail: (error: unknown) => settle({ _tag: "Failure", error }),
+  };
+}
+
+async function startClone(
+  view: Awaited<ReturnType<typeof mountWorkflow>>,
+): Promise<{ readonly submission: Promise<void> }> {
+  act(() => view.current.selectHost(ENV_REMOTE));
+  act(() => view.current.openClone());
+  act(() => view.current.setCloneUrl("https://example.test/demo.git"));
+  act(() => view.current.setCloneParent("/srv/code"));
+  let submission!: Promise<void>;
+  act(() => {
+    submission = view.current.submitClone();
+  });
+  await flushPromises();
+  // Wrapped: an async function that returned the bare promise would wait for the clone itself.
+  return { submission };
+}
+
+describe("clone re-attach", () => {
+  it("shows the reconnecting line while the connection is lost and registers after re-attach", async () => {
+    const harness = makeIntegratedOperations();
+    const clone = reattachingClone(harness);
+    testState.operationOverride = harness.operations;
+    const view = await mountWorkflow({ open: true });
+    const { submission } = await startClone(view);
+
+    act(() => clone.calls[0]?.onProgress?.({ phase: "reconnecting", reattach: true }));
+    expect(view.current.cloneProgress).toBe("reconnecting");
+    expect(view.current.notice).toBe(
+      "Lost the connection to Remote. The clone continues on the server; reconnecting…",
+    );
+    expect(view.current.busy).toBe(true);
+
+    act(() => clone.calls[0]?.onProgress?.({ phase: "cloning", reattach: true }));
+    expect(view.current.cloneProgress).toBe("cloning");
+    expect(view.current.notice).toBeNull();
+
+    await act(async () => {
+      clone.replies[0]?.({ _tag: "Success", value: { path: "/srv/code/demo" } });
+      await submission;
+    });
+    expect(harness.createProject).toHaveBeenCalledTimes(1);
+    expect(testState.onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("cancels on the server while disconnected and ends with the server's answer", async () => {
+    const harness = makeIntegratedOperations();
+    const clone = reattachingClone(harness);
+    const cancel = heldCancel(harness);
+    testState.operationOverride = harness.operations;
+    const view = await mountWorkflow({ open: true });
+    const { submission } = await startClone(view);
+    act(() => clone.calls[0]?.onProgress?.({ phase: "reconnecting", reattach: true }));
+
+    act(() => view.current.cancelClone());
+    expect(view.current.cloneProgress).toBe("cancelling");
+    expect(view.current.notice).toBe("The clone stops when Remote reconnects.");
+    expect(harness.cancelClone).toHaveBeenCalledWith({
+      environmentId: ENV_REMOTE,
+      url: "https://example.test/demo.git",
+      parentDir: "/srv/code",
+    });
+    // Progress after Cancel does not reopen Cancel.
+    act(() => clone.calls[0]?.onProgress?.({ phase: "cloning", reattach: true }));
+    expect(view.current.cloneProgress).toBe("cancelling");
+
+    await act(async () => {
+      cancel.acknowledge();
+      await Promise.resolve();
+    });
+    expect(view.current.cloneProgress).toBe("cancelling");
+    await act(async () => {
+      clone.replies[0]?.({ _tag: "Failure", error: SERVER_CANCELLED });
+      await submission;
+    });
+
+    expect(clone.calls[0]?.signal?.aborted).toBe(false);
+    expect(view.current.notice).toBe("Clone cancelled.");
+    expect(view.current.error).toBeNull();
+    expect(view.current.cloneUrl).toBe("https://example.test/demo.git");
+    expect(view.current.busy).toBe(false);
+  });
+
+  it("after Cancel, shows when the clone stops if the connection then drops", async () => {
+    const harness = makeIntegratedOperations();
+    const clone = reattachingClone(harness);
+    const cancel = heldCancel(harness);
+    testState.operationOverride = harness.operations;
+    const view = await mountWorkflow({ open: true });
+    const { submission } = await startClone(view);
+
+    act(() => view.current.cancelClone());
+    expect(view.current.cloneProgress).toBe("cancelling");
+    expect(view.current.notice).toBeNull();
+
+    // The connection drops before the cancel settles.
+    act(() => clone.calls[0]?.onProgress?.({ phase: "reconnecting", reattach: true }));
+    expect(view.current.cloneProgress).toBe("cancelling");
+    expect(view.current.notice).toBe("The clone stops when Remote reconnects.");
+
+    await act(async () => {
+      cancel.acknowledge();
+      clone.replies[0]?.({ _tag: "Failure", error: SERVER_CANCELLED });
+      await submission;
+    });
+    expect(view.current.notice).toBe("Clone cancelled.");
+  });
+
+  it("after a disconnected Cancel, clears the line on reconnect and stays Cancelling… until it settles", async () => {
+    const harness = makeIntegratedOperations();
+    const clone = reattachingClone(harness);
+    const cancel = heldCancel(harness);
+    testState.operationOverride = harness.operations;
+    const view = await mountWorkflow({ open: true });
+    const { submission } = await startClone(view);
+    act(() => clone.calls[0]?.onProgress?.({ phase: "reconnecting", reattach: true }));
+    act(() => view.current.cancelClone());
+    expect(view.current.notice).toBe("The clone stops when Remote reconnects.");
+
+    // The host is back while the cancel is still on its way.
+    act(() => clone.calls[0]?.onProgress?.({ phase: "cloning", reattach: true }));
+    expect(view.current.cloneProgress).toBe("cancelling");
+    expect(view.current.notice).toBeNull();
+    expect(view.current.busy).toBe(true);
+
+    await act(async () => {
+      cancel.acknowledge();
+      await Promise.resolve();
+    });
+    expect(view.current.cloneProgress).toBe("cancelling");
+    await act(async () => {
+      clone.replies[0]?.({ _tag: "Failure", error: SERVER_CANCELLED });
+      await submission;
+    });
+    expect(view.current.notice).toBe("Clone cancelled.");
+    expect(view.current.busy).toBe(false);
+  });
+
+  it("keeps Cancelling… until the server cancel settles, so a retry is never cancelled by it", async () => {
+    const harness = makeIntegratedOperations();
+    const clone = reattachingClone(harness);
+    const cancel = heldCancel(harness);
+    testState.operationOverride = harness.operations;
+    const view = await mountWorkflow({ open: true });
+    const { submission } = await startClone(view);
+    act(() => clone.calls[0]?.onProgress?.({ phase: "reconnecting", reattach: true }));
+    act(() => view.current.cancelClone());
+
+    // The clone's own cancelled answer arrives while the cancel's acknowledgement was lost and
+    // the cancel is still retrying on the next session.
+    await act(async () => {
+      clone.replies[0]?.({ _tag: "Failure", error: SERVER_CANCELLED });
+      await Promise.resolve();
+    });
+    expect(view.current.cloneProgress).toBe("cancelling");
+    expect(view.current.busy).toBe(true);
+    await act(async () => {
+      await view.current.submitClone();
+    });
+    expect(harness.cloneRepository).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      cancel.acknowledge();
+      await submission;
+    });
+    expect(view.current.notice).toBe("Clone cancelled.");
+    expect(view.current.busy).toBe(false);
+
+    // Only now can a retry start, and the settled cancel cannot reach it.
+    let retry!: Promise<void>;
+    act(() => {
+      retry = view.current.submitClone();
+    });
+    await flushPromises();
+    expect(harness.cloneRepository).toHaveBeenCalledTimes(2);
+    expect(harness.cancelClone).toHaveBeenCalledTimes(1);
+    expect(clone.calls[1]?.signal?.aborted).toBe(false);
+    await act(async () => {
+      clone.replies[1]?.({ _tag: "Success", value: { path: "/srv/code/demo" } });
+      await retry;
+    });
+    expect(testState.onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it.each([
+    [
+      "cancelled elsewhere",
+      new GitCloneOperationError({
+        reason: "cancelled",
+        destination: "/srv/code/demo",
+        message: "x",
+      }),
+      "The clone into /srv/code/demo was cancelled elsewhere. Press Clone to start again.",
+    ],
+    [
+      "not in progress",
+      new GitCloneOperationError({
+        reason: "not-in-progress",
+        destination: "/srv/code/demo",
+        message: "x",
+      }),
+      "No clone is in progress for /srv/code/demo. Press Clone to start again.",
+    ],
+    [
+      "busy",
+      new GitCloneOperationError({ reason: "busy", destination: "/srv/code/demo", message: "x" }),
+      "Another clone into /srv/code/demo is in progress. Wait for it to finish or choose another folder.",
+    ],
+    [
+      "capacity",
+      new GitCloneOperationError({
+        reason: "capacity",
+        destination: "/srv/code/demo",
+        message: "x",
+      }),
+      "Too many clones are running on Remote. Wait for one to finish and try again.",
+    ],
+    [
+      "shutting down",
+      new GitCloneOperationError({
+        reason: "shutting-down",
+        destination: "/srv/code/demo",
+        message: "x",
+      }),
+      "Remote is shutting down. Press Clone again once it is back.",
+    ],
+    [
+      "unreachable",
+      new VcsCloneStoppedError({
+        environmentId: "remote",
+        reason: "environment-unavailable",
+        message: "x",
+      }),
+      "Can't reconnect to Remote. The clone continues there; clone the same URL into the same folder to finish.",
+    ],
+  ])("shows the %s copy and keeps the form values", async (_label, failure, copy) => {
+    const harness = makeIntegratedOperations();
+    harness.cloneRepository.mockResolvedValueOnce({ _tag: "Failure", error: failure });
+    testState.operationOverride = harness.operations;
+    const view = await mountWorkflow({ open: true });
+    const { submission } = await startClone(view);
+    await act(async () => submission);
+
+    expect(view.current.error).toBe(copy);
+    expect(view.current.cloneUrl).toBe("https://example.test/demo.git");
+    expect(view.current.cloneParent).toBe("/srv/code");
+    expect(view.current.cloneProgress).toBe("idle");
+    expect(view.current.busy).toBe(false);
+  });
+
+  it("shows the can't-reconnect copy when a cancel cannot reach the host", async () => {
+    const harness = makeIntegratedOperations();
+    const clone = reattachingClone(harness);
+    const cancel = heldCancel(harness);
+    testState.operationOverride = harness.operations;
+    const view = await mountWorkflow({ open: true });
+    const { submission } = await startClone(view);
+    act(() => clone.calls[0]?.onProgress?.({ phase: "reconnecting", reattach: true }));
+    act(() => view.current.cancelClone());
+
+    await act(async () => {
+      cancel.fail(
+        new VcsCloneStoppedError({
+          environmentId: "remote",
+          reason: "environment-unavailable",
+          message: "x",
+        }),
+      );
+      await submission;
+    });
+    expect(clone.calls[0]?.signal?.aborted).toBe(true);
+    expect(view.current.error).toBe(
+      "Can't reconnect to Remote. The clone continues there; clone the same URL into the same folder to finish.",
+    );
+    expect(view.current.busy).toBe(false);
+  });
+
+  it("never stays in Cancelling… when the host comes back without re-attach", async () => {
+    const harness = makeIntegratedOperations();
+    const clone = reattachingClone(harness);
+    const cancel = heldCancel(harness);
+    testState.operationOverride = harness.operations;
+    const view = await mountWorkflow({ open: true });
+    const { submission } = await startClone(view);
+    act(() => clone.calls[0]?.onProgress?.({ phase: "reconnecting", reattach: true }));
+    act(() => view.current.cancelClone());
+
+    await act(async () => {
+      cancel.fail(
+        new VcsCloneStoppedError({
+          environmentId: "remote",
+          reason: "reattach-unsupported",
+          message: "x",
+        }),
+      );
+      await submission;
+    });
+    expect(view.current.cloneProgress).toBe("idle");
+    expect(view.current.busy).toBe(false);
+    expect(view.current.error).toBe("The clone stopped before it finished. Try again.");
+  });
+
+  it("shows a folder the cancelled clone could not remove instead of a clean cancel", async () => {
+    const detail =
+      "Git command was interrupted.\nThe incomplete clone at /srv/code/demo could not be removed (the folder was replaced after the clone started). Remove it before trying again.";
+    const harness = makeIntegratedOperations();
+    const clone = reattachingClone(harness);
+    const cancel = heldCancel(harness);
+    testState.operationOverride = harness.operations;
+    const view = await mountWorkflow({ open: true });
+    const { submission } = await startClone(view);
+    act(() => view.current.cancelClone());
+
+    await act(async () => {
+      cancel.acknowledge();
+      clone.replies[0]?.({
+        _tag: "Failure",
+        error: new GitCommandError({
+          operation: "GitVcsDriver.clone",
+          command: "git",
+          cwd: "/srv/code/demo",
+          detail,
+        }),
+      });
+      await submission;
+    });
+    expect(view.current.error).toBe(`Clone failed: ${detail}`);
+    expect(view.current.notice).toBeNull();
+  });
+
+  it("does not add a clone that finished while its cancel was pending", async () => {
+    const harness = makeIntegratedOperations();
+    const clone = reattachingClone(harness);
+    const cancel = heldCancel(harness);
+    testState.operationOverride = harness.operations;
+    const view = await mountWorkflow({ open: true });
+    const { submission } = await startClone(view);
+    act(() => view.current.cancelClone());
+
+    await act(async () => {
+      clone.replies[0]?.({ _tag: "Success", value: { path: "/srv/code/demo" } });
+      await Promise.resolve();
+    });
+    expect(harness.createProject).not.toHaveBeenCalled();
+    await act(async () => {
+      cancel.acknowledge();
+      await submission;
+    });
+    expect(view.current.notice).toBe(
+      "The clone finished before it could be cancelled. It is in /srv/code/demo and was not added as a project. Press Clone to add it.",
+    );
+    expect(view.current.error).toBeNull();
+    expect(view.current.cloneUrl).toBe("https://example.test/demo.git");
+    expect(harness.createProject).not.toHaveBeenCalled();
+    expect(testState.onOpenChange).not.toHaveBeenCalledWith(false);
+  });
+
+  it("reports a clone that finished before a failed cancel instead of the cancel's error", async () => {
+    const harness = makeIntegratedOperations();
+    const clone = reattachingClone(harness);
+    const cancel = heldCancel(harness);
+    testState.operationOverride = harness.operations;
+    const view = await mountWorkflow({ open: true });
+    const { submission } = await startClone(view);
+    act(() => view.current.cancelClone());
+
+    await act(async () => {
+      clone.replies[0]?.({ _tag: "Success", value: { path: "/srv/code/demo" } });
+      await Promise.resolve();
+    });
+    await act(async () => {
+      cancel.fail(
+        new GitCommandError({
+          operation: "vcs.cancelClone",
+          command: "git",
+          cwd: "/srv/code",
+          detail: "Synthetic cancel failure.",
+        }),
+      );
+      await submission;
+    });
+    expect(view.current.notice).toBe(
+      "The clone finished before it could be cancelled. It is in /srv/code/demo and was not added as a project. Press Clone to add it.",
+    );
+    expect(view.current.error).toBeNull();
+    expect(harness.createProject).not.toHaveBeenCalled();
+    expect(testState.onOpenChange).not.toHaveBeenCalledWith(false);
+  });
+
+  it("asks the host to cancel, as best effort, and stops waiting when the workflow unmounts", async () => {
+    const harness = makeIntegratedOperations();
+    const clone = reattachingClone(harness);
+    testState.operationOverride = harness.operations;
+    const view = await mountWorkflow({ open: true });
+    const { submission } = await startClone(view);
+
+    await act(async () => {
+      workflowRoot?.unmount();
+      await submission;
+    });
+    workflowRoot = null;
+
+    expect(harness.cancelClone).toHaveBeenCalledWith({
+      environmentId: ENV_REMOTE,
+      url: "https://example.test/demo.git",
+      parentDir: "/srv/code",
+    });
+    expect(clone.calls[0]?.signal?.aborted).toBe(true);
+    expect(harness.createProject).not.toHaveBeenCalled();
+  });
+
+  it("a stale attempt returns without waiting for its cancel", async () => {
+    const harness = makeIntegratedOperations();
+    const clone = reattachingClone(harness);
+    heldCancel(harness); // never settles in this test
+    testState.operationOverride = harness.operations;
+    const view = await mountWorkflow({ open: true });
+    const { submission } = await startClone(view);
+    act(() => view.current.cancelClone());
+
+    // The selected host leaves the catalog: the workflow resets, so the attempt is stale.
+    await view.rerender(true, [primaryHost, wslHost]);
+    await act(async () => {
+      clone.replies[0]?.({ _tag: "Failure", error: SERVER_CANCELLED });
+      await submission;
+    });
+
+    expect(view.current.busy).toBe(false);
+    expect(view.current.cloneProgress).toBe("idle");
+    expect(view.current.error).toBe("The selected host disconnected. Choose a host and try again.");
+  });
+});
+
+describe("closing the dialog while the clone waits for the host", () => {
+  it("is dismissible when idle and while waiting for the host, never while cloning", async () => {
+    const harness = makeIntegratedOperations();
+    const clone = reattachingClone(harness);
+    const cancel = heldCancel(harness);
+    testState.operationOverride = harness.operations;
+    const view = await mountWorkflow({ open: true });
+    expect(view.current.dismissible).toBe(true);
+
+    const { submission } = await startClone(view);
+    expect(view.current.cloneProgress).toBe("cloning");
+    expect(view.current.dismissible).toBe(false);
+    act(() => clone.calls[0]?.onProgress?.({ phase: "reconnecting", reattach: true }));
+    expect(view.current.dismissible).toBe(true);
+    act(() => clone.calls[0]?.onProgress?.({ phase: "cloning", reattach: true }));
+    expect(view.current.dismissible).toBe(false);
+    act(() => view.current.cancelClone());
+    expect(view.current.cloneProgress).toBe("cancelling");
+    expect(view.current.dismissible).toBe(true);
+    // Busy keeps its meaning: Back and host selection stay unavailable.
+    expect(view.current.busy).toBe(true);
+
+    await act(async () => {
+      cancel.acknowledge();
+      clone.replies[0]?.({ _tag: "Failure", error: SERVER_CANCELLED });
+      await submission;
+    });
+    expect(view.current.dismissible).toBe(true);
+  });
+
+  it("is not dismissible while the cloned repository is being added", async () => {
+    const harness = makeIntegratedOperations();
+    const registration = deferredResult<
+      AddProjectCommandResult<{
+        readonly projectId: ProjectId;
+        readonly defaultThreadId: ThreadId;
+      }>
+    >();
+    harness.createProject.mockReturnValueOnce(registration.promise);
+    testState.operationOverride = harness.operations;
+    const view = await mountWorkflow({ open: true });
+    const { submission } = await startClone(view);
+    expect(view.current.cloneProgress).toBe("registering");
+    expect(view.current.dismissible).toBe(false);
+
+    await act(async () => {
+      const command = harness.createProject.mock.calls[0]?.[0];
+      if (command === undefined) throw new Error("Missing project command");
+      registration.resolve({
+        _tag: "Success",
+        value: { projectId: command.projectId, defaultThreadId: DEFAULT_THREAD_ID },
+      });
+      await submission;
+    });
+    expect(testState.onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("is not dismissible while another step is busy", async () => {
+    const createResult = deferredResult<boolean>();
+    testState.operations.create.mockReturnValue(createResult.promise);
+    const view = await mountWorkflow({ open: true });
+    act(() => view.current.openCreate());
+    act(() => view.current.setCreateName("demo"));
+    act(() => {
+      void view.current.submitCreate();
+    });
+    expect(view.current.busy).toBe(true);
+    expect(view.current.dismissible).toBe(false);
+
+    createResult.resolve(false);
+    await flushPromises();
+    expect(view.current.dismissible).toBe(true);
+  });
+
+  it("closing while the connection is lost cancels the clone once and stops waiting", async () => {
+    const harness = makeIntegratedOperations();
+    const clone = reattachingClone(harness);
+    testState.operationOverride = harness.operations;
+    const view = await mountWorkflow({ open: true });
+    const { submission } = await startClone(view);
+    act(() => clone.calls[0]?.onProgress?.({ phase: "reconnecting", reattach: true }));
+
+    await view.rerender(false);
+
+    expect(harness.cancelClone).toHaveBeenCalledTimes(1);
+    expect(harness.cancelClone).toHaveBeenCalledWith({
+      environmentId: ENV_REMOTE,
+      url: "https://example.test/demo.git",
+      parentDir: "/srv/code",
+    });
+    expect(clone.calls[0]?.signal?.aborted).toBe(true);
+    await act(async () => submission);
+    expect(harness.createProject).not.toHaveBeenCalled();
+    expect(view.current.busy).toBe(false);
+    expect(view.current.cloneProgress).toBe("idle");
+  });
+
+  it("closing while cancelling sends no second cancel and stops waiting", async () => {
+    const harness = makeIntegratedOperations();
+    const clone = reattachingClone(harness);
+    const cancel = heldCancel(harness);
+    testState.operationOverride = harness.operations;
+    const view = await mountWorkflow({ open: true });
+    const { submission } = await startClone(view);
+    act(() => clone.calls[0]?.onProgress?.({ phase: "reconnecting", reattach: true }));
+    act(() => view.current.cancelClone());
+    expect(harness.cancelClone).toHaveBeenCalledTimes(1);
+
+    await view.rerender(false);
+
+    expect(harness.cancelClone).toHaveBeenCalledTimes(1);
+    expect(clone.calls[0]?.signal?.aborted).toBe(true);
+    // The cancel still settles on its own, and the closed dialog reports nothing more.
+    const noticeWhenClosed = view.current.notice;
+    await act(async () => {
+      cancel.acknowledge();
+      await submission;
+    });
+    expect(harness.cancelClone).toHaveBeenCalledTimes(1);
+    expect(harness.createProject).not.toHaveBeenCalled();
+    expect(view.current.notice).toBe(noticeWhenClosed);
+    expect(view.current.error).toBeNull();
   });
 });
