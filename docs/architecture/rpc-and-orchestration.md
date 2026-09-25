@@ -1933,11 +1933,21 @@ replacement that now occupies the old path.
   server-owned lifecycle continues to a terminal receipt while only the caller
   wait is canceled.
 - Cancellation flows from client interrupt or socket closure into registered
-  handlers and supervised processes. On Unix, a handler that runs Git inline
-  is dropped on interrupt, which kills only the top-level `git` process, so a
-  transport helper can outlive it (on Windows the job object kills the tree);
-  clone runs its transfer in an owned task so cancellation stops the whole
-  process group and cleans up.
+  handlers and supervised processes. An inline handler is dropped on interrupt
+  or teardown instead of observing its token; the supervised runner's drop
+  guard then stops the whole process tree (the process group on Unix, the job
+  on Windows), as it does for an aborted request task, runtime shutdown, or a
+  panic. The guard never waits (tokio reaps the root, the adopting parent reaps
+  descendants) and signals only while the root is unreaped, so a run dropped
+  after its root was reaped but before its output closed is not signalled; a
+  descendant that still holds the pipes then survives until it exits. A failed
+  run, which already owns an orderly termination path, still signals its group
+  after the root was reaped: a descendant that is still in the group keeps the
+  group id reserved, so the kill reaches exactly the stragglers, and only an
+  empty group's id could be reused, which takes a PID wrap-around in between.
+  Work that must finish cleanup before the caller continues cancels its token
+  instead: clone's owned transfer task stops the process group and removes the
+  destination it created.
 - Git Manager mutations use the worktree catalog's project-then-repository lock
   order and fail a competing operation with `operation-in-flight`; they do not
   introduce an independent repository lock.

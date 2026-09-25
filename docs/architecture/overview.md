@@ -275,7 +275,11 @@ flowchart TB
   `ETXTBSY` (the executable is still open for writing, typically a helper
   that was just installed or rewritten, or a fork of this process that has
   not exec'd yet) every 25 ms for at most one second and never past the run's
-  own deadline. Every other spawn error is returned immediately.
+  own deadline. Every other spawn error is returned immediately. A run whose
+  future is dropped before it settles (an interrupted inline RPC, an aborted
+  task, runtime shutdown, or a panic) kills its whole process group or Windows
+  job while the root is unreaped, without waiting; see the cancellation
+  invariants in [RPC and orchestration](./rpc-and-orchestration.md).
 
 - **Contracts (`packages/contracts`)** contains Effect schemas and TypeScript
   contracts only. It defines persisted models, RPC methods, HTTP APIs, desktop
