@@ -4,7 +4,7 @@ import { writeTextToClipboard } from "../../../hooks/useCopyToClipboard";
 import { Button } from "../../ui/button";
 import { Popover, PopoverPopup, PopoverTitle, PopoverTrigger } from "../../ui/popover";
 import { usePullRequestsActions } from "../usePullRequestsAction";
-import { PullRequestsPermissionButton, constrainPermission } from "./PullRequestsPermissionButton";
+import { PermissionButton, constrainPermission } from "../../ui/permission-button";
 type Suggestion = NonNullable<
   Extract<PullRequestsTimelineItem, { kind: "thread" }>["comments"][number]["suggestion"]
 >;
@@ -67,14 +67,7 @@ export function PullRequestsApplySuggestionsButton({
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger
         disabled={!available.allowed}
-        render={
-          <PullRequestsPermissionButton
-            mutation
-            permission={available}
-            variant="outline"
-            size="sm"
-          />
-        }
+        render={<PermissionButton mutation permission={available} variant="outline" size="sm" />}
       >
         {label}
       </PopoverTrigger>
@@ -105,7 +98,7 @@ export function PullRequestsApplySuggestionsButton({
               <Button variant="outline" size="sm" onClick={() => setOpen(false)}>
                 Cancel
               </Button>
-              <PullRequestsPermissionButton
+              <PermissionButton
                 mutation
                 permission={available}
                 size="sm"
@@ -116,7 +109,7 @@ export function PullRequestsApplySuggestionsButton({
                   : suggestionIds.length === 1
                     ? "Apply suggestion"
                     : `Apply ${suggestionIds.length} suggestions`}
-              </PullRequestsPermissionButton>
+              </PermissionButton>
             </div>
           </div>
         </PopoverPopup>

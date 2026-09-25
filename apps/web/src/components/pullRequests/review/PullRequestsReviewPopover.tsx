@@ -6,10 +6,7 @@ import { usePullRequestsStore } from "../../../pullRequestsStore";
 import { Button } from "../../ui/button";
 import { PopoverPopup, PopoverTitle } from "../../ui/popover";
 import { toastManager } from "../../ui/toast";
-import {
-  PullRequestsPermissionButton,
-  constrainPermission,
-} from "../shared/PullRequestsPermissionButton";
+import { PermissionButton, constrainPermission } from "../../ui/permission-button";
 import { usePullRequestsActions } from "../usePullRequestsAction";
 import { reconcilePendingReview, reviewComments } from "./pendingReview.logic";
 export interface PullRequestsReviewProps {
@@ -148,7 +145,7 @@ export function PullRequestsReviewPopover({
                 value={option.value}
                 disabled={!permission.allowed}
                 render={
-                  <PullRequestsPermissionButton
+                  <PermissionButton
                     permission={permission}
                     variant="outline"
                     className="w-full justify-start gap-2"
@@ -172,7 +169,7 @@ export function PullRequestsReviewPopover({
           </p>
         ) : null}
         <div className="flex flex-wrap gap-2 border-t border-border pt-3">
-          <PullRequestsPermissionButton
+          <PermissionButton
             mutation
             permission={constrainPermission(
               detail.permissions.revokeApproval,
@@ -183,8 +180,8 @@ export function PullRequestsReviewPopover({
             onClick={() => void runSeparate("revokeApproval")}
           >
             Revoke approval
-          </PullRequestsPermissionButton>
-          <PullRequestsPermissionButton
+          </PermissionButton>
+          <PermissionButton
             mutation
             permission={constrainPermission(
               detail.permissions.removeOwnChangeRequest,
@@ -195,19 +192,15 @@ export function PullRequestsReviewPopover({
             onClick={() => void runSeparate("removeOwnChangeRequest")}
           >
             Remove my change request
-          </PullRequestsPermissionButton>
+          </PermissionButton>
         </div>
         <div className="flex justify-end gap-2">
           <Button variant="outline" onClick={onClose}>
             Close review
           </Button>
-          <PullRequestsPermissionButton
-            mutation
-            permission={submitPermission}
-            onClick={() => void submit()}
-          >
+          <PermissionButton mutation permission={submitPermission} onClick={() => void submit()}>
             {submitting ? "Submitting…" : "Submit review"}
-          </PullRequestsPermissionButton>
+          </PermissionButton>
         </div>
       </div>
     </PopoverPopup>

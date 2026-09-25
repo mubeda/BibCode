@@ -9,10 +9,7 @@ import {
   AlertDialogDescription,
 } from "../../ui/alert-dialog";
 import { Button } from "../../ui/button";
-import {
-  PullRequestsPermissionButton,
-  constrainPermission,
-} from "../shared/PullRequestsPermissionButton";
+import { PermissionButton, constrainPermission } from "../../ui/permission-button";
 import { pullRequestsActionError, usePullRequestsActions } from "../usePullRequestsAction";
 
 export function PullRequestsConfirmAction({
@@ -72,7 +69,7 @@ export function PullRequestsConfirmAction({
           <Button variant="outline" disabled={pending} onClick={onClose}>
             Cancel
           </Button>
-          <PullRequestsPermissionButton
+          <PermissionButton
             mutation
             permission={constrainPermission(
               permission,
@@ -82,7 +79,7 @@ export function PullRequestsConfirmAction({
             onClick={() => void confirm()}
           >
             {pending ? "Working…" : confirmLabel}
-          </PullRequestsPermissionButton>
+          </PermissionButton>
         </AlertDialogFooter>
       </AlertDialogPopup>
     </AlertDialog>

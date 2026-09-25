@@ -10,10 +10,7 @@ import {
   ComboboxList,
   ComboboxItem,
 } from "../../ui/combobox";
-import {
-  PullRequestsPermissionButton,
-  constrainPermission,
-} from "../shared/PullRequestsPermissionButton";
+import { PermissionButton, constrainPermission } from "../../ui/permission-button";
 import { pullRequestsActionError, usePullRequestsActions } from "../usePullRequestsAction";
 import { usePullRequestsVocabulary } from "./usePullRequestsVocabulary";
 import { PullRequestsConfirmAction } from "./PullRequestsConfirmAction";
@@ -114,7 +111,7 @@ export function PullRequestsBaseBranchPicker({
           }}
         />
       ) : (
-        <PullRequestsPermissionButton
+        <PermissionButton
           mutation
           permission={permission}
           size="sm"
@@ -123,7 +120,7 @@ export function PullRequestsBaseBranchPicker({
           onClick={() => setOpen(true)}
         >
           <code className="text-xs">{detail.baseBranch}</code>
-        </PullRequestsPermissionButton>
+        </PermissionButton>
       )}
       {error ? (
         <span role="alert" className="text-sm text-destructive">

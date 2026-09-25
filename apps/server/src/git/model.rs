@@ -54,6 +54,32 @@ pub enum ProviderKind {
     Unknown,
 }
 
+// The Git status wire model mirrors the source-control provider kinds one to one.
+impl From<crate::source_control::ProviderKind> for ProviderKind {
+    fn from(kind: crate::source_control::ProviderKind) -> Self {
+        use crate::source_control::ProviderKind as Source;
+        match kind {
+            Source::Github => Self::Github,
+            Source::Gitlab => Self::Gitlab,
+            Source::AzureDevops => Self::AzureDevops,
+            Source::Bitbucket => Self::Bitbucket,
+            Source::Unknown => Self::Unknown,
+        }
+    }
+}
+
+impl From<ProviderKind> for crate::source_control::ProviderKind {
+    fn from(kind: ProviderKind) -> Self {
+        match kind {
+            ProviderKind::Github => Self::Github,
+            ProviderKind::Gitlab => Self::Gitlab,
+            ProviderKind::AzureDevops => Self::AzureDevops,
+            ProviderKind::Bitbucket => Self::Bitbucket,
+            ProviderKind::Unknown => Self::Unknown,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SourceControlProviderInfo {

@@ -11,6 +11,7 @@ import type {
   ScopedProjectRef,
   VcsWorktreeDescriptor,
 } from "@bibcode/contracts";
+import { resolveChangeRequestPresentation } from "@bibcode/shared/sourceControl";
 import * as Cause from "effect/Cause";
 import {
   ArchiveIcon,
@@ -279,6 +280,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
   );
   const refsQuery = useEnvironmentQuery(refsAtom);
   const statusQuery = useEnvironmentQuery(statusAtom);
+  const changeRequest = resolveChangeRequestPresentation(statusQuery.data?.sourceControlProvider);
   const stashesQuery = useEnvironmentQuery(stashesAtom);
   const refreshRefs = refsQuery.refresh;
   const refreshStashes = stashesQuery.refresh;
@@ -866,7 +868,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
               : "git-manager-pull-requests-disabled-reason"
           }
           aria-expanded={providerPaneOpen}
-          aria-label={`${providerPaneOpen ? "Hide" : "Show"} pull requests and checks`}
+          aria-label={`${providerPaneOpen ? "Hide" : "Show"} ${changeRequest.pluralLongName} and checks`}
           disabled={pullRequestsDisabledReason !== null}
           size="xs"
           title={pullRequestsDisabledReason ?? undefined}
@@ -874,7 +876,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
           onClick={toggleProviderPane}
         >
           <GitPullRequestIcon aria-hidden="true" />
-          {providerPaneOpen ? "Hide pull requests" : "Show pull requests"}
+          {`${providerPaneOpen ? "Hide" : "Show"} ${changeRequest.pluralLongName}`}
         </Button>
         {pullRequestsDisabledReason === null ? null : (
           <span className="sr-only" id="git-manager-pull-requests-disabled-reason">
@@ -950,6 +952,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
         <div className="h-80 min-h-0 overflow-auto border-b border-panel-separator">
           <GitManagerPullRequestPanel
             projectRef={projectRef}
+            provider={statusQuery.data?.sourceControlProvider ?? null}
             disabledReason={pullRequestsDisabledReason}
             scope={scope}
             onRefresh={refreshRefs}

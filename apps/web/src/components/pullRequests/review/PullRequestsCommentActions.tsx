@@ -18,10 +18,7 @@ import {
   AlertDialogFooter,
 } from "../../ui/alert-dialog";
 import { PullRequestsExternalLink } from "../shared/PullRequestsMarkdown";
-import {
-  PullRequestsPermissionButton,
-  constrainPermission,
-} from "../shared/PullRequestsPermissionButton";
+import { PermissionButton, constrainPermission } from "../../ui/permission-button";
 import { usePullRequestsActions } from "../usePullRequestsAction";
 import { PullRequestsCommentBox } from "./PullRequestsCommentBox";
 type Comment =
@@ -74,7 +71,7 @@ export function PullRequestsCommentActions({
                   nativeButton
                   disabled={!permission("editOwnComment").allowed}
                   render={
-                    <PullRequestsPermissionButton
+                    <PermissionButton
                       mutation
                       permission={permission("editOwnComment")}
                       variant="ghost"
@@ -88,7 +85,7 @@ export function PullRequestsCommentActions({
                   nativeButton
                   disabled={!permission("deleteOwnComment").allowed}
                   render={
-                    <PullRequestsPermissionButton
+                    <PermissionButton
                       mutation
                       permission={permission("deleteOwnComment")}
                       variant="ghost"
@@ -107,7 +104,7 @@ export function PullRequestsCommentActions({
               nativeButton
               disabled={!permission("minimizeComment").allowed}
               render={
-                <PullRequestsPermissionButton
+                <PermissionButton
                   mutation
                   permission={permission("minimizeComment")}
                   variant="ghost"
@@ -191,7 +188,7 @@ export function PullRequestsCommentActions({
             <Button variant="outline" disabled={deleting} onClick={() => setConfirmDelete(false)}>
               Cancel
             </Button>
-            <PullRequestsPermissionButton
+            <PermissionButton
               mutation
               permission={permission("deleteOwnComment")}
               variant="destructive"
@@ -216,7 +213,7 @@ export function PullRequestsCommentActions({
               }}
             >
               {deleting ? "Deleting…" : "Delete comment"}
-            </PullRequestsPermissionButton>
+            </PermissionButton>
           </AlertDialogFooter>
         </AlertDialogPopup>
       </AlertDialog>

@@ -1,3 +1,7 @@
+import {
+  getChangeRequestTerminologyForKind,
+  formatChangeRequestNumber,
+} from "@bibcode/shared/sourceControl";
 import type {
   PullRequestsContext,
   PullRequestsDetail,
@@ -18,12 +22,9 @@ import {
   MenuSeparator,
 } from "../../ui/menu";
 import { toastManager } from "../../ui/toast";
-import {
-  PullRequestsPermissionButton,
-  constrainPermission,
-} from "../shared/PullRequestsPermissionButton";
+import { PermissionButton, constrainPermission } from "../../ui/permission-button";
 import { PullRequestsExternalLink } from "../shared/PullRequestsMarkdown";
-import { PullRequestsMutationsDisabledContext } from "../pullRequestsMutationAvailability";
+import { MutationsDisabledContext } from "../../ui/mutationAvailability";
 import { usePullRequestsActions, type PullRequestsAction } from "../usePullRequestsAction";
 import { inverseOf, scheduleUndo } from "./undoToast.logic";
 import { PullRequestsConfirmAction } from "./PullRequestsConfirmAction";
@@ -39,8 +40,8 @@ function StateConfirmation({
   onClose,
 }: Props & { action: "delete" | "revert"; onClose: () => void }) {
   const { run, pending } = usePullRequestsActions();
-  const noun = context.capabilities.vocabulary.pullRequest;
-  const number = `${context.provider === "github" ? "#" : "!"}${detail.number}`;
+  const noun = getChangeRequestTerminologyForKind(context.provider).singular;
+  const number = formatChangeRequestNumber(context.provider, detail.number);
   return (
     <PullRequestsConfirmAction
       title={action === "delete" ? `Delete ${noun} ${number}` : `Revert ${number}`}
@@ -74,7 +75,7 @@ export function PullRequestsRevertButton(props: Props) {
   const [open, setOpen] = useState(false);
   return (
     <>
-      <PullRequestsPermissionButton
+      <PermissionButton
         mutation
         permission={constrainPermission(
           props.detail.permissions.revert,
@@ -89,7 +90,7 @@ export function PullRequestsRevertButton(props: Props) {
         onClick={() => setOpen(true)}
       >
         Revert
-      </PullRequestsPermissionButton>
+      </PermissionButton>
       {open ? (
         <StateConfirmation {...props} action="revert" onClose={() => setOpen(false)} />
       ) : null}
@@ -133,7 +134,7 @@ export function PullRequestsSecondaryActions({ detail, context }: Props) {
   const { run, pending } = usePullRequestsActions();
   const [confirmation, setConfirmation] = useState<"delete" | "revert" | null>(null);
   const [copyStatus, setCopyStatus] = useState<string | null>(null);
-  const disabledReason = useContext(PullRequestsMutationsDisabledContext);
+  const disabledReason = useContext(MutationsDisabledContext);
   const permissions = detail.permissions;
   const available = (permission: PullRequestsPermission) =>
     constrainPermission(
@@ -247,7 +248,7 @@ export function PullRequestsSecondaryActions({ detail, context }: Props) {
             onClick={() => {
               void writeTextToClipboard(
                 detail.url,
-                `${context.capabilities.vocabulary.pullRequest} URL`,
+                `${getChangeRequestTerminologyForKind(context.provider).singular} URL`,
               ).then(
                 () => setCopyStatus("URL copied"),
                 () => setCopyStatus("Could not copy the URL. Use Open in browser."),

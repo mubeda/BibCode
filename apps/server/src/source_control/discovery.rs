@@ -189,12 +189,31 @@ pub(crate) fn provider_install_hint(kind: ProviderKind) -> Option<&'static str> 
         .map(|probe| probe.install_hint)
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct SourceControlDiscovery {
     runner: ProcessRunner,
+    /// Tests resolve every probed executable inside this directory.
+    #[cfg(test)]
+    executable_dir: Option<PathBuf>,
 }
 
 impl SourceControlDiscovery {
+    #[cfg(test)]
+    pub(crate) fn with_executable_dir_for_test(executable_dir: PathBuf) -> Self {
+        Self {
+            runner: ProcessRunner,
+            executable_dir: Some(executable_dir),
+        }
+    }
+
+    fn command(&self, executable: &str) -> PathBuf {
+        #[cfg(test)]
+        if let Some(directory) = &self.executable_dir {
+            return directory.join(executable);
+        }
+        PathBuf::from(executable)
+    }
+
     pub async fn discover(
         &self,
         cwd: PathBuf,
@@ -286,7 +305,7 @@ impl SourceControlDiscovery {
             .run(
                 ProcessRequest {
                     operation: "source-control.discovery.probe".into(),
-                    command: executable.into(),
+                    command: self.command(executable),
                     args: args.iter().map(OsString::from).collect(),
                     cwd: cwd.to_path_buf(),
                     env: vec![],
@@ -369,6 +388,16 @@ fn parse_auth(kind: ProviderKind, result: Option<&ProcessOutput>) -> SourceContr
         }
         ProviderKind::Gitlab => {
             let hosts = parse_gitlab_auth_status(&combined);
+            if hosts.is_empty() {
+                if super::gitlab_auth_status_is_logged_out(&combined) {
+                    return SourceControlProviderAuth {
+                        hosts: Some(Vec::new()),
+                        ..unauthenticated_auth()
+                    };
+                }
+                // Not a host list: an explicit discovery must not read it as "no hosts".
+                return unknown_auth("GitLab CLI authentication output was not recognized.");
+            }
             let mut auth = hosts
                 .iter()
                 .find(|host| host.account.is_some())
@@ -439,7 +468,7 @@ mod tests {
     #[tokio::test]
     async fn discovery_covers_native_probe_inventory() {
         let root = tempfile::tempdir().unwrap();
-        let result = SourceControlDiscovery::default()
+        let result = SourceControlDiscovery::with_executable_dir_for_test(root.path().join("bin"))
             .discover(root.path().to_path_buf(), &CancellationToken::new())
             .await;
         assert_eq!(result.version_control_systems.len(), VCS_PROBES.len());
@@ -451,6 +480,45 @@ mod tests {
             result.source_control_providers.last().unwrap().kind,
             ProviderKind::Bitbucket
         );
+    }
+
+    #[test]
+    fn gitlab_logout_is_unauthenticated_but_unrecognized_output_is_unknown() {
+        // Captured with an isolated GLAB_CONFIG_DIR and an empty hosts map.
+        let logged_out = parse_auth(
+            ProviderKind::Gitlab,
+            Some(&output(
+                1,
+                "",
+                include_str!("../../tests/fixtures/pull_requests/glab_logged_out.txt"),
+            )),
+        );
+        assert_eq!(logged_out.status, AuthStatus::Unauthenticated);
+        assert_eq!(logged_out.hosts, Some(Vec::new()));
+
+        let unknown = parse_auth(
+            ProviderKind::Gitlab,
+            Some(&output(
+                1,
+                "",
+                "error: unexpected response from the keyring\n",
+            )),
+        );
+        assert_eq!(unknown.status, AuthStatus::Unknown);
+        assert_eq!(unknown.hosts, None);
+    }
+
+    #[test]
+    fn gitlab_logout_recognizes_wrapped_core_phrase_without_punctuation() {
+        for text in [
+            "No GitLab instances have been authenticated with glab",
+            "ERROR\n\n No GitLab instances have\n been authenticated\twith glab.\n",
+            "NO GITLAB INSTANCES HAVE BEEN AUTHENTICATED WITH GLAB: run auth login",
+        ] {
+            let auth = parse_auth(ProviderKind::Gitlab, Some(&output(1, "", text)));
+            assert_eq!(auth.status, AuthStatus::Unauthenticated, "{text}");
+            assert_eq!(auth.hosts, Some(Vec::new()), "{text}");
+        }
     }
 
     #[test]
@@ -519,6 +587,19 @@ mod tests {
             )
             .status,
             AuthStatus::Unauthenticated
+        );
+        let unrecognized = parse_auth(
+            ProviderKind::Gitlab,
+            Some(&output(
+                1,
+                "",
+                "error: unexpected response from the keyring\n",
+            )),
+        );
+        assert_eq!(unrecognized.status, AuthStatus::Unknown);
+        assert_eq!(
+            unrecognized.hosts, None,
+            "an unrecognized answer lists no hosts"
         );
         assert_eq!(
             parse_auth(ProviderKind::AzureDevops, Some(&output(0, "{}", ""))).status,

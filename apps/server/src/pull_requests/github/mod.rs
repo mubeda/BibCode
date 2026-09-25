@@ -218,20 +218,20 @@ impl PullRequestHost for GitHubHost {
                 .repository
                 .split_once('/')
                 .ok_or_else(|| parse::invalid(operation))?;
-            let user = self.api(scope, "user", operation, c).await?;
-            let repository = self
-                .api(scope, &format!("repos/{}", scope.repository), operation, c)
-                .await?;
-            let viewer = self
-                .graphql(
+            let repository_path = format!("repos/{}", scope.repository);
+            // Independent host round trips: issue them together, keep the error order.
+            let (user, repository, viewer) = tokio::join!(
+                self.api(scope, "user", operation, c),
+                self.api(scope, &repository_path, operation, c),
+                self.graphql(
                     scope,
                     graphql::CONTEXT,
                     json!({"owner":owner,"name":name}),
                     operation,
                     c,
-                )
-                .await?;
-            parse::context(scope, &user, &repository, &viewer)
+                ),
+            );
+            parse::context(scope, &user?, &repository?, &viewer?)
         })
     }
 
@@ -603,6 +603,62 @@ mod tests {
             })
         );
         assert_eq!(host.head_ref_spec(14), "refs/pull/14/head");
+    }
+
+    /// Each fake context read waits until its two siblings run, so a sequential
+    /// adapter fails instead of answering. When reads fail, the `user` failure still
+    /// wins even though the repository read failed first.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pull_requests_github_context_reads_run_together_and_keep_the_error_order() {
+        use crate::test_support::TestSandbox;
+        use std::fs;
+        let s = TestSandbox::new("pr-github-concurrent");
+        fs::write(
+            s.path("repository.json"),
+            include_str!("../../../tests/fixtures/pull_requests/github_repository.json"),
+        )
+        .unwrap();
+        fs::write(s.path("mode"), "answer").unwrap();
+        let script = s.executable_script(
+            "gh",
+            r#"arrive() {
+  : > "$1.$$"; i=0
+  while [ "$(ls "$1".* 2>/dev/null | wc -l)" -lt 3 ]; do
+    i=$((i + 1)); if [ "$i" -gt 60 ]; then rm -f "$1.$$"; echo "$1 read ran alone" >&2; exit 75; fi
+    sleep 0.05
+  done
+}
+mode=$(cat mode)
+case "$1 $2" in
+  'api user') arrive "$mode"
+    if [ "$mode" = fail ]; then sleep 0.3; echo 'HTTP 401: Bad credentials' >&2; exit 1; fi
+    echo '{"login":"mubeda","name":""}' ;;
+  'api repos/example/repository') arrive "$mode"
+    if [ "$mode" = fail ]; then echo 'HTTP 404: Not Found' >&2; exit 1; fi
+    cat repository.json ;;
+  'api graphql') cat > /dev/null; arrive "$mode"; echo '{"data":{"repository":{"viewerPermission":"ADMIN"}}}' ;;
+  *) exit 64 ;;
+esac"#,
+            "",
+        );
+        let host = GitHubHost::new(Arc::new(
+            HostCommandRunner::new(s.path("state")).with_commands(&script, &script, &script),
+        ));
+        let scope = HostScope {
+            cwd: s.root().into(),
+            host: "github.com".into(),
+            repository: "example/repository".into(),
+            provider: ProviderKind::Github,
+        };
+        let c = CancellationToken::new();
+        let context = host.context(&scope, &c).await.unwrap();
+        assert_eq!(context.account.login, "mubeda");
+        assert_eq!(context.repository_permission, RepositoryPermission::Admin);
+
+        fs::write(s.path("mode"), "fail").unwrap();
+        let error = host.context(&scope, &c).await.unwrap_err();
+        assert_eq!(error.code, "not_authenticated", "{error:?}");
     }
 
     #[cfg(unix)]

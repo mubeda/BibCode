@@ -6,6 +6,7 @@ import type {
 import { Link } from "@tanstack/react-router";
 import { CircleCheckIcon, CircleDotIcon, CircleXIcon, MessageSquareIcon } from "lucide-react";
 import { memo } from "react";
+import { formatChangeRequestNumber } from "@bibcode/shared/sourceControl";
 import { formatRelativeTimeLabel } from "../../../timestampFormat";
 import { PullRequestsActor } from "../shared/PullRequestsActor";
 import { PullRequestsLabelChip } from "../shared/PullRequestsLabelChip";
@@ -33,6 +34,7 @@ export const PullRequestsRow = memo(function PullRequestsRow({
   context,
 }: PullRequestsRowProps) {
   const combinedClosed = context.capabilities.closedTabIncludesMerged;
+  const reference = formatChangeRequestNumber(context.provider, row.number);
   const check = row.checksSummary === null ? null : CHECKS[row.checksSummary];
   return (
     <div
@@ -65,9 +67,8 @@ export const PullRequestsRow = memo(function PullRequestsRow({
         </div>
         <div className="flex min-w-0 items-center gap-2 overflow-hidden whitespace-nowrap text-xs text-muted-foreground">
           <span>
-            {combinedClosed ? `#${row.number} opened` : `!${row.number} · created`}{" "}
-            {rowTimeLabel(row)} by{" "}
-            <PullRequestsActor actor={row.author} preferName={!combinedClosed} />
+            {combinedClosed ? `${reference} opened` : `${reference} · created`} {rowTimeLabel(row)}{" "}
+            by <PullRequestsActor actor={row.author} preferName={!combinedClosed} />
           </span>
           {row.reviewDecision ? <span>· {REVIEW_LABELS[row.reviewDecision]}</span> : null}
           {row.approvals ? (

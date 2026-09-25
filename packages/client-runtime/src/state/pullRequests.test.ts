@@ -1,9 +1,13 @@
-import { createPullRequestsEnvironmentAtoms } from "@bibcode/client-runtime/state/pull-requests";
-import { EnvironmentId } from "@bibcode/contracts";
+import {
+  createOneShotBypass,
+  createPullRequestsEnvironmentAtoms,
+} from "@bibcode/client-runtime/state/pull-requests";
+import { EnvironmentId, PullRequestsOperationError } from "@bibcode/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import { Atom } from "effect/unstable/reactivity";
-import { describe, expect, it } from "vite-plus/test";
+import { RpcClientError } from "effect/unstable/rpc";
+import { describe, expect, it } from "@effect/vitest";
 
 import { EnvironmentRegistry } from "../connection/registry.ts";
 
@@ -26,6 +30,8 @@ describe("Pull Requests environment atoms", () => {
       "getTimeline",
       "getVocabulary",
       "list",
+      "requestContextRescan",
+      "requestListTotalsRefresh",
       "runAction",
     ]);
 
@@ -37,5 +43,91 @@ describe("Pull Requests environment atoms", () => {
     expect(
       atoms.getContext({ environmentId: EnvironmentId.make("env-2"), input: { cwd: "/repo" } }),
     ).not.toBe(context);
+    atoms.requestContextRescan({ environmentId, input: { cwd: "/repo" } });
+    expect(atoms.getContext({ environmentId, input: { cwd: "/repo" } })).toBe(context);
   });
+
+  it.effect(
+    "sends a requested bypass until a read is answered, for that environment and input only",
+    () =>
+      Effect.gen(function* () {
+        const bypass = createOneShotBypass("rescan");
+        const environmentId = EnvironmentId.make("env-1");
+        const input = { cwd: "/repo" };
+        const sent: object[] = [];
+        const record = (payload: object) => Effect.sync(() => void sent.push(payload));
+        const read = (
+          target: EnvironmentId,
+          value: { readonly cwd: string },
+          send: (
+            payload: object,
+          ) => Effect.Effect<
+            void,
+            RpcClientError.RpcClientError | PullRequestsOperationError
+          > = record,
+        ) => Effect.exit(bypass.run(target, value, send));
+
+        yield* read(environmentId, input);
+        bypass.request({ environmentId, input: { cwd: "/repo" } });
+        yield* read(EnvironmentId.make("env-2"), input);
+        yield* read(environmentId, { cwd: "/other" });
+        // An interrupted read and a lost connection are not answers: the next read still bypasses.
+        yield* read(environmentId, input, (payload) =>
+          record(payload).pipe(Effect.andThen(Effect.interrupt)),
+        );
+        yield* read(environmentId, input, (payload) =>
+          record(payload).pipe(
+            Effect.andThen(
+              Effect.fail(
+                new RpcClientError.RpcClientError({
+                  reason: new RpcClientError.RpcClientDefect({
+                    message: "socket closed",
+                    cause: new Error("socket closed"),
+                  }),
+                }),
+              ),
+            ),
+          ),
+        );
+        // The server's typed failure is an answer, like a success.
+        yield* read(environmentId, input, (payload) =>
+          record(payload).pipe(
+            Effect.andThen(
+              Effect.fail(
+                new PullRequestsOperationError({
+                  operation: "pullRequests.getContext",
+                  code: "timeout",
+                  message: "The read timed out.",
+                  hostDetail: null,
+                  retryable: true,
+                }),
+              ),
+            ),
+          ),
+        );
+        yield* read(environmentId, input);
+        expect(sent).toEqual([
+          { cwd: "/repo" },
+          { cwd: "/repo" },
+          { cwd: "/other" },
+          { cwd: "/repo", rescan: true },
+          { cwd: "/repo", rescan: true },
+          { cwd: "/repo", rescan: true },
+          { cwd: "/repo" },
+        ]);
+
+        const totals = createOneShotBypass("refreshTotals");
+        const page = { cwd: "/repo", state: "open", cursor: null as string | null };
+        const pages: object[] = [];
+        const list = (value: typeof page) =>
+          totals.run(environmentId, value, (payload) =>
+            Effect.sync(() => void pages.push(payload)),
+          );
+        totals.request({ environmentId, input: { ...page } });
+        yield* list({ ...page, cursor: "2" });
+        yield* list(page);
+        yield* list(page);
+        expect(pages).toEqual([{ ...page, cursor: "2" }, { ...page, refreshTotals: true }, page]);
+      }),
+  );
 });

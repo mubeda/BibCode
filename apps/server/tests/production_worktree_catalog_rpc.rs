@@ -4590,7 +4590,7 @@ impl CatalogRpcFixture {
         register_orchestration_rpc(&mut registry, engine.clone());
         register_git_vcs_rpc(
             &mut registry,
-            GitVcsRpcServices::with_repository(git_repository.clone()),
+            GitVcsRpcServices::with_repository(git_repository.clone(), Arc::default()),
         );
         let server_state = root.path().join("server");
         let config = ServerConfig::new(server_state)

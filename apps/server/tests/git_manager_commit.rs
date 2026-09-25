@@ -151,7 +151,7 @@ async fn commit_amend_undo_discard_scope_and_concurrency_follow_the_wire_contrac
     register_git_manager_rpc(&mut registry, services);
     register_git_vcs_rpc(
         &mut registry,
-        GitVcsRpcServices::with_repository(repository),
+        GitVcsRpcServices::with_repository(repository, Arc::default()),
     );
     let config = ServerConfig::new(state.path())
         .with_bind("127.0.0.1", 0)

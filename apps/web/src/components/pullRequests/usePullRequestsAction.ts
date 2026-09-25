@@ -1,4 +1,4 @@
-import { PullRequestsMutationsDisabledContext } from "./pullRequestsMutationAvailability";
+import { MutationsDisabledContext } from "../ui/mutationAvailability";
 import type {
   EnvironmentId,
   PullRequestsActionRequest,
@@ -90,7 +90,7 @@ export function useRunPullRequestsAction(
   requestKind: string,
 ): PullRequestsActions {
   const refresh = useContext(RefreshContext);
-  const disabledReason = useContext(PullRequestsMutationsDisabledContext);
+  const disabledReason = useContext(MutationsDisabledContext);
   if (!refresh) throw new Error("Pull Requests actions require the detail query refresh handles");
   const command = useAtomCommand(pullRequestsEnvironment.runAction, {
     reportFailure: false,
@@ -231,7 +231,7 @@ export function PullRequestsActionProvider({
     RefreshContext,
     { value: refresh },
     createElement(
-      PullRequestsMutationsDisabledContext,
+      MutationsDisabledContext,
       { value: disabledReason },
       createElement(ActionOwner, { scope, number, requestKind }, children),
     ),

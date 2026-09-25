@@ -1,5 +1,6 @@
+import { resolveChangeRequestPresentationForKind } from "@bibcode/shared/sourceControl";
 import { projectKey } from "@bibcode/client-runtime/state/entities";
-import { squashAtomCommandFailure } from "@bibcode/client-runtime/state/runtime";
+import { environmentRpcKey, squashAtomCommandFailure } from "@bibcode/client-runtime/state/runtime";
 import {
   PullRequestsOperationError,
   type EnvironmentId,
@@ -32,7 +33,12 @@ import { PullRequestsContextRefresh } from "../pullRequestsContextRefresh";
 import { usePullRequestsQuery } from "../shared/usePullRequestsQuery";
 import { PullRequestsFilters } from "./PullRequestsFilters";
 import { PullRequestsRow } from "./PullRequestsRow";
-import { buildListInput } from "./pullRequestsList.logic";
+import {
+  buildListInput,
+  selectListFilters,
+  selectListSort,
+  selectListTab,
+} from "./pullRequestsList.logic";
 
 export interface PullRequestsListViewHandle {
   refresh: () => void;
@@ -42,6 +48,12 @@ export interface PullRequestsListViewProps {
   projectRef: ScopedProjectRef;
   context: Extract<PullRequestsContext, { status: "available" }>;
   ref?: Ref<PullRequestsListViewHandle> | undefined;
+  /**
+   * The page read alongside this context load. Rendering only reads this value;
+   * the committed list acknowledges it so later opens refresh.
+   */
+  freshPageKey?: string | null | undefined;
+  onFreshPageConsumed?: ((key: string) => void) | undefined;
 }
 const isPullRequestsOperationError = Schema.is(PullRequestsOperationError);
 const TABS = { open: "Open", merged: "Merged", closed: "Closed", all: "All" };
@@ -119,6 +131,7 @@ function PullRequestsPages({
     };
   }, [input, projectRef, scope.cwd]);
   const refreshFirstPage = firstQuery.refresh;
+  const environmentId = scope.environmentId;
   const refresh = useCallback(() => {
     restorationTarget.current = null;
     setCursors([null]);
@@ -126,8 +139,10 @@ function PullRequestsPages({
     scrollTopRef.current = 0;
     usePullRequestsStore.getState().setScrollTop(projectRef, 0);
     scrollRef.current?.scrollToOffset({ offset: 0, animated: false });
+    // An explicit Refresh also re-reads the repository-wide tab totals.
+    pullRequestsEnvironment.requestListTotalsRefresh({ environmentId, input });
     refreshFirstPage();
-  }, [refreshFirstPage, projectRef]);
+  }, [environmentId, input, refreshFirstPage, projectRef]);
   useImperativeHandle(ref, () => ({ refresh }), [refresh]);
   const renderRow = useCallback(
     ({ item }: { item: PullRequestsListRow }) => (
@@ -210,7 +225,7 @@ function PullRequestsPages({
           ref={scrollRef}
           className="min-h-0 flex-1 overflow-x-hidden"
           role="list"
-          aria-label={context.capabilities.vocabulary.pullRequests}
+          aria-label={resolveChangeRequestPresentationForKind(context.provider).pluralLongName}
           data={rows}
           estimatedItemSize={56}
           getFixedItemSize={getRowSize}
@@ -230,7 +245,9 @@ function PullRequestsPages({
       ) : null}
       {query.isPending ? (
         <div role="status" className="space-y-2 p-4">
-          <span className="sr-only">Loading {context.capabilities.vocabulary.pullRequests}…</span>
+          <span className="sr-only">
+            Loading {resolveChangeRequestPresentationForKind(context.provider).pluralLongName}…
+          </span>
           <Skeleton className="h-14 w-full" />
         </div>
       ) : null}
@@ -239,7 +256,7 @@ function PullRequestsPages({
           <p>
             {hasFilters
               ? "Nothing matches these filters"
-              : `No ${input.state === "all" ? "" : `${input.state} `}${context.capabilities.vocabulary.pullRequests}`}
+              : `No ${input.state === "all" ? "" : `${input.state} `}${resolveChangeRequestPresentationForKind(context.provider).pluralLongName}`}
           </p>
           {hasFilters ? (
             <Button size="sm" variant="outline" onClick={onClear}>
@@ -269,13 +286,13 @@ export function PullRequestsListView({
   projectRef,
   context,
   ref,
+  freshPageKey,
+  onFreshPageConsumed,
 }: PullRequestsListViewProps) {
   const key = projectKey(projectRef);
-  const filters = usePullRequestsStore(
-    (state) => state.byProjectKey[key]?.filters ?? DEFAULT_PULL_REQUESTS_FILTERS,
-  );
-  const storedTab = usePullRequestsStore((state) => state.byProjectKey[key]?.listTab ?? "open");
-  const sort = usePullRequestsStore((state) => state.byProjectKey[key]?.sort ?? "newest");
+  const filters = usePullRequestsStore((state) => selectListFilters(state.byProjectKey[key]));
+  const storedTab = usePullRequestsStore((state) => selectListTab(state.byProjectKey[key]));
+  const sort = usePullRequestsStore((state) => selectListSort(state.byProjectKey[key]));
   const listTab =
     context.capabilities.closedTabIncludesMerged && (storedTab === "merged" || storedTab === "all")
       ? "closed"
@@ -288,7 +305,12 @@ export function PullRequestsListView({
     () => pullRequestsEnvironment.list({ environmentId: scope.environmentId, input }),
     [input, scope.environmentId],
   );
-  const firstQuery = usePullRequestsQuery(firstAtom);
+  const firstQuery = usePullRequestsQuery(firstAtom, {
+    freshOnOpen: freshPageKey === environmentRpcKey({ environmentId: scope.environmentId, input }),
+  });
+  useEffect(() => {
+    if (freshPageKey != null) onFreshPageConsumed?.(freshPageKey);
+  }, [freshPageKey, onFreshPageConsumed]);
   const tabs = context.capabilities.closedTabIncludesMerged ? COMBINED_TABS : SEPARATE_TABS;
   const hasFilters = Object.values(filters).some((value) =>
     Array.isArray(value) ? value.length > 0 : value !== null && value !== "",
@@ -309,7 +331,7 @@ export function PullRequestsListView({
         }}
       >
         <TabsList
-          aria-label={`${context.capabilities.vocabulary.pullRequest} state`}
+          aria-label={`${resolveChangeRequestPresentationForKind(context.provider).longName} state`}
           className="mx-4 mt-3 shrink-0"
         >
           {tabs.map((tab) => {

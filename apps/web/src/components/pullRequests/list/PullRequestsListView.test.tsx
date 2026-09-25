@@ -1,5 +1,7 @@
 // @vitest-environment happy-dom
+import { environmentRpcKey } from "@bibcode/client-runtime/state/runtime";
 import {
+  EnvironmentId,
   PullRequestsOperationError,
   type PullRequestsListInput,
   type PullRequestsListPage,
@@ -8,7 +10,8 @@ import * as Cause from "effect/Cause";
 import { act, createRef, useReducer, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import { usePullRequestsStore } from "../../../pullRequestsStore";
+import { DEFAULT_PULL_REQUESTS_FILTERS, usePullRequestsStore } from "../../../pullRequestsStore";
+import { buildListInput } from "./pullRequestsList.logic";
 import { PullRequestsContextRefresh } from "../pullRequestsContextRefresh";
 import { context, row } from "../testFixtures";
 import { gitlabContext } from "../detail/testFixtures";
@@ -19,12 +22,16 @@ const h = vi.hoisted(() => ({
   pending: false,
   autoCompleteRefresh: true,
   requests: vi.fn((args: { input: PullRequestsListInput }) => ({ kind: "list", ...args })),
+  requestTotals: vi.fn(),
   refresh: vi.fn(),
   listProps: null as Record<string, unknown> | null,
+  // One emission per failure, as an atom keeps it; a refresh answers with a new one.
+  failures: new Map<object, unknown>(),
 }));
 vi.mock("../../../state/pullRequests", () => ({
   pullRequestsEnvironment: {
     list: h.requests,
+    requestListTotalsRefresh: h.requestTotals,
     getVocabulary: vi.fn(() => ({ kind: "vocabulary" })),
   },
 }));
@@ -33,11 +40,11 @@ vi.mock("../../../state/query", () => ({
     const [, publish] = useReducer((value: number) => value + 1, 0);
     const data = atom?.kind === "list" ? (atom.input.cursor === null ? h.first : h.second) : null;
     const error = atom?.kind === "list" ? h.error : null;
+    if (error && !h.failures.has(error))
+      h.failures.set(error, { _tag: "Failure", cause: Cause.fail(error) });
     return {
       data,
-      emission: error
-        ? { _tag: "Failure", cause: Cause.fail(error) }
-        : { _tag: "Success", value: data },
+      emission: error ? h.failures.get(error) : { _tag: "Success", value: data },
       error: error?.message ?? null,
       isPending: h.pending,
       refresh: () => {
@@ -47,6 +54,7 @@ vi.mock("../../../state/query", () => ({
             h.first = { ...h.first, rows: [...h.first.rows] };
           if (atom.input.cursor !== null && h.second)
             h.second = { ...h.second, rows: [...h.second.rows] };
+          if (h.error) h.failures.delete(h.error);
           publish();
         }
       },
@@ -118,9 +126,11 @@ beforeEach(() => {
     counts: null,
   };
   h.error = null;
+  h.failures.clear();
   h.pending = false;
   h.autoCompleteRefresh = true;
   h.requests.mockClear();
+  h.requestTotals.mockClear();
   h.refresh.mockClear();
   h.listProps = null;
 });
@@ -182,10 +192,92 @@ describe("PullRequestsListView", () => {
   it("Refresh resets cursors and refreshes the first page", async () => {
     await render();
     await act(async () => button("Load more").click());
+    h.refresh.mockClear();
     await act(async () => handle.current!.refresh());
     expect(h.refresh).toHaveBeenCalledWith(null);
+    // An explicit Refresh also re-reads the repository-wide tab totals, for this page only.
+    expect(h.requestTotals).toHaveBeenCalledWith({
+      environmentId: "env",
+      input: expect.objectContaining({ cwd: "/repo", state: "open", cursor: null }),
+    });
+    expect(h.requestTotals.mock.invocationCallOrder[0]).toBeLessThan(
+      h.refresh.mock.invocationCallOrder[0]!,
+    );
     expect(container.textContent).not.toContain("Second page");
     expect(container.textContent).toContain("Load more");
+  });
+  it("shows a first page read alongside the context without reading it again", async () => {
+    const firstPage = buildListInput(
+      { filters: DEFAULT_PULL_REQUESTS_FILTERS, listTab: "open", sort: "newest" },
+      "/repo",
+    );
+    const onFreshPageConsumed = vi.fn();
+    const view = (
+      <PullRequestsListView
+        scope={{ environmentId: "env" as never, cwd: "/repo" }}
+        projectRef={projectRef}
+        context={context}
+        freshPageKey={environmentRpcKey({
+          environmentId: EnvironmentId.make("env"),
+          input: firstPage,
+        })}
+        onFreshPageConsumed={onFreshPageConsumed}
+      />
+    );
+    await act(async () => root.render(view));
+    expect(container.textContent).toContain("Fix connection recovery");
+    // The list takes the page once, at its first open; re-renders keep the page as it is.
+    await act(async () => root.render(view));
+    expect(onFreshPageConsumed).toHaveBeenCalledExactlyOnceWith(
+      environmentRpcKey({ environmentId: EnvironmentId.make("env"), input: firstPage }),
+    );
+    expect(h.refresh).not.toHaveBeenCalled();
+    expect(h.requestTotals).not.toHaveBeenCalled();
+    // Leaving the page and coming back is a later open: it refreshes as usual.
+    await act(async () => usePullRequestsStore.getState().setListTab(projectRef, "closed"));
+    await act(async () => usePullRequestsStore.getState().setListTab(projectRef, "open"));
+    expect(h.refresh).toHaveBeenCalledWith(null);
+
+    // A cached page from an earlier open is still refreshed before it is shown.
+    h.refresh.mockClear();
+    await act(async () => root.unmount());
+    root = createRoot(container);
+    await render();
+    expect(h.refresh).toHaveBeenCalledWith(null);
+  });
+  it("re-reads a failure cached by an earlier open and hides it until the read answers", async () => {
+    h.first = null;
+    h.error = new PullRequestsOperationError({
+      operation: "list",
+      code: "not_authenticated",
+      message: "Sign in again.",
+      hostDetail: null,
+      retryable: false,
+    });
+    h.autoCompleteRefresh = false;
+    const rescan = vi.fn();
+    await act(async () =>
+      root.render(
+        <PullRequestsContextRefresh value={rescan}>
+          <PullRequestsListView
+            ref={handle}
+            scope={{ environmentId: "env" as never, cwd: "/repo" }}
+            projectRef={projectRef}
+            context={context}
+          />
+        </PullRequestsContextRefresh>,
+      ),
+    );
+    expect(h.refresh).toHaveBeenCalledWith(null);
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    expect(container.textContent).not.toContain("Sign in again.");
+    expect(rescan).not.toHaveBeenCalled();
+
+    // The new read answers with a failure of its own, which is shown and acted on.
+    h.autoCompleteRefresh = true;
+    await act(async () => handle.current!.refresh());
+    expect(container.textContent).toContain("Sign in again.");
+    expect(rescan).toHaveBeenCalledOnce();
   });
   it("renders a GitLab unavailable filter error with detail and recovery, never as empty", async () => {
     usePullRequestsStore.getState().setFilters(projectRef, { reviewStatus: "approved" });
@@ -314,7 +406,8 @@ it("rescans context once for each authentication failure without retrying list r
   expect(rescan).toHaveBeenCalledOnce();
   await act(async () => root.render(element));
   expect(rescan).toHaveBeenCalledOnce();
-  expect(h.refresh).not.toHaveBeenCalled();
+  // Opening re-reads the cached failure once; the answer rescans without list retries.
+  expect(h.refresh).toHaveBeenCalledOnce();
 });
 it("persists scroll on pagehide so a reload does not depend on React unmount", async () => {
   await render();
@@ -345,4 +438,42 @@ it("refreshes a cached first page on a fresh context mount and hides its old rep
   h.first = { ...h.first!, rows: [{ ...row, title: "New repository result" }] };
   await render();
   expect(container.textContent).toContain("New repository result");
+});
+
+it("hides cached rows when opened during revalidation without starting another refresh", async () => {
+  h.pending = true;
+  h.autoCompleteRefresh = false;
+  await render();
+  expect(container.textContent).not.toContain("Fix connection recovery");
+  expect(h.refresh).not.toHaveBeenCalled();
+
+  h.first = { ...h.first!, rows: [{ ...row, title: "New repository result" }] };
+  h.pending = false;
+  await render();
+  expect(container.textContent).toContain("New repository result");
+  expect(h.refresh).not.toHaveBeenCalled();
+});
+
+it("hides a cached failure when opened during revalidation until the existing read answers", async () => {
+  h.first = null;
+  h.error = new PullRequestsOperationError({
+    operation: "list",
+    code: "not_authenticated",
+    message: "Sign in again.",
+    hostDetail: null,
+    retryable: false,
+  });
+  h.pending = true;
+  h.autoCompleteRefresh = false;
+  await render();
+  expect(container.querySelector('[role="alert"]')).toBeNull();
+  expect(container.textContent).not.toContain("Sign in again.");
+  expect(h.refresh).not.toHaveBeenCalled();
+
+  h.error = null;
+  h.first = { rows: [row], nextCursor: null, totalCount: 1, counts: null };
+  h.pending = false;
+  await render();
+  expect(container.textContent).toContain("Fix connection recovery");
+  expect(h.refresh).not.toHaveBeenCalled();
 });

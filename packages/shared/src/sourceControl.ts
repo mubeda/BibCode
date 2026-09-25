@@ -4,6 +4,7 @@ export interface ChangeRequestPresentation {
   readonly icon: "github" | "gitlab" | "azure-devops" | "bitbucket" | "change-request";
   readonly providerName: string;
   readonly shortName: string;
+  readonly numberPrefix: "#" | "!";
   readonly longName: string;
   readonly pluralLongName: string;
   readonly providerLongName: string;
@@ -25,6 +26,7 @@ const GITHUB_CHANGE_REQUEST_PRESENTATION: ChangeRequestPresentation = {
   icon: "github",
   providerName: "GitHub",
   shortName: "PR",
+  numberPrefix: "#",
   longName: "pull request",
   pluralLongName: "pull requests",
   providerLongName: "GitHub pull request",
@@ -36,6 +38,7 @@ const GITLAB_CHANGE_REQUEST_PRESENTATION: ChangeRequestPresentation = {
   icon: "gitlab",
   providerName: "GitLab",
   shortName: "MR",
+  numberPrefix: "!",
   longName: "merge request",
   pluralLongName: "merge requests",
   providerLongName: "GitLab merge request",
@@ -47,6 +50,7 @@ const AZURE_DEVOPS_CHANGE_REQUEST_PRESENTATION: ChangeRequestPresentation = {
   icon: "azure-devops",
   providerName: "Azure DevOps",
   shortName: "PR",
+  numberPrefix: "#",
   longName: "pull request",
   pluralLongName: "pull requests",
   providerLongName: "Azure DevOps pull request",
@@ -58,6 +62,7 @@ const BITBUCKET_CHANGE_REQUEST_PRESENTATION: ChangeRequestPresentation = {
   icon: "bitbucket",
   providerName: "Bitbucket",
   shortName: "PR",
+  numberPrefix: "#",
   longName: "pull request",
   pluralLongName: "pull requests",
   providerLongName: "Bitbucket pull request",
@@ -68,6 +73,7 @@ const GENERIC_CHANGE_REQUEST_PRESENTATION: ChangeRequestPresentation = {
   icon: "change-request",
   providerName: "source control",
   shortName: "change request",
+  numberPrefix: "#",
   longName: "change request",
   pluralLongName: "change requests",
   providerLongName: "change request",
@@ -103,6 +109,13 @@ export function formatChangeRequestAction(
   presentation: ChangeRequestPresentation,
 ): string {
   return `${verb} ${presentation.shortName}`;
+}
+
+export function formatChangeRequestNumber(
+  provider: SourceControlProviderKind | null | undefined,
+  number: number,
+): string {
+  return `${resolveChangeRequestPresentationForKind(provider ?? "github").numberPrefix}${String(number)}`;
 }
 
 export function formatCreateChangeRequestPhrase(presentation: ChangeRequestPresentation): string {

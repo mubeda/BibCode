@@ -42,6 +42,14 @@ impl<K: Clone + Eq + Hash, V: Clone> ContextCache<K, V> {
         entries.order.clear();
     }
 
+    /// Detaches one key; an in-flight load for it cannot repopulate the map.
+    pub(super) fn remove(&self, key: &K) {
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        if entries.values.remove(key).is_some() {
+            entries.order.retain(|known| known != key);
+        }
+    }
+
     pub(super) fn get(&self, key: &K) -> Option<V> {
         let slot = self
             .entries

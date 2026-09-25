@@ -10,6 +10,7 @@ import { GitPullRequestIcon } from "lucide-react";
 import { memo, type ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { Button } from "~/components/ui/button";
+import { PermissionButton } from "~/components/ui/permission-button";
 import {
   Dialog,
   DialogDescription,
@@ -22,6 +23,12 @@ import {
 import { Input } from "~/components/ui/input";
 import { Label } from "~/components/ui/label";
 import { Textarea } from "~/components/ui/textarea";
+import {
+  formatChangeRequestNumber,
+  getChangeRequestTerminology,
+  resolveChangeRequestPresentation,
+} from "@bibcode/shared/sourceControl";
+import { capitalize } from "effect/String";
 import { randomUUID } from "~/lib/utils";
 import { gitManagerEnvironment } from "~/state/gitManager";
 import { useEnvironmentQuery } from "~/state/query";
@@ -31,14 +38,14 @@ import { vcsEnvironment } from "~/state/vcs";
 import {
   createPullRequestAction,
   failCreatePullRequestProgress,
+  hintedProvider,
   presentCreatePullRequestProgress,
   reduceCreatePullRequestProgress,
   resolveCreatePullRequestReview,
   REVIEW_PROGRESS,
   type CreatePullRequestProgress,
+  type CreatePullRequestProviderHint,
 } from "./GitManagerPullRequestPanel.logic";
-
-const WAIT_REASON = "Wait for the pull request to finish.";
 
 function safeExternalUrl(value: string | null): string | null {
   if (value === null) return null;
@@ -50,10 +57,10 @@ function safeExternalUrl(value: string | null): string | null {
   }
 }
 
-function failureMessage(error: unknown): string {
+function failureMessage(error: unknown, noun: string): string {
   return error instanceof Error && error.message.trim().length > 0
     ? error.message
-    : "The pull request could not be created.";
+    : `The ${noun} could not be created.`;
 }
 
 export interface GitManagerCreatePullRequestDialogProps {
@@ -62,6 +69,11 @@ export interface GitManagerCreatePullRequestDialogProps {
   readonly onOpenChange: (open: boolean) => void;
   /** Called once a pull request was created or found so the pane can refresh. */
   readonly onSettled: () => void;
+  /**
+   * A host the caller already identified (the Pull Requests panel). It stands in for a
+   * status that has not named the host yet; the server validates it when creating.
+   */
+  readonly providerHint?: CreatePullRequestProviderHint | null;
 }
 
 /**
@@ -73,6 +85,7 @@ export const GitManagerCreatePullRequestDialog = memo(function GitManagerCreateP
   scope,
   onOpenChange,
   onSettled,
+  providerHint = null,
 }: GitManagerCreatePullRequestDialogProps) {
   const { environmentId, cwd } = scope;
   const statusAtom = useMemo(
@@ -91,16 +104,21 @@ export const GitManagerCreatePullRequestDialog = memo(function GitManagerCreateP
   const status: VcsStatusResult | null = statusQuery.data ?? null;
   const latestCommit: GitManagerCommitEntry | null = latestCommitQuery.data?.commits[0] ?? null;
   const review = useMemo(
-    () => (status === null ? null : resolveCreatePullRequestReview({ status, latestCommit })),
-    [latestCommit, status],
+    () =>
+      status === null
+        ? null
+        : resolveCreatePullRequestReview({ status, latestCommit, providerHint }),
+    [latestCommit, providerHint, status],
   );
+  const provider = review === null ? hintedProvider(providerHint) : review.provider;
+  const noun = getChangeRequestTerminology(provider).singular;
+  const waitReason = `Wait for the ${noun} to finish.`;
 
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
   const [progress, setProgress] = useState<CreatePullRequestProgress>(REVIEW_PROGRESS);
   const seededDefaultsRef = useRef<string | null>(null);
-  const progressRef = useRef(progress);
-  progressRef.current = progress;
+  const running = progress.kind === "running";
 
   // Seed the editable fields from the latest commit once per opened review, and
   // start every review from a clean slate when the dialog closes.
@@ -126,6 +144,7 @@ export const GitManagerCreatePullRequestDialog = memo(function GitManagerCreateP
       : presentCreatePullRequestProgress(progress, {
           publishRequired: review.publishRequired,
           head: review.head,
+          provider: review.provider,
         });
   const busy = presentation?.busy === true;
   const settled = presentation?.settled === true;
@@ -134,14 +153,14 @@ export const GitManagerCreatePullRequestDialog = memo(function GitManagerCreateP
     review === null
       ? "Reading repository status…"
       : busy
-        ? WAIT_REASON
+        ? waitReason
         : settled
           ? null
           : (review.blockedReason ??
             (review.existingPullRequest !== null
-              ? "A pull request already exists for this branch."
+              ? `A ${noun} already exists for this branch.`
               : trimmedTitle.length === 0
-                ? "Enter a title for the pull request."
+                ? `Enter a title for the ${noun}.`
                 : null));
 
   const onProgress = useCallback((event: GitActionProgressEvent) => {
@@ -175,7 +194,7 @@ export const GitManagerCreatePullRequestDialog = memo(function GitManagerCreateP
       return;
     }
     const failure = squashAtomCommandFailure(result);
-    setProgress((current) => failCreatePullRequestProgress(current, failureMessage(failure)));
+    setProgress((current) => failCreatePullRequestProgress(current, failureMessage(failure, noun)));
   }, [
     body,
     cwd,
@@ -186,14 +205,15 @@ export const GitManagerCreatePullRequestDialog = memo(function GitManagerCreateP
     runStackedAction,
     settled,
     trimmedTitle,
+    noun,
   ]);
 
   const handleOpenChange = useCallback(
     (nextOpen: boolean) => {
-      if (!nextOpen && progressRef.current.kind === "running") return;
+      if (!nextOpen && running) return;
       onOpenChange(nextOpen);
     },
-    [onOpenChange],
+    [onOpenChange, running],
   );
   const changeTitle = useCallback(
     (event: ChangeEvent<HTMLInputElement>) => setTitle(event.target.value),
@@ -222,14 +242,12 @@ export const GitManagerCreatePullRequestDialog = memo(function GitManagerCreateP
         data-testid="git-manager-create-pr-dialog"
       >
         <DialogHeader className="pb-4">
-          <DialogTitle>Create pull request</DialogTitle>
-          <DialogDescription>
-            Review the pull request before anything is published.
-          </DialogDescription>
+          <DialogTitle>Create {noun}</DialogTitle>
+          <DialogDescription>Review the {noun} before anything is published.</DialogDescription>
         </DialogHeader>
         <DialogPanel className="space-y-5">
           <section
-            aria-label="Pull request details"
+            aria-label={`${capitalize(noun)} details`}
             className="rounded-xl border border-border/70 bg-muted/24 px-4"
             data-testid="create-pr-summary"
           >
@@ -237,9 +255,13 @@ export const GitManagerCreatePullRequestDialog = memo(function GitManagerCreateP
               <div className="grid grid-cols-[6rem_minmax(0,1fr)] items-start gap-4 py-2.5">
                 <dt className="whitespace-nowrap text-muted-foreground">Repository</dt>
                 <dd className="min-w-0 break-all text-right" data-testid="create-pr-repository">
-                  {review?.provider === null || review?.provider === undefined
-                    ? "Not detected"
-                    : `${review.provider.name} · ${review.provider.baseUrl}`}
+                  {provider !== null
+                    ? `${resolveChangeRequestPresentation(provider).providerName} · ${provider.baseUrl}`
+                    : review === null
+                      ? "…"
+                      : status?.hasPrimaryRemote === false
+                        ? "No origin remote"
+                        : "Not identified yet"}
                 </dd>
               </div>
               <div className="grid grid-cols-[6rem_minmax(0,1fr)] items-center gap-4 py-2.5">
@@ -281,7 +303,9 @@ export const GitManagerCreatePullRequestDialog = memo(function GitManagerCreateP
               className="rounded-lg border border-border/70 px-3 py-2.5 text-xs"
               data-testid="create-pr-existing"
             >
-              Pull request #{review.existingPullRequest.number} already exists for this branch:{" "}
+              {capitalize(noun)}{" "}
+              {formatChangeRequestNumber(provider?.kind ?? null, review.existingPullRequest.number)}{" "}
+              already exists for this branch:{" "}
               {outcomeUrl === null ? (
                 review.existingPullRequest.title
               ) : (
@@ -296,7 +320,7 @@ export const GitManagerCreatePullRequestDialog = memo(function GitManagerCreateP
               )}
             </p>
           )}
-          <section aria-label="Pull request content" className="space-y-4">
+          <section aria-label={`${capitalize(noun)} content`} className="space-y-4">
             <div className="flex flex-col gap-1.5">
               <Label htmlFor="git-manager-create-pr-title">Title</Label>
               <Input
@@ -339,7 +363,7 @@ export const GitManagerCreatePullRequestDialog = memo(function GitManagerCreateP
                     rel="noreferrer"
                     target="_blank"
                   >
-                    Open pull request
+                    Open {noun}
                   </a>
                 </>
               ) : null}
@@ -349,22 +373,21 @@ export const GitManagerCreatePullRequestDialog = memo(function GitManagerCreateP
         <DialogFooter>
           <Button
             disabled={busy}
-            title={busy ? WAIT_REASON : undefined}
+            title={busy ? waitReason : undefined}
             variant="outline"
             onClick={() => handleOpenChange(false)}
           >
             {settled ? "Close" : "Cancel"}
           </Button>
-          <Button
-            disabled={primaryDisabledReason !== null}
-            title={primaryDisabledReason ?? undefined}
+          <PermissionButton
+            permission={{ allowed: primaryDisabledReason === null, reason: primaryDisabledReason }}
             onClick={() => {
               void submit();
             }}
           >
             <GitPullRequestIcon aria-hidden="true" />
-            {presentation?.primaryLabel ?? "Create pull request"}
-          </Button>
+            {presentation?.primaryLabel ?? `Create ${noun}`}
+          </PermissionButton>
         </DialogFooter>
       </DialogPopup>
     </Dialog>

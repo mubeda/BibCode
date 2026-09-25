@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     persistence::Repositories,
     pull_requests::{
-        PullRequestsService,
+        ContextRead, PullRequestsService,
         error::PullRequestsOperationError,
         model::{ActionRequest, ListQuery, VocabularyKind},
     },
@@ -70,6 +70,16 @@ impl From<PullRequestsRpcServices> for ConfiguredPullRequestsRpcServices {
 }
 
 impl ConfiguredPullRequestsRpcServices {
+    /// Shares the server's host observation (status reads and Settings discovery).
+    #[must_use]
+    pub fn with_provider_hosts(
+        mut self,
+        provider_hosts: std::sync::Arc<crate::source_control::ProviderHosts>,
+    ) -> Self {
+        self.service = self.service.with_provider_hosts(provider_hosts);
+        self
+    }
+
     pub fn with_worktrees(
         mut self,
         worktrees: super::worktree_catalog_rpc::WorktreeCatalogRpcServices,
@@ -102,10 +112,20 @@ impl ConfiguredPullRequestsRpcServices {
         let operation = request.tag.as_str();
         match operation {
             "pullRequests.getContext" => {
-                let input: CwdInput = decode(request.payload, operation)?;
+                let input: ContextInput = decode(request.payload, operation)?;
                 validate_cwd(&input.cwd, operation)?;
                 encode(
-                    self.service.context(&input.cwd, &cancellation).await,
+                    self.service
+                        .context(
+                            &input.cwd,
+                            if input.rescan {
+                                ContextRead::Rescan
+                            } else {
+                                ContextRead::Open
+                            },
+                            &cancellation,
+                        )
+                        .await,
                     operation,
                 )
             }
@@ -280,8 +300,11 @@ struct PullRequestsNumberInput {
 }
 
 #[derive(Deserialize)]
-struct CwdInput {
+struct ContextInput {
     cwd: PathBuf,
+    /// Only Rescan and auth recovery bypass the bounded context caches.
+    #[serde(default)]
+    rescan: bool,
 }
 
 #[derive(Deserialize)]

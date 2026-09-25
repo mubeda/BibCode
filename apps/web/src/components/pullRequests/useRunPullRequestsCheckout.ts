@@ -14,7 +14,7 @@ import { useAtomCommand } from "../../state/use-atom-command";
 import { pullRequestsEnvironment } from "../../state/pullRequests";
 import { useGitManagerStore } from "../../gitManagerStore";
 import { toastManager } from "../ui/toast";
-import { PullRequestsMutationsDisabledContext } from "./pullRequestsMutationAvailability";
+import { MutationsDisabledContext } from "../ui/mutationAvailability";
 import {
   pullRequestsActionError,
   usePullRequestsActions,
@@ -77,7 +77,7 @@ export function useRunPullRequestsCheckout({
     reportDefect: false,
   });
   const navigate = useNavigate();
-  const disabledReason = useContext(PullRequestsMutationsDisabledContext);
+  const disabledReason = useContext(MutationsDisabledContext);
   const actions = usePullRequestsActions();
   const busy = useRef(false);
   const retry = useRef<

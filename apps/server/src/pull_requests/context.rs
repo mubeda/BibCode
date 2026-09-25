@@ -1,13 +1,13 @@
 //! Resolve each explicit read against its origin and the CLI's host configuration.
 
-use std::{io::ErrorKind, path::Path};
+use std::{future::Future, io::ErrorKind, path::Path};
 
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     git::ProcessError,
     source_control::{
-        ProviderKind, parse_github_auth_status, parse_gitlab_auth_status, provider_from_remote,
+        IdentifiedProvider, ProviderKind, parse_github_auth_status, parse_gitlab_auth_status,
         provider_install_hint, remote_host, remote_repository_path,
     },
 };
@@ -15,8 +15,18 @@ use crate::{
 use super::{
     error::{CODES, PullRequestsOperationError, from_process_error},
     host::{HostCommandRunner, HostScope, ProcessFailure, PullRequestHost},
-    model::{Context, UnavailableCode},
+    model::{Context, PullRequestsProvider, UnavailableCode},
 };
+
+/// Whether a context read may reuse what explicit probes already answered.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContextRead {
+    /// Opening the module or switching checkout: reuse the recorded host and
+    /// the bounded 30 s answers.
+    Open,
+    /// Rescan and authentication recovery: forget the recorded host and ask again.
+    Rescan,
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct DiscoveredHosts {
@@ -81,12 +91,21 @@ impl Unavailable {
     }
 }
 
-fn cli(provider: ProviderKind) -> &'static str {
-    if provider == ProviderKind::Github {
-        "gh"
-    } else {
-        "glab"
+fn cli(provider: PullRequestsProvider) -> &'static str {
+    match provider {
+        PullRequestsProvider::Github => "gh",
+        PullRequestsProvider::Gitlab => "glab",
     }
+}
+
+pub(super) fn supported_provider(scope: &HostScope) -> Result<PullRequestsProvider, Unavailable> {
+    PullRequestsProvider::from_kind(scope.provider).ok_or_else(|| {
+        Unavailable::new(
+            "unsupported_provider",
+            "Pull Requests supports GitHub and GitLab repositories on this environment.",
+            Some(scope),
+        )
+    })
 }
 
 fn process_unavailable(
@@ -109,8 +128,101 @@ pub async fn resolve_scope(
     discovered_hosts: &DiscoveredHosts,
     c: &CancellationToken,
 ) -> Result<HostScope, Unavailable> {
+    resolve_checked_scope(runner, cwd, discovered_hosts, ContextRead::Open, c).await
+}
+
+/// An identified GitHub/GitLab scope whose login must still be checked. Only read
+/// paths may use it concurrently; mutations continue through `resolve_scope`.
+pub(super) struct PendingScope {
+    pub scope: HostScope,
+    authentication: ScopeAuthentication,
+}
+
+enum ScopeAuthentication {
+    Named,
+    Recorded,
+    Discovered(Option<String>),
+}
+
+impl PendingScope {
+    /// Authenticate alongside a cancellable read. A login failure owns precedence,
+    /// but its provider child must be cancelled and drained before returning it.
+    /// After login succeeds, reject a checkout lost while either read was active.
+    pub(super) async fn read_authenticated<T, F>(
+        &self,
+        runner: &HostCommandRunner,
+        c: &CancellationToken,
+        read: impl FnOnce(CancellationToken) -> F,
+    ) -> Result<Result<T, PullRequestsOperationError>, Unavailable>
+    where
+        F: Future<Output = Result<T, PullRequestsOperationError>>,
+    {
+        let read_cancellation = c.child_token();
+        let authenticate = async {
+            let result = self.authenticate(runner, c).await;
+            if result.is_err() {
+                read_cancellation.cancel();
+            }
+            result
+        };
+        let (authenticated, result) = tokio::join!(authenticate, read(read_cancellation.clone()));
+        authenticated?;
+        validate_checkout(&self.scope.cwd).await?;
+        Ok(result)
+    }
+
+    pub(super) async fn authenticate(
+        &self,
+        runner: &HostCommandRunner,
+        c: &CancellationToken,
+    ) -> Result<(), Unavailable> {
+        let provider = supported_provider(&self.scope)?;
+        let (status, record_host) = match &self.authentication {
+            ScopeAuthentication::Named => (None, false),
+            ScopeAuthentication::Recorded => (
+                provider_status(runner, &self.scope, provider, c).await,
+                true,
+            ),
+            ScopeAuthentication::Discovered(status) => (status.clone(), true),
+        };
+        let result = ensure_authenticated(runner, &self.scope, status.as_deref(), c).await;
+        match &result {
+            Ok(()) if record_host => runner
+                .provider_hosts()
+                .record(&self.scope.host, self.scope.provider),
+            Err(unavailable) if unavailable.code == "not_authenticated" => {
+                runner.provider_hosts().forget(&self.scope.host);
+            }
+            Err(unavailable) if unavailable.code == "cli_missing" => {
+                validate_checkout(&self.scope.cwd).await?;
+            }
+            _ => {}
+        }
+        result
+    }
+}
+
+async fn resolve_checked_scope(
+    runner: &HostCommandRunner,
+    cwd: &Path,
+    discovered_hosts: &DiscoveredHosts,
+    read: ContextRead,
+    c: &CancellationToken,
+) -> Result<HostScope, Unavailable> {
+    let pending = resolve_pending_scope(runner, cwd, discovered_hosts, read, c).await?;
+    pending.authenticate(runner, c).await?;
+    Ok(pending.scope)
+}
+
+pub(super) async fn resolve_pending_scope(
+    runner: &HostCommandRunner,
+    cwd: &Path,
+    discovered_hosts: &DiscoveredHosts,
+    read: ContextRead,
+    c: &CancellationToken,
+) -> Result<PendingScope, Unavailable> {
     validate_checkout(cwd).await?;
-    let result = resolve_existing_checkout_scope(runner, cwd, discovered_hosts, c).await;
+    let result = resolve_existing_checkout_scope(runner, cwd, discovered_hosts, read, c).await;
     // ENOENT may mean the checkout disappeared between commands, not a missing CLI.
     if matches!(&result, Err(unavailable) if unavailable.code == "cli_missing") {
         validate_checkout(cwd).await?;
@@ -118,7 +230,40 @@ pub async fn resolve_scope(
     result
 }
 
-async fn validate_checkout(cwd: &Path) -> Result<(), Unavailable> {
+/// Decode the remote once for both scope resolution and created-request invalidation.
+pub(super) fn scope_from_remote(
+    cwd: &Path,
+    remote: &str,
+    provider: ProviderKind,
+) -> Result<HostScope, Unavailable> {
+    let Some(host) = remote_host(remote) else {
+        return Err(Unavailable::new(
+            "no_remote",
+            "This checkout has no hosted origin remote.",
+            None,
+        ));
+    };
+    let scope = HostScope {
+        cwd: cwd.into(),
+        host,
+        repository: remote_repository_path(remote).unwrap_or_default(),
+        provider,
+    };
+    // Unknown hosts still need CLI discovery before provider admission.
+    if provider != ProviderKind::Unknown {
+        supported_provider(&scope)?;
+    }
+    if scope.repository.is_empty() {
+        return Err(Unavailable::new(
+            "no_remote",
+            "The origin remote has no repository path.",
+            Some(&scope),
+        ));
+    }
+    Ok(scope)
+}
+
+pub(super) async fn validate_checkout(cwd: &Path) -> Result<(), Unavailable> {
     let (problem, recovery) = match tokio::fs::metadata(cwd).await {
         Ok(metadata) if metadata.is_dir() => return Ok(()),
         Ok(_) => (
@@ -152,8 +297,9 @@ async fn resolve_existing_checkout_scope(
     runner: &HostCommandRunner,
     cwd: &Path,
     discovered_hosts: &DiscoveredHosts,
+    read: ContextRead,
     c: &CancellationToken,
-) -> Result<HostScope, Unavailable> {
+) -> Result<PendingScope, Unavailable> {
     let remote = match runner.git(cwd, &["remote", "get-url", "origin"], c).await {
         Ok(output) => output.stdout.trim().to_owned(),
         Err(failure)
@@ -169,181 +315,232 @@ async fn resolve_existing_checkout_scope(
         }
         Err(failure) => return Err(process_unavailable(&failure, "git", None)),
     };
-    let Some(host) = remote_host(&remote) else {
-        return Err(Unavailable::new(
-            "no_remote",
-            "This checkout has no hosted origin remote.",
-            None,
-        ));
-    };
-    let mut scope = HostScope {
-        cwd: cwd.into(),
-        host,
-        repository: remote_repository_path(&remote).unwrap_or_default(),
-        provider: provider_from_remote(&remote).kind,
-    };
-    if matches!(
-        scope.provider,
-        ProviderKind::AzureDevops | ProviderKind::Bitbucket
-    ) {
-        return Err(Unavailable::new(
-            "unsupported_provider",
-            "Pull Requests supports GitHub and GitLab repositories on this environment.",
-            Some(&scope),
-        ));
+    let recorded = runner.provider_hosts();
+    if read == ContextRead::Rescan
+        && let Some(host) = remote_host(&remote)
+    {
+        recorded.forget(&host);
     }
-    if scope.repository.is_empty() {
-        return Err(Unavailable::new(
-            "no_remote",
-            "The origin remote has no repository path.",
-            Some(&scope),
-        ));
-    }
-    if scope.provider == ProviderKind::Unknown {
-        let discovered;
-        let hosts = if discovered_hosts.github.is_empty() && discovered_hosts.gitlab.is_empty() {
-            discovered = discover_hosts(runner, &scope, c).await?;
-            &discovered
-        } else {
-            discovered_hosts
-        };
-        scope.provider = if hosts
-            .github
-            .iter()
-            .any(|host| host.eq_ignore_ascii_case(&scope.host))
-        {
-            ProviderKind::Github
-        } else if hosts
-            .gitlab
-            .iter()
-            .any(|host| host.eq_ignore_ascii_case(&scope.host))
-        {
-            ProviderKind::Gitlab
-        } else {
-            let mut unavailable = Unavailable::new(
-                "unknown_host",
-                format!(
-                    "`{}` is not a configured GitHub or GitLab host on this environment. Run `gh auth login --hostname {}` or `glab auth login --hostname {}` there, then rescan.",
-                    scope.host, scope.host, scope.host
-                ),
-                Some(&scope),
-            );
-            let command = if hosts.gitlab.is_empty() {
-                "gh"
+    let identified = recorded.identify(&remote);
+    let mut scope = scope_from_remote(cwd, &remote, identified.kind())?;
+    let authentication = match identified {
+        IdentifiedProvider::Named(_) => ScopeAuthentication::Named,
+        IdentifiedProvider::Recorded(_) => ScopeAuthentication::Recorded,
+        IdentifiedProvider::Unknown => {
+            let discovery =
+                if discovered_hosts.github.is_empty() && discovered_hosts.gitlab.is_empty() {
+                    discover_hosts(runner, &scope, c).await?
+                } else {
+                    Discovery {
+                        hosts: discovered_hosts.clone(),
+                        github_status: None,
+                        gitlab_status: None,
+                    }
+                };
+            let hosts = &discovery.hosts;
+            let provider = if hosts
+                .github
+                .iter()
+                .any(|host| host.eq_ignore_ascii_case(&scope.host))
+            {
+                PullRequestsProvider::Github
+            } else if hosts
+                .gitlab
+                .iter()
+                .any(|host| host.eq_ignore_ascii_case(&scope.host))
+            {
+                PullRequestsProvider::Gitlab
             } else {
-                "glab"
+                let mut unavailable = Unavailable::new(
+                    "unknown_host",
+                    format!(
+                        "`{}` is not a configured GitHub or GitLab host on this environment. Run `gh auth login --hostname {}` or `glab auth login --hostname {}` there, then rescan.",
+                        scope.host, scope.host, scope.host
+                    ),
+                    Some(&scope),
+                );
+                let command = if hosts.gitlab.is_empty() {
+                    "gh"
+                } else {
+                    "glab"
+                };
+                unavailable.auth_command =
+                    Some(format!("{command} auth login --hostname {}", scope.host));
+                recorded.forget(&scope.host);
+                return Err(unavailable);
             };
-            unavailable.auth_command =
-                Some(format!("{command} auth login --hostname {}", scope.host));
-            return Err(unavailable);
-        };
+            scope.provider = provider.kind();
+            ScopeAuthentication::Discovered(match provider {
+                PullRequestsProvider::Github => discovery.github_status,
+                PullRequestsProvider::Gitlab => discovery.gitlab_status,
+            })
+        }
+    };
+    Ok(PendingScope {
+        scope,
+        authentication,
+    })
+}
+
+/// Both CLIs' configured hosts, plus each probe's status text. Probes run with the
+/// host pinned (`GH_HOST`/`GITLAB_HOST`), so the text already answers whether this
+/// host is logged in and the authentication check can reuse it.
+struct Discovery {
+    hosts: DiscoveredHosts,
+    github_status: Option<String>,
+    gitlab_status: Option<String>,
+}
+
+fn discovery_args(provider: PullRequestsProvider) -> &'static [&'static str] {
+    match provider {
+        PullRequestsProvider::Github => &["auth", "status", "--json", "hosts"],
+        PullRequestsProvider::Gitlab => &["auth", "status"],
     }
-    ensure_authenticated(runner, &scope, c).await?;
-    Ok(scope)
+}
+
+fn status_text(provider: PullRequestsProvider, output: &super::host::CommandOutput) -> String {
+    match provider {
+        PullRequestsProvider::Github => output.stdout.clone(),
+        PullRequestsProvider::Gitlab => format!("{}\n{}", output.stdout, output.stderr),
+    }
+}
+
+async fn discovery_probe(
+    runner: &HostCommandRunner,
+    scope: &HostScope,
+    provider: PullRequestsProvider,
+    c: &CancellationToken,
+) -> Result<String, ProcessFailure> {
+    let probe_scope = HostScope {
+        provider: provider.kind(),
+        ..scope.clone()
+    };
+    runner
+        .probe(&probe_scope, provider, discovery_args(provider), c)
+        .await
+        .or_else(ProcessFailure::into_output)
+        .map(|output| status_text(provider, &output))
+}
+
+/// The recorded provider's discovery answer alone, reused by the authentication check.
+async fn provider_status(
+    runner: &HostCommandRunner,
+    scope: &HostScope,
+    provider: PullRequestsProvider,
+    c: &CancellationToken,
+) -> Option<String> {
+    discovery_probe(runner, scope, provider, c).await.ok()
 }
 
 async fn discover_hosts(
     runner: &HostCommandRunner,
     scope: &HostScope,
     c: &CancellationToken,
-) -> Result<DiscoveredHosts, Unavailable> {
-    let mut result = DiscoveredHosts::default();
-    for provider in [ProviderKind::Github, ProviderKind::Gitlab] {
-        let probe_scope = HostScope {
-            provider,
-            ..scope.clone()
-        };
-        let args = if provider == ProviderKind::Github {
-            vec!["auth", "status", "--json", "hosts"]
-        } else {
-            vec!["auth", "status"]
-        };
-        let output = match runner
-            .probe(&probe_scope, &args, c)
-            .await
-            .or_else(ProcessFailure::into_output)
-        {
-            Ok(output) => output,
+) -> Result<Discovery, Unavailable> {
+    // The two CLIs answer independently; probing them together halves discovery.
+    let (github, gitlab) = tokio::join!(
+        discovery_probe(runner, scope, PullRequestsProvider::Github, c),
+        discovery_probe(runner, scope, PullRequestsProvider::Gitlab, c),
+    );
+    let mut discovery = Discovery {
+        hosts: DiscoveredHosts::default(),
+        github_status: None,
+        gitlab_status: None,
+    };
+    for (provider, outcome) in [
+        (PullRequestsProvider::Github, github),
+        (PullRequestsProvider::Gitlab, gitlab),
+    ] {
+        let text = match outcome {
+            Ok(text) => text,
             Err(failure) if c.is_cancelled() => {
                 return Err(process_unavailable(&failure, cli(provider), Some(scope)));
             }
             Err(_) => continue,
         };
-        if provider == ProviderKind::Github {
-            result.github = parse_github_auth_status(&output.stdout)
-                .accounts
-                .into_iter()
-                .map(|account| account.host)
-                .collect();
-        } else {
-            let text = format!("{}\n{}", output.stdout, output.stderr);
-            result.gitlab = parse_gitlab_auth_status(&text)
-                .into_iter()
-                .map(|host| host.host)
-                .collect();
+        match provider {
+            PullRequestsProvider::Github => {
+                discovery.hosts.github = parse_github_auth_status(&text)
+                    .accounts
+                    .into_iter()
+                    .map(|account| account.host)
+                    .collect();
+                discovery.github_status = Some(text);
+            }
+            PullRequestsProvider::Gitlab => {
+                discovery.hosts.gitlab = parse_gitlab_auth_status(&text)
+                    .into_iter()
+                    .map(|host| host.host)
+                    .collect();
+                discovery.gitlab_status = Some(text);
+            }
         }
     }
-    Ok(result)
+    Ok(discovery)
+}
+
+/// Whether a status answer shows this host logged in, without failure markers.
+fn status_authenticated(provider: PullRequestsProvider, text: &str, host: &str) -> bool {
+    match provider {
+        PullRequestsProvider::Github => {
+            let status = parse_github_auth_status(text);
+            status.parsed
+                && status.accounts.iter().any(|account| {
+                    account.host.eq_ignore_ascii_case(host)
+                        && account.active
+                        && account.authenticated
+                })
+        }
+        PullRequestsProvider::Gitlab => gitlab_authenticated(text, host),
+    }
 }
 
 async fn ensure_authenticated(
     runner: &HostCommandRunner,
     scope: &HostScope,
+    discovered_status: Option<&str>,
     c: &CancellationToken,
 ) -> Result<(), Unavailable> {
-    if let Err(failure) = runner.probe(scope, &["--version"], c).await {
+    let provider = supported_provider(scope)?;
+    if let Err(failure) = runner.probe(scope, provider, &["--version"], c).await {
         let missing = matches!(failure.error, ProcessError::NonZeroExit { .. })
             || matches!(&failure.error, ProcessError::Spawn { source, .. } if source.kind() == std::io::ErrorKind::NotFound);
         if !missing {
-            return Err(process_unavailable(
-                &failure,
-                cli(scope.provider),
-                Some(scope),
-            ));
+            return Err(process_unavailable(&failure, cli(provider), Some(scope)));
         }
         let mut unavailable = Unavailable::new(
             "cli_missing",
-            format!(
-                "`{}` is not installed on this environment",
-                cli(scope.provider)
-            ),
+            format!("`{}` is not installed on this environment", cli(provider)),
             Some(scope),
         );
         unavailable.install_hint = provider_install_hint(scope.provider).map(str::to_owned);
         return Err(unavailable);
     }
-    let args = if scope.provider == ProviderKind::Github {
-        vec![
+    // A discovery answer already checked this host's login; only a missing or failed
+    // answer needs the explicit per-host probe and its failure classification.
+    if discovered_status.is_some_and(|text| status_authenticated(provider, text, &scope.host)) {
+        return Ok(());
+    }
+    let args = match provider {
+        PullRequestsProvider::Github => vec![
             "auth",
             "status",
             "--hostname",
             scope.host.as_str(),
             "--json",
             "hosts",
-        ]
-    } else {
-        vec!["auth", "status", "--hostname", scope.host.as_str()]
+        ],
+        PullRequestsProvider::Gitlab => vec!["auth", "status", "--hostname", scope.host.as_str()],
     };
     let output = runner
-        .probe(scope, &args, c)
+        .probe(scope, provider, &args, c)
         .await
         .or_else(ProcessFailure::into_output)
-        .map_err(|failure| process_unavailable(&failure, cli(scope.provider), Some(scope)))?;
-    let text = format!("{}\n{}", output.stdout, output.stderr);
-    let authenticated = if scope.provider == ProviderKind::Github {
-        let status = parse_github_auth_status(&output.stdout);
-        status.parsed
-            && status.accounts.iter().any(|account| {
-                account.host.eq_ignore_ascii_case(&scope.host)
-                    && account.active
-                    && account.authenticated
-            })
-    } else {
-        gitlab_authenticated(&text, &scope.host)
-    };
-    if authenticated {
+        .map_err(|failure| process_unavailable(&failure, cli(provider), Some(scope)))?;
+    if status_authenticated(provider, &status_text(provider, &output), &scope.host) {
         return Ok(());
     }
+    let text = format!("{}\n{}", output.stdout, output.stderr);
     let lower = text.to_lowercase();
     if lower.contains("unknown flag") || lower.contains("unknown command") {
         return Err(Unavailable::new(
@@ -359,7 +556,7 @@ async fn ensure_authenticated(
     );
     unavailable.auth_command = Some(format!(
         "{} auth login --hostname {}",
-        cli(scope.provider),
+        cli(provider),
         scope.host
     ));
     Err(unavailable)
@@ -401,6 +598,10 @@ pub async fn build_context(
     scope: &HostScope,
     c: &CancellationToken,
 ) -> Result<Context, PullRequestsOperationError> {
+    let provider = match supported_provider(scope) {
+        Ok(provider) => provider,
+        Err(unavailable) => return unavailable.into_context(),
+    };
     let context = match host.context(scope, c).await {
         Ok(context) => context,
         Err(error) if matches!(error.code, "not_found" | "forbidden") => {
@@ -421,7 +622,7 @@ pub async fn build_context(
             if error.code == "not_authenticated" {
                 unavailable.auth_command = Some(format!(
                     "{} auth login --hostname {}",
-                    cli(scope.provider),
+                    cli(provider),
                     scope.host
                 ));
             }
@@ -603,6 +804,171 @@ mod tests {
             "git.acme.example\n  Logged in to git.acme.example as alice\n  x Invalid credentials\n",
             "git.acme.example"
         ));
+    }
+
+    /// A custom host needs both CLIs' host lists. Each fake discovery probe waits
+    /// until the other one is running, so sequential discovery finds no host.
+    #[tokio::test]
+    async fn pull_requests_custom_host_discovery_runs_both_probes_together_and_reuses_the_login() {
+        const ARRIVE: &str = r#"arrive() {
+  : > "$1.$$"; i=0
+  while [ "$(ls "$1".* 2>/dev/null | wc -l)" -lt "$2" ]; do
+    i=$((i + 1)); if [ "$i" -gt 60 ]; then rm -f "$1.$$"; echo "$1 probe ran alone" >&2; exit 75; fi
+    sleep 0.05
+  done
+}"#;
+        for (login, expected) in [
+            ("  ✓ Logged in to git.acme.example as alice", Ok(())),
+            (
+                "  ✓ Logged in to git.acme.example as alice\n  x HTTP 401",
+                Err("not_authenticated"),
+            ),
+        ] {
+            let s = TestSandbox::new("pr-discovery");
+            let gh = format!(
+                r#"{ARRIVE}
+printf 'gh %s\n' "$*" >> calls
+case "$1 $2" in
+  '--version ') echo 'gh version 2.97.0' ;;
+  'auth status') arrive discovery 2; echo '{{"hosts":{{"github.com":[{{"state":"success","active":true,"host":"github.com","login":"mubeda"}}]}}}}' ;;
+  *) exit 64 ;;
+esac"#
+            );
+            let glab = format!(
+                r#"{ARRIVE}
+printf 'glab %s\n' "$*" >> calls
+case "$1 $2 $3" in
+  '--version  ') echo 'glab 1.114.0' ;;
+  'auth status ') arrive discovery 2; printf 'git.acme.example\n{login}\n' ;;
+  'auth status --hostname') printf 'git.acme.example\n{login}\n' ;;
+  *) exit 64 ;;
+esac"#
+            );
+            let runner = runner(
+                &s,
+                Some("https://git.acme.example/team/sub/repo.git"),
+                &gh,
+                &glab,
+            );
+            let result = resolve_scope(
+                &runner,
+                s.root(),
+                &DiscoveredHosts::default(),
+                &CancellationToken::new(),
+            )
+            .await;
+            let calls = std::fs::read_to_string(s.path("calls")).unwrap();
+            let explicit_probe = calls.contains("glab auth status --hostname git.acme.example");
+            match expected {
+                Ok(()) => {
+                    let scope = result.unwrap();
+                    assert_eq!(scope.provider, ProviderKind::Gitlab);
+                    assert!(
+                        !explicit_probe,
+                        "discovery already proved this host's login:\n{calls}"
+                    );
+                }
+                Err(code) => {
+                    assert_eq!(result.unwrap_err().code, code);
+                    assert!(
+                        explicit_probe,
+                        "a failed login must be rechecked explicitly:\n{calls}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Discovery records an authenticated custom host. Later reads skip the other CLI
+    /// and recheck the login with the recorded provider's discovery probe;
+    /// `not_authenticated`, Rescan and `unknown_host` each forget the host on their own.
+    #[tokio::test]
+    async fn pull_requests_scope_records_skips_and_forgets_custom_hosts() {
+        let s = TestSandbox::new("pr-recorded-hosts");
+        let gh = r#"printf 'gh %s\n' "$*" >> calls
+case "$1 $2" in
+  '--version ') echo 'gh version 2.97.0' ;;
+  'auth status') echo '{"hosts":{"github.com":[{"state":"success","active":true,"host":"github.com","login":"mubeda"}]}}' ;;
+  *) exit 64 ;;
+esac"#;
+        let glab = r#"printf 'glab %s\n' "$*" >> calls
+case "$1 $2 $3" in
+  '--version  ') echo 'glab 1.114.0' ;;
+  'auth status '|'auth status --hostname')
+    if [ -e logged-out ]; then printf 'git.acme.example\n  x HTTP 401\n'
+    elif [ -e unconfigured ]; then
+      : > probing; while [ ! -e release ]; do sleep 0.02; done
+      printf 'gitlab.com\n  x HTTP 401\n'
+    else printf 'git.acme.example\n  ✓ Logged in to git.acme.example as alice\n'; fi ;;
+  *) exit 64 ;;
+esac"#;
+        let runner = runner(&s, Some("https://git.acme.example/team/repo.git"), gh, glab);
+        let hosts = runner.provider_hosts();
+        let c = CancellationToken::new();
+        let calls = || std::fs::read_to_string(s.path("calls")).unwrap_or_default();
+        let none = DiscoveredHosts::default();
+        let resolve = || resolve_scope(&runner, s.root(), &none, &c);
+
+        assert_eq!(resolve().await.unwrap().provider, ProviderKind::Gitlab);
+        assert_eq!(
+            hosts.provider("git.acme.example"),
+            Some(ProviderKind::Gitlab)
+        );
+        assert!(calls().contains("gh auth status"), "{}", calls());
+
+        runner.clear_context_probes();
+        std::fs::remove_file(s.path("calls")).unwrap();
+        assert_eq!(resolve().await.unwrap().provider, ProviderKind::Gitlab);
+        let recorded = calls();
+        assert!(
+            !recorded.contains("gh "),
+            "a recorded host skips gh:\n{recorded}"
+        );
+        assert!(
+            recorded.contains("glab auth status\n") && !recorded.contains("--hostname"),
+            "the login is rechecked with glab's discovery probe:\n{recorded}"
+        );
+
+        runner.clear_context_probes();
+        std::fs::write(s.path("logged-out"), "").unwrap();
+        assert_eq!(resolve().await.unwrap_err().code, "not_authenticated");
+        assert_eq!(hosts.provider("git.acme.example"), None);
+
+        // Rescan: a host recorded under the wrong provider would only ask gh; Rescan
+        // forgets it, so discovery answers again and records what glab reports.
+        std::fs::remove_file(s.path("logged-out")).unwrap();
+        runner.clear_context_probes();
+        hosts.record("git.acme.example", ProviderKind::Github);
+        let rescanned = resolve_checked_scope(
+            &runner,
+            s.root(),
+            &DiscoveredHosts::default(),
+            ContextRead::Rescan,
+            &c,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rescanned.provider, ProviderKind::Gitlab);
+        assert_eq!(
+            hosts.provider("git.acme.example"),
+            Some(ProviderKind::Gitlab)
+        );
+
+        // `unknown_host` without Rescan: another explicit probe recorded the host
+        // while this read's discovery ran; this read's answer forgets it again.
+        runner.clear_context_probes();
+        hosts.forget("git.acme.example");
+        std::fs::write(s.path("unconfigured"), "").unwrap();
+        let concurrent_record = async {
+            while !s.path("probing").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            hosts.record("git.acme.example", ProviderKind::Gitlab);
+            std::fs::write(s.path("release"), "").unwrap();
+        };
+        let (read, ()) = tokio::join!(resolve(), concurrent_record);
+        assert_eq!(read.unwrap_err().code, "unknown_host");
+        assert_eq!(hosts.provider("git.acme.example"), None);
     }
 
     #[tokio::test]

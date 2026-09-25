@@ -5,12 +5,9 @@ import { useContext, useId, useRef, useState } from "react";
 import { Dialog, DialogPopup, DialogTitle, DialogHeader, DialogFooter } from "../../ui/dialog";
 import { Button } from "../../ui/button";
 import { Input } from "../../ui/input";
-import {
-  PullRequestsPermissionButton,
-  constrainPermission,
-} from "../shared/PullRequestsPermissionButton";
+import { PermissionButton, constrainPermission } from "../../ui/permission-button";
 import { PullRequestsLabelChip } from "../shared/PullRequestsLabelChip";
-import { PullRequestsMutationsDisabledContext } from "../pullRequestsMutationAvailability";
+import { MutationsDisabledContext } from "../../ui/mutationAvailability";
 import { pullRequestsActionError, usePullRequestsActions } from "../usePullRequestsAction";
 import { usePullRequestsVocabulary } from "./usePullRequestsVocabulary";
 export interface PullRequestsPickerProps {
@@ -152,7 +149,7 @@ function PickerDialog({ onClose, ...props }: PullRequestsPickerProps & { onClose
         ) : null}
         <DialogFooter>
           {!props.multiple ? (
-            <PullRequestsPermissionButton
+            <PermissionButton
               mutation
               permission={constrainPermission(
                 permission,
@@ -162,7 +159,7 @@ function PickerDialog({ onClose, ...props }: PullRequestsPickerProps & { onClose
               onClick={() => void change(null)}
             >
               Clear
-            </PullRequestsPermissionButton>
+            </PermissionButton>
           ) : null}
           <Button disabled={pending} onClick={onClose}>
             Done
@@ -174,11 +171,11 @@ function PickerDialog({ onClose, ...props }: PullRequestsPickerProps & { onClose
 }
 export function PullRequestsPicker(props: PullRequestsPickerProps) {
   const [open, setOpen] = useState(false);
-  const disabledReason = useContext(PullRequestsMutationsDisabledContext);
+  const disabledReason = useContext(MutationsDisabledContext);
   const permission = constrainPermission(props.permission, disabledReason);
   return (
     <>
-      <PullRequestsPermissionButton
+      <PermissionButton
         mutation
         permission={permission}
         aria-label={`Edit ${props.label}`}
@@ -187,7 +184,7 @@ export function PullRequestsPicker(props: PullRequestsPickerProps) {
         onClick={() => setOpen(true)}
       >
         <PencilIcon aria-hidden="true" />
-      </PullRequestsPermissionButton>
+      </PermissionButton>
       {open ? (
         <PickerDialog {...props} permission={permission} onClose={() => setOpen(false)} />
       ) : null}

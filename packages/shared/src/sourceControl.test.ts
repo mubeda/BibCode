@@ -3,6 +3,7 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   detectSourceControlProviderFromRemoteUrl,
   formatChangeRequestAction,
+  formatChangeRequestNumber,
   formatCreateChangeRequestPhrase,
   getChangeRequestTerminology,
   getChangeRequestTerminologyForKind,
@@ -11,6 +12,15 @@ import {
 } from "./sourceControl.ts";
 
 describe("source control presentation", () => {
+  it("formats request numbers using the shared provider terminology", () => {
+    expect(formatChangeRequestNumber("gitlab", 14)).toBe("!14");
+    for (const provider of ["github", "azure-devops", "bitbucket", "unknown", null] as const) {
+      expect(formatChangeRequestNumber(provider, 14)).toBe("#14");
+    }
+    expect(getChangeRequestTerminology(null).singular).toBe("pull request");
+    expect(getChangeRequestTerminologyForKind("unknown").singular).toBe("change request");
+  });
+
   it("uses merge request terminology for GitLab", () => {
     expect(getChangeRequestTerminologyForKind("gitlab")).toEqual({
       shortLabel: "MR",
@@ -46,7 +56,13 @@ describe("source control presentation", () => {
 
   it("resolves every presentation and formats action copy", () => {
     expect(resolveChangeRequestPresentation(null).providerName).toBe("GitHub");
-    expect(resolveChangeRequestPresentationForKind("gitlab").icon).toBe("gitlab");
+    expect(resolveChangeRequestPresentationForKind("gitlab")).toMatchObject({
+      icon: "gitlab",
+      numberPrefix: "!",
+    });
+    for (const kind of ["github", "azure-devops", "bitbucket", "unknown"] as const) {
+      expect(resolveChangeRequestPresentationForKind(kind).numberPrefix).toBe("#");
+    }
     expect(resolveChangeRequestPresentationForKind("azure-devops").icon).toBe("azure-devops");
     expect(resolveChangeRequestPresentationForKind("bitbucket").icon).toBe("bitbucket");
 
