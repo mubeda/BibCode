@@ -10,6 +10,7 @@ import {
   WsServerConsumeCodexRateLimitResetRpc,
   WsServerRefreshProvidersRpc,
   WsServerRefreshProviderUsageRpc,
+  WsVcsCancelCloneRpc,
   WsVcsPullRpc,
   WsVcsInitRpc,
   WsShellOpenInEditorRpc,
@@ -71,6 +72,8 @@ const decodeRefreshProviderUsageError = Schema.decodeUnknownSync(
 );
 const decodeConfirmPairing = Schema.decodeUnknownSync(WsAuthConfirmPairingRpc.payloadSchema);
 const decodeConfirmPairingSuccess = Schema.decodeUnknownSync(WsAuthConfirmPairingRpc.successSchema);
+const decodeCancelCloneSuccess = Schema.decodeUnknownSync(WsVcsCancelCloneRpc.successSchema);
+const decodeCancelCloneError = Schema.decodeUnknownSync(WsVcsCancelCloneRpc.errorSchema);
 
 describe("WS_METHODS", () => {
   it("maps method identifiers to unique dotted wire names", () => {
@@ -514,5 +517,33 @@ describe("WsRpcGroup", () => {
     }
     // The group is non-trivial: it registers many procedures.
     expect(WsRpcGroup.requests.size).toBeGreaterThanOrEqual(70);
+  });
+});
+
+// The literals are exactly what `cancel_clone_answers_only_its_declared_shapes` in
+// apps/server/tests/production_git_vcs_rpc.rs asserts the Rust handler sends.
+describe("vcs.cancelClone wire shapes", () => {
+  it("decodes every answer the handler sends against the declared union", () => {
+    expect(decodeCancelCloneSuccess({ cancelled: true })).toEqual({ cancelled: true });
+    expect(decodeCancelCloneSuccess({ cancelled: false })).toEqual({ cancelled: false });
+    const unresolvable = decodeCancelCloneError({
+      _tag: "GitCommandError",
+      operation: "vcs.cancelClone",
+      command: "git",
+      cwd: "/missing-parent",
+      detail: "host path does not exist: /missing-parent",
+    });
+    expect(unresolvable._tag).toBe("GitCommandError");
+  });
+
+  it("has no typed failure for a caller that left: that is the RPC interrupt path", () => {
+    expect(() =>
+      decodeCancelCloneError({
+        _tag: "GitCloneOperationError",
+        reason: "cancelled",
+        destination: "/code/demo",
+        message: "x",
+      }),
+    ).toThrow();
   });
 });

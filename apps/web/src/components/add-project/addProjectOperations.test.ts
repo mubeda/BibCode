@@ -55,16 +55,22 @@ function makeHarness(options: HarnessOptions = {}) {
     _tag: "Success" as const,
     value: undefined,
   }));
+  const cancelClone = vi.fn<AddProjectOperationsDependencies["cancelClone"]>(async () => ({
+    _tag: "Success",
+    value: { cancelled: true },
+  }));
   const reportFailure = vi.fn();
   return {
     createProject,
     cloneRepository,
     openProject,
+    cancelClone,
     reportFailure,
     dependencies: {
       getProjects: () => options.projects ?? [],
       createProject,
       cloneRepository,
+      cancelClone,
       openProject,
       reportFailure,
     } satisfies AddProjectOperationsDependencies,
@@ -550,5 +556,82 @@ describe("add project operations", () => {
     await expect(result).resolves.toBe(false);
     expect(harness.reportFailure).not.toHaveBeenCalled();
     expect(harness.openProject).not.toHaveBeenCalled();
+  });
+});
+
+describe("clone re-attach plumbing", () => {
+  function operationsWith(
+    cloneRepository: AddProjectOperationsDependencies["cloneRepository"],
+    createProject: AddProjectOperationsDependencies["createProject"] = vi.fn(async (input) => ({
+      _tag: "Success" as const,
+      value: { projectId: input.projectId },
+    })),
+  ) {
+    const cancelClone = vi.fn<AddProjectOperationsDependencies["cancelClone"]>(async () => ({
+      _tag: "Success",
+      value: { cancelled: true },
+    }));
+    const operations = createAddProjectOperations({
+      getProjects: () => [],
+      createProject,
+      cloneRepository,
+      cancelClone,
+      openProject: vi.fn(async () => ({ _tag: "Success" as const, value: undefined })),
+      reportFailure: vi.fn(),
+    });
+    return { operations, cancelClone };
+  }
+  const environmentId = EnvironmentId.make("remote");
+
+  it("forwards progress to the clone command and passes cancel through", async () => {
+    const progress = vi.fn();
+    const { operations, cancelClone } = operationsWith(async (input) => {
+      input.onProgress?.({ phase: "reconnecting", reattach: true });
+      return { _tag: "Failure", error: null };
+    });
+
+    await operations.clone({
+      environmentId,
+      url: "https://example.test/demo.git",
+      parentDir: "/code",
+      shouldContinue: () => true,
+      onProgress: progress,
+    });
+    expect(progress).toHaveBeenCalledWith({ phase: "reconnecting", reattach: true });
+
+    await expect(
+      operations.cancelClone({
+        environmentId,
+        url: "https://example.test/demo.git",
+        parentDir: "/code",
+      }),
+    ).resolves.toEqual({ _tag: "Success", value: { cancelled: true } });
+    expect(cancelClone).toHaveBeenCalledWith({
+      environmentId,
+      url: "https://example.test/demo.git",
+      parentDir: "/code",
+    });
+  });
+
+  it("does not register a finished clone when shouldRegister says no", async () => {
+    const createProject = vi.fn<AddProjectOperationsDependencies["createProject"]>();
+    const onCloned = vi.fn();
+    const { operations } = operationsWith(
+      async () => ({ _tag: "Success", value: { path: "/code/demo" } }),
+      createProject,
+    );
+
+    const outcome = await operations.clone({
+      environmentId,
+      url: "https://example.test/demo.git",
+      parentDir: "/code",
+      shouldContinue: () => true,
+      shouldRegister: () => false,
+      onCloned,
+    });
+
+    expect(outcome).toEqual({ _tag: "ClonedNotAdded", path: "/code/demo" });
+    expect(onCloned).not.toHaveBeenCalled();
+    expect(createProject).not.toHaveBeenCalled();
   });
 });

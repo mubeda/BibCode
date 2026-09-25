@@ -2,6 +2,9 @@ import { describe, expect, it } from "vite-plus/test";
 import * as Schema from "effect/Schema";
 
 import {
+  GitCancelCloneInput,
+  GitCloneInput,
+  GitCloneOperationError,
   GitCommandError,
   GitManagerError,
   GitManagerServiceError,
@@ -28,6 +31,9 @@ const decodePreparePullRequestThreadInput = Schema.decodeUnknownSync(
 );
 const decodeRunStackedActionInput = Schema.decodeUnknownSync(GitRunStackedActionInput);
 const decodeRunStackedActionResult = Schema.decodeUnknownSync(GitRunStackedActionResult);
+const decodeCloneInput = Schema.decodeUnknownSync(GitCloneInput);
+const decodeCloneOperationError = Schema.decodeUnknownSync(GitCloneOperationError);
+const decodeCancelCloneInput = Schema.decodeUnknownSync(GitCancelCloneInput);
 const decodeResolvePullRequestResult = Schema.decodeUnknownSync(GitResolvePullRequestResult);
 const decodeManagerServiceError = Schema.decodeUnknownSync(GitManagerServiceError);
 const encodeManagerServiceError = Schema.encodeUnknownSync(GitManagerServiceError);
@@ -304,5 +310,50 @@ describe("git errors", () => {
       makeInvalidClassInstance(GitPullRequestMaterializationError.prototype, invalid),
       encodeExpected,
     );
+  });
+});
+
+describe("clone re-attach contracts", () => {
+  it("keeps attach and detach optional on the clone input", () => {
+    expect(decodeCloneInput({ url: "https://example.test/demo.git", parentDir: "/code" })).toEqual({
+      url: "https://example.test/demo.git",
+      parentDir: "/code",
+    });
+    expect(
+      decodeCloneInput({
+        url: "https://example.test/demo.git",
+        parentDir: "/code",
+        directoryName: "demo",
+        attach: true,
+        detach: true,
+      }),
+    ).toMatchObject({ attach: true, detach: true, directoryName: "demo" });
+  });
+
+  it("decodes every clone operation reason and rejects unknown ones", () => {
+    for (const reason of ["busy", "capacity", "shutting-down", "not-in-progress", "cancelled"]) {
+      const error = decodeCloneOperationError({
+        _tag: "GitCloneOperationError",
+        reason,
+        destination: "/code/demo",
+        message: "Synthetic server message.",
+      });
+      expect(error.reason).toBe(reason);
+      expect(error.message).toBe("Synthetic server message.");
+    }
+    expect(() =>
+      decodeCloneOperationError({
+        _tag: "GitCloneOperationError",
+        reason: "unknown",
+        destination: "/code/demo",
+        message: "x",
+      }),
+    ).toThrow();
+  });
+
+  it("cancels by the clone's own input so only the server derives the destination", () => {
+    expect(
+      decodeCancelCloneInput({ url: "https://example.test/demo.git", parentDir: "~/code" }),
+    ).toEqual({ url: "https://example.test/demo.git", parentDir: "~/code" });
   });
 });

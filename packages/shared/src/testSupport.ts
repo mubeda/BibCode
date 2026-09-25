@@ -24,6 +24,7 @@ export function makeTestExecutionEnvironmentCapabilities(
     pullRequestsMutations: false,
     activityProtocolVersion: null,
     remoteUpdateControl: false,
+    vcsCloneReattach: false,
     ...overrides,
   };
 }

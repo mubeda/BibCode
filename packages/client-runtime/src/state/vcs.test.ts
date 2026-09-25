@@ -1,5 +1,6 @@
 import {
   EnvironmentId,
+  GitCommandError,
   GitManagerError,
   WS_METHODS,
   type VcsStatusSummary,
@@ -13,11 +14,15 @@ import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import * as TestClock from "effect/testing/TestClock";
 import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
+import { RpcClientError } from "effect/unstable/rpc";
 
+import { AVAILABLE_CONNECTION_STATE, type SupervisorConnectionState } from "../connection/model.ts";
+import type { ConnectionCatalogEntry } from "../connection/catalog.ts";
 import { EnvironmentRegistry } from "../connection/registry.ts";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import type { RpcSession } from "../rpc/session.ts";
+import { isAtomCommandInterrupted, runAtomCommand } from "./runtime.ts";
 import { createVcsEnvironmentAtoms } from "./vcs.ts";
 
 const ENVIRONMENT_ID = EnvironmentId.make("environment-1");
@@ -524,6 +529,238 @@ describe("VCS summary atoms", () => {
         active: { count: 1, maximum: 1 },
         finalized: { status: 1, summary: 0 },
       });
+    }),
+  );
+});
+
+const LOST_SOCKET = new RpcClientError.RpcClientError({
+  reason: new RpcClientError.RpcClientDefect({
+    message: "socket closed",
+    cause: new Error("socket closed"),
+  }),
+});
+
+function cloneSession(
+  client: Record<string, (input: unknown) => Effect.Effect<unknown, unknown>>,
+): RpcSession {
+  return {
+    client: client as unknown as WsRpcProtocolClient,
+    initialConfig: Effect.succeed({
+      environment: { capabilities: { vcsCloneReattach: true } },
+    } as never),
+    ready: Effect.void,
+    probe: Effect.void,
+    closed: Effect.never,
+    e2eeAuthenticated: Effect.succeed(null),
+  };
+}
+
+const makeCommandHarness = Effect.fn("TestVcs.makeCommandHarness")(function* (initial: RpcSession) {
+  const sessionRef = yield* SubscriptionRef.make<Option.Option<RpcSession>>(Option.some(initial));
+  const stateRef = yield* SubscriptionRef.make<SupervisorConnectionState>({
+    ...AVAILABLE_CONNECTION_STATE,
+    desired: true,
+    phase: "connected",
+  });
+  const target = { environmentId: ENVIRONMENT_ID, label: "Environment" };
+  const supervisor = EnvironmentSupervisor.of({
+    target,
+    session: sessionRef,
+    state: stateRef,
+  } as never);
+  const run: EnvironmentRegistry["Service"]["run"] = (_environmentId, effect) =>
+    Effect.provideService(effect, EnvironmentSupervisor, supervisor);
+  // The clone loops follow the registry's current supervisor; here it never changes.
+  const followStream: EnvironmentRegistry["Service"]["followStream"] = (_environmentId, stream) =>
+    Stream.provideService(stream, EnvironmentSupervisor, supervisor);
+  const entries = yield* SubscriptionRef.make<ReadonlyMap<EnvironmentId, ConnectionCatalogEntry>>(
+    new Map([[ENVIRONMENT_ID, { target } as ConnectionCatalogEntry]]),
+  );
+  const environmentRegistry = EnvironmentRegistry.of({ run, followStream, entries } as never);
+  const vcs = createVcsEnvironmentAtoms(
+    Atom.runtime(Layer.succeed(EnvironmentRegistry, environmentRegistry)),
+  );
+  return { atomRegistry: AtomRegistry.make(), sessionRef, vcs };
+});
+
+describe("clone commands", () => {
+  it.effect("cancels on its own lane while the clone holds the destination's lane", () =>
+    Effect.gen(function* () {
+      let cancelInput: unknown = null;
+      const harness = yield* makeCommandHarness(
+        cloneSession({
+          [WS_METHODS.vcsClone]: () => Effect.never,
+          [WS_METHODS.vcsCancelClone]: (input) => {
+            cancelInput = input;
+            return Effect.succeed({ cancelled: true });
+          },
+        }),
+      );
+      const controller = new AbortController();
+      const input = { url: "https://example.test/demo.git", parentDir: "/code" };
+      let cloneSettled = false;
+      const clone = runAtomCommand(
+        harness.atomRegistry,
+        harness.vcs.clone,
+        { environmentId: ENVIRONMENT_ID, input },
+        { signal: controller.signal },
+      ).then((result) => {
+        cloneSettled = true;
+        return result;
+      });
+
+      const cancelled = yield* Effect.promise(() =>
+        runAtomCommand(harness.atomRegistry, harness.vcs.cancelClone, {
+          environmentId: ENVIRONMENT_ID,
+          input,
+        }),
+      );
+
+      expect(AsyncResult.isSuccess(cancelled) ? cancelled.value : null).toEqual({
+        cancelled: true,
+      });
+      expect(cancelInput).toEqual(input);
+      expect(cloneSettled).toBe(false);
+      controller.abort();
+      expect(isAtomCommandInterrupted(yield* Effect.promise(() => clone))).toBe(true);
+      harness.atomRegistry.dispose();
+    }),
+  );
+
+  it.effect(
+    "a retry after a lost cancel acknowledgement and a remount waits for that cancel and is not cancelled",
+    () =>
+      Effect.gen(function* () {
+        const events: Array<string> = [];
+        const input = { url: "https://example.test/demo.git", parentDir: "/code" };
+        const harness = yield* makeCommandHarness(
+          cloneSession({
+            [WS_METHODS.vcsClone]: () => {
+              events.push("clone");
+              return Effect.never;
+            },
+            // The host cancels the clone, but the answer is lost with the socket.
+            [WS_METHODS.vcsCancelClone]: () => {
+              events.push("cancel sent, answer lost");
+              return Effect.fail(LOST_SOCKET);
+            },
+          }),
+        );
+        const firstDialog = new AbortController();
+        const first = runAtomCommand(
+          harness.atomRegistry,
+          harness.vcs.clone,
+          { environmentId: ENVIRONMENT_ID, input },
+          { signal: firstDialog.signal },
+        );
+        yield* waitFor(() => events.includes("clone"), "the first clone was not dispatched");
+        const cancel = runAtomCommand(harness.atomRegistry, harness.vcs.cancelClone, {
+          environmentId: ENVIRONMENT_ID,
+          input,
+        });
+        yield* waitFor(
+          () => events.includes("cancel sent, answer lost"),
+          "the cancel was not sent",
+        );
+
+        // The dialog unmounts: its clone wait ends; the cancel stays registered and keeps retrying.
+        firstDialog.abort();
+        expect(isAtomCommandInterrupted(yield* Effect.promise(() => first))).toBe(true);
+
+        // A remounted dialog retries into the same folder: the retry waits for the pending cancel.
+        const secondDialog = new AbortController();
+        const retry = runAtomCommand(
+          harness.atomRegistry,
+          harness.vcs.clone,
+          { environmentId: ENVIRONMENT_ID, input },
+          { signal: secondDialog.signal },
+        );
+        for (let attempt = 0; attempt < 50; attempt += 1) yield* Effect.yieldNow;
+        expect(events).toEqual(["clone", "cancel sent, answer lost"]);
+
+        // The host is reachable again: the cancel goes out once more and is acknowledged, and
+        // only then does the retry dispatch. Nothing cancels the retry.
+        yield* SubscriptionRef.set(
+          harness.sessionRef,
+          Option.some(
+            cloneSession({
+              [WS_METHODS.vcsClone]: () => {
+                events.push("retry");
+                return Effect.never;
+              },
+              [WS_METHODS.vcsCancelClone]: () => {
+                events.push("cancel acknowledged");
+                return Effect.succeed({ cancelled: true });
+              },
+            }),
+          ),
+        );
+        const acknowledged = yield* Effect.promise(() => cancel);
+        expect(AsyncResult.isSuccess(acknowledged) ? acknowledged.value : null).toEqual({
+          cancelled: true,
+        });
+        yield* waitFor(() => events.includes("retry"), "the retry was not dispatched");
+        expect(events).toEqual([
+          "clone",
+          "cancel sent, answer lost",
+          "cancel acknowledged",
+          "retry",
+        ]);
+
+        secondDialog.abort();
+        yield* Effect.promise(() => retry);
+        harness.atomRegistry.dispose();
+      }),
+  );
+
+  it.effect("a cancel the host refuses releases its pending record at once", () =>
+    Effect.gen(function* () {
+      const events: Array<string> = [];
+      const input = {
+        url: "https://example.test/demo.git",
+        parentDir: "/code",
+        directoryName: "a/../b",
+      };
+      const harness = yield* makeCommandHarness(
+        cloneSession({
+          [WS_METHODS.vcsClone]: () => {
+            events.push("clone");
+            return Effect.succeed({ path: "/code/b" });
+          },
+          // The server refuses a path as the folder name with a typed failure.
+          [WS_METHODS.vcsCancelClone]: () => {
+            events.push("cancel refused");
+            return Effect.fail(
+              new GitCommandError({
+                operation: "vcs.cancelClone",
+                command: "git",
+                cwd: "/code",
+                detail: 'The folder name "a/../b" must be a single name, without slashes or "..".',
+              }),
+            );
+          },
+        }),
+      );
+
+      const refused = yield* Effect.promise(() =>
+        runAtomCommand(
+          harness.atomRegistry,
+          harness.vcs.cancelClone,
+          { environmentId: ENVIRONMENT_ID, input },
+          { reportFailure: false },
+        ),
+      );
+      expect(refused._tag).toBe("Failure");
+      // The refused cancel left no pending record, so a clone into the folder dispatches at once.
+      const cloned = yield* Effect.promise(() =>
+        runAtomCommand(harness.atomRegistry, harness.vcs.clone, {
+          environmentId: ENVIRONMENT_ID,
+          input,
+        }),
+      );
+      expect(AsyncResult.isSuccess(cloned) ? cloned.value : null).toEqual({ path: "/code/b" });
+      expect(events).toEqual(["cancel refused", "clone"]);
+      harness.atomRegistry.dispose();
     }),
   );
 });

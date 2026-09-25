@@ -35,6 +35,7 @@ use crate::{
     process::configure_background_command,
     production::{
         agent_activity::ProductionAgentActivity,
+        clone_operations::CloneRuntime,
         connect_mcp::ConnectMcpService,
         control::{NativeServerControl, ProviderUpdateCheckTask},
         git_manager_rpc::{GitManagerRpcServices, register_git_manager_rpc},
@@ -106,6 +107,7 @@ pub struct ProductionRuntime {
     worktree_catalog_operations: WorktreeCatalogOperationRuntime,
     worktree_runtime: WorktreeRuntime,
     worktree_removal_tasks: WorktreeRemovalTaskTracker,
+    clone_operations: CloneRuntime,
     status_broadcaster: crate::git::StatusBroadcaster,
     workspace: WorkspaceRpc,
     _resource_sampler: Arc<NativeResourceSampler>,
@@ -333,6 +335,7 @@ impl ProductionRuntime {
         .with_created_request_observer(Arc::new(pull_requests.service.clone()))
         .with_availability_registry(workspace_availability.clone());
         let worktree_removal_tasks = git_vcs.worktree_removal_tasks();
+        let clone_operations = git_vcs.clone_operations();
         let status_broadcaster = git_vcs.status_broadcaster();
         let terminal_status_broadcaster = status_broadcaster.clone();
         terminal_manager.set_process_exit_callback(Arc::new(move |cwd| {
@@ -484,6 +487,7 @@ impl ProductionRuntime {
             worktree_catalog_operations,
             worktree_runtime,
             worktree_removal_tasks,
+            clone_operations,
             status_broadcaster,
             workspace,
             _resource_sampler: resource_sampler,
@@ -619,6 +623,9 @@ impl ProductionRuntime {
         self.worktree_runtime.shutdown().await;
         let mut first_error = None;
         self.worktree_removal_tasks.close_and_drain().await;
+        // Stops every live clone, including detached ones, and waits until each removed the
+        // folder it created, before providers and terminals shut down.
+        self.clone_operations.close_and_drain().await;
         self.provider_update_checks.shutdown().await;
         self.turn_delivery.shutdown().await;
         self.orchestration_effects.shutdown().await;

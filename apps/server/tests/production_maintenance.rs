@@ -580,3 +580,118 @@ async fn abandoned_preparation_lease_expires_and_exits() {
         .expect("lease expiry shuts the quiesced backend down");
     server.join().await.expect("expired server joins cleanly");
 }
+
+/// Exchanges the desktop bootstrap token and opens an authenticated RPC socket.
+async fn authenticated_socket(
+    server: &bibcode_server::ServerHandle,
+    bootstrap: &str,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    let base = format!("http://{}", server.local_addr());
+    let client = reqwest::Client::new();
+    let token = client
+        .post(format!("{base}/oauth/token"))
+        .form(&[
+            (
+                "grant_type",
+                "urn:ietf:params:oauth:grant-type:token-exchange",
+            ),
+            ("subject_token", bootstrap),
+            (
+                "subject_token_type",
+                "urn:bibcode:params:oauth:token-type:environment-bootstrap",
+            ),
+            (
+                "requested_token_type",
+                "urn:ietf:params:oauth:token-type:access_token",
+            ),
+        ])
+        .send()
+        .await
+        .expect("bootstrap exchange")
+        .json::<Value>()
+        .await
+        .expect("bootstrap exchange JSON")["access_token"]
+        .as_str()
+        .expect("access token")
+        .to_owned();
+    let ticket = client
+        .post(format!("{base}/api/auth/websocket-ticket"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("ticket response")
+        .json::<Value>()
+        .await
+        .expect("ticket JSON")["ticket"]
+        .as_str()
+        .expect("ticket")
+        .to_owned();
+    connect_async(format!("ws://{}/ws?wsTicket={ticket}", server.local_addr()))
+        .await
+        .expect("authenticated socket")
+        .0
+}
+
+#[tokio::test]
+async fn shutdown_stops_a_detached_clone_and_removes_its_folder() {
+    use tokio::io::AsyncReadExt;
+
+    let root = tempfile::tempdir().expect("data root");
+    disable_provider_processes(root.path());
+    let clones = tempfile::tempdir().expect("clone parent");
+    let destination = clones.path().join("detached");
+    // `git://` has no HTTP proxy, so a host proxy setting cannot divert Git away from this
+    // listener. The listener accepts and never answers, so the clone runs until stopped.
+    let remote = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("stalled remote");
+    let url = format!(
+        "git://{}/stalled.git",
+        remote.local_addr().expect("address")
+    );
+    let bootstrap = "clone-shutdown-bootstrap";
+    let server = ServerRuntime::start(desktop_config(root.path(), bootstrap))
+        .await
+        .expect("desktop runtime");
+    let mut socket = authenticated_socket(&server, bootstrap).await;
+
+    socket
+        .send(Message::Text(
+            json!({
+                "_tag": "Request", "id": "1", "tag": "vcs.clone", "headers": [],
+                "payload": { "url": url, "parentDir": clones.path(), "directoryName": "detached", "detach": true }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("clone request");
+    let (mut connection, _) = timeout(Duration::from_secs(30), remote.accept())
+        .await
+        .expect("Git connects")
+        .expect("accept Git");
+    assert!(destination.is_dir(), "the clone created its destination");
+    // The client leaves; the detached clone keeps running until shutdown.
+    let _ = socket.close(None).await;
+
+    server.shutdown();
+    timeout(Duration::from_secs(60), server.join())
+        .await
+        .expect("shutdown finishes")
+        .expect("server joins");
+    assert!(
+        !destination.exists(),
+        "shutdown removed the partial folder before finishing"
+    );
+    let mut buffer = [0_u8; 1024];
+    let closed = timeout(Duration::from_secs(5), async {
+        loop {
+            match connection.read(&mut buffer).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
+    assert!(closed.is_ok(), "Git was stopped");
+}

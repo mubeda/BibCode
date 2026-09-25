@@ -1044,6 +1044,50 @@ typed `WorktreeOperationError` results (`operation-capacity` and
 terminal result; completion releases capacity and shutdown closes admission
 before draining all accepted tasks.
 
+The clone runtime (`apps/server/src/production/clone_operations.rs`, owned by
+`GitVcsRpcServices`) serves `vcs.clone` and `sourceControl.cloneRepository`. It
+keys one live clone per destination: the canonical parent folder plus the leaf
+derived from `directoryName` or the URL. The leaf must be a single folder name:
+the server refuses a `directoryName` that is a path, `.`, or `..`, and a URL that
+yields no usable name (never echoing the URL) before admission, the disk check,
+a cancel, or the reservation, so a destination key always names the folder the
+kernel resolves. A request for the same URL joins the live clone and shares its
+outcome; another URL is refused as `busy` at once, without naming the running
+clone's URL. Errors follow each method's declared union. `vcs.clone` reports
+the leaf refusal as a `GitCommandError` and runtime refusals (`busy`,
+`capacity`, `shutting-down`, `not-in-progress`, `cancelled`) as
+`GitCloneOperationError` reasons. `vcs.cancelClone` answers `{ cancelled }`,
+or a `GitCommandError` for the leaf refusal or a parent folder it cannot
+resolve; it has no runtime refusal. `sourceControl.cloneRepository` reports
+every clone-runtime failure, the leaf refusal and a failed clone included, as a
+`SourceControlRepositoryError` carrying the same detail. A new clone of the same
+URL waits for a cancelled one's cleanup, then starts. Admission never waits: at
+most 16 clones are live, and a full or closed runtime answers `capacity` or
+`shutting-down`. Each clone owns a root cancellation token, a tracked task, and
+a clone of its starter's admission permit, so the update drain names a detached
+`vcs.clone` until Git has stopped and its cleanup has finished. Git runs in a
+task of its own: the clone's task removes the folder it created after any
+failure, cancellation, or panic of that transfer, and only then publishes the
+outcome and frees its slot. A cancelled clone whose folder could not be removed
+reports that folder, not a clean cancel. `attach: true` is join-only: it joins
+a live clone, returns a failed or cancelled outcome retained for the same URL,
+or runs the reuse check without reserving (the finished clone's path, the
+incomplete-clone error, or `not-in-progress`). An attach that raced a new clone
+admits again and joins it. Outcomes are retained for five minutes per
+destination and URL and swept on every access. None is dropped early: once
+live clones plus retained outcomes reach 256, a new clone is refused with
+`capacity` until outcomes expire.
+`vcs.cancelClone` takes the clone's own input, cancels a live clone of that
+URL, and answers `{ cancelled }` after that clone's outcome is published:
+`true` unless Git had already succeeded, and it never touches a finished clone.
+A caller that leaves a waiting `vcs.clone` or `vcs.cancelClone` gets an
+`Interrupt` exit, never a typed failure. Shutdown closes admission, cancels
+every live clone, and drains beside the worktree-removal tasks, so Git stops
+and each partial folder is removed before providers and terminals shut down.
+Clients send `attach` and `detach` only when the server advertises
+`vcsCloneReattach`: `CloneInput` accepts unknown fields, so an older server
+would run an `attach` as a new clone.
+
 With that claim held, an already-accepted retry is replayed first. Every new
 removal must then acquire one finite runtime-cleanup lifetime slot before receipt
 reservation, `Removing`, quiesce, Git, or detach; saturation returns the retryable
@@ -1994,8 +2038,13 @@ replacement that now occupies the old path.
   group id reserved, so the kill reaches exactly the stragglers, and only an
   empty group's id could be reused, which takes a PID wrap-around in between.
   Work that must finish cleanup before the caller continues cancels its token
-  instead: clone's owned transfer task stops the process group and removes the
-  destination it created.
+  instead: a clone's owned transfer task stops the process group and removes the
+  destination it created. With `detach`, admission into the clone runtime is
+  the clone's handoff: caller cancellation (Interrupt, socket teardown, a
+  dropped handler) then ends only that caller's wait, and only
+  `vcs.cancelClone` or shutdown stops the clone. Without `detach`, a starter's
+  cancellation still cancels its clone; a caller that joined a running clone
+  never cancels it by leaving.
 - Git Manager mutations use the worktree catalog's project-then-repository lock
   order and fail a competing operation with `operation-in-flight`; they do not
   introduce an independent repository lock.

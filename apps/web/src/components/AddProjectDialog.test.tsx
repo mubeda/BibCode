@@ -132,6 +132,7 @@ beforeEach(() => {
     selectedHost,
     step: "start",
     busy: false,
+    dismissible: true,
     cloneProgress: "idle",
     hostPath: "~/",
     cloneUrl: "",
@@ -239,6 +240,7 @@ describe("AddProjectDialog mounted interactions", () => {
     testState.workflow.step = "clone";
     testState.workflow.cloneUrl = "https://example.test/demo.git";
     testState.workflow.busy = true;
+    testState.workflow.dismissible = false;
     testState.workflow.cloneProgress = "cloning";
     const onOpenChange = vi.fn();
     await mount(<AddProjectDialog open onOpenChange={onOpenChange} />);
@@ -266,11 +268,55 @@ describe("AddProjectDialog mounted interactions", () => {
 
   it("prevents dismissal while a mutation is pending", async () => {
     testState.workflow.busy = true;
+    testState.workflow.dismissible = false;
     const onOpenChange = vi.fn();
     await mount(<AddProjectDialog open onOpenChange={onOpenChange} />);
     await pressEscape();
     expect(onOpenChange).not.toHaveBeenCalledWith(false);
   });
+
+  it.each([
+    [
+      "reconnecting",
+      "Lost the connection to Remote. The clone continues on the server; reconnecting…",
+    ],
+    ["cancelling", "The clone stops when Remote reconnects."],
+  ] as const)("offers Close while the clone waits for the host (%s)", async (progress, notice) => {
+    testState.workflow.step = "clone";
+    testState.workflow.cloneUrl = "https://example.test/demo.git";
+    testState.workflow.busy = true;
+    testState.workflow.dismissible = true;
+    testState.workflow.cloneProgress = progress;
+    testState.workflow.notice = notice;
+    const onOpenChange = vi.fn();
+    await mount(<AddProjectDialog open onOpenChange={onOpenChange} />);
+
+    expect(buttonWithText("Back").disabled).toBe(true);
+    const close = document.querySelector<HTMLButtonElement>('button[aria-label="Close"]');
+    expect(close).not.toBeNull();
+    await pressEscape();
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    onOpenChange.mockClear();
+    await click(close!);
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it.each(["cloning", "registering"] as const)(
+    "hides Close and ignores Escape while %s",
+    async (progress) => {
+      testState.workflow.step = "clone";
+      testState.workflow.cloneUrl = "https://example.test/demo.git";
+      testState.workflow.busy = true;
+      testState.workflow.dismissible = false;
+      testState.workflow.cloneProgress = progress;
+      const onOpenChange = vi.fn();
+      await mount(<AddProjectDialog open onOpenChange={onOpenChange} />);
+
+      expect(document.querySelector('button[aria-label="Close"]')).toBeNull();
+      await pressEscape();
+      expect(onOpenChange).not.toHaveBeenCalledWith(false);
+    },
+  );
 
   it("renders the server directory browser for the remote-browse step", async () => {
     testState.workflow.step = "remote-browse";

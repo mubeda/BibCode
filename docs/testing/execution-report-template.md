@@ -218,6 +218,12 @@ Delete the unused result values above. Do not leave an ambiguous status.
 - Cancel: notice, destination removal, immediate retry result:
 - Stalled transfer: failure time and exact message, destination removal:
 - Incomplete-clone refusal message, folder kept, Git Manager "No commits yet":
+- Connection drop: outage length, reconnecting line shown, clone duration, registration after reconnect:
+- Fixture duration or slow-rate method used to keep the clone running through each event:
+- Cancel across a reconnect: Cancelling… line; for each variant (disconnected, reconnected, Cancel then drop), whether the clone was partial ("Clone cancelled.", folder removed) or completed (the finished-before-cancel notice, folder kept and not added, next Clone adds it):
+- Dialog closed while reconnecting: close button shown, dialog closed, folder removed after the connection returned, and whether a new Clone of that URL into that folder waited for the cancel, then started:
+- Server restart mid-clone: partial or completed at the stop; partial folder removed at shutdown and the exact "No clone is in progress…" message, or the completed clone added:
+- Window closed mid-clone: whether the host kept cloning, and the result of re-cloning the same URL into the same folder (joined or added):
 
 ## SSH environment evidence
 

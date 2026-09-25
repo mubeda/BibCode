@@ -1139,6 +1139,55 @@ sending after a few megabytes while keeping the connection open. Clone through
    the folder is kept. Opening that repository in the Git Manager shows **No
    commits yet** and offers Fetch.
 
+Steps 5-8 need the clone to still be running when the outage, the Cancel, or
+the restart reaches the host. Either use a fixture whose clone lasts at least
+three times the longest outage (for example 120 MB or more of incompressible
+data at about 600 KB/s, over 200 seconds), or switch the throttled server to a
+slow rate during the event. Keep that rate above 1 KB/s, or Git's stall guard
+ends the clone. Record which method was used.
+
+5. Connection drop during a throttled clone: after the clone has run for about
+   ten seconds, drop the client's connection for at least 40 seconds (take the
+   network offline, or stop a TCP proxy between client and server). The form
+   keeps **Cloning…** and shows "Lost the connection to <host>. The clone
+   continues on the server; reconnecting…". The destination folder keeps
+   growing on the server. After the connection returns, the line clears, the
+   clone completes, and the dialog closes once the project appears. If the
+   clone finished during the outage, the re-attach finds the finished clone
+   and adds it the same way.
+6. Cancel across a reconnect: start a throttled clone and drop the connection.
+   Press **Cancel clone** while disconnected. The form shows **Cancelling…**
+   and "The clone stops when <host> reconnects.". Restore the connection. The
+   line clears while the cancel reaches the host, and the result depends on
+   where the clone stood:
+   - partial clone (Git still running when the Cancel reached the host): the
+     form shows "Clone cancelled." and the folder is removed;
+   - completed clone (Git finished first): the form shows "The clone finished
+     before it could be cancelled. It is in <path> and was not added as a
+     project. Press Clone to add it."; the folder keeps its full checkout, is
+     not added as a project, and the next **Clone** into it adds it.
+
+   Repeat with the connection restored before pressing Cancel, with the same
+   two outcomes. Then press **Cancel clone** while connected and drop the
+   connection at once: the form stays **Cancelling…** and shows "The clone
+   stops when <host> reconnects." until the connection returns. Close the
+   dialog while it shows the reconnecting line: it closes; after the
+   connection returns the clone is cancelled and its folder removed, and a new
+   Clone of that URL into that folder waits for the cancel, then starts. State
+   which outcome occurred in each variant.
+
+7. Server restart mid-clone: stop the server gracefully during a throttled
+   clone and start it again. For a partial clone, the destination folder is
+   removed during shutdown, and after reconnecting the form shows "No clone is
+   in progress for <path>. Press Clone to start again.". A clone that
+   completed before the stop is found again after reconnecting, and the
+   project is added.
+8. Window closed mid-clone (orphan policy): close the client window during a
+   throttled clone against a remote host. The cancel is best effort, so the
+   clone may keep running on the host. Reopen the client, and clone the same
+   URL into the same folder: it joins the running clone or adds the finished
+   repository. It must never report an incomplete clone while the orphan runs.
+
 Record each duration and the exact messages. SSH remotes have no stall guard;
 record SSH coverage separately if tested.
 

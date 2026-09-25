@@ -1,4 +1,5 @@
 import {
+  type GitCancelCloneInput,
   type VcsStatusResult,
   type VcsStatusStreamEvent,
   type VcsStatusSummary,
@@ -13,6 +14,7 @@ import * as SubscriptionRef from "effect/SubscriptionRef";
 import { Atom, AtomRegistry } from "effect/unstable/reactivity";
 
 import {
+  createEnvironmentCommand,
   createEnvironmentRpcCommand,
   createEnvironmentRpcQueryAtomFamily,
   createEnvironmentSubscriptionAtomFamily,
@@ -31,6 +33,7 @@ import {
   type EnvironmentRpcStreamFailure,
 } from "../rpc/client.ts";
 import {
+  vcsCloneCancelScheduler,
   vcsCloneCommandConcurrency,
   vcsCommandConcurrency,
   vcsCommandScheduler,
@@ -38,6 +41,12 @@ import {
   vcsStatusRefreshConcurrency,
   vcsStatusRefreshScheduler,
 } from "./vcsCommandScheduler.ts";
+import {
+  cancelCloneOnNextSession,
+  cloneWithReattach,
+  registerCloneCancel,
+  type VcsCloneCommandInput,
+} from "./vcsClone.ts";
 
 export type VcsPassiveStatus = VcsStatusSummary | VcsStatusResult;
 
@@ -107,6 +116,43 @@ function subscribeToVcsSummary<E, R>(
   );
 }
 
+/**
+ * The clone loops follow the environment's current supervisor through the registry, so their
+ * effects also need `EnvironmentRegistry`, which the command runtime provides. The explicit type
+ * arguments below say so; inference would leave the registry out of the allowed services.
+ */
+type CloneEffect = ReturnType<typeof cloneWithReattach>;
+type CancelCloneEffect = ReturnType<typeof cancelCloneOnNextSession>;
+
+/**
+ * `vcs.cancelClone` as a command. Its `run` records the pending cancel synchronously, before
+ * anything is scheduled, so a later clone of the same URL into the same leaf waits for it,
+ * even from a remounted dialog. The record ends when the command settles: acknowledged,
+ * stopped, or failed. The dialog that asked never owns it.
+ */
+function createCancelCloneCommand<R, E>(runtime: Atom.AtomRuntime<EnvironmentRegistry | R, E>) {
+  const command = createEnvironmentCommand<
+    EnvironmentRegistry | R,
+    E,
+    GitCancelCloneInput,
+    Effect.Success<CancelCloneEffect>,
+    Effect.Error<CancelCloneEffect>
+  >(runtime, {
+    label: "environment-data:vcs:cancel-clone",
+    scheduler: vcsCloneCancelScheduler,
+    concurrency: vcsCloneCommandConcurrency,
+    execute: (input: GitCancelCloneInput) => cancelCloneOnNextSession(input),
+  });
+  return {
+    ...command,
+    run: (...args: Parameters<typeof command.run>) => {
+      const [, target] = args;
+      const release = registerCloneCancel(target.environmentId, target.input);
+      return command.run(...args).finally(release);
+    },
+  };
+}
+
 export function createVcsEnvironmentAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, E>,
 ) {
@@ -159,12 +205,20 @@ export function createVcsEnvironmentAtoms<R, E>(
       scheduler: vcsStatusRefreshScheduler,
       concurrency: vcsStatusRefreshConcurrency,
     }),
-    clone: createEnvironmentRpcCommand(runtime, {
+    // React owns no retry loops: the re-attach loop lives in the command itself.
+    clone: createEnvironmentCommand<
+      EnvironmentRegistry | R,
+      E,
+      VcsCloneCommandInput,
+      Effect.Success<CloneEffect>,
+      Effect.Error<CloneEffect>
+    >(runtime, {
       label: "environment-data:vcs:clone",
-      tag: WS_METHODS.vcsClone,
       scheduler: vcsCommandScheduler,
       concurrency: vcsCloneCommandConcurrency,
+      execute: (input: VcsCloneCommandInput) => cloneWithReattach(input),
     }),
+    cancelClone: createCancelCloneCommand(runtime),
     createRef: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:vcs:create-ref",
       tag: WS_METHODS.vcsCreateRef,
@@ -215,3 +269,4 @@ export * from "./gitActions.ts";
 export * from "./vcsAction.ts";
 export * from "./vcsRef.ts";
 export * from "./vcsStatus.ts";
+export * from "./vcsClone.ts";

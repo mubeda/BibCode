@@ -113,6 +113,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "shell.openInEditor"
         | "sourceControl.cloneRepository"
         | "sourceControl.publishRepository"
+        | "vcs.cancelClone"
         | "vcs.clone"
         | "vcs.createRef"
         | "vcs.discardFiles"
@@ -289,6 +290,11 @@ mod tests {
                 "wrong activity mutation scope for {method}"
             );
         }
+        assert_eq!(
+            required_scope("vcs.cancelClone"),
+            Some(SCOPE_ORCHESTRATION_OPERATE),
+            "cancelling a clone needs the same scope as starting one"
+        );
         assert_eq!(required_scope("unknown.method"), None);
     }
 }

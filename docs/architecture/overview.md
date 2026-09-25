@@ -161,14 +161,20 @@ flowchart TB
   Create PR dialog). SSH transports have no stall guard, so a dead SSH link ends
   only by cancellation, those bounds, or the connection's own keepalive
   settings. The orchestration bootstrap fetch and the Pull Requests checkout
-  fetch run outside the driver with their own budgets and no stall guard. Clone
-  reserves its
-  destination before Git runs, and an owned task removes only a destination
-  that clone created after a failure, timeout, stall, or cancellation
-  (including an interrupted RPC); a new clone into a destination still being
-  cleaned up waits for that cleanup. Reusing an existing destination requires a
-  `HEAD` that resolves to a commit; otherwise the error names the incomplete
-  clone and asks the user to remove it or choose another folder.
+  fetch run outside the driver with their own budgets and no stall guard.
+  Clone runs in a server-owned clone runtime keyed by
+  destination (canonical parent plus leaf). It reserves its destination before
+  Git runs, and its owned task removes only a destination that clone created
+  after a failure, timeout, stall, cancellation, or panic of the transfer,
+  before it reports the outcome. A caller that asked to
+  `detach` can lose its socket without stopping the clone; a later session
+  re-attaches, and `vcs.cancelClone` or shutdown stops it. An orphaned clone runs
+  to completion under the 24-hour bound and, for HTTP(S), the stall guard. A new
+  clone into a destination still being cleaned up waits for that cleanup.
+  Reusing an existing destination requires a `HEAD` that resolves to a commit
+  and an index file (`git rev-parse --git-path index`); otherwise the error
+  names the incomplete clone and asks the user to remove it or choose another
+  folder.
 
   Shared observations never bypass per-caller anchor validation, and final
   view/repository ownership release is atomic against concurrent attachment. A

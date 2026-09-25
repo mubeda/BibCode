@@ -63,7 +63,10 @@ import {
   GitCommandError,
   VcsCreateRefInput,
   VcsCreateRefResult,
+  GitCancelCloneInput,
+  GitCancelCloneResult,
   GitCloneInput,
+  GitCloneOperationError,
   GitCloneResult,
   VcsDiscardFilesInput,
   VcsGenerateCommitMessageInput,
@@ -399,6 +402,7 @@ export const WS_METHODS = {
   vcsListRefs: "vcs.listRefs",
   vcsListCommits: "vcs.listCommits",
   vcsClone: "vcs.clone",
+  vcsCancelClone: "vcs.cancelClone",
   vcsCreateRef: "vcs.createRef",
   vcsSwitchRef: "vcs.switchRef",
   vcsInit: "vcs.init",
@@ -970,7 +974,14 @@ export const WsVcsCloneRpc = Rpc.make(WS_METHODS.vcsClone, {
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
     EnvironmentRpcError,
+    GitCloneOperationError,
   ]),
+});
+
+export const WsVcsCancelCloneRpc = Rpc.make(WS_METHODS.vcsCancelClone, {
+  payload: GitCancelCloneInput,
+  success: GitCancelCloneResult,
+  error: Schema.Union([GitCommandError, EnvironmentRpcError]),
 });
 
 export const WsVcsCreateRefRpc = Rpc.make(WS_METHODS.vcsCreateRef, {
@@ -1636,6 +1647,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsVcsListRefsRpc,
   WsVcsListCommitsRpc,
   WsVcsCloneRpc,
+  WsVcsCancelCloneRpc,
   WsVcsCreateRefRpc,
   WsVcsSwitchRefRpc,
   WsVcsInitRpc,
