@@ -389,10 +389,7 @@ fn run_service_command(command: ServiceCommand) -> Result<(), RunError> {
 
 /// Display name embedded in offers when the caller gives none.
 pub(crate) fn default_pairing_offer_name() -> String {
-    sysinfo::System::host_name()
-        .map(|name| name.trim().to_owned())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "BiBCode server".to_owned())
+    config::machine_host_name().unwrap_or_else(|| "BiBCode server".to_owned())
 }
 
 #[cfg(unix)]

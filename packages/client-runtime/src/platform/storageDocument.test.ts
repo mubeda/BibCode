@@ -21,6 +21,7 @@ import {
   ConnectionCatalogDocument,
   EMPTY_CONNECTION_CATALOG_DOCUMENT,
   registerConnectionInCatalog,
+  relabelConnectionInCatalog,
   removeConnectionFromCatalog,
   removeConnectionRegistrationFromCatalog,
 } from "./storageDocument.ts";
@@ -264,5 +265,66 @@ describe("ConnectionCatalogDocument", () => {
     expect(document.targets).toEqual([target]);
     expect(document.profiles).toEqual([profile]);
     expect(document.credentials).toEqual([]);
+  });
+
+  it("renames one saved target in place and leaves every other record alone", () => {
+    const relay = new RelayConnectionTarget({
+      environmentId: EnvironmentId.make("environment-relay"),
+      label: "Relay",
+    });
+    const ssh = new SshConnectionTarget({
+      environmentId: EnvironmentId.make("environment-ssh"),
+      label: "SSH",
+      connectionId: "ssh-1",
+    });
+    const pairedBearer = new BearerConnectionTarget({
+      ...BEARER_TARGET,
+      serverEnvironmentId: EnvironmentId.make("local"),
+    });
+    const document: ConnectionCatalogDocument = {
+      ...EMPTY_CONNECTION_CATALOG_DOCUMENT,
+      targets: [pairedBearer, relay, ssh],
+      profiles: [BEARER_PROFILE],
+      credentials: [{ connectionId: BEARER_TARGET.connectionId, credential: BEARER_CREDENTIAL }],
+      remoteDpopTokens: [REMOTE_TOKEN],
+      acceptedStorageIdentities: [{ targetKey: "bearer:bearer-1", storageInstanceId: "store-1" }],
+    };
+
+    const renamed = relabelConnectionInCatalog(document, ENVIRONMENT_ID, "GPU box");
+
+    expect(renamed?.target).toEqual(
+      new BearerConnectionTarget({
+        environmentId: ENVIRONMENT_ID,
+        label: "GPU box",
+        connectionId: BEARER_TARGET.connectionId,
+        serverEnvironmentId: EnvironmentId.make("local"),
+      }),
+    );
+    expect(renamed?.document).toEqual({
+      ...document,
+      targets: [renamed?.target, relay, ssh],
+    });
+    // The profile keeps the name it was saved with; only the target label is
+    // the saved name every surface reads.
+    expect(renamed?.document.profiles).toEqual([BEARER_PROFILE]);
+
+    const renamedRelay = relabelConnectionInCatalog(document, relay.environmentId, "Cloud box");
+    expect(renamedRelay?.target).toEqual(
+      new RelayConnectionTarget({ environmentId: relay.environmentId, label: "Cloud box" }),
+    );
+    const renamedSsh = relabelConnectionInCatalog(document, ssh.environmentId, "Build host");
+    expect(renamedSsh?.target).toEqual(
+      new SshConnectionTarget({
+        environmentId: ssh.environmentId,
+        label: "Build host",
+        connectionId: "ssh-1",
+      }),
+    );
+  });
+
+  it("does not rename an environment that is not saved", () => {
+    expect(
+      relabelConnectionInCatalog(EMPTY_CONNECTION_CATALOG_DOCUMENT, ENVIRONMENT_ID, "GPU box"),
+    ).toBeNull();
   });
 });

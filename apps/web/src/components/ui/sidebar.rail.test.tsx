@@ -15,6 +15,7 @@ const harness = vi.hoisted(() => {
   const state = {
     isMobile: false,
     storedWidth: null as number | null,
+    storageReadError: null as Error | null,
     localStorageSets: [] as Array<{ key: string; value: unknown }>,
     localStorageGets: [] as string[],
     localStorageRemoves: [] as string[],
@@ -75,6 +76,7 @@ vi.mock("~/hooks/useMediaQuery", () => ({
 vi.mock("~/hooks/useLocalStorage", () => ({
   getLocalStorageItem: (key: string) => {
     harness.localStorageGets.push(key);
+    if (harness.storageReadError) throw harness.storageReadError;
     return harness.storedWidth;
   },
   setLocalStorageItem: (key: string, value: unknown) => {
@@ -114,7 +116,7 @@ vi.mock("~/components/ui/sheet", () => ({
   SheetDescription: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
 }));
 
-import { Sidebar, SidebarProvider, SidebarRail } from "./sidebar";
+import { Sidebar, SidebarProvider, SidebarRail, readStoredSidebarWidth } from "./sidebar";
 
 // ── Fake DOM plumbing ────────────────────────────────────────────────
 
@@ -141,7 +143,7 @@ function fakeStyle(): FakeStyle {
   return style;
 }
 
-function fakeDom(startWidth = 256) {
+function fakeDom(startWidth = 256, wrapperClientWidth = startWidth) {
   const wrapperStyle = fakeStyle();
   const containerStyle = fakeStyle();
   const gapStyle = fakeStyle();
@@ -158,7 +160,7 @@ function fakeDom(startWidth = 256) {
           ? gap
           : null,
   };
-  const wrapper = { style: wrapperStyle };
+  const wrapper = { style: wrapperStyle, clientWidth: wrapperClientWidth };
   const rail = {
     captured: [] as Array<[string, number]>,
     closest: (selector: string) =>
@@ -218,6 +220,7 @@ beforeEach(() => {
   harness.reset();
   harness.isMobile = false;
   harness.storedWidth = null;
+  harness.storageReadError = null;
 
   rafCallbacks = [];
   cancelledFrames = [];
@@ -257,7 +260,7 @@ type RailProps = Record<string, unknown> & {
 };
 
 interface ResizableOptions {
-  defaultWidth?: number;
+  defaultWidth?: number | ((context: { wrapper: { clientWidth: number } }) => number);
   minWidth?: number;
   maxWidth?: number;
   storageKey?: string;
@@ -455,6 +458,46 @@ describe("SidebarRail resize drag flow", () => {
     expect(onResize).toHaveBeenCalledWith(320);
   });
 
+  it("double-click resolves a function default width against the wrapper", () => {
+    const dom = fakeDom(613, 1000);
+    const onResize = vi.fn();
+    const defaultWidth = vi.fn(
+      ({ wrapper }: { wrapper: { clientWidth: number } }) => wrapper.clientWidth - 640,
+    );
+    const { rail, markup } = renderRail({
+      defaultWidth,
+      minWidth: 200,
+      maxWidth: 400,
+      storageKey: "sb",
+      onResize,
+    });
+    expect(markup).toContain("double-click to reset");
+
+    const dbl = pointerEvent(dom.rail);
+    rail.onDoubleClick?.(dbl);
+    expect(defaultWidth).toHaveBeenCalledWith({ wrapper: dom.wrapper });
+    // 1000 - 640 = 360, within [200, 400] so the clamp leaves it unchanged.
+    expect(dom.wrapperStyle.set).toContainEqual(["--sidebar-width", "360px"]);
+    expect(harness.localStorageRemoves).toEqual(["sb"]);
+    expect(onResize).toHaveBeenCalledWith(360);
+  });
+
+  it("clamps a function default width to the configured minimum", () => {
+    const dom = fakeDom(613, 700);
+    const defaultWidth = ({ wrapper }: { wrapper: { clientWidth: number } }) =>
+      wrapper.clientWidth - 640;
+    const { rail } = renderRail({
+      defaultWidth,
+      minWidth: 200,
+      maxWidth: 400,
+      storageKey: "sb",
+    });
+
+    rail.onDoubleClick?.(pointerEvent(dom.rail));
+    // 700 - 640 = 60, clamped up to the configured minimum of 200.
+    expect(dom.wrapperStyle.set).toContainEqual(["--sidebar-width", "200px"]);
+  });
+
   it("double-click is inert without a default width", () => {
     const dom = fakeDom(613);
     const onResize = vi.fn();
@@ -613,6 +656,18 @@ describe("SidebarRail effects", () => {
     expect(onResize).not.toHaveBeenCalled();
   });
 
+  it("does not restore anything and does not throw when the storage read is blocked", () => {
+    const dom = fakeDom(256);
+    const onResize = vi.fn();
+    harness.storageReadError = new Error("storage blocked");
+    renderRail({ minWidth: 200, maxWidth: 400, storageKey: "sb", onResize });
+    harness.refs[0]!.current = dom.rail;
+
+    expect(runEffects).not.toThrow();
+    expect(dom.wrapperStyle.set).toHaveLength(0);
+    expect(onResize).not.toHaveBeenCalled();
+  });
+
   it("skips the restore effect entirely without a storage key", () => {
     const dom = fakeDom(256);
     harness.storedWidth = 300;
@@ -638,6 +693,30 @@ describe("SidebarRail effects", () => {
     expect(cancelledFrames).toContain(1);
     expect(dom.gapStyle.removed).toContain("transition-duration");
     expect(bodyStyle.removed).toEqual(expect.arrayContaining(["cursor", "user-select"]));
+  });
+});
+
+describe("readStoredSidebarWidth", () => {
+  it("returns the stored width clamped to the given bounds", () => {
+    harness.storedWidth = 900;
+    expect(readStoredSidebarWidth("sb", { minWidth: 200, maxWidth: 400 })).toBe(400);
+  });
+
+  it("returns null when nothing is stored", () => {
+    harness.storedWidth = null;
+    expect(readStoredSidebarWidth("sb", { minWidth: 200, maxWidth: 400 })).toBeNull();
+  });
+
+  it("returns null without a storage key", () => {
+    harness.storedWidth = 300;
+    expect(readStoredSidebarWidth(null, { minWidth: 200, maxWidth: 400 })).toBeNull();
+    expect(readStoredSidebarWidth(undefined, { minWidth: 200, maxWidth: 400 })).toBeNull();
+    expect(harness.localStorageGets).toHaveLength(0);
+  });
+
+  it("returns null instead of throwing when the read is blocked", () => {
+    harness.storageReadError = new Error("storage blocked");
+    expect(readStoredSidebarWidth("sb", { minWidth: 200, maxWidth: 400 })).toBeNull();
   });
 });
 

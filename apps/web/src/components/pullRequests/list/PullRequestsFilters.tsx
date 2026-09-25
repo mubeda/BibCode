@@ -1,3 +1,4 @@
+import { resolveChangeRequestPresentationForKind } from "@bibcode/shared/sourceControl";
 import type {
   EnvironmentId,
   PullRequestsContext,
@@ -247,13 +248,14 @@ export function PullRequestsFilters({
   onClear,
 }: PullRequestsFiltersProps) {
   const vocabulary = context.capabilities.vocabulary;
+  const presentation = resolveChangeRequestPresentationForKind(context.provider);
   return (
     <div className="space-y-2 border-b border-border px-4 py-3">
       <div className="flex flex-wrap gap-2">
         <SearchFilter
           key={resetKey}
           value={filters.search}
-          label={`Search ${vocabulary.pullRequests}`}
+          label={`Search ${presentation.pluralLongName}`}
           onChange={(search) => onFiltersChange({ search: search.trim() || null })}
         />
         <ChoiceMenu

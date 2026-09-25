@@ -8,6 +8,7 @@ import {
   ADD_SERVER_FAILURE_REASONS,
   countRunningThreadsForEnvironment,
   describeAddServerFailure,
+  describeRenameServerFailure,
   resolvePairingAddFailureDetail,
   describeCompatBadge,
   formatServerVersionLabel,
@@ -206,5 +207,33 @@ describe("countRunningThreadsForEnvironment", () => {
     ];
     expect(countRunningThreadsForEnvironment(shells, "env-1")).toBe(1);
     expect(countRunningThreadsForEnvironment(shells, "env-3")).toBe(0);
+  });
+});
+
+describe("describeRenameServerFailure", () => {
+  it("explains a server removed elsewhere, keeps validation copy, and hides storage internals", () => {
+    expect(
+      describeRenameServerFailure({
+        _tag: "EnvironmentNotRegisteredError",
+        environmentId: "env-1",
+      }),
+    ).toBe("This server is no longer saved on this device.");
+    expect(
+      describeRenameServerFailure({
+        _tag: "ConnectionBlockedError",
+        reason: "configuration",
+        message: "Enter a name for this server.",
+      }),
+    ).toBe("Enter a name for this server.");
+    expect(
+      describeRenameServerFailure({
+        _tag: "ConnectionPersistenceError",
+        operation: "rename-connection",
+        message: "Could not rename connection: IndexedDB aborted",
+      }),
+    ).toBe("Couldn't save the name on this device. Try again.");
+    expect(describeRenameServerFailure(null)).toBe(
+      "Couldn't save the name on this device. Try again.",
+    );
   });
 });

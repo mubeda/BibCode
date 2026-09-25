@@ -1938,6 +1938,43 @@ describe("connectionStorageLayer", () => {
     }).pipe(Effect.provide(connectionStorageLayer));
   });
 
+  it.effect("renames only the saved target label and reports an unsaved environment", () => {
+    installFakeIndexedDb();
+    const registration = bearerRegistration();
+
+    return Effect.gen(function* () {
+      const registrationStore = yield* ConnectionRegistrationStore;
+      const targetStore = yield* ConnectionTargetStore;
+      const profileStore = yield* ProfileStore.ConnectionProfileStore;
+      const credentialStore = yield* CredentialStore.ConnectionCredentialStore;
+      const tokenStore = yield* TokenStore.RemoteDpopAccessTokenStore;
+
+      yield* registrationStore.register(registration);
+      yield* tokenStore.put(remoteToken);
+
+      const renamed = new BearerConnectionTarget({
+        environmentId,
+        label: "GPU box",
+        connectionId,
+        serverEnvironmentId: null,
+      });
+      expect(yield* registrationStore.relabel(environmentId, "GPU box")).toEqual(
+        Option.some(renamed),
+      );
+      expect(yield* targetStore.list).toEqual([renamed]);
+      expect(yield* profileStore.get(connectionId)).toEqual(Option.some(registration.profile));
+      expect(yield* credentialStore.get(connectionId)).toEqual(
+        Option.some(registration.credential),
+      );
+      expect(yield* tokenStore.get(environmentId)).toEqual(Option.some(remoteToken));
+
+      expect(yield* registrationStore.relabel(otherEnvironmentId, "Elsewhere")).toEqual(
+        Option.none(),
+      );
+      expect(yield* targetStore.list).toEqual([renamed]);
+    }).pipe(Effect.provide(connectionStorageLayer));
+  });
+
   it.effect("persists and restores shell and thread snapshots", () => {
     installFakeIndexedDb();
     return Effect.gen(function* () {

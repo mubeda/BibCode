@@ -146,7 +146,7 @@ import { readLocalApi } from "../localApi";
 import { useComposerDraftStore } from "../composerDraftStore";
 import { useNewThreadHandler } from "../hooks/useHandleNewThread";
 import { useDesktopUpdateState } from "../state/desktopUpdate";
-import { remoteUpdateEnvironment } from "../state/remoteUpdates";
+import { remoteUpdateEnvironment, useRemoteUpdateCheckState } from "../state/remoteUpdates";
 import { projectDataSafetyStore } from "../state/projectDataSafety";
 
 import { useThreadActions } from "../hooks/useThreadActions";
@@ -170,7 +170,7 @@ import { formatRelativeTimeLabel } from "../timestampFormat";
 import { SettingsSidebarNav } from "./settings/SettingsSidebarNav";
 import { AgentsNavRow } from "./sidebar/AgentsNavRow";
 import { EnvironmentContextCard } from "./sidebar/EnvironmentContextCard";
-import { ServerUpdateBadge } from "./settings/ServerUpdateBadge";
+import { ServerUpdateBadge, serverUpdateStatusFromQuery } from "./settings/ServerUpdateBadge";
 import {
   resolveAddProjectTargetLabel,
   selectRailVisibleEnvironmentIds,
@@ -294,31 +294,43 @@ function SidebarEnvironmentContextCard() {
   const remoteUpdateControl = selectRemoteUpdateControlCapability(
     environment?.serverConfig ?? null,
   );
+  const updateEnvironmentId = remoteUpdateControl ? activeEnvironmentId : null;
   const updateQuery = useEnvironmentQuery(
-    remoteUpdateControl && activeEnvironmentId !== null
-      ? remoteUpdateEnvironment.snapshot({ environmentId: activeEnvironmentId, input: {} })
-      : null,
+    updateEnvironmentId === null
+      ? null
+      : remoteUpdateEnvironment.snapshot({ environmentId: updateEnvironmentId, input: {} }),
   );
+  const updateCheck = useRemoteUpdateCheckState(updateEnvironmentId);
   const runCheck = useAtomCommand(remoteUpdateEnvironment.check, { reportFailure: false });
+  const refreshUpdateStatus = updateQuery.refresh;
   const checkForUpdates = useCallback(
     async (environmentId: EnvironmentId) => {
-      const result = await runCheck({ environmentId, input: {} });
-      if (result._tag === "Success") {
-        updateQuery.refresh();
-      }
+      // The check records its own progress and failure in the shared check state; the
+      // status is re-read either way so the badge shows what the host now reports.
+      await runCheck({ environmentId, input: {} });
+      refreshUpdateStatus();
     },
-    [runCheck, updateQuery.refresh],
+    [runCheck, refreshUpdateStatus],
   );
 
   return (
     <EnvironmentContextCard
-      {...(remoteUpdateControl
-        ? {
-            updateBadge: <ServerUpdateBadge snapshot={updateQuery.data} />,
+      {...(updateEnvironmentId === null
+        ? {}
+        : {
+            updateBadge: (
+              <ServerUpdateBadge
+                {...serverUpdateStatusFromQuery(updateQuery, {
+                  connected: environment?.connection.phase === "connected",
+                  check: updateCheck,
+                })}
+                onRetry={refreshUpdateStatus}
+                onCheckAgain={() => void checkForUpdates(updateEnvironmentId)}
+              />
+            ),
             onCheckForUpdates: (environmentId: EnvironmentId) =>
               void checkForUpdates(environmentId),
-          }
-        : {})}
+          })}
     />
   );
 }
@@ -1153,7 +1165,7 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
                     className={`text-xs tabular-nums ${
                       isHighlighted
                         ? "text-foreground/72 dark:text-foreground/82"
-                        : "text-muted-foreground/40"
+                        : "text-muted-foreground"
                     }`}
                   >
                     {formatRelativeTimeLabel(

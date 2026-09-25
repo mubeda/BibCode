@@ -9,7 +9,7 @@ use std::{
 #[cfg(not(windows))]
 use std::process::Stdio;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 #[cfg(not(windows))]
 use tokio::process::Command;
@@ -25,10 +25,11 @@ use crate::{
     },
     maintenance::RpcPermit,
     persistence::{Repositories, WorktreeRemovalReceipt},
+    pull_requests::CreatedRequestObserver,
     rpc::{RpcRegistry, RpcRequest, RpcResult, RpcSessionContext, RpcStreamChunk},
     source_control::{
-        ChangeRequestState, CreatePullRequestInput, ProviderKind, PullRequestService,
-        ResolvePullRequestInput, ResolvedPullRequest, SourceControlDiscovery,
+        ChangeRequestState, CreatePullRequestInput, ProviderHosts, ProviderKind,
+        PullRequestService, ResolvePullRequestInput, ResolvedPullRequest, SourceControlDiscovery,
     },
     terminal::TerminalManager,
     workspace::{WorkspaceMutationFuture, WorkspaceMutationObserver},
@@ -200,7 +201,12 @@ pub struct GitVcsRpcServices {
     broadcaster: StatusBroadcaster,
     summary: GitStatusSummaryService,
     discovery: SourceControlDiscovery,
+    /// Written only by an explicit Settings discovery (`recordHosts`).
+    provider_hosts: Arc<ProviderHosts>,
     pull_requests: PullRequestService,
+    /// Told about requests `git.runStackedAction` creates, which bypass
+    /// `pullRequests.runAction` and its list-totals invalidation.
+    created_request_observer: Option<Arc<dyn CreatedRequestObserver>>,
     github_command: PathBuf,
     github_runner: Arc<dyn GitProcessRunner>,
     availability_registry: Option<WorkspaceAvailabilityRegistry>,
@@ -243,36 +249,48 @@ impl StatusStreamEnrichmentTestHook {
     }
 }
 
+#[cfg(test)]
 impl Default for GitVcsRpcServices {
     fn default() -> Self {
-        Self::with_repository(Arc::new(GitRepository::default()))
+        let provider_hosts = Arc::new(ProviderHosts::default());
+        Self::with_repository(
+            Arc::new(GitRepository::default().with_provider_hosts(provider_hosts.clone())),
+            provider_hosts,
+        )
     }
 }
 
 impl GitVcsRpcServices {
-    pub fn with_repository(repository: Arc<GitRepository>) -> Self {
+    pub fn with_repository(
+        repository: Arc<GitRepository>,
+        provider_hosts: Arc<ProviderHosts>,
+    ) -> Self {
         let (automatic_remote_refresh_interval, _) = watch::channel(STATUS_SAFETY_INTERVAL);
         Self::with_repository_and_automatic_fetch_interval(
             repository,
             automatic_remote_refresh_interval,
+            provider_hosts,
         )
     }
 
     pub fn with_repository_and_automatic_fetch_interval(
         repository: Arc<GitRepository>,
         automatic_remote_refresh_interval: watch::Sender<Duration>,
+        provider_hosts: Arc<ProviderHosts>,
     ) -> Self {
         Self::with_repository_dependencies(
             repository,
             automatic_remote_refresh_interval,
             None,
             None,
+            provider_hosts,
         )
     }
 
     pub fn with_repository_and_terminal(
         repository: Arc<GitRepository>,
         terminal: TerminalManager,
+        provider_hosts: Arc<ProviderHosts>,
     ) -> Self {
         let (automatic_remote_refresh_interval, _) = watch::channel(STATUS_SAFETY_INTERVAL);
         Self::with_repository_dependencies(
@@ -280,6 +298,7 @@ impl GitVcsRpcServices {
             automatic_remote_refresh_interval,
             Some(terminal),
             None,
+            provider_hosts,
         )
     }
 
@@ -287,12 +306,14 @@ impl GitVcsRpcServices {
         repository: Arc<GitRepository>,
         terminal: TerminalManager,
         automatic_remote_refresh_interval: watch::Sender<Duration>,
+        provider_hosts: Arc<ProviderHosts>,
     ) -> Self {
         Self::with_repository_dependencies(
             repository,
             automatic_remote_refresh_interval,
             Some(terminal),
             None,
+            provider_hosts,
         )
     }
 
@@ -301,12 +322,14 @@ impl GitVcsRpcServices {
         terminal: TerminalManager,
         repositories: Repositories,
         automatic_remote_refresh_interval: watch::Sender<Duration>,
+        provider_hosts: Arc<ProviderHosts>,
     ) -> Self {
         Self::with_repository_dependencies(
             repository,
             automatic_remote_refresh_interval,
             Some(terminal),
             Some(repositories),
+            provider_hosts,
         )
     }
 
@@ -315,6 +338,7 @@ impl GitVcsRpcServices {
         automatic_remote_refresh_interval: watch::Sender<Duration>,
         terminal: Option<TerminalManager>,
         repositories: Option<Repositories>,
+        provider_hosts: Arc<ProviderHosts>,
     ) -> Self {
         let pull_requests = PullRequestService::default();
         let broadcaster = StatusBroadcaster::with_automatic_remote_refresh_interval(
@@ -342,9 +366,11 @@ impl GitVcsRpcServices {
         Self {
             broadcaster,
             summary,
+            provider_hosts,
             repository,
             discovery: SourceControlDiscovery::default(),
             pull_requests,
+            created_request_observer: None,
             github_command: PathBuf::from("gh"),
             github_runner: Arc::new(ProcessRunner),
             availability_registry: None,
@@ -361,7 +387,7 @@ impl GitVcsRpcServices {
         repository: Arc<GitRepository>,
         github_command: PathBuf,
     ) -> Self {
-        let mut services = Self::with_repository(repository);
+        let mut services = Self::with_repository(repository, Arc::default());
         services.github_command = github_command;
         services
     }
@@ -371,7 +397,7 @@ impl GitVcsRpcServices {
         repository: Arc<GitRepository>,
         github_runner: Arc<dyn GitProcessRunner>,
     ) -> Self {
-        let mut services = Self::with_repository(repository);
+        let mut services = Self::with_repository(repository, Arc::default());
         services.github_runner = github_runner;
         services
     }
@@ -382,6 +408,16 @@ impl GitVcsRpcServices {
         hook: Arc<StatusStreamEnrichmentTestHook>,
     ) -> Self {
         self.status_stream_enrichment_test_hook = Some(hook);
+        self
+    }
+
+    /// The Pull Requests service, so a request created here refreshes its list totals.
+    #[must_use]
+    pub fn with_created_request_observer(
+        mut self,
+        observer: Arc<dyn CreatedRequestObserver>,
+    ) -> Self {
+        self.created_request_observer = Some(observer);
         self
     }
 
@@ -852,12 +888,18 @@ impl GitVcsRpcServices {
                 Ok(json!({ "pullRequest": pull_request }))
             }
             "server.discoverSourceControl" => {
-                let _: EmptyInput = decode(request.payload, "server.discoverSourceControl")?;
-                Ok(encode_value(
-                    self.discovery
-                        .discover(PathBuf::from("."), &cancellation)
-                        .await,
-                ))
+                let input: DiscoverSourceControlInput =
+                    decode(request.payload, "server.discoverSourceControl")?;
+                let discovery = self
+                    .discovery
+                    .discover(PathBuf::from("."), &cancellation)
+                    .await;
+                // Only an explicit Settings scan records hosts; background reads (for
+                // example the publish dialog) leave the observation untouched.
+                if input.record_hosts {
+                    self.provider_hosts.replace_from_discovery(&discovery);
+                }
+                Ok(encode_value(discovery))
             }
             "sourceControl.lookupRepository" => {
                 let input: LookupRepositoryInput =
@@ -1353,6 +1395,7 @@ impl GitVcsRpcServices {
         let repository = Arc::clone(&self.repository);
         let broadcaster = self.broadcaster.clone();
         let pull_requests = self.pull_requests.clone();
+        let created_request_observer = self.created_request_observer.clone();
         let availability = self.availability_registry.clone();
         tokio::spawn(async move {
             let input = match decode::<StackedActionInput>(request.payload, "git.runStackedAction")
@@ -1411,6 +1454,18 @@ impl GitVcsRpcServices {
                             )
                             .await;
                             mutation.finish().await;
+                            if let (Ok(result), Some(observer)) =
+                                (&result, created_request_observer.as_deref())
+                            {
+                                notify_created_request(
+                                    &repository,
+                                    observer,
+                                    &input.cwd,
+                                    result,
+                                    &operation_cancellation,
+                                )
+                                .await;
+                            }
                             result
                         },
                     )
@@ -1462,17 +1517,7 @@ impl GitVcsRpcServices {
             .local_status(&input.cwd, cancellation)
             .await
             .map_err(serialize_error)?;
-        let provider = local
-            .source_control_provider
-            .as_ref()
-            .map(|provider| match provider.kind {
-                crate::git::ProviderKind::Github => ProviderKind::Github,
-                crate::git::ProviderKind::Gitlab => ProviderKind::Gitlab,
-                crate::git::ProviderKind::AzureDevops => ProviderKind::AzureDevops,
-                crate::git::ProviderKind::Bitbucket => ProviderKind::Bitbucket,
-                crate::git::ProviderKind::Unknown => ProviderKind::Unknown,
-            })
-            .unwrap_or(ProviderKind::Unknown);
+        let provider = local_provider_kind(&local);
         let pull_request = self
             .pull_requests
             .resolve(
@@ -1907,7 +1952,12 @@ fn editor_launch_strategy(
 }
 
 #[derive(Deserialize)]
-struct EmptyInput {}
+#[serde(rename_all = "camelCase")]
+struct DiscoverSourceControlInput {
+    /// Settings → Source Control and its Rescan: record the authenticated hosts found.
+    #[serde(default)]
+    record_hosts: bool,
+}
 #[derive(Deserialize)]
 struct CwdInput {
     cwd: PathBuf,
@@ -2015,6 +2065,34 @@ struct StackedActionInput {
     pull_request_title: Option<String>,
     pull_request_body: Option<String>,
 }
+
+#[derive(Debug, Serialize)]
+struct StackedActionResult {
+    action: String,
+    branch: Value,
+    commit: Value,
+    push: Value,
+    pr: PullRequestStep,
+    toast: Value,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum PullRequestStep {
+    SkippedNotRequested,
+    Created(PullRequestStepDetails),
+    OpenedExisting(PullRequestStepDetails),
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestStepDetails {
+    url: String,
+    number: u64,
+    base_branch: String,
+    head_branch: String,
+    title: String,
+}
 #[derive(Deserialize)]
 struct LookupRepositoryInput {
     provider: String,
@@ -2084,7 +2162,7 @@ async fn run_stacked_action(
     pull_requests: &PullRequestService,
     input: &StackedActionInput,
     cancellation: &CancellationToken,
-) -> Result<Value, Value> {
+) -> Result<StackedActionResult, Value> {
     validate_stacked_action_input(input)?;
     let wants_commit = matches!(
         input.action.as_str(),
@@ -2117,6 +2195,13 @@ async fn run_stacked_action(
         };
         return Err(request_error("git.runStackedAction", detail));
     }
+    // Resolve the provider before any branch, commit or push, so an unidentified
+    // host never publishes the branch and then fails to create the request.
+    let pull_request_provider = if wants_pr {
+        Some(pull_request_provider(repository, &input.cwd, &initial_local, cancellation).await?)
+    } else {
+        None
+    };
     let wants_push = if input.action == "create_pr" {
         let remote = repository
             .remote_status(&input.cwd, cancellation)
@@ -2192,12 +2277,11 @@ async fn run_stacked_action(
     } else {
         json!({ "status": "skipped_not_requested" })
     };
-    let pull_request = if wants_pr {
+    let pull_request = if let Some(provider) = pull_request_provider {
         let current_local = repository
             .local_status(&input.cwd, cancellation)
             .await
             .map_err(serialize_error)?;
-        let provider = local_provider_kind(&current_local);
         let head_branch = current_local.ref_name.as_deref().ok_or_else(|| {
             request_error(
                 "git.runStackedAction",
@@ -2213,7 +2297,7 @@ async fn run_stacked_action(
         )
         .await
         {
-            resolved_pull_request_step("opened_existing", &existing)
+            PullRequestStep::OpenedExisting(resolved_pull_request_step(&existing))
         } else {
             let reviewed_title = input
                 .pull_request_title
@@ -2257,32 +2341,78 @@ async fn run_stacked_action(
                 )
                 .await
                 .map_err(serialize_error)?;
-            resolved_pull_request_step("created", &created)
+            PullRequestStep::Created(resolved_pull_request_step(&created))
         }
     } else {
-        json!({ "status": "skipped_not_requested" })
+        PullRequestStep::SkippedNotRequested
     };
-    Ok(json!({
-        "action": input.action,
-        "branch": branch,
-        "commit": commit,
-        "push": push,
-        "pr": pull_request,
-        "toast": { "title": "Git action completed", "cta": { "kind": "none" } }
-    }))
+    Ok(StackedActionResult {
+        action: input.action.clone(),
+        branch,
+        commit,
+        push,
+        pr: pull_request,
+        toast: json!({ "title": "Git action completed", "cta": { "kind": "none" } }),
+    })
+}
+
+/// A request created here bypasses `pullRequests.runAction`, so tell the Pull
+/// Requests service; its cached Open total would otherwise miss it for up to 30 s.
+async fn notify_created_request(
+    repository: &GitRepository,
+    observer: &dyn CreatedRequestObserver,
+    cwd: &Path,
+    result: &StackedActionResult,
+    cancellation: &CancellationToken,
+) {
+    if !matches!(result.pr, PullRequestStep::Created(_)) {
+        return;
+    }
+    match repository.origin_url(cwd, cancellation).await {
+        Ok(Some(remote)) => observer.request_created(cwd, &remote),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(%error, "could not read origin to invalidate created request totals")
+        }
+    }
+}
+
+/// The request's provider from the pre-publication status, or an actionable error
+/// that states nothing was published.
+async fn pull_request_provider(
+    repository: &GitRepository,
+    cwd: &std::path::Path,
+    local: &VcsStatusLocalResult,
+    cancellation: &CancellationToken,
+) -> Result<ProviderKind, Value> {
+    let provider = local_provider_kind(local);
+    if provider != ProviderKind::Unknown {
+        return Ok(provider);
+    }
+    if !local.has_primary_remote {
+        return Err(request_error(
+            "git.runStackedAction",
+            "Nothing was published. Add an origin remote to create a pull request.",
+        ));
+    }
+    let host = repository
+        .origin_host(cwd, cancellation)
+        .await
+        .map_err(serialize_error)?
+        .unwrap_or_else(|| "this repository's host".to_owned());
+    Err(request_error(
+        "git.runStackedAction",
+        &format!(
+            "Nothing was published. BiBCode hasn't identified {host} yet. Open Pull Requests for this project or run Rescan in Settings → Source Control, then try again."
+        ),
+    ))
 }
 
 fn local_provider_kind(local: &VcsStatusLocalResult) -> ProviderKind {
     local
         .source_control_provider
         .as_ref()
-        .map_or(ProviderKind::Unknown, |provider| match provider.kind {
-            crate::git::ProviderKind::Github => ProviderKind::Github,
-            crate::git::ProviderKind::Gitlab => ProviderKind::Gitlab,
-            crate::git::ProviderKind::AzureDevops => ProviderKind::AzureDevops,
-            crate::git::ProviderKind::Bitbucket => ProviderKind::Bitbucket,
-            crate::git::ProviderKind::Unknown => ProviderKind::Unknown,
-        })
+        .map_or(ProviderKind::Unknown, |provider| provider.kind.into())
 }
 
 async fn resolve_open_pull_request(
@@ -2309,15 +2439,14 @@ async fn resolve_open_pull_request(
         .filter(|pull_request| pull_request.state == ChangeRequestState::Open)
 }
 
-fn resolved_pull_request_step(status: &str, pull_request: &ResolvedPullRequest) -> Value {
-    json!({
-        "status": status,
-        "url": pull_request.url,
-        "number": pull_request.number,
-        "baseBranch": pull_request.base_branch,
-        "headBranch": pull_request.head_branch,
-        "title": pull_request.title,
-    })
+fn resolved_pull_request_step(pull_request: &ResolvedPullRequest) -> PullRequestStepDetails {
+    PullRequestStepDetails {
+        url: pull_request.url.clone(),
+        number: pull_request.number,
+        base_branch: pull_request.base_branch.clone(),
+        head_branch: pull_request.head_branch.clone(),
+        title: pull_request.title.clone(),
+    }
 }
 
 async fn finish_fenced_enrichment<T>(
@@ -2915,7 +3044,7 @@ mod mutation_ownership_tests {
         let runner = Arc::new(ControlledMutationRunner::new());
         let repository = Arc::new(GitRepository::with_runner_for_test(runner));
         let hook = Arc::new(StatusStreamEnrichmentTestHook::default());
-        let services = GitVcsRpcServices::with_repository(repository)
+        let services = GitVcsRpcServices::with_repository(repository, Arc::default())
             .with_status_stream_enrichment_test_hook(Arc::clone(&hook));
         let cancellation = CancellationToken::new();
         let mut stream = services.status_stream(
@@ -2996,7 +3125,7 @@ mod mutation_ownership_tests {
         let root = tempfile::tempdir().expect("repository root");
         let runner = Arc::new(ControlledMutationRunner::new());
         let repository = Arc::new(GitRepository::with_runner_for_test(runner.clone()));
-        let services = GitVcsRpcServices::with_repository(repository);
+        let services = GitVcsRpcServices::with_repository(repository, Arc::default());
         let mut subscription = services
             .broadcaster
             .subscribe(root.path().to_path_buf(), CancellationToken::new())
@@ -3098,7 +3227,7 @@ mod mutation_ownership_tests {
         let root = tempfile::tempdir().expect("repository root");
         let runner = Arc::new(ControlledMutationRunner::new());
         let repository = Arc::new(GitRepository::with_runner_for_test(runner.clone()));
-        let services = GitVcsRpcServices::with_repository(repository);
+        let services = GitVcsRpcServices::with_repository(repository, Arc::default());
         let mut subscription = services
             .broadcaster
             .subscribe(root.path().to_path_buf(), CancellationToken::new())
@@ -3467,7 +3596,7 @@ mod mutation_ownership_tests {
         let root = tempfile::tempdir().expect("repository root");
         let runner = Arc::new(ControlledMutationRunner::blocking("GitVcsDriver.initRepo"));
         let repository = Arc::new(GitRepository::with_runner_for_test(runner.clone()));
-        let services = GitVcsRpcServices::with_repository(repository);
+        let services = GitVcsRpcServices::with_repository(repository, Arc::default());
         let cancellation = CancellationToken::new();
         let task_services = services.clone();
         let task_cancellation = cancellation.clone();
@@ -3524,7 +3653,7 @@ mod mutation_ownership_tests {
         let repository = Arc::new(GitRepository::with_runner_for_test(Arc::new(
             ControlledMutationRunner::new(),
         )));
-        let services = GitVcsRpcServices::with_repository(repository);
+        let services = GitVcsRpcServices::with_repository(repository, Arc::default());
         for (tag, payload, succeeds) in [
             (
                 "vcs.init",
@@ -3603,9 +3732,12 @@ mod mutation_ownership_tests {
     #[tokio::test]
     async fn unsupported_stacked_action_keeps_action_started_order_without_a_mutation_fence() {
         let root = tempfile::tempdir().expect("repository root");
-        let services = GitVcsRpcServices::with_repository(Arc::new(
-            GitRepository::with_runner_for_test(Arc::new(ControlledMutationRunner::new())),
-        ));
+        let services = GitVcsRpcServices::with_repository(
+            Arc::new(GitRepository::with_runner_for_test(Arc::new(
+                ControlledMutationRunner::new(),
+            ))),
+            Arc::default(),
+        );
         let mut stream = services.stacked_action_stream(
             RpcRequest {
                 id: RequestId::try_from("4").expect("request id"),
@@ -4012,7 +4144,7 @@ mod tests {
         let repository = Arc::new(GitRepository::with_runner_for_test(Arc::new(
             CapturedGitRunner::new(&sandbox),
         )));
-        let services = GitVcsRpcServices::with_repository(repository);
+        let services = GitVcsRpcServices::with_repository(repository, Arc::default());
         let mut summaries = services
             .summary
             .subscribe(cwd.clone())
@@ -4041,7 +4173,7 @@ mod tests {
         let repository = Arc::new(GitRepository::with_runner_for_test(Arc::new(
             CapturedGitRunner::new(&sandbox),
         )));
-        let services = GitVcsRpcServices::with_repository(repository)
+        let services = GitVcsRpcServices::with_repository(repository, Arc::default())
             .with_availability_registry(registry.clone());
         let mut stream = services.status_stream(
             rpc_request("subscribeVcsStatus", json!({"cwd": sandbox.root()})),
@@ -4141,7 +4273,7 @@ mod tests {
         let git_repository = Arc::new(GitRepository::with_runner_for_test(Arc::new(
             CapturedGitRunner::new(&sandbox),
         )));
-        let mut services = GitVcsRpcServices::with_repository(git_repository);
+        let mut services = GitVcsRpcServices::with_repository(git_repository, Arc::default());
 
         assert!(
             unary(&services, "vcs.init", json!({"cwd":cwd,"kind":"mercurial"}),)
@@ -4750,6 +4882,7 @@ esac
         )
         .await
         .expect("reviewed pull request creates");
+        let result = serde_json::to_value(result).unwrap();
 
         assert_eq!(result["push"]["status"], "pushed");
         assert_eq!(result["pr"]["status"], "created");
@@ -4798,6 +4931,7 @@ esac
         )
         .await
         .expect("retry resolves the existing pull request");
+        let retried = serde_json::to_value(retried).unwrap();
         assert_eq!(retried["push"]["status"], "skipped_not_requested");
         assert_eq!(retried["pr"]["status"], "opened_existing");
         assert_eq!(retried["pr"]["number"], 9);
@@ -4821,6 +4955,332 @@ esac
             error["detail"],
             "A pull request title or body applies only to pull request actions."
         );
+    }
+
+    /// The provider is resolved before anything is published: an unidentified host
+    /// is refused with the next steps and the branch stays local; once an explicit
+    /// probe recorded the host, the same action publishes, creates the request and
+    /// tells the Pull Requests service, so its cached list totals refresh.
+    #[tokio::test]
+    async fn create_pr_resolves_the_provider_before_publishing_the_branch() {
+        let sandbox = crate::test_support::TestSandbox::new("git-vcs-pr-provider-first");
+        let repository = sandbox.root().join("repository");
+        let bare_remote = sandbox.root().join("remote.git");
+        tokio::fs::create_dir_all(&repository)
+            .await
+            .expect("repository directory");
+        tokio::fs::create_dir_all(&bare_remote)
+            .await
+            .expect("bare remote directory");
+        git(&sandbox, &bare_remote, &["init", "--bare", "-b", "main"]).await;
+        git(&sandbox, &repository, &["init", "-q", "-b", "main"]).await;
+        git(
+            &sandbox,
+            &repository,
+            &["config", "user.email", "fixture@example.test"],
+        )
+        .await;
+        git(&sandbox, &repository, &["config", "user.name", "Fixture"]).await;
+        tokio::fs::write(repository.join("base.txt"), "base\n")
+            .await
+            .expect("base file");
+        git(&sandbox, &repository, &["add", "base.txt"]).await;
+        git(&sandbox, &repository, &["commit", "-q", "-m", "base"]).await;
+        let bare_remote_text = bare_remote.to_string_lossy().into_owned();
+        git(
+            &sandbox,
+            &repository,
+            &["remote", "add", "origin", bare_remote_text.as_str()],
+        )
+        .await;
+        git(
+            &sandbox,
+            &repository,
+            &["push", "-q", "-u", "origin", "main"],
+        )
+        .await;
+        git(
+            &sandbox,
+            &repository,
+            &["switch", "-q", "-c", "feature/unpublished"],
+        )
+        .await;
+        tokio::fs::write(repository.join("feature.txt"), "feature\n")
+            .await
+            .expect("feature file");
+        git(&sandbox, &repository, &["add", "feature.txt"]).await;
+        git(&sandbox, &repository, &["commit", "-q", "-m", "feature"]).await;
+        git(
+            &sandbox,
+            &repository,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://git.acme.example/team/repo.git",
+            ],
+        )
+        .await;
+        git(
+            &sandbox,
+            &repository,
+            &[
+                "remote",
+                "set-url",
+                "--push",
+                "origin",
+                bare_remote_text.as_str(),
+            ],
+        )
+        .await;
+        let calls = sandbox.root().join("glab-calls");
+        let calls_text = calls.to_string_lossy().into_owned();
+        let glab = sandbox.executable_script(
+            "glab",
+            &format!(
+                "printf '%s\\n' \"$*\" >> '{calls_text}'\ncase \"$1:$2\" in\n  mr:list) printf '[]\\n' ;;\n  api:--method) printf '%s\\n' '{{\"iid\":3,\"title\":\"feature\",\"web_url\":\"https://git.acme.example/team/repo/-/merge_requests/3\",\"source_branch\":\"feature/unpublished\",\"target_branch\":\"main\",\"state\":\"opened\"}}' ;;\n  *) exit 64 ;;\nesac\n"
+            ),
+            "",
+        );
+        let recorder = Arc::new(RecordedCreatedRequests::default());
+        let hosts = Arc::new(ProviderHosts::default());
+        let mut services = GitVcsRpcServices::with_repository(
+            Arc::new(GitRepository::default().with_provider_hosts(hosts.clone())),
+            hosts,
+        )
+        .with_created_request_observer(recorder.clone());
+        services.pull_requests = PullRequestService::with_provider_commands(
+            "unused-gh",
+            glab.to_string_lossy(),
+            "unused-az",
+        );
+        let run = || async {
+            let mut stream = services.stacked_action_stream(
+                rpc_request(
+                    "git.runStackedAction",
+                    json!({
+                        "actionId": "action-provider-first",
+                        "cwd": repository,
+                        "action": "create_pr",
+                        "pullRequestTitle": "feature",
+                    }),
+                ),
+                CancellationToken::new(),
+            );
+            let started = stream.recv().await.expect("start chunk").expect("start");
+            assert_eq!(started[0]["kind"], "action_started");
+            stream.recv().await.expect("final chunk").expect("final")[0].clone()
+        };
+        let published = bare_remote.join("refs/heads/feature/unpublished");
+
+        let refused = run().await;
+        assert_eq!(refused["kind"], "action_failed");
+        assert_eq!(
+            refused["message"],
+            "Nothing was published. BiBCode hasn't identified git.acme.example yet. Open Pull Requests for this project or run Rescan in Settings → Source Control, then try again."
+        );
+        assert!(!published.exists(), "the branch was not published");
+        assert!(!calls.exists(), "no provider command ran");
+        assert!(recorder.0.lock().expect("recorder").is_empty());
+
+        services.provider_hosts.record(
+            "git.acme.example",
+            crate::source_control::ProviderKind::Gitlab,
+        );
+        let finished = run().await;
+        assert_eq!(finished["kind"], "action_finished", "{finished}");
+        let result = &finished["result"];
+        assert_eq!(result["push"]["status"], "pushed");
+        assert_eq!(result["pr"]["status"], "created");
+        assert_eq!(result["pr"]["number"], 3);
+        assert!(published.exists());
+        let calls = std::fs::read_to_string(&calls).expect("glab calls");
+        assert!(
+            calls.contains("mr list --source-branch feature/unpublished"),
+            "{calls}"
+        );
+        assert!(
+            calls.contains("target_branch=main") && calls.contains("title=feature"),
+            "{calls}"
+        );
+        assert_eq!(
+            *recorder.0.lock().expect("recorder"),
+            [(
+                repository.clone(),
+                "https://git.acme.example/team/repo.git".to_owned()
+            )],
+            "the created request refreshes the Pull Requests totals"
+        );
+    }
+
+    /// Records the requests `git.runStackedAction` reports as created.
+    #[derive(Default)]
+    struct RecordedCreatedRequests(Mutex<Vec<(PathBuf, String)>>);
+
+    impl CreatedRequestObserver for RecordedCreatedRequests {
+        fn request_created(&self, cwd: &Path, remote: &str) {
+            self.0
+                .lock()
+                .expect("recorder")
+                .push((cwd.to_path_buf(), remote.to_owned()));
+        }
+    }
+
+    /// A feature-branch `commit_push_pr` for an unidentified host is refused before
+    /// the branch or the commit exists, so the checkout stays exactly as it was.
+    #[tokio::test]
+    async fn commit_push_pr_on_a_feature_branch_refuses_before_branching() {
+        let sandbox = crate::test_support::TestSandbox::new("git-vcs-pr-feature-branch");
+        let repository = sandbox.root().join("repository");
+        tokio::fs::create_dir_all(&repository)
+            .await
+            .expect("repository directory");
+        git(&sandbox, &repository, &["init", "-q", "-b", "main"]).await;
+        git(
+            &sandbox,
+            &repository,
+            &["config", "user.email", "fixture@example.test"],
+        )
+        .await;
+        git(&sandbox, &repository, &["config", "user.name", "Fixture"]).await;
+        tokio::fs::write(repository.join("base.txt"), "base\n")
+            .await
+            .expect("base file");
+        git(&sandbox, &repository, &["add", "base.txt"]).await;
+        git(&sandbox, &repository, &["commit", "-q", "-m", "base"]).await;
+        git(
+            &sandbox,
+            &repository,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://git.acme.example/team/repo.git",
+            ],
+        )
+        .await;
+        tokio::fs::write(repository.join("base.txt"), "changed\n")
+            .await
+            .expect("working tree change");
+        let git_repository = GitRepository::default();
+        let input = StackedActionInput {
+            action_id: "action-feature-branch".to_owned(),
+            cwd: repository.clone(),
+            action: "commit_push_pr".to_owned(),
+            commit_message: Some("feature work".to_owned()),
+            file_paths: None,
+            feature_branch: Some(true),
+            commit_staged_index_as_is: None,
+            pull_request_title: None,
+            pull_request_body: None,
+        };
+
+        let error = run_stacked_action(
+            &git_repository,
+            &PullRequestService::with_provider_commands("unused-gh", "unused-glab", "unused-az"),
+            &input,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("an unidentified host is refused");
+        assert_eq!(
+            error["detail"],
+            "Nothing was published. BiBCode hasn't identified git.acme.example yet. Open Pull Requests for this project or run Rescan in Settings → Source Control, then try again."
+        );
+        let heads = std::fs::read_dir(repository.join(".git/refs/heads"))
+            .expect("branch refs")
+            .map(|entry| entry.expect("branch ref").file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(heads, ["main"], "no feature branch was created");
+        let local = git_repository
+            .local_status(&repository, &CancellationToken::new())
+            .await
+            .expect("local status");
+        assert_eq!(local.ref_name.as_deref(), Some("main"));
+        assert!(local.has_working_tree_changes, "nothing was committed");
+    }
+
+    /// Only an explicit Settings scan records hosts: a background discovery read,
+    /// such as the publish dialog's, leaves the host observation untouched.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn only_an_explicit_source_control_discovery_records_hosts() {
+        use std::os::unix::fs::PermissionsExt;
+        let sandbox = crate::test_support::TestSandbox::new("git-vcs-discovery-hosts");
+        let bin = sandbox.root().join("bin");
+        std::fs::create_dir_all(&bin).expect("bin directory");
+        let glab = bin.join("glab");
+        let auth_output = sandbox.root().join("glab-auth.txt");
+        std::fs::write(
+            &auth_output,
+            "git.acme.example\n  Logged in to git.acme.example as alice\n",
+        )
+        .expect("authenticated fixture");
+        std::fs::write(
+            &glab,
+            format!("#!/bin/sh\ncase \"$1\" in\n  --version) echo 'glab 1.114.0' ;;\n  auth) cat '{}' >&2 ;;\nesac\n", auth_output.display()),
+        )
+        .expect("glab script");
+        std::fs::set_permissions(&glab, std::fs::Permissions::from_mode(0o755))
+            .expect("glab permissions");
+        let hosts = Arc::new(ProviderHosts::default());
+        let repository = Arc::new(GitRepository::default().with_provider_hosts(hosts.clone()));
+        let services = GitVcsRpcServices {
+            discovery: SourceControlDiscovery::with_executable_dir_for_test(bin),
+            ..GitVcsRpcServices::with_repository(repository, hosts.clone())
+        };
+        let discover = |payload: Value| {
+            services.handle_unary_with_context(
+                rpc_request("server.discoverSourceControl", payload),
+                RpcSessionContext::unauthenticated(),
+                CancellationToken::new(),
+            )
+        };
+
+        let background = discover(json!({})).await.expect("background discovery");
+        assert!(background.to_string().contains("git.acme.example"));
+        assert_eq!(hosts.provider("git.acme.example"), None);
+
+        discover(json!({ "recordHosts": true }))
+            .await
+            .expect("explicit discovery");
+        assert_eq!(
+            hosts.provider("git.acme.example"),
+            Some(ProviderKind::Gitlab)
+        );
+
+        std::fs::write(
+            &auth_output,
+            "error: unexpected response from the keyring\n",
+        )
+        .expect("unrecognized fixture");
+        let unknown = discover(json!({ "recordHosts": true }))
+            .await
+            .expect("rescan");
+        assert!(
+            unknown["sourceControlProviders"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["kind"] == "gitlab" && item["auth"]["status"] == "unknown")
+        );
+        assert_eq!(
+            hosts.provider("git.acme.example"),
+            Some(ProviderKind::Gitlab)
+        );
+
+        std::fs::write(
+            &auth_output,
+            include_str!("../../tests/fixtures/pull_requests/glab_logged_out.txt"),
+        )
+        .expect("logged out fixture");
+        let logged_out = discover(json!({ "recordHosts": true }))
+            .await
+            .expect("rescan");
+        assert!(logged_out["sourceControlProviders"].as_array().unwrap().iter().any(|item|
+            item["kind"] == "gitlab" && item["auth"]["status"] == "unauthenticated"
+        ));
+        assert_eq!(hosts.provider("git.acme.example"), None);
     }
 
     #[tokio::test]

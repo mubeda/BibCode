@@ -18,6 +18,8 @@ import * as Ref from "effect/Ref";
 import * as Result from "effect/Result";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
+import * as TestClock from "effect/testing/TestClock";
+import { currentSession } from "../rpc/client.ts";
 import { makeTestExecutionEnvironmentCapabilities } from "@bibcode/shared/testSupport";
 
 import * as ClientCapabilities from "../platform/capabilities.ts";
@@ -50,6 +52,8 @@ import {
   type PreparedConnection,
   type SupervisorConnectionState,
   UnavailableConnectionTarget,
+  isPersistedConnectionTarget,
+  withPersistedTargetLabel,
 } from "./model.ts";
 import * as Persistence from "../platform/persistence.ts";
 import * as ConnectionProfileStore from "./profileStore.ts";
@@ -176,6 +180,7 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
   initialProfiles: ReadonlyArray<ConnectionProfile> = [],
   initialCredentials: ReadonlyArray<readonly [string, ConnectionCredential]> = [],
   options?: {
+    readonly relabel?: Persistence.ConnectionRegistrationStore["Service"]["relabel"];
     readonly beforeSessionConnect?: (
       environmentId: EnvironmentId,
     ) => Effect.Effect<void, ConnectionAttemptError>;
@@ -319,6 +324,22 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
         return { removed: true, current: null };
       }),
     remove: removeStoredRegistration,
+    relabel:
+      options?.relabel ??
+      ((environmentId, label) =>
+        Effect.gen(function* () {
+          const current = (yield* Ref.get(storedTargets)).get(environmentId);
+          if (current === undefined || !isPersistedConnectionTarget(current)) {
+            return Option.none();
+          }
+          const relabeled = withPersistedTargetLabel(current, label);
+          yield* Ref.update(storedTargets, (targets) => {
+            const next = new Map(targets);
+            next.set(environmentId, relabeled);
+            return next;
+          });
+          return Option.some(relabeled);
+        })),
   });
   const externalRegistrationStore = Persistence.ConnectionRegistrationStore.of({
     ...registrationStore,
@@ -674,7 +695,7 @@ describe("EnvironmentRegistry", () => {
     }),
   );
 
-  it.effect("starts persisted environments independently", () =>
+  it.live("starts persisted environments independently", () =>
     Effect.gen(function* () {
       const bothLoadsStarted = yield* Deferred.make<void>();
       const releaseLoads = yield* Deferred.make<void>();
@@ -813,7 +834,7 @@ describe("EnvironmentRegistry", () => {
     }),
   );
 
-  it.effect("moves durable streams to a replacement supervisor", () =>
+  it.live("moves durable streams to a replacement supervisor", () =>
     Effect.gen(function* () {
       const replacement = new RelayConnectionTarget({
         environmentId: RELAY_TARGET.environmentId,
@@ -865,6 +886,391 @@ describe("EnvironmentRegistry", () => {
         yield* Fiber.interrupt(subscription);
 
         expect(yield* Ref.get(labels)).toEqual([RELAY_TARGET.label, replacement.label]);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  it.live("moves durable streams to the runtime of an identical re-registration", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness([RELAY_TARGET]);
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        const environmentId = RELAY_TARGET.environmentId;
+        const firstObserved = yield* Deferred.make<void>();
+        const secondObserved = yield* Deferred.make<void>();
+        const observed = yield* Ref.make<
+          ReadonlyArray<EnvironmentSupervisor.EnvironmentSupervisor["Service"]>
+        >([]);
+        yield* registry.start;
+        yield* awaitConnectionState(
+          registry,
+          environmentId,
+          (state) => state.phase === "connected",
+        );
+
+        const subscription = yield* Effect.forkChild(
+          registry
+            .followStream(
+              environmentId,
+              Stream.unwrap(
+                EnvironmentSupervisor.EnvironmentSupervisor.pipe(
+                  Effect.map((supervisor) =>
+                    Stream.concat(Stream.succeed(supervisor), Stream.never),
+                  ),
+                ),
+              ),
+            )
+            .pipe(
+              Stream.tap((supervisor) =>
+                Ref.updateAndGet(observed, (current) => [...current, supervisor]).pipe(
+                  Effect.flatMap((current) =>
+                    Deferred.succeed(
+                      current.length === 1 ? firstObserved : secondObserved,
+                      undefined,
+                    ),
+                  ),
+                ),
+              ),
+              Stream.runDrain,
+            ),
+        );
+
+        yield* Deferred.await(firstObserved).pipe(Effect.timeout("1 second"));
+        // Registration always installs a fresh runtime, even for an identical entry.
+        yield* registry.register(new RelayConnectionRegistration({ target: RELAY_TARGET }));
+        yield* Deferred.await(secondObserved).pipe(Effect.timeout("1 second"));
+        const current = yield* registry.run(
+          environmentId,
+          EnvironmentSupervisor.EnvironmentSupervisor.pipe(Effect.map((supervisor) => supervisor)),
+        );
+        yield* Fiber.interrupt(subscription);
+
+        const [first, second] = yield* Ref.get(observed);
+        expect(second).not.toBe(first);
+        expect(second).toBe(current);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  it.live("moves followers when acquisition replaces a supervisor after catalog drift", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness([RELAY_TARGET]);
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        const id = RELAY_TARGET.environmentId;
+        const first = yield* Deferred.make<void>();
+        const second = yield* Deferred.make<void>();
+        const observed = yield* Ref.make<
+          ReadonlyArray<EnvironmentSupervisor.EnvironmentSupervisor["Service"]>
+        >([]);
+        yield* registry.start;
+        yield* registry
+          .followStream(
+            id,
+            Stream.unwrap(
+              EnvironmentSupervisor.EnvironmentSupervisor.pipe(
+                Effect.map((supervisor) => Stream.concat(Stream.succeed(supervisor), Stream.never)),
+              ),
+            ),
+          )
+          .pipe(
+            Stream.runForEach((supervisor) =>
+              Ref.updateAndGet(observed, (values) => [...values, supervisor]).pipe(
+                Effect.flatMap((values) =>
+                  Deferred.succeed(values.length === 1 ? first : second, undefined),
+                ),
+              ),
+            ),
+            Effect.forkChild,
+          );
+        yield* Deferred.await(first).pipe(Effect.timeout("1 second"));
+        yield* SubscriptionRef.update(registry.entries, (entries) =>
+          new Map(entries).set(id, {
+            target: new RelayConnectionTarget({ ...RELAY_TARGET, label: "Changed externally" }),
+            profile: Option.none(),
+          }),
+        );
+        const current = yield* registry.run(id, EnvironmentSupervisor.EnvironmentSupervisor);
+        yield* Deferred.await(second).pipe(Effect.timeout("1 second"));
+        const values = yield* Ref.get(observed);
+        expect(values).toHaveLength(2);
+        expect(values[1]).toBe(current);
+        expect(values[0]).not.toBe(current);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  it.live(
+    "releases its subscription on removal and re-binds when the same id is registered again",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness([]);
+        yield* Effect.gen(function* () {
+          const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+          const subscribed = yield* Deferred.make<void>();
+          const rebound = yield* Deferred.make<void>();
+          const released = yield* Deferred.make<void>();
+          const observed = yield* Ref.make<
+            ReadonlyArray<EnvironmentSupervisor.EnvironmentSupervisor["Service"]>
+          >([]);
+          const follower = yield* registry
+            .followStream(
+              RELAY_TARGET.environmentId,
+              Stream.fromEffect(EnvironmentSupervisor.EnvironmentSupervisor).pipe(
+                Stream.concat(Stream.never),
+                Stream.ensuring(Deferred.succeed(released, undefined)),
+              ),
+            )
+            .pipe(
+              Stream.runForEach((supervisor) =>
+                Ref.updateAndGet(observed, (values) => [...values, supervisor]).pipe(
+                  Effect.flatMap((values) =>
+                    Deferred.succeed(values.length === 1 ? subscribed : rebound, undefined),
+                  ),
+                ),
+              ),
+              Effect.forkChild({ startImmediately: true }),
+            );
+          expect(yield* Ref.get(observed)).toEqual([]);
+          yield* registry.register(new RelayConnectionRegistration({ target: RELAY_TARGET }));
+          yield* Deferred.await(subscribed).pipe(Effect.timeout("1 second"));
+          yield* registry.remove(RELAY_TARGET.environmentId);
+          yield* Deferred.await(released).pipe(Effect.timeout("1 second"));
+          yield* registry.register(new RelayConnectionRegistration({ target: RELAY_TARGET }));
+          yield* Deferred.await(rebound).pipe(Effect.timeout("1 second"));
+          const current = yield* registry.run(
+            RELAY_TARGET.environmentId,
+            EnvironmentSupervisor.EnvironmentSupervisor,
+          );
+          const values = yield* Ref.get(observed);
+          expect(values).toHaveLength(2);
+          expect(values[0]).not.toBe(current);
+          expect(values[1]).toBe(current);
+          yield* Fiber.interrupt(follower);
+        }).pipe(Effect.provide(harness.layer), Effect.scoped);
+      }),
+  );
+
+  for (const outcome of ["failure", "missing"] as const) {
+    it.effect(`keeps runtime and persisted metadata when relabel returns ${outcome}`, () =>
+      Effect.gen(function* () {
+        const removedTargets = yield* Ref.make<ReadonlyArray<ConnectionTarget>>([]);
+        const harness = yield* makeHarness([RELAY_TARGET], [], [], {
+          relabel: () =>
+            outcome === "missing"
+              ? Effect.succeedNone
+              : Effect.fail(
+                  new Persistence.ConnectionPersistenceError({
+                    operation: "rename-connection",
+                    message: "Catalog unavailable",
+                  }),
+                ),
+          beforeRegistrationRemove: (target) =>
+            Ref.update(removedTargets, (targets) => [...targets, target]),
+        });
+        yield* Effect.gen(function* () {
+          const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+          const id = RELAY_TARGET.environmentId;
+          const before = yield* registry.run(id, EnvironmentSupervisor.EnvironmentSupervisor);
+          const entries = yield* SubscriptionRef.get(registry.entries);
+          const saved = yield* Ref.get(harness.storedTargets);
+          const error = yield* registry.rename(id, "Changed").pipe(Effect.flip);
+          expect(error._tag).toBe(
+            outcome === "missing" ? "EnvironmentNotRegisteredError" : "ConnectionPersistenceError",
+          );
+          expect(yield* SubscriptionRef.get(registry.entries)).toBe(entries);
+          expect(yield* Ref.get(harness.storedTargets)).toBe(saved);
+          expect(yield* registry.run(id, EnvironmentSupervisor.EnvironmentSupervisor)).toBe(before);
+          expect(before.target).toBe(RELAY_TARGET);
+          // Platform shadowing consumes the registry's persisted-target bookkeeping.
+          yield* registry.registerPlatform(
+            new PrimaryConnectionRegistration({
+              target: new PrimaryConnectionTarget({
+                ...TARGET,
+                environmentId: id,
+              }),
+            }),
+          );
+          expect(yield* Ref.get(removedTargets)).toEqual([RELAY_TARGET]);
+        }).pipe(Effect.provide(harness.layer), Effect.scoped);
+      }),
+    );
+  }
+
+  it.live("renames a saved environment without replacing its runtime or followers", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(
+        [BEARER_TARGET],
+        [BEARER_PROFILE],
+        [[BEARER_TARGET.connectionId, BEARER_CREDENTIAL]],
+      );
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        const environmentId = BEARER_TARGET.environmentId;
+        const subscribed = yield* Deferred.make<void>();
+        const subscriptions = yield* Ref.make(0);
+        yield* registry.start;
+        yield* awaitConnectionState(
+          registry,
+          environmentId,
+          (state) => state.phase === "connected",
+        );
+
+        const follower = yield* Effect.forkChild(
+          registry
+            .followStream(
+              environmentId,
+              Stream.unwrap(
+                EnvironmentSupervisor.EnvironmentSupervisor.pipe(
+                  Effect.map(() => Stream.concat(Stream.succeed("subscribed"), Stream.never)),
+                ),
+              ),
+            )
+            .pipe(
+              Stream.tap(() =>
+                Ref.update(subscriptions, (count) => count + 1).pipe(
+                  Effect.andThen(Deferred.succeed(subscribed, undefined)),
+                ),
+              ),
+              Stream.runDrain,
+            ),
+        );
+        yield* Deferred.await(subscribed).pipe(Effect.timeout("1 second"));
+
+        yield* registry.rename(environmentId, "  GPU box  ");
+
+        const entry = (yield* SubscriptionRef.get(registry.entries)).get(environmentId);
+        expect(entry?.target.label).toBe("GPU box");
+        expect(entry?.profile).toEqual(Option.some(BEARER_PROFILE));
+        expect((yield* Ref.get(harness.storedTargets)).get(environmentId)?.label).toBe("GPU box");
+        expect((yield* Ref.get(harness.storedProfiles)).get(BEARER_TARGET.connectionId)).toEqual(
+          BEARER_PROFILE,
+        );
+        expect((yield* Ref.get(harness.storedCredentials)).get(BEARER_TARGET.connectionId)).toEqual(
+          BEARER_CREDENTIAL,
+        );
+
+        // Later lookups keep the live runtime: no reconnect, no resubscription.
+        const state = yield* registry.state(environmentId);
+        for (let iteration = 0; iteration < 50; iteration += 1) {
+          yield* Effect.yieldNow;
+        }
+        yield* Fiber.interrupt(follower);
+        expect(state.phase).toBe("connected");
+        expect(state.desired).toBe(true);
+        expect(yield* Ref.get(subscriptions)).toBe(1);
+        expect(yield* Ref.get(harness.sessions)).toHaveLength(1);
+        expect(yield* Ref.get(harness.releasedSessions)).toBe(0);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  it.effect("uses the renamed label for supervisor failures and unavailable RPCs", () =>
+    Effect.gen(function* () {
+      const connecting = yield* Deferred.make<void>();
+      const harness = yield* makeHarness([RELAY_TARGET], [], [], {
+        beforeSessionConnect: () =>
+          Deferred.succeed(connecting, undefined).pipe(Effect.andThen(Effect.never)),
+      });
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        const environmentId = RELAY_TARGET.environmentId;
+        yield* registry.start;
+        yield* Deferred.await(connecting);
+        const before = yield* registry.run(
+          environmentId,
+          EnvironmentSupervisor.EnvironmentSupervisor,
+        );
+        yield* registry.rename(environmentId, "GPU box");
+        const after = yield* registry.run(
+          environmentId,
+          EnvironmentSupervisor.EnvironmentSupervisor,
+        );
+        expect(after).toBe(before);
+        const unavailable = yield* registry.run(environmentId, currentSession()).pipe(Effect.flip);
+        expect(unavailable.message).toBe("GPU box is not connected.");
+        yield* TestClock.adjust(EnvironmentSupervisor.CONNECTION_ESTABLISHMENT_TIMEOUT);
+        const state = yield* awaitConnectionState(
+          registry,
+          environmentId,
+          (value) => value.phase === "backoff",
+        );
+        expect(state.lastFailure?.detail).toBe("GPU box did not respond during connection setup.");
+        expect(yield* Ref.get(harness.sessions)).toEqual([]);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  it.effect("keeps a disconnected environment disconnected across a rename", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness([RELAY_TARGET]);
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        yield* registry.disconnect(RELAY_TARGET.environmentId);
+
+        yield* registry.rename(RELAY_TARGET.environmentId, "Cloud box");
+
+        const state = yield* registry.state(RELAY_TARGET.environmentId);
+        expect(state.desired).toBe(false);
+        expect(yield* Ref.get(harness.sessions)).toEqual([]);
+        expect(
+          (yield* SubscriptionRef.get(registry.entries)).get(RELAY_TARGET.environmentId)?.target
+            .label,
+        ).toBe("Cloud box");
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  it.effect("loads a renamed environment's saved name in a new registry", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness([RELAY_TARGET]);
+
+      yield* EnvironmentRegistry.EnvironmentRegistry.pipe(
+        Effect.flatMap((registry) => registry.rename(RELAY_TARGET.environmentId, "Cloud box")),
+        Effect.provide(harness.layer),
+        Effect.scoped,
+      );
+      const reloaded = yield* EnvironmentRegistry.EnvironmentRegistry.pipe(
+        Effect.flatMap((registry) => SubscriptionRef.get(registry.entries)),
+        Effect.provide(harness.layer),
+        Effect.scoped,
+      );
+
+      expect(reloaded.get(RELAY_TARGET.environmentId)?.target).toEqual(
+        new RelayConnectionTarget({
+          environmentId: RELAY_TARGET.environmentId,
+          label: "Cloud box",
+        }),
+      );
+    }),
+  );
+
+  it.effect("refuses blank names, platform environments, and unknown environments", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness([RELAY_TARGET]);
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        yield* registry.registerPlatform(new PrimaryConnectionRegistration({ target: TARGET }));
+
+        const blank = yield* registry.rename(RELAY_TARGET.environmentId, " \t ").pipe(Effect.flip);
+        const platform = yield* registry.rename(TARGET.environmentId, "Renamed").pipe(Effect.flip);
+        const unknown = yield* registry
+          .rename(EnvironmentId.make("missing-environment"), "Renamed")
+          .pipe(Effect.flip);
+
+        expect(blank._tag).toBe("ConnectionBlockedError");
+        expect(platform._tag).toBe("ConnectionBlockedError");
+        expect(unknown._tag).toBe("EnvironmentNotRegisteredError");
+        expect((yield* Ref.get(harness.storedTargets)).get(RELAY_TARGET.environmentId)).toEqual(
+          RELAY_TARGET,
+        );
+        const entries = yield* SubscriptionRef.get(registry.entries);
+        expect(entries.get(RELAY_TARGET.environmentId)?.target.label).toBe(RELAY_TARGET.label);
+        expect(entries.get(TARGET.environmentId)?.target.label).toBe(TARGET.label);
       }).pipe(Effect.provide(harness.layer), Effect.scoped);
     }),
   );
@@ -1706,4 +2112,29 @@ describe("EnvironmentRegistry", () => {
       }).pipe(Effect.provide(harness.layer));
     }),
   );
+});
+
+describe("persisted target labels", () => {
+  it("recognizes persistable class instances rather than structurally matching objects", () => {
+    expect(isPersistedConnectionTarget(RELAY_TARGET)).toBe(true);
+    expect(isPersistedConnectionTarget(TARGET)).toBe(false);
+    expect(isPersistedConnectionTarget({ ...RELAY_TARGET })).toBe(false);
+  });
+
+  it.each([
+    BEARER_TARGET,
+    RELAY_TARGET,
+    new SshConnectionTarget({
+      environmentId: EnvironmentId.make("env-ssh"),
+      connectionId: "ssh-1",
+      label: "SSH box",
+    }),
+  ])("preserves class equality and every field except label for $_tag", (target) => {
+    const same = withPersistedTargetLabel(target, target.label);
+    const changed = withPersistedTargetLabel(target, "New name");
+    expect(Equal.equals(same, target)).toBe(true);
+    expect(changed).toBeInstanceOf(target.constructor);
+    expect(Equal.equals(changed, target)).toBe(false);
+    expect({ ...changed }).toEqual({ ...target, label: "New name" });
+  });
 });

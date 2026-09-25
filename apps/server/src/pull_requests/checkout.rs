@@ -1,9 +1,10 @@
 //! Guarded checkout and managed worktree creation for hosted pull requests.
 use super::{
     PullRequestsService, bounded_read,
-    context::{DiscoveredHosts, resolve_scope},
+    context::{DiscoveredHosts, resolve_scope, supported_provider},
     error::{PullRequestsOperationError, from_process_error},
     host::{Budget, CommandOutput, HostCommandRunner, HostScope, ProcessFailure},
+    model::PullRequestsProvider,
 };
 use crate::{
     git::{
@@ -22,7 +23,6 @@ use crate::{
     production::{
         git_manager_rpc::resolve_project_id, worktree_catalog_rpc::WorktreeCatalogRpcServices,
     },
-    source_control::ProviderKind,
     worktree_catalog::{CatalogRefreshTrigger, CatalogScanStatus, ProjectMutationAttempt},
 };
 use serde::{Deserialize, Serialize};
@@ -284,7 +284,7 @@ impl LockedCheckout<'_> {
             return Ok(mismatch());
         }
         let head_branch = service
-            .host(scope)
+            .host(scope, "pullRequests.checkout")?
             .head_branch(scope, input.number, c)
             .await?;
         validate_branch(&service.runner, &input.cwd, &head_branch, c).await?;
@@ -313,7 +313,9 @@ impl LockedCheckout<'_> {
                     &service.runner,
                     scope,
                     input.number,
-                    &service.host(scope).head_ref_spec(input.number),
+                    &service
+                        .host(scope, "pullRequests.checkout")?
+                        .head_ref_spec(input.number),
                     branch_name.as_deref().unwrap_or(&head_branch),
                     &snapshot.worktrees,
                     c,
@@ -469,8 +471,8 @@ async fn local_checkout(
         ..scope.clone()
     };
     let number = number.to_string();
-    let (cli, result) = if scope.provider == ProviderKind::Github {
-        (
+    let (cli, result) = match supported_provider(scope).map_err(|u| u.operation_error(OP))? {
+        PullRequestsProvider::Github => (
             "gh",
             runner
                 .gh(
@@ -481,9 +483,8 @@ async fn local_checkout(
                     c,
                 )
                 .await,
-        )
-    } else {
-        (
+        ),
+        PullRequestsProvider::Gitlab => (
             "glab",
             runner
                 .glab(
@@ -494,7 +495,7 @@ async fn local_checkout(
                     c,
                 )
                 .await,
-        )
+        ),
     };
     result.map_err(|failure| from_process_error(OP, cli, &failure.error, &failure.stderr))?;
     let actual = git_output(runner.git(cwd, &["branch", "--show-current"], c).await)?

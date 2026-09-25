@@ -6,7 +6,7 @@ import {
   createRouter,
   RouterProvider,
 } from "@tanstack/react-router";
-import type { GitManagerPullRequestsResult } from "@bibcode/contracts";
+import type { GitManagerPullRequestsResult, SourceControlProviderInfo } from "@bibcode/contracts";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
@@ -51,11 +51,16 @@ import { GitManagerPullRequestPanel } from "./GitManagerPullRequestPanel";
 let container: HTMLDivElement;
 let root: Root;
 
-async function renderPanel(onRefresh = vi.fn(), disabledReason: string | null = null) {
+async function renderPanel(
+  onRefresh = vi.fn(),
+  disabledReason: string | null = null,
+  provider: SourceControlProviderInfo | null = null,
+) {
   await act(async () =>
     root.render(
       <GitManagerPullRequestPanel
         disabledReason={disabledReason}
+        provider={provider}
         scope={{ environmentId: "env-a" as never, cwd: "/repo" }}
         onRefresh={onRefresh}
       />,
@@ -94,6 +99,45 @@ afterEach(async () => {
 });
 
 describe("GitManagerPullRequestPanel", () => {
+  it.each([
+    ["gitlab", "merge request", "Merge requests", "!14"],
+    ["github", "pull request", "Pull requests", "#14"],
+    ["unknown", "change request", "Change requests", "#14"],
+  ] as const)(
+    "uses %s terminology and number references from the known provider",
+    async (kind, noun, title, number) => {
+      h.result = {
+        status: "available",
+        pullRequests: [
+          {
+            number: 14,
+            title: "Review this branch",
+            url: "https://forge.invalid/team/repo/requests/14",
+            baseBranch: "main",
+            headBranch: "feature",
+            state: "open",
+          },
+        ],
+        checks: [],
+      };
+      await renderPanel(vi.fn(), null, { kind, name: "Forge", baseUrl: "https://forge.invalid" });
+      expect(button(`Create ${noun}`).disabled).toBe(false);
+      expect(container.querySelector("section")?.getAttribute("aria-label")).toBe(
+        `${title} and checks`,
+      );
+      expect(container.querySelector("h2")?.textContent).toBe(`${title} and checks`);
+      expect(container.textContent).toContain(
+        `${title} and checks load only when you choose Refresh.`,
+      );
+      expect(h.listRequests).not.toHaveBeenCalled();
+      await act(async () => button("Refresh").click());
+      expect(container.textContent).toContain(`${number} · feature → main`);
+      expect(container.textContent).toContain(`Current ${noun}`);
+      expect(container.textContent).toContain(`${title} and checks loaded.`);
+      expect(h.listRequests).toHaveBeenCalledOnce();
+    },
+  );
+
   it("issues no provider request on mount or after an idle hour", async () => {
     await renderPanel();
     expect(container.textContent).toContain("load only when you choose Refresh");

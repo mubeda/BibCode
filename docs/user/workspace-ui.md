@@ -11,8 +11,17 @@ returned usage does not borrow the local server's values.
 
 ## Left Panel
 
-The panel opens 320px wide. Drag its right edge to resize it; the width is
-remembered, and double-clicking the edge restores the default.
+The panel opens 422px wide by default (a 370px projects panel beside the 52px
+rail); on a narrower window it opens narrower so the main area keeps its
+minimum width. Drag its right edge to resize it; the width is remembered, and
+double-clicking the edge restores the default for the current window size.
+
+The rail chooses which environment the panel shows: **Local** (this machine) or
+one of your saved servers. The choice stays until you pick another entry;
+background updates from this machine's server never switch it back to Local. If
+the selected server is removed, the rail returns to Local. Saved servers show
+the name you gave them on this device (see
+[Remote access](./remote-access.md#name-a-saved-server)).
 
 The **Search** row is followed by an **Agents** nav row, then Projects. Its
 unread-count badge covers agents across all connected environments. Selecting
@@ -393,11 +402,20 @@ continue/abort strip, and conflicted paths are marked in Changes. For supported
 conflicted operations, resolve each listed path with Ours or Theirs in the
 panel's conflict list, then choose Continue once it is enabled.
 
-**Pull requests** opens the provider pane without making a request. Pull-request
-and check data load only when **Refresh** is pressed, and the pane never starts a
-provider timer. Its create-pull-request review dialog groups repository, base,
-and head details separately from branch-publication status, then keeps the
+**Show pull requests** (**Show merge requests** on GitLab) opens the provider
+pane without making a request. Pull-request and check data load only when
+**Refresh** is pressed, and the pane never starts a
+provider timer. The pane's toggle, heading, status messages, request number and
+Create button follow the provider: GitLab uses merge-request wording, `!N` and
+**Create merge request**. Its create-pull-request review
+dialog groups repository, base, and head details separately from branch-publication status, then keeps the
 editable title and description in one padded form above the fixed action footer.
+On GitLab it says **Create merge request** and uses `!N`. A self-hosted host
+that BiBCode has not identified yet shows "Not identified yet" with the next
+step (open Pull Requests for the project or Rescan in **Settings → Source
+Control**); nothing is published until the host is identified. **New merge
+request** in Pull Requests already knows the host and shows it right away.
+Hover a disabled **Create** button to see why it is unavailable.
 GitHub checks are available; other providers currently return checks
 unavailable.
 
@@ -432,7 +450,10 @@ provider rows list configured hosts, with account names redacted until revealed.
 
 The repository header shows the provider, account, and custom host. Choose a
 worktree to change the checkout scope, **Refresh** to reload the first list
-page, or **Rescan** to recheck repository context. A disconnected environment
+page, or **Rescan** to recheck repository context. Opening the module or
+switching worktree reuses host answers from the last 30 seconds and loads the
+first list page alongside the context; Rescan asks the host again. A
+disconnected environment
 stays disconnected. Missing remotes, tools, authentication, and repository
 access show server advice, install hints, and a copyable login command when
 available. The checkout selector remains available for recovery when a saved

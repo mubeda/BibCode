@@ -3,10 +3,7 @@ import { useId, useLayoutEffect, useRef, useState } from "react";
 import { usePullRequestsStore } from "../../../pullRequestsStore";
 import { Tabs, TabsList, TabsPanel, TabsTab } from "../../ui/tabs";
 import { PullRequestsMarkdown } from "../shared/PullRequestsMarkdown";
-import {
-  PullRequestsPermissionButton,
-  constrainPermission,
-} from "../shared/PullRequestsPermissionButton";
+import { PermissionButton, constrainPermission } from "../../ui/permission-button";
 import { usePullRequestsActions } from "../usePullRequestsAction";
 export interface PullRequestsCommentBoxProps {
   permission: PullRequestsPermission;
@@ -113,13 +110,9 @@ export function PullRequestsCommentBox({
         </p>
       ) : null}
       <div className="flex justify-end">
-        <PullRequestsPermissionButton
-          mutation
-          permission={submitPermission}
-          onClick={() => void submit()}
-        >
+        <PermissionButton mutation permission={submitPermission} onClick={() => void submit()}>
           {pending ? "Posting…" : submitLabel}
-        </PullRequestsPermissionButton>
+        </PermissionButton>
       </div>
     </section>
   );

@@ -13,10 +13,7 @@ import {
   MenuGroup,
   MenuGroupLabel,
 } from "../ui/menu";
-import {
-  PullRequestsPermissionButton,
-  constrainPermission,
-} from "./shared/PullRequestsPermissionButton";
+import { PermissionButton, constrainPermission } from "../ui/permission-button";
 import { checkoutTargets, type CheckoutWorktree } from "./pullRequestsCheckout.logic";
 import { usePullRequestsActions, type PullRequestsScope } from "./usePullRequestsAction";
 import { useRunPullRequestsCheckout } from "./useRunPullRequestsCheckout";
@@ -61,7 +58,7 @@ export function PullRequestsCheckoutMenu({
   const others = targets.filter((target) => target.kind === "checkout" && target.cwd !== scope.cwd);
   return (
     <div className="inline-flex" role="group" aria-label={`Check out ${requestKind}`}>
-      <PullRequestsPermissionButton
+      <PermissionButton
         mutation
         permission={available}
         variant="outline"
@@ -72,7 +69,7 @@ export function PullRequestsCheckoutMenu({
         }}
       >
         {pending ? "Checking out…" : "Checkout"}
-      </PullRequestsPermissionButton>
+      </PermissionButton>
       <Menu>
         <span className="inline-flex" title={reason}>
           <MenuTrigger

@@ -362,13 +362,16 @@ provider pass from static checks or unit tests.
 
 ### Selecting other focused coverage
 
-For the Pull Requests web shell/detail/review, settings, and auth-host display, run:
+For the Pull Requests web shell/detail/review, settings, and auth-host display,
+and the Pull Requests client runtime and contracts, run:
 
 ```sh
-vp test run apps/web/src/pullRequestsStore.test.ts apps/web/src/components/pullRequests apps/web/src/components/Sidebar.test.tsx apps/web/src/components/settings apps/web/src/components/gitManager/provider
+vp test run apps/web/src/pullRequestsStore.test.ts apps/web/src/components/pullRequests apps/web/src/components/Sidebar.test.tsx apps/web/src/components/settings apps/web/src/components/gitManager/provider apps/web/src/components/ui/permission-button.test.tsx packages/shared/src/sourceControl.test.ts packages/shared/src/git.test.ts packages/client-runtime/src/state/pullRequests.test.ts packages/contracts/src/pullRequests.test.ts packages/contracts/src/sourceControl.test.ts
+vp run check:contracts
 vp run typecheck
 vp check
 cargo test -p bibcode-server discovery -j 2
+cargo test -p bibcode-server --test git_rpc source_control_discovery_uses_structured_bounded_probes -j 2
 ```
 
 Auth schema changes also require regenerated RPC fixtures and contract parity
@@ -391,12 +394,33 @@ cargo test -p bibcode-server --test rpc_wire -j 2
 cargo test -p bibcode-server registers_every -j 2
 ```
 
+For provider detection of self-hosted hosts (the recorded host observation,
+remote parsing, status classification, and the create action's provider check
+before anything is published), also run:
+
+```sh
+cargo test -p bibcode-server source_control:: -j 2
+cargo test -p bibcode-server --lib only_an_explicit_source_control_discovery_records_hosts -j 2
+cargo test -p bibcode-server status_provider -j 2
+cargo test -p bibcode-server create_pr -j 2
+cargo test -p bibcode-server commit_push_pr -j 2
+```
+
 The inline CLI-script integration fixtures currently run on Unix. Shared
 parser, model, error, capability, deadline, and registration tests cover
 platform-independent behavior; native Windows CLI and private-file ACL
-execution still require native evidence. Verify custom-host discovery,
+execution still require native evidence. Verify custom-host discovery, that a
+recorded host skips discovery until Rescan, `unknown_host` or
+`not_authenticated` forgets it, that only an explicit Settings scan
+(`recordHosts`) replaces recorded hosts, that full GitLab logout reports
+Unauthenticated and clears its recorded hosts while unrecognized output keeps
+them with Unknown status, that a request created through
+`git.runStackedAction` makes the next list read its totals again,
 host/repository pinning, no-origin and auth failures, pagination, optional
-totals, bounded cancellation, and private body-file cleanup. For detail reads,
+totals and their 30 s reuse, bounded cancellation, and private body-file cleanup.
+For both context and list, verify a failed login cancels and awaits the provider child instead
+of waiting for the page-read deadline, retains login-error precedence, and
+rechecks a checkout removed while reads were in flight. For detail reads,
 verify the permission/readiness tables and server-authored reasons, GitLab
 version gates, reviewer-state mappings, opaque timeline ids and line positions,
 native GitLab `appliable` suggestions and observed note/body reactions,
@@ -447,6 +471,25 @@ success must not start a server reread. Validate new GraphQL documents against
 the intended hosts separately from recording-stub tests and report blocked
 network/listener execution with the exact error. GitLab multi-line review
 comments currently use the documented end-line fallback.
+
+For supervised process runner changes (spawn, deadline, cancellation, drop,
+or process-tree cleanup), run the owner and the inline Git RPC boundaries:
+
+```sh
+cargo test -p bibcode-server --lib process:: -j 2
+cargo test -p bibcode-server --test process_runner -j 2
+cargo test -p bibcode-server --test production_git_manager_rpc -j 2
+cargo test -p bibcode-server --test production_git_vcs_rpc -j 2
+```
+
+Keep separate evidence that a dropped, aborted, or runtime-shutdown run leaves
+no descendant alive; that interrupting an inline Git read, or closing its
+socket, closes the transport helper's connection to a stalled remote; and that
+a cancelled run still stops a descendant that outlives its root. On Linux the
+subreaper unit test re-executes itself to prove the killed helper ended by
+`SIGKILL` and the dropped run's root was reaped. On Windows the same drop
+terminates the run's Job, with kill-on-close as the backstop; record native
+Windows results for these cases rather than inferring them from Unix.
 
 Run the closest behavioral coverage before broad suites. Discover exact Rust
 targets and filters from manifests and `cargo test -- --list`; do not invent
@@ -806,7 +849,9 @@ a stale first page that resolves behind the loaded generation is ignored); the
 shared project-then-repository lock rejecting a competing Git Manager or
 catalog mutation with `operation-in-flight`;
 server-authored blocked copy rendered unchanged; stream cancellation reaching
-the Git child; and one explicit provider refresh after an idle interval that
+the Git child; an interrupted or disconnected inline read (such as
+`gitManager.getRemoteTags` against a stalled remote) stopping Git's transport
+helper; and one explicit provider refresh after an idle interval that
 produced no provider process or browser network request.
 
 For external Git Manager refresh, keep the automatic fetch interval at its
@@ -1480,15 +1525,19 @@ starts.
     confirm the added file has no Before image and the deleted file has no After
     image. If delete or push is absent from the routed tag surface, record
     **FAIL** rather than substituting command-line Git.
-11. Open **Show pull requests**, confirm the pane says provider data loads only
-    on demand, and choose **Refresh** exactly once. Confirm one
+11. Open **Show pull requests** (**Show merge requests** on GitLab), confirm the
+    pane says provider data loads only on demand, and choose **Refresh** exactly once. Confirm one
     `gitManager.listPullRequests` refresh is sent through the environment's
     existing RPC connection. A configured provider may run separate pull-request
     and checks subcommands on the server; a missing CLI, credentials, or the
     fixture's intentionally nonexistent forge repository must produce the
     provider pane's explicit error or unavailable presentation without retrying
-    in the background. Then choose **Create pull request**: the review dialog
-    must open with the detected provider, base and head branches, whether the
+    in the background. For GitLab, confirm the pane uses merge-request wording
+    throughout its toggle, heading and empty/unavailable states, `!N` for a loaded
+    request and **Create merge request**; GitHub uses pull-request wording,
+    `#N` and **Create pull request**.
+    Choose that Create action: the review dialog must open with the detected
+    provider, base and head branches, whether the
     branch will be published first, and a title and description seeded from
     the latest commit, while no push, provider process, or pull request is
     created. Cancel it and confirm the branch, its upstream, and the forge are

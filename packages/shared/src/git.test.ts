@@ -338,6 +338,22 @@ describe("applyGitStatusStreamEvent", () => {
     });
   });
 
+  it("keeps the resolved default ref when the remote part follows a snapshot", () => {
+    // The server sends the local snapshot first and the remote part moments later.
+    const snapshot = applyGitStatusStreamEvent(null, {
+      _tag: "snapshot",
+      local: { ...localStatus, defaultRefName: "master" },
+      remote: null,
+    });
+    const updated = applyGitStatusStreamEvent(snapshot, { _tag: "remoteUpdated", remote: null });
+
+    expect(updated.defaultRefName).toBe("master");
+    expect(
+      applyGitStatusStreamEvent(updated, { _tag: "remoteUpdated", remote: remoteStatus })
+        .defaultRefName,
+    ).toBe("master");
+  });
+
   it("omits an absent source-control provider when rebuilding local state", () => {
     const current: VcsStatusResult = { ...localStatus, ...remoteStatus };
     const updated = applyGitStatusStreamEvent(current, {

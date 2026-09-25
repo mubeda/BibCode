@@ -8,17 +8,26 @@ use std::{
 
 use base64::Engine;
 use bibcode_server::{
-    RequestId, RpcRequest,
+    CauseItem, RequestId, RpcExit, RpcRegistry, RpcRequest, ServerConfig, ServerHandle,
+    ServerMessage, ServerRuntime,
     git::{GitRepository, MAX_DIFF_BUFFER_SIZE, NativeFileTrash, StatusBroadcaster},
     persistence::{Database, ProjectionProject, Repositories, run_migrations},
-    production::git_manager_rpc::{ConfiguredGitManagerRpcServices, GitManagerRpcServices},
+    production::git_manager_rpc::{
+        ConfiguredGitManagerRpcServices, GitManagerRpcServices, register_git_manager_rpc,
+    },
     worktree_catalog::{WorkspaceAvailabilityRegistry, WorktreeCatalogService},
 };
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
+
+const SOCKET_RESPONSE_BOUND: Duration = Duration::from_secs(60);
+
+type TestSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 struct Fixture {
     _root: TempDir,
@@ -2024,6 +2033,40 @@ async fn remote_tags_read_lists_tags_on_the_remote_and_reports_an_unavailable_re
 }
 
 #[tokio::test]
+async fn interrupting_a_remote_tags_read_stops_git_and_its_transport_helpers() {
+    let mut read = StalledRemoteTagsRead::start("71").await;
+
+    send_json(
+        &mut read.socket,
+        json!({ "_tag": "Interrupt", "requestId": "71" }),
+    )
+    .await;
+    let interrupted = next_server_message(&mut read.socket).await;
+    assert!(
+        matches!(
+            &interrupted,
+            ServerMessage::Exit { request_id, exit: RpcExit::Failure { cause } }
+                if request_id.as_str() == "71"
+                    && cause == &vec![CauseItem::Interrupt { fiber_id: None }]
+        ),
+        "the read must end as interrupted, got {interrupted:?}"
+    );
+    wait_for_connection_close(&mut read.helper_connection, "interrupting the read").await;
+
+    read.shutdown().await;
+}
+
+#[tokio::test]
+async fn closing_the_socket_during_a_remote_tags_read_stops_git_and_its_transport_helpers() {
+    let mut read = StalledRemoteTagsRead::start("72").await;
+
+    read.socket.close(None).await.expect("close the WebSocket");
+    wait_for_connection_close(&mut read.helper_connection, "closing the socket").await;
+
+    read.shutdown().await;
+}
+
+#[tokio::test]
 async fn push_with_tags_publishes_local_tags_atomically() {
     let fixture = Fixture::new().await;
     let cwd = fixture.repository_path.clone();
@@ -2587,6 +2630,144 @@ fn rpc_request(id: &str, tag: &str, payload: Value) -> RpcRequest {
         span_id: None,
         sampled: None,
     }
+}
+
+/// A `gitManager.getRemoteTags` read, sent over a real WebSocket, against a
+/// remote that accepts Git's HTTP connection and never answers. The read runs
+/// inline in its RPC handler, so an Interrupt or a closed socket makes the
+/// session drop the handler's future: the process runner never sees a
+/// cancelled token, and that drop alone must stop Git and its helpers.
+struct StalledRemoteTagsRead {
+    _state: TempDir,
+    _repository: TempDir,
+    handle: ServerHandle,
+    socket: TestSocket,
+    /// Git's HTTP transport helper holds this connection while it runs.
+    helper_connection: tokio::net::TcpStream,
+}
+
+impl StalledRemoteTagsRead {
+    async fn start(request_id: &str) -> Self {
+        let state = TempDir::new().expect("temporary server state");
+        let repository = TempDir::new().expect("temporary repository");
+        git(repository.path(), &["init", "-q", "-b", "main"]);
+        // An explicit empty proxy keeps Git on the loopback remote even when the host sets one.
+        git(repository.path(), &["config", "http.proxy", ""]);
+        let remote = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("stalled remote listener");
+        let url = format!(
+            "http://{}/stalled.git",
+            remote.local_addr().expect("stalled remote address")
+        );
+        git(repository.path(), &["remote", "add", "stalled", &url]);
+
+        let mut registry = RpcRegistry::empty();
+        register_git_manager_rpc(&mut registry, GitManagerRpcServices);
+        let config = ServerConfig::new(state.path())
+            .with_bind("127.0.0.1", 0)
+            .with_unsafe_no_auth();
+        let handle = ServerRuntime::start_with_registry(config, registry)
+            .await
+            .expect("Git Manager server starts");
+        let (mut socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+            .await
+            .expect("WebSocket connects");
+
+        send_json(
+            &mut socket,
+            json!({
+                "_tag": "Request",
+                "id": request_id,
+                "tag": "gitManager.getRemoteTags",
+                "payload": { "cwd": repository.path(), "remote": "stalled" },
+                "headers": []
+            }),
+        )
+        .await;
+        let (mut helper_connection, _) = timeout(SOCKET_RESPONSE_BOUND, remote.accept())
+            .await
+            .expect("Git connects to the stalled remote")
+            .expect("accept Git's connection");
+        let request = read_http_request_head(&mut helper_connection).await;
+        assert!(
+            request.starts_with("GET /stalled.git/info/refs?service=git-upload-pack "),
+            "unexpected request from Git: {request}"
+        );
+        Self {
+            _state: state,
+            _repository: repository,
+            handle,
+            socket,
+            helper_connection,
+        }
+    }
+
+    async fn shutdown(self) {
+        let Self {
+            handle, mut socket, ..
+        } = self;
+        let _ = socket.close(None).await;
+        handle.shutdown();
+        let _ = handle.join().await;
+    }
+}
+
+async fn read_http_request_head(connection: &mut tokio::net::TcpStream) -> String {
+    use tokio::io::AsyncReadExt;
+
+    let mut head = Vec::new();
+    timeout(SOCKET_RESPONSE_BOUND, async {
+        let mut buffer = [0_u8; 1024];
+        while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = connection
+                .read(&mut buffer)
+                .await
+                .expect("read Git's request");
+            assert_ne!(
+                read, 0,
+                "Git closed its connection before sending a request"
+            );
+            head.extend_from_slice(&buffer[..read]);
+        }
+    })
+    .await
+    .expect("Git sends its request");
+    String::from_utf8_lossy(&head).into_owned()
+}
+
+async fn wait_for_connection_close(connection: &mut tokio::net::TcpStream, action: &str) {
+    use tokio::io::AsyncReadExt;
+
+    timeout(Duration::from_secs(20), async {
+        let mut buffer = [0_u8; 4096];
+        while let Ok(read) = connection.read(&mut buffer).await {
+            if read == 0 {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{action} left Git's transport helper connected to the remote"));
+}
+
+async fn send_json(socket: &mut TestSocket, value: Value) {
+    socket
+        .send(Message::Text(value.to_string().into()))
+        .await
+        .expect("send WebSocket message");
+}
+
+async fn next_server_message(socket: &mut TestSocket) -> ServerMessage {
+    let frame = timeout(SOCKET_RESPONSE_BOUND, socket.next())
+        .await
+        .expect("WebSocket response timeout")
+        .expect("WebSocket remains open")
+        .expect("valid WebSocket frame");
+    let Message::Text(text) = frame else {
+        panic!("expected a text WebSocket message, got {frame:?}");
+    };
+    serde_json::from_str(&text).expect("valid server RPC message")
 }
 
 /// Waits until the signal has been quiet for longer than the ref debounce and

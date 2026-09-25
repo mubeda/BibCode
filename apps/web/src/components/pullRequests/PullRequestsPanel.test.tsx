@@ -3,12 +3,14 @@ import {
   AVAILABLE_CONNECTION_STATE,
   type SupervisorConnectionState,
 } from "@bibcode/client-runtime/connection";
+import { environmentRpcKey } from "@bibcode/client-runtime/state/runtime";
 import type { PullRequestsContext, ScopedProjectRef, ServerConfig } from "@bibcode/contracts";
 import { makeTestExecutionEnvironmentCapabilities } from "@bibcode/shared/testSupport";
-import { act, useImperativeHandle, type Ref } from "react";
+import { act, useContext, useImperativeHandle, type Ref } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { usePullRequestsStore } from "../../pullRequestsStore";
+import { PullRequestsContextRefresh } from "./pullRequestsContextRefresh";
 import { context } from "./testFixtures";
 const h = vi.hoisted(() => ({
   enabled: true,
@@ -22,6 +24,9 @@ const h = vi.hoisted(() => ({
   } | null,
   catalogError: null as string | null,
   getContext: vi.fn((args: unknown) => ({ kind: "context", args })),
+  list: vi.fn((args: unknown) => ({ kind: "list", args })),
+  requestContextRescan: vi.fn(),
+  contextRefresh: null as (() => void) | null,
   catalog: vi.fn((args: unknown) => ({ kind: "catalog", args })),
   refresh: vi.fn(),
   listRefresh: vi.fn(),
@@ -41,7 +46,11 @@ vi.mock("../../hooks/useSettings", () => ({
     select({ pullRequestsEnabled: h.enabled }),
 }));
 vi.mock("../../state/pullRequests", () => ({
-  pullRequestsEnvironment: { getContext: h.getContext },
+  pullRequestsEnvironment: {
+    getContext: h.getContext,
+    list: h.list,
+    requestContextRescan: h.requestContextRescan,
+  },
 }));
 vi.mock("../../state/worktrees", () => ({ worktreeEnvironment: { catalog: h.catalog } }));
 vi.mock("../../state/query", () => ({
@@ -64,6 +73,7 @@ vi.mock("./list/PullRequestsListView", () => ({
     props: Record<string, unknown> & { ref?: Ref<{ refresh: () => void }> },
   ) => {
     h.listProps = props;
+    h.contextRefresh = useContext(PullRequestsContextRefresh);
     useImperativeHandle(props.ref, () => ({ refresh: h.listRefresh }));
     return <div>List content</div>;
   },
@@ -118,6 +128,9 @@ beforeEach(() => {
   h.listProps = null;
   h.dialogProps = null;
   h.getContext.mockClear();
+  h.list.mockClear();
+  h.requestContextRescan.mockClear();
+  h.contextRefresh = null;
   h.catalog.mockClear();
   h.refresh.mockClear();
   h.listRefresh.mockClear();
@@ -155,6 +168,7 @@ describe("PullRequestsPanel", () => {
     expect(container.textContent).toContain("This environment is disconnected.");
     expect(h.getContext).not.toHaveBeenCalled();
     expect(h.catalog).not.toHaveBeenCalled();
+    expect(h.list).not.toHaveBeenCalled();
     expect(h.listProps).toBeNull();
   });
   it("gates disabled settings and links to settings", async () => {
@@ -186,6 +200,7 @@ describe("PullRequestsPanel", () => {
     expect(h.dialogProps).toMatchObject({
       scope: { environmentId: "env", cwd: "Z:\\opaque\\worktree" },
       open: true,
+      providerHint: { kind: context.provider, host: context.host },
     });
   });
   it("shows loading and actionable unavailable context with Rescan", async () => {
@@ -206,8 +221,100 @@ describe("PullRequestsPanel", () => {
     await act(async () => root.render(<PullRequestsPanel projectRef={ref} />));
     expect(container.textContent).toContain("Add an origin remote.");
     await act(async () => button("Rescan").click());
+    expect(h.requestContextRescan).toHaveBeenCalledWith({
+      environmentId: "env",
+      input: { cwd: "Z:\\opaque\\main" },
+    });
     expect(h.refresh).toHaveBeenCalled();
+    expect(h.requestContextRescan.mock.invocationCallOrder[0]).toBeLessThan(
+      h.refresh.mock.invocationCallOrder[0]!,
+    );
     expect(h.listProps).toBeNull();
+  });
+  it("reads the first list page alongside a pending context, for Open and Closed only", async () => {
+    const firstPage = {
+      cwd: "Z:\\opaque\\main",
+      state: "open",
+      search: null,
+      author: null,
+      assignee: null,
+      reviewer: null,
+      reviewStatus: null,
+      draft: null,
+      labels: [],
+      milestone: null,
+      targetBranch: null,
+      sort: "newest",
+      cursor: null,
+    };
+    h.context = null;
+    h.pending = true;
+    await act(async () => root.render(<PullRequestsPanel projectRef={ref} />));
+    expect(h.list).toHaveBeenCalledWith({ environmentId: "env", input: firstPage });
+
+    h.pending = false;
+    h.context = context;
+    await act(async () => root.render(<PullRequestsPanel projectRef={ref} />));
+    // The page stays available until the committed list acknowledges it.
+    expect(h.listProps?.freshPageKey).toBe(
+      environmentRpcKey({ environmentId: ref.environmentId, input: firstPage }),
+    );
+    const consume = h.listProps?.onFreshPageConsumed as (key: string) => void;
+    await act(async () =>
+      consume(environmentRpcKey({ environmentId: ref.environmentId, input: firstPage })),
+    );
+    expect(h.listProps?.freshPageKey).toBeNull();
+
+    // Merged and All depend on the host (GitHub folds them into Closed): wait for context.
+    usePullRequestsStore.getState().setListTab(ref, "merged");
+    h.context = null;
+    h.pending = true;
+    h.list.mockClear();
+    await act(async () => root.render(<PullRequestsPanel projectRef={ref} />));
+    expect(h.list).not.toHaveBeenCalled();
+    await act(async () =>
+      root.render(<PullRequestsPanel projectRef={ref} number={14} tab="files" />),
+    );
+    expect(h.list).not.toHaveBeenCalled();
+  });
+  it("marks no page as fresh when the context was already available", async () => {
+    await act(async () => root.render(<PullRequestsPanel projectRef={ref} />));
+    expect(h.list).not.toHaveBeenCalled();
+    expect(h.listProps?.freshPageKey).toBeNull();
+  });
+  it("drops the page read during a load whose context settles unavailable", async () => {
+    h.context = null;
+    h.pending = true;
+    await act(async () => root.render(<PullRequestsPanel projectRef={ref} />));
+    expect(h.list).toHaveBeenCalled();
+    h.pending = false;
+    h.context = {
+      status: "unavailable",
+      code: "not_authenticated",
+      message: "Authenticate the provider CLI for this host, then rescan.",
+      authCommand: "glab auth login --hostname git.example.test",
+      installHint: null,
+      provider: "gitlab",
+      host: "git.example.test",
+    };
+    await act(async () => root.render(<PullRequestsPanel projectRef={ref} />));
+    await act(async () => button("Rescan").click());
+    h.context = context;
+    await act(async () => root.render(<PullRequestsPanel projectRef={ref} />));
+    // The list opens only after Rescan: the earlier page is not fresh, so it is read again.
+    expect(h.listProps).not.toBeNull();
+    expect(h.listProps?.freshPageKey).toBeNull();
+  });
+  it("rescans the context when a read reports lost authentication", async () => {
+    await act(async () => root.render(<PullRequestsPanel projectRef={ref} />));
+    expect(h.requestContextRescan).not.toHaveBeenCalled();
+    await act(async () => h.contextRefresh?.());
+    expect(h.requestContextRescan).toHaveBeenCalledWith({
+      environmentId: "env",
+      input: { cwd: "Z:\\opaque\\main" },
+    });
+    // Only the context is read again; the worktree catalog is left alone.
+    expect(h.refresh).toHaveBeenCalledTimes(1);
   });
   it("mounts the detail view with the number, tab, context and selected checkout", async () => {
     await act(async () =>

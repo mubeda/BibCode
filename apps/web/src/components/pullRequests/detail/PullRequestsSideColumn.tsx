@@ -16,10 +16,7 @@ import { memo, useMemo, type ReactNode } from "react";
 import { PullRequestsActor } from "../shared/PullRequestsActor";
 import { PullRequestsLabelChip } from "../shared/PullRequestsLabelChip";
 import { PullRequestsExternalLink } from "../shared/PullRequestsMarkdown";
-import {
-  PullRequestsPermissionButton,
-  constrainPermission,
-} from "../shared/PullRequestsPermissionButton";
+import { PermissionButton, constrainPermission } from "../../ui/permission-button";
 const REVIEW_STATES = {
   unreviewed: { Icon: CircleIcon, label: "Unreviewed", color: "text-muted-foreground" },
   commented: { Icon: MessageSquareIcon, label: "Commented", color: "text-muted-foreground" },
@@ -139,7 +136,7 @@ export const PullRequestsSideColumn = memo(function PullRequestsSideColumn({
                     <PullRequestsActor actor={actor} />
                   </span>
                   {canRerequest ? (
-                    <PullRequestsPermissionButton
+                    <PermissionButton
                       mutation
                       permission={constrainPermission(
                         detail.permissions.rerequestReview,
@@ -155,7 +152,7 @@ export const PullRequestsSideColumn = memo(function PullRequestsSideColumn({
                       }}
                     >
                       <RefreshCcwIcon aria-hidden="true" />
-                    </PullRequestsPermissionButton>
+                    </PermissionButton>
                   ) : null}
                 </div>
               );

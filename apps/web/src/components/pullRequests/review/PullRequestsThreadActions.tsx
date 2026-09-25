@@ -5,10 +5,7 @@ import type {
 } from "@bibcode/contracts";
 import { useState } from "react";
 import { usePullRequestsStore } from "../../../pullRequestsStore";
-import {
-  PullRequestsPermissionButton,
-  constrainPermission,
-} from "../shared/PullRequestsPermissionButton";
+import { PermissionButton, constrainPermission } from "../../ui/permission-button";
 import { usePullRequestsActions } from "../usePullRequestsAction";
 import { PullRequestsCommentBox } from "./PullRequestsCommentBox";
 export function PullRequestsThreadActions({
@@ -37,7 +34,7 @@ export function PullRequestsThreadActions({
   );
   return (
     <div className="space-y-3 p-3">
-      <PullRequestsPermissionButton
+      <PermissionButton
         mutation
         permission={resolvePermission}
         variant="outline"
@@ -56,7 +53,7 @@ export function PullRequestsThreadActions({
         }}
       >
         {thread.isResolved ? "Unresolve thread" : "Resolve thread"}
-      </PullRequestsPermissionButton>
+      </PermissionButton>
       {error ? (
         <p role="alert" className="text-sm text-destructive">
           {error}

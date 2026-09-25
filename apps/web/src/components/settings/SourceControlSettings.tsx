@@ -463,12 +463,14 @@ export function SourceControlSettingsPanel() {
   const pullRequestsEnabled = usePrimarySettings((settings) => settings.pullRequestsEnabled);
   const updateSettings = useUpdatePrimarySettings();
   const environmentId = usePrimaryEnvironment()?.environmentId ?? null;
+  // This scan is the explicit one: the server records the authenticated hosts it
+  // lists, so status reads can classify self-hosted origins without a CLI call.
   const discovery = useEnvironmentQuery(
     environmentId === null
       ? null
       : sourceControlEnvironment.discovery({
           environmentId,
-          input: {},
+          input: { recordHosts: true },
         }),
   );
   const result = discovery.data ?? EMPTY_DISCOVERY_RESULT;

@@ -1,6 +1,32 @@
 import type { PullRequestsListInput, PullRequestsListRow } from "@bibcode/contracts";
-import type { PullRequestsViewState } from "../../../pullRequestsStore";
+import {
+  DEFAULT_PULL_REQUESTS_VIEW_STATE,
+  type PullRequestsViewState,
+} from "../../../pullRequestsStore";
 import { formatRelativeTimeLabel } from "../../../timestampFormat";
+/** The list settings the list view reads; the panel's first-page read uses the same. */
+export const selectListFilters = (view: PullRequestsViewState | undefined) =>
+  view?.filters ?? DEFAULT_PULL_REQUESTS_VIEW_STATE.filters;
+export const selectListTab = (view: PullRequestsViewState | undefined) =>
+  view?.listTab ?? DEFAULT_PULL_REQUESTS_VIEW_STATE.listTab;
+export const selectListSort = (view: PullRequestsViewState | undefined) =>
+  view?.sort ?? DEFAULT_PULL_REQUESTS_VIEW_STATE.sort;
+/**
+ * The Open or Closed first page the list opens on, which the panel reads
+ * alongside a pending context. Merged and All wait: GitHub folds them into Closed.
+ */
+export function firstPagePrefetchInput(
+  view: PullRequestsViewState | undefined,
+  cwd: string,
+): PullRequestsListInput | null {
+  const tab = selectListTab(view);
+  return tab === "open" || tab === "closed"
+    ? buildListInput(
+        { filters: selectListFilters(view), listTab: tab, sort: selectListSort(view) },
+        cwd,
+      )
+    : null;
+}
 export function buildListInput(
   state: Pick<PullRequestsViewState, "listTab" | "filters" | "sort">,
   cwd: string,

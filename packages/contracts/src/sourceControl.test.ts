@@ -5,6 +5,7 @@ import {
   ChangeRequest,
   SourceControlProviderAuth,
   SourceControlCloneRepositoryInput,
+  SourceControlDiscoveryInput,
   SourceControlProviderError,
   SourceControlRepositoryError,
 } from "./sourceControl.ts";
@@ -22,9 +23,16 @@ const encodeCloneRepositoryInput = Schema.encodeSync(SourceControlCloneRepositor
 const decodeProviderError = Schema.decodeUnknownSync(SourceControlProviderError);
 const encodeProviderError = Schema.encodeSync(SourceControlProviderError);
 const decodeRepositoryError = Schema.decodeUnknownSync(SourceControlRepositoryError);
+const decodeDiscoveryInput = Schema.decodeUnknownSync(SourceControlDiscoveryInput);
 const encodeRepositoryError = Schema.encodeSync(SourceControlRepositoryError);
 
 describe("source control schemas", () => {
+  it("decodes the discovery input with and without the explicit-scan flag", () => {
+    expect(decodeDiscoveryInput({})).toEqual({});
+    expect(decodeDiscoveryInput({ recordHosts: true })).toEqual({ recordHosts: true });
+    expect(() => decodeDiscoveryInput({ recordHosts: "yes" })).toThrow();
+  });
+
   it("round-trips clone input with and without optional selection fields", () => {
     const minimal = decodeCloneRepositoryInput({ destinationPath: "/repo" });
     const selected = decodeCloneRepositoryInput({

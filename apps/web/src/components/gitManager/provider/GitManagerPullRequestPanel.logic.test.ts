@@ -14,6 +14,7 @@ import {
   resolveCreatePullRequestReview,
   resolveProviderPanePresentation,
   REVIEW_PROGRESS,
+  UNIDENTIFIED_HOST_REASON,
   type CreatePullRequestProgress,
 } from "./GitManagerPullRequestPanel.logic";
 
@@ -78,6 +79,7 @@ describe("Git Manager provider pane logic", () => {
   it("starts not loaded and never implies an automatic request", () => {
     expect(
       resolveProviderPanePresentation({
+        providerKind: null,
         requested: false,
         pending: false,
         error: null,
@@ -92,6 +94,7 @@ describe("Git Manager provider pane logic", () => {
   it("renders provider unavailability as explanatory content", () => {
     expect(
       resolveProviderPanePresentation({
+        providerKind: "github",
         requested: true,
         pending: false,
         error: null,
@@ -106,6 +109,7 @@ describe("Git Manager provider pane logic", () => {
   it("keeps provider errors distinct from unavailable capability", () => {
     expect(
       resolveProviderPanePresentation({
+        providerKind: "gitlab",
         requested: true,
         pending: false,
         error: "Provider CLI failed.",
@@ -113,6 +117,43 @@ describe("Git Manager provider pane logic", () => {
       }),
     ).toEqual({ kind: "error", message: "Provider CLI failed." });
   });
+
+  it.each([
+    ["github", "pull request", "pull requests", "Pull requests"],
+    ["gitlab", "merge request", "merge requests", "Merge requests"],
+    ["unknown", "change request", "change requests", "Change requests"],
+  ] as const)(
+    "uses %s vocabulary for each provider read state",
+    (providerKind, noun, plural, title) => {
+      const input = { providerKind, requested: true, pending: false, error: null, result: null };
+      expect(resolveProviderPanePresentation({ ...input, requested: false })).toEqual({
+        kind: "not-loaded",
+        message: `${title} and checks load only when you choose Refresh.`,
+      });
+      expect(resolveProviderPanePresentation({ ...input, pending: true })).toEqual({
+        kind: "loading",
+        message: `Loading ${plural} and checks…`,
+      });
+      expect(
+        resolveProviderPanePresentation({
+          ...input,
+          result: { status: "unavailable", pullRequests: [], checks: [] },
+        }),
+      ).toEqual({
+        kind: "unavailable",
+        message: `${title} or checks are unavailable for this repository provider.`,
+      });
+      expect(
+        resolveProviderPanePresentation({
+          ...input,
+          result: { status: "available", pullRequests: [], checks: [] },
+        }),
+      ).toEqual({
+        kind: "loaded",
+        message: `No open ${noun} was found for the current branch.`,
+      });
+    },
+  );
 
   it("reuses the existing stacked create-pr action shape with the reviewed fields", () => {
     expect(createPullRequestAction("action-1")).toEqual({
@@ -193,9 +234,10 @@ describe("resolveCreatePullRequestReview", () => {
   it.each([
     [status({ isRepo: false }), "This folder is not a Git repository."],
     [status({ refName: null }), "Check out a branch before creating a pull request."],
+    [status({ sourceControlProvider: undefined }), UNIDENTIFIED_HOST_REASON],
     [
-      status({ sourceControlProvider: undefined }),
-      "No supported source-control provider was found for this repository's remote.",
+      status({ sourceControlProvider: undefined, hasPrimaryRemote: false }),
+      "Add an origin remote to create a pull request.",
     ],
     [
       status({ hasWorkingTreeChanges: true }),
@@ -206,10 +248,87 @@ describe("resolveCreatePullRequestReview", () => {
       resolveCreatePullRequestReview({ status: blockedStatus, latestCommit: null }).blockedReason,
     ).toBe(reason);
   });
+
+  it("tells an unidentified host how to get identified", () => {
+    expect(UNIDENTIFIED_HOST_REASON).toBe(
+      "BiBCode hasn't identified this repository's host yet. Open Pull Requests for this project or run Rescan in Settings → Source Control.",
+    );
+  });
+
+  it("uses the host's words: merge requests on GitLab, pull requests elsewhere", () => {
+    const gitlab = status({
+      sourceControlProvider: {
+        kind: "gitlab",
+        name: "GitLab",
+        baseUrl: "https://luna.tripunkt.de",
+      },
+      hasWorkingTreeChanges: true,
+    });
+    expect(
+      resolveCreatePullRequestReview({ status: gitlab, latestCommit: null }).blockedReason,
+    ).toBe("Commit local changes before creating a merge request.");
+    expect(
+      resolveCreatePullRequestReview({
+        status: status({ hasWorkingTreeChanges: true }),
+        latestCommit: null,
+      }).blockedReason,
+    ).toBe("Commit local changes before creating a pull request.");
+  });
+
+  it("lets the Pull Requests panel's identified host stand in for a status without one", () => {
+    const providerHint = { kind: "gitlab", host: "luna.tripunkt.de" } as const;
+    const hinted = resolveCreatePullRequestReview({
+      status: status({ sourceControlProvider: undefined }),
+      latestCommit: null,
+      providerHint,
+    });
+    expect(hinted.provider).toEqual({
+      kind: "gitlab",
+      name: "GitLab",
+      baseUrl: "https://luna.tripunkt.de",
+    });
+    // The server validates the provider when creating; the review does not block.
+    expect(hinted.blockedReason).toBeNull();
+    // A status that names the host wins over the hint.
+    expect(
+      resolveCreatePullRequestReview({ status: status(), latestCommit: null, providerHint })
+        .provider?.kind,
+    ).toBe("github");
+  });
 });
 
 describe("create pull request progress", () => {
-  const review = { publishRequired: true, head: "feature/reviewed" };
+  const review = { publishRequired: true, head: "feature/reviewed", provider: null };
+
+  it("names a GitLab merge request with its reference in every phase", () => {
+    const gitlab = {
+      ...review,
+      provider: { kind: "gitlab", name: "GitLab", baseUrl: "https://luna.tripunkt.de" } as const,
+    };
+    expect(presentCreatePullRequestProgress(REVIEW_PROGRESS, gitlab).primaryLabel).toBe(
+      "Publish and create merge request",
+    );
+    expect(
+      presentCreatePullRequestProgress(REVIEW_PROGRESS, { ...gitlab, publishRequired: false })
+        .primaryLabel,
+    ).toBe("Create merge request");
+    expect(
+      presentCreatePullRequestProgress({ kind: "running", phase: "pr", pushed: true }, gitlab)
+        .status,
+    ).toBe("Creating the merge request…");
+    expect(
+      presentCreatePullRequestProgress({ kind: "created", url: null, number: 14 }, gitlab).status,
+    ).toBe("Merge request !14 created.");
+    expect(
+      presentCreatePullRequestProgress({ kind: "existing", url: null, number: 14 }, gitlab).status,
+    ).toBe("Merge request !14 already exists for this branch, so none was created.");
+    expect(
+      presentCreatePullRequestProgress(
+        { kind: "failed", phase: "pr", message: "denied", branchPublished: true },
+        gitlab,
+      ).status,
+    ).toBe("feature/reviewed was published, but creating the merge request failed: denied");
+  });
 
   function run(events: ReadonlyArray<GitActionProgressEvent>): CreatePullRequestProgress {
     return events.reduce(reduceCreatePullRequestProgress, REVIEW_PROGRESS);

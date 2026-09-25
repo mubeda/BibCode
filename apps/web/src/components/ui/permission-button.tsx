@@ -1,25 +1,23 @@
-import { PullRequestsMutationsDisabledContext } from "../pullRequestsMutationAvailability";
-import type { PullRequestsPermission } from "@bibcode/contracts";
+import { MutationsDisabledContext } from "./mutationAvailability";
 import { useContext, useId, type ComponentProps } from "react";
-import { Button } from "../../ui/button";
-export type PullRequestsPermissionButtonProps = Omit<ComponentProps<typeof Button>, "disabled"> & {
-  permission: PullRequestsPermission;
+import { Button } from "./button";
+
+export interface ActionPermission {
+  readonly allowed: boolean;
+  readonly reason: string | null;
+}
+
+export type PermissionButtonProps = Omit<ComponentProps<typeof Button>, "disabled"> & {
+  permission: ActionPermission;
   mutation?: boolean;
 };
-/** Release placeholder only; a host denial and its wording always take precedence. */
-export function readOnlyPermission(
-  permission: PullRequestsPermission,
-  reason = "This action arrives in a later build",
-): PullRequestsPermission {
-  return permission.allowed ? { allowed: false, reason } : permission;
-}
 export function constrainPermission(
-  permission: PullRequestsPermission,
+  permission: ActionPermission,
   reason: string | null,
-): PullRequestsPermission {
+): ActionPermission {
   return permission.allowed && reason ? { allowed: false, reason } : permission;
 }
-export function PullRequestsPermissionButton({
+export function PermissionButton({
   permission: requestedPermission,
   mutation = false,
   children,
@@ -27,9 +25,9 @@ export function PullRequestsPermissionButton({
   variant,
   size,
   ...props
-}: PullRequestsPermissionButtonProps) {
+}: PermissionButtonProps) {
   const id = useId();
-  const disabledReason = useContext(PullRequestsMutationsDisabledContext);
+  const disabledReason = useContext(MutationsDisabledContext);
   const permission = constrainPermission(requestedPermission, mutation ? disabledReason : null);
   return (
     <span

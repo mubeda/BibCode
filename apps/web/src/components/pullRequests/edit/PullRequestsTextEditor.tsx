@@ -5,10 +5,7 @@ import { usePullRequestsStore } from "../../../pullRequestsStore";
 import { Button } from "../../ui/button";
 import { Input } from "../../ui/input";
 import { Tabs, TabsList, TabsTab, TabsPanel } from "../../ui/tabs";
-import {
-  PullRequestsPermissionButton,
-  constrainPermission,
-} from "../shared/PullRequestsPermissionButton";
+import { PermissionButton, constrainPermission } from "../../ui/permission-button";
 import { PullRequestsMarkdown } from "../shared/PullRequestsMarkdown";
 import { pullRequestsActionError, usePullRequestsActions } from "../usePullRequestsAction";
 
@@ -77,7 +74,7 @@ export function PullRequestsTextEditor({
       <div className={field === "title" ? "flex min-w-0 items-start gap-2" : "space-y-2"}>
         {field === "title" ? children : null}
         <div className="flex justify-end">
-          <PullRequestsPermissionButton
+          <PermissionButton
             mutation
             permission={permission}
             variant="ghost"
@@ -91,7 +88,7 @@ export function PullRequestsTextEditor({
           >
             <PencilIcon aria-hidden="true" />
             {field === "body" ? "Edit" : null}
-          </PullRequestsPermissionButton>
+          </PermissionButton>
         </div>
         {field === "body" ? children : null}
       </div>
@@ -157,14 +154,14 @@ export function PullRequestsTextEditor({
         <Button variant="outline" size="sm" disabled={saving} onClick={() => setEditing(false)}>
           Cancel
         </Button>
-        <PullRequestsPermissionButton
+        <PermissionButton
           mutation
           permission={savePermission}
           size="sm"
           onClick={() => void save()}
         >
           {saving ? "Saving…" : "Save"}
-        </PullRequestsPermissionButton>
+        </PermissionButton>
       </div>
     </section>
   );

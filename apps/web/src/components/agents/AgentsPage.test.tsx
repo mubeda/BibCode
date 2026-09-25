@@ -123,6 +123,9 @@ vi.mock("../sidebar/EnvironmentRail", () => ({
 
 vi.mock("../ui/sidebar", async (importOriginal) => ({
   SidebarInset: (await importOriginal<typeof import("../ui/sidebar")>()).SidebarInset,
+  // AppSidebarLayout reads this to seed its initial width; this suite doesn't
+  // exercise sidebar-width behavior, so simulate "nothing saved" statically.
+  readStoredSidebarWidth: () => null,
   Sidebar: ({
     children,
     resizable: _resizable,

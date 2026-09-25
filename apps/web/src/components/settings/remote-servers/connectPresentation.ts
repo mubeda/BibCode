@@ -150,6 +150,26 @@ export function describeAddServerFailure(
   }
 }
 
+/**
+ * Copy for a rename that did not save. A server removed from another window
+ * says so, validation keeps its own sentence, and storage failures stay
+ * readable rather than exposing catalog internals.
+ */
+export function describeRenameServerFailure(error: unknown): string {
+  const tag =
+    error !== null && typeof error === "object" ? (error as { _tag?: unknown })._tag : undefined;
+  if (tag === "EnvironmentNotRegisteredError") {
+    return "This server is no longer saved on this device.";
+  }
+  if (tag === "ConnectionBlockedError") {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === "string" && message.trim().length > 0) {
+      return message;
+    }
+  }
+  return "Couldn't save the name on this device. Try again.";
+}
+
 /** Accepts bare codes, bibcode deep links, and HTTP(S) pairing URLs. */
 export function normalizePairingCodeInput(value: string): string | null {
   const trimmed = value.trim();

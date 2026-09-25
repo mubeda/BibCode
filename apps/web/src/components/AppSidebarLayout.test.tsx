@@ -6,6 +6,16 @@ import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
 const navigate = vi.fn();
 let menuListener: ((action: string) => void) | undefined;
+const initialInnerWidth = window.innerWidth;
+// Backs the mocked `readStoredSidebarWidth` below: swap it per test to return
+// a saved (already-clamped) width, or null for a first launch. The real
+// export already handles "nothing saved" and "storage blocked" the same way
+// (see its own tests in ui/sidebar.rail.test.tsx), so AppSidebarLayout only
+// ever needs to handle its two-value contract: a number, or null.
+let readStoredSidebarWidthMock: (
+  storageKey: string,
+  options: { minWidth: number; maxWidth: number },
+) => number | null = () => null;
 
 vi.mock("@effect/atom-react", () => ({
   useAtomValue: () => [],
@@ -39,6 +49,8 @@ vi.mock("./ui/sidebar", () => ({
   SidebarRail: () => null,
   SidebarTrigger: () => null,
   useSidebar: () => ({ toggleSidebar: vi.fn() }),
+  readStoredSidebarWidth: (storageKey: string, options: { minWidth: number; maxWidth: number }) =>
+    readStoredSidebarWidthMock(storageKey, options),
 }));
 
 vi.mock("./ui/tooltip", () => ({
@@ -52,6 +64,21 @@ import { toastManager } from "./ui/toast";
 
 const mounted: Array<{ root: ReturnType<typeof createRoot>; container: HTMLDivElement }> = [];
 
+// `resizable.defaultWidth` is a function evaluated at double-click-reset time
+// against the sidebar wrapper (see ui/sidebar.tsx); resolve it the same way
+// against a fake wrapper of the given width so tests can assert its result.
+function resolveDefaultWidth(
+  resizable: Record<string, unknown> | undefined,
+  wrapperClientWidth: number,
+): unknown {
+  const defaultWidth = resizable?.["defaultWidth"];
+  return typeof defaultWidth === "function"
+    ? (defaultWidth as (context: { wrapper: { clientWidth: number } }) => number)({
+        wrapper: { clientWidth: wrapperClientWidth },
+      })
+    : defaultWidth;
+}
+
 afterEach(async () => {
   await act(async () => {
     for (const entry of mounted.splice(0)) entry.root.unmount();
@@ -59,10 +86,13 @@ afterEach(async () => {
   navigate.mockReset();
   menuListener = undefined;
   delete (window as { desktopBridge?: unknown }).desktopBridge;
+  Object.defineProperty(window, "innerWidth", { configurable: true, value: initialInnerWidth });
+  readStoredSidebarWidthMock = () => null;
 });
 
 describe("AppSidebarLayout", () => {
-  it("opens the left sidebar at 320px by default so 13px titles and 12px badges fit", async () => {
+  it("opens the left sidebar at 422px on a wide window with no saved width", async () => {
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 1400 });
     sidebarProviderProps.length = 0;
     sidebarProps.length = 0;
     const container = document.createElement("div");
@@ -72,13 +102,104 @@ describe("AppSidebarLayout", () => {
       root.render(<AppSidebarLayout>Workspace</AppSidebarLayout>);
     });
     const style = sidebarProviderProps[0]?.["style"] as Record<string, string> | undefined;
-    expect(style?.["--sidebar-width"]).toBe("320px");
+    expect(style?.["--sidebar-width"]).toBe("422px");
     const resizable = sidebarProps[0]?.["resizable"] as Record<string, unknown> | undefined;
-    expect(resizable?.["defaultWidth"]).toBe(320);
+    expect(resolveDefaultWidth(resizable, 1400)).toBe(422);
     await act(async () => {
       root.unmount();
     });
     container.remove();
+  });
+
+  it("shrinks the first-launch width to keep the main area's 640px minimum on a 1000px window", async () => {
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 1000 });
+    sidebarProviderProps.length = 0;
+    sidebarProps.length = 0;
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    mounted.push({ root, container });
+
+    await act(async () => {
+      root.render(<AppSidebarLayout>Workspace</AppSidebarLayout>);
+    });
+
+    const style = sidebarProviderProps[0]?.["style"] as Record<string, string> | undefined;
+    expect(style?.["--sidebar-width"]).toBe("360px");
+    // The double-click "reset to default" target fits the same way, evaluated
+    // against the wrapper's width at reset time rather than baked in here.
+    const resizable = sidebarProps[0]?.["resizable"] as Record<string, unknown> | undefined;
+    expect(resolveDefaultWidth(resizable, 1000)).toBe(360);
+  });
+
+  it("never shrinks the first-launch width below the 260px sidebar minimum", async () => {
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 700 });
+    sidebarProviderProps.length = 0;
+    sidebarProps.length = 0;
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    mounted.push({ root, container });
+
+    await act(async () => {
+      root.render(<AppSidebarLayout>Workspace</AppSidebarLayout>);
+    });
+
+    const style = sidebarProviderProps[0]?.["style"] as Record<string, string> | undefined;
+    expect(style?.["--sidebar-width"]).toBe("260px");
+    // The reset target hits the same 260px floor on an equally narrow wrapper.
+    const resizable = sidebarProps[0]?.["resizable"] as Record<string, unknown> | undefined;
+    expect(resolveDefaultWidth(resizable, 700)).toBe(260);
+  });
+
+  it("seeds the initial width from a saved value, with no flash of the default", async () => {
+    // A narrow window that would otherwise clamp an unsaved default to 360px;
+    // the saved value wins outright, painted directly on first render so
+    // there is no flash of the default before the primitive's restore effect
+    // (which still runs, harmlessly writing the same value back) corrects it.
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 1000 });
+    const readStoredSidebarWidthSpy = vi.fn(() => 500);
+    readStoredSidebarWidthMock = readStoredSidebarWidthSpy;
+    sidebarProviderProps.length = 0;
+    sidebarProps.length = 0;
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    mounted.push({ root, container });
+
+    await act(async () => {
+      root.render(<AppSidebarLayout>Workspace</AppSidebarLayout>);
+    });
+
+    const style = sidebarProviderProps[0]?.["style"] as Record<string, string> | undefined;
+    expect(style?.["--sidebar-width"]).toBe("500px");
+    // Reads and clamps through the same bounds passed to the resizable
+    // sidebar itself (`minWidth`, and no configured ceiling).
+    expect(readStoredSidebarWidthSpy).toHaveBeenCalledWith("bibcode:sidebar-width:v2", {
+      minWidth: 260,
+      maxWidth: Number.POSITIVE_INFINITY,
+    });
+  });
+
+  it("passes one shared resizable options object to every mount", async () => {
+    // A fresh object per render would defeat Sidebar's `useMemo([resizable])`,
+    // re-running the storage-restore effect (and re-reading localStorage). The
+    // React Compiler may skip re-rendering an unchanged Sidebar, so count on
+    // mounts instead: its cache is per component instance, so only a
+    // module-level object reaches two separate mounts as the same reference.
+    sidebarProps.length = 0;
+    for (const label of ["First", "Second"]) {
+      const container = document.createElement("div");
+      const root = createRoot(container);
+      mounted.push({ root, container });
+      await act(async () => {
+        root.render(<AppSidebarLayout>{label}</AppSidebarLayout>);
+      });
+    }
+
+    expect(sidebarProps.length).toBeGreaterThanOrEqual(2);
+    const first = sidebarProps[0]?.["resizable"];
+    expect(first).not.toBeUndefined();
+    for (const props of sidebarProps) {
+      expect(props["resizable"]).toBe(first);
+    }
   });
 
   it("mounts the environment rail before the panel content inside the left sidebar", async () => {

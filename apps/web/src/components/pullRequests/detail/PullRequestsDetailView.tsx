@@ -1,3 +1,7 @@
+import {
+  resolveChangeRequestPresentationForKind,
+  formatChangeRequestNumber,
+} from "@bibcode/shared/sourceControl";
 import { useAtomRefresh } from "@effect/atom-react";
 import type { EnvironmentId, PullRequestsContext, ScopedProjectRef } from "@bibcode/contracts";
 import { useNavigate } from "@tanstack/react-router";
@@ -107,6 +111,7 @@ export function PullRequestsDetailView({
     usePullRequestsStore.getState().setLastNumber(projectRef, number);
   }, [number, projectRef]);
   const vocabulary = context.capabilities.vocabulary;
+  const presentation = resolveChangeRequestPresentationForKind(context.provider);
   const labels = {
     conversation: "Conversation",
     commits: "Commits",
@@ -128,7 +133,7 @@ export function PullRequestsDetailView({
       key={JSON.stringify([scope.environmentId, scope.cwd, number])}
       scope={scope}
       number={number}
-      requestKind={vocabulary.pullRequest}
+      requestKind={presentation.longName}
       refresh={actionRefresh}
       disabledReason={mutationsDisabledReason}
     >
@@ -144,12 +149,12 @@ export function PullRequestsDetailView({
               });
             }}
           >
-            Back to {vocabulary.pullRequests}
+            Back to {presentation.pluralLongName}
           </Button>
         </div>
         <PullRequestsQueryState
           query={detailQuery}
-          label={`${vocabulary.pullRequest} ${context.capabilities.closedTabIncludesMerged ? "#" : "!"}${number}`}
+          label={`${presentation.longName} ${formatChangeRequestNumber(context.provider, number)}`}
         >
           {detail ? (
             <>
@@ -181,7 +186,7 @@ export function PullRequestsDetailView({
                 }}
               >
                 <TabsList
-                  aria-label={`${vocabulary.pullRequest} sections`}
+                  aria-label={`${presentation.longName} sections`}
                   className="mx-4 max-w-full shrink-0 overflow-x-auto"
                 >
                   {(Object.keys(labels) as PullRequestsDetailTab[]).map((value) => (

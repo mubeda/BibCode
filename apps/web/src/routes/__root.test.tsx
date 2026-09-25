@@ -25,6 +25,7 @@ const s = vi.hoisted(() => ({
   primaryEnvironment: null as unknown,
   project: null as unknown,
   activeEnvironmentId: null as string | null,
+  selectionAtoms: new Map<unknown, string>(),
   setActiveCalls: [] as string[],
   settings: {} as Record<string, unknown>,
   logicalKey: null as string | null,
@@ -47,10 +48,12 @@ const s = vi.hoisted(() => ({
 const hk = vi.hoisted(() => ({
   effects: [] as Array<() => void | (() => void)>,
   refs: [] as Array<{ current: unknown }>,
+  refCursor: 0,
   setStateCalls: [] as Array<{ next: unknown; applied: unknown }>,
   reset() {
     hk.effects.length = 0;
     hk.refs.length = 0;
+    hk.refCursor = 0;
     hk.setStateCalls.length = 0;
   },
 }));
@@ -72,8 +75,9 @@ vi.mock("react", async (importOriginal) => {
     hk.effects.push(effect);
   };
   const useRef = (initial?: unknown) => {
-    const ref = { current: initial ?? null };
-    hk.refs.push(ref);
+    const index = hk.refCursor++;
+    const ref = hk.refs[index] ?? { current: initial ?? null };
+    hk.refs[index] = ref;
     return ref;
   };
   const useEffectEvent = (fn: (...args: never[]) => unknown) => fn;
@@ -120,12 +124,27 @@ vi.mock("../state/environments", () => ({
   usePrimaryEnvironment: () => s.primaryEnvironment,
 }));
 
-vi.mock("../state/entities", () => ({
-  readProject: () => s.project,
-  setActiveEnvironmentId: (environmentId: string) => {
-    s.setActiveCalls.push(environmentId);
+vi.mock("../state/projects", () => ({ environmentProjects: {} }));
+vi.mock("../state/threads", () => ({ environmentThreadDetails: {}, environmentThreadShells: {} }));
+vi.mock("../rpc/atomRegistry", () => ({
+  appAtomRegistry: {
+    get: (atom: unknown) =>
+      atom === activeEnvironmentIdAtom
+        ? s.activeEnvironmentId
+        : (s.selectionAtoms.get(atom) ?? null),
+    set: (atom: unknown, environmentId: string) => {
+      if (atom === activeEnvironmentIdAtom) {
+        s.setActiveCalls.push(environmentId);
+        s.activeEnvironmentId = environmentId;
+      } else {
+        s.selectionAtoms.set(atom, environmentId);
+      }
+    },
   },
-  useActiveEnvironmentId: () => s.activeEnvironmentId,
+}));
+vi.mock("../state/entities", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../state/entities")>()),
+  readProject: () => s.project,
 }));
 
 vi.mock("../state/server", () => ({
@@ -252,12 +271,14 @@ vi.mock("../components/SlowRpcRequestToastCoordinator", () => ({
 }));
 
 import { Route } from "./__root";
+import { activeEnvironmentIdAtom } from "../state/entities";
 
 // ── Helpers ──────────────────────────────────────────────────────────
 type RootComponent = () => ReactNode;
 
-function renderComponent(): string {
-  hk.reset();
+function renderComponent(rerender = false): string {
+  if (!rerender) hk.reset();
+  hk.refCursor = 0;
   const Component = Route.options.component as RootComponent;
   return renderToStaticMarkup(<Component />);
 }
@@ -296,6 +317,7 @@ beforeEach(() => {
   s.primaryEnvironment = null;
   s.project = null;
   s.activeEnvironmentId = null;
+  s.selectionAtoms.clear();
   s.setActiveCalls.length = 0;
   s.settings = {};
   s.logicalKey = null;
@@ -561,6 +583,99 @@ describe("EventRouter", () => {
     expect(s.setActiveCalls).toContain("env-1");
   });
 
+  it("keeps the user's rail selection through later primary config emissions", () => {
+    // First load: nothing is selected yet, so the primary becomes active.
+    s.atomValues.set("config", seedServerConfig());
+    renderComponent();
+    runEffects();
+    expect(s.setActiveCalls).toEqual(["env-1"]);
+
+    // The user selects a remote, then the primary streams a routine
+    // providerStatuses update: a new config object for the same environment.
+    s.activeEnvironmentId = "env-remote";
+    s.atomValues.set("config", seedServerConfig({ providers: [] }));
+    renderComponent();
+    runEffects();
+
+    expect(s.setActiveCalls).toEqual(["env-1"]);
+  });
+
+  it.each(["/", "/agents"])("follows a primary identity change on %s", (pathname) => {
+    s.pathname = pathname;
+    s.atomValues.set("config", seedServerConfig());
+    renderComponent();
+    runEffects();
+    expect(s.activeEnvironmentId).toBe("env-1");
+
+    s.atomValues.set("config", seedServerConfig({ environment: { environmentId: "env-2" } }));
+    renderComponent(true);
+    runEffects();
+    expect(s.activeEnvironmentId).toBe("env-2");
+  });
+
+  it("keeps a selected remote when the primary identity changes", () => {
+    s.atomValues.set("config", seedServerConfig());
+    renderComponent();
+    runEffects();
+    s.activeEnvironmentId = "env-remote";
+
+    s.atomValues.set("config", seedServerConfig({ environment: { environmentId: "env-2" } }));
+    renderComponent(true);
+    runEffects();
+    expect(s.activeEnvironmentId).toBe("env-remote");
+  });
+
+  it.each([
+    { selected: "env-1", expected: "env-2" },
+    { selected: "env-remote", expected: "env-remote" },
+  ])("reconciles $selected across an auth-gate remount", ({ selected, expected }) => {
+    s.atomValues.set("config", seedServerConfig());
+    renderComponent();
+    runEffects();
+    s.activeEnvironmentId = selected;
+
+    s.routeContext = { authGateState: { status: "unauthenticated" } };
+    s.atomValues.set("config", null);
+    renderComponent();
+    runEffects();
+
+    s.routeContext = { authGateState: { status: "authenticated" } };
+    s.atomValues.set("config", seedServerConfig({ environment: { environmentId: "env-2" } }));
+    renderComponent();
+    runEffects();
+    expect(s.activeEnvironmentId).toBe(expected);
+  });
+
+  it("keeps the user's rail selection when the primary lifecycle welcome repeats", async () => {
+    // A primary reconnect re-delivers the welcome after the user picked a remote.
+    s.activeEnvironmentId = "env-remote";
+    s.atomValues.set("welcome", {
+      environment: { environmentId: "env-1" },
+      bootstrapProjectId: null,
+      bootstrapThreadId: null,
+    });
+
+    renderComponent();
+    runEffects();
+    await flush();
+
+    expect(s.setActiveCalls).toEqual([]);
+  });
+
+  it("does not navigate away from a remote selected before the primary welcome", async () => {
+    s.activeEnvironmentId = "env-remote";
+    s.atomValues.set("welcome", {
+      environment: { environmentId: "env-1" },
+      bootstrapProjectId: "proj-1",
+      bootstrapThreadId: "thread-1",
+    });
+    renderComponent();
+    runEffects();
+    await flush();
+    expect(s.activeEnvironmentId).toBe("env-remote");
+    expect(s.navigateCalls).toEqual([]);
+  });
+
   it("handles a welcome payload by expanding the project and navigating", async () => {
     s.pathname = "/";
     s.project = { id: "proj-1" };
@@ -698,6 +813,17 @@ describe("bootstrap effects", () => {
     renderComponent();
     runEffects();
     expect(s.setActiveCalls).toContain("env-saved");
+  });
+
+  it("keeps a user selection made between hosted bootstrap render and its effect", () => {
+    s.routeContext = { authGateState: { status: "hosted-static" } };
+    s.environments = [
+      { environmentId: "env-saved", entry: { target: { _tag: "BearerConnectionTarget" } } },
+    ];
+    renderComponent();
+    s.activeEnvironmentId = "env-remote";
+    runEffects();
+    expect(s.activeEnvironmentId).toBe("env-remote");
   });
 
   it("does not override the active environment when a primary target exists", () => {
