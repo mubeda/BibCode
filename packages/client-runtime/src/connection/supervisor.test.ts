@@ -53,6 +53,14 @@ const RELAY_ENTRY: ConnectionCatalogEntry = {
   profile: Option.none(),
 };
 
+const makeSupervisor = Effect.fn("TestConnectionHarness.makeSupervisor")(function* (
+  entry: ConnectionCatalogEntry,
+  options?: Pick<EnvironmentSupervisor.EnvironmentSupervisorOptions, "initiallyDesired">,
+) {
+  const targetRef = yield* Ref.make(entry.target);
+  return yield* EnvironmentSupervisor.make(entry, { ...options, targetRef });
+});
+
 const PREPARED_CONNECTION: PreparedConnection = {
   environmentId: TARGET.environmentId,
   label: TARGET.label,
@@ -403,7 +411,7 @@ describe("EnvironmentSupervisor", () => {
   it.effect("blocks a changed store before opening or synchronizing the RPC session", () =>
     Effect.gen(function* () {
       const harness = yield* makeStorageIdentityHarness("store-a", "store-b");
-      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY, {
         initiallyDesired: true,
       }).pipe(Effect.provide(harness.dependencies));
 
@@ -430,7 +438,7 @@ describe("EnvironmentSupervisor", () => {
   it.effect("persists the first reported store before opening the RPC session", () =>
     Effect.gen(function* () {
       const harness = yield* makeStorageIdentityHarness(null, "store-a");
-      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY, {
         initiallyDesired: true,
       }).pipe(Effect.provide(harness.dependencies));
 
@@ -448,7 +456,7 @@ describe("EnvironmentSupervisor", () => {
   it.effect("opens one RPC session when the reported store matches the accepted store", () =>
     Effect.gen(function* () {
       const harness = yield* makeStorageIdentityHarness("store-a", "store-a");
-      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY, {
         initiallyDesired: true,
       }).pipe(Effect.provide(harness.dependencies));
 
@@ -469,7 +477,7 @@ describe("EnvironmentSupervisor", () => {
         ),
         sessionReportedStorageInstanceId: "store-b",
       });
-      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY, {
         initiallyDesired: true,
       }).pipe(Effect.provide(harness.dependencies));
 
@@ -509,7 +517,7 @@ describe("EnvironmentSupervisor", () => {
       const harness = yield* makeStorageIdentityHarness(null, "store-a", {
         failAcceptance: true,
       });
-      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY, {
         initiallyDesired: true,
       }).pipe(Effect.provide(harness.dependencies));
 
@@ -533,7 +541,7 @@ describe("EnvironmentSupervisor", () => {
   it.effect("keeps an accepted store when an older server reports no storage identity", () =>
     Effect.gen(function* () {
       const harness = yield* makeStorageIdentityHarness("store-a", null);
-      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY, {
         initiallyDesired: true,
       }).pipe(Effect.provide(harness.dependencies));
 
@@ -550,7 +558,7 @@ describe("EnvironmentSupervisor", () => {
   it.effect("does not attempt a connection until it is desired", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness();
-      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY).pipe(
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY).pipe(
         Effect.provide(harness.dependencies),
       );
 
@@ -562,7 +570,7 @@ describe("EnvironmentSupervisor", () => {
   it.effect("does not let the initial connect signal cancel the first attempt", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness();
-      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY).pipe(
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY).pipe(
         Effect.provide(harness.dependencies),
       );
 
@@ -577,7 +585,7 @@ describe("EnvironmentSupervisor", () => {
   it.effect("waits while offline and connects immediately when the network returns", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({ networkStatus: "offline" });
-      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY, {
         initiallyDesired: true,
       }).pipe(Effect.provide(harness.dependencies));
 
@@ -604,7 +612,7 @@ describe("EnvironmentSupervisor", () => {
       const harness = yield* makeHarness({
         prepare: () => Effect.fail(transient()),
       });
-      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY, {
         initiallyDesired: true,
       }).pipe(Effect.provide(harness.dependencies));
 
@@ -632,7 +640,7 @@ describe("EnvironmentSupervisor", () => {
         prepare: (attempt) =>
           attempt === 1 ? Effect.fail(transient("Relay connection timed out.")) : Effect.never,
       });
-      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY, {
         initiallyDesired: true,
       }).pipe(Effect.provide(harness.dependencies));
 
@@ -665,7 +673,7 @@ describe("EnvironmentSupervisor", () => {
       const harness = yield* makeHarness({
         ready: () => Effect.never,
       });
-      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY, {
         initiallyDesired: true,
       }).pipe(Effect.provide(harness.dependencies));
 
@@ -697,7 +705,7 @@ describe("EnvironmentSupervisor", () => {
       const harness = yield* makeHarness({
         prepare: () => Effect.never,
       });
-      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY, {
         initiallyDesired: true,
       }).pipe(Effect.provide(harness.dependencies));
 
@@ -729,7 +737,7 @@ describe("EnvironmentSupervisor", () => {
             ? Effect.die(new Error("Native transport defect."))
             : Effect.succeed(PREPARED_CONNECTION),
       });
-      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY, {
         initiallyDesired: true,
       }).pipe(Effect.provide(harness.dependencies));
 
@@ -757,7 +765,7 @@ describe("EnvironmentSupervisor", () => {
         prepare: (attempt) =>
           attempt === 1 ? Effect.fail(transient()) : Effect.succeed(PREPARED_CONNECTION),
       });
-      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY, {
         initiallyDesired: true,
       }).pipe(Effect.provide(harness.dependencies));
 
@@ -775,7 +783,7 @@ describe("EnvironmentSupervisor", () => {
         prepare: (attempt) =>
           attempt === 1 ? Effect.fail(blocked()) : Effect.succeed(PREPARED_CONNECTION),
       });
-      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY, {
         initiallyDesired: true,
       }).pipe(Effect.provide(harness.dependencies));
 
@@ -792,7 +800,7 @@ describe("EnvironmentSupervisor", () => {
   it.effect("releases a live session while offline and starts a new generation when online", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness();
-      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY, {
         initiallyDesired: true,
       }).pipe(Effect.provide(harness.dependencies));
 
@@ -821,7 +829,7 @@ describe("EnvironmentSupervisor", () => {
         prepare: (attempt) =>
           attempt === 1 ? Effect.fail(blocked()) : Effect.succeed(PREPARED_CONNECTION),
       });
-      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY, {
         initiallyDesired: true,
       }).pipe(Effect.provide(harness.dependencies));
 
@@ -840,7 +848,7 @@ describe("EnvironmentSupervisor", () => {
         prepare: () =>
           Deferred.succeed(firstAttemptStarted, undefined).pipe(Effect.andThen(Effect.never)),
       });
-      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY, {
         initiallyDesired: true,
       }).pipe(Effect.provide(harness.dependencies));
 
@@ -878,7 +886,7 @@ describe("EnvironmentSupervisor", () => {
   it.effect("treats an involuntary session close as transient and reconnects", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness();
-      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY, {
         initiallyDesired: true,
       }).pipe(Effect.provide(harness.dependencies));
 
@@ -904,7 +912,7 @@ describe("EnvironmentSupervisor", () => {
   it.effect("keeps escalating backoff when a newly opened session flaps", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness();
-      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY, {
         initiallyDesired: true,
       }).pipe(Effect.provide(harness.dependencies));
 
@@ -950,7 +958,7 @@ describe("EnvironmentSupervisor", () => {
             Effect.andThen(Deferred.succeed(probed, undefined)),
           ),
       });
-      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY, {
         initiallyDesired: true,
       }).pipe(Effect.provide(harness.dependencies));
       yield* awaitState(supervisor.state, (state) => state.phase === "connected");
@@ -973,7 +981,7 @@ describe("EnvironmentSupervisor", () => {
             Effect.andThen(Deferred.succeed(probeCalled, undefined)),
           ),
       });
-      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY, {
         initiallyDesired: true,
       }).pipe(Effect.provide(harness.dependencies));
 
@@ -994,7 +1002,7 @@ describe("EnvironmentSupervisor", () => {
         probe: (attempt) =>
           attempt === 1 ? Effect.fail(transient("The live session is stale.")) : Effect.void,
       });
-      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY, {
         initiallyDesired: true,
       }).pipe(Effect.provide(harness.dependencies));
 
@@ -1017,7 +1025,7 @@ describe("EnvironmentSupervisor", () => {
       const harness = yield* makeHarness({
         probe: (attempt) => (attempt === 1 ? Effect.never : Effect.void),
       });
-      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY, {
         initiallyDesired: true,
       }).pipe(Effect.provide(harness.dependencies));
 
@@ -1042,7 +1050,7 @@ describe("EnvironmentSupervisor", () => {
       const harness = yield* makeHarness({
         probe: () => Deferred.succeed(probeStarted, undefined).pipe(Effect.andThen(Effect.never)),
       });
-      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY, {
         initiallyDesired: true,
       }).pipe(Effect.provide(harness.dependencies));
 
@@ -1059,7 +1067,7 @@ describe("EnvironmentSupervisor", () => {
   it.effect("does not churn a healthy session when credentials change", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness();
-      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY, {
         initiallyDesired: true,
       }).pipe(Effect.provide(harness.dependencies));
 
@@ -1076,7 +1084,7 @@ describe("EnvironmentSupervisor", () => {
   it.effect("releases and reconnects a relay session when credentials change", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness();
-      const supervisor = yield* EnvironmentSupervisor.make(RELAY_ENTRY, {
+      const supervisor = yield* makeSupervisor(RELAY_ENTRY, {
         initiallyDesired: true,
       }).pipe(Effect.provide(harness.dependencies));
 
@@ -1101,7 +1109,7 @@ describe("EnvironmentSupervisor", () => {
             ? Deferred.succeed(firstAttemptStarted, undefined).pipe(Effect.andThen(Effect.never))
             : Effect.succeed(PREPARED_CONNECTION),
       });
-      const supervisor = yield* EnvironmentSupervisor.make(RELAY_ENTRY, {
+      const supervisor = yield* makeSupervisor(RELAY_ENTRY, {
         initiallyDesired: true,
       }).pipe(Effect.provide(harness.dependencies));
 
@@ -1117,7 +1125,7 @@ describe("EnvironmentSupervisor", () => {
   it.effect("explicit disconnect releases the session and returns to available", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness();
-      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY, {
         initiallyDesired: true,
       }).pipe(Effect.provide(harness.dependencies));
 
@@ -1134,7 +1142,7 @@ describe("EnvironmentSupervisor", () => {
   it.effect("does not lose an explicit disconnect among concurrent wakeup signals", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness();
-      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY, {
         initiallyDesired: true,
       }).pipe(Effect.provide(harness.dependencies));
 

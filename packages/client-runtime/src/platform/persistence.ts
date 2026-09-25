@@ -11,7 +11,7 @@ import * as Schema from "effect/Schema";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 
 import type { ConnectionCatalogEntry, ConnectionRegistration } from "../connection/catalog.ts";
-import type { ConnectionTarget } from "../connection/model.ts";
+import type { ConnectionTarget, PersistedConnectionTarget } from "../connection/model.ts";
 
 export class ConnectionPersistenceError extends Schema.TaggedError<ConnectionPersistenceError>()(
   "ConnectionPersistenceError",
@@ -20,6 +20,7 @@ export class ConnectionPersistenceError extends Schema.TaggedError<ConnectionPer
       "list-targets",
       "register-connection",
       "remove-connection",
+      "rename-connection",
       "load-shell",
       "save-shell",
       "load-thread",
@@ -56,6 +57,16 @@ export class ConnectionRegistrationStore extends Context.Service<
       registration: ConnectionRegistration,
     ) => Effect.Effect<ConnectionRegistrationRemovalResult, ConnectionPersistenceError>;
     readonly remove: (target: ConnectionTarget) => Effect.Effect<void, ConnectionPersistenceError>;
+    /**
+     * Rewrites only the saved display label of one persisted target in a single
+     * catalog transition, leaving its profile, credential, tokens, and accepted
+     * identity untouched. Returns the durable target, or none when the
+     * environment is not saved.
+     */
+    readonly relabel: (
+      environmentId: EnvironmentId,
+      label: string,
+    ) => Effect.Effect<Option.Option<PersistedConnectionTarget>, ConnectionPersistenceError>;
   }
 >()("@bibcode/client-runtime/platform/persistence/ConnectionRegistrationStore") {}
 

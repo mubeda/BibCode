@@ -20,6 +20,27 @@ use crate::static_assets::{StaticDirError, StaticDirSource, resolve_static_dir};
 
 pub const DEFAULT_PORT: u16 = 3773;
 
+/// The label desktop-owned servers declare, and the default for embedders that
+/// build a [`ServerConfig`] directly.
+const LOCAL_ENVIRONMENT_LABEL: &str = "Local";
+
+/// This machine's hostname, trimmed, or `None` when the host reports none.
+pub(crate) fn machine_host_name() -> Option<String> {
+    non_blank_host_name(sysinfo::System::host_name())
+}
+
+fn non_blank_host_name(host_name: Option<String>) -> Option<String> {
+    host_name
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+}
+
+/// A headless server names itself after its machine, so other devices can
+/// tell it apart from their own "Local" environment.
+fn headless_environment_label(host_name: Option<String>) -> String {
+    host_name.unwrap_or_else(|| LOCAL_ENVIRONMENT_LABEL.to_owned())
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 pub enum ServerMode {
     Desktop,
@@ -88,7 +109,7 @@ impl ServerConfig {
             desktop_wsl_transport: false,
             unsafe_no_auth: false,
             environment_id: "local".to_owned(),
-            environment_label: "Local".to_owned(),
+            environment_label: LOCAL_ENVIRONMENT_LABEL.to_owned(),
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
             storage_instance_id: None,
             remote_update_support: RemoteUpdateSupport::manual(),
@@ -220,6 +241,67 @@ mod tests {
             .into_server_config()
             .expect("build disabled startup offer config");
         assert!(!disabled.startup_pairing_offer);
+    }
+
+    #[test]
+    fn headless_server_declares_its_hostname_as_the_environment_label() {
+        let config = Cli::try_parse_from(["bibcode", "serve"])
+            .expect("parse serve CLI")
+            .into_server_config()
+            .expect("build serve config");
+        let hostname = machine_host_name();
+
+        assert_eq!(config.mode, ServerMode::Web);
+        assert_eq!(
+            config.environment_label,
+            hostname.unwrap_or_else(|| "Local".to_owned())
+        );
+    }
+
+    #[test]
+    fn browser_launching_commands_keep_the_local_environment_label() {
+        for args in [
+            vec!["bibcode"],
+            vec!["bibcode", "start"],
+            vec!["bibcode", "start", "--no-browser"],
+        ] {
+            let config = Cli::try_parse_from(args)
+                .expect("parse browser CLI")
+                .into_server_config()
+                .expect("build browser config");
+            assert_eq!(config.mode, ServerMode::Web);
+            assert_eq!(config.environment_label, "Local");
+        }
+    }
+
+    #[test]
+    fn host_names_are_trimmed_and_a_missing_name_keeps_the_local_label() {
+        assert_eq!(
+            non_blank_host_name(Some("  ai-server\n".to_owned())),
+            Some("ai-server".to_owned())
+        );
+        assert_eq!(non_blank_host_name(Some(" \t ".to_owned())), None);
+        assert_eq!(non_blank_host_name(None), None);
+        assert_eq!(
+            headless_environment_label(Some("ai-server".to_owned())),
+            "ai-server"
+        );
+        assert_eq!(headless_environment_label(None), "Local");
+    }
+
+    #[test]
+    fn desktop_mode_and_embedded_servers_keep_the_local_environment_label() {
+        let desktop = Cli::try_parse_from(["bibcode", "--mode", "desktop", "serve"])
+            .expect("parse desktop serve CLI")
+            .into_server_config()
+            .expect("build desktop serve config");
+
+        assert_eq!(desktop.mode, ServerMode::Desktop);
+        assert_eq!(desktop.environment_label, "Local");
+        assert_eq!(
+            ServerConfig::new("/tmp/bibcode-test").environment_label,
+            "Local"
+        );
     }
 
     #[test]
@@ -861,6 +943,11 @@ impl Cli {
         .with_bind(host, port);
         config.data_root_request = data_root_request;
         config.mode = mode;
+        // Only headless web servers name themselves after the machine. Browser
+        // launches and desktop-owned backends remain this device's "Local".
+        if headless && mode == ServerMode::Web {
+            config.environment_label = headless_environment_label(machine_host_name());
+        }
         let current_executable = match executable {
             Some(executable) => executable.to_path_buf(),
             None => std::env::current_exe().map_err(ConfigError::CurrentExecutable)?,

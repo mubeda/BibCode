@@ -86,6 +86,30 @@ then saves the result in the existing bearer target and profile `label` fields.
 The environment rail and saved-server list use the catalog target label, which
 survives catalog hydration and reconnects. The alias does not change the remote
 descriptor, environment identity, pairing credential, or server-side name.
+Without an alias the label is the offer's name or the descriptor label; a
+headless web-mode `bibcode serve` server declares its hostname there (see
+[Remote architecture](./remote.md#design-rules)).
+
+**Rename…** in **Settings → Remote Servers** rewrites that same target label
+for a saved bearer, relay, or SSH environment through
+`EnvironmentRegistry.rename`. The label is trimmed and must not be blank. One
+catalog transition (`ConnectionRegistrationStore.relabel`) replaces only the
+target label in place, so no persisted field or schema change is involved and
+profiles, credentials, DPoP tokens, and accepted identities stay as saved. The
+registry then republishes the entry without installing a runtime: the live
+supervisor, its session, desired intent, and every followed stream are kept, so
+a rename neither reconnects nor resynchronizes. The registry maintains
+`serviceScopes[id].entry === entries[id]` for every installed scope; rename
+updates both references together and updates the supervisor's target Ref. The
+Settings row title, rail entry and avatar initials, and selected server's
+workspace card use the saved label. Disconnect reasons and storage-identity
+errors still use `PreparedConnection.label`, the server's reported name. When
+a test server is paused, the visible disconnect reason uses that server name,
+followed by an endpoint timeout; the health-check message does not become
+visible in this scenario.
+A failed or missing durable relabel leaves all runtime and persisted-target
+bookkeeping unchanged. Platform-managed environments (the primary and
+desktop-local backends) are named by their host and cannot be renamed.
 
 ## Pinned direct profiles and sessions
 
@@ -405,6 +429,17 @@ grouped per the `DESKTOP_LOCAL_CONNECTION_ID_PREFIX` convention) and one entry
 per saved remote environment. Selection writes `activeEnvironmentIdAtom` and
 scopes _presentation only_: the panel filters which environments' projects and
 threads it shows, and **Add project** targets the selected environment.
+The web entities module remembers the previous non-null primary identity in a
+keep-alive atom, so it survives an authentication-gate remount without being
+persisted across app reloads. The root reconciles that identity when its primary
+config identity changes. On first load it selects the primary only if nothing
+is selected; on an identity change it follows the new
+primary only if nothing or the old primary is selected. This also runs on
+`/agents` and with the mobile rail closed. Routine config emissions and repeated
+welcomes preserve any other selection. Startup defaults read the current entity
+atom when they run, and welcome navigation requires that the primary is still
+selected. A selected saved environment that leaves the catalog falls back to
+Local in the rail.
 When the target cannot use the native folder dialog, the dialog embeds
 `RemoteDirectoryBrowser`, which lists directories through the read-scoped
 `filesystem.browse` RPC on that environment's server, while its **New folder**
@@ -436,8 +471,19 @@ decision.
 Subscription acquisition resolves the current supervisor session. When a
 connection is replaced after disconnect or reconnect, the session switch ends
 the old stream and subscribes again through the new session. Replacing an
-environment registration follows the same scoped switch. Window focus and
-document visibility request one single-flight refresh per distinct physical
+environment registration follows the same scoped switch: followed streams
+re-bind whenever the registry installs a runtime for the environment
+(registration, platform reconciliation, rollback replacement, or detected
+catalog drift, even of an identical entry). Registry publication helpers own
+entries and their installation tokens: installs advance the token, removals
+delete it, and metadata-only renames preserve it. Replacements, including
+catalog drift, use the same lease-locked order: close the old scope, publish
+the entry and new token, then create the replacement supervisor. Followers wait
+for their first registration. Removal releases the inner subscription and
+switches to an empty stream while the follower keeps waiting; registering the
+same environment ID again re-binds it to the new supervisor. They key on the
+installation token, not the catalog entry, so a rename leaves them subscribed.
+Window focus and document visibility request one single-flight refresh per distinct physical
 project, even if several rows or panels render it.
 
 Managed creation, panel creation, retargeting, adoption, policy, and removal

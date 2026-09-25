@@ -3,8 +3,10 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { createRoot, type Root } from "react-dom/client";
 import { Window } from "happy-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Option from "effect/Option";
+import { AsyncResult } from "effect/unstable/reactivity";
 import {
   type AdvertisedEndpoint,
   type AuthClientSession,
@@ -84,6 +86,7 @@ const h = vi.hoisted(() => {
     },
     nullQuery: {
       data: null as unknown,
+      emission: { _tag: "Initial", waiting: false } as unknown,
       error: null as string | null,
       isPending: false,
       refresh: vi.fn(),
@@ -113,6 +116,7 @@ const h = vi.hoisted(() => {
       refresh: vi.fn(),
     },
     remoteUpdateQueries: new Map<string, Record<string, unknown>>(),
+    remoteUpdateCheckStates: new Map<string, unknown>(),
     atoms: {
       desktopNetworkAccess: Symbol("desktopNetworkAccessStateAtom"),
       desktopSshHosts: Symbol("desktopSshHostsStateAtom"),
@@ -124,6 +128,7 @@ const h = vi.hoisted(() => {
       catalogConnect: Symbol("environmentCatalog.connect"),
       catalogDisconnect: Symbol("environmentCatalog.disconnect"),
       catalogRemove: Symbol("environmentCatalog.remove"),
+      catalogRename: Symbol("environmentCatalog.rename"),
       catalogRetryNow: Symbol("environmentCatalog.retryNow"),
       relayRefresh: Symbol("relayEnvironmentDiscovery.refresh"),
       linkPrimary: Symbol("linkPrimaryEnvironment"),
@@ -139,6 +144,7 @@ const h = vi.hoisted(() => {
       connect: vi.fn(),
       disconnect: vi.fn(),
       remove: vi.fn(),
+      rename: vi.fn(),
       retryNow: vi.fn(),
       relayRefresh: vi.fn(),
       link: vi.fn(),
@@ -296,6 +302,7 @@ vi.mock("~/connection/catalog", () => ({
     connect: h.atoms.catalogConnect,
     disconnect: h.atoms.catalogDisconnect,
     remove: h.atoms.catalogRemove,
+    rename: h.atoms.catalogRename,
     retryNow: h.atoms.catalogRetryNow,
   },
 }));
@@ -358,6 +365,11 @@ vi.mock("~/state/remoteUpdates", () => ({
     check: h.atoms.remoteUpdateCheck,
     install: h.atoms.remoteUpdateInstall,
   },
+  useRemoteUpdateCheckState: (environmentId: string | null) =>
+    (environmentId === null ? undefined : h.remoteUpdateCheckStates.get(environmentId)) ?? {
+      inFlight: false,
+      failure: null,
+    },
 }));
 
 vi.mock("~/state/environments", () => ({
@@ -383,6 +395,7 @@ vi.mock("../../../state/use-atom-command", () => ({
     if (atom === h.atoms.catalogConnect) return h.commands.connect;
     if (atom === h.atoms.catalogDisconnect) return h.commands.disconnect;
     if (atom === h.atoms.catalogRemove) return h.commands.remove;
+    if (atom === h.atoms.catalogRename) return h.commands.rename;
     if (atom === h.atoms.catalogRetryNow) return h.commands.retryNow;
     if (atom === h.atoms.relayRefresh) return h.commands.relayRefresh;
     if (atom === h.atoms.linkPrimary) return h.commands.link;
@@ -441,7 +454,13 @@ vi.mock("../../ui/button", () => ({
       props,
     });
     return (
-      <button type="button" data-variant={String(props.variant)} disabled={Boolean(props.disabled)}>
+      <button
+        type={(props.type as "button" | "submit" | "reset" | undefined) ?? "button"}
+        form={props.form as string | undefined}
+        data-variant={String(props.variant)}
+        disabled={Boolean(props.disabled)}
+        onClick={props.onClick as (() => void) | undefined}
+      >
         {props.children as ReactNode}
       </button>
     );
@@ -457,6 +476,7 @@ vi.mock("../../ui/input", () => ({
     });
     return (
       <input
+        aria-label={props["aria-label"] as string | undefined}
         placeholder={props.placeholder as string | undefined}
         readOnly
         defaultValue={props.value as string | undefined}
@@ -478,7 +498,14 @@ vi.mock("../../ui/dialog", () => ({
     return <div data-dialog>{props.children as ReactNode}</div>;
   },
   DialogTrigger: (props: AnyProps) => renderSlot(props.render, props.children),
-  DialogPopup: (props: AnyProps) => <div data-dialog-popup>{props.children as ReactNode}</div>,
+  DialogPopup: (props: AnyProps) => (
+    <div
+      data-dialog-popup
+      onKeyDown={props.onKeyDown as React.KeyboardEventHandler<HTMLDivElement> | undefined}
+    >
+      {props.children as ReactNode}
+    </div>
+  ),
   DialogHeader: (props: AnyProps) => <div>{props.children as ReactNode}</div>,
   DialogTitle: (props: AnyProps) => <h2>{props.children as ReactNode}</h2>,
   DialogDescription: (props: AnyProps) => <p>{props.children as ReactNode}</p>,
@@ -892,6 +919,33 @@ function endpoint(input: {
   };
 }
 
+const UP_TO_DATE_SNAPSHOT = {
+  serverVersion: "0.4.2",
+  latestVersion: null,
+  state: "up-to-date",
+  error: null,
+  support: { installMode: "interactive", reason: "available" },
+} as const;
+
+function updateCapableConfig() {
+  return {
+    environment: {
+      serverVersion: "0.4.2",
+      capabilities: { remoteUpdateControl: true },
+    },
+  };
+}
+
+function settledUpdateQuery(data: unknown) {
+  return {
+    data,
+    emission: AsyncResult.success(data),
+    error: null,
+    isPending: false,
+    refresh: vi.fn(),
+  };
+}
+
 interface TestConnection {
   readonly phase: string;
   readonly error?: unknown;
@@ -1016,12 +1070,19 @@ beforeEach(() => {
     defaultAdvertisedEndpointKey: null,
     setDefaultAdvertisedEndpointKey: vi.fn(),
   };
-  h.nullQuery = { data: null, error: null, isPending: false, refresh: vi.fn() };
+  h.nullQuery = {
+    data: null,
+    emission: { _tag: "Initial", waiting: false },
+    error: null,
+    isPending: false,
+    refresh: vi.fn(),
+  };
   h.networkAccessQuery = { data: null, error: null, isPending: false, refresh: vi.fn() };
   h.sshHostsQuery = { data: null, error: null, isPending: false, refresh: vi.fn() };
   h.wslQuery = { data: null, error: null, isPending: false, refresh: vi.fn() };
   h.accessChangesQuery = { data: null, error: null, isPending: false, refresh: vi.fn() };
   h.remoteUpdateQueries.clear();
+  h.remoteUpdateCheckStates.clear();
   for (const command of Object.values(h.commands)) {
     command.mockReset();
     command.mockResolvedValue(success(undefined));
@@ -1456,6 +1517,263 @@ describe("Remote Servers tabs", () => {
     expect(h.commands.remove).not.toHaveBeenCalled();
   });
 
+  describe("Rename flow", () => {
+    const serverNameInput = () =>
+      h.controls.findLast(
+        (entry) => entry.kind === "input" && entry.props["aria-label"] === "Server name",
+      )!;
+    const saveButton = () => findControls("button", "Save").at(-1)!;
+    const buttonIn = (container: HTMLElement, label: string) =>
+      Array.from(container.querySelectorAll("button")).find(
+        (button) => button.textContent === label,
+      )!;
+
+    function renderRenamableServer() {
+      stubBrowserWindow();
+      h.hasCloudConfig = false;
+      h.environments = [
+        environment({
+          id: "env-1",
+          label: "ai-server",
+          targetTag: "BearerConnectionTarget",
+          connection: { phase: "connected" },
+          serverConfig: { environment: { label: "ai-server" } },
+        }),
+      ];
+      return mountConnections(<ConnectTab />);
+    }
+
+    it("renames a saved server from its row menu with the current name prefilled", async () => {
+      const container = await renderRenamableServer();
+      expect(container.textContent).not.toContain("Rename server");
+
+      await act(async () => {
+        invoke(control("menu-item", "Rename…"), "onClick");
+      });
+      expect(container.textContent).toContain("Rename server");
+      expect(container.textContent).toContain("The new name shows on this device only.");
+      expect(serverNameInput().props.value).toBe("ai-server");
+      // The server's own name is the current name, so there is nothing to restore.
+      expect(container.textContent).not.toContain("Use the server’s name");
+
+      await act(async () => {
+        invoke(serverNameInput(), "onChange", { target: { value: "  GPU box " } });
+      });
+      await act(async () => {
+        buttonIn(container, "Save").click();
+        await flush();
+      });
+
+      expect(h.commands.rename).toHaveBeenCalledExactlyOnceWith({
+        environmentId: EnvironmentId.make("env-1"),
+        label: "GPU box",
+      });
+      expect(h.commands.remove).not.toHaveBeenCalled();
+      expect(container.textContent).not.toContain("Rename server");
+    });
+
+    it("associates Save with the name field's form and saves through requestSubmit", async () => {
+      const container = await renderRenamableServer();
+      await act(async () => {
+        invoke(control("menu-item", "Rename…"), "onClick");
+      });
+      await act(async () => {
+        invoke(serverNameInput(), "onChange", { target: { value: "  GPU box  " } });
+      });
+      const input = container.querySelector<HTMLInputElement>('[aria-label="Server name"]')!;
+      const save = buttonIn(container, "Save");
+      const form = input.form!;
+      expect(form.id).not.toBe("");
+      expect(save.getAttribute("form")).toBe(form.id);
+      expect(save.form).toBe(form);
+      await act(async () => {
+        input.focus();
+        const submit = input.dispatchEvent(
+          new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }),
+        );
+        // Happy DOM does not synthesize Enter's implicit form submission.
+        if (submit) form.requestSubmit(save);
+        await flush();
+      });
+      expect(h.commands.rename).toHaveBeenCalledExactlyOnceWith({
+        environmentId: EnvironmentId.make("env-1"),
+        label: "GPU box",
+      });
+      expect(container.textContent).not.toContain("Rename server");
+    });
+
+    it("explains a blank name and offers the server's own name back", async () => {
+      const container = await renderRenamableServer();
+      await act(async () => {
+        invoke(control("menu-item", "Rename…"), "onClick");
+      });
+
+      await act(async () => {
+        invoke(serverNameInput(), "onChange", { target: { value: " \t " } });
+      });
+      expect(container.textContent).toContain("Enter a name for this server.");
+      expect(saveButton().props.disabled).toBe(true);
+
+      await act(async () => {
+        invoke(findControls("button", "Use the server’s name").at(-1)!, "onClick");
+      });
+      expect(serverNameInput().props.value).toBe("ai-server");
+      expect(container.textContent).not.toContain("Enter a name for this server.");
+      expect(saveButton().props.disabled).toBe(false);
+    });
+
+    it.each(["escape-key", "outside-press"])(
+      "keeps the rename dialog open during saving on %s",
+      async (reason) => {
+        const container = await renderRenamableServer();
+        let finish!: (value: ReturnType<typeof success>) => void;
+        h.commands.rename.mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              finish = resolve;
+            }),
+        );
+        await act(async () => {
+          invoke(control("menu-item", "Rename…"), "onClick");
+        });
+        await act(async () => {
+          invoke(serverNameInput(), "onChange", { target: { value: "GPU box" } });
+        });
+        await act(async () => {
+          buttonIn(container, "Save").click();
+        });
+        expect(h.commands.rename).toHaveBeenCalledOnce();
+        expect(container.textContent).toContain("Saving…");
+        await act(async () => {
+          invoke(findControls("dialog", "true").at(-1)!, "onOpenChange", false, {
+            reason,
+            event: new KeyboardEvent("keydown", { key: "Escape" }),
+          });
+        });
+        expect(container.textContent).toContain("Rename server");
+        expect(serverNameInput().props.value).toBe("GPU box");
+        await act(async () => {
+          finish(success(undefined));
+          await flush();
+        });
+        expect(container.textContent).not.toContain("Rename server");
+      },
+    );
+
+    it("does not save when Enter is pressed on Cancel", async () => {
+      const container = await renderRenamableServer();
+      await act(async () => {
+        invoke(control("menu-item", "Rename…"), "onClick");
+      });
+      await act(async () => {
+        invoke(serverNameInput(), "onChange", { target: { value: "GPU box" } });
+      });
+      const cancel = buttonIn(container, "Cancel");
+      await act(async () => {
+        cancel.focus();
+        cancel.dispatchEvent(
+          new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }),
+        );
+      });
+      expect(h.commands.rename).not.toHaveBeenCalled();
+      // Happy DOM does not synthesize the browser's keyboard activation click.
+      await act(async () => {
+        cancel.click();
+      });
+      expect(container.textContent).not.toContain("Rename server");
+    });
+
+    it("uses the server name without saving when its control is activated with Enter", async () => {
+      const container = await renderRenamableServer();
+      await act(async () => {
+        invoke(control("menu-item", "Rename…"), "onClick");
+      });
+      await act(async () => {
+        invoke(serverNameInput(), "onChange", { target: { value: "GPU box" } });
+      });
+      const restore = buttonIn(container, "Use the server’s name: ai-server");
+      await act(async () => {
+        restore.focus();
+        restore.dispatchEvent(
+          new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }),
+        );
+        restore.click();
+      });
+      expect(h.commands.rename).not.toHaveBeenCalled();
+      expect(serverNameInput().props.value).toBe("ai-server");
+      expect(container.textContent).toContain("Rename server");
+    });
+
+    it.each([
+      {
+        error: new Error("Catalog unavailable"),
+        message: "Couldn't save the name on this device. Try again.",
+      },
+      {
+        error: { _tag: "EnvironmentNotRegisteredError", environmentId: "env-1" },
+        message: "This server is no longer saved on this device.",
+      },
+      {
+        error: {
+          _tag: "ConnectionBlockedError",
+          message: "This device names its own environments.",
+        },
+        message: "This device names its own environments.",
+      },
+    ])(
+      "describes a rejected save as $message and preserves the name for retry",
+      async ({ error, message }) => {
+        const container = await renderRenamableServer();
+        h.commands.rename.mockRejectedValueOnce(error);
+        await act(async () => {
+          invoke(control("menu-item", "Rename…"), "onClick");
+        });
+        await act(async () => {
+          invoke(serverNameInput(), "onChange", { target: { value: "GPU box" } });
+        });
+        await act(async () => {
+          buttonIn(container, "Save").click();
+          await flush();
+        });
+        expect(container.textContent).toContain(message);
+        expect(serverNameInput().props.value).toBe("GPU box");
+        expect(saveButton().props.disabled).toBe(false);
+        await act(async () => {
+          buttonIn(container, "Save").click();
+          await flush();
+        });
+        expect(container.textContent).not.toContain("Rename server");
+      },
+    );
+
+    it("keeps the dialog and the typed name when saving fails", async () => {
+      const container = await renderRenamableServer();
+      h.commands.rename.mockResolvedValueOnce(
+        failure({ _tag: "EnvironmentNotRegisteredError", environmentId: "env-1" }),
+      );
+      await act(async () => {
+        invoke(control("menu-item", "Rename…"), "onClick");
+      });
+      await act(async () => {
+        invoke(serverNameInput(), "onChange", { target: { value: "GPU box" } });
+      });
+      await act(async () => {
+        buttonIn(container, "Save").click();
+        await flush();
+      });
+
+      expect(container.textContent).toContain("Rename server");
+      expect(container.textContent).toContain("This server is no longer saved on this device.");
+      expect(serverNameInput().props.value).toBe("GPU box");
+
+      await act(async () => {
+        clickButton("Cancel");
+      });
+      expect(container.textContent).not.toContain("Rename server");
+      expect(h.commands.rename).toHaveBeenCalledOnce();
+    });
+  });
+
   describe("Add Server flow", () => {
     async function enterPairingCode(value: string): Promise<void> {
       await act(async () => {
@@ -1649,26 +1967,17 @@ describe("Remote Servers tabs", () => {
         environment({
           id: capableId,
           label: "Capable server",
-          serverConfig: {
-            environment: {
-              serverVersion: "0.4.2",
-              capabilities: { remoteUpdateControl: true },
-            },
-          },
+          serverConfig: updateCapableConfig(),
         }),
       ];
-      h.remoteUpdateQueries.set(capableId, {
-        data: {
-          serverVersion: "0.4.2",
-          latestVersion: null,
+      h.remoteUpdateQueries.set(
+        capableId,
+        settledUpdateQuery({
+          ...UP_TO_DATE_SNAPSHOT,
           state: "idle",
-          error: null,
           support: { installMode: "manual", reason: "manual-update-required" },
-        },
-        error: null,
-        isPending: false,
-        refresh: vi.fn(),
-      });
+        }),
+      );
 
       const markup = render(<ConnectTab />);
       expect(markup.match(/data-variant="manual"/gu)).toHaveLength(1);
@@ -1676,47 +1985,147 @@ describe("Remote Servers tabs", () => {
       expect(markup).toContain("Copy instructions");
     });
 
-    it("keeps a failed batch check local to the row as Status unavailable", async () => {
+    it("shows a failed check as Check failed with its reason, and Check again re-runs it", async () => {
       stubBrowserWindow();
       h.hasCloudConfig = false;
       const environmentId = EnvironmentId.make("env-check-failure");
       h.environments = [
         environment({
           id: environmentId,
-          label: "Offline update server",
-          serverConfig: {
-            environment: {
-              serverVersion: "0.4.2",
-              capabilities: { remoteUpdateControl: true },
-            },
-          },
+          label: "Slow update server",
+          connection: { phase: "connected" },
+          serverConfig: updateCapableConfig(),
         }),
       ];
-      h.remoteUpdateQueries.set(environmentId, {
-        data: {
-          serverVersion: "0.4.2",
-          latestVersion: null,
-          state: "up-to-date",
-          error: null,
-          support: { installMode: "interactive", reason: "available" },
-        },
-        error: null,
-        isPending: false,
-        refresh: vi.fn(),
+      h.remoteUpdateQueries.set(environmentId, settledUpdateQuery(UP_TO_DATE_SNAPSHOT));
+      h.remoteUpdateCheckStates.set(environmentId, {
+        inFlight: false,
+        failure: { cause: Cause.fail(new Error("feed timed out")), generation: 1 },
       });
-      h.commands.remoteUpdateCheck.mockResolvedValueOnce(failure(new Error("offline")));
 
       const container = await mountConnections(<ConnectTab />);
+
+      expect(container.querySelector('[data-variant="check-failed"]')?.textContent).toContain(
+        "Check failed",
+      );
+      expect(container.textContent).toContain("feed timed out");
+      expect(container.textContent).not.toContain("Up to date");
+      expect(container.textContent).not.toContain("Can't reach updater");
+      // The row's own Check turns into the next step; the badge adds no second button.
+      expect(findControls("button", "Retry update status")).toHaveLength(0);
       await act(async () => {
-        invoke(control("button", "Check for Server Updates"), "onClick");
+        clickButton("Check again");
         await flush();
       });
-
-      expect(container.textContent).toContain("Status unavailable");
       expect(h.commands.remoteUpdateCheck).toHaveBeenCalledExactlyOnceWith({
         environmentId,
         input: {},
       });
+    });
+
+    it("offers Retry that re-reads a status read that failed over a live connection", async () => {
+      stubBrowserWindow();
+      h.hasCloudConfig = false;
+      const environmentId = EnvironmentId.make("env-status-failure");
+      h.environments = [
+        environment({
+          id: environmentId,
+          label: "Flaky update server",
+          connection: { phase: "connected" },
+          serverConfig: updateCapableConfig(),
+        }),
+      ];
+      const refresh = vi.fn();
+      h.remoteUpdateQueries.set(environmentId, {
+        data: null,
+        emission: AsyncResult.failure(Cause.fail(new Error("Desktop updater did not answer."))),
+        error: "Desktop updater did not answer.",
+        isPending: false,
+        refresh,
+      });
+
+      const container = await mountConnections(<ConnectTab />);
+
+      expect(container.textContent).toContain("Can't reach updater");
+      expect(container.textContent).toContain("Desktop updater did not answer.");
+      await act(async () => {
+        clickButton("Retry update status");
+        await flush();
+      });
+      expect(refresh).toHaveBeenCalledOnce();
+      expect(h.commands.remoteUpdateCheck).not.toHaveBeenCalled();
+    });
+
+    it("says a host has not checked yet and keeps Check usable during background re-reads", () => {
+      stubBrowserWindow();
+      h.hasCloudConfig = false;
+      const environmentId = EnvironmentId.make("env-not-checked");
+      h.environments = [
+        environment({
+          id: environmentId,
+          label: "Fresh desktop host",
+          connection: { phase: "connected" },
+          serverConfig: updateCapableConfig(),
+        }),
+      ];
+      h.remoteUpdateQueries.set(environmentId, {
+        ...settledUpdateQuery({ ...UP_TO_DATE_SNAPSHOT, state: "idle" }),
+        isPending: true,
+      });
+
+      const markup = render(<ConnectTab />);
+
+      expect(markup).toContain("Not checked yet");
+      expect(markup).not.toContain("Status unavailable");
+      const check = control("button", "Check");
+      expect(check.props.disabled).toBe(false);
+    });
+
+    it("shows Checking… while the first status read is in flight", () => {
+      stubBrowserWindow();
+      h.hasCloudConfig = false;
+      const environmentId = EnvironmentId.make("env-first-read");
+      h.environments = [
+        environment({
+          id: environmentId,
+          label: "Loading update server",
+          connection: { phase: "connected" },
+          serverConfig: updateCapableConfig(),
+        }),
+      ];
+      h.remoteUpdateQueries.set(environmentId, {
+        data: null,
+        emission: AsyncResult.initial(true),
+        error: null,
+        isPending: true,
+        refresh: vi.fn(),
+      });
+
+      const markup = render(<ConnectTab />);
+
+      expect(markup).toContain('data-variant="checking"');
+      expect(control("button", "Checking…").props.disabled).toBe(true);
+    });
+
+    it("shows a check started from any view as Checking… on the row", () => {
+      stubBrowserWindow();
+      h.hasCloudConfig = false;
+      const environmentId = EnvironmentId.make("env-check-running");
+      h.environments = [
+        environment({
+          id: environmentId,
+          label: "Checking update server",
+          connection: { phase: "connected" },
+          serverConfig: updateCapableConfig(),
+        }),
+      ];
+      h.remoteUpdateQueries.set(environmentId, settledUpdateQuery(UP_TO_DATE_SNAPSHOT));
+      h.remoteUpdateCheckStates.set(environmentId, { inFlight: true, failure: null });
+
+      const markup = render(<ConnectTab />);
+
+      expect(markup).toContain('data-variant="checking"');
+      expect(control("button", "Checking…").props.disabled).toBe(true);
     });
   });
 

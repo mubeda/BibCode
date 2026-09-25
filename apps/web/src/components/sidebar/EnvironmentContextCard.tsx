@@ -63,15 +63,18 @@ export function EnvironmentContextCard(props: EnvironmentContextCardProps) {
       />
       <div className="min-w-0 flex-1">
         <div className="truncate text-[13px] font-semibold text-foreground">{view.name}</div>
-        <div className="flex min-w-0 items-center gap-1 truncate text-[11px] text-muted-foreground">
-          <span className="truncate">{view.statusText}</span>
-          {view.versionLine ? <span aria-hidden>·</span> : null}
-          {view.versionLine ? <span className="shrink-0">{view.versionLine}</span> : null}
+        {/* Badges wrap onto their own row in a narrow sidebar instead of being clipped. */}
+        <div className="flex min-w-0 flex-wrap items-center gap-x-1 gap-y-0.5 text-xs text-muted-foreground">
+          <span className="flex min-w-0 items-center gap-1">
+            <span className="truncate">{view.statusText}</span>
+            {view.versionLine ? <span aria-hidden>·</span> : null}
+            {view.versionLine ? <span className="shrink-0">{view.versionLine}</span> : null}
+          </span>
           {view.compatBadge ? (
             <span
               data-tone={view.compatBadge.tone}
               className={cn(
-                "shrink-0 rounded-full px-1.5 py-px text-[10px] font-medium",
+                "shrink-0 rounded-full px-1.5 py-px text-xs font-medium",
                 view.compatBadge.tone === "error"
                   ? "bg-destructive/12 text-destructive-foreground"
                   : "bg-warning/15 text-warning-foreground",

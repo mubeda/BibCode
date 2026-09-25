@@ -336,6 +336,40 @@ verify:
   list and environment rail show that alias after reconnecting and restarting
   the app. Blank aliases use the pairing code's server name; failed pairing
   preserves the alias for retry. The remote server's own name remains unchanged;
+- Add a headless web-mode `bibcode serve` server without an alias (pairing code
+  or **Advanced: manual endpoint and token**) and confirm its name is the
+  machine's hostname, with "Local" only if no usable hostname is reported.
+  `bibcode start`, bare `bibcode`, and desktop-owned backends keep "Local".
+  Select this server in the rail, then open **Settings → Remote Servers**.
+  Choose **Rename…** from its **⋯** menu: the dialog is prefilled, refuses a
+  blank name with **Enter a name for this server.**, and Enter in the name field
+  saves. Enter on **Cancel** cancels; Enter on **Use the server's name** restores
+  the reported name without saving. During saving, Escape and backdrop clicks
+  keep the dialog open. A failed save explains the known reason and preserves
+  the typed name for retry. Save a distinct name such as **Edge box** and confirm
+  it appears immediately in the Settings row title, environment rail entry, and
+  selected server's workspace card. Confirm the rail avatar initials update
+  (**EB** for **Edge box**). Hover the Settings row's status dot before and after
+  saving: it stays **Connected**, with no reconnect during the rename. Reload
+  the app, then restart it; after each, confirm the saved name and initials
+  persist;
+- With that renamed test server connected, check a stalled connection on a
+  Linux remote host: use `pgrep -f "bibcode serve"` or the process list to find
+  the test server's PID, then run `kill -STOP <pid>` on that host. Hover the
+  Settings row's status dot and wait for
+  `Failed to connect. Reconnecting... Reason: <server's own name> disconnected.`,
+  followed by
+  `Reason: Remote environment endpoint <base URL>/.well-known/bibcode/environment timed out after 10000ms.`
+  with the test server's endpoint URL. The disconnect reason uses the server's
+  own name, not the saved name. The disconnect appears before a health-check
+  message can become visible. Run `kill -CONT <pid>` on the remote host to resume
+  the same test server and confirm it reconnects;
+- select a saved server within a second of launch and confirm the rail keeps it
+  selected for at least ten seconds while provider and settings updates arrive;
+  repeat while the first primary welcome is delayed. A primary identity change
+  follows the new primary only when the old primary was selected; a selected
+  remote remains selected, including on `/agents` and with the mobile rail
+  closed;
 - Pair a loopback offer through a local connection or tunnel and confirm the
   already-active standard credential remains saved without administrative
   confirmation scope. Pending and off-host scope denials must still fail;
@@ -390,10 +424,15 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   `bibcode serve` is sufficient), open Remote Servers settings, run **Check for
   Server Updates**, and confirm each saved server row shows an update badge
   (**Manual updates** for a headless server) and a manual-instructions block
-  with a copy button. An offline server must show **Status unavailable** without
-  blocking the rest of the batch; a blackholed check must settle after 30
-  seconds across supervisor acquisition, readiness, and RPC execution, then
-  release its batch worker;
+  with a copy button. An offline server must not block the rest of the batch and
+  shows no update failure while it is disconnected; a blackholed check must settle
+  after 30 seconds across supervisor acquisition, readiness, and RPC execution,
+  then release its batch worker. A check that fails over a live connection shows
+  **Check failed** with the reason as its tooltip, and the row's button reads
+  **Check again**. When the second server is a desktop-hosted release build,
+  restart it and confirm its sidebar card reads **Not checked yet**, then changes
+  to **Up to date** or **Update to v…** within about a minute without **Check
+  for updates**;
 - seed an incompatible newer connection IndexedDB version and confirm the
   boot-level recovery dialog lists the deleted data classes, keeps **Reload** as
   a non-destructive exit, requires a separately acknowledged confirmation that a

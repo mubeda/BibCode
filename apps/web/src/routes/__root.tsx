@@ -47,7 +47,11 @@ import {
   primaryServerConfigEventAtom,
   primaryServerWelcomeAtom,
 } from "../state/server";
-import { readProject, setActiveEnvironmentId, useActiveEnvironmentId } from "../state/entities";
+import {
+  readActiveEnvironmentId,
+  readProject,
+  reconcileEnvironmentSelection,
+} from "../state/entities";
 import { readCurrentEnvironmentPresentationPolicy } from "../connection/currentEnvironmentPresentation";
 import {
   createKeybindingsUpdateToastController,
@@ -166,7 +170,6 @@ function DocumentTitleSync() {
 
 function HostedStaticEnvironmentBootstrap() {
   const { environments } = useEnvironments();
-  const activeEnvironmentId = useActiveEnvironmentId();
 
   useEffect(() => {
     if (
@@ -177,17 +180,13 @@ function HostedStaticEnvironmentBootstrap() {
       return;
     }
 
-    if (activeEnvironmentId) {
-      return;
-    }
-
     const firstSavedEnvironment = environments[0];
     if (!firstSavedEnvironment) {
       return;
     }
 
-    setActiveEnvironmentId(firstSavedEnvironment.environmentId);
-  }, [activeEnvironmentId, environments]);
+    reconcileEnvironmentSelection(firstSavedEnvironment.environmentId, "if-unselected");
+  }, [environments]);
 
   return null;
 }
@@ -287,6 +286,7 @@ function EventRouter() {
     reportFailure: false,
   });
   const serverConfig = useAtomValue(primaryServerConfigAtom);
+  const primaryConfigEnvironmentId = serverConfig?.environment.environmentId ?? null;
   const serverConfigEvent = useAtomValue(primaryServerConfigEventAtom);
   const serverWelcome = useAtomValue(primaryServerWelcomeAtom);
   const readPathname = useEffectEvent(() => pathname);
@@ -299,7 +299,7 @@ function EventRouter() {
   const handleWelcome = useEffectEvent((payload: ServerLifecycleWelcomePayload | null) => {
     if (!payload) return;
 
-    setActiveEnvironmentId(payload.environment.environmentId);
+    reconcileEnvironmentSelection(payload.environment.environmentId, "if-unselected");
     void (async () => {
       if (!payload.bootstrapProjectId || !payload.bootstrapThreadId) {
         return;
@@ -319,7 +319,10 @@ function EventRouter() {
         );
       useUiStateStore.getState().setProjectExpanded(bootstrapProjectKey, true);
 
-      if (readPathname() !== "/") {
+      if (
+        readPathname() !== "/" ||
+        readActiveEnvironmentId() !== payload.environment.environmentId
+      ) {
         return;
       }
       if (handledBootstrapThreadIdRef.current === payload.bootstrapThreadId) {
@@ -397,12 +400,12 @@ function EventRouter() {
   });
 
   useEffect(() => {
-    if (!serverConfig) {
+    if (primaryConfigEnvironmentId === null) {
       return;
     }
 
-    setActiveEnvironmentId(serverConfig.environment.environmentId);
-  }, [serverConfig]);
+    reconcileEnvironmentSelection(primaryConfigEnvironmentId, "follow-primary-identity");
+  }, [primaryConfigEnvironmentId]);
 
   useEffect(() => {
     handleWelcome(serverWelcome);
