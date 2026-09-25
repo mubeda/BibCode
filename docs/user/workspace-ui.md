@@ -91,7 +91,17 @@ has connected and returned a successful empty project snapshot. During startup,
 reconnects, unavailable environments, storage-location changes, or recovery
 conditions it shows that availability state instead. Cached project rows stay
 visible during those conditions and are replaced only after a newly accepted
-environment completes synchronization.
+environment completes synchronization. When an environment cannot connect, the
+notice names it ("<name> is not connected."); hover or focus that line for the
+reason, which the chat's banner states in full.
+
+In a chat whose environment is not connected, the banner above the composer
+gives the state in its title and the reason once in its body, and the composer
+says only that the environment is not connected. The banner offers
+**Reconnect** where this client reconnects in place. For a remote environment
+in the desktop app, which manages remote connections in **Settings → Remote
+Servers**, the banner and the sidebar notice offer **Open Remote Servers**
+instead.
 
 Use the project `+` action to create a worktree. The Create Worktree dialog has a
 permanent Name field, an optional Smart/GitHub/Branch **Create From** selector,

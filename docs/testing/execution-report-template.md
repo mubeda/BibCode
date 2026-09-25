@@ -219,6 +219,29 @@ Delete the unused result values above. Do not leave an ambiguous status.
 - Stalled transfer: failure time and exact message, destination removal:
 - Incomplete-clone refusal message, folder kept, Git Manager "No commits yet":
 
+## SSH environment evidence
+
+See [Desktop-managed SSH environments](./ssh-environments.md).
+
+- Automated harness command and result (`ssh_environment`, `--ignored`):
+- Remote host OS and login shell:
+- Authentication methods exercised (key, password):
+- Remote `bibcode --version`:
+- Devices for this desktop on the host before (count, access):
+
+| #   | Scenario                     | Evidence class | Result | Exact error or message |
+| --- | ---------------------------- | -------------- | ------ | ---------------------- |
+| 1   | Add                          |                |        |                        |
+| 2   | Remote restart, tunnel alive |                |        |                        |
+| 3   | Disconnect, then Connect     |                |        |                        |
+| 4   | Reload                       |                |        |                        |
+| 5   | Desktop restart              |                |        |                        |
+| 6   | Dead link (optional)         |                |        |                        |
+| 7   | Revocation (optional)        |                |        |                        |
+
+- Devices for this desktop on the host after (count, access):
+- Cleanup (environment removed, device revoked, no leftover managed server):
+
 ## Process and temporary-root cleanup
 
 - Before snapshot:

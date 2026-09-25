@@ -443,6 +443,12 @@ describe("tauriDesktopBridge", () => {
       bridge.bootstrapSshBearerSession("http://127.0.0.1:3773", "pairing-token"),
     ).resolves.toEqual({ access_token: "ssh-bearer" });
     await expect(
+      bridge.bootstrapSshBearerSession("http://127.0.0.1:3773", "scoped-token", [
+        "orchestration:read",
+        "terminal:operate",
+      ]),
+    ).resolves.toEqual({ access_token: "ssh-bearer" });
+    await expect(
       bridge.fetchSshSessionState("http://127.0.0.1:3773", "bearer-token"),
     ).resolves.toEqual({ authenticated: true });
     await expect(
@@ -455,6 +461,11 @@ describe("tauriDesktopBridge", () => {
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_bootstrap_ssh_bearer_session", {
       httpBaseUrl: "http://127.0.0.1:3773",
       credential: "pairing-token",
+    });
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_bootstrap_ssh_bearer_session", {
+      httpBaseUrl: "http://127.0.0.1:3773",
+      credential: "scoped-token",
+      scopes: ["orchestration:read", "terminal:operate"],
     });
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_fetch_ssh_session_state", {
       httpBaseUrl: "http://127.0.0.1:3773",

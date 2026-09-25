@@ -179,6 +179,32 @@ loopback, and create a local port forward. The remote host must provide:
 The launcher does not install Node.js, npm, npx, package-manager shims, or a
 BiBCode binary on the remote host. Install a matching standalone server release first.
 
+Adding the environment pairs this desktop with the remote server over SSH. The
+desktop then appears as a device with standard access on the host's **Share**
+tab, and it keeps that credential for reconnects, so reconnecting while the SSH
+tunnel is up runs no SSH command. The success toast says the environment is
+connecting; its row shows whether it connected.
+
+SSH access decides who can connect. If you revoke the desktop's device on the
+host, the desktop pairs again over SSH on its next connection. To cut a desktop
+off, remove its SSH access to the host or remove the environment on that
+desktop. If the host rejects a credential the desktop has just received, the
+environment stops retrying and asks you to connect again; if that keeps
+failing, remove the environment and add it again.
+
+Each remote step has a time limit: issuing the pairing credential 30 seconds,
+starting the server 60 seconds, stopping it 30 seconds. A step that runs out
+reports the limit (for example "The remote host did not issue a pairing
+credential within 30 seconds. Check the connection; BiBCode keeps trying.").
+BiBCode keeps retrying on its own; the environment shows **Connecting…** until a
+step succeeds.
+
+While a remote environment is not connected, its chats show the reason once in
+the banner above the composer, with **Open Remote Servers**, which opens this
+settings page, where you connect, rename, or remove the environment. The
+sidebar notice names the environment and offers the same action; hover or
+focus it for the reason.
+
 ## Windows Subsystem for Linux
 
 The optional WSL backend runs a native Linux `bibcode` binary. It does not invoke

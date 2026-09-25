@@ -147,8 +147,33 @@ export function registerConnectionInCatalog(
           (value) => value.connectionId,
           registration.profile,
         ),
+        credentials: replaceCatalogValue(next.credentials, (value) => value.connectionId, {
+          connectionId: registration.target.connectionId,
+          credential: registration.credential,
+        }),
       };
   }
+}
+
+/**
+ * Replaces the credential of a saved environment. Returns null, and writes
+ * nothing, when no saved target owns `connectionId` any more.
+ */
+export function replaceSavedConnectionCredential(
+  document: ConnectionCatalogDocument,
+  connectionId: string,
+  credential: ConnectionCredential,
+): ConnectionCatalogDocument | null {
+  if (!document.targets.some((target) => connectionIdOf(target) === connectionId)) {
+    return null;
+  }
+  return {
+    ...document,
+    credentials: replaceCatalogValue(document.credentials, (value) => value.connectionId, {
+      connectionId,
+      credential,
+    }),
+  };
 }
 
 export function removeConnectionFromCatalog(
@@ -237,6 +262,8 @@ export function removeConnectionRegistrationFromCatalog(
       return { document, removed: false, current };
     }
   } else if (registration._tag === "SshConnectionRegistration") {
+    // The SSH credential is not compared: reconnects replace it when the host
+    // rejects it, and the registration is still the same one.
     const profile = document.profiles.find(
       (candidate) => candidate.connectionId === registration.target.connectionId,
     );

@@ -11,6 +11,8 @@ Start with the shared procedure, then use the page for the native host:
 - [Windows desktop](./windows-desktop.md)
 - [Linux desktop](./linux-desktop.md)
 - [macOS desktop](./macos-desktop.md)
+- [Desktop-managed SSH environments](./ssh-environments.md) (all three desktops;
+  its automated harness runs on Linux and macOS)
 - [Execution report template](./execution-report-template.md)
 
 ## Evidence classes

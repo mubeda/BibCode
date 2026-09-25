@@ -108,7 +108,7 @@ async fn public_remote_bridge_commands_route_and_decode_environment_requests() {
         r#"{"access_token":"token","token_type":"Bearer"}"#,
     );
     assert_eq!(
-        desktop_bridge_bootstrap_ssh_bearer_session(base_url, "credential".to_string())
+        desktop_bridge_bootstrap_ssh_bearer_session(base_url, "credential".to_string(), None)
             .await
             .expect("bearer session should bootstrap")["access_token"],
         "token",

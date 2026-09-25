@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -32,16 +32,44 @@ const SSH_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const SSH_READY_INTERVAL: Duration = Duration::from_millis(250);
 const SSH_READY_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const SSH_TUNNEL_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(1500);
+/// How long the pipes of an exited SSH child may stay idle before the rest of
+/// its output is given up on. A descendant that inherited them (a
+/// ProxyCommand helper, a ControlPersist master on older OpenSSH, a
+/// backgrounded process) can hold them open long after ssh itself has exited,
+/// so end of file never arrives. Output that keeps arriving keeps the drain
+/// going; the remote script deadline bounds it as a whole.
+const SSH_OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(2);
+/// Longest wait for an exited tunnel's stderr, which no script deadline
+/// covers.
+const SSH_STDERR_COLLECT_LIMIT: Duration = Duration::from_secs(10);
+/// Output kept per pipe (the tail, where ssh and the remote scripts put their
+/// result and their final error).
+const SSH_OUTPUT_CAP: usize = 64 * 1024;
+const SSH_OUTPUT_CUT_OFF: &str = "[output cut off]";
 const SSH_CHILD_REAPER_CAPACITY: usize = 32;
 const REMOTE_PORT_SCAN_WINDOW: u16 = 200;
 const REMOTE_READY_TIMEOUT_MS: u64 = 15_000;
 const REMOTE_REUSE_READY_TIMEOUT_MS: u64 = 2_000;
-/// Remote command that mints the one-time SSH bootstrap pairing credential.
-/// Must target the same `--base-dir` the launch script passes to `serve`
-/// (`SERVER_HOME`), and must print a JSON line with a `credential` field —
-/// see `parse_remote_pairing_credential`.
-pub const REMOTE_PAIRING_ISSUE_COMMAND: &str =
-    r#"bibcode pairing issue --base-dir "$HOME/.bibcode" --json"#;
+const SSH_PAIRING_DEADLINE: Duration = Duration::from_secs(30);
+const SSH_LAUNCH_DEADLINE: Duration = Duration::from_secs(60);
+const SSH_STOP_DEADLINE: Duration = Duration::from_secs(30);
+/// Remote script that mints the one-time SSH bootstrap pairing credential.
+///
+/// It travels on stdin to `sh -s --`, like the launch and stop scripts, so the
+/// remote login shell only ever parses `sh -s --` (OpenSSH joins the remote
+/// argv with spaces and hands the result to the login shell). It runs under
+/// the same non-login `sh` and `PATH` as the launch script, so it uses the
+/// `bibcode` that serves the environment. It must target the same
+/// `--base-dir` the launch script passes to `serve` (`SERVER_HOME`), and must
+/// print a JSON line with a `credential` field — see
+/// `parse_remote_pairing_credential`.
+pub const REMOTE_PAIRING_SCRIPT: &str = r#"set -eu
+if ! command -v bibcode >/dev/null 2>&1; then
+  printf 'Remote host is missing the native BiBCode CLI. Install the Rust bibcode binary before connecting.\n' >&2
+  exit 1
+fi
+exec bibcode pairing issue --base-dir "$HOME/.bibcode" --json
+"#;
 const ASKPASS_POSIX_SCRIPT: &str = r#"#!/bin/sh
 if [ "${BIBCODE_SSH_AUTH_SECRET+x}" = "x" ]; then
   printf "%s\n" "$BIBCODE_SSH_AUTH_SECRET"
@@ -138,7 +166,7 @@ if [ -z "$REMOTE_PORT" ]; then
   printf 'Failed to find an available port on the remote host.\n' >&2
   exit 1
 fi
-nohup env BIBCODE_NO_BROWSER=1 "$RUNNER_FILE" serve --host 127.0.0.1 --port "$REMOTE_PORT" --base-dir "$SERVER_HOME" >>"$LOG_FILE" 2>&1 < /dev/null &
+nohup "$RUNNER_FILE" serve --host 127.0.0.1 --port "$REMOTE_PORT" --base-dir "$SERVER_HOME" >>"$LOG_FILE" 2>&1 < /dev/null &
 REMOTE_PID="$!"
 printf '%s\n' "$REMOTE_PID" >"$PID_FILE"
 printf '%s\n' "$REMOTE_PORT" >"$PORT_FILE"
@@ -358,12 +386,40 @@ struct ManagedSshTunnel {
     bootstrap: SshEnvironmentBootstrap,
 }
 
+/// Per-operation deadlines for the remote scripts the manager runs over SSH.
+/// On expiry the SSH child is terminated and reaped, and the operation fails
+/// with a `[ssh_timeout:<operation>]` error the renderer classifies as
+/// transient.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SshOperationDeadlines {
+    pub pairing: Duration,
+    pub launch: Duration,
+    pub stop: Duration,
+}
+
+impl Default for SshOperationDeadlines {
+    fn default() -> Self {
+        Self {
+            pairing: SSH_PAIRING_DEADLINE,
+            launch: SSH_LAUNCH_DEADLINE,
+            stop: SSH_STOP_DEADLINE,
+        }
+    }
+}
+
 pub struct SshEnvironmentManager {
     tunnels: Mutex<HashMap<String, ManagedSshTunnel>>,
     auth_secrets: Mutex<HashMap<String, String>>,
     askpass_temporary_base: PathBuf,
     askpass_launcher: Mutex<Weak<SshAskpassLauncherInner>>,
     child_reaper: SshChildReaper,
+    ssh_program: String,
+    deadlines: SshOperationDeadlines,
+    /// One async lock per target connection key. `ensure_environment` and
+    /// `disconnect_environment` hold it for their whole remote sequence, so
+    /// preparation and stop of one target never interleave. It is the only
+    /// lock held across an await.
+    target_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl Default for SshEnvironmentManager {
@@ -374,22 +430,59 @@ impl Default for SshEnvironmentManager {
 
 impl SshEnvironmentManager {
     pub fn new() -> Self {
-        Self::with_askpass_temp_base_internal(env::temp_dir())
+        Self::with_options(
+            env::temp_dir(),
+            ssh_command().to_string(),
+            SshOperationDeadlines::default(),
+        )
     }
 
-    fn with_askpass_temp_base_internal(askpass_temporary_base: PathBuf) -> Self {
+    /// A manager that runs `ssh_program` instead of the platform `ssh` and
+    /// uses `deadlines` for remote scripts. For test harnesses that stand in
+    /// for OpenSSH without changing `PATH`; the application uses `new`.
+    #[doc(hidden)]
+    pub fn with_ssh_program(
+        ssh_program: impl Into<String>,
+        deadlines: SshOperationDeadlines,
+    ) -> Self {
+        Self::with_options(env::temp_dir(), ssh_program.into(), deadlines)
+    }
+
+    fn with_options(
+        askpass_temporary_base: PathBuf,
+        ssh_program: String,
+        deadlines: SshOperationDeadlines,
+    ) -> Self {
         Self {
             tunnels: Mutex::new(HashMap::new()),
             auth_secrets: Mutex::new(HashMap::new()),
             askpass_temporary_base,
             askpass_launcher: Mutex::new(Weak::new()),
             child_reaper: SshChildReaper::new(),
+            ssh_program,
+            deadlines,
+            target_locks: Mutex::new(HashMap::new()),
         }
     }
 
     #[cfg(test)]
     fn with_askpass_temp_base(askpass_temporary_base: PathBuf) -> Self {
-        Self::with_askpass_temp_base_internal(askpass_temporary_base)
+        Self::with_options(
+            askpass_temporary_base,
+            ssh_command().to_string(),
+            SshOperationDeadlines::default(),
+        )
+    }
+
+    fn remote_runner(&self, operation: RemoteOperation) -> RemoteScriptRunner {
+        RemoteScriptRunner {
+            program: self.ssh_program.clone(),
+            deadline: match operation {
+                RemoteOperation::Pairing => self.deadlines.pairing,
+                RemoteOperation::Launch => self.deadlines.launch,
+                RemoteOperation::Stop => self.deadlines.stop,
+            },
+        }
     }
 
     fn askpass_launcher(&self) -> Result<SshAskpassLauncher, String> {
@@ -449,18 +542,54 @@ impl SshEnvironmentManager {
         }
         let target = normalize_ssh_environment_target(target)?;
         let key = target_connection_key(&target);
-        if let Some(existing) = self.take_existing_bootstrap_if_running(&key)? {
-            return Ok(existing);
+        let issue_pairing_token = options
+            .as_ref()
+            .and_then(|options| options.issue_pairing_token)
+            .unwrap_or(false);
+        // Serialise the whole probe, launch-or-reuse, tunnel and publish
+        // sequence per target: a second caller waits here and then finds the
+        // first caller's tunnel on the cache-hit path. The wait is bounded
+        // because everything the holder awaits is:
+        // - the probe: one request of at most 2 s;
+        // - each remote script: its deadline (launch 60 s, pairing 30 s,
+        //   stop 30 s), which also covers draining its output; after ssh
+        //   exits, the drain also stops once the pipes are idle for 2 s, even
+        //   if a descendant holds them open;
+        // - the tunnel: 30 s of readiness polling (each request at most 2 s),
+        //   and at most 10 s (2 s idle) to collect an exited tunnel's stderr;
+        // - each terminate-and-reap: 1.5 s, then the retained reaper owns it;
+        // - each password prompt: 3 min, at most two per step, so a step runs
+        //   at most three times.
+        let target_lock = self.target_lock(&key)?;
+        let _serialised = target_lock.lock().await;
+        if !self.child_reaper.accepting() {
+            return Err("SSH process owner is shutting down.".to_string());
+        }
+        if let Some(cached) = self.take_existing_bootstrap_if_running(&key)? {
+            // A live ssh process does not prove a live remote server: probe it
+            // through the tunnel so a server that stopped under a live SSH
+            // session is relaunched by the full path below.
+            if tunnel_endpoint_responds(&cached.http_base_url).await {
+                return self
+                    .reuse_cached_tunnel(app, prompts, &key, &target, cached, issue_pairing_token)
+                    .await;
+            }
+            tracing::info!("cached SSH tunnel endpoint did not respond; reconnecting");
+            self.drop_cached_tunnel(&key).await;
         }
 
         let local_port = portpicker::pick_unused_port()
             .ok_or_else(|| "Could not find an available local SSH tunnel port.".to_string())?;
         let askpass_launcher = self.askpass_launcher()?;
+        let launch_runner = self.remote_runner(RemoteOperation::Launch);
         let remote_launch = self
             .run_with_ssh_auth(app, prompts, &key, &target, |auth| {
                 let target = target.clone();
                 let askpass_launcher = askpass_launcher.clone();
-                async move { launch_or_reuse_remote_server(&target, &auth, askpass_launcher).await }
+                let runner = launch_runner.clone();
+                async move {
+                    launch_or_reuse_remote_server(&runner, &target, &auth, askpass_launcher).await
+                }
             })
             .await?;
         let tunnel_result = self
@@ -468,13 +597,15 @@ impl SshEnvironmentManager {
                 let target = target.clone();
                 let askpass_launcher = askpass_launcher.clone();
                 let remote_launch = remote_launch.clone();
+                let ssh_program = self.ssh_program.clone();
                 async move {
-                    let plan = SshEnvironmentLaunchPlan::forward_with_auth(
+                    let mut plan = SshEnvironmentLaunchPlan::forward_with_auth(
                         target,
                         local_port,
                         remote_launch,
                         &auth,
                     )?;
+                    plan.program = ssh_program;
                     let child = start_ssh_tunnel(&plan, &auth, askpass_launcher).await?;
                     Ok((plan, child))
                 }
@@ -487,25 +618,21 @@ impl SshEnvironmentManager {
                     .cached_auth_secret(&key)
                     .map(SshAuthOptions::with_secret)
                     .unwrap_or_else(SshAuthOptions::batch);
-                let _ = stop_remote_server(&target, &cleanup_auth, askpass_launcher).await;
+                let _ = stop_remote_server(
+                    &self.remote_runner(RemoteOperation::Stop),
+                    &target,
+                    &cleanup_auth,
+                    askpass_launcher,
+                )
+                .await;
                 return Err(error);
             }
         };
 
-        let pairing_token = if options
-            .as_ref()
-            .and_then(|options| options.issue_pairing_token)
-            .unwrap_or(false)
-        {
+        let pairing_token = if issue_pairing_token {
             Some(
-                self.run_with_ssh_auth(app, prompts, &key, &target, |auth| {
-                    let target = target.clone();
-                    let askpass_launcher = askpass_launcher.clone();
-                    async move {
-                        issue_remote_pairing_token(&target, &auth, askpass_launcher).await
-                    }
-                })
-                .await?,
+                self.mint_pairing_token(app, prompts, &key, &target, &askpass_launcher)
+                    .await?,
             )
         } else {
             None
@@ -525,6 +652,71 @@ impl SshEnvironmentManager {
         Ok(bootstrap)
     }
 
+    fn target_lock(&self, key: &str) -> Result<Arc<tokio::sync::Mutex<()>>, String> {
+        let mut locks = self
+            .target_locks
+            .lock()
+            .map_err(|error| format!("Could not access SSH target locks: {error}"))?;
+        Ok(locks.entry(key.to_string()).or_default().clone())
+    }
+
+    /// Returns a cached, responding tunnel. Cached bootstraps never carry a
+    /// token; every request for one mints a fresh one-time credential.
+    async fn reuse_cached_tunnel<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        prompts: &SshPasswordPromptManager,
+        key: &str,
+        target: &SshEnvironmentTarget,
+        cached: SshEnvironmentBootstrap,
+        issue_pairing_token: bool,
+    ) -> Result<SshEnvironmentBootstrap, String> {
+        if !issue_pairing_token {
+            return Ok(cached);
+        }
+        let askpass_launcher = self.askpass_launcher()?;
+        let pairing_token = self
+            .mint_pairing_token(app, prompts, key, target, &askpass_launcher)
+            .await?;
+        Ok(SshEnvironmentBootstrap {
+            pairing_token: Some(pairing_token),
+            ..cached
+        })
+    }
+
+    async fn mint_pairing_token<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        prompts: &SshPasswordPromptManager,
+        key: &str,
+        target: &SshEnvironmentTarget,
+        askpass_launcher: &SshAskpassLauncher,
+    ) -> Result<String, String> {
+        let runner = self.remote_runner(RemoteOperation::Pairing);
+        self.run_with_ssh_auth(app, prompts, key, target, |auth| {
+            let target = target.clone();
+            let askpass_launcher = askpass_launcher.clone();
+            let runner = runner.clone();
+            async move { issue_remote_pairing_token(&runner, &target, &auth, askpass_launcher).await }
+        })
+        .await
+    }
+
+    /// Removes and reaps the cached tunnel for `key`. Callers hold the
+    /// target lock, so the entry is the one they inspected.
+    async fn drop_cached_tunnel(&self, key: &str) {
+        let stale = match self.tunnels.lock() {
+            Ok(mut tunnels) => tunnels.remove(key),
+            Err(error) => {
+                tracing::warn!(%error, "could not access SSH tunnels to drop a stale tunnel");
+                None
+            }
+        };
+        if let Some(mut stale) = stale {
+            stale.child.terminate_and_reap().await;
+        }
+    }
+
     pub async fn disconnect_environment<R: Runtime>(
         &self,
         app: &AppHandle<R>,
@@ -533,6 +725,10 @@ impl SshEnvironmentManager {
     ) -> Result<(), String> {
         let target = normalize_ssh_environment_target(target)?;
         let key = target_connection_key(&target);
+        // Same lock as `ensure_environment`: a stop never interleaves with a
+        // preparation of this target.
+        let target_lock = self.target_lock(&key)?;
+        let _serialised = target_lock.lock().await;
         let tunnel = self
             .tunnels
             .lock()
@@ -546,10 +742,12 @@ impl SshEnvironmentManager {
             }
             None => self.askpass_launcher()?,
         };
+        let stop_runner = self.remote_runner(RemoteOperation::Stop);
         self.run_with_ssh_auth(app, prompts, &key, &target, |auth| {
             let target = target.clone();
             let askpass_launcher = askpass_launcher.clone();
-            async move { stop_remote_server(&target, &auth, askpass_launcher).await }
+            let runner = stop_runner.clone();
+            async move { stop_remote_server(&runner, &target, &auth, askpass_launcher).await }
         })
         .await?;
         Ok(())
@@ -596,7 +794,7 @@ impl SshEnvironmentManager {
                 },
             )
             .await
-            .map_err(|error| error.to_string())
+            .map_err(password_prompt_failure)
     }
 
     async fn run_with_ssh_auth<R: Runtime, T, F, Fut>(
@@ -669,12 +867,19 @@ impl SshEnvironmentManager {
         }
     }
 
+    /// Records a live tunnel. Callers hold the target lock, so the slot is
+    /// empty or holds a tunnel this caller has already dropped.
+    ///
+    /// The cached bootstrap never keeps a pairing token: one-time credentials
+    /// are consumed by the first exchange, so a cached copy could only ever be
+    /// rejected.
     fn publish_tunnel(
         &self,
         key: String,
         child: ManagedSshChild,
-        bootstrap: SshEnvironmentBootstrap,
+        mut bootstrap: SshEnvironmentBootstrap,
     ) -> Result<(), (String, Box<ManagedSshChild>)> {
+        bootstrap.pairing_token = None;
         let mut tunnels = match self.tunnels.lock() {
             Ok(tunnels) => tunnels,
             Err(error) => {
@@ -690,7 +895,10 @@ impl SshEnvironmentManager {
                 Box::new(child),
             ));
         }
-        tunnels.insert(key, ManagedSshTunnel { child, bootstrap });
+        let replaced = tunnels.insert(key, ManagedSshTunnel { child, bootstrap });
+        drop(tunnels);
+        // Dropping hands a replaced child to the retained reaper.
+        drop(replaced);
         Ok(())
     }
 }
@@ -1079,45 +1287,80 @@ impl ManagedSshChild {
         self.transfer_to_reaper();
     }
 
+    /// Waits for the child and collects its output. Both pipes are read while
+    /// the child runs, keeping the last `SSH_OUTPUT_CAP` bytes of each. After
+    /// the child exits, reading continues until end of file or until the
+    /// pipes have been idle for `SSH_OUTPUT_DRAIN_GRACE`; callers bound the
+    /// whole wait with the operation deadline. Output cut short by either
+    /// limit is marked at the end of stderr.
     async fn wait_with_output(&mut self) -> io::Result<std::process::Output> {
+        enum FirstDone<S, D> {
+            Status(S),
+            Drained(D),
+        }
+
         let mut stdout = self.child_mut().stdout.take();
         let mut stderr = self.child_mut().stderr.take();
-        let stdout_task = async move {
-            let mut bytes = Vec::new();
-            if let Some(stdout) = stdout.as_mut() {
-                stdout.read_to_end(&mut bytes).await?;
-            }
-            Ok::<Vec<u8>, io::Error>(bytes)
-        };
-        let stderr_task = async move {
-            let mut bytes = Vec::new();
-            if let Some(stderr) = stderr.as_mut() {
-                stderr.read_to_end(&mut bytes).await?;
-            }
-            Ok::<Vec<u8>, io::Error>(bytes)
-        };
+        let mut stdout_bytes = CappedOutput::default();
+        let mut stderr_bytes = CappedOutput::default();
+        let activity = OutputActivity::new();
         let mut shutdown = self
             .reaper_permit
             .as_ref()
             .expect("managed SSH child retains bounded cleanup ownership")
             .shutdown_receiver();
-        let status_task = async {
-            tokio::select! {
-                status = self.child_mut().wait() => status.map(|status| (status, false)),
-                _ = wait_for_ssh_shutdown(&mut shutdown) => {
-                    let _ = self.child_mut().start_kill();
-                    self.child_mut().wait().await.map(|status| (status, true))
+        // The drain after exit honours the same shutdown signal as the wait.
+        let mut drain_shutdown = shutdown.clone();
+        let child = self.child.as_mut().expect("managed SSH child is live");
+        let (status, drained, drain_interrupted) = {
+            let status_task = async {
+                tokio::select! {
+                    status = child.wait() => status.map(|status| (status, false)),
+                    _ = wait_for_ssh_shutdown(&mut shutdown) => {
+                        let _ = child.start_kill();
+                        child.wait().await.map(|status| (status, true))
+                    }
                 }
+            };
+            let drain = async {
+                tokio::try_join!(
+                    stdout_bytes.read_to_end(stdout.as_mut(), &activity),
+                    stderr_bytes.read_to_end(stderr.as_mut(), &activity),
+                )
+            };
+            tokio::pin!(status_task, drain);
+            let first = tokio::select! {
+                status = &mut status_task => FirstDone::Status(status),
+                drained = &mut drain => FirstDone::Drained(drained),
+            };
+            match first {
+                FirstDone::Status(status) => tokio::select! {
+                    drained = drain_until_idle(&mut drain, &activity, None) => {
+                        (status, drained, false)
+                    }
+                    _ = wait_for_ssh_shutdown(&mut drain_shutdown) => (status, None, true),
+                },
+                FirstDone::Drained(drained) => ((&mut status_task).await, Some(drained), false),
             }
         };
-        let ((status, interrupted), stdout, stderr) =
-            tokio::try_join!(status_task, stdout_task, stderr_task,)?;
+        let (status, interrupted) = status?;
+        let interrupted = interrupted || drain_interrupted;
         self.release_reaped();
         if interrupted {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "SSH process owner is shutting down",
             ));
+        }
+        let reached_end = match drained {
+            Some(Ok(_)) => true,
+            Some(Err(error)) => return Err(error),
+            None => false,
+        };
+        let (stdout, stdout_truncated) = stdout_bytes.finish();
+        let (mut stderr, stderr_truncated) = stderr_bytes.finish();
+        if !reached_end || stdout_truncated || stderr_truncated {
+            stderr.extend_from_slice(format!("\n{SSH_OUTPUT_CUT_OFF}").as_bytes());
         }
         Ok(std::process::Output {
             status,
@@ -1225,7 +1468,46 @@ fn build_remote_launch_script() -> String {
         )
 }
 
+/// The remote scripts the manager runs, each with its own deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteOperation {
+    Pairing,
+    Launch,
+    Stop,
+}
+
+/// The SSH program and deadline for one remote script operation.
+#[derive(Debug, Clone)]
+struct RemoteScriptRunner {
+    program: String,
+    deadline: Duration,
+}
+
+enum RemoteScriptFailure {
+    Write(String),
+    Wait(String),
+}
+
+/// The error for a remote script that outlived its deadline. The
+/// `[ssh_timeout:<operation>]` prefix is part of the bridge contract: the
+/// renderer classifies it as transient and owns the user-facing copy.
+fn remote_script_timeout_error(operation: &str, deadline: Duration) -> String {
+    let limit = if deadline.subsec_millis() == 0 && deadline.as_secs() > 0 {
+        format!("{} seconds", deadline.as_secs())
+    } else {
+        format!("{} ms", deadline.as_millis())
+    };
+    let what = match operation {
+        "pairing" => "issue a pairing credential",
+        "launch" => "start BiBCode",
+        "stop" => "stop BiBCode",
+        _ => "finish the SSH command",
+    };
+    format!("[ssh_timeout:{operation}] The remote host did not {what} within {limit}.")
+}
+
 async fn run_remote_ssh_script(
+    runner: &RemoteScriptRunner,
     target: &SshEnvironmentTarget,
     script: &str,
     script_args: &[String],
@@ -1239,7 +1521,7 @@ async fn run_remote_ssh_script(
     args.extend(["sh".to_string(), "-s".to_string(), "--".to_string()]);
     args.extend(script_args.iter().cloned());
 
-    let mut command = Command::new(ssh_command());
+    let mut command = Command::new(&runner.program);
     configure_background_command(&mut command);
     command
         .args(args)
@@ -1259,23 +1541,36 @@ async fn run_remote_ssh_script(
         .take()
         .ok_or_else(|| format!("SSH {operation} command did not expose stdin."))?;
     let mut shutdown = child.shutdown_receiver();
-    let write_result = tokio::select! {
-        result = stdin.write_all(script.as_bytes()) => result
-            .map_err(|error| format!("Failed to write SSH {operation} script: {error}")),
-        _ = wait_for_ssh_shutdown(&mut shutdown) => {
-            Err("SSH process owner is shutting down.".to_string())
+    let exchange = async {
+        let write_result = tokio::select! {
+            result = stdin.write_all(script.as_bytes()) => result
+                .map_err(|error| format!("Failed to write SSH {operation} script: {error}")),
+            _ = wait_for_ssh_shutdown(&mut shutdown) => {
+                Err("SSH process owner is shutting down.".to_string())
+            }
+        };
+        drop(stdin);
+        if let Err(error) = write_result {
+            return Err(RemoteScriptFailure::Write(error));
+        }
+        child.wait_with_output().await.map_err(|error| {
+            RemoteScriptFailure::Wait(format!(
+                "Failed to wait for SSH {operation} command: {error}"
+            ))
+        })
+    };
+    let output = match tokio::time::timeout(runner.deadline, exchange).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(RemoteScriptFailure::Write(error))) => {
+            child.terminate_and_reap().await;
+            return Err(error);
+        }
+        Ok(Err(RemoteScriptFailure::Wait(error))) => return Err(error),
+        Err(_elapsed) => {
+            child.terminate_and_reap().await;
+            return Err(remote_script_timeout_error(operation, runner.deadline));
         }
     };
-    drop(stdin);
-    if let Err(error) = write_result {
-        child.terminate_and_reap().await;
-        return Err(error);
-    }
-
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|error| format!("Failed to wait for SSH {operation} command: {error}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
@@ -1335,12 +1630,14 @@ pub fn parse_remote_launch_result(output: &str) -> Result<RemoteLaunchResult, St
 }
 
 async fn launch_or_reuse_remote_server(
+    runner: &RemoteScriptRunner,
     target: &SshEnvironmentTarget,
     auth: &SshAuthOptions,
     askpass_launcher: SshAskpassLauncher,
 ) -> Result<RemoteLaunchResult, String> {
     let state_key = remote_state_key(target);
     let output = run_remote_ssh_script(
+        runner,
         target,
         &build_remote_launch_script(),
         &[state_key],
@@ -1353,12 +1650,14 @@ async fn launch_or_reuse_remote_server(
 }
 
 async fn stop_remote_server(
+    runner: &RemoteScriptRunner,
     target: &SshEnvironmentTarget,
     auth: &SshAuthOptions,
     askpass_launcher: SshAskpassLauncher,
 ) -> Result<(), String> {
     let state_key = remote_state_key(target);
     run_remote_ssh_script(
+        runner,
         target,
         REMOTE_STOP_SCRIPT,
         &[state_key],
@@ -1371,41 +1670,22 @@ async fn stop_remote_server(
 }
 
 async fn issue_remote_pairing_token(
+    runner: &RemoteScriptRunner,
     target: &SshEnvironmentTarget,
     auth: &SshAuthOptions,
     askpass_launcher: SshAskpassLauncher,
 ) -> Result<String, String> {
-    let host_spec = build_ssh_host_spec(target)?;
-    let mut args = base_ssh_args_with_auth(target, auth);
-    args.push(host_spec);
-    args.extend([
-        "sh".to_string(),
-        "-lc".to_string(),
-        REMOTE_PAIRING_ISSUE_COMMAND.to_string(),
-    ]);
-    let mut command = Command::new(ssh_command());
-    configure_background_command(&mut command);
-    command
-        .args(args)
-        .envs(build_ssh_child_environment(auth, askpass_launcher.path()))
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    let mut child = spawn_managed_ssh_child(command, askpass_launcher, "run SSH pairing command")?;
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|error| format!("Failed to run SSH pairing command: {error}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "SSH pairing command failed with status {}: {}",
-            output.status,
-            stderr.trim()
-        ));
-    }
-    parse_remote_pairing_credential(&String::from_utf8_lossy(&output.stdout))
+    let output = run_remote_ssh_script(
+        runner,
+        target,
+        REMOTE_PAIRING_SCRIPT,
+        &[],
+        auth,
+        askpass_launcher,
+        "pairing",
+    )
+    .await?;
+    parse_remote_pairing_credential(&output)
 }
 
 async fn start_ssh_tunnel(
@@ -1437,6 +1717,27 @@ async fn start_ssh_tunnel(
     }
 
     Ok(child)
+}
+
+/// One readiness probe of the remote server through a cached tunnel.
+async fn tunnel_endpoint_responds(http_base_url: &str) -> bool {
+    let Ok(mut url) = url::Url::parse(http_base_url) else {
+        return false;
+    };
+    url.set_path(SSH_READY_PATH);
+    url.set_query(None);
+    url.set_fragment(None);
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(SSH_READY_REQUEST_TIMEOUT)
+        .build()
+    else {
+        return false;
+    };
+    client
+        .get(url)
+        .send()
+        .await
+        .is_ok_and(|response| response.status().is_success())
 }
 
 async fn wait_for_ssh_tunnel_ready(child: &mut Child, http_base_url: &str) -> Result<(), String> {
@@ -1477,15 +1778,132 @@ async fn wait_for_ssh_tunnel_ready(child: &mut Child, http_base_url: &str) -> Re
     ))
 }
 
+/// Collects an exited child's stderr for an error message: reading stops at
+/// end of file, after `SSH_OUTPUT_DRAIN_GRACE` without new bytes, or after
+/// `SSH_STDERR_COLLECT_LIMIT` in all, and keeps the last `SSH_OUTPUT_CAP`
+/// bytes. Output cut short is marked.
 async fn read_child_stderr(child: &mut Child) -> String {
     let Some(mut stderr) = child.stderr.take() else {
         return String::new();
     };
-    let mut output = String::new();
-    if stderr.read_to_string(&mut output).await.is_err() {
-        return String::new();
+    let mut output = CappedOutput::default();
+    let activity = OutputActivity::new();
+    let limit = tokio::time::Instant::now() + SSH_STDERR_COLLECT_LIMIT;
+    let reached_end = {
+        let read = output.read_to_end(Some(&mut stderr), &activity);
+        tokio::pin!(read);
+        matches!(
+            drain_until_idle(&mut read, &activity, Some(limit)).await,
+            Some(Ok(()))
+        )
+    };
+    let (bytes, truncated) = output.finish();
+    let text = String::from_utf8_lossy(&bytes);
+    let text = text.trim();
+    match (reached_end && !truncated, text.is_empty()) {
+        (true, _) => text.to_string(),
+        (false, true) => SSH_OUTPUT_CUT_OFF.to_string(),
+        (false, false) => format!("{text}\n{SSH_OUTPUT_CUT_OFF}"),
     }
-    output.trim().to_string()
+}
+
+/// When a child's pipes last delivered bytes, shared by its pipe readers.
+struct OutputActivity {
+    started: tokio::time::Instant,
+    last_millis: AtomicU64,
+}
+
+impl OutputActivity {
+    fn new() -> Self {
+        Self {
+            started: tokio::time::Instant::now(),
+            last_millis: AtomicU64::new(0),
+        }
+    }
+
+    fn touch(&self) {
+        let elapsed = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_millis.fetch_max(elapsed, Ordering::Relaxed);
+    }
+
+    fn last(&self) -> tokio::time::Instant {
+        self.started + Duration::from_millis(self.last_millis.load(Ordering::Relaxed))
+    }
+}
+
+/// Polls `drain` (pipe readers that report to `activity`) until it finishes,
+/// or until the pipes have been idle for `SSH_OUTPUT_DRAIN_GRACE`, or until
+/// `limit`. The idle window starts no earlier than the call, so a read still
+/// being scheduled when the child exits gets a full window. Bytes read before
+/// giving up stay with the readers. Returns `None` when it gave up.
+async fn drain_until_idle<F: std::future::Future + Unpin>(
+    drain: &mut F,
+    activity: &OutputActivity,
+    limit: Option<tokio::time::Instant>,
+) -> Option<F::Output> {
+    activity.touch();
+    loop {
+        let idle_deadline = activity.last() + SSH_OUTPUT_DRAIN_GRACE;
+        let wake = limit.map_or(idle_deadline, |limit| idle_deadline.min(limit));
+        if let Ok(output) = tokio::time::timeout_at(wake, &mut *drain).await {
+            return Some(output);
+        }
+        let still_arriving = activity.last() + SSH_OUTPUT_DRAIN_GRACE > idle_deadline;
+        let within_limit = limit.is_none_or(|limit| tokio::time::Instant::now() < limit);
+        if !still_arriving || !within_limit {
+            return None;
+        }
+    }
+}
+
+/// The tail of a child's output. It keeps the last `SSH_OUTPUT_CAP` bytes and
+/// discards older ones while still reading, so a chatty child neither grows
+/// memory without bound nor blocks on a full pipe.
+#[derive(Default)]
+struct CappedOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+impl CappedOutput {
+    /// Reads `reader` to end of file. Cancel-safe: every chunk read before the
+    /// future is dropped has already been kept.
+    async fn read_to_end<R: tokio::io::AsyncRead + Unpin>(
+        &mut self,
+        reader: Option<&mut R>,
+        activity: &OutputActivity,
+    ) -> io::Result<()> {
+        let Some(reader) = reader else {
+            return Ok(());
+        };
+        let mut chunk = vec![0_u8; 8 * 1024];
+        loop {
+            let read = reader.read(&mut chunk).await?;
+            if read == 0 {
+                return Ok(());
+            }
+            activity.touch();
+            self.bytes.extend_from_slice(&chunk[..read]);
+            // Trim in batches so a long stream costs amortised O(1) per byte.
+            if self.bytes.len() > 2 * SSH_OUTPUT_CAP {
+                self.keep_tail();
+            }
+        }
+    }
+
+    fn keep_tail(&mut self) {
+        if self.bytes.len() > SSH_OUTPUT_CAP {
+            let excess = self.bytes.len() - SSH_OUTPUT_CAP;
+            self.bytes.drain(..excess);
+            self.truncated = true;
+        }
+    }
+
+    /// The kept bytes and whether older output was discarded.
+    fn finish(mut self) -> (Vec<u8>, bool) {
+        self.keep_tail();
+        (self.bytes, self.truncated)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1559,6 +1977,17 @@ impl std::fmt::Display for SshPasswordPromptRequestError {
 }
 
 impl std::error::Error for SshPasswordPromptRequestError {}
+
+/// The bridge error for a failed password prompt. A cancellation carries the
+/// `[ssh_cancelled]` prefix, part of the bridge contract like
+/// `[ssh_http:<status>]`, so the renderer can tell the user's own cancel from
+/// any other failure without matching words that a host name could contain.
+fn password_prompt_failure(error: SshPasswordPromptRequestError) -> String {
+    match error {
+        SshPasswordPromptRequestError::Cancelled { .. } => format!("[ssh_cancelled] {error}"),
+        error => error.to_string(),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SshPasswordPromptResolveError {
@@ -3231,6 +3660,927 @@ mod tests {
         }
         assert!(REMOTE_LAUNCH_SCRIPT.contains("command -v bibcode"));
         assert!(REMOTE_LAUNCH_SCRIPT.contains("native BiBCode CLI"));
+    }
+
+    #[test]
+    fn only_a_cancelled_password_prompt_carries_the_cancellation_marker() {
+        let cancelled = SshPasswordPromptRequestError::Cancelled {
+            request_id: "id".to_string(),
+            destination: "cancelbox".to_string(),
+        };
+        assert_eq!(
+            password_prompt_failure(cancelled),
+            "[ssh_cancelled] SSH authentication cancelled for cancelbox."
+        );
+        let timed_out = SshPasswordPromptRequestError::TimedOut {
+            request_id: "id".to_string(),
+            destination: "cancelbox".to_string(),
+        };
+        assert_eq!(
+            password_prompt_failure(timed_out),
+            "SSH authentication timed out for cancelbox."
+        );
+    }
+
+    #[test]
+    fn launch_script_runs_serve_without_environment_assignments() {
+        let script = build_remote_launch_script();
+        let launch = script
+            .lines()
+            .find(|line| line.starts_with("nohup "))
+            .expect("the launch script starts serve with nohup");
+        assert!(
+            launch.starts_with(r#"nohup "$RUNNER_FILE" serve --host 127.0.0.1 "#),
+            "serve must start without environment assignments: {launch}"
+        );
+        assert!(!script.contains("BIBCODE_NO_BROWSER"));
+    }
+
+    /// Stand-ins for the OpenSSH client. Each fake records the remote command
+    /// line it receives (options stripped, the rest joined with spaces, as
+    /// `ssh(1)` sends it) and then runs a shell body. Nothing leaves the host.
+    #[cfg(unix)]
+    mod fake_ssh {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        const PRELUDE: &str = r#"#!/bin/sh
+dir='@@DIR@@'
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -L) forward="$2"; shift 2 ;;
+    -o|-p) shift 2 ;;
+    -n|-N|-T) shift ;;
+    -*) printf 'fake ssh: unsupported option %s\n' "$1" >&2; exit 255 ;;
+    *) break ;;
+  esac
+done
+shift
+printf '%s\n' "$*" >>"$dir/invocations.log"
+"#;
+
+        /// `sshd(8)` semantics: the joined command runs under `/bin/sh -c`
+        /// with the fixture's remote HOME and a PATH holding only the
+        /// recording `bibcode`.
+        const JOINING_BODY: &str = r#"exec env -i HOME="$dir/remote-home" PATH="$dir/remote-bin:/usr/bin:/bin" /bin/sh -c "$*"
+"#;
+
+        const RECORDING_BIBCODE: &str = r#"#!/bin/sh
+dir='@@DIR@@'
+if [ "$#" -eq 0 ]; then
+  printf 'fixture: bare bibcode would start a foreground server\n' >&2
+  exit 97
+fi
+{
+  for arg in "$@"; do printf '[%s] ' "$arg"; done
+  printf '\n'
+} >>"$dir/bibcode-argv.log"
+count=$(wc -l <"$dir/bibcode-argv.log" | tr -d ' ')
+printf '{"credential":"fixture-credential-%s"}\n' "$count"
+"#;
+
+        pub(super) struct FakeSsh {
+            pub(super) dir: tempfile::TempDir,
+            pub(super) program: PathBuf,
+        }
+
+        impl FakeSsh {
+            pub(super) fn joining() -> Self {
+                Self::with_body(JOINING_BODY)
+            }
+
+            pub(super) fn with_body(body: &str) -> Self {
+                let dir = tempfile::tempdir().expect("fake ssh directory");
+                let root = dir.path().display().to_string();
+                fs::create_dir_all(dir.path().join("remote-home")).expect("fake remote home");
+                fs::create_dir_all(dir.path().join("remote-bin")).expect("fake remote bin");
+                let program = dir.path().join("ssh");
+                write_executable(
+                    &program,
+                    &format!("{PRELUDE}{body}").replace("@@DIR@@", &root),
+                );
+                write_executable(
+                    &dir.path().join("remote-bin/bibcode"),
+                    &RECORDING_BIBCODE.replace("@@DIR@@", &root),
+                );
+                Self { dir, program }
+            }
+
+            pub(super) fn manager(
+                &self,
+                deadlines: SshOperationDeadlines,
+            ) -> SshEnvironmentManager {
+                SshEnvironmentManager::with_options(
+                    self.dir.path().to_path_buf(),
+                    self.program.display().to_string(),
+                    deadlines,
+                )
+            }
+
+            pub(super) fn invocations(&self) -> Vec<String> {
+                read_lines(&self.dir.path().join("invocations.log"))
+            }
+
+            pub(super) fn bibcode_argv(&self) -> Vec<String> {
+                read_lines(&self.dir.path().join("bibcode-argv.log"))
+            }
+
+            pub(super) fn remote_home(&self) -> PathBuf {
+                self.dir.path().join("remote-home")
+            }
+
+            pub(super) fn path(&self, name: &str) -> PathBuf {
+                self.dir.path().join(name)
+            }
+        }
+
+        fn read_lines(path: &Path) -> Vec<String> {
+            fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .map(|line| line.trim_end().to_string())
+                .filter(|line| !line.is_empty())
+                .collect()
+        }
+
+        fn write_executable(path: &Path, contents: &str) {
+            fs::write(path, contents).expect("write fake executable");
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+                .expect("chmod fake executable");
+        }
+    }
+
+    #[cfg(unix)]
+    fn fixture_target() -> SshEnvironmentTarget {
+        SshEnvironmentTarget {
+            alias: "fixture-host".to_string(),
+            hostname: "fixture-host".to_string(),
+            username: None,
+            port: None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn mock_app() -> tauri::App<tauri::test::MockRuntime> {
+        use tauri::test::{mock_builder, mock_context, noop_assets};
+        mock_builder()
+            .build(mock_context(noop_assets()))
+            .expect("mock Tauri app")
+    }
+
+    /// A loopback endpoint that answers every request with `200 {}`, standing
+    /// in for the remote server behind a live tunnel.
+    #[cfg(unix)]
+    async fn spawn_ready_endpoint() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fixture endpoint");
+        let port = listener
+            .local_addr()
+            .expect("fixture endpoint address")
+            .port();
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut request = [0_u8; 2048];
+                    let _ = stream.read(&mut request).await;
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+                        )
+                        .await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        (format!("http://127.0.0.1:{port}/"), server)
+    }
+
+    /// Publishes a live stand-in tunnel (a sleeping child) whose bootstrap
+    /// points at `http_base_url`, as a completed `ensure_environment` would.
+    #[cfg(unix)]
+    fn publish_fixture_tunnel(
+        manager: &SshEnvironmentManager,
+        http_base_url: &str,
+        pairing_token: Option<&str>,
+    ) -> (String, u32) {
+        let launcher = manager.askpass_launcher().expect("askpass launcher");
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "exec sleep 60"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let child = spawn_managed_ssh_child(command, launcher, "start fixture tunnel")
+            .expect("fixture tunnel child");
+        let pid = child
+            .child
+            .as_ref()
+            .and_then(Child::id)
+            .expect("fixture tunnel pid");
+        let target = normalize_ssh_environment_target(fixture_target()).expect("fixture target");
+        let key = target_connection_key(&target);
+        let bootstrap = SshEnvironmentBootstrap::new(
+            target,
+            4000,
+            http_base_url.to_string(),
+            http_base_url.replace("http://", "ws://"),
+            pairing_token.map(str::to_string),
+            "managed",
+        );
+        if manager
+            .publish_tunnel(key.clone(), child, bootstrap)
+            .is_err()
+        {
+            panic!("fixture tunnel should publish");
+        }
+        (key, pid)
+    }
+
+    #[cfg(unix)]
+    async fn wait_until_exited(pid: u32) -> bool {
+        for _ in 0..60 {
+            if !process_is_alive(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pairing_script_survives_openssh_argument_joining() {
+        let fake = fake_ssh::FakeSsh::joining();
+        let manager = fake.manager(SshOperationDeadlines::default());
+        let launcher = manager.askpass_launcher().expect("askpass launcher");
+
+        let credential = tokio::time::timeout(
+            Duration::from_secs(10),
+            issue_remote_pairing_token(
+                &manager.remote_runner(RemoteOperation::Pairing),
+                &fixture_target(),
+                &SshAuthOptions::batch(),
+                launcher,
+            ),
+        )
+        .await
+        .expect("pairing must finish");
+
+        assert_eq!(
+            fake.bibcode_argv(),
+            vec![format!(
+                "[pairing] [issue] [--base-dir] [{}/.bibcode] [--json]",
+                fake.remote_home().display()
+            )],
+            "the remote login shell must run the full pairing command (invocations: {:?})",
+            fake.invocations()
+        );
+        assert_eq!(credential.as_deref(), Ok("fixture-credential-1"));
+        assert_eq!(fake.invocations(), vec!["sh -s --".to_string()]);
+        manager.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn never_exiting_ssh_fails_at_the_deadline_and_is_reaped() {
+        let fake =
+            fake_ssh::FakeSsh::with_body("printf '%s\\n' \"$$\" >\"$dir/pid\"\nexec sleep 60\n");
+        let manager = fake.manager(SshOperationDeadlines {
+            pairing: Duration::from_millis(300),
+            ..SshOperationDeadlines::default()
+        });
+        let launcher = manager.askpass_launcher().expect("askpass launcher");
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            issue_remote_pairing_token(
+                &manager.remote_runner(RemoteOperation::Pairing),
+                &fixture_target(),
+                &SshAuthOptions::batch(),
+                launcher,
+            ),
+        )
+        .await;
+        let pid = fs::read_to_string(fake.path("pid"))
+            .ok()
+            .and_then(|pid| pid.trim().parse::<u32>().ok())
+            .expect("the fake ssh recorded its pid");
+
+        let error = result
+            .expect("the pairing deadline must end the operation")
+            .expect_err("a never-exiting ssh must fail");
+        assert!(
+            error.starts_with("[ssh_timeout:pairing] "),
+            "unexpected error: {error}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(
+            !process_is_alive(pid),
+            "the SSH child must be terminated and reaped at the deadline"
+        );
+        assert_eq!(manager.child_reaper.active(), 0);
+        manager.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cached_tunnel_bootstrap_never_carries_a_pairing_token() {
+        let fake = fake_ssh::FakeSsh::joining();
+        let manager = fake.manager(SshOperationDeadlines::default());
+        let (endpoint, server) = spawn_ready_endpoint().await;
+        publish_fixture_tunnel(&manager, &endpoint, Some("already-exchanged"));
+        let app = mock_app();
+        let prompts = SshPasswordPromptManager::with_timeout(Duration::ZERO);
+
+        for options in [
+            None,
+            Some(SshEnvironmentEnsureOptions {
+                issue_pairing_token: Some(false),
+            }),
+        ] {
+            let bootstrap = manager
+                .ensure_environment(app.handle(), &prompts, fixture_target(), options)
+                .await
+                .expect("a live tunnel is reused");
+            assert_eq!(bootstrap.http_base_url, endpoint);
+            assert_eq!(bootstrap.pairing_token, None);
+        }
+        assert!(
+            fake.invocations().is_empty(),
+            "reusing a live tunnel without a token must not run SSH: {:?}",
+            fake.invocations()
+        );
+        server.abort();
+        manager.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn issue_pairing_token_on_a_live_tunnel_mints_a_fresh_token() {
+        let fake = fake_ssh::FakeSsh::joining();
+        let manager = fake.manager(SshOperationDeadlines::default());
+        let (endpoint, server) = spawn_ready_endpoint().await;
+        publish_fixture_tunnel(&manager, &endpoint, Some("already-exchanged"));
+        let app = mock_app();
+        let prompts = SshPasswordPromptManager::with_timeout(Duration::ZERO);
+        let issue = || {
+            Some(SshEnvironmentEnsureOptions {
+                issue_pairing_token: Some(true),
+            })
+        };
+
+        let first = manager
+            .ensure_environment(app.handle(), &prompts, fixture_target(), issue())
+            .await
+            .expect("first mint on the live tunnel");
+        let second = manager
+            .ensure_environment(app.handle(), &prompts, fixture_target(), issue())
+            .await
+            .expect("second mint on the live tunnel");
+        let reused = manager
+            .ensure_environment(app.handle(), &prompts, fixture_target(), None)
+            .await
+            .expect("reuse after minting");
+
+        assert_eq!(first.pairing_token.as_deref(), Some("fixture-credential-1"));
+        assert_eq!(
+            second.pairing_token.as_deref(),
+            Some("fixture-credential-2")
+        );
+        assert_eq!(first.http_base_url, endpoint);
+        assert_eq!(reused.pairing_token, None, "a minted token is never cached");
+        assert_eq!(
+            fake.invocations(),
+            vec!["sh -s --".to_string(), "sh -s --".to_string()],
+            "each mint runs one pairing script and nothing else"
+        );
+        server.abort();
+        manager.shutdown().await;
+    }
+
+    /// Records each remote script's kind in `kinds.log`. A launch waits for
+    /// `$dir/gate`; a stop answers at once; a `-N` tunnel answers every
+    /// request on its forwarded local port with `200 {}`.
+    #[cfg(unix)]
+    const GATED_LAUNCH_AND_SERVING_TUNNEL: &str = r#"if [ -z "$*" ]; then
+  printf 'tunnel\n' >>"$dir/kinds.log"
+  exec python3 -c 'import http.server, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("content-length", "2")
+        self.end_headers()
+        self.wfile.write(b"{}")
+    def log_message(self, *args):
+        pass
+http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()' "${forward%%:*}"
+fi
+script=$(cat)
+case "$script" in
+  *nohup*)
+    printf 'launch\n' >>"$dir/kinds.log"
+    while [ ! -e "$dir/gate" ]; do sleep 0.05; done
+    printf '{"remotePort":4000,"serverKind":"managed"}\n'
+    ;;
+  *'{"stopped":true}'*)
+    printf 'stop\n' >>"$dir/kinds.log"
+    printf '{"stopped":true}\n'
+    ;;
+  *)
+    printf 'other\n' >>"$dir/kinds.log"
+    exit 1
+    ;;
+esac
+"#;
+
+    #[cfg(unix)]
+    fn cached_http_base_url(manager: &SshEnvironmentManager, key: &str) -> Option<String> {
+        manager
+            .tunnels
+            .lock()
+            .expect("tunnels")
+            .get(key)
+            .map(|tunnel| tunnel.bootstrap.http_base_url.clone())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_ensures_on_one_target_launch_once_and_share_the_tunnel() {
+        let fake = fake_ssh::FakeSsh::with_body(GATED_LAUNCH_AND_SERVING_TUNNEL);
+        let manager = fake.manager(SshOperationDeadlines::default());
+        let app = mock_app();
+        let prompts = SshPasswordPromptManager::with_timeout(Duration::ZERO);
+        let kinds = || {
+            fs::read_to_string(fake.path("kinds.log"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+
+        // Both callers find no tunnel. The first launch waits at the gate long
+        // enough for an unserialised second caller to start its own launch.
+        let (first, second, ()) = tokio::join!(
+            tokio::time::timeout(
+                Duration::from_secs(20),
+                manager.ensure_environment(app.handle(), &prompts, fixture_target(), None),
+            ),
+            tokio::time::timeout(
+                Duration::from_secs(20),
+                manager.ensure_environment(app.handle(), &prompts, fixture_target(), None),
+            ),
+            async {
+                while !kinds().iter().any(|kind| kind == "launch") {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                fs::write(fake.path("gate"), "").expect("open the launch gate");
+            }
+        );
+
+        let first = first.expect("first caller finishes").expect("first tunnel");
+        let second = second
+            .expect("second caller finishes")
+            .expect("second tunnel");
+        assert_eq!(
+            kinds(),
+            ["launch", "tunnel"],
+            "one launch, one tunnel, no stop"
+        );
+        assert_eq!(first.http_base_url, second.http_base_url);
+        let key =
+            target_connection_key(&normalize_ssh_environment_target(fixture_target()).unwrap());
+        assert_eq!(
+            cached_http_base_url(&manager, &key),
+            Some(first.http_base_url)
+        );
+        manager.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disconnect_waits_for_an_in_flight_preparation_of_the_same_target() {
+        let fake = fake_ssh::FakeSsh::with_body(GATED_LAUNCH_AND_SERVING_TUNNEL);
+        let manager = fake.manager(SshOperationDeadlines::default());
+        let app = mock_app();
+        let prompts = SshPasswordPromptManager::with_timeout(Duration::ZERO);
+        let kinds = || {
+            fs::read_to_string(fake.path("kinds.log"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+
+        let (prepared, disconnected, ()) = tokio::join!(
+            tokio::time::timeout(
+                Duration::from_secs(20),
+                manager.ensure_environment(app.handle(), &prompts, fixture_target(), None),
+            ),
+            async {
+                while !kinds().iter().any(|kind| kind == "launch") {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                tokio::time::timeout(
+                    Duration::from_secs(20),
+                    manager.disconnect_environment(app.handle(), &prompts, fixture_target()),
+                )
+                .await
+            },
+            async {
+                while !kinds().iter().any(|kind| kind == "launch") {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                fs::write(fake.path("gate"), "").expect("open the launch gate");
+            }
+        );
+
+        prepared
+            .expect("prepare finishes")
+            .expect("prepared tunnel");
+        disconnected
+            .expect("disconnect finishes")
+            .expect("disconnected");
+        assert_eq!(
+            kinds(),
+            ["launch", "tunnel", "stop"],
+            "the stop runs only after the preparation it would otherwise interleave with"
+        );
+        let key =
+            target_connection_key(&normalize_ssh_environment_target(fixture_target()).unwrap());
+        assert_eq!(cached_http_base_url(&manager, &key), None);
+        manager.shutdown().await;
+    }
+
+    /// The fake ssh exits at once while a background subshell it leaves
+    /// behind writes five stdout chunks 700 ms apart, longer in total than
+    /// the 2 s idle grace but never idle that long.
+    #[cfg(unix)]
+    const SLOW_STDOUT_AFTER_EXIT: &str = r#"cat >/dev/null
+(
+  for chunk in 1 2 3 4 5; do
+    sleep 0.7
+    printf 'chunk-%s\n' "$chunk"
+  done
+) &
+exit 0
+"#;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn output_still_arriving_after_ssh_exits_is_kept() {
+        let fake = fake_ssh::FakeSsh::with_body(SLOW_STDOUT_AFTER_EXIT);
+        let manager = fake.manager(SshOperationDeadlines::default());
+        let launcher = manager.askpass_launcher().expect("askpass launcher");
+
+        let stdout = tokio::time::timeout(
+            Duration::from_secs(20),
+            run_remote_ssh_script(
+                &manager.remote_runner(RemoteOperation::Pairing),
+                &fixture_target(),
+                "exit 0\n",
+                &[],
+                &SshAuthOptions::batch(),
+                launcher,
+                "pairing",
+            ),
+        )
+        .await
+        .expect("the drain is bounded")
+        .expect("the script succeeds");
+
+        assert_eq!(
+            stdout.lines().collect::<Vec<_>>(),
+            ["chunk-1", "chunk-2", "chunk-3", "chunk-4", "chunk-5"],
+            "every chunk written after ssh exited must be kept"
+        );
+        manager.shutdown().await;
+    }
+
+    /// `ps -o stat=` for `pid` (Linux and macOS); empty when there is no
+    /// such process.
+    #[cfg(unix)]
+    fn fixture_process_state(pid: u32) -> String {
+        std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .unwrap_or_default()
+    }
+
+    /// Whether a fixture process that is not this test's child has ended. A
+    /// zombie counts as ended: an orphan is reaped by PID 1 or a subreaper,
+    /// which some environments lack. A live process never counts as ended.
+    #[cfg(unix)]
+    fn fixture_process_is_gone(pid: u32) -> bool {
+        let state = fixture_process_state(pid);
+        state.is_empty() || state.starts_with('Z') || state.starts_with('X')
+    }
+
+    #[cfg(unix)]
+    async fn wait_until_fixture_gone(pid: u32) -> bool {
+        for _ in 0..60 {
+            if fixture_process_is_gone(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fixture_liveness_counts_a_zombie_as_gone_but_not_a_live_process() {
+        // An unreaped child is a zombie: `kill(pid, 0)` still succeeds, which
+        // is why orphaned fixtures cannot be checked with it where no PID 1
+        // reaps them.
+        let mut exited = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("short-lived child");
+        let zombie = exited.id();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !fixture_process_state(zombie).starts_with('Z') {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child never became a zombie"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            process_is_alive(zombie),
+            "kill(pid, 0) succeeds for a zombie"
+        );
+        assert!(fixture_process_is_gone(zombie), "a zombie is gone");
+        exited.wait().expect("reap the zombie");
+        assert!(fixture_process_is_gone(zombie), "a reaped process is gone");
+
+        let mut sleeping = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("live child");
+        let live = sleeping.id();
+        assert!(!fixture_process_is_gone(live), "a live process is not gone");
+        let _ = sleeping.kill();
+        sleeping.wait().expect("reap the live child");
+    }
+
+    /// A fake remote step that fails after leaving a backgrounded `sleep`
+    /// holding its inherited output pipes, as a ProxyCommand helper or an
+    /// older ControlPersist master can. `@@FAILING@@` selects the step
+    /// (`tunnel` or `launch`); the other steps succeed.
+    #[cfg(unix)]
+    const FAILS_WITH_HELD_PIPES: &str = r#"hold_pipes_and_fail() {
+  # The helper leads its own process group so cleanup can kill all of it.
+  python3 -c 'import os; os.setpgid(0, 0); os.execvp("sleep", ["sleep", "600"])' &
+  printf '%s\n' "$!" >>"$dir/background.pids"
+  printf 'fake ssh: %s failed while a helper kept stderr open\n' "$1" >&2
+  exit 255
+}
+if [ -z "$*" ]; then
+  [ '@@FAILING@@' = tunnel ] && hold_pipes_and_fail tunnel
+  exec sleep 60
+fi
+script=$(cat)
+case "$script" in
+  *nohup*)
+    [ '@@FAILING@@' = launch ] && hold_pipes_and_fail launch
+    printf '{"remotePort":4000,"serverKind":"managed"}\n'
+    ;;
+  *'{"stopped":true}'*) printf '{"stopped":true}\n' ;;
+  *) exit 1 ;;
+esac
+"#;
+
+    /// Kills the backgrounded fixture processes a fake recorded in
+    /// `background.pids`, even when the test panics. Only a pid whose command
+    /// line still contains `marker` is signalled, so a recycled pid is safe;
+    /// when it leads its own process group, the whole group is killed.
+    #[cfg(unix)]
+    struct BackgroundedFixtureProcesses {
+        pids_file: PathBuf,
+        /// Text the recorded process's command line must still contain.
+        marker: &'static str,
+    }
+
+    #[cfg(unix)]
+    impl BackgroundedFixtureProcesses {
+        fn pids(&self) -> Vec<u32> {
+            fs::read_to_string(&self.pids_file)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|pid| pid.trim().parse::<u32>().ok())
+                .collect()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for BackgroundedFixtureProcesses {
+        fn drop(&mut self) {
+            for pid in self.pids() {
+                let command = std::process::Command::new("ps")
+                    .args(["-o", "command=", "-p", &pid.to_string()])
+                    .output()
+                    .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+                    .unwrap_or_default();
+                if !command.contains(self.marker) {
+                    continue;
+                }
+                let group = std::process::Command::new("ps")
+                    .args(["-o", "pgid=", "-p", &pid.to_string()])
+                    .output()
+                    .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+                    .unwrap_or_default();
+                let target = if group == pid.to_string() {
+                    -(pid as libc::pid_t)
+                } else {
+                    pid as libc::pid_t
+                };
+                // SAFETY: signals only the fixture's own recorded process, or
+                // the process group it leads.
+                unsafe {
+                    libc::kill(target, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    /// The fake ssh exits at once, leaving a writer in its own process group
+    /// that prints to the inherited stdout every 200 ms, so the post-exit
+    /// drain never goes idle.
+    #[cfg(unix)]
+    const ENDLESS_STDOUT_AFTER_EXIT: &str = r#"cat >/dev/null
+python3 -c 'import os, sys, time
+os.setpgid(0, 0)
+while True:
+    sys.stdout.write("tick\n")
+    sys.stdout.flush()
+    time.sleep(0.2)' fixture-writer &
+printf '%s\n' "$!" >>"$dir/background.pids"
+exit 0
+"#;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_interrupts_a_post_exit_drain_that_never_goes_idle() {
+        let fake = fake_ssh::FakeSsh::with_body(ENDLESS_STDOUT_AFTER_EXIT);
+        let writer = BackgroundedFixtureProcesses {
+            pids_file: fake.path("background.pids"),
+            marker: "fixture-writer",
+        };
+        let manager = fake.manager(SshOperationDeadlines::default());
+        let runner = manager.remote_runner(RemoteOperation::Launch);
+        let launcher = manager.askpass_launcher().expect("askpass launcher");
+        let operation = tokio::spawn(async move {
+            run_remote_ssh_script(
+                &runner,
+                &fixture_target(),
+                "exit 0\n",
+                &[],
+                &SshAuthOptions::batch(),
+                launcher,
+                "launch",
+            )
+            .await
+        });
+        while writer.pids().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // The fake has exited; the drain is now following the writer.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let shutdown = tokio::time::timeout(Duration::from_secs(2), manager.shutdown()).await;
+        let result = tokio::time::timeout(Duration::from_secs(2), operation).await;
+
+        assert!(
+            shutdown.is_ok(),
+            "shutdown must not wait for the drain to reach the launch deadline"
+        );
+        let error = result
+            .expect("the operation ends with the shutdown")
+            .expect("operation task")
+            .expect_err("a drain cut short by shutdown fails");
+        assert!(
+            error.contains("SSH process owner is shutting down"),
+            "{error}"
+        );
+        let pids = writer.pids();
+        drop(writer);
+        for pid in pids {
+            assert!(
+                wait_until_fixture_gone(pid).await,
+                "writer {pid} must be gone"
+            );
+        }
+    }
+
+    /// Runs `ensure_environment` twice on one target whose `failing` step
+    /// leaves its pipes held open, and checks that each call fails fast with
+    /// the step's own stderr, so the target lock is never held indefinitely.
+    #[cfg(unix)]
+    async fn assert_held_pipes_fail_fast(failing: &str) {
+        let fake =
+            fake_ssh::FakeSsh::with_body(&FAILS_WITH_HELD_PIPES.replace("@@FAILING@@", failing));
+        let background = BackgroundedFixtureProcesses {
+            pids_file: fake.path("background.pids"),
+            marker: "sleep 600",
+        };
+        let manager = fake.manager(SshOperationDeadlines::default());
+        let app = mock_app();
+        let prompts = SshPasswordPromptManager::with_timeout(Duration::ZERO);
+
+        for attempt in ["first", "second"] {
+            let started = std::time::Instant::now();
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                manager.ensure_environment(app.handle(), &prompts, fixture_target(), None),
+            )
+            .await;
+            let elapsed = started.elapsed();
+            let error = result
+                .unwrap_or_else(|_| {
+                    panic!("{attempt} {failing} failure must not wait for the held pipes to close")
+                })
+                .expect_err("the step fails");
+            assert!(
+                error.contains(&format!(
+                    "fake ssh: {failing} failed while a helper kept stderr open"
+                )),
+                "{attempt}: {error}"
+            );
+            assert!(error.contains("[output cut off]"), "{attempt}: {error}");
+            assert!(
+                elapsed < Duration::from_secs(6),
+                "{attempt} took {elapsed:?}"
+            );
+        }
+
+        assert_eq!(
+            background.pids().len(),
+            2,
+            "each attempt left one held pipe"
+        );
+        let pids = background.pids();
+        drop(background);
+        for pid in pids {
+            assert!(
+                wait_until_fixture_gone(pid).await,
+                "backgrounded sleep {pid} must be gone"
+            );
+        }
+        manager.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exited_tunnel_with_held_stderr_fails_fast_and_releases_the_target() {
+        assert_held_pipes_fail_fast("tunnel").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exited_remote_script_with_held_pipes_fails_fast_and_releases_the_target() {
+        assert_held_pipes_fail_fast("launch").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dead_tunnel_endpoint_drops_the_cached_tunnel() {
+        let fake = fake_ssh::FakeSsh::with_body(
+            "printf 'fake ssh: connection refused\\n' >&2\nexit 255\n",
+        );
+        let manager = fake.manager(SshOperationDeadlines::default());
+        let closed_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .expect("reserve a closed port")
+            .port();
+        let (key, tunnel_pid) =
+            publish_fixture_tunnel(&manager, &format!("http://127.0.0.1:{closed_port}/"), None);
+        let app = mock_app();
+        let prompts = SshPasswordPromptManager::with_timeout(Duration::ZERO);
+
+        let error = manager
+            .ensure_environment(app.handle(), &prompts, fixture_target(), None)
+            .await
+            .expect_err("a dead endpoint must not be reused; the full path then fails here");
+
+        assert!(error.contains("SSH launch command failed"), "{error}");
+        assert_eq!(
+            manager
+                .take_existing_bootstrap_if_running(&key)
+                .expect("inspect tunnels"),
+            None
+        );
+        assert!(
+            wait_until_exited(tunnel_pid).await,
+            "the dropped tunnel child must be reaped"
+        );
+        assert_eq!(fake.invocations().len(), 1, "{:?}", fake.invocations());
+        manager.shutdown().await;
     }
 
     #[test]

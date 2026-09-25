@@ -17,6 +17,15 @@ export class ConnectionCredentialStore extends Context.Service<
       credential: ConnectionCredential,
     ) => Effect.Effect<void, ConnectionAttemptError>;
     readonly remove: (connectionId: string) => Effect.Effect<void, ConnectionAttemptError>;
+    /**
+     * Replaces the credential only while a saved environment still owns
+     * `connectionId`, so a refresh racing a removal leaves no orphan.
+     * Returns whether it wrote.
+     */
+    readonly putIfSaved: (
+      connectionId: string,
+      credential: ConnectionCredential,
+    ) => Effect.Effect<boolean, ConnectionAttemptError>;
   }
 >()("@bibcode/client-runtime/connection/credentialStore/ConnectionCredentialStore") {}
 

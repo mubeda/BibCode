@@ -13,14 +13,21 @@
  */
 import {
   act,
+  isValidElement,
   StrictMode,
   type ComponentProps,
+  type ReactElement,
   type ReactNode,
   type RefObject,
   useEffect,
   useState,
   useSyncExternalStore,
 } from "react";
+import {
+  type ConnectionTarget,
+  PrimaryConnectionTarget,
+  SshConnectionTarget,
+} from "@bibcode/client-runtime/connection";
 import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
@@ -81,6 +88,10 @@ const h = vi.hoisted(() => {
     previewState: {} as Record<string, unknown>,
     settings: {} as Record<string, unknown>,
     navigateCalls: [] as unknown[],
+    presentationSurface: {
+      surface: "browser" as "browser" | "desktop",
+      platform: "linux" as "macos" | "windows" | "linux" | "unknown",
+    },
     releasedTerminalInputs: [] as Array<{
       environmentId: string;
       threadId: string;
@@ -111,6 +122,15 @@ const h = vi.hoisted(() => {
 });
 
 // ── Heavy state/atom modules ─────────────────────────────────────────
+
+vi.mock("../connection/currentEnvironmentPresentation", async () => {
+  const { createEnvironmentPresentationPolicy } =
+    await import("../connection/environmentPresentationPolicy");
+  return {
+    readCurrentEnvironmentPresentationPolicy: () =>
+      createEnvironmentPresentationPolicy(h.presentationSurface),
+  };
+});
 
 vi.mock("../state/use-atom-command", () => ({
   useAtomCommand: (command: { key?: string } | null | undefined, options?: unknown) => {
@@ -764,6 +784,7 @@ interface TestConnectionPresentation {
 interface TestEnvironmentPresentation {
   readonly environmentId: EnvironmentId;
   readonly label: string;
+  readonly entry?: { readonly target: ConnectionTarget };
   readonly displayUrl: string | null;
   readonly relayManaged: boolean;
   readonly connection: TestConnectionPresentation;
@@ -812,6 +833,21 @@ function makeEnvironmentPresentation(
               },
             },
   };
+}
+
+/** The first element in `node`'s tree whose children are exactly `text`. */
+function findElementByText(node: ReactNode, text: string): ReactElement | null {
+  if (Array.isArray(node)) {
+    for (const child of node) {
+      const found = findElementByText(child, text);
+      if (found) return found;
+    }
+    return null;
+  }
+  if (!isValidElement(node)) return null;
+  const children = (node.props as { children?: ReactNode }).children;
+  if (children === text) return node;
+  return findElementByText(children, text);
 }
 
 function seedEnvironment(presentation: TestEnvironmentPresentation): void {
@@ -940,6 +976,7 @@ beforeEach(() => {
   };
   h.settings = { ...DEFAULT_SERVER_SETTINGS, ...DEFAULT_CLIENT_SETTINGS };
   h.navigateCalls = [];
+  h.presentationSurface = { surface: "browser", platform: "linux" };
   h.releasedTerminalInputs = [];
   h.filePreviewRevealEvents = [];
   h.filePreviewCommentActions = [];
@@ -4285,7 +4322,7 @@ describe("ChatView", () => {
       const item = bannerStack.items[0]!;
       expect(item.id).toBe(`environment-unavailable:${environmentId}`);
       expect(item.variant).toBe("error");
-      expect(item.title).toBe("Local: Connection failed. Reason: socket closed");
+      expect(item.title).toBe("Local: Connection failed");
       expect(item.description).toBe("socket closed");
 
       const composer = capturedProps<Record<string, unknown>>("chatComposer");
@@ -4294,6 +4331,58 @@ describe("ChatView", () => {
         label: "Local",
         connection: { phase: "error", error: "socket closed", traceId: null },
       });
+    });
+  });
+
+  describe("when: an unavailable environment's connection is managed in Settings", () => {
+    function unavailableBanner(target: ConnectionTarget): ComposerBannerStackItem {
+      h.presentationSurface = { surface: "desktop", platform: "linux" };
+      seedEnvironment(
+        makeEnvironmentPresentation({
+          connection: {
+            phase: "error",
+            error:
+              "devbox rejected a new pairing credential. Connect again; if it keeps failing, remove the environment and add it again.",
+            traceId: null,
+          },
+          entry: { target },
+        }),
+      );
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      renderServerRoute();
+      return capturedProps<{ items: ComposerBannerStackItem[] }>("composerBannerStack").items[0]!;
+    }
+
+    it("offers Open Remote Servers for a remote target on desktop and states the reason once", () => {
+      const item = unavailableBanner(
+        new SshConnectionTarget({ connectionId: "ssh:devbox", environmentId, label: "Local" }),
+      );
+
+      expect(item.title).toBe("Local: Connection failed");
+      expect(item.description).toBe(
+        "devbox rejected a new pairing credential. Connect again; if it keeps failing, remove the environment and add it again.",
+      );
+      expect(findElementByText(item.actions, "Reconnect")).toBeNull();
+      const open = findElementByText(item.actions, "Open Remote Servers");
+      expect(open).not.toBeNull();
+      (open!.props as { onClick: () => void }).onClick();
+      expect(h.navigateCalls).toEqual([{ to: "/settings/remote-servers" }]);
+    });
+
+    it("keeps Reconnect, and no Open Remote Servers, where the desktop reconnects in place", () => {
+      const item = unavailableBanner(
+        new PrimaryConnectionTarget({
+          environmentId,
+          label: "Local",
+          httpBaseUrl: "http://127.0.0.1:13935",
+          wsBaseUrl: "ws://127.0.0.1:13935",
+        }),
+      );
+
+      expect(findElementByText(item.actions, "Reconnect")).not.toBeNull();
+      expect(findElementByText(item.actions, "Open Remote Servers")).toBeNull();
     });
   });
 

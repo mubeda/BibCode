@@ -88,11 +88,17 @@ export class BearerConnectionRegistration extends Schema.TaggedClass<BearerConne
   },
 ) {}
 
+/**
+ * A desktop-managed SSH environment. `credential` is the standard-scope bearer
+ * onboarding received from the host; reconnects reuse it through the tunnel
+ * and replace it only when the host rejects it.
+ */
 export class SshConnectionRegistration extends Schema.TaggedClass<SshConnectionRegistration>()(
   "SshConnectionRegistration",
   {
     target: SshConnectionTarget,
     profile: SshConnectionProfile,
+    credential: BearerConnectionCredential,
   },
 ) {}
 

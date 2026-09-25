@@ -58,3 +58,20 @@ export function createEnvironmentPresentationPolicy(input: {
     permitsConnectionAction: presentsTarget,
   };
 }
+
+/**
+ * The connection action a surface offers for `target`. Where this client
+ * manages the connection it reconnects in place; on the desktop, remote
+ * connections are managed in Settings → Remote Servers, so the surface links
+ * there instead of offering a reconnect it may not perform.
+ */
+export function environmentConnectionActions(
+  policy: Pick<EnvironmentPresentationPolicy, "permitsConnectionAction">,
+  target: ConnectionTarget | null | undefined,
+): { readonly reconnect: boolean; readonly openRemoteServers: boolean } {
+  if (target === null || target === undefined) {
+    return { reconnect: false, openRemoteServers: false };
+  }
+  const reconnect = policy.permitsConnectionAction(target);
+  return { reconnect, openRemoteServers: !reconnect };
+}
