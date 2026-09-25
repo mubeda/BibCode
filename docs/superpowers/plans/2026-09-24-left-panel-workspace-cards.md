@@ -3093,7 +3093,7 @@ with:
 
 ```
 
-The creation test must mount React so the dialog state can update. Add inside the existing browser-runtime describe (`if (browserRuntime)`); run the happy-dom command below so it executes:
+The creation test must mount React so the dialog state can update. Add inside the mounted describe in `Sidebar.browser.test.tsx` (happy-dom via its file pragma; fix round 1 moved the former `if (browserRuntime)` block there so plain `vp test run` collects it):
 
 ```tsx
   it("starts worktree creation from New Worktree… for the selected project", async () => {
@@ -3183,7 +3183,7 @@ The creation test must mount React so the dialog state can update. Add inside th
 - [ ] **Step 2: Run the tests and watch them fail**
 
 Run: `cd /work/workspaces/orca/BibCode/main-3/apps/web && vp test run src/components/Sidebar.logic.test.ts src/components/WorktreeDiscoverySection.test.tsx src/components/Sidebar.test.tsx`
-Run: `cd /work/workspaces/orca/BibCode/main-3/apps/web && vp test run --environment happy-dom src/components/Sidebar.test.tsx`
+Run: `cd /work/workspaces/orca/BibCode/main-3/apps/web && vp test run src/components/Sidebar.browser.test.tsx`
 Run: `cd /work/workspaces/orca/BibCode/main-3 && vp test run apps/desktop/e2e/support/ui-state.test.ts`
 Expected: FAIL — no `contextMenuAnchorForRect`, no `onHiddenCountChange`, no ⋯ button or projects-group test id, and the motion guard still anchors on the placeholder.
 
@@ -3488,7 +3488,7 @@ Expected: PASS (the Task 5 label failures are gone too).
 Run: `cd /work/workspaces/orca/BibCode/main-3 && vp test run apps/desktop/e2e/support/ui-state.test.ts apps/desktop/e2e/support/motion-guard.test.ts`
 Expected: PASS.
 
-Run: `cd /work/workspaces/orca/BibCode/main-3/apps/web && vp test run --environment happy-dom src/components/Sidebar.test.tsx`
+Run: `cd /work/workspaces/orca/BibCode/main-3/apps/web && vp test run src/components/Sidebar.browser.test.tsx`
 Expected: PASS, including mounted dialog/card regressions.
 
 Run: `cd /work/workspaces/orca/BibCode/main-3 && vp run --filter @bibcode/web typecheck && vp check`
@@ -6870,8 +6870,8 @@ Add inside the existing browser-runtime describe, after its `mount`/`dispatch`/`
   );
 ```
 
-Run the happy-dom variant at both red and green stages; the default Node command skips this describe:
-`cd /work/workspaces/orca/BibCode/main-3/apps/web && vp test run --environment happy-dom src/components/Sidebar.test.tsx`.
+Run the mounted suite at both red and green stages (`Sidebar.browser.test.tsx`, collected by plain `vp test run`):
+`cd /work/workspaces/orca/BibCode/main-3/apps/web && vp test run src/components/Sidebar.browser.test.tsx`.
 Expected before implementation: FAIL (missing card/echo dismissal); after: PASS, with one surviving menu and restored card focus.
 
 In `apps/web/src/components/Sidebar.logic.test.ts`: remove `formatSessionDuration,` from the import list; delete the whole `describe("formatSessionDuration", () => { … });`; in `it("clamps negative prewarm limits and invalid session elapsed time"`, delete the two `formatSessionDuration` expectations and rename the test to `it("clamps negative prewarm limits"`.
@@ -7864,7 +7864,7 @@ add `chatSummaries,` to the returned object, and change the destructuring line t
 Run: `cd /work/workspaces/orca/BibCode/main-3/apps/web && vp test run src/components/Sidebar.test.tsx src/components/Sidebar.logic.test.ts src/components/ThreadStatusIndicators.test.tsx src/components/sidebar`
 Expected: PASS.
 
-Run: `cd /work/workspaces/orca/BibCode/main-3/apps/web && vp test run --environment happy-dom src/components/Sidebar.test.tsx`
+Run: `cd /work/workspaces/orca/BibCode/main-3/apps/web && vp test run src/components/Sidebar.browser.test.tsx`
 Expected: PASS, including the real fallback renderer integration.
 
 Run: `cd /work/workspaces/orca/BibCode/main-3 && vp run --filter @bibcode/web typecheck && vp check`
@@ -8033,7 +8033,7 @@ In `apps/web/src/components/ThreadStatusIndicators.test.tsx`, in "renders status
 - [ ] **Step 2: Run the tests and watch them fail**
 
 Run: `cd /work/workspaces/orca/BibCode/main-3/apps/web && vp test run src/components/Sidebar.test.tsx`
-Run: `cd /work/workspaces/orca/BibCode/main-3/apps/web && vp test run --environment happy-dom src/components/Sidebar.test.tsx`
+Run: `cd /work/workspaces/orca/BibCode/main-3/apps/web && vp test run src/components/Sidebar.browser.test.tsx`
 Expected: FAIL — there is no `primary-card-project-a`, two `SidebarMenuSub` lists render, and the summaries still use dots.
 
 - [ ] **Step 3: Delete the superseded helpers**
@@ -8465,7 +8465,7 @@ In both memo dependency lists replace `threadLastVisitedAts` with `workspaceStat
 Run: `cd /work/workspaces/orca/BibCode/main-3/apps/web && vp test run src/components/Sidebar.test.tsx src/components/Sidebar.logic.test.ts src/components/ThreadStatusIndicators.test.tsx src/components/sidebar src/components/CommandPalette.test.tsx`
 Expected: PASS.
 
-Run: `cd /work/workspaces/orca/BibCode/main-3/apps/web && vp test run --environment happy-dom src/components/Sidebar.test.tsx`
+Run: `cd /work/workspaces/orca/BibCode/main-3/apps/web && vp test run src/components/Sidebar.browser.test.tsx`
 Expected: PASS, including mounted dialog/card regressions.
 
 Run: `cd /work/workspaces/orca/BibCode/main-3 && vp run --filter @bibcode/web typecheck && vp check`

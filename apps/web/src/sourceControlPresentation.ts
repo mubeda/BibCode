@@ -4,6 +4,7 @@ import type { SourceControlProviderInfo } from "@bibcode/contracts";
 export {
   DEFAULT_CHANGE_REQUEST_TERMINOLOGY,
   formatChangeRequestAction,
+  formatChangeRequestNumber,
   formatCreateChangeRequestPhrase,
   getChangeRequestTerminology,
   resolveChangeRequestPresentation,

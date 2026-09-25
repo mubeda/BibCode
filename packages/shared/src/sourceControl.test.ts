@@ -14,7 +14,14 @@ import {
 describe("source control presentation", () => {
   it("formats request numbers using the shared provider terminology", () => {
     expect(formatChangeRequestNumber("gitlab", 14)).toBe("!14");
-    for (const provider of ["github", "azure-devops", "bitbucket", "unknown", null] as const) {
+    for (const provider of [
+      "github",
+      "azure-devops",
+      "bitbucket",
+      "unknown",
+      null,
+      undefined,
+    ] as const) {
       expect(formatChangeRequestNumber(provider, 14)).toBe("#14");
     }
     expect(getChangeRequestTerminology(null).singular).toBe("pull request");

@@ -66,7 +66,6 @@ import {
   ThreadRowLeadingStatus,
   ThreadRowTrailingStatus,
   ThreadStatusLabel,
-  ThreadWorktreeIndicator,
 } from "./ThreadStatusIndicators";
 
 const environmentId = EnvironmentId.make("env-1");
@@ -105,6 +104,7 @@ describe("thread status indicators", () => {
     expect(prStatusIndicator(null, null)).toBeNull();
     expect(prStatusIndicator({ ...base, state: "open" }, github)).toMatchObject({
       label: "PR open",
+      numberLabel: "#42",
       tooltip: "#42 PR open: Ship it",
     });
     expect(prStatusIndicator({ ...base, state: "closed" }, github)).toMatchObject({
@@ -112,6 +112,8 @@ describe("thread status indicators", () => {
     });
     expect(prStatusIndicator({ ...base, state: "merged" }, gitlab)).toMatchObject({
       label: "MR merged",
+      numberLabel: "!42",
+      tooltip: "!42 MR merged: Ship it",
     });
     expect(prStatusIndicator({ ...base, state: "draft" } as never, null)).toBeNull();
     expect(renderToStaticMarkup(<ChangeRequestStatusIcon className="icon" />)).toContain("icon");
@@ -157,53 +159,23 @@ describe("thread status indicators", () => {
     expect(terminalStatusFromRunningIds([])).toBeNull();
     expect(terminalStatusFromRunningIds(["terminal-1"])).toEqual({
       label: "Terminal process running",
-      colorClass: "text-teal-600 dark:text-teal-300/90",
-      pulse: true,
+      colorClass: "text-muted-foreground",
     });
   });
 
-  it("renders worktree and status labels in every display mode", () => {
-    expect(
-      renderToStaticMarkup(
-        <ThreadWorktreeIndicator
-          thread={{ id: thread.id, branch: null, worktreePath: "/repo/worktree" }}
-        />,
-      ),
-    ).toContain("Worktree: worktree");
-    expect(renderToStaticMarkup(<ThreadWorktreeIndicator thread={thread} />)).toContain(
-      "feature/test",
-    );
-    // The label is text, not an icon: the folder-git glyph is reserved for the
-    // sidebar's "New worktree" action and must not appear on thread rows.
-    expect(renderToStaticMarkup(<ThreadWorktreeIndicator thread={thread} />)).not.toContain("<svg");
-    expect(
-      renderToStaticMarkup(
-        <ThreadWorktreeIndicator
-          thread={{ id: thread.id, branch: null, worktreePath: "/repo/worktree" }}
-        />,
-      ),
-    ).toContain(">worktree<");
-
+  it("renders status labels in every display mode", () => {
     const status = {
       label: "Working" as const,
       colorClass: "status-color",
       dotClass: "dot-color",
       pulse: true,
     };
-    expect(renderToStaticMarkup(<ThreadStatusLabel status={status} compact />)).toContain(
-      "animate-pulse",
-    );
     expect(
       renderToStaticMarkup(<ThreadStatusLabel status={{ ...status, pulse: false }} />),
     ).toContain("Working");
-  });
-
-  it.each([null, "", "   "])("renders no worktree for path %j", (worktreePath) => {
     expect(
-      renderToStaticMarkup(
-        <ThreadWorktreeIndicator thread={{ id: thread.id, branch: "main", worktreePath }} />,
-      ),
-    ).toBe("");
+      renderToStaticMarkup(<ThreadStatusLabel status={{ ...status, pulse: false }} />),
+    ).toContain("text-xs");
   });
 
   it("renders leading PR and thread status combinations", () => {
@@ -244,7 +216,7 @@ describe("thread status indicators", () => {
     harness.runningIds = ["terminal-1"];
     const terminalOnly = renderToStaticMarkup(<ThreadRowTrailingStatus thread={thread} />);
     expect(terminalOnly).toContain("Terminal process running");
-    expect(terminalOnly).toContain("animate-pulse");
+    expect(terminalOnly).not.toContain("animate-pulse");
 
     harness.primaryEnvironmentId = "primary";
     harness.environment = { label: "Remote Mac" };

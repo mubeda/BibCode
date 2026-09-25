@@ -1,5 +1,10 @@
 # Project Toolbar Actions Design
 
+> **Superseded on 2026-09-24** by
+> [`2026-09-24-left-panel-workspace-cards-design.md`](./2026-09-24-left-panel-workspace-cards-design.md):
+> the invisible main-branch chat button is gone, **⋯** (project actions) takes
+> its place, and the New worktree action uses `+`.
+
 ## Goal
 
 Make the project-row actions clearer without changing their behavior or layout.

@@ -1,7 +1,7 @@
 import type {
   AuthAccessTokenResult,
   ClientSettings,
-  ContextMenuItem,
+  ContextMenuEntry,
   DesktopAppBranding,
   DesktopBridge,
   DesktopBridgeHostMetadata,
@@ -436,7 +436,7 @@ function isWindowsWebViewRuntime(): boolean {
 }
 
 async function showTauriContextMenu<T extends string>(
-  items: readonly ContextMenuItem<T>[],
+  items: readonly ContextMenuEntry<T>[],
   position?: { x: number; y: number },
 ): Promise<T | null> {
   if (isWindowsWebViewRuntime()) {
@@ -588,7 +588,7 @@ function createTauriDesktopBridge(
       tauriInvokeOr("desktop_bridge_confirm", { message }, () => window.confirm(message)),
     setTheme: (theme) => tauriInvokeOr("desktop_bridge_set_theme", { theme }, () => undefined),
     showContextMenu: <T extends string>(
-      items: readonly ContextMenuItem<T>[],
+      items: readonly ContextMenuEntry<T>[],
       position?: { x: number; y: number },
     ) => showTauriContextMenu(items, position),
     openExternal: (url: string) =>

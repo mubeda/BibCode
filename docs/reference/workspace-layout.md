@@ -54,9 +54,9 @@ through Tauri commands/events. Browser mode connects directly to a native
 ## UI Workspace Model
 
 - A project is a repository/workspace root in an environment.
-- Every project has a primary row backed by an undeletable default thread for
+- Every project has a primary card backed by an undeletable default thread for
   the main checkout.
-- Worktree rows are workspace threads with `worktreePath` set.
+- Worktree cards are workspace threads with `worktreePath` set.
 - Center chat panels are sibling threads with `kind: "panel"` that share the
   host worktree while owning their own provider session and transcript.
 - Center surfaces are arranged into tab groups. Up to four groups can be shown

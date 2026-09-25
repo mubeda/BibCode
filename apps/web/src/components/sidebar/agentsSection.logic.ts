@@ -80,15 +80,26 @@ export function resolveAgentProvider(providerName: string | null | undefined): {
   };
 }
 
+/** The preview line: the running tool while working, else the latest reply, else the prompt. */
+export function resolveConversationPreviewLine(
+  isWorking: boolean,
+  preview: OrchestrationConversationPreview | null | undefined,
+): string | null {
+  if (preview === null || preview === undefined) return null;
+  if (isWorking && preview.tool !== null) {
+    return preview.tool;
+  }
+  return preview.assistantMessage ?? preview.prompt ?? null;
+}
+
 export function resolveAgentPreviewLine(
   pill: ThreadStatusPill | null,
   preview: OrchestrationConversationPreview | null | undefined,
 ): string | null {
-  if (preview === null || preview === undefined) return null;
-  if ((pill?.label === "Working" || pill?.label === "Connecting") && preview.tool !== null) {
-    return preview.tool;
-  }
-  return preview.assistantMessage ?? preview.prompt ?? null;
+  return resolveConversationPreviewLine(
+    pill?.label === "Working" || pill?.label === "Connecting",
+    preview,
+  );
 }
 
 export function buildAgentRows(input: {

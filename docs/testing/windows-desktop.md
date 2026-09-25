@@ -609,6 +609,13 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   OpenCode without Early Access labels and omit Grok/Grok Terminal;
 - external worktrees group by parent, expose full paths accessibly, adopt
   idempotently through junction/case aliases, and persist across restart;
+- sidebar menus use the in-app menu: separators split the groups and are
+  never doubled or at an edge. From the keyboard, focus starts on the first
+  enabled item, the arrow keys skip separators and disabled items, **Home** and
+  **End** jump to the ends, **→** and **←** open and close **Open in**,
+  **Enter** or **Space** chooses, and **Escape** closes the menu and returns
+  focus to the card or **⋯**. **Shift+F10** and the **Menu** key on a focused
+  card open the menu once, at the card;
 - thread creation, switching, persistence, terminal I/O, and panel switching
   work;
 - Activity subagents/background tasks align, show realistic elapsed time, and

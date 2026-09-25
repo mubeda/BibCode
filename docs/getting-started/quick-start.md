@@ -46,7 +46,7 @@ ship or require Node.js.
    machine or environment running the BiBCode server.
 2. Add a project from the left panel or Command Palette. The Add Project dialog
    can open one local folder, clone a Git URL, or create a new local project.
-3. Pick the project's primary row to work in the live checkout, or use the
+3. Pick the project's primary card to work in the live checkout, or use the
    project `+` action to create a worktree thread.
 4. Use the chat header `+` menu to open another AI chat panel, a shell terminal
    in the same worktree, a provider CLI terminal, or a custom action.
