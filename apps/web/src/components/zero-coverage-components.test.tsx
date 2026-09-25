@@ -72,6 +72,9 @@ vi.mock("./ui/sidebar", () => {
       h.sidebarProps = { resizable, ...props };
       return <aside>{children as ReactNode}</aside>;
     },
+    // AppSidebarLayout reads this to seed its initial width; this suite
+    // doesn't exercise sidebar-width behavior, so simulate "nothing saved".
+    readStoredSidebarWidth: () => null,
     SidebarContent: Container,
     SidebarFooter: Container,
     SidebarGroup: Container,
