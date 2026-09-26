@@ -15,13 +15,17 @@ use bibcode_server::{
         manager::{graph::page, refs::build_refs_snapshot},
     },
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
+
+#[path = "support/websocket_frames.rs"]
+mod websocket_frames;
+use websocket_frames::next_frame_past_heartbeat;
 
 const DESKTOP_BOOTSTRAP: &str = "git-manager-read-bootstrap";
 const TOKEN_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
@@ -455,7 +459,7 @@ async fn next_message<S>(socket: &mut tokio_tungstenite::WebSocketStream<S>) -> 
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let frame = timeout(Duration::from_secs(10), socket.next())
+    let frame = timeout(Duration::from_secs(10), next_frame_past_heartbeat(socket))
         .await
         .expect("WebSocket response timeout")
         .expect("WebSocket remains open")

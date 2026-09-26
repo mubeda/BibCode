@@ -20,8 +20,12 @@ use bibcode_server::{
         ConfiguredPullRequestsRpcServices, register_pull_requests_rpc,
     },
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+#[path = "support/websocket_frames.rs"]
+mod websocket_frames;
+use websocket_frames::next_frame_past_heartbeat;
 
 const GITHUB_ORIGIN: &str = "https://github.com/example/repository.git";
 const GITLAB_ORIGIN: &str = "ssh://git@git.acme.example/team/sub/repo.git";
@@ -1080,11 +1084,14 @@ async fn pull_requests_rpc_registry_round_trips_context_list_and_typed_failure()
             ))
             .await
             .unwrap();
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        let frame = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            next_frame_past_heartbeat(&mut socket),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
         let Message::Text(text) = frame else {
             panic!("expected RPC text frame")
         };

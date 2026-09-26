@@ -42,12 +42,16 @@ use bibcode_server::{
     provider_usage,
     terminal::{PortablePtyBackend, TerminalManager, TerminalManagerOptions},
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use serde_json::Value;
 use tempfile::TempDir;
 use tokio::sync::{Notify, mpsc};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
+
+#[path = "support/websocket_frames.rs"]
+mod websocket_frames;
+use websocket_frames::next_frame_past_heartbeat;
 
 const ATTACHMENT_ABORT_CHILD_STATE: &str = "BIBCODE_TURN_DELIVERY_ATTACHMENT_ABORT_CHILD_STATE";
 const ATTACHMENT_ABORT_CHILD_READY: &str = "BIBCODE_TURN_DELIVERY_ATTACHMENT_ABORT_CHILD_READY";
@@ -250,7 +254,7 @@ async fn attachment_abort_child() {
                 break;
             }
             tokio::select! {
-                frame = socket.next() => {
+                frame = next_frame_past_heartbeat(&mut socket) => {
                     panic!("attachment RPC completed before publication: {frame:?}");
                 }
                 _ = tokio::time::sleep(Duration::from_millis(5)) => {}
@@ -532,8 +536,7 @@ async fn durable_boundary_crash_child() {
         .await
         .expect("crash RPC request");
     if matches!(mode.as_str(), "after-db-commit" | "queued-after-db-commit") {
-        let frame = socket
-            .next()
+        let frame = next_frame_past_heartbeat(&mut socket)
             .await
             .expect("crash RPC response")
             .expect("valid crash RPC response");

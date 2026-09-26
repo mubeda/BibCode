@@ -11,7 +11,7 @@ use bibcode_server::{
     },
     persistence::{Database, run_migrations},
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::time::timeout;
@@ -20,6 +20,9 @@ use tokio_tungstenite::{WebSocketStream, connect_async, tungstenite::Message};
 #[path = "support/activity_time.rs"]
 mod activity_time;
 use activity_time::{activity_timestamp, recent_activity_anchor};
+#[path = "support/websocket_frames.rs"]
+mod websocket_frames;
+use websocket_frames::next_frame_past_heartbeat;
 
 #[tokio::test]
 async fn activity_unary_rpc_pages_rosters_and_detail_and_bounds_scope_errors() {
@@ -1770,7 +1773,7 @@ async fn next_message<S>(socket: &mut WebSocketStream<S>) -> ServerMessage
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let frame = timeout(Duration::from_secs(2), socket.next())
+    let frame = timeout(Duration::from_secs(2), next_frame_past_heartbeat(socket))
         .await
         .expect("server message timeout")
         .expect("WebSocket open")

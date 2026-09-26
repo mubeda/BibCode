@@ -7,11 +7,15 @@ use bibcode_server::{
     persistence::{BackupTrigger, StatePaths, StorageInstanceId, inventory_verified_backups},
     rpc_mutability,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use tokio::time::{Instant, timeout};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+#[path = "support/websocket_frames.rs"]
+mod websocket_frames;
+use websocket_frames::next_frame_past_heartbeat;
 
 fn desktop_config(root: &std::path::Path, token: &str) -> ServerConfig {
     ServerConfig::new(root)
@@ -282,11 +286,14 @@ async fn desktop_prepare_is_authenticated_single_flight_and_cancel_is_identity_b
         ))
         .await
         .expect("mutating RPC request");
-    let rejected = timeout(Duration::from_secs(2), socket.next())
-        .await
-        .expect("mutating response timeout")
-        .expect("socket remains open")
-        .expect("mutating response frame");
+    let rejected = timeout(
+        Duration::from_secs(2),
+        next_frame_past_heartbeat(&mut socket),
+    )
+    .await
+    .expect("mutating response timeout")
+    .expect("socket remains open")
+    .expect("mutating response frame");
     let rejected: Value =
         serde_json::from_str(rejected.to_text().expect("response text")).expect("response JSON");
     assert_eq!(rejected["exit"]["_tag"], "Failure");
@@ -313,11 +320,14 @@ async fn desktop_prepare_is_authenticated_single_flight_and_cancel_is_identity_b
             ))
             .await
             .expect("activity mutation RPC request");
-        let rejected = timeout(Duration::from_secs(2), socket.next())
-            .await
-            .expect("activity mutation response timeout")
-            .expect("socket remains open")
-            .expect("activity mutation response frame");
+        let rejected = timeout(
+            Duration::from_secs(2),
+            next_frame_past_heartbeat(&mut socket),
+        )
+        .await
+        .expect("activity mutation response timeout")
+        .expect("socket remains open")
+        .expect("activity mutation response frame");
         let rejected: Value =
             serde_json::from_str(rejected.to_text().expect("activity mutation response text"))
                 .expect("activity mutation response JSON");
@@ -340,11 +350,14 @@ async fn desktop_prepare_is_authenticated_single_flight_and_cancel_is_identity_b
         ))
         .await
         .expect("read RPC request");
-    let readable = timeout(Duration::from_secs(2), socket.next())
-        .await
-        .expect("read response timeout")
-        .expect("socket remains open")
-        .expect("read response frame");
+    let readable = timeout(
+        Duration::from_secs(2),
+        next_frame_past_heartbeat(&mut socket),
+    )
+    .await
+    .expect("read response timeout")
+    .expect("socket remains open")
+    .expect("read response frame");
     let readable: Value =
         serde_json::from_str(readable.to_text().expect("response text")).expect("response JSON");
     assert_eq!(readable["exit"]["_tag"], "Success");

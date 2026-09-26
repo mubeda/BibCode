@@ -10,7 +10,7 @@ use bibcode_server::{
     ConfigError, DESKTOP_SHUTDOWN_PATH, DESKTOP_SHUTDOWN_TOKEN_HEADER, ROUTE_INVENTORY,
     RpcRegistry, ServerConfig, ServerError, ServerMode, ServerRuntime, logging,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use reqwest::{Client, StatusCode, redirect::Policy};
 use serde_json::Value;
 use tempfile::TempDir;
@@ -22,6 +22,10 @@ use tokio::{
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 use url::Url;
 use uuid::Uuid;
+
+#[path = "support/websocket_frames.rs"]
+mod websocket_frames;
+use websocket_frames::next_frame_past_heartbeat;
 
 const PROVIDER_DRIVERS: [&str; 5] = ["codex", "claudeAgent", "cursor", "grok", "opencode"];
 const SAME_LOG_PATH_CHILD_ENV: &str = "BIBCODE_TEST_SAME_LOG_PATH_CHILD_ROOT";
@@ -164,11 +168,14 @@ async fn fetch_server_config(client: &Client, address: SocketAddr, access_token:
         ))
         .await
         .expect("send server configuration request");
-    let frame = timeout(Duration::from_secs(2), socket.next())
-        .await
-        .expect("server configuration timeout")
-        .expect("configuration WebSocket remains open")
-        .expect("server configuration frame");
+    let frame = timeout(
+        Duration::from_secs(2),
+        next_frame_past_heartbeat(&mut socket),
+    )
+    .await
+    .expect("server configuration timeout")
+    .expect("configuration WebSocket remains open")
+    .expect("server configuration frame");
     let wire: Value = serde_json::from_str(frame.to_text().expect("configuration text frame"))
         .expect("server configuration JSON");
     assert_eq!(wire["_tag"], "Exit");
@@ -206,7 +213,7 @@ async fn next_rpc_wire(
     socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
     context: &str,
 ) -> Value {
-    let frame = timeout(Duration::from_secs(2), socket.next())
+    let frame = timeout(Duration::from_secs(2), next_frame_past_heartbeat(socket))
         .await
         .unwrap_or_else(|_| panic!("{context} timeout"))
         .unwrap_or_else(|| panic!("{context} WebSocket remains open"))

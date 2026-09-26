@@ -1184,10 +1184,12 @@ mod tests {
         terminal::{TerminalEvent, TerminalLaunchCommand, TerminalOpenInput},
     };
     use axum::http::{HeaderMap, Uri};
-    use futures_util::{SinkExt, StreamExt};
+    use futures_util::SinkExt;
     use tempfile::TempDir;
     use tokio::time::timeout;
     use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+    use crate::test_support::websocket_frames::next_frame_past_heartbeat;
 
     fn route_context() -> RouteContext {
         RouteContext {
@@ -1755,7 +1757,7 @@ mod tests {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
-        let frame = timeout(Duration::from_secs(2), socket.next())
+        let frame = timeout(Duration::from_secs(2), next_frame_past_heartbeat(socket))
             .await
             .expect("activity message timeout")
             .expect("WebSocket remains open")

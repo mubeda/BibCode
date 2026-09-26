@@ -4,7 +4,7 @@ use bibcode_server::{
     ACTIVE_RPC_METHODS, CauseItem, ClientMessage, MethodMode, RequestId, RpcExit, RpcRegistry,
     ServerConfig, ServerMessage, ServerRuntime, WireMessage,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -13,6 +13,10 @@ use tokio_tungstenite::{
     connect_async,
     tungstenite::{Message, client::IntoClientRequest, http::HeaderValue},
 };
+
+#[path = "support/websocket_frames.rs"]
+mod websocket_frames;
+use websocket_frames::next_frame_past_heartbeat;
 
 const HUGE_REQUEST_ID: &str = "900719925474099312345";
 
@@ -537,7 +541,7 @@ async fn next_server_message<S>(socket: &mut tokio_tungstenite::WebSocketStream<
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let message = timeout(Duration::from_secs(2), socket.next())
+    let message = timeout(Duration::from_secs(2), next_frame_past_heartbeat(socket))
         .await
         .expect("WebSocket response timeout")
         .expect("WebSocket remains open")
@@ -599,11 +603,14 @@ async fn chunked_subprotocol_splits_large_responses_into_records() {
         json!({ "_tag": "Request", "id": "1", "tag": "fixture.bytes", "payload": { "bytes": 1024 }, "headers": [] }),
     )
     .await;
-    let small = timeout(Duration::from_secs(2), socket.next())
-        .await
-        .expect("small response")
-        .expect("socket open")
-        .expect("frame");
+    let small = timeout(
+        Duration::from_secs(2),
+        next_frame_past_heartbeat(&mut socket),
+    )
+    .await
+    .expect("small response")
+    .expect("socket open")
+    .expect("frame");
     assert!(
         matches!(small, Message::Text(_)),
         "small messages stay whole text frames"
@@ -617,11 +624,14 @@ async fn chunked_subprotocol_splits_large_responses_into_records() {
     let mut flags = Vec::new();
     let mut body = Vec::new();
     loop {
-        let frame = timeout(Duration::from_secs(2), socket.next())
-            .await
-            .expect("record")
-            .expect("socket open")
-            .expect("frame");
+        let frame = timeout(
+            Duration::from_secs(2),
+            next_frame_past_heartbeat(&mut socket),
+        )
+        .await
+        .expect("record")
+        .expect("socket open")
+        .expect("frame");
         let Message::Binary(record) = frame else {
             panic!("large messages arrive as binary records, got {frame:?}");
         };
@@ -653,11 +663,14 @@ async fn clients_without_the_subprotocol_receive_whole_text_frames() {
         json!({ "_tag": "Request", "id": "1", "tag": "fixture.bytes", "payload": { "bytes": 200 * 1024 }, "headers": [] }),
     )
     .await;
-    let frame = timeout(Duration::from_secs(2), socket.next())
-        .await
-        .expect("response")
-        .expect("socket open")
-        .expect("frame");
+    let frame = timeout(
+        Duration::from_secs(2),
+        next_frame_past_heartbeat(&mut socket),
+    )
+    .await
+    .expect("response")
+    .expect("socket open")
+    .expect("frame");
     assert!(matches!(frame, Message::Text(text) if text.len() > 200 * 1024));
     socket.close(None).await.expect("close WebSocket");
     handle.shutdown();

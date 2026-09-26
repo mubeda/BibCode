@@ -8,6 +8,8 @@ mod event;
 #[path = "../../tests/support/reexec.rs"]
 pub(crate) mod reexec;
 mod sandbox;
+#[path = "../../tests/support/websocket_frames.rs"]
+pub(crate) mod websocket_frames;
 
 #[cfg(target_os = "linux")]
 pub(crate) use capability_probe::check_capability_probe_appimage_environment;
@@ -128,5 +130,101 @@ mod tests {
     fn fixture_lease_has_a_crate_private_name() {
         let sandbox = TestSandbox::new("lease-name");
         let _lease: FixtureLease = sandbox.acquire_fixture();
+    }
+
+    /// Runs once here rather than in every integration binary that includes
+    /// `tests/support/websocket_frames.rs`.
+    #[tokio::test]
+    async fn next_frame_past_heartbeat_skips_only_ping_and_pong() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::{
+            WebSocketStream,
+            tungstenite::{
+                Error, Message,
+                error::ProtocolError,
+                protocol::{CloseFrame, Role, frame::coding::CloseCode},
+            },
+        };
+
+        use super::websocket_frames::next_frame_past_heartbeat;
+
+        // Ping and Pong are skipped, the data frames behind them arrive
+        // unchanged, and skipping the Ping sent tungstenite's queued Pong.
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let mut client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        for frame in [
+            Message::Ping("heartbeat".into()),
+            Message::Pong("unsolicited".into()),
+            Message::Text("data".into()),
+            Message::Binary(vec![1, 2, 3].into()),
+        ] {
+            server.send(frame).await.expect("peer sends a frame");
+        }
+        assert_eq!(
+            next_frame_past_heartbeat(&mut client)
+                .await
+                .expect("a frame")
+                .expect("a valid frame"),
+            Message::Text("data".into())
+        );
+        assert_eq!(
+            next_frame_past_heartbeat(&mut client)
+                .await
+                .expect("a frame")
+                .expect("a valid frame"),
+            Message::Binary(vec![1, 2, 3].into())
+        );
+        assert_eq!(
+            server
+                .next()
+                .await
+                .expect("the client's reply")
+                .expect("a valid reply"),
+            Message::Pong("heartbeat".into())
+        );
+
+        // A Close frame passes through, then the end of the stream once the
+        // closing handshake completes.
+        let close = CloseFrame {
+            code: CloseCode::Away,
+            reason: "done".into(),
+        };
+        server
+            .send(Message::Close(Some(close.clone())))
+            .await
+            .expect("peer closes");
+        assert_eq!(
+            next_frame_past_heartbeat(&mut client)
+                .await
+                .expect("a frame")
+                .expect("a valid frame"),
+            Message::Close(Some(close))
+        );
+        let (end, _) = tokio::join!(next_frame_past_heartbeat(&mut client), async move {
+            // The peer reads the client's close reply, then drops the socket.
+            let reply = server.next().await;
+            drop(server);
+            reply
+        });
+        assert!(
+            end.is_none(),
+            "the end of the stream passes through: {end:?}"
+        );
+
+        // An error passes through: the peer vanishes without a closing handshake.
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let mut client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        drop(server_io);
+        let reset = next_frame_past_heartbeat(&mut client).await;
+        assert!(
+            matches!(
+                reset,
+                Some(Err(Error::Protocol(
+                    ProtocolError::ResetWithoutClosingHandshake
+                )))
+            ),
+            "{reset:?}"
+        );
     }
 }
