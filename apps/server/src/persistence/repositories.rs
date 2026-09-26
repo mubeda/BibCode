@@ -25,6 +25,31 @@ use super::{Database, PersistenceError, Result};
 
 pub type Timestamp = String;
 
+/// How many events one page holds when a caller walks the event log.
+pub const EVENT_PAGE_SIZE: usize = 128;
+
+/// Walks the event log after an exclusive sequence cursor, one bounded read at a time, so a
+/// caller never holds more than [`EVENT_PAGE_SIZE`] events.
+pub struct EventPages<'a> {
+    repositories: &'a Repositories,
+    cursor: i64,
+}
+
+impl EventPages<'_> {
+    /// Returns the next page after the cursor, or `None` once a read finds no newer event.
+    pub async fn next_page(&mut self) -> Result<Option<Vec<OrchestrationEvent>>> {
+        let page = self
+            .repositories
+            .read_events_from_sequence(self.cursor, EVENT_PAGE_SIZE)
+            .await?;
+        let Some(last) = page.last() else {
+            return Ok(None);
+        };
+        self.cursor = last.sequence;
+        Ok(Some(page))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Repositories {
     database: Database,
@@ -109,6 +134,7 @@ impl Repositories {
 
     /// Reads at most `limit` events after an exclusive sequence cursor.  Callers
     /// stream large replays by advancing the cursor to the last returned event.
+    /// [`Repositories::event_pages`] walks the log that way in [`EVENT_PAGE_SIZE`] pages.
     pub async fn read_events_from_sequence(
         &self,
         sequence_exclusive: i64,
@@ -130,6 +156,14 @@ impl Repositories {
                     .map_err(Into::into)
             })
             .await
+    }
+
+    /// Starts walking the event log after `sequence_exclusive`; see [`EventPages`].
+    pub fn event_pages(&self, sequence_exclusive: i64) -> EventPages<'_> {
+        EventPages {
+            repositories: self,
+            cursor: sequence_exclusive,
+        }
     }
 
     pub async fn max_event_sequence(&self) -> Result<i64> {

@@ -1,12 +1,12 @@
 use bibcode_server::orchestration::TurnDeliveryState;
 use bibcode_server::persistence::{
     AuthPairingLink, AuthSessionClient, AuthSessionDeliveryState, CheckpointDiffBlob,
-    CommandReceipt, Database, NewAuthPairingOffer, NewAuthSession, NewOrchestrationEvent,
-    ProjectionCheckpoint, ProjectionPendingApproval, ProjectionPendingTurnStart, ProjectionProject,
-    ProjectionState, ProjectionThread, ProjectionThreadActivity, ProjectionThreadMessage,
-    ProjectionThreadProposedPlan, ProjectionThreadSession, ProjectionTurnById,
-    ProviderSessionRuntime, Repositories, WorktreeRemovalReceipt, WorktreeRepositoryPinOutcome,
-    run_migrations,
+    CommandReceipt, Database, EVENT_PAGE_SIZE, NewAuthPairingOffer, NewAuthSession,
+    NewOrchestrationEvent, ProjectionCheckpoint, ProjectionPendingApproval,
+    ProjectionPendingTurnStart, ProjectionProject, ProjectionState, ProjectionThread,
+    ProjectionThreadActivity, ProjectionThreadMessage, ProjectionThreadProposedPlan,
+    ProjectionThreadSession, ProjectionTurnById, ProviderSessionRuntime, Repositories,
+    WorktreeRemovalReceipt, WorktreeRepositoryPinOutcome, run_migrations,
 };
 use std::collections::HashMap;
 
@@ -307,6 +307,7 @@ fn public_repository_api_inventory_is_explicit() {
 
     let mut expected = vec![
         "append_event",
+        "event_pages",
         "auth_authority_revision",
         "can_promote_queued_provider_turn",
         "claim_provider_turn",
@@ -368,6 +369,7 @@ fn public_repository_api_inventory_is_explicit() {
         "list_turns_by_thread",
         "load_auth_authority_snapshot",
         "max_event_sequence",
+        "next_page",
         "min_last_applied_sequence",
         "pin_project_worktree_repository_key",
         "prepare_reserved_command_receipt",
@@ -530,6 +532,60 @@ async fn orchestration_event_writer_round_trips_json() {
         .expect("event 1");
     assert!(inserted_first.sequence > 0);
     assert_row_eq(&inserted_first.event, &first);
+}
+
+#[tokio::test]
+async fn event_pages_walk_the_log_after_a_cursor_one_bounded_page_at_a_time() {
+    let repositories = migrated_repositories().await;
+    let mut sequences = Vec::new();
+    for index in 0..EVENT_PAGE_SIZE + 2 {
+        let event = repositories
+            .append_event(NewOrchestrationEvent {
+                event_id: format!("paged-{index}"),
+                event_type: "thread.updated".to_owned(),
+                aggregate_kind: "thread".to_owned(),
+                aggregate_id: "thread-1".to_owned(),
+                occurred_at: T0.to_owned(),
+                command_id: None,
+                causation_event_id: None,
+                correlation_id: None,
+                payload: json!({}),
+                metadata: json!({}),
+            })
+            .await
+            .expect("event");
+        sequences.push(event.sequence);
+    }
+
+    let mut pages = repositories.event_pages(sequences[0]);
+    let first = pages
+        .next_page()
+        .await
+        .expect("first page")
+        .expect("events");
+    assert_eq!(first.len(), EVENT_PAGE_SIZE);
+    assert_eq!(first[0].sequence, sequences[1]);
+    let second = pages
+        .next_page()
+        .await
+        .expect("second page")
+        .expect("events");
+    assert_eq!(
+        second
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        sequences[EVENT_PAGE_SIZE + 1..]
+    );
+    assert!(pages.next_page().await.expect("end").is_none());
+    assert!(
+        repositories
+            .event_pages(*sequences.last().unwrap())
+            .next_page()
+            .await
+            .expect("empty tail")
+            .is_none()
+    );
 }
 
 #[tokio::test]

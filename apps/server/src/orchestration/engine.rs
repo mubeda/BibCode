@@ -5323,18 +5323,10 @@ async fn read_all_events(
     repositories: &Repositories,
     from_sequence_exclusive: i64,
 ) -> Result<Vec<OrchestrationEvent>, Arc<PersistenceError>> {
-    let mut cursor = from_sequence_exclusive;
+    let mut pages = repositories.event_pages(from_sequence_exclusive);
     let mut all = Vec::new();
-    loop {
-        let batch = repositories
-            .read_events_from_sequence(cursor, 128)
-            .await
-            .map_err(Arc::new)?;
-        if batch.is_empty() {
-            break;
-        }
-        cursor = batch.last().map(|event| event.sequence).unwrap_or(cursor);
-        all.extend(batch);
+    while let Some(page) = pages.next_page().await.map_err(Arc::new)? {
+        all.extend(page);
     }
     Ok(all)
 }
