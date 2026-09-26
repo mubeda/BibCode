@@ -33,7 +33,23 @@ export interface WorkspaceCardMenuInput {
   readonly pinned: boolean;
   readonly unread: boolean;
   readonly confirmThreadDelete: boolean;
+  /**
+   * A provider session in the card's worktree is running (see
+   * `isWorktreeSessionRunning`). Disables Delete Worktree with
+   * `WORKTREE_DELETE_BLOCKED_REASON`; Delete Thread stops its own session first.
+   */
+  readonly worktreeSessionRunning: boolean;
 }
+
+/**
+ * Why Delete Worktree waits: it is refused while a session in the worktree runs
+ * (`isWorktreeSessionRunning`), so the checkout never disappears under a working
+ * agent. "Runs" is the card menu's Archive rule, `isWorkspaceThreadRunning`,
+ * which is stricter than `archiveThread`'s refusal of a running session only
+ * while it has an active turn.
+ */
+export const WORKTREE_DELETE_BLOCKED_REASON =
+  "Stop the running session before deleting this worktree.";
 
 export interface PrimaryCardMenuInput {
   readonly openIn: readonly ContextMenuItem<string>[];
@@ -114,6 +130,12 @@ export function buildWorkspaceCardMenu(input: WorkspaceCardMenuInput): SidebarMe
     : input.confirmThreadDelete
       ? "Delete Thread…"
       : "Delete Thread";
+  const deleteEntry: ContextMenuItem<string> = {
+    id: "delete",
+    label: deleteLabel,
+    destructive: true,
+    icon: "trash",
+  };
   return [
     openInEntry(input.openIn, input.workspaceUnavailableReason),
     (input.pullDisabledReason ?? input.workspaceUnavailableReason)
@@ -132,7 +154,9 @@ export function buildWorkspaceCardMenu(input: WorkspaceCardMenuInput): SidebarMe
     ...pinAndReadEntries(input.pinned, input.unread),
     { id: "rename", label: "Rename…" },
     SEPARATOR,
-    { id: "delete", label: deleteLabel, destructive: true, icon: "trash" },
+    input.isWorktree && input.worktreeSessionRunning
+      ? { ...deleteEntry, disabled: true, description: WORKTREE_DELETE_BLOCKED_REASON }
+      : deleteEntry,
   ];
 }
 

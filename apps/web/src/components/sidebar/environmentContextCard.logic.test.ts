@@ -64,6 +64,21 @@ describe("buildEnvironmentContextCardView", () => {
     expect(card?.showUpdateActions).toBe(false);
     expect(card?.statusText).toContain("Reconnecting");
   });
+
+  it.each([
+    { phase: "reconnecting", error: "No data for 30 seconds.", hasReason: true },
+    { phase: "error", error: "The pairing credential expired.", hasReason: true },
+    { phase: "connected", error: "A stale failure from before.", hasReason: false },
+    { phase: "reconnecting", error: "", hasReason: false },
+    { phase: "reconnecting", error: null, hasReason: false },
+  ] as const)(
+    "shows a reason only when the status text carries one ($phase, error $error)",
+    ({ phase, error, hasReason }) => {
+      const card = view({ connection: { phase, error, traceId: null } });
+      expect(card?.hasReason).toBe(hasReason);
+      if (hasReason) expect(card?.statusText).toContain(error);
+    },
+  );
 });
 
 describe("resolveCompatBadge", () => {

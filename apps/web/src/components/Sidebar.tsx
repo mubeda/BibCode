@@ -242,6 +242,7 @@ import {
   isContextMenuShortcut,
   isKeyboardContextMenuEcho,
   isWorkspaceThreadRunning,
+  isWorktreeSessionRunning,
   resolveWorkspaceCardAgeSource,
   resolveWorkspaceCardClassName,
   resolveWorkspaceCardStatus,
@@ -264,6 +265,7 @@ import {
   buildWorkspaceCardMenu,
   describeUnavailableWorkspace,
   parseProjectHeaderSelection,
+  WORKTREE_DELETE_BLOCKED_REASON,
 } from "./sidebar/sidebarMenus.logic";
 import { markKeyboardContextMenuOpened } from "../contextMenuKeyboard";
 import { resolveAgentProvider } from "./sidebar/agentsSection.logic";
@@ -2830,6 +2832,10 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
           pinned: pinnedThreadKeys.includes(threadKey),
           unread: unreadThreadKeys.includes(threadKey),
           confirmThreadDelete: appSettingsConfirmThreadDelete,
+          worktreeSessionRunning: isWorktreeSessionRunning(
+            thread,
+            sidebarThreadByKeyRef.current.values(),
+          ),
         }),
         position,
       );
@@ -2932,6 +2938,22 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       }
       if (clicked !== "delete") return;
       if (thread.worktreePath) {
+        // Re-check when chosen: the menu was built when it opened, and a session
+        // may have started since. This is the card menu's Archive rule,
+        // `isWorkspaceThreadRunning`, stricter than `archiveThread`'s turn check.
+        const latestThreads = sidebarThreadByKeyRef.current;
+        if (
+          isWorktreeSessionRunning(latestThreads.get(threadKey) ?? thread, latestThreads.values())
+        ) {
+          toastManager.add(
+            stackedThreadToast({
+              type: "warning",
+              title: "Worktree not deleted",
+              description: WORKTREE_DELETE_BLOCKED_REASON,
+            }),
+          );
+          return;
+        }
         if (removalPolicy === "legacy-detach-only") {
           const confirmed = await api.dialogs.confirm(
             [

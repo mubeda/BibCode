@@ -704,6 +704,48 @@ export function summarizeWorkspaceChats<T extends WorkspaceChatThread>(
   return summaries;
 }
 
+type WorktreeSessionThread = Pick<
+  WorkspaceChatThread,
+  "environmentId" | "projectId" | "worktreePath" | "archivedAt"
+> &
+  Pick<ThreadStatusInput, "session">;
+
+/**
+ * Whether a provider session is running in a worktree card's checkout: the
+ * card's own thread, or an unarchived chat open in the same worktree (its
+ * "N more chats"). "Running" is the card menu's Archive rule,
+ * `isWorkspaceThreadRunning` (session status `running`), which is stricter than
+ * `archiveThread`'s refusal of a running session only while it has an active turn.
+ *
+ * Archived chats are skipped, as in `summarizeWorkspaceChats`, even though
+ * archiving does not stop a session (the engine only records `thread.archived`),
+ * so an archived chat can leave an idle session in the worktree. That is safe:
+ * archiving requires no active turn, the sidebar offers no way to stop a chat it
+ * hides, and removing the worktree stops any idle session left behind (the
+ * server's `stop_session_if_current` in `worktree_runtime.rs`).
+ *
+ * O(threads), so run it when a menu opens or memoize it, never on every render.
+ * A thread without a worktree has none.
+ */
+export function isWorktreeSessionRunning<T extends WorktreeSessionThread>(
+  card: T,
+  threads: Iterable<T>,
+): boolean {
+  if (card.worktreePath === null) return false;
+  if (isWorkspaceThreadRunning(card)) return true;
+  const key = workspaceCheckoutKey(card);
+  for (const thread of threads) {
+    if (
+      thread.archivedAt === null &&
+      isWorkspaceThreadRunning(thread) &&
+      workspaceCheckoutKey(thread) === key
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
  * A card's surface for its state, per States.dc.html, refined by the user on
  * 2026-09-25: every card is outlined so neighbouring cards read as separate.

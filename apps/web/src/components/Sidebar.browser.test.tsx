@@ -18,6 +18,7 @@ import {
   makeProject,
   makeThread,
   projectA,
+  threadActive,
   threadKeyOf,
 } from "./Sidebar.testHarness";
 import { createRoot, type Root } from "react-dom/client";
@@ -164,6 +165,104 @@ describe("SidebarThreadRow browser interactions", () => {
       }
     },
   );
+
+  it("explains the disabled Delete Worktree in the real menu while the worktree's session runs", async () => {
+    const reason = "Stop the running session before deleting this worktree.";
+    baseScenario();
+    fakeLocalApi();
+    h.spies.contextMenuShow.mockImplementation(showContextMenuFallback);
+    const { container, root } = await mount(<Sidebar />);
+    try {
+      const card = requiredElement<HTMLLIElement>(
+        container,
+        "[data-testid='thread-row-thread-active']",
+      );
+      await dispatch(
+        card,
+        new MouseEvent("contextmenu", {
+          bubbles: true,
+          cancelable: true,
+          clientX: 24,
+          clientY: 48,
+        }),
+      );
+      await nextFrame();
+      const deleteItem = [
+        ...document.querySelectorAll<HTMLButtonElement>('[role="menu"] [role="menuitem"]'),
+      ].find((item) => item.textContent?.startsWith("Delete Worktree…"));
+      expect(deleteItem).toBeDefined();
+      expect(deleteItem!.disabled).toBe(true);
+      expect(deleteItem!.getAttribute("aria-disabled")).toBe("true");
+      expect(deleteItem!.getAttribute("aria-description")).toBe(reason);
+      expect(deleteItem!.textContent).toBe(`Delete Worktree…${reason}`);
+    } finally {
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      await unmount(root, container);
+    }
+  });
+
+  it("refuses a Delete Worktree chosen after a session started while the menu was open", async () => {
+    const readyWorktree: EnvironmentThreadShell = {
+      ...threadActive,
+      session: { ...threadActive.session!, status: "ready" },
+    };
+    const withWorktree = (worktree: EnvironmentThreadShell) =>
+      (h.state.threads as EnvironmentThreadShell[]).map((thread) =>
+        thread.id === worktree.id ? worktree : thread,
+      );
+    baseScenario();
+    h.state.threads = withWorktree(readyWorktree);
+    fakeLocalApi();
+    let deleteItem: { disabled?: boolean } | undefined;
+    let choose: (id: string | null) => void = () => {};
+    h.spies.contextMenuShow.mockImplementation(
+      (items: Array<{ id?: string; disabled?: boolean }>) =>
+        new Promise<string | null>((resolve) => {
+          deleteItem = items.find((item) => item.id === "delete");
+          choose = resolve;
+        }),
+    );
+    const { container, root } = await mount(<Sidebar />);
+    try {
+      const card = requiredElement<HTMLLIElement>(
+        container,
+        "[data-testid='thread-row-thread-active']",
+      );
+      const cardStatus = () => card.querySelector("[data-status]")?.getAttribute("data-status");
+      await dispatch(card, new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
+      expect(deleteItem?.disabled).not.toBe(true);
+      expect(cardStatus()).not.toBe("working");
+
+      // A session starts while the menu is open. The store replaces the thread
+      // with a new object, never touching the one the menu was built from, and
+      // the sidebar re-renders with it (`root.render` stands in for the store
+      // subscription, which the harness mocks away).
+      h.state.threads = withWorktree({
+        ...readyWorktree,
+        session: { ...readyWorktree.session!, status: "running" },
+      });
+      await React.act(async () => root.render(<Sidebar />));
+      expect(cardStatus()).toBe("working");
+
+      await React.act(async () => {
+        choose("delete");
+        await flush();
+      });
+
+      expect(h.spies.requestWorktreeRemoval).not.toHaveBeenCalled();
+      expect(h.spies.deleteThread).not.toHaveBeenCalled();
+      expect(h.spies.dialogConfirm).not.toHaveBeenCalled();
+      expect(h.spies.toastAdd).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: "warning",
+          title: "Worktree not deleted",
+          description: "Stop the running session before deleting this worktree.",
+        }),
+      );
+    } finally {
+      await unmount(root, container);
+    }
+  });
 
   it("opens the dialog for the clicked worktree row project", async () => {
     const projectB = makeProject("project-browser-b", {
