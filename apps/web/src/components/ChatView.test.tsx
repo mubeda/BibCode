@@ -621,13 +621,6 @@ vi.mock("./RightPanelSheet", () => ({
   },
 }));
 
-vi.mock("./BranchToolbar", () => ({
-  BranchToolbar: (props: Record<string, unknown>) => {
-    h.captured["branchToolbar"] = props;
-    return <div data-mock="branch-toolbar" />;
-  },
-}));
-
 // Lazy-loaded panels: keep the imports trivial so Suspense fallbacks stay inert.
 vi.mock("./preview/PreviewPanel", () => ({
   PreviewPanel: () => <div data-mock="preview-panel" />,
@@ -3637,7 +3630,7 @@ describe("ChatView", () => {
   });
 
   describe("when: a server thread exists on a connected environment", () => {
-    it("renders header, timeline, and composer without the old branch toolbar", () => {
+    it("renders header, timeline, and composer", () => {
       seedEnvironment(makeEnvironmentPresentation());
       seedProject(makeProject());
       seedServerThread(makeThread());
@@ -3650,7 +3643,6 @@ describe("ChatView", () => {
       expect(markup).not.toContain("data-center-panel-header-row");
       expect(markup).toContain('data-mock="messages-timeline"');
       expect(markup).toContain('data-mock="chat-composer"');
-      expect(markup).not.toContain('data-mock="branch-toolbar"');
       expect(markup).not.toContain('data-mock="no-active-thread"');
 
       const workspace = capturedProps<Record<string, unknown>>("centerWorkspace");
@@ -4353,7 +4345,7 @@ describe("ChatView", () => {
       expect(markup).toContain('data-mock="chat-composer"');
     });
 
-    it("hides the branch toolbar when the workspace is not a git repository", () => {
+    it("renders the composer when the workspace is not a git repository", () => {
       seedEnvironment(makeEnvironmentPresentation());
       seedProject(makeProject());
       seedServerThread(makeThread());
@@ -4362,7 +4354,6 @@ describe("ChatView", () => {
       const markup = renderServerRoute();
 
       expect(markup).toContain('data-mock="chat-composer"');
-      expect(markup).not.toContain('data-mock="branch-toolbar"');
     });
 
     it("surfaces the session error through the thread error banner", () => {
@@ -4619,7 +4610,6 @@ describe("ChatView", () => {
       expect(markup).toContain('data-mock="messages-timeline"');
       expect(markup).toContain('data-mock="chat-composer"');
       expect(markup).not.toContain('data-mock="chat-header"');
-      expect(markup).not.toContain('data-mock="branch-toolbar"');
       expect(h.activityStateTargets).toEqual([
         {
           environmentId,

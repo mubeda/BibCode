@@ -12,7 +12,6 @@ const h = vi.hoisted(() => ({
   menuOnOpenChange: null as ((open: boolean) => void) | null,
   navigate: vi.fn(),
   previewServers: [] as unknown[],
-  selectProps: null as Record<string, unknown> | null,
   setOpenMobile: vi.fn(),
   sheetOnOpenChange: null as
     | ((
@@ -171,22 +170,6 @@ vi.mock("./ui/sheet", () => ({
   SheetPopup: ({ children }: { children?: ReactNode }) => <aside>{children}</aside>,
 }));
 
-vi.mock("./ui/select", () => {
-  const Container = ({ children }: { children?: ReactNode }) => <>{children}</>;
-  return {
-    Select: ({ children, ...props }: Record<string, unknown>) => {
-      h.selectProps = props;
-      return <div>{children as ReactNode}</div>;
-    },
-    SelectGroup: Container,
-    SelectGroupLabel: Container,
-    SelectItem: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
-    SelectPopup: Container,
-    SelectTrigger: Container,
-    SelectValue: () => <span data-select-value />,
-  };
-});
-
 vi.mock("./ui/menu", () => ({
   Menu: ({
     children,
@@ -249,7 +232,6 @@ vi.mock("../state/server", () => ({
 }));
 
 import { AppSidebarLayout } from "./AppSidebarLayout";
-import { BranchToolbarEnvModeSelector } from "./BranchToolbarEnvModeSelector";
 import { DiffWorkerError, DiffWorkerPoolProvider } from "./DiffWorkerPoolProvider";
 import { RightPanelSheet } from "./RightPanelSheet";
 import { ComposerPendingApprovalPanel } from "./chat/ComposerPendingApprovalPanel";
@@ -311,7 +293,6 @@ beforeEach(() => {
   h.menuOnOpenChange = null;
   h.navigate.mockReset().mockResolvedValue(undefined);
   h.previewServers = [];
-  h.selectProps = null;
   h.setOpenMobile.mockReset();
   h.sheetOnOpenChange = null;
   h.sidebarIsMobile = false;
@@ -633,47 +614,6 @@ describe("preview empty and menu surfaces", () => {
 });
 
 describe("layout and navigation surfaces", () => {
-  it("renders workspace selector locked/unlocked variants and forwards changes", async () => {
-    const onEnvModeChange = vi.fn();
-    const mounted = await mount(
-      <BranchToolbarEnvModeSelector
-        envLocked
-        effectiveEnvMode="local"
-        activeWorktreePath={null}
-        onEnvModeChange={onEnvModeChange}
-      />,
-    );
-    expect(mounted.container.textContent).toContain("Local checkout");
-    await rerender(
-      mounted,
-      <BranchToolbarEnvModeSelector
-        envLocked
-        effectiveEnvMode="worktree"
-        activeWorktreePath="/repo/worktrees/feature"
-        onEnvModeChange={onEnvModeChange}
-      />,
-    );
-    expect(mounted.container.textContent).toContain("Worktree");
-
-    for (const [mode, path] of [
-      ["local", null],
-      ["local", "/repo/worktrees/feature"],
-      ["worktree", null],
-    ] as const) {
-      await rerender(
-        mounted,
-        <BranchToolbarEnvModeSelector
-          envLocked={false}
-          effectiveEnvMode={mode}
-          activeWorktreePath={path}
-          onEnvModeChange={onEnvModeChange}
-        />,
-      );
-    }
-    (h.selectProps!.onValueChange as (value: string) => void)("worktree");
-    expect(onEnvModeChange).toHaveBeenCalledWith("worktree");
-  });
-
   it("closes right-panel sheets only when their open state becomes false", async () => {
     const onClose = vi.fn();
     const mounted = await mount(
