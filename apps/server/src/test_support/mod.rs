@@ -11,7 +11,7 @@ mod sandbox;
 
 #[cfg(target_os = "linux")]
 pub(crate) use capability_probe::check_capability_probe_appimage_environment;
-pub(crate) use event::FixtureEvent;
+pub(crate) use event::{FixtureEvent, within_fixture_deadline};
 pub(crate) use sandbox::{FixtureLease, TestSandbox};
 
 #[cfg(target_os = "linux")]
