@@ -6,6 +6,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import type { PendingUserInput } from "../../session-logic";
+import { textSizesBelowTextXs } from "../../test/uiTypography";
 import { ComposerPendingUserInputPanel } from "./ComposerPendingUserInputPanel";
 
 interface MountedTree {
@@ -128,6 +129,25 @@ describe("ComposerPendingUserInputPanel mounted behavior", () => {
     expect(optionButton("Beta").querySelector("svg")).not.toBeNull();
   });
 
+  it("follows the UI.md typography rules", async () => {
+    await mount(
+      renderPanel({
+        pendingUserInputs: [
+          prompt(
+            question("q1", [{ label: "Alpha", description: "First choice" }], {
+              multiSelect: true,
+            }),
+            question("q2", [{ label: "Gamma" }]),
+          ),
+        ],
+      }),
+    );
+
+    expect(textSizesBelowTextXs(document.body.innerHTML)).toEqual([]);
+    // The muted token is already the secondary colour; text must not dim it further.
+    expect(document.body.innerHTML).not.toMatch(/text-muted-foreground\/\d+/);
+  });
+
   it("optimistically selects a single option and advances once after the delay", async () => {
     const onToggleOption = vi.fn();
     const onAdvance = vi.fn();
@@ -178,6 +198,62 @@ describe("ComposerPendingUserInputPanel mounted behavior", () => {
 
     expect(onToggleOption).toHaveBeenCalledWith("multi", "Two");
     expect(onAdvance).not.toHaveBeenCalled();
+  });
+
+  // The card stays mounted while the user moves through one prompt's questions, so option
+  // selection must read the question and callback of the latest render, not the first.
+  describe("after the active question or its callbacks change", () => {
+    const single = question("q1", [{ label: "Alpha" }, { label: "Beta" }]);
+    const multi = question("q2", [{ label: "One" }, { label: "Two" }], { multiSelect: true });
+
+    it("toggles a later multi-select question from the keyboard without auto-advancing", async () => {
+      const onToggleOption = vi.fn();
+      const onAdvance = vi.fn();
+      const props = { pendingUserInputs: [prompt(single, multi)], onToggleOption, onAdvance };
+      const mounted = await mount(renderPanel(props));
+      await act(async () => mounted.root.render(renderPanel({ ...props, questionIndex: 1 })));
+      expect(document.body.textContent).toContain("Select one or more options.");
+
+      await act(async () => {
+        document.dispatchEvent(new KeyboardEvent("keydown", { key: "2", bubbles: true }));
+      });
+      await act(async () => vi.advanceTimersByTime(500));
+
+      expect(onToggleOption).toHaveBeenCalledWith("q2", "Two");
+      expect(onAdvance).not.toHaveBeenCalled();
+    });
+
+    it("toggles a later multi-select question on click without auto-advancing", async () => {
+      const onToggleOption = vi.fn();
+      const onAdvance = vi.fn();
+      const props = { pendingUserInputs: [prompt(single, multi)], onToggleOption, onAdvance };
+      const mounted = await mount(renderPanel(props));
+      await act(async () => mounted.root.render(renderPanel({ ...props, questionIndex: 1 })));
+
+      await click(optionButton("One"));
+      await act(async () => vi.advanceTimersByTime(500));
+
+      expect(onToggleOption).toHaveBeenCalledWith("q2", "One");
+      expect(onAdvance).not.toHaveBeenCalled();
+    });
+
+    it("calls the latest option callback", async () => {
+      const firstToggle = vi.fn();
+      const latestToggle = vi.fn();
+      const mounted = await mount(renderPanel({ onToggleOption: firstToggle }));
+      await act(async () => mounted.root.render(renderPanel({ onToggleOption: latestToggle })));
+
+      await act(async () => {
+        document.dispatchEvent(new KeyboardEvent("keydown", { key: "1", bubbles: true }));
+      });
+      await click(optionButton("Beta"));
+
+      expect(firstToggle).not.toHaveBeenCalled();
+      expect(latestToggle.mock.calls).toEqual([
+        ["q1", "Alpha"],
+        ["q1", "Beta"],
+      ]);
+    });
   });
 
   it("supports number shortcuts while ignoring modifiers and editable targets", async () => {
