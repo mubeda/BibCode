@@ -1616,6 +1616,11 @@ mod tests {
 
     #[tokio::test]
     async fn protection_bypass_after_failure_stops_and_restarts_prior_set_on_installer_failure() {
+        if !crate::test_support::scenario_runs_in_this_process(
+            "updates::tests::protection_bypass_after_failure_stops_and_restarts_prior_set_on_installer_failure",
+        ) {
+            return;
+        }
         let (base_url, update_server) = spawn_update_server("test");
         let app = updater_test_app(format!("{base_url}/latest.json"));
         let handle = app.handle();
@@ -1632,11 +1637,13 @@ mod tests {
 
         let state = tempfile::tempdir().expect("backend state tempdir should open");
         let supervisor = BackendSupervisor::new();
+        let port = crate::test_support::free_test_port();
+        let config = BackendRunConfig {
+            port,
+            ..test_backend_config()
+        };
         supervisor
-            .start(BackendLaunchPlan::local(
-                state.path().to_path_buf(),
-                test_backend_config(),
-            ))
+            .start(BackendLaunchPlan::local(state.path().to_path_buf(), config))
             .await
             .expect("primary backend should start");
         supervisor.record_unavailable_environment(BackendUnavailableEnvironment {
@@ -1656,12 +1663,14 @@ mod tests {
             "primary protection should succeed: {blocked}"
         );
         assert_eq!(blocked["state"]["protection"][1]["status"], "failed");
+        let after_blocked = supervisor.snapshot_for_update();
         assert!(
-            supervisor
-                .snapshot_for_update()
+            after_blocked
                 .environments
                 .iter()
-                .any(|environment| environment.primary && environment.running)
+                .any(|environment| environment.primary && environment.running),
+            "{blocked}\n{:?}",
+            after_blocked.environments
         );
 
         manager.fail_next_install("synthetic installer failure");
@@ -1690,12 +1699,14 @@ mod tests {
                 .as_str()
                 .is_some_and(|message| message.contains("synthetic installer failure"))
         );
+        let after_restart = supervisor.snapshot_for_update();
         assert!(
-            supervisor
-                .snapshot_for_update()
+            after_restart
                 .environments
                 .iter()
-                .any(|environment| environment.primary && environment.running)
+                .any(|environment| environment.primary && environment.running),
+            "{failed_install}\n{:?}",
+            after_restart.environments
         );
 
         supervisor

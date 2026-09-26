@@ -17,7 +17,7 @@ if [ "$#" -eq 0 ]; then
 fi
 if [ "$1" = "pairing" ] && [ "${SSH_FIXTURE_HANG_PAIRING:-0}" = "1" ]; then
   if [ -n "$state" ]; then
-    printf '%s\n' "$$" >"$state/hang.pid"
+    printf '%s\n' "$$" >>"$state/hang.pid"
   fi
   exec sleep 600
 fi

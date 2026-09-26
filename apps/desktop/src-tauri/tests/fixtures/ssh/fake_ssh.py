@@ -12,6 +12,13 @@ single spaces and sshd(8) runs the joined string with `$SHELL -c` (/bin/sh
 here). `-N -L LOCAL:HOST:PORT` (the desktop tunnel) runs a local TCP forwarder
 that stays alive until it is killed, like a live `ssh -N` session.
 
+By default the fake execs into the remote shell, so killing the client also
+kills the remote command. With SSH_FIXTURE_SSHD_SESSIONS=1 it behaves like
+sshd(8) without a PTY instead: the remote command runs in its own session and
+the fake only relays stdio, so killing the client closes the channel but
+signals nothing, and the remote command runs on until it ends by itself or
+writes to the closed channel.
+
 Destination aliases starting with `hang-pairing` make the remote `bibcode`
 wrapper hang on `pairing issue`, to exercise the desktop's pairing deadline.
 
@@ -22,11 +29,13 @@ Environment:
                                 (required)
   SSH_FIXTURE_REMOTE_PORT_START first remote port the launch script scans
                                 (keeps the fake remote server away from 3773)
+  SSH_FIXTURE_SSHD_SESSIONS     1 for sshd-like remote sessions (see above)
 """
 
 import json
 import os
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -37,14 +46,15 @@ def fail(message):
     return 255
 
 
+SCRIPT_HEADER = "# bibcode-ssh:"
+
+
 def classify(remote, script):
+    """Names a remote script by its first line, `# bibcode-ssh:<kind>`."""
     if remote[:3] == ["sh", "-s", "--"]:
-        if "nohup" in script:
-            return "launch"
-        if '{"stopped":true}' in script:
-            return "stop"
-        if "pairing issue" in script:
-            return "pairing"
+        first_line = script.split("\n", 1)[0]
+        if first_line.startswith(SCRIPT_HEADER):
+            return first_line[len(SCRIPT_HEADER):].strip()
         return "script"
     return "other"
 
@@ -105,6 +115,55 @@ def run_tunnel(state, forward):
     while True:
         client, _ = listener.accept()
         threading.Thread(target=serve_connection, args=(client, host, port), daemon=True).start()
+
+
+def relay(source, sink):
+    """Copies a remote output pipe to this client's own stream until EOF."""
+    while True:
+        data = source.read1(65536)
+        if not data:
+            break
+        try:
+            sink.write(data)
+            sink.flush()
+        except OSError:
+            break
+    source.close()
+
+
+def run_sshd_session(state, remote_home, command, environment, script):
+    """Runs `command` the way sshd(8) runs a session without a PTY.
+
+    The command gets its own session, so nothing this client does (or
+    suffers) signals it. The client writes the script to its stdin, relays its
+    stdout and stderr, and exits with its status once both reach EOF.
+    """
+    remote = subprocess.Popen(
+        ["/bin/sh", "-c", command],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=environment,
+        cwd=remote_home,
+        start_new_session=True,
+    )
+    with open(os.path.join(state, "remote-sessions.jsonl"), "a") as log:
+        log.write(json.dumps({"pid": remote.pid, "command": command}) + "\n")
+    relays = [
+        threading.Thread(target=relay, args=(remote.stdout, sys.stdout.buffer)),
+        threading.Thread(target=relay, args=(remote.stderr, sys.stderr.buffer)),
+    ]
+    for thread in relays:
+        thread.start()
+    try:
+        remote.stdin.write(script.encode())
+        remote.stdin.close()
+    except OSError:
+        pass
+    for thread in relays:
+        thread.join()
+    status = remote.wait()
+    return status if status >= 0 else 255
 
 
 def seed_port(remote_home, state_key, start):
@@ -192,7 +251,8 @@ def main():
             start = str(int(start) + (sum(alias.encode()) % 40) * 5)
         seed_port(remote_home, remote[3], start)
 
-    if script:
+    sshd_sessions = os.environ.get("SSH_FIXTURE_SSHD_SESSIONS") == "1"
+    if script and not sshd_sessions:
         script_path = os.path.join(state, "stdin-%d.sh" % os.getpid())
         with open(script_path, "w") as handle:
             handle.write(script)
@@ -214,6 +274,8 @@ def main():
     }
     if not remote:
         return fail("fake ssh: interactive sessions are not supported")
+    if sshd_sessions:
+        return run_sshd_session(state, remote_home, " ".join(remote), environment, script)
     os.chdir(remote_home)
     os.execvpe("/bin/sh", ["/bin/sh", "-c", " ".join(remote)], environment)
     return 255

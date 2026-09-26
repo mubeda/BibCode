@@ -75,6 +75,79 @@ pub(crate) async fn with_appimage_test_environment_async(
     }
 }
 
+/// Writes an executable test fixture (a script the test then runs) from a
+/// short-lived child process, with `mode` (for example `0o755`).
+///
+/// Written in this process with `fs::write`, the file would be open for
+/// writing here for a moment, and a child that another test forks in that
+/// moment keeps the descriptor until it `exec`s; running a file that is open
+/// for writing fails with ETXTBSY ("Text file busy"). Writing from a child
+/// keeps the descriptor out of the test process altogether.
+#[cfg(unix)]
+pub(crate) fn write_executable_fixture(path: &std::path::Path, contents: &str, mode: u32) {
+    use std::io::Write as _;
+
+    let mut writer = std::process::Command::new("/bin/sh")
+        .args(["-c", "cat >\"$1\" && chmod \"$2\" \"$1\"", "sh"])
+        .arg(path)
+        .arg(format!("{mode:o}"))
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("start the fixture writer");
+    writer
+        .stdin
+        .take()
+        .expect("fixture writer stdin")
+        .write_all(contents.as_bytes())
+        .expect("write the fixture");
+    assert!(
+        writer.wait().expect("fixture writer status").success(),
+        "could not write {}",
+        path.display()
+    );
+}
+
+/// A free port for tests that bind or restart onto it after releasing it.
+/// Any socket another process binds there in between makes the restart fail
+/// ("Address already in use"): with port 0 the port came from the kernel's
+/// ephemeral range, and portpicker's 15000-25000 is where this suite's own
+/// fixtures bind. A random free port from 25000-32767 sits below the ephemeral
+/// ranges (32768 on Linux, 49152 on macOS and Windows) and above portpicker.
+pub(crate) fn free_test_port() -> u16 {
+    (0..64)
+        .map(|_| 25_000 + (uuid::Uuid::new_v4().as_u128() % 7_768) as u16)
+        .find(|port| std::net::TcpListener::bind(("127.0.0.1", *port)).is_ok())
+        .expect("a free port from 25000-32767")
+}
+
+/// Runs test `name` again in a process of its own, where no other test runs,
+/// and returns false once it passed there; returns true in that process, which
+/// then runs the scenario itself. `name` is the test's full path, as
+/// `cargo test` prints it.
+///
+/// For tests that restart a backend on the port it has just released. In the
+/// shared test process other tests fork children, and a child keeps a copy of
+/// every open socket until it `exec`s, the old listener included; a restart in
+/// that window fails with "Address already in use".
+pub(crate) fn scenario_runs_in_this_process(name: &str) -> bool {
+    const ISOLATED: &str = "BIBCODE_DESKTOP_ISOLATED_TEST";
+    if std::env::var_os(ISOLATED).is_some() {
+        return true;
+    }
+    let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([name, "--exact", "--test-threads=1", "--nocapture"])
+        .env(ISOLATED, name)
+        .output()
+        .expect("run the scenario in its own process");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("test result: ok. 1 passed"),
+        "{name} did not pass in its own process:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct FixtureEvent {
     generation: AtomicU64,

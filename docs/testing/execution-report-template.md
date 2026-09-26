@@ -254,9 +254,11 @@ See [Desktop-managed SSH environments](./ssh-environments.md).
 | 5   | Desktop restart              |                |        |                        |
 | 6   | Dead link (optional)         |                |        |                        |
 | 7   | Revocation (optional)        |                |        |                        |
+| 8   | Hung pairing (optional)      |                |        |                        |
 
 - Devices for this desktop on the host after (count, access):
-- Cleanup (environment removed, device revoked, no leftover managed server):
+- Cleanup (environment removed, device revoked, no leftover managed server or
+  pairing command):
 
 ## Process and temporary-root cleanup
 
