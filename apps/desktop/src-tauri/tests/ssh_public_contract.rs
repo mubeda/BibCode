@@ -206,11 +206,13 @@ fn public_remote_parsers_cover_success_defaults_and_validation_errors() {
 
 #[test]
 fn public_remote_pairing_command_targets_the_native_cli_and_parses_its_output() {
-    assert!(REMOTE_PAIRING_SCRIPT.starts_with("set -eu\n"));
+    assert!(REMOTE_PAIRING_SCRIPT.starts_with("# bibcode-ssh:pairing\nset -eu\n"));
     assert!(REMOTE_PAIRING_SCRIPT.contains("command -v bibcode"));
+    // The command runs under the remote watchdog, bounded by the script's
+    // first argument.
     assert_eq!(
         REMOTE_PAIRING_SCRIPT.lines().last(),
-        Some("exec bibcode pairing issue --base-dir \"$HOME/.bibcode\" --json")
+        Some("run_bounded \"$1\" bibcode pairing issue --base-dir \"$HOME/.bibcode\" --json")
     );
 
     assert_eq!(

@@ -36,11 +36,39 @@ binary; `BIBCODE_SSH_FIXTURE_PORT_START` moves the fake remote's port scan
 (default 47310, away from a local BiBCode on 3773). Each scenario stops the
 remote servers and tunnels it started; after a run, no `fake_ssh.py`,
 `bibcode serve --base-dir …/remote-home/.bibcode`, or `sleep 600` process
-should remain.
+should remain (a stopped server can take a moment to exit).
+
+The fake classifies each remote script by its first line,
+`# bibcode-ssh:<launch|pairing|stop>`. By default it execs into the remote
+shell, so killing the client also kills the remote command. The pairing-timeout
+scenarios instead use its sshd-like mode (`SSH_FIXTURE_SSHD_SESSIONS=1`, set by
+`Harness::with_sshd_sessions`): each remote command runs in its own session and
+the fake only relays stdio, so, as with `sshd` without a PTY, killing the client
+signals nothing. With a hung `bibcode pairing issue` (alias `hang-pairing…`),
+the remote command must end within the pairing watchdog's bound, the pairing
+deadline plus 5 s, plus 3 s, after the desktop has given up; three timed-out
+attempts in a row must leave no remote command behind.
+
+`cargo test -p bibcode-desktop` also runs the remote scripts themselves,
+without SSH, under `/bin/sh` and each of `dash`, `bash --posix` and
+`busybox sh` that is installed, once per shell binary: on Ubuntu CI `/bin/sh`
+is dash, so dash and bash run; on Fedora `/bin/sh` is bash, so only bash runs;
+macOS runs its `/bin/sh` and bash 3.2. They cover the
+pairing watchdog, the launch script's wall-clock readiness limits (including a
+`wget`-only `PATH`), its stopping of servers it gave up on even with its output
+closed, its checks of recorded pids (malformed ones included, with `kill`
+replaced by a recorder), its state records when a launch is cut short, and the
+stop script's TERM-only stop, which waits for the server to exit, so a launch
+right after it never runs beside a server still shutting down. On
+Windows the same command runs two tests that saturate a Tokio blocking pool,
+checking that SSH output still arrives and that no pipe read stays parked after
+a drain gives up; only a Windows host or CI can run them.
 
 The harness is compatibility evidence for OpenSSH join semantics. It does not
 exercise askpass, a real `sshd`, a remote login shell other than `/bin/sh`, or
-Windows `ssh.exe`; the live procedure below covers those.
+Windows `ssh.exe`; the live procedure below covers those. Its sshd-like mode
+models only one property of `sshd`: a command without a PTY is not signalled
+when the client goes away.
 
 ## Live procedure (Windows, Linux, and macOS desktops)
 
@@ -74,6 +102,7 @@ the environment row's state, and any exact error text.
 | 5   | Desktop restart              | Quit the desktop app and start it again.                                                                                     | Connects (launch and tunnel run again; password auth prompts again). No new device.                                    |
 | 6   | Dead link (optional)         | Cut the network path to the host for over 45 s, then restore it.                                                             | The tunnel ends after keepalive; the row reconnects after the link returns.                                            |
 | 7   | Revocation (optional)        | Revoke the desktop's device on the host's Share tab, then wait for the desktop to reconnect.                                 | The desktop pairs again over SSH and connects; the old device is gone and one new device appears.                      |
+| 8   | Hung pairing (optional)      | With the wrapper from [Hung pairing command](#hung-pairing-command) on the host, add the environment; let it retry 3 times.  | Each attempt fails with the pairing-timeout copy; about 37 s after each, its `sleep 6143` is gone. Nothing builds up.  |
 
 ### Stopping the remote server
 
@@ -105,6 +134,30 @@ kill "$pid"
 
 If `ps` shows anything other than `bibcode serve`, stop: the pid file is stale
 and the pid may belong to another process. Record that and skip scenario 2.
+The launch and stop scripts make the same check before they reuse or stop a
+recorded pid, and leave any other process alone.
+
+### Hung pairing command
+
+Scenario 8 checks the remote pairing watchdog: `sshd` does not signal a command
+without a PTY when the client goes away, so the pairing script itself ends a
+`bibcode pairing issue` that outlives the desktop's 30 s limit, with TERM at
+35 s and KILL 2 s later. Remove the environment and its device first, so that
+adding it mints a credential. On the host, create a wrapper named `bibcode` in a
+directory that precedes the real one on non-interactive `sh`'s `PATH`, without
+changing any configuration (skip the scenario if no such directory exists):
+
+```sh
+#!/bin/sh
+# Hangs on `pairing issue`; runs the real CLI otherwise.
+if [ "$1" = pairing ]; then exec sleep 6143; fi
+exec /path/to/the/real/bibcode "$@"
+```
+
+`ssh <host> 'command -v bibcode'` must print the wrapper. Add the environment,
+note when each pairing timeout appears, and about 40 s after each run
+`ssh <host> 'pgrep -fl "sleep 6143"'`: it must print nothing. After three
+attempts, remove the environment and delete the wrapper.
 
 After scenario 5 (or 7), the host must list exactly **one** device for this
 desktop, labelled **BiBCode Tauri Desktop**, with standard access (not
@@ -120,6 +173,8 @@ the row stays **Connecting…** while BiBCode retries.
 1. Remove the environment on the desktop (row menu → **Remove server…**). This stops the
    tunnel and the managed remote server.
 2. Revoke the test device on the host's Share tab.
-3. Check that the host has no leftover managed server:
-   `ssh <host> 'ls ~/.bibcode-ssh-launch/*/pid 2>/dev/null; pgrep -fl "bibcode serve"'`.
-   Stop only a server this test started.
+3. Check that the host has no leftover managed server or pairing command:
+   `ssh <host> 'ls ~/.bibcode-ssh-launch/*/pid 2>/dev/null; pgrep -fl "bibcode serve"; pgrep -fl "bibcode pairing"'`.
+   Stop only a process this test started. A server that ignored the stop's
+   TERM for 10 s keeps running and keeps its `pid` file; record that, and stop
+   it as in [Stopping the remote server](#stopping-the-remote-server).

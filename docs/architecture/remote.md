@@ -817,6 +817,39 @@ connection; BiBCode keeps trying." and asks the user for nothing. Remote API ref
 401 blocks with `authentication`, 403 with `permission`, 400 with
 `configuration`; network failures and 5xx stay transient.
 
+**Remote bounds.** A deadline ends only the local `ssh`: `sshd` does not signal
+a command without a PTY when the client goes away. The pairing script bounds
+`bibcode pairing issue` itself. The desktop runs it as `sh -s -- <bound>`, the
+pairing deadline plus 5 s (35 s by default), and at the bound the script sends
+TERM, then KILL 2 s later. A host-side pairing command therefore ends within
+about 37 s even with no client left, and the user still sees only
+`[ssh_timeout:pairing]`. The launch script bounds its own waits on the host's
+clock: a recorded server gets 10 s to answer and a new one 15 s. Curl probes
+have a 1 s timeout; wget's own 1 s timeout runs under a 2 s watchdog (TERM after
+1–2 s, then KILL 2 s later), bounding a stuck wget to about 4 s. It thus
+ends well inside its 60 s deadline. Before it trusts, reuses, or stops a
+recorded pid, it checks that the pid still runs this state's
+`bibcode serve --port <port>` (`/proc/<pid>/cmdline`, or
+`ps -p <pid> -o command=` on macOS), and it leaves any other process alone. A
+live but silent recorded server is stopped (TERM, then KILL after 2 s) before
+exactly one replacement starts, so two managed servers never share a data root;
+if it survives KILL, the launch fails rather than start a second server beside
+it. A server the script started and gave up on is stopped the same way before any
+error is reported; SIGPIPE is ignored and every report may fail, so a closed
+channel cannot leave that server running. The launch records the port before
+the server starts, and the server records its own pid before it becomes
+`bibcode serve`, so a launch cut short never leaves a running server
+unrecorded or recorded with another port. The pid and port files are removed
+only while they still name that pid.
+
+The stop script sends TERM only, to a verified pid, then waits up to 10 s for
+the server to exit and clears its state files only once it has. A launch that
+follows at once therefore never starts a second server beside one still
+shutting down. The stop never forces a server that outlives the wait: it
+reports `{"stopped":false}` and keeps the record, and the desktop logs a warning.
+The next launch finds that server and stops it (TERM, then KILL) before it starts
+exactly one replacement.
+
 **Credentials.** Add runs launch, tunnel, and the pairing script
 `REMOTE_PAIRING_SCRIPT` (`bibcode pairing issue --base-dir "$HOME/.bibcode"
 --json`, the data root the launched `serve` uses), fetches the descriptor, and
@@ -858,6 +891,21 @@ is kept, because a descendant that inherited the pipes (a ProxyCommand helper,
 a ControlPersist master on older OpenSSH, a backgrounded process) can keep
 them open indefinitely. Errors built from such output end with
 `[output cut off]`.
+
+SSH children run on a private Tokio runtime owned by `SshEnvironmentManager`:
+one worker thread and at most 128 blocking threads. It starts on first use and
+stops in the background at the end of `shutdown()`, after every SSH child is
+reaped. Script children are spawned, fed, drained, waited on, and reaped
+there, and tunnels are spawned there and their stderr read there. A published
+tunnel is terminated and reaped from the caller's runtime, which needs no
+blocking-pool thread: on Windows a child wait is a registered wait, and
+elsewhere it runs on the I/O runtime's driver. Password prompts and events stay
+on Tauri's runtime. On Windows, Tokio
+runs child pipe I/O on a blocking pool, so this keeps SSH output from queueing
+behind the in-process server's blocking work. When a drain gives up (idle
+pipes, the deadline, or shutdown), each pipe read still in flight is cancelled
+with `CancelIoEx`. The cancel repeats while the read is polled, for up to 1 s,
+so no pool thread stays parked on a pipe that a descendant holds open.
 
 **Revocation.** SSH access is the authority for a desktop-managed environment.
 A bearer revoked on the host's Share tab is replaced on the next connection by
@@ -972,12 +1020,13 @@ performed on the machine that owns that server and filesystem.
   session). Sessions
   minted for SSH expire after 30 days; a standard-scope bearer cannot revoke
   them.
-- On Windows, Tokio reads child pipes on its blocking thread pool, so a
-  starved pool can still delay output past the 2 s idle window; that path has
-  no automated test.
-- An SSH script deadline terminates only the local `ssh` child. There is no
-  remote watchdog, so a remote `bibcode pairing issue` that hangs after the
-  connection drops keeps running on the host until sshd or the host ends it.
+- The remote bounds cannot end a process stuck in uninterruptible I/O. A
+  recorded server stuck that way blocks new launches of its environment until
+  it exits.
+- The stop script never forces a managed server that ignores TERM, because
+  killing it could orphan its provider children. Such a server keeps running,
+  still recorded, until the next launch of its environment stops it; if the
+  environment is never launched again, it runs until the host ends it.
 - Desktop SSH and some advertised endpoint providers are host capabilities and
   are unavailable in an ordinary browser.
 - Endpoint availability is advisory. The connection supervisor still verifies

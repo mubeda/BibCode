@@ -242,6 +242,7 @@ pub async fn probe_tailscale_https_endpoint(base_url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -409,12 +410,13 @@ mod tests {
     ) -> PathBuf {
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-
             let _ = windows_body;
             let path = directory.join(name);
-            fs::write(&path, format!("#!/bin/sh\n{unix_body}\n")).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            crate::test_support::write_executable_fixture(
+                &path,
+                &format!("#!/bin/sh\n{unix_body}\n"),
+                0o755,
+            );
             path
         }
         #[cfg(windows)]

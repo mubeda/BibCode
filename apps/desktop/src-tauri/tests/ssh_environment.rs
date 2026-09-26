@@ -6,6 +6,10 @@
 //! (`fixtures/ssh/fake_ssh.py`, Python 3) runs remote commands locally with
 //! OpenSSH semantics: the remote argv is joined with spaces and run by
 //! `/bin/sh -c`, as `ssh(1)` and `sshd(8)` specify. It never contacts a host.
+//! By default it execs into the remote shell; `Harness::with_sshd_sessions`
+//! makes it run each remote command in its own session and only relay stdio,
+//! as sshd does without a PTY, so killing the client leaves the remote command
+//! running and a remote leak is visible.
 //!
 //! Every test is `#[ignore]`d because it needs a fresh `bibcode`, which
 //! `cargo test -p bibcode-desktop` neither builds nor checks:
@@ -128,13 +132,20 @@ fn process_is_running(pid: u32) -> bool {
 }
 
 async fn wait_until_exited(pid: u32) -> bool {
-    for _ in 0..100 {
+    wait_until_exited_within(pid, Duration::from_secs(10)).await
+}
+
+async fn wait_until_exited_within(pid: u32, limit: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    loop {
         if !process_is_running(pid) {
             return true;
         }
+        if Instant::now() >= deadline {
+            return false;
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    false
 }
 
 struct Harness {
@@ -150,6 +161,16 @@ struct Harness {
 
 impl Harness {
     async fn new(alias: &'static str) -> Self {
+        Self::create(alias, false).await
+    }
+
+    /// A harness whose fake ssh runs remote commands in their own sessions,
+    /// as sshd does without a PTY: killing the client leaves them running.
+    async fn with_sshd_sessions(alias: &'static str) -> Self {
+        Self::create(alias, true).await
+    }
+
+    async fn create(alias: &'static str, sshd_sessions: bool) -> Self {
         let scenario = SCENARIO_LOCK.lock().await;
         let bibcode = real_bibcode();
         let root = tempfile::Builder::new()
@@ -173,10 +194,12 @@ impl Harness {
                 "#!/bin/sh\n\
                  SSH_FIXTURE_ROOT={root} SSH_FIXTURE_BIBCODE={bibcode} \
                  SSH_FIXTURE_REMOTE_BIN={remote_bin} SSH_FIXTURE_REMOTE_PORT_START={port_start} \
+                 SSH_FIXTURE_SSHD_SESSIONS={sshd_sessions} \
                  exec python3 {fake} \"$@\"\n",
                 root = quote(root.path()),
                 bibcode = quote(&bibcode),
                 remote_bin = quote(&fixtures_dir().join("remote-bin")),
+                sshd_sessions = u8::from(sshd_sessions),
                 fake = quote(&fixtures_dir().join("fake_ssh.py")),
             ),
         )
@@ -267,6 +290,28 @@ impl Harness {
         self.state.join("remote-home")
     }
 
+    fn pids_in(&self, file: &str, field: Option<&str>) -> Vec<u32> {
+        fs::read_to_string(self.state.join(file))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| match field {
+                Some(field) => serde_json::from_str::<Value>(line).ok()?[field].as_u64(),
+                None => line.trim().parse::<u64>().ok(),
+            })
+            .filter_map(|pid| u32::try_from(pid).ok())
+            .collect()
+    }
+
+    /// Pids of every hung remote `bibcode pairing` stand-in (`sleep 600`).
+    fn hang_pids(&self) -> Vec<u32> {
+        self.pids_in("hang.pid", None)
+    }
+
+    /// Pids of the sshd-like remote sessions the fake started.
+    fn remote_session_pids(&self) -> Vec<u32> {
+        self.pids_in("remote-sessions.jsonl", Some("pid"))
+    }
+
     /// Pids of the managed remote servers, from the launch script's pid files.
     fn remote_server_pids(&self) -> Vec<u32> {
         fs::read_dir(self.remote_home().join(".bibcode-ssh-launch"))
@@ -294,8 +339,8 @@ impl Harness {
 impl Drop for Harness {
     /// Last-resort cleanup of processes this harness started, for panics
     /// before the explicit `disconnect_environment`: remote `bibcode serve`
-    /// (pid files written by the launch script), fake tunnel forwarders, and a
-    /// hung remote pairing stand-in.
+    /// (pid files written by the launch script), fake tunnel forwarders, hung
+    /// remote pairing stand-ins, and sshd-like remote sessions still running.
     fn drop(&mut self) {
         let remote_root = self.remote_home().display().to_string();
         for pid in self.remote_server_pids() {
@@ -304,11 +349,11 @@ impl Drop for Harness {
         for pid in self.tunnel_pids() {
             self.terminate_owned(pid, "fake_ssh.py");
         }
-        if let Some(pid) = fs::read_to_string(self.state.join("hang.pid"))
-            .ok()
-            .and_then(|pid| pid.trim().parse::<u32>().ok())
-        {
+        for pid in self.hang_pids() {
             self.terminate_owned(pid, "sleep 600");
+        }
+        for pid in self.remote_session_pids() {
+            self.terminate_owned(pid, "sh -s --");
         }
     }
 }
@@ -558,14 +603,20 @@ async fn remote_server_stopped_under_a_live_tunnel_is_relaunched() {
     harness.disconnect(&manager).await;
 }
 
+/// Real sshd does not signal a remote command without a PTY when the client
+/// goes away, so a hung `bibcode pairing issue` would outlive the desktop's
+/// deadline. The remote watchdog ends it within its bound
+/// (`SshOperationDeadlines::pairing_watchdog_bound`) plus the TERM-to-KILL
+/// grace; this allows 3 s past the bound.
 #[tokio::test]
 #[ignore = "needs a fresh bibcode: cargo build -p bibcode-server --bin bibcode"]
-async fn pairing_timeout_terminates_the_ssh_child() {
-    let harness = Harness::new("hang-pairing").await;
-    let manager = harness.manager(SshOperationDeadlines {
+async fn pairing_timeout_terminates_the_ssh_child_and_the_remote_command() {
+    let harness = Harness::with_sshd_sessions("hang-pairing").await;
+    let deadlines = SshOperationDeadlines {
         pairing: Duration::from_secs(3),
         ..SshOperationDeadlines::default()
-    });
+    };
+    let manager = harness.manager(deadlines);
 
     let started = Instant::now();
     let error = harness
@@ -591,6 +642,68 @@ async fn pairing_timeout_terminates_the_ssh_child() {
         "the pairing SSH child must be terminated and reaped"
     );
     eprintln!("[hang-pairing] failed after {elapsed:?}");
+
+    // Asserted before `disconnect` and `Drop`, which would kill it anyway.
+    let client_gone = Instant::now();
+    let stand_ins = harness.hang_pids();
+    assert_eq!(stand_ins.len(), 1, "one hung remote pairing command");
+    let limit = deadlines.pairing_watchdog_bound() + Duration::from_secs(3);
+    for pid in stand_ins {
+        assert!(
+            wait_until_exited_within(pid, limit).await,
+            "the remote pairing command {pid} outlived the watchdog bound ({limit:?} after the client died)"
+        );
+    }
+    eprintln!(
+        "[hang-pairing] remote pairing command ended {:?} after the client",
+        client_gone.elapsed()
+    );
+
+    harness.disconnect(&manager).await;
+}
+
+#[tokio::test]
+#[ignore = "needs a fresh bibcode: cargo build -p bibcode-server --bin bibcode"]
+async fn timed_out_pairing_retries_leave_no_remote_command() {
+    let harness = Harness::with_sshd_sessions("hang-pairing-retries").await;
+    let deadlines = SshOperationDeadlines {
+        pairing: Duration::from_secs(3),
+        ..SshOperationDeadlines::default()
+    };
+    let manager = harness.manager(deadlines);
+
+    for attempt in 1..=3 {
+        let error = harness
+            .ensure(&manager, issue_token())
+            .await
+            .expect_err("a hung pairing command must fail at its deadline");
+        assert!(
+            error.starts_with("[ssh_timeout:pairing] "),
+            "attempt {attempt}: {error}"
+        );
+    }
+    assert_eq!(
+        harness.ssh_kinds(),
+        [
+            "launch", "tunnel", "pairing", "launch", "tunnel", "pairing", "launch", "tunnel",
+            "pairing"
+        ]
+    );
+
+    let last_client_gone = Instant::now();
+    let stand_ins = harness.hang_pids();
+    assert_eq!(
+        stand_ins.len(),
+        3,
+        "one hung remote pairing command per attempt"
+    );
+    let limit = deadlines.pairing_watchdog_bound() + Duration::from_secs(3);
+    for pid in stand_ins {
+        assert!(
+            wait_until_exited_within(pid, limit.saturating_sub(last_client_gone.elapsed())).await,
+            "the remote pairing command {pid} outlived the watchdog bound"
+        );
+    }
 
     harness.disconnect(&manager).await;
 }

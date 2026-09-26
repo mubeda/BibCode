@@ -9,7 +9,7 @@ use bibcode_server::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt, fs,
     io::{self, Read, Write},
     net::{IpAddr, Ipv4Addr, TcpStream, ToSocketAddrs},
@@ -59,6 +59,9 @@ const DEFAULT_BACKEND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_BACKEND_RESTART_INITIAL_DELAY: Duration = Duration::from_millis(250);
 const DEFAULT_BACKEND_RESTART_MAX_DELAY: Duration = Duration::from_secs(5);
 const DEFAULT_BACKEND_MONITOR_INTERVAL: Duration = Duration::from_millis(250);
+/// How long a restart keeps retrying its in-process listener bind on the port
+/// its stopped predecessor held, while that port is still being released.
+const SAME_PORT_RESTART_BIND_RETRY: Duration = Duration::from_secs(3);
 const PRIMARY_BACKEND_LOG_FILE_NAME: &str = "server-child.log";
 const WSL_BACKEND_LOG_FILE_PREFIX: &str = "server-child-wsl-";
 const WSL_BACKEND_LOG_FILE_EXTENSION: &str = ".log";
@@ -535,6 +538,10 @@ fn backend_slot_key(plan: &BackendLaunchPlan) -> String {
 #[cfg(test)]
 type BackendStartPublishGate = (oneshot::Sender<()>, oneshot::Receiver<()>);
 
+/// Each start's slot key and the listener bind retry window it passed on.
+#[cfg(test)]
+type ListenerBindRetryRecord = Vec<(String, Option<Duration>)>;
+
 trait WslCommandResolver: Send + Sync {
     fn command(&self) -> std::process::Command;
 
@@ -607,6 +614,8 @@ pub struct BackendSupervisor {
     concurrent_stop_waiting: Arc<FixtureEvent>,
     #[cfg(test)]
     runtime_published: Arc<FixtureEvent>,
+    #[cfg(test)]
+    listener_bind_retries: Arc<Mutex<ListenerBindRetryRecord>>,
 }
 
 impl fmt::Debug for BackendSupervisor {
@@ -642,6 +651,8 @@ impl Default for BackendSupervisor {
             concurrent_stop_waiting: Arc::default(),
             #[cfg(test)]
             runtime_published: Arc::default(),
+            #[cfg(test)]
+            listener_bind_retries: Arc::default(),
         }
     }
 }
@@ -733,6 +744,8 @@ impl BackendProjectDataOperation {
                 BackendRestartConfig::default(),
                 true,
                 true,
+                // Only a target this operation stopped was holding its port.
+                self.target.running.then_some(SAME_PORT_RESTART_BIND_RETRY),
             )
             .await
             .map(|_| ())
@@ -949,6 +962,7 @@ impl BackendSupervisor {
                     BackendRestartConfig::default(),
                     true,
                     true,
+                    Some(SAME_PORT_RESTART_BIND_RETRY),
                 )
                 .await
             {
@@ -1095,15 +1109,18 @@ impl BackendSupervisor {
         &self,
         app: AppHandle<R>,
     ) -> Result<BackendRunConfig, String> {
-        self.start_default_with_reason(app, "started", Some("local-only"))
+        self.start_default_with_reason(app, "started", Some("local-only"), &BTreeSet::new())
             .await
     }
 
+    /// Plans and starts the default topology. `held_ports` are the ports the
+    /// backends stopped for this restart held; empty for a first start.
     async fn start_default_with_reason<R: Runtime>(
         &self,
         app: AppHandle<R>,
         reason: &'static str,
         exposure_override: Option<&str>,
+        held_ports: &BTreeSet<u16>,
     ) -> Result<BackendRunConfig, String> {
         self.install_ui_process_observer(ui_process_observer::for_app(&app));
         let selection = match default_launch_plans(
@@ -1127,7 +1144,10 @@ impl BackendSupervisor {
             .position(|plan| plan.config.environment_id == PRIMARY_LOCAL_ENVIRONMENT_ID)
             .unwrap_or(0);
         let primary_plan = plans.remove(primary_index);
-        let primary_config = match self.start(primary_plan.clone()).await {
+        let primary_config = match self
+            .start_default_plan(primary_plan.clone(), held_ports)
+            .await
+        {
             Ok(config) => config,
             Err(detail) => {
                 let plan_error = classify_primary_start_error(&primary_plan, &detail);
@@ -1158,7 +1178,7 @@ impl BackendSupervisor {
         }
 
         for plan in plans {
-            if let Err(error) = self.start(plan.clone()).await {
+            if let Err(error) = self.start_default_plan(plan.clone(), held_ports).await {
                 self.record_plan_error(&plan, error.clone());
                 tracing::warn!(
                     target: "bibcode_desktop_tauri::backend",
@@ -1200,26 +1220,35 @@ impl BackendSupervisor {
         app: AppHandle<R>,
         exposure_override: Option<&str>,
     ) -> Result<Option<BackendRunConfig>, String> {
-        let is_active = {
+        let (is_active, held_ports) = {
             let state = self
                 .state
                 .lock()
                 .expect("backend supervisor mutex poisoned");
-            state.slots.values().any(|slot| {
+            let is_active = state.slots.values().any(|slot| {
                 slot.backend.is_some() || slot.launch_plan.is_some() || slot.last_error.is_some()
-            })
+            });
+            let held_ports = state
+                .slots
+                .values()
+                .filter(|slot| slot.backend.is_some())
+                .filter_map(|slot| slot.launch_plan.as_ref())
+                .map(|plan| plan.config.port)
+                .collect::<BTreeSet<_>>();
+            (is_active, held_ports)
         };
         if !is_active {
             return Ok(None);
         }
 
         self.stop(BackendShutdownConfig::default()).await?;
-        self.start_default_with_reason(app, "restarted", exposure_override)
+        self.start_default_with_reason(app, "restarted", exposure_override, &held_ports)
             .await
             .map(Some)
     }
 
-    pub async fn start(&self, plan: BackendLaunchPlan) -> Result<BackendRunConfig, String> {
+    #[cfg(test)]
+    pub(crate) async fn start(&self, plan: BackendLaunchPlan) -> Result<BackendRunConfig, String> {
         self.start_with_options(
             plan,
             BackendReadinessConfig::default(),
@@ -1228,16 +1257,41 @@ impl BackendSupervisor {
         .await
     }
 
+    #[cfg(test)]
     async fn start_with_options(
         &self,
         plan: BackendLaunchPlan,
         readiness: BackendReadinessConfig,
         restart: BackendRestartConfig,
     ) -> Result<BackendRunConfig, String> {
-        self.start_with_options_inner(plan, readiness, restart, true, false)
+        self.start_with_options_inner(plan, readiness, restart, true, false, None)
             .await
     }
 
+    /// Starts one plan of the default topology. A plan whose port a backend
+    /// stopped for this restart held gets the same-port bind retry window.
+    async fn start_default_plan(
+        &self,
+        plan: BackendLaunchPlan,
+        held_ports: &BTreeSet<u16>,
+    ) -> Result<BackendRunConfig, String> {
+        let listener_bind_retry = held_ports
+            .contains(&plan.config.port)
+            .then_some(SAME_PORT_RESTART_BIND_RETRY);
+        self.start_with_options_inner(
+            plan,
+            BackendReadinessConfig::default(),
+            BackendRestartConfig::default(),
+            true,
+            false,
+            listener_bind_retry,
+        )
+        .await
+    }
+
+    /// Starts `plan`. `listener_bind_retry` is set only by a restart onto the
+    /// port its stopped predecessor held; in-process servers then retry a
+    /// bind that finds the port still in use for that long.
     async fn start_with_options_inner(
         &self,
         plan: BackendLaunchPlan,
@@ -1245,6 +1299,7 @@ impl BackendSupervisor {
         restart: BackendRestartConfig,
         reset_restart_attempt: bool,
         update_recovery: bool,
+        listener_bind_retry: Option<Duration>,
     ) -> Result<BackendRunConfig, String> {
         let permit =
             self.begin_start_with_update_recovery(reset_restart_attempt, update_recovery)?;
@@ -1255,6 +1310,11 @@ impl BackendSupervisor {
             .expect("delegate slot")
             .clone();
         let remote_update_support = *self.remote_update_support.lock().expect("support slot");
+        #[cfg(test)]
+        self.listener_bind_retries
+            .lock()
+            .expect("listener bind retry test record mutex poisoned")
+            .push((backend_slot_key(&plan), listener_bind_retry));
         let (config, managed, pid) = start_managed_backend(
             plan.clone(),
             readiness,
@@ -1262,6 +1322,7 @@ impl BackendSupervisor {
             remote_update_delegate,
             remote_update_support,
             permit.run_id,
+            listener_bind_retry,
         )
         .await?;
         #[cfg(test)]
@@ -1652,8 +1713,16 @@ impl BackendSupervisor {
             if !supervisor.restart_still_desired(&slot_key) {
                 return;
             }
+            // The plan carries the port the crashed backend was bound to.
             if let Err(error) = supervisor
-                .start_with_options_inner(plan.clone(), readiness, restart, false, false)
+                .start_with_options_inner(
+                    plan.clone(),
+                    readiness,
+                    restart,
+                    false,
+                    false,
+                    Some(SAME_PORT_RESTART_BIND_RETRY),
+                )
                 .await
             {
                 supervisor.schedule_restart(plan, readiness, restart, error);
@@ -1795,6 +1864,7 @@ async fn start_managed_backend(
     remote_update_delegate: Option<Arc<dyn bibcode_server::remote_update::RemoteUpdateDelegate>>,
     remote_update_support: Option<bibcode_server::remote_update::RemoteUpdateSupport>,
     run_id: u64,
+    listener_bind_retry: Option<Duration>,
 ) -> Result<(BackendRunConfig, ManagedBackend, Option<u32>), String> {
     match &plan.target {
         BackendLaunchTarget::InProcess { data_root, .. } => {
@@ -1803,6 +1873,9 @@ async fn start_managed_backend(
             let mut server_config = server_config_for_launch(data_root.clone(), &plan.config);
             if let Some(support) = remote_update_support {
                 server_config = server_config.with_remote_update_support(support);
+            }
+            if let Some(window) = listener_bind_retry {
+                server_config = server_config.with_listener_bind_retry(window);
             }
             let handle = match remote_update_delegate {
                 Some(delegate) => {
@@ -2919,6 +2992,7 @@ fn desktop_base_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::free_test_port;
     use bibcode_server::diagnostics::{
         DesktopUiObservation, ProcessIdentity, UiCoverage, UiCoverageStatus,
     };
@@ -2950,8 +3024,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn soft_termination_command_ignores_appimage_environment() {
-        use std::os::unix::fs::PermissionsExt;
-
         crate::test_support::with_appimage_test_environment_async(
             "backend::tests::soft_termination_command_ignores_appimage_environment",
             async {
@@ -2960,7 +3032,7 @@ mod tests {
                     .parent()
                     .expect("fixture parent")
                     .join("host-bin/kill");
-                fs::write(
+                crate::test_support::write_executable_fixture(
                     &kill,
                     r#"#!/bin/sh
 [ -z "${APPIMAGE+x}" ] && [ -z "${PYTHONHOME+x}" ] || exit 81
@@ -2968,10 +3040,8 @@ mod tests {
 [ "$1" = -TERM ] || exit 83
 exec /bin/kill "$@"
 "#,
-                )
-                .expect("host kill fixture");
-                fs::set_permissions(&kill, fs::Permissions::from_mode(0o755))
-                    .expect("host kill fixture permissions");
+                    0o755,
+                );
                 let mut child = Command::new("/bin/sleep")
                     .arg("60")
                     .kill_on_drop(true)
@@ -3078,12 +3148,10 @@ exec /bin/kill "$@"
                 .expect("WSL resolver server fixture should write");
             #[cfg(unix)]
             let command_path = {
-                use std::os::unix::fs::PermissionsExt;
-
                 let path = root.path().join("wsl-fixture.sh");
-                fs::write(
+                crate::test_support::write_executable_fixture(
                     &path,
-                    format!(
+                    &format!(
                         r#"#!/bin/sh
 if [ "$1" = "-l" ]; then
   printf '  NAME STATE VERSION\n* Ubuntu Running 2\n  Debian Stopped 2\n'
@@ -3109,10 +3177,8 @@ fi
 exit 9
 "#
                     ),
-                )
-                .expect("WSL resolver command fixture should write");
-                fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
-                    .expect("WSL resolver command fixture should be executable");
+                    0o700,
+                );
                 path
             };
             #[cfg(windows)]
@@ -3710,19 +3776,21 @@ exit /b 9
         let primary_state = tempfile::tempdir().expect("primary state tempdir should open");
         let secondary_state = tempfile::tempdir().expect("secondary state tempdir should open");
         let supervisor = BackendSupervisor::new();
-        let primary_plan =
-            BackendLaunchPlan::local(primary_state.path().to_path_buf(), local_test_config(0));
-        let mut secondary_config = local_test_config(0);
-        secondary_config.environment_id = "wsl:Ubuntu".to_string();
-        secondary_config.label = "WSL (Ubuntu)".to_string();
-        secondary_config.desktop_bootstrap_token = "secondary-token".to_string();
-        let secondary_plan =
-            BackendLaunchPlan::local(secondary_state.path().to_path_buf(), secondary_config);
+        let primary_plan = BackendLaunchPlan::local(
+            primary_state.path().to_path_buf(),
+            local_test_config(free_test_port()),
+        );
 
         supervisor
             .start(primary_plan)
             .await
             .expect("primary backend should start");
+        let mut secondary_config = local_test_config(free_test_port());
+        secondary_config.environment_id = "wsl:Ubuntu".to_string();
+        secondary_config.label = "WSL (Ubuntu)".to_string();
+        secondary_config.desktop_bootstrap_token = "secondary-token".to_string();
+        let secondary_plan =
+            BackendLaunchPlan::local(secondary_state.path().to_path_buf(), secondary_config);
         supervisor
             .start(secondary_plan)
             .await
@@ -3816,6 +3884,287 @@ exit /b 9
             .expect("backend should stop");
     }
 
+    fn recorded_listener_bind_retries(supervisor: &BackendSupervisor) -> ListenerBindRetryRecord {
+        supervisor
+            .listener_bind_retries
+            .lock()
+            .expect("listener bind retry test record mutex poisoned")
+            .clone()
+    }
+
+    fn primary_bind_retry(retry: Option<Duration>) -> (String, Option<Duration>) {
+        (PRIMARY_LOCAL_ENVIRONMENT_ID.to_owned(), retry)
+    }
+
+    /// Takes `port` once its stopped backend has let go of it, allowing for a
+    /// descriptor briefly copied into a concurrently spawned child.
+    async fn hold_released_port(port: u16) -> TcpListener {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
+                    Ok(holder) => return holder,
+                    Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                    Err(error) => panic!("port {port} should be free to hold: {error}"),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the stopped backend should release port {port} within 5s"))
+    }
+
+    #[tokio::test]
+    async fn update_recovery_restart_waits_for_a_port_that_is_still_held() {
+        let state = tempfile::tempdir().expect("backend state tempdir should open");
+        let port = free_test_port();
+        let supervisor = BackendSupervisor::new();
+        supervisor
+            .start(BackendLaunchPlan::local(
+                state.path().to_path_buf(),
+                local_test_config(port),
+            ))
+            .await
+            .expect("backend should start on its test port");
+        let snapshot = supervisor
+            .begin_update_snapshot()
+            .await
+            .expect("update coordination should begin");
+        supervisor
+            .stop_update_snapshot(&snapshot)
+            .await
+            .expect("snapshot backend should stop");
+
+        // Something still holds the port for half a second after the stop.
+        let holder = hold_released_port(port).await;
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(500));
+            drop(holder);
+        });
+        let restart = supervisor.restart_update_snapshot(&snapshot).await;
+        release.join().expect("port holder thread should finish");
+
+        restart.expect("update recovery should restart once the port is released");
+        assert_eq!(
+            supervisor.current_run_config().map(|config| config.port),
+            Some(port),
+            "update recovery should restart on the port the backend held"
+        );
+        assert_eq!(
+            recorded_listener_bind_retries(&supervisor),
+            vec![
+                primary_bind_retry(None),
+                primary_bind_retry(Some(SAME_PORT_RESTART_BIND_RETRY)),
+            ],
+            "only the restart onto the held port may retry its bind"
+        );
+        supervisor
+            .stop(BackendShutdownConfig::default())
+            .await
+            .expect("restarted backend should stop");
+    }
+
+    #[tokio::test]
+    async fn project_data_restart_retries_the_bind_only_for_the_target_it_stopped() {
+        let running_state = tempfile::tempdir().expect("running target state tempdir should open");
+        let running = BackendSupervisor::new();
+        running
+            .start(BackendLaunchPlan::local(
+                running_state.path().to_path_buf(),
+                local_test_config(free_test_port()),
+            ))
+            .await
+            .expect("running target should start");
+        {
+            let mut operation = running
+                .begin_project_data_operation(PRIMARY_LOCAL_ENVIRONMENT_ID)
+                .await
+                .expect("project-data operation should begin");
+            operation
+                .stop_selected()
+                .await
+                .expect("the running target should stop");
+            operation
+                .restart_after_commit()
+                .await
+                .expect("the stopped target should restart on its port");
+        }
+        assert_eq!(
+            recorded_listener_bind_retries(&running),
+            vec![
+                primary_bind_retry(None),
+                primary_bind_retry(Some(SAME_PORT_RESTART_BIND_RETRY)),
+            ],
+            "the restart after stopping a running target may retry its bind"
+        );
+        running
+            .stop(BackendShutdownConfig::default())
+            .await
+            .expect("restarted target should stop");
+
+        let failed_state = tempfile::tempdir().expect("failed target state tempdir should open");
+        let failed = BackendSupervisor::new();
+        failed.record_plan_error(
+            &BackendLaunchPlan::local(failed_state.path().to_path_buf(), local_test_config(0)),
+            "the first start failed".to_owned(),
+        );
+        {
+            let mut operation = failed
+                .begin_project_data_operation(PRIMARY_LOCAL_ENVIRONMENT_ID)
+                .await
+                .expect("project-data operation should begin for a failed target");
+            operation
+                .stop_selected()
+                .await
+                .expect("a stopped target needs no stop");
+            operation
+                .restart_after_commit()
+                .await
+                .expect("the failed target should start");
+        }
+        assert_eq!(
+            recorded_listener_bind_retries(&failed),
+            vec![primary_bind_retry(None)],
+            "a target that was not running held no port to wait for"
+        );
+        failed
+            .stop(BackendShutdownConfig::default())
+            .await
+            .expect("started target should stop");
+    }
+
+    #[tokio::test]
+    async fn crash_restart_retries_the_bind_on_the_port_the_crashed_backend_held() {
+        let state = tempfile::tempdir().expect("backend state tempdir should open");
+        let port = free_test_port();
+        let supervisor = BackendSupervisor::new();
+        let readiness = BackendReadinessConfig::default();
+        let restart = BackendRestartConfig {
+            initial_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            monitor_interval: Duration::from_millis(10),
+        };
+        supervisor
+            .start_with_options(
+                BackendLaunchPlan::local(state.path().to_path_buf(), local_test_config(port)),
+                readiness,
+                restart,
+            )
+            .await
+            .expect("backend should start on its test port");
+        let (runtime, plan) = {
+            let state = supervisor
+                .state
+                .lock()
+                .expect("backend supervisor mutex poisoned");
+            let slot = state
+                .slots
+                .get(PRIMARY_LOCAL_ENVIRONMENT_ID)
+                .expect("backend slot should exist");
+            let Some(ManagedBackend::Runtime(runtime)) = &slot.backend else {
+                panic!("backend should be in-process");
+            };
+            (
+                runtime.clone(),
+                slot.launch_plan
+                    .clone()
+                    .expect("running backend should keep its plan"),
+            )
+        };
+        runtime.request_stop();
+        runtime
+            .wait_for_completion()
+            .await
+            .expect("backend should stop");
+
+        supervisor.schedule_restart(plan, readiness, restart, "test crash".to_owned());
+        let restarted = wait_for_restart_config(&supervisor, readiness.timeout).await;
+
+        assert_eq!(restarted.port, port);
+        assert_eq!(
+            recorded_listener_bind_retries(&supervisor),
+            vec![
+                primary_bind_retry(None),
+                primary_bind_retry(Some(SAME_PORT_RESTART_BIND_RETRY)),
+            ],
+            "a crash restart may retry its bind on the port the crashed backend held"
+        );
+        supervisor
+            .stop(BackendShutdownConfig::default())
+            .await
+            .expect("restarted backend should stop");
+    }
+
+    #[derive(Debug)]
+    struct SequenceBackendPortResolver {
+        ports: Mutex<VecDeque<u16>>,
+    }
+
+    impl BackendPortResolver for SequenceBackendPortResolver {
+        fn port(&self) -> u16 {
+            self.ports
+                .lock()
+                .expect("port sequence mutex poisoned")
+                .pop_front()
+                .expect("every planning should have a port left in the sequence")
+        }
+    }
+
+    #[tokio::test]
+    async fn default_restart_retries_the_bind_only_for_a_port_the_stopped_backend_held() {
+        use crate::config::IsolatedTestDataRoot;
+        use tauri::test::{mock_builder, mock_context, noop_assets};
+
+        let temp = tempfile::tempdir().expect("isolated desktop data root");
+        let mut context = mock_context(noop_assets());
+        context.config_mut().identifier = format!(
+            "com.bibcode.backend-bind-retry-tests-{}",
+            std::process::id()
+        );
+        let app = mock_builder()
+            .manage(IsolatedTestDataRoot::new(temp.path().join("data-root")))
+            .build(context)
+            .expect("mock Tauri app");
+        let port = free_test_port();
+        // Start and restart on one port, then re-plan onto an OS-assigned one.
+        let supervisor =
+            BackendSupervisor::with_backend_port_resolver(Arc::new(SequenceBackendPortResolver {
+                ports: Mutex::new(VecDeque::from([port, port, 0])),
+            }));
+
+        let started = supervisor
+            .start_default(app.handle().clone())
+            .await
+            .expect("default backend should start");
+        assert_eq!(started.port, port);
+        let restarted = supervisor
+            .restart_default_if_active_preserving_exposure(app.handle().clone())
+            .await
+            .expect("default backend should restart on its port")
+            .expect("active backend should produce a replacement config");
+        assert_eq!(restarted.port, port);
+        let replanned = supervisor
+            .restart_default_if_active_preserving_exposure(app.handle().clone())
+            .await
+            .expect("default backend should restart on a new port")
+            .expect("active backend should produce a replacement config");
+        assert_ne!(replanned.port, port);
+
+        assert_eq!(
+            recorded_listener_bind_retries(&supervisor),
+            vec![
+                primary_bind_retry(None),
+                primary_bind_retry(Some(SAME_PORT_RESTART_BIND_RETRY)),
+                primary_bind_retry(None),
+            ],
+            "a default restart retries its bind only on a port its stopped backend held"
+        );
+        supervisor
+            .stop(BackendShutdownConfig::default())
+            .await
+            .expect("default backend should stop");
+    }
+
     #[test]
     fn builds_primary_bootstrap_for_frontend_resolution() {
         let config = local_test_config(3773);
@@ -3863,6 +4212,7 @@ exit /b 9
                 monitor_interval: Duration::from_millis(250),
             }
         );
+        assert_eq!(SAME_PORT_RESTART_BIND_RETRY, Duration::from_secs(3));
     }
 
     #[test]
@@ -4452,14 +4802,49 @@ exit /b 9
         assert!(restart_error.contains("cleanup"), "{restart_error}");
     }
 
+    /// Deadlock guard for supervisor test gates, not a product budget: it
+    /// outlasts a slow start's whole readiness wait, so only a gate that can
+    /// never open reaches it.
+    const TEST_GATE_DEADLINE: Duration = Duration::from_secs(60);
+
+    async fn within_test_gate_deadline<T>(
+        future: impl std::future::Future<Output = T>,
+        description: &str,
+    ) -> T {
+        tokio::time::timeout(TEST_GATE_DEADLINE, future)
+            .await
+            .unwrap_or_else(|_| {
+                panic!("timed out after {TEST_GATE_DEADLINE:?} waiting for {description}")
+            })
+    }
+
+    /// Waits for `start` to reach its pre-publish gate. A start that ends
+    /// first, for example because its port was taken, fails the test with
+    /// its result instead of leaving the gate's sender parked forever.
+    async fn wait_for_start_at_publish_gate(
+        reached: oneshot::Receiver<()>,
+        start: &mut tokio::task::JoinHandle<Result<BackendRunConfig, String>>,
+    ) {
+        within_test_gate_deadline(
+            async {
+                tokio::select! {
+                    reached = reached => {
+                        reached.expect("the start publish gate should stay registered");
+                    }
+                    ended = start => {
+                        panic!("start ended before reaching the pre-publish gate: {ended:?}");
+                    }
+                }
+            },
+            "the start to reach its pre-publish gate",
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn start_racing_stop_cleans_late_backend_without_publishing_it() {
         let temp = tempfile::tempdir().expect("tempdir should open");
-        let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .expect("temporary port should bind")
-            .local_addr()
-            .expect("temporary listener should have an address")
-            .port();
+        let port = free_test_port();
         let supervisor = BackendSupervisor::new();
         let (publish_reached, wait_for_publish) = oneshot::channel();
         let (allow_publish, publish_release) = oneshot::channel();
@@ -4469,7 +4854,7 @@ exit /b 9
         let plan = BackendLaunchPlan::local(temp.path().to_path_buf(), local_test_config(port));
 
         let start_supervisor = supervisor.clone();
-        let start = tokio::spawn(async move {
+        let mut start = tokio::spawn(async move {
             start_supervisor
                 .start_with_options(
                     plan,
@@ -4478,16 +4863,14 @@ exit /b 9
                 )
                 .await
         });
-        wait_for_publish
-            .await
-            .expect("start should reach the pre-publish gate");
+        wait_for_start_at_publish_gate(wait_for_publish, &mut start).await;
 
         let stop_supervisor = supervisor.clone();
         let stop =
             tokio::spawn(
                 async move { stop_supervisor.stop(BackendShutdownConfig::default()).await },
             );
-        wait_for_cleanup
+        within_test_gate_deadline(wait_for_cleanup, "shutdown to clean published backends")
             .await
             .expect("shutdown should finish cleaning currently published backends");
         let shutdown_completed_before_start_cleanup = matches!(
@@ -4501,8 +4884,11 @@ exit /b 9
         allow_publish
             .send(())
             .expect("blocked start should still be waiting");
-        let start_result = start.await.expect("start task should join");
-        stop.await
+        let start_result = within_test_gate_deadline(start, "the late start to finish")
+            .await
+            .expect("start task should join");
+        within_test_gate_deadline(stop, "the stop to finish")
+            .await
             .expect("stop task should join")
             .expect("stop should succeed after late startup cleanup");
         if start_result.is_ok() {
@@ -4538,11 +4924,7 @@ exit /b 9
     #[tokio::test]
     async fn late_start_cleanup_failure_is_shared_retained_and_blocks_restart() {
         let temp = tempfile::tempdir().expect("tempdir should open");
-        let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .expect("temporary port should bind")
-            .local_addr()
-            .expect("temporary listener should have an address")
-            .port();
+        let port = free_test_port();
         let supervisor = BackendSupervisor::new();
         let (publish_reached, wait_for_publish) = oneshot::channel();
         let (allow_publish, publish_release) = oneshot::channel();
@@ -4553,7 +4935,7 @@ exit /b 9
         let plan = BackendLaunchPlan::local(temp.path().to_path_buf(), local_test_config(port));
 
         let start_supervisor = supervisor.clone();
-        let start = tokio::spawn(async move {
+        let mut start = tokio::spawn(async move {
             start_supervisor
                 .start_with_options(
                     plan,
@@ -4562,9 +4944,7 @@ exit /b 9
                 )
                 .await
         });
-        wait_for_publish
-            .await
-            .expect("start should reach the pre-publish gate");
+        wait_for_start_at_publish_gate(wait_for_publish, &mut start).await;
 
         let first_stop_supervisor = supervisor.clone();
         let first_stop = tokio::spawn(async move {
@@ -4572,9 +4952,12 @@ exit /b 9
                 .stop(BackendShutdownConfig::default())
                 .await
         });
-        wait_for_cleanup
-            .await
-            .expect("shutdown should reach its in-flight start wait");
+        within_test_gate_deadline(
+            wait_for_cleanup,
+            "shutdown to reach its in-flight start wait",
+        )
+        .await
+        .expect("shutdown should reach its in-flight start wait");
 
         let concurrent_wait_checkpoint = supervisor.concurrent_stop_waiting.checkpoint();
         let second_stop_supervisor = supervisor.clone();
@@ -4597,7 +4980,7 @@ exit /b 9
         allow_publish
             .send(())
             .expect("blocked start should still be waiting");
-        let start_error = start
+        let start_error = within_test_gate_deadline(start, "the late start to finish")
             .await
             .expect("start task should join")
             .expect_err("start must surface its late cleanup failure");
@@ -4606,11 +4989,11 @@ exit /b 9
             "{start_error}"
         );
 
-        let first_error = first_stop
+        let first_error = within_test_gate_deadline(first_stop, "the first stop to finish")
             .await
             .expect("first stop task should join")
             .expect_err("stop must surface the late cleanup failure");
-        let second_error = second_stop
+        let second_error = within_test_gate_deadline(second_stop, "the concurrent stop to finish")
             .await
             .expect("second stop task should join")
             .expect_err("concurrent stop must share the late cleanup failure");
@@ -5763,6 +6146,7 @@ exit /b 9
             None,
             None,
             0,
+            None,
         )
         .await
         .expect_err("missing executable should fail");
@@ -5782,6 +6166,7 @@ exit /b 9
             None,
             None,
             1,
+            None,
         )
         .await
         .expect_err("occupied local port should fail");
@@ -5804,6 +6189,7 @@ exit /b 9
             None,
             None,
             8,
+            None,
         )
         .await
         .expect_err("unreachable renderer address should fail readiness");
@@ -6250,6 +6636,7 @@ $client.Dispose()
             None,
             None,
             10,
+            None,
         )
         .await
         .expect("external backend should become ready");
@@ -6331,6 +6718,7 @@ $client.Dispose()
             None,
             None,
             11,
+            None,
         )
         .await
         .expect("independent readiness endpoint should accept child");
@@ -6442,7 +6830,7 @@ $client.Dispose()
     #[tokio::test]
     async fn local_runtime_starts_without_child_process_and_clears_state_on_stop() {
         let temp = tempfile::tempdir().expect("tempdir should open");
-        let port = portpicker::pick_unused_port().expect("test port should be available");
+        let port = free_test_port();
         let plan = BackendLaunchPlan::local(temp.path().to_path_buf(), local_test_config(port));
         let supervisor = BackendSupervisor::new();
 
@@ -6525,10 +6913,9 @@ $client.Dispose()
     #[tokio::test]
     async fn restarting_local_runtime_replaces_the_previous_in_process_server() {
         let temp = tempfile::tempdir().expect("tempdir should open");
-        let first_port = portpicker::pick_unused_port().expect("first port should be available");
+        let first_port = free_test_port();
         let second_port = loop {
-            let candidate =
-                portpicker::pick_unused_port().expect("second port should be available");
+            let candidate = free_test_port();
             if candidate != first_port {
                 break candidate;
             }

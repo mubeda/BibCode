@@ -84,6 +84,9 @@ pub struct ServerConfig {
     pub remote_update_support: RemoteUpdateSupport,
     pub(crate) update_maintenance_drain_timeout: Duration,
     pub(crate) update_maintenance_lease: Duration,
+    /// How long the listener bind keeps retrying while its port is still in
+    /// use. `None`, the default, fails the bind at once.
+    pub(crate) listener_bind_retry: Option<Duration>,
 }
 
 impl ServerConfig {
@@ -115,6 +118,7 @@ impl ServerConfig {
             remote_update_support: RemoteUpdateSupport::manual(),
             update_maintenance_drain_timeout: Duration::from_secs(30),
             update_maintenance_lease: Duration::from_secs(90),
+            listener_bind_retry: None,
         }
     }
 
@@ -128,6 +132,16 @@ impl ServerConfig {
     #[must_use]
     pub fn with_remote_update_support(mut self, support: RemoteUpdateSupport) -> Self {
         self.remote_update_support = support;
+        self
+    }
+
+    /// Keeps retrying the listener bind for up to `window` while the port is
+    /// still in use, backing off from 25 ms to 250 ms between attempts. For an
+    /// embedder restarting a server on a port its predecessor has only just
+    /// released; when the window ends, startup fails with the last bind error.
+    #[must_use]
+    pub fn with_listener_bind_retry(mut self, window: Duration) -> Self {
+        self.listener_bind_retry = Some(window);
         self
     }
 
@@ -225,6 +239,20 @@ mod tests {
                 install_mode: crate::remote_update::RemoteUpdateInstallMode::Manual,
                 reason: crate::remote_update::RemoteUpdateSupportReason::ManualUpdateRequired,
             }
+        );
+    }
+
+    #[test]
+    fn listener_bind_retry_is_opt_in() {
+        assert_eq!(
+            ServerConfig::new("/tmp/bibcode-test").listener_bind_retry,
+            None
+        );
+        assert_eq!(
+            ServerConfig::new("/tmp/bibcode-test")
+                .with_listener_bind_retry(Duration::from_secs(3))
+                .listener_bind_retry,
+            Some(Duration::from_secs(3))
         );
     }
 

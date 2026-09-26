@@ -765,6 +765,12 @@ exits as expected, stops every backend from the captured running set, and does
 not invoke the platform installer until every included backend has committed
 and stopped. A prepare, cancel, commit, stop, or installer failure attempts to
 restart the exact prior running set before update coordination is released.
+Any restart onto a port its stopped predecessor held (this update recovery, a
+project-data restart of the target it stopped, a crash restart, or an exposure
+or topology restart that re-plans a held port) lets the in-process server retry
+a bind that finds the port still in use for up to 3 s, backing off from 25 ms
+to 250 ms. First starts and WSL backends fail at once, and an expired window
+reports the original bind error.
 Stopping the primary in-process backend never sweeps descendants of the shared
 desktop PID; doing so would terminate the system WebView before the installer
 can take ownership of application restart.

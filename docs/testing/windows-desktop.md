@@ -114,6 +114,13 @@ Select focused tests from affected source and verify at least:
   state;
 - independent runtimes cannot terminate each other's process roots;
 - local Windows and WSL presentation follows current environment capability;
+- desktop-managed SSH child I/O runs on the desktop's own SSH runtime: with the
+  calling runtime's only blocking thread held, a stand-in ssh's pairing line is
+  still parsed, and after a descendant holding its pipes makes the drain give
+  up, no pipe read stays parked
+  (`node scripts/run-msvc.mjs cargo test -p bibcode-desktop --lib ssh::tests::windows_drain`;
+  the tests start `cmd.exe` and the built-in `powershell.exe`, and kill the
+  descendant they record);
 - saved remote environments appear in the environment rail without exposing
   privileged SSH, Tailscale, relay, or connection-lifecycle controls outside
   their owning settings and desktop-bridge boundaries; and

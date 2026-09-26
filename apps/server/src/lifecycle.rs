@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use thiserror::Error;
 use tokio::{net::TcpListener, task::JoinHandle};
@@ -228,15 +228,9 @@ impl ServerRuntime {
         let storage_instance_id = prepared_store.storage_instance_id;
         let store_classification = prepared_store.classification;
         let database = prepared_store.database;
-        let bind_address = format!("{}:{}", config.host, config.port);
-        let listener = TcpListener::bind((config.host.as_str(), config.port))
-            .await
-            .map_err(|source| ServerError::Bind {
-                address: bind_address.clone(),
-                source,
-            })?;
+        let listener = bind_listener(&config.host, config.port, config.listener_bind_retry).await?;
         let local_addr = listener.local_addr().map_err(|source| ServerError::Bind {
-            address: bind_address,
+            address: format!("{}:{}", config.host, config.port),
             source,
         })?;
         let state_directory = config.base_dir.join(if config.dev_url.is_some() {
@@ -439,6 +433,71 @@ impl ServerRuntime {
             shutdown,
             task: Some(task),
         })
+    }
+}
+
+/// First pause before retrying a listener bind whose port is still in use.
+const LISTENER_BIND_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(25);
+/// The pause doubles up to this cap.
+const LISTENER_BIND_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(250);
+
+/// Binds the server listener on `host:port`.
+///
+/// With a `retry` window, a bind that fails because the port is still in use
+/// is retried with backoff until the window ends, so a server restarted on
+/// the port its predecessor has only just released does not fail on a socket
+/// that is still closing. Any other failure, or a port still in use when the
+/// window ends, returns that last bind error. Without a window the first
+/// failure is final.
+async fn bind_listener(
+    host: &str,
+    port: u16,
+    retry: Option<Duration>,
+) -> Result<TcpListener, ServerError> {
+    let address = format!("{host}:{port}");
+    let started = tokio::time::Instant::now();
+    let mut backoff = LISTENER_BIND_RETRY_INITIAL_BACKOFF;
+    let mut attempts: u32 = 0;
+    loop {
+        attempts = attempts.saturating_add(1);
+        let source = match TcpListener::bind((host, port)).await {
+            Ok(listener) => {
+                if attempts > 1 {
+                    tracing::info!(
+                        %address,
+                        attempts,
+                        elapsed = ?started.elapsed(),
+                        "bound the server listener once its port was released"
+                    );
+                }
+                return Ok(listener);
+            }
+            Err(source) => source,
+        };
+        let Some(window) = retry.filter(|_| source.kind() == std::io::ErrorKind::AddrInUse) else {
+            return Err(ServerError::Bind { address, source });
+        };
+        let elapsed = started.elapsed();
+        let Some(remaining) = window.checked_sub(elapsed).filter(|left| !left.is_zero()) else {
+            tracing::warn!(
+                %address,
+                attempts,
+                ?elapsed,
+                ?window,
+                "the server listener port stayed in use for the whole bind retry window"
+            );
+            return Err(ServerError::Bind { address, source });
+        };
+        tracing::debug!(
+            %address,
+            attempt = attempts,
+            ?elapsed,
+            "the server listener port is still in use; retrying the bind"
+        );
+        tokio::time::sleep(backoff.min(remaining)).await;
+        backoff = backoff
+            .saturating_mul(2)
+            .min(LISTENER_BIND_RETRY_MAX_BACKOFF);
     }
 }
 
@@ -738,6 +797,113 @@ mod tests {
             )),
             Some("http://[fd00::5]:3773".to_owned())
         );
+    }
+
+    /// Holds a loopback port the way a predecessor's listener would.
+    fn hold_loopback_port() -> (std::net::TcpListener, u16) {
+        let holder = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("a loopback port should bind");
+        let port = holder.local_addr().expect("held port address").port();
+        (holder, port)
+    }
+
+    fn release_after(
+        holder: std::net::TcpListener,
+        delay: Duration,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            drop(holder);
+        })
+    }
+
+    fn assert_address_in_use(error: &ServerError, port: u16) {
+        match error {
+            ServerError::Bind { address, source } => {
+                assert_eq!(address, &format!("127.0.0.1:{port}"));
+                assert_eq!(source.kind(), std::io::ErrorKind::AddrInUse);
+            }
+            other => panic!("expected an address-in-use Bind error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bind_retry_window_outlasts_a_port_released_within_it() {
+        let (holder, port) = hold_loopback_port();
+        let release = release_after(holder, Duration::from_millis(200));
+
+        let listener = bind_listener("127.0.0.1", port, Some(Duration::from_secs(3)))
+            .await
+            .expect("the bind should succeed once the port is released");
+
+        assert_eq!(listener.local_addr().expect("bound address").port(), port);
+        release.join().expect("the holder thread should finish");
+    }
+
+    #[tokio::test]
+    async fn a_bind_retry_window_ends_with_the_bind_error_while_the_port_stays_held() {
+        let (_holder, port) = hold_loopback_port();
+        let window = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+
+        let error = bind_listener("127.0.0.1", port, Some(window))
+            .await
+            .expect_err("a port held throughout the window must fail the bind");
+
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= window,
+            "the bind gave up after {elapsed:?}, before its {window:?} window ended"
+        );
+        assert_address_in_use(&error, port);
+    }
+
+    #[tokio::test]
+    async fn without_a_bind_retry_window_the_first_failure_is_final() {
+        let (holder, port) = hold_loopback_port();
+        // The port frees half a second in; a bind that retried would succeed.
+        let release = release_after(holder, Duration::from_millis(500));
+
+        let error = bind_listener("127.0.0.1", port, None)
+            .await
+            .expect_err("without a window a held port must fail the bind at once");
+
+        assert!(
+            !release.is_finished(),
+            "the bind should fail while the port is still held"
+        );
+        assert_address_in_use(&error, port);
+        release.join().expect("the holder thread should finish");
+    }
+
+    #[tokio::test]
+    async fn server_start_applies_the_configured_bind_retry_window() {
+        let (_holder, port) = hold_loopback_port();
+        let temp = tempfile::tempdir().expect("temporary base directory");
+        let window = Duration::from_secs(1);
+        let started = std::time::Instant::now();
+
+        let error = match ServerRuntime::start_with_registry(
+            ServerConfig::new(temp.path())
+                .with_bind("127.0.0.1", port)
+                .with_listener_bind_retry(window),
+            RpcRegistry::empty(),
+        )
+        .await
+        {
+            Ok(handle) => {
+                drop(handle);
+                panic!("a port held throughout the window must fail startup");
+            }
+            Err(error) => error,
+        };
+
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= window,
+            "startup gave up after {elapsed:?}, before its {window:?} bind window ended"
+        );
+        assert_address_in_use(&error, port);
     }
 
     #[tokio::test]
