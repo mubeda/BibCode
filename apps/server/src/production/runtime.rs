@@ -294,7 +294,8 @@ impl ProductionRuntime {
                     state_paths.attachments_dir.clone(),
                     process_attribution.clone(),
                     chat_activity_controller.clone(),
-                ),
+                )
+                .with_published_inventory(control.published_provider_inventory()),
             ),
             activity_projections.chat(),
             SupervisorOptions::default(),

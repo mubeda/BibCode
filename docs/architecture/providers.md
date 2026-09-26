@@ -33,6 +33,54 @@ submissions stay in its durable queue without starting work; a ready settle
 promotes one eligible head. Explicit steering uses the same delivery owner and
 `ProviderDriver::steer`, gated by `supportsTurnSteer`.
 
+A durable turn is replayed unchanged, so a launch that fails because the
+selected model or session refuses the turn's own options
+(`ProviderRuntimeError::InvalidOption`) fails that delivery once. Every other
+launch failure, such as a spawn error, stays definitely not sent and is retried.
+`InvalidOption` comes from every deterministic option check:
+
+- the shape checks of Claude, Codex and OpenCode: an option without an id, and a
+  value of the wrong shape (Claude's and OpenCode's fast mode must be a boolean,
+  Codex's options and OpenCode's variant a non-empty string). OpenCode also
+  refuses fast mode combined with a variant, and options without a selected
+  provider/model;
+- Claude's Fast Mode check;
+- the checks Codex (`model/list`, which must also offer the session's model),
+  Cursor (the advertised config options) and OpenCode (the advertised variants)
+  make against the selected model or session. As in the catalog, Codex also
+  offers the instance's custom models, with the options of the first listed
+  model. A Cursor session configuration BiBCode can't work with, such as an
+  advertised option of an unexpected category or type, is refused too, because
+  a relaunch advertises the same configuration, and so is a switch of a live
+  Cursor session to a default model the session does not advertise;
+- Grok, which accepts no option.
+
+At launch, a failed request inside those checks, such as `model/list` or an
+unreachable server, and a Cursor update that was rolled back stay retryable. In
+a live session the same checks run when a turn changes the model or its options
+(`reconcile_model_selection`), and any failure there, refusal or not, takes the
+frozen delivery's `Rejected` arm, so the delivery fails once.
+
+Every delivery detail, the text an undelivered or uncertain turn shows, comes
+from one formatter: plain words that name the provider by the instance's label
+(its display name, otherwise the driver's name from contracts'
+`PROVIDER_DISPLAY_NAMES`), never by a driver id. A refusal is its plain
+sentence, such as "Fast Mode is not supported by the selected model." or "gpt-5
+is not available in Work Codex.", built from shared helpers that name an option
+by the label its descriptor shows, and by its id only for an option the driver
+does not take. A Cursor configuration BiBCode can't work with reads "BiBCode
+can't apply these options to the selected model. Choose another model, or turn
+these options off." The error text, logs and runtime rows keep the internal
+detail. The instance's label is read from the persisted settings without their
+secrets, so a missing secret can't cost an instance its name.
+
+The static Claude catalog used when the CLI reports no models offers only
+options the Claude session applies (`effort` and `fastMode`; `agent` comes from
+the discovered agents). A launch decides Fast Mode from the model's entry in the
+published provider inventory, which carries what the CLI reported for aliases
+such as `opus`, and uses the static catalog only for a model the inventory does
+not list. Fast Mode off asks for nothing and is never refused.
+
 Each driver translates between the common orchestration model and its native
 protocol:
 

@@ -818,6 +818,7 @@ fn launch() -> ProviderLaunchRequest {
         interaction_mode: "default".to_owned(),
         model: Some("gpt-5".to_owned()),
         options: Vec::new(),
+        custom_models: Vec::new(),
         service_tier: None,
         effort: None,
         agent: None,
@@ -2926,11 +2927,13 @@ async fn durable_delivery_classifies_launch_failure_as_definitely_not_sent() {
         "launch-failure-key".to_owned(),
     )
     .await;
-    assert!(matches!(
+    // The retried delivery's detail names the provider as the user does, not by driver id.
+    assert_eq!(
         outcome,
-        ProviderDeliveryOutcome::DefinitelyNotSent { detail }
-            if detail.contains("fixture launch failed")
-    ));
+        ProviderDeliveryOutcome::DefinitelyNotSent {
+            detail: "Codex could not start: fixture launch failed".to_owned()
+        }
+    );
     let state = state.lock().unwrap();
     assert_eq!(state.starts, 1);
     assert!(state.sends.is_empty());
@@ -2940,6 +2943,466 @@ async fn durable_delivery_classifies_launch_failure_as_definitely_not_sent() {
 
     supervisor.shutdown().await.expect("supervisor shutdown");
     engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn durable_claude_turn_with_an_option_the_session_refuses_fails_once_instead_of_retrying() {
+    let temp = TempDir::new().expect("attachments");
+    let (engine, database) = engine_and_database().await;
+    let settings = TempDir::new().expect("settings");
+    // Nothing is spawned: the Claude session refuses the options before it launches a process.
+    write_live_retry_settings(&settings, "claudeAgent", "route-claude");
+    let command_id = "claude-refused-option".to_owned();
+    let mut row = delivery_row("claudeAgent", "claude-refused-option-key");
+    row.command_id = command_id.clone();
+    row.message_id = format!("message-{command_id}");
+    row.provider_instance_id = "route-claude".to_owned();
+    // A thread that picked Claude Fable 5 from the static fallback catalog persisted every select
+    // option at its default, including `contextWindow`, which the Claude session never applies.
+    row.payload = json!({
+        "type":"thread.turn.start", "commandId":command_id, "threadId":"t1",
+        "message":{
+            "messageId":row.message_id, "role":"user", "text":"hello", "attachments":[]
+        },
+        "modelSelection":{
+            "instanceId":"route-claude", "model":"claude-fable-5",
+            "options":[{"id":"effort","value":"high"},{"id":"contextWindow","value":"200k"}]
+        },
+        "runtimeMode":"full-access", "interactionMode":"default", "createdAt":NOW
+    });
+    freeze_row_route(&engine, &settings, &mut row).await;
+    seed_pending_delivery(&database, row).await;
+    let supervisor = Arc::new(ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(NativeProviderDriverFactory::new(
+            temp.path().join("attachments"),
+        )),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    ));
+    let service = TurnDeliveryService::start(
+        engine.clone(),
+        supervisor.clone(),
+        settings.path().to_path_buf(),
+    );
+    let read_delivery = || async {
+        engine
+            .repositories()
+            .get_provider_turn_delivery(command_id.clone())
+            .await
+            .expect("delivery row")
+            .expect("durable delivery")
+    };
+
+    let settled = timeout(Duration::from_secs(10), async {
+        loop {
+            let delivery = read_delivery().await;
+            // A retried refusal keeps claiming new attempts while it stays pending.
+            if delivery.state == TurnDeliveryState::Failed || delivery.attempts >= 3 {
+                break delivery;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the refused delivery fails or keeps retrying");
+    assert_eq!(
+        (settled.state, settled.attempts),
+        (TurnDeliveryState::Failed, 1),
+        "a refused option must end the turn instead of retrying it: {:?}",
+        settled.last_error
+    );
+    // The undelivered turn states the refusal plainly, without the driver's internal id.
+    let refusal = "contextWindow is not supported by the selected model.";
+    assert_eq!(settled.last_error.as_deref(), Some(refusal));
+    // A failed row is terminal: the worker claims only pending rows. Stopping the service drains
+    // its in-flight work, so the row read afterwards is final and the check needs no timing bound.
+    service.shutdown().await;
+    let later = read_delivery().await;
+    assert_eq!(
+        (later.state, later.attempts),
+        (TurnDeliveryState::Failed, 1)
+    );
+    let (unresolved_state, unresolved_detail) = database
+        .call(|connection| {
+            connection
+                .query_row(
+                    "SELECT unresolved_delivery_state, unresolved_delivery_detail FROM projection_threads WHERE thread_id = 't1'",
+                    [],
+                    |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .map_err(Into::into)
+        })
+        .await
+        .expect("thread shell");
+    assert_eq!(unresolved_state.as_deref(), Some("failed"));
+    assert_eq!(unresolved_detail.as_deref(), Some(refusal));
+
+    supervisor.shutdown().await.expect("supervisor shutdown");
+    engine.shutdown().await;
+}
+
+/// A turn with an option, driven through a real driver and the production delivery loop.
+/// `refusal` is the plain detail a refused turn fails with; `None` means the turn is delivered.
+struct OptionCase {
+    provider: &'static str,
+    instance_config: Value,
+    binary_path: Option<PathBuf>,
+    endpoint: Option<String>,
+    environment: Vec<(String, String)>,
+    model: &'static str,
+    option: Value,
+    refusal: Option<&'static str>,
+}
+
+/// Runs `case` until its delivery settles, and asserts it settles once: failed with the refusal,
+/// or delivered, after a single launch.
+async fn assert_option_case_settles_once(case: OptionCase) {
+    let temp = TempDir::new().expect("provider fixture directory");
+    let (engine, database) = engine_and_database().await;
+    let settings = TempDir::new().expect("settings");
+    let instance_id = format!("refusing-{}", case.provider);
+    let mut instances = serde_json::Map::new();
+    instances.insert(instance_id.clone(), case.instance_config);
+    std::fs::write(
+        settings.path().join("settings.json"),
+        serde_json::to_vec(&json!({ "providerInstances": instances })).expect("settings json"),
+    )
+    .expect("write settings");
+    let command_id = format!("refused-option-{}", case.provider);
+    let mut row = delivery_row(case.provider, &format!("{command_id}-key"));
+    row.command_id = command_id.clone();
+    row.message_id = format!("message-{command_id}");
+    row.provider_instance_id = instance_id.clone();
+    row.payload = json!({
+        "type":"thread.turn.start", "commandId":command_id, "threadId":"t1",
+        "message":{
+            "messageId":row.message_id, "role":"user", "text":"hello", "attachments":[]
+        },
+        "modelSelection":{"instanceId":instance_id, "model":case.model, "options":[case.option]},
+        "runtimeMode":"full-access", "interactionMode":"default", "createdAt":NOW
+    });
+    freeze_row_route(&engine, &settings, &mut row).await;
+    seed_pending_delivery(&database, row).await;
+    let launches = Arc::new(StdMutex::new(Vec::new()));
+    let supervisor = Arc::new(ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(NativeFixtureFactory {
+            inner: NativeProviderDriverFactory::new(temp.path().join("attachments")),
+            binary_path: case.binary_path,
+            endpoint: case.endpoint,
+            cwd: Some(temp.path().to_path_buf()),
+            environment: case.environment,
+            launches: launches.clone(),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    ));
+    let service = TurnDeliveryService::start(
+        engine.clone(),
+        supervisor.clone(),
+        settings.path().to_path_buf(),
+    );
+    let read_delivery = || async {
+        engine
+            .repositories()
+            .get_provider_turn_delivery(command_id.clone())
+            .await
+            .expect("delivery row")
+            .expect("durable delivery")
+    };
+
+    let Ok(settled) = timeout(Duration::from_secs(20), async {
+        loop {
+            let delivery = read_delivery().await;
+            if matches!(
+                delivery.state,
+                TurnDeliveryState::Failed | TurnDeliveryState::Delivered
+            ) || delivery.attempts >= 3
+            {
+                break delivery;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    else {
+        let delivery = read_delivery().await;
+        panic!(
+            "{}: the delivery neither settled nor retried: {:?} at attempt {}, {:?}",
+            case.provider, delivery.state, delivery.attempts, delivery.last_error
+        );
+    };
+    let expected = if case.refusal.is_some() {
+        TurnDeliveryState::Failed
+    } else {
+        TurnDeliveryState::Delivered
+    };
+    assert_eq!(
+        (settled.state, settled.attempts),
+        (expected, 1),
+        "{}: the turn must settle once instead of retrying: {:?}",
+        case.provider,
+        settled.last_error
+    );
+    assert_eq!(
+        settled.last_error.as_deref(),
+        case.refusal,
+        "{}",
+        case.provider
+    );
+    // A failed or delivered row is terminal: the worker claims only pending rows. Stopping the
+    // service drains its in-flight work, so what is read afterwards is final and the check needs
+    // no timing bound.
+    service.shutdown().await;
+    let later = read_delivery().await;
+    assert_eq!(
+        (later.state, later.attempts),
+        (expected, 1),
+        "{}",
+        case.provider
+    );
+    assert_eq!(
+        launches.lock().unwrap().len(),
+        1,
+        "{}: the turn launches its provider once",
+        case.provider
+    );
+
+    supervisor.shutdown().await.expect("supervisor shutdown");
+    engine.shutdown().await;
+}
+
+/// A Codex App Server whose model list advertises `gpt-5` with only `high` reasoning, or, with
+/// `BIBCODE_TEST_UNLISTED_MODEL` set, lists another model only. Its session runs
+/// `BIBCODE_TEST_SESSION_MODEL`, `gpt-5` by default, and it accepts every turn.
+#[cfg(unix)]
+const MODEL_LIST_CODEX_FIXTURE: &str = r#"#!/bin/sh
+session_model=${BIBCODE_TEST_SESSION_MODEL:-gpt-5}
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"id":%s,"result":{"userAgent":"fixture"}}\n' "$id" ;;
+    *'"method":"thread/start"'*|*'"method":"thread/resume"'*) printf '{"id":%s,"result":{"cwd":"/tmp","model":"%s","thread":{"id":"native-codex-thread"}}}\n' "$id" "$session_model" ;;
+    *'"method":"turn/start"'*) printf '{"id":%s,"result":{"turn":{"id":"native-codex-turn"}}}\n' "$id" ;;
+    *'"method":"mcpServerStatus/list"'*) printf '{"id":%s,"result":{"data":[],"nextCursor":null}}\n' "$id" ;;
+    *'"method":"model/list"'*)
+      if [ -n "$BIBCODE_TEST_UNLISTED_MODEL" ]; then
+        printf '{"id":%s,"result":{"data":[{"model":"gpt-other","serviceTiers":[],"supportedReasoningEfforts":[{"reasoningEffort":"high"}]}],"nextCursor":null}}\n' "$id"
+      else
+        printf '{"id":%s,"result":{"data":[{"model":"gpt-5","serviceTiers":[],"supportedReasoningEfforts":[{"reasoningEffort":"high"}]}],"nextCursor":null}}\n' "$id"
+      fi ;;
+    *'"method":"shutdown"'*) printf '{"id":%s,"result":null}\n' "$id" ;;
+  esac
+done
+"#;
+
+/// A Cursor agent whose session advertises only a model option, or, with
+/// `BIBCODE_TEST_FAST_WRONG_CATEGORY` set, a `fast` option in a category BiBCode does not use.
+#[cfg(unix)]
+const REFUSING_CURSOR_FIXTURE: &str = r#"#!/bin/sh
+if [ -n "$BIBCODE_TEST_FAST_WRONG_CATEGORY" ]; then
+  options='[{"id":"model","category":"model"},{"id":"fast","category":"model","type":"select","options":[{"value":"false"},{"value":"true"}]}]'
+else
+  options='[{"id":"model","category":"model"}]'
+fi
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*|*'"method":"authenticate"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+    *'"method":"session/new"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"cursor-session","configOptions":%s,"modes":{"currentModeId":"ask","availableModes":[{"id":"ask","name":"Ask"},{"id":"code","name":"Agent"},{"id":"architect","name":"Plan"}]}}}\n' "$id" "$options" ;;
+    *'"method":"session/set_config_option"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"configOptions":%s}}\n' "$id" "$options" ;;
+    *'"method":"session/set_mode"'*|*'"method":"session/set_model"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+  esac
+done
+"#;
+
+/// A Codex instance with one custom model, `gpt-custom`, driving [`MODEL_LIST_CODEX_FIXTURE`].
+#[cfg(unix)]
+fn codex_case(fixtures: &TempDir, display_name: Option<&str>) -> OptionCase {
+    let mut instance_config = json!({
+        "driver":"codex", "enabled":true,
+        "config":{
+            "binaryPath":"refusing-codex-route",
+            "homePath":fixtures.path().join("codex-home"),
+            "shadowHomePath":fixtures.path().join("codex-shadow"),
+            "customModels":["gpt-custom"]
+        }
+    });
+    if let Some(display_name) = display_name {
+        instance_config["displayName"] = json!(display_name);
+    }
+    OptionCase {
+        provider: "codex",
+        instance_config,
+        binary_path: Some(executable_fixture(
+            fixtures,
+            "model-list-codex",
+            MODEL_LIST_CODEX_FIXTURE,
+            "",
+        )),
+        endpoint: None,
+        environment: Vec::new(),
+        model: "gpt-5",
+        option: json!({"id":"reasoningEffort","value":"xhigh"}),
+        refusal: None,
+    }
+}
+
+#[cfg(unix)]
+fn cursor_case(fixtures: &TempDir) -> OptionCase {
+    OptionCase {
+        provider: "cursor",
+        instance_config: json!({
+            "driver":"cursor", "enabled":true, "config":{"binaryPath":"refusing-cursor-route"}
+        }),
+        binary_path: Some(executable_fixture(
+            fixtures,
+            "refusing-cursor",
+            REFUSING_CURSOR_FIXTURE,
+            "",
+        )),
+        endpoint: None,
+        environment: Vec::new(),
+        model: "gpt-5",
+        option: json!({"id":"fastMode","value":true}),
+        refusal: None,
+    }
+}
+
+/// Codex checks a turn's options against its model list after it starts. An option value the
+/// model does not advertise ends the durable turn after one launch.
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_option_the_model_does_not_advertise_fails_the_turn_once() {
+    let fixtures = TempDir::new().expect("fixture directory");
+    assert_option_case_settles_once(OptionCase {
+        refusal: Some("Reasoning Extra High is not supported by the selected model."),
+        ..codex_case(&fixtures, None)
+    })
+    .await;
+}
+
+/// A model that is neither on Codex's model list nor one of the instance's custom models cannot
+/// be checked, and never will be for the same turn, so the turn ends once, naming the instance as
+/// the user does.
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_model_missing_from_the_model_list_fails_the_turn_once() {
+    let fixtures = TempDir::new().expect("fixture directory");
+    assert_option_case_settles_once(OptionCase {
+        environment: vec![("BIBCODE_TEST_UNLISTED_MODEL".to_owned(), "1".to_owned())],
+        refusal: Some("gpt-5 is not available in Work Codex."),
+        ..codex_case(&fixtures, Some("Work Codex"))
+    })
+    .await;
+}
+
+/// The catalog offers an instance's custom models with the options of the first listed model, so
+/// a custom model with one of those efforts validates the same way and the turn is delivered.
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_custom_model_with_an_effort_is_delivered() {
+    let fixtures = TempDir::new().expect("fixture directory");
+    assert_option_case_settles_once(OptionCase {
+        environment: vec![(
+            "BIBCODE_TEST_SESSION_MODEL".to_owned(),
+            "gpt-custom".to_owned(),
+        )],
+        model: "gpt-custom",
+        option: json!({"id":"reasoningEffort","value":"high"}),
+        ..codex_case(&fixtures, None)
+    })
+    .await;
+}
+
+/// Cursor checks a turn's options against the session's advertised config options. An option the
+/// session does not advertise ends the durable turn after one launch.
+#[cfg(unix)]
+#[tokio::test]
+async fn cursor_option_the_session_does_not_advertise_fails_the_turn_once() {
+    let fixtures = TempDir::new().expect("fixture directory");
+    assert_option_case_settles_once(OptionCase {
+        refusal: Some("Fast is not supported by the selected model."),
+        ..cursor_case(&fixtures)
+    })
+    .await;
+}
+
+/// A session that advertises an option in a shape BiBCode does not use offers it the same way on
+/// every launch, so the turn ends once, with a plain detail instead of Cursor's protocol text.
+#[cfg(unix)]
+#[tokio::test]
+async fn cursor_option_in_an_unsupported_shape_fails_the_turn_once_in_plain_words() {
+    let fixtures = TempDir::new().expect("fixture directory");
+    assert_option_case_settles_once(OptionCase {
+        environment: vec![(
+            "BIBCODE_TEST_FAST_WRONG_CATEGORY".to_owned(),
+            "1".to_owned(),
+        )],
+        refusal: Some(
+            "BiBCode can't apply these options to the selected model. Choose another model, or turn these options off.",
+        ),
+        ..cursor_case(&fixtures)
+    })
+    .await;
+}
+
+/// OpenCode checks a turn's options against the model's advertised variants. An option the model
+/// does not offer ends the durable turn after one launch.
+#[cfg(unix)]
+#[tokio::test]
+async fn opencode_option_the_model_does_not_advertise_fails_the_turn_once() {
+    let app = Router::new()
+        .route(
+            "/session",
+            post(|| async { Json(json!({"id":"opencode-refusal-session"})) }),
+        )
+        .route(
+            "/session/{session_id}",
+            get(|| async { Json(json!({"id":"opencode-refusal-session"})) }),
+        )
+        .route(
+            "/event",
+            get(|| async { Sse::new(stream::pending::<Result<Event, Infallible>>()) }),
+        )
+        .route(
+            "/session/{session_id}/message",
+            get(|| async { Json(json!({"data":[]})) }),
+        )
+        .route(
+            "/provider",
+            get(|| async {
+                Json(json!({
+                    "connected": ["openai"],
+                    "all": [{"id":"openai", "models":{"gpt-5":{"variants":{"high":{}}}}}]
+                }))
+            }),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("OpenCode fixture bind");
+    let endpoint = format!("http://{}", listener.local_addr().expect("fixture address"));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("OpenCode fixture serve");
+    });
+    assert_option_case_settles_once(OptionCase {
+        provider: "opencode",
+        instance_config: json!({
+            "driver":"opencode", "enabled":true,
+            "config":{"binaryPath":"refusing-opencode-route", "serverUrl":endpoint}
+        }),
+        binary_path: None,
+        endpoint: Some(endpoint.clone()),
+        environment: Vec::new(),
+        model: "openai/gpt-5",
+        option: json!({"id":"fastMode","value":true}),
+        refusal: Some("Fast is not supported by the selected model."),
+    })
+    .await;
+    server.abort();
 }
 
 #[tokio::test]

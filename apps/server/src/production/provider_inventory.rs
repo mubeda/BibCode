@@ -172,6 +172,18 @@ fn default_provider_binary(driver: &str) -> &str {
     }
 }
 
+/// The custom models a provider instance offers, read the way the catalog reads them: the
+/// instance's own `customModels`, otherwise its driver's legacy provider settings. A launch
+/// validates a turn's options with this list, so a custom model the catalog offers is accepted
+/// the same way.
+pub(crate) fn instance_custom_models(settings: &Value, instance_id: &str) -> Vec<String> {
+    definitions(settings)
+        .into_iter()
+        .find(|definition| definition.instance_id == instance_id)
+        .map(|definition| definition.custom_models)
+        .unwrap_or_default()
+}
+
 fn definitions(settings: &Value) -> Vec<ProviderDefinition> {
     let legacy = settings.get("providers").and_then(Value::as_object);
     let instances = settings.get("providerInstances").and_then(Value::as_object);
@@ -1969,6 +1981,40 @@ mod tests {
         assert_eq!(
             drivers.iter().filter(|driver| **driver == "cursor").count(),
             1
+        );
+    }
+
+    /// A launch reads an instance's custom models exactly as the catalog does, so the models the
+    /// catalog offers are the models the launch accepts.
+    #[test]
+    fn instance_custom_models_are_the_ones_the_catalog_offers() {
+        let settings = json!({
+            "providers": { "codex": { "customModels": ["legacy-custom"] } },
+            "providerInstances": {
+                "codex-work": {
+                    "driver": "codex",
+                    "config": { "customModels": [" work-custom ", ""] }
+                },
+                "codex-plain": { "driver": "codex" }
+            }
+        });
+        assert_eq!(
+            instance_custom_models(&settings, "codex-work"),
+            vec!["work-custom"]
+        );
+        // An instance without a list of its own takes its driver's legacy list.
+        assert_eq!(
+            instance_custom_models(&settings, "codex-plain"),
+            vec!["legacy-custom"]
+        );
+        assert!(instance_custom_models(&settings, "codex-missing").is_empty());
+        // Settings without instances offer the legacy list on the default instance.
+        assert_eq!(
+            instance_custom_models(
+                &json!({ "providers": { "codex": { "customModels": ["legacy-custom"] } } }),
+                "codex"
+            ),
+            vec!["legacy-custom"]
         );
     }
 

@@ -1,4 +1,4 @@
-use bibcode_server::provider::opencode;
+use bibcode_server::provider::{OptionRefusal, opencode};
 
 use std::{
     collections::{HashMap, HashSet},
@@ -2361,18 +2361,43 @@ async fn opencode_options_use_exact_model_variants_and_reject_conflicts_before_p
     );
     runtime.start().await.expect("start");
 
-    assert!(
-        runtime
-            .set_options(vec![json!({ "id": "madeUp", "value": true })])
-            .await
-            .is_err()
+    let unknown = runtime
+        .set_options(vec![json!({ "id": "madeUp", "value": true })])
+        .await
+        .expect_err("an unknown option is refused");
+    assert_eq!(
+        unknown.option_refusal(),
+        Some("madeUp is not supported by the selected model.")
     );
-    assert!(state.prompt_body.lock().await.is_none());
-    assert!(
-        runtime
-            .set_options(vec![json!({ "id": "variant", "value": "medium" })])
+    // The shape checks name each option by the label its descriptor shows.
+    for (options, refusal) in [
+        (
+            vec![json!({ "value": true })],
+            "The turn has an option without an id.",
+        ),
+        (
+            vec![json!({ "id": "fastMode", "value": "yes" })],
+            "Fast must be on or off.",
+        ),
+        (
+            vec![json!({ "id": "variant", "value": "" })],
+            "Variant needs a value.",
+        ),
+    ] {
+        let refused = runtime
+            .set_options(options)
             .await
-            .is_err()
+            .expect_err("a malformed option is refused");
+        assert_eq!(refused.option_refusal(), Some(refusal));
+    }
+    assert!(state.prompt_body.lock().await.is_none());
+    let unadvertised = runtime
+        .set_options(vec![json!({ "id": "variant", "value": "medium" })])
+        .await
+        .expect_err("a variant the model does not advertise is refused");
+    assert_eq!(
+        unadvertised.option_refusal(),
+        Some("Variant medium is not supported by the selected model.")
     );
     assert!(state.prompt_body.lock().await.is_none());
 
@@ -2380,14 +2405,16 @@ async fn opencode_options_use_exact_model_variants_and_reject_conflicts_before_p
         .set_options(vec![json!({ "id": "fastMode", "value": false })])
         .await
         .expect("false selects the advertised non-fast default");
-    assert!(
-        runtime
-            .set_options(vec![
-                json!({ "id": "fastMode", "value": true }),
-                json!({ "id": "variant", "value": "high" }),
-            ])
-            .await
-            .is_err()
+    let conflict = runtime
+        .set_options(vec![
+            json!({ "id": "fastMode", "value": true }),
+            json!({ "id": "variant", "value": "high" }),
+        ])
+        .await
+        .expect_err("Fast and a variant exclude each other");
+    assert_eq!(
+        conflict.option_refusal(),
+        Some("Fast and Variant can't be used together.")
     );
     runtime
         .send_turn(Some("hello"), Vec::new(), None)
@@ -2433,6 +2460,27 @@ async fn opencode_options_use_exact_model_variants_and_reject_conflicts_before_p
     );
 
     server.abort();
+}
+
+/// A server that cannot be reached says nothing about the options, so the failure stays one a
+/// retry may overcome instead of a refusal.
+#[tokio::test]
+async fn opencode_unreachable_server_is_not_an_option_refusal() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address: SocketAddr = listener.local_addr().expect("addr");
+    drop(listener);
+    let runtime = OpenCodeSessionRuntime::new(
+        &format!("http://{address}"),
+        "opencode-unreachable-thread",
+        "/tmp/project",
+        Some("openai/gpt-5"),
+    );
+
+    let error = runtime
+        .set_options(vec![json!({ "id": "fastMode", "value": true })])
+        .await
+        .expect_err("the advertised variants cannot be read");
+    assert_eq!(error.option_refusal(), None, "{error}");
 }
 
 #[tokio::test]

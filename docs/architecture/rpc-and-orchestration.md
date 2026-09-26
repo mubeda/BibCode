@@ -1526,6 +1526,19 @@ dismissed. Deriving it keeps the projection owner unchanged: no delivery
 component writes the provider session, and the field never alters session
 `status`, provider identity, runtime mode, the active turn, or any turn row.
 
+A launch refused because the selected model or session does not accept the
+turn's own options fails the delivery once, because the unchanged durable
+payload would be refused on every attempt. Other launch failures, such as a
+spawn error, stay definitely not sent and retry with backoff. The delivery
+detail is what the turn shows, so every one is plain text from a single
+formatter that names the provider by its instance label, never by a driver id:
+the refusal itself, such as "Fast Mode is not supported by the selected model.";
+for a spawn failure, that the provider could not start and why; for an uncertain
+delivery, that the Claude instance never confirmed a written message, or that
+BiBCode can't check after a restart whether a provider without exact
+reconciliation received it. Error text, logs and runtime rows keep the internal
+detail.
+
 ### Durable message queue
 
 The server owns the queue through durable outbox rows and projected user
