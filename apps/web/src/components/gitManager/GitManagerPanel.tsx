@@ -1015,19 +1015,19 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
         <div className="border-b border-panel-separator px-4 pt-2">
           <TabsList className="w-fit rounded-none border-0 bg-transparent p-0">
             <TabsTab
-              className="rounded-none border-b-2 border-transparent px-3 py-2 data-selected:border-foreground data-selected:bg-transparent data-selected:shadow-none"
+              className="rounded-none border-b-2 border-transparent px-3 py-2 data-active:border-foreground data-active:bg-transparent data-active:shadow-none"
               value="changes"
             >
               Changes
             </TabsTab>
             <TabsTab
-              className="rounded-none border-b-2 border-transparent px-3 py-2 data-selected:border-foreground data-selected:bg-transparent data-selected:shadow-none"
+              className="rounded-none border-b-2 border-transparent px-3 py-2 data-active:border-foreground data-active:bg-transparent data-active:shadow-none"
               value="history"
             >
               History
             </TabsTab>
             <TabsTab
-              className="rounded-none border-b-2 border-transparent px-3 py-2 data-selected:border-foreground data-selected:bg-transparent data-selected:shadow-none"
+              className="rounded-none border-b-2 border-transparent px-3 py-2 data-active:border-foreground data-active:bg-transparent data-active:shadow-none"
               value="tags"
             >
               Tags
