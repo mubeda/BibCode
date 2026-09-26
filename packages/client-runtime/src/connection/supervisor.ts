@@ -25,6 +25,7 @@ import {
   type PreparedConnection,
   type SupervisorConnectionState,
 } from "./model.ts";
+import { LIVENESS_TIMEOUT_SECONDS } from "../rpc/liveness.ts";
 import * as RpcSession from "../rpc/session.ts";
 import { safeErrorLogAttributes } from "../errors/safeLog.ts";
 import * as ConnectionWakeups from "./wakeups.ts";
@@ -59,6 +60,31 @@ interface PendingRetryTrace {
   readonly delayMs: number;
   readonly reason: ConnectionAttemptError["reason"];
 }
+
+/**
+ * The run loop's current run of failed attempts. It starts over as a whole when the user
+ * disconnects and when a connection stays up long enough to count as stable.
+ */
+interface FailureStreak {
+  /** Failed attempts so far; the next attempt is number `failureCount + 1`. */
+  readonly failureCount: number;
+  /** Kept visible through the next attempt. */
+  readonly latestFailure: ConnectionAttemptError | null;
+  /** Links the next relay attempt's trace to the one that failed. */
+  readonly pendingRetry: Option.Option<PendingRetryTrace>;
+  /** When the first failure of this streak happened. */
+  readonly failingSince: number | null;
+  /** Consecutive failures while on the idle ladder. */
+  readonly idleFailures: number;
+}
+
+const NO_FAILURES: FailureStreak = {
+  failureCount: 0,
+  latestFailure: null,
+  pendingRetry: Option.none(),
+  failingSince: null,
+  idleFailures: 0,
+};
 
 interface TracedAttemptFailure {
   readonly error: ConnectionAttemptError;
@@ -197,7 +223,7 @@ function labelDisconnectFailure(
     case "liveness-timeout":
       return new ConnectionTransientError({
         reason: error.reason,
-        detail: `No data from ${label} for 30 seconds. The connection is too slow or was lost.`,
+        detail: `No data from ${label} for ${LIVENESS_TIMEOUT_SECONDS} seconds. The connection is too slow or was lost.`,
       });
     case "connection-closed":
       return new ConnectionTransientError({
@@ -652,21 +678,13 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
   });
 
   const run = Effect.fnUntraced(function* () {
-    let failureCount = 0;
     let generation = 0;
-    let latestFailure: ConnectionAttemptError | null = null;
-    let pendingRetry = Option.none<PendingRetryTrace>();
-    let failingSince: number | null = null;
-    let idleFailures = 0;
+    let streak = NO_FAILURES;
 
     for (;;) {
       const currentIntent = yield* Ref.get(intent);
       if (!currentIntent.desired) {
-        failureCount = 0;
-        latestFailure = null;
-        pendingRetry = Option.none();
-        failingSince = null;
-        idleFailures = 0;
+        streak = NO_FAILURES;
         yield* clearLease;
         yield* setState(availableState(currentIntent, generation));
         yield* waitForSignal;
@@ -674,24 +692,22 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
       }
       if (currentIntent.network === "offline") {
         yield* clearLease;
-        yield* setState(offlineState(currentIntent, generation, failureCount + 1, latestFailure));
+        yield* setState(
+          offlineState(currentIntent, generation, streak.failureCount + 1, streak.latestFailure),
+        );
         yield* waitForSignal;
         continue;
       }
 
-      const attempt = failureCount + 1;
+      const attempt = streak.failureCount + 1;
       const nextGeneration = generation + 1;
       const outcome: AttemptOutcome = yield* Effect.scoped(
-        runAttempt(attempt, nextGeneration, latestFailure, pendingRetry),
+        runAttempt(attempt, nextGeneration, streak.latestFailure, streak.pendingRetry),
       );
       if (outcome.established) {
         generation = nextGeneration;
         if (outcome.stable) {
-          failureCount = 0;
-          latestFailure = null;
-          pendingRetry = Option.none();
-          failingSince = null;
-          idleFailures = 0;
+          streak = NO_FAILURES;
         }
       }
       if (outcome._tag === "Interrupted") {
@@ -700,11 +716,11 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
 
       const attemptSpan: Option.Option<Tracer.Span> = outcome.failure.attemptSpan;
       const error: ConnectionAttemptError = outcome.failure.error;
-      latestFailure = error;
       if (
         error._tag === "ConnectionBlockedError" ||
         error._tag === "ConnectionStorageChangedError"
       ) {
+        streak = { ...streak, latestFailure: error };
         const blockedIntent = yield* Ref.get(intent);
         yield* setState({
           desired: blockedIntent.desired,
@@ -720,21 +736,27 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
         continue;
       }
 
-      failureCount += 1;
+      const failureCount = streak.failureCount + 1;
       const failedAt = yield* Clock.currentTimeMillis;
-      failingSince ??= failedAt;
+      const failingSince = streak.failingSince ?? failedAt;
       const idle = !(yield* Ref.get(shown)) && failedAt - failingSince >= IDLE_LADDER_AFTER_MS;
-      idleFailures = idle ? idleFailures + 1 : 0;
+      const idleFailures = idle ? streak.idleFailures + 1 : 0;
       const delayMs = jitteredDelayMs(
         idle ? idleRetryDelayMs(idleFailures) : retryDelayMs(failureCount - 1),
         random,
       );
-      pendingRetry = Option.map(attemptSpan, (previousAttempt) => ({
-        previousAttempt,
+      streak = {
         failureCount,
-        delayMs,
-        reason: error.reason,
-      }));
+        latestFailure: error,
+        pendingRetry: Option.map(attemptSpan, (previousAttempt) => ({
+          previousAttempt,
+          failureCount,
+          delayMs,
+          reason: error.reason,
+        })),
+        failingSince,
+        idleFailures,
+      };
       const failedIntent = yield* Ref.get(intent);
       yield* setState({
         desired: failedIntent.desired,

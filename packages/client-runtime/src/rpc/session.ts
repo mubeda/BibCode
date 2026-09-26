@@ -1,4 +1,9 @@
-import { type E2eeAuthenticatedMessage, type ServerConfig, WS_METHODS } from "@bibcode/contracts";
+import {
+  type E2eeAuthenticatedMessage,
+  type ServerConfig,
+  type ServerConfigStreamEvent,
+  WS_METHODS,
+} from "@bibcode/contracts";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -13,7 +18,11 @@ import * as Socket from "effect/unstable/socket/Socket";
 
 import { makeWsRpcProtocolClient, type WsRpcProtocolClient } from "./protocol.ts";
 import { e2eeFailureOf, makeE2eeSocket } from "../e2ee/index.ts";
-import type { ConnectionAttemptError, PreparedConnection } from "../connection/model.ts";
+import type {
+  ConnectionAttemptError,
+  ConnectionTransientReason,
+  PreparedConnection,
+} from "../connection/model.ts";
 import {
   ConnectionBlockedError,
   ConnectionTransientError as ConnectionTransientErrorClass,
@@ -27,8 +36,32 @@ import { makeSharedServerConfig } from "./sharedServerConfig.ts";
 
 const SOCKET_OPEN_TIMEOUT = "15 seconds";
 
+type ServerConfigSubscription = WsRpcProtocolClient[typeof WS_METHODS.subscribeServerConfig];
+
+/** Failures of the config subscription that readiness waits on. */
+type InitialConfigError = ServerConfigSubscription extends (
+  input: any,
+  options?: any,
+) => Stream.Stream<any, infer E, any>
+  ? E
+  : never;
+
+/**
+ * The session's RPC client. Its `subscribeServerConfig` replays the connection's one config
+ * stream instead of opening another, so it has only the stream form: no `asQueue`, and no
+ * per-call options.
+ */
+export type RpcSessionClient = Omit<
+  WsRpcProtocolClient,
+  typeof WS_METHODS.subscribeServerConfig
+> & {
+  readonly [WS_METHODS.subscribeServerConfig]: (
+    input: Parameters<ServerConfigSubscription>[0],
+  ) => Stream.Stream<ServerConfigStreamEvent, InitialConfigError>;
+};
+
 export interface RpcSession {
-  readonly client: WsRpcProtocolClient;
+  readonly client: RpcSessionClient;
   readonly initialConfig: Effect.Effect<ServerConfig, ConnectionAttemptError>;
   readonly ready: Effect.Effect<void, ConnectionAttemptError>;
   readonly probe: Effect.Effect<void, ConnectionAttemptError>;
@@ -45,14 +78,6 @@ export class RpcSessionFactory extends Context.Service<
   }
 >()("@bibcode/client-runtime/rpc/session/RpcSessionFactory") {}
 
-/** Failures of the config subscription that readiness waits on. */
-type InitialConfigError = WsRpcProtocolClient[typeof WS_METHODS.subscribeServerConfig] extends (
-  input: any,
-  options?: any,
-) => Stream.Stream<any, infer E, any>
-  ? E
-  : never;
-
 function mapInitialConfigError(error: InitialConfigError): ConnectionAttemptError {
   switch (error._tag) {
     case "EnvironmentAuthorizationError":
@@ -61,16 +86,8 @@ function mapInitialConfigError(error: InitialConfigError): ConnectionAttemptErro
         detail: error.message,
       });
     case "UpdateMaintenanceActiveError":
-      return new ConnectionTransientErrorClass({
-        reason: "remote-unavailable",
-        detail: error.message,
-      });
     case "KeybindingsConfigParseError":
     case "ServerSettingsError":
-      return new ConnectionTransientErrorClass({
-        reason: "remote-unavailable",
-        detail: error.message,
-      });
     case "RpcResponseTooLargeError":
       return new ConnectionTransientErrorClass({
         reason: "remote-unavailable",
@@ -111,6 +128,13 @@ function mapE2eeFailure(error: unknown): ConnectionAttemptError | null {
   }
 }
 
+/** How each end of an established connection is reported; the supervisor adds the name. */
+const DISCONNECT_REASONS = {
+  LivenessTimeout: "liveness-timeout",
+  Closed: "connection-closed",
+  Lost: "connection-lost",
+} as const satisfies Record<RpcDisconnect["_tag"], ConnectionTransientReason>;
+
 function disconnectError(
   wasConnected: boolean,
   disconnect: RpcDisconnect,
@@ -121,23 +145,10 @@ function disconnectError(
       detail: "Could not establish a WebSocket connection.",
     });
   }
-  switch (disconnect._tag) {
-    case "LivenessTimeout":
-      return new ConnectionTransientErrorClass({
-        reason: "liveness-timeout",
-        detail: "The connection disconnected.",
-      });
-    case "Closed":
-      return new ConnectionTransientErrorClass({
-        reason: "connection-closed",
-        detail: "The connection disconnected.",
-      });
-    case "Lost":
-      return new ConnectionTransientErrorClass({
-        reason: "connection-lost",
-        detail: "The connection disconnected.",
-      });
-  }
+  return new ConnectionTransientErrorClass({
+    reason: DISCONNECT_REASONS[disconnect._tag],
+    detail: "The connection disconnected.",
+  });
 }
 
 export const make = Effect.gen(function* () {
@@ -229,13 +240,10 @@ export const make = Effect.gen(function* () {
         Deferred.await(connected).pipe(Effect.as(admitted[WS_METHODS.subscribeServerConfig]({}))),
       ),
     );
-    // Later subscribers replay the shared stream. No caller reads this method
-    // as a queue (`asQueue`), so the stream form is its whole contract here.
-    const subscribeSharedConfig = (() =>
-      sharedConfig.events) as WsRpcProtocolClient[typeof WS_METHODS.subscribeServerConfig];
-    const client: WsRpcProtocolClient = {
+    // Later subscribers replay the shared stream (see `RpcSessionClient`).
+    const client: RpcSessionClient = {
       ...admitted,
-      [WS_METHODS.subscribeServerConfig]: subscribeSharedConfig,
+      [WS_METHODS.subscribeServerConfig]: () => sharedConfig.events,
     };
     // The protocol publishes the classified disconnect before it fails sends
     // and pending calls, so a transport failure seen after the socket ended

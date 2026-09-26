@@ -968,6 +968,89 @@ describe("RpcSessionFactory", () => {
     ),
   );
 
+  for (const [error, expected] of [
+    [
+      { _tag: "UpdateMaintenanceActiveError", message: "An update is being installed." },
+      {
+        _tag: "ConnectionTransientError",
+        reason: "remote-unavailable",
+        detail: "An update is being installed.",
+      },
+    ],
+    [
+      {
+        _tag: "KeybindingsConfigParseError",
+        configPath: "/home/dev/keybindings.json",
+        detail: "Unexpected token.",
+      },
+      {
+        _tag: "ConnectionTransientError",
+        reason: "remote-unavailable",
+        detail:
+          "Unable to parse keybindings config at /home/dev/keybindings.json: Unexpected token.",
+      },
+    ],
+    [
+      {
+        _tag: "ServerSettingsError",
+        settingsPath: "/home/dev/settings.json",
+        operation: "read-file",
+        cause: "unreadable",
+      },
+      {
+        _tag: "ConnectionTransientError",
+        reason: "remote-unavailable",
+        detail: "Server settings read-file failed at /home/dev/settings.json.",
+      },
+    ],
+    [
+      {
+        _tag: "RpcResponseTooLargeError",
+        method: WS_METHODS.subscribeServerConfig,
+        bytes: 70_000_000,
+        limitBytes: 67_108_864,
+      },
+      {
+        _tag: "ConnectionTransientError",
+        reason: "remote-unavailable",
+        detail: "This result is too large to send (66.8 MiB; limit 64 MiB).",
+      },
+    ],
+    [
+      {
+        _tag: "EnvironmentAuthorizationError",
+        message: "This client may not read the configuration.",
+        requiredScope: "orchestration:read",
+      },
+      {
+        _tag: "ConnectionBlockedError",
+        reason: "permission",
+        detail: "This client may not read the configuration.",
+      },
+    ],
+  ] as const) {
+    it.effect(`fails readiness on a config ${error._tag} as ${expected.reason}`, () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const { factory, sockets } = yield* makeFactory();
+          const session = yield* factory.connect(PREPARED);
+          const ready = yield* Effect.forkChild(Effect.flip(session.ready));
+          const socket = yield* awaitSocket(sockets);
+          socket.open();
+          const request = yield* awaitRequest(socket);
+          socket.serverMessage(
+            encodeJson({
+              _tag: "Exit",
+              requestId: request.id,
+              exit: { _tag: "Failure", cause: [{ _tag: "Fail", error }] },
+            }),
+          );
+          expect(yield* Fiber.join(ready)).toMatchObject(expected);
+        }),
+      ),
+    );
+  }
+
   it.effect("serves later config subscriptions from the one server stream", () =>
     Effect.scoped(
       Effect.gen(function* () {
