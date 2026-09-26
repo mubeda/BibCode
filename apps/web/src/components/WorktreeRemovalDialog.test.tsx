@@ -11,15 +11,51 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
+interface ThreadFixture {
+  readonly id: string;
+  readonly environmentId: string;
+  readonly projectId: string;
+  readonly kind: "workspace" | "panel";
+  readonly worktreePath: string | null;
+  readonly archivedAt: string | null;
+  readonly session: { readonly status: string; readonly activeTurnId: string | null } | null;
+}
+
 const h = vi.hoisted(() => ({
   commands: new Map<string, (input: unknown) => Promise<unknown>>(),
   runners: new Map<string, (input: unknown) => Promise<unknown>>(),
   calls: [] as Array<{ readonly label: string; readonly input: unknown }>,
+  /** The live thread shells; tests replace the array, as the store does. */
+  threads: [] as ThreadFixture[],
 }));
 
 vi.mock("../state/use-atom-command", () => ({
   useAtomCommand: (command: { label: string }) => h.runners.get(command.label),
 }));
+
+vi.mock("../state/entities", () => {
+  const find = (ref: { environmentId: string; threadId: string }) =>
+    h.threads.find(
+      (thread) => thread.environmentId === ref.environmentId && thread.id === ref.threadId,
+    ) ?? null;
+  return {
+    useThreadShell: (ref: { environmentId: string; threadId: string } | null) =>
+      ref === null ? null : find(ref),
+    useThreadShellsForProjectRefs: (
+      refs: ReadonlyArray<{ environmentId: string; projectId: string }>,
+    ) =>
+      h.threads.filter((thread) =>
+        refs.some(
+          (ref) => ref.environmentId === thread.environmentId && ref.projectId === thread.projectId,
+        ),
+      ),
+    readThreadShell: find,
+    readEnvironmentThreadRefs: (environmentId: string) =>
+      h.threads
+        .filter((thread) => thread.environmentId === environmentId)
+        .map((thread) => ({ environmentId, threadId: thread.id })),
+  };
+});
 
 vi.mock("../state/worktrees", () => ({
   worktreeEnvironment: {
@@ -71,6 +107,24 @@ function plan(overrides: Partial<WorktreeRemovalPlan> = {}): WorktreeRemovalPlan
     trackedChangeCount: 0,
     untrackedFileCount: 0,
     pruneImpact: [],
+    ...overrides,
+  };
+}
+
+const DELETE_BLOCKED_REASON = "Stop the running session before deleting this worktree.";
+const RUNNING = { status: "running", activeTurnId: "turn-one" } as const;
+const READY = { status: "ready", activeTurnId: null } as const;
+
+/** A live thread shell in the target's project, in the target's worktree unless overridden. */
+function threadShell(id: string, overrides: Partial<ThreadFixture> = {}): ThreadFixture {
+  return {
+    id,
+    environmentId: target.environmentId,
+    projectId: target.projectId,
+    kind: "workspace",
+    worktreePath: target.path,
+    archivedAt: null,
+    session: null,
     ...overrides,
   };
 }
@@ -135,6 +189,7 @@ beforeEach(() => {
   h.calls = [];
   h.commands.clear();
   h.runners.clear();
+  h.threads = [threadShell(target.threadId, { session: READY })];
   for (const label of ["get-plan", "detach", "remove"]) {
     h.runners.set(label, async (input: unknown) => {
       h.calls.push({ label, input });
@@ -478,5 +533,129 @@ describe("WorktreeRemovalDialog", () => {
     await renderDialog({ target: { ...target, availability: "removing" } });
     expect(container.textContent).toContain("Removal is already in progress");
     expect(button("Remove from BiBCode").disabled).toBe(true);
+  });
+});
+
+describe("WorktreeRemovalDialog while a session runs in the worktree", () => {
+  /** The visible line explaining why deletion waits, if the dialog shows it. */
+  function deletionBlockedReason(): HTMLElement | null {
+    return (
+      [...container.querySelectorAll<HTMLElement>("p")].find(
+        (line) => line.textContent === DELETE_BLOCKED_REASON,
+      ) ?? null
+    );
+  }
+
+  function removeCalls() {
+    return h.calls.filter((call) => call.label === "remove");
+  }
+
+  it("disables deletion and says why in the dialog, keeping Remove from BiBCode available", async () => {
+    h.threads = [threadShell(target.threadId, { session: RUNNING })];
+    await renderDialog();
+
+    const deleteButton = button("Delete Git worktree and remove");
+    expect(deleteButton.disabled).toBe(true);
+    const reason = deletionBlockedReason();
+    expect(reason, "the reason is visible text, not a hover-only tooltip").not.toBeNull();
+    expect(deleteButton.getAttribute("aria-describedby")).toBe(reason!.id);
+    expect(button("Remove from BiBCode").disabled).toBe(false);
+  });
+
+  it("re-enables deletion as soon as the session stops", async () => {
+    h.threads = [threadShell(target.threadId, { session: RUNNING })];
+    await renderDialog();
+    expect(button("Delete Git worktree and remove").disabled).toBe(true);
+
+    h.threads = [threadShell(target.threadId, { session: READY })];
+    await updateDialog();
+
+    const deleteButton = button("Delete Git worktree and remove");
+    expect(deleteButton.disabled).toBe(false);
+    expect(deleteButton.hasAttribute("aria-describedby")).toBe(false);
+    expect(deletionBlockedReason()).toBeNull();
+    await click("Delete Git worktree and remove");
+    expect(removeCalls()).toHaveLength(1);
+  });
+
+  it("refuses a click that lands after a session started but before the dialog re-rendered", async () => {
+    await renderDialog();
+    expect(button("Delete Git worktree and remove").disabled).toBe(false);
+
+    // The store already reports the session; the dialog has not re-rendered.
+    h.threads = [threadShell(target.threadId, { session: RUNNING })];
+    await click("Delete Git worktree and remove");
+
+    expect(removeCalls()).toHaveLength(0);
+    await updateDialog();
+    expect(button("Delete Git worktree and remove").disabled).toBe(true);
+    expect(deletionBlockedReason()).not.toBeNull();
+  });
+
+  it("guards the dirty and prune confirmations too", async () => {
+    h.commands.set(
+      "get-plan",
+      vi.fn().mockResolvedValue({
+        _tag: "Success",
+        value: plan({
+          trackedChangeCount: 1,
+          pruneImpact: [
+            { path: "/repo/worktrees/old-one", pruneReason: "directory missing", locked: false },
+          ],
+        }),
+      }),
+    );
+    await renderDialog();
+    await click("Delete Git worktree and remove");
+
+    h.threads = [threadShell(target.threadId, { session: RUNNING })];
+    await updateDialog();
+    expect(button("Delete dirty worktree").disabled).toBe(true);
+    expect(deletionBlockedReason()).not.toBeNull();
+
+    h.threads = [threadShell(target.threadId, { session: READY })];
+    await updateDialog();
+    await click("Delete dirty worktree");
+    h.threads = [threadShell(target.threadId, { session: RUNNING })];
+    await updateDialog();
+    expect(button("Confirm repository-wide prune").disabled).toBe(true);
+    expect(deletionBlockedReason()).not.toBeNull();
+    expect(removeCalls()).toHaveLength(0);
+  });
+
+  it("guards an archived target, which the live store leaves out, while a chat in its worktree runs", async () => {
+    // Settings → Archived Threads: the target is archived, so it has no live shell.
+    h.threads = [
+      threadShell("chat-elsewhere", {
+        kind: "panel",
+        worktreePath: "/repo/worktrees/other",
+        session: RUNNING,
+      }),
+    ];
+    await renderDialog();
+    expect(button("Delete Git worktree and remove").disabled).toBe(false);
+
+    h.threads = [...h.threads, threadShell("chat-here", { kind: "panel", session: RUNNING })];
+    await updateDialog();
+    expect(button("Delete Git worktree and remove").disabled).toBe(true);
+    expect(deletionBlockedReason()).not.toBeNull();
+  });
+
+  it("shows no reason when the plan offers no deletion to wait for", async () => {
+    h.commands.set(
+      "get-plan",
+      vi.fn().mockResolvedValue({
+        _tag: "Success",
+        value: plan({ availability: "verification-unavailable", registered: true }),
+      }),
+    );
+    h.threads = [threadShell(target.threadId, { session: RUNNING })];
+    await renderDialog({
+      target: { ...target, availability: "verification-unavailable", registrationState: null },
+    });
+
+    expect(container.textContent).not.toContain("Delete Git worktree and remove");
+    expect(deletionBlockedReason()).toBeNull();
+    expect(button("Remove from BiBCode").disabled).toBe(false);
   });
 });

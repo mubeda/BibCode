@@ -65,6 +65,36 @@ import Sidebar, {
 } from "./Sidebar";
 import { WORKSPACE_CARD_STATUS } from "./Sidebar.logic";
 
+/** A card menu item as `api.contextMenu.show` receives it. */
+type CardMenuItem = {
+  id?: string;
+  label?: string;
+  disabled?: boolean;
+  description?: string;
+  separator?: true;
+};
+
+/** Sets the session status of the worktree fixture, whose own session is running. */
+function setWorktreeSessionStatus(
+  status: NonNullable<EnvironmentThreadShell["session"]>["status"],
+): void {
+  h.state.threads = h.state.threads.map((thread: EnvironmentThreadShell) =>
+    thread.id === threadActive.id
+      ? { ...threadActive, session: { ...threadActive.session!, status } }
+      : thread,
+  );
+}
+
+/** Makes the card menu choose Delete; `current` is the Delete item the menu was built with. */
+function chooseDeleteFromCardMenu(): { current: CardMenuItem | undefined } {
+  const deleteItem: { current: CardMenuItem | undefined } = { current: undefined };
+  h.spies.contextMenuShow.mockImplementation(async (items: CardMenuItem[]) => {
+    deleteItem.current = items.find((item) => item.id === "delete");
+    return "delete";
+  });
+  return deleteItem;
+}
+
 staticDescribe("Sidebar global event helpers", () => {
   function navigationEvent(overrides: { defaultPrevented?: boolean; repeat?: boolean } = {}) {
     return {
@@ -1681,6 +1711,7 @@ staticDescribe("worktree discovery integration", () => {
 
   it("starts no row subscription and uses direct legacy detach when capability is false", async () => {
     baseScenario();
+    setWorktreeSessionStatus("ready");
     h.state.serverConfigs = new Map([
       [ENV_MAIN, { environment: { capabilities: { worktreeCatalog: false } } }],
     ]);
@@ -1698,6 +1729,27 @@ staticDescribe("worktree discovery integration", () => {
       threadId: threadActive.id,
     });
     expect(h.spies.requestWorktreeRemoval).not.toHaveBeenCalled();
+  });
+
+  it("holds legacy detach too while the worktree's session runs", async () => {
+    baseScenario();
+    h.state.serverConfigs = new Map([
+      [ENV_MAIN, { environment: { capabilities: { worktreeCatalog: false } } }],
+    ]);
+
+    render(<Sidebar />);
+    fakeLocalApi();
+    const deleteItem = chooseDeleteFromCardMenu();
+    const row = mustFindProps(byTestId("thread-row-thread-active"), "legacy worktree row");
+    invoke(row, "onContextMenu", mouseEvent());
+    await flush();
+
+    expect(deleteItem.current).toMatchObject({
+      disabled: true,
+      description: "Stop the running session before deleting this worktree.",
+    });
+    expect(h.spies.dialogConfirm).not.toHaveBeenCalled();
+    expect(h.spies.deleteThread).not.toHaveBeenCalled();
   });
 
   it("keeps false-capability bulk deletion on detach-only thread actions", async () => {
@@ -1975,6 +2027,18 @@ staticDescribe("thread rows in the full sidebar", () => {
 });
 
 staticDescribe("thread context menu", () => {
+  /** Opens a card's menu and returns the items it was built with, choosing nothing. */
+  async function openCardMenu(rowTestId: string): Promise<CardMenuItem[]> {
+    let menuItems: CardMenuItem[] = [];
+    h.spies.contextMenuShow.mockImplementation(async (items: CardMenuItem[]) => {
+      menuItems = items;
+      return null;
+    });
+    invoke(mustFindProps(byTestId(rowTestId), rowTestId), "onContextMenu", mouseEvent());
+    await flush();
+    return menuItems;
+  }
+
   function setupMenu(clickedId: string | null) {
     baseScenario();
     h.state.serverConfigs.set(ENV_MAIN, {
@@ -2320,14 +2384,17 @@ staticDescribe("thread context menu", () => {
 
   it("opens the typed removal dialog for a worktree instead of native delete confirmation", async () => {
     baseScenario();
+    setWorktreeSessionStatus("ready");
     render(<Sidebar />);
     fakeLocalApi();
-    h.spies.contextMenuShow.mockResolvedValue("delete");
+    const deleteItem = chooseDeleteFromCardMenu();
     const row = mustFindProps(byTestId("thread-row-thread-active"), "worktree row");
 
     invoke(row, "onContextMenu", mouseEvent());
     await flush();
 
+    expect(deleteItem.current).toMatchObject({ label: "Delete Worktree…" });
+    expect(deleteItem.current?.disabled).not.toBe(true);
     expect(h.spies.requestWorktreeRemoval).toHaveBeenCalledWith(
       expect.objectContaining({
         projectId: projectA.id,
@@ -2337,6 +2404,55 @@ staticDescribe("thread context menu", () => {
     );
     expect(h.spies.dialogConfirm).not.toHaveBeenCalled();
     expect(h.spies.deleteThread).not.toHaveBeenCalled();
+  });
+
+  it("disables Delete Worktree, saying how to proceed, while the worktree's session runs", async () => {
+    baseScenario();
+    // An editor keeps Open in enabled, so only the session can disable an item.
+    h.state.serverConfigs.set(ENV_MAIN, {
+      availableEditors: ["vscode"],
+      environment: { capabilities: { worktreeCatalog: true } },
+    });
+    render(<Sidebar />);
+    fakeLocalApi();
+    const items = await openCardMenu("thread-row-thread-active");
+
+    expect(items.find((item) => item.id === "delete")).toEqual({
+      id: "delete",
+      label: "Delete Worktree…",
+      destructive: true,
+      icon: "trash",
+      disabled: true,
+      description: "Stop the running session before deleting this worktree.",
+    });
+    // Only Delete waits for the session; the card's other actions stay usable.
+    expect(items.filter((item) => item.disabled === true).map((item) => item.id)).toEqual([
+      "delete",
+    ]);
+  });
+
+  it("disables Delete Worktree while another chat open in the worktree runs, not one elsewhere", async () => {
+    const runningChat = (id: string, worktreePath: string) =>
+      makeThread(id, {
+        kind: "panel",
+        worktreePath,
+        session: { ...threadActive.session!, threadId: ThreadId.make(id) },
+      });
+    baseScenario();
+    setWorktreeSessionStatus("ready");
+    h.state.threads = [...h.state.threads, runningChat("chat-elsewhere", "C:/wt/other")];
+    render(<Sidebar />);
+    fakeLocalApi();
+    let items = await openCardMenu("thread-row-thread-active");
+    expect(items.find((item) => item.id === "delete")?.disabled).not.toBe(true);
+
+    h.state.threads = [...h.state.threads, runningChat("chat-here", "C:/wt/x")];
+    render(<Sidebar />);
+    items = await openCardMenu("thread-row-thread-active");
+    expect(items.find((item) => item.id === "delete")).toMatchObject({
+      disabled: true,
+      description: "Stop the running session before deleting this worktree.",
+    });
   });
 
   it("shows the multi-select menu when the row is part of a selection", async () => {

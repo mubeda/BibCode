@@ -8,6 +8,7 @@ import {
   buildWorkspaceCardMenu,
   describeUnavailableWorkspace,
   parseProjectHeaderSelection,
+  WORKTREE_DELETE_BLOCKED_REASON,
   type WorkspaceCardMenuInput,
 } from "./sidebarMenus.logic";
 
@@ -33,6 +34,7 @@ const worktreeCard: WorkspaceCardMenuInput = {
   pinned: false,
   unread: false,
   confirmThreadDelete: true,
+  worktreeSessionRunning: false,
 };
 
 describe("buildWorkspaceCardMenu", () => {
@@ -67,7 +69,39 @@ describe("buildWorkspaceCardMenu", () => {
       "delete",
     ]);
     expect(menu.at(-1)).toMatchObject({ destructive: true, icon: "trash" });
+    expect(menu.at(-1)).not.toHaveProperty("disabled");
     expect(menu[0]).toMatchObject({ children: openIn });
+  });
+
+  it("disables Delete Worktree in place, with how to proceed, while a session in the worktree runs", () => {
+    expect(WORKTREE_DELETE_BLOCKED_REASON).toBe(
+      "Stop the running session before deleting this worktree.",
+    );
+    const menu = buildWorkspaceCardMenu({ ...worktreeCard, worktreeSessionRunning: true });
+    expect(ids(menu)).toEqual(ids(buildWorkspaceCardMenu(worktreeCard)));
+    expect(menu.at(-1)).toEqual({
+      id: "delete",
+      label: "Delete Worktree…",
+      destructive: true,
+      icon: "trash",
+      disabled: true,
+      description: WORKTREE_DELETE_BLOCKED_REASON,
+    });
+    expect(menu.filter((entry) => "disabled" in entry && entry.disabled === true)).toHaveLength(1);
+  });
+
+  it("keeps Delete Thread enabled for a running thread without a worktree, which stops its session first", () => {
+    const menu = buildWorkspaceCardMenu({
+      ...worktreeCard,
+      isWorktree: false,
+      worktreeSessionRunning: true,
+    });
+    expect(menu.at(-1)).toEqual({
+      id: "delete",
+      label: "Delete Thread…",
+      destructive: true,
+      icon: "trash",
+    });
   });
 
   it("omits Copy Branch Name without a branch and reflects pin, read and pull state", () => {

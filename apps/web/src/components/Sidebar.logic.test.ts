@@ -37,6 +37,7 @@ import {
   shouldShowWorkspaceBranchText,
   summarizeWorkspaceChats,
   workspaceCheckoutKey,
+  isWorktreeSessionRunning,
 } from "./Sidebar.logic";
 import { KEYBOARD_CONTEXT_MENU_ECHO_MS } from "../contextMenuKeyboard";
 import {
@@ -45,6 +46,8 @@ import {
   ProjectId,
   ProviderInstanceId,
   ThreadId,
+  TurnId,
+  type OrchestrationSessionStatus,
   type VcsStatusResult,
   type VcsStatusSummary,
 } from "@bibcode/contracts";
@@ -1720,6 +1723,88 @@ describe("summarizeWorkspaceChats", () => {
     expect(
       workspaceCheckoutKey({ environmentId: "a", projectId: "p", worktreePath: null }),
     ).not.toBe(workspaceCheckoutKey({ environmentId: "a", projectId: "q", worktreePath: null }));
+  });
+});
+
+describe("isWorktreeSessionRunning", () => {
+  const environmentId = localEnvironmentId;
+  const session = (status: OrchestrationSessionStatus, activeTurnId: TurnId | null = null) => ({
+    threadId: ThreadId.make("session-thread"),
+    status,
+    providerName: "Claude Code",
+    runtimeMode: DEFAULT_RUNTIME_MODE,
+    activeTurnId,
+    lastError: null,
+    updatedAt: "2026-03-09T10:00:00.000Z",
+  });
+  const thread = (id: string, overrides: Record<string, unknown> = {}) => ({
+    id,
+    environmentId: environmentId as string,
+    projectId: "project-1",
+    worktreePath: "/wt/fix" as string | null,
+    archivedAt: null as string | null,
+    session: null as ReturnType<typeof session> | null,
+    ...overrides,
+  });
+
+  it("is true while the card's own session runs", () => {
+    const card = thread("card", { session: session("running") });
+    expect(isWorktreeSessionRunning(card, [card])).toBe(true);
+  });
+
+  it("is true while a chat open in the same worktree runs", () => {
+    const card = thread("card", { session: session("ready") });
+    const chat = thread("chat", { session: session("running") });
+    expect(isWorktreeSessionRunning(card, [card, chat])).toBe(true);
+  });
+
+  it("refuses Delete Worktree for the realistic busy case: a running session mid-turn", () => {
+    const busy = session("running", TurnId.make("turn-busy"));
+    const card = thread("card", { session: busy });
+    expect(isWorktreeSessionRunning(card, [card])).toBe(true);
+    const idleCard = thread("idle-card", { session: session("ready") });
+    const chat = thread("chat", { session: busy });
+    expect(isWorktreeSessionRunning(idleCard, [idleCard, chat])).toBe(true);
+  });
+
+  it("ignores other worktrees, other environments, the main checkout and archived chats", () => {
+    const card = thread("card");
+    expect(
+      isWorktreeSessionRunning(card, [
+        card,
+        thread("other-worktree", { worktreePath: "/wt/other", session: session("running") }),
+        thread("other-environment", {
+          environmentId: "environment-remote",
+          session: session("running"),
+        }),
+        thread("main-checkout", { worktreePath: null, session: session("running") }),
+        thread("archived", {
+          archivedAt: "2026-03-09T10:00:00.000Z",
+          session: session("running"),
+        }),
+      ]),
+    ).toBe(false);
+  });
+
+  it("counts only a running session, the card menu's Archive rule", () => {
+    const card = thread("card");
+    for (const status of [
+      "idle",
+      "starting",
+      "ready",
+      "interrupted",
+      "stopped",
+      "error",
+    ] as const) {
+      expect(
+        isWorktreeSessionRunning(card, [card, thread("chat", { session: session(status) })]),
+      ).toBe(false);
+    }
+  });
+
+  it("is false for a thread without a worktree", () => {
+    const card = thread("card", { worktreePath: null, session: session("running") });
+    expect(isWorktreeSessionRunning(card, [card])).toBe(false);
   });
 });
 

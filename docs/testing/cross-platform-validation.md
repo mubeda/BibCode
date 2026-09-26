@@ -1982,7 +1982,12 @@ sizes. Cover relevant:
   groups in the native menus (macOS, Linux) and the in-app menu (Windows,
   browser), never two in a row and never at an edge; **Pull** and **Copy Branch
   Name** on worktree and primary cards; **Show Hidden Worktrees (N)** on an
-  expanded project with discovery; and keyboard operation of the in-app menu;
+  expanded project with discovery; while a session runs in a worktree, its
+  card's **Delete Worktree…** is disabled with "Stop the running session before
+  deleting this worktree." (the native menus append it to the label), and the
+  removal dialog, opened from **Settings → Archive → Delete**, shows its delete
+  action disabled with the same visible reason until the session stops; and
+  keyboard operation of the in-app menu;
 - the left panel after the typography sweep: an expanded project without
   worktrees shows only its primary card; a saved server's project headers show
   no cloud icon, while a WSL project under **Local** keeps its container icon;
