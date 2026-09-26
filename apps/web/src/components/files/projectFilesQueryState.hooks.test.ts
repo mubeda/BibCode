@@ -9,8 +9,6 @@ const harness = vi.hoisted(() => ({
   atomValues: new Map<string, unknown>(),
   refresh: vi.fn(),
   retries: [] as unknown[],
-  awaitingRetry: new Set<string>(),
-  awaitingRetryReads: [] as Array<readonly [unknown, unknown]>,
   key(atom: unknown): string {
     return (atom as { key: string }).key;
   },
@@ -68,10 +66,6 @@ vi.mock("@bibcode/client-runtime/state/runtime", async (importOriginal) => ({
     harness.retries.push(atom);
     refresh();
   },
-  isEnvironmentQueryAwaitingRetry: (atom: unknown, emission: unknown) => {
-    harness.awaitingRetryReads.push([atom, emission]);
-    return harness.awaitingRetry.has(harness.key(atom));
-  },
 }));
 
 import { useProjectEntriesQuery, useProjectFileQuery } from "./projectFilesQueryState";
@@ -87,8 +81,6 @@ beforeEach(() => {
   harness.atomValues.clear();
   harness.refresh.mockReset();
   harness.retries.length = 0;
-  harness.awaitingRetry.clear();
-  harness.awaitingRetryReads.length = 0;
 });
 
 describe("project file query hooks", () => {
@@ -104,7 +96,7 @@ describe("project file query hooks", () => {
     expect(harness.retries).toEqual([{ key: entriesKey }]);
   });
 
-  it("names a transport cut-off and reports when only Retry sends the list again", () => {
+  it("names a transport cut-off with the connection-dropped copy", () => {
     harness.atomValues.set(
       entriesKey,
       AsyncResult.failure(
@@ -115,25 +107,9 @@ describe("project file query hooks", () => {
         ),
       ),
     );
-    expect(useProjectEntriesQuery(environmentId, "/repo")).toMatchObject({
-      error: "The connection dropped before the result arrived.",
-      requiresRetry: false,
-    });
-    harness.awaitingRetry.add(entriesKey);
-    expect(useProjectEntriesQuery(environmentId, "/repo").requiresRetry).toBe(true);
-  });
-
-  it("reads the Retry latch against the emission each render shows", () => {
-    // The React Compiler memoizes the read on its arguments, so the emission must be one.
-    const failure = AsyncResult.failure(Cause.fail(new Error("Workspace missing.")));
-    harness.atomValues.set(entriesKey, failure);
-    harness.atomValues.set(fileKey, failure);
-    useProjectEntriesQuery(environmentId, "/repo");
-    useProjectFileQuery(environmentId, "/repo", "README.md");
-    expect(harness.awaitingRetryReads).toEqual([
-      [{ key: entriesKey }, failure],
-      [{ key: fileKey }, failure],
-    ]);
+    expect(useProjectEntriesQuery(environmentId, "/repo").error).toBe(
+      "The connection dropped before the result arrived.",
+    );
   });
 
   it("revalidates without clearing a transport cut-off; only refresh retries", () => {

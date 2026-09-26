@@ -35,6 +35,7 @@ import { createCommitLookup, spliceCommitGeneration, mergeCommitDecorations } fr
 import { GitManagerCommitDetail } from "./GitManagerCommitDetail";
 import { GitManagerCommitList } from "./GitManagerCommitList";
 import { Button } from "../../ui/button";
+import { RetryButton } from "../../ui/retry-button";
 
 const HISTORY_PAGE_SIZE = 100;
 const COMMIT_LOOKUP_MAX_ENTRIES = 1_000;
@@ -926,14 +927,7 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
             Couldn’t refresh history: {asSentence(refreshFailure.cause)} Your loaded commits are
             still available.
           </span>
-          <Button
-            disabled={refreshFailure.retrying}
-            size="xs"
-            variant="outline"
-            onClick={refreshFailure.retry}
-          >
-            {refreshFailure.retrying ? "Retrying…" : "Retry"}
-          </Button>
+          <RetryButton retrying={refreshFailure.retrying} onRetry={refreshFailure.retry} />
         </div>
       )}
       {loadMoreError !== null ? (

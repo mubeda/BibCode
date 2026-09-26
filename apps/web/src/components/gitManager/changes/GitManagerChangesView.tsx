@@ -17,6 +17,7 @@ import { SearchIcon, XIcon } from "lucide-react";
 import { memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 
 import { Button } from "~/components/ui/button";
+import { RetryButton, type RetryButtonProps } from "~/components/ui/retry-button";
 import { Checkbox } from "~/components/ui/checkbox";
 import { useOpenInPreferredEditor } from "~/editorPreferences";
 import { readLocalApi } from "~/localApi";
@@ -131,12 +132,13 @@ function contextMenuItems(
   ];
 }
 
-function errorPanel(title: string, message: string) {
+function errorPanel(title: string, message: string, retry: RetryButtonProps) {
   return (
     <div className="flex min-h-0 flex-1 items-center justify-center p-6" role="alert">
       <div className="max-w-md text-center">
         <p className="font-medium text-sm text-foreground">{title}</p>
         <p className="mt-1 text-sm text-muted-foreground">{message}</p>
+        <RetryButton className="mt-3" {...retry} />
       </div>
     </div>
   );
@@ -541,9 +543,21 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
   const refsUnavailable = isEnvironmentUnavailable(refsQuery.emission);
   if (statusQuery.error !== null || refsQuery.error !== null) {
     const message = statusQuery.error ?? refsQuery.error ?? "The environment request failed.";
+    // Retry reads again only what failed, through the explicit refresh that clears a cut-off.
+    // Without a session no read can run; both resume by themselves once it is back.
+    const retry: RetryButtonProps = {
+      retrying:
+        (statusQuery.error !== null && statusQuery.isPending) ||
+        (refsQuery.error !== null && refsQuery.isPending),
+      waitingForConnection: statusUnavailable || refsUnavailable,
+      onRetry: () => {
+        if (statusQuery.error !== null) statusQuery.refresh();
+        if (refsQuery.error !== null) refsQuery.refresh();
+      },
+    };
     return statusUnavailable || refsUnavailable
-      ? errorPanel("Environment unavailable", message)
-      : errorPanel("Could not load changes", message);
+      ? errorPanel("Environment unavailable", message, retry)
+      : errorPanel("Could not load changes", message, retry);
   }
   if (statusQuery.data === null || refsQuery.data === null) {
     return (

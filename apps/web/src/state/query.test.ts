@@ -77,6 +77,18 @@ describe("formatEnvironmentQueryError", () => {
     );
   });
 
+  it("names an attempt interrupted by a closing session like a cut-off, not with Effect's text", () => {
+    expect(formatEnvironmentQueryError(Cause.interrupt())).toBe(QUERY_CONNECTION_DROPPED_MESSAGE);
+    expect(formatEnvironmentQueryError(Cause.interrupt(), "Workspace query failed.")).toBe(
+      QUERY_CONNECTION_DROPPED_MESSAGE,
+    );
+  });
+
+  it("keeps a typed failure's message when an interrupt came with it", () => {
+    const cause = Cause.combine(Cause.fail(new Error("Branch not found.")), Cause.interrupt());
+    expect(formatEnvironmentQueryError(cause)).toBe("Branch not found.");
+  });
+
   it("names a cut-off the same way whatever the view's fallback", () => {
     const cause = Cause.fail(
       new RpcClientError.RpcClientError({
