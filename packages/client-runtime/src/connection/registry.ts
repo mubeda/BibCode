@@ -332,6 +332,8 @@ export const make = Effect.gen(function* () {
     yield* Scope.close(lease.scope, Exit.void);
   });
 
+  // A supervisor is built with the stored intent, so the first state it publishes already
+  // carries that intent: a desired replacement never reads as disconnected, even briefly.
   const createServiceScope = Effect.fn("EnvironmentRegistry.createServiceScope")(
     (entry: ConnectionCatalogEntry, desired: boolean) =>
       Effect.uninterruptible(
@@ -341,7 +343,7 @@ export const make = Effect.gen(function* () {
           const targetRef = yield* Ref.make(entry.target);
           const supervisor = yield* EnvironmentSupervisor.make(entry, {
             targetRef,
-            initiallyDesired: false,
+            initiallyDesired: desired,
           }).pipe(
             Effect.provideService(Connectivity.Connectivity, connectivity),
             Effect.provideService(ConnectionDriver.ConnectionDriver, driver),
@@ -350,9 +352,6 @@ export const make = Effect.gen(function* () {
             Scope.provide(scope),
             Effect.onError(() => Scope.close(scope, Exit.void)),
           );
-          if (desired) {
-            yield* supervisor.connect;
-          }
           yield* SubscriptionRef.update(serviceScopes, (current) => {
             const next = new Map(current);
             next.set(environmentId, { entry, supervisor, scope, targetRef });

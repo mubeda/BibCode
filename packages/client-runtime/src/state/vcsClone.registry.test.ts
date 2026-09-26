@@ -461,6 +461,74 @@ describe("clone commands follow the registry's current supervisor", () => {
     TEST_TIMEOUT_MS,
   );
 
+  for (const [label, disconnectFirst] of [
+    ["disconnect, then replacement", true],
+    ["replacement, then disconnect", false],
+  ] as const) {
+    it.effect(
+      `stop both loops when the user disconnects as the registry replaces the supervisor (${label})`,
+      () =>
+        Effect.gen(function* () {
+          const harness = makeHarness();
+          const CLONE = cloneOf(`disconnect-${disconnectFirst ? "first" : "last"}`);
+          harness.script.clone = () => Effect.fail(LOST_SOCKET);
+          harness.script.cancel = () => Effect.fail(LOST_SOCKET);
+          // The replacement never connects, so neither loop ever takes a session from it.
+          harness.script.hangConnect = (label) => label === MOVED_TARGET.label;
+
+          yield* Effect.gen(function* () {
+            const { registry, vcs, atomRegistry } = yield* commandsFor();
+            yield* registry.registerPlatform(new PrimaryConnectionRegistration({ target: TARGET }));
+            yield* awaitConnected(registry);
+            const progress: Array<VcsCloneProgress> = [];
+            const clone = runAtomCommand(
+              atomRegistry,
+              vcs.clone,
+              {
+                environmentId: ENVIRONMENT_ID,
+                input: { ...CLONE, onProgress: (next) => progress.push(next) },
+              },
+              { reportFailure: false },
+            );
+            yield* waitFor(() => progress.at(-1)?.phase === "reconnecting", "not reconnecting");
+            const cancel = runAtomCommand(
+              atomRegistry,
+              vcs.cancelClone,
+              { environmentId: ENVIRONMENT_ID, input: CLONE },
+              { reportFailure: false },
+            );
+            yield* waitFor(() => harness.calls.cancel.length === 1, "the cancel was not sent");
+
+            // Back to back in this fiber, so neither supervisor's loop runs in between.
+            const disconnect = registry.disconnect(ENVIRONMENT_ID);
+            const replace = registry.reconcilePlatform([
+              new PrimaryConnectionRegistration({ target: MOVED_TARGET }),
+            ]);
+            if (disconnectFirst) {
+              yield* disconnect;
+              yield* replace;
+            } else {
+              yield* replace;
+              yield* disconnect;
+            }
+
+            for (const result of [
+              yield* Effect.promise(() => clone),
+              yield* Effect.promise(() => cancel),
+            ]) {
+              const error = failureOf(result);
+              expect(error).toBeInstanceOf(VcsCloneStoppedError);
+              expect((error as VcsCloneStoppedError).message).toBe(
+                `Can't reconnect to ${MOVED_TARGET.label}.`,
+              );
+            }
+            atomRegistry.dispose();
+          }).pipe(Effect.provide(harness.layer), Effect.scoped);
+        }),
+      TEST_TIMEOUT_MS,
+    );
+  }
+
   it.effect(
     "dispatch on the replacement supervisor after waiting behind a pending cancel",
     () =>

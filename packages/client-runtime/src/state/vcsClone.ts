@@ -81,9 +81,9 @@ type NextSession =
  * moves to the replacement and takes its sessions. Ends as `Stopped` when the environment is
  * blocked, disconnected by the user, or removed from the registry. No attempt limit and no timer.
  *
- * `known` is the supervisor the caller last used. One the registry installed since then starts
- * out undesired until its own loop takes the registry's connect request, so for it only a change
- * from desired to undesired counts as the user disconnecting.
+ * `known` is the supervisor the caller last used; it names the environment. Every supervisor,
+ * a replacement included, publishes the registry's connection intent from its first state on, so
+ * an undesired state on the current supervisor means the user disconnected.
  *
  * A stop names the environment by its current label: the current supervisor's or, once the
  * environment is removed, the last label the registry published for it.
@@ -97,9 +97,8 @@ function nextSession(
   let label = known.target.label;
   const onCurrentSupervisor = Stream.unwrap(
     EnvironmentSupervisor.pipe(
-      Effect.map((supervisor) => {
-        let desiredSeen = supervisor === known;
-        return Stream.merge(
+      Effect.map((supervisor) =>
+        Stream.merge(
           SubscriptionRef.changes(supervisor.session).pipe(
             Stream.filter((current) => Option.isSome(current) && current.value !== lost),
             Stream.map((current): NextSession => ({
@@ -109,18 +108,11 @@ function nextSession(
             })),
           ),
           SubscriptionRef.changes(supervisor.state).pipe(
-            Stream.filter((state) => {
-              if (state.phase === "blocked") return true;
-              if (state.desired) {
-                desiredSeen = true;
-                return false;
-              }
-              return desiredSeen;
-            }),
+            Stream.filter((state) => state.phase === "blocked" || !state.desired),
             Stream.map((): NextSession => ({ _tag: "Stopped", label: supervisor.target.label })),
           ),
-        );
-      }),
+        ),
+      ),
     ),
   );
   const removed = SubscriptionRef.changes(registry.entries).pipe(
