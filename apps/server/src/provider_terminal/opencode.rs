@@ -4293,7 +4293,9 @@ mod tests {
                 ) {
                     return;
                 }
-                tokio::task::yield_now().await;
+                // Tokio reaps dropped children from its orphan queue only after a driver turn.
+                // A yield_now loop cannot complete one while an idle worker holds the driver.
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await;
