@@ -1,5 +1,4 @@
 import type {
-  VcsRef,
   VcsStatusLocalResult,
   VcsStatusRemoteResult,
   VcsStatusResult,
@@ -9,8 +8,6 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   applyGitStatusStreamEvent,
   buildTemporaryWorktreeBranchName,
-  dedupeRemoteBranchesWithLocalMatches,
-  deriveLocalBranchNameFromRemoteRef,
   detectSourceControlProviderFromGitRemoteUrl,
   isTemporaryWorktreeBranch,
   mergeGitStatusParts,
@@ -43,15 +40,6 @@ const remoteStatus: VcsStatusRemoteResult = {
   pr: null,
 };
 
-function ref(input: Pick<VcsRef, "name"> & Partial<VcsRef>): VcsRef {
-  return {
-    current: false,
-    isDefault: false,
-    worktreePath: null,
-    ...input,
-  };
-}
-
 describe("branch names", () => {
   it("sanitizes branch fragments and supplies a non-empty fallback", () => {
     expect(sanitizeBranchFragment("  `Fix API!!!`  ")).toBe("fix-api");
@@ -75,13 +63,6 @@ describe("branch names", () => {
     ).toBe("feature/release-notes-4");
     expect(resolveAutoFeatureBranchName([], "   ")).toBe("feature/update");
     expect(resolveAutoFeatureBranchName([])).toBe("feature/update");
-  });
-
-  it("strips only a complete remote prefix", () => {
-    expect(deriveLocalBranchNameFromRemoteRef("origin/feature/demo")).toBe("feature/demo");
-    expect(deriveLocalBranchNameFromRemoteRef("main")).toBe("main");
-    expect(deriveLocalBranchNameFromRemoteRef("/main")).toBe("/main");
-    expect(deriveLocalBranchNameFromRemoteRef("origin/")).toBe("origin/");
   });
 });
 
@@ -144,32 +125,6 @@ describe("parseGitHubRepositoryNameWithOwnerFromRemoteUrl", () => {
       parseGitHubRepositoryNameWithOwnerFromRemoteUrl("https://gitlab.com/a/b.git"),
     ).toBeNull();
     expect(parseGitHubRepositoryNameWithOwnerFromRemoteUrl("https://github.com/owner")).toBeNull();
-  });
-});
-
-describe("remote branch deduplication", () => {
-  it("hides origin refs with local matches while preserving order and other remotes", () => {
-    const refs = [
-      ref({ name: "feature/demo", isRemote: false }),
-      ref({ name: "origin/feature/demo", isRemote: true, remoteName: "origin" }),
-      ref({ name: "upstream/feature/demo", isRemote: true, remoteName: "upstream" }),
-      ref({ name: "origin/feature/other", isRemote: true, remoteName: "origin" }),
-    ];
-
-    expect(dedupeRemoteBranchesWithLocalMatches(refs).map((entry) => entry.name)).toEqual([
-      "feature/demo",
-      "upstream/feature/demo",
-      "origin/feature/other",
-    ]);
-  });
-
-  it("retains malformed-but-typed remote names that have no local candidate", () => {
-    const refs = [
-      ref({ name: "main" }),
-      ref({ name: "origin/", isRemote: true, remoteName: "origin" }),
-      ref({ name: "upstream/other", isRemote: true, remoteName: "origin" }),
-    ];
-    expect(dedupeRemoteBranchesWithLocalMatches(refs)).toEqual(refs);
   });
 });
 

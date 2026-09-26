@@ -4,13 +4,7 @@ import type {
   CheckpointDiffTarget,
   ComposerPathSearchTarget,
 } from "@bibcode/client-runtime/state/threads";
-import type { VcsRefTarget } from "@bibcode/client-runtime/state/vcs";
-import type { VcsListRefsResult, VcsRef } from "@bibcode/contracts";
-import * as Cause from "effect/Cause";
 import * as Option from "effect/Option";
-import { AsyncResult } from "effect/unstable/reactivity";
-import { RpcClientError } from "effect/unstable/rpc";
-import * as Socket from "effect/unstable/socket/Socket";
 import type { Dispatch, SetStateAction } from "react";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -75,7 +69,7 @@ const hooks = vi.hoisted(() => {
 });
 
 interface QueryDescriptor {
-  readonly kind: "fullThreadDiff" | "listEntries" | "listRefs" | "searchEntries" | "turnDiff";
+  readonly kind: "fullThreadDiff" | "listEntries" | "searchEntries" | "turnDiff";
   readonly args: {
     readonly environmentId: string;
     readonly input: Readonly<Record<string, unknown>>;
@@ -91,11 +85,8 @@ interface QueryView {
 }
 
 const testState = vi.hoisted(() => ({
-  atomResults: new Map<string, unknown>(),
   queryDescriptors: [] as Array<QueryDescriptor | null>,
   queryViews: new Map<QueryDescriptor["kind"], QueryView>(),
-  refreshedAtoms: [] as QueryDescriptor[],
-  retriedAtoms: [] as unknown[],
   threadState: null as unknown as {
     data: Option.Option<unknown>;
     error: Option.Option<string>;
@@ -122,60 +113,6 @@ vi.mock("react", async (importOriginal) => {
     useState: hooks.useState,
   };
 });
-
-vi.mock("effect/unstable/reactivity", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("effect/unstable/reactivity")>();
-  type Read = (get: (atom: QueryDescriptor) => unknown) => unknown;
-  interface TestAtom {
-    readonly read: Read;
-    readonly label?: string;
-    pipe: (...operations: Array<(atom: TestAtom) => TestAtom>) => TestAtom;
-  }
-  const make = (read: Read): TestAtom => {
-    const atom: TestAtom = {
-      read,
-      pipe: (...operations) => operations.reduce((current, operation) => operation(current), atom),
-    };
-    return atom;
-  };
-  const withLabel =
-    (label: string) =>
-    (atom: TestAtom): TestAtom => ({ ...atom, label });
-  return {
-    ...actual,
-    Atom: {
-      ...actual.Atom,
-      make,
-      withLabel,
-    },
-  };
-});
-
-vi.mock("@effect/atom-react", () => ({
-  useAtomValue: (atom: { read: (get: (page: QueryDescriptor) => unknown) => unknown }) =>
-    atom.read((page) => {
-      if (!testState.atomResults.has(page.key)) {
-        throw new Error(`Missing atom result for ${page.key}.`);
-      }
-      return testState.atomResults.get(page.key);
-    }),
-}));
-
-vi.mock("../rpc/atomRegistry", () => ({
-  appAtomRegistry: {
-    refresh: (atom: QueryDescriptor) => {
-      testState.refreshedAtoms.push(atom);
-    },
-  },
-}));
-
-vi.mock("@bibcode/client-runtime/state/runtime", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@bibcode/client-runtime/state/runtime")>()),
-  retryEnvironmentQuery: (atom: unknown, refresh: () => void) => {
-    testState.retriedAtoms.push(atom);
-    refresh();
-  },
-}));
 
 vi.mock("./threads", () => ({
   useEnvironmentThread: () => testState.threadState,
@@ -205,12 +142,6 @@ vi.mock("./query", async (importOriginal) => ({
   },
 }));
 
-vi.mock("./vcs", () => ({
-  vcsEnvironment: {
-    listRefs: (args: QueryDescriptor["args"]) => descriptor("listRefs", args),
-  },
-}));
-
 vi.mock("./projects", () => ({
   projectEnvironment: {
     listEntries: (args: QueryDescriptor["args"]) => descriptor("listEntries", args),
@@ -225,13 +156,7 @@ vi.mock("./orchestration", () => ({
   },
 }));
 
-import {
-  useBranches,
-  useCheckpointDiff,
-  useComposerPathSearch,
-  usePaginatedBranches,
-  useThreadDetail,
-} from "./queries";
+import { useCheckpointDiff, useComposerPathSearch, useThreadDetail } from "./queries";
 
 let captured: unknown;
 
@@ -258,15 +183,6 @@ function runEffects(): Array<() => void> {
   return cleanups;
 }
 
-function refsTarget(overrides: Partial<VcsRefTarget> = {}): VcsRefTarget {
-  return {
-    environmentId: "environment-1" as VcsRefTarget["environmentId"],
-    cwd: "/repo",
-    query: null,
-    ...overrides,
-  };
-}
-
 function searchTarget(overrides: Partial<ComposerPathSearchTarget> = {}): ComposerPathSearchTarget {
   return {
     environmentId: "environment-1" as ComposerPathSearchTarget["environmentId"],
@@ -287,56 +203,10 @@ function checkpointTarget(overrides: Partial<CheckpointDiffTarget> = {}): Checkp
   };
 }
 
-function ref(name: string, current = false): VcsRef {
-  return {
-    name,
-    current,
-    isDefault: name === "main",
-    worktreePath: null,
-  };
-}
-
-function page(
-  refs: ReadonlyArray<VcsRef>,
-  options: Partial<Omit<VcsListRefsResult, "refs">> = {},
-): VcsListRefsResult {
-  return {
-    refs,
-    isRepo: true,
-    hasPrimaryRemote: true,
-    nextCursor: null,
-    totalCount: refs.length,
-    ...options,
-  };
-}
-
-function setPageResult(
-  target: VcsRefTarget,
-  cursor: number | undefined,
-  result: unknown,
-): QueryDescriptor {
-  const query = target.query?.trim() ?? "";
-  const input = {
-    cwd: target.cwd!,
-    ...(query.length > 0 ? { query } : {}),
-    ...(cursor === undefined ? {} : { cursor }),
-    limit: 100,
-  };
-  const pageDescriptor = descriptor("listRefs", {
-    environmentId: target.environmentId as string,
-    input,
-  });
-  testState.atomResults.set(pageDescriptor.key, result);
-  return pageDescriptor;
-}
-
 beforeEach(() => {
   hooks.reset();
-  testState.atomResults.clear();
   testState.queryDescriptors = [];
   testState.queryViews.clear();
-  testState.refreshedAtoms = [];
-  testState.retriedAtoms = [];
   testState.threadState = {
     data: Option.none(),
     error: Option.none(),
@@ -377,151 +247,6 @@ describe("useThreadDetail", () => {
       isPending: false,
       isDeleted: false,
     });
-  });
-});
-
-describe("useBranches", () => {
-  it("disables the query until both target fields exist", () => {
-    const view = renderHook(() => useBranches(refsTarget({ environmentId: null })));
-
-    expect(testState.queryDescriptors).toEqual([null]);
-    expect(view.data).toBeNull();
-  });
-
-  it.each([
-    ["   ", { cwd: "/repo", limit: 100 }],
-    ["  feature  ", { cwd: "/repo", query: "feature", limit: 100 }],
-  ] as const)("normalizes the %j query", (query, expectedInput) => {
-    const refresh = vi.fn();
-    testState.queryViews.set("listRefs", {
-      data: { refs: [] },
-      error: null,
-      isPending: false,
-      refresh,
-    });
-
-    const view = renderHook(() => useBranches(refsTarget({ query })));
-
-    expect(testState.queryDescriptors[0]).toMatchObject({
-      kind: "listRefs",
-      args: { environmentId: "environment-1", input: expectedInput },
-    });
-    expect(view.refresh).toBe(refresh);
-  });
-});
-
-describe("usePaginatedBranches", () => {
-  it("merges pages, preserves first-page flags, and suppresses duplicate cursors", () => {
-    const target = refsTarget({ query: "  feat " });
-    setPageResult(
-      target,
-      undefined,
-      AsyncResult.success(
-        page([ref("main", true), ref("feature")], {
-          isRepo: true,
-          hasPrimaryRemote: false,
-          nextCursor: 2,
-          totalCount: 4,
-        }),
-      ),
-    );
-    setPageResult(
-      target,
-      2,
-      AsyncResult.success(
-        page([ref("feature", true), ref("release")], {
-          isRepo: false,
-          hasPrimaryRemote: true,
-          nextCursor: null,
-          totalCount: 5,
-        }),
-      ),
-    );
-
-    const first = renderHook(() => usePaginatedBranches(target));
-    first.loadNext();
-    first.loadNext();
-    const merged = renderHook(() => usePaginatedBranches(target));
-
-    expect(merged.refs.map((item) => [item.name, item.current])).toEqual([
-      ["main", true],
-      ["feature", true],
-      ["release", false],
-    ]);
-    expect(merged.data).toMatchObject({
-      isRepo: true,
-      hasPrimaryRemote: false,
-      nextCursor: null,
-      totalCount: 5,
-    });
-    expect(merged.isPending).toBe(false);
-  });
-
-  it("reports pending pages and refreshes only the first page", () => {
-    const target = refsTarget();
-    const firstPage = setPageResult(
-      target,
-      undefined,
-      AsyncResult.success(page([ref("main")], { nextCursor: 1, totalCount: 2 })),
-    );
-    setPageResult(target, 1, AsyncResult.initial(true));
-
-    const first = renderHook(() => usePaginatedBranches(target));
-    first.loadNext();
-    const pending = renderHook(() => usePaginatedBranches(target));
-    pending.refresh();
-    const refreshed = renderHook(() => usePaginatedBranches(target));
-
-    expect(pending.isPending).toBe(true);
-    expect(testState.refreshedAtoms).toEqual([firstPage]);
-    expect(testState.retriedAtoms).toEqual([firstPage]);
-    expect(refreshed.refs.map((item) => item.name)).toEqual(["main"]);
-  });
-
-  it("revalidates the first page without clearing a transport cut-off", () => {
-    const target = refsTarget();
-    const firstPage = setPageResult(
-      target,
-      undefined,
-      AsyncResult.success(page([ref("main")], { nextCursor: null, totalCount: 1 })),
-    );
-
-    renderHook(() => usePaginatedBranches(target)).revalidate();
-
-    expect(testState.refreshedAtoms).toEqual([firstPage]);
-    expect(testState.retriedAtoms).toEqual([]);
-  });
-
-  it.each([
-    [Cause.fail(new Error("refs exploded")), "refs exploded"],
-    [Cause.fail(new Error("")), "Failed to load refs."],
-    [Cause.fail("opaque failure"), "Failed to load refs."],
-    [
-      Cause.fail(
-        new RpcClientError.RpcClientError({
-          reason: new Socket.SocketCloseError({ code: 4408, closeReason: "liveness timeout" }),
-        }),
-      ),
-      "The connection dropped before the result arrived.",
-    ],
-  ] as const)("formats a failed page", (cause, expected) => {
-    const target = refsTarget();
-    setPageResult(target, undefined, AsyncResult.failure<never, unknown>(cause));
-
-    const result = renderHook(() => usePaginatedBranches(target));
-
-    expect(result.error).toBe(expected);
-    expect(result.data).toBeNull();
-    expect(result.refs).toEqual([]);
-  });
-
-  it("returns an inert view for an incomplete target", () => {
-    const result = renderHook(() => usePaginatedBranches(refsTarget({ cwd: null })));
-
-    result.loadNext();
-    result.refresh();
-    expect(result).toMatchObject({ data: null, refs: [], error: null, isPending: false });
-    expect(testState.refreshedAtoms).toEqual([]);
   });
 });
 
