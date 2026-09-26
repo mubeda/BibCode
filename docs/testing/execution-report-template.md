@@ -229,7 +229,7 @@ Delete the unused result values above. Do not leave an ambiguous status.
 ## Slow-link liveness scenario
 
 - Server, web, and proxy ports; fixture diff size:
-- 64 KiB/s: transfer duration, negotiated subprotocol, binary frames seen, disconnects (none expected):
+- 64 KiB/s: transfer duration, negotiated subprotocol, binary frames seen, disconnects (none expected), slow-request warning text and whether it cleared:
 - 256 KiB/s: transfer duration, disconnects (none expected):
 - Frozen link: seconds until the 4408 close, exact status text, reconnect after thawing:
 - Idle freeze: freeze-start and server teardown timestamps; elapsed seconds (at most 50), observed before thaw:

@@ -13,6 +13,7 @@ import { RefreshCwIcon } from "lucide-react";
 import { useCallback, useContext, useEffect, useRef, useState } from "react";
 
 import { useClientSettings } from "../../hooks/useSettings";
+import { useSlowRpcAckRequests } from "../../rpc/requestLatencyState";
 import { useActiveEnvironmentId } from "../../state/entities";
 import { usePrimaryLocalEnvironmentForSelected } from "../../state/environments";
 import { useEnvironmentQuery } from "../../state/query";
@@ -21,6 +22,7 @@ import { useKnownTerminalSessions } from "../../state/terminalSessions";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { ProviderUsageControl } from "./ProviderUsageControl";
 import { ResourceUsageSegment } from "./ResourceUsageSegment";
+import { SlowRequestsIndicator } from "./SlowRequestsIndicator";
 import { type ResourceDiagnosticsQueryState } from "./statusBarPresentation";
 import {
   buildProviderUsageViewModels,
@@ -31,6 +33,10 @@ import {
 export const STATUS_BAR_USAGE_REFRESH_INTERVAL_MS = 30_000;
 export const STATUS_BAR_RESOURCE_REFRESH_INTERVAL_MS = 2_000;
 export const STATUS_BAR_USAGE_ICON_ONLY_BREAKPOINT_PX = 820;
+
+// The bar's own look, shared by the full status bar and the hosted app's slow-request bar.
+const STATUS_BAR_CLASS_NAME =
+  "relative z-20 flex h-6 min-h-6 shrink-0 items-center gap-3 border-t border-panel-separator bg-background px-3 text-xs";
 
 type StatusBarUsageRefresh = () => void | Promise<unknown>;
 type ProviderUsageQueryEmission = AsyncResult.AsyncResult<ServerProviderUsageResult, unknown>;
@@ -252,7 +258,8 @@ export function AppStatusBarView({
   const providers = presentationCache.current.providers;
   return (
     <div
-      className="relative z-20 flex h-6 min-h-6 shrink-0 items-center justify-between gap-3 border-t border-panel-separator bg-background px-3 text-xs"
+      className={`${STATUS_BAR_CLASS_NAME} justify-between`}
+      data-status-bar=""
       data-testid="app-status-bar"
     >
       <div className="flex min-w-0 flex-1 items-center gap-1 overflow-hidden">
@@ -281,6 +288,7 @@ export function AppStatusBarView({
         ) : null}
       </div>
       <div className="flex shrink-0 items-center gap-2">
+        <SlowRequestsIndicator />
         {showResourceUsage ? (
           <ResourceUsageSegment
             diagnostics={diagnostics}
@@ -290,6 +298,26 @@ export function AppStatusBarView({
           />
         ) : null}
       </div>
+    </div>
+  );
+}
+
+/**
+ * The hosted web app's status bar. With no primary environment there is nothing else
+ * to show, so it carries only the slow-request indicator and takes no space until a
+ * request is slow. The element stays mounted while collapsed so the indicator's live
+ * region can announce the first slow request.
+ */
+export function SlowRequestsStatusBar() {
+  const hasSlowRequests = useSlowRpcAckRequests().length > 0;
+  return (
+    <div
+      className={`${STATUS_BAR_CLASS_NAME} justify-end data-collapsed:h-0 data-collapsed:min-h-0 data-collapsed:overflow-hidden data-collapsed:border-t-0`}
+      data-collapsed={hasSlowRequests ? undefined : ""}
+      data-status-bar=""
+      data-testid="slow-requests-status-bar"
+    >
+      <SlowRequestsIndicator />
     </div>
   );
 }

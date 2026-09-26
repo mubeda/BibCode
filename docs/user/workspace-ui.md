@@ -9,6 +9,12 @@ in the left rail. Selecting a remote server changes both the displayed account
 usage and the target of refresh or usage-reset actions. A server that has not
 returned usage does not borrow the local server's values.
 
+When a request has waited more than 15 seconds for a response, the status bar
+shows a warning such as **2 slow requests**. Click it to see each request's name
+and start time. The warning goes away when the requests finish. The hosted web
+app has no status bar, so there a bar holding only this warning appears at the
+bottom while requests are slow.
+
 ## Left Panel
 
 The panel opens 422px wide by default (a 370px projects panel beside the 52px

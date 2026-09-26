@@ -4,18 +4,14 @@ import { Toast } from "@base-ui/react/toast";
 import {
   useEffect,
   useMemo,
-  useState,
   type CSSProperties,
   type ComponentPropsWithoutRef,
-  type KeyboardEvent,
   type ReactNode,
 } from "react";
 import { useParams } from "@tanstack/react-router";
 import { type ScopedThreadRef, type ThreadId } from "@bibcode/contracts";
 import {
   CheckIcon,
-  ChevronDownIcon,
-  ChevronUpIcon,
   CircleAlertIcon,
   CircleCheckIcon,
   CopyIcon,
@@ -58,11 +54,6 @@ export type ThreadToastData = {
     | "link"
     | "outline"
     | "secondary";
-  /** Optional extra body shown after toggling “Show details” (e.g. a list of pending RPCs). */
-  expandableContent?: ReactNode;
-  expandableLabels?: { expand?: string; collapse?: string };
-  /** When set with `expandableContent`, the summary + label act as one text disclosure (no separate chevron row). */
-  expandableDescriptionTrigger?: boolean;
   actionLayout?: "inline" | "stacked-end";
   actionVariant?:
     | "default"
@@ -136,134 +127,6 @@ function CopyErrorButton({ text }: { text: string }) {
       </TooltipTrigger>
       <TooltipPopup side="top">{label}</TooltipPopup>
     </Tooltip>
-  );
-}
-
-/** Scrollable cap for long expandable lists (~10rem); keeps the toast from growing without bound. */
-const toastExpandablePanelClassName =
-  "mt-2 max-h-40 min-h-0 overflow-y-auto overscroll-contain pr-0.5 select-text";
-
-function ToastExpandableSection({
-  children,
-  labels,
-}: {
-  children: ReactNode;
-  labels: { expand?: string; collapse?: string };
-}) {
-  const [open, setOpen] = useState(false);
-  const expandLabel = labels.expand ?? "Show details";
-  const collapseLabel = labels.collapse ?? "Hide details";
-
-  return (
-    <div className="min-w-0">
-      <button
-        aria-expanded={open}
-        className="inline-flex cursor-pointer items-center gap-1 rounded-md py-0.5 text-left text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
-        onClick={() => setOpen((prev) => !prev)}
-        type="button"
-      >
-        {open ? (
-          <ChevronUpIcon className="size-3.5 shrink-0 opacity-80" strokeWidth={2.25} />
-        ) : (
-          <ChevronDownIcon className="size-3.5 shrink-0 opacity-80" strokeWidth={2.25} />
-        )}
-        {open ? collapseLabel : expandLabel}
-      </button>
-      {open ? <div className={toastExpandablePanelClassName}>{children}</div> : null}
-    </div>
-  );
-}
-
-function ToastDescriptionAndExpandable({
-  toastData,
-  toastDescription,
-  toastType,
-}: {
-  toastData: ThreadToastData | undefined;
-  toastDescription: unknown;
-  toastType: unknown;
-}) {
-  const expandableContent = toastData?.expandableContent;
-  const labels = toastData?.expandableLabels ?? {};
-  const descriptionTrigger = toastData?.expandableDescriptionTrigger ?? false;
-  const descriptionClassName = cn(
-    "min-w-0 select-text wrap-break-word text-muted-foreground",
-    errorDescriptionClampClass(toastType, toastDescription),
-  );
-  const [open, setOpen] = useState(false);
-
-  if (!expandableContent) {
-    return <Toast.Description className={descriptionClassName} data-slot="toast-description" />;
-  }
-
-  if (!descriptionTrigger) {
-    return (
-      <>
-        <Toast.Description className={descriptionClassName} data-slot="toast-description" />
-        <ToastExpandableSection labels={labels}>{expandableContent}</ToastExpandableSection>
-      </>
-    );
-  }
-
-  const expandLabel = labels.expand ?? "Show details";
-  const collapseLabel = labels.collapse ?? "Hide details";
-
-  const toggle = () => setOpen((v) => !v);
-  const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
-    if (event.key === "Enter" || event.key === " ") {
-      event.preventDefault();
-      toggle();
-    }
-  };
-
-  return (
-    <>
-      <Tooltip>
-        <TooltipTrigger
-          render={
-            <div
-              aria-label={open ? collapseLabel : expandLabel}
-              aria-expanded={open}
-              className={cn(
-                "group flex min-w-0 w-full cursor-pointer select-none items-start gap-1.5 rounded-sm text-left outline-none ring-offset-background",
-                "transition-colors hover:bg-muted/40",
-                "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background",
-              )}
-              onClick={toggle}
-              onKeyDown={onKeyDown}
-              role="button"
-              tabIndex={0}
-            />
-          }
-        >
-          <div className="min-w-0 flex-1">
-            <Toast.Description
-              className={cn(
-                "min-w-0 select-none wrap-break-word text-muted-foreground",
-                errorDescriptionClampClass(toastType, toastDescription),
-                "underline-offset-2 decoration-muted-foreground/60 group-hover:underline",
-              )}
-              data-slot="toast-description"
-            />
-          </div>
-          {open ? (
-            <ChevronUpIcon
-              aria-hidden
-              className="mt-0.5 size-3.5 shrink-0 text-muted-foreground opacity-80"
-              strokeWidth={2.25}
-            />
-          ) : (
-            <ChevronDownIcon
-              aria-hidden
-              className="mt-0.5 size-3.5 shrink-0 text-muted-foreground opacity-80"
-              strokeWidth={2.25}
-            />
-          )}
-        </TooltipTrigger>
-        <TooltipPopup side="top">{open ? collapseLabel : expandLabel}</TooltipPopup>
-      </Tooltip>
-      {open ? <div className={toastExpandablePanelClassName}>{expandableContent}</div> : null}
-    </>
   );
 }
 
@@ -365,10 +228,12 @@ function ToastBodyContent({
           )}
         >
           <Toast.Title className="min-w-0 wrap-break-word font-medium" data-slot="toast-title" />
-          <ToastDescriptionAndExpandable
-            toastData={toastData}
-            toastDescription={toastDescription}
-            toastType={toastType}
+          <Toast.Description
+            className={cn(
+              "min-w-0 select-text wrap-break-word text-muted-foreground",
+              errorDescriptionClampClass(toastType, toastDescription),
+            )}
+            data-slot="toast-description"
           />
         </div>
       </div>
@@ -606,7 +471,7 @@ function Toasts({ position }: { position: ToastPosition }) {
                 "[--toast-gap:--spacing(3)] [--toast-peek:--spacing(3)] [--toast-scale:calc(max(0,1-(var(--toast-index)*.1)))] [--toast-shrink:calc(1-var(--toast-scale))]",
                 // Root height: never `min-h-(--toast-height)` — Base UI measures height by briefly forcing
                 // `height: auto` on this node; an old `min-height` from `--toast-height` blocks shrinking,
-                // so `recalculateHeight` keeps the inflated value after an expandable closes.
+                // so `recalculateHeight` keeps the inflated value after the content shrinks.
                 // Behind + collapsed: fixed peek. Otherwise natural height (expand/collapse, hover stack).
                 visibleIndex > 0
                   ? "not-data-expanded:h-(--toast-calc-height) data-expanded:h-auto"
@@ -676,7 +541,7 @@ function Toasts({ position }: { position: ToastPosition }) {
               <Toast.Content
                 className={cn(
                   // `overflow-x: clip` avoids the CSS quirk where pairing `hidden` + `y: visible`
-                  // forces `y` to `auto`. Expandable detail panels can extend below without being cut off.
+                  // forces `y` to `auto`.
                   "pointer-events-auto min-h-0 overflow-y-visible pl-3.5 text-sm transition-opacity duration-250 [overflow-x:clip] data-expanded:opacity-100",
                   stackedActionLayout
                     ? "flex flex-col gap-2 py-2.5 pr-3.5"
