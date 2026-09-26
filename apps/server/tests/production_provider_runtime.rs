@@ -86,6 +86,10 @@ use tokio::time::{timeout, timeout_at};
 use tokio::{net::TcpListener, sync::mpsc};
 use tokio_tungstenite::{WebSocketStream, connect_async, tungstenite::Message};
 
+#[path = "support/websocket_frames.rs"]
+mod websocket_frames;
+use websocket_frames::next_frame_past_heartbeat;
+
 const NOW: &str = "2026-07-10T10:00:00.000Z";
 const CHECKPOINT_RPC_INTEGRATION_DEADLINE: Duration = Duration::from_secs(30);
 const NATIVE_PROVIDER_EVENT_INTEGRATION_DEADLINE: Duration = Duration::from_secs(30);
@@ -1433,7 +1437,7 @@ async fn rpc_response<S>(socket: &mut WebSocketStream<S>, id: &str) -> Result<Va
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let frame = timeout(Duration::from_secs(10), socket.next())
+    let frame = timeout(Duration::from_secs(10), next_frame_past_heartbeat(socket))
         .await
         .expect("orchestration RPC response timeout")
         .expect("WebSocket remains open")
@@ -1512,7 +1516,7 @@ where
     .map_err(|_| format!("unary RPC {tag} send deadline elapsed"))?
     .map_err(|error| format!("failed to send unary RPC {tag}: {error}"))?;
 
-    let frame = timeout_at(deadline, socket.next())
+    let frame = timeout_at(deadline, next_frame_past_heartbeat(socket))
         .await
         .map_err(|_| format!("unary RPC {tag} response deadline elapsed"))?
         .ok_or_else(|| format!("unary RPC {tag} WebSocket closed before response"))?
@@ -1591,7 +1595,7 @@ async fn stream_rpc_message<S>(socket: &mut WebSocketStream<S>) -> ServerMessage
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let frame = timeout(Duration::from_secs(10), socket.next())
+    let frame = timeout(Duration::from_secs(10), next_frame_past_heartbeat(socket))
         .await
         .expect("stream RPC response timeout")
         .expect("stream WebSocket remains open")
@@ -1609,7 +1613,7 @@ async fn stream_rpc_message_until<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let frame = timeout_at(deadline, socket.next())
+    let frame = timeout_at(deadline, next_frame_past_heartbeat(socket))
         .await
         .map_err(|_| "Activity stream deadline elapsed".to_owned())?
         .ok_or_else(|| "Activity stream closed before convergence".to_owned())?

@@ -1384,9 +1384,11 @@ mod tests {
             AdoptedWorktreeAvailability, WorkspaceAvailabilityRegistry, WorkspaceLossTransition,
         },
     };
-    use futures_util::{SinkExt, StreamExt};
+    use futures_util::SinkExt;
     use std::sync::atomic::AtomicUsize;
     use tokio_tungstenite::tungstenite::Message;
+
+    use crate::test_support::websocket_frames::next_frame_past_heartbeat;
 
     const CREATED_AT: &str = "2026-07-11T00:00:00.000Z";
 
@@ -2167,11 +2169,14 @@ mod tests {
             ))
             .await
             .expect("send registered orchestration request");
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(10), socket.next())
-            .await
-            .expect("registered orchestration response timeout")
-            .expect("registered orchestration socket remains open")
-            .expect("registered orchestration frame");
+        let frame = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            next_frame_past_heartbeat(socket),
+        )
+        .await
+        .expect("registered orchestration response timeout")
+        .expect("registered orchestration socket remains open")
+        .expect("registered orchestration frame");
         let Message::Text(text) = frame else {
             panic!("expected registered orchestration text frame, got {frame:?}");
         };
@@ -3236,11 +3241,14 @@ mod tests {
             ))
             .await
             .expect("interrupt disconnect-only request");
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
-            .await
-            .expect("disconnect-only interrupt response timeout")
-            .expect("disconnect-only interrupt response")
-            .expect("disconnect-only interrupt frame");
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            next_frame_past_heartbeat(&mut socket),
+        )
+        .await
+        .expect("disconnect-only interrupt response timeout")
+        .expect("disconnect-only interrupt response")
+        .expect("disconnect-only interrupt frame");
         disconnect_pause.release();
         let disconnect_scope = WorkspaceLossTransition {
             thread_id: thread_id.clone(),
@@ -3303,7 +3311,9 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             tokio::select! {
                 () = pause.wait_until_entered() => {}
-                frame = socket.next() => panic!("turn exited before persistence: {frame:?}"),
+                frame = next_frame_past_heartbeat(&mut socket) => {
+                    panic!("turn exited before persistence: {frame:?}")
+                }
             }
         })
         .await
@@ -3316,11 +3326,14 @@ mod tests {
             ))
             .await
             .expect("interrupt turn request");
-        let interrupted = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
-            .await
-            .expect("interrupt response timeout")
-            .expect("interrupt response")
-            .expect("interrupt frame");
+        let interrupted = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            next_frame_past_heartbeat(&mut socket),
+        )
+        .await
+        .expect("interrupt response timeout")
+        .expect("interrupt response")
+        .expect("interrupt frame");
         assert!(matches!(interrupted, Message::Text(_)));
 
         let loss = WorkspaceLossTransition {

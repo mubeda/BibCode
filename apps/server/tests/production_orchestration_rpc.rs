@@ -17,11 +17,15 @@ use bibcode_server::{
         AdoptedWorktreeAvailability, WorkspaceAvailabilityRegistry, WorkspaceLossTransition,
     },
 };
-use futures_util::{FutureExt, SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::time::timeout;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
+
+#[path = "support/websocket_frames.rs"]
+mod websocket_frames;
+use websocket_frames::next_frame_past_heartbeat;
 
 const CREATED_AT: &str = "2026-07-14T10:00:00.000Z";
 const RPC_RESPONSE_DEADLINE: Duration = Duration::from_secs(2);
@@ -2222,7 +2226,7 @@ async fn next_server_message_with_deadline(
     socket: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
     deadline: Duration,
 ) -> ServerMessage {
-    let message = timeout(deadline, socket.next())
+    let message = timeout(deadline, next_frame_past_heartbeat(socket))
         .await
         .expect("WebSocket response timeout")
         .expect("WebSocket remains open")
