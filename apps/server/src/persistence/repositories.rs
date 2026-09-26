@@ -5,6 +5,7 @@
 //! not normalize or regenerate them while reading an existing database.
 
 use std::cmp::min;
+use std::collections::HashMap;
 #[cfg(test)]
 use std::sync::{
     Arc, Mutex as StdMutex,
@@ -757,6 +758,43 @@ impl Repositories {
 
     pub async fn list_referenced_attachment_ids(&self) -> Result<Vec<String>> {
         self.database.call(|connection| collect(connection, "SELECT DISTINCT attachment_id FROM orchestration_attachment_refs ORDER BY attachment_id ASC", [], |row| row.get(0))).await
+    }
+
+    /// Returns which of `attachment_ids` an accepted command on `thread_id` already attached, each
+    /// with its recorded content digest (none for references backfilled from legacy events).
+    pub async fn thread_attachment_digests(
+        &self,
+        thread_id: String,
+        attachment_ids: Vec<String>,
+    ) -> Result<HashMap<String, Option<String>>> {
+        self.database
+            .call(move |connection| {
+                // One digest per attachment: MAX ignores NULL, so a recorded digest wins over a
+                // legacy reference without one. Several different digests for one id, which the
+                // immutable attachment files rule out in practice, resolve to the
+                // lexicographically greatest, and the stored file must then match that one.
+                let mut statement = connection.prepare(
+                    "SELECT MAX(refs.content_digest) FROM orchestration_attachment_refs AS refs \
+                     JOIN orchestration_command_receipts AS receipts \
+                       ON receipts.command_id = refs.command_id \
+                     WHERE refs.attachment_id = ? AND receipts.aggregate_kind = 'thread' \
+                       AND receipts.aggregate_id = ? AND receipts.status = 'accepted' \
+                     GROUP BY refs.attachment_id",
+                )?;
+                let mut digests = HashMap::new();
+                for attachment_id in attachment_ids {
+                    let digest = statement
+                        .query_row(params![attachment_id, thread_id], |row| {
+                            row.get::<_, Option<String>>(0)
+                        })
+                        .optional()?;
+                    if let Some(digest) = digest {
+                        digests.insert(attachment_id, digest);
+                    }
+                }
+                Ok(digests)
+            })
+            .await
     }
 
     pub async fn claim_provider_turn(

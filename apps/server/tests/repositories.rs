@@ -8,6 +8,8 @@ use bibcode_server::persistence::{
     ProviderSessionRuntime, Repositories, WorktreeRemovalReceipt, WorktreeRepositoryPinOutcome,
     run_migrations,
 };
+use std::collections::HashMap;
+
 use serde::Serialize;
 use serde_json::json;
 use tempfile::TempDir;
@@ -359,6 +361,7 @@ fn public_repository_api_inventory_is_explicit() {
         "list_provider_turn_deliveries",
         "list_queued_provider_turn_heads",
         "list_referenced_attachment_ids",
+        "thread_attachment_digests",
         "list_thread_sessions_by_status",
         "list_threads_by_project",
         "load_worktree_catalog_projection",
@@ -771,6 +774,31 @@ async fn provider_turn_delivery_repositories_fetch_filter_reference_and_claim() 
             .await
             .expect("reference list"),
         vec!["attachment-a", "attachment-z"]
+    );
+    assert_eq!(
+        repositories
+            .thread_attachment_digests(
+                "thread-1".to_owned(),
+                vec![
+                    "attachment-z".to_owned(),
+                    "attachment-a".to_owned(),
+                    "attachment-unreferenced".to_owned(),
+                ],
+            )
+            .await
+            .expect("thread attachment digests"),
+        HashMap::from([
+            ("attachment-z".to_owned(), Some("digest-z".to_owned())),
+            ("attachment-a".to_owned(), None),
+        ])
+    );
+    assert!(
+        repositories
+            .thread_attachment_digests("thread-2".to_owned(), vec!["attachment-z".to_owned()])
+            .await
+            .expect("another thread's digests")
+            .is_empty(),
+        "an attachment belongs only to the thread whose command attached it"
     );
     let claimed = repositories
         .claim_provider_turn("command-a".to_owned(), "2026-08-01T00:00:04Z".to_owned())

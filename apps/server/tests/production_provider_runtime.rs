@@ -4166,6 +4166,123 @@ async fn registered_dispatch_rpc_proves_one_mixed_attachment_delivery_for_every_
 }
 
 #[tokio::test]
+async fn registered_dispatch_rpc_refuses_an_attachment_id_from_another_thread() {
+    let engine = engine().await;
+    engine
+        .dispatch(
+            serde_json::from_value(json!({
+                "type":"thread.create", "commandId":"thread-2", "threadId":"t2", "projectId":"p1",
+                "title":"Other thread", "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                "runtimeMode":"full-access", "branch":null, "worktreePath":null, "createdAt":NOW
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let state = Arc::new(StdMutex::new(DriverState::default()));
+    let (_events_tx, events_rx) = mpsc::channel(8);
+    let (_other_events_tx, other_events_rx) = mpsc::channel(8);
+    let supervisor = Arc::new(ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(VecDeque::from([events_rx, other_events_rx])),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    ));
+    supervisor.launch(launch()).await.unwrap();
+    let settings = TempDir::new().unwrap();
+    let mut registry = RpcRegistry::empty();
+    let delivery = Arc::new(TurnDeliveryService::start(
+        engine.clone(),
+        supervisor.clone(),
+        settings.path().to_path_buf(),
+    ));
+    register_orchestration_rpc_with_delivery(
+        &mut registry,
+        engine.clone(),
+        supervisor.clone(),
+        settings.path().to_path_buf(),
+        delivery.clone(),
+    );
+    let handle = ServerRuntime::start_with_registry(test_config(&settings), registry)
+        .await
+        .unwrap();
+    let (mut socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .unwrap();
+    let turn = |command_id: &str, thread_id: &str, attachment: Value| {
+        json!({
+            "type":"thread.turn.start", "commandId":command_id, "threadId":thread_id,
+            "message":{
+                "messageId":format!("message-{command_id}"), "role":"user", "text":"review",
+                "attachments":[attachment]
+            },
+            "createdAt":NOW
+        })
+    };
+    let reference = json!({
+        "type":"file", "id":"notes-1", "name":"notes.txt", "mimeType":"text/plain", "sizeBytes":5
+    });
+    let mut upload = reference.clone();
+    upload["dataUrl"] = json!("data:text/plain;base64,bm90ZXM=");
+
+    rpc_request(&mut socket, "801", turn("t1-upload", "t1", upload)).await;
+    rpc_response(&mut socket, "801")
+        .await
+        .expect("the upload is admitted on its own thread");
+
+    // The id exists and its size matches, but another thread's command attached it.
+    rpc_request(
+        &mut socket,
+        "802",
+        turn("t2-reuse", "t2", reference.clone()),
+    )
+    .await;
+    let cause = rpc_response(&mut socket, "802")
+        .await
+        .expect_err("another thread's attachment id is refused");
+    assert_eq!(cause[0]["error"]["_tag"], "InvalidRequest", "{cause}");
+    assert!(
+        cause[0]["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("notes-1")),
+        "{cause}"
+    );
+    assert!(
+        engine
+            .repositories()
+            .get_provider_turn_delivery("t2-reuse".to_owned())
+            .await
+            .expect("delivery lookup")
+            .is_none()
+    );
+    assert!(
+        !engine
+            .read_events(0)
+            .await
+            .expect("events")
+            .iter()
+            .any(|event| event.event.command_id.as_deref() == Some("t2-reuse")),
+        "a refused reference persists nothing"
+    );
+
+    // The thread that first received the attachment can still send it again by id.
+    rpc_request(&mut socket, "803", turn("t1-reuse", "t1", reference)).await;
+    rpc_response(&mut socket, "803")
+        .await
+        .expect("a thread may reuse its own attachment by id");
+
+    socket.close(None).await.expect("websocket close");
+    handle.shutdown();
+    handle.join().await.expect("runtime shutdown");
+    delivery.shutdown().await;
+    supervisor.shutdown().await.expect("provider shutdown");
+    engine.shutdown().await;
+}
+
+#[tokio::test]
 async fn routes_orchestration_commands_and_persists_resume_state() {
     let engine = engine().await;
     let state = Arc::new(StdMutex::new(DriverState::default()));

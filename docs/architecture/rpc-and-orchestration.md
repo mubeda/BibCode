@@ -1165,6 +1165,12 @@ files follows the same durable arbitration rule. A model-changing
 `thread.meta.update` reserves the exact command aggregate and canonical payload
 digest before calling the provider. A turn start reserves that identity before
 attachment publication, provider identity lookup, or delivery-route freezing.
+An attachment sent by id without its bytes is accepted only when an accepted
+command already attached that id in the same thread, the stored file's size
+equals the request's claimed `sizeBytes`, and, when a digest was recorded for
+that id, the file still matches it; the attachment cap and each id's shape are
+checked before that lookup, and any other id is refused as `InvalidRequest`
+before anything persists.
 An accepted replay performs none of those effects; a concurrent matching caller
 waits for the live claim and then replays without repeating preparation. A
 matching reserved receipt is restart-resumable, while a changed payload conflicts
