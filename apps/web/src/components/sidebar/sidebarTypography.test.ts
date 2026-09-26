@@ -3,6 +3,8 @@ import * as NodeFS from "node:fs";
 
 import { describe, expect, it } from "vite-plus/test";
 
+import { textSizesBelowTextXs } from "~/test/uiTypography";
+
 // Every file that renders text in the left panel, except batch 1's environment
 // context card and update badge. UI.md: nothing smaller than text-xs (12 px)
 // and no letter-spacing utilities.
@@ -20,7 +22,6 @@ const LEFT_PANEL_SOURCES = [
   "./WorkspaceCard.tsx",
 ] as const;
 
-const BELOW_TEXT_XS = /\btext-\[(?:[0-9]|1[01])(?:\.\d+)?px\]/g;
 const LETTER_SPACING = /\btracking-[\w.[\]-]+/g;
 
 describe("left panel typography", () => {
@@ -55,7 +56,7 @@ describe("left panel typography", () => {
 
   it.each(LEFT_PANEL_SOURCES)("%s has no text below 12 px and no letter-spacing", (path) => {
     const source = NodeFS.readFileSync(new URL(path, import.meta.url), "utf8");
-    expect(source.match(BELOW_TEXT_XS) ?? []).toEqual([]);
+    expect(textSizesBelowTextXs(source)).toEqual([]);
     expect(source.match(LETTER_SPACING) ?? []).toEqual([]);
   });
 });

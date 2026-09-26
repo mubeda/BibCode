@@ -4,6 +4,8 @@ import { renderToStaticMarkup } from "react-dom/server";
 import * as React from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
+import { textSizesBelowTextXs } from "~/test/uiTypography";
+
 /**
  * FileBrowserPanel is rendered with `renderToStaticMarkup`. React's stateful
  * hooks are partially mocked: `useState` can be seeded and its setter calls are
@@ -555,10 +557,10 @@ describe("header rendering", () => {
   it("sets the header text at 12 px or larger (UI.md typography)", () => {
     setEntries([entry("a.ts", "file")], { truncated: true });
     const markup = renderPanel();
-    expect(markup).not.toMatch(/text-\[(?:[0-9]|1[01])(?:\.\d+)?px\]/);
-    expect(markup).toMatch(
-      /<div class="truncate text-xs text-muted-foreground">1 files · partial<\/div>/,
-    );
+    expect(markup).toContain("1 files · partial");
+    expect(textSizesBelowTextXs(markup)).toEqual([]);
+    // UI.md: the secondary color is solid; text never alpha-reduces it.
+    expect(markup).not.toMatch(/text-muted-foreground\/\d/);
   });
 
   it("shows and disables a user-initiated rescan while it is pending", () => {
