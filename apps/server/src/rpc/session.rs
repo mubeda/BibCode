@@ -2,7 +2,6 @@ use std::{
     any::Any,
     collections::HashMap,
     future::Future,
-    io,
     panic::AssertUnwindSafe,
     pin::Pin,
     sync::{
@@ -33,6 +32,7 @@ use super::{
 use crate::{
     auth::{AuthService, Principal, authorization_error, required_scope},
     diagnostics::TraceDiagnosticsStore,
+    json_size::encoded_json_len,
     maintenance::{RpcAdmissionGate, RpcPermit, rpc_mutability},
 };
 
@@ -205,7 +205,7 @@ impl RpcOutboundQueue {
         tokio::select! {
             () = shutdown.cancelled() => Err(SendFailure::Rejected),
             result = budget.acquire(bytes, deadline) => {
-                result.map(Some).map_err(|()| SendFailure::Rejected)
+                result.map(Some).map_err(SendFailure::rejected)
             }
         }
     }
@@ -624,13 +624,8 @@ pub(crate) async fn run_session(
     };
     let liveness = ConnectionLiveness::new();
     let (socket_writer, socket_reader) = socket.split();
-    let reader_liveness = Arc::clone(&liveness);
-    let socket_reader = socket_reader.map(move |frame| {
-        if frame.is_ok() {
-            reader_liveness.record_inbound();
-        }
-        frame.map(RpcInboundFrame::plain)
-    });
+    let socket_reader = transport::observe_inbound(Arc::clone(&liveness), socket_reader)
+        .map(|frame| frame.map(RpcInboundFrame::plain));
     run_session_split_budgeted(
         socket_writer,
         framing,
@@ -809,7 +804,7 @@ async fn process_client_message(
     in_flight: &mut HashMap<RequestId, InFlight>,
     received_eof: &mut bool,
     _inbound_guard: Option<SharedRpcInboundGuard>,
-) -> Result<(), ()> {
+) -> Result<(), SendFailure> {
     if *received_eof && matches!(message, ClientMessage::Request { .. }) {
         return Ok(());
     }
@@ -880,7 +875,7 @@ async fn process_client_message(
                         "code": "capacity",
                         "message": "Terminal input is paused because the connection is busy. Reconnect the terminal before typing again.",
                     })),
-                ).await.map_err(|_| ());
+                ).await;
             }
             if in_flight.len() >= MAX_IN_FLIGHT_REQUESTS {
                 return send_server_message(
@@ -888,8 +883,7 @@ async fn process_client_message(
                     dispatch.shutdown,
                     ServerMessage::connection_defect("RPC in-flight request limit exceeded"),
                 )
-                .await
-                .map_err(|_| ());
+                .await;
             }
             let Some(method) = dispatch.registry.get(&request.tag) else {
                 return send_server_message(
@@ -900,8 +894,7 @@ async fn process_client_message(
                         request.tag
                     )),
                 )
-                .await
-                .map_err(|_| ());
+                .await;
             };
             if let Some(principal) = dispatch.session.principal.as_ref() {
                 let Some(scope) = required_scope(&request.tag) else {
@@ -913,8 +906,7 @@ async fn process_client_message(
                             request.tag
                         )),
                     )
-                    .await
-                    .map_err(|_| ());
+                    .await;
                 };
                 if let Some(auth) = dispatch.session.auth.as_ref()
                     && !dispatch
@@ -932,8 +924,7 @@ async fn process_client_message(
                                     authorization_error(scope),
                                 ),
                             )
-                            .await
-                            .map_err(|_| ());
+                            .await;
                         }
                         Err(_) => {
                             return send_server_message(
@@ -943,8 +934,7 @@ async fn process_client_message(
                                     "Authenticated session is no longer valid",
                                 ),
                             )
-                            .await
-                            .map_err(|_| ());
+                            .await;
                         }
                     }
                 }
@@ -967,8 +957,7 @@ async fn process_client_message(
                             }),
                         ),
                     )
-                    .await
-                    .map_err(|_| ());
+                    .await;
                 }
             };
             spawn_request(request, method, admission, dispatch, in_flight);
@@ -1387,18 +1376,14 @@ async fn send_server_message(
     message: ServerMessage,
 ) -> Result<(), SendFailure> {
     let deadline = Instant::now() + OUTBOUND_SEND_TIMEOUT;
-    let frame = if let Some(limit) = outbound.message_limit() {
+    let limit = outbound.message_limit();
+    let frame = if limit.is_some() {
         // Encode exactly once and drop the value tree before the admission
         // wait, so the memory resident while waiting is precisely the bytes
         // that will be charged.
-        let encoded = serde_json::to_string(&message).map_err(|_| SendFailure::Rejected)?;
+        let encoded = serde_json::to_string(&message).map_err(SendFailure::rejected)?;
         drop(message);
-        if encoded.len() > limit {
-            return Err(SendFailure::TooLarge {
-                bytes: encoded.len(),
-                limit,
-            });
-        }
+        check_fits(encoded.len(), limit)?;
         let budget = outbound
             .acquire_budget(session_shutdown, encoded.len(), deadline)
             .await?;
@@ -1412,11 +1397,21 @@ async fn send_server_message(
             _budget: None,
         }
     };
+    admit_before(session_shutdown, deadline, outbound.sender.send(frame)).await
+}
+
+/// Waits for `admission` until `deadline`. The session ending, the deadline
+/// passing and the queue closing all reject the message.
+async fn admit_before<T, E>(
+    session_shutdown: &CancellationToken,
+    deadline: Instant,
+    admission: impl Future<Output = Result<T, E>>,
+) -> Result<T, SendFailure> {
     tokio::select! {
         () = session_shutdown.cancelled() => Err(SendFailure::Rejected),
-        result = timeout_at(deadline, outbound.sender.send(frame)) => {
+        result = timeout_at(deadline, admission) => {
             match result {
-                Ok(Ok(())) => Ok(()),
+                Ok(Ok(admitted)) => Ok(admitted),
                 Ok(Err(_)) | Err(_) => Err(SendFailure::Rejected),
             }
         }
@@ -1446,31 +1441,33 @@ async fn send_stream_terminal(
 /// Delivers an interrupt through the control lane without byte budgeting and
 /// without waiting. Oversized controls use data framing and budgeting,
 /// but remain control-class for all progress accounting.
-fn try_send_control_message(outbound: &RpcOutboundQueue, message: ServerMessage) -> Result<(), ()> {
-    let encoded = serde_json::to_string(&message).map_err(|_| ())?;
+fn try_send_control_message(
+    outbound: &RpcOutboundQueue,
+    message: ServerMessage,
+) -> Result<(), SendFailure> {
+    let encoded = serde_json::to_string(&message).map_err(SendFailure::rejected)?;
     if encoded.len() <= super::e2ee::MAX_E2EE_CHUNK_BYTES {
-        return outbound.control.try_send(message).map_err(|_| ());
+        return outbound
+            .control
+            .try_send(message)
+            .map_err(SendFailure::rejected);
     }
     // A control larger than one record takes the budgeted data queue, so the
     // connection's message limit applies to it like any other message.
-    if outbound
-        .message_limit()
-        .is_some_and(|limit| encoded.len() > limit)
-    {
-        return Err(());
-    }
+    check_fits(encoded.len(), outbound.message_limit())?;
     let permit = outbound
         .budget
         .as_ref()
         .map(|budget| budget.try_acquire(encoded.len()))
-        .transpose()?;
+        .transpose()
+        .map_err(SendFailure::rejected)?;
     outbound
         .sender
         .try_send(RpcOutboundFrame {
             payload: RpcOutboundPayload::Control(Message::Text(encoded.into())),
             _budget: permit,
         })
-        .map_err(|_| ())
+        .map_err(SendFailure::rejected)
 }
 
 /// Sends a bounded terminal or protocol error through the control lane,
@@ -1481,62 +1478,58 @@ async fn send_unbudgeted_server_message(
     outbound: &RpcOutboundQueue,
     session_shutdown: &CancellationToken,
     message: ServerMessage,
-) -> Result<(), ()> {
+) -> Result<(), SendFailure> {
     let deadline = Instant::now() + OUTBOUND_SEND_TIMEOUT;
-    let encoded = serde_json::to_string(&message).map_err(|_| ())?;
+    let encoded = serde_json::to_string(&message).map_err(SendFailure::rejected)?;
     if encoded.len() > super::e2ee::MAX_E2EE_CHUNK_BYTES {
         drop(message);
-        if outbound
-            .message_limit()
-            .is_some_and(|limit| encoded.len() > limit)
-        {
-            return Err(());
-        }
+        check_fits(encoded.len(), outbound.message_limit())?;
         let budget = outbound
             .acquire_budget(session_shutdown, encoded.len(), deadline)
-            .await
-            .map_err(|_| ())?;
+            .await?;
         let frame = RpcOutboundFrame {
             payload: RpcOutboundPayload::Control(Message::Text(encoded.into())),
             _budget: budget,
         };
-        return tokio::select! {
-            () = session_shutdown.cancelled() => Err(()),
-            result = timeout_at(deadline, outbound.sender.send(frame)) => {
-                match result {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(_)) | Err(_) => Err(()),
-                }
-            }
-        };
+        return admit_before(session_shutdown, deadline, outbound.sender.send(frame)).await;
     }
-    tokio::select! {
-        () = session_shutdown.cancelled() => Err(()),
-        result = timeout_at(deadline, outbound.control.send(message)) => {
-            match result {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(_)) | Err(_) => Err(()),
-            }
-        }
-    }
+    admit_before(session_shutdown, deadline, outbound.control.send(message)).await
 }
 
 /// Why an outbound message could not be queued.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SendFailure {
-    /// Admission failed: deadline, closed queue, or session shutdown.
+    /// The message could not be encoded, its queue was full or closed, its
+    /// deadline passed, or the session ended.
     Rejected,
     /// The encoded message exceeds what this connection can deliver.
     TooLarge { bytes: usize, limit: usize },
 }
 
 impl SendFailure {
+    /// The `map_err` adapter that turns any refusal not about size into
+    /// [`Self::Rejected`], discarding its detail.
+    fn rejected<E>(_refusal: E) -> Self {
+        Self::Rejected
+    }
+
     /// The typed failure the client receives for the request.
     fn into_error(self, method: &str) -> Value {
         match self {
             Self::Rejected => outbound_admission_failure(),
             Self::TooLarge { bytes, limit } => response_too_large_failure(method, bytes, limit),
         }
+    }
+}
+
+/// Refuses a message of `bytes` over the connection's `limit`
+/// ([`RpcOutboundQueue::message_limit`]; `None` admits any size). The only
+/// place a [`SendFailure::TooLarge`] is built: it carries the exact `bytes`
+/// and the limit they broke.
+fn check_fits(bytes: usize, limit: Option<usize>) -> Result<(), SendFailure> {
+    match limit {
+        Some(limit) if bytes > limit => Err(SendFailure::TooLarge { bytes, limit }),
+        _ => Ok(()),
     }
 }
 
@@ -1563,57 +1556,28 @@ async fn reserve_server_message(
     session_shutdown: &CancellationToken,
     encoded_len_bound: usize,
 ) -> Result<RpcResponseEnqueuePermit, SendFailure> {
-    if let Some(limit) = outbound.message_limit()
-        && encoded_len_bound > limit
-    {
-        return Err(SendFailure::TooLarge {
-            bytes: encoded_len_bound,
-            limit,
-        });
-    }
+    check_fits(encoded_len_bound, outbound.message_limit())?;
     let deadline = Instant::now() + OUTBOUND_SEND_TIMEOUT;
     let budget = outbound
         .acquire_budget(session_shutdown, encoded_len_bound, deadline)
         .await?;
-    tokio::select! {
-        () = session_shutdown.cancelled() => Err(SendFailure::Rejected),
-        result = timeout_at(deadline, outbound.sender.clone().reserve_owned()) => {
-            match result {
-                Ok(Ok(permit)) => Ok(RpcResponseEnqueuePermit {
-                    permit,
-                    budget,
-                    encoded_len_bound,
-                }),
-                Ok(Err(_)) | Err(_) => Err(SendFailure::Rejected),
-            }
-        }
-    }
-}
-
-struct JsonLength(usize);
-
-impl io::Write for JsonLength {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0 = self.0.checked_add(bytes.len()).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::FileTooLarge,
-                "serialized RPC response is too large",
-            )
-        })?;
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
+    let permit = admit_before(
+        session_shutdown,
+        deadline,
+        outbound.sender.clone().reserve_owned(),
+    )
+    .await?;
+    Ok(RpcResponseEnqueuePermit {
+        permit,
+        budget,
+        encoded_len_bound,
+    })
 }
 
 pub(crate) fn encoded_server_message_len(
     message: &ServerMessage,
 ) -> Result<usize, serde_json::Error> {
-    let mut length = JsonLength(0);
-    serde_json::to_writer(&mut length, message)?;
-    Ok(length.0)
+    encoded_json_len(message)
 }
 
 fn decode_client_messages(bytes: &[u8]) -> Result<Vec<ClientMessage>, serde_json::Error> {
@@ -2354,7 +2318,22 @@ mod tests {
         assert_eq!(error["_tag"], "RpcResponseTooLargeError");
         assert_eq!(error["method"], "test.oversizedResponse");
         assert_eq!(error["limitBytes"], 1024);
-        assert!(error["bytes"].as_u64().is_some_and(|bytes| bytes > 1024));
+        let refused = ServerMessage::success(
+            RequestId::try_from("1").expect("request id"),
+            Some(json!({ "value": "x".repeat(2 * 1024) })),
+        );
+        assert_eq!(
+            error["bytes"].as_u64(),
+            Some(
+                u64::try_from(
+                    serde_json::to_string(&refused)
+                        .expect("response JSON")
+                        .len()
+                )
+                .expect("size fits u64")
+            ),
+            "the failure reports the refused response's exact encoded size"
+        );
         let small = frames
             .iter()
             .find(|frame| frame["requestId"] == "2")
@@ -2378,18 +2357,39 @@ mod tests {
             budget: None,
             max_message_bytes: Some(1024),
         };
+        let response = |data_bytes: usize| {
+            ServerMessage::success(
+                RequestId::try_from("1").expect("request id"),
+                Some(json!({ "data": "x".repeat(data_bytes) })),
+            )
+        };
+        let envelope = serde_json::to_string(&response(0))
+            .expect("response JSON")
+            .len();
+        let at_limit = response(1024 - envelope);
+        assert_eq!(
+            serde_json::to_string(&at_limit)
+                .expect("response JSON")
+                .len(),
+            1024
+        );
+        send_server_message(&outbound, &CancellationToken::new(), at_limit)
+            .await
+            .expect("a message of exactly the limit is sent");
+
         let failure = send_server_message(
             &outbound,
             &CancellationToken::new(),
-            ServerMessage::success(
-                RequestId::try_from("1").expect("request id"),
-                Some(json!({ "data": "x".repeat(2048) })),
-            ),
+            response(1025 - envelope),
         )
         .await;
-        assert!(
-            matches!(failure, Err(SendFailure::TooLarge { limit: 1024, bytes }) if bytes > 2048),
-            "{failure:?}"
+        assert_eq!(
+            failure,
+            Err(SendFailure::TooLarge {
+                bytes: 1025,
+                limit: 1024
+            }),
+            "the failure reports the exact encoded size and the limit"
         );
     }
 

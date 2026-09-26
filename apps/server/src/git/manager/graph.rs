@@ -6,7 +6,10 @@ use serde::Serialize;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use crate::git::{GitCommandError, GitRepository};
+use crate::{
+    git::{GitCommandError, GitRepository},
+    json_size::encoded_json_len,
+};
 
 use super::generation::{
     RepositoryStateObservation, current_repository_generation, observe_repository_state,
@@ -23,11 +26,13 @@ const RECORD_SEPARATOR: char = '\u{1e}';
 /// commit so an unusually large entry cannot stop pagination.
 pub const COMMIT_PAGE_TARGET_BYTES: usize = 1024 * 1024;
 
-/// Serialization accounts for escaping, arrays, field names and numbers.
+/// The entry's exact JSON size, escaping, field names and numbers included.
+/// It is counted, not built, so the response encoding is the only place the
+/// page's JSON text is produced. Counting fails only when the size would
+/// overflow `usize`; such an entry never fits, which `usize::MAX` records, so
+/// it can only appear as a page's first commit.
 fn encoded_entry_bytes(entry: &GitManagerCommitEntry) -> usize {
-    serde_json::to_vec(entry)
-        .expect("GitManagerCommitEntry serializes to JSON")
-        .len()
+    encoded_json_len(entry).unwrap_or(usize::MAX)
 }
 
 /// How many leading commits fit the page target; always at least one.
@@ -502,6 +507,66 @@ parent1\u{1f}HEAD -> main\0\nfirst.txt\0nested/second.txt\0";
             .len();
         assert!(bytes <= COMMIT_PAGE_TARGET_BYTES);
         assert!(serde_json::to_vec(&entries).expect("all JSON").len() > COMMIT_PAGE_TARGET_BYTES);
+    }
+
+    /// Forty commits of varied sizes; commit 23 alone is larger than a page.
+    /// Every fifth subject holds characters that JSON escapes, and some
+    /// commits list changed files.
+    fn boundary_fixture() -> Vec<GitManagerCommitEntry> {
+        (0..40)
+            .map(|index| {
+                let body = if index == 23 {
+                    10_000
+                } else {
+                    173 * (index % 7) + 59 * (index % 4)
+                };
+                let mut entry = entry_with_body(body);
+                entry.sha = format!("{index:040x}");
+                if index % 5 == 0 {
+                    entry.subject = "tab\t\"quote\" back\\slash \u{1}".repeat(index / 5 + 1);
+                }
+                entry.changed_files = (0..index % 4)
+                    .map(|file| format!("src/{index}/{file}.rs"))
+                    .collect();
+                entry
+            })
+            .collect()
+    }
+
+    #[test]
+    fn page_boundaries_on_a_fixture_are_the_longest_prefix_that_fits() {
+        let commits = boundary_fixture();
+        let encoded = |entries: &[GitManagerCommitEntry]| {
+            serde_json::to_vec(entries).expect("page JSON").len()
+        };
+        // Five commits fill this target exactly, so the fifth stays; one
+        // byte less and it moves to the next page.
+        let target = encoded(&commits[..5]);
+        assert_eq!(commits_within_target(&commits, target), 5);
+        assert_eq!(commits_within_target(&commits, target - 1), 4);
+
+        let mut pages = Vec::new();
+        let mut rest = commits.as_slice();
+        while !rest.is_empty() {
+            let kept = commits_within_target(rest, target);
+            assert!(
+                kept == 1 || encoded(&rest[..kept]) <= target,
+                "page {} is over the target",
+                pages.len()
+            );
+            if kept < rest.len() {
+                assert!(
+                    encoded(&rest[..=kept]) > target,
+                    "page {} had room for one more commit",
+                    pages.len()
+                );
+            }
+            pages.push(kept);
+            rest = &rest[kept..];
+        }
+        // Commit 22 cannot share a page with commit 23, and commit 23 fills
+        // a page on its own.
+        assert_eq!(pages, vec![5, 3, 4, 3, 4, 3, 1, 1, 3, 4, 3, 4, 2]);
     }
 
     #[tokio::test]

@@ -29,7 +29,10 @@ use super::{
         PUMP_JOIN_TIMEOUT, PairingConfirmationLatch, RpcInboundFrame, SOCKET_WRITE_TIMEOUT,
         run_session_split_budgeted,
     },
-    transport::{ConnectionLiveness, E2EE_INTERLEAVE_FEATURE, OutboundFraming, log_peer_close},
+    transport::{
+        ConnectionLiveness, E2EE_INTERLEAVE_FEATURE, OutboundFraming, log_peer_close,
+        observe_inbound,
+    },
 };
 use crate::{
     auth::{
@@ -965,13 +968,12 @@ pub(crate) async fn run_e2ee_session(
             .ok_or(E2eeSessionError::Closed)?;
         let (mut channel, message_b) =
             E2eeChannel::respond_to_message_a(auth.host_identity(), &message_a)?;
-        timeout(
-            SOCKET_WRITE_TIMEOUT,
-            ws_writer.send(Message::Binary(message_b.into())),
+        send_frame_before(
+            &mut ws_writer,
+            Message::Binary(message_b.into()),
+            Instant::now() + SOCKET_WRITE_TIMEOUT,
         )
-        .await
-        .map_err(|_| E2eeSessionError::Timeout)?
-        .map_err(|_| E2eeSessionError::Closed)?;
+        .await?;
 
         let auth_bytes = loop {
             let frame = next_binary_frame(&mut ws_reader)
@@ -1156,12 +1158,22 @@ async fn send_encrypted_frames(
     let deadline = Instant::now() + SOCKET_WRITE_TIMEOUT;
     for (flag, chunk) in plaintext_records(plaintext)? {
         let frame = channel.encrypt_record(flag, chunk)?;
-        timeout_at(deadline, writer.send(Message::Binary(frame.into())))
-            .await
-            .map_err(|_| E2eeSessionError::Timeout)?
-            .map_err(|_| E2eeSessionError::Closed)?;
+        send_frame_before(writer, Message::Binary(frame.into()), deadline).await?;
     }
     Ok(())
+}
+
+/// Writes one frame before `deadline`. A missed deadline is `Timeout` and a
+/// rejected write is `Closed`.
+async fn send_frame_before(
+    writer: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    frame: Message,
+    deadline: Instant,
+) -> Result<(), E2eeSessionError> {
+    timeout_at(deadline, writer.send(frame))
+        .await
+        .map_err(|_| E2eeSessionError::Timeout)?
+        .map_err(|_| E2eeSessionError::Closed)
 }
 
 #[allow(
@@ -1170,7 +1182,7 @@ async fn send_encrypted_frames(
 )]
 async fn run_established_e2ee<W, R>(
     mut ws_writer: W,
-    mut ws_reader: R,
+    ws_reader: R,
     channel: E2eeChannel,
     admission: EstablishedE2eeAdmission,
     interleave: bool,
@@ -1246,7 +1258,7 @@ async fn run_established_e2ee<W, R>(
     let global_inbound_permits = E2EE_RESOURCE_BUDGET.global_inbound();
     let channel = Arc::new(Mutex::new(channel));
     let liveness = ConnectionLiveness::new();
-    let inbound_liveness = Arc::clone(&liveness);
+    let mut ws_reader = observe_inbound(Arc::clone(&liveness), ws_reader);
     let (inbound_tx, inbound_rx) =
         tokio::sync::mpsc::channel::<Result<RpcInboundFrame, axum::Error>>(64);
 
@@ -1287,9 +1299,6 @@ async fn run_established_e2ee<W, R>(
                     }
                 }
             };
-            if frame.is_ok() {
-                inbound_liveness.record_inbound();
-            }
             let message = match frame {
                 Ok(Message::Binary(bytes)) => {
                     let record = {

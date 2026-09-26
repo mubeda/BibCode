@@ -20,7 +20,7 @@ use std::{
 };
 
 use axum::extract::ws::{CloseFrame, Message};
-use futures_util::{Sink, SinkExt};
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use tokio::{
     sync::{Notify, mpsc},
     time::{Instant, MissedTickBehavior, timeout, timeout_at},
@@ -84,8 +84,9 @@ impl ConnectionLiveness {
         })
     }
 
-    /// Any inbound frame, including WebSocket Ping, Pong and Close.
-    pub(crate) fn record_inbound(&self) {
+    /// Any inbound frame, including WebSocket Ping, Pong and Close. Readers
+    /// count frames through [`observe_inbound`].
+    fn record_inbound(&self) {
         self.touch();
     }
 
@@ -114,6 +115,23 @@ impl ConnectionLiveness {
     fn take_ping(&self) -> bool {
         self.ping_due.swap(false, Ordering::AcqRel)
     }
+}
+
+/// Counts every frame read from the socket as inbound activity, including
+/// WebSocket Ping, Pong and Close; a read error is not activity. Plain and
+/// E2EE readers both wrap their raw socket reader with it.
+pub(crate) fn observe_inbound<S>(
+    liveness: Arc<ConnectionLiveness>,
+    reader: S,
+) -> impl Stream<Item = Result<Message, axum::Error>> + Unpin
+where
+    S: Stream<Item = Result<Message, axum::Error>> + Unpin,
+{
+    reader.inspect(move |frame| {
+        if frame.is_ok() {
+            liveness.record_inbound();
+        }
+    })
 }
 
 /// Asks the writer for a WebSocket Ping every 15 s and ends the session after
