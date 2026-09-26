@@ -6,6 +6,8 @@ import "./index.css";
 import { runClientStateMigrationsV1 } from "./clientStateMigrations";
 import { installDesktopCloseShortcutRouter } from "./desktopCloseShortcut";
 import { isTauri } from "./env";
+// Installs the app's single theme listeners at boot, so every route follows the OS.
+import { applyStoredTheme } from "./hooks/useTheme";
 import { resolveStorage } from "./lib/storage";
 import { applyLinuxWebkitTypography } from "./linuxWebkitTypography";
 
@@ -28,6 +30,8 @@ async function main(): Promise<void> {
     import("./tauriDesktopBridge"),
   ]);
   await tauriDesktopBridgeReady.catch(() => undefined);
+  // The theme module loaded before the desktop bridge existed; sync the shell now.
+  applyStoredTheme();
   applyLinuxWebkitTypography(document);
   await renderApplication();
 }
