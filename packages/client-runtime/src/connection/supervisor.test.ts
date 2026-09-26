@@ -58,10 +58,13 @@ const RELAY_ENTRY: ConnectionCatalogEntry = {
 
 const makeSupervisor = Effect.fn("TestConnectionHarness.makeSupervisor")(function* (
   entry: ConnectionCatalogEntry,
-  options?: Pick<EnvironmentSupervisor.EnvironmentSupervisorOptions, "initiallyDesired">,
+  options: Pick<EnvironmentSupervisor.EnvironmentSupervisorOptions, "initiallyDesired">,
 ) {
   const targetRef = yield* Ref.make(entry.target);
-  return yield* EnvironmentSupervisor.make(entry, { ...options, targetRef });
+  return yield* EnvironmentSupervisor.make(entry, {
+    initiallyDesired: options.initiallyDesired,
+    targetRef,
+  });
 });
 
 const PREPARED_CONNECTION: PreparedConnection = {
@@ -576,9 +579,9 @@ describe("EnvironmentSupervisor", () => {
   it.effect("does not attempt a connection until it is desired", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness();
-      const supervisor = yield* makeSupervisor(TARGET_ENTRY).pipe(
-        Effect.provide(harness.dependencies),
-      );
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY, {
+        initiallyDesired: false,
+      }).pipe(Effect.provide(harness.dependencies));
 
       expect((yield* SubscriptionRef.get(supervisor.state)).phase).toBe("available");
       expect(yield* Ref.get(harness.prepareCount)).toBe(0);
@@ -588,9 +591,9 @@ describe("EnvironmentSupervisor", () => {
   it.effect("does not let the initial connect signal cancel the first attempt", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness();
-      const supervisor = yield* makeSupervisor(TARGET_ENTRY).pipe(
-        Effect.provide(harness.dependencies),
-      );
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY, {
+        initiallyDesired: false,
+      }).pipe(Effect.provide(harness.dependencies));
 
       yield* supervisor.connect;
       yield* awaitState(supervisor.state, (state) => state.phase === "connected");

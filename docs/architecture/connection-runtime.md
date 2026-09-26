@@ -390,7 +390,11 @@ writes `false`, and removal clears the entry. Catalog/profile drift recreates a
 scope with the stored intent, so a deliberately disconnected environment does
 not reconnect merely because its supervisor was replaced. Passive state lookup
 may materialize a cold supervisor for state publication, but it preserves the
-stored intent and does not dial while that intent is disconnected.
+stored intent and does not dial while that intent is disconnected. The registry
+builds every supervisor, a replacement included, with the stored intent, so the
+first state it publishes already carries that intent: a desired environment
+starts at `connecting` (`offline` while the network is offline), never at
+`available`.
 
 Environment commands may place a deadline around the complete lazy
 `runInEnvironment` effect. That deadline includes supervisor acquisition,
@@ -591,10 +595,7 @@ the replacement's session, and a removed environment ends the wait. Typed
 failures never re-attach. There is no attempt limit and no timer. The loop ends
 at an outcome, at an abort, when the environment is blocked, disconnected by the
 user, or removed, or on a session without the capability; the last two end with
-`VcsCloneStoppedError`. One exception: a user disconnect that lands while the
-registry replaces the supervisor is not seen, because a replacement starts out
-undesired, so the wait lasts until the environment reconnects or is removed.
-The dialog can be closed meanwhile.
+`VcsCloneStoppedError`.
 
 **Cancel clone** then sends `vcs.cancelClone` on its own command lane, because
 the clone holds the destination's serial lane. The cancel waits for a session

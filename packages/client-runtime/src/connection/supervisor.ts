@@ -103,7 +103,7 @@ function exitUnlessInterrupted<A, E, R>(
 }
 
 export interface EnvironmentSupervisorOptions {
-  readonly initiallyDesired?: boolean;
+  readonly initiallyDesired: boolean;
   /** Registry-owned target metadata; label changes preserve this supervisor. */
   readonly targetRef: Ref.Ref<ConnectionTarget>;
 }
@@ -285,7 +285,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
   const random = yield* Random.Random;
   const shown = yield* Ref.make(isEnvironmentShown(yield* selection.current, target.environmentId));
   const initialIntent: SupervisorIntent = {
-    desired: options.initiallyDesired ?? false,
+    desired: options.initiallyDesired,
     network: yield* connectivity.status,
   };
   const intent = yield* Ref.make(initialIntent);
@@ -816,7 +816,8 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
 
 export const layer = (
   entry: ConnectionCatalogEntry,
-  options?: Partial<EnvironmentSupervisorOptions>,
+  options: Pick<EnvironmentSupervisorOptions, "initiallyDesired"> &
+    Partial<Pick<EnvironmentSupervisorOptions, "targetRef">>,
 ): Layer.Layer<
   EnvironmentSupervisor,
   never,
@@ -827,7 +828,7 @@ export const layer = (
   Layer.effect(
     EnvironmentSupervisor,
     Effect.gen(function* () {
-      const targetRef = options?.targetRef ?? (yield* Ref.make(entry.target));
-      return yield* make(entry, { ...options, targetRef });
+      const targetRef = options.targetRef ?? (yield* Ref.make(entry.target));
+      return yield* make(entry, { initiallyDesired: options.initiallyDesired, targetRef });
     }),
   );
