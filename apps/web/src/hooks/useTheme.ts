@@ -232,8 +232,38 @@ export function syncDesktopTheme(theme: Theme) {
   });
 }
 
-// Apply immediately on module load to prevent flash
+function handleSystemThemeChange() {
+  if (getStored() === "system") applyTheme("system", true);
+  emitChange();
+}
+
+function handleThemeStorageChange(event: StorageEvent) {
+  if (event.key !== STORAGE_KEY) return;
+  themeStorageReadFailure = null;
+  applyTheme(getStored(), true);
+  emitChange();
+}
+
+// Apply immediately on module load to prevent flash, then follow OS light/dark
+// switches and theme changes from other tabs for the app's lifetime. These are
+// the app's only theme listeners: main.tsx loads this module at boot, so every
+// route follows the OS, including routes that render no `useTheme` consumer.
+// The desktop bridge does not exist yet at boot; main.tsx calls
+// `applyStoredTheme` once it does.
 if (typeof document !== "undefined" && typeof window !== "undefined") {
+  applyTheme(getStored());
+  const systemDarkQuery =
+    typeof window.matchMedia === "function" ? window.matchMedia(MEDIA_QUERY) : null;
+  if (typeof systemDarkQuery?.addEventListener === "function") {
+    systemDarkQuery.addEventListener("change", handleSystemThemeChange);
+  }
+  if (typeof window.addEventListener === "function") {
+    window.addEventListener("storage", handleThemeStorageChange);
+  }
+}
+
+/** Applies the stored theme everywhere, including a desktop bridge installed after boot. */
+export function applyStoredTheme(): void {
   applyTheme(getStored());
 }
 
@@ -254,32 +284,12 @@ function getServerSnapshot() {
   return DEFAULT_THEME_SNAPSHOT;
 }
 
+// Components only subscribe to snapshot changes; the module-level listeners
+// above apply OS and cross-tab theme changes once for the whole app.
 function subscribe(listener: () => void): () => void {
-  if (typeof window === "undefined") return () => {};
   listeners.push(listener);
-
-  // Listen for system preference changes
-  const mq = typeof window.matchMedia === "function" ? window.matchMedia(MEDIA_QUERY) : null;
-  const handleChange = () => {
-    if (getStored() === "system") applyTheme("system", true);
-    emitChange();
-  };
-  mq?.addEventListener("change", handleChange);
-
-  // Listen for storage changes from other tabs
-  const handleStorage = (e: StorageEvent) => {
-    if (e.key === STORAGE_KEY) {
-      themeStorageReadFailure = null;
-      applyTheme(getStored(), true);
-      emitChange();
-    }
-  };
-  window.addEventListener("storage", handleStorage);
-
   return () => {
     listeners = listeners.filter((l) => l !== listener);
-    mq?.removeEventListener("change", handleChange);
-    window.removeEventListener("storage", handleStorage);
   };
 }
 

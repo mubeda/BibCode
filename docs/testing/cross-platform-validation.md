@@ -2032,6 +2032,10 @@ sizes. Cover relevant:
   directory-timestamp fidelity differs across that boundary;
 - Activity subagents and background tasks, including elapsed time and keyboard
   navigation;
+- with **Settings → General → Theme** on **System**, switch the operating system
+  between light and dark while the app shows the home screen and again while it
+  shows a thread: the window follows each switch without a reload; with
+  **Light** or **Dark** selected, the app ignores the switch;
 - responsive menus, overlays, narrow panels, and focus states; and
 - loaded interaction without stale ownership, duplicate events, or runaway
   process growth.
