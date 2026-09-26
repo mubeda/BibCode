@@ -381,6 +381,28 @@ retry prompt but do not change provider readiness or discard inventory data.
 The advisory timestamp records the registry result or attempt; the provider's
 top-level `checkedAt` continues to record the executable and capability probe.
 
+A `subscribeServerConfig` subscription starts a full provider refresh only when
+no full refresh has completed yet, or the last completed one is more than five
+minutes old, and it never duplicates a full refresh already in progress.
+`server.refreshProviders` runs immediately. It finishes and publishes even if the
+requesting client disconnects, and a full refresh also records its completion. A
+settings change discards every result it makes stale and starts a full refresh at
+once; if a full refresh is already running, that refresh probes again with the
+new settings instead. The settings-triggered refresh continues even if the RPC
+that changed the settings disconnects.
+
+Refreshes a user triggers (`server.refreshProviders`, full or per instance)
+always publish `providerStatuses`, even when only timestamps changed. If a newer
+probe has already committed under the same settings, the request publishes the
+current inventory without overwriting it or renewing the five-minute window.
+Automatic refreshes (subscriptions, background checks and settings changes) and
+the re-probe after `server.updateProvider` publish `providerStatuses` only when
+the merged provider array changed, ignoring each provider's `checkedAt` and
+`versionAdvisory.checkedAt`. Those timestamps are still stored, so connected
+clients keep their previous `checkedAt` until a content change or a
+user-triggered refresh publishes, or until they reconnect and receive a fresh
+snapshot.
+
 An update reservation is bound to the complete maintenance target and settings
 generation. After acquiring the per-command lock, the server rereads settings,
 re-resolves the target and action, and rejects a queued update if its binary,
