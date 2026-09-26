@@ -330,6 +330,7 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
   );
   const firstPageQuery = useEnvironmentQuery(firstPageAtom);
   const refreshFirstPage = firstPageQuery.refresh;
+  const revalidateFirstPage = firstPageQuery.revalidate;
   firstPageRef.current = firstPageQuery.data;
   const firstPage = firstPageQuery.data;
   // A repository generation past everything loaded or returned (the loaded
@@ -566,12 +567,12 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
       setLoadedPageCursors(currentProjectRef, []);
       setLoadedPageCount(currentProjectRef, 0);
       setRefreshEpoch((epoch) => epoch + 1);
-      refreshFirstPage();
+      revalidateFirstPage();
       return;
     }
     setLoadMoreError(nextPageQuery.error);
   }, [
-    refreshFirstPage,
+    revalidateFirstPage,
     loadingOffset,
     nextPageQuery.error,
     nextPageTipsUnresolvable,

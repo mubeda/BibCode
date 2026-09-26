@@ -196,11 +196,11 @@ export function RemoteDirectoryBrowser({
       context.refreshRequestId === marker.requestId
     ) {
       refreshAfterNavigationRef.current = null;
-      query.refresh();
+      query.revalidate();
       return;
     }
     refreshAfterNavigationRef.current = null;
-  }, [createEntry, environmentId, path, query.refresh]);
+  }, [createEntry, environmentId, path, query.revalidate]);
 
   useEffect(() => {
     if (newFolderName === null && query.error && path !== "~" && fallbackWarning === null) {

@@ -87,6 +87,7 @@ vi.mock("../../state/entities", () => ({
 
 vi.mock("../../state/environments", () => ({
   useEnvironmentConnectionState: () => ({ data: h.connectionState }),
+  useEnvironment: () => ({ label: "Local" }),
 }));
 
 vi.mock("../../state/query", () => ({
@@ -112,13 +113,17 @@ vi.mock("../../state/query", () => ({
               : atom?.kind === "stashes"
                 ? h.stashes
                 : null;
+    // Automatic re-reads record the same way as refreshes.
+    const refresh = () => {
+      if (atom !== null) h.refreshed.push(atom.kind);
+    };
     return {
       data,
       error: null,
       isPending: atom?.kind === "catalog" && h.catalogPending,
-      refresh: () => {
-        if (atom !== null) h.refreshed.push(atom.kind);
-      },
+      refresh,
+      revalidate: refresh,
+      requiresRetry: false,
       emission: data === null ? { _tag: "Initial" } : { _tag: "Success", value: data },
     };
   },

@@ -214,7 +214,22 @@ describe("connection presentation", () => {
         error: "Relay request timed out.",
         traceId: "trace-retry",
       }),
-    ).toBe("Failed to connect. Reconnecting... Reason: Relay request timed out.");
+    ).toBe("Relay request timed out. Reconnecting…");
+  });
+
+  it("ends a failure that lacks punctuation before announcing the reconnect", () => {
+    expect(
+      connectionStatusText({ phase: "reconnecting", error: "connect ECONNREFUSED", traceId: null }),
+    ).toBe("connect ECONNREFUSED. Reconnecting…");
+    expect(
+      connectionStatusText({
+        phase: "reconnecting",
+        error: "No data from Local for 30 seconds. The connection is too slow or was lost.",
+        traceId: null,
+      }),
+    ).toBe(
+      "No data from Local for 30 seconds. The connection is too slow or was lost. Reconnecting…",
+    );
   });
 
   it("presents the supervisor's offline state without consulting shell state", () => {
@@ -310,10 +325,10 @@ describe("connection presentation", () => {
     );
     expect(connectionStatusText({ phase: "offline", error: null, traceId: null })).toBe("Offline");
     expect(connectionStatusText({ phase: "connecting", error: null, traceId: null })).toBe(
-      "Connecting...",
+      "Connecting…",
     );
     expect(connectionStatusText({ phase: "reconnecting", error: null, traceId: null })).toBe(
-      "Reconnecting...",
+      "Reconnecting…",
     );
     expect(connectionStatusText({ phase: "connected", error: null, traceId: null })).toBe(
       "Connected",

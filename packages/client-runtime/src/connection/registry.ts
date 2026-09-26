@@ -39,6 +39,7 @@ import * as Persistence from "../platform/persistence.ts";
 import * as EnvironmentSupervisor from "./supervisor.ts";
 import * as ConnectionDriver from "./driver.ts";
 import * as ConnectionWakeups from "./wakeups.ts";
+import { EnvironmentSelection } from "./selection.ts";
 
 const isSshConnectionProfile = Schema.is(SshConnectionProfile);
 
@@ -173,6 +174,7 @@ export const make = Effect.gen(function* () {
   const connectivity = yield* Connectivity.Connectivity;
   const driver = yield* ConnectionDriver.ConnectionDriver;
   const wakeups = yield* ConnectionWakeups.ConnectionWakeups;
+  const selection = yield* EnvironmentSelection;
   const ssh = yield* ClientCapabilities.SshEnvironmentGateway;
   const persistedTargets = yield* storage.list;
   const initialEntries = new Map(
@@ -344,6 +346,7 @@ export const make = Effect.gen(function* () {
             Effect.provideService(Connectivity.Connectivity, connectivity),
             Effect.provideService(ConnectionDriver.ConnectionDriver, driver),
             Effect.provideService(ConnectionWakeups.ConnectionWakeups, wakeups),
+            Effect.provideService(EnvironmentSelection, selection),
             Scope.provide(scope),
             Effect.onError(() => Scope.close(scope, Exit.void)),
           );

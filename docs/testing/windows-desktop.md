@@ -441,6 +441,10 @@ retained after reload. Record unavailable fixture/host states separately from
 that pass. The packaged Pierre spec's sibling checks route entry only; the
 shared procedure owns authenticated list/detail/files evidence.
 
+Include the shared [slow-link liveness scenario](./cross-platform-validation.md#slow-link-liveness-scenario)
+when a browser client and a development or standalone server are available on
+this platform; otherwise record it as unavailable evidence.
+
 Use Codex Computer Use to operate the packaged executable. Capture normal,
 minimum-size, and relevant Windows DPI states. Verify:
 
@@ -469,18 +473,28 @@ minimum-size, and relevant Windows DPI states. Verify:
   (**EB** for **Edge box**). Hover the Settings row's status dot before and after
   saving: it stays **Connected**, with no reconnect during the rename. Reload
   the app, then restart it; after each, confirm the saved name and initials
-  persist;
+  persist. Disconnect reasons also use the saved name: rename the connected server, then
+  close or interrupt its connection and confirm the reconnecting detail names
+  the new alias. Repeat with a liveness timeout. Storage-identity errors still
+  use the server's reported name;
 - With that renamed test server connected, check a stalled connection on a
   Windows remote host: open Resource Monitor (`resmon.exe`) on that host, select
   the **CPU** tab, find the test server's `bibcode` process in the process list,
   right-click it, and choose **Suspend process**. Hover the Settings row's status
   dot and wait for
-  `Failed to connect. Reconnecting... Reason: <server's own name> disconnected.`,
+  `No data from <saved name> for 30 seconds. The connection is too slow or was lost. Reconnecting…`,
   followed by
-  `Reason: Remote environment endpoint <base URL>/.well-known/bibcode/environment timed out after 10000ms.`
-  with the test server's endpoint URL. The disconnect reason uses the server's
-  own name, not the saved name. The disconnect appears before a health-check
-  message can become visible. In Resource Monitor, right-click the same test
+  `Remote environment endpoint <base URL>/.well-known/bibcode/environment timed out after 10000ms. Reconnecting…`
+  with the test server's endpoint URL. The disconnect reason uses the saved
+  name (**Edge box**) and appears 27–33 seconds after the last data from the
+  stopped server, when the client's liveness timeout closes the socket with
+  code 4408. Keep BiBCode visible and focused for the whole stall: the
+  disconnect then appears before a health-check message can become visible. If
+  the window is restored from hidden or minimized during the stall, the
+  application-active health check can report
+  `<saved name> did not respond to a connection health check.` after 15
+  seconds instead; repeat the check with the window kept visible.
+  In Resource Monitor, right-click the same test
   server process, choose **Resume process**, and confirm it reconnects;
 - select a saved server within a second of launch and confirm the rail keeps it
   selected for at least ten seconds while provider and settings updates arrive;

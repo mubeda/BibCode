@@ -152,6 +152,7 @@ const testState = vi.hoisted(() => ({
   branchState: {
     refs: [] as unknown[],
     data: null as { nextCursor: number | null; totalCount: number } | null,
+    error: null as string | null,
     isPending: false,
     refresh: vi.fn(),
     loadNext: vi.fn(),
@@ -207,6 +208,7 @@ interface CapturedLegendProps {
 
 interface CapturedTriggerProps {
   disabled?: boolean;
+  className?: string;
   children?: unknown;
 }
 
@@ -228,6 +230,7 @@ const captured = vi.hoisted(() => ({
   trigger: [] as CapturedTriggerProps[],
   tooltipTriggers: [] as CapturedTooltipTriggerProps[],
   switches: [] as CapturedSwitchProps[],
+  buttons: [] as Array<{ children?: unknown; onClick?: () => void }>,
   clear() {
     this.combobox = [];
     this.items = [];
@@ -236,6 +239,7 @@ const captured = vi.hoisted(() => ({
     this.trigger = [];
     this.tooltipTriggers = [];
     this.switches = [];
+    this.buttons = [];
   },
 }));
 
@@ -290,8 +294,12 @@ vi.mock("../lib/openPullRequestLink", () => ({
   useOpenPrLink: () => testState.openPrLink,
 }));
 
+// Automatic re-reads (`revalidate`) measure through the same spies as `refresh`.
 vi.mock("../state/queries", () => ({
-  usePaginatedBranches: () => testState.branchState,
+  usePaginatedBranches: () => ({
+    ...testState.branchState,
+    revalidate: () => testState.branchState.refresh(),
+  }),
 }));
 
 vi.mock("../state/entities", () => ({
@@ -302,7 +310,9 @@ vi.mock("../state/entities", () => ({
 vi.mock("../state/query", () => ({
   useEnvironmentQuery: (atom: { kind?: string } | null) => {
     testState.statusAtoms.push(atom);
-    return atom?.kind === "worktree-catalog" ? testState.catalogQuery : testState.statusQuery;
+    const query =
+      atom?.kind === "worktree-catalog" ? testState.catalogQuery : testState.statusQuery;
+    return { ...query, revalidate: () => query.refresh(), requiresRetry: false };
   },
 }));
 
@@ -376,6 +386,13 @@ vi.mock("./ui/combobox", () => ({
     <div data-testid="status">{props.children as never}</div>
   ),
   ComboboxListVirtualized: (props: { children?: unknown }) => <div>{props.children as never}</div>,
+}));
+
+vi.mock("./ui/button", () => ({
+  Button: (props: { children?: unknown; onClick?: () => void }) => {
+    captured.buttons.push(props);
+    return <button type="button">{props.children as never}</button>;
+  },
 }));
 
 vi.mock("./ui/switch", () => ({
@@ -566,6 +583,7 @@ beforeEach(() => {
   testState.branchState = {
     refs: [...REFS],
     data: { nextCursor: null, totalCount: REFS.length },
+    error: null,
     isPending: false,
     refresh: vi.fn(),
     loadNext: vi.fn(),
@@ -622,6 +640,26 @@ describe("BranchToolbarBranchSelector", () => {
     expect(testState.openPrLink).toHaveBeenCalledWith(event, "https://example.com/pr/12");
   });
 
+  it("sets its text at 12 px or larger on the solid muted color (UI.md typography)", () => {
+    useServerThread();
+    testState.statusQuery.data = status({
+      pr: {
+        number: 12,
+        title: "Open PR",
+        url: "https://example.com/pr/12",
+        baseRef: "main",
+        headRef: "feature/test",
+        state: "open",
+      },
+    });
+    const markup = render(buildProps());
+    expect(markup).toContain(">default<");
+    expect(markup).not.toMatch(/text-\[(?:[0-9]|1[01])(?:\.\d+)?px\]/);
+    // Text never fades the muted color further; icon tints may.
+    expect(markup).not.toMatch(/<span[^>]*class="[^"]*text-muted-foreground\/\d+/);
+    expect(captured.trigger[0]?.className ?? "").not.toMatch(/text-muted-foreground\/\d+/);
+  });
+
   it("falls back to 'Select ref' when nothing resolves a branch", () => {
     testState.statusQuery = { data: null, error: null, isPending: false, refresh: vi.fn() };
     testState.branchState.refs = [];
@@ -637,6 +675,20 @@ describe("BranchToolbarBranchSelector", () => {
     testState.statusQuery.data = status({ refName: null });
     const markup = render(buildProps());
     expect(markup).toContain("From main");
+  });
+
+  it("shows a failed refs page with a Retry that clears the cut-off", () => {
+    useServerThread();
+    testState.branchState.refs = [];
+    testState.branchState.data = null;
+    testState.branchState.error = "The connection dropped before the result arrived.";
+    const markup = render(buildProps());
+    expect(markup).toContain("The connection dropped before the result arrived.");
+    expect(markup).not.toContain("No refs found.");
+    const retry = captured.buttons.find((button) => button.children === "Retry");
+    expect(retry).toBeDefined();
+    retry?.onClick?.();
+    expect(testState.branchState.refresh).toHaveBeenCalledTimes(1);
   });
 
   it("refreshes refs when the menu opens and clears the query when it closes", () => {

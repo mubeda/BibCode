@@ -384,7 +384,10 @@ type ActivityPageData = ActivityRosterPageData | ActivityDetailPageData;
 interface BoundedActivityQuery<Page extends ActivityPageData> extends ActivityQueryResult<Page> {
   readonly failure: unknown | null;
   readonly loadMore: () => void;
+  /** Explicit user Retry from the newest page. */
   readonly refresh: () => void;
+  /** Automatic re-read from the newest page; keeps an exhausted cut-off latched. */
+  readonly revalidate: () => void;
 }
 
 function useBoundedActivityQuery<Page extends ActivityPageData>(
@@ -404,7 +407,7 @@ function useBoundedActivityQuery<Page extends ActivityPageData>(
     [atomForCursor, current.cursor, queryKey],
   );
   const query = useEnvironmentQuery<Page, unknown>(queryAtom);
-  const newestRefreshKeyRef = useRef<string | null>(null);
+  const newestRefreshKeyRef = useRef<{ key: string; retry: boolean } | null>(null);
 
   useEffect(() => {
     if (queryKey === null || query.data === null) {
@@ -422,12 +425,12 @@ function useBoundedActivityQuery<Page extends ActivityPageData>(
   }, [current.cursor, query.data, queryKey]);
 
   useEffect(() => {
-    if (queryKey === null || current.cursor !== null || newestRefreshKeyRef.current !== queryKey) {
-      return;
-    }
+    const pending = newestRefreshKeyRef.current;
+    if (queryKey === null || current.cursor !== null || pending?.key !== queryKey) return;
     newestRefreshKeyRef.current = null;
-    query.refresh();
-  }, [current.cursor, query.refresh, queryKey]);
+    if (pending.retry) query.refresh();
+    else query.revalidate();
+  }, [current.cursor, query.refresh, query.revalidate, queryKey]);
 
   const pages = useMemo(() => current.pages.map((entry) => entry.page), [current.pages]);
   const failure = Option.getOrNull(AsyncResult.error(query.emission));
@@ -449,21 +452,27 @@ function useBoundedActivityQuery<Page extends ActivityPageData>(
       pages: previous.key === queryKey ? previous.pages : [],
     }));
   }, [current.cursor, failure, pages, query.refresh, queryKey]);
-  const refresh = useCallback(() => {
-    if (queryKey === null) {
-      return;
-    }
-    if (current.cursor === null) {
-      query.refresh();
-      return;
-    }
-    newestRefreshKeyRef.current = queryKey;
-    setState((previous) => ({
-      key: queryKey,
-      cursor: null,
-      pages: previous.key === queryKey ? previous.pages : [],
-    }));
-  }, [current.cursor, query.refresh, queryKey]);
+  // Returning to the newest page keeps whether the initiating action was an
+  // explicit Retry or an automatic re-read.
+  const refreshNewest = useCallback(
+    (retry: boolean) => {
+      if (queryKey === null) return;
+      if (current.cursor === null) {
+        if (retry) query.refresh();
+        else query.revalidate();
+        return;
+      }
+      newestRefreshKeyRef.current = { key: queryKey, retry };
+      setState((previous) => ({
+        key: queryKey,
+        cursor: null,
+        pages: previous.key === queryKey ? previous.pages : [],
+      }));
+    },
+    [current.cursor, query.refresh, query.revalidate, queryKey],
+  );
+  const refresh = useCallback(() => refreshNewest(true), [refreshNewest]);
+  const revalidate = useCallback(() => refreshNewest(false), [refreshNewest]);
 
   return useMemo(
     () => ({
@@ -473,8 +482,9 @@ function useBoundedActivityQuery<Page extends ActivityPageData>(
       failure,
       loadMore,
       refresh,
+      revalidate,
     }),
-    [failure, loadMore, pages, query.error, query.isPending, refresh],
+    [failure, loadMore, pages, query.error, query.isPending, refresh, revalidate],
   );
 }
 
@@ -663,9 +673,9 @@ const ActivityPanelBinding = memo(function ActivityPanelBinding({
   const detailQuery = useBoundedActivityQuery(detailQueryKey, detailAtomForCursor);
   const refreshQueriesRef = useRef<() => void>(() => undefined);
   refreshQueriesRef.current = () => {
-    activeRoster.refresh();
-    doneRoster.refresh();
-    detailQuery.refresh();
+    activeRoster.revalidate();
+    doneRoster.revalidate();
+    detailQuery.revalidate();
   };
   const refreshTimerRef = useRef<ReturnType<typeof globalThis.setTimeout> | null>(null);
   useEffect(() => {

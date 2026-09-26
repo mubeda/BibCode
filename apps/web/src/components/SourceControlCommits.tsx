@@ -57,7 +57,7 @@ export function SourceControlCommits({
     if (!expanded) return;
     setPreviousPages([]);
     setCursor(null);
-    query.refresh();
+    query.revalidate();
   }, [reloadToken, expanded]);
 
   const currentPage = query.data?.commits ?? [];

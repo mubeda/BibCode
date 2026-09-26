@@ -216,7 +216,11 @@ credential authenticates anywhere; when it is absent the credential is already
 active — which is also how a new client interoperates with servers that
 predate the confirmation flow. A returning device sends
 `{"type":"e2ee_auth","bearer":"<stored credential>"}` and receives an
-`e2ee_authenticated` acknowledgement. Invalid credentials receive
+`e2ee_authenticated` acknowledgement. Either form may carry
+`"features":["interleave-v1"]`; the server then confirms the same list in
+`e2ee_authenticated` and may send stand-alone `0x02` control records between
+the records of a large message. Without the confirmation, control messages
+overtake queued data only between whole messages. Invalid credentials receive
 `e2ee_error/unauthorized`; malformed protocol receives `e2ee_error/protocol`;
 both paths close the socket.
 
@@ -311,15 +315,20 @@ frame owns those permits
 through Noise record encryption and every successful or failed WebSocket
 write;
 generic queue capacity therefore cannot hide additional plaintext. Unary
-results, stream chunks, handler-error terminals, RPC ping/pong control
-messages, protocol errors, and defects use the same admission path. Interrupts
-bypass byte admission through a non-blocking control lane, and when a budgeted
-terminal or unary response loses its admission deadline the session delivers an
-explicit unbudgeted `RpcOutboundAdmissionError` terminal instead of ending the
-request silently; both bypasses are bounded by the 64-request in-flight cap at
-one small control message per request. WebSocket-level ping/pong frames are
+results, stream chunks, handler-error terminals, and defects use the same
+admission path. RPC `Pong`, interrupt exits, `RpcOutboundAdmissionError`
+terminals, and client protocol errors bypass byte admission through the
+connection writer's bounded control lane, which holds one small control message
+per in-flight request plus room for Pongs; a full lane drops a `Pong` instead
+of ending the read loop. When a budgeted terminal or unary response loses its
+admission deadline, the session delivers that explicit `RpcOutboundAdmissionError`
+terminal instead of ending the request silently. A control message larger than
+one record keeps ordinary byte admission on the data queue and still never
+counts as write progress. WebSocket-level ping/pong frames are
 transport control and carry no RPC plaintext. A response larger than the
-64 MiB connection cap fails the session closed immediately; otherwise both
+64 MiB connection cap fails only its own request with a typed
+`RpcResponseTooLargeError { method, bytes, limitBytes }`, and the session stays
+open; otherwise both
 connection and process byte admission plus the bounded 64-entry response queue
 share one absolute five-second admission deadline. Granting is push-based:
 waiters sleep on their own grant channel and every release runs one fit-first
@@ -331,12 +340,19 @@ traffic therefore cannot starve a large response, and the resulting pause for
 younger waiters is bounded by the front waiter's own size rather than being an
 open-ended blockade. Cancellation removes the waiter and refunds both a
 concurrently granted reservation and any accumulated aged-head reservation
-exactly once. Each Noise record then receives a fresh five-second
-WebSocket-sink progress deadline, while the whole logical message is bounded
-by five seconds plus one second per 64 KiB of plaintext. Records remain
-serialized, and the pump retains its one-second join bound.
+exactly once. The connection's one writer task encrypts and writes one record
+at a time: each Noise record must be accepted by the socket within 20 seconds,
+and the whole logical message within 30 seconds plus its size at 16 KiB/s. When
+either deadline passes, the writer ends the session at once.
 Dropping a queued, cancelled, rejected, serialization-failed, encryption-failed,
 or write-failed frame releases its single permit set without double accounting.
+
+An E2EE socket follows the shared heartbeat rule in
+[RPC and orchestration](./rpc-and-orchestration.md#wire-protocol) once
+`e2ee_authenticated` is sent (pre-auth keeps its 10-second deadline): a
+WebSocket Ping every 15 seconds between records, and reaping after 45 seconds
+without an inbound frame or a data write that waited on the peer, checked every 5 seconds. Reaping
+an E2EE session frees its permits, live-connection row, and subscriptions.
 
 Together, these limits preserve the 65,535-byte ciphertext record ceiling,
 65,518-byte plaintext chunk size, and 64 MiB logical-message contract.

@@ -259,13 +259,22 @@ export function PullRequestsPanel({ projectRef, number, tab }: PullRequestsPanel
       usePullRequestsStore.getState().setLastNumber({ environmentId, projectId }, number);
   }, [environmentId, number, projectId]);
   const refreshContext = query.refresh;
+  const revalidateContext = query.revalidate;
   // Rescan and auth recovery bypass the server's bounded context caches; opening the
   // panel and switching checkout reuse them.
-  const rescanContext = useCallback(() => {
+  const requestContextRescan = useCallback(() => {
     if (cwd !== null)
       pullRequestsEnvironment.requestContextRescan({ environmentId, input: { cwd } });
+  }, [cwd, environmentId]);
+  const rescanContext = useCallback(() => {
+    requestContextRescan();
     refreshContext();
-  }, [cwd, environmentId, refreshContext]);
+  }, [refreshContext, requestContextRescan]);
+  // Auth recovery follows a read failure automatically, so it keeps a cut-off latched.
+  const recoverContext = useCallback(() => {
+    requestContextRescan();
+    revalidateContext();
+  }, [requestContextRescan, revalidateContext]);
   const rescan = () => {
     rescanContext();
     catalog.refresh();
@@ -349,7 +358,7 @@ export function PullRequestsPanel({ projectRef, number, tab }: PullRequestsPanel
       </div>
     );
   return (
-    <PullRequestsContextRefresh value={rescanContext}>
+    <PullRequestsContextRefresh value={recoverContext}>
       <AvailablePullRequests
         key={JSON.stringify([
           storeKey,

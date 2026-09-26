@@ -232,11 +232,12 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
   );
   const refsQuery = useEnvironmentQuery(refsAtom);
   const signalQuery = useEnvironmentQuery(signalAtom);
-  const refreshRefs = refsQuery.refresh;
+  // Signals and finished operations are automatic reads: they keep a cut-off latched.
+  const revalidateRefs = refsQuery.revalidate;
   const signalGeneration = signalQuery.data?.generation ?? null;
   useEffect(() => {
-    if (signalGeneration !== null) refreshRefs();
-  }, [refreshRefs, signalGeneration]);
+    if (signalGeneration !== null) revalidateRefs();
+  }, [revalidateRefs, signalGeneration]);
 
   const snapshot: GitManagerRefsSnapshot | null = refsQuery.data ?? null;
   const localBranches = snapshot?.localBranches ?? EMPTY_BRANCHES;
@@ -320,7 +321,7 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
       const result = await handle.result;
       if (activeOperationRef.current === handle) activeOperationRef.current = null;
       setIsOperationRunning(false);
-      refreshRefs();
+      revalidateRefs();
       if (result._tag === "Failure") {
         if (Cause.hasInterruptsOnly(result.cause)) return false;
         const error = Cause.squash(result.cause);
@@ -337,7 +338,7 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
       }
       return result.value._tag === "finished";
     },
-    [environmentId, refreshRefs, registry],
+    [environmentId, revalidateRefs, registry],
   );
   const cancelOperation = useCallback(() => {
     const active = activeOperationRef.current;
@@ -785,7 +786,7 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
         scope={tagScope}
         tag={tagDialog.tag}
         targetSha={tagTargetSha}
-        onFinished={refreshRefs}
+        onFinished={revalidateRefs}
         onOpenChange={changeTagDialogOpen}
       />
       <GitManagerSwitchWithChangesDialog

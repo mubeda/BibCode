@@ -17,6 +17,7 @@ const h = vi.hoisted(() => ({
   navigate: vi.fn(),
   toast: vi.fn(),
   refresh: vi.fn(),
+  revalidate: vi.fn(),
   catalog: vi.fn(),
   error: null as string | null,
   loading: false,
@@ -38,6 +39,8 @@ vi.mock("../../state/query", () => ({
         }
       : null,
     refresh: h.refresh,
+    revalidate: h.revalidate,
+    requiresRetry: false,
     error: h.error,
     isPending: h.loading,
   }),
@@ -142,7 +145,9 @@ describe("PullRequestsCheckoutMenu", () => {
       environmentId: "env",
       input: { cwd: "/selected", number: 7, target: { kind: "checkout", cwd: "/selected" } },
     });
-    expect(h.refresh).toHaveBeenCalledOnce();
+    // A finished checkout re-reads the catalog automatically; Retry stays explicit.
+    expect(h.revalidate).toHaveBeenCalledOnce();
+    expect(h.refresh).not.toHaveBeenCalled();
     expect(h.navigate).not.toHaveBeenCalled();
     const toast = h.toast.mock.calls.at(-1)![0];
     expect(toast.title).toBe("Checked out feature in /selected");
@@ -197,6 +202,7 @@ describe("PullRequestsCheckoutMenu", () => {
     expect(toast.title).toBe("Checkout is blocked: held at /occupied.");
     expect(toast.actionProps.children).toBe("Switch to that worktree");
     expect(h.refresh).not.toHaveBeenCalled();
+    expect(h.revalidate).not.toHaveBeenCalled();
     await act(async () => toast.actionProps.onClick());
     expect(h.command.mock.calls[1]![0].input.target).toEqual({
       kind: "checkout",
@@ -343,6 +349,7 @@ describe("PullRequestsCheckoutMenu", () => {
     await act(async () => root.unmount());
     await act(async () => finish({ _tag: "Success", value: receipt }));
     expect(h.refresh).not.toHaveBeenCalled();
+    expect(h.revalidate).not.toHaveBeenCalled();
     expect(h.navigate).not.toHaveBeenCalled();
     expect(h.toast.mock.calls.at(-1)![0].actionProps.children).toBe("Open Git Manager there");
   });

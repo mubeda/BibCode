@@ -9,8 +9,10 @@ desktop bridge is reserved for host-native capabilities.
 `ConnectionResolver` first produces a `PreparedConnection`. Remote bearer and
 DPoP clients exchange their credential for a short-lived, one-purpose
 WebSocket ticket and put only `wsTicket` on the `/ws` URL. `RpcSessionFactory`
-then opens the socket, builds the Effect RPC client, and calls
-`server.getConfig`. The session is ready only after both steps succeed.
+then opens the socket, builds the Effect RPC client, and opens the connection's
+one `subscribeServerConfig` stream. The session is ready only after the socket
+opens and the first snapshot arrives; later config subscriptions on the same
+session replay that stream.
 
 Primary desktop/browser bootstraps may already have a host-authorized socket
 URL, but they enter the same session and RPC pipeline.
@@ -37,6 +39,57 @@ from the schema-only `WsRpcGroup`. The Rust mirror is
 Schemas validate payloads at the client boundary. The Rust session validates
 request IDs, registered method names, authorization scopes, cancellation, and
 stream flow before invoking handlers.
+
+Each connection has one writer task that owns the socket sink. It drains a
+bounded control lane before every queued message: RPC `Pong`, interrupt exits,
+`RpcOutboundAdmissionError` terminals, and client protocol errors (80 entries,
+one per in-flight request plus room for Pongs). A `Ping` never ends the read
+loop; when the lane is full its `Pong` is dropped, because the client's
+liveness counts any inbound data. Terminal output and other data never use the
+lane. Every write is bounded by progress: a record must be accepted within 20
+seconds, a whole frame within its message deadline, and every message within
+30 seconds plus its size at 16 KiB/s. When a deadline passes, the writer ends
+the session at once, so the socket closes instead of staying open and silent.
+
+Plain and E2EE sessions share one heartbeat rule. Once a socket is
+authenticated (plain `/ws` after the upgrade, E2EE after `e2ee_authenticated`),
+the heartbeat asks the writer for a WebSocket Ping every 15 seconds, which it
+sends between frames or records. Every inbound frame, including the browser's
+automatic Pong, counts as activity. A data write counts only if it had to wait at
+least 100 ms for the peer to drain the socket before it completed; a write the
+socket accepts at once, or after a brief internal handoff, proves nothing about
+the peer, so small frames the server keeps sending to a frozen client never move
+the silence origin. No control write (Ping, Pong, interrupt, admission terminal or
+protocol error) is data progress. The heartbeat checks every 5 seconds and ends the session after
+45 seconds without activity, so a stopped reader is reaped within 50 seconds.
+A check that fires more than 10 seconds late, because the process was suspended
+or starved, restarts the silence clock and pings at once instead of reaping.
+A client close with code 4408, the client's liveness timeout, is logged at info
+level; other client closes are logged at debug level.
+Inbound activity counts per complete frame, so a single plain request that
+takes longer than 45 s to arrive on an otherwise idle connection is reaped (and
+the client's own 30 s monitor ends it first); E2EE requests travel in records.
+[Remote environments](./remote.md#direct-connection-e2ee) covers what reaping
+releases on E2EE sessions.
+
+A plain `/ws` client may offer the WebSocket subprotocol
+`bibcode.rpc.chunked.v1`. When the server selects it, every RPC message over 64
+KiB leaves as binary frames, one record per frame, in the E2EE record format:
+`0x00` for the final record, `0x01` for a continuation, and `0x02` for a
+stand-alone control message sent between the records of another message, which
+the client returns without touching the partial message. Smaller messages stay
+whole text frames, requests are never split, and the limits are 64 MiB and
+2,048 records per message. Without the echoed subprotocol the server keeps
+today's whole text frames. E2EE sockets always use records; `0x02` control
+records are used there only when the client lists `interleave-v1` in
+`e2ee_auth` and the server confirms it.
+
+A response that does not fit the connection's message limit (64 MiB on E2EE and
+record-framed plain sockets) fails only its own request with a typed
+`RpcResponseTooLargeError { method, bytes, limitBytes }`; the session stays
+open. Clients decode it for every method through the client-runtime
+`RpcTransportErrors` middleware, and its message reads "This result is too large
+to send (<size>; limit 64 MiB)."
 
 ## Server composition
 

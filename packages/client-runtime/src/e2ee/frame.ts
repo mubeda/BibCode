@@ -2,6 +2,7 @@ import { MAX_NOISE_MESSAGE_BYTES, NOISE_TAG_BYTES } from "./noise.ts";
 
 export const E2EE_RECORD_FLAG_FINAL = 0x00;
 export const E2EE_RECORD_FLAG_CONTINUATION = 0x01;
+export const E2EE_RECORD_FLAG_CONTROL = 0x02;
 export const MAX_E2EE_CHUNK_BYTES = MAX_NOISE_MESSAGE_BYTES - NOISE_TAG_BYTES - 1;
 export const MAX_E2EE_LOGICAL_MESSAGE_BYTES = 64 * 1024 * 1024;
 export const MAX_E2EE_PREAUTH_MESSAGE_BYTES = 64 * 1024;
@@ -35,14 +36,21 @@ export const splitIntoRecords = (plaintext: Uint8Array): Array<Uint8Array> => [
   ...plaintextRecords(plaintext),
 ];
 
+export interface RecordAssemblerOptions {
+  /** Accept `0x02` stand-alone control records between the records of another message. */
+  readonly allowControlRecords?: boolean;
+}
+
 export class RecordAssembler {
   private parts: Array<Uint8Array> = [];
   private assembledBytes = 0;
   private recordCount = 0;
   private readonly maxMessageBytes: number;
+  private readonly allowControlRecords: boolean;
 
-  constructor(maxMessageBytes = MAX_E2EE_LOGICAL_MESSAGE_BYTES) {
+  constructor(maxMessageBytes = MAX_E2EE_LOGICAL_MESSAGE_BYTES, options?: RecordAssemblerOptions) {
     this.maxMessageBytes = maxMessageBytes;
+    this.allowControlRecords = options?.allowControlRecords ?? false;
   }
 
   push(recordPlaintext: Uint8Array): Uint8Array | null {
@@ -50,14 +58,25 @@ export class RecordAssembler {
 
     const flag = recordPlaintext[0];
     const chunk = recordPlaintext.subarray(1);
+    // Apply the existing 64 MiB / 2,048-record bounds before any early
+    // control return. The control itself is one complete record and does
+    // not mutate the in-progress data message.
     if (this.recordCount >= MAX_E2EE_RECORDS_PER_MESSAGE) {
       throw new E2eeFrameError("E2EE record count overflow");
     }
-    if (flag === E2EE_RECORD_FLAG_CONTINUATION && chunk.length === 0) {
-      throw new E2eeFrameError("empty E2EE continuation");
-    }
     if (this.assembledBytes + chunk.length > this.maxMessageBytes) {
       throw new E2eeFrameError("E2EE reassembly overflow");
+    }
+    if (flag === E2EE_RECORD_FLAG_CONTROL && this.allowControlRecords) {
+      if (chunk.length > MAX_E2EE_CHUNK_BYTES) {
+        throw new E2eeFrameError("E2EE control record overflow");
+      }
+      if (chunk.length === 0) throw new E2eeFrameError("empty E2EE control record");
+      // A control message is complete in one record and leaves the partial message alone.
+      return chunk.slice();
+    }
+    if (flag === E2EE_RECORD_FLAG_CONTINUATION && chunk.length === 0) {
+      throw new E2eeFrameError("empty E2EE continuation");
     }
     this.recordCount += 1;
     if (flag === E2EE_RECORD_FLAG_CONTINUATION) {

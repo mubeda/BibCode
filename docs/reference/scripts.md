@@ -193,6 +193,12 @@ preservation in the documented native-architecture containers.
   lock automatically.
 - `vp run measure:desktop-runtime -- ...`: capture startup, memory, and
   process-tree measurements.
+- `node scripts/throttle-proxy.ts --listen <host:port> --target <host:port> --control <host:port> [--down <bytes/s>] [--up <bytes/s>]`:
+  development-only throttling TCP proxy for the
+  [slow-link liveness scenario](../testing/cross-platform-validation.md#slow-link-liveness-scenario).
+  Each direction is paced separately with backpressure; `GET /set?down=&up=&freeze=0|1`
+  on the control address changes the link (0 bytes/s is unlimited) and `GET /state`
+  reports it.
 - `node scripts/measure-vcs-runtime.ts`: on Windows, build and run the
   current-source server VCS idle-process measurement plus the production-Atom
   foreground queue benchmark. It defaults to 600 seconds and writes all

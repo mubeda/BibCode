@@ -164,7 +164,8 @@ export const GitManagerDiffPane = memo(function GitManagerDiffPane({
     [activeArea, cwd, environmentId, path],
   );
   const diffQuery = useEnvironmentQuery(diffAtom);
-  const refreshDiff = diffQuery.refresh;
+  // Stale selections and finished partial mutations re-read automatically; no explicit Retry here.
+  const revalidateDiff = diffQuery.revalidate;
   const diff = diffQuery.data;
   const patch = diff?._tag === "patch" ? diff.patch : null;
   const renderablePatch = useMemo(
@@ -261,11 +262,11 @@ export const GitManagerDiffPane = memo(function GitManagerDiffPane({
           squashAtomCommandFailure(result),
         );
         setMutationError(resolution.message);
-        if (resolution.stale) refreshDiff();
+        if (resolution.stale) revalidateDiff();
         return;
       }
       setLineSelection(projectRef, path, null);
-      refreshDiff();
+      revalidateDiff();
     } finally {
       partialBusyRef.current = false;
       setPartialBusy(false);
@@ -277,7 +278,7 @@ export const GitManagerDiffPane = memo(function GitManagerDiffPane({
     generation,
     path,
     projectRef,
-    refreshDiff,
+    revalidateDiff,
     selectable,
     setLineSelection,
     stagePartial,
@@ -288,8 +289,8 @@ export const GitManagerDiffPane = memo(function GitManagerDiffPane({
   }, []);
   const handleDiscardCompleted = useCallback(() => {
     setLineSelection(projectRef, path, null);
-    refreshDiff();
-  }, [path, projectRef, refreshDiff, setLineSelection]);
+    revalidateDiff();
+  }, [path, projectRef, revalidateDiff, setLineSelection]);
   const disabledReason = mutationBusy
     ? "A commit is in progress."
     : partialBusy
@@ -431,7 +432,7 @@ export const GitManagerDiffPane = memo(function GitManagerDiffPane({
           selection={pendingDiscard.selection}
           onCompleted={handleDiscardCompleted}
           onOpenChange={handleDiscardOpenChange}
-          onStale={refreshDiff}
+          onStale={revalidateDiff}
         />
       )}
     </section>

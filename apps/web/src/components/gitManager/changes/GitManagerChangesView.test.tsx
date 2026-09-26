@@ -70,6 +70,8 @@ vi.mock("../../../state/gitManager", () => ({
 vi.mock("../../../state/query", () => ({
   useEnvironmentQuery: (atom: { kind?: string } | null) => {
     const kind = atom?.kind;
+    const refresh =
+      kind === "refs" ? h.refreshRefs : kind === "commits" ? h.refreshCommits : () => undefined;
     const data =
       kind === "status"
         ? h.status
@@ -88,8 +90,10 @@ vi.mock("../../../state/query", () => ({
           : { _tag: data === null ? "Initial" : "Success", waiting: data === null },
       error: kind === "status" ? h.statusError : null,
       isPending: data === null,
-      refresh:
-        kind === "refs" ? h.refreshRefs : kind === "commits" ? h.refreshCommits : () => undefined,
+      refresh,
+      // Automatic re-reads measure through the same spies.
+      revalidate: refresh,
+      requiresRetry: false,
     };
   },
 }));

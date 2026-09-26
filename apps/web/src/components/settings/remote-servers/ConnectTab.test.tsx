@@ -90,6 +90,8 @@ const h = vi.hoisted(() => {
       error: null as string | null,
       isPending: false,
       refresh: vi.fn(),
+      revalidate: vi.fn(),
+      requiresRetry: false,
     },
     networkAccessQuery: {
       data: null as unknown,
@@ -937,12 +939,15 @@ function updateCapableConfig() {
 }
 
 function settledUpdateQuery(data: unknown) {
+  const refresh = vi.fn();
   return {
     data,
     emission: AsyncResult.success(data),
     error: null,
     isPending: false,
-    refresh: vi.fn(),
+    refresh,
+    revalidate: refresh,
+    requiresRetry: false,
   };
 }
 
@@ -1076,6 +1081,8 @@ beforeEach(() => {
     error: null,
     isPending: false,
     refresh: vi.fn(),
+    revalidate: vi.fn(),
+    requiresRetry: false,
   };
   h.networkAccessQuery = { data: null, error: null, isPending: false, refresh: vi.fn() };
   h.sshHostsQuery = { data: null, error: null, isPending: false, refresh: vi.fn() };
@@ -2087,6 +2094,77 @@ describe("Remote Servers tabs", () => {
       });
       expect(refresh).toHaveBeenCalledOnce();
       expect(h.commands.remoteUpdateCheck).not.toHaveBeenCalled();
+    });
+
+    it("re-reads each status after Check for Server Updates without clearing a cut-off latch", async () => {
+      stubBrowserWindow();
+      h.hasCloudConfig = false;
+      const environmentId = EnvironmentId.make("env-fan-out");
+      h.environments = [
+        environment({
+          id: environmentId,
+          label: "Fan-out server",
+          connection: { phase: "connected" },
+          serverConfig: updateCapableConfig(),
+        }),
+      ];
+      const refresh = vi.fn();
+      const revalidate = vi.fn();
+      h.remoteUpdateQueries.set(environmentId, {
+        ...settledUpdateQuery(UP_TO_DATE_SNAPSHOT),
+        refresh,
+        revalidate,
+        requiresRetry: true,
+      });
+
+      await mountConnections(<ConnectTab showServerUpdateCheck />);
+      await act(async () => {
+        clickButton("Check for Server Updates");
+        await flush();
+      });
+
+      expect(h.commands.remoteUpdateCheck).toHaveBeenCalledExactlyOnceWith({
+        environmentId,
+        input: {},
+      });
+      // The fan-out's epoch is automatic: only the row's Retry may clear the latch.
+      expect(revalidate).toHaveBeenCalledOnce();
+      expect(refresh).not.toHaveBeenCalled();
+    });
+
+    it("re-reads the status after a row Check without clearing a cut-off latch", async () => {
+      stubBrowserWindow();
+      h.hasCloudConfig = false;
+      const environmentId = EnvironmentId.make("env-row-check");
+      h.environments = [
+        environment({
+          id: environmentId,
+          label: "Row check server",
+          connection: { phase: "connected" },
+          serverConfig: updateCapableConfig(),
+        }),
+      ];
+      const refresh = vi.fn();
+      const revalidate = vi.fn();
+      h.remoteUpdateQueries.set(environmentId, {
+        ...settledUpdateQuery(UP_TO_DATE_SNAPSHOT),
+        refresh,
+        revalidate,
+        requiresRetry: true,
+      });
+
+      await mountConnections(<ConnectTab />);
+      await act(async () => {
+        clickButton("Check");
+        await flush();
+      });
+
+      expect(h.commands.remoteUpdateCheck).toHaveBeenCalledExactlyOnceWith({
+        environmentId,
+        input: {},
+      });
+      expect(revalidate).toHaveBeenCalledOnce();
+      expect(refresh).not.toHaveBeenCalled();
     });
 
     it("says a host has not checked yet and keeps Check usable during background re-reads", () => {
@@ -3128,7 +3206,11 @@ describe("Remote Servers tabs", () => {
 
     const markup = render();
 
-    expect(markup.match(/Connecting…/gu)).toHaveLength(2);
+    // Both in-progress rows label their action "Connecting…", and the connecting row's
+    // status copy now uses the same ellipsis character.
+    expect(findControls("button", "Connecting…")).toHaveLength(2);
+    expect(markup.match(/Connecting…/gu)).toHaveLength(5);
+    expect(markup).not.toContain("Connecting...");
     expect(markup).toContain("Connection failed. Reason: Error: transport failed");
     expect(markup).not.toContain("Copy trace ID");
     expect(markup).toContain("SSH build-host.internal");

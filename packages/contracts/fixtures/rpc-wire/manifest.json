@@ -1289,6 +1289,7 @@
     "exit-defect.json",
     "exit-failure.json",
     "exit-interrupt.json",
+    "exit-response-too-large.json",
     "exit-stream-success.json",
     "exit-success.json",
     "interrupt.json",

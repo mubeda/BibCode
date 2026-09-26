@@ -36,8 +36,8 @@ use crate::{
     production::http_routes::{self, HttpRoutesState},
     remote_update::RemoteUpdateSupport,
     rpc::{
-        E2eePreauthAdmission, MAX_E2EE_CIPHERTEXT_BYTES, RpcRegistry, RpcSessionContext,
-        run_session,
+        CHUNKED_RPC_SUBPROTOCOL, E2eePreauthAdmission, MAX_E2EE_CIPHERTEXT_BYTES, RpcRegistry,
+        RpcSessionContext, run_session,
     },
 };
 
@@ -223,6 +223,7 @@ async fn websocket(
     let session_shutdown = state.shutdown.child_token();
     if state.config.unsafe_no_auth {
         return upgrade
+            .protocols([CHUNKED_RPC_SUBPROTOCOL])
             .max_frame_size(MAX_PLAIN_WEBSOCKET_FRAME_BYTES)
             .max_message_size(MAX_PLAIN_WEBSOCKET_MESSAGE_BYTES)
             .on_upgrade(move |socket| {
@@ -242,6 +243,7 @@ async fn websocket(
             let expires_at_ms = principal.expires_at_ms;
             let rpc_context = RpcSessionContext::authenticated(principal, auth.clone());
             upgrade
+                .protocols([CHUNKED_RPC_SUBPROTOCOL])
                 .max_frame_size(MAX_PLAIN_WEBSOCKET_FRAME_BYTES)
                 .max_message_size(MAX_PLAIN_WEBSOCKET_MESSAGE_BYTES)
                 .on_upgrade(move |socket| async move {

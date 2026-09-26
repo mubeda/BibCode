@@ -9,7 +9,7 @@ use std::{
 use std::ops::AsyncFnMut;
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
-use futures_util::{Sink, SinkExt, StreamExt, stream};
+use futures_util::{SinkExt, StreamExt, stream};
 use serde::Deserialize;
 use serde_json::json;
 use thiserror::Error;
@@ -17,7 +17,7 @@ use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
     time::{Instant, timeout, timeout_at},
 };
-use tokio_util::sync::{CancellationToken, PollSender};
+use tokio_util::sync::CancellationToken;
 
 use super::{
     RpcRegistry, RpcSessionContext,
@@ -26,9 +26,10 @@ use super::{
         WeightedByteGrant,
     },
     session::{
-        PUMP_JOIN_TIMEOUT, PairingConfirmationLatch, RpcInboundFrame, RpcOutboundFrame,
-        SOCKET_WRITE_TIMEOUT, run_session_split_budgeted,
+        PUMP_JOIN_TIMEOUT, PairingConfirmationLatch, RpcInboundFrame, SOCKET_WRITE_TIMEOUT,
+        run_session_split_budgeted,
     },
+    transport::{ConnectionLiveness, E2EE_INTERLEAVE_FEATURE, OutboundFraming, log_peer_close},
 };
 use crate::{
     auth::{
@@ -80,7 +81,7 @@ pub(crate) const E2EE_INBOUND_BUFFER_BUDGET_BYTES_PER_PRINCIPAL: usize = 64 * 10
 pub(crate) const E2EE_OUTBOUND_BUFFER_BUDGET_BYTES: usize = 128 * 1024 * 1024;
 pub(crate) const E2EE_OUTBOUND_BUFFER_BUDGET_BYTES_PER_CONNECTION: usize = 64 * 1024 * 1024;
 
-struct PlaintextRecords<'a> {
+pub(super) struct PlaintextRecords<'a> {
     plaintext: &'a [u8],
     offset: usize,
     emitted_empty: bool,
@@ -115,7 +116,9 @@ impl<'a> Iterator for PlaintextRecords<'a> {
     }
 }
 
-fn plaintext_records(plaintext: &[u8]) -> Result<PlaintextRecords<'_>, E2eeSessionError> {
+pub(super) fn plaintext_records(
+    plaintext: &[u8],
+) -> Result<PlaintextRecords<'_>, E2eeSessionError> {
     if plaintext.len() > MAX_E2EE_LOGICAL_MESSAGE_BYTES {
         return Err(E2eeSessionError::Protocol(
             "outbound message too large".into(),
@@ -678,7 +681,11 @@ impl E2eeChannel {
             .collect()
     }
 
-    fn encrypt_record(&mut self, flag: u8, chunk: &[u8]) -> Result<Vec<u8>, E2eeSessionError> {
+    pub(super) fn encrypt_record(
+        &mut self,
+        flag: u8,
+        chunk: &[u8],
+    ) -> Result<Vec<u8>, E2eeSessionError> {
         let mut record = Vec::with_capacity(1 + chunk.len());
         record.push(flag);
         record.extend_from_slice(chunk);
@@ -793,10 +800,24 @@ pub(crate) struct E2eeAuthMessage {
     pub pairing: Option<String>,
     #[serde(default)]
     pub bearer: Option<String>,
+    /// Channel features the client supports; older clients send none.
+    #[serde(default)]
+    pub features: Vec<String>,
 }
 
-pub(crate) fn e2ee_authenticated_json() -> Vec<u8> {
-    serde_json::to_vec(&json!({ "type": "e2ee_authenticated" })).expect("static JSON")
+fn confirm_features(reply: &mut serde_json::Value, interleave: bool) {
+    if interleave {
+        reply
+            .as_object_mut()
+            .expect("static authenticated reply is an object")
+            .insert("features".to_owned(), json!([E2EE_INTERLEAVE_FEATURE]));
+    }
+}
+
+pub(crate) fn e2ee_authenticated_json(interleave: bool) -> Vec<u8> {
+    let mut reply = json!({ "type": "e2ee_authenticated" });
+    confirm_features(&mut reply, interleave);
+    serde_json::to_vec(&reply).expect("static JSON")
 }
 
 pub(crate) fn e2ee_authenticated_with_credential_json(
@@ -804,6 +825,7 @@ pub(crate) fn e2ee_authenticated_with_credential_json(
     environment_id: &str,
     storage_instance_id: Option<&str>,
     pairing_confirmation_required: bool,
+    interleave: bool,
 ) -> Vec<u8> {
     let mut reply = json!({
         "type": "e2ee_authenticated",
@@ -828,6 +850,7 @@ pub(crate) fn e2ee_authenticated_with_credential_json(
                 serde_json::Value::Bool(true),
             );
     }
+    confirm_features(&mut reply, interleave);
     serde_json::to_vec(&reply).expect("static JSON")
 }
 
@@ -904,6 +927,7 @@ enum EstablishOutcome {
     Accepted {
         channel: E2eeChannel,
         admission: EstablishedE2eeAdmission,
+        interleave: bool,
     },
     Rejected {
         channel: E2eeChannel,
@@ -969,6 +993,10 @@ pub(crate) async fn run_e2ee_session(
                 code: "protocol",
             });
         }
+        let interleave = message
+            .features
+            .iter()
+            .any(|feature| feature == E2EE_INTERLEAVE_FEATURE);
 
         let established_reservation = match E2EE_RESOURCE_BUDGET.try_reserve() {
             Ok(reservation) => reservation,
@@ -1049,9 +1077,10 @@ pub(crate) async fn run_e2ee_session(
                 &config.environment_id,
                 storage_instance_id.as_deref(),
                 minted.delivery_guard.is_some(),
+                interleave,
             ),
             E2eeAccept::Authenticated { minted: None, .. } | E2eeAccept::Unauthenticated => {
-                e2ee_authenticated_json()
+                e2ee_authenticated_json(interleave)
             }
         };
         send_encrypted_frames(&mut ws_writer, &mut channel, &reply).await?;
@@ -1061,13 +1090,18 @@ pub(crate) async fn run_e2ee_session(
                 accept,
                 _permit: established_permit,
             },
+            interleave,
         })
     })
     .await;
     drop(preauth_permit);
 
-    let (channel, admission) = match established {
-        Ok(Ok(EstablishOutcome::Accepted { channel, admission })) => (channel, admission),
+    let (channel, admission, interleave) = match established {
+        Ok(Ok(EstablishOutcome::Accepted {
+            channel,
+            admission,
+            interleave,
+        })) => (channel, admission, interleave),
         Ok(Ok(EstablishOutcome::Rejected { mut channel, code })) => {
             let _ =
                 send_encrypted_frames(&mut ws_writer, &mut channel, &e2ee_error_json(code)).await;
@@ -1094,6 +1128,7 @@ pub(crate) async fn run_e2ee_session(
         ws_reader,
         channel,
         admission,
+        interleave,
         auth,
         registry,
         session_shutdown,
@@ -1129,48 +1164,23 @@ async fn send_encrypted_frames(
     Ok(())
 }
 
-async fn send_established_encrypted_message<W>(
-    writer: &mut W,
-    channel: &Arc<Mutex<E2eeChannel>>,
-    plaintext: &[u8],
-    started_at: Instant,
-) -> Result<(), E2eeSessionError>
-where
-    W: Sink<Message> + Unpin,
-{
-    let size_seconds = plaintext
-        .len()
-        .div_ceil(E2EE_LOGICAL_WRITE_BYTES_PER_SECOND);
-    let size_allowance = Duration::from_secs(u64::try_from(size_seconds).unwrap_or(u64::MAX));
-    let aggregate_deadline = started_at
-        .checked_add(SOCKET_WRITE_TIMEOUT.saturating_add(size_allowance))
-        .ok_or(E2eeSessionError::Timeout)?;
-    for (flag, chunk) in plaintext_records(plaintext)? {
-        let frame = channel
-            .lock()
-            .expect("E2EE channel lock")
-            .encrypt_record(flag, chunk)?;
-        let record_deadline = Instant::now() + SOCKET_WRITE_TIMEOUT;
-        timeout_at(
-            record_deadline.min(aggregate_deadline),
-            writer.send(Message::Binary(frame.into())),
-        )
-        .await
-        .map_err(|_| E2eeSessionError::Timeout)?
-        .map_err(|_| E2eeSessionError::Closed)?;
-    }
-    Ok(())
-}
-
-async fn run_established_e2ee(
-    mut ws_writer: futures_util::stream::SplitSink<WebSocket, Message>,
-    mut ws_reader: futures_util::stream::SplitStream<WebSocket>,
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Explicit authenticated transport handoff"
+)]
+async fn run_established_e2ee<W, R>(
+    mut ws_writer: W,
+    mut ws_reader: R,
     channel: E2eeChannel,
     admission: EstablishedE2eeAdmission,
+    interleave: bool,
     auth: AuthService,
     registry: RpcRegistry,
     session_shutdown: CancellationToken,
-) {
+) where
+    W: futures_util::Sink<Message> + Unpin + Send + 'static,
+    R: futures_util::Stream<Item = Result<Message, axum::Error>> + Unpin + Send + 'static,
+{
     let EstablishedE2eeAdmission {
         accept,
         _permit: established_permit,
@@ -1235,36 +1245,10 @@ async fn run_established_e2ee(
     let principal_inbound_permits = established_permit.principal_inbound();
     let global_inbound_permits = E2EE_RESOURCE_BUDGET.global_inbound();
     let channel = Arc::new(Mutex::new(channel));
-    let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<RpcOutboundFrame>(64);
+    let liveness = ConnectionLiveness::new();
+    let inbound_liveness = Arc::clone(&liveness);
     let (inbound_tx, inbound_rx) =
         tokio::sync::mpsc::channel::<Result<RpcInboundFrame, axum::Error>>(64);
-
-    let outbound_shutdown = session_shutdown.clone();
-    let outbound_channel = Arc::clone(&channel);
-    let outbound_pump = tokio::spawn(async move {
-        while let Some(outbound) = outbound_rx.recv().await {
-            let (message, _outbound_budget) = outbound.into_parts();
-            let plaintext = match &message {
-                Message::Text(text) => text.as_bytes(),
-                Message::Binary(bytes) => bytes.as_ref(),
-                Message::Close(_) => break,
-                Message::Ping(_) | Message::Pong(_) => continue,
-            };
-            if send_established_encrypted_message(
-                &mut ws_writer,
-                &outbound_channel,
-                plaintext,
-                Instant::now(),
-            )
-            .await
-            .is_err()
-            {
-                break;
-            }
-        }
-        let _ = timeout(SOCKET_WRITE_TIMEOUT, ws_writer.close()).await;
-        outbound_shutdown.cancel();
-    });
 
     let inbound_shutdown = session_shutdown.clone();
     let inbound_channel = Arc::clone(&channel);
@@ -1303,6 +1287,9 @@ async fn run_established_e2ee(
                     }
                 }
             };
+            if frame.is_ok() {
+                inbound_liveness.record_inbound();
+            }
             let message = match frame {
                 Ok(Message::Binary(bytes)) => {
                     let record = {
@@ -1382,7 +1369,11 @@ async fn run_established_e2ee(
                     }
                 }
                 Ok(Message::Ping(_) | Message::Pong(_)) => continue,
-                Ok(Message::Close(_)) | Err(_) | Ok(Message::Text(_)) => break,
+                Ok(Message::Close(close)) => {
+                    log_peer_close(close.as_ref());
+                    break;
+                }
+                Err(_) | Ok(Message::Text(_)) => break,
             };
             if inbound_tx.send(Ok(message)).await.is_err() {
                 break;
@@ -1391,12 +1382,18 @@ async fn run_established_e2ee(
         inbound_shutdown.cancel();
     });
 
-    let writer_sink = PollSender::new(outbound_tx);
     let reader_stream = stream::unfold(inbound_rx, |mut receiver| async {
         receiver.recv().await.map(|item| (item, receiver))
     });
+    // The session's writer task owns the socket sink and encrypts one record
+    // at a time, so control records can overtake a large message.
     run_session_split_budgeted(
-        writer_sink,
+        ws_writer,
+        OutboundFraming::Encrypted {
+            channel: Arc::clone(&channel),
+            interleave,
+        },
+        liveness,
         reader_stream,
         registry,
         context,
@@ -1412,7 +1409,6 @@ async fn run_established_e2ee(
     if let Some(expiration_guard) = expiration_guard {
         let _ = expiration_guard.await;
     }
-    reap_pump(outbound_pump).await;
     reap_pump(inbound_pump).await;
     if let Some(connection_guard) = connection_guard {
         connection_guard.close().await;
@@ -1470,10 +1466,9 @@ struct InboundAssemblyState {
     progress_deadline: Instant,
 }
 
-/// One absolute deadline per logical inbound message: the base write timeout
-/// plus one second per 64 KiB received, mirroring the outbound size-derived
-/// deadline. Compliant senders at or above the floor rate always fit; total
-/// pool occupancy per message stays bounded.
+/// Absolute inbound assembly bound: the five-second base plus one second
+/// per 64 KiB received. This inbound resource limit is independent of the
+/// outbound writer's 30-second base and 16 KiB/s floor.
 fn inbound_assembly_deadline(started_at: Instant, received_bytes: usize) -> Instant {
     let size_seconds = received_bytes.div_ceil(E2EE_LOGICAL_WRITE_BYTES_PER_SECOND);
     let allowance = Duration::from_secs(u64::try_from(size_seconds).unwrap_or(u64::MAX));
@@ -1976,10 +1971,15 @@ mod tests {
 
     #[test]
     fn pairing_reply_omits_an_absent_storage_identity() {
-        let absent = serde_json::from_slice::<serde_json::Value>(
-            &e2ee_authenticated_with_credential_json("credential", "environment", None, true),
-        )
-        .expect("absent storage reply");
+        let absent =
+            serde_json::from_slice::<serde_json::Value>(&e2ee_authenticated_with_credential_json(
+                "credential",
+                "environment",
+                None,
+                true,
+                false,
+            ))
+            .expect("absent storage reply");
         assert!(absent.get("storageInstanceId").is_none());
 
         let present =
@@ -1988,9 +1988,236 @@ mod tests {
                 "environment",
                 Some("storage"),
                 true,
+                false,
             ))
             .expect("present storage reply");
         assert_eq!(present["storageInstanceId"], "storage");
+    }
+
+    #[test]
+    fn authenticated_replies_confirm_interleave_only_when_requested() {
+        let plain: serde_json::Value =
+            serde_json::from_slice(&e2ee_authenticated_json(false)).expect("plain reply");
+        assert!(plain.get("features").is_none());
+        let interleaved: serde_json::Value =
+            serde_json::from_slice(&e2ee_authenticated_json(true)).expect("interleaved reply");
+        assert_eq!(interleaved["features"], json!(["interleave-v1"]));
+        let minted: serde_json::Value =
+            serde_json::from_slice(&e2ee_authenticated_with_credential_json(
+                "credential",
+                "environment",
+                None,
+                false,
+                true,
+            ))
+            .expect("minted reply");
+        assert_eq!(minted["features"], json!(["interleave-v1"]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn interleave_sends_control_records_between_encrypted_records() {
+        let (mut initiator, responder) = establish().await;
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let sink_recorded = Arc::clone(&recorded);
+        let sink = Box::pin(futures_util::sink::unfold(
+            (),
+            move |(), message: Message| {
+                let recorded = Arc::clone(&sink_recorded);
+                async move {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    recorded.lock().expect("recorded frames").push(message);
+                    Ok::<_, std::convert::Infallible>(())
+                }
+            },
+        ));
+        let (data_sender, data) = tokio::sync::mpsc::channel(4);
+        let (control_sender, control) =
+            tokio::sync::mpsc::channel(super::super::transport::CONTROL_LANE_CAPACITY);
+        data_sender
+            .try_send(encrypted_response(MAX_E2EE_CHUNK_BYTES * 4))
+            .expect("queue frame");
+        let writer = tokio::spawn(super::super::transport::run_writer(
+            sink,
+            OutboundFraming::Encrypted {
+                channel: Arc::new(Mutex::new(responder)),
+                interleave: true,
+            },
+            ConnectionLiveness::new(),
+            data,
+            control,
+            CancellationToken::new(),
+        ));
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        control_sender
+            .try_send(crate::rpc::ServerMessage::Pong)
+            .expect("queue pong");
+        drop(data_sender);
+        writer.await.expect("writer joins");
+
+        let mut flags = Vec::new();
+        let mut control_plaintext = Vec::new();
+        for message in recorded.lock().expect("recorded frames").iter() {
+            let Message::Binary(frame) = message else {
+                panic!("encrypted records are binary");
+            };
+            let mut plaintext = vec![0_u8; MAX_E2EE_CIPHERTEXT_BYTES];
+            let len = initiator
+                .transport
+                .read_message(frame, &mut plaintext)
+                .expect("decrypt record");
+            flags.push(plaintext[0]);
+            if plaintext[0] == super::super::transport::RECORD_FLAG_CONTROL {
+                control_plaintext = plaintext[1..len].to_vec();
+            }
+        }
+        let control_at = flags
+            .iter()
+            .position(|flag| *flag == super::super::transport::RECORD_FLAG_CONTROL)
+            .expect("a control record");
+        assert!(control_at > 0 && control_at < flags.len() - 1, "{flags:?}");
+        assert_eq!(control_plaintext, br#"{"_tag":"Pong"}"#);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_reap_releases_permits_live_row_and_subscriptions() {
+        let config = ServerConfig::new(".")
+            .with_bind("127.0.0.1", 3773)
+            .with_desktop("desktop-test-seed")
+            .expect("config");
+        let auth = AuthService::new(&config, vec![7_u8; 32]);
+        let issued = timeout(
+            Duration::from_secs(1),
+            auth.exchange_bootstrap(
+                "desktop-test-seed",
+                None,
+                e2ee_client_metadata(),
+                None,
+                SessionTransport::E2ee,
+            ),
+        )
+        .await
+        .expect("bounded bootstrap")
+        .expect("session");
+        let principal = timeout(
+            Duration::from_secs(1),
+            auth.authenticate_token(&issued.token, SessionTransport::E2ee),
+        )
+        .await
+        .expect("bounded authentication")
+        .expect("principal");
+        let session_id = principal.session_id.clone();
+        let budget = E2eeResourceBudget::new(1, 1, 1024, 1024, 1024);
+        let permit = budget
+            .try_reserve()
+            .expect("global permit")
+            .bind_principal(&session_id)
+            .expect("principal permit");
+        let started = CancellationToken::new();
+        let closed = CancellationToken::new();
+        let mut registry = RpcRegistry::empty();
+        let handler_started = started.clone();
+        let handler_closed = closed.clone();
+        registry.register_stream("subscribeServerConfig", move |_, cancellation| {
+            let (sender, receiver) = tokio::sync::mpsc::channel(1);
+            let started = handler_started.clone();
+            let closed = handler_closed.clone();
+            tokio::spawn(async move {
+                started.cancel();
+                timeout(Duration::from_secs(55), cancellation.cancelled())
+                    .await
+                    .expect("bounded subscription cancellation");
+                timeout(Duration::from_secs(1), sender.closed())
+                    .await
+                    .expect("bounded subscription receiver closure");
+                closed.cancel();
+            });
+            receiver
+        });
+        let (mut initiator, channel) = timeout(Duration::from_secs(1), establish())
+            .await
+            .expect("bounded Noise setup");
+        let request = serde_json::json!({
+            "_tag": "Request", "id": "1", "tag": "subscribeServerConfig", "payload": {}, "headers": [],
+        })
+        .to_string();
+        let records = initiator_encrypt(&mut initiator, &[record(0x00, request.as_bytes())]);
+        let (inbound, receiver) = tokio::sync::mpsc::channel(1);
+        let reader = futures_util::stream::unfold(receiver, |mut receiver| async {
+            timeout(Duration::from_secs(60), receiver.recv())
+                .await
+                .ok()
+                .flatten()
+                .map(|frame| (Ok::<_, axum::Error>(frame), receiver))
+        });
+        let shutdown = CancellationToken::new();
+        let session = tokio::spawn(run_established_e2ee(
+            futures_util::sink::drain(),
+            Box::pin(reader),
+            channel,
+            EstablishedE2eeAdmission {
+                accept: E2eeAccept::Authenticated {
+                    principal,
+                    minted: None,
+                },
+                _permit: permit,
+            },
+            true,
+            auth.clone(),
+            registry,
+            shutdown,
+        ));
+        timeout(
+            Duration::from_secs(1),
+            inbound.send(Message::Binary(records[0].clone().into())),
+        )
+        .await
+        .expect("bounded request send")
+        .expect("watch request");
+        timeout(Duration::from_secs(1), started.cancelled())
+            .await
+            .expect("authorized stream handler starts");
+        assert_eq!(
+            timeout(
+                Duration::from_secs(1),
+                auth.live_connection_count_for_test(&session_id)
+            )
+            .await
+            .expect("bounded live-row read"),
+            1
+        );
+        assert!(
+            budget.try_reserve().is_err(),
+            "established permit held while live"
+        );
+        let frozen_at = Instant::now(); // keep reader open, deliver no more frames
+        let cleanup_deadline = frozen_at + Duration::from_secs(51);
+        timeout_at(cleanup_deadline, session)
+            .await
+            .expect("reaped within 50 s plus 1 s scheduling tolerance")
+            .expect("session joins");
+        timeout_at(cleanup_deadline, closed.cancelled())
+            .await
+            .expect("subscription receiver closed within the same freeze bound");
+        assert_eq!(
+            timeout_at(
+                cleanup_deadline,
+                auth.live_connection_count_for_test(&session_id)
+            )
+            .await
+            .expect("bounded live-row read"),
+            0,
+            "the live-connection row is gone"
+        );
+        assert!(
+            budget
+                .try_reserve()
+                .expect("global permit released")
+                .bind_principal(&session_id)
+                .is_ok(),
+            "principal permit released"
+        );
+        assert!(frozen_at.elapsed() <= Duration::from_secs(51));
+        drop(inbound);
     }
 
     #[tokio::test]
@@ -2019,92 +2246,99 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn outbound_logical_message_accepts_progress_across_record_deadlines() {
-        let (_initiator, responder) = establish().await;
-        let channel = Arc::new(Mutex::new(responder));
-        let mut writer = Box::pin(futures_util::sink::unfold(
+    fn encrypted_response(bytes: usize) -> crate::rpc::session::RpcOutboundFrame {
+        crate::rpc::session::RpcOutboundFrame::plain(crate::rpc::ServerMessage::success(
+            crate::rpc::RequestId::try_from("1").expect("request id"),
+            Some(json!({ "data": "x".repeat(bytes) })),
+        ))
+    }
+
+    /// Runs the shared writer over an encrypted channel with a sink that takes
+    /// `delay` per record, and reports the records, whether the session was
+    /// cancelled, and the elapsed time.
+    async fn run_encrypted_writer(
+        delay: Duration,
+        bytes: usize,
+    ) -> (SnowInitiator, Vec<Message>, bool, Duration) {
+        let (initiator, responder) = establish().await;
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let sink_recorded = Arc::clone(&recorded);
+        let sink = Box::pin(futures_util::sink::unfold(
             (),
-            |(), _message: Message| async move {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                Ok::<_, std::convert::Infallible>(())
+            move |(), message: Message| {
+                let recorded = Arc::clone(&sink_recorded);
+                async move {
+                    tokio::time::sleep(delay).await;
+                    recorded.lock().expect("recorded frames").push(message);
+                    Ok::<_, std::convert::Infallible>(())
+                }
             },
         ));
-        let plaintext = vec![b'x'; MAX_E2EE_CHUNK_BYTES * 6];
-        let started = tokio::time::Instant::now();
+        let (data_sender, data) = tokio::sync::mpsc::channel(4);
+        let (_control_sender, control) =
+            tokio::sync::mpsc::channel(super::super::transport::CONTROL_LANE_CAPACITY);
+        let shutdown = CancellationToken::new();
+        data_sender
+            .try_send(encrypted_response(bytes))
+            .expect("queue frame");
+        drop(data_sender);
+        let started = Instant::now();
+        super::super::transport::run_writer(
+            sink,
+            OutboundFraming::Encrypted {
+                channel: Arc::new(Mutex::new(responder)),
+                interleave: false,
+            },
+            ConnectionLiveness::new(),
+            data,
+            control,
+            shutdown.clone(),
+        )
+        .await;
+        let recorded = recorded.lock().expect("recorded frames").clone();
+        (
+            initiator,
+            recorded,
+            shutdown.is_cancelled(),
+            Instant::now() - started,
+        )
+    }
 
-        send_established_encrypted_message(&mut writer, &channel, &plaintext, started)
-            .await
-            .expect("record-level progress keeps the logical message alive");
-        assert_eq!(
-            tokio::time::Instant::now() - started,
-            Duration::from_secs(6)
+    #[tokio::test(start_paused = true)]
+    async fn encrypted_records_accept_progress_across_record_deadlines() {
+        let (_initiator, recorded, cancelled, elapsed) =
+            run_encrypted_writer(Duration::from_secs(1), MAX_E2EE_CHUNK_BYTES * 5).await;
+        assert!(!cancelled);
+        assert_eq!(recorded.len(), 6);
+        assert_eq!(elapsed, Duration::from_secs(6));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_encrypted_record_ends_the_session_after_twenty_seconds() {
+        let (_initiator, _recorded, cancelled, elapsed) =
+            run_encrypted_writer(Duration::from_secs(3_600), 1024).await;
+        assert!(cancelled);
+        assert_eq!(elapsed, Duration::from_secs(20));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_trickling_encrypted_sink_fails_the_message_deadline() {
+        // Three records at 19 s each; the message deadline is 30 s + ~8.5 s.
+        let (_initiator, _recorded, cancelled, elapsed) =
+            run_encrypted_writer(Duration::from_secs(19), 140_000).await;
+        assert!(cancelled);
+        assert!(
+            elapsed > Duration::from_secs(38) && elapsed < Duration::from_secs(39),
+            "the message deadline fires at about 38.5 s, not {elapsed:?}"
         );
     }
 
     #[tokio::test(start_paused = true)]
-    async fn outbound_logical_message_rejects_a_stalled_record() {
-        let (_initiator, responder) = establish().await;
-        let channel = Arc::new(Mutex::new(responder));
-        let mut writer = Box::pin(futures_util::sink::unfold(
-            (),
-            |(), _message: Message| async move {
-                tokio::time::sleep(Duration::from_secs(6)).await;
-                Ok::<_, std::convert::Infallible>(())
-            },
-        ));
-        let started = tokio::time::Instant::now();
-
-        assert!(matches!(
-            send_established_encrypted_message(&mut writer, &channel, b"stalled", started).await,
-            Err(E2eeSessionError::Timeout)
-        ));
-        assert_eq!(tokio::time::Instant::now() - started, SOCKET_WRITE_TIMEOUT);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn outbound_logical_message_enforces_the_size_derived_total_deadline() {
-        let (_initiator, responder) = establish().await;
-        let channel = Arc::new(Mutex::new(responder));
-        let mut writer = Box::pin(futures_util::sink::unfold(
-            (),
-            |(), _message: Message| async move {
-                tokio::time::sleep(Duration::from_secs(4)).await;
-                Ok::<_, std::convert::Infallible>(())
-            },
-        ));
-        let plaintext = vec![b'x'; MAX_E2EE_CHUNK_BYTES + 1];
-        let started = tokio::time::Instant::now();
-
-        assert!(matches!(
-            send_established_encrypted_message(&mut writer, &channel, &plaintext, started).await,
-            Err(E2eeSessionError::Timeout)
-        ));
-        assert_eq!(
-            tokio::time::Instant::now() - started,
-            Duration::from_secs(6)
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn outbound_size_allowance_lets_a_large_message_finish_on_a_slow_sink() {
-        let (_initiator, responder) = establish().await;
-        let channel = Arc::new(Mutex::new(responder));
-        // One second per record: far beyond the flat five-second aggregate the
-        // old deadline imposed, but within the size-derived allowance.
-        let mut writer = Box::pin(futures_util::sink::unfold(
-            (),
-            |(), _message: Message| async move {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                Ok::<_, std::convert::Infallible>(())
-            },
-        ));
-        let plaintext = vec![b'x'; 8 * 1024 * 1024];
-        let started = tokio::time::Instant::now();
-
-        send_established_encrypted_message(&mut writer, &channel, &plaintext, started)
-            .await
-            .expect("a compliant slow sink finishes a large message");
+    async fn a_slow_encrypted_sink_that_keeps_the_floor_finishes_eight_mebibytes() {
+        let (_initiator, recorded, cancelled, _elapsed) =
+            run_encrypted_writer(Duration::from_secs(1), 8 * 1024 * 1024).await;
+        assert!(!cancelled);
+        assert_eq!(recorded.len(), 129);
     }
 
     #[tokio::test]

@@ -18,6 +18,8 @@ const harness = vi.hoisted(() => ({
     error: string | null;
     isPending: boolean;
     refresh: ReturnType<typeof vi.fn>;
+    revalidate: ReturnType<typeof vi.fn>;
+    requiresRetry: boolean;
   }>,
   queryInputs: [] as unknown[],
   providerUsage: vi.fn((input: unknown) => ({ kind: "usage", input })),
@@ -145,7 +147,7 @@ import {
 } from "./AppStatusBar";
 
 function query(data: unknown = null, isPending = false, error: string | null = null) {
-  return { data, error, isPending, refresh: vi.fn() };
+  return { data, error, isPending, refresh: vi.fn(), revalidate: vi.fn(), requiresRetry: false };
 }
 
 function renderStatusBar(): string {
@@ -410,12 +412,37 @@ describe("AppStatusBar", () => {
     expect(oldUsageCleanup).toHaveBeenCalledOnce();
     expect(oldResourceCleanup).toHaveBeenCalledOnce();
     expect(harness.refreshProviderUsage).toHaveBeenCalledOnce();
-    expect(harness.queries[1]?.refresh).toHaveBeenCalledTimes(2);
-    expect(harness.queries[2]?.refresh).toHaveBeenCalledTimes(2);
+    expect(harness.queries[1]?.revalidate).toHaveBeenCalledTimes(2);
+    expect(harness.queries[2]?.revalidate).toHaveBeenCalledTimes(2);
     expect(typeof harness.refs[3]?.current).toBe("function");
     expect(typeof harness.refs[5]?.current).toBe("function");
     invokeRef(3);
     invokeRef(5);
+  });
+
+  it("keeps exhausted queries latched through usage and resource timer ticks", async () => {
+    vi.useFakeTimers();
+    harness.selectedEnvironment = { environmentId: EnvironmentId.make("remote") };
+    harness.primaryLocalEnvironment = { environmentId: EnvironmentId.make("local") };
+    harness.queries = [
+      query({ providers: [] }, false, "The connection dropped."),
+      query(null, false, "The connection dropped."),
+      query(null, false, "The connection dropped."),
+    ];
+    for (const value of harness.queries) value.requiresRetry = true;
+    renderStatusBar();
+    const cleanups = harness.effects.map((effect) => effect());
+    try {
+      await vi.advanceTimersByTimeAsync(61_000); // 30 s usage and 2 s resource intervals
+      expect(harness.refreshProviderUsage).toHaveBeenCalledTimes(3);
+      for (const value of harness.queries) {
+        expect(value.revalidate).toHaveBeenCalled();
+        expect(value.refresh).not.toHaveBeenCalled();
+        expect(value.requiresRetry).toBe(true);
+      }
+    } finally {
+      for (const cleanup of cleanups.toReversed()) if (typeof cleanup === "function") cleanup();
+    }
   });
 
   it("keeps safe no-op refreshers until command handlers are installed", () => {

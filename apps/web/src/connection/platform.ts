@@ -14,6 +14,7 @@ import {
   ConnectionBlockedError,
   ConnectionTransientError,
   Connectivity,
+  EnvironmentSelection,
   mapRemoteEnvironmentError,
   type PlatformConnectionRegistration,
   sshCredentialRejectedError,
@@ -55,6 +56,7 @@ import {
 import { clearComposerDraftsEnvironment } from "../composerDraftStore";
 import { isHostedStaticApp } from "../hostedPairing";
 import { appAtomRegistry } from "../rpc/atomRegistry";
+import { makeEnvironmentSelection } from "./environmentSelection";
 import { acknowledgeRpcRequest, trackRpcRequestSent } from "../rpc/requestLatencyState";
 import {
   desktopLocalConnectionId,
@@ -740,6 +742,11 @@ const rpcRequestObserverLayer = Layer.succeed(
   }),
 );
 
+const environmentSelectionLayer = Layer.succeed(
+  EnvironmentSelection,
+  makeEnvironmentSelection(appAtomRegistry),
+);
+
 type ConnectionPlatformLayerSource =
   | typeof connectionStorageLayer
   | typeof connectivityLayer
@@ -747,7 +754,8 @@ type ConnectionPlatformLayerSource =
   | typeof capabilitiesLayer
   | typeof platformConnectionSourceLayer
   | typeof environmentOwnedDataCleanupLayer
-  | typeof rpcRequestObserverLayer;
+  | typeof rpcRequestObserverLayer
+  | typeof environmentSelectionLayer;
 
 export const connectionPlatformLayer: Layer.Layer<
   Layer.Success<ConnectionPlatformLayerSource>,
@@ -761,4 +769,5 @@ export const connectionPlatformLayer: Layer.Layer<
   platformConnectionSourceLayer,
   environmentOwnedDataCleanupLayer,
   rpcRequestObserverLayer,
+  environmentSelectionLayer,
 );

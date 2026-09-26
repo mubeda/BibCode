@@ -3,6 +3,7 @@ mod e2ee;
 mod message;
 mod methods;
 mod session;
+mod transport;
 
 pub use message::{
     CauseItem, ClientMessage, InvalidRequestId, RequestId, RpcExit, RpcRequest, ServerMessage,
@@ -21,3 +22,4 @@ pub(crate) use session::{
     PreparedRpcResponse, RpcResponseEnqueueGuard, RpcResponseEnqueuePermit, RpcSessionContext,
     RpcUnaryResult, encoded_server_message_len, run_session,
 };
+pub(crate) use transport::CHUNKED_RPC_SUBPROTOCOL;

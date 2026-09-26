@@ -293,6 +293,8 @@ export function BranchToolbarBranchSelector({
     branchRefState.data?.nextCursor !== null && branchRefState.data?.nextCursor !== undefined;
   const isFetchingNextPage = branchRefState.isPending && branchRefState.data !== null;
   const isInitialBranchesLoadPending = branchRefState.isPending && branchRefState.data === null;
+  // A failed first page would otherwise read as "No refs found."; Retry clears a cut-off latch.
+  const branchLoadError = refs.length === 0 ? branchRefState.error : null;
   const currentGitBranch =
     branchStatusQuery.data?.refName ?? refs.find((refName) => refName.current)?.name ?? null;
   const sourceControlPresentation = useMemo(
@@ -371,8 +373,9 @@ export function BranchToolbarBranchSelector({
   const runBranchAction = (action: () => Promise<void>) => {
     startBranchActionTransition(async () => {
       await action();
-      branchRefState.refresh();
-      branchStatusQuery.refresh();
+      // Post-action reads are automatic: they keep an exhausted cut-off latched.
+      branchRefState.revalidate();
+      branchStatusQuery.revalidate();
     });
   };
 
@@ -498,9 +501,9 @@ export function BranchToolbarBranchSelector({
         setBranchQuery("");
         return;
       }
-      branchRefState.refresh();
+      branchRefState.revalidate();
     },
-    [branchRefState.refresh],
+    [branchRefState.revalidate],
   );
 
   const branchListScrollElementRef = useRef<HTMLElement | null>(null);
@@ -666,7 +669,7 @@ export function BranchToolbarBranchSelector({
       >
         <div className="flex w-full min-w-0 items-center justify-between gap-2">
           <span className="min-w-0 flex-1 truncate">{itemValue}</span>
-          {badge && <span className="shrink-0 text-[10px] text-muted-foreground/45">{badge}</span>}
+          {badge ? <span className="shrink-0 text-xs text-muted-foreground">{badge}</span> : null}
         </div>
       </ComboboxItem>
     );
@@ -701,7 +704,7 @@ export function BranchToolbarBranchSelector({
                   aria-label={branchPrTooltip}
                   onClick={(event) => openPrLink(event, branchPrStatus.url)}
                   className={cn(
-                    "inline-flex shrink-0 items-center gap-0.5 rounded px-1 py-0.5 text-[11px] font-medium tabular-nums transition-colors hover:bg-muted/60",
+                    "inline-flex shrink-0 items-center gap-0.5 rounded px-1 py-0.5 text-xs font-medium tabular-nums transition-colors hover:bg-muted/60",
                     branchPrStatus.colorClass,
                   )}
                 />
@@ -715,7 +718,7 @@ export function BranchToolbarBranchSelector({
         ) : null}
         <ComboboxTrigger
           render={<Button variant="ghost" size="xs" />}
-          className="min-w-0 text-muted-foreground/70 hover:text-foreground/80"
+          className="min-w-0 text-muted-foreground hover:text-foreground/80"
           disabled={isInitialBranchesLoadPending || isBranchActionPending}
         >
           <GitBranchIcon className="size-3 shrink-0 opacity-70" />
@@ -743,7 +746,16 @@ export function BranchToolbarBranchSelector({
           </div>
         </div>
         <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-          <ComboboxEmpty>No refs found.</ComboboxEmpty>
+          {branchLoadError !== null ? (
+            <div role="alert" className="flex items-center justify-between gap-2 px-3 py-2 text-xs">
+              <span className="min-w-0 text-destructive">{branchLoadError}</span>
+              <Button size="xs" variant="outline" onClick={branchRefState.refresh}>
+                Retry
+              </Button>
+            </div>
+          ) : (
+            <ComboboxEmpty>No refs found.</ComboboxEmpty>
+          )}
           <div className="relative min-h-0 w-full max-h-56 flex-1 overflow-hidden">
             <ComboboxListVirtualized className="size-full min-w-0 p-0">
               <LegendList<string>

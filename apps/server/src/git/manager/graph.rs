@@ -19,6 +19,30 @@ pub const MAX_REASONABLE_DIFF_SIZE: usize = MAX_DIFF_BUFFER_SIZE / 16;
 pub const MAX_DIFF_LINE_CHARACTERS: usize = 5_000;
 const COMMIT_TEXT_LIMIT: usize = 100 * 1024;
 const RECORD_SEPARATOR: char = '\u{1e}';
+/// History pages target 1 MiB of serialized commit JSON. Always retain one
+/// commit so an unusually large entry cannot stop pagination.
+pub const COMMIT_PAGE_TARGET_BYTES: usize = 1024 * 1024;
+
+/// Serialization accounts for escaping, arrays, field names and numbers.
+fn encoded_entry_bytes(entry: &GitManagerCommitEntry) -> usize {
+    serde_json::to_vec(entry)
+        .expect("GitManagerCommitEntry serializes to JSON")
+        .len()
+}
+
+/// How many leading commits fit the page target; always at least one.
+fn commits_within_target(commits: &[GitManagerCommitEntry], target: usize) -> usize {
+    let mut total = 2_usize; // JSON array brackets
+    for (index, entry) in commits.iter().enumerate() {
+        total = total
+            .saturating_add(encoded_entry_bytes(entry))
+            .saturating_add(usize::from(index > 0));
+        if total > target && index > 0 {
+            return index;
+        }
+    }
+    commits.len()
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -216,13 +240,17 @@ pub async fn page(
     }
     let has_more = commits.len() > limit;
     commits.truncate(limit);
+    let kept = commits_within_target(&commits, COMMIT_PAGE_TARGET_BYTES);
+    let trimmed = kept < commits.len();
+    commits.truncate(kept);
     let returned = commits.len();
+    let more = has_more || trimmed;
     Ok(GitManagerCommitPage {
         generation,
         pinned_tips: selection.pinned_tips,
         commits,
-        next_offset: has_more.then_some(offset.saturating_add(returned)),
-        exhausted: !has_more,
+        next_offset: more.then_some(offset.saturating_add(returned)),
+        exhausted: !more,
         degraded_to_all_paging: selection.degraded_to_all_paging,
     })
 }
@@ -426,5 +454,102 @@ parent1\u{1f}HEAD -> main\0\nfirst.txt\0nested/second.txt\0";
         .expect("second history page");
 
         assert_eq!(second.commits[0].sha, expected_second);
+    }
+
+    fn entry_with_body(bytes: usize) -> GitManagerCommitEntry {
+        GitManagerCommitEntry {
+            sha: "a".repeat(40),
+            short_sha: "a".repeat(7),
+            parents: Vec::new(),
+            decorations: Vec::new(),
+            subject: "subject".to_owned(),
+            body: "b".repeat(bytes),
+            author_name: "Ann".to_owned(),
+            author_email: "ann@example.test".to_owned(),
+            authored_at_ms: 0,
+            committer_name: "Cara".to_owned(),
+            committer_email: "cara@example.test".to_owned(),
+            committed_at_ms: 0,
+            changed_files: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn pages_keep_commits_up_to_the_byte_target_and_at_least_one() {
+        let large: Vec<_> = (0..10).map(|_| entry_with_body(300 * 1024)).collect();
+        assert_eq!(commits_within_target(&large, COMMIT_PAGE_TARGET_BYTES), 3);
+        let huge = vec![entry_with_body(5 * 1024 * 1024), entry_with_body(10)];
+        assert_eq!(commits_within_target(&huge, COMMIT_PAGE_TARGET_BYTES), 1);
+        let small: Vec<_> = (0..100).map(|_| entry_with_body(100)).collect();
+        assert_eq!(commits_within_target(&small, COMMIT_PAGE_TARGET_BYTES), 100);
+    }
+
+    #[test]
+    fn history_budget_counts_json_escaping_instead_of_raw_string_lengths() {
+        let mut entry = entry_with_body(0);
+        entry.body = "\u{0001}".repeat(80 * 1024);
+        entry.subject = "\\\"\\".repeat(1024);
+        let encoded = serde_json::to_vec(&entry).expect("entry JSON").len();
+        assert!(
+            encoded > entry.body.len() * 5,
+            "control characters expand in JSON"
+        );
+        let entries = vec![entry.clone(), entry.clone(), entry];
+        let kept = commits_within_target(&entries, COMMIT_PAGE_TARGET_BYTES);
+        assert_eq!(kept, 2);
+        let bytes = serde_json::to_vec(&entries[..kept])
+            .expect("page JSON")
+            .len();
+        assert!(bytes <= COMMIT_PAGE_TARGET_BYTES);
+        assert!(serde_json::to_vec(&entries).expect("all JSON").len() > COMMIT_PAGE_TARGET_BYTES);
+    }
+
+    #[tokio::test]
+    async fn a_page_of_large_commits_stops_near_one_mebibyte_and_pages_on() {
+        let repository = repository_with_one_commit();
+        for index in 0..14 {
+            fs::write(repository.path().join("counter.txt"), format!("{index}\n"))
+                .expect("fixture file");
+            git(repository.path(), &["add", "counter.txt"]);
+            let message = repository.path().join("message.txt");
+            fs::write(
+                &message,
+                format!("large {index}\n\n{}", "b".repeat(90 * 1024)),
+            )
+            .expect("commit message");
+            git(
+                repository.path(),
+                &["commit", "-q", "-F", message.to_str().expect("utf-8 path")],
+            );
+        }
+        let first = page(
+            &GitRepository::default(),
+            repository.path(),
+            None,
+            0,
+            COMMIT_PAGE_SIZE,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("first history page");
+        assert_eq!(first.commits.len(), 11, "eleven 90 KiB commits fit 1 MiB");
+        assert_eq!(first.next_offset, Some(11));
+        assert!(!first.exhausted);
+        let second = page(
+            &GitRepository::default(),
+            repository.path(),
+            Some(first.pinned_tips.as_slice()),
+            11,
+            COMMIT_PAGE_SIZE,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("second history page");
+        assert_eq!(
+            second.commits.len(),
+            4,
+            "three large commits and the first one"
+        );
+        assert!(second.exhausted);
     }
 }

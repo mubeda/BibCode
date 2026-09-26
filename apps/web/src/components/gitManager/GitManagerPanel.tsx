@@ -28,7 +28,7 @@ import {
   useGitManagerStore,
 } from "../../gitManagerStore";
 import { useProject, useServerConfigs } from "../../state/entities";
-import { useEnvironmentConnectionState } from "../../state/environments";
+import { useEnvironment, useEnvironmentConnectionState } from "../../state/environments";
 import {
   gitManagerEnvironment,
   runGitManagerOperation,
@@ -282,14 +282,16 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
   const statusQuery = useEnvironmentQuery(statusAtom);
   const changeRequest = resolveChangeRequestPresentation(statusQuery.data?.sourceControlProvider);
   const stashesQuery = useEnvironmentQuery(stashesAtom);
+  // Manual Refresh/Retry use refresh; automatic reads (signals, finished operations) revalidate.
   const refreshRefs = refsQuery.refresh;
-  const refreshStashes = stashesQuery.refresh;
+  const revalidateRefs = refsQuery.revalidate;
+  const revalidateStashes = stashesQuery.revalidate;
   // History relies on this refs refresh: every signal change re-reads refs, so
   // the repository generation it receives reports any change the signal carries.
   useEffect(() => {
     if (signalGeneration === null) return;
-    refreshRefs();
-  }, [refreshRefs, signalGeneration]);
+    revalidateRefs();
+  }, [revalidateRefs, signalGeneration]);
   // Opening the pane mounts a fresh stash query, and a signal that (re)subscribes
   // starts from null while the mounted query reads anyway, so only a step from
   // one signal generation to the next while the pane is open re-reads the list.
@@ -298,8 +300,8 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
     const previous = stashSignalGenerationRef.current;
     stashSignalGenerationRef.current = signalGeneration;
     if (!stashPaneOpen || previous === null || signalGeneration === null) return;
-    if (signalGeneration !== previous) refreshStashes();
-  }, [refreshStashes, signalGeneration, stashPaneOpen]);
+    if (signalGeneration !== previous) revalidateStashes();
+  }, [revalidateStashes, signalGeneration, stashPaneOpen]);
 
   const snapshot: GitManagerRefsSnapshot | null = refsQuery.data ?? null;
   const localBranches = snapshot?.localBranches ?? EMPTY_REFS;
@@ -366,10 +368,10 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
     },
     [],
   );
-  const refreshRepositoryReads = useCallback(() => {
-    refreshRefs();
-    if (stashPaneOpen) refreshStashes();
-  }, [refreshRefs, refreshStashes, stashPaneOpen]);
+  const revalidateRepositoryReads = useCallback(() => {
+    revalidateRefs();
+    if (stashPaneOpen) revalidateStashes();
+  }, [revalidateRefs, revalidateStashes, stashPaneOpen]);
   const executeOperation = useCallback(
     async (
       input: GitManagerOperationRequest,
@@ -391,7 +393,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
       const result = await handle.result;
       if (activeOperationRef.current === handle) activeOperationRef.current = null;
       setOperationRunning(false);
-      refreshRepositoryReads();
+      revalidateRepositoryReads();
       if (result._tag === "Failure") {
         if (Cause.hasInterruptsOnly(result.cause)) return false;
         const error = Cause.squash(result.cause);
@@ -414,7 +416,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
       }
       return result.value._tag === "finished";
     },
-    [environmentId, refreshRepositoryReads, registry],
+    [environmentId, revalidateRepositoryReads, registry],
   );
   const cancelOperation = useCallback(() => {
     activeOperationRef.current?.cancel();
@@ -694,12 +696,12 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
       }
       const index = resolveStashIndex(stashes, sha);
       if (index === null) {
-        refreshStashes();
+        revalidateStashes();
         return;
       }
       await executeOperation({ _tag: kind, cwd, projectId, index });
     },
-    [cwd, executeOperation, projectId, refreshStashes, stashes, stashMergeDisabledReason],
+    [cwd, executeOperation, projectId, revalidateStashes, stashes, stashMergeDisabledReason],
   );
   const runStashApply = useCallback(
     (sha: string) => runStashMutation("stash-apply", sha),
@@ -736,7 +738,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
     }
     setMergeDialogOpen(true);
   }, [stashMergeDisabledReason]);
-  const handleMergeFinished = useCallback(() => refreshRefs(), [refreshRefs]);
+  const handleMergeFinished = useCallback(() => revalidateRefs(), [revalidateRefs]);
   const closeHistoryBranchDialog = useCallback(() => {
     if (!operationRunning) setHistoryBranchDialog(null);
   }, [operationRunning]);
@@ -997,7 +999,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
                 selectedPath={selectedFilePath}
                 selectedStashSha={selectedStashSha}
                 stashesPending={stashesQuery.isPending}
-                onRefreshStashes={refreshStashes}
+                onRefreshStashes={revalidateStashes}
                 onSelectPath={selectStashFile}
               />
             </>
@@ -1088,7 +1090,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
         scope={historyTagScope}
         tag={tagDialog?.tag ?? null}
         targetSha={tagDialog?.targetSha ?? null}
-        onFinished={refreshRefs}
+        onFinished={revalidateRefs}
         onOpenChange={closeHistoryTagDialog}
       />
       <GitManagerResetDialog
@@ -1119,8 +1121,13 @@ export const GitManagerPanel = memo(function GitManagerPanel({ projectRef }: Git
   );
   const project = useProject(stableProjectRef);
   const connection = useEnvironmentConnectionState(environmentId);
+  const environmentLabel = useEnvironment(environmentId)?.label ?? "this environment";
   const serverConfig = useServerConfigs().get(environmentId) ?? null;
-  const availability = resolveGitManagerAvailability(connection.data, serverConfig);
+  const availability = resolveGitManagerAvailability(
+    connection.data,
+    serverConfig,
+    environmentLabel,
+  );
   const capabilityDisabledReasons = resolveGitManagerCapabilityDisabledReasons(serverConfig);
   const catalogProjectId = project?.id ?? null;
   const storeKey = projectKey(stableProjectRef);

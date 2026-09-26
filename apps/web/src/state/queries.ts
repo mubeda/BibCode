@@ -1,4 +1,5 @@
 import { useAtomValue } from "@effect/atom-react";
+import { retryEnvironmentQuery } from "@bibcode/client-runtime/state/runtime";
 import {
   type CheckpointDiffTarget,
   type ComposerPathSearchTarget,
@@ -11,7 +12,6 @@ import type {
   VcsListRefsResult,
   VcsRef,
 } from "@bibcode/contracts";
-import * as Cause from "effect/Cause";
 import * as Option from "effect/Option";
 import { AsyncResult, Atom } from "effect/unstable/reactivity";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -19,7 +19,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { appAtomRegistry } from "../rpc/atomRegistry";
 import { orchestrationEnvironment } from "./orchestration";
 import { projectEnvironment } from "./projects";
-import { useEnvironmentQuery } from "./query";
+import { formatEnvironmentQueryError, useEnvironmentQuery } from "./query";
 import { useEnvironmentThread } from "./threads";
 import { vcsEnvironment } from "./vcs";
 
@@ -144,20 +144,22 @@ export function usePaginatedBranches(target: VcsRefTarget) {
   const failed = results.find((result) => result._tag === "Failure");
   const error =
     failed?._tag === "Failure"
-      ? (() => {
-          const cause = Cause.squash(failed.cause);
-          return cause instanceof Error && cause.message.trim().length > 0
-            ? cause.message
-            : "Failed to load refs.";
-        })()
+      ? formatEnvironmentQueryError(failed.cause, "Failed to load refs.")
       : null;
-  const refresh = useCallback(() => {
-    const firstPage = pageAtoms[0];
-    setPagination({ targetKey, cursors: INITIAL_BRANCH_CURSORS });
-    if (firstPage !== undefined) {
-      appAtomRegistry.refresh(firstPage);
-    }
-  }, [pageAtoms, targetKey]);
+  // Both restart from the first page; only an explicit Retry clears an exhausted cut-off.
+  const reloadFirstPage = useCallback(
+    (retry: boolean) => {
+      const firstPage = pageAtoms[0];
+      setPagination({ targetKey, cursors: INITIAL_BRANCH_CURSORS });
+      if (firstPage === undefined) return;
+      const refreshFirstPage = () => appAtomRegistry.refresh(firstPage);
+      if (retry) retryEnvironmentQuery(firstPage, refreshFirstPage);
+      else refreshFirstPage();
+    },
+    [pageAtoms, targetKey],
+  );
+  const refresh = useCallback(() => reloadFirstPage(true), [reloadFirstPage]);
+  const revalidate = useCallback(() => reloadFirstPage(false), [reloadFirstPage]);
   const loadNext = useCallback(() => {
     if (targetKey === null || data?.nextCursor === null || data?.nextCursor === undefined) {
       return;
@@ -177,6 +179,7 @@ export function usePaginatedBranches(target: VcsRefTarget) {
     error,
     isPending: results.some((result) => result.waiting),
     refresh,
+    revalidate,
     loadNext,
   };
 }

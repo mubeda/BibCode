@@ -3,6 +3,16 @@ import { describe, expect, it } from "vite-plus/test";
 import { isTransportConnectionErrorMessage, sanitizeThreadErrorMessage } from "./transport.ts";
 
 describe("isTransportConnectionErrorMessage", () => {
+  it("recognizes the disconnect copy the RPC session reports", () => {
+    expect(
+      isTransportConnectionErrorMessage(
+        "No data from Local for 30 seconds. The connection is too slow or was lost.",
+      ),
+    ).toBe(true);
+    expect(isTransportConnectionErrorMessage("Local closed the connection.")).toBe(true);
+    expect(isTransportConnectionErrorMessage("The connection to Local was lost.")).toBe(true);
+  });
+
   it("returns true for SocketCloseError", () => {
     expect(isTransportConnectionErrorMessage("SocketCloseError: connection reset")).toBe(true);
   });

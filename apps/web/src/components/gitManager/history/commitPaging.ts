@@ -59,6 +59,11 @@ export function mergeCommitDecorations(
   return changed ? result : loaded;
 }
 
+/** The next page loads once the rendered end is this many rows from the last row. */
+export const NEXT_PAGE_ROW_THRESHOLD = 10;
+/** Minimum interval between two next-page requests. */
+export const NEXT_PAGE_REQUEST_INTERVAL_MS = 500;
+
 interface ShouldLoadNextPageInput {
   readonly renderedIndex: number;
   readonly totalRows: number;
@@ -75,7 +80,10 @@ export function shouldLoadNextPage({
   nowMs,
 }: ShouldLoadNextPageInput): boolean {
   return (
-    totalRows > 0 && totalRows - renderedIndex <= 10 && !isLoading && nowMs - lastRequestAtMs >= 500
+    totalRows > 0 &&
+    totalRows - renderedIndex <= NEXT_PAGE_ROW_THRESHOLD &&
+    !isLoading &&
+    nowMs - lastRequestAtMs >= NEXT_PAGE_REQUEST_INTERVAL_MS
   );
 }
 
