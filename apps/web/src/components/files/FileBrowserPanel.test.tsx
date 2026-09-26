@@ -78,11 +78,11 @@ const testState = vi.hoisted(() => ({
     error: string | null;
     isPending: boolean;
     refresh: () => void;
-    requiresRetry?: boolean;
   },
   primaryEnvironmentId: null as string | null,
   environmentHttpBaseUrl: null as string | null,
   environment: null as Record<string, unknown> | null,
+  connectionPhase: "connected" as string | null,
   preferredEditor: null as string | null,
   isPreviewSupported: true,
   isBrowserPreviewFile: (() => false) as (path: string) => boolean,
@@ -216,6 +216,9 @@ vi.mock("~/state/environments", () => ({
   useEnvironment: () => testState.environment,
   usePrimaryEnvironmentId: () => testState.primaryEnvironmentId,
   useEnvironmentHttpBaseUrl: () => testState.environmentHttpBaseUrl,
+  useEnvironmentConnectionState: () => ({
+    data: testState.connectionPhase === null ? null : { phase: testState.connectionPhase },
+  }),
 }));
 
 vi.mock("~/state/preview", () => ({
@@ -469,6 +472,7 @@ beforeEach(() => {
   testState.primaryEnvironmentId = environmentId;
   testState.environmentHttpBaseUrl = null;
   testState.environment = null;
+  testState.connectionPhase = "connected";
   testState.preferredEditor = null;
   testState.isPreviewSupported = true;
   testState.isBrowserPreviewFile = vi.fn(() => false);
@@ -504,6 +508,36 @@ describe("header rendering", () => {
     expect(markup).toContain("Indexing…");
     expect(markup).toContain("animate-spin");
     expect(markup).toContain(">demo</div>");
+  });
+
+  it("shows no file count while the list has failed", () => {
+    testState.entriesQuery = {
+      data: null,
+      error: "Workspace query failed.",
+      isPending: false,
+      refresh: vi.fn(),
+    };
+    const markup = renderPanel();
+    expect(markup).toContain("Workspace query failed.");
+    expect(markup).not.toMatch(/\d files/);
+    expect(markup).not.toContain("Indexing…");
+  });
+
+  it("shows no file count before any list has loaded", () => {
+    testState.entriesQuery = { data: null, error: null, isPending: false, refresh: vi.fn() };
+    expect(renderPanel()).not.toMatch(/\d files/);
+  });
+
+  it("shows Indexing… and no file count while a failed list is read again", () => {
+    testState.entriesQuery = {
+      data: null,
+      error: "The connection dropped before the result arrived.",
+      isPending: true,
+      refresh: vi.fn(),
+    };
+    const markup = renderPanel();
+    expect(markup).toContain("Indexing…");
+    expect(markup).not.toMatch(/\d files/);
   });
 
   it("shows the file count and the partial suffix when truncated", () => {
@@ -553,14 +587,13 @@ describe("header rendering", () => {
     expect(ui.filter("FileTree")).toHaveLength(0);
   });
 
-  it("offers Retry once a cut-off list is awaiting an explicit retry", () => {
+  it("offers Retry for a cut-off list", () => {
     const refresh = vi.fn();
     testState.entriesQuery = {
       data: null,
       error: "The connection dropped before the result arrived.",
       isPending: false,
       refresh,
-      requiresRetry: true,
     };
     const markup = renderPanel();
     expect(markup).toContain("The connection dropped before the result arrived.");
@@ -570,15 +603,51 @@ describe("header rendering", () => {
     expect(refresh).toHaveBeenCalledOnce();
   });
 
-  it("offers no Retry for a failure that is not awaiting one", () => {
+  it("offers Retry for any failed list, not only a cut-off", () => {
+    const refresh = vi.fn();
     testState.entriesQuery = {
       data: null,
       error: "Workspace query failed.",
       isPending: false,
-      refresh: vi.fn(),
-      requiresRetry: false,
+      refresh,
     };
     renderPanel();
+    const retry = ui.filter("Button").find((props) => props.children === "Retry");
+    if (retry === undefined) throw new Error("Retry was not rendered.");
+    expect(retry.disabled).toBe(false);
+    (retry.onClick as () => void)();
+    expect(refresh).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the failure on screen and disables Retry while the list is read again", () => {
+    testState.entriesQuery = {
+      data: null,
+      error: "The connection dropped before the result arrived.",
+      isPending: true,
+      refresh: vi.fn(),
+    };
+    const markup = renderPanel();
+    expect(markup).toContain("The connection dropped before the result arrived.");
+    const retry = ui.filter("Button").find((props) => props.children === "Retrying…");
+    if (retry === undefined) throw new Error("Retrying… was not rendered.");
+    expect(retry.disabled).toBe(true);
+  });
+
+  it("waits for the connection instead of offering Retry while the environment is disconnected", () => {
+    const refresh = vi.fn();
+    testState.connectionPhase = "backoff";
+    testState.entriesQuery = {
+      data: null,
+      error: "The connection dropped before the result arrived.",
+      isPending: false,
+      refresh,
+    };
+    renderPanel();
+    const waiting = ui
+      .filter("Button")
+      .find((props) => props.children === "Waiting for the connection…");
+    if (waiting === undefined) throw new Error("Waiting for the connection… was not rendered.");
+    expect(waiting.disabled).toBe(true);
     expect(ui.filter("Button").some((props) => props.children === "Retry")).toBe(false);
   });
 

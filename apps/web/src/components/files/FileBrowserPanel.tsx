@@ -28,6 +28,7 @@ import { useRightPanelStore } from "~/rightPanelStore";
 import { assetEnvironment } from "~/state/assets";
 import {
   useEnvironment,
+  useEnvironmentConnectionState,
   useEnvironmentHttpBaseUrl,
   usePrimaryEnvironmentId,
 } from "~/state/environments";
@@ -40,7 +41,7 @@ import { useAtomQueryRunner } from "~/state/use-atom-query-runner";
 import { vcsEnvironment } from "~/state/vcs";
 import { resolveProviderSessionSelectionForInstance } from "~/providerSessionSelection";
 
-import { Button } from "../ui/button";
+import { RetryButton } from "../ui/retry-button";
 import { stackedThreadToast, toastManager } from "../ui/toast";
 import FileEntryDialog, { type FileEntryDialogRequest } from "./FileEntryDialog";
 import type { FilePathMutationLease, FilePathMutationRequest } from "./filePathMutationLease";
@@ -168,6 +169,20 @@ export function currentlyExpandedTreePaths(
   });
 }
 
+/**
+ * The header's second line: rescan or load progress, or the size of the list on screen.
+ * Without a loaded list (still loading, or failed) there is no count to show.
+ */
+function fileListStatus(input: {
+  readonly rescanning: boolean;
+  readonly pending: boolean;
+  readonly fileCount: number | null;
+}): string | null {
+  if (input.rescanning) return "Refreshing…";
+  if (input.fileCount !== null) return `${input.fileCount.toLocaleString()} files`;
+  return input.pending ? "Indexing…" : null;
+}
+
 export function collapseDirectoryTreePaths(
   model: CollapsibleTreeModel,
   directoryTreePaths: ReadonlyArray<string>,
@@ -215,6 +230,9 @@ export default function FileBrowserPanel({
 
   const primaryEnvironmentId = usePrimaryEnvironmentId();
   const environment = useEnvironment(environmentId);
+  // A read cannot reach a disconnected environment; the list reads again once it reconnects.
+  const connectionPhase = useEnvironmentConnectionState(environmentId).data?.phase ?? null;
+  const waitingForConnection = connectionPhase !== null && connectionPhase !== "connected";
   const isPrimaryEnv = primaryEnvironmentId === environmentId;
   const hasWorkspaceRoot = cwd.length > 0;
 
@@ -723,6 +741,11 @@ export default function FileBrowserPanel({
     () => entries.reduce((count, entry) => count + (entry.kind === "file" ? 1 : 0), 0),
     [entries],
   );
+  const listStatus = fileListStatus({
+    rescanning: isRescanning,
+    pending: entriesQuery.isPending,
+    fileCount: entriesQuery.data === null ? null : fileCount,
+  });
 
   // The menu model decides which actions show for a file vs a directory, so the full handler set is
   // supplied for every row. New File/Folder target the clicked folder itself, or a file's parent
@@ -796,14 +819,12 @@ export default function FileBrowserPanel({
       <div className="flex h-9 shrink-0 items-center gap-2 border-b border-panel-separator px-3">
         <div className="min-w-0 flex-1">
           <div className="truncate text-xs font-medium text-foreground">{projectName}</div>
-          <div className="truncate text-xs text-muted-foreground">
-            {isRescanning
-              ? "Refreshing…"
-              : entriesQuery.isPending && entriesQuery.data === null
-                ? "Indexing…"
-                : `${fileCount.toLocaleString()} files`}
-            {entriesQuery.data?.truncated ? " · partial" : ""}
-          </div>
+          {listStatus === null ? null : (
+            <div className="truncate text-xs text-muted-foreground">
+              {listStatus}
+              {entriesQuery.data?.truncated ? " · partial" : ""}
+            </div>
+          )}
         </div>
         <button
           type="button"
@@ -845,11 +866,11 @@ export default function FileBrowserPanel({
       {entriesQuery.error && entriesQuery.data === null ? (
         <div className="space-y-2 p-4">
           <p className="text-xs leading-relaxed text-destructive">{entriesQuery.error}</p>
-          {entriesQuery.requiresRetry ? (
-            <Button size="xs" variant="outline" onClick={entriesQuery.refresh}>
-              Retry
-            </Button>
-          ) : null}
+          <RetryButton
+            retrying={entriesQuery.isPending}
+            waitingForConnection={waitingForConnection}
+            onRetry={entriesQuery.refresh}
+          />
         </div>
       ) : (
         <FileTree

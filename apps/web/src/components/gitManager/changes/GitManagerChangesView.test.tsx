@@ -24,12 +24,17 @@ const h = vi.hoisted(() => ({
   availableEditors: [] as string[],
   statusError: null as string | null,
   statusEmission: null as AsyncResult.AsyncResult<unknown, unknown> | null,
+  refsError: null as string | null,
+  refreshStatusQuery: vi.fn(),
+  revalidateStatusQuery: vi.fn(),
   statusAtom: vi.fn((target: unknown) => ({ kind: "status", target })),
   refsAtom: vi.fn((target: unknown) => ({ kind: "refs", target })),
   commitsAtom: vi.fn((target: unknown) => ({ kind: "commits", target })),
   signalAtom: vi.fn((target: unknown) => ({ kind: "signal", target })),
   refreshRefs: vi.fn(),
+  revalidateRefs: vi.fn(),
   refreshCommits: vi.fn(),
+  revalidateCommits: vi.fn(),
   contextMenuShow: vi.fn(
     (
       _items: ReadonlyArray<{ label: string }>,
@@ -67,11 +72,28 @@ vi.mock("../../../state/gitManager", () => ({
   },
 }));
 
+const NO_READ_ACTIONS = { refresh: () => undefined, revalidate: () => undefined };
+
+/** Explicit Retry (`refresh`) and automatic re-reads (`revalidate`) go to separate spies. */
+function readActionsFor(kind: string | undefined) {
+  if (kind === "status")
+    return { refresh: h.refreshStatusQuery, revalidate: h.revalidateStatusQuery };
+  if (kind === "refs") return { refresh: h.refreshRefs, revalidate: h.revalidateRefs };
+  if (kind === "commits") return { refresh: h.refreshCommits, revalidate: h.revalidateCommits };
+  return NO_READ_ACTIONS;
+}
+
+/** A settled failure is not pending; a read after Retry waits on the failure it replaces. */
+function pendingFor(kind: string | undefined, data: unknown): boolean {
+  if (kind === "status" && h.statusEmission !== null) return h.statusEmission.waiting;
+  if (kind === "refs" && h.refsError !== null) return false;
+  return data === null;
+}
+
 vi.mock("../../../state/query", () => ({
   useEnvironmentQuery: (atom: { kind?: string } | null) => {
     const kind = atom?.kind;
-    const refresh =
-      kind === "refs" ? h.refreshRefs : kind === "commits" ? h.refreshCommits : () => undefined;
+    const { refresh, revalidate } = readActionsFor(kind);
     const data =
       kind === "status"
         ? h.status
@@ -88,11 +110,10 @@ vi.mock("../../../state/query", () => ({
         kind === "status" && h.statusEmission !== null
           ? h.statusEmission
           : { _tag: data === null ? "Initial" : "Success", waiting: data === null },
-      error: kind === "status" ? h.statusError : null,
-      isPending: data === null,
+      error: kind === "status" ? h.statusError : kind === "refs" ? h.refsError : null,
+      isPending: pendingFor(kind, data),
       refresh,
-      // Automatic re-reads measure through the same spies.
-      revalidate: refresh,
+      revalidate,
       requiresRetry: false,
     };
   },
@@ -239,6 +260,9 @@ beforeEach(() => {
   h.availableEditors = [];
   h.statusError = null;
   h.statusEmission = null;
+  h.refsError = null;
+  h.refreshStatusQuery.mockClear();
+  h.revalidateStatusQuery.mockClear();
   h.listProps = null;
   h.listRenderCount = 0;
   h.statusAtom.mockClear();
@@ -246,7 +270,9 @@ beforeEach(() => {
   h.commitsAtom.mockClear();
   h.signalAtom.mockClear();
   h.refreshRefs.mockClear();
+  h.revalidateRefs.mockClear();
   h.refreshCommits.mockClear();
+  h.revalidateCommits.mockClear();
   h.contextMenuShow.mockClear();
   h.openInEditor.mockClear();
   h.refreshStatus.mockReset();
@@ -330,6 +356,55 @@ describe("GitManagerChangesView", () => {
 
     expect(container.textContent).toContain("Environment unavailable");
     expect(container.textContent).toContain("Remote environment is not connected.");
+    // The read resumes by itself when the connection is back; Retry could not reach it.
+    expect(buttonWithText("Waiting for the connection…").disabled).toBe(true);
+    expect(container.textContent).not.toContain("Retry");
+  });
+
+  it("offers Retry when changes fail to load, and reads status again explicitly", async () => {
+    h.statusError = "The connection dropped before the result arrived.";
+    h.statusEmission = AsyncResult.failure(Cause.fail(new Error(h.statusError)));
+
+    await renderView();
+    // Mounting revalidates refs for the live signal; only Retry's reads count here.
+    expect(h.revalidateRefs).toHaveBeenCalled();
+    h.revalidateRefs.mockClear();
+
+    expect(container.textContent).toContain("Could not load changes");
+    await act(async () => buttonWithText("Retry").click());
+    expect(h.refreshStatusQuery).toHaveBeenCalledOnce();
+    expect(h.refreshRefs).not.toHaveBeenCalled();
+    expect(h.revalidateStatusQuery).not.toHaveBeenCalled();
+    expect(h.revalidateRefs).not.toHaveBeenCalled();
+  });
+
+  it("retries only the read that failed", async () => {
+    h.status = statusWith("src/loaded.ts");
+    h.refs = null;
+    h.refsError = "Git could not read the branches.";
+
+    await renderView();
+    h.revalidateRefs.mockClear();
+
+    expect(container.textContent).toContain("Git could not read the branches.");
+    await act(async () => buttonWithText("Retry").click());
+    expect(h.refreshRefs).toHaveBeenCalledOnce();
+    expect(h.refreshStatusQuery).not.toHaveBeenCalled();
+    expect(h.revalidateRefs).not.toHaveBeenCalled();
+    expect(h.revalidateStatusQuery).not.toHaveBeenCalled();
+  });
+
+  it("keeps the failure on screen and disables Retry while changes are read again", async () => {
+    h.statusError = "The connection dropped before the result arrived.";
+    h.statusEmission = {
+      ...AsyncResult.failure(Cause.fail(new Error(h.statusError))),
+      waiting: true,
+    };
+
+    await renderView();
+
+    expect(container.textContent).toContain("Could not load changes");
+    expect(buttonWithText("Retrying…").disabled).toBe(true);
   });
 
   it("keeps inclusion local while selection updates the shared view state", async () => {
@@ -519,17 +594,19 @@ describe("GitManagerChangesView", () => {
     h.status = statusWith("src/selected.ts");
     h.freshStatus = h.status;
     await renderView();
-    h.refreshRefs.mockClear();
-    h.refreshCommits.mockClear();
+    h.revalidateRefs.mockClear();
+    h.revalidateCommits.mockClear();
 
     await act(async () => buttonWithText("Commit 1 files to main").click());
 
     await vi.waitFor(() => expect(h.commit).toHaveBeenCalledOnce());
-    await vi.waitFor(() => expect(h.refreshRefs).toHaveBeenCalledOnce());
-    expect(h.refreshCommits).toHaveBeenCalledOnce();
-    expect(h.refreshRefs.mock.invocationCallOrder[0]).toBeGreaterThan(
+    await vi.waitFor(() => expect(h.revalidateRefs).toHaveBeenCalledOnce());
+    expect(h.revalidateCommits).toHaveBeenCalledOnce();
+    expect(h.revalidateRefs.mock.invocationCallOrder[0]).toBeGreaterThan(
       h.commit.mock.invocationCallOrder[0]!,
     );
+    expect(h.refreshRefs).not.toHaveBeenCalled();
+    expect(h.refreshCommits).not.toHaveBeenCalled();
   });
 
   it("does not refresh refs or history reads when the commit fails", async () => {
@@ -549,12 +626,14 @@ describe("GitManagerChangesView", () => {
       ),
     );
     await renderView();
-    h.refreshRefs.mockClear();
-    h.refreshCommits.mockClear();
+    h.revalidateRefs.mockClear();
+    h.revalidateCommits.mockClear();
 
     await act(async () => buttonWithText("Commit 1 files to main").click());
 
     await vi.waitFor(() => expect(container.textContent).toContain(reason));
+    expect(h.revalidateRefs).not.toHaveBeenCalled();
+    expect(h.revalidateCommits).not.toHaveBeenCalled();
     expect(h.refreshRefs).not.toHaveBeenCalled();
     expect(h.refreshCommits).not.toHaveBeenCalled();
   });

@@ -32,15 +32,18 @@ export interface EnvironmentQueryView<A, E = unknown> {
 export const QUERY_CONNECTION_DROPPED_MESSAGE = "The connection dropped before the result arrived.";
 
 /**
- * The one message rule for a failed environment query: a transport cut-off gets the
- * connection-dropped copy, an error with a non-blank message shows it, and anything
- * else shows `fallback`. Views pass a fallback that names what failed; the default
- * is generic.
+ * The one message rule for a failed environment query: a transport cut-off, or an
+ * attempt interrupted by its closing session, gets the connection-dropped copy; an
+ * error with a non-blank message shows it; anything else shows `fallback`. Views pass
+ * a fallback that names what failed; the default is generic.
  */
 export function formatEnvironmentQueryError(
   cause: Cause.Cause<unknown>,
   fallback = "The environment request failed.",
 ): string {
+  // The RPC client interrupts a closing session's requests; squashing that cause would
+  // show Effect's "All fibers interrupted without error".
+  if (Cause.hasInterruptsOnly(cause)) return QUERY_CONNECTION_DROPPED_MESSAGE;
   const error = Cause.squash(cause);
   if (isQueryTransportCutoff(error)) return QUERY_CONNECTION_DROPPED_MESSAGE;
   return error instanceof Error && error.message.trim().length > 0 ? error.message : fallback;

@@ -10,11 +10,7 @@ import { useCallback } from "react";
 
 import { appAtomRegistry } from "~/rpc/atomRegistry";
 import { projectEnvironment } from "~/state/projects";
-import {
-  executeAtomQuery,
-  isEnvironmentQueryAwaitingRetry,
-  retryEnvironmentQuery,
-} from "@bibcode/client-runtime/state/runtime";
+import { executeAtomQuery, retryEnvironmentQuery } from "@bibcode/client-runtime/state/runtime";
 import { formatEnvironmentQueryError } from "~/state/query";
 
 const EMPTY_PROJECT_FILE_PATH = "";
@@ -30,8 +26,6 @@ interface ProjectQueryState<A> {
   readonly refresh: () => void;
   /** Automatic re-read (signals, finished mutations); keeps cut-off state. */
   readonly revalidate: () => void;
-  /** The automatic re-issue after a cut-off failed; only `refresh` sends the request again. */
-  readonly requiresRetry: boolean;
 }
 
 export function getProjectEntriesQueryAtom(environmentId: EnvironmentId, cwd: string) {
@@ -140,7 +134,6 @@ export function useProjectEntriesQuery(
     isPending: result.waiting,
     refresh,
     revalidate: refreshAtom,
-    requiresRetry: isEnvironmentQueryAwaitingRetry(atom, result),
   };
 }
 
@@ -165,6 +158,5 @@ export function useProjectFileQuery(
     isPending: result.waiting,
     refresh,
     revalidate: refreshAtom,
-    requiresRetry: isEnvironmentQueryAwaitingRetry(atom, result),
   };
 }

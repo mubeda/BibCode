@@ -463,11 +463,23 @@ In the web client, `useEnvironmentQuery` exposes `refresh` for
 explicit Retry and Refresh actions and `revalidate` for every automatic re-read
 (timers, Git and file signals, opening a view, finished mutations); only
 `refresh` clears the latch. Its `requiresRetry` is true only while the rendered
-result is the latched failure: hooks read the latch against the emission they
-render, because the React Compiler re-runs that read only when its arguments change.
+result is the latched failure: `useEnvironmentQuery` reads the latch against the
+emission it renders, because the React Compiler re-runs that read only when its
+arguments change.
 Views format a failed query with one rule (`formatEnvironmentQueryError`): a
-cut-off shows the connection-dropped copy, an error with a non-blank message shows
-that message, and anything else shows the view's own fallback.
+cut-off, or an attempt interrupted by its closing session, shows the
+connection-dropped copy, an error with a non-blank message shows that message, and
+anything else shows the view's own fallback.
+The file browser, Git Manager's Changes view and History offer **Retry**, bound
+to `refresh`, with any failed load they show in place of their content. Retry is
+disabled while a read runs (**Retrying…**, or History's loading state) and, in
+the file browser while the environment is not connected and in Changes when a
+read found no session (**Waiting for the connection…**), because those views
+read again by themselves once the connection is back. The file preview, the diff panes, the stash list, commit detail
+and merge preview do not offer Retry yet.
+`requiresRetry` does not decide whether Retry is shown: `usePullRequestsQuery`
+uses it so that opening a view neither re-reads a latched failure nor hides it
+behind a fresh load.
 
 ## Worktree catalog subscriptions
 
