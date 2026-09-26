@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 #[cfg(test)]
 use tokio::sync::{Barrier, Notify};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, watch};
-use tokio::time::MissedTickBehavior;
+use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -35,6 +35,20 @@ use crate::{
 };
 
 const MAX_KEYBINDINGS: usize = 256;
+const PROVIDER_REFRESH_TTL: Duration = Duration::from_secs(5 * 60);
+const PROVIDER_PROBE_TIMESTAMP_PATHS: &[&[&str]] =
+    &[&["checkedAt"], &["versionAdvisory", "checkedAt"]];
+
+enum ProviderSnapshotPublication {
+    Always,
+    IfChanged,
+}
+
+enum FullProviderRefreshTrigger {
+    Subscription,
+    SettingsChange,
+    BackgroundCheck { cancellation: CancellationToken },
+}
 
 fn provider_snapshot_identity(snapshot: &Value) -> Option<(&str, &str)> {
     Some((
@@ -70,6 +84,43 @@ fn merge_provider_snapshot(
         }
     }
     next
+}
+
+fn provider_snapshot_content_eq(current: &Value, next: &Value) -> bool {
+    fn equal_at_path(current: &Value, next: &Value, path: &[&str]) -> bool {
+        let (Value::Object(current), Value::Object(next)) = (current, next) else {
+            return current == next;
+        };
+        let is_ignored = |key: &str| {
+            PROVIDER_PROBE_TIMESTAMP_PATHS
+                .iter()
+                .any(|ignored| ignored.strip_prefix(path) == Some(&[key]))
+        };
+        let content_len = |object: &serde_json::Map<String, Value>| {
+            object.keys().filter(|key| !is_ignored(key)).count()
+        };
+        content_len(current) == content_len(next)
+            && current.iter().all(|(key, value)| {
+                if is_ignored(key) {
+                    return true;
+                }
+                let Some(next_value) = next.get(key) else {
+                    return false;
+                };
+                // Descend only along an ignored path; compare all other content
+                // directly without cloning the inventory or allocating paths.
+                let nested = PROVIDER_PROBE_TIMESTAMP_PATHS.iter().find(|ignored| {
+                    ignored.starts_with(path)
+                        && ignored.len() > path.len() + 1
+                        && ignored[path.len()] == key
+                });
+                match nested {
+                    Some(ignored) => equal_at_path(value, next_value, &ignored[..path.len() + 1]),
+                    None => value == next_value,
+                }
+            })
+    }
+    equal_at_path(current, next, &[])
 }
 
 fn provider_update_state(
@@ -195,6 +246,35 @@ impl fmt::Debug for AgentActivityHandlerSlot {
     }
 }
 
+#[derive(Debug, Default)]
+struct ProviderRefreshState {
+    last_completed: Option<Instant>,
+    manual_refreshes: usize,
+}
+
+struct ManualFullProviderRefresh {
+    state: Arc<std::sync::Mutex<ProviderRefreshState>>,
+}
+
+impl ManualFullProviderRefresh {
+    fn new(state: Arc<std::sync::Mutex<ProviderRefreshState>>) -> Self {
+        state
+            .lock()
+            .expect("provider refresh state lock")
+            .manual_refreshes += 1;
+        Self { state }
+    }
+}
+
+impl Drop for ManualFullProviderRefresh {
+    fn drop(&mut self) {
+        self.state
+            .lock()
+            .expect("provider refresh state lock")
+            .manual_refreshes -= 1;
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct NativeServerControl {
     config: ServerConfig,
@@ -208,7 +288,7 @@ pub struct NativeServerControl {
     settings_generation: Arc<AtomicU64>,
     agent_activity_handler: AgentActivityHandlerSlot,
     next_provider_probe_sequence: Arc<AtomicU64>,
-    latest_published_provider_probe_sequence: Arc<AtomicU64>,
+    latest_committed_provider_probe_sequence: Arc<AtomicU64>,
     #[cfg(test)]
     provider_update_refresh_attempts: Arc<AtomicU64>,
     #[cfg(test)]
@@ -237,6 +317,7 @@ pub struct NativeServerControl {
     providers: Arc<RwLock<Vec<Value>>>,
     provider_maintenance: ProviderMaintenance,
     full_provider_refresh_running: Arc<AtomicBool>,
+    provider_refresh_state: Arc<std::sync::Mutex<ProviderRefreshState>>,
     activity_protocol_registered: Arc<AtomicBool>,
     config_events: broadcast::Sender<Value>,
     trace_diagnostics: TraceDiagnosticsStore,
@@ -314,7 +395,7 @@ impl NativeServerControl {
             settings_generation: Arc::new(AtomicU64::new(0)),
             agent_activity_handler: AgentActivityHandlerSlot::default(),
             next_provider_probe_sequence: Arc::new(AtomicU64::new(0)),
-            latest_published_provider_probe_sequence: Arc::new(AtomicU64::new(0)),
+            latest_committed_provider_probe_sequence: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             provider_update_refresh_attempts: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
@@ -343,6 +424,9 @@ impl NativeServerControl {
             providers: Arc::new(RwLock::new(providers)),
             provider_maintenance,
             full_provider_refresh_running: Arc::new(AtomicBool::new(false)),
+            provider_refresh_state: Arc::new(
+                std::sync::Mutex::new(ProviderRefreshState::default()),
+            ),
             activity_protocol_registered: Arc::new(AtomicBool::new(false)),
             config_events,
             trace_diagnostics,
@@ -518,29 +602,39 @@ impl NativeServerControl {
                 "payload": { "settings": next.clone() },
             }));
             drop(update_guard);
-            Ok::<(Value, u64), Value>((next, generation))
+            // Once settings are committed, their inventory refresh must also survive
+            // the caller disconnecting, including when it supersedes a manual probe.
+            let cwd =
+                std::env::current_dir().unwrap_or_else(|_| commit_control.config.base_dir.clone());
+            let probe_sequence = commit_control.begin_provider_probe();
+            let providers = commit_control
+                .probe_provider_snapshots(&next, None, &cwd)
+                .await;
+            commit_control
+                .publish_provider_snapshots_if_current(
+                    providers,
+                    false,
+                    generation,
+                    &next,
+                    probe_sequence,
+                    ProviderSnapshotPublication::IfChanged,
+                )
+                .await;
+            let _ = commit_control.start_full_provider_refresh(
+                generation,
+                next.clone(),
+                cwd,
+                FullProviderRefreshTrigger::SettingsChange,
+            );
+            Ok::<Value, Value>(next)
         });
-        let (next, generation) = commit.await.map_err(|_| {
+        commit.await.map_err(|_| {
             settings_error(
                 &self.settings_path,
                 "commit",
                 "persisted settings commit task stopped unexpectedly",
             )
-        })??;
-
-        let cwd = std::env::current_dir().unwrap_or_else(|_| self.config.base_dir.clone());
-        let probe_sequence = self.begin_provider_probe();
-        let providers = self.probe_provider_snapshots(&next, None, &cwd).await;
-        self.publish_provider_snapshots_if_current(
-            providers,
-            false,
-            generation,
-            &next,
-            probe_sequence,
-        )
-        .await;
-        self.spawn_full_provider_refresh(generation, next.clone(), cwd);
-        Ok(next)
+        })?
     }
 
     #[cfg(test)]
@@ -603,6 +697,9 @@ impl NativeServerControl {
     async fn refresh_providers(&self, payload: &Value) -> Value {
         self.provider_maintenance.begin_latest_version_refresh();
         let instance_id = payload.get("instanceId").and_then(Value::as_str);
+        let _manual_refresh = instance_id
+            .is_none()
+            .then(|| ManualFullProviderRefresh::new(self.provider_refresh_state.clone()));
         let (generation, settings) = self.settings_snapshot().await;
         let cwd = std::env::current_dir().unwrap_or_else(|_| self.config.base_dir.clone());
         let probe_sequence = self.begin_provider_probe();
@@ -616,10 +713,16 @@ impl NativeServerControl {
                 generation,
                 &settings,
                 probe_sequence,
+                ProviderSnapshotPublication::Always,
             )
             .await
         {
-            Some(providers) => providers,
+            Some(providers) => {
+                if instance_id.is_none() {
+                    self.record_full_provider_refresh();
+                }
+                providers
+            }
             None => self.providers.read().await.clone(),
         };
         json!({ "providers": providers })
@@ -653,12 +756,17 @@ impl NativeServerControl {
                 .invalidate_update_lifecycle_if_current(&target.instance_id, &target.driver, token);
         }
         let mut providers = self.providers.write().await;
+        let mut changed = false;
         for provider in providers.iter_mut() {
+            let previous = provider.get("updateState").cloned();
             self.provider_maintenance.overlay_update_state(provider);
+            changed |= provider.get("updateState") != previous.as_ref();
         }
         let snapshot = providers.clone();
         drop(providers);
-        self.publish_provider_snapshots(&snapshot);
+        if changed {
+            self.publish_provider_snapshots(&snapshot);
+        }
         (snapshot, retained)
     }
 
@@ -961,6 +1069,7 @@ impl NativeServerControl {
                 generation,
                 &settings,
                 probe_sequence,
+                ProviderSnapshotPublication::IfChanged,
             )
             .await
         {
@@ -1071,9 +1180,12 @@ impl NativeServerControl {
         if cancellation.is_cancelled() {
             return;
         }
-        if let Some(task) =
-            self.start_full_provider_refresh(generation, settings, cwd, Some(cancellation))
-            && let Some(previous) = refresh_task.lock().await.replace(task)
+        if let Some(task) = self.start_full_provider_refresh(
+            generation,
+            settings,
+            cwd,
+            FullProviderRefreshTrigger::BackgroundCheck { cancellation },
+        ) && let Some(previous) = refresh_task.lock().await.replace(task)
         {
             let _ = previous.await;
         }
@@ -1167,22 +1279,32 @@ impl NativeServerControl {
         generation: u64,
         expected_settings: &Value,
         probe_sequence: u64,
+        publication: ProviderSnapshotPublication,
     ) -> Option<Vec<Value>> {
         let _update_guard = self.settings_update_lock.lock().await;
         let settings_are_current = self.settings.read().await.eq(expected_settings);
-        if self.settings_generation.load(Ordering::Acquire) != generation
-            || !settings_are_current
-            || probe_sequence
-                <= self
-                    .latest_published_provider_probe_sequence
-                    .load(Ordering::Acquire)
-        {
+        if self.settings_generation.load(Ordering::Acquire) != generation || !settings_are_current {
             return None;
         }
-        let providers = self.merge_provider_snapshots(refreshed, partial).await;
-        self.latest_published_provider_probe_sequence
+        if probe_sequence
+            <= self
+                .latest_committed_provider_probe_sequence
+                .load(Ordering::Acquire)
+        {
+            if matches!(publication, ProviderSnapshotPublication::Always) {
+                // A newer probe may have stored only timestamps without publishing.
+                // Acknowledge the manual refresh with that current inventory, while
+                // keeping its superseded result out of the cache and completion TTL.
+                self.publish_provider_snapshots(&self.providers.read().await);
+            }
+            return None;
+        }
+        let (providers, changed) = self.merge_provider_snapshots(refreshed, partial).await;
+        self.latest_committed_provider_probe_sequence
             .store(probe_sequence, Ordering::Release);
-        self.publish_provider_snapshots(&providers);
+        if changed || matches!(publication, ProviderSnapshotPublication::Always) {
+            self.publish_provider_snapshots(&providers);
+        }
         Some(providers)
     }
 
@@ -1190,9 +1312,10 @@ impl NativeServerControl {
         &self,
         refreshed: Vec<provider_inventory::ProviderProbeResult>,
         partial: bool,
-    ) -> Vec<Value> {
+    ) -> (Vec<Value>, bool) {
         let mut current = self.providers.write().await;
-        if partial {
+        let mut merged = if partial {
+            let mut merged = current.clone();
             for result in refreshed {
                 let Some(id) = result
                     .snapshot
@@ -1202,37 +1325,44 @@ impl NativeServerControl {
                 else {
                     continue;
                 };
-                let position = current.iter().position(|row| {
+                let position = merged.iter().position(|row| {
                     row.get("instanceId").and_then(Value::as_str) == Some(id.as_str())
                 });
-                let merged = merge_provider_snapshot(position.map(|index| &current[index]), result);
+                let snapshot =
+                    merge_provider_snapshot(position.map(|index| &merged[index]), result);
                 if let Some(position) = position {
-                    current[position] = merged;
+                    merged[position] = snapshot;
                 } else {
-                    current.push(merged);
+                    merged.push(snapshot);
                 }
             }
+            merged
         } else {
-            let previous = current.clone();
-            *current = refreshed
+            refreshed
                 .into_iter()
                 .map(|result| {
                     let id = result.snapshot.get("instanceId").and_then(Value::as_str);
-                    let previous = previous
+                    let previous = current
                         .iter()
                         .find(|row| row.get("instanceId").and_then(Value::as_str) == id);
                     merge_provider_snapshot(previous, result)
                 })
-                .collect();
-        }
+                .collect()
+        };
         if !partial {
             self.provider_maintenance
-                .prune_update_states(current.iter().filter_map(provider_snapshot_identity));
+                .prune_update_states(merged.iter().filter_map(provider_snapshot_identity));
         }
-        for provider in current.iter_mut() {
+        for provider in merged.iter_mut() {
             self.provider_maintenance.overlay_update_state(provider);
         }
-        current.clone()
+        let changed = current.len() != merged.len()
+            || current
+                .iter()
+                .zip(&merged)
+                .any(|(current, next)| !provider_snapshot_content_eq(current, next));
+        *current = merged;
+        (current.clone(), changed)
     }
 
     fn publish_provider_snapshots(&self, providers: &[Value]) {
@@ -1243,8 +1373,11 @@ impl NativeServerControl {
         }));
     }
 
-    fn spawn_full_provider_refresh(&self, generation: u64, settings: Value, cwd: PathBuf) {
-        let _ = self.start_full_provider_refresh(generation, settings, cwd, None);
+    fn record_full_provider_refresh(&self) {
+        self.provider_refresh_state
+            .lock()
+            .expect("provider refresh state lock")
+            .last_completed = Some(Instant::now());
     }
 
     fn start_full_provider_refresh(
@@ -1252,13 +1385,24 @@ impl NativeServerControl {
         mut generation: u64,
         mut settings: Value,
         cwd: PathBuf,
-        cancellation: Option<CancellationToken>,
+        trigger: FullProviderRefreshTrigger,
     ) -> Option<tokio::task::JoinHandle<()>> {
-        if self
-            .full_provider_refresh_running
-            .swap(true, Ordering::AcqRel)
         {
-            return None;
+            let state = self
+                .provider_refresh_state
+                .lock()
+                .expect("provider refresh state lock");
+            if (matches!(trigger, FullProviderRefreshTrigger::Subscription)
+                && (state.manual_refreshes > 0
+                    || state
+                        .last_completed
+                        .is_some_and(|completed| completed.elapsed() <= PROVIDER_REFRESH_TTL)))
+                || self
+                    .full_provider_refresh_running
+                    .swap(true, Ordering::AcqRel)
+            {
+                return None;
+            }
         }
         let control = self.clone();
         Some(tokio::spawn(async move {
@@ -1266,7 +1410,10 @@ impl NativeServerControl {
             'refresh: loop {
                 loop {
                     let probe_sequence = control.begin_provider_probe();
-                    let providers = if let Some(cancellation) = cancellation.as_ref() {
+                    let providers = if let FullProviderRefreshTrigger::BackgroundCheck {
+                        cancellation,
+                    } = &trigger
+                    {
                         tokio::select! {
                             () = cancellation.cancelled() => break 'refresh,
                             providers = control.probe_full_provider_snapshots(&settings, None, &cwd) => providers,
@@ -1283,10 +1430,12 @@ impl NativeServerControl {
                             generation,
                             &settings,
                             probe_sequence,
+                            ProviderSnapshotPublication::IfChanged,
                         )
                         .await
                         .is_some()
                     {
+                        control.record_full_provider_refresh();
                         #[cfg(test)]
                         control
                             .latest_full_provider_refresh_generation
@@ -1396,7 +1545,19 @@ impl ProductionServerControl for NativeServerControl {
                     None => Ok(control.settings.read().await.clone()),
                 },
                 "server.updateSettings" => control.update_settings(payload).await,
-                "server.refreshProviders" => Ok(control.refresh_providers(&payload).await),
+                "server.refreshProviders" => {
+                    // The task owns the manual-refresh guard through probe, publish,
+                    // and completion recording even if the RPC future is dropped.
+                    match tokio::spawn(async move { control.refresh_providers(&payload).await })
+                        .await
+                    {
+                        Ok(providers) => Ok(providers),
+                        Err(error) if error.is_panic() => {
+                            std::panic::resume_unwind(error.into_panic())
+                        }
+                        Err(_) => Err(json!({ "_tag": "RequestCancelled", "method": method })),
+                    }
+                }
                 "server.updateProvider" => control.update_provider(&payload, cancellation).await,
                 "server.upsertKeybinding" | "server.removeKeybinding" => {
                     control.update_keybinding(method, payload).await
@@ -1424,7 +1585,12 @@ impl ProductionServerControl for NativeServerControl {
                     let (generation, settings) = control.settings_snapshot().await;
                     let cwd =
                         std::env::current_dir().unwrap_or_else(|_| control.config.base_dir.clone());
-                    control.spawn_full_provider_refresh(generation, settings, cwd);
+                    let _ = control.start_full_provider_refresh(
+                        generation,
+                        settings,
+                        cwd,
+                        FullProviderRefreshTrigger::Subscription,
+                    );
                     let mut updates = control.config_events.subscribe();
                     if send_event(
                         &sender,
@@ -2547,14 +2713,18 @@ mod tests {
         NativeServerControl::new(ServerConfig::new(directory), json!({})).await
     }
 
-    async fn scheduler_control(temp: &tempfile::TempDir) -> NativeServerControl {
-        let config = ServerConfig::new(temp.path());
-        let settings_path = config.state_dir().join("settings.json");
-        let missing_binary = temp
-            .path()
+    fn missing_provider_executable(temp: &tempfile::TempDir) -> String {
+        temp.path()
             .join("missing-provider-executable")
             .to_string_lossy()
-            .into_owned();
+            .into_owned()
+    }
+
+    async fn scheduler_control(temp: &tempfile::TempDir) -> NativeServerControl {
+        let config = running_test_config(temp.path());
+        let settings_path = config.state_dir().join("settings.json");
+        let missing_binary = missing_provider_executable(temp);
+        let missing_provider = json!({ "binaryPath": missing_binary });
         tokio::fs::create_dir_all(config.state_dir())
             .await
             .expect("state directory exists");
@@ -2562,6 +2732,18 @@ mod tests {
             settings_path,
             serde_json::to_vec(&json!({
                 "enableProviderUpdateChecks": false,
+                // A settings patch replaces `providerInstances` wholesale, and the
+                // inventory then falls back to these legacy entries for every
+                // built-in driver left without an instance. Pinning them keeps any
+                // patched full probe from launching the host's real provider CLIs,
+                // whose load-dependent startup can outlast `PROBE_WAIT_GUARD`.
+                "providers": {
+                    "codex": missing_provider,
+                    "claudeAgent": missing_provider,
+                    "cursor": missing_provider,
+                    "grok": missing_provider,
+                    "opencode": missing_provider
+                },
                 "providerInstances": {
                     "codex": { "driver": "codex", "enabled": true, "config": { "binaryPath": missing_binary } },
                     "claude": { "driver": "claudeAgent", "enabled": true, "config": { "binaryPath": missing_binary } },
@@ -2878,8 +3060,12 @@ mod tests {
         assert_eq!(requests.load(Ordering::SeqCst), 2);
     }
 
+    /// A hang guard, not a timing assertion: a loaded host can stretch one full
+    /// provider probe well past a few seconds.
+    const PROBE_WAIT_GUARD: Duration = Duration::from_secs(30);
+
     async fn wait_for_probe_after(control: &NativeServerControl, previous: u64) -> u64 {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(PROBE_WAIT_GUARD, async {
             loop {
                 let current = control.next_provider_probe_sequence.load(Ordering::Acquire);
                 if current > previous {
@@ -2893,7 +3079,7 @@ mod tests {
     }
 
     async fn wait_for_full_refresh_idle(control: &NativeServerControl) {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(PROBE_WAIT_GUARD, async {
             loop {
                 if !control
                     .full_provider_refresh_running
@@ -2923,6 +3109,519 @@ mod tests {
         })
         .await
         .expect("provider update check did not request a refresh");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn server_config_subscriptions_refresh_only_after_completion_ttl() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let control = scheduler_control(&temp).await;
+        let cancellation = CancellationToken::new();
+        let first_probe = control.install_next_full_provider_probe_pause().await;
+        let mut first = control.subscribe("subscribeServerConfig", cancellation.clone());
+        assert_eq!(
+            first
+                .recv()
+                .await
+                .expect("config stream")
+                .expect("snapshot")[0]["type"],
+            "snapshot"
+        );
+        first_probe.wait_until_entered().await;
+        assert_eq!(
+            control.next_provider_probe_sequence.load(Ordering::Acquire),
+            1
+        );
+
+        // Even a long-running initial refresh is shared by reconnecting clients.
+        tokio::time::advance(Duration::from_secs(601)).await;
+        let mut during_refresh = control.subscribe("subscribeServerConfig", cancellation.clone());
+        during_refresh
+            .recv()
+            .await
+            .expect("config stream")
+            .expect("snapshot");
+        tokio::task::yield_now().await;
+        assert_eq!(
+            control.next_provider_probe_sequence.load(Ordering::Acquire),
+            1
+        );
+        first_probe.release();
+        wait_for_full_refresh_idle(&control).await;
+
+        let next_probe = control.install_next_full_provider_probe_pause().await;
+        for elapsed in [Duration::from_secs(299), Duration::from_secs(1)] {
+            tokio::time::advance(elapsed).await;
+            let mut reconnect = control.subscribe("subscribeServerConfig", cancellation.clone());
+            reconnect
+                .recv()
+                .await
+                .expect("config stream")
+                .expect("snapshot");
+            tokio::task::yield_now().await;
+            assert_eq!(
+                control.next_provider_probe_sequence.load(Ordering::Acquire),
+                1,
+                "a subscription within five minutes of completion must reuse the inventory"
+            );
+        }
+
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        let mut expired = control.subscribe("subscribeServerConfig", cancellation.clone());
+        expired
+            .recv()
+            .await
+            .expect("config stream")
+            .expect("snapshot");
+        next_probe.wait_until_entered().await;
+        assert_eq!(
+            control.next_provider_probe_sequence.load(Ordering::Acquire),
+            2
+        );
+        next_probe.release();
+        wait_for_full_refresh_idle(&control).await;
+        cancellation.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn server_config_subscriptions_receive_manual_refresh_after_rpc_disconnect() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let control = scheduler_control(&temp).await;
+        let manual_probe = control.install_next_full_provider_probe_pause().await;
+        let manual_control = control.clone();
+        let manual = tokio::spawn(async move {
+            manual_control
+                .call(
+                    "server.refreshProviders",
+                    json!({}),
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        manual_probe.wait_until_entered().await;
+
+        let cancellation = CancellationToken::new();
+        let mut stream = control.subscribe("subscribeServerConfig", cancellation.clone());
+        stream
+            .recv()
+            .await
+            .expect("config stream")
+            .expect("snapshot");
+        tokio::task::yield_now().await;
+        assert_eq!(
+            control.next_provider_probe_sequence.load(Ordering::Acquire),
+            1,
+            "a subscription must not duplicate an in-flight manual full refresh"
+        );
+
+        manual.abort();
+        assert!(
+            manual
+                .await
+                .expect_err("manual refresh cancelled")
+                .is_cancelled()
+        );
+        manual_probe.release();
+        let event = tokio::time::timeout(PROBE_WAIT_GUARD, stream.recv())
+            .await
+            .expect("suppressed subscriber receives the detached manual refresh")
+            .expect("config stream")
+            .expect("provider statuses");
+        assert_eq!(event[0]["type"], "providerStatuses");
+        assert_eq!(
+            event[0]["payload"]["providers"],
+            control.config_snapshot().await["providers"]
+        );
+
+        let mut retry = control.subscribe("subscribeServerConfig", cancellation.clone());
+        retry
+            .recv()
+            .await
+            .expect("config stream")
+            .expect("snapshot");
+        tokio::task::yield_now().await;
+        assert_eq!(
+            control.next_provider_probe_sequence.load(Ordering::Acquire),
+            1,
+            "the detached manual refresh records completion and renews the TTL"
+        );
+        cancellation.cancel();
+    }
+
+    fn replacement_provider_instances() -> Value {
+        json!({ "replacement": { "driver": "codex", "enabled": false, "config": {} } })
+    }
+
+    #[tokio::test]
+    async fn scheduler_control_providers_never_fall_back_to_host_executables() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let control = scheduler_control(&temp).await;
+        let (_, mut settings) = control.settings_snapshot().await;
+        apply_settings_patch(
+            &mut settings,
+            json!({ "providerInstances": replacement_provider_instances() }),
+        );
+        apply_settings_defaults(&mut settings);
+
+        let missing_binary = missing_provider_executable(&temp);
+        let host_fallbacks = ["codex", "claudeAgent", "cursor", "grok", "opencode"]
+            .into_iter()
+            .filter_map(|driver| {
+                let target = provider_inventory::maintenance_target(&settings, driver, None)
+                    .unwrap_or_else(|| panic!("{driver} has a provider definition"));
+                (target.binary_path != missing_binary)
+                    .then(|| format!("{driver} -> {}", target.binary_path))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            host_fallbacks.is_empty(),
+            "providers must not resolve CLIs from the host PATH: {host_fallbacks:?}"
+        );
+    }
+
+    async fn assert_stale_manual_refresh_is_replaced_by_settings(disconnect_settings_rpc: bool) {
+        let temp = tempfile::tempdir().expect("state directory");
+        let control = scheduler_control(&temp).await;
+        let manual_probe = control.install_next_full_provider_probe_pause().await;
+        let manual_control = control.clone();
+        let manual = tokio::spawn(async move {
+            manual_control
+                .call(
+                    "server.refreshProviders",
+                    json!({}),
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        manual_probe.wait_until_entered().await;
+        let cancellation = CancellationToken::new();
+        let mut stream = control.subscribe("subscribeServerConfig", cancellation.clone());
+        stream
+            .recv()
+            .await
+            .expect("config stream")
+            .expect("snapshot");
+        assert_eq!(
+            control.next_provider_probe_sequence.load(Ordering::Acquire),
+            1
+        );
+
+        let mut events = control.config_events.subscribe();
+        let quick_probe = control.install_next_quick_provider_probe_pause().await;
+        let full_probe = control.install_next_full_provider_probe_pause().await;
+        let settings_control = control.clone();
+        let settings_update = tokio::spawn(async move {
+            settings_control
+                .call(
+                    "server.updateSettings",
+                    json!({ "patch": { "providerInstances": replacement_provider_instances() } }),
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        quick_probe.wait_until_entered().await;
+        if disconnect_settings_rpc {
+            settings_update.abort();
+        }
+        manual_probe.release();
+        manual
+            .await
+            .expect("manual refresh joins")
+            .expect("stale refresh returns current inventory");
+        assert_eq!(
+            events.try_recv().expect("committed settings")["type"],
+            "settingsUpdated"
+        );
+        assert!(
+            matches!(
+                events.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ),
+            "the stale manual result must not publish after settings change"
+        );
+
+        quick_probe.release();
+        if disconnect_settings_rpc {
+            assert!(
+                settings_update
+                    .await
+                    .expect_err("settings RPC disconnected")
+                    .is_cancelled()
+            );
+        } else {
+            settings_update
+                .await
+                .expect("settings RPC joins")
+                .expect("settings update");
+        }
+        tokio::time::timeout(PROBE_WAIT_GUARD, full_probe.wait_until_entered())
+            .await
+            .expect("committed settings must start a replacement full refresh");
+        full_probe.release();
+        wait_for_full_refresh_idle(&control).await;
+        let event = tokio::time::timeout(PROBE_WAIT_GUARD, async {
+            loop {
+                let batch = stream
+                    .recv()
+                    .await
+                    .expect("config stream")
+                    .expect("config event");
+                if let Some(event) = batch
+                    .into_iter()
+                    .find(|event| event["type"] == "providerStatuses")
+                {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("suppressed subscriber receives current settings inventory");
+        assert!(
+            event["payload"]["providers"]
+                .as_array()
+                .expect("providers")
+                .iter()
+                .any(|provider| provider["instanceId"] == "replacement")
+        );
+        assert_eq!(
+            control
+                .latest_full_provider_refresh_generation
+                .load(Ordering::Acquire),
+            control.settings_generation.load(Ordering::Acquire)
+        );
+        let mut reconnect = control.subscribe("subscribeServerConfig", cancellation.clone());
+        reconnect
+            .recv()
+            .await
+            .expect("config stream")
+            .expect("snapshot");
+        tokio::task::yield_now().await;
+        assert_eq!(
+            control.next_provider_probe_sequence.load(Ordering::Acquire),
+            3,
+            "replacement refresh records completion and renews the TTL"
+        );
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn stale_manual_provider_refresh_is_replaced_by_settings_refresh() {
+        assert_stale_manual_refresh_is_replaced_by_settings(false).await;
+    }
+
+    #[tokio::test]
+    async fn stale_manual_provider_refresh_is_replaced_after_settings_rpc_disconnect() {
+        assert_stale_manual_refresh_is_replaced_by_settings(true).await;
+    }
+
+    async fn assert_explicit_provider_refresh_publishes_unchanged_inventory(payload: Value) {
+        let temp = tempfile::tempdir().expect("state directory");
+        let control = scheduler_control(&temp).await;
+        control.refresh_providers(&json!({})).await;
+        let old_checked_at = json!("2026-01-01T00:00:00Z");
+        let previous = {
+            let mut providers = control.providers.write().await;
+            for provider in providers.iter_mut() {
+                provider["checkedAt"] = old_checked_at.clone();
+            }
+            providers.clone()
+        };
+        let instance_id = payload.get("instanceId").and_then(Value::as_str);
+        let mut events = control.config_events.subscribe();
+
+        let refreshed = control
+            .call(
+                "server.refreshProviders",
+                payload.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("explicit provider refresh");
+        let providers = refreshed["providers"].as_array().expect("providers");
+        assert_eq!(providers.len(), previous.len());
+        for (previous, next) in previous.iter().zip(providers) {
+            let mut expected = previous.clone();
+            if instance_id.is_none_or(|id| next["instanceId"] == id) {
+                assert_ne!(next["checkedAt"], old_checked_at);
+                expected["checkedAt"] = next["checkedAt"].clone();
+            }
+            assert_eq!(*next, expected, "only probe timestamps should change");
+        }
+        let event = events
+            .try_recv()
+            .expect("explicit refresh must publish even when only checkedAt changed");
+        assert_eq!(event["type"], "providerStatuses");
+        assert_eq!(event["payload"], refreshed);
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn explicit_provider_refresh_publishes_unchanged_full_inventory_once() {
+        assert_explicit_provider_refresh_publishes_unchanged_inventory(json!({})).await;
+    }
+
+    #[tokio::test]
+    async fn explicit_provider_refresh_publishes_unchanged_instance_once() {
+        assert_explicit_provider_refresh_publishes_unchanged_inventory(
+            json!({ "instanceId": "codex" }),
+        )
+        .await;
+    }
+
+    async fn assert_overtaken_explicit_provider_refresh_publishes_current_inventory(
+        payload: Value,
+    ) {
+        let temp = tempfile::tempdir().expect("state directory");
+        let control = scheduler_control(&temp).await;
+        control.refresh_providers(&json!({})).await;
+        let old_checked_at = json!("2026-01-01T00:00:00Z");
+        for provider in control.providers.write().await.iter_mut() {
+            provider["checkedAt"] = old_checked_at.clone();
+        }
+        let mut events = control.config_events.subscribe();
+        let pause = control.install_next_full_provider_probe_pause().await;
+        let manual_control = control.clone();
+        let manual = tokio::spawn(async move {
+            manual_control
+                .call("server.refreshProviders", payload, CancellationToken::new())
+                .await
+        });
+        pause.wait_until_entered().await;
+        let manual_sequence = control.next_provider_probe_sequence.load(Ordering::Acquire);
+        let checks = control.start_provider_update_checks();
+        wait_for_probe_after(&control, manual_sequence).await;
+        wait_for_full_refresh_idle(&control).await;
+        checks.shutdown().await;
+        let current = control.config_snapshot().await["providers"].clone();
+        assert!(
+            current
+                .as_array()
+                .expect("providers")
+                .iter()
+                .all(|provider| provider["checkedAt"] != old_checked_at)
+        );
+        assert!(
+            matches!(
+                events.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ),
+            "automatic timestamp-only refresh must remain silent"
+        );
+
+        // The newer full probe owns the TTL; acknowledging this older manual
+        // result must neither overwrite that inventory nor renew its completion.
+        tokio::time::advance(Duration::from_secs(240)).await;
+        pause.release();
+        let result = manual
+            .await
+            .expect("manual refresh joins")
+            .expect("manual refresh");
+        assert_eq!(result["providers"], current);
+        let event = events
+            .try_recv()
+            .expect("overtaken explicit refresh must publish the current inventory");
+        assert_eq!(event["type"], "providerStatuses");
+        assert_eq!(event["payload"], result);
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        tokio::time::advance(Duration::from_secs(61)).await;
+        let next_probe = control.install_next_full_provider_probe_pause().await;
+        let cancellation = CancellationToken::new();
+        let mut stream = control.subscribe("subscribeServerConfig", cancellation.clone());
+        stream
+            .recv()
+            .await
+            .expect("config stream")
+            .expect("snapshot");
+        tokio::time::timeout(PROBE_WAIT_GUARD, next_probe.wait_until_entered())
+            .await
+            .expect("a discarded manual probe must not renew the TTL");
+        next_probe.release();
+        wait_for_full_refresh_idle(&control).await;
+        cancellation.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overtaken_explicit_provider_refresh_publishes_current_full_inventory_once() {
+        assert_overtaken_explicit_provider_refresh_publishes_current_inventory(json!({})).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overtaken_explicit_provider_refresh_publishes_current_instance_once() {
+        assert_overtaken_explicit_provider_refresh_publishes_current_inventory(
+            json!({ "instanceId": "codex" }),
+        )
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manual_provider_refresh_bypasses_and_renews_subscription_ttl() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let control = scheduler_control(&temp).await;
+        let cancellation = CancellationToken::new();
+        control
+            .call("server.refreshProviders", json!({}), cancellation.clone())
+            .await
+            .expect("initial manual refresh");
+
+        tokio::time::advance(Duration::from_secs(240)).await;
+        let refreshed = control
+            .call("server.refreshProviders", json!({}), cancellation.clone())
+            .await
+            .expect("manual refresh within the TTL");
+        assert_eq!(
+            control.next_provider_probe_sequence.load(Ordering::Acquire),
+            2
+        );
+        assert_eq!(
+            refreshed["providers"],
+            control.config_snapshot().await["providers"]
+        );
+
+        // The first refresh is expired, but the manual refresh is still fresh.
+        tokio::time::advance(Duration::from_secs(61)).await;
+        let mut stream = control.subscribe("subscribeServerConfig", cancellation.clone());
+        stream
+            .recv()
+            .await
+            .expect("config stream")
+            .expect("snapshot");
+        tokio::task::yield_now().await;
+        assert_eq!(
+            control.next_provider_probe_sequence.load(Ordering::Acquire),
+            2,
+            "a completed manual refresh must renew the subscription TTL"
+        );
+        cancellation.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn settings_changes_refresh_providers_within_subscription_ttl() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let control = scheduler_control(&temp).await;
+        control.refresh_providers(&json!({})).await;
+        let full_probe = control.install_next_full_provider_probe_pause().await;
+
+        control
+            .call(
+                "server.updateSettings",
+                json!({ "patch": { "enableAssistantStreaming": true } }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("settings update");
+        full_probe.wait_until_entered().await;
+        assert_eq!(
+            control.next_provider_probe_sequence.load(Ordering::Acquire),
+            3
+        );
+        full_probe.release();
+        wait_for_full_refresh_idle(&control).await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -3033,7 +3732,12 @@ mod tests {
             .await;
         let (generation, settings) = control.settings_snapshot().await;
         let cwd = std::env::current_dir().unwrap_or_else(|_| control.config.base_dir.clone());
-        control.spawn_full_provider_refresh(generation, settings, cwd);
+        let _ = control.start_full_provider_refresh(
+            generation,
+            settings,
+            cwd,
+            FullProviderRefreshTrigger::SettingsChange,
+        );
         pause.wait_until_entered().await;
 
         control
@@ -4261,6 +4965,180 @@ mod tests {
         }
     }
 
+    async fn publish_inventory_for_test(
+        control: &NativeServerControl,
+        snapshots: Vec<Value>,
+        partial: bool,
+    ) {
+        let (generation, settings) = control.settings_snapshot().await;
+        let sequence = control.begin_provider_probe();
+        control
+            .publish_provider_snapshots_if_current(
+                snapshots
+                    .into_iter()
+                    .map(|snapshot| provider_inventory::ProviderProbeResult {
+                        snapshot,
+                        rich_metadata: provider_inventory::RichMetadataOutcome::Succeeded,
+                        models_authoritative: true,
+                    })
+                    .collect(),
+                partial,
+                generation,
+                &settings,
+                sequence,
+                ProviderSnapshotPublication::IfChanged,
+            )
+            .await
+            .expect("current probe is accepted");
+    }
+
+    #[tokio::test]
+    async fn provider_statuses_ignore_probe_timestamps_but_store_them() {
+        let mut unexpected_publications = Vec::new();
+        for partial in [false, true] {
+            let temp = tempfile::tempdir().expect("state directory");
+            let control = scheduler_control(&temp).await;
+            let mut snapshot = control.providers.read().await[0].clone();
+            snapshot["checkedAt"] = json!("2026-09-26T10:00:00Z");
+            snapshot["models"] = json!([{ "slug": "initial-model" }]);
+            snapshot["versionAdvisory"] = json!({
+                "status": "unknown",
+                "currentVersion": null,
+                "latestVersion": null,
+                "updateCommand": null,
+                "canUpdate": false,
+                "checkedAt": "2026-09-26T10:00:00Z",
+                "message": null
+            });
+            let mut events = control.config_events.subscribe();
+            publish_inventory_for_test(&control, vec![snapshot.clone()], partial).await;
+            assert_eq!(
+                events.try_recv().expect("initial inventory")["type"],
+                "providerStatuses"
+            );
+
+            for path in PROVIDER_PROBE_TIMESTAMP_PATHS {
+                let pointer = format!("/{}", path.join("/"));
+                *snapshot.pointer_mut(&pointer).expect("probe timestamp") =
+                    json!("2026-09-26T11:00:00Z");
+                publish_inventory_for_test(&control, vec![snapshot.clone()], partial).await;
+                let config = control.config_snapshot().await;
+                let stored = config["providers"]
+                    .as_array()
+                    .expect("provider snapshot")
+                    .iter()
+                    .find(|provider| provider["instanceId"] == snapshot["instanceId"])
+                    .expect("refreshed provider");
+                assert_eq!(
+                    stored.pointer(&pointer),
+                    Some(&json!("2026-09-26T11:00:00Z"))
+                );
+                while let Ok(event) = events.try_recv() {
+                    assert_eq!(event["type"], "providerStatuses");
+                    unexpected_publications.push((partial, pointer.clone()));
+                }
+            }
+        }
+        assert!(
+            unexpected_publications.is_empty(),
+            "timestamp-only refreshes published providerStatuses: {unexpected_publications:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_statuses_publish_once_for_model_and_skill_changes() {
+        for partial in [false, true] {
+            let temp = tempfile::tempdir().expect("state directory");
+            let control = scheduler_control(&temp).await;
+            let mut snapshot = control.providers.read().await[0].clone();
+            snapshot["models"] = json!([{ "slug": "initial-model" }]);
+            let mut events = control.config_events.subscribe();
+            publish_inventory_for_test(&control, vec![snapshot.clone()], partial).await;
+            events.try_recv().expect("initial inventory");
+
+            for (field, value) in [
+                ("models", json!([{ "slug": "new-model" }])),
+                ("skills", json!([{ "name": "new-skill" }])),
+            ] {
+                snapshot[field] = value.clone();
+                publish_inventory_for_test(&control, vec![snapshot.clone()], partial).await;
+                let event = events.try_recv().expect("changed inventory publishes");
+                assert_eq!(event["type"], "providerStatuses");
+                let published = event["payload"]["providers"]
+                    .as_array()
+                    .expect("provider statuses")
+                    .iter()
+                    .find(|provider| provider["instanceId"] == snapshot["instanceId"])
+                    .expect("changed provider");
+                assert_eq!(published[field], value);
+                assert!(matches!(
+                    events.try_recv(),
+                    Err(broadcast::error::TryRecvError::Empty)
+                ));
+
+                publish_inventory_for_test(&control, vec![snapshot.clone()], partial).await;
+                assert!(
+                    matches!(
+                        events.try_recv(),
+                        Err(broadcast::error::TryRecvError::Empty)
+                    ),
+                    "an unchanged {field} inventory must not publish again (partial={partial})"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_statuses_publish_only_changed_update_state() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let control = scheduler_control(&temp).await;
+        let (generation, settings) = control.settings_snapshot().await;
+        let target = provider_inventory::maintenance_target(&settings, "cursor", Some("cursor"))
+            .expect("configured Cursor target");
+        let reservation = control
+            .provider_maintenance
+            .reserve_target(&target, generation)
+            .expect("reserve provider update");
+        let mut events = control.config_events.subscribe();
+
+        for (status, finished_at) in [
+            ("running", None),
+            ("succeeded", Some("2026-09-26T11:00:00Z")),
+        ] {
+            let state = provider_update_state(
+                status,
+                Some("2026-09-26T10:00:00Z"),
+                finished_at,
+                "Provider update",
+                None,
+            );
+            for first_publication in [true, false] {
+                let (_, retained) = control
+                    .publish_provider_update_state(&target, reservation.token(), state.clone())
+                    .await;
+                assert!(retained);
+                if first_publication {
+                    let event = events.try_recv().expect("changed update state publishes");
+                    assert_eq!(event["type"], "providerStatuses");
+                    let cursor = event["payload"]["providers"]
+                        .as_array()
+                        .expect("provider statuses")
+                        .iter()
+                        .find(|provider| provider["instanceId"] == "cursor")
+                        .expect("Cursor status");
+                    assert_eq!(cursor["updateState"]["status"], status);
+                }
+                assert!(
+                    matches!(
+                        events.try_recv(),
+                        Err(broadcast::error::TryRecvError::Empty)
+                    ),
+                    "unchanged update state must not publish providerStatuses"
+                );
+            }
+        }
+    }
+
     #[test]
     fn authoritative_models_survive_a_failed_capabilities_probe() {
         let current = json!({
@@ -4574,6 +5452,7 @@ mod tests {
                         generation,
                         &settings,
                         older_sequence,
+                        ProviderSnapshotPublication::IfChanged,
                     )
                     .await
             })
@@ -4599,6 +5478,7 @@ mod tests {
                 generation,
                 &settings,
                 newer_sequence,
+                ProviderSnapshotPublication::IfChanged,
             )
             .await
             .expect("newer probe publishes");
@@ -4754,13 +5634,21 @@ mod tests {
             settings_events.last().expect("last settings event")["payload"]["settings"],
             memory_settings
         );
-        assert_eq!(
-            events
+        let published_providers = events
+            .iter()
+            .rev()
+            .find(|event| event["type"] == "providerStatuses")
+            .expect("last provider event")["payload"]["providers"]
+            .as_array()
+            .expect("published providers")
+            .clone();
+        // A final refresh may store newer timestamps without another event.
+        assert_eq!(published_providers.len(), memory_providers.len());
+        assert!(
+            published_providers
                 .iter()
-                .rev()
-                .find(|event| event["type"] == "providerStatuses")
-                .expect("last provider event")["payload"]["providers"],
-            json!(memory_providers)
+                .zip(&memory_providers)
+                .all(|(published, stored)| provider_snapshot_content_eq(published, stored))
         );
     }
 
