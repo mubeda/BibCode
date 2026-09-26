@@ -6,7 +6,7 @@ use bibcode_server::{
     preview::PreviewManager,
     workspace::{WorkspaceRpc, WorkspaceService},
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::time::timeout;
@@ -15,6 +15,10 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use bibcode_server::production::workspace_preview::{
     WorkspacePreviewRpcServices, register_workspace_preview_rpc,
 };
+
+#[path = "support/websocket_frames.rs"]
+mod websocket_frames;
+use websocket_frames::next_frame_past_heartbeat;
 
 fn path_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
@@ -40,7 +44,7 @@ async fn next_server_message<S>(socket: &mut tokio_tungstenite::WebSocketStream<
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let message = timeout(Duration::from_secs(2), socket.next())
+    let message = timeout(Duration::from_secs(2), next_frame_past_heartbeat(socket))
         .await
         .expect("WebSocket response timeout")
         .expect("WebSocket remains open")

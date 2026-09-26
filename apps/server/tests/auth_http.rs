@@ -21,6 +21,10 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite};
 
+#[path = "support/websocket_frames.rs"]
+mod websocket_frames;
+use websocket_frames::next_frame_past_heartbeat;
+
 const DESKTOP_BOOTSTRAP: &str = "desktop-bootstrap-fixture";
 const TOKEN_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
@@ -711,11 +715,14 @@ async fn websocket_requires_a_short_lived_ticket_or_request_credential() {
         ))
         .await
         .expect("send protocol ping");
-    let pong = timeout(Duration::from_secs(2), socket.next())
-        .await
-        .expect("Pong timeout")
-        .expect("WebSocket open")
-        .expect("valid WebSocket frame");
+    let pong = timeout(
+        Duration::from_secs(2),
+        next_frame_past_heartbeat(&mut socket),
+    )
+    .await
+    .expect("Pong timeout")
+    .expect("WebSocket open")
+    .expect("valid WebSocket frame");
     assert_eq!(pong.into_text().expect("text Pong"), r#"{"_tag":"Pong"}"#);
     socket.close(None).await.expect("close WebSocket");
 
@@ -985,9 +992,12 @@ async fn plain_websocket_rejects_a_single_frame_larger_than_16_mib() {
     let terminal = if send_result.is_err() {
         true
     } else {
-        let outcome = timeout(Duration::from_secs(3), socket.next())
-            .await
-            .expect("oversized plain frame reaches a terminal outcome");
+        let outcome = timeout(
+            Duration::from_secs(3),
+            next_frame_past_heartbeat(&mut socket),
+        )
+        .await
+        .expect("oversized plain frame reaches a terminal outcome");
         matches!(
             outcome,
             None | Some(Ok(tungstenite::Message::Close(_))) | Some(Err(_))
@@ -2726,7 +2736,7 @@ async fn next_ws_json<S>(socket: &mut tokio_tungstenite::WebSocketStream<S>) -> 
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let frame = timeout(Duration::from_secs(2), socket.next())
+    let frame = timeout(Duration::from_secs(2), next_frame_past_heartbeat(socket))
         .await
         .expect("WebSocket response timeout")
         .expect("WebSocket remains open")

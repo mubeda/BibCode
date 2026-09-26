@@ -26,6 +26,10 @@ use tokio_tungstenite::{
     },
 };
 
+#[path = "support/websocket_frames.rs"]
+mod websocket_frames;
+use websocket_frames::next_frame_past_heartbeat;
+
 const NOISE_NK_PARAMS: &str = "Noise_NK_25519_ChaChaPoly_SHA256";
 const MAX_CIPHERTEXT_BYTES: usize = 65_535;
 const MAX_CHUNK_BYTES: usize = 65_518;
@@ -916,9 +920,12 @@ async fn oversized_binary_frame_closes_the_connection() {
         .send(Message::Binary(vec![0_u8; MAX_CIPHERTEXT_BYTES + 1].into()))
         .await
         .expect("send oversized frame");
-    let outcome = timeout(Duration::from_secs(3), socket.next())
-        .await
-        .expect("oversized authenticated frame reaches a terminal outcome");
+    let outcome = timeout(
+        Duration::from_secs(3),
+        next_frame_past_heartbeat(&mut socket),
+    )
+    .await
+    .expect("oversized authenticated frame reaches a terminal outcome");
     assert!(matches!(
         outcome,
         None | Some(Ok(Message::Close(_))) | Some(Err(_))
@@ -984,9 +991,12 @@ async fn authenticated_empty_continuation_is_rejected() {
         .send(Message::Binary(frame.into()))
         .await
         .expect("send empty continuation");
-    let outcome = timeout(Duration::from_secs(3), socket.next())
-        .await
-        .expect("server rejects invalid fragmentation");
+    let outcome = timeout(
+        Duration::from_secs(3),
+        next_frame_past_heartbeat(&mut socket),
+    )
+    .await
+    .expect("server rejects invalid fragmentation");
     assert!(matches!(
         outcome,
         None | Some(Ok(Message::Close(_))) | Some(Err(_))
@@ -1008,9 +1018,12 @@ async fn incomplete_authenticated_message_closes_after_ten_seconds_without_progr
         .send(Message::Binary(frame.into()))
         .await
         .expect("send incomplete encrypted message");
-    let outcome = timeout(Duration::from_secs(12), socket.next())
-        .await
-        .expect("incomplete-message progress deadline");
+    let outcome = timeout(
+        Duration::from_secs(12),
+        next_frame_past_heartbeat(&mut socket),
+    )
+    .await
+    .expect("incomplete-message progress deadline");
     assert!(matches!(
         outcome,
         None | Some(Ok(Message::Close(_))) | Some(Err(_))
@@ -1238,9 +1251,12 @@ async fn inbound_plaintext_capacity_backpressures_by_principal_and_releases_on_c
     )
     .await;
     assert!(
-        timeout(Duration::from_millis(100), waiting.next())
-            .await
-            .is_err(),
+        timeout(
+            Duration::from_millis(100),
+            next_frame_past_heartbeat(&mut waiting)
+        )
+        .await
+        .is_err(),
         "principal pressure must backpressure without closing the waiting socket"
     );
 

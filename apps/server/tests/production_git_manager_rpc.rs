@@ -17,13 +17,17 @@ use bibcode_server::{
     },
     worktree_catalog::{WorkspaceAvailabilityRegistry, WorktreeCatalogService},
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
+
+#[path = "support/websocket_frames.rs"]
+mod websocket_frames;
+use websocket_frames::next_frame_past_heartbeat;
 
 const SOCKET_RESPONSE_BOUND: Duration = Duration::from_secs(60);
 
@@ -2759,7 +2763,7 @@ async fn send_json(socket: &mut TestSocket, value: Value) {
 }
 
 async fn next_server_message(socket: &mut TestSocket) -> ServerMessage {
-    let frame = timeout(SOCKET_RESPONSE_BOUND, socket.next())
+    let frame = timeout(SOCKET_RESPONSE_BOUND, next_frame_past_heartbeat(socket))
         .await
         .expect("WebSocket response timeout")
         .expect("WebSocket remains open")

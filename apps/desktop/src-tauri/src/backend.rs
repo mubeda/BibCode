@@ -3538,7 +3538,18 @@ exit /b 9
             ))
             .await
             .expect("RPC request should send");
-        let frame = tokio::time::timeout(response_timeout, socket.next())
+        // Skip the server's 15 s heartbeat Ping and any Pong: tungstenite
+        // queues the Pong reply itself and sends it on the next read. The
+        // timeout bounds the whole wait.
+        let next_frame_past_heartbeat = async {
+            loop {
+                match socket.next().await {
+                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                    other => break other,
+                }
+            }
+        };
+        let frame = tokio::time::timeout(response_timeout, next_frame_past_heartbeat)
             .await
             .expect("RPC response should arrive before the timeout")
             .expect("RPC socket should remain open")

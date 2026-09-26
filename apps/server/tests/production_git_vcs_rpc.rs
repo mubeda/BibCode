@@ -13,7 +13,7 @@ use bibcode_server::{
         AdoptedWorktreeAvailability, WorkspaceAvailabilityRegistry, WorkspaceLossTransition,
     },
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::{
@@ -29,6 +29,9 @@ use bibcode_server::production::git_vcs::{
 #[path = "support/isolated_git_config.rs"]
 mod isolated_git_config;
 use isolated_git_config::IsolatedGitConfig;
+#[path = "support/websocket_frames.rs"]
+mod websocket_frames;
+use websocket_frames::next_frame_past_heartbeat;
 
 fn git_vcs_services() -> GitVcsRpcServices {
     let hosts = Arc::new(bibcode_server::source_control::ProviderHosts::default());
@@ -2405,7 +2408,12 @@ async fn assert_connection_stays_open(connection: &mut tokio::net::TcpStream, co
 }
 
 async fn assert_no_reply(socket: &mut TestSocket, context: &str) {
-    if let Ok(message) = timeout(Duration::from_millis(500), socket.next()).await {
+    if let Ok(message) = timeout(
+        Duration::from_millis(500),
+        next_frame_past_heartbeat(socket),
+    )
+    .await
+    {
         panic!("{context}: expected no reply yet, got {message:?}");
     }
 }
@@ -3005,11 +3013,14 @@ async fn next_server_message_for<S>(socket: &mut WebSocketStream<S>, context: &s
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let frame = timeout(GIT_RPC_RESPONSE_DEADLOCK_BOUND, socket.next())
-        .await
-        .unwrap_or_else(|_| panic!("WebSocket response timeout while waiting for {context}"))
-        .expect("WebSocket remains open")
-        .expect("valid WebSocket frame");
+    let frame = timeout(
+        GIT_RPC_RESPONSE_DEADLOCK_BOUND,
+        next_frame_past_heartbeat(socket),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("WebSocket response timeout while waiting for {context}"))
+    .expect("WebSocket remains open")
+    .expect("valid WebSocket frame");
     let Message::Text(text) = frame else {
         panic!("expected text WebSocket message while waiting for {context}, got {frame:?}");
     };
@@ -3023,7 +3034,7 @@ async fn next_server_message_with_timeout<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let frame = timeout(timeout_duration, socket.next())
+    let frame = timeout(timeout_duration, next_frame_past_heartbeat(socket))
         .await
         .expect("WebSocket response timeout")
         .expect("WebSocket remains open")

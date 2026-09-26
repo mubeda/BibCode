@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use futures_util::{FutureExt, SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::net::TcpStream;
@@ -29,6 +29,10 @@ use bibcode_server::{
         AdoptedWorktreeAvailability, WorkspaceAvailabilityRegistry, WorkspaceLossTransition,
     },
 };
+
+#[path = "support/websocket_frames.rs"]
+mod websocket_frames;
+use websocket_frames::next_frame_past_heartbeat;
 
 const TERMINAL_RPC_INTEGRATION_DEADLINE: Duration = Duration::from_secs(5);
 
@@ -1995,11 +1999,14 @@ async fn next_message(socket: &mut TestSocket) -> ServerMessage {
 }
 
 async fn next_message_for(socket: &mut TestSocket, expected: &str) -> ServerMessage {
-    let message = tokio::time::timeout(TERMINAL_RPC_INTEGRATION_DEADLINE, socket.next())
-        .await
-        .unwrap_or_else(|error| panic!("response timeout while waiting for {expected}: {error}"))
-        .expect("socket remains open")
-        .expect("valid socket message");
+    let message = tokio::time::timeout(
+        TERMINAL_RPC_INTEGRATION_DEADLINE,
+        next_frame_past_heartbeat(socket),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("response timeout while waiting for {expected}: {error}"))
+    .expect("socket remains open")
+    .expect("valid socket message");
     let Message::Text(text) = message else {
         panic!("expected text message")
     };

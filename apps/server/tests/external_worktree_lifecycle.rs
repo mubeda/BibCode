@@ -20,7 +20,7 @@ use bibcode_server::{
     },
     worktree_catalog::WorktreeCatalogService,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 #[cfg(unix)]
@@ -28,6 +28,10 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::time::timeout;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
+
+#[path = "support/websocket_frames.rs"]
+mod websocket_frames;
+use websocket_frames::next_frame_past_heartbeat;
 
 type TestSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -1031,7 +1035,7 @@ async fn ack(socket: &mut TestSocket, request_id: &str) {
 }
 
 async fn next(socket: &mut TestSocket) -> ServerMessage {
-    let message = timeout(Duration::from_secs(10), socket.next())
+    let message = timeout(Duration::from_secs(10), next_frame_past_heartbeat(socket))
         .await
         .expect("bounded RPC response")
         .expect("WebSocket remains open")

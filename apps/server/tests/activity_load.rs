@@ -42,7 +42,7 @@ use bibcode_server::{
         TerminalLaunchCommand, TerminalManager, TerminalManagerOptions, TerminalOpenInput,
     },
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use serde_json::{Value, json};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use tempfile::TempDir;
@@ -54,6 +54,10 @@ use tokio::{
 };
 use tokio_tungstenite::{WebSocketStream, connect_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
+
+#[path = "support/websocket_frames.rs"]
+mod websocket_frames;
+use websocket_frames::next_frame_past_heartbeat;
 
 const ACTOR_COUNT: usize = 50;
 const EVENTS_PER_ACTOR: usize = 100;
@@ -1987,7 +1991,7 @@ async fn next_message<S>(socket: &mut WebSocketStream<S>) -> ServerMessage
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let frame = timeout(Duration::from_secs(3), socket.next())
+    let frame = timeout(Duration::from_secs(3), next_frame_past_heartbeat(socket))
         .await
         .expect("server message timeout")
         .expect("websocket open")
