@@ -171,9 +171,16 @@ fn register_orchestration_rpc_inner(
     registry.register_unary("orchestration.replayEvents", move |request, _| {
         let replay = replay.clone();
         async move {
+            let tag = request.tag.clone();
             let input = decode::<ReplayInput>(request)?;
+            if input.from_sequence_exclusive < 0 {
+                return Err(invalid_request(
+                    &tag,
+                    "fromSequenceExclusive must be a non-negative integer",
+                ));
+            }
             replay
-                .read_events(input.from_sequence_exclusive.max(0))
+                .read_events(input.from_sequence_exclusive)
                 .await
                 .map(|events| Value::Array(events.iter().map(wire_event).collect()))
                 .map_err(|error| orchestration_error("OrchestrationReplayEventsError", error))
