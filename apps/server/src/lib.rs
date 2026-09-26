@@ -13,6 +13,7 @@ pub mod diagnostics;
 mod environment_identity;
 pub mod git;
 mod http;
+mod json_size;
 mod lifecycle;
 pub mod logging;
 mod maintenance;
