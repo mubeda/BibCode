@@ -189,10 +189,11 @@ remote environments and browser mode.
 
 The desktop app shows native menus on macOS and Linux. In the browser and on
 Windows the menu opens inside the app: its first enabled item is focused, the
-arrow keys move between items (skipping separators and disabled items),
-**Home** and **End** jump to the ends, **→** and **←** open and close a
-submenu, **Enter** or **Space** chooses, and **Escape** closes the menu and
-returns focus to where you were.
+arrow keys move between items (skipping separators, but stopping on disabled
+items so you can read or hear why they are unavailable; choosing one does
+nothing), **Home** and **End** jump to the ends, **→** and **←** open and
+close a submenu, **Enter** or **Space** chooses, and **Escape** closes the menu
+and returns focus to where you were.
 
 External editors are listed when the server host can find them on `PATH`. Zed
 is additionally detected through the `zeditor` alias, a Flatpak export

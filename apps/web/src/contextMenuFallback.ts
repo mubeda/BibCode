@@ -7,6 +7,13 @@ import {
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 
+let nextMenuElementId = 0;
+/** A document-unique id for the label and reason spans an item references. */
+function menuElementId(part: "label" | "reason"): string {
+  nextMenuElementId += 1;
+  return `bibcode-context-menu-${part}-${nextMenuElementId}`;
+}
+
 // Inline Lucide-style icon paths (stroke-based, viewBox 0 0 24 24, strokeWidth 2).
 const ICON_PATHS: Record<string, ReadonlyArray<{ tag: string; attrs: Record<string, string> }>> = {
   pencil: [
@@ -155,7 +162,9 @@ function readFocusedElement(): HTMLElement | null {
 /**
  * Imperative DOM-based context menu for browsers and the Windows desktop
  * webview. Supports nested submenus, separators and full keyboard control, and
- * resolves with the chosen leaf item id.
+ * resolves with the chosen leaf item id. Disabled items stay reachable with
+ * the arrow keys, Home and End, but Enter, Space and clicks never choose them
+ * or open their submenus.
  */
 export function showContextMenuFallback<T extends string>(
   items: readonly ContextMenuEntry<T>[],
@@ -192,11 +201,18 @@ export function showContextMenuFallback<T extends string>(
       resolve(result);
     };
 
-    const enabledRecords = (level: number): RenderedMenuItem<T>[] =>
-      (renderedItemsByLevel[level] ?? []).filter((record) => record.enabled);
+    // Every item, disabled ones included, takes part in the roving focus.
+    const levelRecords = (level: number): RenderedMenuItem<T>[] =>
+      renderedItemsByLevel[level] ?? [];
+
+    /** A menu opens on its first enabled item, or its first item if none is enabled. */
+    const focusOpeningItem = (level: number) => {
+      const records = levelRecords(level);
+      focusElement((records.find((record) => record.enabled) ?? records[0])?.element);
+    };
 
     const focusBoundary = (level: number, boundary: "first" | "last") => {
-      const records = enabledRecords(level);
+      const records = levelRecords(level);
       focusElement((boundary === "first" ? records[0] : records.at(-1))?.element);
     };
 
@@ -219,7 +235,7 @@ export function showContextMenuFallback<T extends string>(
     const moveFocus = (step: 1 | -1) => {
       const position = focusedPosition();
       const level = position?.level ?? renderedItemsByLevel.length - 1;
-      const records = enabledRecords(level);
+      const records = levelRecords(level);
       if (records.length === 0) {
         return;
       }
@@ -259,7 +275,7 @@ export function showContextMenuFallback<T extends string>(
         }
         case "ArrowRight": {
           const position = focusedPosition();
-          if (!position?.record.hasChildren) {
+          if (!position?.record.enabled || !position.record.hasChildren) {
             return;
           }
           event.preventDefault();
@@ -287,6 +303,10 @@ export function showContextMenuFallback<T extends string>(
           }
           event.preventDefault();
           event.stopPropagation();
+          if (!position.record.enabled) {
+            // Focusable so it can explain itself, never chosen or opened.
+            return;
+          }
           if (position.record.hasChildren) {
             openSubmenu(position.record, position.level, true);
           } else {
@@ -351,7 +371,7 @@ export function showContextMenuFallback<T extends string>(
       openParents[level] = record;
       record.element.setAttribute("aria-expanded", "true");
       if (focusFirst) {
-        focusBoundary(level + 1, "first");
+        focusOpeningItem(level + 1);
       }
     };
 
@@ -413,7 +433,9 @@ export function showContextMenuFallback<T extends string>(
         button.type = "button";
         button.tabIndex = -1;
         button.setAttribute("role", "menuitem");
-        button.disabled = isDisabled;
+        // `aria-disabled`, never `disabled`: a disabled item stays in the roving
+        // focus so keyboard and screen-reader users hear it and its reason
+        // (WAI-ARIA APG menu pattern). The key handler refuses to choose it.
         if (isDisabled) {
           button.setAttribute("aria-disabled", "true");
         }
@@ -470,6 +492,14 @@ export function showContextMenuFallback<T extends string>(
             "display:block;white-space:normal;font-size:0.75rem;line-height:1rem;color:var(--muted-foreground);";
           reason.textContent = item.description;
           label.appendChild(reason);
+          // The content holds the label and the reason, so name the item by its label
+          // and describe it by its reason: otherwise a screen reader reads the reason
+          // twice, in the name and again as the description. `aria-description`
+          // above stays as the fallback where `aria-describedby` is unsupported.
+          labelText.id = menuElementId("label");
+          reason.id = menuElementId("reason");
+          button.setAttribute("aria-labelledby", labelText.id);
+          button.setAttribute("aria-describedby", reason.id);
         }
         button.appendChild(label);
 
@@ -489,28 +519,37 @@ export function showContextMenuFallback<T extends string>(
         };
         records.push(record);
 
-        if (!isDisabled) {
-          // Pointer hover and keyboard focus share one highlight: the inline
-          // styles above would otherwise override a focus utility class.
-          const highlight = () => {
-            for (const [other, clear] of unhighlightByButton) {
-              if (other !== button) clear();
-            }
-            button.dataset.active = "true";
-            button.style.background = isLeafDestructive
+        // Pointer hover and keyboard focus share one highlight: the inline
+        // styles above would otherwise override a focus utility class. A
+        // disabled row takes it from keyboard focus only, on the neutral wash
+        // and with its muted text, so it never looks like a choosable item.
+        const restingColor = isDisabled
+          ? "var(--muted-foreground)"
+          : isLeafDestructive
+            ? "var(--destructive-foreground)"
+            : "var(--foreground)";
+        const highlight = () => {
+          for (const [other, clear] of unhighlightByButton) {
+            if (other !== button) clear();
+          }
+          button.dataset.active = "true";
+          button.style.background =
+            isLeafDestructive && !isDisabled
               ? "color-mix(in srgb, var(--destructive) 10%, transparent)"
               : "var(--accent)";
-            button.style.color = isLeafDestructive
-              ? "var(--destructive-foreground)"
-              : "var(--accent-foreground)";
-          };
-          const unhighlight = () => {
-            button.dataset.active = "false";
-            button.style.background = "transparent";
-            button.style.color = isLeafDestructive
-              ? "var(--destructive-foreground)"
-              : "var(--foreground)";
-          };
+          button.style.color =
+            isDisabled || isLeafDestructive ? restingColor : "var(--accent-foreground)";
+        };
+        const unhighlight = () => {
+          button.dataset.active = "false";
+          button.style.background = "transparent";
+          button.style.color = restingColor;
+        };
+        unhighlightByButton.set(button, unhighlight);
+        button.addEventListener("focus", highlight);
+        button.addEventListener("blur", unhighlight);
+
+        if (!isDisabled) {
           // One active item for pointer and keyboard: hovering moves focus, so
           // Enter always runs the highlighted item and only one row looks active.
           button.addEventListener("mouseenter", () => {
@@ -525,9 +564,6 @@ export function showContextMenuFallback<T extends string>(
             }
             unhighlight();
           });
-          unhighlightByButton.set(button, unhighlight);
-          button.addEventListener("focus", highlight);
-          button.addEventListener("blur", unhighlight);
 
           if (hasChildren) {
             button.addEventListener("mouseenter", () => {
@@ -574,7 +610,7 @@ export function showContextMenuFallback<T extends string>(
     document.addEventListener("pointerdown", onPointerDown, true);
     document.addEventListener("contextmenu", onContextMenu, true);
     openMenu(items, position?.x ?? 0, position?.y ?? 0, 0);
-    focusBoundary(0, "first");
+    focusOpeningItem(0);
 
     requestAnimationFrame(() => {
       canDismissFromPointer = true;

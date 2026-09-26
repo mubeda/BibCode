@@ -191,7 +191,7 @@ describe("SidebarThreadRow browser interactions", () => {
         ...document.querySelectorAll<HTMLButtonElement>('[role="menu"] [role="menuitem"]'),
       ].find((item) => item.textContent?.startsWith("Delete Worktree…"));
       expect(deleteItem).toBeDefined();
-      expect(deleteItem!.disabled).toBe(true);
+      expect(deleteItem!.hasAttribute("disabled")).toBe(false);
       expect(deleteItem!.getAttribute("aria-disabled")).toBe("true");
       expect(deleteItem!.getAttribute("aria-description")).toBe(reason);
       expect(deleteItem!.textContent).toBe(`Delete Worktree…${reason}`);

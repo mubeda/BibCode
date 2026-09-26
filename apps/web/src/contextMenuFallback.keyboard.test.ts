@@ -55,7 +55,7 @@ describe("showContextMenuFallback keyboard support", () => {
     expect(document.activeElement).toBe(trigger);
   });
 
-  it("moves with the arrow keys, skipping separators and disabled items, and wraps", async () => {
+  it("moves with the arrow keys onto disabled items, skipping separators, and wraps", async () => {
     focusTrigger();
     const selection = showContextMenuFallback([
       { id: "rename", label: "Rename…" },
@@ -67,6 +67,8 @@ describe("showContextMenuFallback keyboard support", () => {
     ]);
     expect(focusedText()).toBe("Rename…");
     press("ArrowDown");
+    expect(focusedText()).toBe("Disabled");
+    press("ArrowDown");
     expect(focusedText()).toBe("Copy Path");
     press("ArrowDown");
     expect(focusedText()).toBe("Delete");
@@ -74,10 +76,195 @@ describe("showContextMenuFallback keyboard support", () => {
     expect(focusedText()).toBe("Rename…");
     press("ArrowUp");
     expect(focusedText()).toBe("Delete");
+    press("ArrowUp");
+    expect(focusedText()).toBe("Copy Path");
+    press("ArrowUp");
+    expect(focusedText()).toBe("Disabled");
     press("Home");
     expect(focusedText()).toBe("Rename…");
     press("End");
     expect(focusedText()).toBe("Delete");
+
+    press("Escape");
+    await expect(selection).resolves.toBeNull();
+  });
+
+  it("keeps a disabled item focusable: aria-disabled, never the disabled attribute", async () => {
+    const selection = showContextMenuFallback([
+      { id: "pull", label: "Pull" },
+      { id: "open-in", label: "Open in", disabled: true, description: "Unavailable." },
+    ]);
+    const item = document.querySelector<HTMLButtonElement>('[role="menuitem"][aria-disabled]')!;
+    expect(item.getAttribute("aria-disabled")).toBe("true");
+    expect(item.hasAttribute("disabled")).toBe(false);
+    expect(item.disabled).toBe(false);
+    press("Escape");
+    await expect(selection).resolves.toBeNull();
+  });
+
+  it("lands Home and End on disabled items at either end, but opens on the first enabled one", async () => {
+    focusTrigger();
+    const selection = showContextMenuFallback([
+      { id: "open-in", label: "Open in", disabled: true, description: "No local opener." },
+      { id: "pull", label: "Pull" },
+      { separator: true },
+      {
+        id: "delete",
+        label: "Delete Worktree…",
+        destructive: true,
+        disabled: true,
+        description: "Stop the running session before deleting this worktree.",
+      },
+    ]);
+    expect(focusedText()).toBe("Pull");
+    press("End");
+    expect(focusedText()).toBe(
+      "Delete Worktree…Stop the running session before deleting this worktree.",
+    );
+    expect(document.activeElement?.getAttribute("aria-disabled")).toBe("true");
+    press("Home");
+    expect(focusedText()).toBe("Open inNo local opener.");
+    press("ArrowUp");
+    expect(focusedText()).toContain("Delete Worktree…");
+
+    press("Escape");
+    await expect(selection).resolves.toBeNull();
+  });
+
+  it("chooses nothing and stays open on Enter, Space or click on a disabled item", async () => {
+    const trigger = focusTrigger();
+    const chosen = vi.fn();
+    const selection = showContextMenuFallback([
+      { id: "pull", label: "Pull" },
+      {
+        id: "delete",
+        label: "Delete Worktree…",
+        destructive: true,
+        disabled: true,
+        description: "Stop the running session before deleting this worktree.",
+      },
+    ]);
+    void selection.then(chosen);
+    press("ArrowDown");
+    const item = document.activeElement as HTMLElement;
+    expect(item.getAttribute("aria-disabled")).toBe("true");
+
+    expect(press("Enter").defaultPrevented).toBe(true);
+    expect(press(" ").defaultPrevented).toBe(true);
+    item.click();
+    await Promise.resolve();
+
+    expect(chosen).not.toHaveBeenCalled();
+    expect(menus()).toHaveLength(1);
+    expect(document.activeElement).toBe(item);
+    press("Escape");
+    await expect(selection).resolves.toBeNull();
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it("never opens a disabled item's submenu", async () => {
+    focusTrigger();
+    const selection = showContextMenuFallback([
+      {
+        id: "move-to-split",
+        label: "Move Tab to Split",
+        disabled: true,
+        children: [{ id: "move-to-split:left", label: "Left" }],
+      },
+      { id: "close", label: "Close" },
+    ]);
+    expect(focusedText()).toBe("Close");
+    press("ArrowUp");
+    const parent = document.activeElement as HTMLElement;
+    expect(parent.getAttribute("aria-haspopup")).toBe("menu");
+
+    press("ArrowRight");
+    press("Enter");
+    press(" ");
+    parent.dispatchEvent(new MouseEvent("mouseenter"));
+
+    expect(menus()).toHaveLength(1);
+    expect(parent.getAttribute("aria-expanded")).toBe("false");
+    expect(document.activeElement).toBe(parent);
+    press("Escape");
+    await expect(selection).resolves.toBeNull();
+  });
+
+  it("opens a submenu on its first enabled item and reaches its disabled ones", async () => {
+    focusTrigger();
+    const selection = showContextMenuFallback([
+      {
+        id: "move-to-split",
+        label: "Move Tab to Split",
+        children: [
+          { id: "move-to-split:left", label: "Left", disabled: true },
+          { id: "move-to-split:right", label: "Right" },
+        ],
+      },
+    ]);
+    press("ArrowRight");
+    expect(menus()).toHaveLength(2);
+    expect(focusedText()).toBe("Right");
+    press("ArrowUp");
+    expect(focusedText()).toBe("Left");
+    press("Enter");
+    expect(menus()).toHaveLength(2);
+    press("ArrowLeft");
+    expect(menus()).toHaveLength(1);
+
+    press("Escape");
+    await expect(selection).resolves.toBeNull();
+  });
+
+  it("focuses the first item when every item is disabled", async () => {
+    focusTrigger();
+    const selection = showContextMenuFallback([
+      { id: "open-in", label: "Open in", disabled: true, description: "No local opener." },
+      { id: "pull", label: "Pull", disabled: true, description: "Workspace is unavailable." },
+    ]);
+    expect(focusedText()).toBe("Open inNo local opener.");
+    press("ArrowDown");
+    expect(focusedText()).toBe("PullWorkspace is unavailable.");
+    press("Enter");
+    expect(menus()).toHaveLength(1);
+
+    press("Escape");
+    await expect(selection).resolves.toBeNull();
+  });
+
+  it("shows focus on a disabled item without giving it the hover style", async () => {
+    focusTrigger();
+    const selection = showContextMenuFallback([
+      { id: "pull", label: "Pull" },
+      {
+        id: "delete",
+        label: "Delete Worktree…",
+        destructive: true,
+        disabled: true,
+        icon: "trash",
+        description: "Stop the running session before deleting this worktree.",
+      },
+    ]);
+    const [pull, item] = Array.from(document.querySelectorAll<HTMLElement>('[role="menuitem"]'));
+    press("ArrowDown");
+    expect(document.activeElement).toBe(item);
+    expect(item!.dataset.active).toBe("true");
+    expect(item!.style.background).toBe("var(--accent)");
+    // Focus never makes a disabled row look actionable: its text stays muted.
+    expect(item!.style.color).toBe("var(--muted-foreground)");
+    expect(pull!.dataset.active).toBe("false");
+
+    // The pointer moving to an enabled row takes focus and the highlight with it.
+    pull!.dispatchEvent(new MouseEvent("mouseenter"));
+    expect(document.activeElement).toBe(pull);
+    expect(item!.dataset.active).toBe("false");
+    expect(item!.style.color).toBe("var(--muted-foreground)");
+
+    // Hovering the disabled row is inert: focus and highlight stay put.
+    item!.dispatchEvent(new MouseEvent("mouseenter"));
+    expect(document.activeElement).toBe(pull);
+    expect(pull!.dataset.active).toBe("true");
+    expect(item!.dataset.active).toBe("false");
 
     press("Escape");
     await expect(selection).resolves.toBeNull();
@@ -164,6 +351,31 @@ describe("showContextMenuFallback keyboard support", () => {
     ].entries()) {
       expect(items[index]?.getAttribute("aria-description")).toBe(reason);
       expect(items[index]?.textContent).toContain(reason);
+    }
+    press("Escape");
+    await expect(selection).resolves.toBeNull();
+  });
+
+  it("names a disabled item by its label and describes it by its reason, once each", async () => {
+    const selection = showContextMenuFallback([
+      { id: "open-in", label: "Open in", disabled: true, description: "No local opener." },
+      { id: "pull", label: "Pull", disabled: true, description: "Workspace is unavailable." },
+    ]);
+    const items = document.querySelectorAll<HTMLElement>('[role="menuitem"]');
+    const textOf = (ids: string | null | undefined) =>
+      (ids ?? "")
+        .split(" ")
+        .filter((id) => id.length > 0)
+        .map((id) => document.getElementById(id)?.textContent ?? "")
+        .join(" ");
+    for (const [index, [label, reason]] of [
+      ["Open in", "No local opener."],
+      ["Pull", "Workspace is unavailable."],
+    ].entries()) {
+      // The content holds label and reason; without these references the reason
+      // would be read twice: once in the name, once as the description.
+      expect(textOf(items[index]?.getAttribute("aria-labelledby"))).toBe(label);
+      expect(textOf(items[index]?.getAttribute("aria-describedby"))).toBe(reason);
     }
     press("Escape");
     await expect(selection).resolves.toBeNull();
