@@ -203,14 +203,31 @@ function statusWith(path: string) {
   };
 }
 
+/** The status a live server streamed while `.git/HEAD` was broken; a bad `.git/config` matched it. */
+function unreadableStatus() {
+  return {
+    isRepo: false,
+    hasPrimaryRemote: false,
+    isDefaultRef: false,
+    refName: null,
+    hasWorkingTreeChanges: false,
+    workingTree: { files: [], insertions: 0, deletions: 0 },
+    hasUpstream: false,
+    aheadCount: 0,
+    behindCount: 0,
+    aheadOfDefaultCount: 0,
+    pr: null,
+  };
+}
+
 let container: HTMLDivElement;
 let root: Root | null;
 
-async function renderView() {
+async function renderView(cwd = "/repo/main") {
   await act(async () =>
     root?.render(
       <GitManagerChangesView
-        scope={{ environmentId: "environment-1" as never, cwd: "/repo/main" }}
+        scope={{ environmentId: "environment-1" as never, cwd }}
         projectRef={projectRef}
       />,
     ),
@@ -405,6 +422,112 @@ describe("GitManagerChangesView", () => {
 
     expect(container.textContent).toContain("Could not load changes");
     expect(buttonWithText("Retrying…").disabled).toBe(true);
+  });
+
+  it("explains a repository Git cannot read instead of showing no changes", async () => {
+    h.status = unreadableStatus();
+
+    await renderView();
+
+    expect(container.textContent).toContain("Could not load changes");
+    expect(container.textContent).toContain(
+      "Git can't read this folder as a repository. Run git init to create one, or check its .git folder if it already is one.",
+    );
+    expect(container.textContent).not.toContain("No local changes");
+    expect(container.querySelector("#git-manager-summary")).toBeNull();
+    expect(buttonWithText("Retry").disabled).toBe(false);
+  });
+
+  it("asks the server to read the status again on Retry, and is busy while that read runs", async () => {
+    h.status = unreadableStatus();
+    let finishRead: (result: unknown) => void = () => undefined;
+    h.refreshStatus.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finishRead = resolve;
+        }),
+    );
+    await renderView();
+    h.revalidateRefs.mockClear();
+
+    await act(async () => buttonWithText("Retry").click());
+
+    expect(h.refreshStatus).toHaveBeenCalledOnce();
+    expect(h.refreshStatus).toHaveBeenCalledWith({
+      environmentId: "environment-1",
+      input: { cwd: "/repo/main" },
+    });
+    expect(buttonWithText("Retrying…").disabled).toBe(true);
+    // The status stream itself is healthy, and the refs keep their last good answer.
+    expect(h.refreshStatusQuery).not.toHaveBeenCalled();
+    expect(h.refreshRefs).not.toHaveBeenCalled();
+    expect(h.revalidateRefs).not.toHaveBeenCalled();
+
+    await act(async () => finishRead(AsyncResult.success(unreadableStatus())));
+
+    expect(container.textContent).toContain("Git can't read this folder as a repository.");
+    expect(buttonWithText("Retry").disabled).toBe(false);
+  });
+
+  it("shows another checkout idle while the earlier checkout's status is read again", async () => {
+    h.status = unreadableStatus();
+    let finishRead: (result: unknown) => void = () => undefined;
+    h.refreshStatus.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finishRead = resolve;
+        }),
+    );
+    await renderView("/repo/main");
+    await act(async () => buttonWithText("Retry").click());
+    expect(buttonWithText("Retrying…").disabled).toBe(true);
+
+    await renderView("/repo/other");
+    expect(buttonWithText("Retry").disabled).toBe(false);
+
+    await act(async () => finishRead(AsyncResult.success(unreadableStatus())));
+    expect(buttonWithText("Retry").disabled).toBe(false);
+  });
+
+  it("explains the unreadable repository rather than the refs failure it causes", async () => {
+    h.status = unreadableStatus();
+    h.refs = null;
+    h.refsError = "Git could not complete the requested read.";
+
+    await renderView();
+
+    expect(container.textContent).toContain("Git can't read this folder as a repository.");
+    expect(container.textContent).not.toContain("Git could not complete the requested read.");
+  });
+
+  it("waits for the connection instead of blaming the repository", async () => {
+    h.status = unreadableStatus();
+    h.statusError = "Remote environment is not connected.";
+    h.statusEmission = AsyncResult.failure(
+      Cause.fail(
+        new EnvironmentRpcUnavailableError({
+          environmentId: "environment-1",
+          message: h.statusError,
+        }),
+      ),
+    );
+
+    await renderView();
+
+    expect(container.textContent).toContain("Environment unavailable");
+    expect(container.textContent).not.toContain("Git can't read this folder as a repository.");
+    expect(buttonWithText("Waiting for the connection…").disabled).toBe(true);
+  });
+
+  it("shows the changes again once Git can read the repository", async () => {
+    h.status = unreadableStatus();
+    await renderView();
+
+    h.status = statusWith("src/repaired.ts");
+    await renderView();
+
+    expect(container.textContent).toContain("src/repaired.ts");
+    expect(container.textContent).not.toContain("Could not load changes");
   });
 
   it("keeps inclusion local while selection updates the shared view state", async () => {
