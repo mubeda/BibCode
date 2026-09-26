@@ -282,7 +282,7 @@ describe("MessagesTimeline", () => {
     expect(markup).toContain("Delivery uncertain");
     expect(markup).toContain("Claude may have received this message");
     expect(markup).toContain('aria-label="Retry message delivery"');
-    expect(markup).toContain('aria-label="Dismiss delivery warning"');
+    expect(markup).toContain('aria-label="Dismiss and skip this message"');
     expect(markup.indexOf('data-user-message-body="true"')).toBeLessThan(
       markup.indexOf("Delivery uncertain"),
     );
@@ -1644,7 +1644,9 @@ describe("MessagesTimeline mounted interactions", () => {
     });
 
     const retry = container.querySelector<HTMLElement>('[aria-label="Retry message delivery"]');
-    const dismiss = container.querySelector<HTMLElement>('[aria-label="Dismiss delivery warning"]');
+    const dismiss = container.querySelector<HTMLElement>(
+      '[aria-label="Dismiss and skip this message"]',
+    );
     expect(retry).not.toBeNull();
     expect(dismiss).not.toBeNull();
     await click(retry!);
