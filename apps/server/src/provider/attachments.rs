@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Component, Path, PathBuf},
     sync::{
         Arc,
@@ -23,6 +23,11 @@ const MAX_ATTACHMENTS: usize = 8;
 const MAX_ENCODED_ATTACHMENT_BYTES: usize = 4 * MAX_ATTACHMENT_BYTES.div_ceil(3);
 const MAX_ATTACHMENT_NAME_LENGTH: usize = 255;
 const MAX_ATTACHED_FILES_TEXT_BYTES: usize = 16 * 1024;
+
+/// Attachments a turn may send again by id alone, without their bytes: files an accepted command
+/// already attached in the same thread, keyed by id, with the content digest recorded then
+/// (references backfilled from legacy events have none).
+pub(crate) type ReusableAttachments = HashMap<String, Option<String>>;
 
 #[derive(Clone, Debug)]
 pub(crate) struct AttachmentMaterializer {
@@ -135,6 +140,8 @@ pub(crate) enum AttachmentMaterializationError {
     InvalidMetadata(String),
     #[error("invalid attachment id {0}")]
     InvalidId(String),
+    #[error("attachment {0} was not attached earlier in this thread; attach the file again")]
+    NotReusable(String),
     #[error("failed to access attachment directory {path}: {source}")]
     AttachmentDirectory {
         path: PathBuf,
@@ -198,17 +205,18 @@ impl AttachmentMaterializer {
         self
     }
 
+    /// Publishes each upload (`dataUrl`) under its id. An attachment sent by id alone must be one
+    /// of `reusable`; any other id is refused, even when a file with that id exists.
     pub(crate) async fn prepare(
         &self,
         attachments: Vec<Value>,
+        reusable: &ReusableAttachments,
     ) -> Result<PreparedAttachmentBatch, AttachmentMaterializationError> {
         if attachments.is_empty() {
             return Ok(PreparedAttachmentBatch::new(0, None));
         }
         if attachments.len() > MAX_ATTACHMENTS {
-            return Err(AttachmentMaterializationError::InvalidMetadata(
-                "at most eight attachments are allowed".to_owned(),
-            ));
+            return Err(too_many_attachments());
         }
         let transaction = self.root_transaction.clone().lock_owned().await;
         let mut prepared = PreparedAttachmentBatch::new(attachments.len(), Some(transaction));
@@ -223,7 +231,7 @@ impl AttachmentMaterializer {
                 AttachmentMaterializationError::InvalidMetadata(error.to_string())
             })?;
             validate_attachment(&attachment)?;
-            let bytes = match (data_url_present, attachment.data_url.as_deref()) {
+            let content_digest = match (data_url_present, attachment.data_url.as_deref()) {
                 (true, Some(data_url)) => {
                     let bytes = decode_data_url(data_url, &attachment.mime_type)?;
                     if bytes.len() != usize::try_from(attachment.size_bytes).unwrap_or(usize::MAX) {
@@ -233,9 +241,12 @@ impl AttachmentMaterializer {
                     }
                     self.publish(&root, &attachment.id, &bytes, &mut prepared)
                         .await?;
-                    bytes
+                    crate::crypto::sha256_hex(&bytes)
                 }
                 (false, None) => {
+                    let recorded_digest = reusable.get(&attachment.id).ok_or_else(|| {
+                        AttachmentMaterializationError::NotReusable(attachment.id.clone())
+                    })?;
                     let existing = self.read_canonical(&root, &attachment.id).await?;
                     if existing.len()
                         != usize::try_from(attachment.size_bytes).unwrap_or(usize::MAX)
@@ -244,7 +255,16 @@ impl AttachmentMaterializer {
                             "claimed size does not match prepared file".to_owned(),
                         ));
                     }
-                    existing
+                    let digest = crate::crypto::sha256_hex(&existing);
+                    if recorded_digest
+                        .as_ref()
+                        .is_some_and(|recorded| *recorded != digest)
+                    {
+                        return Err(AttachmentMaterializationError::InvalidMetadata(
+                            "prepared file does not match the attachment sent earlier".to_owned(),
+                        ));
+                    }
+                    digest
                 }
                 _ => {
                     return Err(AttachmentMaterializationError::InvalidMetadata(
@@ -263,7 +283,7 @@ impl AttachmentMaterializer {
             }));
             prepared.references.push(AttachmentReference {
                 attachment_id: attachment.id,
-                content_digest: Some(crate::crypto::sha256_hex(&bytes)),
+                content_digest: Some(content_digest),
                 size_bytes: i64::try_from(attachment.size_bytes)
                     .expect("validated attachment size"),
             });
@@ -333,9 +353,7 @@ impl AttachmentMaterializer {
             return Ok(Vec::new());
         }
         if attachments.len() > MAX_ATTACHMENTS {
-            return Err(AttachmentMaterializationError::InvalidMetadata(
-                "at most eight attachments are allowed".to_owned(),
-            ));
+            return Err(too_many_attachments());
         }
         let root = self.canonical_root(false).await?;
         let mut materialized = Vec::with_capacity(attachments.len());
@@ -654,6 +672,39 @@ pub(crate) fn prompt_parts(text: Option<&str>, attachments: Vec<Value>) -> Vec<V
     parts
 }
 
+/// The distinct ids of the attachments sent by id alone, for the caller to look up before
+/// [`prepare`]. The attachment cap and each id's shape are checked first, so a lookup sees at
+/// most [`MAX_ATTACHMENTS`] well-formed ids.
+///
+/// [`prepare`]: AttachmentMaterializer::prepare
+pub(crate) fn id_only_attachment_ids(
+    attachments: &[Value],
+) -> Result<Vec<String>, AttachmentMaterializationError> {
+    if attachments.len() > MAX_ATTACHMENTS {
+        return Err(too_many_attachments());
+    }
+    let mut ids = Vec::<String>::new();
+    for attachment in attachments
+        .iter()
+        .filter(|attachment| attachment.get("dataUrl").is_none())
+    {
+        let Some(id) = attachment.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        validate_attachment_id(id)?;
+        if !ids.iter().any(|known| known == id) {
+            ids.push(id.to_owned());
+        }
+    }
+    Ok(ids)
+}
+
+fn too_many_attachments() -> AttachmentMaterializationError {
+    AttachmentMaterializationError::InvalidMetadata(
+        "at most eight attachments are allowed".to_owned(),
+    )
+}
+
 fn validate_attachment_id(id: &str) -> Result<(), AttachmentMaterializationError> {
     let mut components = Path::new(id).components();
     let valid_component =
@@ -867,7 +918,14 @@ mod tests {
     use std::{collections::HashSet, path::PathBuf, process::Command, sync::Arc};
     use tempfile::TempDir;
 
-    use super::{AttachmentMaterializer, STANDARD};
+    use super::{
+        AttachmentMaterializationError, AttachmentMaterializer, ReusableAttachments, STANDARD,
+    };
+
+    /// Reusable ids without a recorded digest, as for references backfilled from legacy events.
+    fn reusable(ids: &[&str]) -> ReusableAttachments {
+        ids.iter().map(|id| ((*id).to_owned(), None)).collect()
+    }
 
     const ATTACHMENT_ABORT_CHILD_DIR: &str = "BIBCODE_ATTACHMENT_ABORT_CHILD_DIR";
     const ATTACHMENT_ABORT_CHILD_READY: &str = "BIBCODE_ATTACHMENT_ABORT_CHILD_READY";
@@ -890,11 +948,14 @@ mod tests {
             .block_on(async move {
                 let _prepare = tokio::spawn(async move {
                     materializer
-                        .prepare(vec![json!({
-                            "type":"file", "id":"aborted-final", "name":"notes.txt",
-                            "mimeType":"text/plain", "sizeBytes":5,
-                            "dataUrl":"data:text/plain;base64,bm90ZXM="
-                        })])
+                        .prepare(
+                            vec![json!({
+                                "type":"file", "id":"aborted-final", "name":"notes.txt",
+                                "mimeType":"text/plain", "sizeBytes":5,
+                                "dataUrl":"data:text/plain;base64,bm90ZXM="
+                            })],
+                            &ReusableAttachments::new(),
+                        )
                         .await
                 });
                 tokio::time::timeout(std::time::Duration::from_secs(5), reached)
@@ -972,11 +1033,14 @@ mod tests {
         let reached = pause.reached.notified();
         let task = tokio::spawn(async move {
             materializer
-                .prepare(vec![json!({
-                    "type":"file", "id":"cancelled", "name":"notes.txt",
-                    "mimeType":"text/plain", "sizeBytes":5,
-                    "dataUrl":"data:text/plain;base64,bm90ZXM="
-                })])
+                .prepare(
+                    vec![json!({
+                        "type":"file", "id":"cancelled", "name":"notes.txt",
+                        "mimeType":"text/plain", "sizeBytes":5,
+                        "dataUrl":"data:text/plain;base64,bm90ZXM="
+                    })],
+                    &ReusableAttachments::new(),
+                )
                 .await
         });
 
@@ -1056,14 +1120,17 @@ mod tests {
         let materializer = AttachmentMaterializer::new(attachments_dir.clone());
 
         let prepared_batch = materializer
-            .prepare(vec![json!({
-                "type": "file",
-                "id": "notes-1",
-                "name": "notes.txt",
-                "mimeType": "text/plain",
-                "sizeBytes": 5,
-                "dataUrl": "data:text/plain;base64,bm90ZXM="
-            })])
+            .prepare(
+                vec![json!({
+                    "type": "file",
+                    "id": "notes-1",
+                    "name": "notes.txt",
+                    "mimeType": "text/plain",
+                    "sizeBytes": 5,
+                    "dataUrl": "data:text/plain;base64,bm90ZXM="
+                })],
+                &ReusableAttachments::new(),
+            )
             .await
             .expect("file upload prepares");
         let prepared = prepared_batch.attachments().to_vec();
@@ -1092,16 +1159,19 @@ mod tests {
     async fn prepared_batch_exposes_sha256_references_for_every_attachment() {
         let state = TempDir::new().expect("state dir");
         let prepared = AttachmentMaterializer::new(state.path().join("attachments"))
-            .prepare(vec![
-                json!({
-                    "type":"file", "id":"a", "name":"a.txt", "mimeType":"text/plain",
-                    "sizeBytes":1, "dataUrl":"data:text/plain;base64,YQ=="
-                }),
-                json!({
-                    "type":"file", "id":"b", "name":"b.txt", "mimeType":"text/plain",
-                    "sizeBytes":1, "dataUrl":"data:text/plain;base64,Yg=="
-                }),
-            ])
+            .prepare(
+                vec![
+                    json!({
+                        "type":"file", "id":"a", "name":"a.txt", "mimeType":"text/plain",
+                        "sizeBytes":1, "dataUrl":"data:text/plain;base64,YQ=="
+                    }),
+                    json!({
+                        "type":"file", "id":"b", "name":"b.txt", "mimeType":"text/plain",
+                        "sizeBytes":1, "dataUrl":"data:text/plain;base64,Yg=="
+                    }),
+                ],
+                &ReusableAttachments::new(),
+            )
             .await
             .expect("attachments prepare");
 
@@ -1132,10 +1202,13 @@ mod tests {
         let state = TempDir::new().expect("state dir");
         let attachment = state.path().join("attachments/drop-1");
         let prepared = AttachmentMaterializer::new(state.path().join("attachments"))
-            .prepare(vec![json!({
-                "type":"file", "id":"drop-1", "name":"notes.txt", "mimeType":"text/plain",
-                "sizeBytes":5, "dataUrl":"data:text/plain;base64,bm90ZXM="
-            })])
+            .prepare(
+                vec![json!({
+                    "type":"file", "id":"drop-1", "name":"notes.txt", "mimeType":"text/plain",
+                    "sizeBytes":5, "dataUrl":"data:text/plain;base64,bm90ZXM="
+                })],
+                &ReusableAttachments::new(),
+            )
             .await
             .expect("upload prepares");
         assert!(attachment.is_file());
@@ -1251,14 +1324,17 @@ mod tests {
 
             let materializer = AttachmentMaterializer::new(attachments_dir.clone());
             materializer
-                .prepare(vec![json!({
-                    "type": "image",
-                    "id": "linked-image",
-                    "name": "outside.png",
-                    "mimeType": "image/png",
-                    "sizeBytes": 6,
-                    "dataUrl": "data:image/png;base64,c2VjcmV0"
-                })])
+                .prepare(
+                    vec![json!({
+                        "type": "image",
+                        "id": "linked-image",
+                        "name": "outside.png",
+                        "mimeType": "image/png",
+                        "sizeBytes": 6,
+                        "dataUrl": "data:image/png;base64,c2VjcmV0"
+                    })],
+                    &ReusableAttachments::new(),
+                )
                 .await
                 .expect_err("publishing over a symlink must fail");
             let mut entries = tokio::fs::read_dir(&attachments_dir)
@@ -1291,14 +1367,17 @@ mod tests {
         }
 
         let error = AttachmentMaterializer::new(attachments_dir)
-            .prepare(vec![json!({
-                "type": "file",
-                "id": "notes-1",
-                "name": "notes.txt",
-                "mimeType": "text/plain",
-                "sizeBytes": 5,
-                "dataUrl": "data:text/plain;base64,bm90ZXM="
-            })])
+            .prepare(
+                vec![json!({
+                    "type": "file",
+                    "id": "notes-1",
+                    "name": "notes.txt",
+                    "mimeType": "text/plain",
+                    "sizeBytes": 5,
+                    "dataUrl": "data:text/plain;base64,bm90ZXM="
+                })],
+                &ReusableAttachments::new(),
+            )
             .await
             .expect_err("a junction root must fail before publication");
         assert!(error.to_string().contains("resolves outside"));
@@ -1319,7 +1398,7 @@ mod tests {
         ];
         for upload in invalid {
             materializer
-                .prepare(vec![upload])
+                .prepare(vec![upload], &ReusableAttachments::new())
                 .await
                 .expect_err("invalid upload must fail");
         }
@@ -1334,11 +1413,14 @@ mod tests {
         let max_mime = format!("a/{}", "b".repeat(98));
 
         materializer
-            .prepare(vec![json!({
-                "type":"file", "id":"valid-boundary", "name":max_name,
-                "mimeType":max_mime, "sizeBytes":0,
-                "dataUrl":format!("data:{max_mime};base64,")
-            })])
+            .prepare(
+                vec![json!({
+                    "type":"file", "id":"valid-boundary", "name":max_name,
+                    "mimeType":max_mime, "sizeBytes":0,
+                    "dataUrl":format!("data:{max_mime};base64,")
+                })],
+                &ReusableAttachments::new(),
+            )
             .await
             .expect("contract maxima prepare")
             .commit();
@@ -1360,11 +1442,14 @@ mod tests {
         .enumerate()
         {
             materializer
-                .prepare(vec![json!({
-                    "type":"file", "id":format!("invalid-boundary-{index}"), "name":name,
-                    "mimeType":mime_type, "sizeBytes":0,
-                    "dataUrl":format!("data:{mime_type};base64,")
-                })])
+                .prepare(
+                    vec![json!({
+                        "type":"file", "id":format!("invalid-boundary-{index}"), "name":name,
+                        "mimeType":mime_type, "sizeBytes":0,
+                        "dataUrl":format!("data:{mime_type};base64,")
+                    })],
+                    &ReusableAttachments::new(),
+                )
                 .await
                 .expect_err("metadata outside the wire contract rejects");
         }
@@ -1376,7 +1461,7 @@ mod tests {
         let materializer = AttachmentMaterializer::new(state.path().join("attachments"));
         let body = "A".repeat(super::MAX_ENCODED_ATTACHMENT_BYTES + 4);
         let error = materializer
-            .prepare(vec![json!({"type":"file","id":"notes-1","name":"notes.txt","mimeType":"text/plain","sizeBytes":1,"dataUrl":format!("data:text/plain;base64,{body}")})])
+            .prepare(vec![json!({"type":"file","id":"notes-1","name":"notes.txt","mimeType":"text/plain","sizeBytes":1,"dataUrl":format!("data:text/plain;base64,{body}")})], &ReusableAttachments::new())
             .await
             .expect_err("encoded body rejects before decode");
         assert_eq!(
@@ -1385,23 +1470,23 @@ mod tests {
         );
         for id in ["CON", "nul", &"a".repeat(129)] {
             materializer
-                .prepare(vec![json!({"type":"file","id":id,"name":"notes.txt","mimeType":"text/plain","sizeBytes":0,"dataUrl":"data:text/plain;base64,"})])
+                .prepare(vec![json!({"type":"file","id":id,"name":"notes.txt","mimeType":"text/plain","sizeBytes":0,"dataUrl":"data:text/plain;base64,"})], &ReusableAttachments::new())
                 .await
                 .expect_err("invalid Windows-safe id rejects");
         }
         materializer
-            .prepare(vec![json!({"type":"image","id":"image-1","name":"screen.png","mimeType":"IMAGE/PNG","sizeBytes":0,"dataUrl":"data:IMAGE/PNG;base64,"})])
+            .prepare(vec![json!({"type":"image","id":"image-1","name":"screen.png","mimeType":"IMAGE/PNG","sizeBytes":0,"dataUrl":"data:IMAGE/PNG;base64,"})], &ReusableAttachments::new())
             .await
             .expect("image MIME matching is ASCII-case-insensitive")
             .commit();
         let reconnect = materializer
-            .prepare(vec![json!({"type":"image","id":"image-1","name":"screen.png","mimeType":"image/png","sizeBytes":0})])
+            .prepare(vec![json!({"type":"image","id":"image-1","name":"screen.png","mimeType":"image/png","sizeBytes":0})], &reusable(&["image-1"]))
             .await
             .expect("a missing dataUrl reconnects to the prepared file");
         assert_eq!(reconnect.attachments()[0]["id"], "image-1");
         reconnect.commit();
         let null_error = materializer
-            .prepare(vec![json!({"type":"image","id":"image-1","name":"screen.png","mimeType":"image/png","sizeBytes":0,"dataUrl":null})])
+            .prepare(vec![json!({"type":"image","id":"image-1","name":"screen.png","mimeType":"image/png","sizeBytes":0,"dataUrl":null})], &ReusableAttachments::new())
             .await
             .expect_err("an explicit null dataUrl is not a reconnect");
         assert!(
@@ -1415,7 +1500,7 @@ mod tests {
             .expect_err("residual null dataUrl rejects");
         let attachments = (0..9).map(|index| json!({"type":"file","id":format!("notes-{index}"),"name":"notes.txt","mimeType":"text/plain","sizeBytes":0,"dataUrl":"data:text/plain;base64,"})).collect();
         materializer
-            .prepare(attachments)
+            .prepare(attachments, &ReusableAttachments::new())
             .await
             .expect_err("more than eight attachments rejects");
     }
@@ -1453,16 +1538,108 @@ mod tests {
         assert!(super::append_file_references(String::new(), &[control]).is_err());
     }
 
+    /// The ids a turn sends without bytes are checked before anything is looked up: the batch
+    /// keeps the attachment cap, every id is well formed, and each id is looked up once.
+    #[test]
+    fn id_only_references_are_capped_deduplicated_and_validated_before_any_lookup() {
+        let reference = |id: &str| json!({"type":"file", "id":id, "name":"notes.txt", "mimeType":"text/plain", "sizeBytes":5});
+        let mut upload = reference("upload-1");
+        upload["dataUrl"] = json!("data:text/plain;base64,bm90ZXM=");
+        assert_eq!(
+            super::id_only_attachment_ids(&[
+                reference("notes-1"),
+                upload,
+                reference("notes-1"),
+                reference("notes-2"),
+            ])
+            .expect("ids"),
+            ["notes-1", "notes-2"]
+        );
+        let too_many = (0..9)
+            .map(|index| reference(&format!("notes-{index}")))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            super::id_only_attachment_ids(&too_many),
+            Err(AttachmentMaterializationError::InvalidMetadata(ref message))
+                if message == "at most eight attachments are allowed"
+        ));
+        assert!(matches!(
+            super::id_only_attachment_ids(&[reference("../escape")]),
+            Err(AttachmentMaterializationError::InvalidId(ref id)) if id == "../escape"
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_attachment_sent_by_id_must_be_reusable_and_unchanged() {
+        let state = TempDir::new().expect("state dir");
+        let materializer = AttachmentMaterializer::new(state.path().join("attachments"));
+        materializer
+            .prepare(
+                vec![json!({
+                    "type":"file", "id":"notes-1", "name":"notes.txt", "mimeType":"text/plain",
+                    "sizeBytes":5, "dataUrl":"data:text/plain;base64,bm90ZXM="
+                })],
+                &ReusableAttachments::new(),
+            )
+            .await
+            .expect("upload prepares")
+            .commit();
+        let reference = json!({
+            "type":"file", "id":"notes-1", "name":"notes.txt", "mimeType":"text/plain", "sizeBytes":5
+        });
+
+        let refused = materializer
+            .prepare(vec![reference.clone()], &ReusableAttachments::new())
+            .await
+            .expect_err("an existing file the caller may not reuse is refused");
+        assert!(
+            matches!(refused, AttachmentMaterializationError::NotReusable(ref id) if id == "notes-1"),
+            "{refused}"
+        );
+
+        let digest = crate::crypto::sha256_hex(b"notes");
+        let reused = materializer
+            .prepare(
+                vec![reference.clone()],
+                &ReusableAttachments::from([("notes-1".to_owned(), Some(digest.clone()))]),
+            )
+            .await
+            .expect("a reusable id sends the stored file again");
+        assert_eq!(
+            reused.references()[0].content_digest.as_deref(),
+            Some(digest.as_str())
+        );
+        reused.commit();
+        materializer
+            .prepare(vec![reference.clone()], &reusable(&["notes-1"]))
+            .await
+            .expect("a reference without a recorded digest is checked by size")
+            .commit();
+        materializer
+            .prepare(
+                vec![reference],
+                &ReusableAttachments::from([(
+                    "notes-1".to_owned(),
+                    Some(crate::crypto::sha256_hex(b"other")),
+                )]),
+            )
+            .await
+            .expect_err("a stored file that differs from the recorded digest is refused");
+    }
+
     #[tokio::test]
     async fn rejects_oversized_decoded_upload_and_conflicting_retries() {
         let state = TempDir::new().expect("state dir");
         let materializer = AttachmentMaterializer::new(state.path().join("attachments"));
         let oversized = STANDARD.encode(vec![0; super::MAX_ATTACHMENT_BYTES + 1]);
         materializer
-            .prepare(vec![json!({
-                "type":"file", "id":"large-1", "name":"large.txt", "mimeType":"text/plain",
-                "sizeBytes":1, "dataUrl":format!("data:text/plain;base64,{oversized}")
-            })])
+            .prepare(
+                vec![json!({
+                    "type":"file", "id":"large-1", "name":"large.txt", "mimeType":"text/plain",
+                    "sizeBytes":1, "dataUrl":format!("data:text/plain;base64,{oversized}")
+                })],
+                &ReusableAttachments::new(),
+            )
             .await
             .expect_err("decoded size is capped independently of the claim");
 
@@ -1471,20 +1648,23 @@ mod tests {
             "sizeBytes":5, "dataUrl":"data:text/plain;base64,bm90ZXM="
         });
         materializer
-            .prepare(vec![upload.clone()])
+            .prepare(vec![upload.clone()], &ReusableAttachments::new())
             .await
             .expect("initial upload prepares")
             .commit();
         materializer
-            .prepare(vec![upload])
+            .prepare(vec![upload], &ReusableAttachments::new())
             .await
             .expect("identical retry prepares")
             .commit();
         materializer
-            .prepare(vec![json!({
-                "type":"file", "id":"notes-1", "name":"notes.txt", "mimeType":"text/plain",
-                "sizeBytes":5, "dataUrl":"data:text/plain;base64,b3RoZXI="
-            })])
+            .prepare(
+                vec![json!({
+                    "type":"file", "id":"notes-1", "name":"notes.txt", "mimeType":"text/plain",
+                    "sizeBytes":5, "dataUrl":"data:text/plain;base64,b3RoZXI="
+                })],
+                &ReusableAttachments::new(),
+            )
             .await
             .expect_err("different retry cannot overwrite");
         assert_eq!(
@@ -1511,14 +1691,18 @@ mod tests {
                 owner.prepare(vec![
                     upload.clone(),
                     json!({"type":"file","id":"missing","name":"missing.txt","mimeType":"text/plain","sizeBytes":0}),
-                ])
+                ], &reusable(&["missing"]))
                 .await
             }
         });
         tokio::time::timeout(std::time::Duration::from_secs(5), pause.reached.notified())
             .await
             .expect("the owner publishes its first item");
-        let adopted = tokio::spawn(async move { adopter.prepare(vec![upload]).await });
+        let adopted = tokio::spawn(async move {
+            adopter
+                .prepare(vec![upload], &ReusableAttachments::new())
+                .await
+        });
         tokio::task::yield_now().await;
         assert!(
             !adopted.is_finished(),
@@ -1543,12 +1727,12 @@ mod tests {
         let different = json!({"type":"file","id":"different-1","name":"notes.txt","mimeType":"text/plain","sizeBytes":5,"dataUrl":"data:text/plain;base64,b3RoZXI="});
         let original = json!({"type":"file","id":"different-1","name":"notes.txt","mimeType":"text/plain","sizeBytes":5,"dataUrl":"data:text/plain;base64,bm90ZXM="});
         materializer
-            .prepare(vec![original])
+            .prepare(vec![original], &ReusableAttachments::new())
             .await
             .expect("first body publishes")
             .commit();
         materializer
-            .prepare(vec![different])
+            .prepare(vec![different], &ReusableAttachments::new())
             .await
             .expect_err("a different body cannot adopt the published id");
 
@@ -1556,7 +1740,7 @@ mod tests {
             .prepare(vec![
                 json!({"type":"file","id":"cleanup-1","name":"notes.txt","mimeType":"text/plain","sizeBytes":5,"dataUrl":"data:text/plain;base64,bm90ZXM="}),
                 json!({"type":"file","id":"cleanup-2","name":"notes.txt","mimeType":"text/plain","sizeBytes":4,"dataUrl":"data:text/plain;base64,bm90ZXM="}),
-            ])
+            ], &ReusableAttachments::new())
             .await
             .expect_err("later batch failure cleans earlier publication");
         assert!(!state.path().join("attachments/cleanup-1").exists());
@@ -1571,7 +1755,7 @@ mod tests {
             .prepare(vec![
                 json!({"type":"file","id":"rollback-1","name":"notes.txt","mimeType":"text/plain","sizeBytes":5,"dataUrl":"data:text/plain;base64,bm90ZXM="}),
                 json!({"type":"file","id":"missing","name":"missing.txt","mimeType":"text/plain","sizeBytes":0}),
-            ])
+            ], &reusable(&["missing"]))
             .await
             .expect_err("a later reconnect failure rolls back earlier publication");
         assert!(
@@ -1593,10 +1777,13 @@ mod tests {
             .expect("stale stage");
         let materializer = AttachmentMaterializer::new(attachments_dir.clone());
         materializer
-            .prepare(vec![json!({
-                "type":"file", "id":"initialized", "name":"notes.txt", "mimeType":"text/plain",
-                "sizeBytes":0, "dataUrl":"data:text/plain;base64,"
-            })])
+            .prepare(
+                vec![json!({
+                    "type":"file", "id":"initialized", "name":"notes.txt", "mimeType":"text/plain",
+                    "sizeBytes":0, "dataUrl":"data:text/plain;base64,"
+                })],
+                &ReusableAttachments::new(),
+            )
             .await
             .expect("initial batch prepares")
             .commit();
@@ -1614,7 +1801,7 @@ mod tests {
                     "type":"file", "id":"cancelled", "name":"large.bin",
                     "mimeType":"application/octet-stream", "sizeBytes":super::MAX_ATTACHMENT_BYTES,
                     "dataUrl":format!("data:application/octet-stream;base64,{body}")
-                })])
+                })], &ReusableAttachments::new())
                 .await
         });
         tokio::time::timeout(std::time::Duration::from_secs(5), async {

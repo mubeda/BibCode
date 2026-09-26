@@ -23,6 +23,7 @@ use crate::{
     persistence::{OrchestrationEvent, ProjectionThread},
     provider::attachments::{
         AttachmentMaterializationError, AttachmentMaterializer, PreparedAttachmentBatch,
+        ReusableAttachments, id_only_attachment_ids,
     },
     rpc::{RpcRegistry, RpcRequest, RpcResult, RpcStreamChunk},
     server_settings::ProviderSettingsStore,
@@ -538,8 +539,9 @@ async fn dispatch_reserved_turn_command(
     workspace_admission: Option<crate::worktree_catalog::WorkspaceAdmissionLease>,
     command_claim: crate::orchestration::engine::CommandAdmissionClaim,
 ) -> RpcResult {
+    let reusable = reusable_thread_attachments(&dispatch, &command, &request_tag).await?;
     let (mut command, prepared_batch) =
-        prepare_attachments(&provider.attachments, command)
+        prepare_attachments(&provider.attachments, command, &reusable)
             .await
             .map_err(|error| invalid_request(&request_tag, error.to_string()))?;
     let attachment_refs = prepared_batch
@@ -722,9 +724,35 @@ async fn turn_identity(
     ))
 }
 
+/// The attachments a turn start may send again by id alone: those an accepted command already
+/// attached in the same thread. Nothing is looked up when every attachment carries its bytes.
+async fn reusable_thread_attachments(
+    engine: &OrchestrationEngine,
+    command: &OrchestrationCommand,
+    request_tag: &str,
+) -> Result<ReusableAttachments, Value> {
+    let OrchestrationCommand::ThreadTurnStart {
+        thread_id, message, ..
+    } = command
+    else {
+        return Ok(ReusableAttachments::new());
+    };
+    let ids = id_only_attachment_ids(&message.attachments)
+        .map_err(|error| invalid_request(request_tag, error.to_string()))?;
+    if ids.is_empty() {
+        return Ok(ReusableAttachments::new());
+    }
+    engine
+        .repositories()
+        .thread_attachment_digests(thread_id.clone(), ids)
+        .await
+        .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))
+}
+
 async fn prepare_attachments(
     attachments: &AttachmentMaterializer,
     mut command: OrchestrationCommand,
+    reusable: &ReusableAttachments,
 ) -> Result<(OrchestrationCommand, Option<PreparedAttachmentBatch>), AttachmentMaterializationError>
 {
     if let OrchestrationCommand::ThreadTurnStart { message, .. } = &mut command {
@@ -732,7 +760,7 @@ async fn prepare_attachments(
             return Ok((command, None));
         }
         let prepared = attachments
-            .prepare(std::mem::take(&mut message.attachments))
+            .prepare(std::mem::take(&mut message.attachments), reusable)
             .await?;
         message.attachments = prepared.attachments().to_vec();
         return Ok((command, Some(prepared)));
@@ -4116,9 +4144,10 @@ mod tests {
                 "sizeBytes":5, "dataUrl":"data:text/plain;base64,bm90ZXM="
             }]}, "createdAt": CREATED_AT,
         }));
-        let (command, prepared) = prepare_attachments(&attachments, command)
-            .await
-            .expect("upload prepares");
+        let (command, prepared) =
+            prepare_attachments(&attachments, command, &ReusableAttachments::new())
+                .await
+                .expect("upload prepares");
         engine.dispatch(command).await.expect("turn dispatches");
         prepared.expect("attachment batch").commit();
         let snapshot = thread_snapshot(&engine, &thread_id)
@@ -4146,6 +4175,7 @@ mod tests {
                     "sizeBytes":5, "dataUrl":"data:text/plain,notes"
                 }]}, "createdAt": CREATED_AT,
             })),
+            &ReusableAttachments::new(),
         )
         .await
         .expect_err("malformed upload rejects before dispatch");

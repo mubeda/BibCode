@@ -12129,7 +12129,7 @@ done
         } else {
             None
         };
-        let prepared = driver.attachments.prepare(vec![json!({"type":"image","id":"image-replay","name":"image.png","mimeType":"image/png","sizeBytes":5,"dataUrl":"data:image/png;base64,aW1hZ2U="})]).await.unwrap();
+        let prepared = driver.attachments.prepare(vec![json!({"type":"image","id":"image-replay","name":"image.png","mimeType":"image/png","sizeBytes":5,"dataUrl":"data:image/png;base64,aW1hZ2U="})], &crate::provider::attachments::ReusableAttachments::new()).await.unwrap();
         let attachments = prepared.attachments().to_vec();
         prepared.commit();
         let outcome = timeout(Duration::from_secs(5), async {
@@ -14285,7 +14285,7 @@ done
                     "type":"file", "id":"notes-1", "name":"notes<&.txt", "mimeType":"text/plain",
                     "sizeBytes":5, "dataUrl":"data:text/plain;base64,bm90ZXM="
                 }),
-            ])
+            ], &crate::provider::attachments::ReusableAttachments::new())
             .await
             .expect("attachment pair should prepare");
         let attachments = prepared.attachments().to_vec();
