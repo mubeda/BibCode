@@ -5,6 +5,8 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
+import { textSizesBelowTextXs } from "~/test/uiTypography";
+
 const h = vi.hoisted(() => ({
   listProps: null as Record<string, unknown> | null,
   commitPage: null as {
@@ -184,7 +186,7 @@ describe("GitManagerCommitList", () => {
     const markup = container.innerHTML;
     expect(markup).toContain(decorated.shortSha);
     expect(markup).toContain(">main<");
-    expect(markup).not.toMatch(/text-\[(?:[0-9]|1[01])(?:\.\d+)?px\]/);
+    expect(textSizesBelowTextXs(markup)).toEqual([]);
   });
 
   it("requests one next page when the tenth-from-last row becomes visible", async () => {
