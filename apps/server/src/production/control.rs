@@ -383,6 +383,13 @@ impl NativeServerControl {
         self.automatic_git_fetch_interval.clone()
     }
 
+    /// The provider inventory this control publishes, for a launch to read a model's capabilities.
+    pub(crate) fn published_provider_inventory(
+        &self,
+    ) -> crate::production::provider_runtime::PublishedProviderInventory {
+        self.providers.clone()
+    }
+
     pub async fn attach_agent_activity_handler(
         &self,
         handler: Arc<dyn AgentActivitySettingsHandler>,

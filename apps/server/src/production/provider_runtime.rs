@@ -49,6 +49,7 @@ use crate::{
         orchestration_effects::process_compatible_path,
     },
     provider::{
+        OptionRefusal,
         attachments::{
             AttachmentMaterializer, MaterializedAttachment, append_file_references,
             split_native_images_and_file_references,
@@ -81,6 +82,8 @@ use crate::{
             GrokSessionOptions, GrokSessionRuntime,
         },
         opencode::OpenCodeSessionRuntime,
+        option_needs_value_refusal, option_on_or_off_refusal, option_without_id_refusal,
+        unsupported_option_refusal,
     },
     server_settings::{ProviderBinarySettingsState, ProviderSettingsStore},
 };
@@ -127,6 +130,9 @@ pub struct ProviderLaunchRequest {
     pub interaction_mode: String,
     pub model: Option<String>,
     pub options: Vec<Value>,
+    /// The instance's custom models, as the catalog lists them. Read for Codex only, which
+    /// validates a turn's options for one against the capabilities the catalog gives it.
+    pub custom_models: Vec<String>,
     pub service_tier: Option<String>,
     pub effort: Option<String>,
     pub agent: Option<String>,
@@ -255,6 +261,10 @@ pub enum ProviderDeliveryOutcome {
     Rejected { detail: String },
 }
 
+/// What a steer shows when the turn it was steering is no longer running.
+pub(crate) const STEER_TARGET_GONE_DETAIL: &str =
+    "The selected turn is no longer available for steering.";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderReconciliationOutcome {
     Found,
@@ -271,7 +281,7 @@ impl ProviderDeliveryHandle {
         self.completion
             .await
             .unwrap_or_else(|_| ProviderDeliveryOutcome::Ambiguous {
-                detail: "provider delivery task ended without an outcome".to_owned(),
+                detail: delivery_detail(&ProviderRuntimeError::ResponseDropped, None),
             })
     }
 }
@@ -295,7 +305,7 @@ pub trait ProviderDriver: Send + Sync {
             match self.send(text, attachments, interaction_mode).await {
                 Ok(turn_id) => ProviderDeliveryOutcome::Accepted { turn_id },
                 Err(error) => ProviderDeliveryOutcome::Ambiguous {
-                    detail: error.to_string(),
+                    detail: delivery_detail(&error, None),
                 },
             }
         })
@@ -433,6 +443,27 @@ pub enum ProviderRuntimeError {
     Spawn { provider: String, detail: String },
     #[error("{provider} provider operation failed: {detail}")]
     Provider { provider: String, detail: String },
+    /// The selected model or session refuses one of the request's own options, so the same
+    /// request is refused again on every retry. Raised by:
+    /// - the shape checks of Claude, Codex and OpenCode: an option without an id, and a value of
+    ///   the wrong shape (Claude's and OpenCode's fast mode must be a boolean, Codex's options and
+    ///   OpenCode's variant a non-empty string); OpenCode also refuses fast mode combined with a
+    ///   variant, and options without a selected provider/model;
+    /// - Claude's Fast Mode check;
+    /// - the checks Codex, Cursor and OpenCode make against what the model or session advertises,
+    ///   including a model offered neither by Codex's model list nor as one of the instance's
+    ///   custom models, a Cursor session configuration BiBCode can't work with, and a switch of a
+    ///   live Cursor session to a default model it does not advertise;
+    /// - Grok, which accepts no option.
+    ///
+    /// `refusal` is the plain sentence an undelivered turn shows. The Display deliberately equals
+    /// `Provider`'s, so logs, RPC errors and runtime rows read exactly as before.
+    #[error("{provider} provider operation failed: {detail}")]
+    InvalidOption {
+        provider: String,
+        detail: String,
+        refusal: String,
+    },
     #[error("provider runtime persistence failed: {0}")]
     Persistence(String),
     #[error("provider event projection failed: {0}")]
@@ -1217,7 +1248,10 @@ pub async fn deliver_durable_orchestration_turn(
         }
         Err(error) => {
             return ProviderDeliveryOutcome::Rejected {
-                detail: error.to_string(),
+                detail: delivery_detail(
+                    &ProviderRuntimeError::Persistence(error.to_string()),
+                    None,
+                ),
             };
         }
     };
@@ -1439,22 +1473,24 @@ async fn deliver_orchestration_turn_with_identity(
             {
                 Ok(request) => request,
                 Err(error) => {
+                    let label =
+                        frozen_delivery_label(settings_root, frozen_delivery.as_ref(), &error)
+                            .await;
                     return ProviderDeliveryOutcome::Rejected {
-                        detail: error.to_string(),
+                        detail: delivery_detail(&error, label.as_deref()),
                     };
                 }
             };
+            let label = request.provider_label.clone();
             if let Some(row) = frozen_delivery.as_ref()
                 && let Err(error) = validate_frozen_delivery_route(row, &request)
             {
                 return ProviderDeliveryOutcome::Rejected {
-                    detail: error.to_string(),
+                    detail: delivery_detail(&error, Some(&label)),
                 };
             }
             if let Err(error) = supervisor.launch(request).await {
-                return ProviderDeliveryOutcome::DefinitelyNotSent {
-                    detail: error.to_string(),
-                };
+                return launch_failure_outcome(&error, &label);
             }
             if let Some(row) = frozen_delivery.as_ref() {
                 match engine
@@ -1471,7 +1507,10 @@ async fn deliver_orchestration_turn_with_identity(
                     Ok(_) => {}
                     Err(error) => {
                         return ProviderDeliveryOutcome::DefinitelyNotSent {
-                            detail: error.to_string(),
+                            detail: delivery_detail(
+                                &ProviderRuntimeError::Persistence(error.to_string()),
+                                Some(&label),
+                            ),
                         };
                     }
                 }
@@ -1484,30 +1523,197 @@ async fn deliver_orchestration_turn_with_identity(
                 Ok(handle) => handle,
                 Err(error) if is_frozen => {
                     return ProviderDeliveryOutcome::Rejected {
-                        detail: error.to_string(),
+                        detail: delivery_detail(&error, Some(&label)),
                     };
                 }
-                Err(error) => return delivery_enqueue_failure(error),
+                Err(error) => return delivery_enqueue_failure(&error, Some(&label)),
             }
         }
-        Err(error) if is_frozen => {
-            return ProviderDeliveryOutcome::Rejected {
-                detail: error.to_string(),
+        Err(error) => {
+            let label =
+                frozen_delivery_label(settings_root, frozen_delivery.as_ref(), &error).await;
+            return if is_frozen {
+                ProviderDeliveryOutcome::Rejected {
+                    detail: delivery_detail(&error, label.as_deref()),
+                }
+            } else {
+                delivery_enqueue_failure(&error, label.as_deref())
             };
         }
-        Err(error) => return delivery_enqueue_failure(error),
     };
     handle.completion().await
 }
 
-fn delivery_enqueue_failure(error: ProviderRuntimeError) -> ProviderDeliveryOutcome {
+/// A durable turn is replayed unchanged, so a launch refused for the turn's own options fails the
+/// delivery once. Every other launch failure, such as a spawn error, is retried.
+fn launch_failure_outcome(error: &ProviderRuntimeError, label: &str) -> ProviderDeliveryOutcome {
+    let detail = delivery_detail(error, Some(label));
+    if matches!(error, ProviderRuntimeError::InvalidOption { .. }) {
+        ProviderDeliveryOutcome::Rejected { detail }
+    } else {
+        ProviderDeliveryOutcome::DefinitelyNotSent { detail }
+    }
+}
+
+/// The one formatter for what a turn's delivery shows the user: the outbox `last_error`, from
+/// which the message's delivery detail and the thread's unresolved delivery derive. Plain words,
+/// never a driver id: `provider_label` is the provider instance's label, and `None` names the
+/// provider by its driver's name. The error's Display, which logs, RPC errors and runtime rows
+/// use, stays as it is.
+pub(crate) fn delivery_detail(
+    error: &ProviderRuntimeError,
+    provider_label: Option<&str>,
+) -> String {
+    let label = |provider: &str| {
+        provider_label.map_or_else(|| provider_display_name(provider).to_owned(), str::to_owned)
+    };
     match error {
-        ProviderRuntimeError::ResponseDropped => ProviderDeliveryOutcome::Ambiguous {
+        ProviderRuntimeError::InvalidOption { refusal, .. } => refusal.clone(),
+        // Drivers and BiBCode's own delivery ordering both raise this one, so its detail, without
+        // the "{driver id} provider operation failed:" prefix, is what it says.
+        ProviderRuntimeError::Provider { detail, .. } => detail.clone(),
+        ProviderRuntimeError::Spawn { provider, detail } => {
+            format!("{} could not start: {detail}", label(provider))
+        }
+        ProviderRuntimeError::UnsupportedProvider { provider } => format!(
+            "{} is turned off or not set up. Check it in Settings → Providers.",
+            label(provider)
+        ),
+        ProviderRuntimeError::UnsupportedCapability {
+            provider,
+            capability,
+        } => format!(
+            "{} does not support {capability} while a session is running.",
+            label(provider)
+        ),
+        ProviderRuntimeError::ActivityTargetUnsupported { provider } => {
+            format!("{} can't cancel a single activity.", label(provider))
+        }
+        // `StaleSession` is raised only for actions other than a delivery (an interrupt, an
+        // approval, a targeted activity cancellation) whose session is gone, so it has no
+        // delivery wording of its own: it means what `SessionNotFound` means.
+        ProviderRuntimeError::SessionNotFound { .. }
+        | ProviderRuntimeError::StaleSession { .. } => {
+            "No session is running for this thread.".to_owned()
+        }
+        ProviderRuntimeError::SessionAlreadyExists { .. } => {
+            "A session is already running for this thread.".to_owned()
+        }
+        ProviderRuntimeError::Shutdown | ProviderRuntimeError::QueueClosed => {
+            "BiBCode was shutting down.".to_owned()
+        }
+        ProviderRuntimeError::ResponseDropped => {
+            "BiBCode lost track of this message while sending it.".to_owned()
+        }
+        ProviderRuntimeError::Persistence(detail) => {
+            format!("BiBCode could not use its database: {detail}")
+        }
+        ProviderRuntimeError::Orchestration(detail) => {
+            format!("BiBCode could not update this thread: {detail}")
+        }
+    }
+}
+
+/// Maps an error from applying a turn's options: a deterministic refusal becomes
+/// [`ProviderRuntimeError::InvalidOption`]; anything else, such as a lost connection, stays a
+/// retryable provider failure.
+fn option_error<E: OptionRefusal + std::fmt::Display>(
+    provider: &str,
+    error: E,
+) -> ProviderRuntimeError {
+    match error.option_refusal() {
+        Some(refusal) => ProviderRuntimeError::InvalidOption {
+            provider: provider.to_owned(),
+            detail: error.to_string(),
+            refusal: refusal.to_owned(),
+        },
+        None => ProviderRuntimeError::Provider {
+            provider: provider.to_owned(),
             detail: error.to_string(),
         },
-        _ => ProviderDeliveryOutcome::DefinitelyNotSent {
-            detail: error.to_string(),
-        },
+    }
+}
+
+/// The name users see for a provider driver kind. It mirrors contracts' `PROVIDER_DISPLAY_NAMES`,
+/// which a test holds it to, and serves only where no instance label exists: an instance without
+/// a display name, a route whose instance is unknown, and an error a driver raises without one.
+pub(crate) fn provider_display_name(provider_kind: &str) -> &str {
+    match provider_kind {
+        "claudeAgent" | "claude" => "Claude",
+        "codex" => "Codex",
+        "cursor" => "Cursor",
+        "grok" => "Grok",
+        "opencode" => "OpenCode",
+        other => other,
+    }
+}
+
+/// The label policy for a provider instance: its display name, otherwise its driver's name.
+fn instance_label(display_name: Option<&str>, provider_kind: &str) -> String {
+    display_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| provider_display_name(provider_kind))
+        .to_owned()
+}
+
+/// The label of a provider instance, read from the persisted settings without their secrets, so
+/// a missing secret can't cost the instance its name. Settings that can't be read, and an
+/// instance they no longer hold, fall back to the driver's name.
+pub(crate) async fn provider_instance_label(
+    settings_root: &Path,
+    instance_id: &str,
+    provider_kind: &str,
+) -> String {
+    let settings = ProviderSettingsStore::new(settings_root)
+        .get_document()
+        .await
+        .ok();
+    let display_name = settings
+        .as_ref()
+        .and_then(|settings| settings.get("providerInstances"))
+        .and_then(|instances| instances.get(instance_id))
+        .and_then(|instance| instance.get("displayName"))
+        .and_then(Value::as_str);
+    instance_label(display_name, provider_kind)
+}
+
+/// The label for the detail of an `error` raised before a launch request exists: the frozen
+/// route's instance label, read from the settings only when the detail names the provider. The
+/// non-durable path has no frozen route, so its details name the provider by its driver.
+async fn frozen_delivery_label(
+    settings_root: &Path,
+    frozen_delivery: Option<&ProviderTurnDelivery>,
+    error: &ProviderRuntimeError,
+) -> Option<String> {
+    let row = frozen_delivery?;
+    if !delivery_detail_names_provider(error) {
+        return None;
+    }
+    Some(
+        provider_instance_label(settings_root, &row.provider_instance_id, &row.provider_kind).await,
+    )
+}
+
+/// Whether [`delivery_detail`] names the provider for `error`.
+fn delivery_detail_names_provider(error: &ProviderRuntimeError) -> bool {
+    matches!(
+        error,
+        ProviderRuntimeError::Spawn { .. }
+            | ProviderRuntimeError::UnsupportedProvider { .. }
+            | ProviderRuntimeError::UnsupportedCapability { .. }
+            | ProviderRuntimeError::ActivityTargetUnsupported { .. }
+    )
+}
+
+fn delivery_enqueue_failure(
+    error: &ProviderRuntimeError,
+    provider_label: Option<&str>,
+) -> ProviderDeliveryOutcome {
+    let detail = delivery_detail(error, provider_label);
+    match error {
+        ProviderRuntimeError::ResponseDropped => ProviderDeliveryOutcome::Ambiguous { detail },
+        _ => ProviderDeliveryOutcome::DefinitelyNotSent { detail },
     }
 }
 
@@ -1849,6 +2055,21 @@ async fn launch_request_for_command(
     }
     let options = selection_options(selection);
     let session_options = provider_session_options(&route.provider, &options);
+    // Only Codex checks a turn's model against a list that leaves out the catalog's custom models.
+    let custom_models = if provider == "codex" {
+        ProviderSettingsStore::new(settings_root)
+            .get_document()
+            .await
+            .map(|settings| {
+                super::provider_inventory::instance_custom_models(&settings, &instance_id)
+            })
+            .map_err(|error| ProviderRuntimeError::Provider {
+                provider: provider.to_owned(),
+                detail: error.to_string(),
+            })?
+    } else {
+        Vec::new()
+    };
     Ok(ProviderLaunchRequest {
         thread_id: thread_id.clone(),
         activity_causal_revision: 0,
@@ -1868,6 +2089,7 @@ async fn launch_request_for_command(
         effort: selection_effort(&options),
         agent: selection_string_option_from(&options, "agent"),
         options: session_options,
+        custom_models,
         resume_cursor,
         environment: route.environment,
         endpoint: (!route.binary.server_url.trim().is_empty())
@@ -1998,12 +2220,10 @@ async fn resolve_provider_route_settings(
     Ok(ResolvedProviderRouteSettings {
         provider: provider.to_owned(),
         provider_instance_id: instance_id.to_owned(),
-        provider_label: instance
-            .and_then(|value| value.display_name.as_deref())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(provider)
-            .to_owned(),
+        provider_label: instance_label(
+            instance.and_then(|value| value.display_name.as_deref()),
+            provider,
+        ),
         binary,
         environment,
         codex_home,
@@ -3039,9 +3259,9 @@ async fn spawn_delivery(
                     ),
                 }),
                 Err(error) => Some(ProviderDeliveryOutcome::DefinitelyNotSent {
-                    detail: format!(
-                        "durable provider session freeze failed for {}: {error}",
-                        row.command_id
+                    detail: delivery_detail(
+                        &ProviderRuntimeError::Persistence(error.to_string()),
+                        None,
                     ),
                 }),
             }
@@ -3061,10 +3281,13 @@ async fn spawn_delivery(
                         .await
                 }
                 Ok(None) => ProviderDeliveryOutcome::Rejected {
-                    detail: "The selected turn is no longer available for steering.".to_owned(),
+                    detail: STEER_TARGET_GONE_DETAIL.to_owned(),
                 },
                 Err(error) => ProviderDeliveryOutcome::DefinitelyNotSent {
-                    detail: error.to_string(),
+                    detail: delivery_detail(
+                        &ProviderRuntimeError::Persistence(error.to_string()),
+                        None,
+                    ),
                 },
             }
         } else {
@@ -3369,7 +3592,9 @@ fn normalize_agent_activity_transition_error(error: ProviderRuntimeError) -> Pro
         ProviderRuntimeError::UnsupportedCapability { .. } => "unsupported capability",
         ProviderRuntimeError::ActivityTargetUnsupported { .. } => "targeted activity unsupported",
         ProviderRuntimeError::Spawn { .. } => "provider spawn failure",
-        ProviderRuntimeError::Provider { .. } => "provider operation failure",
+        ProviderRuntimeError::Provider { .. } | ProviderRuntimeError::InvalidOption { .. } => {
+            "provider operation failure"
+        }
         ProviderRuntimeError::Persistence(_) => "persistence failure",
         ProviderRuntimeError::Orchestration(_) => "projection failure",
     };
@@ -4100,10 +4325,30 @@ fn model_from_selection(selection: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Refuses an option the driver does not take, naming it by its id: a driver has a label only
+/// for the options it takes.
 fn unsupported_option(provider: &str, option_id: &str) -> ProviderRuntimeError {
-    ProviderRuntimeError::Provider {
+    unsupported_labelled_option(provider, option_id, option_id)
+}
+
+/// Refuses an option, naming it by `label` in the sentence a user reads.
+fn unsupported_labelled_option(
+    provider: &str,
+    option_id: &str,
+    label: &str,
+) -> ProviderRuntimeError {
+    ProviderRuntimeError::InvalidOption {
         provider: provider.to_owned(),
         detail: format!("option {option_id} is not supported by the selected model/session"),
+        refusal: unsupported_option_refusal(label),
+    }
+}
+
+fn option_without_id(provider: &str) -> ProviderRuntimeError {
+    ProviderRuntimeError::InvalidOption {
+        provider: provider.to_owned(),
+        detail: "option is missing an id".to_owned(),
+        refusal: option_without_id_refusal(),
     }
 }
 
@@ -5256,6 +5501,10 @@ fn now() -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
 }
 
+/// The provider inventory the server last published: one snapshot per provider instance, each
+/// listing its models and their option descriptors.
+pub type PublishedProviderInventory = Arc<RwLock<Vec<Value>>>;
+
 #[derive(Clone, Debug)]
 pub struct NativeProviderDriverFactory {
     attachments: AttachmentMaterializer,
@@ -5263,6 +5512,7 @@ pub struct NativeProviderDriverFactory {
     activity_controller: AgentActivityController,
     claude_probe_cache: ClaudeActivityProbeCache,
     claude_probe_launch_policy: ClaudeProbeLaunchPolicy,
+    published_inventory: Option<PublishedProviderInventory>,
 }
 
 impl NativeProviderDriverFactory {
@@ -5311,7 +5561,39 @@ impl NativeProviderDriverFactory {
             activity_controller,
             claude_probe_cache,
             claude_probe_launch_policy,
+            published_inventory: None,
         }
+    }
+
+    /// Lets a launch read the inventory the server last published, so a Claude session honours
+    /// what the CLI reported for its model.
+    #[must_use]
+    pub fn with_published_inventory(mut self, inventory: PublishedProviderInventory) -> Self {
+        self.published_inventory = Some(inventory);
+        self
+    }
+
+    /// Whether the launched model accepts Fast Mode: what the CLI reported for it in the published
+    /// inventory, or the built-in catalog when the inventory does not list the model.
+    async fn claude_fast_mode_support(&self, request: &ProviderLaunchRequest) -> bool {
+        let Some(model) = request.model.as_deref() else {
+            return false;
+        };
+        if let Some(inventory) = &self.published_inventory {
+            let instance_id = request
+                .provider_instance_id
+                .as_deref()
+                .unwrap_or(&request.provider);
+            if let Some(offered) = published_model_offers_option(
+                &inventory.read().await,
+                instance_id,
+                model,
+                "fastMode",
+            ) {
+                return offered;
+            }
+        }
+        claude_supports_fast_mode(Some(model))
     }
 }
 
@@ -5353,17 +5635,21 @@ impl ProviderDriverFactory for NativeProviderDriverFactory {
                     )
                     .await?,
                 ) as Arc<dyn ProviderDriver>),
-                "claude" | "claudeAgent" => Ok(Arc::new(
-                    ClaudeDriver::spawn(
-                        request,
-                        self.attachments.clone(),
-                        self.attribution.clone(),
-                        activity_enabled,
-                        self.claude_probe_cache.clone(),
-                        self.claude_probe_launch_policy,
-                    )
-                    .await?,
-                ) as Arc<dyn ProviderDriver>),
+                "claude" | "claudeAgent" => {
+                    let supports_fast_mode = self.claude_fast_mode_support(&request).await;
+                    Ok(Arc::new(
+                        ClaudeDriver::spawn(
+                            request,
+                            self.attachments.clone(),
+                            self.attribution.clone(),
+                            activity_enabled,
+                            self.claude_probe_cache.clone(),
+                            self.claude_probe_launch_policy,
+                            supports_fast_mode,
+                        )
+                        .await?,
+                    ) as Arc<dyn ProviderDriver>)
+                }
                 provider => Err(ProviderRuntimeError::UnsupportedProvider {
                     provider: provider.to_owned(),
                 }),
@@ -5653,6 +5939,10 @@ struct CodexDriver {
     runtime: CodexSessionRuntime,
     child: SharedChild,
     attachments: AttachmentMaterializer,
+    /// The instance's label, which delivery details and refusals name the provider by.
+    provider_label: String,
+    /// The instance's custom models, which the catalog offers beside Codex's model list.
+    custom_models: Vec<String>,
 }
 
 fn codex_activity_target_ids(
@@ -5776,7 +6066,18 @@ impl CodexDriver {
             runtime,
             child: Arc::new(Mutex::new(child)),
             attachments,
+            provider_label: request.provider_label,
+            custom_models: request.custom_models,
         })
+    }
+
+    /// The session has no Codex thread to send to yet, so nothing was sent.
+    fn session_not_ready_detail(&self) -> String {
+        format!("The {} session was not ready yet.", self.provider_label)
+    }
+
+    fn runtime_error_detail(&self, error: crate::provider::codex::runtime::RuntimeError) -> String {
+        delivery_detail(&provider_error("codex")(error), Some(&self.provider_label))
     }
 
     async fn prepare_turn_input(
@@ -5860,7 +6161,7 @@ impl ProviderDriver for CodexDriver {
                 Ok(input) => input,
                 Err(error) => {
                     return ProviderDeliveryOutcome::Rejected {
-                        detail: error.to_string(),
+                        detail: delivery_detail(&error, Some(&self.provider_label)),
                     };
                 }
             };
@@ -5879,11 +6180,11 @@ impl ProviderDriver for CodexDriver {
                 },
                 Err(crate::provider::codex::runtime::RuntimeError::MissingProviderThreadId) => {
                     ProviderDeliveryOutcome::DefinitelyNotSent {
-                        detail: "Codex session is missing a provider thread id".to_owned(),
+                        detail: self.session_not_ready_detail(),
                     }
                 }
                 Err(error) => ProviderDeliveryOutcome::Ambiguous {
-                    detail: error.to_string(),
+                    detail: self.runtime_error_detail(error),
                 },
             }
         })
@@ -5900,7 +6201,7 @@ impl ProviderDriver for CodexDriver {
                 Ok(input) => input,
                 Err(error) => {
                     return ProviderDeliveryOutcome::Rejected {
-                        detail: error.to_string(),
+                        detail: delivery_detail(&error, Some(&self.provider_label)),
                     };
                 }
             };
@@ -5919,7 +6220,7 @@ impl ProviderDriver for CodexDriver {
                 },
                 Err(crate::provider::codex::runtime::RuntimeError::MissingProviderThreadId) => {
                     ProviderDeliveryOutcome::DefinitelyNotSent {
-                        detail: "Codex session is missing a provider thread id".to_owned(),
+                        detail: self.session_not_ready_detail(),
                     }
                 }
                 Err(crate::provider::codex::runtime::RuntimeError::Protocol(
@@ -5932,7 +6233,7 @@ impl ProviderDriver for CodexDriver {
                     ProviderDeliveryOutcome::Rejected { detail: message }
                 }
                 Err(error) => ProviderDeliveryOutcome::Ambiguous {
-                    detail: error.to_string(),
+                    detail: self.runtime_error_detail(error),
                 },
             }
         })
@@ -6022,38 +6323,37 @@ impl ProviderDriver for CodexDriver {
             let mut service_tier = None;
             let mut effort = None;
             for option in options {
-                let id = option.get("id").and_then(Value::as_str).ok_or_else(|| {
-                    ProviderRuntimeError::Provider {
-                        provider: "codex".to_owned(),
-                        detail: "option is missing an id".to_owned(),
-                    }
-                })?;
+                let id = option
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| option_without_id("codex"))?;
                 let value = option
                     .get("value")
                     .and_then(Value::as_str)
                     .filter(|value| !value.trim().is_empty())
                     .map(str::to_owned)
-                    .ok_or_else(|| ProviderRuntimeError::Provider {
+                    .ok_or_else(|| ProviderRuntimeError::InvalidOption {
                         provider: "codex".to_owned(),
                         detail: format!("option {id} must be a non-empty string"),
+                        refusal: option_needs_value_refusal(
+                            crate::provider::codex::model::turn_option_label(id),
+                        ),
                     })?;
                 match id {
                     "serviceTier" => service_tier = Some(value),
                     "reasoningEffort" => effort = Some(value),
-                    _ => {
-                        return Err(ProviderRuntimeError::Provider {
-                            provider: "codex".to_owned(),
-                            detail: format!(
-                                "option {id} is not supported by the selected model/session"
-                            ),
-                        });
-                    }
+                    _ => return Err(unsupported_option("codex", id)),
                 }
             }
             self.runtime
-                .validate_turn_options(service_tier.as_deref(), effort.as_deref())
+                .validate_turn_options(
+                    service_tier.as_deref(),
+                    effort.as_deref(),
+                    &self.provider_label,
+                    &self.custom_models,
+                )
                 .await
-                .map_err(provider_error("codex"))?;
+                .map_err(|error| option_error("codex", error))?;
             self.runtime.set_turn_options(service_tier, effort).await;
             Ok(())
         })
@@ -6209,7 +6509,7 @@ impl ProviderDriver for CursorDriver {
                 Ok(input) => input,
                 Err(error) => {
                     return ProviderDeliveryOutcome::Rejected {
-                        detail: error.to_string(),
+                        detail: delivery_detail(&error, None),
                     };
                 }
             };
@@ -6221,7 +6521,7 @@ impl ProviderDriver for CursorDriver {
                 Ok(receipt) => receipt,
                 Err(error) => {
                     return ProviderDeliveryOutcome::DefinitelyNotSent {
-                        detail: error.to_string(),
+                        detail: delivery_detail(&provider_error("cursor")(error), None),
                     };
                 }
             };
@@ -6235,10 +6535,10 @@ impl ProviderDriver for CursorDriver {
                         crate::provider::cursor::acp::AcpProtocolError::RemoteRequest { .. },
                     ),
                 ) => ProviderDeliveryOutcome::Rejected {
-                    detail: error.to_string(),
+                    detail: delivery_detail(&provider_error("cursor")(error), None),
                 },
                 Err(error) => ProviderDeliveryOutcome::Ambiguous {
-                    detail: error.to_string(),
+                    detail: delivery_detail(&provider_error("cursor")(error), None),
                 },
             }
         })
@@ -6299,10 +6599,12 @@ impl ProviderDriver for CursorDriver {
     }
     fn set_model(&self, model: String) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
+            // A switch to the default model the session advertises none of is refused for good;
+            // any other failure, such as a lost connection, stays retryable.
             self.runtime
                 .set_model(&model)
                 .await
-                .map_err(provider_error("cursor"))
+                .map_err(|error| option_error("cursor", error))
         })
     }
     fn reapply_options_on_model_change(&self) -> bool {
@@ -6316,7 +6618,7 @@ impl ProviderDriver for CursorDriver {
             self.runtime
                 .set_options(options)
                 .await
-                .map_err(provider_error("cursor"))
+                .map_err(|error| option_error("cursor", error))
         })
     }
     fn rollback(&self, _: i64) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
@@ -6705,7 +7007,7 @@ impl ProviderDriver for OpenCodeDriver {
                 Ok(attachments) => attachments,
                 Err(error) => {
                     return ProviderDeliveryOutcome::Rejected {
-                        detail: error.to_string(),
+                        detail: delivery_detail(&error, None),
                     };
                 }
             };
@@ -6734,11 +7036,11 @@ impl ProviderDriver for OpenCodeDriver {
                 Err(error @ crate::provider::opencode::runtime::OpenCodeRuntimeError::MissingSession)
                 | Err(error @ crate::provider::opencode::runtime::OpenCodeRuntimeError::InvalidResponse(_)) => {
                     ProviderDeliveryOutcome::DefinitelyNotSent {
-                        detail: error.to_string(),
+                        detail: delivery_detail(&provider_error("opencode")(error), None),
                     }
                 }
                 Err(error) => ProviderDeliveryOutcome::Ambiguous {
-                    detail: error.to_string(),
+                    detail: delivery_detail(&provider_error("opencode")(error), None),
                 },
             }
         })
@@ -6823,7 +7125,7 @@ impl ProviderDriver for OpenCodeDriver {
             self.runtime
                 .set_options(options)
                 .await
-                .map_err(provider_error("opencode"))
+                .map_err(|error| option_error("opencode", error))
         })
     }
     fn rollback(&self, count: i64) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
@@ -8114,6 +8416,8 @@ mod claude_context_query_tests {
 
 struct ClaudeDriver {
     provider: String,
+    /// The instance's label, which delivery details name the provider by.
+    provider_label: String,
     runtime: Arc<Mutex<ClaudeProviderRuntime>>,
     writer: Mutex<Box<dyn AsyncWrite + Send + Unpin>>,
     events: Mutex<mpsc::Receiver<ProviderEvent>>,
@@ -8665,6 +8969,7 @@ fn selection_boolean_option(options: &[Value], id: &str) -> Option<bool> {
         .and_then(Value::as_bool)
 }
 
+/// Whether the built-in Claude catalog offers Fast Mode for `model`.
 fn claude_supports_fast_mode(model: Option<&str>) -> bool {
     let Some(model) = model else {
         return false;
@@ -8672,16 +8977,36 @@ fn claude_supports_fast_mode(model: Option<&str>) -> bool {
     crate::provider::claude::model::all_models(&[])
         .into_iter()
         .find(|candidate| candidate.get("slug").and_then(Value::as_str) == Some(model))
-        .is_some_and(|candidate| {
-            candidate["capabilities"]["optionDescriptors"]
-                .as_array()
-                .is_some_and(|descriptors| {
-                    descriptors.iter().any(|descriptor| {
-                        descriptor.get("id").and_then(Value::as_str) == Some("fastMode")
-                            && descriptor.get("type").and_then(Value::as_str) == Some("boolean")
-                    })
-                })
+        .is_some_and(|candidate| model_offers_boolean_option(&candidate, "fastMode"))
+}
+
+fn model_offers_boolean_option(model: &Value, option: &str) -> bool {
+    model["capabilities"]["optionDescriptors"]
+        .as_array()
+        .is_some_and(|descriptors| {
+            descriptors.iter().any(|descriptor| {
+                descriptor.get("id").and_then(Value::as_str) == Some(option)
+                    && descriptor.get("type").and_then(Value::as_str) == Some("boolean")
+            })
         })
+}
+
+/// Whether `model` offers the boolean `option` in the inventory published for `instance_id`, or
+/// `None` when that inventory does not list the model.
+fn published_model_offers_option(
+    inventory: &[Value],
+    instance_id: &str,
+    model: &str,
+    option: &str,
+) -> Option<bool> {
+    let entry = inventory
+        .iter()
+        .find(|snapshot| snapshot.get("instanceId").and_then(Value::as_str) == Some(instance_id))?
+        .get("models")?
+        .as_array()?
+        .iter()
+        .find(|entry| entry.get("slug").and_then(Value::as_str) == Some(model))?;
+    Some(model_offers_boolean_option(entry, option))
 }
 
 fn validate_claude_options(
@@ -8689,19 +9014,25 @@ fn validate_claude_options(
     options: &[Value],
     supports_fast_mode: bool,
 ) -> Result<(), ProviderRuntimeError> {
+    use crate::provider::claude::model::FAST_MODE_LABEL;
     let mut seen = HashSet::new();
     for option in options {
         let Some(id) = option.get("id").and_then(Value::as_str) else {
-            return Err(unsupported_option(provider, "unknown"));
+            return Err(option_without_id(provider));
         };
-        if !seen.insert(id) || id != "fastMode" || !supports_fast_mode {
+        if !seen.insert(id) || id != "fastMode" {
             return Err(unsupported_option(provider, id));
         }
-        if option.get("value").and_then(Value::as_bool).is_none() {
-            return Err(ProviderRuntimeError::Provider {
+        let Some(enabled) = option.get("value").and_then(Value::as_bool) else {
+            return Err(ProviderRuntimeError::InvalidOption {
                 provider: provider.to_owned(),
                 detail: "option fastMode requires a boolean value".to_owned(),
+                refusal: option_on_or_off_refusal(FAST_MODE_LABEL),
             });
+        };
+        // Fast Mode off asks for nothing, so only turning it on needs the model's support.
+        if enabled && !supports_fast_mode {
+            return Err(unsupported_labelled_option(provider, id, FAST_MODE_LABEL));
         }
     }
     Ok(())
@@ -8831,6 +9162,7 @@ const fn test_claude_probe_launch_policy() -> ClaudeProbeLaunchPolicy {
 }
 
 impl ClaudeDriver {
+    /// `supports_fast_mode` is the launched model's Fast Mode capability, decided by the factory.
     async fn spawn(
         mut request: ProviderLaunchRequest,
         attachments: AttachmentMaterializer,
@@ -8838,8 +9170,8 @@ impl ClaudeDriver {
         activity_enabled: bool,
         probe_cache: ClaudeActivityProbeCache,
         probe_launch_policy: ClaudeProbeLaunchPolicy,
+        supports_fast_mode: bool,
     ) -> Result<Self, ProviderRuntimeError> {
-        let supports_fast_mode = claude_supports_fast_mode(request.model.as_deref());
         validate_claude_options(&request.provider, &request.options, supports_fast_mode)?;
         let mode = claude_mode(&request.runtime_mode, &request.interaction_mode);
         let session_id = request
@@ -8921,6 +9253,7 @@ impl ClaudeDriver {
         );
         Ok(Self {
             provider: request.provider,
+            provider_label: request.provider_label,
             runtime,
             writer: Mutex::new(Box::new(stdin)),
             events: Mutex::new(events_rx),
@@ -8969,35 +9302,52 @@ impl ClaudeDriver {
     ) -> Result<(), ProviderDeliveryOutcome> {
         // Before the first byte, cancellation proves nothing was sent. Once a
         // prefix is written, finish the frame so later input cannot be corrupted.
+        let label = &self.provider_label;
         let written = tokio::select! {
             biased;
             () = turn_cancellation.cancelled() => return Err(ProviderDeliveryOutcome::Rejected {
-                detail: "Claude turn is no longer available for steering".to_owned(),
+                detail: STEER_TARGET_GONE_DETAIL.to_owned(),
             }),
-            () = self.output.cancellation.cancelled() => return Err(ProviderDeliveryOutcome::DefinitelyNotSent {
-                detail: "Claude output closed before delivery".to_owned(),
-            }),
-            () = session_cancellation.cancelled() => return Err(ProviderDeliveryOutcome::DefinitelyNotSent {
-                detail: "Claude session retired before delivery".to_owned(),
-            }),
-            result = writer.write(bytes) => result.map_err(|error| ProviderDeliveryOutcome::DefinitelyNotSent { detail: error.to_string() })?,
+            () = self.output.cancellation.cancelled() => return Err(self.stopped_before_sending()),
+            () = session_cancellation.cancelled() => return Err(self.session_ended_before_sending()),
+            result = writer.write(bytes) => result.map_err(|error| ProviderDeliveryOutcome::DefinitelyNotSent {
+                detail: format!("BiBCode could not send this message to {label}: {error}"),
+            })?,
         };
         if written == 0 {
             return Err(ProviderDeliveryOutcome::DefinitelyNotSent {
-                detail: "Claude input closed before delivery write".to_owned(),
+                detail: format!("{label} stopped taking input before BiBCode sent this message."),
             });
         }
-        writer.write_all(&bytes[written..]).await.map_err(|error| {
-            ProviderDeliveryOutcome::Ambiguous {
-                detail: error.to_string(),
-            }
-        })?;
+        // Part of the message is written, so a failure from here on leaves its fate unknown.
+        let unfinished = |error: std::io::Error| ProviderDeliveryOutcome::Ambiguous {
+            detail: format!("BiBCode could not finish sending this message to {label}: {error}"),
+        };
         writer
-            .flush()
+            .write_all(&bytes[written..])
             .await
-            .map_err(|error| ProviderDeliveryOutcome::Ambiguous {
-                detail: error.to_string(),
-            })
+            .map_err(unfinished)?;
+        writer.flush().await.map_err(unfinished)
+    }
+
+    /// Claude's output closed before anything was written, so nothing was sent.
+    fn stopped_before_sending(&self) -> ProviderDeliveryOutcome {
+        ProviderDeliveryOutcome::DefinitelyNotSent {
+            detail: format!(
+                "{} stopped before BiBCode sent this message.",
+                self.provider_label
+            ),
+        }
+    }
+
+    /// The session was retired before anything was written, so nothing was sent.
+    fn session_ended_before_sending(&self) -> ProviderDeliveryOutcome {
+        ProviderDeliveryOutcome::DefinitelyNotSent {
+            detail: format!(
+                "The {} session ended before BiBCode sent this message.",
+                self.provider_label
+            ),
+        }
     }
 
     async fn write_json(&self, value: Value) -> Result<(), ProviderRuntimeError> {
@@ -9052,7 +9402,7 @@ impl ClaudeDriver {
             let steer_cancellation = if let Some(expected) = expected_turn_id.as_deref() {
                 let Some(token) = runtime.turn_steer_cancellation(expected) else {
                     return ProviderDeliveryOutcome::Rejected {
-                        detail: "Claude turn is no longer available for steering".to_owned(),
+                        detail: STEER_TARGET_GONE_DETAIL.to_owned(),
                     };
                 };
                 Some(token)
@@ -9068,7 +9418,7 @@ impl ClaudeDriver {
             Ok(input) => input,
             Err(error) => {
                 return ProviderDeliveryOutcome::Rejected {
-                    detail: error.to_string(),
+                    detail: delivery_detail(&error, Some(&self.provider_label)),
                 };
             }
         };
@@ -9085,7 +9435,7 @@ impl ClaudeDriver {
             Ok(bytes) => bytes,
             Err(error) => {
                 return ProviderDeliveryOutcome::Rejected {
-                    detail: error.to_string(),
+                    detail: delivery_detail(&error, Some(&self.provider_label)),
                 };
             }
         };
@@ -9093,14 +9443,10 @@ impl ClaudeDriver {
         let mut writer = tokio::select! {
             biased;
             () = write_cancellation.cancelled() => return ProviderDeliveryOutcome::Rejected {
-                detail: "Claude turn is no longer available for steering".to_owned(),
+                detail: STEER_TARGET_GONE_DETAIL.to_owned(),
             },
-            () = self.output.cancellation.cancelled() => return ProviderDeliveryOutcome::DefinitelyNotSent {
-                detail: "Claude output closed before delivery".to_owned(),
-            },
-            () = acknowledgement_cancellation.cancelled() => return ProviderDeliveryOutcome::DefinitelyNotSent {
-                detail: "Claude session retired before delivery".to_owned(),
-            },
+            () = self.output.cancellation.cancelled() => return self.stopped_before_sending(),
+            () = acknowledgement_cancellation.cancelled() => return self.session_ended_before_sending(),
             writer = self.writer.lock() => writer,
         };
         // Register under the writer lock: identical-text waiters must have the
@@ -9133,20 +9479,26 @@ impl ClaudeDriver {
         }
         drop(writer);
         drop(bytes);
+        // The message was written, so each outcome below means it probably arrived. Their details
+        // are what an uncertain turn shows, so they say that plainly, naming the instance.
+        let label = &self.provider_label;
         let outcome = tokio::select! {
             biased;
             result = acknowledgement_rx => match result {
                 Ok(turn_id) => ProviderDeliveryOutcome::Accepted { turn_id },
+                // The acknowledgement waiter closed.
                 Err(_) => ProviderDeliveryOutcome::Ambiguous {
-                    detail: "Claude acknowledgement waiter closed after delivery write".to_owned(),
+                    detail: format!("{label} did not confirm it received this message."),
                 },
             },
+            // The session was retired before Claude acknowledged the write.
             () = acknowledgement_cancellation.cancelled() => ProviderDeliveryOutcome::Ambiguous {
-                detail: "Claude session retired after delivery write before acknowledgement".to_owned(),
+                detail: format!("The session ended before {label} confirmed it received this message."),
             },
+            // Claude's output closed before it acknowledged the write.
             () = self.output.cancellation.cancelled() => {
                 ProviderDeliveryOutcome::Ambiguous {
-                    detail: "Claude output closed after delivery write before acknowledgement".to_owned(),
+                    detail: format!("{label} stopped before it confirmed it received this message."),
                 }
             }
         };
@@ -10313,13 +10665,10 @@ fn reject_unsupported_options(
         let Some(option) = options.first() else {
             return Ok(());
         };
-        Err(unsupported_option(
-            provider,
-            option
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown"),
-        ))
+        let Some(id) = option.get("id").and_then(Value::as_str) else {
+            return Err(option_without_id(provider));
+        };
+        Err(unsupported_option(provider, id))
     })
 }
 
@@ -11048,6 +11397,7 @@ mod tests {
             interaction_mode: "default".to_owned(),
             model: Some("test-model".to_owned()),
             options: Vec::new(),
+            custom_models: Vec::new(),
             service_tier: None,
             effort: None,
             agent: None,
@@ -11159,6 +11509,416 @@ mod tests {
         assert_eq!(
             request.options,
             vec![json!({ "id":"fastMode", "value":true })]
+        );
+    }
+
+    /// The static catalog is what the inventory advertises when the Claude CLI reports no models
+    /// at initialization. The composer always sends every select option's current value (its
+    /// default until the user picks another) and a boolean once the user sets it, so every value a
+    /// fallback model offers must pass the validation the Claude session runs before it spawns.
+    #[tokio::test]
+    async fn claude_fallback_catalog_offers_only_options_the_session_accepts() {
+        let engine = supervisor_engine().await;
+        let settings = TempDir::new().expect("provider settings directory");
+        for model in crate::provider::claude::model::all_models(&[]) {
+            let slug = model["slug"].as_str().expect("model slug");
+            let descriptors = model["capabilities"]["optionDescriptors"]
+                .as_array()
+                .expect("option descriptors");
+            let defaults = descriptors
+                .iter()
+                .filter(|descriptor| descriptor["type"] == "select")
+                .filter_map(|descriptor| {
+                    let default = descriptor["options"]
+                        .as_array()?
+                        .iter()
+                        .find(|option| option["isDefault"] == true)?;
+                    Some(json!({ "id": descriptor["id"], "value": default["id"] }))
+                })
+                .collect::<Vec<_>>();
+            let mut selections = vec![defaults.clone()];
+            for descriptor in descriptors {
+                let values = match descriptor["type"].as_str() {
+                    Some("boolean") => vec![json!(true), json!(false)],
+                    Some("select") => descriptor["options"]
+                        .as_array()
+                        .expect("select options")
+                        .iter()
+                        .map(|option| option["id"].clone())
+                        .collect(),
+                    other => panic!("{slug}: unexpected option descriptor type {other:?}"),
+                };
+                for value in values {
+                    let mut selection = defaults
+                        .iter()
+                        .filter(|option| option["id"] != descriptor["id"])
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    selection.push(json!({ "id": descriptor["id"], "value": value }));
+                    selections.push(selection);
+                }
+            }
+            for selection in selections {
+                let command = serde_json::from_value(json!({
+                    "type":"thread.turn.start",
+                    "commandId":"fallback-catalog-options",
+                    "threadId":"t1",
+                    "message":{
+                        "messageId":"fallback-catalog-message",
+                        "role":"user",
+                        "text":"hello",
+                        "attachments":[]
+                    },
+                    "modelSelection":{
+                        "instanceId":"claudeAgent",
+                        "model":slug,
+                        "options":selection
+                    },
+                    "runtimeMode":"full-access",
+                    "interactionMode":"default",
+                    "createdAt":"2026-07-16T00:00:00Z"
+                }))
+                .expect("turn command");
+                let request = super::launch_request_for_command(
+                    &engine,
+                    &settings.path().to_path_buf(),
+                    &command,
+                    None,
+                )
+                .await
+                .expect("launch request");
+                super::validate_claude_options(
+                    &request.provider,
+                    &request.options,
+                    super::claude_supports_fast_mode(request.model.as_deref()),
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{slug} offers {selection:?}, but the Claude session refuses it: {error}"
+                    )
+                });
+            }
+        }
+        engine.shutdown().await;
+    }
+
+    /// `InvalidOption` changes only how a delivery is classified and what an undelivered turn
+    /// shows: logs, RPC errors and runtime rows read exactly as a provider failure does.
+    #[test]
+    fn invalid_option_displays_exactly_like_a_provider_failure() {
+        let refused = super::unsupported_labelled_option("claudeAgent", "fastMode", "Fast Mode");
+        let super::ProviderRuntimeError::InvalidOption {
+            provider,
+            detail,
+            refusal,
+        } = &refused
+        else {
+            panic!("an unsupported option is an InvalidOption: {refused:?}");
+        };
+        assert_eq!(
+            refused.to_string(),
+            super::ProviderRuntimeError::Provider {
+                provider: provider.clone(),
+                detail: detail.clone(),
+            }
+            .to_string()
+        );
+        assert_eq!(
+            refused.to_string(),
+            "claudeAgent provider operation failed: option fastMode is not supported by the selected model/session"
+        );
+        assert_eq!(refusal, "Fast Mode is not supported by the selected model.");
+    }
+
+    /// Every error a delivery can meet reads as plain words that name the provider by the
+    /// instance's label, never by a driver id; the Display stays for logs.
+    #[test]
+    fn delivery_details_are_plain_words_that_name_the_instance() {
+        use super::{ProviderRuntimeError as Error, delivery_detail};
+        let cases = [
+            (
+                Error::InvalidOption {
+                    provider: "codex".to_owned(),
+                    detail: "option madeUp is not supported by the selected model/session"
+                        .to_owned(),
+                    refusal: "madeUp is not supported by the selected model.".to_owned(),
+                },
+                "madeUp is not supported by the selected model.",
+            ),
+            (
+                Error::Provider {
+                    provider: "codex".to_owned(),
+                    detail: "connection reset by peer".to_owned(),
+                },
+                "connection reset by peer",
+            ),
+            (
+                Error::Spawn {
+                    provider: "codex".to_owned(),
+                    detail: "No such file or directory".to_owned(),
+                },
+                "Work Codex could not start: No such file or directory",
+            ),
+            (
+                Error::UnsupportedProvider {
+                    provider: "codex".to_owned(),
+                },
+                "Work Codex is turned off or not set up. Check it in Settings → Providers.",
+            ),
+            (
+                Error::UnsupportedCapability {
+                    provider: "codex".to_owned(),
+                    capability: "checkpoint rollback",
+                },
+                "Work Codex does not support checkpoint rollback while a session is running.",
+            ),
+            (
+                Error::ActivityTargetUnsupported {
+                    provider: "codex".to_owned(),
+                },
+                "Work Codex can't cancel a single activity.",
+            ),
+            (
+                Error::SessionNotFound {
+                    thread_id: "thread-1".to_owned(),
+                },
+                "No session is running for this thread.",
+            ),
+            (
+                Error::StaleSession {
+                    thread_id: "thread-1".to_owned(),
+                    action: "interrupt".to_owned(),
+                },
+                "No session is running for this thread.",
+            ),
+            (
+                Error::SessionAlreadyExists {
+                    thread_id: "thread-1".to_owned(),
+                },
+                "A session is already running for this thread.",
+            ),
+            (Error::Shutdown, "BiBCode was shutting down."),
+            (Error::QueueClosed, "BiBCode was shutting down."),
+            (
+                Error::ResponseDropped,
+                "BiBCode lost track of this message while sending it.",
+            ),
+            (
+                Error::Persistence("database is locked".to_owned()),
+                "BiBCode could not use its database: database is locked",
+            ),
+            (
+                Error::Orchestration("projection failed".to_owned()),
+                "BiBCode could not update this thread: projection failed",
+            ),
+        ];
+        for (error, expected) in cases {
+            let detail = delivery_detail(&error, Some("Work Codex"));
+            assert_eq!(detail, expected, "{error}");
+            assert!(!detail.contains("codex"), "a driver id leaked: {detail}");
+            // A caller reads the label from the settings only for the details that show it.
+            assert_eq!(
+                super::delivery_detail_names_provider(&error),
+                detail.contains("Work Codex"),
+                "{error}"
+            );
+        }
+        // Without an instance label, the driver's name stands in for it.
+        assert_eq!(
+            delivery_detail(
+                &Error::Spawn {
+                    provider: "claudeAgent".to_owned(),
+                    detail: "gone".to_owned(),
+                },
+                None,
+            ),
+            "Claude could not start: gone"
+        );
+    }
+
+    /// A live Cursor session switched to its default model (the catalog's "Auto") while the
+    /// session advertises no reversible default is refused for good, and the delivery says so in
+    /// plain words instead of Cursor's protocol text.
+    #[tokio::test]
+    async fn cursor_switch_to_an_unadvertised_default_model_is_refused_in_plain_words() {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let driver = cursor_delivery_fixture(
+            &temp,
+            &temp.path().join("cursor-child.jsonl"),
+            None,
+            false,
+            false,
+        )
+        .await;
+        driver.start().await.expect("Cursor fixture should start");
+
+        let refused = driver
+            .set_model("default".to_owned())
+            .await
+            .expect_err("the fixture session advertises no default model");
+        let super::ProviderRuntimeError::InvalidOption { refusal, .. } = &refused else {
+            panic!("an unadvertised default model is an option refusal: {refused:?}");
+        };
+        assert_eq!(
+            refusal,
+            "This session can't switch to the default model. Choose another model."
+        );
+        assert_eq!(super::delivery_detail(&refused, Some("Cursor")), *refusal);
+        timeout(std::time::Duration::from_secs(2), driver.shutdown())
+            .await
+            .expect("Cursor fixture shutdown timeout")
+            .expect("Cursor fixture shutdown");
+    }
+
+    /// The Rust fallback names mirror contracts' `PROVIDER_DISPLAY_NAMES`, the table the web
+    /// reads, so the two can't drift apart.
+    #[test]
+    fn provider_display_names_match_the_contracts_table() {
+        let source = include_str!("../../../../packages/contracts/src/model.ts");
+        let kinds = source
+            .lines()
+            .filter_map(|line| {
+                let rest = line.trim().strip_prefix("const ")?;
+                let (constant, rest) = rest.split_once(" = ProviderDriverKind.make(\"")?;
+                let (kind, _) = rest.split_once('"')?;
+                Some((constant, kind))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        let (_, table) = source
+            .split_once("export const PROVIDER_DISPLAY_NAMES")
+            .expect("contracts define the display-name table");
+        let table = &table[..table.find("};").expect("the table ends")];
+        let names = table
+            .lines()
+            .filter_map(|line| {
+                let rest = line.trim().strip_prefix('[')?;
+                let (constant, rest) = rest.split_once("]: \"")?;
+                let (name, _) = rest.split_once('"')?;
+                Some((kinds[constant], name))
+            })
+            .collect::<Vec<_>>();
+        for kind in ["claudeAgent", "codex", "cursor", "grok", "opencode"] {
+            assert!(
+                names.iter().any(|(listed, _)| *listed == kind),
+                "contracts name {kind}"
+            );
+        }
+        for (kind, name) in names {
+            assert_eq!(super::provider_display_name(kind), name, "{kind}");
+        }
+    }
+
+    /// An inventory with one Claude instance whose models come from the CLI's initialization.
+    fn published_claude_models(models: Value) -> super::PublishedProviderInventory {
+        let models = crate::provider::claude::model::models_from_initialization(
+            &json!({ "models": models }),
+            &[],
+        )
+        .expect("discovered models");
+        Arc::new(tokio::sync::RwLock::new(vec![json!({
+            "instanceId": "claudeAgent",
+            "driver": "claudeAgent",
+            "models": models,
+        })]))
+    }
+
+    fn claude_launch(
+        temp: &TempDir,
+        model: &str,
+        fast_mode: Option<bool>,
+    ) -> super::ProviderLaunchRequest {
+        let mut request = native_launch(temp, "claudeAgent");
+        request.model = Some(model.to_owned());
+        request.options = fast_mode
+            .map(|value| json!({ "id": "fastMode", "value": value }))
+            .into_iter()
+            .collect();
+        request
+    }
+
+    /// The CLI's initialization decides Fast Mode for every model it reports, aliases such as
+    /// `opus` included; the built-in catalog decides only for models the CLI did not report.
+    #[tokio::test]
+    async fn claude_fast_mode_follows_the_published_model_before_the_built_in_catalog() {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"))
+            .with_published_inventory(published_claude_models(json!([
+                {"value":"opus", "displayName":"Opus", "supportsFastMode":true},
+                {"value":"haiku", "displayName":"Haiku"},
+                {"value":"claude-opus-4-8", "displayName":"Opus 4.8"},
+            ])));
+        for (model, supported) in [
+            ("opus", true),
+            ("haiku", false),
+            ("claude-opus-4-8", false),
+            ("claude-opus-4-7", true),
+            ("claude-fable-5", false),
+        ] {
+            assert_eq!(
+                factory
+                    .claude_fast_mode_support(&claude_launch(&temp, model, None))
+                    .await,
+                supported,
+                "{model}"
+            );
+        }
+    }
+
+    /// Fast Mode off asks for nothing, so no model refuses it; on is accepted only where the model
+    /// offers it.
+    #[tokio::test]
+    async fn claude_fast_mode_off_is_never_refused_and_on_needs_the_model_to_offer_it() {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"))
+            .with_published_inventory(published_claude_models(json!([
+                {"value":"opus", "displayName":"Opus", "supportsFastMode":true},
+                {"value":"sonnet", "displayName":"Sonnet"},
+            ])));
+        for (model, fast_mode_on_accepted) in
+            [("opus", true), ("sonnet", false), ("custom-model", false)]
+        {
+            for (fast_mode, accepted) in [(false, true), (true, fast_mode_on_accepted)] {
+                let request = claude_launch(&temp, model, Some(fast_mode));
+                let supports_fast_mode = factory.claude_fast_mode_support(&request).await;
+                let result = super::validate_claude_options(
+                    &request.provider,
+                    &request.options,
+                    supports_fast_mode,
+                );
+                assert_eq!(
+                    result.is_ok(),
+                    accepted,
+                    "{model} fastMode={fast_mode}: {result:?}"
+                );
+            }
+        }
+    }
+
+    /// A model that does not offer Fast Mode refuses it before anything spawns, and the refusal
+    /// ends the delivery once with a plain detail.
+    #[tokio::test]
+    async fn claude_fast_mode_on_a_model_without_it_is_refused_once_in_plain_words() {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"))
+            .with_published_inventory(published_claude_models(json!([
+                {"value":"haiku", "displayName":"Haiku"},
+            ])));
+        let error = match factory
+            .create(claude_launch(&temp, "haiku", Some(true)))
+            .await
+        {
+            Ok(_) => panic!("Fast Mode must be refused before the session spawns"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, super::ProviderRuntimeError::InvalidOption { .. }),
+            "{error}"
+        );
+        assert_eq!(
+            super::launch_failure_outcome(&error, "Work Claude"),
+            super::ProviderDeliveryOutcome::Rejected {
+                detail: "Fast Mode is not supported by the selected model.".to_owned()
+            }
         );
     }
 
@@ -11578,6 +12338,8 @@ done
         let executable = executable_fixture(temp, name, fixture);
         let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"));
         let mut request = native_launch(temp, "claudeAgent");
+        // The name the user gave this instance; details that name the provider use it.
+        request.provider_label = "Work Claude".to_owned();
         request.binary_path = executable.to_string_lossy().into_owned();
         request.environment.insert(
             "BIBCODE_TEST_REQUEST_CAPTURE".to_owned(),
@@ -11603,6 +12365,7 @@ done
                 false,
                 factory.claude_probe_cache.clone(),
                 factory.claude_probe_launch_policy,
+                false,
             )
             .await
             .expect("Claude delivery fixture should start"),
@@ -11695,6 +12458,7 @@ done
                 true,
                 factory.claude_probe_cache.clone(),
                 factory.claude_probe_launch_policy,
+                false,
             )
             .await
             .expect("Claude stop-task driver"),
@@ -11926,6 +12690,7 @@ done
             false,
             factory.claude_probe_cache.clone(),
             factory.claude_probe_launch_policy,
+            true,
         )
         .await
         .expect("Claude driver should create");
@@ -11944,7 +12709,7 @@ done
             driver
                 .set_options(vec![json!({ "id": "unknown", "value": true })])
                 .await,
-            Err(super::ProviderRuntimeError::Provider { .. })
+            Err(super::ProviderRuntimeError::InvalidOption { .. })
         ));
         driver
             .shutdown()
@@ -12413,7 +13178,20 @@ done
     #[cfg(unix)]
     #[tokio::test]
     async fn claude_steer_process_or_session_retirement_after_write_is_ambiguous() {
-        for retirement in ["exit", "stream-failure", "session-replacement"] {
+        for (retirement, detail) in [
+            (
+                "exit",
+                "Work Claude stopped before it confirmed it received this message.",
+            ),
+            (
+                "stream-failure",
+                "The session ended before Work Claude confirmed it received this message.",
+            ),
+            (
+                "session-replacement",
+                "The session ended before Work Claude confirmed it received this message.",
+            ),
+        ] {
             let (_temp, driver, _active, steer) = claude_pending_steer_fixture().await;
             match retirement {
                 "exit" => claude_fixture_action(&driver, "exit").await,
@@ -12436,9 +13214,13 @@ done
                 .unwrap()
                 .unwrap();
             driver.shutdown().await.unwrap();
-            assert!(
-                matches!(outcome, super::ProviderDeliveryOutcome::Ambiguous { .. }),
-                "{retirement}: {outcome:?}"
+            // The uncertain delivery's detail reads as a plain sentence, not internal state.
+            assert_eq!(
+                outcome,
+                super::ProviderDeliveryOutcome::Ambiguous {
+                    detail: detail.to_owned()
+                },
+                "{retirement}"
             );
         }
     }
@@ -16690,11 +17472,11 @@ done
     #[test]
     fn dropped_delivery_response_is_ambiguous_but_closed_queue_is_not_sent() {
         assert!(matches!(
-            super::delivery_enqueue_failure(super::ProviderRuntimeError::ResponseDropped),
+            super::delivery_enqueue_failure(&super::ProviderRuntimeError::ResponseDropped, None),
             super::ProviderDeliveryOutcome::Ambiguous { .. }
         ));
         assert!(matches!(
-            super::delivery_enqueue_failure(super::ProviderRuntimeError::QueueClosed),
+            super::delivery_enqueue_failure(&super::ProviderRuntimeError::QueueClosed, None),
             super::ProviderDeliveryOutcome::DefinitelyNotSent { .. }
         ));
     }
@@ -16989,7 +17771,7 @@ done
                 .await
                 .unwrap()
                 .provider_label,
-            "codex"
+            "Codex"
         );
         engine
             .repositories()
@@ -17298,6 +18080,7 @@ done
             true,
             factory.claude_probe_cache.clone(),
             factory.claude_probe_launch_policy,
+            false,
         )
         .await
         .expect("Claude driver should create");
@@ -17403,6 +18186,7 @@ done
             true,
             factory.claude_probe_cache.clone(),
             factory.claude_probe_launch_policy,
+            false,
         )
         .await
         .expect("fresh Claude driver should create");

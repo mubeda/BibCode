@@ -281,14 +281,34 @@ impl ProviderSettingsStore {
         self.root.join("secrets")
     }
 
+    /// The settings document as persisted, read without its secrets: a sensitive environment
+    /// value stays redacted. It also keeps the fields the typed state leaves out, such as a
+    /// provider's custom models. A missing file reads as an empty document.
+    pub(crate) async fn get_document(&self) -> Result<Value, ServerSettingsReadError> {
+        let _guard = self.lock.lock().await;
+        let Some(bytes) = self.read_bytes().await? else {
+            return Ok(Value::Object(serde_json::Map::new()));
+        };
+        serde_json::from_slice(&bytes).map_err(|source| ServerSettingsReadError::Decode {
+            path: self.settings_path(),
+            source,
+        })
+    }
+
+    /// The settings file's bytes, or `None` when it does not exist.
+    async fn read_bytes(&self) -> Result<Option<Vec<u8>>, ServerSettingsReadError> {
+        let path = self.settings_path();
+        match fs::read(&path).await {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(ServerSettingsReadError::Read { path, source }),
+        }
+    }
+
     async fn read_persisted(&self) -> Result<ProviderSettingsState, ServerSettingsReadError> {
         let path = self.settings_path();
-        let bytes = match fs::read(&path).await {
-            Ok(bytes) => bytes,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(ProviderSettingsState::default());
-            }
-            Err(source) => return Err(ServerSettingsReadError::Read { path, source }),
+        let Some(bytes) = self.read_bytes().await? else {
+            return Ok(ProviderSettingsState::default());
         };
         let mut settings =
             serde_json::from_slice(&bytes).map_err(|source| ServerSettingsReadError::Decode {

@@ -2,6 +2,9 @@ use std::collections::HashSet;
 
 use serde_json::{Value, json};
 
+/// How the Fast Mode option is named everywhere a user sees it, including a refusal.
+pub(crate) const FAST_MODE_LABEL: &str = "Fast Mode";
+
 const MINIMUM_FABLE_5_VERSION: [u64; 3] = [2, 1, 169];
 const MINIMUM_OPUS_4_8_VERSION: [u64; 3] = [2, 1, 154];
 const MINIMUM_OPUS_4_7_VERSION: [u64; 3] = [2, 1, 111];
@@ -97,7 +100,7 @@ fn model_from_initialization(value: &Value) -> Option<Value> {
         }
     }
     if value.get("supportsFastMode").and_then(Value::as_bool) == Some(true) {
-        descriptors.push(boolean_option("fastMode", "Fast Mode"));
+        descriptors.push(boolean_option("fastMode", FAST_MODE_LABEL));
     }
     Some(model(slug, &name, descriptors))
 }
@@ -140,23 +143,30 @@ fn with_custom_models(mut models: Vec<Value>, custom_models: &[String]) -> Vec<V
     models
 }
 
+/// The built-in catalog. The inventory offers it whenever the CLI reports no models at
+/// initialization, and a launch reads it to decide Fast Mode for a model the published inventory
+/// does not list.
+///
+/// Offer only options the Claude session applies: `effort` (`--effort`) and `fastMode` (session
+/// settings); `agent` comes from the discovered agents. The composer always sends every select
+/// option's value, so a descriptor the session refuses would fail every turn on that model.
+/// `claude_fallback_catalog_offers_only_options_the_session_accepts` in `provider_runtime.rs`
+/// holds three sources together: this catalog, `launch_request_for_command`, which keeps
+/// `effort` and `agent` out of the session options, and `validate_claude_options`.
 fn built_in_models() -> Vec<Value> {
     vec![
         model(
             "claude-fable-5",
             "Claude Fable 5",
-            vec![
-                effort(&[
-                    ("low", "Low", false),
-                    ("medium", "Medium", false),
-                    ("high", "High", true),
-                    ("xhigh", "Extra High", false),
-                    ("max", "Max", false),
-                    ("ultracode", "Ultracode", false),
-                    ("ultrathink", "Ultrathink", false),
-                ]),
-                context_window(),
-            ],
+            vec![effort(&[
+                ("low", "Low", false),
+                ("medium", "Medium", false),
+                ("high", "High", true),
+                ("xhigh", "Extra High", false),
+                ("max", "Max", false),
+                ("ultracode", "Ultracode", false),
+                ("ultrathink", "Ultrathink", false),
+            ])],
         ),
         model(
             "claude-opus-4-8",
@@ -171,7 +181,7 @@ fn built_in_models() -> Vec<Value> {
                     ("ultracode", "Ultracode", false),
                     ("ultrathink", "Ultrathink", false),
                 ]),
-                boolean_option("fastMode", "Fast Mode"),
+                boolean_option("fastMode", FAST_MODE_LABEL),
             ],
         ),
         model(
@@ -186,7 +196,7 @@ fn built_in_models() -> Vec<Value> {
                     ("max", "Max", false),
                     ("ultrathink", "Ultrathink", false),
                 ]),
-                boolean_option("fastMode", "Fast Mode"),
+                boolean_option("fastMode", FAST_MODE_LABEL),
             ],
         ),
         model(
@@ -200,8 +210,7 @@ fn built_in_models() -> Vec<Value> {
                     ("max", "Max", false),
                     ("ultrathink", "Ultrathink", false),
                 ]),
-                boolean_option("fastMode", "Fast Mode"),
-                context_window(),
+                boolean_option("fastMode", FAST_MODE_LABEL),
             ],
         ),
         model(
@@ -214,43 +223,33 @@ fn built_in_models() -> Vec<Value> {
                     ("high", "High", true),
                     ("max", "Max", false),
                 ]),
-                boolean_option("fastMode", "Fast Mode"),
+                boolean_option("fastMode", FAST_MODE_LABEL),
             ],
         ),
         model(
             "claude-sonnet-5",
             "Claude Sonnet 5",
-            vec![
-                effort(&[
-                    ("low", "Low", false),
-                    ("medium", "Medium", false),
-                    ("high", "High", true),
-                    ("xhigh", "Extra High", false),
-                    ("max", "Max", false),
-                    ("ultrathink", "Ultrathink", false),
-                ]),
-                context_window(),
-            ],
+            vec![effort(&[
+                ("low", "Low", false),
+                ("medium", "Medium", false),
+                ("high", "High", true),
+                ("xhigh", "Extra High", false),
+                ("max", "Max", false),
+                ("ultrathink", "Ultrathink", false),
+            ])],
         ),
         model(
             "claude-sonnet-4-6",
             "Claude Sonnet 4.6",
-            vec![
-                effort(&[
-                    ("low", "Low", false),
-                    ("medium", "Medium", false),
-                    ("high", "High", true),
-                    ("max", "Max", false),
-                    ("ultrathink", "Ultrathink", false),
-                ]),
-                context_window(),
-            ],
+            vec![effort(&[
+                ("low", "Low", false),
+                ("medium", "Medium", false),
+                ("high", "High", true),
+                ("max", "Max", false),
+                ("ultrathink", "Ultrathink", false),
+            ])],
         ),
-        model(
-            "claude-haiku-4-5",
-            "Claude Haiku 4.5",
-            vec![boolean_option("thinking", "Thinking")],
-        ),
+        model("claude-haiku-4-5", "Claude Haiku 4.5", Vec::new()),
     ]
 }
 
@@ -269,15 +268,6 @@ fn effort(options: &[(&str, &str, bool)]) -> Value {
         .any(|(id, _, _)| *id == "ultrathink")
         .then_some(&["ultrathink"][..]);
     select_option("effort", "Reasoning", options, prompt_injected_values)
-}
-
-fn context_window() -> Value {
-    select_option(
-        "contextWindow",
-        "Context Window",
-        &[("200k", "200k", true), ("1m", "1M", false)],
-        None,
-    )
 }
 
 fn select_option(

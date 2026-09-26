@@ -2774,6 +2774,7 @@ mod tests {
                 interaction_mode: "default".to_owned(),
                 model: Some("gpt-5".to_owned()),
                 options: Vec::new(),
+                custom_models: Vec::new(),
                 service_tier: None,
                 effort: None,
                 agent: None,

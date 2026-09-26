@@ -369,6 +369,7 @@ fn crash_launch(provider: &str, state: &Path) -> ProviderLaunchRequest {
         interaction_mode: "default".to_owned(),
         model: Some(crash_model(provider).to_owned()),
         options: Vec::new(),
+        custom_models: Vec::new(),
         service_tier: None,
         effort: None,
         agent: None,
@@ -1293,10 +1294,9 @@ async fn bootstrap_restart_after_setup_launch_reuses_worktree_and_terminal_for_p
                     .expect("row");
                 if row.state == TurnDeliveryState::Pending
                     && row.attempts == 1
-                    && row
-                        .last_error
-                        .as_deref()
-                        .is_some_and(|detail| detail.contains("provider codex is not supported"))
+                    && row.last_error.as_deref().is_some_and(|detail| {
+                        detail.starts_with("Codex is turned off or not set up.")
+                    })
                 {
                     break;
                 }
