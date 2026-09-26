@@ -99,6 +99,11 @@ cargo test -p bibcode-server --lib rpc::session::tests -j 2
 cargo test -p bibcode-server --test production_server_terminal_rpc -j 2
 ```
 
+Root runs leave these web tests uncompiled: confirm
+[compiler-sensitive](./README.md#web-unit-tests-and-the-react-compiler)
+happy-dom files from `apps/web` with `vp test run --project unit` and the same
+paths without the `apps/web/` prefix.
+
 Use delayed acknowledgements to prove that multiple ordered frames are sent
 before the first reply while the legacy path remains serialized. Include two
 input callers, Unicode paste boundaries, connection-wide saturation with
@@ -126,6 +131,11 @@ vp test run apps/web/src/components/ThreadTerminalPanel apps/web/src/components/
 cargo test -p bibcode-server --lib terminal -j 2
 cargo test -p bibcode-server --test production_server_terminal_rpc -j 2
 ```
+
+Root runs leave these web tests uncompiled: confirm
+[compiler-sensitive](./README.md#web-unit-tests-and-the-react-compiler)
+happy-dom files from `apps/web` with `vp test run --project unit` and the same
+paths without the `apps/web/` prefix.
 
 Open the same disposable terminal in two windows with different sizes, including
 a desktop host and remote browser when available. Use tmux and a supported
@@ -374,6 +384,11 @@ cargo test -p bibcode-server discovery -j 2
 cargo test -p bibcode-server --test git_rpc source_control_discovery_uses_structured_bounded_probes -j 2
 ```
 
+Root runs leave these web tests uncompiled: confirm
+[compiler-sensitive](./README.md#web-unit-tests-and-the-react-compiler)
+happy-dom files from `apps/web` with `vp test run --project unit` and the same
+paths without the `apps/web/` prefix.
+
 Auth schema changes also require regenerated RPC fixtures and contract parity
 checks. A sandbox denial of TCP binding is a blocked validation result; record
 the exact error and rerun the affected target on a capable host. Do not report
@@ -505,6 +520,9 @@ loads, and it fails with an install instruction when dependencies are missing.
 Exact subprocess tests may select a single thread only when the subprocess
 intentionally owns isolated process-global state, as documented in the
 repository scripts reference.
+
+Root `vp test` runs web tests without the React Compiler; see
+[Web unit tests and the React Compiler](./README.md#web-unit-tests-and-the-react-compiler).
 
 A focused suite must cover the changed success behavior and its material
 failure, cancellation, retry, restart, and cleanup seams. For cross-platform
@@ -817,6 +835,11 @@ node scripts/run-msvc.mjs cargo test -p bibcode-server --test production_git_man
 node scripts/run-msvc.mjs cargo test -p bibcode-server --test git_rpc -- --nocapture
 vp test run packages/client-runtime/src/state/vcs.test.ts packages/client-runtime/src/state/gitManager.test.ts packages/client-runtime/src/state/gitManagerRefresh.test.ts apps/web/src/connection/platform.test.ts apps/web/src/components/GitActionsControl.test.tsx
 ```
+
+Root runs leave these web tests uncompiled: confirm
+[compiler-sensitive](./README.md#web-unit-tests-and-the-react-compiler)
+happy-dom files from `apps/web` with `vp test run --project unit` and the same
+paths without the `apps/web/` prefix.
 
 `vp run check:contracts` regenerates the RPC wire fixtures and ends by failing
 when the regenerated tree differs from the committed one, so a contract change
@@ -1730,6 +1753,11 @@ Run the regression tripwires without a browser:
 vp test run apps/web/src/components/pullRequests/pullRequestsTelemetry.test.tsx
 cargo test -p bibcode-server --lib pull_requests::tripwires -j 2
 ```
+
+The root run leaves this web test uncompiled: if a change is
+[compiler-sensitive](./README.md#web-unit-tests-and-the-react-compiler), confirm
+it from `apps/web` with `vp test run --project unit` and the same path without
+the `apps/web/` prefix.
 
 The web test forbids direct fetch/Image/WebSocket/XHR/beacon use and rendered
 images, checks all actor initials, advances an idle hour, and counts explicit
