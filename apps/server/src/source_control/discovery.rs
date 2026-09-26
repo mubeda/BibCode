@@ -521,6 +521,67 @@ mod tests {
         }
     }
 
+    /// Each glab release family words the full logout differently; the strings are
+    /// verbatim from glab's `auth/status/status.go` at the cited tags.
+    #[test]
+    fn gitlab_logout_recognizes_every_known_glab_phrasing() {
+        for (versions, text) in [
+            (
+                "v1.36.0, v1.39.0",
+                "No GitLab instance has been authenticated with glab. Run `glab auth login` to authenticate.\n",
+            ),
+            (
+                "v1.43.0 to v1.100.0",
+                "No GitLab instances have been authenticated with glab. Run `glab auth login` to authenticate.\n",
+            ),
+            (
+                "v1.110.0, captured with 1.114.0",
+                include_str!("../../tests/fixtures/pull_requests/glab_logged_out.txt"),
+            ),
+        ] {
+            let auth = parse_auth(ProviderKind::Gitlab, Some(&output(1, "", text)));
+            assert_eq!(auth.status, AuthStatus::Unauthenticated, "{versions}");
+            assert_eq!(auth.hosts, Some(Vec::new()), "{versions}");
+        }
+
+        // One host's refusal (`auth status --hostname`) is not a full logout.
+        let one_host = parse_auth(
+            ProviderKind::Gitlab,
+            Some(&output(
+                1,
+                "",
+                "x gitlab.invalid has not been authenticated with glab; run `glab auth login --hostname gitlab.invalid` to authenticate\n",
+            )),
+        );
+        assert_eq!(one_host.status, AuthStatus::Unknown);
+        assert_eq!(one_host.hosts, None);
+    }
+
+    #[test]
+    fn gitlab_configured_host_without_token_is_unauthenticated_not_logged_out() {
+        // glab 1.114.0 captured offline: a user and network namespace, an isolated
+        // GLAB_CONFIG_DIR that configures `gitlab.invalid` without a token, and no
+        // reachable keyring. The host stays listed, unauthenticated.
+        let auth = parse_auth(
+            ProviderKind::Gitlab,
+            Some(&output(
+                1,
+                "",
+                include_str!("../../tests/fixtures/pull_requests/glab_no_token.txt"),
+            )),
+        );
+        assert_eq!(auth.status, AuthStatus::Unauthenticated);
+        assert_eq!(auth.account, WireOption::none());
+        assert_eq!(
+            auth.hosts,
+            Some(vec![SourceControlProviderAuthHost {
+                host: "gitlab.invalid".to_owned(),
+                account: None,
+                authenticated: false,
+            }])
+        );
+    }
+
     #[test]
     fn auth_and_wire_helpers_cover_success_unknown_and_empty_results() {
         assert_eq!(first_line(None), WireOption::none());

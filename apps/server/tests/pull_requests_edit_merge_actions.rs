@@ -3,8 +3,7 @@
 #[path = "support/pull_request_action_fixture.rs"]
 mod pull_request_action_fixture;
 
-use bibcode_server::pull_requests::model::ActionResult;
-use bibcode_server::source_control::ProviderKind;
+use bibcode_server::pull_requests::model::{ActionResult, PullRequestsProvider};
 use pull_request_action_fixture::Fixture;
 use serde_json::{Value, json};
 use std::fs;
@@ -1039,7 +1038,7 @@ impl Fixture {
 
 impl Fixture {
     fn merge_precheck(&mut self) {
-        if self.scope.provider == ProviderKind::Gitlab {
+        if self.scope.provider == PullRequestsProvider::Gitlab {
             self.gitlab_precheck(true);
             self.change_response(7, |v| {
                 v["user"]["can_merge"] = json!(true);

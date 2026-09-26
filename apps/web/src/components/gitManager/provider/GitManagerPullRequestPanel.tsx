@@ -7,10 +7,7 @@ import type {
   SourceControlProviderInfo,
   SourceControlProviderKind,
 } from "@bibcode/contracts";
-import {
-  formatChangeRequestNumber,
-  resolveChangeRequestPresentation,
-} from "@bibcode/shared/sourceControl";
+import { formatChangeRequestNumber } from "@bibcode/shared/sourceControl";
 import { Link } from "@tanstack/react-router";
 import { capitalize } from "effect/String";
 import { CheckCircle2Icon, GitPullRequestIcon, RefreshCwIcon } from "lucide-react";
@@ -21,7 +18,10 @@ import { gitManagerEnvironment } from "../../../state/gitManager";
 import { useEnvironmentQuery } from "../../../state/query";
 import { Button } from "../../ui/button";
 import { GitManagerCreatePullRequestDialog } from "./GitManagerCreatePullRequestDialog";
-import { resolveProviderPanePresentation } from "./GitManagerPullRequestPanel.logic";
+import {
+  resolveProviderPanePresentation,
+  resolveStatusChangeRequestPresentation,
+} from "./GitManagerPullRequestPanel.logic";
 
 const EMPTY_PULL_REQUESTS: ReadonlyArray<GitManagerPullRequestEntry> = Object.freeze([]);
 const EMPTY_CHECKS: ReadonlyArray<GitManagerCheckEntry> = Object.freeze([]);
@@ -125,6 +125,11 @@ const CheckRow = memo(function CheckRow({ check }: CheckRowProps) {
 export interface GitManagerPullRequestPanelProps {
   readonly projectRef?: ScopedProjectRef;
   readonly provider?: SourceControlProviderInfo | null;
+  /**
+   * Whether status has answered. Until it has, a missing `provider` says nothing
+   * about the host, and the pane uses the neutral pre-status nouns.
+   */
+  readonly statusLoaded: boolean;
   readonly scope: { readonly environmentId: EnvironmentId; readonly cwd: string };
   readonly disabledReason?: string | null;
   readonly onRefresh: () => void;
@@ -134,6 +139,7 @@ export const GitManagerPullRequestPanel = memo(function GitManagerPullRequestPan
   scope,
   projectRef,
   provider = null,
+  statusLoaded,
   disabledReason = null,
   onRefresh,
 }: GitManagerPullRequestPanelProps) {
@@ -151,14 +157,14 @@ export const GitManagerPullRequestPanel = memo(function GitManagerPullRequestPan
   const query = useEnvironmentQuery(queryAtom);
   const result: GitManagerPullRequestsResult | null = query.data ?? null;
   const providerKind = provider?.kind ?? null;
+  const changeRequest = resolveStatusChangeRequestPresentation(provider, statusLoaded);
   const presentation = resolveProviderPanePresentation({
-    providerKind,
+    changeRequest,
     requested,
     pending: query.isPending,
     error: query.error,
     result,
   });
-  const changeRequest = resolveChangeRequestPresentation(provider);
   const heading = `${capitalize(changeRequest.pluralLongName)} and checks`;
   const pullRequests = result?.pullRequests ?? EMPTY_PULL_REQUESTS;
   const checks = result?.checks ?? EMPTY_CHECKS;

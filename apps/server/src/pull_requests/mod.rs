@@ -43,6 +43,8 @@ pub struct PullRequestsService {
 }
 
 impl PullRequestsService {
+    /// A service with a private host observation (see `HostCommandRunner::new`);
+    /// the server shares its own through `with_provider_hosts`.
     pub fn new(state_dir: PathBuf) -> Self {
         Self::with_runner(HostCommandRunner::new(state_dir))
     }
@@ -71,14 +73,11 @@ impl PullRequestsService {
         }
     }
 
-    fn host(
-        &self,
-        scope: &host::HostScope,
-        operation: &str,
-    ) -> Result<&dyn PullRequestHost, PullRequestsOperationError> {
-        match context::supported_provider(scope).map_err(|u| u.operation_error(operation))? {
-            model::PullRequestsProvider::Github => Ok(self.github.as_ref()),
-            model::PullRequestsProvider::Gitlab => Ok(self.gitlab.as_ref()),
+    /// The admitted scope already names a supported provider.
+    fn host(&self, scope: &host::HostScope) -> &dyn PullRequestHost {
+        match scope.provider {
+            model::PullRequestsProvider::Github => self.github.as_ref(),
+            model::PullRequestsProvider::Gitlab => self.gitlab.as_ref(),
         }
     }
 
@@ -114,13 +113,7 @@ impl PullRequestsService {
                 let scope = &pending.scope;
                 match pending
                     .read_authenticated(&self.runner, &c, |read_c| async move {
-                        build_context(
-                            self.host(scope, "pullRequests.getContext")?,
-                            &self.runner,
-                            scope,
-                            &read_c,
-                        )
-                        .await
+                        build_context(self.host(scope), &self.runner, scope, &read_c).await
                     })
                     .await
                 {
@@ -169,9 +162,7 @@ impl PullRequestsService {
                 let scope = resolve_scope(&self.runner, cwd, &DiscoveredHosts::default(), &c)
                     .await
                     .map_err(|u| u.operation_error("pullRequests.getVocabulary"))?;
-                self.host(&scope, "pullRequests.getVocabulary")?
-                    .vocabulary(&scope, kind, query, &c)
-                    .await
+                self.host(&scope).vocabulary(&scope, kind, query, &c).await
             },
         )
         .await
@@ -201,9 +192,7 @@ impl PullRequestsService {
                 let scope = &pending.scope;
                 pending
                     .read_authenticated(&self.runner, &c, |read_c| async move {
-                        self.host(scope, "pullRequests.list")?
-                            .list(scope, &query, &read_c)
-                            .await
+                        self.host(scope).list(scope, &query, &read_c).await
                     })
                     .await
                     .map_err(|u| u.operation_error("pullRequests.list"))?
@@ -223,7 +212,7 @@ impl PullRequestsService {
             let scope = resolve_scope(&self.runner, cwd, &DiscoveredHosts::default(), &c)
                 .await
                 .map_err(|u| u.operation_error(operation))?;
-            let host = self.host(&scope, operation)?;
+            let host = self.host(&scope);
             let context = host.context(&scope, &c).await.map_err(|mut e| {
                 e.operation = operation.into();
                 e
@@ -253,9 +242,7 @@ impl PullRequestsService {
             let scope = resolve_scope(&self.runner, cwd, &DiscoveredHosts::default(), &c)
                 .await
                 .map_err(|u| u.operation_error(operation))?;
-            self.host(&scope, operation)?
-                .timeline(&scope, number, &c)
-                .await
+            self.host(&scope).timeline(&scope, number, &c).await
         })
         .await
         .inspect_err(|error| self.invalidate_failed_context(error))
@@ -272,9 +259,7 @@ impl PullRequestsService {
             let scope = resolve_scope(&self.runner, cwd, &DiscoveredHosts::default(), &c)
                 .await
                 .map_err(|u| u.operation_error(operation))?;
-            self.host(&scope, operation)?
-                .commits(&scope, number, &c)
-                .await
+            self.host(&scope).commits(&scope, number, &c).await
         })
         .await
         .inspect_err(|error| self.invalidate_failed_context(error))
@@ -291,9 +276,7 @@ impl PullRequestsService {
             let scope = resolve_scope(&self.runner, cwd, &DiscoveredHosts::default(), &c)
                 .await
                 .map_err(|u| u.operation_error(operation))?;
-            self.host(&scope, operation)?
-                .checks(&scope, number, &c)
-                .await
+            self.host(&scope).checks(&scope, number, &c).await
         })
         .await
         .inspect_err(|error| self.invalidate_failed_context(error))
@@ -310,9 +293,7 @@ impl PullRequestsService {
             let scope = resolve_scope(&self.runner, cwd, &DiscoveredHosts::default(), &c)
                 .await
                 .map_err(|u| u.operation_error(operation))?;
-            self.host(&scope, operation)?
-                .files(&scope, number, &c)
-                .await
+            self.host(&scope).files(&scope, number, &c).await
         })
         .await
         .inspect_err(|error| self.invalidate_failed_context(error))
@@ -336,7 +317,7 @@ impl PullRequestsService {
             .map_err(|u| u.operation_error(operation))?;
             let result = self.run_scoped_action(&scope, action, &c).await?;
             // Merges, state changes, reverts and deletions can change the tab totals.
-            self.host(&scope, operation)?.invalidate_totals(&scope);
+            self.host(&scope).invalidate_totals(&scope);
             Ok(result)
         })
         .await
@@ -358,7 +339,7 @@ impl PullRequestsService {
             let mut gates = self.action_gates.lock().unwrap_or_else(|p| p.into_inner());
             gates.retain(|_, gate| gate.strong_count() > 0);
             let key = (
-                scope.provider == crate::source_control::ProviderKind::Github,
+                scope.provider == model::PullRequestsProvider::Github,
                 scope.host.to_ascii_lowercase(),
                 scope.repository.to_ascii_lowercase(),
                 number,
@@ -390,7 +371,7 @@ impl PullRequestsService {
         let _permit = self
             .acquire_action_gate(scope, action.target().number, operation, c)
             .await?;
-        let host = self.host(scope, operation)?;
+        let host = self.host(scope);
         let context = host.context(scope, c).await?;
         let raw = host
             .action_detail(scope, action.target().number, &context, c)
@@ -481,11 +462,13 @@ pub trait CreatedRequestObserver: Send + Sync {
 
 impl CreatedRequestObserver for PullRequestsService {
     fn request_created(&self, cwd: &Path, remote: &str) {
-        let provider = self.runner.provider_hosts().identify(remote).kind();
-        if let Ok(scope) = context::scope_from_remote(cwd, remote, provider)
-            && let Ok(host) = self.host(&scope, "pullRequests.requestCreated")
+        let identified = self.runner.provider_hosts().identify(remote);
+        // A host only CLI discovery could place has no cached totals to clear.
+        if let Ok(
+            context::RemoteAdmission::Named(scope) | context::RemoteAdmission::Recorded(scope),
+        ) = context::scope_from_remote(cwd, remote, &identified)
         {
-            host.invalidate_totals(&scope);
+            self.host(&scope).invalidate_totals(&scope);
         }
     }
 }
@@ -723,7 +706,7 @@ mod service_tests {
             cwd: PathBuf::from("/repo"),
             host: "github.com".into(),
             repository: "owner/repo".into(),
-            provider: crate::source_control::ProviderKind::Github,
+            provider: model::PullRequestsProvider::Github,
         };
         let result = service
             .run_scoped_action(&scope, &action, &CancellationToken::new())
@@ -744,46 +727,78 @@ mod service_tests {
         }
     }
 
-    #[tokio::test]
-    async fn pull_requests_unsupported_scopes_never_dispatch_to_a_host() {
-        use crate::source_control::ProviderKind;
-        let calls = Arc::new(AtomicUsize::new(0));
-        let contexts = Arc::new(AtomicUsize::new(0));
-        let fake = Arc::new(ActionHost {
-            inputs: permissions::tests::github_inputs(),
-            calls: calls.clone(),
-            context_calls: Some(contexts.clone()),
-            block_first: None,
-        });
-        let service = PullRequestsService {
-            runner: Arc::new(HostCommandRunner::new(PathBuf::new())),
-            github: fake.clone(),
-            gitlab: fake,
-            action_gates: Arc::default(),
+    /// Admission is the only way to a scope, and so to an adapter: an identified
+    /// provider other than GitHub or GitLab is refused there, and an unidentified
+    /// host waits for CLI discovery. The refusal names the provider and host on the
+    /// wire, and keeps the unsupported answer ahead of a missing repository path.
+    #[test]
+    fn pull_requests_admit_only_supported_providers() {
+        use crate::source_control::{ProviderHosts, ProviderKind};
+        use context::RemoteAdmission;
+        let hosts = ProviderHosts::default();
+        let admit = |remote: &str| {
+            context::scope_from_remote(Path::new("/checkout"), remote, &hosts.identify(remote))
         };
-        for provider in [
-            ProviderKind::AzureDevops,
-            ProviderKind::Bitbucket,
-            ProviderKind::Unknown,
+        for (remote, code, provider, host) in [
+            (
+                "https://dev.azure.com/org/project/_git/repo",
+                "unsupported_provider",
+                ProviderKind::AzureDevops,
+                "dev.azure.com",
+            ),
+            (
+                "git@bitbucket.org:team/repo.git",
+                "unsupported_provider",
+                ProviderKind::Bitbucket,
+                "bitbucket.org",
+            ),
+            (
+                "https://dev.azure.com",
+                "unsupported_provider",
+                ProviderKind::AzureDevops,
+                "dev.azure.com",
+            ),
+            (
+                "https://github.com",
+                "no_remote",
+                ProviderKind::Github,
+                "github.com",
+            ),
+            (
+                "https://git.acme.example",
+                "no_remote",
+                ProviderKind::Unknown,
+                "git.acme.example",
+            ),
         ] {
-            let scope = host::HostScope {
-                cwd: "/checkout".into(),
-                host: "unsupported.invalid".into(),
-                repository: "owner/repo".into(),
-                provider,
+            let Err(unavailable) = admit(remote) else {
+                panic!("{remote} must not be admitted");
             };
-            let error = service
-                .run_scoped_action(
-                    &scope,
-                    &review_action(ReviewEvent::Comment, "head-sha"),
-                    &CancellationToken::new(),
-                )
-                .await
-                .expect_err("unsupported scopes must not use the GitLab fallback");
-            assert_eq!(error.code, "unavailable");
+            assert_eq!(unavailable.code, code, "{remote}");
+            assert_eq!(unavailable.provider, Some(provider), "{remote}");
+            assert_eq!(unavailable.host.as_deref(), Some(host), "{remote}");
         }
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert_eq!(contexts.load(Ordering::SeqCst), 0);
+
+        let custom = "https://git.acme.example/team/repo.git";
+        assert!(matches!(
+            admit(custom),
+            Ok(RemoteAdmission::Unidentified(_))
+        ));
+        hosts.record("git.acme.example", ProviderKind::Gitlab);
+        assert!(matches!(
+            admit(custom),
+            Ok(RemoteAdmission::Recorded(host::HostScope {
+                provider: model::PullRequestsProvider::Gitlab,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            admit("git@github.com:owner/repo.git"),
+            Ok(RemoteAdmission::Named(host::HostScope {
+                provider: model::PullRequestsProvider::Github,
+                ..
+            }))
+        ));
     }
 
     #[tokio::test]
@@ -807,7 +822,7 @@ mod service_tests {
             cwd: "/checkout-a".into(),
             host: "github.com".into(),
             repository: "owner/repo".into(),
-            provider: crate::source_control::ProviderKind::Github,
+            provider: model::PullRequestsProvider::Github,
         };
         let mut other_checkout = scope.clone();
         other_checkout.cwd = "/checkout-b".into();
@@ -1024,6 +1039,48 @@ mod service_tests {
         assert_eq!(cleaned.load(Ordering::SeqCst), 1);
     }
 
+    /// List and action calls on an unsupported origin answer the generic wire code:
+    /// `unsupported_provider` is a context-only code (not in `error::CODES`), so
+    /// `operation_error` sends `unavailable`. No provider CLI runs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pull_requests_unsupported_origin_operations_answer_unavailable() {
+        let s = crate::test_support::TestSandbox::new("pr-unsupported-origin");
+        let git = s.executable_script(
+            "git",
+            "printf '%s' 'https://dev.azure.com/org/project/_git/repo'",
+            "",
+        );
+        let provider =
+            s.executable_script("provider", "echo called >> provider-calls\nexit 64", "");
+        let service = PullRequestsService::with_runner(
+            HostCommandRunner::new(s.path("state")).with_commands(&provider, &provider, &git),
+        );
+        let c = CancellationToken::new();
+        let cwd = s.root().to_string_lossy().into_owned();
+        let query: ListQuery = serde_json::from_value(serde_json::json!({"cwd":cwd,"state":"open","search":null,"author":null,"assignee":null,"reviewer":null,"reviewStatus":null,"draft":null,"labels":[],"milestone":null,"targetBranch":null,"sort":"newest","cursor":null})).unwrap();
+        let list = service.list(s.root(), query, &c).await.unwrap_err();
+        assert_eq!(
+            (list.operation.as_str(), list.code),
+            ("pullRequests.list", "unavailable")
+        );
+        assert!(
+            list.message.contains("GitHub and GitLab"),
+            "{}",
+            list.message
+        );
+        let comment: ActionRequest = serde_json::from_value(
+            serde_json::json!({"action":"comment","cwd":cwd,"number":14,"body":"hello"}),
+        )
+        .unwrap();
+        let action = service.run_action(&comment, &c).await.unwrap_err();
+        assert_eq!(
+            (action.operation.as_str(), action.code),
+            ("pullRequests.runAction", "unavailable")
+        );
+        assert!(!s.path("provider-calls").exists(), "no provider CLI ran");
+    }
+
     /// A request `git.runStackedAction` created re-reads its repository's GitLab
     /// totals on the next list; other repositories keep their cached totals.
     #[cfg(unix)]
@@ -1051,7 +1108,7 @@ esac"#,
             cwd: s.root().into(),
             host: "git.acme.example".into(),
             repository: repository.into(),
-            provider: crate::source_control::ProviderKind::Gitlab,
+            provider: model::PullRequestsProvider::Gitlab,
         };
         let query: ListQuery = serde_json::from_value(serde_json::json!({"cwd":s.root(),"state":"open","search":null,"author":null,"assignee":null,"reviewer":null,"reviewStatus":null,"draft":null,"labels":[],"milestone":null,"targetBranch":null,"sort":"newest","cursor":null})).unwrap();
         let totals_reads = || {

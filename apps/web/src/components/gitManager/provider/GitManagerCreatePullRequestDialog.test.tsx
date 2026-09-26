@@ -335,6 +335,32 @@ describe("GitManagerCreatePullRequestDialog", () => {
     expect(text("create-pr-status")).toBe("Commit local changes before creating a change request.");
   });
 
+  it("stays neutral while reading status without a hint", async () => {
+    h.status = null;
+    await renderDialog();
+    expect(document.body.textContent).toContain("Create change request");
+    expect(document.body.textContent).toContain(
+      "Review the change request before anything is published.",
+    );
+    expect(document.body.textContent).not.toContain("ull request");
+    expect(
+      document.querySelector('[data-testid="create-pr-summary"]')?.getAttribute("aria-label"),
+    ).toBe("Change request details");
+    expect(button("Create change request").parentElement?.getAttribute("title")).toBe(
+      "Reading repository status…",
+    );
+    // Nothing is known about the branch yet either.
+    expect(text("create-pr-base")).toBe("…");
+    expect(text("create-pr-head")).toBe("…");
+
+    h.status = status({
+      sourceControlProvider: { kind: "gitlab", name: "GitLab", baseUrl: "https://gitlab.invalid" },
+    });
+    await renderDialog();
+    expect(button("Publish and create merge request").disabled).toBe(false);
+    expect(h.runs).toEqual([]);
+  });
+
   it("shows the host Pull Requests identified while the status has not named it", async () => {
     const providerHint = { kind: "gitlab", baseUrl: "https://luna.tripunkt.de" } as const;
     h.status = null;

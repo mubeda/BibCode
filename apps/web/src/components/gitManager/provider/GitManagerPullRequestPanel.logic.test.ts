@@ -2,8 +2,14 @@ import type {
   GitActionProgressEvent,
   GitManagerCommitEntry,
   GitRunStackedActionResult,
+  SourceControlProviderInfo,
+  SourceControlProviderKind,
   VcsStatusResult,
 } from "@bibcode/contracts";
+import {
+  NEUTRAL_CHANGE_REQUEST_PRESENTATION,
+  resolveChangeRequestPresentation,
+} from "@bibcode/shared/sourceControl";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
@@ -13,6 +19,7 @@ import {
   reduceCreatePullRequestProgress,
   resolveCreatePullRequestReview,
   resolveProviderPanePresentation,
+  resolveStatusChangeRequestPresentation,
   REVIEW_PROGRESS,
   UNIDENTIFIED_HOST_REASON,
   type CreatePullRequestProgress,
@@ -75,11 +82,15 @@ function finished(prStatus: "created" | "opened_existing"): GitActionProgressEve
   return { ...base, kind: "action_finished", result };
 }
 
+function provider(kind: SourceControlProviderKind): SourceControlProviderInfo {
+  return { kind, name: "Forge", baseUrl: "https://forge.invalid" };
+}
+
 describe("Git Manager provider pane logic", () => {
   it("starts not loaded and never implies an automatic request", () => {
     expect(
       resolveProviderPanePresentation({
-        providerKind: null,
+        changeRequest: resolveStatusChangeRequestPresentation(null, true),
         requested: false,
         pending: false,
         error: null,
@@ -94,7 +105,7 @@ describe("Git Manager provider pane logic", () => {
   it("renders provider unavailability as explanatory content", () => {
     expect(
       resolveProviderPanePresentation({
-        providerKind: "github",
+        changeRequest: resolveStatusChangeRequestPresentation(provider("github"), true),
         requested: true,
         pending: false,
         error: null,
@@ -109,7 +120,7 @@ describe("Git Manager provider pane logic", () => {
   it("keeps provider errors distinct from unavailable capability", () => {
     expect(
       resolveProviderPanePresentation({
-        providerKind: "gitlab",
+        changeRequest: resolveStatusChangeRequestPresentation(provider("gitlab"), true),
         requested: true,
         pending: false,
         error: "Provider CLI failed.",
@@ -119,13 +130,28 @@ describe("Git Manager provider pane logic", () => {
   });
 
   it.each([
-    ["github", "pull request", "pull requests", "Pull requests"],
-    ["gitlab", "merge request", "merge requests", "Merge requests"],
-    ["unknown", "change request", "change requests", "Change requests"],
+    ["GitHub", provider("github"), true, "pull request", "pull requests", "Pull requests"],
+    ["GitLab", provider("gitlab"), true, "merge request", "merge requests", "Merge requests"],
+    [
+      "an unknown",
+      provider("unknown"),
+      true,
+      "change request",
+      "change requests",
+      "Change requests",
+    ],
+    ["a missing", null, true, "pull request", "pull requests", "Pull requests"],
+    ["a not-yet-named", null, false, "change request", "change requests", "Change requests"],
   ] as const)(
-    "uses %s vocabulary for each provider read state",
-    (providerKind, noun, plural, title) => {
-      const input = { providerKind, requested: true, pending: false, error: null, result: null };
+    "uses %s provider's vocabulary for each provider read state",
+    (_label, host, statusLoaded, noun, plural, title) => {
+      const input = {
+        changeRequest: resolveStatusChangeRequestPresentation(host, statusLoaded),
+        requested: true,
+        pending: false,
+        error: null,
+        result: null,
+      };
       expect(resolveProviderPanePresentation({ ...input, requested: false })).toEqual({
         kind: "not-loaded",
         message: `${title} and checks load only when you choose Refresh.`,
@@ -154,6 +180,32 @@ describe("Git Manager provider pane logic", () => {
       });
     },
   );
+
+  it("stays neutral until status answers, then follows the shared provider table", () => {
+    // Nothing has named the host yet, so the shared neutral nouns apply.
+    expect(resolveStatusChangeRequestPresentation(null, false)).toBe(
+      NEUTRAL_CHANGE_REQUEST_PRESENTATION,
+    );
+    expect(resolveStatusChangeRequestPresentation(undefined, false)).toBe(
+      NEUTRAL_CHANGE_REQUEST_PRESENTATION,
+    );
+    expect(NEUTRAL_CHANGE_REQUEST_PRESENTATION).toMatchObject({
+      longName: "change request",
+      pluralLongName: "change requests",
+      numberPrefix: "#",
+    });
+    // Once status has answered, a missing provider takes the shared table's own rule.
+    expect(resolveStatusChangeRequestPresentation(null, true)).toBe(
+      resolveChangeRequestPresentation(undefined),
+    );
+    // A provider already known (reported, or a caller's hint) names its requests at once.
+    expect(resolveStatusChangeRequestPresentation(provider("gitlab"), false)).toBe(
+      resolveChangeRequestPresentation(provider("gitlab")),
+    );
+    expect(resolveStatusChangeRequestPresentation(provider("unknown"), true)).toBe(
+      resolveChangeRequestPresentation(provider("unknown")),
+    );
+  });
 
   it("reuses the existing stacked create-pr action shape with the reviewed fields", () => {
     expect(createPullRequestAction("action-1")).toEqual({

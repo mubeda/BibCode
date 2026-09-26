@@ -151,6 +151,12 @@ pub struct GitRepository {
     /// `-c` configuration placed before the subcommand of every command this variant runs.
     command_config: &'static [&'static str],
     /// Hosts identified by explicit provider probes; status reads only read it.
+    /// `default()` and `with_worktree_settings` start with a private, empty
+    /// observation, so status names only providers its host name identifies. That
+    /// is safe where provider identity is unused (project init, the review diff's
+    /// repository check) and in tests. A repository whose status reaches the UI
+    /// (VCS status, Git Manager, the create flow) must share the server's
+    /// observation through `with_provider_hosts`, as `production/runtime.rs` does.
     provider_hosts: Arc<ProviderHosts>,
 }
 
@@ -344,6 +350,8 @@ impl GitRepository {
         }
     }
 
+    /// The server's repository. It still needs the shared host observation from
+    /// `with_provider_hosts` before its status can name recorded hosts.
     pub fn with_worktree_settings(
         worktree_settings: Arc<dyn WorktreeBaseDirectoryProvider>,
     ) -> Self {

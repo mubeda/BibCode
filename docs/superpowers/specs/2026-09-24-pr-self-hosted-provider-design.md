@@ -177,8 +177,9 @@ design. The first five entries originated in round 3:
 - **Hinted dialog:** a provider/host supplied by the Pull Requests panel no
   longer blocks creation while status has no provider; the server validates it.
 - **Unknown-provider copy (round 4):** an explicit `unknown` provider now says
-  "change request" instead of the approved "pull request". A missing provider
-  still uses "pull request"; identified GitLab uses "merge request".
+  "change request" instead of the approved "pull request". Once status has
+  answered, a missing provider still uses "pull request"; identified GitLab uses
+  "merge request". Before status answers, see the 2026-09-26 decision below.
 - **D1 login ordering (rounds 4–5):** once the host is identified, its login
   check runs alongside context/list reads rather than before them. Round 4
   awaited both and gave a failed login precedence. That avoids a successful
@@ -202,12 +203,27 @@ design. The first five entries originated in round 3:
   list's acknowledgement effect calls the panel's setter to consume it after
   commit.
 
+### Decided by the user on 2026-09-26: neutral nouns until status names the host
+
+- **Copy before status answers:** once status names the host, each host keeps
+  its own noun (GitHub "pull request", GitLab "merge request"). Until status
+  answers (while it loads, or after it failed without an earlier answer), every
+  Git Manager surface says "change request": the toolbar's Show/Hide toggle,
+  the provider pane's heading, messages and Create button, and the create
+  dialog without a hint. The dialog's head branch shows "…" rather than "No
+  branch checked out". After status answers, a missing provider says "pull
+  request", following the shared table's own rule. The Git Manager derives
+  "status has answered" once from its status query and passes it to the pane
+  (`statusLoaded`); the toggle and the pane take their nouns from the same
+  helper, so one view never mixes nouns.
+
 ## UI copy (create dialog, `UI.md`)
 
 - Vocabulary follows the detected provider: GitLab uses "merge request" and
   `!N`; other supported providers or a missing provider use "pull request" and
   `#N`; an explicit `unknown` provider uses "change request" and `#N`, following
-  `packages/shared/src/sourceControl.ts`. This covers the
+  `packages/shared/src/sourceControl.ts`. Until status answers, every surface
+  uses "change request" (the user's decision of 2026-09-26, above). This covers the
   title, description, primary button ("Publish and create merge request"),
   progress, results, blocked reasons and the "Open merge request" link. The
   publication panel text has no request noun and is unchanged.
@@ -219,7 +235,8 @@ design. The first five entries originated in round 3:
   as a hint. While status has not named the host (cold or stale), the
   Repository cell shows the hinted host ("GitLab · https://luna.tripunkt.de")
   and creation is not blocked; the server validates the provider. Without a
-  hint a missing provider keeps "pull request" wording.
+  hint the dialog says "change request" until status answers; after it answers,
+  a missing provider says "pull request".
 - A disabled primary button explains itself: a wrapper carries the tooltip and
   the button's `aria-describedby` names the reason.
 - The server's create error for an unidentified host starts with "Nothing was
