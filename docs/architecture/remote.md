@@ -230,7 +230,14 @@ tokens without a transport claim decode as `plain` for compatibility. Client
 preparation also sets `httpAuthorization` to `null` for a pinned profile, so an
 E2EE-only credential is not exposed as a usable HTTP authorization capability.
 File transfers use token-in-path URLs for the same reason asset previews do,
-so they work on every profile.
+so they work on every profile. On a pinned (E2EE) profile whose endpoint is
+plain `http://`, Files panel downloads and uploads (`/api/transfers/<token>`)
+and asset previews (`/api/assets/<capability>/<path>`: chat images, project
+icons, and HTML or PDF files opened in the integrated browser) travel outside
+the Noise channel, and only the RPC that issues their URLs is encrypted, so
+anyone on the network path can read and alter their contents, read the
+workspace paths encoded in those URLs, and reuse a captured URL until it
+expires (five minutes for transfers, one hour for previews).
 
 Pre-auth work is bounded independently of normal RPC traffic. The complete
 upgrade, handshake, and authentication sequence has one 10-second deadline;
