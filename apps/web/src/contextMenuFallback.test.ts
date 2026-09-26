@@ -306,6 +306,17 @@ describe("showContextMenuFallback", () => {
     copy.dispatchEvent(new FakeDomEvent("mouseleave"));
     expect(copy.style.color).toBe("var(--foreground)");
 
+    // A disabled row stays reachable (aria-disabled, not `disabled`), but a
+    // click or hover neither chooses it nor closes the menu.
+    const disabled = findButton("Disabled")!;
+    expect(disabled.disabled).toBe(false);
+    expect(disabled.attributes["aria-disabled"]).toBe("true");
+    disabled.dispatchEvent(new FakeDomEvent("mouseenter"));
+    disabled.dispatchEvent(new FakeDomEvent("click"));
+    expect(disabled.dataset.active).not.toBe("true");
+    expect(disabled.style.color).toBe("var(--muted-foreground)");
+    expect(fakeDocument.body.children).toHaveLength(1);
+
     const remove = findButton("Remove")!;
     remove.dispatchEvent(new FakeDomEvent("mouseenter"));
     expect(remove.style.color).toBe("var(--destructive-foreground)");
