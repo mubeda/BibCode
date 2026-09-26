@@ -316,7 +316,7 @@ describe("environment presentation hooks", () => {
       data: "connected",
       error: null,
       isPending: false,
-      refresh: h.refresh,
+      revalidate: h.refresh,
     });
   });
 });
@@ -330,12 +330,17 @@ describe("query and asset adapters", () => {
     });
     const queryAtom = { key: "query" };
     h.atomValues.set("query", { ...AsyncResult.success("value"), waiting: true });
-    expect(useEnvironmentQuery(queryAtom as never)).toMatchObject({
+    const pending = useEnvironmentQuery(queryAtom as never);
+    expect(pending).toMatchObject({
       data: "value",
       error: null,
       isPending: true,
-      refresh: h.refresh,
+      revalidate: h.refresh,
+      requiresRetry: false,
     });
+    // An explicit Retry refreshes the same atom after clearing any cut-off latch.
+    pending.refresh();
+    expect(h.refresh).toHaveBeenCalledOnce();
     h.atomValues.set("query", AsyncResult.failure(Cause.fail(new Error("Request failed"))));
     expect(useEnvironmentQuery(queryAtom as never).error).toBe("Request failed");
     h.atomValues.set("query", AsyncResult.failure(Cause.fail(new Error("   "))));

@@ -26,10 +26,15 @@ export function usePullRequestsQuery<A, E>(
     openedView(atom, query, options?.freshOnOpen === true),
   );
   if (opened.atom !== atom) setOpened(openedView(atom, query, false));
-  const refresh = useEffectEvent(() => query.refresh());
+  // Opening a view is automatic: it never re-sends a request whose cut-off re-issue failed.
+  const refresh = useEffectEvent(() => {
+    if (!query.requiresRetry) query.revalidate();
+  });
   useEffect(() => {
     if (opened.shouldRefresh) refresh();
   }, [opened]);
+  // A latched cut-off keeps its cause, so it stays visible until the user retries.
+  if (query.requiresRetry) return query;
   if (opened.atom !== atom) return query;
   // Until the open's read answers, the cached failure or value it replaces stays hidden.
   const cause = query.emission._tag === "Failure" ? query.emission.cause : null;

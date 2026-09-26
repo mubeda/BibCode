@@ -1,9 +1,11 @@
 import { EnvironmentId, type ServerConfig } from "@bibcode/contracts";
 import { describe, expect, it } from "@effect/vitest";
+import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Random from "effect/Random";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
@@ -28,6 +30,7 @@ import {
 } from "./model.ts";
 import * as RpcSession from "../rpc/session.ts";
 import * as ConnectionResolver from "./resolver.ts";
+import { EnvironmentSelection } from "./selection.ts";
 import * as EnvironmentSupervisor from "./supervisor.ts";
 import * as ConnectionWakeups from "./wakeups.ts";
 
@@ -136,7 +139,10 @@ const makeHarness = Effect.fn("TestConnectionHarness.make")(function* (options?:
   ) => Effect.Effect<PreparedConnection, ConnectionAttemptError>;
   readonly ready?: (attempt: number) => Effect.Effect<void, ConnectionAttemptError>;
   readonly probe?: (attempt: number) => Effect.Effect<void, ConnectionAttemptError>;
+  readonly random?: number;
+  readonly selection?: SubscriptionRef.SubscriptionRef<EnvironmentId | null>;
 }) {
+  const selection = options?.selection ?? (yield* SubscriptionRef.make<EnvironmentId | null>(null));
   const networkStatus = yield* SubscriptionRef.make<NetworkStatus>(
     options?.networkStatus ?? "online",
   );
@@ -216,6 +222,17 @@ const makeHarness = Effect.fn("TestConnectionHarness.make")(function* (options?:
     Layer.succeed(
       ConnectionDriver.ConnectionDriver,
       ConnectionDriver.ConnectionDriver.of({ connect }),
+    ),
+    Layer.succeed(Random.Random, {
+      nextDoubleUnsafe: () => options?.random ?? 0.5,
+      nextIntUnsafe: () => 0,
+    }),
+    Layer.succeed(
+      EnvironmentSelection,
+      EnvironmentSelection.of({
+        current: SubscriptionRef.get(selection),
+        changes: SubscriptionRef.changes(selection),
+      }),
     ),
   );
 
@@ -395,6 +412,7 @@ const makeStorageIdentityHarness = Effect.fn("TestStorageIdentityHarness.make")(
       }),
     ),
     Layer.succeed(ConnectionDriver.ConnectionDriver, driver),
+    Layer.succeed(Random.Random, { nextDoubleUnsafe: () => 0.5, nextIntUnsafe: () => 0 }),
   );
 
   return {
@@ -1160,6 +1178,135 @@ describe("EnvironmentSupervisor", () => {
 
       expect(yield* Ref.get(harness.releaseCount)).toBe(1);
       expect(Option.isNone(yield* SubscriptionRef.get(supervisor.session))).toBe(true);
+    }),
+  );
+  it.effect("moves every retry delay by up to fifteen percent", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ prepare: () => Effect.fail(transient()), random: 0 });
+      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+        targetRef: yield* Ref.make<ConnectionTarget>(TARGET_ENTRY.target),
+        initiallyDesired: true,
+      }).pipe(Effect.provide(harness.dependencies));
+      const first = yield* awaitState(
+        supervisor.state,
+        (state) => state.phase === "backoff" && state.attempt === 1,
+      );
+      expect(first.retryAt! - (yield* Clock.currentTimeMillis)).toBe(850);
+      yield* TestClock.adjust(849);
+      expect(yield* Ref.get(harness.prepareCount)).toBe(1);
+      yield* TestClock.adjust(1);
+      yield* eventuallyState(
+        supervisor.state,
+        (state) => state.phase === "backoff" && state.attempt === 2,
+      );
+      expect(yield* Ref.get(harness.prepareCount)).toBe(2);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  const collectBackoffDelays = Effect.fn("TestConnectionHarness.collectBackoffDelays")(function* (
+    state: SubscriptionRef.SubscriptionRef<SupervisorConnectionState>,
+    until: (delays: ReadonlyArray<number>) => boolean,
+  ) {
+    const delays: Array<number> = [];
+    for (let attempt = 1; !until(delays); attempt += 1) {
+      const backoff = yield* eventuallyState(
+        state,
+        (value) => value.phase === "backoff" && value.attempt === attempt,
+      );
+      const delay = backoff.retryAt! - (yield* Clock.currentTimeMillis);
+      delays.push(delay);
+      yield* TestClock.adjust(delay);
+    }
+    return delays;
+  });
+
+  it.effect("moves an unselected environment to the idle ladder after five minutes", () =>
+    Effect.gen(function* () {
+      const selection = yield* SubscriptionRef.make<EnvironmentId | null>(
+        EnvironmentId.make("another-environment"),
+      );
+      const harness = yield* makeHarness({ prepare: () => Effect.fail(transient()), selection });
+      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+        targetRef: yield* Ref.make<ConnectionTarget>(TARGET_ENTRY.target),
+        initiallyDesired: true,
+      }).pipe(Effect.provide(harness.dependencies));
+      const delays = yield* collectBackoffDelays(
+        supervisor.state,
+        (collected) => collected.filter((delay) => delay >= 60_000).length === 4,
+      );
+      const firstIdle = delays.findIndex((delay) => delay >= 60_000);
+      expect(delays.slice(firstIdle)).toEqual([60_000, 120_000, 300_000, 300_000]);
+      expect(delays.slice(0, firstIdle).every((delay) => delay <= 16_000)).toBe(true);
+      expect(
+        delays.slice(0, firstIdle).reduce((total, delay) => total + delay, 0),
+      ).toBeGreaterThanOrEqual(300_000);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("keeps the selected environment on the normal ladder", () =>
+    Effect.gen(function* () {
+      const selection = yield* SubscriptionRef.make<EnvironmentId | null>(TARGET.environmentId);
+      const harness = yield* makeHarness({ prepare: () => Effect.fail(transient()), selection });
+      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+        targetRef: yield* Ref.make<ConnectionTarget>(TARGET_ENTRY.target),
+        initiallyDesired: true,
+      }).pipe(Effect.provide(harness.dependencies));
+      const delays = yield* collectBackoffDelays(
+        supervisor.state,
+        (collected) => collected.reduce((total, delay) => total + delay, 0) > 600_000,
+      );
+      expect(delays.every((delay) => delay <= 16_000)).toBe(true);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("ends an idle wait at once when the environment is selected", () =>
+    Effect.gen(function* () {
+      const selection = yield* SubscriptionRef.make<EnvironmentId | null>(
+        EnvironmentId.make("another-environment"),
+      );
+      const harness = yield* makeHarness({ prepare: () => Effect.fail(transient()), selection });
+      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+        targetRef: yield* Ref.make<ConnectionTarget>(TARGET_ENTRY.target),
+        initiallyDesired: true,
+      }).pipe(Effect.provide(harness.dependencies));
+      const delays: Array<number> = [];
+      let attempt = 1;
+      for (;;) {
+        const backoff = yield* eventuallyState(
+          supervisor.state,
+          (value) => value.phase === "backoff" && value.attempt === attempt,
+        );
+        const delay = backoff.retryAt! - (yield* Clock.currentTimeMillis);
+        if (delay >= 60_000) break;
+        delays.push(delay);
+        yield* TestClock.adjust(delay);
+        attempt += 1;
+      }
+      const before = yield* Ref.get(harness.prepareCount);
+      yield* SubscriptionRef.set(selection, TARGET.environmentId);
+      yield* eventuallyState(
+        supervisor.state,
+        (value) => value.phase === "backoff" && value.attempt === attempt + 1,
+      );
+      expect(yield* Ref.get(harness.prepareCount)).toBe(before + 1);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("does not restart a blocked environment when it is selected", () =>
+    Effect.gen(function* () {
+      const selection = yield* SubscriptionRef.make<EnvironmentId | null>(
+        EnvironmentId.make("another-environment"),
+      );
+      const harness = yield* makeHarness({ prepare: () => Effect.fail(blocked()), selection });
+      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+        targetRef: yield* Ref.make<ConnectionTarget>(TARGET_ENTRY.target),
+        initiallyDesired: true,
+      }).pipe(Effect.provide(harness.dependencies));
+      yield* awaitState(supervisor.state, (state) => state.phase === "blocked");
+      yield* SubscriptionRef.set(selection, TARGET.environmentId);
+      for (let index = 0; index < 20; index += 1) yield* Effect.yieldNow;
+      expect(yield* Ref.get(harness.prepareCount)).toBe(1);
+      expect((yield* SubscriptionRef.get(supervisor.state)).phase).toBe("blocked");
     }),
   );
 });

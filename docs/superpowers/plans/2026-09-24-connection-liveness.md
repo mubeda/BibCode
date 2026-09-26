@@ -8238,7 +8238,7 @@ In `page`, replace everything from `let has_more = commits.len() > limit;` throu
 
 - [ ] **Step 3: Implement the review source bound**
 
-In `apps/server/src/production/runtime.rs` (current anchors: `GitReviewBackend` at 781, `run_review_diff` at 885, `untracked_review_diff` at 932):
+In `apps/server/src/production/runtime.rs` (current anchors: `GitReviewBackend` at 788, `run_review_diff` at 892, `untracked_review_diff` at 939; re-anchored after the clone-reconnect commit db847393):
 
 1. Add these helpers after `MAX_UNTRACKED_REVIEW_TOTAL_BYTES`. The capture owns at most the cap plus one EOF/overflow probe byte and stops reading immediately on overflow:
 
@@ -8381,7 +8381,7 @@ with:
 Keep the existing total/file-count caps. Update each existing
 `untracked_review_diff(cwd)` test call to
 `untracked_review_diff(cwd, MAX_REVIEW_SOURCE_DIFF_BYTES)`; the helper is local
-to this review backend. In `review_diff_commands_ignore_appimage_environment` (re-verified declaration at line 2708; tracked-diff expectation at line 2727), change `.expect("tracked review diff"),` to `.expect("tracked review diff").diff,` for the new capture result. No source captures an entire oversized git diff first.
+to this review backend. In `review_diff_commands_ignore_appimage_environment` (re-verified declaration at line 2715; tracked-diff expectation at line 2734, re-anchored after db847393), change `.expect("tracked review diff"),` to `.expect("tracked review diff").diff,` for the new capture result. No source captures an entire oversized git diff first.
 
 This file carries the PR-panel agent's uncommitted runtime edits. Re-read `GitReviewBackend` and `review_diff_commands_ignore_appimage_environment` before applying this task; touch only that review backend region.
 

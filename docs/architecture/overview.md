@@ -208,12 +208,15 @@ flowchart TB
   lifecycle.
 
 - **Git Manager (`apps/server/src/git/manager/`)** owns repository generations,
-  refs and worktree occupancy snapshots, tip-pinned history pages, diff and
+  refs and worktree occupancy snapshots, tip-pinned history pages (at most 100
+  commits and about 1 MiB each), diff and
   patch parsing, server-authored guards, in-progress/conflict inspection, and
   the branch, sync, stash, merge, rewrite, conflict, and tag operation
   primitives. `apps/server/src/production/git_manager_rpc.rs` adapts those
   owners to the typed RPC registry and the worktree catalog's existing mutation
-  arbitration.
+  arbitration. Review preview sources stop capturing git output at the patch
+  cap, discard the last incomplete file, and set `truncated`; History budgets
+  count serialized JSON including escaping.
 
   Git Manager signals reuse the status watcher's lifecycle. The worktree root
   retains one native recursive watch, including its `.git` tree. The notify
@@ -479,8 +482,9 @@ global, exact-peer, IPv4 `/24` or IPv6 `/64`, and loopback-forwarder admission.
 Authenticated assembly uses cancellable fit-first byte pressure, a 10-second
 incomplete-message progress deadline, and releases permits after dispatch rather
 than handler completion. Outbound fit-first admission keeps a five-second
-reservation deadline, gives each record a fresh five-second sink deadline, and
-adds a size-derived aggregate deadline. Desktop exposure remains a privileged
+reservation deadline; the connection writer then gives each record 20 seconds
+to be accepted and each message 30 seconds plus its size at 16 KiB/s, and ends
+the session when either passes. Desktop exposure remains a privileged
 `DesktopBridge` operation: native starts are local-only, WSL exposure is
 externally managed, and only authoritative live grants or an explicit
 legacy-resume action can request a wide native bind. Pairing credentials remain
@@ -488,7 +492,9 @@ pending until the verified client persists local state and confirms the session.
 Desktop discovery advertises only usable IPv4 addresses until a dual-stack
 listener exists; public candidates are labeled, never defaulted, and require an
 explicit warning acknowledgement. Plain `/ws` caps individual frames at 16 MiB
-while retaining the 64 MiB reassembled-message cap.
+while retaining the 64 MiB reassembled-message cap; a client that offers the
+`bibcode.rpc.chunked.v1` subprotocol receives messages over 64 KiB as binary
+records instead.
 Hosted pairing rejects URL userinfo and renders and submits one normalized host;
 legacy query credentials are scrubbed after capture. Saved blank host keys
 normalize to the legacy plain-transport representation. The environment registry
@@ -1029,7 +1035,9 @@ wrapper. Any new scrollable reading surface must add one.
 
 1. The client runtime resolves a connection target and obtains any required
    bearer, DPoP, relay, or SSH authorization.
-2. `RpcSessionFactory` opens a WebSocket and synchronizes `server.getConfig`.
+2. `RpcSessionFactory` opens a WebSocket and starts the connection's one
+   `subscribeServerConfig` stream; its first snapshot is the session's initial
+   configuration, and later config subscribers replay the same stream.
 3. Effect RPC schemas encode requests and decode unary results or streams.
 4. The Rust `RpcRegistry` authorizes and routes each method.
 5. Orchestration commands are admitted and persisted before provider delivery.

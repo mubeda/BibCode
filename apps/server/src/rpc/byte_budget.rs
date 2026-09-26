@@ -107,12 +107,11 @@ impl RpcOutboundBudget {
         ))
     }
 
-    #[cfg(test)]
+    /// Nonblocking two-tier admission, used by the oversized-control fallback.
     pub(super) fn try_acquire(&self, bytes: usize) -> Result<RpcOutboundBytePermit, ()> {
         self.try_acquire_both(bytes).ok_or(())
     }
 
-    #[cfg(test)]
     fn try_acquire_both(&self, bytes: usize) -> Option<RpcOutboundBytePermit> {
         if bytes > self.connection_capacity || bytes > self.process.inner.capacity {
             return None;

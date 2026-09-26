@@ -1,6 +1,14 @@
 import type { GitManagerCommitEntry } from "@bibcode/contracts";
 import { LegendList, type LegendListRef, type OnViewableItemsChanged } from "@legendapp/list/react";
-import { memo, useCallback, useMemo, useRef, type KeyboardEvent, type MouseEvent } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  type KeyboardEvent,
+  type MouseEvent,
+} from "react";
 
 import { cn } from "../../../lib/utils";
 import {
@@ -10,7 +18,11 @@ import {
   useGitManagerCommitDragSource,
 } from "../rewrite/gitManagerCommitDrag";
 import { deriveAuthorIdentity } from "./authorIdentity";
-import { shouldLoadNextPage } from "./commitPaging";
+import {
+  NEXT_PAGE_REQUEST_INTERVAL_MS,
+  NEXT_PAGE_ROW_THRESHOLD,
+  shouldLoadNextPage,
+} from "./commitPaging";
 
 const COMMIT_ROW_HEIGHT = 50;
 const getCommitRowSize = () => COMMIT_ROW_HEIGHT;
@@ -116,7 +128,7 @@ const GitManagerCommitRow = memo(function GitManagerCommitRow({
     >
       <span
         aria-hidden="true"
-        className="flex size-7 shrink-0 items-center justify-center rounded-full text-[10px] font-semibold text-white"
+        className="flex size-7 shrink-0 items-center justify-center rounded-full text-xs font-semibold text-white"
         style={{ backgroundColor: `hsl(${author.hue} 55% 42%)` }}
       >
         {author.initials}
@@ -125,20 +137,20 @@ const GitManagerCommitRow = memo(function GitManagerCommitRow({
         <span className="block truncate text-xs font-medium">
           {commit.subject || "(no subject)"}
         </span>
-        <span className="block truncate text-[11px] text-muted-foreground" title={author.title}>
+        <span className="block truncate text-xs text-muted-foreground" title={author.title}>
           {commit.authorName.trim() || commit.authorEmail.trim() || "Unknown author"} ·{" "}
           {commitDateFormatter.format(commit.committedAtMs)}
         </span>
       </span>
       {commit.decorations[0] ? (
         <span
-          className="max-w-24 shrink-0 truncate rounded-full bg-muted px-1.5 py-0.5 text-[9px] text-muted-foreground"
+          className="max-w-24 shrink-0 truncate rounded-full bg-muted px-1.5 py-0.5 text-xs text-muted-foreground"
           translate="no"
         >
           {commit.decorations[0]}
         </span>
       ) : null}
-      <span className="shrink-0 font-mono text-[10px] text-muted-foreground" translate="no">
+      <span className="shrink-0 font-mono text-xs text-muted-foreground" translate="no">
         {commit.shortSha}
       </span>
     </button>
@@ -199,23 +211,61 @@ export const GitManagerCommitList = memo(function GitManagerCommitList({
     commits.findIndex((commit) => commit.sha === selectedSha),
   );
 
-  const handleViewableItemsChanged = useCallback<
-    NonNullable<OnViewableItemsChanged<GitManagerCommitEntry>>
-  >(({ end }) => {
+  // The one paging gate for both triggers; reports whether it asked for the next page.
+  const requestNextPage = useCallback((renderedIndex: number): boolean => {
     const nowMs = Date.now();
     if (
-      shouldLoadNextPage({
-        renderedIndex: end,
+      !shouldLoadNextPage({
+        renderedIndex,
         totalRows: commitsRef.current.length,
         isLoading: isLoadingMoreRef.current,
         lastRequestAtMs: lastRequestAtMsRef.current,
         nowMs,
       })
     ) {
-      lastRequestAtMsRef.current = nowMs;
-      onReachEndRef.current();
+      return false;
     }
+    lastRequestAtMsRef.current = nowMs;
+    onReachEndRef.current();
+    return true;
   }, []);
+  const handleViewableItemsChanged = useCallback<
+    NonNullable<OnViewableItemsChanged<GitManagerCommitEntry>>
+  >(
+    ({ end }) => {
+      requestNextPage(end);
+    },
+    [requestNextPage],
+  );
+
+  // History pages stop near 1 MiB, so a page of a few large commits can fit the list,
+  // and then no scroll or viewability change ever asks for more. While the rows end
+  // within the threshold of the viewport, ask through the same gate. One automatic
+  // request per rows array: a failed, latched or exhausted page adds no rows, so it
+  // cannot loop.
+  const autoRequestedCommitsRef = useRef<ReadonlyArray<GitManagerCommitEntry> | null>(null);
+  const requestMoreIfUnfilled = useCallback(() => {
+    const rows = commitsRef.current;
+    if (rows === autoRequestedCommitsRef.current) return;
+    const scrollElement = listRef.current?.getScrollableNode?.();
+    if (!(scrollElement instanceof HTMLElement) || scrollElement.clientHeight === 0) return;
+    const distanceFromBottom =
+      scrollElement.scrollHeight - scrollElement.scrollTop - scrollElement.clientHeight;
+    if (distanceFromBottom > COMMIT_ROW_HEIGHT * NEXT_PAGE_ROW_THRESHOLD) return;
+    if (requestNextPage(rows.length - 1)) autoRequestedCommitsRef.current = rows;
+  }, [requestNextPage]);
+  useEffect(() => {
+    // Re-check when rows arrive or a load ends; a page that lands inside the request
+    // interval is checked once the interval ends.
+    if (commits.length === 0 || isLoadingMore) return;
+    const waitMs = lastRequestAtMsRef.current + NEXT_PAGE_REQUEST_INTERVAL_MS - Date.now();
+    if (waitMs <= 0) {
+      requestMoreIfUnfilled();
+      return;
+    }
+    const timer = globalThis.setTimeout(requestMoreIfUnfilled, waitMs);
+    return () => globalThis.clearTimeout(timer);
+  }, [commits, isLoadingMore, requestMoreIfUnfilled]);
 
   const focusCommit = useCallback((sha: string) => {
     const buttons = containerRef.current?.querySelectorAll<HTMLButtonElement>("[data-commit-sha]");
@@ -278,6 +328,7 @@ export const GitManagerCommitList = memo(function GitManagerCommitList({
           maintainVisibleContentPosition={MAINTAIN_VISIBLE_COMMIT_POSITION}
           renderItem={renderCommit}
           onViewableItemsChanged={handleViewableItemsChanged}
+          onLayout={requestMoreIfUnfilled}
         />
       </GitManagerCommitDndContext>
       {rewriteDisabledReason === null ? null : (

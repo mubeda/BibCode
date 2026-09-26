@@ -49,6 +49,8 @@ vi.mock("../../state/query", () => ({
     error: null,
     isPending: false,
     refresh: h.refreshRefs,
+    revalidate: h.refreshRefs,
+    requiresRetry: false,
   }),
 }));
 

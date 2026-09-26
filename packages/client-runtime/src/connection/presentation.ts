@@ -118,6 +118,12 @@ export function isConnectionUnavailable(connection: EnvironmentConnectionPresent
   return connection.phase !== "connected";
 }
 
+/** Ends `text` with sentence punctuation so a follow-on sentence reads cleanly. */
+function asSentence(text: string): string {
+  const trimmed = text.trim();
+  return /[.!?…]$/.test(trimmed) ? trimmed : `${trimmed}.`;
+}
+
 export function connectionStatusText(connection: EnvironmentConnectionPresentation): string {
   switch (connection.phase) {
     case "available":
@@ -125,11 +131,9 @@ export function connectionStatusText(connection: EnvironmentConnectionPresentati
     case "offline":
       return "Offline";
     case "connecting":
-      return "Connecting...";
+      return "Connecting…";
     case "reconnecting":
-      return connection.error
-        ? `Failed to connect. Reconnecting... Reason: ${connection.error}`
-        : "Reconnecting...";
+      return connection.error ? `${asSentence(connection.error)} Reconnecting…` : "Reconnecting…";
     case "connected":
       return "Connected";
     case "error":

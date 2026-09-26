@@ -79,6 +79,9 @@ const h = vi.hoisted(() => {
     queryDataByKey: new Map<string, unknown>(),
     queryEmissionsByKey: new Map<string, unknown>(),
     queryRefreshCalls: [] as string[],
+    queryRevalidationCalls: [] as string[],
+    queryRetryCalls: [] as string[],
+    queryAwaitingRetry: new Set<string>(),
     querySubscriptionStarts: [] as string[],
     querySubscriptionStops: [] as string[],
     activeQuerySubscriptions: new Map<string, number>(),
@@ -259,8 +262,17 @@ vi.mock("../state/query", async () => {
         error,
         isPending: result?._tag === "Initial",
         refresh: () => {
-          if (key !== null) h.queryRefreshCalls.push(key);
+          if (key === null) return;
+          h.queryRetryCalls.push(key);
+          h.queryAwaitingRetry.delete(key);
+          h.queryRefreshCalls.push(key);
         },
+        revalidate: () => {
+          if (key === null) return;
+          h.queryRevalidationCalls.push(key);
+          h.queryRefreshCalls.push(key);
+        },
+        requiresRetry: key !== null && h.queryAwaitingRetry.has(key),
       };
     },
   };
@@ -959,6 +971,9 @@ beforeEach(() => {
   h.queryDataByKey.clear();
   h.queryEmissionsByKey.clear();
   h.queryRefreshCalls = [];
+  h.queryRevalidationCalls = [];
+  h.queryRetryCalls = [];
+  h.queryAwaitingRetry.clear();
   h.querySubscriptionStarts = [];
   h.querySubscriptionStops = [];
   h.activeQuerySubscriptions.clear();
@@ -2921,6 +2936,81 @@ describe("ChatView", () => {
       } finally {
         await act(async () => root.unmount());
         container.remove();
+      }
+    });
+
+    it("keeps exhausted roster and detail queries latched across snapshot timers", async () => {
+      const child = actor("actor-liveness", "Liveness inspector");
+      const snapshot = activitySnapshot({ _tag: "thread", threadId }, [child]);
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      seedActivityState(environmentId, snapshot.scope, snapshot);
+      seedActivityQueries(environmentId, snapshot, [child]);
+      const { container, root } = await mountActivityRoute();
+      try {
+        await openSubagents(container);
+        await vi.waitFor(() =>
+          expect(container.querySelector(`[data-activity-row="${child.id}"]`)).not.toBeNull(),
+        );
+        await click(container.querySelector(`[data-activity-row="${child.id}"]`)!);
+        await vi.waitFor(() => expect(h.queryRefreshCalls.length).toBeGreaterThan(0));
+        const keys = [...h.activeQuerySubscriptions.keys()].filter(
+          (key) => key.startsWith("activity-roster:") || key.startsWith("activity-detail:"),
+        );
+        expect(keys.some((key) => key.startsWith("activity-detail:"))).toBe(true);
+        expect(keys.filter((key) => key.startsWith("activity-roster:"))).toHaveLength(2);
+        for (const key of keys) {
+          h.queryAwaitingRetry.add(key);
+          h.queryEmissionsByKey.set(
+            key,
+            AsyncResult.failure(
+              Cause.fail(new Error("The connection dropped before the result arrived.")),
+            ),
+          );
+        }
+        h.queryRetryCalls = [];
+        h.queryRevalidationCalls = [];
+        vi.useFakeTimers();
+        for (const revision of [2, 3, 4]) {
+          seedActivityState(
+            environmentId,
+            snapshot.scope,
+            activitySnapshot(snapshot.scope, [child], { revision }),
+          );
+          await act(async () => {
+            // As in the snapshot-revision test above, the store update re-renders the binding.
+            useRightPanelStore
+              .getState()
+              .openActivity(scopeThreadRef(environmentId, threadId), "subagents", snapshot.scope);
+            root.render(
+              <ChatView
+                environmentId={environmentId}
+                threadId={threadId}
+                routeKind="server"
+                reserveTitleBarControlInset
+              />,
+            );
+          });
+          await act(async () => {
+            await vi.advanceTimersByTimeAsync(100);
+          });
+        }
+        for (const key of keys) {
+          expect(h.queryRevalidationCalls).toContain(key);
+          expect(h.queryAwaitingRetry.has(key)).toBe(true);
+        }
+        expect(h.queryRetryCalls).toEqual([]);
+        // The failed-detail Retry handler is an explicit user action.
+        await act(async () => {
+          latestActivityPanelProps().onLoadMoreDetail();
+        });
+        expect(h.queryRetryCalls.some((key) => key.startsWith("activity-detail:"))).toBe(true);
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+        vi.useRealTimers();
       }
     });
 

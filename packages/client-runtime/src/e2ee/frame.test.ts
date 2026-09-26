@@ -3,6 +3,7 @@ import transportConstants from "../../../shared/fixtures/e2ee-transport-constant
 
 import {
   E2EE_RECORD_FLAG_CONTINUATION,
+  E2EE_RECORD_FLAG_CONTROL,
   E2EE_RECORD_FLAG_FINAL,
   E2eeFrameError,
   MAX_E2EE_CHUNK_BYTES,
@@ -138,5 +139,54 @@ describe("e2ee record layer", () => {
     expect(() => splitIntoRecords(new Uint8Array(MAX_E2EE_LOGICAL_MESSAGE_BYTES + 1))).toThrow(
       E2eeFrameError,
     );
+  });
+});
+
+describe("RecordAssembler control records", () => {
+  const encoder = new TextEncoder();
+  const record = (flag: number, text: string) => {
+    const bytes = encoder.encode(text);
+    const out = new Uint8Array(1 + bytes.length);
+    out[0] = flag;
+    out.set(bytes, 1);
+    return out;
+  };
+
+  it("returns a 0x02 record at once without touching the partial message", () => {
+    const assembler = new RecordAssembler(undefined, { allowControlRecords: true });
+    expect(assembler.push(record(0x01, "hello "))).toBeNull();
+    expect(new TextDecoder().decode(assembler.push(record(0x02, "pong"))!)).toBe("pong");
+    expect(new TextDecoder().decode(assembler.push(record(0x00, "world"))!)).toBe("hello world");
+  });
+
+  it("rejects 0x02 unless control records were negotiated", () => {
+    const assembler = new RecordAssembler();
+    expect(() => assembler.push(record(E2EE_RECORD_FLAG_CONTROL, "pong"))).toThrow(E2eeFrameError);
+  });
+
+  it("refuses a control payload larger than one record", () => {
+    const assembler = new RecordAssembler(undefined, { allowControlRecords: true });
+    expect(() => assembler.push(record(0x02, "x".repeat(MAX_E2EE_CHUNK_BYTES + 1)))).toThrow(
+      E2eeFrameError,
+    );
+  });
+
+  it("checks the byte limit before returning a control payload", () => {
+    const assembler = new RecordAssembler(4, { allowControlRecords: true });
+    assembler.push(record(0x01, "abc"));
+    expect(() => assembler.push(record(0x02, "de"))).toThrow(E2eeFrameError);
+  });
+
+  it("checks the record limit before returning a control payload", () => {
+    const assembler = new RecordAssembler(undefined, { allowControlRecords: true });
+    for (let i = 0; i < MAX_E2EE_RECORDS_PER_MESSAGE; i += 1) {
+      assembler.push(record(0x01, "x"));
+    }
+    expect(() => assembler.push(record(0x02, "pong"))).toThrow(E2eeFrameError);
+  });
+
+  it("rejects an empty control record", () => {
+    const assembler = new RecordAssembler(undefined, { allowControlRecords: true });
+    expect(() => assembler.push(Uint8Array.of(0x02))).toThrow(E2eeFrameError);
   });
 });

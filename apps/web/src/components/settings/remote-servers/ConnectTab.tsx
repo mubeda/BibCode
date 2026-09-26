@@ -465,23 +465,26 @@ function RemoteServerRowFromSession(
     remoteUpdateControl ? remoteUpdateEnvironment.snapshot({ environmentId, input: {} }) : null,
   );
   const refreshUpdateStatus = updateQuery.refresh;
+  const revalidateUpdateStatus = updateQuery.revalidate;
   const updateCheck = useRemoteUpdateCheckState(remoteUpdateControl ? environmentId : null);
   const runCheck = useAtomCommand(remoteUpdateEnvironment.check, { reportFailure: false });
   const runInstall = useAtomCommand(remoteUpdateEnvironment.install, { reportFailure: false });
   const [installPending, setInstallPending] = useState(false);
   const [manualInstallRequired, setManualInstallRequired] = useState(false);
 
+  // A fan-out check's epoch is an automatic re-read; it keeps a transport cut-off latched.
   useEffect(() => {
     if (remoteUpdateControl && updateRefreshEpoch > 0) {
-      refreshUpdateStatus();
+      revalidateUpdateStatus();
     }
-  }, [refreshUpdateStatus, remoteUpdateControl, updateRefreshEpoch]);
+  }, [revalidateUpdateStatus, remoteUpdateControl, updateRefreshEpoch]);
 
+  // Re-reads after a check or install are automatic; only Retry clears a cut-off latch.
   const checkForUpdate = useCallback(async () => {
     // The check records its own progress and failure in the shared check state.
     await runCheck({ environmentId, input: {} });
-    refreshUpdateStatus();
-  }, [environmentId, refreshUpdateStatus, runCheck]);
+    revalidateUpdateStatus();
+  }, [environmentId, revalidateUpdateStatus, runCheck]);
 
   const installUpdate = useCallback(async () => {
     setInstallPending(true);
@@ -489,7 +492,7 @@ function RemoteServerRowFromSession(
     setInstallPending(false);
     if (result._tag === "Success") {
       setManualInstallRequired(false);
-      refreshUpdateStatus();
+      revalidateUpdateStatus();
       return;
     }
     const error = squashAtomCommandFailure(result);
@@ -500,9 +503,9 @@ function RemoteServerRowFromSession(
       error.code === REMOTE_UPDATE_MANUAL_REQUIRED
     ) {
       setManualInstallRequired(true);
-      refreshUpdateStatus();
+      revalidateUpdateStatus();
     }
-  }, [environmentId, refreshUpdateStatus, runInstall]);
+  }, [environmentId, revalidateUpdateStatus, runInstall]);
 
   const queryStatus = serverUpdateStatusFromQuery(updateQuery, {
     connected: props.environment.connection.phase === "connected",

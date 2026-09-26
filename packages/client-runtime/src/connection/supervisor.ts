@@ -7,6 +7,7 @@ import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
+import * as Random from "effect/Random";
 import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
@@ -27,8 +28,14 @@ import {
 import * as RpcSession from "../rpc/session.ts";
 import { safeErrorLogAttributes } from "../errors/safeLog.ts";
 import * as ConnectionWakeups from "./wakeups.ts";
+import { EnvironmentSelection, isEnvironmentShown } from "./selection.ts";
 
 const RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 16_000] as const;
+/** Every retry delay moves by up to ±15 % so reconnecting clients spread out. */
+const RETRY_JITTER = 0.15;
+/** After this much continuous failure an unselected environment retries rarely. */
+const IDLE_LADDER_AFTER_MS = 5 * 60_000;
+const IDLE_RETRY_DELAYS_MS = [60_000, 120_000, 300_000] as const;
 export const CONNECTION_ESTABLISHMENT_TIMEOUT = "15 seconds";
 const CONNECTION_PROBE_TIMEOUT = "15 seconds";
 const BACKOFF_RESET_AFTER_MS = 30_000;
@@ -43,7 +50,8 @@ type SupervisorSignal =
   | { readonly _tag: "DisconnectRequested" }
   | { readonly _tag: "RetryRequested" }
   | { readonly _tag: "NetworkChanged"; readonly network: NetworkStatus }
-  | { readonly _tag: "Wakeup"; readonly reason: ConnectionWakeups.ConnectionWakeup };
+  | { readonly _tag: "Wakeup"; readonly reason: ConnectionWakeups.ConnectionWakeup }
+  | { readonly _tag: "SelectionChanged" };
 
 interface PendingRetryTrace {
   readonly previousAttempt: Tracer.Span;
@@ -104,6 +112,19 @@ function retryDelayMs(failureCount: number): number {
   return RETRY_DELAYS_MS[Math.min(failureCount, RETRY_DELAYS_MS.length - 1)] ?? 16_000;
 }
 
+function idleRetryDelayMs(idleFailures: number): number {
+  return (
+    IDLE_RETRY_DELAYS_MS[Math.min(idleFailures - 1, IDLE_RETRY_DELAYS_MS.length - 1)] ?? 300_000
+  );
+}
+
+function jitteredDelayMs(
+  delayMs: number,
+  random: { readonly nextDoubleUnsafe: () => number },
+): number {
+  return Math.round(delayMs * (1 + (random.nextDoubleUnsafe() * 2 - 1) * RETRY_JITTER));
+}
+
 function annotateTarget(target: ConnectionTarget) {
   return Effect.annotateCurrentSpan({
     "environment.id": target.environmentId,
@@ -162,6 +183,37 @@ function connectingState(
   };
 }
 
+/**
+ * The session reports disconnects without a name; the supervisor names them
+ * with the current saved catalog label when it publishes the failure.
+ */
+function labelDisconnectFailure(
+  target: ConnectionTarget,
+  error: ConnectionAttemptError,
+): ConnectionAttemptError {
+  if (error._tag !== "ConnectionTransientError") return error;
+  const label = target.label;
+  switch (error.reason) {
+    case "liveness-timeout":
+      return new ConnectionTransientError({
+        reason: error.reason,
+        detail: `No data from ${label} for 30 seconds. The connection is too slow or was lost.`,
+      });
+    case "connection-closed":
+      return new ConnectionTransientError({
+        reason: error.reason,
+        detail: `${label} closed the connection.`,
+      });
+    case "connection-lost":
+      return new ConnectionTransientError({
+        reason: error.reason,
+        detail: `The connection to ${label} was lost.`,
+      });
+    default:
+      return error;
+  }
+}
+
 function failureFromExit<A>(
   target: ConnectionTarget,
   exit: Exit.Exit<A, TracedAttemptFailure>,
@@ -177,7 +229,10 @@ function failureFromExit<A>(
       _tag: "Failure",
       established,
       stable,
-      failure: typedFailure.error,
+      failure: {
+        ...typedFailure.error,
+        error: labelDisconnectFailure(target, typedFailure.error.error),
+      },
     };
   }
   return {
@@ -226,6 +281,9 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
   const connectivity = yield* Connectivity.Connectivity;
   const driver = yield* ConnectionDriver.ConnectionDriver;
   const wakeups = yield* ConnectionWakeups.ConnectionWakeups;
+  const selection = yield* EnvironmentSelection;
+  const random = yield* Random.Random;
+  const shown = yield* Ref.make(isEnvironmentShown(yield* selection.current, target.environmentId));
   const initialIntent: SupervisorIntent = {
     desired: options.initiallyDesired ?? false,
     network: yield* connectivity.status,
@@ -371,6 +429,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
           }
           break;
         case "ConnectRequested":
+        case "SelectionChanged":
           break;
         case "Wakeup":
           if (next.reason === "credentials-changed" && target._tag === "RelayConnectionTarget") {
@@ -441,12 +500,14 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
                   break;
                 case "ConnectRequested":
                 case "Wakeup":
+                case "SelectionChanged":
                   break;
               }
             }
           }
           break;
         case "ConnectRequested":
+        case "SelectionChanged":
           break;
       }
     }
@@ -573,6 +634,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
             case "RetryRequested":
             case "NetworkChanged":
             case "Wakeup":
+            case "SelectionChanged":
               return;
           }
         }
@@ -580,13 +642,22 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     );
   });
 
-  const waitForSignal = Queue.take(signals);
+  // A selection change only shortens retry waits; it never restarts an idle,
+  // offline or blocked supervisor.
+  const waitForSignal = Effect.gen(function* () {
+    for (;;) {
+      const next = yield* Queue.take(signals);
+      if (next._tag !== "SelectionChanged") return next;
+    }
+  });
 
   const run = Effect.fnUntraced(function* () {
     let failureCount = 0;
     let generation = 0;
     let latestFailure: ConnectionAttemptError | null = null;
     let pendingRetry = Option.none<PendingRetryTrace>();
+    let failingSince: number | null = null;
+    let idleFailures = 0;
 
     for (;;) {
       const currentIntent = yield* Ref.get(intent);
@@ -594,6 +665,8 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
         failureCount = 0;
         latestFailure = null;
         pendingRetry = Option.none();
+        failingSince = null;
+        idleFailures = 0;
         yield* clearLease;
         yield* setState(availableState(currentIntent, generation));
         yield* waitForSignal;
@@ -617,6 +690,8 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
           failureCount = 0;
           latestFailure = null;
           pendingRetry = Option.none();
+          failingSince = null;
+          idleFailures = 0;
         }
       }
       if (outcome._tag === "Interrupted") {
@@ -646,7 +721,14 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
       }
 
       failureCount += 1;
-      const delayMs = retryDelayMs(failureCount - 1);
+      const failedAt = yield* Clock.currentTimeMillis;
+      failingSince ??= failedAt;
+      const idle = !(yield* Ref.get(shown)) && failedAt - failingSince >= IDLE_LADDER_AFTER_MS;
+      idleFailures = idle ? idleFailures + 1 : 0;
+      const delayMs = jitteredDelayMs(
+        idle ? idleRetryDelayMs(idleFailures) : retryDelayMs(failureCount - 1),
+        random,
+      );
       pendingRetry = Option.map(attemptSpan, (previousAttempt) => ({
         previousAttempt,
         failureCount,
@@ -662,7 +744,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
         attempt,
         generation,
         lastFailure: error,
-        retryAt: (yield* Clock.currentTimeMillis) + delayMs,
+        retryAt: failedAt + delayMs,
       });
       yield* waitForRetrySignal(delayMs);
     }
@@ -682,6 +764,17 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
   );
   yield* wakeups.changes.pipe(
     Stream.runForEach((reason) => signal({ _tag: "Wakeup", reason })),
+    Effect.forkScoped,
+  );
+  yield* selection.changes.pipe(
+    Stream.runForEach((selected) => {
+      const nowShown = isEnvironmentShown(selected, target.environmentId);
+      return Ref.getAndSet(shown, nowShown).pipe(
+        Effect.flatMap((wasShown) =>
+          !wasShown && nowShown ? signal({ _tag: "SelectionChanged" }) : Effect.void,
+        ),
+      );
+    }),
     Effect.forkScoped,
   );
   yield* run().pipe(Effect.forkScoped);

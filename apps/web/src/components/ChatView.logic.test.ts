@@ -1351,7 +1351,7 @@ describe("describeUnavailableEnvironment", () => {
       connection: { phase: "reconnecting", error: reason, traceId: null },
     });
 
-    expect(copy).toEqual({ title: "devbox: Reconnecting...", description: reason });
+    expect(copy).toEqual({ title: "devbox: Reconnecting…", description: reason });
   });
 
   it("explains what is blocked when there is no reason", () => {

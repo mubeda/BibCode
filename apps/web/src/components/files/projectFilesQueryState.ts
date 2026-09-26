@@ -4,14 +4,18 @@ import type {
   ProjectListEntriesResult,
   ProjectReadFileResult,
 } from "@bibcode/contracts";
-import * as Cause from "effect/Cause";
 import * as Option from "effect/Option";
 import { AsyncResult } from "effect/unstable/reactivity";
 import { useCallback } from "react";
 
 import { appAtomRegistry } from "~/rpc/atomRegistry";
 import { projectEnvironment } from "~/state/projects";
-import { executeAtomQuery } from "@bibcode/client-runtime/state/runtime";
+import {
+  executeAtomQuery,
+  isEnvironmentQueryAwaitingRetry,
+  retryEnvironmentQuery,
+} from "@bibcode/client-runtime/state/runtime";
+import { formatEnvironmentQueryError } from "~/state/query";
 
 const EMPTY_PROJECT_FILE_PATH = "";
 function optimisticFileAtom(environmentId: EnvironmentId, cwd: string, relativePath: string) {
@@ -22,7 +26,12 @@ interface ProjectQueryState<A> {
   readonly data: A | null;
   readonly error: string | null;
   readonly isPending: boolean;
+  /** Explicit user rescan/Retry: also clears an exhausted transport cut-off. */
   readonly refresh: () => void;
+  /** Automatic re-read (signals, finished mutations); keeps cut-off state. */
+  readonly revalidate: () => void;
+  /** The automatic re-issue after a cut-off failed; only `refresh` sends the request again. */
+  readonly requiresRetry: boolean;
 }
 
 export function getProjectEntriesQueryAtom(environmentId: EnvironmentId, cwd: string) {
@@ -112,9 +121,9 @@ export function clearProjectFileQueryData(
 }
 
 function errorMessage<A>(result: AsyncResult.AsyncResult<A, unknown>): string | null {
-  if (result._tag !== "Failure") return null;
-  const cause = Cause.squash(result.cause);
-  return cause instanceof Error ? cause.message : "Workspace query failed.";
+  return result._tag === "Failure"
+    ? formatEnvironmentQueryError(result.cause, "Workspace query failed.")
+    : null;
 }
 
 export function useProjectEntriesQuery(
@@ -124,12 +133,14 @@ export function useProjectEntriesQuery(
   const atom = getProjectEntriesQueryAtom(environmentId, cwd);
   const result = useAtomValue(atom);
   const refreshAtom = useAtomRefresh(atom);
-  const refresh = useCallback(() => refreshAtom(), [refreshAtom]);
+  const refresh = useCallback(() => retryEnvironmentQuery(atom, refreshAtom), [atom, refreshAtom]);
   return {
     data: Option.getOrNull(AsyncResult.value(result)),
     error: errorMessage(result),
     isPending: result.waiting,
     refresh,
+    revalidate: refreshAtom,
+    requiresRetry: isEnvironmentQueryAwaitingRetry(atom, result),
   };
 }
 
@@ -141,7 +152,7 @@ export function useProjectFileQuery(
   const atom = getProjectFileQueryAtom(environmentId, cwd, relativePath);
   const result = useAtomValue(atom);
   const refreshAtom = useAtomRefresh(atom);
-  const refresh = useCallback(() => refreshAtom(), [refreshAtom]);
+  const refresh = useCallback(() => retryEnvironmentQuery(atom, refreshAtom), [atom, refreshAtom]);
   const data = Option.getOrNull(AsyncResult.value(result));
   const optimisticResult = useAtomValue(
     optimisticFileAtom(environmentId, cwd, relativePath ?? EMPTY_PROJECT_FILE_PATH),
@@ -153,5 +164,7 @@ export function useProjectFileQuery(
     error: errorMessage(result),
     isPending: result.waiting,
     refresh,
+    revalidate: refreshAtom,
+    requiresRetry: isEnvironmentQueryAwaitingRetry(atom, result),
   };
 }

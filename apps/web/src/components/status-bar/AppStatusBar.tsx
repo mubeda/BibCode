@@ -333,22 +333,31 @@ export function AppStatusBar() {
   const consumeCodexRateLimitReset = useAtomCommand(serverEnvironment.consumeCodexRateLimitReset, {
     reportFailure: false,
   });
+  // Only the user's forced refresh may clear an exhausted cut-off; timers revalidate.
   const performRefresh = useCallback(
-    createStatusBarRefreshHandler({
-      environmentId,
-      refreshProviderUsage,
-      refreshUsageQuery: usage.refresh,
-      refreshProcessDiagnostics: diagnostics.refresh,
-      refreshLocalProcessDiagnostics:
-        primaryLocalEnvironmentId === null ? null : localDiagnostics.refresh,
-    }),
+    (force: boolean) =>
+      createStatusBarRefreshHandler({
+        environmentId,
+        refreshProviderUsage,
+        refreshUsageQuery: force ? usage.refresh : usage.revalidate,
+        refreshProcessDiagnostics: force ? diagnostics.refresh : diagnostics.revalidate,
+        refreshLocalProcessDiagnostics:
+          primaryLocalEnvironmentId === null
+            ? null
+            : force
+              ? localDiagnostics.refresh
+              : localDiagnostics.revalidate,
+      })(force),
     [
       diagnostics.refresh,
+      diagnostics.revalidate,
       environmentId,
       localDiagnostics.refresh,
+      localDiagnostics.revalidate,
       primaryLocalEnvironmentId,
       refreshProviderUsage,
       usage.refresh,
+      usage.revalidate,
     ],
   );
   const refresh = useCallback((): Promise<void> => {
@@ -381,11 +390,11 @@ export function AppStatusBar() {
   const resourceRefresh = useCallback(
     createStatusBarResourceRefreshHandler({
       environmentId,
-      refreshProcessDiagnostics: diagnostics.refresh,
+      refreshProcessDiagnostics: diagnostics.revalidate,
       refreshLocalProcessDiagnostics:
-        primaryLocalEnvironmentId === null ? null : localDiagnostics.refresh,
+        primaryLocalEnvironmentId === null ? null : localDiagnostics.revalidate,
     }),
-    [diagnostics.refresh, environmentId, localDiagnostics.refresh, primaryLocalEnvironmentId],
+    [diagnostics.revalidate, environmentId, localDiagnostics.revalidate, primaryLocalEnvironmentId],
   );
   const handleOpenProviderSettings = useCallback(() => {
     void navigate({ to: "/settings/providers" });

@@ -213,11 +213,12 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
   const signalQuery = useEnvironmentQuery(signalAtom);
   const latestCommitQuery = useEnvironmentQuery(latestCommitAtom);
   const signalGeneration = signalQuery.data?.generation ?? null;
-  const refreshRefs = refsQuery.refresh;
-  const refreshLatestCommit = latestCommitQuery.refresh;
+  // Signals and finished mutations are automatic reads: they keep a cut-off latched.
+  const revalidateRefs = refsQuery.revalidate;
+  const revalidateLatestCommit = latestCommitQuery.revalidate;
   useEffect(() => {
-    if (signalGeneration !== null) refreshRefs();
-  }, [refreshRefs, signalGeneration]);
+    if (signalGeneration !== null) revalidateRefs();
+  }, [revalidateRefs, signalGeneration]);
 
   const availableEditors = serverConfig?.availableEditors ?? EMPTY_EDITORS;
   const openInPreferredEditor = useOpenInPreferredEditor(environmentId, availableEditors);
@@ -396,8 +397,8 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
           setMutationError(message);
           throw new Error(message);
         }
-        refreshRefs();
-        refreshLatestCommit();
+        revalidateRefs();
+        revalidateLatestCommit();
       } finally {
         setMutationBusy(false);
       }
@@ -406,8 +407,8 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
       commit,
       cwd,
       environmentId,
-      refreshLatestCommit,
-      refreshRefs,
+      revalidateLatestCommit,
+      revalidateRefs,
       refreshStatus,
       stageFiles,
       unstageFiles,
@@ -422,13 +423,13 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
         setMutationError(gitManagerMutationErrorMessage(squashAtomCommandFailure(result)));
         return null;
       }
-      refreshRefs();
-      refreshLatestCommit();
+      revalidateRefs();
+      revalidateLatestCommit();
       return result.value;
     } finally {
       setMutationBusy(false);
     }
-  }, [cwd, environmentId, refreshLatestCommit, refreshRefs, undoCommit]);
+  }, [cwd, environmentId, revalidateLatestCommit, revalidateRefs, undoCommit]);
   const requestDiscardAll = useCallback(() => {
     if (allChangedPaths.length > 0) {
       setPendingDiscard({ paths: allChangedPaths, disposition: "trash" });

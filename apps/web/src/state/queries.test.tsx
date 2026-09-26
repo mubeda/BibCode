@@ -9,6 +9,8 @@ import type { VcsListRefsResult, VcsRef } from "@bibcode/contracts";
 import * as Cause from "effect/Cause";
 import * as Option from "effect/Option";
 import { AsyncResult } from "effect/unstable/reactivity";
+import { RpcClientError } from "effect/unstable/rpc";
+import * as Socket from "effect/unstable/socket/Socket";
 import type { Dispatch, SetStateAction } from "react";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -93,6 +95,7 @@ const testState = vi.hoisted(() => ({
   queryDescriptors: [] as Array<QueryDescriptor | null>,
   queryViews: new Map<QueryDescriptor["kind"], QueryView>(),
   refreshedAtoms: [] as QueryDescriptor[],
+  retriedAtoms: [] as unknown[],
   threadState: null as unknown as {
     data: Option.Option<unknown>;
     error: Option.Option<string>;
@@ -166,11 +169,21 @@ vi.mock("../rpc/atomRegistry", () => ({
   },
 }));
 
+vi.mock("@bibcode/client-runtime/state/runtime", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@bibcode/client-runtime/state/runtime")>()),
+  retryEnvironmentQuery: (atom: unknown, refresh: () => void) => {
+    testState.retriedAtoms.push(atom);
+    refresh();
+  },
+}));
+
 vi.mock("./threads", () => ({
   useEnvironmentThread: () => testState.threadState,
 }));
 
-vi.mock("./query", () => ({
+vi.mock("./query", async (importOriginal) => ({
+  // The real message rule; only the hook is replaced.
+  ...(await importOriginal<typeof import("./query")>()),
   useEnvironmentQuery: (query: QueryDescriptor | null) => {
     testState.queryDescriptors.push(query);
     if (query === null) {
@@ -323,6 +336,7 @@ beforeEach(() => {
   testState.queryDescriptors = [];
   testState.queryViews.clear();
   testState.refreshedAtoms = [];
+  testState.retriedAtoms = [];
   testState.threadState = {
     data: Option.none(),
     error: Option.none(),
@@ -460,13 +474,36 @@ describe("usePaginatedBranches", () => {
 
     expect(pending.isPending).toBe(true);
     expect(testState.refreshedAtoms).toEqual([firstPage]);
+    expect(testState.retriedAtoms).toEqual([firstPage]);
     expect(refreshed.refs.map((item) => item.name)).toEqual(["main"]);
+  });
+
+  it("revalidates the first page without clearing a transport cut-off", () => {
+    const target = refsTarget();
+    const firstPage = setPageResult(
+      target,
+      undefined,
+      AsyncResult.success(page([ref("main")], { nextCursor: null, totalCount: 1 })),
+    );
+
+    renderHook(() => usePaginatedBranches(target)).revalidate();
+
+    expect(testState.refreshedAtoms).toEqual([firstPage]);
+    expect(testState.retriedAtoms).toEqual([]);
   });
 
   it.each([
     [Cause.fail(new Error("refs exploded")), "refs exploded"],
     [Cause.fail(new Error("")), "Failed to load refs."],
     [Cause.fail("opaque failure"), "Failed to load refs."],
+    [
+      Cause.fail(
+        new RpcClientError.RpcClientError({
+          reason: new Socket.SocketCloseError({ code: 4408, closeReason: "liveness timeout" }),
+        }),
+      ),
+      "The connection dropped before the result arrived.",
+    ],
   ] as const)("formats a failed page", (cause, expected) => {
     const target = refsTarget();
     setPageResult(target, undefined, AsyncResult.failure<never, unknown>(cause));

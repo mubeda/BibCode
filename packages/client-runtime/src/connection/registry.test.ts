@@ -184,6 +184,9 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
     readonly beforeSessionConnect?: (
       environmentId: EnvironmentId,
     ) => Effect.Effect<void, ConnectionAttemptError>;
+    readonly sessionReady?: (
+      environmentId: EnvironmentId,
+    ) => Effect.Effect<void, ConnectionAttemptError>;
     readonly beforeRegistrationRegister?: (
       registration: ConnectionRegistration,
     ) => Effect.Effect<void, Persistence.ConnectionPersistenceError>;
@@ -564,7 +567,7 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
           Effect.succeed({
             client: {} as RpcSession.RpcSession["client"],
             initialConfig: Effect.die(new Error("Config is not used by registry tests.")),
-            ready: Effect.void,
+            ready: options?.sessionReady?.(target.environmentId) ?? Effect.void,
             probe: Effect.void,
             closed: Deferred.await(closed),
             e2eeAuthenticated: Effect.succeed(null),
@@ -1204,6 +1207,86 @@ describe("EnvironmentRegistry", () => {
       }).pipe(Effect.provide(harness.layer), Effect.scoped);
     }),
   );
+
+  it.effect("names a disconnect during readiness with the saved name after a rename", () =>
+    Effect.gen(function* () {
+      const connecting = yield* Deferred.make<void>();
+      const renamed = yield* Deferred.make<void>();
+      const harness = yield* makeHarness([RELAY_TARGET], [], [], {
+        beforeSessionConnect: () =>
+          Deferred.succeed(connecting, undefined).pipe(Effect.andThen(Deferred.await(renamed))),
+        sessionReady: () =>
+          Effect.fail(
+            new ConnectionTransientError({
+              reason: "connection-closed",
+              detail: "The connection disconnected.",
+            }),
+          ),
+      });
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        const environmentId = RELAY_TARGET.environmentId;
+        yield* registry.start;
+        yield* Deferred.await(connecting);
+        yield* registry.rename(environmentId, "GPU box");
+        yield* Deferred.succeed(renamed, undefined);
+        const state = yield* awaitConnectionState(
+          registry,
+          environmentId,
+          (value) => value.phase === "backoff",
+        );
+        expect(state.lastFailure?.message).toBe("GPU box closed the connection.");
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  for (const [reason, expected] of [
+    ["connection-closed", "GPU box closed the connection."],
+    ["connection-lost", "The connection to GPU box was lost."],
+    [
+      "liveness-timeout",
+      "No data from GPU box for 30 seconds. The connection is too slow or was lost.",
+    ],
+  ] as const) {
+    it.effect(`uses the saved name after rename for ${reason}`, () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness([RELAY_TARGET]);
+        yield* Effect.gen(function* () {
+          const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+          const environmentId = RELAY_TARGET.environmentId;
+          yield* registry.start;
+          yield* awaitConnectionState(
+            registry,
+            environmentId,
+            (state) => state.phase === "connected",
+          );
+          const supervisor = yield* registry.run(
+            environmentId,
+            EnvironmentSupervisor.EnvironmentSupervisor,
+          );
+          const prepared = yield* SubscriptionRef.get(supervisor.prepared);
+          yield* registry.rename(environmentId, "GPU box");
+          expect(yield* SubscriptionRef.get(supervisor.prepared)).toBe(prepared);
+          expect(Option.getOrThrow(prepared).label).not.toBe("GPU box");
+          const session = (yield* Ref.get(harness.sessions)).at(-1);
+          if (session === undefined) throw new Error("Missing live session");
+          yield* Deferred.fail(
+            session.closed,
+            new ConnectionTransientError({
+              reason,
+              detail: "The connection disconnected.",
+            }),
+          );
+          const state = yield* awaitConnectionState(
+            registry,
+            environmentId,
+            (value) => value.phase === "backoff",
+          );
+          expect(state.lastFailure?.message).toBe(expected);
+        }).pipe(Effect.provide(harness.layer), Effect.scoped);
+      }),
+    );
+  }
 
   it.effect("keeps a disconnected environment disconnected across a rename", () =>
     Effect.gen(function* () {

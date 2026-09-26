@@ -22,6 +22,7 @@ import {
   ORCHESTRATION_WS_METHODS,
 } from "../src/orchestration.ts";
 import { WS_METHODS, WsRpcGroup } from "../src/rpc.ts";
+import { RpcResponseTooLargeError } from "../src/rpcTransport.ts";
 import {
   ServerProcessDiagnosticsResult,
   ServerProcessResourceHistoryResult,
@@ -101,6 +102,25 @@ const fixtures = {
     exit: {
       _tag: "Failure",
       cause: [{ _tag: "Interrupt", fiberId: undefined }],
+    },
+  } satisfies RpcMessage.ResponseExitEncoded,
+  "exit-response-too-large": {
+    _tag: "Exit",
+    requestId,
+    exit: {
+      _tag: "Failure",
+      cause: [
+        {
+          _tag: "Fail",
+          error: Schema.encodeSync(RpcResponseTooLargeError)(
+            new RpcResponseTooLargeError({
+              method: "gitManager.getCommits",
+              bytes: 70_000_000,
+              limitBytes: 67_108_864,
+            }),
+          ),
+        },
+      ],
     },
   } satisfies RpcMessage.ResponseExitEncoded,
   "exit-stream-success": {

@@ -9,7 +9,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::{process::Command, sync::mpsc, time::timeout};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{Message, client::IntoClientRequest, http::HeaderValue},
+};
 
 const HUGE_REQUEST_ID: &str = "900719925474099312345";
 
@@ -543,4 +546,120 @@ where
         panic!("expected text WebSocket message, got {message:?}");
     };
     serde_json::from_str(&text).expect("valid server RPC message")
+}
+
+async fn connect_plain(
+    address: std::net::SocketAddr,
+    chunked: bool,
+) -> (
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    Option<String>,
+) {
+    let mut request = format!("ws://{address}/ws")
+        .into_client_request()
+        .expect("WebSocket request");
+    if chunked {
+        request.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            HeaderValue::from_static("bibcode.rpc.chunked.v1"),
+        );
+    }
+    let (socket, response) = connect_async(request).await.expect("WebSocket connects");
+    let selected = response
+        .headers()
+        .get("sec-websocket-protocol")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    (socket, selected)
+}
+
+fn bytes_registry() -> RpcRegistry {
+    let mut registry = RpcRegistry::empty();
+    registry.register_unary("fixture.bytes", |request, _cancellation| async move {
+        let bytes = request.payload["bytes"]
+            .as_u64()
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .unwrap_or_default();
+        Ok(json!({ "data": "x".repeat(bytes) }))
+    });
+    registry
+}
+
+#[tokio::test]
+async fn chunked_subprotocol_splits_large_responses_into_records() {
+    let temp = TempDir::new().expect("temporary base directory");
+    let handle = ServerRuntime::start_with_registry(test_config(&temp), bytes_registry())
+        .await
+        .expect("server starts");
+    let (mut socket, selected) = connect_plain(handle.local_addr(), true).await;
+    assert_eq!(selected.as_deref(), Some("bibcode.rpc.chunked.v1"));
+
+    send_json(
+        &mut socket,
+        json!({ "_tag": "Request", "id": "1", "tag": "fixture.bytes", "payload": { "bytes": 1024 }, "headers": [] }),
+    )
+    .await;
+    let small = timeout(Duration::from_secs(2), socket.next())
+        .await
+        .expect("small response")
+        .expect("socket open")
+        .expect("frame");
+    assert!(
+        matches!(small, Message::Text(_)),
+        "small messages stay whole text frames"
+    );
+
+    send_json(
+        &mut socket,
+        json!({ "_tag": "Request", "id": "2", "tag": "fixture.bytes", "payload": { "bytes": 200 * 1024 }, "headers": [] }),
+    )
+    .await;
+    let mut flags = Vec::new();
+    let mut body = Vec::new();
+    loop {
+        let frame = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("record")
+            .expect("socket open")
+            .expect("frame");
+        let Message::Binary(record) = frame else {
+            panic!("large messages arrive as binary records, got {frame:?}");
+        };
+        flags.push(record[0]);
+        body.extend_from_slice(&record[1..]);
+        if record[0] == 0x00 {
+            break;
+        }
+    }
+    assert!(flags.len() >= 4);
+    assert!(flags[..flags.len() - 1].iter().all(|flag| *flag == 0x01));
+    let response: Value = serde_json::from_slice(&body).expect("records reassemble");
+    assert_eq!(response["requestId"], "2");
+    socket.close(None).await.expect("close WebSocket");
+    handle.shutdown();
+    handle.join().await.expect("server joins");
+}
+
+#[tokio::test]
+async fn clients_without_the_subprotocol_receive_whole_text_frames() {
+    let temp = TempDir::new().expect("temporary base directory");
+    let handle = ServerRuntime::start_with_registry(test_config(&temp), bytes_registry())
+        .await
+        .expect("server starts");
+    let (mut socket, selected) = connect_plain(handle.local_addr(), false).await;
+    assert_eq!(selected, None);
+    send_json(
+        &mut socket,
+        json!({ "_tag": "Request", "id": "1", "tag": "fixture.bytes", "payload": { "bytes": 200 * 1024 }, "headers": [] }),
+    )
+    .await;
+    let frame = timeout(Duration::from_secs(2), socket.next())
+        .await
+        .expect("response")
+        .expect("socket open")
+        .expect("frame");
+    assert!(matches!(frame, Message::Text(text) if text.len() > 200 * 1024));
+    socket.close(None).await.expect("close WebSocket");
+    handle.shutdown();
+    handle.join().await.expect("server joins");
 }

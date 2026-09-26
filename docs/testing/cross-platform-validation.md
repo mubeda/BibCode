@@ -1191,6 +1191,60 @@ ends the clone. Record which method was used.
 Record each duration and the exact messages. SSH remotes have no stall guard;
 record SSH coverage separately if tested.
 
+## Slow-link liveness scenario
+
+Run this against an isolated development server (its own `BIBCODE_HOME`) or a
+standalone server reached from a browser, never against user data. Create a
+disposable repository whose newest commit adds a text file of about 4 MB, below
+the 4.375 MB patch bound, so Git Manager returns the whole patch:
+
+```sh
+node -e "require('fs').writeFileSync('big.txt', ('0123456789abcdef'.repeat(4)+'\n').repeat(61500))"
+git add big.txt && git commit -q -m "big diff"
+```
+
+Put `scripts/throttle-proxy.ts` between the browser and the server:
+
+1. Start the web client and note `webPort` from its `[dev-runner] mode=dev:web …`
+   line: `BIBCODE_PORT_OFFSET=81 vp run dev:web`. It targets server port
+   13854 (13773 + 81), where the proxy will listen.
+2. Start the server on another offset and allow the web origin:
+   `BIBCODE_PORT_OFFSET=80 BIBCODE_HOME=<disposable> vp run dev:server -- --dev-url http://localhost:<webPort>`.
+3. Start the proxy:
+   `node scripts/throttle-proxy.ts --listen 127.0.0.1:13854 --target 127.0.0.1:13853 --control 127.0.0.1:13855`.
+4. Pair through the server's startup token (`/pair#token=…` on the web port) and
+   add the repository.
+
+With the browser's network panel on the RPC WebSocket:
+
+1. `curl "http://127.0.0.1:13855/set?down=65536&up=65536"`, then open the big
+   commit's diff in Git Manager History. The transfer takes about a minute and
+   must finish without a disconnect. The socket must show
+   `Sec-WebSocket-Protocol: bibcode.rpc.chunked.v1`, and the large response must
+   arrive as binary frames.
+2. Repeat at `down=262144&up=262144`.
+3. With the page idle, `curl "http://127.0.0.1:13855/set?freeze=1"`. Within 33
+   seconds the socket closes with code 4408, and Git Manager shows "Reconnecting
+   to <environment>. Git Manager loads when the connection is back." A remote
+   environment's context card shows "No data from <environment> for 30 seconds.
+   The connection is too slow or was lost. Reconnecting…". Record that text
+   within 15 seconds of the close. After that, a reconnect attempt through the
+   frozen link can time out and show its own failure instead. Thaw with
+   `freeze=0` and confirm the connection returns.
+4. Freeze an idle connection and record the freeze-start timestamp. While it
+   remains frozen, verify the server ends that session within 50 seconds of
+   freeze start ("RPC peer silent past the heartbeat limit; ending the session",
+   with its `silent_for` and `limit` fields). Record the
+   timestamp and duration before thawing. A later end is a failed check;
+   accepted writes never move this measurement's origin.
+5. Thaw after the idle assertion. Start another large transfer, freeze it after the first record, and keep it
+   frozen. Verify server-side teardown within 33 seconds of freeze start,
+   before thawing. Record subscription cleanup and the writer-failure log.
+   A post-thaw close is not evidence of teardown within the bound.
+
+Record the rates, transfer durations, close codes, the exact status text, and
+the server log lines.
+
 ## Git Manager validation scenario
 
 Run this scenario only against the exact packaged application and disposable

@@ -16,6 +16,7 @@ import {
   createEnvironmentRpcSubscriptionAtomFamily,
 } from "./runtime.ts";
 import type { EnvironmentRegistry } from "../connection/registry.ts";
+import { applyServerConfigEvent } from "../rpc/sharedServerConfig.ts";
 
 export interface ServerConfigProjection {
   readonly config: ServerConfig;
@@ -26,38 +27,11 @@ export function applyServerConfigProjection(
   current: Option.Option<ServerConfigProjection>,
   event: ServerConfigStreamEvent,
 ): Option.Option<ServerConfigProjection> {
-  switch (event.type) {
-    case "snapshot":
-      return Option.some({
-        config: event.config,
-        latestEvent: event,
-      });
-    case "keybindingsUpdated":
-      return Option.map(current, (projection) => ({
-        config: {
-          ...projection.config,
-          keybindings: event.payload.keybindings,
-          issues: event.payload.issues,
-        },
-        latestEvent: event,
-      }));
-    case "providerStatuses":
-      return Option.map(current, (projection) => ({
-        config: {
-          ...projection.config,
-          providers: event.payload.providers,
-        },
-        latestEvent: event,
-      }));
-    case "settingsUpdated":
-      return Option.map(current, (projection) => ({
-        config: {
-          ...projection.config,
-          settings: event.payload.settings,
-        },
-        latestEvent: event,
-      }));
-  }
+  const config = applyServerConfigEvent(
+    Option.getOrNull(Option.map(current, (projection) => projection.config)),
+    event,
+  );
+  return config === null ? Option.none() : Option.some({ config, latestEvent: event });
 }
 
 export function projectServerConfig(

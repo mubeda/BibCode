@@ -21,6 +21,9 @@ const decodeAuthenticated = Schema.decodeUnknownSync(E2eeAuthenticatedMessage);
 
 export const E2EE_HANDSHAKE_TIMEOUT_MS = 10_000;
 export const E2EE_HOST_IDENTITY_CLOSE_CODE = 4403;
+/** Lets the server interleave `0x02` control records with a large message. */
+export const E2EE_INTERLEAVE_FEATURE = "interleave-v1";
+const E2EE_CLIENT_FEATURES = [E2EE_INTERLEAVE_FEATURE];
 
 const EMPTY = new Uint8Array(0);
 const encoder = new TextEncoder();
@@ -182,8 +185,16 @@ export const makeE2eeSocket = (inner: Socket.Socket, options: E2eeSocketOptions)
                 // that predate the confirmation flow.
                 const authMessage =
                   options.auth.kind === "pairing"
-                    ? { type: "e2ee_auth", pairing: options.auth.token }
-                    : { type: "e2ee_auth", bearer: options.auth.credential };
+                    ? {
+                        type: "e2ee_auth",
+                        pairing: options.auth.token,
+                        features: E2EE_CLIENT_FEATURES,
+                      }
+                    : {
+                        type: "e2ee_auth",
+                        bearer: options.auth.credential,
+                        features: E2EE_CLIENT_FEATURES,
+                      };
                 return encryptAndSend(
                   currentTransport(),
                   innerWrite,
@@ -228,7 +239,9 @@ export const makeE2eeSocket = (inner: Socket.Socket, options: E2eeSocketOptions)
                     return fail("protocol", `authenticated callback failed: ${String(cause)}`);
                   }
                   phase = "open";
-                  assembler = new RecordAssembler();
+                  assembler = new RecordAssembler(undefined, {
+                    allowControlRecords: ready.features?.includes(E2EE_INTERLEAVE_FEATURE) === true,
+                  });
                   Deferred.doneUnsafe(sessionTransport, Effect.succeed(currentTransport()));
                   Deferred.doneUnsafe(authenticated, Effect.void);
                   return undefined;

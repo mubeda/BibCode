@@ -76,5 +76,11 @@ describe("remote pairing contract", () => {
     expect(minted.pairingConfirmationRequired).toBe(true);
 
     expect(decodeError({ type: "e2ee_error", code: "unauthorized" }).code).toBe("unauthorized");
+    expect(
+      decodeAuth({ type: "e2ee_auth", bearer: "stored", features: ["interleave-v1"] }),
+    ).toEqual({ type: "e2ee_auth", bearer: "stored", features: ["interleave-v1"] });
+    expect(
+      decodeReady({ type: "e2ee_authenticated", features: ["interleave-v1"] }).features,
+    ).toEqual(["interleave-v1"]);
   });
 });

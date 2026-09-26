@@ -153,6 +153,7 @@ Delete the unused result values above. Do not leave an ambiguous status.
 | Tag create/delete/push and all four image-diff modes                      |        |                                      |                                   |
 | Explicit pull-request/check refresh and no idle provider refresh          |        |                                      |                                   |
 | Disconnect/reconnect and one missing-capability degradation               |        |                                      |                                   |
+| Slow-link liveness: no disconnect; 4408 within 33 s when frozen           |        |                                      |                                   |
 | Local-only author identity and no external image source                   |        |                                      |                                   |
 | Two-project selection, filter, tab, and repository-data isolation         |        |                                      |                                   |
 | Three-project visit with two-entry least-recently-used eviction           |        |                                      |                                   |
@@ -224,6 +225,15 @@ Delete the unused result values above. Do not leave an ambiguous status.
 - Dialog closed while reconnecting: close button shown, dialog closed, folder removed after the connection returned, and whether a new Clone of that URL into that folder waited for the cancel, then started:
 - Server restart mid-clone: partial or completed at the stop; partial folder removed at shutdown and the exact "No clone is in progress…" message, or the completed clone added:
 - Window closed mid-clone: whether the host kept cloning, and the result of re-cloning the same URL into the same folder (joined or added):
+
+## Slow-link liveness scenario
+
+- Server, web, and proxy ports; fixture diff size:
+- 64 KiB/s: transfer duration, negotiated subprotocol, binary frames seen, disconnects (none expected):
+- 256 KiB/s: transfer duration, disconnects (none expected):
+- Frozen link: seconds until the 4408 close, exact status text, reconnect after thawing:
+- Idle freeze: freeze-start and server teardown timestamps; elapsed seconds (at most 50), observed before thaw:
+- Transfer freeze: freeze-start and server teardown timestamps; elapsed seconds (at most 33), observed before thaw; subscription cleanup evidence:
 
 ## SSH environment evidence
 

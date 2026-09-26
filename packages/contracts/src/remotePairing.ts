@@ -20,10 +20,15 @@ export const RemotePairingCodePayload = Schema.Struct({
 });
 export type RemotePairingCodePayload = typeof RemotePairingCodePayload.Type;
 
+/** Optional transport features a client offers and the server confirms inside the channel. */
+export const E2eeChannelFeatures = Schema.Array(TrimmedNonEmptyString);
+export type E2eeChannelFeatures = typeof E2eeChannelFeatures.Type;
+
 /** First-connect form: exchange the one-time credential inside the E2EE channel. */
 export const E2eeAuthPairingMessage = Schema.Struct({
   type: Schema.Literal("e2ee_auth"),
   pairing: TrimmedNonEmptyString,
+  features: Schema.optionalKey(E2eeChannelFeatures),
 });
 export type E2eeAuthPairingMessage = typeof E2eeAuthPairingMessage.Type;
 
@@ -31,6 +36,7 @@ export type E2eeAuthPairingMessage = typeof E2eeAuthPairingMessage.Type;
 export const E2eeAuthBearerMessage = Schema.Struct({
   type: Schema.Literal("e2ee_auth"),
   bearer: TrimmedNonEmptyString,
+  features: Schema.optionalKey(E2eeChannelFeatures),
 });
 export type E2eeAuthBearerMessage = typeof E2eeAuthBearerMessage.Type;
 
@@ -44,6 +50,7 @@ export const E2eeAuthenticatedMessage = Schema.Struct({
   environmentId: Schema.optionalKey(EnvironmentId),
   storageInstanceId: Schema.optionalKey(TrimmedNonEmptyString),
   pairingConfirmationRequired: Schema.optionalKey(Schema.Literal(true)),
+  features: Schema.optionalKey(E2eeChannelFeatures),
 });
 export type E2eeAuthenticatedMessage = typeof E2eeAuthenticatedMessage.Type;
 

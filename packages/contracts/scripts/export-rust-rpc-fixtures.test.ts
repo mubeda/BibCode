@@ -111,7 +111,8 @@ describe("RPC wire fixture exporter", () => {
       "projects.list",
       "projects.remove",
     ]);
-    expect(manifest.fixtures).toHaveLength(392);
+    expect(manifest.fixtures).toHaveLength(393);
+    expect(manifest.fixtures).toContain("exit-response-too-large.json");
     expect(manifest.typedFailureFixtures).toContain("typed-failures/vcs__clone-04.json");
     expect(manifest.typedFailureFixtures).toEqual(
       expect.arrayContaining([

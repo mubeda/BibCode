@@ -4,20 +4,25 @@ import React, { type ReactElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-const harness = vi.hoisted(() => ({
-  stateValues: [] as unknown[],
-  stateIndex: 0,
-  setters: [] as Array<ReturnType<typeof vi.fn>>,
-  effects: [] as Array<() => void | (() => void)>,
-  queryInput: null as unknown,
-  query: {
-    data: null as null | { commits: Array<Record<string, unknown>>; nextCursor: number | null },
-    error: null as unknown,
-    isPending: false,
-    refresh: vi.fn(),
-  },
-  listCommits: vi.fn((input: unknown) => ({ query: input })),
-}));
+const harness = vi.hoisted(() => {
+  const refreshQuery = vi.fn();
+  return {
+    stateValues: [] as unknown[],
+    stateIndex: 0,
+    setters: [] as Array<ReturnType<typeof vi.fn>>,
+    effects: [] as Array<() => void | (() => void)>,
+    queryInput: null as unknown,
+    query: {
+      data: null as null | { commits: Array<Record<string, unknown>>; nextCursor: number | null },
+      error: null as unknown,
+      isPending: false,
+      refresh: refreshQuery,
+      revalidate: refreshQuery,
+      requiresRetry: false,
+    },
+    listCommits: vi.fn((input: unknown) => ({ query: input })),
+  };
+});
 
 vi.mock("react", async (importOriginal) => ({
   ...(await importOriginal<typeof import("react")>()),

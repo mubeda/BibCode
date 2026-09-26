@@ -56,14 +56,21 @@ export function resolveGitManagerCapabilityDisabledReasons(
   };
 }
 
-function disconnectedReason(connectionState: SupervisorConnectionState): string {
+function reconnectingReason(environmentLabel: string): string {
+  return `Reconnecting to ${environmentLabel}. Git Manager loads when the connection is back.`;
+}
+
+function disconnectedReason(
+  connectionState: SupervisorConnectionState,
+  environmentLabel: string,
+): string {
   switch (connectionState.phase) {
     case "available":
       return "This environment is disconnected.";
     case "offline":
       return "This environment is offline.";
     case "backoff":
-      return connectionState.lastFailure?.message ?? "This environment is reconnecting.";
+      return reconnectingReason(environmentLabel);
     case "blocked":
       return connectionState.lastFailure?.message ?? "This environment connection is blocked.";
     case "connecting":
@@ -75,6 +82,7 @@ function disconnectedReason(connectionState: SupervisorConnectionState): string 
 export function resolveGitManagerAvailability(
   connectionState: SupervisorConnectionState | null,
   serverConfig: ServerConfig | null,
+  environmentLabel: string,
 ): GitManagerAvailability {
   if (connectionState === null) {
     return { kind: "pending", reason: "Waiting for the environment connection state." };
@@ -83,6 +91,9 @@ export function resolveGitManagerAvailability(
     return { kind: "disconnected", reason: "This environment is disconnected." };
   }
   if (connectionState.phase === "connecting") {
+    if (connectionState.lastFailure !== null) {
+      return { kind: "pending", reason: reconnectingReason(environmentLabel) };
+    }
     return {
       kind: "pending",
       reason:
@@ -92,7 +103,7 @@ export function resolveGitManagerAvailability(
     };
   }
   if (connectionState.phase !== "connected") {
-    return { kind: "disconnected", reason: disconnectedReason(connectionState) };
+    return { kind: "disconnected", reason: disconnectedReason(connectionState, environmentLabel) };
   }
   if (serverConfig === null) {
     return { kind: "pending", reason: "Waiting for Git Manager capabilities." };

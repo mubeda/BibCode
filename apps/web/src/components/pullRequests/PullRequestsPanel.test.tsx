@@ -29,6 +29,7 @@ const h = vi.hoisted(() => ({
   contextRefresh: null as (() => void) | null,
   catalog: vi.fn((args: unknown) => ({ kind: "catalog", args })),
   refresh: vi.fn(),
+  revalidate: vi.fn(),
   listRefresh: vi.fn(),
   listProps: null as Record<string, unknown> | null,
   detailProps: null as Record<string, unknown> | null,
@@ -60,6 +61,8 @@ vi.mock("../../state/query", () => ({
     error: atom?.kind === "catalog" ? h.catalogError : null,
     isPending: atom?.kind === "catalog" ? h.catalogPending : h.pending,
     refresh: h.refresh,
+    revalidate: h.revalidate,
+    requiresRetry: false,
   }),
 }));
 vi.mock("../../lib/openPullRequestLink", () => ({ useOpenPrLink: () => vi.fn() }));
@@ -133,6 +136,7 @@ beforeEach(() => {
   h.contextRefresh = null;
   h.catalog.mockClear();
   h.refresh.mockClear();
+  h.revalidate.mockClear();
   h.listRefresh.mockClear();
 });
 afterEach(async () => {
@@ -313,8 +317,10 @@ describe("PullRequestsPanel", () => {
       environmentId: "env",
       input: { cwd: "Z:\\opaque\\main" },
     });
-    // Only the context is read again; the worktree catalog is left alone.
-    expect(h.refresh).toHaveBeenCalledTimes(1);
+    // Only the context is read again; the worktree catalog is left alone. Recovery is
+    // automatic, so it re-reads without clearing an exhausted transport cut-off.
+    expect(h.revalidate).toHaveBeenCalledTimes(1);
+    expect(h.refresh).not.toHaveBeenCalled();
   });
   it("mounts the detail view with the number, tab, context and selected checkout", async () => {
     await act(async () =>

@@ -790,6 +790,44 @@ struct GitReviewBackend;
 const MAX_UNTRACKED_REVIEW_FILES: usize = 500;
 const MAX_UNTRACKED_REVIEW_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_UNTRACKED_REVIEW_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
+/// Each review preview source is bounded like a Git Manager commit diff.
+const MAX_REVIEW_SOURCE_DIFF_BYTES: usize = crate::git::manager::graph::MAX_REASONABLE_DIFF_SIZE;
+
+/// Keeps a diff within `limit`, cut at the last complete file. A diff that was
+/// captured incompletely is always treated as truncated.
+fn bound_review_diff(diff: String, limit: usize, captured_truncated: bool) -> (String, bool) {
+    if !captured_truncated && diff.len() <= limit {
+        return (diff, false);
+    }
+    let mut end = limit.min(diff.len());
+    while !diff.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = diff[..end]
+        .rfind("\ndiff --git ")
+        .map_or(0, |index| index + 1);
+    (diff[..cut].to_owned(), true)
+}
+
+/// Reads at most `limit` bytes plus one probe byte, so an oversized diff stops
+/// the capture at once instead of being read to the end.
+async fn capture_review_diff<R: tokio::io::AsyncRead + Unpin>(
+    reader: R,
+    limit: usize,
+) -> std::io::Result<(String, bool)> {
+    let mut bytes = Vec::new();
+    reader
+        .take(limit.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .await?;
+    let truncated = bytes.len() > limit;
+    bytes.truncate(limit);
+    Ok(bound_review_diff(
+        String::from_utf8_lossy(&bytes).into_owned(),
+        limit,
+        truncated,
+    ))
+}
 
 impl ReviewBackend for GitReviewBackend {
     fn get_diff_preview<'a>(
@@ -818,8 +856,23 @@ impl ReviewBackend for GitReviewBackend {
                 review_diff_args(ignore_whitespace, Some("HEAD"), false),
             )
             .await?;
-            let untracked = untracked_review_diff(&input.cwd).await?;
-            let working_tree_diff = join_review_diffs(&tracked_worktree, &untracked.diff);
+            let untracked = if tracked_worktree.truncated {
+                BoundedReviewDiff {
+                    diff: String::new(),
+                    truncated: false,
+                }
+            } else {
+                untracked_review_diff(
+                    &input.cwd,
+                    MAX_REVIEW_SOURCE_DIFF_BYTES.saturating_sub(tracked_worktree.diff.len() + 1),
+                )
+                .await?
+            };
+            let (working_tree_diff, working_tree_truncated) = bound_review_diff(
+                join_review_diffs(&tracked_worktree.diff, &untracked.diff),
+                MAX_REVIEW_SOURCE_DIFF_BYTES,
+                false,
+            );
 
             let base_ref = input.base_ref.clone().or(status.default_ref_name);
             let branch_diff = match (&base_ref, &status.ref_name) {
@@ -831,7 +884,10 @@ impl ReviewBackend for GitReviewBackend {
                     )
                     .await?
                 }
-                _ => String::new(),
+                _ => BoundedReviewDiff {
+                    diff: String::new(),
+                    truncated: false,
+                },
             };
             let sources = vec![
                 review_source(
@@ -841,7 +897,7 @@ impl ReviewBackend for GitReviewBackend {
                     Some("HEAD".to_owned()),
                     None,
                     working_tree_diff,
-                    untracked.truncated,
+                    tracked_worktree.truncated || untracked.truncated || working_tree_truncated,
                 ),
                 review_source(
                     "branch-range",
@@ -852,8 +908,8 @@ impl ReviewBackend for GitReviewBackend {
                     ),
                     base_ref,
                     Some(status.ref_name.unwrap_or_else(|| "HEAD".to_owned())),
-                    branch_diff,
-                    false,
+                    branch_diff.diff,
+                    branch_diff.truncated,
                 ),
             ];
             Ok(Some(ReviewDiffPreviewResult {
@@ -865,7 +921,8 @@ impl ReviewBackend for GitReviewBackend {
     }
 }
 
-struct UntrackedReviewDiff {
+/// One review preview source, bounded at the patch cap; `truncated` says later files were dropped.
+struct BoundedReviewDiff {
     diff: String,
     truncated: bool,
 }
@@ -889,20 +946,37 @@ fn review_diff_args(ignore_whitespace: bool, target: Option<&str>, three_dot: bo
     args
 }
 
-async fn run_review_diff(cwd: &str, args: Vec<String>) -> Result<String, ReviewError> {
+async fn run_review_diff(cwd: &str, args: Vec<String>) -> Result<BoundedReviewDiff, ReviewError> {
     let mut command = Command::new("git");
     configure_background_command(&mut command);
     crate::process::isolate_appimage_environment(&mut command);
-    let output = command
+    let mut child = command
         .args(["-C", cwd])
         .args(args)
-        .output()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| ReviewError::Backend(error.to_string()))?;
+    let stdout = child.stdout.take().expect("piped git stdout");
+    let captured = capture_review_diff(stdout, MAX_REVIEW_SOURCE_DIFF_BYTES).await;
+    if !matches!(&captured, Ok((_, false))) {
+        // Stop git once the capture is complete or failed; `wait` reaps it.
+        let _ = child.start_kill();
+    }
+    let status = child
+        .wait()
         .await
         .map_err(|error| ReviewError::Backend(error.to_string()))?;
-    Ok(if output.status.success() {
-        String::from_utf8_lossy(&output.stdout).into_owned()
-    } else {
-        String::new()
+    let (diff, truncated) = captured.map_err(|error| ReviewError::Backend(error.to_string()))?;
+    Ok(BoundedReviewDiff {
+        diff: if status.success() || truncated {
+            diff
+        } else {
+            String::new()
+        },
+        truncated,
     })
 }
 
@@ -936,7 +1010,7 @@ fn review_source(
     }
 }
 
-async fn untracked_review_diff(cwd: &str) -> Result<UntrackedReviewDiff, ReviewError> {
+async fn untracked_review_diff(cwd: &str, limit: usize) -> Result<BoundedReviewDiff, ReviewError> {
     let mut command = Command::new("git");
     configure_background_command(&mut command);
     crate::process::isolate_appimage_environment(&mut command);
@@ -963,12 +1037,17 @@ async fn untracked_review_diff(cwd: &str) -> Result<UntrackedReviewDiff, ReviewE
     let mut total_bytes = 0_u64;
     let mut diffs = Vec::new();
     let mut truncated = false;
+    let mut patch_bytes = 0_usize;
     for path in output
         .stdout
         .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
         .take(MAX_UNTRACKED_REVIEW_FILES)
     {
+        if patch_bytes >= limit {
+            truncated = true;
+            break;
+        }
         let path = String::from_utf8_lossy(path).into_owned();
         let absolute = root.join(&path);
         let metadata = tokio::fs::symlink_metadata(&absolute)
@@ -980,21 +1059,44 @@ async fn untracked_review_diff(cwd: &str) -> Result<UntrackedReviewDiff, ReviewE
         if metadata.len() > MAX_UNTRACKED_REVIEW_FILE_BYTES
             || total_bytes.saturating_add(metadata.len()) > MAX_UNTRACKED_REVIEW_TOTAL_BYTES
         {
-            diffs.push(binary_untracked_diff(&path));
+            let marker = binary_untracked_diff(&path);
+            let bytes = marker.len() + usize::from(!diffs.is_empty());
+            if patch_bytes.saturating_add(bytes) > limit {
+                truncated = true;
+                break;
+            }
+            patch_bytes += bytes;
+            diffs.push(marker);
             truncated = true;
             continue;
         }
-        let contents = tokio::fs::read(&absolute)
+        let file = tokio::fs::File::open(&absolute)
             .await
             .map_err(|error| ReviewError::Backend(error.to_string()))?;
+        let remaining = limit.saturating_sub(patch_bytes);
+        let mut contents = Vec::new();
+        file.take(remaining.saturating_add(1) as u64)
+            .read_to_end(&mut contents)
+            .await
+            .map_err(|error| ReviewError::Backend(error.to_string()))?;
+        if contents.len() > remaining {
+            truncated = true;
+            break;
+        }
         total_bytes = total_bytes.saturating_add(contents.len() as u64);
-        diffs.push(if contents.contains(&0) {
+        let diff = if contents.contains(&0) {
             binary_untracked_diff(&path)
         } else {
             text_untracked_diff(&path, &String::from_utf8_lossy(&contents))
-        });
+        };
+        if patch_bytes.saturating_add(diff.len() + usize::from(!diffs.is_empty())) > limit {
+            truncated = true;
+            break;
+        }
+        patch_bytes += diff.len() + usize::from(!diffs.is_empty());
+        diffs.push(diff);
     }
-    Ok(UntrackedReviewDiff {
+    Ok(BoundedReviewDiff {
         diff: diffs.join("\n"),
         truncated,
     })
@@ -2731,12 +2833,16 @@ mod tests {
                         review_diff_args(false, Some("HEAD"), false),
                     )
                     .await
-                    .expect("tracked review diff"),
+                    .expect("tracked review diff")
+                    .diff,
                     "tracked review fixture\n"
                 );
-                let untracked = untracked_review_diff(&directory.to_string_lossy())
-                    .await
-                    .expect("untracked review diff");
+                let untracked = untracked_review_diff(
+                    &directory.to_string_lossy(),
+                    MAX_REVIEW_SOURCE_DIFF_BYTES,
+                )
+                .await
+                .expect("untracked review diff");
                 assert!(untracked.diff.contains("+++ b/untracked.txt"));
                 assert!(untracked.diff.contains("+untracked review fixture"));
                 assert!(!untracked.truncated);
@@ -2803,9 +2909,12 @@ mod tests {
         )
         .expect("oversized fixture");
 
-        let diff = untracked_review_diff(&repository.path().to_string_lossy())
-            .await
-            .expect("untracked diff");
+        let diff = untracked_review_diff(
+            &repository.path().to_string_lossy(),
+            MAX_REVIEW_SOURCE_DIFF_BYTES,
+        )
+        .await
+        .expect("untracked diff");
         assert!(diff.diff.contains("binary.dat"));
         assert!(diff.diff.contains("oversized.dat"));
         assert!(diff.truncated);
@@ -2821,7 +2930,11 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(untracked_review_diff("\0").await.is_err());
+        assert!(
+            untracked_review_diff("\0", MAX_REVIEW_SOURCE_DIFF_BYTES)
+                .await
+                .is_err()
+        );
         assert!(
             format!("{:?}", internal_error("injected review error"))
                 .contains("injected review error")
@@ -2866,10 +2979,69 @@ mod tests {
             std::fs::write(&unreadable, "secret\n").expect("unreadable fixture");
             std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000))
                 .expect("remove read permission");
-            let result = untracked_review_diff(&repository.path().to_string_lossy()).await;
+            let result = untracked_review_diff(
+                &repository.path().to_string_lossy(),
+                MAX_REVIEW_SOURCE_DIFF_BYTES,
+            )
+            .await;
             std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o600))
                 .expect("restore read permission");
             assert!(result.is_err());
         }
+    }
+
+    #[test]
+    fn review_diffs_over_the_bound_are_cut_at_a_file_boundary() {
+        let first = format!("diff --git a/one b/one\n+{}\n", "1".repeat(40));
+        let second = format!("diff --git a/two b/two\n+{}\n", "2".repeat(40));
+        let diff = format!("{first}{second}");
+        assert_eq!(
+            bound_review_diff(diff.clone(), diff.len(), false),
+            (diff.clone(), false)
+        );
+        let (cut, truncated) = bound_review_diff(diff.clone(), first.len() + 16, false);
+        assert!(truncated);
+        assert_eq!(cut, first);
+        let (empty, truncated) = bound_review_diff(diff, 10, false);
+        assert!(truncated);
+        assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn review_capture_stops_reading_at_the_cap_plus_one_probe_byte() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Endless(Arc<AtomicUsize>);
+        impl tokio::io::AsyncRead for Endless {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                let bytes = vec![b'x'; buf.remaining()];
+                self.0.fetch_add(bytes.len(), Ordering::Relaxed);
+                buf.put_slice(&bytes);
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        let read = Arc::new(AtomicUsize::new(0));
+        let (diff, truncated) = tokio::time::timeout(
+            Duration::from_secs(1),
+            capture_review_diff(Endless(Arc::clone(&read)), 128),
+        )
+        .await
+        .expect("never wait for EOF on an oversized diff")
+        .expect("capture");
+        assert_eq!(read.load(Ordering::Relaxed), 129);
+        assert!(truncated);
+        assert!(diff.len() <= 128);
+
+        let first = "diff --git a/one b/one\n+one\n";
+        let second = format!("diff --git a/two b/two\n+{}\n", "x".repeat(1000));
+        let input = format!("{first}{second}");
+        let (diff, truncated) = capture_review_diff(input.as_bytes(), first.len() + 32)
+            .await
+            .expect("capture bounded diff");
+        assert!(truncated);
+        assert_eq!(diff, first, "the incomplete last file is discarded");
     }
 }
