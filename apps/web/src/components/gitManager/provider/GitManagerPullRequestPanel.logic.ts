@@ -6,15 +6,34 @@ import type {
   GitRunStackedActionResult,
   PullRequestsProviderKind,
   SourceControlProviderInfo,
-  SourceControlProviderKind,
   VcsStatusResult,
 } from "@bibcode/contracts";
 import {
   formatChangeRequestNumber,
   getChangeRequestTerminology,
+  NEUTRAL_CHANGE_REQUEST_PRESENTATION,
+  resolveChangeRequestPresentation,
   resolveChangeRequestPresentationForKind,
+  type ChangeRequestPresentation,
 } from "@bibcode/shared/sourceControl";
 import { capitalize } from "effect/String";
+
+/**
+ * Request nouns for a provider that status may not have reported yet. A known
+ * provider (reported, or a caller's hint) names its own requests, and once status
+ * has answered a missing provider follows the shared table's rule. Before status
+ * answers (while it loads, or after it failed without an earlier answer), nothing
+ * has named the host, so every Git Manager surface uses the shared neutral nouns
+ * (decided 2026-09-26).
+ */
+export function resolveStatusChangeRequestPresentation(
+  provider: SourceControlProviderInfo | null | undefined,
+  statusLoaded: boolean,
+): ChangeRequestPresentation {
+  return provider == null && !statusLoaded
+    ? NEUTRAL_CHANGE_REQUEST_PRESENTATION
+    : resolveChangeRequestPresentation(provider);
+}
 
 export type ProviderPanePresentation =
   | { readonly kind: "not-loaded"; readonly message: string }
@@ -24,13 +43,14 @@ export type ProviderPanePresentation =
   | { readonly kind: "loaded"; readonly message: string };
 
 export function resolveProviderPanePresentation(input: {
-  readonly providerKind: SourceControlProviderKind | null;
+  /** The request nouns the pane shows, from `resolveStatusChangeRequestPresentation`. */
+  readonly changeRequest: ChangeRequestPresentation;
   readonly requested: boolean;
   readonly pending: boolean;
   readonly error: string | null;
   readonly result: GitManagerPullRequestsResult | null;
 }): ProviderPanePresentation {
-  const changeRequest = resolveChangeRequestPresentationForKind(input.providerKind ?? "github");
+  const { changeRequest } = input;
   const pluralTitle = capitalize(changeRequest.pluralLongName);
   if (!input.requested) {
     return {

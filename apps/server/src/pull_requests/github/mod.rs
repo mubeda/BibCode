@@ -649,7 +649,7 @@ esac"#,
             cwd: s.root().into(),
             host: "github.com".into(),
             repository: "example/repository".into(),
-            provider: ProviderKind::Github,
+            provider: PullRequestsProvider::Github,
         };
         let c = CancellationToken::new();
         let context = host.context(&scope, &c).await.unwrap();
@@ -664,7 +664,7 @@ esac"#,
     #[cfg(unix)]
     #[tokio::test]
     async fn pull_requests_github_context_vocabulary_and_both_list_routes() {
-        use crate::{source_control::ProviderKind, test_support::TestSandbox};
+        use crate::test_support::TestSandbox;
         use std::{fs, sync::Arc};
         use tokio_util::sync::CancellationToken;
         let s = TestSandbox::new("pr-github-adapter");
@@ -719,7 +719,7 @@ esac"#,
             cwd: s.root().into(),
             host: "github.com".into(),
             repository: "example/repository".into(),
-            provider: ProviderKind::Github,
+            provider: PullRequestsProvider::Github,
         };
         let c = CancellationToken::new();
         let context = host.context(&scope, &c).await.unwrap();

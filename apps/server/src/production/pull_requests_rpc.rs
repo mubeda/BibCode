@@ -53,6 +53,9 @@ pub struct ConfiguredPullRequestsRpcServices {
     pub worktrees: Option<super::worktree_catalog_rpc::WorktreeCatalogRpcServices>,
 }
 
+/// For tests and stand-alone registration: the service keeps a private host
+/// observation. The server builds its services with
+/// `PullRequestsRpcServices::with_dependencies(..).with_provider_hosts(..)`.
 impl Default for ConfiguredPullRequestsRpcServices {
     fn default() -> Self {
         Self {

@@ -7,9 +7,8 @@ use bibcode_server::pull_requests::{
     github::GitHubHost,
     gitlab::GitLabHost,
     host::{HostCommandRunner, HostScope, PullRequestHost},
-    model::{ActionRequest, ActionResult},
+    model::{ActionRequest, ActionResult, PullRequestsProvider},
 };
-use bibcode_server::source_control::ProviderKind;
 use serde_json::{Value, json};
 use std::{fs, path::Path, sync::Arc};
 use tempfile::TempDir;
@@ -91,9 +90,9 @@ if [ -f "error-$slot" ]; then cat "error-$slot" >&2; exit 1; fi
             .into(),
             repository: "team/repo".into(),
             provider: if gitlab {
-                ProviderKind::Gitlab
+                PullRequestsProvider::Gitlab
             } else {
-                ProviderKind::Github
+                PullRequestsProvider::Github
             },
         };
         Self {
@@ -187,7 +186,7 @@ if [ -f "error-$slot" ]; then cat "error-$slot" >&2; exit 1; fi
     pub fn assert_body_private(&self, call: usize, body: &str) {
         let args = self.args(call);
         assert!(!args.iter().any(|a| a.contains(body) || a == "--body"));
-        if self.scope.provider == ProviderKind::Gitlab {
+        if self.scope.provider == PullRequestsProvider::Gitlab {
             let path =
                 fs::read_to_string(self.root.path().join(format!("call-{call}.path"))).unwrap();
             assert!(Path::new(&path).starts_with(self.root.path().join("state/pull-requests")));

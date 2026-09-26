@@ -1,0 +1,13 @@
+gitlab.invalid
+  x gitlab.invalid: API call failed: Get "https://gitlab.invalid/api/v4/user": dial tcp: lookup gitlab.invalid: no such host
+  ✓ Git operations for gitlab.invalid configured to use https protocol.
+  ✓ API calls for gitlab.invalid are made over https protocol.
+  ✓ REST API Endpoint: https://gitlab.invalid/api/v4/
+  ✓ GraphQL Endpoint: https://gitlab.invalid/api/graphql/
+  ! No token found (checked config file, keyring, and environment variables).
+          
+   ERROR  
+          
+                                                                                                                      
+  X could not authenticate to one or more of the configured GitLab instances.                                         
+

@@ -275,6 +275,7 @@ describe("Git Manager zero-telemetry runtime", () => {
     await render(
       <GitManagerPullRequestPanel
         scope={{ environmentId: "environment-1" as never, cwd: "/opaque/main" }}
+        statusLoaded={false}
         onRefresh={vi.fn()}
       />,
     );

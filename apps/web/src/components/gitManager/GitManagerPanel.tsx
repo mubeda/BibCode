@@ -11,7 +11,6 @@ import type {
   ScopedProjectRef,
   VcsWorktreeDescriptor,
 } from "@bibcode/contracts";
-import { resolveChangeRequestPresentation } from "@bibcode/shared/sourceControl";
 import * as Cause from "effect/Cause";
 import {
   ArchiveIcon,
@@ -62,6 +61,7 @@ import {
   type GitManagerHistoryAction,
 } from "./history/GitManagerHistoryView";
 import { GitManagerPullRequestPanel } from "./provider/GitManagerPullRequestPanel";
+import { resolveStatusChangeRequestPresentation } from "./provider/GitManagerPullRequestPanel.logic";
 import { GitManagerToolbar } from "./GitManagerToolbar";
 import { GitManagerMultiCommitOperationDialog } from "./rewrite/GitManagerMultiCommitOperationDialog";
 import { GitManagerResetDialog, type GitManagerResetMode } from "./rewrite/GitManagerResetDialog";
@@ -280,7 +280,11 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
   );
   const refsQuery = useEnvironmentQuery(refsAtom);
   const statusQuery = useEnvironmentQuery(statusAtom);
-  const changeRequest = resolveChangeRequestPresentation(statusQuery.data?.sourceControlProvider);
+  // The toggle and the provider pane name requests from this one answer: neutral
+  // until status names the host (a failed read without an earlier answer included).
+  const statusLoaded = statusQuery.data !== null;
+  const sourceControlProvider = statusQuery.data?.sourceControlProvider ?? null;
+  const changeRequest = resolveStatusChangeRequestPresentation(sourceControlProvider, statusLoaded);
   const stashesQuery = useEnvironmentQuery(stashesAtom);
   // Manual Refresh/Retry use refresh; automatic reads (signals, finished operations) revalidate.
   const refreshRefs = refsQuery.refresh;
@@ -954,7 +958,8 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
         <div className="h-80 min-h-0 overflow-auto border-b border-panel-separator">
           <GitManagerPullRequestPanel
             projectRef={projectRef}
-            provider={statusQuery.data?.sourceControlProvider ?? null}
+            provider={sourceControlProvider}
+            statusLoaded={statusLoaded}
             disabledReason={pullRequestsDisabledReason}
             scope={scope}
             onRefresh={refreshRefs}

@@ -493,7 +493,10 @@ pane without making a request. Pull-request and check data load only when
 **Refresh** is pressed, and the pane never starts a
 provider timer. The pane's toggle, heading, status messages, request number and
 Create button follow the provider: GitLab uses merge-request wording, `!N` and
-**Create merge request**. Its create-pull-request review
+**Create merge request**. Until the repository status has loaded, the toggle,
+the pane and its review dialog say “change request”; a loaded status that
+names no host keeps pull-request wording. Its
+create-pull-request review
 dialog groups repository, base, and head details separately from branch-publication status, then keeps the
 editable title and description in one padded form above the fixed action footer.
 On GitLab it says **Create merge request** and uses `!N`. A self-hosted host

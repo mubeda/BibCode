@@ -69,7 +69,12 @@ const BITBUCKET_CHANGE_REQUEST_PRESENTATION: ChangeRequestPresentation = {
   urlExample: "https://bitbucket.org/workspace/repo/pull-requests/42",
 };
 
-const GENERIC_CHANGE_REQUEST_PRESENTATION: ChangeRequestPresentation = {
+/**
+ * The neutral request vocabulary ("change request", `#N`) for a host that isn't
+ * known yet, such as before status has named it. The table also uses it for a
+ * provider it does not recognise, so both cases share this one entry.
+ */
+export const NEUTRAL_CHANGE_REQUEST_PRESENTATION: ChangeRequestPresentation = {
   icon: "change-request",
   providerName: "source control",
   shortName: "change request",
@@ -94,7 +99,7 @@ export function resolveChangeRequestPresentation(
     case "bitbucket":
       return BITBUCKET_CHANGE_REQUEST_PRESENTATION;
     case "unknown":
-      return GENERIC_CHANGE_REQUEST_PRESENTATION;
+      return NEUTRAL_CHANGE_REQUEST_PRESENTATION;
   }
 }
 

@@ -161,7 +161,11 @@ description seeded from the latest commit. The resolved default branch remains
 the base even when later remote-status updates arrive. Its wording follows the host: a
 GitLab repository gets **Create merge request**, `!N` references and
 "merge request" throughout; a missing provider keeps "pull request", while an
-explicit unknown provider uses "change request". Shared presentation also owns
+explicit unknown provider uses "change request". Until status has answered,
+including after a failed read with no earlier answer, the Git Manager's
+Show/Hide toggle, its provider pane and the dialog use the neutral "change
+request", unless the Pull Requests panel supplied the host to the dialog.
+Shared presentation also owns
 the provider name and number prefix. When the
 host is not identified yet, the dialog says so and names the two ways to
 identify it (open Pull Requests for the project, or Rescan in **Settings →
