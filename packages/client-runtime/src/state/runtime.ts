@@ -11,6 +11,7 @@ import * as SubscriptionRef from "effect/SubscriptionRef";
 import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
 import { RpcClientError } from "effect/unstable/rpc";
 
+import type { SupervisorConnectionState } from "../connection/model.ts";
 import { EnvironmentNotRegisteredError, EnvironmentRegistry } from "../connection/registry.ts";
 import {
   type EnvironmentRpcInput,
@@ -570,23 +571,69 @@ export function forwardEnvironmentQueryRetry<A extends object>(source: object, e
   return exposed;
 }
 
-interface QueryTransportState<E> {
-  /** 0: normal; 1: waiting for a new session; 2: automatic budget exhausted. */
-  cutoffs: number;
-  cutoffGeneration: number | null;
-  lastCutoff: Cause.Cause<E> | null;
-  /** Set while an attempt runs; other evaluations of the request wait for it to end. */
-  attempt: Deferred.Deferred<void> | null;
-  /**
-   * An attempt interrupted while its session still looked live, by generation. The
-   * next evaluation decides: a newer generation means that session ended under it
-   * (the RPC client interrupts a closing session's requests before the supervisor
-   * reports the drop); the same generation means a refresh on the live session.
-   */
-  interrupted: { readonly generation: number; readonly reissue: boolean } | null;
+/**
+ * One attempt of a request: the connection generation it ran on, and whether it was
+ * the one automatic re-issue after a cut-off.
+ */
+interface QueryAttempt {
+  readonly generation: number;
+  readonly reissue: boolean;
 }
 
-/** An attempt interrupted after its own session ended was cut off by that session. */
+/**
+ * A recorded transport cut-off. The first one waits for a newer session, which
+ * re-issues the request once; a failure of that re-issue latches.
+ */
+type QueryCutoff<E> =
+  | {
+      /** Shown until a connection of another generation arrives and re-issues the request. */
+      readonly phase: "awaiting-session";
+      readonly generation: number;
+      readonly cause: Cause.Cause<E>;
+    }
+  | {
+      /** The automatic budget is spent: only an explicit Retry sends the request again. */
+      readonly phase: "latched";
+      readonly cause: Cause.Cause<E>;
+    };
+
+interface QueryTransportState<E> {
+  /** The recorded cut-off, or null while the request has none. */
+  cutoff: QueryCutoff<E> | null;
+  /** Set while an attempt runs; other evaluations of the request wait for it to end. */
+  running: Deferred.Deferred<void> | null;
+  /**
+   * An attempt interrupted while its session still looked live. The next evaluation
+   * decides: a newer generation means that session ended under it (the RPC client
+   * interrupts a closing session's requests before the supervisor reports the drop);
+   * the same generation means a refresh on the live session.
+   */
+  interrupted: QueryAttempt | null;
+}
+
+/** The generation of the supervisor's live session, or null while it is not connected. */
+function connectedGeneration(
+  state: Pick<SupervisorConnectionState, "phase" | "generation">,
+): number | null {
+  return state.phase === "connected" ? state.generation : null;
+}
+
+/**
+ * The one rule for whether an attempt's own session is gone: the live session, if there
+ * is one, has another generation. Query evaluations run only on a connected generation,
+ * so they pass their own.
+ */
+function isAttemptSessionGone(attempt: QueryAttempt, liveGeneration: number | null): boolean {
+  return liveGeneration !== attempt.generation;
+}
+
+/**
+ * The cut-off recorded for an attempt interrupted after its own session ended. It is an
+ * `RpcClientError`, like every other cut-off, because consumers classify a query's
+ * failure by that class and not only through `isQueryTransportCutoff`:
+ * `isRemoteUpdateConnectionFailure` (the server update badge) reads it as a lost
+ * connection rather than as an updater failure.
+ */
 const sessionEndedCutoff = (): Cause.Cause<RpcClientError.RpcClientError> =>
   Cause.fail(
     new RpcClientError.RpcClientError({
@@ -613,45 +660,37 @@ function isTransportCutoff(cause: Cause.Cause<unknown>): boolean {
  */
 function recordQueryOutcome<A, E>(
   state: QueryTransportState<E | RpcClientError.RpcClientError>,
-  generation: number,
+  attempt: QueryAttempt,
   exit: Exit.Exit<A, E>,
   sessionEnded: boolean,
-  reissue: boolean,
 ): void {
   state.interrupted = null;
   if (Exit.isSuccess(exit)) {
-    state.cutoffs = 0;
-    state.cutoffGeneration = null;
-    state.lastCutoff = null;
+    state.cutoff = null;
     return;
   }
   if (Cause.hasInterruptsOnly(exit.cause) && !sessionEnded) {
-    state.interrupted = { generation, reissue };
+    state.interrupted = attempt;
     return;
   }
-  const cutoff: Cause.Cause<E | RpcClientError.RpcClientError> | null = Cause.hasInterruptsOnly(
+  const cause: Cause.Cause<E | RpcClientError.RpcClientError> | null = Cause.hasInterruptsOnly(
     exit.cause,
   )
     ? sessionEndedCutoff()
-    : reissue || isTransportCutoff(exit.cause)
+    : attempt.reissue || isTransportCutoff(exit.cause)
       ? exit.cause
       : null;
-  if (cutoff !== null) recordCutoff(state, generation, cutoff, reissue);
+  if (cause !== null) recordCutoff(state, attempt, cause);
 }
 
 function recordCutoff<E>(
   state: QueryTransportState<E>,
-  generation: number,
-  cutoff: Cause.Cause<E>,
-  reissue: boolean,
+  attempt: QueryAttempt,
+  cause: Cause.Cause<E>,
 ): void {
-  if (reissue) {
-    state.cutoffs = 2;
-  } else {
-    state.cutoffs = 1;
-    state.cutoffGeneration = generation;
-  }
-  state.lastCutoff = cutoff;
+  state.cutoff = attempt.reissue
+    ? { phase: "latched", cause }
+    : { phase: "awaiting-session", generation: attempt.generation, cause };
 }
 
 /** Resolves a pending interrupted attempt against the evaluation's own generation. */
@@ -662,8 +701,8 @@ function settleInterruptedAttempt<E>(
   const interrupted = state.interrupted;
   if (interrupted === null) return;
   state.interrupted = null;
-  if (interrupted.generation !== generation) {
-    recordCutoff(state, interrupted.generation, sessionEndedCutoff(), interrupted.reissue);
+  if (isAttemptSessionGone(interrupted, generation)) {
+    recordCutoff(state, interrupted, sessionEndedCutoff());
   }
 }
 
@@ -682,9 +721,10 @@ export function createEnvironmentQueryAtomFamily<R, ER, Input, A, E>(
           EnvironmentSupervisor.pipe(
             Effect.map((supervisor) =>
               SubscriptionRef.changes(supervisor.state).pipe(
-                Stream.filterMap((state) =>
-                  state.phase === "connected" ? Result.succeed(state.generation) : Result.failVoid,
-                ),
+                Stream.filterMap((state) => {
+                  const generation = connectedGeneration(state);
+                  return generation === null ? Result.failVoid : Result.succeed(generation);
+                }),
                 Stream.changes,
                 Stream.map<number, number | null>((generation) => generation),
               ),
@@ -713,7 +753,7 @@ export function createEnvironmentQueryAtomFamily<R, ER, Input, A, E>(
           AsyncResult.value(get(rpcGenerationAtom(target.environmentId))),
         );
         if (generation === null) return Effect.never;
-        type Attempt = Effect.Effect<
+        type AttemptEffect = Effect.Effect<
           A,
           E | EnvironmentNotRegisteredError | RpcClientError.RpcClientError,
           EnvironmentRegistry | Exclude<EnvironmentSupervisor | R, EnvironmentSupervisor>
@@ -724,22 +764,23 @@ export function createEnvironmentQueryAtomFamily<R, ER, Input, A, E>(
         // is installed before anything can interrupt, so the mark is always cleared.
         // When the request is interrupted, the supervisor tells whether that session
         // is gone: a newer generation, or this generation no longer connected.
-        const attempt = (
+        const runAttempt = (
           transport: QueryTransportState<
             E | EnvironmentNotRegisteredError | RpcClientError.RpcClientError
           >,
           reissue: boolean,
           restore: <AX, EX, RX>(effect: Effect.Effect<AX, EX, RX>) => Effect.Effect<AX, EX, RX>,
-        ): Attempt => {
+        ): AttemptEffect => {
           const done = Deferred.makeUnsafe<void>();
-          transport.attempt = done;
+          transport.running = done;
+          const attempt: QueryAttempt = { generation, reissue };
           let sessionEnded = false;
           const request = options.execute(target.input).pipe(
             Effect.onInterrupt(() =>
               EnvironmentSupervisor.pipe(
                 Effect.flatMap((supervisor) => SubscriptionRef.get(supervisor.state)),
                 Effect.map((state) => {
-                  sessionEnded = state.phase !== "connected" || state.generation !== generation;
+                  sessionEnded = isAttemptSessionGone(attempt, connectedGeneration(state));
                 }),
               ),
             ),
@@ -747,11 +788,11 @@ export function createEnvironmentQueryAtomFamily<R, ER, Input, A, E>(
           return restore(runInEnvironment(target.environmentId, request)).pipe(
             Effect.onExit((exit) =>
               Effect.sync(() => {
-                transport.attempt = null;
+                transport.running = null;
                 // An explicit Retry that cleared this entry mid-flight owns the key now.
                 if (cutoffsByKey.get(cutoffKey) === transport) {
-                  recordQueryOutcome(transport, generation, exit, sessionEnded, reissue);
-                  if (transport.lastCutoff === null && transport.interrupted === null) {
+                  recordQueryOutcome(transport, attempt, exit, sessionEnded);
+                  if (transport.cutoff === null && transport.interrupted === null) {
                     cutoffsByKey.delete(cutoffKey);
                   }
                 }
@@ -762,31 +803,29 @@ export function createEnvironmentQueryAtomFamily<R, ER, Input, A, E>(
         };
         // Only the request and the wait for a running attempt can be interrupted; the
         // check, the decision and the mark are one uninterruptible synchronous step.
-        const evaluate = (): Attempt =>
+        const evaluate = (): AttemptEffect =>
           Effect.uninterruptibleMask((restore) =>
-            Effect.suspend((): Attempt => {
+            Effect.suspend((): AttemptEffect => {
               const stored = cutoffsByKey.get(cutoffKey);
-              if (stored?.attempt) {
+              if (stored?.running) {
                 // One attempt at a time: decide once the running one has recorded its end.
                 // The next decision runs inside `restore`, so its own request stays
                 // interruptible.
-                return restore(Deferred.await(stored.attempt).pipe(Effect.andThen(evaluate)));
+                return restore(Deferred.await(stored.running).pipe(Effect.andThen(evaluate)));
               }
-              if (stored !== undefined) settleInterruptedAttempt(stored, generation);
-              if (stored !== undefined && stored.lastCutoff !== null) {
-                return stored.cutoffs >= 2 || generation === stored.cutoffGeneration
-                  ? Effect.failCause(stored.lastCutoff)
-                  : attempt(stored, true, restore);
+              if (stored !== undefined) {
+                settleInterruptedAttempt(stored, generation);
+                const cutoff = stored.cutoff;
+                if (cutoff !== null) {
+                  // The first cut-off stays on screen until a newer session re-issues it.
+                  return cutoff.phase === "latched" || cutoff.generation === generation
+                    ? Effect.failCause(cutoff.cause)
+                    : runAttempt(stored, true, restore);
+                }
               }
-              const transport = stored ?? {
-                cutoffs: 0,
-                cutoffGeneration: null,
-                lastCutoff: null,
-                attempt: null,
-                interrupted: null,
-              };
+              const transport = stored ?? { cutoff: null, running: null, interrupted: null };
               cutoffsByKey.set(cutoffKey, transport);
-              return attempt(transport, false, restore);
+              return runAttempt(transport, false, restore);
             }),
           );
         return evaluate();
@@ -807,7 +846,7 @@ export function createEnvironmentQueryAtomFamily<R, ER, Input, A, E>(
       retry: () => {
         cutoffsByKey.delete(cutoffKey);
       },
-      awaitingRetry: () => (cutoffsByKey.get(cutoffKey)?.cutoffs ?? 0) >= 2,
+      awaitingRetry: () => cutoffsByKey.get(cutoffKey)?.cutoff?.phase === "latched",
     });
     return exposed;
   });
