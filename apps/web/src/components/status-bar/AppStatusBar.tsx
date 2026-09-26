@@ -96,6 +96,19 @@ function isProviderUsageResetCurrent(
   );
 }
 
+/** Only the user's forced refresh may clear an exhausted cut-off (`refresh`); timers revalidate. */
+function rereadFor<Reread>({
+  force,
+  refresh,
+  revalidate,
+}: {
+  readonly force: boolean;
+  readonly refresh: Reread;
+  readonly revalidate: Reread;
+}): Reread {
+  return force ? refresh : revalidate;
+}
+
 function runStatusBarUsageRefresh(refresh: StatusBarUsageRefresh): void {
   void Promise.resolve(refresh()).catch(() => {
     // Manual refresh already reports through the command layer; background refresh
@@ -333,20 +346,29 @@ export function AppStatusBar() {
   const consumeCodexRateLimitReset = useAtomCommand(serverEnvironment.consumeCodexRateLimitReset, {
     reportFailure: false,
   });
-  // Only the user's forced refresh may clear an exhausted cut-off; timers revalidate.
   const performRefresh = useCallback(
     (force: boolean) =>
       createStatusBarRefreshHandler({
         environmentId,
         refreshProviderUsage,
-        refreshUsageQuery: force ? usage.refresh : usage.revalidate,
-        refreshProcessDiagnostics: force ? diagnostics.refresh : diagnostics.revalidate,
+        refreshUsageQuery: rereadFor({
+          force,
+          refresh: usage.refresh,
+          revalidate: usage.revalidate,
+        }),
+        refreshProcessDiagnostics: rereadFor({
+          force,
+          refresh: diagnostics.refresh,
+          revalidate: diagnostics.revalidate,
+        }),
         refreshLocalProcessDiagnostics:
           primaryLocalEnvironmentId === null
             ? null
-            : force
-              ? localDiagnostics.refresh
-              : localDiagnostics.revalidate,
+            : rereadFor({
+                force,
+                refresh: localDiagnostics.refresh,
+                revalidate: localDiagnostics.revalidate,
+              }),
       })(force),
     [
       diagnostics.refresh,

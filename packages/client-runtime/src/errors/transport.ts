@@ -5,7 +5,7 @@ const TRANSPORT_ERROR_PATTERNS = [
   /Unable to connect to the BiBCode server WebSocket\./i,
   /\bis not connected\.$/i,
   /\bdisconnected\.$/i,
-  /^No data from .+ for 30 seconds\./i,
+  /^No data from .+ for \d+ seconds\./i,
   /\bclosed the connection\.$/i,
   /^The connection to .+ was lost\.$/i,
   /\bcould not establish a WebSocket connection\.$/i,

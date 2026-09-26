@@ -969,6 +969,40 @@ describe("EnvironmentSupervisor", () => {
     }).pipe(Effect.provide(TestClock.layer())),
   );
 
+  it.effect("restarts the backoff ladder after a session stays up for thirty seconds", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness();
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY, {
+        initiallyDesired: true,
+      }).pipe(Effect.provide(harness.dependencies));
+
+      yield* awaitState(supervisor.state, (state) => state.phase === "connected");
+      yield* harness.closeLatestSession();
+      yield* awaitState(
+        supervisor.state,
+        (state) => state.phase === "backoff" && state.attempt === 1,
+      );
+      yield* TestClock.adjust("1 second");
+      yield* awaitState(
+        supervisor.state,
+        (state) => state.phase === "connected" && state.generation === 2,
+      );
+
+      // Stable this time, so the next failure waits the first delay again, not the second.
+      yield* TestClock.adjust("30 seconds");
+      yield* harness.closeLatestSession();
+      const failure = yield* awaitState(supervisor.state, (state) => state.phase === "backoff");
+      expect(failure.retryAt).toBe((yield* Clock.currentTimeMillis) + 1_000);
+
+      yield* TestClock.adjust("1 second");
+      yield* awaitState(
+        supervisor.state,
+        (state) => state.phase === "connected" && state.generation === 3,
+      );
+      expect(yield* Ref.get(harness.sessionCount)).toBe(3);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
   it.effect("does not probe connected sessions for Git Manager focus wakeups", () =>
     Effect.gen(function* () {
       const probes = yield* Ref.make(0);

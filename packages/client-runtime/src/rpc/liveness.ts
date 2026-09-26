@@ -24,6 +24,13 @@ export const DEFAULT_LIVENESS_TIMINGS: LivenessTimings = {
 };
 
 /**
+ * How long a connection may stay silent before the client closes it, before jitter, in
+ * seconds. User copy quotes it.
+ */
+export const LIVENESS_TIMEOUT_SECONDS =
+  (DEFAULT_LIVENESS_TIMINGS.intervalMs * DEFAULT_LIVENESS_TIMINGS.deadAfterIntervals) / 1_000;
+
+/**
  * Proof of life for one WebSocket. The session records every raw inbound
  * message here, including E2EE records before reassembly, so a large message
  * that is still arriving keeps the connection alive.
