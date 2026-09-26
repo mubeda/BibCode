@@ -60,3 +60,34 @@ whole workspace with warnings denied:
 cargo clean -p bibcode-server -p bibcode-desktop -p bibcode-updater-verifier
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+## Web unit tests and the React Compiler
+
+The web client build compiles components and hooks with the React Compiler.
+Whether a web unit test runs compiled code depends on how it runs:
+
+- **Web package (`vp run test`, which CI runs):** `apps/web/vite.config.ts`
+  applies the compiler to Vite's client environment. Files marked
+  `// @vitest-environment happy-dom` run through it exactly as the client build
+  does. Node-environment files run in Vite's `ssr` environment, which the
+  compiler preset skips, so they are uncompiled.
+- **Repository root (`vp test`):** the root configuration runs no React
+  plugins, so no web test is compiled there, and `vp run test:coverage:ts`
+  measures source rather than the compiler's generated memoization code.
+
+Node-environment tests that render mostly use `renderToStaticMarkup`, which
+renders once, so they could not observe a stale memoized read anyway. Those
+that render through `createRoot` on a hand-built happy-dom `Window` or stubbed
+globals are still uncompiled, so they don't count as compiled coverage. A test
+whose assertion depends on re-rendering, such as whether a hook reads state
+again after an update, must render through React DOM in a happy-dom file. It
+can pass from the root and still fail in CI, so verify it through the web
+package: from `apps/web`, run `vp test run --project unit src/<path>.test.tsx`.
+Where a global `vp` may shadow the workspace copy (native Windows, Parallels),
+run `node ../../scripts/run-local-vp.mjs` with the same arguments.
+
+`apps/web/src/reactCompiler.test.tsx` guards the compiled lane. It fails when
+happy-dom files stop running through the compiler, or when the compiler stops
+caching the fixture's read by its arguments, for example after an upgrade of
+`babel-plugin-react-compiler`. The root configuration excludes it, so running
+that file from the root reports that no test files were found.

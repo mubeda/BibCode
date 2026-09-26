@@ -56,6 +56,10 @@ const testExclude = [
   "**/node_modules/**",
   "**/dist/**",
   "**/.{idea,git,cache,output,temp}/**",
+  // The root config runs no React plugins, so this React Compiler guard only passes in
+  // the web package's lane (`vp run test`). See "Web unit tests and the React Compiler"
+  // in docs/testing/README.md.
+  "apps/web/src/reactCompiler.test.tsx",
 ] as const;
 
 export default defineConfig({

@@ -91,6 +91,18 @@ macOS `/tmp`; non-test commands and implicit Cargo targets are unchanged.
 Exact subprocess tests may use `--test-threads=1` only inside an isolated child
 process that intentionally owns process-global state.
 
+The two entry points compile web tests differently. `vp run test` runs each
+package's own configuration; `apps/web`'s applies the React Compiler to Vite's
+client environment, so web tests marked `// @vitest-environment happy-dom` run
+compiled, as in the client build. Node-environment web tests run in Vite's `ssr`
+environment, which the compiler preset skips, so they are uncompiled. Root
+`vp test` uses the root configuration, which runs no React plugins, so no web
+test is compiled there, and `vp run test:coverage:ts` measures source rather
+than the compiler's generated memoization code.
+`apps/web/src/reactCompiler.test.tsx` guards the compiled lane and is excluded
+from root runs; see
+[Web unit tests and the React Compiler](../testing/README.md#web-unit-tests-and-the-react-compiler).
+
 `node scripts/run-local-vp.mjs <vp arguments>` runs the checkout-local Vite+
 installation from `node_modules/vite-plus` with the current Node, ignoring any
 globally installed `vp`. Use it wherever a global `vp` might shadow the
