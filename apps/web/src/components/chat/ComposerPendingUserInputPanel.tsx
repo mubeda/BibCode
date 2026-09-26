@@ -1,5 +1,5 @@
-import { type ApprovalRequestId } from "@bibcode/contracts";
-import { memo, useEffect, useEffectEvent, useRef, useState } from "react";
+import { type ApprovalRequestId, type UserInputQuestion } from "@bibcode/contracts";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { type PendingUserInput } from "../../session-logic";
 import {
   derivePendingUserInputProgress,
@@ -61,6 +61,7 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
   const activeQuestion = progress.activeQuestion;
   const autoAdvanceTimerRef = useRef<number | null>(null);
   const onAdvanceRef = useRef(onAdvance);
+  const onToggleOptionRef = useRef(onToggleOption);
   const [optimisticSingleSelect, setOptimisticSingleSelect] = useState<{
     questionId: string;
     optionLabel: string;
@@ -68,7 +69,8 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
 
   useEffect(() => {
     onAdvanceRef.current = onAdvance;
-  }, [onAdvance]);
+    onToggleOptionRef.current = onToggleOption;
+  }, [onAdvance, onToggleOption]);
 
   useEffect(() => {
     if (!activeQuestion || activeQuestion.multiSelect || !optimisticSingleSelect) {
@@ -100,13 +102,16 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
     };
   }, []);
 
-  const handleOptionSelection = useEffectEvent((questionId: string, optionLabel: string) => {
-    if (activeQuestion?.multiSelect) {
-      onToggleOption(questionId, optionLabel);
+  // Callers pass the question the option belongs to, and the callbacks are read through
+  // refs. (An Effect Event would keep the first render's question and callbacks: react-dom
+  // 19.2 never refreshes Effect Events declared in a memo or forwardRef component.)
+  const selectOption = useCallback((question: UserInputQuestion, optionLabel: string) => {
+    if (question.multiSelect) {
+      onToggleOptionRef.current(question.id, optionLabel);
       return;
     }
-    setOptimisticSingleSelect({ questionId, optionLabel });
-    onToggleOption(questionId, optionLabel);
+    setOptimisticSingleSelect({ questionId: question.id, optionLabel });
+    onToggleOptionRef.current(question.id, optionLabel);
     if (autoAdvanceTimerRef.current !== null) {
       window.clearTimeout(autoAdvanceTimerRef.current);
     }
@@ -114,7 +119,7 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
       autoAdvanceTimerRef.current = null;
       onAdvanceRef.current();
     }, 200);
-  });
+  }, []);
 
   // Keyboard shortcut: number keys 1-9 select corresponding options when focus is
   // outside editable fields. Multi-select prompts toggle options in place; single-
@@ -140,11 +145,11 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
       const option = activeQuestion.options[optionIndex];
       if (!option) return;
       event.preventDefault();
-      handleOptionSelection(activeQuestion.id, option.label);
+      selectOption(activeQuestion, option.label);
     };
     document.addEventListener("keydown", handler);
     return () => document.removeEventListener("keydown", handler);
-  }, [activeQuestion, isResponding]);
+  }, [activeQuestion, isResponding, selectOption]);
 
   if (!activeQuestion) {
     return null;
@@ -155,18 +160,18 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
   return (
     <div className="px-4 py-3 sm:px-5">
       <div className="mb-2 flex items-center gap-3">
-        <span className="text-[11px] font-semibold tracking-widest text-muted-foreground/55 uppercase">
+        <span className="text-xs font-semibold tracking-widest text-muted-foreground uppercase">
           {activeQuestion.header}
         </span>
         {prompt.questions.length > 1 ? (
-          <span className="flex h-5 items-center rounded-md bg-muted/60 px-1.5 text-[10px] font-medium tabular-nums text-muted-foreground/60">
+          <span className="flex h-5 items-center rounded-md bg-muted/60 px-1.5 text-xs font-medium tabular-nums text-muted-foreground">
             {questionIndex + 1}/{prompt.questions.length}
           </span>
         ) : null}
       </div>
       <p className="text-sm text-foreground/90">{activeQuestion.question}</p>
       {activeQuestion.multiSelect ? (
-        <p className="mt-1 text-xs text-muted-foreground/65">Select one or more options.</p>
+        <p className="mt-1 text-xs text-muted-foreground">Select one or more options.</p>
       ) : null}
       <div className="mt-3 space-y-1.5">
         {activeQuestion.options.map((option, index) => {
@@ -190,7 +195,7 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
               <div className="min-w-0 flex-1 flex flex-col gap-0.5">
                 <span className="text-sm font-medium">{option.label}</span>
                 {option.description && option.description !== option.label ? (
-                  <span className="text-xs text-muted-foreground/50">{option.description}</span>
+                  <span className="text-xs text-muted-foreground">{option.description}</span>
                 ) : null}
               </div>
               {isSelected ? (
@@ -198,8 +203,8 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
               ) : shortcutKey !== null ? (
                 <kbd
                   className={cn(
-                    "flex size-5 shrink-0 items-center justify-center rounded border border-border/50 text-[11px] font-medium tabular-nums transition-colors duration-150",
-                    "bg-background/35 text-muted-foreground/70 group-hover:border-border/70 group-hover:text-muted-foreground",
+                    "flex size-5 shrink-0 items-center justify-center rounded border border-border/50 text-xs font-medium tabular-nums transition-colors duration-150",
+                    "bg-background/35 text-muted-foreground group-hover:border-border/70",
                   )}
                 >
                   {shortcutKey}
@@ -213,7 +218,7 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
               type="button"
               disabled={isResponding}
               onClick={() => {
-                handleOptionSelection(activeQuestion.id, option.label);
+                selectOption(activeQuestion, option.label);
               }}
               className={className}
             >
