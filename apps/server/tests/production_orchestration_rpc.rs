@@ -1649,7 +1649,7 @@ async fn orchestration_lifecycle_and_query_rpcs_round_trip_real_state() {
             &mut socket,
             "16",
             "orchestration.replayEvents",
-            json!({ "fromSequenceExclusive": -100 }),
+            json!({ "fromSequenceExclusive": 0 }),
         )
         .await;
         let replay_all = replay_all.as_array().expect("events");
@@ -1871,6 +1871,32 @@ async fn shell_and_thread_streams_refresh_on_relevant_events_and_interrupt_clean
             .close(None)
             .await
             .expect("close command socket");
+    })
+    .catch_unwind()
+    .await;
+    finish_test(harness, outcome).await;
+}
+
+#[tokio::test]
+async fn negative_replay_sequence_is_rejected_instead_of_replaying_from_the_start() {
+    let harness = harness().await;
+    let outcome = AssertUnwindSafe(async {
+        let mut socket = harness.connect().await;
+
+        // The contract declares `fromSequenceExclusive` a non-negative integer.
+        rpc_request(
+            &mut socket,
+            "1",
+            "orchestration.replayEvents",
+            json!({ "fromSequenceExclusive": -1 }),
+        )
+        .await;
+        let replay_error = expect_failure(&mut socket, "1").await;
+        assert_invalid_request(
+            &replay_error,
+            "orchestration.replayEvents",
+            "fromSequenceExclusive must be a non-negative integer",
+        );
     })
     .catch_unwind()
     .await;

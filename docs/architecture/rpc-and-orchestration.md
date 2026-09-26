@@ -1506,6 +1506,8 @@ depending on connection-local push caches. `subscribeThread` and
 `subscribeShell` register their durable-event receiver before reading the
 initial snapshot, so a commit concurrent with that read is queued and then
 projected instead of being lost between snapshot and live delivery.
+`orchestration.replayEvents` refuses a negative `fromSequenceExclusive` with
+`InvalidRequest`, as the contract's non-negative integer requires.
 
 The `subscribeShell` thread-shell contract has an additive optional
 `conversationPreview` field with `prompt`, `tool`, and `assistantMessage`
