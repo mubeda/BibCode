@@ -38,7 +38,11 @@ import { vcsEnvironment } from "../../state/vcs";
 import { worktreeEnvironment } from "../../state/worktrees";
 import { Button } from "../ui/button";
 import { Tabs, TabsList, TabsPanel, TabsTab } from "../ui/tabs";
-import { resolveGitManagerDefaultTab } from "./gitManagerDefaultTab";
+import {
+  resolveGitManagerTabTransition,
+  resolveGitManagerWorkingTree,
+  type GitManagerTabTransitionInputs,
+} from "./gitManagerTabTransition";
 import { GitManagerInProgressStrip } from "./GitManagerInProgressStrip";
 import {
   GitManagerBranchDialogs,
@@ -326,16 +330,29 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
   const continueBlocked =
     repositoryBlockedReasons.find((reason) => reason.operation === "continue") ?? null;
   const inProgressOperation = snapshot?.inProgressOperation ?? null;
-  const defaultTab = resolveGitManagerDefaultTab(
-    inProgressOperation,
-    statusQuery.data?.hasWorkingTreeChanges,
-    activeTab,
-  );
-  // A clean transition after commit, discard, or recovery moves to History. A
-  // merge still owns Changes; otherwise manual tab picks remain untouched.
+  const mergePending = inProgressOperation?.kind === "merge";
+  const workingTree = resolveGitManagerWorkingTree(statusQuery.data);
+  // The tab moves only on a transition of these inputs (see resolveGitManagerTabTransition):
+  // a checkout that becomes clean moves to History, and a merge that appears moves to
+  // Changes. Another project or checkout starts a new baseline, like opening the panel. The
+  // selected tab is read from the store when a transition happens instead of being a
+  // dependency, so a manual pick never triggers a move; a Git failure and its recovery never
+  // move it either. (useEffectEvent would do, but react-dom 19.2 never refreshes an Effect
+  // Event declared in a memo component, so it would read a stale tab.)
+  const tabTransitionBaselineRef = useRef<{
+    readonly checkout: string;
+    readonly inputs: GitManagerTabTransitionInputs;
+  } | null>(null);
   useEffect(() => {
-    if (defaultTab !== null) onTabChange(defaultTab);
-  }, [defaultTab, onTabChange]);
+    const checkout = `${storeKey}\u0000${cwd}`;
+    const next = { mergePending, workingTree };
+    const baseline = tabTransitionBaselineRef.current;
+    const previous = baseline?.checkout === checkout ? baseline.inputs : null;
+    tabTransitionBaselineRef.current = { checkout, inputs: next };
+    const currentTab = useGitManagerStore.getState().selectViewState(projectRef).activeTab;
+    const tab = resolveGitManagerTabTransition(previous, next, currentTab);
+    if (tab !== null && tab !== currentTab) onTabChange(tab);
+  }, [cwd, mergePending, onTabChange, projectRef, storeKey, workingTree]);
   const resumableOperation = asResumableOperation(inProgressOperation);
   const resumableOperationDisabledReason =
     resumableOperation?.kind === "merge" ? stashMergeDisabledReason : rewriteDisabledReason;

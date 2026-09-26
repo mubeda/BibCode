@@ -71,6 +71,12 @@ const FILTER_NAMES: ReadonlyArray<keyof ChangeFilters> = Object.freeze([
 ]);
 const isEnvironmentRpcUnavailableError = Schema.is(EnvironmentRpcUnavailableError);
 const isGitManagerOperationError = Schema.is(GitManagerOperationError);
+// The status reports both a folder that is no repository and a repository Git cannot read
+// (a broken HEAD or config) as isRepo false, so the copy offers the way out of each. No
+// visible control initializes a repository (the Git Manager performs no repository
+// lifecycle), so it names git init.
+const REPOSITORY_UNREADABLE_MESSAGE =
+  "Git can't read this folder as a repository. Run git init to create one, or check its .git folder if it already is one.";
 
 interface PendingDiscard {
   readonly paths: ReadonlyArray<string>;
@@ -228,6 +234,18 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
     reportFailure: false,
   });
   const refreshStatus = useAtomCommand(vcsEnvironment.refreshStatus, { reportFailure: false });
+  // Retry while Git cannot read the repository: the server reads the status again and
+  // publishes a changed result to the status stream this view shows. Busy covers that read,
+  // and only for the checkout it reads.
+  const checkoutKey = `${environmentId}\u0000${cwd}`;
+  const [rereadingCheckout, setRereadingCheckout] = useState<string | null>(null);
+  const statusRereading = rereadingCheckout === checkoutKey;
+  const rereadStatus = useCallback(() => {
+    setRereadingCheckout(checkoutKey);
+    void refreshStatus({ environmentId, input: { cwd } }).finally(() =>
+      setRereadingCheckout((current) => (current === checkoutKey ? null : current)),
+    );
+  }, [checkoutKey, cwd, environmentId, refreshStatus]);
   const stageFiles = useAtomCommand(vcsEnvironment.stageFiles, { reportFailure: false });
   const unstageFiles = useAtomCommand(vcsEnvironment.unstageFiles, { reportFailure: false });
   const commit = useAtomCommand(gitManagerEnvironment.commit, { reportFailure: false });
@@ -541,6 +559,15 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
 
   const statusUnavailable = isEnvironmentUnavailable(statusQuery.emission);
   const refsUnavailable = isEnvironmentUnavailable(refsQuery.emission);
+  // A healthy status stream reports a folder Git cannot read as a repository (a broken
+  // HEAD or config, or no repository at all) as isRepo false with no files. Say so rather
+  // than "No local changes"; a refs failure at the same time is only its consequence.
+  if (statusQuery.error === null && statusQuery.data?.isRepo === false && !refsUnavailable) {
+    return errorPanel("Could not load changes", REPOSITORY_UNREADABLE_MESSAGE, {
+      retrying: statusRereading,
+      onRetry: rereadStatus,
+    });
+  }
   if (statusQuery.error !== null || refsQuery.error !== null) {
     const message = statusQuery.error ?? refsQuery.error ?? "The environment request failed.";
     // Retry reads again only what failed, through the explicit refresh that clears a cut-off.

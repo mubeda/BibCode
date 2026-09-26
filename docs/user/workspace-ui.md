@@ -440,13 +440,21 @@ The toolbar has three segments:
    repository usable; ahead/behind remain unknown at zero until Fetch obtains
    that ref instead of making the complete Git Manager unavailable.
 
-The manager opens on **History**. When a checkout with pending changes becomes
-clean after a commit, discard, or recovery, it returns to History. Dirty or
-still-loading checkouts preserve the tab the user chose, and so does the
-**Tags** tab, which is unrelated to the working tree. An in-progress merge
-always selects **Changes**, since that merge is finished there, and returns to
-History once the merge is committed or aborted; the tab is not remembered
-between openings.
+The manager keeps the chosen tab for the session but does not save it, so it
+opens on **History** after a reload. Opening it, or switching to another
+worktree, selects History for a clean checkout and **Changes** while a merge is
+pending; otherwise the chosen tab stays. The manager also returns to History
+when a checkout with pending changes becomes clean, for example after a commit
+or discard, and selects Changes when a merge starts, since the merge is
+finished there. A clean checkout never pulls the user off the **Tags** tab,
+which is unrelated to the working tree. A repository Git cannot read (for
+example a broken `.git/HEAD` or `.git/config`) is not a clean checkout: the
+chosen tab stays while Git fails and after the repository is repaired.
+Meanwhile **Changes** explains that Git can't read the folder as a repository
+and suggests `git init`, or checking the `.git` folder of an existing
+repository, instead of listing no changes; its **Retry** asks the server to
+read the status again, and the changes load again as soon as Git can read the
+repository.
 
 The **Tags** tab lists local tags newest first, then one collapsible section
 per remote with the tags that remote currently advertises, queried with
