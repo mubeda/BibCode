@@ -1244,7 +1244,10 @@ With the browser's network panel on the RPC WebSocket:
    commit's diff in Git Manager History. The transfer takes about a minute and
    must finish without a disconnect. The socket must show
    `Sec-WebSocket-Protocol: bibcode.rpc.chunked.v1`, and the large response must
-   arrive as binary frames.
+   arrive as binary frames. About 15 seconds in, the status bar shows a warning
+   such as **1 slow request**; clicking it lists `gitManager.getDiff` with its
+   start time. No toast covers the panel, and the warning clears when the
+   transfer finishes.
 2. Repeat at `down=262144&up=262144`.
 3. With the page idle, `curl "http://127.0.0.1:13855/set?freeze=1"`. Within 33
    seconds the socket closes with code 4408, and Git Manager shows "Reconnecting

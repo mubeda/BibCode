@@ -256,6 +256,7 @@ vi.mock("../components/CommandPalette", () => ({
 
 vi.mock("../components/status-bar/AppStatusBar", () => ({
   AppStatusBar: () => <div data-mock="app-status-bar" />,
+  SlowRequestsStatusBar: () => <div data-mock="slow-requests-status-bar" />,
 }));
 
 vi.mock("../components/cloud/RelayClientInstallDialog", () => ({
@@ -264,10 +265,6 @@ vi.mock("../components/cloud/RelayClientInstallDialog", () => ({
 
 vi.mock("../components/ProviderUpdateLaunchNotification", () => ({
   ProviderUpdateLaunchNotification: () => <div data-mock="provider-update" />,
-}));
-
-vi.mock("../components/SlowRpcRequestToastCoordinator", () => ({
-  SlowRpcRequestToastCoordinator: () => <div data-mock="slow-rpc" />,
 }));
 
 import { Route } from "./__root";
@@ -494,6 +491,7 @@ describe("RootRouteView", () => {
     expect(markup).toContain('data-mock="command-palette"');
     expect(markup).toContain('data-mock="sidebar-layout"');
     expect(markup).toContain('data-mock="app-status-bar"');
+    expect(markup).not.toContain('data-mock="slow-requests-status-bar"');
     expect(markup).toContain('data-mock="relay-install"');
     expect(markup).toContain('data-mock="provider-update"');
     runEffects();
@@ -540,6 +538,9 @@ describe("RootRouteView", () => {
     s.routeContext = { authGateState: { status: "hosted-static" } };
     const markup = renderComponent();
     expect(markup).toContain('data-mock="sidebar-layout"');
+    // No primary environment, so no full status bar; slow requests still get a bar.
+    expect(markup).not.toContain('data-mock="app-status-bar"');
+    expect(markup).toContain('data-mock="slow-requests-status-bar"');
     // Provider updates only mount for the authenticated primary.
     expect(markup).not.toContain('data-mock="provider-update"');
     runEffects();
