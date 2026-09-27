@@ -3627,20 +3627,57 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn post_admission_retirement_waits_for_lifecycle_task_insertion() {
+        struct GatedRemoteGitRunner {
+            inner: EpochGitRunner,
+            release_remote: Arc<Semaphore>,
+        }
+
+        impl GitProcessRunner for GatedRemoteGitRunner {
+            fn run<'a>(
+                &'a self,
+                request: ProcessRequest,
+                cancellation: &'a CancellationToken,
+            ) -> BoxGitProcessFuture<'a> {
+                Box::pin(async move {
+                    if request.operation == "GitVcsDriver.statusDetailsRemote.status" {
+                        tokio::select! {
+                            biased;
+                            () = cancellation.cancelled() => {
+                                return Err(ProcessError::Cancelled {
+                                    operation: request.operation,
+                                });
+                            }
+                            permit = self.release_remote.acquire() => {
+                                permit.expect("remote publication gate remains open").forget();
+                            }
+                        }
+                    }
+                    self.inner.run(request, cancellation).await
+                })
+            }
+        }
+
         let sandbox = TestSandbox::new("git-broadcaster-post-admission-retirement");
         let cwd = sandbox.path("repository");
         fs::create_dir_all(&cwd).expect("repository fixture");
         let cwd = fs::canonicalize(cwd).expect("canonical repository fixture");
         let (ref_started, _) = mpsc::unbounded_channel();
         let (remote_started, _) = mpsc::unbounded_channel();
-        let runner = Arc::new(EpochGitRunner {
-            branch: Mutex::new("main".to_owned()),
-            ref_calls: AtomicUsize::new(0),
-            remote_calls: AtomicUsize::new(0),
-            ref_started,
-            remote_started,
-            release_ref: Arc::new(Semaphore::new(16)),
-            release_remote: Arc::new(Semaphore::new(16)),
+        // Only the explicit publication below should backpressure this one-slot
+        // stream. Hold remote updates until the replacement consumes its snapshot;
+        // cancellation lets the retired lifecycle settle without a gate permit.
+        let release_remote = Arc::new(Semaphore::new(0));
+        let runner = Arc::new(GatedRemoteGitRunner {
+            inner: EpochGitRunner {
+                branch: Mutex::new("main".to_owned()),
+                ref_calls: AtomicUsize::new(0),
+                remote_calls: AtomicUsize::new(0),
+                ref_started,
+                remote_started,
+                release_ref: Arc::new(Semaphore::new(16)),
+                release_remote: Arc::new(Semaphore::new(16)),
+            },
+            release_remote: Arc::clone(&release_remote),
         });
         let broadcaster = StatusBroadcaster::new(
             Arc::new(GitRepository::with_runner_for_test(runner)),
@@ -3716,6 +3753,13 @@ mod tests {
         assert!(matches!(
             reattached.recv().await,
             Some(VcsStatusStreamEvent::Snapshot { .. })
+        ));
+        release_remote.add_permits(1);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), reattached.recv())
+                .await
+                .expect("remote update follows the consumed snapshot"),
+            Some(VcsStatusStreamEvent::RemoteUpdated { .. })
         ));
         drop(reattached);
         broadcaster.shutdown().await;
