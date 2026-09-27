@@ -8,7 +8,8 @@
 //! after 10 s without inbound data, and the link is declared dead after 30 s.
 //!
 //! The transfer matrix takes about two minutes (8 MiB at 64 KiB/s is 128 s);
-//! all trials run concurrently against one server.
+//! all matrix trials run concurrently against one server. The config snapshot
+//! trial takes about 32 s (256 KiB at 8 KiB/s), with both framings concurrent.
 
 use std::{
     net::SocketAddr,
@@ -355,14 +356,15 @@ fn reassemble(framing: &mut Framing, partial: &mut Assembly, frame: Message) -> 
     }
 }
 
-/// Reads until the Exit for `request_id`, applying the item-1 client rule.
-async fn wait_for_exit(
+/// Reads until `response_tag` or a terminal Exit for `request_id`, applying
+/// the item-1 client rule to each inbound data frame before reassembly.
+async fn wait_for_response(
     socket: &mut TestSocket,
     framing: &mut Framing,
     started: Instant,
     request_id: &str,
-    expected_bytes: usize,
-) -> Outcome {
+    response_tag: &str,
+) -> Result<(Duration, Value), Outcome> {
     let mut last_inbound = Instant::now();
     let mut pinged = false;
     let mut partial = Assembly::default();
@@ -377,7 +379,7 @@ async fn wait_for_exit(
                         reason: "liveness timeout".into(),
                     };
                     let _ = timeout(Duration::from_secs(1), socket.close(Some(close))).await;
-                    return Outcome::Dead(started.elapsed());
+                    return Err(Outcome::Dead(started.elapsed()));
                 }
                 send_text(socket, framing, r#"{"_tag":"Ping"}"#).await;
                 pinged = true;
@@ -385,10 +387,10 @@ async fn wait_for_exit(
             }
         };
         let Some(Ok(frame)) = frame else {
-            return Outcome::Closed(started.elapsed());
+            return Err(Outcome::Closed(started.elapsed()));
         };
         if matches!(frame, Message::Close(_)) {
-            return Outcome::Closed(started.elapsed());
+            return Err(Outcome::Closed(started.elapsed()));
         }
         if matches!(&frame, Message::Text(_) | Message::Binary(_)) {
             last_inbound = Instant::now();
@@ -400,7 +402,24 @@ async fn wait_for_exit(
         let Ok(value) = serde_json::from_slice::<Value>(&message) else {
             continue;
         };
-        if value["_tag"] == "Exit" && value["requestId"] == request_id {
+        if value["requestId"] == request_id
+            && (value["_tag"] == response_tag || value["_tag"] == "Exit")
+        {
+            return Ok((started.elapsed(), value));
+        }
+    }
+}
+
+/// Reads until the Exit for `request_id`, applying the item-1 client rule.
+async fn wait_for_exit(
+    socket: &mut TestSocket,
+    framing: &mut Framing,
+    started: Instant,
+    request_id: &str,
+    expected_bytes: usize,
+) -> Outcome {
+    match wait_for_response(socket, framing, started, request_id, "Exit").await {
+        Ok((after, value)) => {
             assert_eq!(
                 value["exit"]["_tag"], "Success",
                 "matching Exit must succeed: {value}"
@@ -413,8 +432,9 @@ async fn wait_for_exit(
                 data.bytes().all(|byte| byte == b'x'),
                 "exact fixture payload content"
             );
-            return Outcome::Completed(started.elapsed());
+            Outcome::Completed(after)
         }
+        Err(outcome) => outcome,
     }
 }
 
@@ -559,6 +579,126 @@ async fn slow_links_finish_transfers_without_a_disconnect() {
     );
     handle.shutdown();
     handle.join().await.expect("server joins");
+}
+
+// Exactly 256 KiB of snapshot JSON, above the design's 250 KB minimum.
+const CONFIG_SNAPSHOT_BYTES: usize = 256 * 1024;
+// Phase 1's supported slow-link target, half the server's writer rate floor.
+const CONFIG_SNAPSHOT_RATE: u64 = 8 * KIB;
+// Mirrors rpc/transport.rs's whole-message base allowance.
+const WRITER_BASE_ALLOWANCE_SECONDS: u64 = 30;
+// Mirrors rpc/transport.rs's whole-message size allowance at 16 KiB/s.
+const WRITER_FLOOR_BYTES_PER_SECOND: u64 = 16 * KIB;
+// 30 s + 256 KiB / 16 KiB/s = 46 s (conservatively omitting the RPC envelope).
+const CONFIG_SNAPSHOT_WRITER_DEADLINE: Duration = Duration::from_secs(
+    WRITER_BASE_ALLOWANCE_SECONDS + CONFIG_SNAPSHOT_BYTES as u64 / WRITER_FLOOR_BYTES_PER_SECOND,
+);
+
+/// Pins the 8 KiB/s establishment floor for current record-framed clients in
+/// docs/superpowers/specs/2026-09-26-slow-link-establishment-design.md, Phase 1
+/// "Test and live-validation plan": the first snapshot beats the writer deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_link_receives_a_full_config_snapshot_before_the_writer_deadline() {
+    let temp = TempDir::new().expect("temporary base directory");
+    let mut snapshot = json!({ "version": 1, "type": "snapshot", "config": { "padding": "" } });
+    let padding_bytes =
+        CONFIG_SNAPSHOT_BYTES - serde_json::to_vec(&snapshot).expect("snapshot JSON").len();
+    snapshot["config"]["padding"] = Value::String("x".repeat(padding_bytes));
+    let handle = start_server_with(&temp, move |registry| {
+        registry.register_stream("fixture.configSnapshot", move |_, cancellation| {
+            let (sender, receiver) = tokio::sync::mpsc::channel(1);
+            let snapshot = snapshot.clone();
+            tokio::spawn(async move {
+                if sender.send(Ok(vec![snapshot])).await.is_ok() {
+                    cancellation.cancelled().await;
+                }
+                // Keep the stream open after its one snapshot, until interrupted.
+                drop(sender);
+            });
+            receiver
+        });
+    })
+    .await;
+    let host_key = host_public_key(temp.path());
+    let server = handle.local_addr();
+    // PlainLegacy shows no progress for about 32 s, beyond client liveness:
+    // the design's pre-liveness-server floor is about 7.6–9.2 KiB/s.
+    let trials = [Mode::PlainSplit, Mode::Encrypted].map(|mode| {
+        let host_key = &host_key;
+        async move {
+            let label = format!("{mode:?} config snapshot at {CONFIG_SNAPSHOT_RATE} B/s");
+            within_trial_deadline(&label, async {
+                let proxy = ThrottleProxy::start(server, CONFIG_SNAPSHOT_RATE).await;
+                let (mut socket, mut framing) = open(mode, proxy.address, host_key).await;
+                let started = Instant::now();
+                send_text(
+                    &mut socket,
+                    &mut framing,
+                    &json!({
+                        "_tag": "Request", "id": "1", "tag": "fixture.configSnapshot",
+                        "payload": {}, "headers": [],
+                    })
+                    .to_string(),
+                )
+                .await;
+                let outcome =
+                    wait_for_response(&mut socket, &mut framing, started, "1", "Chunk").await;
+                if outcome.is_ok() {
+                    send_text(
+                        &mut socket,
+                        &mut framing,
+                        r#"{"_tag":"Interrupt","requestId":"1"}"#,
+                    )
+                    .await;
+                }
+                let _ = socket.close(None).await;
+                (mode, outcome)
+            })
+            .await
+        }
+    });
+    let outcomes = join_all(trials).await;
+    handle.shutdown();
+    handle.join().await.expect("server joins");
+
+    let minimum_transfer =
+        Duration::from_secs_f64(0.9 * CONFIG_SNAPSHOT_BYTES as f64 / CONFIG_SNAPSHOT_RATE as f64);
+    for (mode, outcome) in outcomes {
+        let (after, chunk) = outcome.unwrap_or_else(|outcome| {
+            panic!("{mode:?}: config snapshot ended before its first Chunk: {outcome:?}")
+        });
+        assert_eq!(
+            chunk["_tag"], "Chunk",
+            "{mode:?}: expected a snapshot Chunk, not a terminal Exit"
+        );
+        let values = chunk["values"].as_array().expect("stream values");
+        assert_eq!(values.len(), 1, "{mode:?}: exactly one snapshot");
+        let snapshot = &values[0];
+        assert_eq!(snapshot["version"], 1, "{mode:?}: snapshot version");
+        assert_eq!(snapshot["type"], "snapshot", "{mode:?}: snapshot type");
+        assert_eq!(
+            serde_json::to_vec(snapshot).expect("snapshot JSON").len(),
+            CONFIG_SNAPSHOT_BYTES,
+            "{mode:?}: exact padded snapshot size"
+        );
+        let padding = snapshot["config"]["padding"]
+            .as_str()
+            .expect("snapshot padding");
+        assert_eq!(padding.len(), padding_bytes, "{mode:?}: full padding");
+        assert!(
+            padding.bytes().all(|byte| byte == b'x'),
+            "{mode:?}: exact snapshot padding content"
+        );
+        assert!(
+            after >= minimum_transfer,
+            "{mode:?}: throttle did not hold: snapshot arrived in {after:?}, expected at least {minimum_transfer:?}"
+        );
+        assert!(
+            after < CONFIG_SNAPSHOT_WRITER_DEADLINE,
+            "{mode:?}: snapshot took {after:?}, exceeding the writer's {CONFIG_SNAPSHOT_WRITER_DEADLINE:?} message deadline at {CONFIG_SNAPSHOT_RATE} B/s"
+        );
+        eprintln!("{mode:?}: {CONFIG_SNAPSHOT_BYTES}-byte config snapshot arrived in {after:?}");
+    }
 }
 
 /// At 1 MiB/s a 64 KiB record nominally drains in about 62 ms, under the server's
