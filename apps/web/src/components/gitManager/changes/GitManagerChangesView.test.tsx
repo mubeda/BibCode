@@ -374,7 +374,9 @@ describe("GitManagerChangesView", () => {
     expect(container.textContent).toContain("Environment unavailable");
     expect(container.textContent).toContain("Remote environment is not connected.");
     // The read resumes by itself when the connection is back; Retry could not reach it.
-    expect(buttonWithText("Waiting for the connection…").disabled).toBe(true);
+    expect(buttonWithText("Waiting for the connection…").getAttribute("aria-disabled")).toBe(
+      "true",
+    );
     expect(container.textContent).not.toContain("Retry");
   });
 
@@ -421,7 +423,7 @@ describe("GitManagerChangesView", () => {
     await renderView();
 
     expect(container.textContent).toContain("Could not load changes");
-    expect(buttonWithText("Retrying…").disabled).toBe(true);
+    expect(buttonWithText("Retrying…").getAttribute("aria-disabled")).toBe("true");
   });
 
   it("explains a repository Git cannot read instead of showing no changes", async () => {
@@ -457,7 +459,7 @@ describe("GitManagerChangesView", () => {
       environmentId: "environment-1",
       input: { cwd: "/repo/main" },
     });
-    expect(buttonWithText("Retrying…").disabled).toBe(true);
+    expect(buttonWithText("Retrying…").getAttribute("aria-disabled")).toBe("true");
     // The status stream itself is healthy, and the refs keep their last good answer.
     expect(h.refreshStatusQuery).not.toHaveBeenCalled();
     expect(h.refreshRefs).not.toHaveBeenCalled();
@@ -480,7 +482,7 @@ describe("GitManagerChangesView", () => {
     );
     await renderView("/repo/main");
     await act(async () => buttonWithText("Retry").click());
-    expect(buttonWithText("Retrying…").disabled).toBe(true);
+    expect(buttonWithText("Retrying…").getAttribute("aria-disabled")).toBe("true");
 
     await renderView("/repo/other");
     expect(buttonWithText("Retry").disabled).toBe(false);
@@ -516,7 +518,9 @@ describe("GitManagerChangesView", () => {
 
     expect(container.textContent).toContain("Environment unavailable");
     expect(container.textContent).not.toContain("Git can't read this folder as a repository.");
-    expect(buttonWithText("Waiting for the connection…").disabled).toBe(true);
+    expect(buttonWithText("Waiting for the connection…").getAttribute("aria-disabled")).toBe(
+      "true",
+    );
   });
 
   it("shows the changes again once Git can read the repository", async () => {

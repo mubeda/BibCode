@@ -471,8 +471,9 @@ cut-off, or an attempt interrupted by its closing session, shows the
 connection-dropped copy, an error with a non-blank message shows that message, and
 anything else shows the view's own fallback.
 The file browser, Git Manager's Changes view and History offer **Retry**, bound
-to `refresh`, with any failed load they show in place of their content. Retry is
-disabled while a read runs (**Retrying…**, or History's loading state) and, in
+to `refresh`, with any failed load they show in place of their content. Retry
+ignores activation but stays focusable (`aria-disabled`) to preserve keyboard
+focus while a read runs (**Retrying…**, or History's loading state) and, in
 the file browser while the environment is not connected and in Changes when a
 read found no session (**Waiting for the connection…**), because those views
 read again by themselves once the connection is back. The file preview, the diff panes, the stash list, commit detail
