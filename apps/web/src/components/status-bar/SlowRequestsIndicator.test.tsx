@@ -16,16 +16,42 @@ import { formatTimestamp } from "../../timestampFormat";
 import { AppStatusBarView, SlowRequestsStatusBar } from "./AppStatusBar";
 import { SlowRequestsIndicator } from "./SlowRequestsIndicator";
 
-// Counts renders of the indicator: it reads the slow-request list once per render.
-const subscription = vi.hoisted(() => ({ renders: 0 }));
+// Each latency-hook consumer gets its own counter, including the hosted bar and indicator shell.
+const subscription = vi.hoisted(() => ({ readers: new Map<string, { renders: number }>() }));
+const environmentState = vi.hoisted(() => ({
+  environments: [] as Array<{ environmentId: string; label: string }>,
+  reads: 0,
+}));
+
+vi.mock("../../state/environments", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../state/environments")>()),
+  useEnvironments: () => {
+    environmentState.reads += 1;
+    return { environments: environmentState.environments };
+  },
+}));
 
 vi.mock("../../rpc/requestLatencyState", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../rpc/requestLatencyState")>();
+  const { useId } = await import("react");
+  function useRenderCounter() {
+    const id = useId();
+    let counter = subscription.readers.get(id);
+    if (counter === undefined) {
+      counter = { renders: 0 };
+      subscription.readers.set(id, counter);
+    }
+    counter.renders += 1;
+  }
   return {
     ...actual,
     useSlowRpcAckRequests: () => {
-      subscription.renders += 1;
+      useRenderCounter();
       return actual.useSlowRpcAckRequests();
+    },
+    useHasSlowRpcAckRequests: () => {
+      useRenderCounter();
+      return actual.useHasSlowRpcAckRequests();
     },
   };
 });
@@ -77,7 +103,8 @@ function statusBarView(
 function sendUnansweredRequests(
   requests: ReadonlyArray<{
     readonly id: string;
-    readonly tag: string;
+    readonly method: string;
+    readonly environmentId: string;
     readonly startedAt: string;
   }>,
 ): void {
@@ -85,7 +112,10 @@ function sendUnansweredRequests(
   try {
     for (const request of requests) {
       vi.setSystemTime(new Date(request.startedAt));
-      trackRpcRequestSent(request.id, request.tag);
+      trackRpcRequestSent(request.id, {
+        method: request.method,
+        environmentId: request.environmentId,
+      });
     }
     act(() => {
       vi.advanceTimersByTime(SLOW_RPC_ACK_THRESHOLD_MS);
@@ -119,7 +149,12 @@ async function nextFrames(): Promise<void> {
 
 function oneSlowRequest(): void {
   sendUnansweredRequests([
-    { id: "one", tag: "projects.listEntries · primary", startedAt: FIRST_STARTED_AT },
+    {
+      id: "one",
+      method: "projects.listEntries",
+      environmentId: "primary",
+      startedAt: FIRST_STARTED_AT,
+    },
   ]);
 }
 
@@ -185,6 +220,12 @@ async function pressEscape(target: Element): Promise<void> {
 beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   resetRequestLatencyStateForTests();
+  subscription.readers.clear();
+  environmentState.environments = [
+    { environmentId: "primary", label: "Local" },
+    { environmentId: "remote-1", label: "Luna" },
+  ];
+  environmentState.reads = 0;
 });
 
 afterEach(async () => {
@@ -194,6 +235,7 @@ afterEach(async () => {
   }
   resetRequestLatencyStateForTests();
   vi.useRealTimers();
+  vi.restoreAllMocks();
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
 });
 
@@ -204,7 +246,7 @@ describe("SlowRequestsIndicator", () => {
 
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     try {
-      trackRpcRequestSent("pending", "git.status · primary");
+      trackRpcRequestSent("pending", { method: "git.status", environmentId: "primary" });
       act(() => {
         vi.advanceTimersByTime(SLOW_RPC_ACK_THRESHOLD_MS - 1);
       });
@@ -220,7 +262,12 @@ describe("SlowRequestsIndicator", () => {
     const container = await render(<SlowRequestsIndicator />);
 
     sendUnansweredRequests([
-      { id: "one", tag: "projects.listEntries · primary", startedAt: FIRST_STARTED_AT },
+      {
+        id: "one",
+        method: "projects.listEntries",
+        environmentId: "primary",
+        startedAt: FIRST_STARTED_AT,
+      },
     ]);
     const trigger = requireIndicator(container);
     expect(trigger.tagName).toBe("BUTTON");
@@ -228,19 +275,26 @@ describe("SlowRequestsIndicator", () => {
     expect(trigger.textContent).toBe("1 slow request");
 
     sendUnansweredRequests([
-      { id: "two", tag: "git.status · primary", startedAt: SECOND_STARTED_AT },
+      { id: "two", method: "git.status", environmentId: "primary", startedAt: SECOND_STARTED_AT },
     ]);
     expect(requireIndicator(container).textContent).toBe("2 slow requests");
   });
 
-  it("lists each slow request's name and start time", async () => {
+  it("lists each slow request's name, environment label, and start time", async () => {
     const container = await render(<SlowRequestsIndicator />);
     sendUnansweredRequests([
-      { id: "one", tag: "projects.listEntries · primary", startedAt: FIRST_STARTED_AT },
-      { id: "two", tag: "git.status · remote-1", startedAt: SECOND_STARTED_AT },
+      {
+        id: "one",
+        method: "projects.listEntries",
+        environmentId: "primary",
+        startedAt: FIRST_STARTED_AT,
+      },
+      { id: "two", method: "git.status", environmentId: "remote-1", startedAt: SECOND_STARTED_AT },
     ]);
 
+    expect(environmentState.reads).toBe(0);
     await click(requireIndicator(container));
+    expect(environmentState.reads).toBeGreaterThan(0);
 
     const list = openList();
     if (list === null) throw new Error("The slow-request list did not open.");
@@ -249,21 +303,52 @@ describe("SlowRequestsIndicator", () => {
       FIRST_STARTED_AT,
       SECOND_STARTED_AT,
     ]);
-    expect(items[0]?.textContent).toContain("projects.listEntries · primary");
+    expect(items[0]?.querySelector("div")?.textContent).toBe("projects.listEntries · Local");
     expect(items[0]?.querySelector("time")?.textContent).toBe(
       formatTimestamp(FIRST_STARTED_AT, DEFAULT_CLIENT_SETTINGS.timestampFormat),
     );
-    expect(items[1]?.textContent).toContain("git.status · remote-1");
+    expect(items[1]?.querySelector("div")?.textContent).toBe("git.status · Luna");
     expect(items[1]?.querySelector("time")?.textContent).toBe(
       formatTimestamp(SECOND_STARTED_AT, DEFAULT_CLIENT_SETTINGS.timestampFormat),
     );
+
+    await pressEscape(list);
+    const readsAfterClosing = environmentState.reads;
+    await finish("two");
+    expect(environmentState.reads).toBe(readsAfterClosing);
   });
+
+  it.each([
+    { environmentId: "missing", label: undefined },
+    { environmentId: "blank", label: "" },
+    { environmentId: "whitespace", label: "   " },
+  ])(
+    "falls back to the environment id for $environmentId labels",
+    async ({ environmentId, label }) => {
+      if (label !== undefined) environmentState.environments.push({ environmentId, label });
+      const container = await render(<SlowRequestsIndicator />);
+      sendUnansweredRequests([
+        { id: "one", method: "git.status", environmentId, startedAt: FIRST_STARTED_AT },
+      ]);
+
+      await click(requireIndicator(container));
+
+      expect(openList()?.querySelector("li > div")?.textContent).toBe(
+        `git.status · ${environmentId}`,
+      );
+    },
+  );
 
   it("disappears when the slow requests finish", async () => {
     const container = await render(<SlowRequestsIndicator />);
     sendUnansweredRequests([
-      { id: "one", tag: "projects.listEntries · primary", startedAt: FIRST_STARTED_AT },
-      { id: "two", tag: "git.status · primary", startedAt: SECOND_STARTED_AT },
+      {
+        id: "one",
+        method: "projects.listEntries",
+        environmentId: "primary",
+        startedAt: FIRST_STARTED_AT,
+      },
+      { id: "two", method: "git.status", environmentId: "primary", startedAt: SECOND_STARTED_AT },
     ]);
 
     await finish("one");
@@ -276,7 +361,12 @@ describe("SlowRequestsIndicator", () => {
   it("closes an open list when the last slow request finishes", async () => {
     const container = await render(<SlowRequestsIndicator />);
     sendUnansweredRequests([
-      { id: "one", tag: "projects.listEntries · primary", startedAt: FIRST_STARTED_AT },
+      {
+        id: "one",
+        method: "projects.listEntries",
+        environmentId: "primary",
+        startedAt: FIRST_STARTED_AT,
+      },
     ]);
     await click(requireIndicator(container));
     expect(openList()).not.toBeNull();
@@ -332,14 +422,19 @@ describe("SlowRequestsIndicator", () => {
     expect(announcement(container)).toBe("");
 
     sendUnansweredRequests([
-      { id: "one", tag: "projects.listEntries · primary", startedAt: FIRST_STARTED_AT },
+      {
+        id: "one",
+        method: "projects.listEntries",
+        environmentId: "primary",
+        startedAt: FIRST_STARTED_AT,
+      },
     ]);
     expect(announcement(container)).toBe("Some requests are slow");
     // The same live region stays mounted, so screen readers hear changes to it.
     expect(container.querySelector('[role="status"]')).toBe(region);
 
     sendUnansweredRequests([
-      { id: "two", tag: "git.status · primary", startedAt: SECOND_STARTED_AT },
+      { id: "two", method: "git.status", environmentId: "primary", startedAt: SECOND_STARTED_AT },
     ]);
     expect(announcement(container)).toBe("Some requests are slow");
 
@@ -351,6 +446,31 @@ describe("SlowRequestsIndicator", () => {
     expect(container.querySelector('[role="status"]')).toBe(region);
   });
 
+  it("does not re-render the live-region shell on count changes while its count label updates", async () => {
+    const container = await render(<SlowRequestsIndicator />);
+    const shell = subscription.readers.values().next().value;
+    if (shell === undefined) throw new Error("The indicator did not subscribe to latency state.");
+    expect(shell.renders).toBe(1);
+
+    oneSlowRequest();
+    expect(shell.renders).toBe(2);
+    expect(requireIndicator(container).textContent).toBe("1 slow request");
+
+    sendUnansweredRequests([
+      { id: "two", method: "git.status", environmentId: "remote-1", startedAt: SECOND_STARTED_AT },
+    ]);
+    expect(requireIndicator(container).textContent).toBe("2 slow requests");
+    expect(shell.renders).toBe(2);
+
+    await finish("one");
+    expect(requireIndicator(container).textContent).toBe("1 slow request");
+    expect(shell.renders).toBe(2);
+
+    await finish("two");
+    expect(indicator(container)).toBeNull();
+    expect(shell.renders).toBe(3);
+  });
+
   it("appears in the status bar", async () => {
     const container = await render(statusBarView(0));
     const statusBar = container.querySelector('[data-testid="app-status-bar"]');
@@ -358,7 +478,12 @@ describe("SlowRequestsIndicator", () => {
     expect(indicator(statusBar)).toBeNull();
 
     sendUnansweredRequests([
-      { id: "one", tag: "projects.listEntries · primary", startedAt: FIRST_STARTED_AT },
+      {
+        id: "one",
+        method: "projects.listEntries",
+        environmentId: "primary",
+        startedAt: FIRST_STARTED_AT,
+      },
     ]);
 
     expect(requireIndicator(statusBar).textContent).toBe("1 slow request");
@@ -367,15 +492,22 @@ describe("SlowRequestsIndicator", () => {
   it("does not re-render when the rest of the status bar re-renders", async () => {
     await render(statusBarView(0));
     sendUnansweredRequests([
-      { id: "one", tag: "projects.listEntries · primary", startedAt: FIRST_STARTED_AT },
+      {
+        id: "one",
+        method: "projects.listEntries",
+        environmentId: "primary",
+        startedAt: FIRST_STARTED_AT,
+      },
     ]);
-    const rendersWithSlowRequest = subscription.renders;
+    const shell = subscription.readers.values().next().value;
+    if (shell === undefined) throw new Error("The indicator did not subscribe to latency state.");
+    const rendersWithSlowRequest = shell.renders;
 
     // The status bar re-renders on its own polling, for example when the terminal count changes.
     await rerender(statusBarView(1));
     await rerender(statusBarView(2));
 
-    expect(subscription.renders).toBe(rendersWithSlowRequest);
+    expect(shell.renders).toBe(rendersWithSlowRequest);
     expect(requireIndicator().textContent).toBe("1 slow request");
   });
 });
@@ -389,6 +521,7 @@ describe("focus when the indicator leaves", () => {
     await pressEnter(trigger);
     await nextFrames();
     expect(openList()?.contains(document.activeElement)).toBe(true);
+    const focus = vi.spyOn(HTMLElement.prototype, "focus");
 
     await finish("one");
     await nextFrames();
@@ -398,6 +531,8 @@ describe("focus when the indicator leaves", () => {
     );
     expect(resources).not.toBeNull();
     expect(document.activeElement).toBe(resources);
+    const focusCall = focus.mock.contexts.findIndex((element) => element === resources);
+    expect(focus.mock.calls[focusCall]).toEqual([{ preventScroll: true }]);
   });
 
   it("moves focus to the control before the indicator when nothing follows it in the bar", async () => {
@@ -410,11 +545,16 @@ describe("focus when the indicator leaves", () => {
     oneSlowRequest();
     const trigger = requireIndicator();
     trigger.focus();
+    const focus = vi.spyOn(HTMLElement.prototype, "focus");
 
     await finish("one");
     await nextFrames();
 
     expect(document.activeElement?.textContent).toBe("Last control");
+    const focusCall = focus.mock.contexts.findIndex(
+      (element) => element === document.activeElement,
+    );
+    expect(focus.mock.calls[focusCall]).toEqual([]);
   });
 
   it("leaves focus alone when the indicator did not have it", async () => {
@@ -439,6 +579,30 @@ describe("focus when the indicator leaves", () => {
 });
 
 describe("SlowRequestsStatusBar", () => {
+  it("re-renders only when slowness starts or ends", async () => {
+    const container = await render(<SlowRequestsStatusBar />);
+    const bar = subscription.readers.values().next().value;
+    if (bar === undefined) throw new Error("The hosted bar did not subscribe to latency state.");
+    expect(bar.renders).toBe(1);
+
+    oneSlowRequest();
+    expect(bar.renders).toBe(2);
+
+    sendUnansweredRequests([
+      { id: "two", method: "git.status", environmentId: "remote-1", startedAt: SECOND_STARTED_AT },
+    ]);
+    expect(requireIndicator(container).textContent).toBe("2 slow requests");
+    expect(bar.renders).toBe(2);
+
+    await finish("one");
+    expect(requireIndicator(container).textContent).toBe("1 slow request");
+    expect(bar.renders).toBe(2);
+
+    await finish("two");
+    expect(indicator(container)).toBeNull();
+    expect(bar.renders).toBe(3);
+  });
+
   it("takes no space until a request is slow, then shows the indicator", async () => {
     const container = await render(<SlowRequestsStatusBar />);
     const bar = container.querySelector<HTMLElement>('[data-testid="slow-requests-status-bar"]');
