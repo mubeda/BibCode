@@ -451,12 +451,12 @@ describe("GitManagerPanel repository unavailable", () => {
     for (const tab of ["Changes", "History", "Tags"] as const) {
       await selectTab(tab);
       expect(container.querySelector('[role="alert"] code')?.textContent).toBe(
-        'git config --global --add safe.directory "/opaque/my checkout"',
+        "git config --global --add safe.directory '/opaque/my checkout'",
       );
     }
     expectDisabled(
       "Choose branch",
-      'Git doesn\'t trust this repository because another user owns it. Run git config --global --add safe.directory "/opaque/my checkout" to trust it.',
+      "Git doesn't trust this repository because another user owns it. Run git config --global --add safe.directory '/opaque/my checkout' to trust it.",
     );
   });
 
