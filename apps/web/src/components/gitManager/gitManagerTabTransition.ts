@@ -19,8 +19,26 @@ export function resolveGitManagerWorkingTree(
 
 /** The repository facts whose transitions move the selected tab. */
 export interface GitManagerTabTransitionInputs {
-  readonly mergePending: boolean;
+  /** Null until refs provide a snapshot; absence of refs does not mean a merge ended. */
+  readonly mergePending: boolean | null;
   readonly workingTree: GitManagerWorkingTree;
+}
+
+/**
+ * Keep settled observations across status subscription gaps; only an opening starts at
+ * loading. Refs load independently, so retain the last known merge state until they return.
+ */
+export function resolveGitManagerTabTransitionBaseline(
+  previous: GitManagerTabTransitionInputs | null,
+  next: GitManagerTabTransitionInputs,
+): GitManagerTabTransitionInputs {
+  if (previous !== null && previous.workingTree !== "loading" && next.workingTree === "loading") {
+    return previous;
+  }
+  return {
+    ...next,
+    mergePending: next.mergePending ?? previous?.mergePending ?? null,
+  };
 }
 
 /**
@@ -41,7 +59,8 @@ export function resolveGitManagerTabTransition(
   next: GitManagerTabTransitionInputs,
   currentTab: GitManagerTab,
 ): GitManagerTab | null {
-  if (next.mergePending) return previous?.mergePending === true ? null : "changes";
+  const mergePending = next.mergePending ?? previous?.mergePending ?? null;
+  if (mergePending) return previous?.mergePending === true ? null : "changes";
   if (next.workingTree !== "clean" || currentTab === "tags") return null;
   if (previous === null || previous.mergePending) return "history";
   return previous.workingTree === "loading" || previous.workingTree === "dirty" ? "history" : null;

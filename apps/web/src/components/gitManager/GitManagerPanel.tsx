@@ -19,7 +19,16 @@ import {
   GitMergeIcon,
   GitPullRequestIcon,
 } from "lucide-react";
-import { memo, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type RefObject,
+} from "react";
 
 import {
   DEFAULT_GIT_MANAGER_VIEW_STATE,
@@ -40,6 +49,7 @@ import { Button } from "../ui/button";
 import { Tabs, TabsList, TabsPanel, TabsTab } from "../ui/tabs";
 import {
   resolveGitManagerTabTransition,
+  resolveGitManagerTabTransitionBaseline,
   resolveGitManagerWorkingTree,
   type GitManagerTabTransitionInputs,
 } from "./gitManagerTabTransition";
@@ -170,6 +180,11 @@ function selectedCheckoutCwd(
   return worktrees.some((worktree) => worktree.path === storedCwd) ? storedCwd : mainCheckoutCwd;
 }
 
+interface GitManagerTabTransitionBaseline {
+  readonly checkout: string;
+  readonly inputs: GitManagerTabTransitionInputs;
+}
+
 interface GitManagerRepositorySurfacesProps {
   readonly scope: {
     readonly environmentId: ScopedProjectRef["environmentId"];
@@ -186,6 +201,7 @@ interface GitManagerRepositorySurfacesProps {
   readonly pullRequestsDisabledReason: string | null;
   readonly liveSignalDisabledReason: string | null;
   readonly activeTab: GitManagerTab;
+  readonly tabTransitionBaselineRef: RefObject<GitManagerTabTransitionBaseline | null>;
   readonly onTabChange: (value: string | number | null) => void;
 }
 
@@ -201,6 +217,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
   pullRequestsDisabledReason,
   liveSignalDisabledReason,
   activeTab,
+  tabTransitionBaselineRef,
   onTabChange,
 }: GitManagerRepositorySurfacesProps) {
   const registry = useContext(RegistryContext);
@@ -339,7 +356,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
   const continueBlocked =
     repositoryBlockedReasons.find((reason) => reason.operation === "continue") ?? null;
   const inProgressOperation = snapshot?.inProgressOperation ?? null;
-  const mergePending = inProgressOperation?.kind === "merge";
+  const mergePending = snapshot === null ? null : inProgressOperation?.kind === "merge";
   const workingTree = resolveGitManagerWorkingTree(statusQuery.data);
   // The tab moves only on a transition of these inputs (see resolveGitManagerTabTransition):
   // a checkout that becomes clean moves to History, and a merge that appears moves to
@@ -348,20 +365,16 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
   // dependency, so a manual pick never triggers a move; a Git failure and its recovery never
   // move it either. (useEffectEvent would do, but react-dom 19.2 never refreshes an Effect
   // Event declared in a memo component, so it would read a stale tab.)
-  const tabTransitionBaselineRef = useRef<{
-    readonly checkout: string;
-    readonly inputs: GitManagerTabTransitionInputs;
-  } | null>(null);
   useEffect(() => {
     const checkout = `${storeKey}\u0000${cwd}`;
-    const next = { mergePending, workingTree };
     const baseline = tabTransitionBaselineRef.current;
     const previous = baseline?.checkout === checkout ? baseline.inputs : null;
+    const next = resolveGitManagerTabTransitionBaseline(previous, { mergePending, workingTree });
     tabTransitionBaselineRef.current = { checkout, inputs: next };
     const currentTab = useGitManagerStore.getState().selectViewState(projectRef).activeTab;
     const tab = resolveGitManagerTabTransition(previous, next, currentTab);
     if (tab !== null && tab !== currentTab) onTabChange(tab);
-  }, [cwd, mergePending, onTabChange, projectRef, storeKey, workingTree]);
+  }, [cwd, mergePending, onTabChange, projectRef, storeKey, tabTransitionBaselineRef, workingTree]);
   const resumableOperation = asResumableOperation(inProgressOperation);
   const resumableOperationDisabledReason =
     resumableOperation?.kind === "merge" ? stashMergeDisabledReason : rewriteDisabledReason;
@@ -1145,6 +1158,9 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
 });
 
 export const GitManagerPanel = memo(function GitManagerPanel({ projectRef }: GitManagerPanelProps) {
+  // Reconnecting unmounts the surfaces, not the route: keep their transition memory here
+  // so only a real panel opening or checkout change starts a fresh baseline.
+  const tabTransitionBaselineRef = useRef<GitManagerTabTransitionBaseline | null>(null);
   const { environmentId, projectId } = projectRef;
   const stableProjectRef = useMemo(
     () => ({ environmentId, projectId }) as ScopedProjectRef,
@@ -1268,6 +1284,7 @@ export const GitManagerPanel = memo(function GitManagerPanel({ projectRef }: Git
           signalPending={signalPending}
           stashMergeDisabledReason={capabilityDisabledReasons.stashMerge}
           tagDisabledReason={capabilityDisabledReasons.tag}
+          tabTransitionBaselineRef={tabTransitionBaselineRef}
           onTabChange={handleTabChange}
         />
       </div>

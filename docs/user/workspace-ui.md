@@ -447,7 +447,8 @@ The toolbar has three segments:
    that ref instead of making the complete Git Manager unavailable.
 
 The manager keeps the chosen tab for the session but does not save it, so it
-opens on **History** after a reload. Opening it, or switching to another
+opens on **History** after a reload. A reconnect keeps the chosen tab and is not
+an opening. Opening it, or switching to another
 worktree, selects History for a clean checkout and **Changes** while a merge is
 pending; otherwise the chosen tab stays. The manager also returns to History
 when a checkout with pending changes becomes clean, for example after a commit

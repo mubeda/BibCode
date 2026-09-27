@@ -24,8 +24,9 @@ const h = vi.hoisted(() => {
   const listeners = new Set<() => void>();
   let version = 0;
   return {
-    status: null as VcsStatusResult | null,
+    statusByCwd: new Map<string, VcsStatusResult | null>(),
     refs: null as GitManagerRefsSnapshot | null,
+    connection: null as SupervisorConnectionState | null,
     /** The latest toolbar props, whose callback switches the checkout. */
     toolbar: null as { onSelectedWorktreeChange: (cwd: string) => void } | null,
     subscribe: (listener: () => void) => {
@@ -46,7 +47,7 @@ const h = vi.hoisted(() => {
 vi.mock("../../state/query", async () => {
   const { useSyncExternalStore } = await import("react");
   return {
-    useEnvironmentQuery: (atom: { kind: string } | null) => {
+    useEnvironmentQuery: (atom: { kind: string; cwd?: string } | null) => {
       useSyncExternalStore(h.subscribe, h.version);
       const data =
         atom?.kind === "catalog"
@@ -57,7 +58,7 @@ vi.mock("../../state/query", async () => {
               ],
             }
           : atom?.kind === "status"
-            ? h.status
+            ? (h.statusByCwd.get(atom.cwd!) ?? null)
             : atom?.kind === "refs"
               ? h.refs
               : atom?.kind === "signal"
@@ -104,24 +105,25 @@ vi.mock("../../state/entities", () => ({
     ]),
 }));
 
-vi.mock("../../state/environments", () => ({
-  useEnvironmentConnectionState: () => ({
-    data: {
-      ...AVAILABLE_CONNECTION_STATE,
-      desired: true,
-      phase: "connected",
-      network: "online",
-    } satisfies SupervisorConnectionState,
-  }),
-  useEnvironment: () => ({ label: "Local" }),
-}));
+vi.mock("../../state/environments", async () => {
+  const { useSyncExternalStore } = await import("react");
+  return {
+    useEnvironmentConnectionState: () => {
+      useSyncExternalStore(h.subscribe, h.version);
+      return { data: h.connection };
+    },
+    useEnvironment: () => ({ label: "Local" }),
+  };
+});
 
 vi.mock("../../state/worktrees", () => ({
   worktreeEnvironment: { catalog: () => ({ kind: "catalog" }) },
 }));
 
 vi.mock("../../state/vcs", () => ({
-  vcsEnvironment: { status: () => ({ kind: "status" }) },
+  vcsEnvironment: {
+    status: ({ input }: { input: { cwd: string } }) => ({ kind: "status", cwd: input.cwd }),
+  },
 }));
 
 vi.mock("../../state/gitManager", () => ({
@@ -232,15 +234,22 @@ const REFS: GitManagerRefsSnapshot = {
   tags: [],
   worktrees: [],
 };
+const MERGING_REFS: GitManagerRefsSnapshot = {
+  ...REFS,
+  inProgressOperation: { kind: "merge", current: null, total: null },
+};
 
 let container: HTMLDivElement;
 let root: Root;
 
 /** Applies each frame as its own emission, the way the status stream delivers them. */
-async function deliver(frames: ReadonlyArray<VcsStatusStreamEvent>): Promise<void> {
+async function deliver(
+  frames: ReadonlyArray<VcsStatusStreamEvent>,
+  cwd = "/opaque/main",
+): Promise<void> {
   for (const frame of frames) {
     await act(async () => {
-      h.status = applyGitStatusStreamEvent(h.status, frame);
+      h.statusByCwd.set(cwd, applyGitStatusStreamEvent(h.statusByCwd.get(cwd) ?? null, frame));
       h.publish();
     });
   }
@@ -267,8 +276,14 @@ async function openManagerOn(name: "Changes" | "History" | "Tags"): Promise<void
 beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   useGitManagerStore.setState({ byProjectKey: {} });
-  h.status = null;
+  h.statusByCwd.clear();
   h.refs = REFS;
+  h.connection = {
+    ...AVAILABLE_CONNECTION_STATE,
+    desired: true,
+    phase: "connected",
+    network: "online",
+  };
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
@@ -282,11 +297,13 @@ afterEach(async () => {
 
 describe("GitManagerPanel selected tab", () => {
   it("stays on Changes while Git cannot read the repository and after it recovers", async () => {
-    h.status = applyGitStatusStreamEvent(null, {
-      _tag: "snapshot",
-      local: DIRTY_LOCAL,
-      remote: null,
-    });
+    await deliver([
+      {
+        _tag: "snapshot",
+        local: DIRTY_LOCAL,
+        remote: null,
+      },
+    ]);
     await openManagerOn("Changes");
 
     await deliver(UNREADABLE);
@@ -299,11 +316,13 @@ describe("GitManagerPanel selected tab", () => {
   });
 
   it("stays on Changes when a clean repository fails and recovers clean", async () => {
-    h.status = applyGitStatusStreamEvent(null, {
-      _tag: "snapshot",
-      local: CLEAN_LOCAL,
-      remote: REMOTE,
-    });
+    await deliver([
+      {
+        _tag: "snapshot",
+        local: CLEAN_LOCAL,
+        remote: REMOTE,
+      },
+    ]);
     await openManagerOn("Changes");
 
     await deliver(UNREADABLE);
@@ -314,11 +333,13 @@ describe("GitManagerPanel selected tab", () => {
   });
 
   it("keeps Changes when it is picked from Tags on a clean checkout", async () => {
-    h.status = applyGitStatusStreamEvent(null, {
-      _tag: "snapshot",
-      local: CLEAN_LOCAL,
-      remote: REMOTE,
-    });
+    await deliver([
+      {
+        _tag: "snapshot",
+        local: CLEAN_LOCAL,
+        remote: REMOTE,
+      },
+    ]);
     await openManagerOn("Tags");
 
     await act(async () => tab("Changes").click());
@@ -327,11 +348,13 @@ describe("GitManagerPanel selected tab", () => {
   });
 
   it("underlines the selected tab through the data-active attribute Base UI sets", async () => {
-    h.status = applyGitStatusStreamEvent(null, {
-      _tag: "snapshot",
-      local: DIRTY_LOCAL,
-      remote: null,
-    });
+    await deliver([
+      {
+        _tag: "snapshot",
+        local: DIRTY_LOCAL,
+        remote: null,
+      },
+    ]);
     await openManagerOn("Changes");
 
     expect(tab("Changes").hasAttribute("data-active")).toBe(true);
@@ -341,11 +364,14 @@ describe("GitManagerPanel selected tab", () => {
   });
 
   it("treats another checkout like opening the panel on it", async () => {
-    h.status = applyGitStatusStreamEvent(null, {
-      _tag: "snapshot",
-      local: CLEAN_LOCAL,
-      remote: REMOTE,
-    });
+    await deliver([
+      {
+        _tag: "snapshot",
+        local: CLEAN_LOCAL,
+        remote: REMOTE,
+      },
+    ]);
+    await deliver(recovered(CLEAN_LOCAL), "/opaque/feature");
     // A pick on a clean checkout stays; moving to another clean checkout starts over.
     await openManagerOn("Changes");
 
@@ -355,15 +381,197 @@ describe("GitManagerPanel selected tab", () => {
   });
 
   it("still moves from Changes to History when a dirty checkout becomes clean", async () => {
-    h.status = applyGitStatusStreamEvent(null, {
-      _tag: "snapshot",
-      local: DIRTY_LOCAL,
-      remote: null,
-    });
+    await deliver([
+      {
+        _tag: "snapshot",
+        local: DIRTY_LOCAL,
+        remote: null,
+      },
+    ]);
     await openManagerOn("Changes");
 
     await deliver([{ _tag: "localUpdated", local: CLEAN_LOCAL }]);
 
+    expect(selectedTab()).toBe("History");
+  });
+
+  it("keeps hand-picked Changes on a clean checkout across reconnecting", async () => {
+    await deliver(recovered(CLEAN_LOCAL));
+    await openManagerOn("Changes");
+
+    await act(async () => {
+      h.connection = { ...h.connection!, phase: "backoff" };
+      h.publish();
+    });
+    expect(
+      container.querySelector('[data-testid="git-manager-unavailable"]')?.textContent,
+    ).toContain("Reconnecting to Local");
+    expect(selectedTab()).toBeNull();
+
+    await act(async () => {
+      h.connection = { ...h.connection!, phase: "connected" };
+      h.publish();
+    });
+
+    expect(selectedTab()).toBe("Changes");
+  });
+
+  it("selects History when the whole panel is unmounted and opened again on a clean checkout", async () => {
+    await deliver(recovered(CLEAN_LOCAL));
+    await openManagerOn("Changes");
+
+    await act(async () => root.unmount());
+    root = createRoot(container);
+    await act(async () => root.render(<GitManagerPanel projectRef={projectRef} />));
+
+    expect(selectedTab()).toBe("History");
+  });
+
+  it("keeps hand-picked Changes when status reloads after reconnecting", async () => {
+    await deliver(recovered(CLEAN_LOCAL));
+    await openManagerOn("Changes");
+
+    await act(async () => {
+      h.connection = { ...h.connection!, phase: "backoff" };
+      h.statusByCwd.set("/opaque/main", null);
+      h.publish();
+    });
+    expect(container.querySelector('[data-testid="git-manager-unavailable"]')).not.toBeNull();
+
+    await act(async () => {
+      h.connection = { ...h.connection!, phase: "connected" };
+      h.publish();
+    });
+    expect(selectedTab()).toBe("Changes");
+
+    await deliver(recovered(CLEAN_LOCAL));
+    expect(selectedTab()).toBe("Changes");
+  });
+
+  it("keeps hand-picked Changes while a mounted status subscription reloads", async () => {
+    await deliver(recovered(CLEAN_LOCAL));
+    await openManagerOn("Changes");
+
+    await act(async () => {
+      h.statusByCwd.set("/opaque/main", null);
+      h.publish();
+    });
+    expect(selectedTab()).toBe("Changes");
+
+    await deliver(recovered(CLEAN_LOCAL));
+    expect(selectedTab()).toBe("Changes");
+  });
+
+  it.each([false, true])(
+    "keeps Changes when refs reload after status on reconnect (merge pending: %s)",
+    async (mergePending) => {
+      const refs = mergePending ? MERGING_REFS : REFS;
+      h.refs = refs;
+      await deliver(recovered(CLEAN_LOCAL));
+      await openManagerOn("Changes");
+
+      await act(async () => {
+        h.connection = { ...h.connection!, phase: "backoff" };
+        h.statusByCwd.set("/opaque/main", null);
+        h.refs = null;
+        h.publish();
+      });
+      expect(container.querySelector('[data-testid="git-manager-unavailable"]')).not.toBeNull();
+
+      await act(async () => {
+        h.connection = { ...h.connection!, phase: "connected" };
+        h.publish();
+      });
+      expect(selectedTab()).toBe("Changes");
+
+      await deliver(recovered(CLEAN_LOCAL));
+      expect(selectedTab()).toBe("Changes");
+
+      await act(async () => {
+        h.refs = refs;
+        h.publish();
+      });
+      expect(selectedTab()).toBe("Changes");
+    },
+  );
+
+  it.each(["History", "Tags"] as const)(
+    "keeps a manual pick of %s when a pending merge's refs reload after reconnecting",
+    async (name) => {
+      h.refs = MERGING_REFS;
+      await deliver(recovered(CLEAN_LOCAL));
+      await openManagerOn(name);
+
+      await act(async () => {
+        h.connection = { ...h.connection!, phase: "backoff" };
+        h.refs = null;
+        h.publish();
+      });
+      expect(selectedTab()).toBeNull();
+
+      await act(async () => {
+        h.connection = { ...h.connection!, phase: "connected" };
+        h.publish();
+      });
+      expect(selectedTab()).toBe(name);
+
+      await act(async () => {
+        h.refs = MERGING_REFS;
+        h.publish();
+      });
+      expect(selectedTab()).toBe(name);
+    },
+  );
+
+  it.each(["status", "refs"] as const)(
+    "still selects History on a clean opening when %s loads first",
+    async (first) => {
+      h.refs = null;
+      await openManagerOn("Changes");
+      const loadStatus = () => deliver(recovered(CLEAN_LOCAL));
+      const loadRefs = () =>
+        act(async () => {
+          h.refs = REFS;
+          h.publish();
+        });
+
+      await (first === "status" ? loadStatus() : loadRefs());
+      await (first === "status" ? loadRefs() : loadStatus());
+
+      expect(selectedTab()).toBe("History");
+    },
+  );
+
+  it.each(["status", "refs"] as const)(
+    "still selects Changes on opening with a pending merge when %s loads first",
+    async (first) => {
+      h.refs = null;
+      await openManagerOn("History");
+      const loadStatus = () => deliver(recovered(CLEAN_LOCAL));
+      const loadRefs = () =>
+        act(async () => {
+          h.refs = MERGING_REFS;
+          h.publish();
+        });
+
+      await (first === "status" ? loadStatus() : loadRefs());
+      await (first === "status" ? loadRefs() : loadStatus());
+
+      expect(selectedTab()).toBe("Changes");
+    },
+  );
+
+  it("keeps hand-picked Changes when switching to a dirty checkout until that checkout becomes clean", async () => {
+    await deliver(recovered(CLEAN_LOCAL));
+    await deliver(recovered(DIRTY_LOCAL), "/opaque/feature");
+    await act(async () => root.render(<GitManagerPanel projectRef={projectRef} />));
+    expect(selectedTab()).toBe("History");
+    await act(async () => tab("Changes").click());
+
+    await act(async () => h.toolbar?.onSelectedWorktreeChange("/opaque/feature"));
+    expect(selectedTab()).toBe("Changes");
+
+    await deliver(recovered(CLEAN_LOCAL), "/opaque/feature");
     expect(selectedTab()).toBe("History");
   });
 });
