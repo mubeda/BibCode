@@ -154,12 +154,12 @@ pub struct GitRepository {
     /// Read only on failed status discovery; tests replace this without changing process state.
     discovery_environment: fn(&str) -> Option<OsString>,
     /// Hosts identified by explicit provider probes; status reads only read it.
-    /// `default()` and `with_worktree_settings` start with a private, empty
-    /// observation, so status names only providers its host name identifies. That
-    /// is safe where provider identity is unused (project init, the review diff's
-    /// repository check) and in tests. A repository whose status reaches the UI
-    /// (VCS status, Git Manager, the create flow) must share the server's
-    /// observation through `with_provider_hosts`, as `production/runtime.rs` does.
+    /// `default()` starts with a private, empty observation, so status names only
+    /// providers its host name identifies. That is safe where provider identity
+    /// is unused (project init, the review diff's repository check) and in tests.
+    /// A repository whose status reaches the UI (VCS status, Git Manager, the create
+    /// flow) must share the server's observation through `with_worktree_settings`
+    /// or `with_provider_hosts`.
     provider_hosts: Arc<ProviderHosts>,
 }
 
@@ -360,10 +360,10 @@ impl GitRepository {
         }
     }
 
-    /// The server's repository. It still needs the shared host observation from
-    /// `with_provider_hosts` before its status can name recorded hosts.
+    /// The server's repository, using its shared host observation for status reads.
     pub fn with_worktree_settings(
         worktree_settings: Arc<dyn WorktreeBaseDirectoryProvider>,
+        provider_hosts: Arc<ProviderHosts>,
     ) -> Self {
         Self {
             runner: Arc::new(ProcessRunner),
@@ -372,7 +372,7 @@ impl GitRepository {
             command_timeout: DEFAULT_TIMEOUT,
             command_config: &[],
             discovery_environment: |name| std::env::var_os(name),
-            provider_hosts: Arc::default(),
+            provider_hosts,
         }
     }
 

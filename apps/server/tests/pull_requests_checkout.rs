@@ -155,6 +155,7 @@ esac
         let mut services = PullRequestsRpcServices::with_dependencies(
             root.path().join("state"),
             repositories.clone(),
+            Arc::default(),
         )
         .with_worktrees(managed.clone());
         services.service = PullRequestsService::with_runner(
