@@ -90,11 +90,11 @@ mod tests {
 
     #[test]
     fn an_inherited_pipe_is_marked_close_on_exec_and_a_spawned_child_lacks_it() {
-        if !crate::test_support::scenario_runs_in_this_process(
+        let Some(isolated) = crate::test_support::isolated_scenario(
             "relaunch::tests::an_inherited_pipe_is_marked_close_on_exec_and_a_spawned_child_lacks_it",
-        ) {
+        ) else {
             return;
-        }
+        };
 
         let (read_end, write_end) = inherited_pipe();
         assert!(!has_cloexec(read_end.as_raw_fd()));
@@ -122,15 +122,16 @@ mod tests {
             .status()
             .expect("sh should spawn");
         assert!(!status.success(), "the child must not inherit the pipe");
+        isolated.complete();
     }
 
     #[test]
     fn proc_fallback_marks_both_pipe_ends_close_on_exec() {
-        if !crate::test_support::scenario_runs_in_this_process(
+        let Some(isolated) = crate::test_support::isolated_scenario(
             "relaunch::tests::proc_fallback_marks_both_pipe_ends_close_on_exec",
-        ) {
+        ) else {
             return;
-        }
+        };
 
         let (read_end, write_end) = inherited_pipe();
         assert!(!has_cloexec(read_end.as_raw_fd()));
@@ -150,5 +151,6 @@ mod tests {
             !has_cloexec(std::io::stdin().as_raw_fd()),
             "stdio stays inheritable"
         );
+        isolated.complete();
     }
 }
