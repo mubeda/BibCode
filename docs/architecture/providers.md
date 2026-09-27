@@ -63,8 +63,13 @@ frozen delivery's `Rejected` arm, so the delivery fails once.
 
 Every delivery detail, the text an undelivered or uncertain turn shows, comes
 from one formatter: plain words that name the provider by the instance's label
-(its display name, otherwise the driver's name from contracts'
-`PROVIDER_DISPLAY_NAMES`), never by a driver id. A refusal is its plain
+(its trimmed display name; otherwise, for an instance that is not its driver's
+default, its id in words — `codex_personal` reads "Codex Personal"; otherwise
+the driver's name from contracts' `PROVIDER_DISPLAY_NAMES`), never by a driver
+id. The server stamps the same label as `displayName` in every provider
+snapshot, so the web shows the server's name and never derives its own. The
+field stays optional for older servers, whose unnamed instances then show the
+driver's name. A refusal is its plain
 sentence, such as "Fast Mode is not supported by the selected model." or "gpt-5
 is not available in Work Codex.", built from shared helpers that name an option
 by the label its descriptor shows, and by its id only for an option the driver

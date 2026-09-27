@@ -88,7 +88,7 @@ describe("applyProviderInstanceSettings", () => {
       providerInstances: {
         [ProviderInstanceId.make("codex_personal")]: {
           driver: ProviderDriverKind.make("codex"),
-          displayName: "Personal Codex",
+          displayName: "  Personal Codex  ",
         },
       },
       providers: {} as never,
@@ -143,11 +143,11 @@ describe("deriveProviderInstanceEntries", () => {
     expect(entry?.isDefault).toBe(false);
   });
 
-  it("humanizes custom instance ids and groups defaults before custom instances", () => {
+  it("uses the server-stamped name and groups defaults before custom instances", () => {
     const custom = provider({
       provider: ProviderDriverKind.make("codex"),
       instanceId: "codex__personal-work",
-      displayName: "Codex",
+      displayName: "  Codex Personal Work  ",
     });
     const defaultProvider = provider({
       provider: ProviderDriverKind.make("codex"),
@@ -161,6 +161,21 @@ describe("deriveProviderInstanceEntries", () => {
       "codex__personal-work",
     ]);
   });
+
+  it.each([undefined, "   ", "Codex"])(
+    "keeps the driver's name for a custom instance with snapshot displayName %s",
+    (displayName) => {
+      const [entry] = deriveProviderInstanceEntries([
+        provider({
+          provider: ProviderDriverKind.make("codex"),
+          instanceId: "codex_personal",
+          ...(displayName === undefined ? {} : { displayName }),
+        }),
+      ]);
+
+      expect(entry?.displayName).toBe("Codex");
+    },
+  );
 
   it("returns models only for an exact provider instance", () => {
     const snapshot = {
