@@ -326,6 +326,30 @@ impl Repositories {
         }).await
     }
 
+    /// Preserve resumable state only while its thread still exists and is not deleted.
+    /// The existence check covers both insertion and conflict updates in one statement.
+    pub(crate) async fn upsert_provider_session_runtime_if_thread_live(
+        &self,
+        row: ProviderSessionRuntime,
+    ) -> Result<bool> {
+        self.database.call(move |connection| {
+            let written = connection.execute(
+                "INSERT INTO provider_session_runtime ( \
+                   thread_id, provider_name, provider_instance_id, adapter_key, runtime_mode, status, \
+                   last_seen_at, resume_cursor_json, runtime_payload_json \
+                 ) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9 \
+                   WHERE EXISTS (SELECT 1 FROM projection_threads WHERE thread_id = ?1 AND deleted_at IS NULL) \
+                 ON CONFLICT (thread_id) DO UPDATE SET \
+                   provider_name = excluded.provider_name, provider_instance_id = excluded.provider_instance_id, \
+                   adapter_key = excluded.adapter_key, runtime_mode = excluded.runtime_mode, \
+                   status = excluded.status, last_seen_at = excluded.last_seen_at, \
+                   resume_cursor_json = excluded.resume_cursor_json, runtime_payload_json = excluded.runtime_payload_json",
+                params![row.thread_id, row.provider_name, row.provider_instance_id, row.adapter_key, row.runtime_mode, row.status, row.last_seen_at, optional_json(&row.resume_cursor)?, optional_json(&row.runtime_payload)?],
+            )?;
+            Ok(written != 0)
+        }).await
+    }
+
     pub async fn get_provider_session_runtime(
         &self,
         thread_id: String,

@@ -1108,7 +1108,10 @@ impl WorktreeRuntimeActions for ProductionWorktreeRuntimeActions {
                 return Ok(());
             }
             match session {
-                Some(session) => match provider.stop_session_if_current(session).await {
+                Some(session) => match provider
+                    .suspend_session_for_removal_if_current(session)
+                    .await
+                {
                     Ok(()) | Err(ProviderRuntimeError::SessionNotFound { .. }) => Ok(()),
                     Err(error) => Err(error.to_string()),
                 },
@@ -1970,7 +1973,7 @@ mod tests {
     }
 
     #[derive(Debug, Default)]
-    struct RuntimeTestPtyBackend {
+    pub(super) struct RuntimeTestPtyBackend {
         processes: Mutex<Vec<Arc<RuntimeTestPty>>>,
     }
 
@@ -2008,7 +2011,7 @@ mod tests {
         }
     }
 
-    fn runtime_terminal_services(manager: TerminalManager) -> ServerTerminalServices {
+    pub(super) fn runtime_terminal_services(manager: TerminalManager) -> ServerTerminalServices {
         let sampler = Arc::new(NativeProcessSampler::default());
         let resource_sampler = Arc::new(NativeResourceSampler::new(
             sampler.clone(),
@@ -3964,5 +3967,172 @@ mod tests {
             assert!(registry.orphan_cleanup_pending(&format!("thread-{index}")));
         }
         runtime.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+pub(super) mod removal_test_support {
+    use super::*;
+    use crate::{
+        activity::{ActivityProjection, ActivityRepository},
+        production::provider_runtime::{
+            BoxRuntimeFuture, ProviderDriver, ProviderDriverFactory, ProviderEvent,
+            ProviderLaunchRequest, StartedSession, SupervisorOptions,
+        },
+        terminal::{TerminalManager, TerminalManagerOptions},
+    };
+    use serde_json::Value;
+    use std::{future::pending, path::PathBuf, sync::atomic::AtomicBool};
+    use tokio::sync::Notify;
+
+    #[derive(Clone, Default)]
+    pub(crate) struct RemovalTestDriver {
+        pub(crate) shutdowns: Arc<AtomicUsize>,
+        pub(crate) hold_send: Arc<AtomicBool>,
+        pub(crate) send_entered: Arc<Notify>,
+        pub(crate) send_release: Arc<Notify>,
+        pub(crate) hold_shutdown: Arc<AtomicBool>,
+        pub(crate) shutdown_entered: Arc<Notify>,
+        pub(crate) shutdown_release: Arc<Notify>,
+    }
+
+    impl ProviderDriverFactory for RemovalTestDriver {
+        fn create(
+            &self,
+            _: ProviderLaunchRequest,
+        ) -> BoxRuntimeFuture<'_, Result<Arc<dyn ProviderDriver>, ProviderRuntimeError>> {
+            Box::pin(async { Ok(Arc::new(self.clone()) as Arc<dyn ProviderDriver>) })
+        }
+    }
+
+    impl ProviderDriver for RemovalTestDriver {
+        fn start(&self) -> BoxRuntimeFuture<'_, Result<StartedSession, ProviderRuntimeError>> {
+            Box::pin(async {
+                Ok(StartedSession {
+                    resume_cursor: Some(json!({"threadId":"native-removal-session"})),
+                    ..StartedSession::default()
+                })
+            })
+        }
+        fn send(
+            &self,
+            _: String,
+            _: Vec<Value>,
+            _: String,
+        ) -> BoxRuntimeFuture<'_, Result<Option<String>, ProviderRuntimeError>> {
+            Box::pin(async {
+                self.send_entered.notify_one();
+                if self.hold_send.load(Ordering::SeqCst) {
+                    self.send_release.notified().await;
+                }
+                Ok(Some("turn-1".into()))
+            })
+        }
+        fn interrupt(
+            &self,
+            _: Option<String>,
+        ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn approve(
+            &self,
+            _: String,
+            _: String,
+        ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn answer(
+            &self,
+            _: String,
+            _: Value,
+        ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn set_mode(&self, _: String) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn set_model(&self, _: String) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn set_options(
+            &self,
+            _: Vec<Value>,
+        ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn rollback(&self, _: i64) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn next_event(&self) -> BoxRuntimeFuture<'_, Option<ProviderEvent>> {
+            Box::pin(pending())
+        }
+        fn shutdown(&self) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(async {
+                self.shutdowns.fetch_add(1, Ordering::SeqCst);
+                self.shutdown_entered.notify_one();
+                if self.hold_shutdown.load(Ordering::SeqCst) {
+                    self.shutdown_release.notified().await;
+                }
+                Ok(())
+            })
+        }
+    }
+
+    pub(crate) fn launch(thread_id: &str, cwd: PathBuf) -> ProviderLaunchRequest {
+        ProviderLaunchRequest {
+            thread_id: thread_id.into(),
+            activity_causal_revision: 0,
+            provider: "codex".into(),
+            provider_label: "Codex".into(),
+            provider_instance_id: Some("codex".into()),
+            binary_path: "in-memory-provider".into(),
+            cwd,
+            runtime_mode: "full-access".into(),
+            interaction_mode: "default".into(),
+            model: Some("gpt-5".into()),
+            options: Vec::new(),
+            custom_models: Vec::new(),
+            service_tier: None,
+            effort: None,
+            agent: None,
+            resume_cursor: None,
+            environment: Default::default(),
+            endpoint: None,
+            server_password: None,
+            mcp: None,
+            codex_home: None,
+        }
+    }
+
+    pub(crate) fn supervisor(
+        engine: &OrchestrationEngine,
+        driver: Arc<RemovalTestDriver>,
+    ) -> Arc<ProviderRuntimeSupervisor> {
+        Arc::new(ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            driver,
+            ActivityProjection::new(ActivityRepository::new(
+                engine.repositories().database().clone(),
+            )),
+            SupervisorOptions::default(),
+        ))
+    }
+
+    pub(crate) fn runtime(
+        engine: &OrchestrationEngine,
+        provider: Arc<ProviderRuntimeSupervisor>,
+        registry: WorkspaceAvailabilityRegistry,
+    ) -> (WorktreeRuntime, TerminalManager) {
+        let terminals = TerminalManager::new(
+            Arc::new(super::tests::RuntimeTestPtyBackend::default()),
+            TerminalManagerOptions::default(),
+        );
+        let runtime = WorktreeRuntime::start(
+            engine.clone(),
+            provider,
+            super::tests::runtime_terminal_services(terminals.clone()),
+            registry,
+        );
+        (runtime, terminals)
     }
 }
