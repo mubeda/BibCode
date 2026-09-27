@@ -40,6 +40,9 @@ export const coverageExclude = [
   "**/target/**",
   "**/.{idea,git,cache,output,temp}/**",
   "apps/web/public/mockServiceWorker.js",
+  // Classic browser script evaluated in node:vm by scripts/lib/theme-bootstrap.test.ts;
+  // V8 coverage does not attribute those executions to this static asset's file path.
+  "apps/web/public/theme-bootstrap.js",
   "apps/web/src/lib/vendor/qrcodegen.ts",
   "apps/web/src/routeTree.gen.ts",
 ] as const;
