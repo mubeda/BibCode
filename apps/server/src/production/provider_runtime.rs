@@ -12078,16 +12078,8 @@ mod tests {
 
     #[cfg(unix)]
     fn executable_fixture(temp: &TempDir, name: &str, contents: &str) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-
         let executable = temp.path().join(name);
-        std::fs::write(&executable, contents).expect("provider fixture should write");
-        let mut permissions = std::fs::metadata(&executable)
-            .expect("provider fixture metadata")
-            .permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&executable, permissions)
-            .expect("provider fixture should be executable");
+        TestSandbox::write_executable(&executable, contents);
         executable
     }
 
@@ -19272,8 +19264,6 @@ printf '2.1.0 (Claude Code)\n'
     #[cfg(unix)]
     #[tokio::test]
     async fn provider_path_outranks_ambient_for_resolution_and_launch_in_isolated_process() {
-        use std::os::unix::fs::PermissionsExt;
-
         const CASE: &str = "provider-runtime-path-precedence";
         const TEST_NAME: &str = "production::provider_runtime::tests::provider_path_outranks_ambient_for_resolution_and_launch_in_isolated_process";
         const SENTINEL: &str = "BIBCODE_TEST_ISOLATED_CASE_DONE=provider-runtime-path-precedence";
@@ -19361,19 +19351,12 @@ printf '2.1.0 (Claude Code)\n'
             (&ambient_executable, "ambient"),
             (&instance_executable, "instance"),
         ] {
-            std::fs::write(
+            TestSandbox::write_executable(
                 executable,
-                format!(
+                &format!(
                     "#!/bin/sh\nprintf '%s' '{label}' > \"$MARKER\"\nprintf '%s' \"$PATH\" > \"$PATH_MARKER\"\n"
                 ),
-            )
-            .expect("write runtime executable");
-            let mut permissions = std::fs::metadata(executable)
-                .expect("runtime fixture metadata")
-                .permissions();
-            permissions.set_mode(0o700);
-            std::fs::set_permissions(executable, permissions)
-                .expect("make runtime fixture executable");
+            );
         }
         let marker = sandbox.path("launched");
         let path_marker = sandbox.path("effective-path");
