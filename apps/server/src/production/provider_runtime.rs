@@ -505,6 +505,10 @@ enum SupervisorMessage {
         identity: ProviderSessionIdentity,
         response: oneshot::Sender<Result<(), ProviderRuntimeError>>,
     },
+    SuspendSessionForRemovalIfCurrent {
+        identity: ProviderSessionIdentity,
+        response: oneshot::Sender<Result<(), ProviderRuntimeError>>,
+    },
     SettleSessionAfterWorkspaceLoss {
         thread_id: String,
         identity: Option<ProviderSessionIdentity>,
@@ -954,6 +958,16 @@ impl ProviderRuntimeSupervisor {
         response_rx
             .await
             .map_err(|_| ProviderRuntimeError::ResponseDropped)?
+    }
+
+    pub async fn suspend_session_for_removal_if_current(
+        &self,
+        identity: ProviderSessionIdentity,
+    ) -> Result<(), ProviderRuntimeError> {
+        self.request(
+            |response| SupervisorMessage::SuspendSessionForRemovalIfCurrent { identity, response },
+        )
+        .await
     }
 
     pub async fn settle_session_after_workspace_loss(
@@ -3177,6 +3191,42 @@ async fn run_supervisor(
                 } else {
                     Ok(())
                 };
+                let _ = response.send(result);
+            }
+            SupervisorMessage::SuspendSessionForRemovalIfCurrent { identity, response } => {
+                let result = async {
+                    if !sessions
+                        .get(&identity.thread_id)
+                        .is_some_and(|entry| Arc::ptr_eq(&entry.driver, &identity.driver))
+                    {
+                        return Ok(());
+                    }
+                    let repositories = engine.repositories();
+                    let confirmed_idle = delivery_sequences
+                        .get(&identity.thread_id)
+                        .is_none_or(|sequence| sequence.active_generation.is_none())
+                        && repositories
+                            .get_thread_session(identity.thread_id.clone())
+                            .await
+                            .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?
+                            .is_some_and(|session| {
+                                !matches!(session.status.as_str(), "running" | "starting")
+                                    && session.active_turn_id.is_none()
+                            });
+                    if confirmed_idle {
+                        suspend_idle_session(
+                            &repositories,
+                            &activity,
+                            &mut sessions,
+                            &identity.thread_id,
+                        )
+                        .await
+                    } else {
+                        stop_session(&repositories, &activity, &mut sessions, &identity.thread_id)
+                            .await
+                    }
+                }
+                .await;
                 let _ = response.send(result);
             }
             SupervisorMessage::SettleSessionAfterWorkspaceLoss {
@@ -6021,20 +6071,26 @@ async fn persist_runtime(
     resume_cursor: Option<Value>,
     runtime_payload: Option<Value>,
 ) -> Result<(), ProviderRuntimeError> {
-    repositories
-        .upsert_provider_session_runtime(ProviderSessionRuntime {
-            thread_id: request.thread_id.clone(),
-            provider_name: request.provider.clone(),
-            provider_instance_id: request.provider_instance_id.clone(),
-            adapter_key: native_adapter_key(&request.provider).to_owned(),
-            runtime_mode: request.runtime_mode.clone(),
-            status: status.to_owned(),
-            last_seen_at: now(),
-            resume_cursor,
-            runtime_payload,
-        })
-        .await
-        .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))
+    let row = ProviderSessionRuntime {
+        thread_id: request.thread_id.clone(),
+        provider_name: request.provider.clone(),
+        provider_instance_id: request.provider_instance_id.clone(),
+        adapter_key: native_adapter_key(&request.provider).to_owned(),
+        runtime_mode: request.runtime_mode.clone(),
+        status: status.to_owned(),
+        last_seen_at: now(),
+        resume_cursor,
+        runtime_payload,
+    };
+    let result = if status == "suspended" {
+        repositories
+            .upsert_provider_session_runtime_if_thread_live(row)
+            .await
+            .map(|_| ())
+    } else {
+        repositories.upsert_provider_session_runtime(row).await
+    };
+    result.map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))
 }
 
 fn native_adapter_key(provider: &str) -> &'static str {
@@ -6083,6 +6139,305 @@ async fn suspend_idle_session(
     )
     .await?;
     result
+}
+
+#[cfg(test)]
+mod removal_suspension_tests {
+    use super::*;
+    use crate::{
+        orchestration::EngineOptions,
+        persistence::{Database, run_migrations},
+        production::worktree_runtime::removal_test_support::{self, RemovalTestDriver},
+    };
+
+    async fn fixture() -> (
+        tempfile::TempDir,
+        OrchestrationEngine,
+        Arc<ProviderRuntimeSupervisor>,
+        Arc<RemovalTestDriver>,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let database = Database::open_in_memory().await.unwrap();
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let engine = OrchestrationEngine::start(database, EngineOptions::default())
+            .await
+            .unwrap();
+        for command in [
+            json!({"type":"project.create", "commandId":"project", "projectId":"p1", "title":"Project", "workspaceRoot":root.path(), "createdAt":"2026-09-27T00:00:00Z"}),
+            json!({"type":"thread.create", "commandId":"thread", "threadId":"t1", "projectId":"p1", "title":"Thread", "kind":"workspace", "modelSelection":{"instanceId":"codex", "model":"gpt-5"}, "runtimeMode":"full-access", "interactionMode":"default", "branch":null, "worktreePath":null, "createdAt":"2026-09-27T00:00:00Z"}),
+        ] {
+            engine
+                .dispatch(serde_json::from_value(command).unwrap())
+                .await
+                .unwrap();
+        }
+        let driver = Arc::new(RemovalTestDriver::default());
+        let supervisor = removal_test_support::supervisor(&engine, driver.clone());
+        supervisor
+            .launch(removal_test_support::launch("t1", root.path().into()))
+            .await
+            .unwrap();
+        (root, engine, supervisor, driver)
+    }
+
+    fn turn() -> OrchestrationCommand {
+        serde_json::from_value(json!({"type":"thread.turn.start", "commandId":"next", "threadId":"t1", "message":{"messageId":"next", "role":"user", "text":"continue", "attachments":[]}, "runtimeMode":"full-access", "interactionMode":"default", "createdAt":"2026-09-27T00:00:01Z"})).unwrap()
+    }
+
+    async fn remove(supervisor: &ProviderRuntimeSupervisor) -> Result<(), ProviderRuntimeError> {
+        let identity = supervisor
+            .capture_session_identity("t1")
+            .await
+            .unwrap()
+            .unwrap();
+        supervisor
+            .suspend_session_for_removal_if_current(identity)
+            .await
+    }
+
+    #[tokio::test]
+    async fn confirmed_idle_suspends_and_next_launch_resumes_the_native_session() {
+        let (root, engine, supervisor, driver) = fixture().await;
+        remove(&supervisor).await.unwrap();
+        let row = engine
+            .repositories()
+            .get_provider_session_runtime("t1".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "suspended");
+        assert_eq!(
+            row.resume_cursor,
+            Some(json!({"threadId":"native-removal-session"}))
+        );
+        let request =
+            launch_request_for_command(&engine, &root.path().to_path_buf(), &turn(), None)
+                .await
+                .unwrap();
+        assert_eq!(
+            request.resume_cursor,
+            Some(json!({"threadId":"native-removal-session"}))
+        );
+        assert!(
+            supervisor
+                .capture_session_identity("t1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(driver.shutdowns.load(Ordering::SeqCst), 1);
+        supervisor.shutdown().await.unwrap();
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn non_idle_projection_stops_instead_of_suspending() {
+        for (status, active_turn) in [
+            ("running", None),
+            ("starting", None),
+            ("ready", Some("active-turn")),
+        ] {
+            let (_root, engine, supervisor, driver) = fixture().await;
+            let repositories = engine.repositories();
+            let mut projection = repositories
+                .get_thread_session("t1".into())
+                .await
+                .unwrap()
+                .unwrap();
+            projection.status = status.into();
+            projection.active_turn_id = active_turn.map(str::to_owned);
+            repositories
+                .upsert_thread_session(projection)
+                .await
+                .unwrap();
+            remove(&supervisor).await.unwrap();
+            assert!(
+                repositories
+                    .get_provider_session_runtime("t1".into())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                supervisor
+                    .capture_session_identity("t1")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(driver.shutdowns.load(Ordering::SeqCst), 1);
+            supervisor.shutdown().await.unwrap();
+            engine.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn active_delivery_generation_stops_even_with_an_idle_projection() {
+        let (_root, engine, supervisor, driver) = fixture().await;
+        driver.hold_send.store(true, Ordering::SeqCst);
+        let delivery = supervisor
+            .deliver_turn(turn(), "delivery-key".into())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), driver.send_entered.notified())
+            .await
+            .unwrap();
+        let projection = engine
+            .repositories()
+            .get_thread_session("t1".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(projection.status, "ready");
+        assert!(projection.active_turn_id.is_none());
+        remove(&supervisor).await.unwrap();
+        assert!(
+            engine
+                .repositories()
+                .get_provider_session_runtime("t1".into())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(driver.shutdowns.load(Ordering::SeqCst), 1);
+        driver.send_release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), delivery.completion())
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .repositories()
+                .get_provider_session_runtime("t1".into())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        supervisor.shutdown().await.unwrap();
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn non_current_identity_leaves_replacement_live() {
+        let (root, engine, supervisor, driver) = fixture().await;
+        let old = supervisor
+            .capture_session_identity("t1")
+            .await
+            .unwrap()
+            .unwrap();
+        supervisor
+            .stop_session_if_current(old.clone())
+            .await
+            .unwrap();
+        supervisor
+            .launch(removal_test_support::launch("t1", root.path().into()))
+            .await
+            .unwrap();
+        let before = engine
+            .repositories()
+            .get_provider_session_runtime("t1".into())
+            .await
+            .unwrap();
+        supervisor
+            .suspend_session_for_removal_if_current(old)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(
+                engine
+                    .repositories()
+                    .get_provider_session_runtime("t1".into())
+                    .await
+                    .unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+        assert!(
+            supervisor
+                .capture_session_identity("t1")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(driver.shutdowns.load(Ordering::SeqCst), 1);
+        supervisor.shutdown().await.unwrap();
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn late_suspension_after_thread_deletion_does_not_recreate_runtime() {
+        let (_root, engine, supervisor, driver) = fixture().await;
+        driver.hold_shutdown.store(true, Ordering::SeqCst);
+        let worker = supervisor.clone();
+        let removal = tokio::spawn(async move { remove(&worker).await });
+        tokio::time::timeout(Duration::from_secs(1), driver.shutdown_entered.notified())
+            .await
+            .unwrap();
+        engine
+            .dispatch(OrchestrationCommand::ThreadDelete {
+                command_id: "delete".into(),
+                thread_id: "t1".into(),
+            })
+            .await
+            .unwrap();
+        driver.shutdown_release.notify_one();
+        removal.await.unwrap().unwrap();
+        assert!(
+            engine
+                .repositories()
+                .get_provider_session_runtime("t1".into())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        supervisor.shutdown().await.unwrap();
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn suspension_write_failure_preserves_the_previous_resume_cursor() {
+        let (_root, engine, supervisor, _driver) = fixture().await;
+        engine.repositories().database().call(|connection| {
+            connection.execute_batch("CREATE TRIGGER refuse_suspension BEFORE INSERT ON provider_session_runtime WHEN NEW.status = 'suspended' BEGIN SELECT RAISE(FAIL, 'injected suspension write failure'); END")?;
+            Ok(())
+        }).await.unwrap();
+        let error = remove(&supervisor).await.unwrap_err();
+        assert!(matches!(error, ProviderRuntimeError::Persistence(_)));
+        assert!(
+            supervisor
+                .capture_session_identity("t1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let row = engine
+            .repositories()
+            .get_provider_session_runtime("t1".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.resume_cursor,
+            Some(json!({"threadId":"native-removal-session"}))
+        );
+        engine
+            .repositories()
+            .database()
+            .call(|connection| {
+                connection.execute_batch("DROP TRIGGER refuse_suspension")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        supervisor.shutdown().await.unwrap();
+        engine.shutdown().await;
+    }
 }
 
 async fn detach_session(

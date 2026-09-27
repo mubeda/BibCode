@@ -1941,6 +1941,11 @@ async fn remove_worktree_owned(
                 )
                 .await
                 .map_err(|error| encode(removal_orchestration_error(error)))?;
+            if cancellation.is_cancelled() {
+                return Err(encode(removal_orchestration_error(
+                    OrchestrationError::Cancelled,
+                )));
+            }
             let quiesce = services
                 .removal_quiescer
                 .quiesce(
@@ -3876,6 +3881,448 @@ mod mutation_invalidation_tests {
         assert!(!fixture.linked.exists());
         assert_eq!(fixture.quiesce_calls.load(Ordering::SeqCst), 1);
         fixture.handler.shutdown().await;
+    }
+
+    mod quiesce_recovery {
+        use super::*;
+        use crate::{
+            git::{
+                GitCommandError, GitPrunableWorktree, GitWorktreeInventory, GitWorktreeRecord,
+                GitWorktreeRemovalInspection,
+            },
+            production::{
+                provider_runtime::ProviderRuntimeSupervisor,
+                worktree_catalog_rpc::{WorktreeRemovalGit, WorktreeRemovalGitFuture},
+                worktree_runtime::{
+                    WorktreeRuntime,
+                    removal_test_support::{self, RemovalTestDriver},
+                },
+            },
+            terminal::{TerminalAttachInput, TerminalManager, TerminalOpenInput, TerminalStatus},
+        };
+
+        struct ObservedQuiescer {
+            runtime: WorktreeRuntime,
+            calls: Arc<AtomicUsize>,
+            cancel_after: Option<CancellationToken>,
+        }
+
+        impl WorktreeRemovalQuiescer for ObservedQuiescer {
+            fn live_session_thread_ids(
+                &self,
+                ids: Vec<String>,
+            ) -> super::super::WorktreeRemovalLiveSessionsFuture {
+                self.runtime.live_session_thread_ids(ids)
+            }
+            fn admit_cleanup(&self) -> super::super::WorktreeRemovalCleanupAdmissionFuture {
+                self.runtime.admit_cleanup()
+            }
+            fn quiesce(
+                &self,
+                admission: super::super::WorktreeRemovalCleanupAdmission,
+                request: WorktreeRemovalQuiesceRequest,
+            ) -> WorktreeRemovalQuiesceFuture {
+                let future = self.runtime.quiesce(admission, request);
+                let calls = self.calls.clone();
+                let cancellation = self.cancel_after.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let lease = future.await;
+                    if let Some(cancellation) = cancellation {
+                        cancellation.cancel();
+                    }
+                    lease
+                })
+            }
+        }
+
+        struct FailingMutationGit(GitRepository);
+
+        impl WorktreeRemovalGit for FailingMutationGit {
+            fn inventory(
+                &self,
+                anchor: PathBuf,
+                cancellation: CancellationToken,
+            ) -> WorktreeRemovalGitFuture<GitWorktreeInventory> {
+                WorktreeRemovalGit::inventory(&self.0, anchor, cancellation)
+            }
+            fn inspect(
+                &self,
+                anchor: PathBuf,
+                record: GitWorktreeRecord,
+                cancellation: CancellationToken,
+            ) -> WorktreeRemovalGitFuture<GitWorktreeRemovalInspection> {
+                WorktreeRemovalGit::inspect(&self.0, anchor, record, cancellation)
+            }
+            fn preview_prune(
+                &self,
+                anchor: PathBuf,
+                cancellation: CancellationToken,
+            ) -> WorktreeRemovalGitFuture<Vec<GitPrunableWorktree>> {
+                WorktreeRemovalGit::preview_prune(&self.0, anchor, cancellation)
+            }
+            fn remove(
+                &self,
+                anchor: PathBuf,
+                _: GitWorktreeRecord,
+                _: bool,
+                _: CancellationToken,
+            ) -> WorktreeRemovalGitFuture<()> {
+                Box::pin(async move {
+                    Err(GitCommandError {
+                        tag: "GitCommandError",
+                        operation: "remove".into(),
+                        command: "git worktree remove".into(),
+                        cwd: anchor.to_string_lossy().into_owned().into(),
+                        diagnostics: None,
+                        detail: "injected removal failure after quiesce".into(),
+                    })
+                })
+            }
+            fn prune(
+                &self,
+                _: PathBuf,
+                _: GitWorktreeRecord,
+                _: String,
+                _: CancellationToken,
+            ) -> WorktreeRemovalGitFuture<()> {
+                panic!("delete mode must not prune")
+            }
+        }
+
+        struct RecoveryFixture {
+            removal: RemovalFixture,
+            provider: Arc<ProviderRuntimeSupervisor>,
+            driver: Arc<RemovalTestDriver>,
+            runtime: WorktreeRuntime,
+            terminals: TerminalManager,
+        }
+
+        impl RecoveryFixture {
+            async fn new(cancel_after: Option<CancellationToken>) -> Self {
+                let mut removal = RemovalFixture::new().await;
+                let engine = &removal.handler.engine;
+                let driver = Arc::new(RemovalTestDriver::default());
+                let provider = removal_test_support::supervisor(engine, driver.clone());
+                provider
+                    .launch(removal_test_support::launch(
+                        "removed-thread",
+                        removal.linked.clone(),
+                    ))
+                    .await
+                    .unwrap();
+                let (runtime, terminals) = removal_test_support::runtime(
+                    engine,
+                    provider.clone(),
+                    removal.handler.catalog.availability_registry(),
+                );
+                terminals
+                    .open(TerminalOpenInput::new(
+                        "removed-thread",
+                        "terminal",
+                        removal.linked.clone(),
+                        80,
+                        24,
+                    ))
+                    .await
+                    .unwrap();
+                removal.handler.services =
+                    removal
+                        .handler
+                        .services
+                        .with_removal_quiescer(Arc::new(ObservedQuiescer {
+                            runtime: runtime.clone(),
+                            calls: removal.quiesce_calls.clone(),
+                            cancel_after,
+                        }));
+                Self {
+                    removal,
+                    provider,
+                    driver,
+                    runtime,
+                    terminals,
+                }
+            }
+
+            async fn assert_resumable(&self) {
+                assert!(self.removal.linked.join("README.md").exists());
+                let repositories = self.removal.handler.engine.repositories();
+                let row = repositories
+                    .get_provider_session_runtime("removed-thread".into())
+                    .await
+                    .unwrap()
+                    .expect("resume state retained");
+                assert_eq!(row.status, "suspended");
+                assert_eq!(
+                    row.resume_cursor,
+                    Some(json!({"threadId":"native-removal-session"}))
+                );
+                let session = repositories
+                    .get_thread_session("removed-thread".into())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(!matches!(session.status.as_str(), "running" | "starting"));
+                assert!(session.active_turn_id.is_none());
+                assert!(
+                    self.provider
+                        .capture_session_identity("removed-thread")
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(self.driver.shutdowns.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    self.terminals
+                        .attach(TerminalAttachInput::existing("removed-thread", "terminal"))
+                        .await
+                        .unwrap()
+                        .initial
+                        .status,
+                    TerminalStatus::Exited
+                );
+                assert!(
+                    repositories
+                        .get_thread("removed-thread".into())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .deleted_at
+                        .is_none()
+                );
+                self.removal
+                    .handler
+                    .catalog
+                    .availability_registry()
+                    .acquire_admission("removed-thread", [self.removal.linked.as_path()])
+                    .await
+                    .expect("failure restores availability");
+            }
+
+            async fn shutdown(self) {
+                self.runtime.shutdown().await;
+                self.provider.shutdown().await.unwrap();
+                self.terminals.shutdown().await;
+                self.removal.handler.shutdown().await;
+            }
+        }
+
+        #[tokio::test]
+        async fn git_failure_after_quiesce_preserves_idle_resume_state() {
+            let mut f = RecoveryFixture::new(None).await;
+            f.removal.handler.services = f
+                .removal
+                .handler
+                .services
+                .with_removal_git(Arc::new(FailingMutationGit(GitRepository::default())));
+            let error = f
+                .removal
+                .remove(f.removal.payload().await)
+                .await
+                .unwrap_err();
+            assert_eq!(error["reason"], "git-failed");
+            f.assert_resumable().await;
+            f.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn cancellation_after_quiesce_preserves_idle_resume_state() {
+            let cancellation = CancellationToken::new();
+            let f = RecoveryFixture::new(Some(cancellation.clone())).await;
+            let error = remove_worktree(
+                &f.removal.handler.services,
+                request("worktree.remove", f.removal.payload().await),
+                cancellation,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error,
+                super::super::encode(super::super::removal_orchestration_error(
+                    crate::orchestration::OrchestrationError::Cancelled
+                ))
+            );
+            assert_eq!(f.removal.quiesce_calls.load(Ordering::SeqCst), 1);
+            f.assert_resumable().await;
+            f.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn cancellation_before_quiesce_preserves_live_resources() {
+            let mut f = RecoveryFixture::new(None).await;
+            let entered = Arc::new(Semaphore::new(0));
+            f.removal.handler.services.removal_drain_entered = Some(entered.clone());
+            let payload = f.removal.payload().await;
+            let registry = f.removal.handler.catalog.availability_registry();
+            let admission = registry
+                .acquire_admission("removed-thread", [f.removal.linked.as_path()])
+                .await
+                .unwrap();
+            let cancellation = CancellationToken::new();
+            let operation_cancellation = cancellation.clone();
+            let services = f.removal.handler.services.clone();
+            let task = tokio::spawn(async move {
+                remove_worktree(
+                    &services,
+                    request("worktree.remove", payload),
+                    operation_cancellation,
+                )
+                .await
+            });
+            tokio::time::timeout(Duration::from_secs(30), entered.acquire())
+                .await
+                .unwrap()
+                .unwrap()
+                .forget();
+            cancellation.cancel();
+            drop(admission);
+            let error = task.await.unwrap().unwrap_err();
+            assert_eq!(
+                error,
+                super::super::encode(super::super::removal_orchestration_error(
+                    crate::orchestration::OrchestrationError::Cancelled
+                ))
+            );
+            assert_eq!(f.removal.quiesce_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(f.driver.shutdowns.load(Ordering::SeqCst), 0);
+            assert!(
+                f.provider
+                    .capture_session_identity("removed-thread")
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                f.terminals
+                    .attach(TerminalAttachInput::existing("removed-thread", "terminal"))
+                    .await
+                    .unwrap()
+                    .initial
+                    .status,
+                TerminalStatus::Running
+            );
+            assert!(f.removal.linked.exists());
+            f.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn successful_removal_cleans_idle_and_previously_suspended_runtime_rows() {
+            let f = RecoveryFixture::new(None).await;
+            f.removal
+                .create_thread("project-1", "panel-thread", "panel")
+                .await;
+            let repositories = f.removal.handler.engine.repositories();
+            let mut row = repositories
+                .get_provider_session_runtime("removed-thread".into())
+                .await
+                .unwrap()
+                .unwrap();
+            row.thread_id = "panel-thread".into();
+            row.status = "suspended".into();
+            repositories
+                .upsert_provider_session_runtime(row)
+                .await
+                .unwrap();
+            let result = f.removal.remove(f.removal.payload().await).await.unwrap();
+            assert_eq!(result["gitOutcome"], "removed");
+            assert!(!f.removal.linked.exists());
+            assert!(
+                repositories
+                    .list_provider_session_runtimes()
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            f.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn post_git_detach_failure_keeps_cursor_until_prepared_retry() {
+            let f = RecoveryFixture::new(None).await;
+            let payload = f.removal.payload().await;
+            f.removal
+                .handler
+                .hooks
+                .fail_next_projector("projection.threads", Some("thread.deleted"));
+            f.removal
+                .remove(payload.clone())
+                .await
+                .expect_err("injected detach failure");
+            assert!(
+                !f.removal.linked.exists(),
+                "Git already removed the checkout"
+            );
+            let repositories = f.removal.handler.engine.repositories();
+            let row = repositories
+                .get_provider_session_runtime("removed-thread".into())
+                .await
+                .unwrap()
+                .expect("resume cursor survives failed detach");
+            assert_eq!(row.status, "suspended");
+            assert_eq!(
+                row.resume_cursor,
+                Some(json!({"threadId":"native-removal-session"}))
+            );
+            assert!(
+                repositories
+                    .get_thread("removed-thread".into())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .deleted_at
+                    .is_none()
+            );
+            let result = f.removal.remove(payload).await.unwrap();
+            assert_eq!(result["threadRemoved"], true);
+            assert!(
+                repositories
+                    .get_provider_session_runtime("removed-thread".into())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            f.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn detach_only_stops_running_sessions_and_cleans_deleted_runtime_rows() {
+            let f = RecoveryFixture::new(None).await;
+            f.removal.set_session("removed-thread", "running").await;
+            f.removal
+                .create_thread("project-1", "panel-thread", "panel")
+                .await;
+            let repositories = f.removal.handler.engine.repositories();
+            let mut row = repositories
+                .get_provider_session_runtime("removed-thread".into())
+                .await
+                .unwrap()
+                .unwrap();
+            row.thread_id = "panel-thread".into();
+            row.status = "suspended".into();
+            repositories
+                .upsert_provider_session_runtime(row)
+                .await
+                .unwrap();
+            let result = remove_from_bibcode(&f.removal.handler.services, request("worktree.removeFromBibCode", json!({"commandId":"detach", "projectId":"project-1", "threadId":"removed-thread"})), CancellationToken::new()).await.unwrap();
+            assert_eq!(result["threadRemoved"], true);
+            assert!(f.removal.linked.exists());
+            assert_eq!(f.driver.shutdowns.load(Ordering::SeqCst), 1);
+            assert!(
+                f.provider
+                    .capture_session_identity("removed-thread")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                repositories
+                    .list_provider_session_runtimes()
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            f.shutdown().await;
+        }
     }
 
     #[tokio::test]

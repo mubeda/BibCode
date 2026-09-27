@@ -5586,6 +5586,10 @@ fn apply_threads_projector_tx(
         match event.event.event_type.as_str() {
             "thread.deleted" => {
                 transaction.execute("UPDATE projection_threads SET deleted_at = ?, updated_at = ? WHERE thread_id = ?", params![required_str(payload,"deletedAt")?, required_str(payload,"deletedAt")?, required_str(payload,"threadId")?])?;
+                transaction.execute(
+                    "DELETE FROM provider_session_runtime WHERE thread_id = ?",
+                    [required_str(payload, "threadId")?],
+                )?;
             }
             "thread.archived" => {
                 transaction.execute("UPDATE projection_threads SET archived_at = ?, updated_at = ? WHERE thread_id = ?", params![required_str(payload,"archivedAt")?, required_str(payload,"updatedAt")?, required_str(payload,"threadId")?])?;
@@ -6973,6 +6977,145 @@ mod tests {
                 detail: None,
                 orphan_cleanup_pending: false,
             }
+        }
+
+        #[tokio::test]
+        async fn removal_runtime_cleanup_covers_detach_and_generic_delete() {
+            for detach_owner in [true, false] {
+                let engine = detach_engine().await;
+                for (id, kind, path, status) in [
+                    ("workspace-owner", "workspace", PATH, "ready"),
+                    ("panel-a", "panel", PATH, "suspended"),
+                    ("panel-b", "panel", PATH, "running"),
+                    ("other-panel", "panel", "/repo/other", "suspended"),
+                ] {
+                    create_thread(&engine, &format!("create-{id}"), id, kind, path).await;
+                    engine
+                        .repositories()
+                        .upsert_provider_session_runtime(
+                            crate::persistence::ProviderSessionRuntime {
+                                thread_id: id.into(),
+                                provider_name: "codex".into(),
+                                provider_instance_id: Some("codex".into()),
+                                adapter_key: "codex-app-server".into(),
+                                runtime_mode: "full-access".into(),
+                                status: status.into(),
+                                last_seen_at: "2026-09-27T00:00:00Z".into(),
+                                resume_cursor: Some(json!({"threadId":id})),
+                                runtime_payload: None,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                }
+                let command = if detach_owner {
+                    detach("remove-runtime")
+                } else {
+                    OrchestrationCommand::ThreadDelete {
+                        command_id: "remove-runtime".into(),
+                        thread_id: "panel-a".into(),
+                    }
+                };
+                engine.dispatch(command).await.unwrap();
+                let rows = engine
+                    .repositories()
+                    .list_provider_session_runtimes()
+                    .await
+                    .unwrap();
+                let ids = rows
+                    .iter()
+                    .map(|row| row.thread_id.as_str())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    ids,
+                    if detach_owner {
+                        vec!["other-panel"]
+                    } else {
+                        vec!["other-panel", "panel-b", "workspace-owner"]
+                    }
+                );
+                assert_eq!(
+                    rows[0].resume_cursor,
+                    Some(json!({"threadId":"other-panel"}))
+                );
+                engine.shutdown().await;
+            }
+        }
+
+        #[tokio::test]
+        async fn guarded_suspension_write_requires_a_live_thread() {
+            let engine = detach_engine().await;
+            for id in ["deleted-panel", "live-panel"] {
+                create_thread(&engine, &format!("create-{id}"), id, "panel", PATH).await;
+            }
+            engine
+                .dispatch(OrchestrationCommand::ThreadDelete {
+                    command_id: "delete-panel".into(),
+                    thread_id: "deleted-panel".into(),
+                })
+                .await
+                .unwrap();
+            let repositories = engine.repositories();
+            for (id, exists) in [
+                ("deleted-panel", false),
+                ("absent-panel", false),
+                ("live-panel", true),
+            ] {
+                for cursor in ["first", "updated"] {
+                    let written = repositories
+                        .upsert_provider_session_runtime_if_thread_live(
+                            crate::persistence::ProviderSessionRuntime {
+                                thread_id: id.into(),
+                                provider_name: "codex".into(),
+                                provider_instance_id: Some("codex".into()),
+                                adapter_key: "codex-app-server".into(),
+                                runtime_mode: "full-access".into(),
+                                status: "suspended".into(),
+                                last_seen_at: "2026-09-27T00:00:00Z".into(),
+                                resume_cursor: Some(json!({"threadId":cursor})),
+                                runtime_payload: None,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(written, exists);
+                    let row = repositories
+                        .get_provider_session_runtime(id.into())
+                        .await
+                        .unwrap();
+                    assert_eq!(row.is_some(), exists, "guarded write for {id}");
+                    if let Some(row) = row {
+                        assert_eq!(row.resume_cursor, Some(json!({"threadId":cursor})));
+                    }
+                }
+            }
+            let mut stale = repositories
+                .get_provider_session_runtime("live-panel".into())
+                .await
+                .unwrap()
+                .unwrap();
+            stale.thread_id = "deleted-panel".into();
+            repositories
+                .upsert_provider_session_runtime(stale.clone())
+                .await
+                .unwrap();
+            stale.resume_cursor = Some(json!({"threadId":"must-not-overwrite"}));
+            assert!(
+                !repositories
+                    .upsert_provider_session_runtime_if_thread_live(stale)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                repositories
+                    .get_provider_session_runtime("deleted-panel".into())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .resume_cursor,
+                Some(json!({"threadId":"updated"}))
+            );
+            engine.shutdown().await;
         }
 
         #[tokio::test]

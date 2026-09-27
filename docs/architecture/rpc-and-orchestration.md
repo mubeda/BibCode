@@ -2088,14 +2088,32 @@ check resolves the quiescer's full thread set, including other projects sharing
 the repository, and checks their projected statuses and provider liveness before
 durable removal preparation, quiesce, or Git mutation. Refusal drops the removal guard and
 restores availability without stopping sessions or deleting the checkout.
+Cancellation is checked before quiesce and again afterward, before the trusted
+repository anchor is re-resolved and Git mutation starts.
 
 The authoritative check is bypassed only for a prepared retry in
 `delete-git-worktree` mode whose target is verified `missing-unregistered`:
 Git already succeeded, and durable detach must finish even with a running
-session row. Accepted receipts replay before either check. Idle sessions still
-stop through quiesce, and `worktree.removeFromBibCode` retains its detach-only
+session row. Accepted receipts replay before either check. The foreground
+quiesce and its reaper retries suspend a current provider session only when its
+projection is neither `running` nor `starting`, has no active turn, and the
+supervisor has no active delivery generation. Suspension shuts down the driver
+and retains its resume cursor in a `suspended` runtime row. Other current
+sessions are stopped; `worktree.removeFromBibCode` retains its detach-only
 behavior, including stopping running sessions. Pending, queued, and uncertain
 deliveries alone do not cause the session refusal.
+
+Both removal RPCs tombstone the owner and its panels through the shared
+`thread.deleted` transaction, which also deletes each deleted thread's provider
+runtime row regardless of status. Other threads retain their rows. Suspension
+uses an atomic conditional upsert that refuses to recreate or update runtime
+state after thread deletion, so a late reaper attempt cannot leave an orphan.
+
+If removal fails or is cancelled after quiesce, idle provider conversations
+remain resumable on the next send. Terminals stay closed with their history
+kept and can be restarted when the checkout is available. A partially completed
+filesystem removal cannot be undone; a prepared retry completes durable detach
+after verified Git removal.
 
 `vcs.removeWorktree` is a server-held terminal, persistence, and filesystem
 critical section. `ownerThreadId` identifies the workspace owner, and the
