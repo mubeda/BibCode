@@ -26,6 +26,21 @@ function copy(
   };
 }
 
+function quoteTrustPath(cwd: string): string {
+  // The checkout belongs to the server, which can use a different OS from the client.
+  const isUncPath = cwd.startsWith("\\\\");
+  if (/^[A-Za-z]:[\\/]/.test(cwd) || isUncPath) {
+    const normalizedPath = cwd.replace(/\\/g, "/");
+    // Git for Windows interpolates %(prefix)/ when matching a UNC safe.directory.
+    const path = isUncPath ? `%(prefix)/${normalizedPath}` : normalizedPath;
+    return /^[A-Za-z0-9_.:/-]+$/.test(path)
+      ? path
+      : `'${path.replace(/['\u2018\u2019\u201a\u201b]/g, "$&$&")}'`;
+  }
+
+  return /^[A-Za-z0-9_@%+=:,./-]+$/.test(cwd) ? cwd : `'${cwd.replace(/'/g, "'\\''")}'`;
+}
+
 /** One wording for both the formatted panel and plain-text disabled reasons. */
 export function gitManagerRepositoryUnavailableCopy(
   reason: GitManagerRepositoryUnavailableReason,
@@ -48,7 +63,7 @@ export function gitManagerRepositoryUnavailableCopy(
       return copy(
         "Repository not trusted",
         "Git doesn't trust this repository because another user owns it. Run ",
-        `git config --global --add safe.directory ${/[^a-zA-Z0-9._/\\:@+~-]/.test(cwd) ? `"${cwd}"` : cwd}`,
+        `git config --global --add safe.directory ${quoteTrustPath(cwd)}`,
         " to trust it.",
       );
     case "unknown":

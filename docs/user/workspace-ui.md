@@ -483,7 +483,9 @@ a clean checkout: the chosen tab stays during the failure and after repair.
 no repository (run `git init`); Git can't read it (check `.git`, for example
 HEAD or config); or Git doesn't trust another user's repository (run
 `git config --global --add safe.directory <folder>` with the selected checkout's
-path). When an older server omits the reason, the message suggests `git init`
+path quoted for the server's shell: single quotes for POSIX shells; forward
+slashes in PowerShell single quotes on Windows).
+When an older server omits the reason, the message suggests `git init`
 or checking an existing repository's `.git` folder. The toolbar shows **No
 branch** and **Sync unavailable**; branch, tag, sync, stash, merge and rebase
 actions are disabled with that reason. Tabs and Worktree stay usable.
