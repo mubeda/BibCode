@@ -4109,6 +4109,50 @@ describe("ChatView", () => {
       );
     });
 
+    it("uses the driver's name for a locked custom instance whose snapshot has no display name", () => {
+      const customClaudeInstanceId = ProviderInstanceId.make("claudeAgent_work");
+      seedEnvironment(
+        makeEnvironmentPresentation({
+          serverConfig: {
+            providers: [
+              {
+                ...codexProvider,
+                instanceId: customClaudeInstanceId,
+                driver: ProviderDriverKind.make("claudeAgent"),
+              },
+            ],
+            environment: { label: "Local" },
+          },
+        }),
+      );
+      seedProject(makeProject());
+      seedServerThread(
+        makeThread({
+          modelSelection: { instanceId: customClaudeInstanceId, model: "claude-sonnet" },
+          session: null,
+          messages: [
+            {
+              id: MessageId.make("started-custom-instance-legacy-snapshot"),
+              role: "user",
+              text: "Started",
+              turnId: null,
+              createdAt: now,
+              updatedAt: now,
+              streaming: false,
+            },
+          ],
+        }),
+      );
+      seedGitStatus(true);
+
+      renderServerRoute();
+
+      expect(capturedProps<Record<string, unknown>>("centerWorkspace")["hostLabel"]).toBe("Claude");
+      expect(capturedProps<Record<string, unknown>>("chatComposer")["lockedProvider"]).toBe(
+        "claudeAgent",
+      );
+    });
+
     it("keeps a sessionless started custom instance defensively locked while statuses load", () => {
       const customCodexInstanceId = ProviderInstanceId.make("codex_personal");
       const claudeInstanceId = ProviderInstanceId.make("claude");

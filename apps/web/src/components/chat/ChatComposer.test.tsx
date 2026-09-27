@@ -1364,6 +1364,28 @@ describe("ChatComposer rendering", () => {
     expect(contextIndex).toBeLessThan(primaryIndex);
   });
 
+  it("passes the thread instance's picker label to the context meter", () => {
+    const instanceId = ProviderInstanceId.make("codex_personal");
+    const modelSelection = { instanceId, model: "gpt-5.4" };
+    renderComposer({
+      activeThread: makeThread({ modelSelection }),
+      activeThreadModelSelection: modelSelection,
+      providerBindingInstanceId: instanceId,
+      providerStatuses: [
+        { ...codexProvider, displayName: "Default Codex" },
+        { ...codexProvider, instanceId, displayName: "Stale Personal Name" },
+      ],
+      settings: {
+        ...DEFAULT_UNIFIED_SETTINGS,
+        providerInstances: {
+          [instanceId]: { driver: codexProvider.driver, displayName: "Codex Personal" },
+        },
+      },
+    });
+
+    expect(findCapture("ContextWindowMeter")["providerDisplayName"]).toBe("Codex Personal");
+  });
+
   it.each([
     ["Cursor", "cursor"],
     ["Grok", "grok"],

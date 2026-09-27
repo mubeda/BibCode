@@ -110,7 +110,6 @@ import {
 } from "lucide-react";
 import { proposedPlanTitle } from "../../proposedPlan";
 import {
-  getProviderDisplayName,
   getProviderInteractionModeToggle,
   type ProviderControlAvailability,
 } from "../../providerModels";
@@ -935,14 +934,14 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   );
   const activeThreadProviderDisplayName = useMemo(() => {
     if (!activeThreadModelSelection) return null;
-    const entry = providerStatuses.find(
-      (p) => p.instanceId === activeThreadModelSelection.instanceId,
+    const entry = providerInstanceEntries.find(
+      (entry) => entry.instanceId === activeThreadModelSelection.instanceId,
     );
     if (entry) {
-      return getProviderDisplayName(providerStatuses, entry.driver);
+      return entry.displayName;
     }
     return formatProviderDisplayName(activeThreadModelSelection.instanceId);
-  }, [providerStatuses, activeThreadModelSelection]);
+  }, [providerInstanceEntries, activeThreadModelSelection]);
 
   // ------------------------------------------------------------------
   // Composer-local state

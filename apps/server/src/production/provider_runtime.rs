@@ -1648,18 +1648,47 @@ pub(crate) fn provider_display_name(provider_kind: &str) -> &str {
     }
 }
 
-/// The label policy for a provider instance: its display name, otherwise its driver's name.
-fn instance_label(display_name: Option<&str>, provider_kind: &str) -> String {
-    display_name
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| provider_display_name(provider_kind))
-        .to_owned()
+/// The instance label for messages and snapshots: its trimmed display name, otherwise a
+/// non-default instance's id in words, otherwise its driver's name.
+pub(crate) fn instance_label(
+    instance_id: &str,
+    display_name: Option<&str>,
+    provider_kind: &str,
+) -> String {
+    if let Some(name) = display_name.map(str::trim).filter(|name| !name.is_empty()) {
+        return name.to_owned();
+    }
+    if instance_id != provider_kind {
+        let mut label = String::with_capacity(instance_id.len());
+        let mut word_start = true;
+        let mut previous_is_lowercase = false;
+        for character in instance_id.chars() {
+            if matches!(character, '_' | '-' | ' ') {
+                word_start = true;
+                previous_is_lowercase = false;
+                continue;
+            }
+            if word_start || (previous_is_lowercase && character.is_ascii_uppercase()) {
+                if !label.is_empty() {
+                    label.push(' ');
+                }
+                label.extend(character.to_uppercase());
+            } else {
+                label.push(character);
+            }
+            word_start = false;
+            previous_is_lowercase = character.is_ascii_lowercase();
+        }
+        if !label.is_empty() {
+            return label;
+        }
+    }
+    provider_display_name(provider_kind).to_owned()
 }
 
 /// The label of a provider instance, read from the persisted settings without their secrets, so
 /// a missing secret can't cost the instance its name. Settings that can't be read, and an
-/// instance they no longer hold, fall back to the driver's name.
+/// instance they no longer hold, use the same unnamed-instance label policy.
 pub(crate) async fn provider_instance_label(
     settings_root: &Path,
     instance_id: &str,
@@ -1675,7 +1704,7 @@ pub(crate) async fn provider_instance_label(
         .and_then(|instances| instances.get(instance_id))
         .and_then(|instance| instance.get("displayName"))
         .and_then(Value::as_str);
-    instance_label(display_name, provider_kind)
+    instance_label(instance_id, display_name, provider_kind)
 }
 
 /// The label for the detail of an `error` raised before a launch request exists: the frozen
@@ -2221,6 +2250,7 @@ async fn resolve_provider_route_settings(
         provider: provider.to_owned(),
         provider_instance_id: instance_id.to_owned(),
         provider_label: instance_label(
+            instance_id,
             instance.and_then(|value| value.display_name.as_deref()),
             provider,
         ),
@@ -11602,6 +11632,46 @@ mod tests {
         engine.shutdown().await;
     }
 
+    #[test]
+    fn instance_labels_use_configured_names_then_custom_id_words_then_driver_names() {
+        let cases = [
+            ("codex", None, "codex", "Codex"),
+            ("codex", Some("  Work Codex  "), "codex", "Work Codex"),
+            ("codex_personal", None, "codex", "Codex Personal"),
+            ("myCustomInstance", None, "codex", "My Custom Instance"),
+            ("claudeAgent_work", None, "claudeAgent", "Claude Agent Work"),
+            ("route-cursor", None, "cursor", "Route Cursor"),
+            ("codex__2", None, "codex", "Codex 2"),
+            ("codex_personal", Some(""), "codex", "Codex Personal"),
+            ("codex_personal", Some(" \t "), "codex", "Codex Personal"),
+            ("codex", Some(""), "codex", "Codex"),
+            ("codex", Some(" \t "), "codex", "Codex"),
+            ("customDriver", None, "customDriver", "customDriver"),
+            ("__--", None, "codex", "Codex"),
+            ("", None, "codex", "Codex"),
+        ];
+
+        for (instance_id, display_name, driver, expected) in cases {
+            assert_eq!(
+                super::instance_label(instance_id, display_name, driver),
+                expected,
+                "instance {instance_id:?} with display name {display_name:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_instance_label_uses_custom_id_words_when_settings_cannot_be_read() {
+        let temp = TempDir::new().unwrap();
+        let settings_root = temp.path().join("blocked-settings");
+        std::fs::write(&settings_root, "not a directory").unwrap();
+
+        assert_eq!(
+            super::provider_instance_label(&settings_root, "codex_personal", "codex").await,
+            "Codex Personal"
+        );
+    }
+
     /// `InvalidOption` changes only how a delivery is classified and what an undelivered turn
     /// shows: logs, RPC errors and runtime rows read exactly as a provider failure does.
     #[test]
@@ -17763,7 +17833,7 @@ done
                 .await
                 .unwrap()
                 .provider_label,
-            "Codex"
+            "Codex Custom"
         );
         engine
             .repositories()

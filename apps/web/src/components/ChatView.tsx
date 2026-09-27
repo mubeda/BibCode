@@ -173,7 +173,7 @@ import {
   type CenterPanelLayoutPath,
 } from "../centerPanelLayout";
 import { useCenterPanelActions } from "../centerPanelActions";
-import { type ProviderInstanceEntry } from "../providerInstances";
+import { providerDriverLabel, type ProviderInstanceEntry } from "../providerInstances";
 import {
   CenterPanelWorkspace,
   type CenterPanelWorkspaceHandle,
@@ -2925,11 +2925,11 @@ function ChatViewContent(props: ChatViewProps) {
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
   const availableEditors = useAtomValue(primaryServerAvailableEditorsAtom);
   const activeProviderStatus = providerBinding.status;
-  const centerHostLabel =
-    activeProviderStatus?.displayName?.trim() ||
-    (lockedProviderInstanceId
+  const centerHostLabel = activeProviderStatus
+    ? activeProviderStatus.displayName?.trim() || providerDriverLabel(activeProviderStatus.driver)
+    : lockedProviderInstanceId
       ? formatProviderSlugLabel(lockedProviderInstanceId)
-      : formatProviderDriverKindLabel(providerBinding.driver ?? selectedProvider));
+      : providerDriverLabel(providerBinding.driver ?? selectedProvider);
   const activeProjectCwd = activeProject?.workspaceRoot ?? null;
   const activeThreadWorktreePath = activeThread?.worktreePath ?? null;
   const activeWorkspaceRoot = activeThreadWorktreePath ?? activeProjectCwd ?? undefined;

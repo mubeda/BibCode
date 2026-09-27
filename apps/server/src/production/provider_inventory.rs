@@ -1591,6 +1591,11 @@ fn snapshot_owned_message(
     let mut result = json!({
         "instanceId": definition.instance_id,
         "driver": definition.driver,
+        "displayName": super::provider_runtime::instance_label(
+            &definition.instance_id,
+            definition.display_name.as_deref(),
+            &definition.driver,
+        ),
         "enabled": definition.enabled && definition.available,
         "installed": installed,
         "version": version,
@@ -1603,9 +1608,6 @@ fn snapshot_owned_message(
         "skills": capabilities.skills,
         "agents": capabilities.agents,
     });
-    if let Some(display_name) = &definition.display_name {
-        result["displayName"] = json!(display_name);
-    }
     if let Some(message) = message {
         result["message"] = json!(message);
     }
@@ -2094,6 +2096,39 @@ mod tests {
         assert_eq!(inventory.len(), 1);
         assert_eq!(inventory[0]["name"], "refactor");
         assert_eq!(inventory[0]["invocation"], "dollar");
+    }
+
+    #[test]
+    fn provider_snapshots_stamp_instance_labels() {
+        let definitions = definitions(&json!({
+            "providerInstances": {
+                "codex_personal": { "driver": "codex" },
+                "codex": { "driver": "codex" },
+                "codex_work": { "driver": "codex", "displayName": "  Work Codex  " }
+            }
+        }));
+        let labels = ["codex_personal", "codex", "codex_work"].map(|instance_id| {
+            snapshot_owned_message(
+                definitions
+                    .iter()
+                    .find(|definition| definition.instance_id == instance_id)
+                    .expect("configured provider definition"),
+                true,
+                None,
+                "ready",
+                json!({ "status": "authenticated" }),
+                Vec::new(),
+                ProviderCapabilities::default(),
+                None,
+                "2026-08-01T00:00:00.000Z".to_owned(),
+            )["displayName"]
+                .clone()
+        });
+
+        assert_eq!(
+            labels,
+            [json!("Codex Personal"), json!("Codex"), json!("Work Codex")]
+        );
     }
 
     #[test]
