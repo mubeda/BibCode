@@ -207,7 +207,7 @@ impl ServerConfig {
 mod tests {
     use super::*;
     use crate::data_root::DataRootSource;
-    use clap::Parser;
+    use clap::{CommandFactory, FromArgMatches, Parser};
 
     #[test]
     fn owned_builder_inputs_cover_desktop_and_static_configuration() {
@@ -407,7 +407,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temporary base directory");
         let base_dir = temp.path().to_string_lossy().into_owned();
 
-        let action = Cli::try_parse_from([
+        let action = pairing_cli_without_dev_env(&[
             "bibcode",
             "pairing",
             "issue",
@@ -417,13 +417,19 @@ mod tests {
             "SSH bootstrap",
             "--json",
         ])
-        .expect("parse pairing issue CLI")
         .into_action()
         .expect("build pairing action");
-        let CliAction::Pairing(PairingCommand::Issue { root, label, json }) = action else {
+        let CliAction::Pairing(PairingCommand::Issue {
+            root,
+            dev_url,
+            label,
+            json,
+        }) = action
+        else {
             panic!("pairing issue must produce a pairing action");
         };
         assert_eq!(root.requested, PathBuf::from(base_dir.as_str()));
+        assert_eq!(dev_url, None);
         assert_eq!(label.as_deref(), Some("SSH bootstrap"));
         assert!(json);
 
@@ -498,7 +504,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temporary base directory");
         let base_dir = temp.path().to_string_lossy().into_owned();
 
-        let action = Cli::try_parse_from([
+        let action = pairing_cli_without_dev_env(&[
             "bibcode",
             "pairing",
             "offer",
@@ -510,11 +516,11 @@ mod tests {
             "laptop",
             "--json",
         ])
-        .expect("parse pairing offer CLI")
         .into_action()
         .expect("build pairing action");
         let CliAction::Pairing(PairingCommand::Offer {
             root,
+            dev_url,
             endpoint,
             reach,
             name,
@@ -525,6 +531,7 @@ mod tests {
             panic!("pairing offer must produce an offer action");
         };
         assert_eq!(root.requested, PathBuf::from(base_dir.as_str()));
+        assert_eq!(dev_url, None);
         assert_eq!(endpoint, "http://100.105.196.60:3773");
         assert_eq!(reach, "another-device");
         assert_eq!(name, None);
@@ -555,6 +562,49 @@ mod tests {
             .is_err(),
             "reach is an enumerated value"
         );
+    }
+
+    #[test]
+    fn pairing_commands_preserve_dev_url_and_select_the_matching_state() {
+        for subcommand in ["offer", "issue"] {
+            for (dev_url, state) in [(None, "userdata"), (Some("http://localhost:5733"), "dev")] {
+                let temp = tempfile::tempdir().expect("temporary pairing root");
+                let base_dir = temp.path().to_string_lossy().into_owned();
+                let mut args = vec!["bibcode", "pairing", subcommand, "--base-dir", &base_dir];
+                if subcommand == "offer" {
+                    args.extend(["--endpoint", "http://100.105.196.60:3773"]);
+                }
+                if let Some(dev_url) = dev_url {
+                    args.extend(["--dev-url", dev_url]);
+                }
+                let action = pairing_cli_without_dev_env(&args)
+                    .into_action()
+                    .expect("build pairing action");
+                let (root, selected_dev_url) = match action {
+                    CliAction::Pairing(PairingCommand::Offer { root, dev_url, .. })
+                    | CliAction::Pairing(PairingCommand::Issue { root, dev_url, .. }) => {
+                        (root, dev_url)
+                    }
+                    _ => panic!("pairing command must produce a pairing action"),
+                };
+                assert_eq!(
+                    selected_dev_url,
+                    dev_url.map(|value| value.parse::<Url>().expect("dev URL")),
+                    "{subcommand} with {dev_url:?}"
+                );
+                let mut config = ServerConfig::new(&root.effective);
+                config.dev_url = selected_dev_url;
+                assert_eq!(config.state_dir(), root.effective.join(state));
+            }
+        }
+    }
+
+    fn pairing_cli_without_dev_env(args: &[&str]) -> Cli {
+        let matches = Cli::command()
+            .mut_arg("dev_url", |arg| arg.env(None::<&str>))
+            .try_get_matches_from(args)
+            .expect("parse pairing CLI without an ambient dev URL");
+        Cli::from_arg_matches(&matches).expect("pairing CLI")
     }
 }
 
@@ -718,11 +768,13 @@ pub enum CliAction {
 pub enum PairingCommand {
     Issue {
         root: ResolvedDataRoot,
+        dev_url: Option<Url>,
         label: Option<String>,
         json: bool,
     },
     Offer {
         root: ResolvedDataRoot,
+        dev_url: Option<Url>,
         endpoint: String,
         reach: String,
         name: Option<String>,
@@ -887,9 +939,12 @@ impl Cli {
                 );
                 let root = crate::data_root::resolve_data_root(request)?;
                 return Ok(CliAction::Pairing(match pairing.command {
-                    PairingSubcommand::Issue { label, json } => {
-                        PairingCommand::Issue { root, label, json }
-                    }
+                    PairingSubcommand::Issue { label, json } => PairingCommand::Issue {
+                        root,
+                        dev_url: args.dev_url,
+                        label,
+                        json,
+                    },
                     PairingSubcommand::Offer {
                         endpoint,
                         reach,
@@ -898,6 +953,7 @@ impl Cli {
                         json,
                     } => PairingCommand::Offer {
                         root,
+                        dev_url: args.dev_url,
                         endpoint,
                         reach: reach.as_str().to_owned(),
                         name,

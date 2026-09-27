@@ -239,6 +239,7 @@ struct PairingOfferOutput {
 /// existing database only, never `prepare_store`.
 async fn open_existing_data_root(
     root: &ResolvedDataRoot,
+    dev_url: Option<url::Url>,
 ) -> Result<
     (
         persistence::StoreRuntimeGuard,
@@ -250,8 +251,28 @@ async fn open_existing_data_root(
     let runtime_guard = persistence::StoreRuntimeGuard::acquire(&root.effective)
         .await
         .map_err(|error| RunError::PairingIssue(error.to_string()))?;
-    let paths = persistence::StatePaths::from_config(&ServerConfig::new(&root.effective));
+    let mut config = ServerConfig::new(&root.effective);
+    config.dev_url = dev_url;
+    let paths = persistence::StatePaths::from_config(&config);
     if !paths.database.exists() {
+        let (other_state, remedy) = match paths.state_kind {
+            persistence::StateKind::Userdata => (
+                "dev",
+                "pass the same --dev-url as the server (or set VITE_DEV_SERVER_URL) to mint for that development store",
+            ),
+            persistence::StateKind::Dev => (
+                "userdata",
+                "drop --dev-url (and unset VITE_DEV_SERVER_URL) to mint for that userdata store",
+            ),
+        };
+        let other_database = root.effective.join(other_state).join("state.sqlite");
+        if other_database.exists() {
+            return Err(RunError::PairingIssue(format!(
+                "no BiBCode data store at {}; a data store exists at {}; {remedy}",
+                paths.database.display(),
+                other_database.display()
+            )));
+        }
         return Err(RunError::PairingIssue(format!(
             "no BiBCode data store at {}; start the server on this data root first",
             paths.database.display()
@@ -273,8 +294,14 @@ async fn open_existing_data_root(
 /// other stdout writers.
 async fn run_pairing_command(command: PairingCommand) -> Result<(), RunError> {
     match command {
-        PairingCommand::Issue { root, label, json } => {
-            let (_runtime_guard, _paths, database) = open_existing_data_root(&root).await?;
+        PairingCommand::Issue {
+            root,
+            dev_url,
+            label,
+            json,
+        } => {
+            let (_runtime_guard, _paths, database) =
+                open_existing_data_root(&root, dev_url).await?;
             let repositories = persistence::Repositories::new(database.clone());
             let issued = auth::issue_administrative_pairing_link(&repositories, label)
                 .await
@@ -300,6 +327,7 @@ async fn run_pairing_command(command: PairingCommand) -> Result<(), RunError> {
         }
         PairingCommand::Offer {
             root,
+            dev_url,
             endpoint,
             reach,
             name,
@@ -310,7 +338,7 @@ async fn run_pairing_command(command: PairingCommand) -> Result<(), RunError> {
             let input =
                 auth::validate_pairing_offer_input(&name, &endpoint, &reach, label.as_deref())
                     .map_err(|error| RunError::PairingIssue(error.to_string()))?;
-            let (_runtime_guard, paths, database) = open_existing_data_root(&root).await?;
+            let (_runtime_guard, paths, database) = open_existing_data_root(&root, dev_url).await?;
             let storage_instance_id = persistence::read_storage_instance_id(&paths)
                 .map_err(|error| RunError::PairingIssue(error.to_string()))?;
             let secret_store = auth::SecretStore::new(paths.secrets_dir.clone())
