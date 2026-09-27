@@ -59,7 +59,13 @@ import {
 
 export const Route = createRootRoute({
   beforeLoad: async ({ location }) => {
-    if (location.pathname === "/pair" && hasHostedPairingRequest(new URL(window.location.href))) {
+    const url = new URL(window.location.href);
+    const hostedStatic = isHostedStaticApp(url);
+    // The pairing surface retains the token in memory and removes it from the
+    // URL. Keep that route active when the history replacement reloads the gate.
+    const hostedPairingHost =
+      hostedStatic && url.searchParams.has("host") && !url.searchParams.has("code");
+    if (location.pathname === "/pair" && (hasHostedPairingRequest(url) || hostedPairingHost)) {
       return {
         authGateState: {
           status: "hosted-pairing",
@@ -67,7 +73,7 @@ export const Route = createRootRoute({
       };
     }
 
-    if (isHostedStaticApp(new URL(window.location.href))) {
+    if (hostedStatic) {
       return {
         authGateState: {
           status: "hosted-static",
@@ -201,7 +207,7 @@ function RootRouteErrorView({ error, reset }: ErrorComponentProps) {
       </div>
 
       <section className="relative w-full max-w-xl rounded-2xl border border-border/80 bg-card/90 p-6 shadow-2xl shadow-black/20 backdrop-blur-md sm:p-8">
-        <p className="text-[11px] font-semibold tracking-[0.18em] text-muted-foreground uppercase">
+        <p className="text-xs font-semibold tracking-[0.18em] text-muted-foreground uppercase">
           {APP_DISPLAY_NAME}
         </p>
         <h1 className="mt-3 text-2xl font-semibold tracking-tight sm:text-3xl">
