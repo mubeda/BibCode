@@ -2448,6 +2448,17 @@ impl OrchestrationEngine {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(wake);
     }
 
+    pub(crate) fn wake_turn_delivery(&self) {
+        if let Some(wake) = self
+            .turn_delivery_wake
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            wake.notify_one();
+        }
+    }
+
     pub fn set_project_command_effects(&self, effects: Arc<dyn ProjectCommandEffects>) {
         *self
             .project_command_effects
