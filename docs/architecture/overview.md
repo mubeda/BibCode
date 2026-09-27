@@ -357,8 +357,9 @@ Empty entries alongside real host entries, including an explicitly configured
 distribution-specific directories.
 
 The policy also removes `APPDIR`, `APPIMAGE`, `ARGV0`, and `OWD`, plus the
-launcher's forced `GTK_THEME`, `GDK_BACKEND`, `PYTHONDONTWRITEBYTECODE`, and
-`GTK_PATH`. The hook replaces `GTK_PATH` without retaining the user's value, so
+launcher's forced `GDK_BACKEND`, `PYTHONDONTWRITEBYTECODE`, and `GTK_PATH`, and
+the user-only `GTK_THEME` override (inherited or supplied through
+`APPIMAGE_GTK_THEME`). The hook replaces `GTK_PATH` without retaining the user's value, so
 its host directories must also be removed. Terminal shells can reapply user
 settings from their rc files. Command-local overrides and removals participate
 in the effective environment; cleared process commands never recover ambient
@@ -1032,9 +1033,10 @@ for local, release, and packaged UI builds.
 `scripts/tauri/linuxdeploy-plugin-gtk.sh` delegates to the pinned plugin and
 preserves discovery calls without an AppDir. After a successful deployment it
 validates that `apprun-hooks/linuxdeploy-plugin-gtk.sh` exists and contains
-exactly one line beginning `export GDK_BACKEND=x11`. A missing hook, absent
-export, or duplicate export fails packaging before post-processing changes the
-AppDir, making upstream drift visible.
+exactly one line each for `export GDK_BACKEND=x11`, the `gsettings` GTK theme
+lookup, the `APPIMAGE_GTK_THEME` default, and the `GTK_THEME` export. A missing
+hook, absent line, or duplicate line fails packaging before post-processing
+changes the AppDir, making upstream drift visible.
 
 The wrapper removes bundled `libwayland-client.so*` files and symlinks under
 `usr/lib*` and verifies their absence, keeping the system Wayland client with
@@ -1043,8 +1045,36 @@ the system Mesa/EGL stack. It then rewrites the hook's export to
 first and falls back to X11; the override is evaluated when the AppImage
 launches. `BIBCODE_GDK_BACKEND=x11` restores the previous backend selection.
 Preferring native Wayland avoids oversized rendering from integer GTK scaling
-under Xwayland on fractionally scaled Hyprland/Omarchy desktops. Both packaging
-steps run before AppImage assembly and updater signing.
+under Xwayland on fractionally scaled Hyprland/Omarchy desktops.
+
+The wrapper also removes the GTK theme lookup and default, and replaces the
+forced `GTK_THEME` export with a conditional export only for a nonempty,
+user-supplied `APPIMAGE_GTK_THEME`. An inherited `GTK_THEME` otherwise passes
+through unchanged. It verifies that no forced export remains and exactly one
+conditional override exists. All post-processing runs before AppImage
+assembly and updater signing.
+
+On Linux AppImage startup (`APPIMAGE` set), the host keeps the bundled,
+known-good Adwaita theme through a process-only `gtk-theme-name` GtkSettings
+override, unless the user supplied a nonempty `GTK_THEME` or
+`APPIMAGE_GTK_THEME`. Application-set GtkSettings outrank session XSETTINGS
+without changing the user's desktop settings. Unlike `GTK_THEME`, this keeps
+the light/dark variant free to follow `gtk-application-prefer-dark-theme`.
+
+The async `DesktopBridge.setTheme` command resolves **System** on Linux through
+the portal settings `Read` method on a blocking worker, then applies that
+scheme explicitly to avoid tao's `SetTheme(None)` forcing light. It uses the
+existing GTK/GIO dependency: `WebviewWindow::theme()` would dispatch the
+blocking portal call back to Tauri's main thread, even from an async command.
+The direct read is independent of any explicit window theme and uses tao's
+five-second call timeout and light fallback if the portal is unavailable.
+Tao's portal subscription continues to update the variant live. Linux managed state remembers
+the last requested choice and serializes theme commands; a main-thread
+GtkSettings notification handler reasserts **Light** or **Dark** if a portal
+change conflicts with that explicit choice. **System** never reasserts, and an
+already-matching notification is a no-op. The webview and native menubar/dialogs
+therefore share the selected variant, subject to user environment overrides.
+Other platforms retain `set_theme(None)` for **System**.
 
 ### Linux webview text rendering
 

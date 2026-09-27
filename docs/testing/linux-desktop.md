@@ -123,9 +123,10 @@ Run the AppImage GTK wrapper regression on Linux:
 vp test scripts/tauri-linuxdeploy-plugin-gtk.test.ts
 ```
 
-It covers Wayland library removal, the generated backend export, missing and
-drifted hooks failing without post-processing mutations, discovery passthrough,
-and upstream failure propagation.
+It covers Wayland library removal, the generated backend export, removal of
+forced theme selection, user theme overrides, missing and drifted hooks failing
+without post-processing mutations, discovery passthrough, and upstream failure
+propagation.
 
 Do not run `vp run test` and a separate broad Cargo command concurrently. Do
 not replace the normal Rust test harness with a serial harness.
@@ -292,7 +293,14 @@ user profile globally.
 Inspect an extracted copy of the built AppImage: no `libwayland-client.so*`
 files or symlinks may remain under `usr/lib*`, and
 `apprun-hooks/linuxdeploy-plugin-gtk.sh` must contain exactly one
-`export GDK_BACKEND="${BIBCODE_GDK_BACKEND:-wayland,x11}"` line.
+`export GDK_BACKEND="${BIBCODE_GDK_BACKEND:-wayland,x11}"` line. The hook must
+contain no `gsettings get org.gnome.desktop.interface gtk-theme` line, no
+`APPIMAGE_GTK_THEME="${APPIMAGE_GTK_THEME:-` default, and no unconditional
+`export GTK_THEME=` line. Require exactly one conditional override:
+
+```sh
+if [ -n "${APPIMAGE_GTK_THEME:-}" ]; then export GTK_THEME="$APPIMAGE_GTK_THEME"; fi
+```
 
 Record the backend actually used by the packaged BiBCode window, alongside the
 desktop session, monitor scale, `GDK_SCALE`, `GDK_DPI_SCALE`, and any
@@ -326,6 +334,31 @@ the previous behavior and may reproduce the oversized rendering. Also launch
 without the override on an X11-only session (or Xvfb with `WAYLAND_DISPLAY`
 unset) to verify automatic X11 fallback. Report unavailable desktop sessions
 separately; Xvfb evidence alone does not validate native Wayland scaling.
+
+### GTK light/dark theme
+
+Use an isolated test session with a working desktop portal settings backend.
+Record its `org.freedesktop.appearance` `color-scheme` and GTK theme name;
+Xvfb alone does not provide a portal. Launch the AppImage with `GTK_THEME` and
+`APPIMAGE_GTK_THEME` unset for the system-following checks:
+
+- With **Settings → General → Theme** on **System**, launch once with a dark
+  system scheme and once with a light scheme. Switch both ways while each
+  instance runs. The webview, native menubar, and native dialogs must match at
+  launch and after every switch.
+- Include a light system scheme with the legacy GTK theme `Adwaita-dark`, and
+  a dark system scheme with GTK theme `Adwaita`. The portal color scheme must
+  determine the variant; the AppImage's process-local theme name stays Adwaita.
+- Select **Light**, then **Dark**, and switch the system scheme both ways for
+  each. The webview and native menubar/dialogs must retain the explicit choice.
+  Return to **System** and verify immediate adoption and subsequent live changes.
+- Separately launch with a user `GTK_THEME` override, then with a nonempty
+  `APPIMAGE_GTK_THEME` override. Confirm those values are honored; the latter
+  takes precedence if both are set. Explicit environment overrides may pin a
+  variant and are excluded from the system-following acceptance checks.
+
+Record screenshots at launch and after changes, the portal/backend setup, and
+any unavailable native sessions. Restore settings only within the test session.
 
 ## Packaged UI scenarios
 

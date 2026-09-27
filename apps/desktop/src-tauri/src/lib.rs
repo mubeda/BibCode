@@ -103,6 +103,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build());
+    #[cfg(target_os = "linux")]
+    let builder = builder.manage(linux_theme::LinuxThemeState::default());
     #[cfg(feature = "desktop-e2e")]
     let builder = builder
         .plugin(desktop_e2e_logging_plugin())
@@ -110,7 +112,10 @@ pub fn run() {
         .plugin(tauri_plugin_wdio_webdriver::init());
     let builder = builder.setup(move |app| {
         #[cfg(target_os = "linux")]
-        linux_text_rendering::apply_webview_hinting_override();
+        {
+            linux_text_rendering::apply_webview_hinting_override();
+            linux_theme::configure_theme(&app.state::<linux_theme::LinuxThemeState>());
+        }
         shell_path_hydration.record();
         window::configure_application_menu(app.handle())?;
         window::restore_main_window_state(app.handle())?;
@@ -302,6 +307,8 @@ mod desktop_e2e_page_load;
 mod firewall;
 #[cfg(target_os = "linux")]
 mod linux_text_rendering;
+#[cfg(target_os = "linux")]
+mod linux_theme;
 mod network_interfaces;
 mod preview;
 mod remote_update_delegate;

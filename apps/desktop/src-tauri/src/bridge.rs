@@ -2012,11 +2012,34 @@ pub async fn desktop_bridge_get_advertised_endpoints(
 }
 
 #[tauri::command]
-pub fn desktop_bridge_set_theme(
+pub async fn desktop_bridge_set_theme(
     app: AppHandle<DesktopRuntime>,
     theme: String,
 ) -> Result<(), String> {
     let native_theme = desktop_theme_to_tauri_theme(&theme)?;
+    #[cfg(target_os = "linux")]
+    let theme_state = app.state::<crate::linux_theme::LinuxThemeState>();
+    #[cfg(target_os = "linux")]
+    let _request = theme_state.request_lock.lock().await;
+    #[cfg(target_os = "linux")]
+    theme_state.remember(native_theme);
+
+    #[cfg(target_os = "linux")]
+    let native_theme = match native_theme {
+        Some(theme) => Some(theme),
+        None => {
+            // Tao's SetTheme(None) forces light. Query the portal directly on a
+            // worker: a window theme getter would dispatch that blocking read
+            // back to the main thread and would need its explicit theme cleared.
+            let system_theme = crate::linux_theme::read_system_theme()
+                .await
+                .map_err(|error| bridge_error("Could not update the Tauri window theme", error))?;
+            Some(crate::linux_theme::resolve_theme_to_apply(
+                native_theme,
+                system_theme,
+            ))
+        }
+    };
     for window in app.webview_windows().values() {
         window
             .set_theme(native_theme)
@@ -4068,6 +4091,8 @@ mod tests {
             ])
             .build(context)
             .expect("mock Tauri app");
+        #[cfg(target_os = "linux")]
+        app.manage(crate::linux_theme::LinuxThemeState::default());
         let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
             .build()
             .expect("mock webview");
@@ -4163,8 +4188,14 @@ mod tests {
             .unwrap(),
             false
         );
-        assert!(invoke("desktop_bridge_set_theme", json!({"theme":"unsupported"}),).is_err());
-        assert!(invoke("desktop_bridge_set_theme", json!({"theme":"dark"})).is_ok());
+        assert_eq!(
+            invoke("desktop_bridge_set_theme", json!({"theme":"unsupported"}))
+                .expect_err("unsupported theme"),
+            "Unsupported desktop theme: unsupported"
+        );
+        for theme in ["dark", "system", "light", "system"] {
+            assert!(invoke("desktop_bridge_set_theme", json!({"theme":theme})).is_ok());
+        }
         for command in [
             "desktop_bridge_get_update_state",
             "desktop_bridge_check_for_update",
