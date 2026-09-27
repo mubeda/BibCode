@@ -284,6 +284,8 @@ const READABLE = {
   refName: "main",
   workingTree: { files: [], insertions: 0, deletions: 0 },
 };
+const CATALOG_ERROR =
+  "Git command failed in GitVcsDriver.worktreeInventory (/opaque/main): fatal: not a git repository (or any of the parent directories): .git";
 const UNREADABLE_MESSAGE =
   "Git can't read this repository. Check its .git folder, for example a damaged HEAD or config file.";
 const HEDGED_MESSAGE =
@@ -341,6 +343,54 @@ afterEach(async () => {
 });
 
 describe("GitManagerPanel repository unavailable", () => {
+  it.each([
+    ["absent", "This folder isn't a Git repository. Run git init to create one."],
+    ["unreadable", UNREADABLE_MESSAGE],
+    [undefined, HEDGED_MESSAGE],
+  ] as const)(
+    "describes Worktree with the %s repository message when the catalog fails",
+    async (reason, message) => {
+      Object.assign(h.query("catalog"), { data: null, error: CATALOG_ERROR });
+      h.query("status", MAIN).data = unavailable(reason);
+      await openManager();
+
+      expect(document.getElementById("git-manager-worktree-status")?.textContent).toBe(message);
+      const trigger = button("Worktree");
+      expect(trigger.getAttribute("aria-describedby")).toBe("git-manager-worktree-status");
+      expect(trigger.disabled).toBe(false);
+      expect(document.body.textContent).not.toContain(CATALOG_ERROR);
+    },
+  );
+
+  it("keeps the Worktree catalog error when the repository is readable", async () => {
+    Object.assign(h.query("catalog"), { data: null, error: CATALOG_ERROR });
+    h.query("status", MAIN).data = READABLE;
+    await openManager();
+
+    expect(document.getElementById("git-manager-worktree-status")?.textContent).toBe(CATALOG_ERROR);
+    expect(button("Worktree").getAttribute("aria-describedby")).toBe("git-manager-worktree-status");
+    expect(button("Worktree").disabled).toBe(false);
+  });
+
+  it("keeps the Worktree loading description when the catalog has not failed", async () => {
+    Object.assign(h.query("catalog"), { data: null, isPending: true });
+    await openManager();
+
+    expect(document.getElementById("git-manager-worktree-status")?.textContent).toBe(
+      "Loading worktrees…",
+    );
+    expect(button("Worktree").getAttribute("aria-describedby")).toBe("git-manager-worktree-status");
+    expect(button("Worktree").disabled).toBe(false);
+  });
+
+  it("keeps Worktree without a status description when the catalog loaded successfully", async () => {
+    await openManager();
+
+    expect(document.getElementById("git-manager-worktree-status")).toBeNull();
+    expect(button("Worktree").getAttribute("aria-describedby")).toBeNull();
+    expect(button("Worktree").disabled).toBe(false);
+  });
+
   it.each([
     ["absent", "This folder isn't a Git repository. Run git init to create one.", "git init"],
     ["unreadable", UNREADABLE_MESSAGE, null],
