@@ -616,7 +616,7 @@ describe("header rendering", () => {
     renderPanel();
     const retry = ui.filter("Button").find((props) => props.children === "Retry");
     if (retry === undefined) throw new Error("Retry was not rendered.");
-    expect(retry.disabled).toBe(false);
+    expect(retry["aria-disabled"]).toBeUndefined();
     (retry.onClick as () => void)();
     expect(refresh).toHaveBeenCalledOnce();
   });
@@ -632,7 +632,7 @@ describe("header rendering", () => {
     expect(markup).toContain("The connection dropped before the result arrived.");
     const retry = ui.filter("Button").find((props) => props.children === "Retrying…");
     if (retry === undefined) throw new Error("Retrying… was not rendered.");
-    expect(retry.disabled).toBe(true);
+    expect(retry["aria-disabled"]).toBe(true);
   });
 
   it("waits for the connection instead of offering Retry while the environment is disconnected", () => {
@@ -649,7 +649,7 @@ describe("header rendering", () => {
       .filter("Button")
       .find((props) => props.children === "Waiting for the connection…");
     if (waiting === undefined) throw new Error("Waiting for the connection… was not rendered.");
-    expect(waiting.disabled).toBe(true);
+    expect(waiting["aria-disabled"]).toBe(true);
     expect(ui.filter("Button").some((props) => props.children === "Retry")).toBe(false);
   });
 

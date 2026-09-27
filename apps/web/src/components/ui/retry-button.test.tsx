@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-import { act } from "react";
+import { act, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
@@ -28,13 +28,49 @@ async function renderButton(props: RetryButtonProps): Promise<HTMLButtonElement>
   return button;
 }
 
+function RetryHarness({ onRetry }: { onRetry: () => void }) {
+  const [retrying, setRetrying] = useState(false);
+  return (
+    <RetryButton
+      retrying={retrying}
+      onRetry={() => {
+        onRetry();
+        setRetrying(true);
+      }}
+    />
+  );
+}
+
 describe("RetryButton", () => {
   it("retries a failed load on click", async () => {
     const onRetry = vi.fn();
     const button = await renderButton({ retrying: false, onRetry });
     expect(button.textContent).toBe("Retry");
     expect(button.disabled).toBe(false);
+    expect(button.hasAttribute("aria-disabled")).toBe(false);
     await act(async () => button.click());
+    expect(onRetry).toHaveBeenCalledOnce();
+  });
+
+  it("keeps keyboard focus when a click starts the retry", async () => {
+    const onRetry = vi.fn();
+    await act(async () => root.render(<RetryHarness onRetry={onRetry} />));
+    const button = container.querySelector("button");
+    if (button === null) throw new Error("RetryButton rendered no button.");
+
+    button.focus();
+    await act(async () => button.click());
+
+    expect(onRetry).toHaveBeenCalledOnce();
+    expect(document.activeElement).toBe(button);
+    expect(button.textContent).toBe("Retrying…");
+    expect(button.getAttribute("aria-disabled")).toBe("true");
+    expect(button.disabled).toBe(false);
+
+    await act(async () => button.click());
+    await act(async () => {
+      button.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: 0 }));
+    });
     expect(onRetry).toHaveBeenCalledOnce();
   });
 
@@ -42,16 +78,21 @@ describe("RetryButton", () => {
     const onRetry = vi.fn();
     const button = await renderButton({ retrying: true, onRetry });
     expect(button.textContent).toBe("Retrying…");
-    expect(button.disabled).toBe(true);
+    expect(button.getAttribute("aria-disabled")).toBe("true");
+    expect(button.disabled).toBe(false);
     await act(async () => button.click());
     expect(onRetry).not.toHaveBeenCalled();
   });
 
   it("says it waits for the connection while the environment is disconnected", async () => {
     for (const retrying of [false, true]) {
-      const button = await renderButton({ retrying, waitingForConnection: true, onRetry: vi.fn() });
+      const onRetry = vi.fn();
+      const button = await renderButton({ retrying, waitingForConnection: true, onRetry });
       expect(button.textContent).toBe("Waiting for the connection…");
-      expect(button.disabled).toBe(true);
+      expect(button.getAttribute("aria-disabled")).toBe("true");
+      expect(button.disabled).toBe(false);
+      await act(async () => button.click());
+      expect(onRetry).not.toHaveBeenCalled();
     }
   });
 });

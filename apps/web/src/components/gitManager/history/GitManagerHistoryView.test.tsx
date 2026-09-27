@@ -1041,7 +1041,7 @@ describe("GitManagerHistoryView repository generation tracking", () => {
     h.firstPageWaiting = true;
     await renderHistory(1, 1);
     expect(retryButton()?.textContent).toBe("Retrying…");
-    expect(retryButton()?.disabled).toBe(true);
+    expect(retryButton()?.getAttribute("aria-disabled")).toBe("true");
     expect(container.textContent).toContain("Commit 80");
 
     h.firstPageWaiting = false;

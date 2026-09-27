@@ -1,3 +1,5 @@
+import { cn } from "~/lib/utils";
+
 import { Button } from "./button";
 
 export interface RetryButtonProps {
@@ -18,8 +20,8 @@ function retryLabel(retrying: boolean, waitingForConnection: boolean): string {
 }
 
 /**
- * The Retry action of a failed load. While it cannot run, it is disabled and its label
- * says what it waits for.
+ * The Retry action of a failed load. While it cannot run, it stays focusable, ignores
+ * activation, and its label says what it waits for.
  */
 export function RetryButton({
   retrying,
@@ -27,13 +29,18 @@ export function RetryButton({
   onRetry,
   className,
 }: RetryButtonProps) {
+  const unavailable = retrying || waitingForConnection;
+
   return (
     <Button
-      className={className}
-      disabled={retrying || waitingForConnection}
+      className={cn("aria-disabled:cursor-not-allowed aria-disabled:opacity-64", className)}
+      aria-disabled={unavailable || undefined}
       size="xs"
       variant="outline"
-      onClick={onRetry}
+      onClick={() => {
+        if (unavailable) return;
+        onRetry();
+      }}
     >
       {retryLabel(retrying, waitingForConnection)}
     </Button>
