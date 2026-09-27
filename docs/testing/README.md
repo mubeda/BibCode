@@ -14,6 +14,7 @@ Start with the shared procedure, then use the page for the native host:
 - [Desktop-managed SSH environments](./ssh-environments.md) (all three desktops;
   its automated harness runs on Linux and macOS)
 - [Execution report template](./execution-report-template.md)
+- [Flaky-test diagnosis](./flaky-tests.md)
 
 ## Evidence classes
 
@@ -112,6 +113,21 @@ and the desktop harnesses follow these rules. The
 [approved hermetic test guard](../superpowers/specs/2026-09-26-hermetic-test-guard-design.md)
 will enforce the no-host-provider-or-hosting-CLI rule across tests; it is not
 implemented yet.
+
+## Static rendering and Zustand
+
+`renderToStaticMarkup` reads Zustand's server snapshot, which uses
+`getInitialState`, not the current `getState`. Calling `setState` or a store
+action before that render does not change the snapshot selectors see. A
+static-markup test can therefore keep rendering the default tab after the
+test selects another one.
+
+Use static markup for initial-state output. For a non-default state or a state
+transition, render through `createRoot` inside `act` in a happy-dom test, or
+verify the interaction in a live browser. Test pure selection logic directly
+when DOM behavior is not the subject. `GitManagerPanel.test.tsx` contains
+mounted tests that set the store before rendering. Follow the compiler-lane
+guidance below when selecting the command.
 
 ## Web unit tests and the React Compiler
 

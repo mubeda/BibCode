@@ -309,6 +309,38 @@ awk -v prefix="$appimage_mount_prefix" '
   '
 ```
 
+### Manual headless development checks
+
+Use the maintained packaged E2E procedure above for release evidence. For a
+manual development check beside an installed app, choose a separate Tauri
+identifier: Linux single-instance ownership is keyed by the identifier, so a
+second launch with the production identifier can exit successfully without
+opening a test window. An identifier alone does not isolate the backend data;
+also set a disposable `BIBCODE_HOME` and XDG config, cache, and data roots for
+every test process.
+
+With the isolated development graph already running, invoke Tauri from
+`apps/desktop` with an identifier override and an empty `beforeDevCommand`.
+Set `build.devUrl` to that graph's actual web URL if its port differs from the
+default in `tauri.conf.json`. Keep these overrides in the command's `--config`
+JSON; do not edit the production configuration. Do not use
+`tauri.e2e.conf.json` for a plain debug launch: its WebDriver permissions need
+the `desktop-e2e` feature selected by the packaged E2E builder.
+
+Use a test-owned Xvfb display and select X11 for the test process. Without a
+window manager, `xdotool windowactivate` may not work; focus the exact test
+window with `xdotool windowfocus --sync "$window_id"` before sending keyboard
+input, including input to a native picker. Capture that window with
+`import -window "$window_id" "$screenshot_file"` and inspect the image. Use
+only disposable fixture directories in pickers. Follow the scoped process
+cleanup below rather than terminating processes by application name.
+
+Xvfb interaction evidence does not establish native Wayland scaling or the
+session's font hinting. For hinting-dependent checks, record the actual GTK
+hinting values and the host's override diagnostic on the test display. Follow
+the [text-rendering contract](../architecture/overview.md#linux-webview-text-rendering);
+do not change the user's desktop settings to make a harness reproduce it.
+
 ### GTK backend and fractional scaling
 
 Inspect an extracted copy of the built AppImage: no `libwayland-client.so*`
