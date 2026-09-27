@@ -16,7 +16,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -364,9 +364,23 @@ impl std::fmt::Debug for ManagedBackendChild {
     }
 }
 
+/// The runtime's maintenance owner stays off the comparable launch configuration.
+#[derive(Clone)]
+pub(crate) struct InProcessUpdateMaintenance(pub(crate) Arc<bibcode_server::UpdateMaintenance>);
+
+impl std::fmt::Debug for InProcessUpdateMaintenance {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InProcessUpdateMaintenance")
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone)]
 struct ManagedBackendRuntime {
     run_id: u64,
+    // Supervisor slots can outlive their runtime; update snapshots retain strong owners.
+    update_maintenance: Option<Weak<bibcode_server::UpdateMaintenance>>,
     stop_requested: Arc<AtomicBool>,
     shutdown: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     completion: Arc<Notify>,
@@ -377,6 +391,9 @@ struct ManagedBackendRuntime {
 
 impl ManagedBackendRuntime {
     fn new(run_id: u64, handle: bibcode_server::ServerHandle) -> Self {
+        let update_maintenance = handle
+            .update_maintenance()
+            .map(|maintenance| Arc::downgrade(&maintenance));
         let stop_requested = Arc::new(AtomicBool::new(false));
         let completion = Arc::new(Notify::new());
         let join_result = Arc::new(AsyncMutex::new(None));
@@ -400,6 +417,7 @@ impl ManagedBackendRuntime {
 
         Self {
             run_id,
+            update_maintenance,
             stop_requested,
             shutdown: Arc::new(Mutex::new(Some(shutdown_tx))),
             completion,
@@ -693,6 +711,18 @@ pub(crate) struct BackendUpdateSnapshot {
     pub environments: Vec<BackendUpdateEnvironment>,
     running_plans: Vec<BackendLaunchPlan>,
     unavailable_environments: Vec<BackendUnavailableEnvironment>,
+    in_process_maintenance: BTreeMap<String, InProcessUpdateMaintenance>,
+}
+
+impl BackendUpdateSnapshot {
+    pub(crate) fn in_process_maintenance(
+        &self,
+        environment_id: &str,
+    ) -> Option<Arc<bibcode_server::UpdateMaintenance>> {
+        self.in_process_maintenance
+            .get(environment_id)
+            .map(|owner| owner.0.clone())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -885,6 +915,7 @@ impl BackendSupervisor {
         let mut environments = Vec::with_capacity(state.slots.len());
         let mut running_plans = Vec::new();
         let mut unavailable_environments = Vec::new();
+        let mut in_process_maintenance = BTreeMap::new();
         for (slot_key, slot) in &state.slots {
             let primary = slot_key == PRIMARY_LOCAL_ENVIRONMENT_ID;
             let running = slot.backend.is_some();
@@ -917,6 +948,13 @@ impl BackendSupervisor {
                     None,
                 )
             };
+            if let Some(ManagedBackend::Runtime(runtime)) = &slot.backend
+                && let Some(owner) = &runtime.update_maintenance
+                && let Some(owner) = owner.upgrade()
+            {
+                in_process_maintenance
+                    .insert(environment_id.clone(), InProcessUpdateMaintenance(owner));
+            }
             environments.push(BackendUpdateEnvironment {
                 environment_id,
                 label,
@@ -936,6 +974,7 @@ impl BackendSupervisor {
             environments,
             running_plans,
             unavailable_environments,
+            in_process_maintenance,
         }
     }
 
@@ -3811,6 +3850,23 @@ exit /b 9
         (handle, config)
     }
 
+    async fn start_wide_test_server(
+        base_dir: &Path,
+    ) -> (bibcode_server::ServerHandle, BackendRunConfig) {
+        prepare_isolated_test_server_settings(base_dir)
+            .expect("isolated desktop test settings should write");
+        let mut config = local_test_config(0);
+        config.bind_host = "0.0.0.0".to_string();
+        let handle = ServerRuntime::start_with_ui_process_observer(
+            server_config_for_launch(test_cli_data_root(base_dir), &config),
+            Arc::new(UnavailableDesktopUiProcessObserver),
+        )
+        .await
+        .expect("wide test server should start");
+        config.port = handle.local_addr().port();
+        (handle, config)
+    }
+
     async fn request_rpc<S>(
         socket: &mut tokio_tungstenite::WebSocketStream<S>,
         id: usize,
@@ -4280,6 +4336,7 @@ exit /b 9
             environments: Vec::new(),
             running_plans: vec![plan],
             unavailable_environments: Vec::new(),
+            in_process_maintenance: BTreeMap::new(),
         };
         let failure = supervisor
             .restart_update_snapshot(&snapshot)
@@ -5194,6 +5251,7 @@ exit /b 9
         ))));
         let runtime = ManagedBackendRuntime {
             run_id: 77,
+            update_maintenance: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
             shutdown: Arc::new(Mutex::new(None)),
             completion: Arc::new(Notify::new()),
@@ -5278,6 +5336,7 @@ exit /b 9
         let supervisor = BackendSupervisor::new();
         let runtime = ManagedBackendRuntime {
             run_id: 78,
+            update_maintenance: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
             shutdown: Arc::new(Mutex::new(None)),
             completion: Arc::new(Notify::new()),
@@ -6745,6 +6804,263 @@ exit /b 9
             .wait_for_completion()
             .await
             .expect("completed runtime result should remain available");
+    }
+
+    #[tokio::test]
+    async fn a_stopped_runtime_releases_its_maintenance_owner() {
+        let temp = tempfile::tempdir().expect("tempdir should open");
+        let (handle, _config) = start_test_server(temp.path()).await;
+        let weak = Arc::downgrade(&handle.update_maintenance().expect("in-process owner"));
+        let runtime = ManagedBackendRuntime::new(44, handle);
+        let runtime_probe = runtime.clone();
+
+        runtime.request_stop();
+        runtime_probe
+            .wait_for_completion()
+            .await
+            .expect("runtime should join cleanly");
+        assert!(
+            weak.upgrade().is_none(),
+            "retaining a stopped runtime must not keep its maintenance owner alive"
+        );
+        drop(runtime_probe);
+    }
+
+    #[tokio::test]
+    async fn update_snapshot_carries_the_in_process_maintenance_owner_of_a_running_runtime() {
+        let temp = tempfile::tempdir().expect("tempdir should open");
+        let (handle, config) = start_test_server(temp.path()).await;
+        let owner = handle.update_maintenance().expect("in-process owner");
+        let backend = BackendSupervisor::new();
+        let runtime = ManagedBackendRuntime::new(43, handle);
+        let runtime_probe = runtime.clone();
+        {
+            let mut state = backend
+                .state
+                .lock()
+                .expect("backend supervisor mutex poisoned");
+            state.slots.insert(
+                PRIMARY_LOCAL_ENVIRONMENT_ID.to_owned(),
+                BackendSlotState {
+                    launch_plan: Some(BackendLaunchPlan::local(temp.path().to_path_buf(), config)),
+                    backend: Some(ManagedBackend::Runtime(Box::new(runtime))),
+                    ..BackendSlotState::default()
+                },
+            );
+        }
+
+        let snapshot = backend.snapshot_for_update();
+        assert!(Arc::ptr_eq(
+            &snapshot
+                .in_process_maintenance(PRIMARY_LOCAL_ENVIRONMENT_ID)
+                .expect("the primary's in-process owner must reach update protection"),
+            &owner,
+        ));
+        assert!(snapshot.in_process_maintenance("wsl:Ubuntu").is_none());
+
+        runtime_probe.request_stop();
+        runtime_probe
+            .wait_for_completion()
+            .await
+            .expect("runtime should join cleanly");
+    }
+
+    #[tokio::test]
+    async fn a_wide_bound_primary_is_protected_in_process_and_exits_after_commit() {
+        use crate::updates::{
+            MaintenanceFinish, UpdateProtectionTransport, finish_backend_update,
+            prepare_backend_for_update,
+        };
+        let temp = tempfile::tempdir().expect("tempdir should open");
+        let (handle, config) = start_wide_test_server(temp.path()).await;
+
+        let http = prepare_backend_for_update(&config, &UpdateProtectionTransport::Http, |_| {})
+            .await
+            .expect_err("the wide bind hides the HTTP maintenance API");
+        assert_eq!(
+            http,
+            "Could not prepare Local for update protection: update maintenance is not available."
+        );
+
+        // Hold preparation at the real store lock until a progress poll arrives.
+        let mut store_lock = Some(
+            bibcode_server::persistence::StoreOperationGuard::acquire(
+                temp.path(),
+                tokio_util::sync::CancellationToken::new(),
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("test should hold the store-operation lock"),
+        );
+        let transport = UpdateProtectionTransport::InProcess(
+            handle.update_maintenance().expect("in-process owner"),
+        );
+        let mut stages = Vec::new();
+        let prepared = prepare_backend_for_update(&config, &transport, |progress| {
+            stages.push(progress.stage);
+            store_lock.take();
+        })
+        .await
+        .expect("in-process prepare succeeds on a wide bind");
+        assert!(
+            stages.iter().any(Option::is_some),
+            "in-process preparation should publish a progress stage"
+        );
+        finish_backend_update(
+            &config,
+            &transport,
+            MaintenanceFinish::Commit,
+            &prepared.operation_id,
+        )
+        .await
+        .expect("in-process commit succeeds");
+        tokio::time::timeout(Duration::from_secs(2), handle.wait_for_shutdown())
+            .await
+            .expect("commit exits the backend like the HTTP path");
+        handle.join().await.expect("backend joins");
+    }
+
+    #[tokio::test]
+    async fn an_in_process_prepare_that_times_out_still_settles_instead_of_wedging() {
+        use crate::updates::{
+            MaintenanceFinish, UpdateProtectionTransport, finish_backend_update,
+            prepare_backend_for_update_with_timeout,
+        };
+        let temp = tempfile::tempdir().expect("tempdir should open");
+        let (handle, config) = start_test_server(temp.path()).await;
+        let maintenance = handle.update_maintenance().expect("in-process owner");
+        let transport = UpdateProtectionTransport::InProcess(maintenance.clone());
+        let store_lock = bibcode_server::persistence::StoreOperationGuard::acquire(
+            temp.path(),
+            tokio_util::sync::CancellationToken::new(),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("test should hold the store-operation lock");
+
+        let error = prepare_backend_for_update_with_timeout(
+            &config,
+            &transport,
+            Duration::from_millis(50),
+            |_| {},
+        )
+        .await
+        .expect_err("preparation should exceed the caller's bound");
+        assert_eq!(
+            error,
+            "Could not prepare Local for update protection: timed out after 45 seconds."
+        );
+        assert_eq!(maintenance.status().await["phase"], "preparing");
+
+        drop(store_lock);
+        let settled = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let status = maintenance.status().await;
+                if status["phase"] != "preparing" {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("timed-out preparation should still settle after the store lock is released");
+        assert_eq!(settled["phase"], "prepared");
+
+        finish_backend_update(
+            &config,
+            &transport,
+            MaintenanceFinish::Cancel,
+            settled["result"]["operationId"]
+                .as_str()
+                .expect("prepared operation should have an id"),
+        )
+        .await
+        .expect("cancel accepts the operation that outlived its caller");
+        tokio::time::timeout(Duration::from_secs(2), handle.wait_for_shutdown())
+            .await
+            .expect("cancel exits the backend like the HTTP path");
+        handle.join().await.expect("backend joins");
+    }
+
+    #[tokio::test]
+    async fn both_transports_report_the_same_text_for_a_mismatched_operation() {
+        use crate::updates::{MaintenanceFinish, UpdateProtectionTransport, finish_backend_update};
+        let temp = tempfile::tempdir().expect("tempdir should open");
+        let (handle, config) = start_test_server(temp.path()).await;
+        let foreign = "00000000-0000-4000-8000-000000000000";
+
+        let over_http = finish_backend_update(
+            &config,
+            &UpdateProtectionTransport::Http,
+            MaintenanceFinish::Cancel,
+            foreign,
+        )
+        .await
+        .expect_err("no prepared operation over HTTP");
+        let in_process = finish_backend_update(
+            &config,
+            &UpdateProtectionTransport::InProcess(
+                handle.update_maintenance().expect("in-process owner"),
+            ),
+            MaintenanceFinish::Cancel,
+            foreign,
+        )
+        .await
+        .expect_err("no prepared operation in process");
+        assert_eq!(over_http, in_process);
+        assert_eq!(
+            in_process,
+            "Could not cancel update protection for Local: no prepared update maintenance operation is active."
+        );
+
+        handle.shutdown();
+        handle.join().await.expect("backend joins");
+    }
+
+    #[tokio::test]
+    async fn an_unparsable_operation_id_reads_the_same_on_both_transports() {
+        use crate::updates::{
+            MaintenanceFinish, UpdateProtectionTransport, finish_backend_update,
+            prepare_backend_for_update,
+        };
+        let temp = tempfile::tempdir().expect("tempdir should open");
+        let (handle, config) = start_test_server(temp.path()).await;
+        let transport = UpdateProtectionTransport::InProcess(
+            handle.update_maintenance().expect("in-process owner"),
+        );
+        let prepared = prepare_backend_for_update(&config, &transport, |_| {})
+            .await
+            .expect("in-process preparation succeeds");
+        let over_http = finish_backend_update(
+            &config,
+            &UpdateProtectionTransport::Http,
+            MaintenanceFinish::Commit,
+            "not-a-uuid",
+        )
+        .await
+        .expect_err("HTTP rejects an unparsable operation id");
+        let in_process =
+            finish_backend_update(&config, &transport, MaintenanceFinish::Commit, "not-a-uuid")
+                .await
+                .expect_err("in-process protection rejects an unparsable operation id");
+        assert_eq!(over_http, in_process);
+        assert_eq!(
+            in_process,
+            "Could not finish update protection for Local: the update maintenance operation does not match the active operation."
+        );
+
+        finish_backend_update(
+            &config,
+            &transport,
+            MaintenanceFinish::Cancel,
+            &prepared.operation_id,
+        )
+        .await
+        .expect("cancel accepts the real operation id");
+        tokio::time::timeout(Duration::from_secs(2), handle.wait_for_shutdown())
+            .await
+            .expect("cancel exits the backend like the HTTP path");
+        handle.join().await.expect("backend joins");
     }
 
     #[tokio::test]

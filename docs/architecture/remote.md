@@ -776,10 +776,9 @@ whose restart, process, firewall, and cleanup operations own their own bounded
 deadlines. This prevents the UI from reporting a failed transition while an
 uncancelable desktop command later commits a wide topology.
 
-A wide-bound native primary does not expose the desktop-only maintenance API.
-Update protection therefore degrades while sharing until exposure returns to
-loopback; update preparation must not assume maintenance routes exist in that
-state.
+The HTTP maintenance API stays hidden on a wide-bound native primary. The
+desktop protects its in-process primary directly, so update protection works
+the same while sharing.
 
 Pairing links converge on that Add Server flow. Web clients accept
 `/pair?code=...`; desktop bundles register `bibcode://pair?code=...` with the

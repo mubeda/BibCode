@@ -754,6 +754,16 @@ the current stage, elapsed time, and active-mutation count to the protection
 dialog. A failed status poll does not cancel or replace the authoritative
 prepare request.
 
+Every desktop-mode runtime with a bootstrap token owns the maintenance
+coordinator regardless of its bind. The host obtains the primary's coordinator
+through `ServerHandle::update_maintenance` and calls it in process; WSL and
+other external backends use the loopback HTTP API. Both transports use a 45 s
+prepare bound, poll progress every 250 ms with a 2 s status bound, and allow
+10 s for commit or cancel; either successful finish exits the backend. Both
+report the same failure message text without transport details. The HTTP
+invariant is unchanged: maintenance routes are exposed only on loopback or a
+WSL-owned wildcard bind.
+
 Each in-process server runtime owns a distinct bounded process-attribution
 registry shared by its provider, terminal, provider-helper, and managed-endpoint
 owners. Runtime quiesce closes
