@@ -95,7 +95,7 @@ import {
   gitManagerRepositoryUnavailableCopy,
   resolveGitManagerRepositoryUnavailable,
   type RepositoryUnavailable,
-} from "./gitManagerRepositoryUnavailable";
+} from "./gitManagerRepositoryAvailability";
 
 const EMPTY_WORKTREES: ReadonlyArray<VcsWorktreeDescriptor> = Object.freeze([]);
 const EMPTY_REFS: ReadonlyArray<GitManagerRefEntry> = Object.freeze([]);

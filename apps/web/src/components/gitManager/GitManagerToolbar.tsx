@@ -38,7 +38,7 @@ import {
 } from "./toolbar/GitManagerSyncButton";
 import { resolveSyncState, type SyncState } from "./toolbar/syncButton.logic";
 import { GitManagerTagDialog } from "./tags/GitManagerTagDialog";
-import type { RepositoryUnavailable } from "./gitManagerRepositoryUnavailable";
+import type { RepositoryUnavailable } from "./gitManagerRepositoryAvailability";
 import {
   Menu,
   MenuItem,
