@@ -9,7 +9,7 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   gitManagerRepositoryUnavailableCopy,
   resolveGitManagerRepositoryUnavailable,
-} from "./gitManagerRepositoryUnavailable";
+} from "./gitManagerRepositoryAvailability";
 
 const decodeStatusResult = Schema.decodeUnknownSync(VcsStatusResult);
 
