@@ -1,13 +1,13 @@
 use std::{
     collections::BTreeSet,
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
 
 use bibcode_server::{
     DESKTOP_MAINTENANCE_TOKEN_HEADER, MAINTENANCE_UPDATE_CANCEL_PATH,
     MAINTENANCE_UPDATE_COMMIT_PATH, MAINTENANCE_UPDATE_PREPARE_PATH,
-    MAINTENANCE_UPDATE_STATUS_PATH, PrepareForUpdateResult,
+    MAINTENANCE_UPDATE_STATUS_PATH, MaintenanceError, PrepareForUpdateResult, UpdateMaintenance,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -38,6 +38,54 @@ const STARTUP_UPDATE_CHECK_DELAY: Duration = Duration::from_secs(15);
 const BACKGROUND_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const UPDATE_PROTECTION_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 const UPDATE_PROTECTION_STATUS_TIMEOUT: Duration = Duration::from_secs(2);
+const UPDATE_PROTECTION_PREPARE_TIMEOUT: Duration = Duration::from_secs(45);
+const UPDATE_PROTECTION_FINISH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The primary calls its owner directly, including while shared on a wide bind.
+/// WSL and other external backends retain the loopback HTTP maintenance API.
+#[derive(Clone)]
+pub(crate) enum UpdateProtectionTransport {
+    Http,
+    InProcess(Arc<UpdateMaintenance>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MaintenanceFinish {
+    Commit,
+    Cancel,
+}
+
+impl MaintenanceFinish {
+    const fn path(self) -> &'static str {
+        match self {
+            Self::Commit => MAINTENANCE_UPDATE_COMMIT_PATH,
+            Self::Cancel => MAINTENANCE_UPDATE_CANCEL_PATH,
+        }
+    }
+
+    const fn step(self) -> MaintenanceStep {
+        match self {
+            Self::Commit => MaintenanceStep::Commit,
+            Self::Cancel => MaintenanceStep::Cancel,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MaintenanceStep {
+    Prepare,
+    Commit,
+    Cancel,
+}
+
+impl MaintenanceStep {
+    const fn timeout_detail(self) -> &'static str {
+        match self {
+            Self::Prepare => "timed out after 45 seconds",
+            Self::Commit | Self::Cancel => "timed out after 10 seconds",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -63,7 +111,7 @@ enum ProtectionStatus {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
-enum ProtectionStage {
+pub(crate) enum ProtectionStage {
     WaitingForMutations,
     QuiescingRuntime,
     AcquiringStoreLock,
@@ -74,9 +122,9 @@ enum ProtectionStage {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
-struct UpdateMaintenanceProgress {
+pub(crate) struct UpdateMaintenanceProgress {
     #[serde(default)]
-    stage: Option<ProtectionStage>,
+    pub(crate) stage: Option<ProtectionStage>,
     #[serde(default)]
     elapsed_ms: Option<u64>,
     #[serde(default)]
@@ -183,6 +231,7 @@ pub(crate) struct DesktopUpdateInstallInput {
 
 struct PreparedBackend {
     config: BackendRunConfig,
+    transport: UpdateProtectionTransport,
     operation_id: String,
 }
 
@@ -707,7 +756,15 @@ impl DesktopUpdateManager {
                     continue;
                 }
                 let environment_id = environment.environment_id.clone();
-                match prepare_backend_for_update(&config, |progress| {
+                let transport = if environment.primary {
+                    snapshot.in_process_maintenance(&environment_id).map_or(
+                        UpdateProtectionTransport::Http,
+                        UpdateProtectionTransport::InProcess,
+                    )
+                } else {
+                    UpdateProtectionTransport::Http
+                };
+                match prepare_backend_for_update(&config, &transport, |progress| {
                     if set_protection_progress(&mut protection, &environment_id, &progress) {
                         self.replace_inner(|inner| inner.protection = protection.clone())
                             .emit(app);
@@ -724,6 +781,7 @@ impl DesktopUpdateManager {
                         );
                         prepared.push(PreparedBackend {
                             config,
+                            transport,
                             operation_id: result.operation_id,
                         });
                     }
@@ -752,7 +810,8 @@ impl DesktopUpdateManager {
             for operation in &prepared {
                 if let Err(error) = finish_backend_update(
                     &operation.config,
-                    MAINTENANCE_UPDATE_COMMIT_PATH,
+                    &operation.transport,
+                    MaintenanceFinish::Commit,
                     &operation.operation_id,
                 )
                 .await
@@ -1050,7 +1109,88 @@ fn set_protection_progress(
     changed
 }
 
-async fn prepare_backend_for_update(
+pub(crate) async fn prepare_backend_for_update(
+    config: &BackendRunConfig,
+    transport: &UpdateProtectionTransport,
+    on_progress: impl FnMut(UpdateMaintenanceProgress),
+) -> Result<PrepareForUpdateResult, String> {
+    prepare_backend_for_update_with_timeout(
+        config,
+        transport,
+        UPDATE_PROTECTION_PREPARE_TIMEOUT,
+        on_progress,
+    )
+    .await
+}
+
+pub(crate) async fn prepare_backend_for_update_with_timeout(
+    config: &BackendRunConfig,
+    transport: &UpdateProtectionTransport,
+    timeout: Duration,
+    on_progress: impl FnMut(UpdateMaintenanceProgress),
+) -> Result<PrepareForUpdateResult, String> {
+    tokio::time::timeout(timeout, async {
+        match transport {
+            UpdateProtectionTransport::Http => prepare_backend_over_http(config, on_progress).await,
+            UpdateProtectionTransport::InProcess(maintenance) => {
+                prepare_backend_in_process(config, maintenance, on_progress).await
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(maintenance_failure_text(
+            config,
+            MaintenanceStep::Prepare,
+            MaintenanceStep::Prepare.timeout_detail(),
+        ))
+    })
+}
+
+async fn prepare_backend_in_process(
+    config: &BackendRunConfig,
+    maintenance: &Arc<UpdateMaintenance>,
+    mut on_progress: impl FnMut(UpdateMaintenanceProgress),
+) -> Result<PrepareForUpdateResult, String> {
+    // A caller timeout must not strand the owner in Preparing. Dropping this
+    // handle detaches preparation so it can settle and retain its exit guarantees.
+    let mut prepare = tokio::spawn({
+        let maintenance = maintenance.clone();
+        async move { maintenance.prepare().await }
+    });
+    let first_progress_poll = tokio::time::Instant::now() + UPDATE_PROTECTION_PROGRESS_INTERVAL;
+    let mut progress_interval =
+        tokio::time::interval_at(first_progress_poll, UPDATE_PROTECTION_PROGRESS_INTERVAL);
+    progress_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut prepare => {
+                return result.map_err(|_| {
+                    maintenance_failure_text(
+                        config,
+                        MaintenanceStep::Prepare,
+                        "the preparation task stopped unexpectedly",
+                    )
+                })?.map_err(|error| {
+                    maintenance_failure_text(config, MaintenanceStep::Prepare, &error.to_string())
+                });
+            }
+            _ = progress_interval.tick() => {
+                if let Ok(status) =
+                    tokio::time::timeout(UPDATE_PROTECTION_STATUS_TIMEOUT, maintenance.status()).await
+                    && let Ok(progress) = serde_json::from_value::<UpdateMaintenanceProgress>(status)
+                    && progress.stage.is_some()
+                {
+                    on_progress(progress);
+                }
+            }
+        }
+    }
+}
+
+async fn prepare_backend_over_http(
     config: &BackendRunConfig,
     mut on_progress: impl FnMut(UpdateMaintenanceProgress),
 ) -> Result<PrepareForUpdateResult, String> {
@@ -1065,7 +1205,7 @@ async fn prepare_backend_for_update(
             DESKTOP_MAINTENANCE_TOKEN_HEADER,
             &config.desktop_bootstrap_token,
         )
-        .timeout(Duration::from_secs(45))
+        .timeout(UPDATE_PROTECTION_PREPARE_TIMEOUT)
         .send();
     tokio::pin!(prepare);
     let first_progress_poll = tokio::time::Instant::now() + UPDATE_PROTECTION_PROGRESS_INTERVAL;
@@ -1076,21 +1216,18 @@ async fn prepare_backend_for_update(
     loop {
         tokio::select! {
             biased;
+            response = &mut prepare => {
+                let response = response.map_err(|error| {
+                    maintenance_transport_error(config, MaintenanceStep::Prepare, &error)
+                })?;
+                return decode_maintenance_response(config, MaintenanceStep::Prepare, response).await;
+            }
             _ = progress_interval.tick() => {
                 if let Ok(progress) = fetch_update_maintenance_progress(&client, config).await
                     && progress.stage.is_some()
                 {
                     on_progress(progress);
                 }
-            }
-            response = &mut prepare => {
-                let response = response.map_err(|error| {
-                    format!(
-                        "Could not prepare {} for update protection: {error}",
-                        config.label
-                    )
-                })?;
-                return decode_maintenance_response(config, "prepare", response).await;
             }
         }
     }
@@ -1120,66 +1257,145 @@ async fn fetch_update_maintenance_progress(
     response.json().await.map_err(|error| error.to_string())
 }
 
-async fn finish_backend_update(
+pub(crate) async fn finish_backend_update(
     config: &BackendRunConfig,
-    path: &str,
+    transport: &UpdateProtectionTransport,
+    finish: MaintenanceFinish,
+    operation_id: &str,
+) -> Result<(), String> {
+    let step = finish.step();
+    tokio::time::timeout(UPDATE_PROTECTION_FINISH_TIMEOUT, async {
+        match transport {
+            UpdateProtectionTransport::Http => {
+                finish_backend_update_over_http(config, finish, operation_id).await
+            }
+            UpdateProtectionTransport::InProcess(maintenance) => {
+                let operation_id = uuid::Uuid::parse_str(operation_id).map_err(|_| {
+                    maintenance_failure_text(
+                        config,
+                        step,
+                        &MaintenanceError::OperationMismatch.to_string(),
+                    )
+                })?;
+                let result = match finish {
+                    MaintenanceFinish::Commit => maintenance.commit(operation_id).await,
+                    MaintenanceFinish::Cancel => maintenance.cancel(operation_id).await,
+                };
+                result
+                    .map_err(|error| maintenance_failure_text(config, step, &error.to_string()))?;
+                // Match the HTTP route: a quiesced backend exits after either finish.
+                maintenance.shutdown_after_response();
+                Ok(())
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(maintenance_failure_text(
+            config,
+            step,
+            step.timeout_detail(),
+        ))
+    })
+}
+
+async fn finish_backend_update_over_http(
+    config: &BackendRunConfig,
+    finish: MaintenanceFinish,
     operation_id: &str,
 ) -> Result<(), String> {
     let response = reqwest::Client::new()
-        .post(format!("{}{}", config.http_base_url(), path))
+        .post(format!("{}{}", config.http_base_url(), finish.path()))
         .header(
             DESKTOP_MAINTENANCE_TOKEN_HEADER,
             &config.desktop_bootstrap_token,
         )
         .json(&json!({ "operationId": operation_id }))
-        .timeout(Duration::from_secs(10))
+        .timeout(UPDATE_PROTECTION_FINISH_TIMEOUT)
         .send()
         .await
-        .map_err(|error| {
-            format!(
-                "Could not complete update maintenance for {}: {error}",
-                config.label
-            )
-        })?;
+        .map_err(|error| maintenance_transport_error(config, finish.step(), &error))?;
     if response.status().is_success() {
         Ok(())
     } else {
-        let status = response.status();
-        Err(format!(
-            "Update maintenance for {} failed with HTTP {}.",
-            config.label,
-            status.as_u16()
-        ))
+        Err(maintenance_response_error(config, finish.step(), response).await)
     }
 }
 
 async fn decode_maintenance_response<T: serde::de::DeserializeOwned>(
     config: &BackendRunConfig,
-    operation: &str,
+    step: MaintenanceStep,
     response: reqwest::Response,
 ) -> Result<T, String> {
     if !response.status().is_success() {
-        let status = response.status();
-        let detail = response
-            .json::<UpdateMaintenanceErrorResponse>()
-            .await
-            .ok()
-            .map(|error| bounded_maintenance_error_detail(&error.message));
-        return Err(format!(
-            "Could not {operation} {} for update protection (HTTP {}).{}",
-            config.label,
-            status.as_u16(),
-            detail
-                .map(|detail| format!(" {detail}"))
-                .unwrap_or_default()
-        ));
+        return Err(maintenance_response_error(config, step, response).await);
     }
     response.json::<T>().await.map_err(|error| {
-        format!(
-            "Could not decode the update protection result for {}: {error}",
-            config.label
-        )
+        if error.is_timeout() {
+            maintenance_transport_error(config, step, &error)
+        } else {
+            format!(
+                "Could not decode the update protection result for {}: {error}",
+                config.label
+            )
+        }
     })
+}
+
+async fn maintenance_response_error(
+    config: &BackendRunConfig,
+    step: MaintenanceStep,
+    response: reqwest::Response,
+) -> String {
+    let fallback = if response.status() == reqwest::StatusCode::NOT_FOUND {
+        "update maintenance is not available"
+    } else {
+        "the server gave no reason"
+    };
+    match response.json::<UpdateMaintenanceErrorResponse>().await {
+        Ok(error) if !error.message.trim().is_empty() => {
+            maintenance_failure_text(config, step, &error.message)
+        }
+        Err(error) if error.is_timeout() => maintenance_transport_error(config, step, &error),
+        _ => maintenance_failure_text(config, step, fallback),
+    }
+}
+
+fn maintenance_transport_error(
+    config: &BackendRunConfig,
+    step: MaintenanceStep,
+    error: &reqwest::Error,
+) -> String {
+    if error.is_timeout() {
+        maintenance_failure_text(config, step, step.timeout_detail())
+    } else {
+        maintenance_failure_text(config, step, &error.to_string())
+    }
+}
+
+fn maintenance_failure_text(
+    config: &BackendRunConfig,
+    step: MaintenanceStep,
+    detail: &str,
+) -> String {
+    let detail = bounded_maintenance_error_detail(detail);
+    let punctuation = if detail.ends_with(['.', '!', '?']) {
+        ""
+    } else {
+        "."
+    };
+    let label = &config.label;
+    match step {
+        MaintenanceStep::Prepare => {
+            format!("Could not prepare {label} for update protection: {detail}{punctuation}")
+        }
+        MaintenanceStep::Commit => {
+            format!("Could not finish update protection for {label}: {detail}{punctuation}")
+        }
+        MaintenanceStep::Cancel => {
+            format!("Could not cancel update protection for {label}: {detail}{punctuation}")
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -1209,7 +1425,8 @@ async fn cancel_stop_and_restart(
     for operation in prepared {
         if let Err(error) = finish_backend_update(
             &operation.config,
-            MAINTENANCE_UPDATE_CANCEL_PATH,
+            &operation.transport,
+            MaintenanceFinish::Cancel,
             &operation.operation_id,
         )
         .await
@@ -1714,6 +1931,115 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_failures_use_consistent_bounded_sentences() {
+        let config = test_backend_config();
+        for (step, detail, expected) in [
+            (
+                MaintenanceStep::Prepare,
+                "backup\n verification failed",
+                "Could not prepare Local for update protection: backup verification failed.",
+            ),
+            (
+                MaintenanceStep::Commit,
+                "no prepared operation.",
+                "Could not finish update protection for Local: no prepared operation.",
+            ),
+            (
+                MaintenanceStep::Cancel,
+                "operation mismatch!",
+                "Could not cancel update protection for Local: operation mismatch!",
+            ),
+            (
+                MaintenanceStep::Cancel,
+                "operation mismatch?",
+                "Could not cancel update protection for Local: operation mismatch?",
+            ),
+        ] {
+            assert_eq!(maintenance_failure_text(&config, step, detail), expected);
+        }
+        assert_eq!(
+            maintenance_failure_text(&config, MaintenanceStep::Prepare, &"x".repeat(400)),
+            format!(
+                "Could not prepare Local for update protection: {}...",
+                "x".repeat(320)
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn http_maintenance_failures_report_messages_or_readable_fallbacks() {
+        for (step, status, body, expected) in [
+            (
+                MaintenanceStep::Prepare,
+                "409 Conflict",
+                r#"{"message":"backup\n verification failed"}"#,
+                "Could not prepare Local for update protection: backup verification failed.",
+            ),
+            (
+                MaintenanceStep::Prepare,
+                "404 Not Found",
+                "Not Found",
+                "Could not prepare Local for update protection: update maintenance is not available.",
+            ),
+            (
+                MaintenanceStep::Commit,
+                "500 Internal Server Error",
+                "unreadable body",
+                "Could not finish update protection for Local: the server gave no reason.",
+            ),
+            (
+                MaintenanceStep::Cancel,
+                "409 Conflict",
+                r#"{"message":"operation mismatch!"}"#,
+                "Could not cancel update protection for Local: operation mismatch!",
+            ),
+            (
+                MaintenanceStep::Cancel,
+                "404 Not Found",
+                r#"{"message":"  "}"#,
+                "Could not cancel update protection for Local: update maintenance is not available.",
+            ),
+        ] {
+            let listener =
+                TcpListener::bind("127.0.0.1:0").expect("maintenance server should bind");
+            let mut config = test_backend_config();
+            config.port = listener.local_addr().expect("maintenance address").port();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("maintenance request");
+                assert_request_read(&mut stream, "maintenance request should read");
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .expect("maintenance response should write");
+            });
+            let result = match step {
+                MaintenanceStep::Prepare => {
+                    prepare_backend_for_update(&config, &UpdateProtectionTransport::Http, |_| {})
+                        .await
+                        .map(|_| ())
+                }
+                MaintenanceStep::Commit | MaintenanceStep::Cancel => {
+                    let finish = match step {
+                        MaintenanceStep::Commit => MaintenanceFinish::Commit,
+                        _ => MaintenanceFinish::Cancel,
+                    };
+                    finish_backend_update(
+                        &config,
+                        &UpdateProtectionTransport::Http,
+                        finish,
+                        "00000000-0000-4000-8000-000000000000",
+                    )
+                    .await
+                }
+            };
+            server.join().expect("maintenance server should stop");
+            assert_eq!(result.expect_err("maintenance should fail"), expected);
+        }
+    }
+
+    #[test]
     fn primary_protection_failure_cannot_be_excluded() {
         let mut protection = vec![DesktopUpdateProtection {
             environment_id: "primary".to_string(),
@@ -1938,7 +2264,10 @@ mod tests {
         config.port = port;
         let mut progress = Vec::new();
 
-        let result = prepare_backend_for_update(&config, |update| progress.push(update))
+        let result =
+            prepare_backend_for_update(&config, &UpdateProtectionTransport::Http, |update| {
+                progress.push(update)
+            })
             .await
             .expect("prepare should complete");
 
