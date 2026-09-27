@@ -407,6 +407,10 @@ impl OrchestrationEffects {
         callbacks: Arc<dyn OrchestrationEffectCallbacks>,
         options: EffectsOptions,
     ) -> Result<Self, OrchestrationEffectsError> {
+        // Read the log head before subscribing: every later commit then reaches the subscription
+        // or lies after this floor, where the producer reads it from the log, while history at or
+        // below the floor is never replayed.
+        let floor = engine.repositories().max_event_sequence().await?;
         let subscription = engine.subscribe_events();
         let cancellation = CancellationToken::new();
         let (sender, receiver) = mpsc::channel(options.queue_capacity.max(1));
@@ -429,6 +433,7 @@ impl OrchestrationEffects {
             sender,
             cancellation.clone(),
             subscription,
+            floor,
         ));
 
         Ok(Self {
@@ -453,15 +458,44 @@ async fn run_producer(
     engine: OrchestrationEngine,
     sender: mpsc::Sender<OrchestrationEvent>,
     cancellation: CancellationToken,
-    mut subscription: broadcast::Receiver<OrchestrationEvent>,
+    subscription: broadcast::Receiver<OrchestrationEvent>,
+    floor: i64,
 ) {
-    let mut last_sequence = 0;
+    // The highest log position already handled. Anything at or below it is history or was
+    // already forwarded from the log, so it is skipped rather than re-running its side effect.
+    let mut handled_through = floor;
+    // Commits between reading the floor and subscribing never reach the subscription.
+    if !forward_logged_events(&engine, &sender, &mut handled_through, LogRead::Startup).await {
+        return;
+    }
+    forward_subscription(
+        &engine,
+        &sender,
+        &cancellation,
+        subscription,
+        handled_through,
+    )
+    .await;
+}
+
+/// Forwards what the subscription delivers after `handled_through`, and reads the log to fill the
+/// gap whenever the subscription lags.
+async fn forward_subscription(
+    engine: &OrchestrationEngine,
+    sender: &mpsc::Sender<OrchestrationEvent>,
+    cancellation: &CancellationToken,
+    mut subscription: broadcast::Receiver<OrchestrationEvent>,
+    mut handled_through: i64,
+) {
     loop {
         tokio::select! {
             () = cancellation.cancelled() => return,
             received = subscription.recv() => match received {
                 Ok(event) => {
-                    last_sequence = event.sequence;
+                    if event.sequence <= handled_through {
+                        continue;
+                    }
+                    handled_through = event.sequence;
                     if is_reactor_event(&event)
                         && sender.send(event).await.is_err()
                     {
@@ -469,21 +503,59 @@ async fn run_producer(
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    match engine.read_events(last_sequence).await {
-                        Ok(events) => {
-                            for event in events {
-                                last_sequence = event.sequence;
-                                if is_reactor_event(&event)
-                                    && sender.send(event).await.is_err()
-                                {
-                                    return;
-                                }
-                            }
-                        }
-                        Err(error) => tracing::warn!(%error, "failed to recover orchestration effect events after receiver lag"),
+                    if !forward_logged_events(engine, sender, &mut handled_through, LogRead::LagRecovery)
+                        .await
+                    {
+                        return;
                     }
                 }
                 Err(broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    }
+}
+
+/// Why the producer reads the event log instead of the subscription.
+#[derive(Clone, Copy, Debug)]
+enum LogRead {
+    /// Once at startup, for commits made before the subscription existed.
+    Startup,
+    /// After the subscription lagged and dropped events.
+    LagRecovery,
+}
+
+/// Forwards the reactor events logged after `handled_through`, one bounded page at a time.
+/// Returns `false` once the worker has stopped.
+async fn forward_logged_events(
+    engine: &OrchestrationEngine,
+    sender: &mpsc::Sender<OrchestrationEvent>,
+    handled_through: &mut i64,
+    read: LogRead,
+) -> bool {
+    let repositories = engine.repositories();
+    let mut pages = repositories.event_pages(*handled_through);
+    loop {
+        let page = match pages.next_page().await {
+            Ok(Some(page)) => page,
+            Ok(None) => return true,
+            Err(error) => {
+                match read {
+                    LogRead::Startup => tracing::warn!(
+                        %error,
+                        "failed to read orchestration effect events committed before the effects subscription"
+                    ),
+                    LogRead::LagRecovery => tracing::warn!(
+                        %error,
+                        "failed to recover orchestration effect events after receiver lag"
+                    ),
+                }
+                return true;
+            }
+        };
+        for event in page {
+            *handled_through = event.sequence;
+            if is_reactor_event(&event) && sender.send(event).await.is_err() {
+                return false;
             }
         }
     }
@@ -1238,10 +1310,164 @@ fn server_id(tag: &str) -> String {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::persistence::{Database, ProjectionProject, Repositories, run_migrations};
+    use crate::orchestration::EngineOptions;
+    use crate::persistence::{
+        Database, NewOrchestrationEvent, ProjectionProject, Repositories, run_migrations,
+    };
     use crate::test_support::TestSandbox;
 
     use super::*;
+
+    /// An engine over an empty in-memory event log.
+    async fn empty_event_log() -> OrchestrationEngine {
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        OrchestrationEngine::start(database, EngineOptions::default())
+            .await
+            .expect("engine")
+    }
+
+    async fn append_reactor_event(
+        repositories: &Repositories,
+        event_type: &'static str,
+        index: usize,
+    ) -> OrchestrationEvent {
+        repositories
+            .append_event(NewOrchestrationEvent {
+                event_id: format!("effects-lag-{index}"),
+                event_type: event_type.to_owned(),
+                aggregate_kind: "thread".to_owned(),
+                aggregate_id: format!("thread-{index}"),
+                occurred_at: "2026-08-01T00:00:00Z".to_owned(),
+                command_id: None,
+                causation_event_id: None,
+                correlation_id: None,
+                payload: json!({ "threadId": format!("thread-{index}") }),
+                metadata: json!({}),
+            })
+            .await
+            .expect("event")
+    }
+
+    /// Runs the producer from `floor` over a subscription of `capacity` that received `broadcast`
+    /// before its first receive and then closed. Returns the sequence of every forwarded event.
+    async fn forwarded_sequences(
+        engine: &OrchestrationEngine,
+        floor: i64,
+        broadcast: Vec<OrchestrationEvent>,
+        capacity: usize,
+    ) -> Vec<i64> {
+        let (events, subscription) = broadcast::channel(capacity);
+        for event in broadcast {
+            let _ = events.send(event);
+        }
+        drop(events);
+        let (sender, mut receiver) = mpsc::channel(1024);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            run_producer(
+                engine.clone(),
+                sender,
+                CancellationToken::new(),
+                subscription,
+                floor,
+            ),
+        )
+        .await
+        .expect("the producer stops when its subscription closes");
+        let mut forwarded = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            forwarded.push(event.sequence);
+        }
+        forwarded
+    }
+
+    /// Events committed after the startup read, but dropped before the producer's first receive,
+    /// are recovered from the log once each. The events the subscription still holds after that
+    /// read are skipped instead of re-running side effects such as a checkpoint revert or a thread
+    /// deletion, and history at or below the floor is never replayed.
+    #[tokio::test]
+    async fn lag_recovery_forwards_events_committed_after_the_startup_read_exactly_once() {
+        let engine = empty_event_log().await;
+        let repositories = engine.repositories();
+        for index in 0..3 {
+            append_reactor_event(&repositories, "thread.checkpoint-revert-requested", index).await;
+        }
+        let floor = repositories.max_event_sequence().await.expect("floor");
+        let (sender, mut receiver) = mpsc::channel(1024);
+        let mut handled_through = floor;
+        assert!(
+            forward_logged_events(&engine, &sender, &mut handled_through, LogRead::Startup).await,
+            "the startup read finds nothing after the floor"
+        );
+        // More than one page commits before the first receive, so the subscription has lagged.
+        let (events, subscription) = broadcast::channel(4);
+        let mut expected = Vec::new();
+        for index in 3..3 + crate::persistence::EVENT_PAGE_SIZE + 5 {
+            let event = append_reactor_event(&repositories, "thread.deleted", index).await;
+            expected.push(event.sequence);
+            let _ = events.send(event);
+        }
+        drop(events);
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            forward_subscription(
+                &engine,
+                &sender,
+                &CancellationToken::new(),
+                subscription,
+                handled_through,
+            ),
+        )
+        .await
+        .expect("the producer stops when its subscription closes");
+
+        let mut forwarded = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            forwarded.push(event.sequence);
+        }
+        assert_eq!(forwarded, expected);
+        engine.shutdown().await;
+    }
+
+    /// Events committed after the floor was read but before the subscription existed never reach
+    /// the subscription, so the producer reads them from the log before its first receive.
+    #[tokio::test]
+    async fn events_between_the_floor_and_the_subscription_are_forwarded_without_a_lag() {
+        let engine = empty_event_log().await;
+        let repositories = engine.repositories();
+        for index in 0..3 {
+            append_reactor_event(&repositories, "thread.checkpoint-revert-requested", index).await;
+        }
+        let floor = repositories.max_event_sequence().await.expect("floor");
+        let mut expected = Vec::new();
+        for index in 3..5 {
+            expected.push(
+                append_reactor_event(&repositories, "thread.deleted", index)
+                    .await
+                    .sequence,
+            );
+        }
+        let mut broadcast = Vec::new();
+        for index in 5..8 {
+            let event = append_reactor_event(&repositories, "thread.deleted", index).await;
+            expected.push(event.sequence);
+            broadcast.push(event);
+        }
+
+        assert_eq!(
+            forwarded_sequences(&engine, floor, broadcast, 64).await,
+            expected
+        );
+        engine.shutdown().await;
+    }
 
     #[tokio::test]
     async fn unit_build_covers_workspace_normalization_and_checkpoint_git_lifecycle() {

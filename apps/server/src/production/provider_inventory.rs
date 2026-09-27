@@ -172,6 +172,18 @@ fn default_provider_binary(driver: &str) -> &str {
     }
 }
 
+/// The custom models a provider instance offers, read the way the catalog reads them: the
+/// instance's own `customModels`, otherwise its driver's legacy provider settings. A launch
+/// validates a turn's options with this list, so a custom model the catalog offers is accepted
+/// the same way.
+pub(crate) fn instance_custom_models(settings: &Value, instance_id: &str) -> Vec<String> {
+    definitions(settings)
+        .into_iter()
+        .find(|definition| definition.instance_id == instance_id)
+        .map(|definition| definition.custom_models)
+        .unwrap_or_default()
+}
+
 fn definitions(settings: &Value) -> Vec<ProviderDefinition> {
     let legacy = settings.get("providers").and_then(Value::as_object);
     let instances = settings.get("providerInstances").and_then(Value::as_object);
@@ -1579,6 +1591,11 @@ fn snapshot_owned_message(
     let mut result = json!({
         "instanceId": definition.instance_id,
         "driver": definition.driver,
+        "displayName": super::provider_runtime::instance_label(
+            &definition.instance_id,
+            definition.display_name.as_deref(),
+            &definition.driver,
+        ),
         "enabled": definition.enabled && definition.available,
         "installed": installed,
         "version": version,
@@ -1591,9 +1608,6 @@ fn snapshot_owned_message(
         "skills": capabilities.skills,
         "agents": capabilities.agents,
     });
-    if let Some(display_name) = &definition.display_name {
-        result["displayName"] = json!(display_name);
-    }
     if let Some(message) = message {
         result["message"] = json!(message);
     }
@@ -1723,22 +1737,13 @@ mod tests {
 
     #[cfg(unix)]
     fn write_version_fixture(directory: &Path, name: &str, version: &str) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-
         let executable = directory.join(name);
-        std::fs::write(
+        crate::test_support::executable_fixture::write_executable(
             &executable,
             format!(
                 "#!/bin/sh\nif [ \"$1\" = about ]; then printf '%s\\n' '{{\"cliVersion\":\"{version}\"}}'; else printf '%s\\n' '{version}'; fi\n"
             ),
-        )
-        .expect("write version fixture");
-        let mut permissions = std::fs::metadata(&executable)
-            .expect("version fixture metadata")
-            .permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&executable, permissions)
-            .expect("make version fixture executable");
+        );
         executable
     }
 
@@ -1828,28 +1833,19 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn exact_target_probe_applies_the_same_case_variant_path_used_for_resolution() {
-        use std::os::unix::fs::PermissionsExt;
-
         let root = tempfile::tempdir().expect("inventory PATH root");
         let first = root.path().join("first");
         let second = root.path().join("second");
         std::fs::create_dir_all(&first).expect("first PATH directory");
         std::fs::create_dir_all(&second).expect("second PATH directory");
         let executable = first.join("codex");
-        std::fs::write(
+        crate::test_support::executable_fixture::write_executable(
             &executable,
             format!(
                 "#!/bin/sh\nif [ \"$PATH\" = '{}' ]; then printf '1.2.3\\n'; else printf '9.9.9\\n'; fi\n",
                 first.to_string_lossy()
             ),
-        )
-        .expect("write version fixture");
-        let mut permissions = std::fs::metadata(&executable)
-            .expect("version fixture metadata")
-            .permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&executable, permissions)
-            .expect("make version fixture executable");
+        );
         let target = ProviderMaintenanceTarget {
             instance_id: "codex-work".to_owned(),
             driver: "codex".to_owned(),
@@ -1972,6 +1968,40 @@ mod tests {
         );
     }
 
+    /// A launch reads an instance's custom models exactly as the catalog does, so the models the
+    /// catalog offers are the models the launch accepts.
+    #[test]
+    fn instance_custom_models_are_the_ones_the_catalog_offers() {
+        let settings = json!({
+            "providers": { "codex": { "customModels": ["legacy-custom"] } },
+            "providerInstances": {
+                "codex-work": {
+                    "driver": "codex",
+                    "config": { "customModels": [" work-custom ", ""] }
+                },
+                "codex-plain": { "driver": "codex" }
+            }
+        });
+        assert_eq!(
+            instance_custom_models(&settings, "codex-work"),
+            vec!["work-custom"]
+        );
+        // An instance without a list of its own takes its driver's legacy list.
+        assert_eq!(
+            instance_custom_models(&settings, "codex-plain"),
+            vec!["legacy-custom"]
+        );
+        assert!(instance_custom_models(&settings, "codex-missing").is_empty());
+        // Settings without instances offer the legacy list on the default instance.
+        assert_eq!(
+            instance_custom_models(
+                &json!({ "providers": { "codex": { "customModels": ["legacy-custom"] } } }),
+                "codex"
+            ),
+            vec!["legacy-custom"]
+        );
+    }
+
     #[test]
     fn grok_inventory_stays_disabled_when_saved_settings_enable_it() {
         let legacy = definitions(&json!({
@@ -2048,6 +2078,39 @@ mod tests {
         assert_eq!(inventory.len(), 1);
         assert_eq!(inventory[0]["name"], "refactor");
         assert_eq!(inventory[0]["invocation"], "dollar");
+    }
+
+    #[test]
+    fn provider_snapshots_stamp_instance_labels() {
+        let definitions = definitions(&json!({
+            "providerInstances": {
+                "codex_personal": { "driver": "codex" },
+                "codex": { "driver": "codex" },
+                "codex_work": { "driver": "codex", "displayName": "  Work Codex  " }
+            }
+        }));
+        let labels = ["codex_personal", "codex", "codex_work"].map(|instance_id| {
+            snapshot_owned_message(
+                definitions
+                    .iter()
+                    .find(|definition| definition.instance_id == instance_id)
+                    .expect("configured provider definition"),
+                true,
+                None,
+                "ready",
+                json!({ "status": "authenticated" }),
+                Vec::new(),
+                ProviderCapabilities::default(),
+                None,
+                "2026-08-01T00:00:00.000Z".to_owned(),
+            )["displayName"]
+                .clone()
+        });
+
+        assert_eq!(
+            labels,
+            [json!("Codex Personal"), json!("Codex"), json!("Work Codex")]
+        );
     }
 
     #[test]

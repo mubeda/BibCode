@@ -52,6 +52,13 @@ export interface WorktreeDiscoverySectionProps {
   readonly serverConfigs: ReadonlyMap<EnvironmentId, ServerConfig>;
   readonly primaryEnvironmentId?: EnvironmentId | null;
   readonly onNavigateToThread: (threadRef: ScopedThreadRef) => void;
+  /**
+   * Receives the number of hidden discovered worktrees across the project's
+   * supported members while the section is mounted and loaded, and null
+   * otherwise, so the project menu can label "Show Hidden Worktrees (N)"
+   * without starting a query of its own.
+   */
+  readonly onHiddenCountChange?: (count: number | null) => void;
 }
 
 type AtomCommandFailureResult = Extract<
@@ -121,7 +128,7 @@ function EnvironmentBadge(props: {
         render={
           <span
             aria-label={ariaLabel}
-            className="inline-flex min-w-0 items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-[9px] font-medium text-muted-foreground"
+            className="inline-flex min-w-0 items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-xs font-medium text-muted-foreground"
           />
         }
       >
@@ -152,11 +159,11 @@ function CandidateDetails(props: {
           />
         }
       >
-        <span className="block max-w-full truncate text-[11px] font-medium text-foreground/90">
+        <span className="block max-w-full truncate text-xs font-medium text-foreground/90">
           {props.label}
         </span>
         {props.discriminator ? (
-          <span className="block max-w-full truncate font-mono text-[9px] text-muted-foreground">
+          <span className="block max-w-full truncate font-mono text-xs text-muted-foreground">
             {props.discriminator}
           </span>
         ) : null}
@@ -179,7 +186,7 @@ function CandidateParentGroup(props: {
   return (
     <div className="flex min-w-0 flex-col gap-0.5" data-worktree-parent-group>
       <div
-        className="block max-w-full truncate px-1 font-mono text-[8px] text-muted-foreground/65"
+        className="block max-w-full truncate px-1 font-mono text-xs text-muted-foreground"
         data-worktree-parent-directory
       >
         {props.parentGroup.parentDirectory}
@@ -197,7 +204,7 @@ function CandidateParentGroup(props: {
             path={presentation.candidate.path}
           />
           {props.discoveredBadge ? (
-            <span className="shrink-0 rounded bg-info/10 px-1 py-px text-[8px] font-medium uppercase tracking-wide text-info">
+            <span className="shrink-0 rounded bg-info/10 px-1 py-px text-xs font-medium text-info">
               Discovered
             </span>
           ) : null}
@@ -214,8 +221,10 @@ function PhysicalWorktreeDiscoverySection(props: {
   readonly serverConfig: ServerConfig;
   readonly primaryEnvironmentId: EnvironmentId | null;
   readonly onNavigateToThread: (threadRef: ScopedThreadRef) => void;
+  readonly onHiddenCountChange: (physicalProjectKey: string, count: number | null) => void;
 }) {
-  const { member, serverConfig, primaryEnvironmentId, onNavigateToThread } = props;
+  const { member, serverConfig, primaryEnvironmentId, onNavigateToThread, onHiddenCountChange } =
+    props;
   const catalog = useEnvironmentQuery(
     worktreeEnvironment.catalog({
       environmentId: member.environmentId,
@@ -257,6 +266,16 @@ function PhysicalWorktreeDiscoverySection(props: {
       discovery === null ? [] : [...discovery.newCandidates, ...discovery.acknowledgedCandidates],
     [discovery],
   );
+  const hiddenCount =
+    snapshot === null || discovery === null
+      ? null
+      : member.worktreeDiscovery.visibility === "hidden"
+        ? allCandidates.length
+        : 0;
+  useEffect(() => {
+    onHiddenCountChange(member.physicalProjectKey, hiddenCount);
+    return () => onHiddenCountChange(member.physicalProjectKey, null);
+  }, [hiddenCount, member.physicalProjectKey, onHiddenCountChange]);
   const initialPromptExpanded =
     snapshot !== null &&
     discovery?.showInitialPrompt === true &&
@@ -428,12 +447,10 @@ function PhysicalWorktreeDiscoverySection(props: {
             <FolderSearchIcon className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
             <div className="min-w-0 flex-1">
               <div className="flex items-center justify-between gap-2">
-                <span className="text-[11px] font-medium text-foreground">
-                  Discovered worktrees
-                </span>
+                <span className="text-xs font-medium text-foreground">Discovered worktrees</span>
                 <EnvironmentBadge environmentLabel={environmentLabel} isRemote={isRemote} />
               </div>
-              <p className="mt-0.5 text-[9px] leading-3 text-muted-foreground">
+              <p className="mt-0.5 text-xs text-muted-foreground">
                 Add existing Git worktrees to use them in BiBCode.
               </p>
             </div>
@@ -451,7 +468,7 @@ function PhysicalWorktreeDiscoverySection(props: {
                   return (
                     <Button
                       aria-label={`Add ${label} from ${accessiblePhysicalScope} at ${candidate.path} to BiBCode`}
-                      className="h-5 shrink-0 px-1.5 text-[9px]"
+                      className="h-5 shrink-0 px-1.5 text-xs"
                       data-worktree-add-action="true"
                       disabled={pending || addAllPendingCount > 0}
                       size="xs"
@@ -470,7 +487,7 @@ function PhysicalWorktreeDiscoverySection(props: {
           <div className="mt-2 flex items-center justify-end gap-1">
             <Button
               aria-label="Keep hidden"
-              className="h-5 px-1.5 text-[9px]"
+              className="h-5 px-1.5 text-xs"
               disabled={addAllPendingCount > 0}
               size="xs"
               variant="ghost"
@@ -480,7 +497,7 @@ function PhysicalWorktreeDiscoverySection(props: {
             </Button>
             <Button
               aria-label="Add all discovered worktrees"
-              className="h-5 px-1.5 text-[9px]"
+              className="h-5 px-1.5 text-xs"
               disabled={addAllPendingCount > 0 || addAllCandidateCount === 0}
               size="xs"
               variant="secondary"
@@ -502,7 +519,7 @@ function PhysicalWorktreeDiscoverySection(props: {
       {showCollapsedLine ? (
         <Button
           aria-label={`Hiding ${formatDiscoveredWorktreeCount(allCandidates.length)}`}
-          className="h-6 w-full justify-start gap-1.5 px-2 text-[9px] text-muted-foreground"
+          className="h-6 w-full justify-start gap-1.5 px-2 text-xs text-muted-foreground"
           size="xs"
           variant="ghost"
           onClick={() => setManuallyExpanded(true)}
@@ -529,7 +546,7 @@ function PhysicalWorktreeDiscoverySection(props: {
                 return (
                   <Button
                     aria-label={`Add discovered worktree ${label} from ${accessiblePhysicalScope} at ${candidate.path} to BiBCode`}
-                    className="h-5 shrink-0 px-1.5 text-[9px]"
+                    className="h-5 shrink-0 px-1.5 text-xs"
                     data-worktree-add-action="true"
                     disabled={pending || addAllPendingCount > 0}
                     size="xs"
@@ -553,7 +570,13 @@ function PhysicalWorktreeDiscoverySection(props: {
 }
 
 export function WorktreeDiscoverySection(props: WorktreeDiscoverySectionProps) {
-  const { project, serverConfigs, primaryEnvironmentId = null, onNavigateToThread } = props;
+  const {
+    project,
+    serverConfigs,
+    primaryEnvironmentId = null,
+    onNavigateToThread,
+    onHiddenCountChange,
+  } = props;
   const supportedMembers = useMemo(
     () => getSupportedWorktreeDiscoveryMembers(project.memberProjects, serverConfigs),
     [project.memberProjects, serverConfigs],
@@ -567,6 +590,28 @@ export function WorktreeDiscoverySection(props: WorktreeDiscoverySectionProps) {
     [supportedMembers],
   );
   useWorktreeCatalogFocusRefresh(subscribedProjects);
+  const hiddenCountsRef = useRef(new Map<string, number>());
+  const reportMemberHiddenCount = useCallback(
+    (physicalProjectKey: string, count: number | null) => {
+      const counts = hiddenCountsRef.current;
+      if (count === null) {
+        counts.delete(physicalProjectKey);
+      } else {
+        counts.set(physicalProjectKey, count);
+      }
+      let total = 0;
+      for (const member of supportedMembers) {
+        const memberCount = counts.get(member.physicalProjectKey);
+        if (memberCount === undefined) {
+          onHiddenCountChange?.(null);
+          return;
+        }
+        total += memberCount;
+      }
+      onHiddenCountChange?.(supportedMembers.length === 0 ? null : total);
+    },
+    [onHiddenCountChange, supportedMembers],
+  );
 
   if (supportedMembers.length === 0) {
     return null;
@@ -581,6 +626,7 @@ export function WorktreeDiscoverySection(props: WorktreeDiscoverySectionProps) {
           serverConfig={serverConfigs.get(member.environmentId)!}
           primaryEnvironmentId={primaryEnvironmentId}
           onNavigateToThread={onNavigateToThread}
+          onHiddenCountChange={reportMemberHiddenCount}
         />
       ))}
     </>

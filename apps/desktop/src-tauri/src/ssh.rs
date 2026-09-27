@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -32,16 +32,198 @@ const SSH_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const SSH_READY_INTERVAL: Duration = Duration::from_millis(250);
 const SSH_READY_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const SSH_TUNNEL_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(1500);
+/// How long the pipes of an exited SSH child may stay idle before the rest of
+/// its output is given up on. A descendant that inherited them (a
+/// ProxyCommand helper, a ControlPersist master on older OpenSSH, a
+/// backgrounded process) can hold them open long after ssh itself has exited,
+/// so end of file never arrives. Output that keeps arriving keeps the drain
+/// going; the remote script deadline bounds it as a whole.
+const SSH_OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(2);
+/// Longest wait for an exited tunnel's stderr, which no script deadline
+/// covers.
+const SSH_STDERR_COLLECT_LIMIT: Duration = Duration::from_secs(10);
+/// Output kept per pipe (the tail, where ssh and the remote scripts put their
+/// result and their final error).
+const SSH_OUTPUT_CAP: usize = 64 * 1024;
+const SSH_OUTPUT_CUT_OFF: &str = "[output cut off]";
 const SSH_CHILD_REAPER_CAPACITY: usize = 32;
+/// Blocking-pool threads of the SSH I/O runtime. On Windows every child pipe
+/// read or write holds one while in flight; a child has three pipes, so this
+/// covers every child the reaper admits, with room to spare.
+const SSH_IO_MAX_BLOCKING_THREADS: usize = 4 * SSH_CHILD_REAPER_CAPACITY;
+/// How long a drain that gave up keeps cancelling the pipe reads it left in
+/// flight (Windows), and how long it polls each read between cancels.
+const SSH_PIPE_SETTLE_LIMIT: Duration = Duration::from_secs(1);
+const SSH_PIPE_SETTLE_INTERVAL: Duration = Duration::from_millis(10);
+/// Whether a drain that gives up must cancel its unfinished pipe reads. Only
+/// Windows reads child pipes on blocking-pool threads, which dropping a read
+/// does not release; elsewhere reads use the I/O driver.
+const SETTLE_PIPE_READS: bool = cfg!(windows);
 const REMOTE_PORT_SCAN_WINDOW: u16 = 200;
-const REMOTE_READY_TIMEOUT_MS: u64 = 15_000;
-const REMOTE_REUSE_READY_TIMEOUT_MS: u64 = 2_000;
-/// Remote command that mints the one-time SSH bootstrap pairing credential.
-/// Must target the same `--base-dir` the launch script passes to `serve`
-/// (`SERVER_HOME`), and must print a JSON line with a `credential` field —
-/// see `parse_remote_pairing_credential`.
-pub const REMOTE_PAIRING_ISSUE_COMMAND: &str =
-    r#"bibcode pairing issue --base-dir "$HOME/.bibcode" --json"#;
+/// How long a server the launch script started gets to answer, in seconds.
+const REMOTE_READY_TIMEOUT_SECS: u64 = 15;
+/// How long a live recorded server gets to answer before the launch script
+/// replaces it, in seconds. Long enough that a busy server is not mistaken
+/// for a hung one; the host's whole-second clock adds at most one more.
+const REMOTE_REUSE_READY_TIMEOUT_SECS: u64 = 10;
+/// How long the stop script waits for a server to exit after TERM before it
+/// leaves the server, and its record, to the next launch, in seconds.
+const REMOTE_STOP_WAIT_SECS: u64 = 10;
+const SSH_PAIRING_DEADLINE: Duration = Duration::from_secs(30);
+const SSH_LAUNCH_DEADLINE: Duration = Duration::from_secs(60);
+const SSH_STOP_DEADLINE: Duration = Duration::from_secs(30);
+/// How far the remote pairing watchdog's bound sits above the local pairing
+/// deadline. The bound only limits a leak on the host, so it must never
+/// fire before the desktop has given up: `[ssh_timeout:pairing]` stays the
+/// only failure a user sees.
+const SSH_PAIRING_WATCHDOG_MARGIN: Duration = Duration::from_secs(5);
+
+/// Script identity prefix, also used by test fixtures.
+macro_rules! remote_script_header_prefix {
+    () => {
+        "# bibcode-ssh:"
+    };
+}
+
+/// Full first-line script identity.
+macro_rules! remote_script_header {
+    ($kind:literal) => {
+        concat!(remote_script_header_prefix!(), $kind, "\n")
+    };
+}
+
+/// Shell helpers shared by every remote script. `wait_while SECONDS CMD…`
+/// polls every 0.2 s while CMD succeeds and fails if it still succeeds after
+/// SECONDS: the one wait loop the scripts use. `pid_running PID` is
+/// `kill -0` without the noise. The poll's `sleep` children also make every
+/// POSIX shell reap a background child that has exited, so `kill -0` stops
+/// seeing it.
+macro_rules! remote_wait_functions {
+    () => {
+        r#"wait_while() {
+  wait_polls=$(( $1 * 5 ))
+  shift
+  while "$@"; do
+    [ "$wait_polls" -gt 0 ] || return 1
+    sleep 0.2
+    wait_polls=$((wait_polls - 1))
+  done
+  return 0
+}
+pid_running() {
+  kill -0 "$1" 2>/dev/null
+}
+"#
+    };
+}
+
+/// Shell function shared by the pairing and launch scripts (needs
+/// `remote_wait_functions`): `run_bounded LIMIT CMD…` runs CMD in the
+/// background (stdin from `/dev/null`, so it cannot eat the script `sh -s` is
+/// still reading) and polls it every 0.2 s. When the host's clock reaches
+/// LIMIT whole seconds after the start (between LIMIT - 1 and LIMIT seconds
+/// later), it sends TERM, sends KILL 2 s later if CMD is still running, and
+/// returns 124; otherwise it returns CMD's status.
+macro_rules! remote_run_bounded_function {
+    () => {
+        r#"run_bounded() {
+  bounded_limit="$1"
+  shift
+  "$@" </dev/null &
+  bounded_pid=$!
+  bounded_deadline=$(( $(date +%s) + bounded_limit ))
+  while pid_running "$bounded_pid"; do
+    if [ "$(date +%s)" -ge "$bounded_deadline" ]; then
+      kill -TERM "$bounded_pid" 2>/dev/null || true
+      wait_while 2 pid_running "$bounded_pid" || kill -KILL "$bounded_pid" 2>/dev/null || true
+      wait "$bounded_pid" 2>/dev/null || true
+      return 124
+    fi
+    sleep 0.2
+  done
+  bounded_status=0
+  wait "$bounded_pid" || bounded_status=$?
+  return "$bounded_status"
+}
+"#
+    };
+}
+
+/// Launch-state variables and helpers shared by the launch and stop
+/// scripts. `$1` is the environment's state key.
+///
+/// `is_state_server PID PORT` succeeds only while PID runs this state's
+/// `bibcode serve --host 127.0.0.1 --port PORT --base-dir ~/.bibcode`, read
+/// from `/proc/PID/cmdline` (Linux, BusyBox included) or `ps -p PID -o
+/// command=` (macOS). A pid file can outlive its server and the pid can then
+/// belong to anything, so no recorded pid is trusted, stopped, or reused
+/// without it. `clear_state_files PID` removes the state files only while the
+/// pid file still names PID, so it never discards a newer launch's record.
+/// `write_state_file FILE VALUE` replaces FILE in one step (a temporary file
+/// and `mv`), so no reader ever sees it half written.
+macro_rules! remote_launch_state {
+    () => {
+        r#"STATE_KEY="$1"
+STATE_DIR="$HOME/.bibcode-ssh-launch/$STATE_KEY"
+SERVER_HOME="$HOME/.bibcode"
+PORT_FILE="$STATE_DIR/port"
+PID_FILE="$STATE_DIR/pid"
+MANAGED_FILE="$STATE_DIR/managed"
+is_state_server() {
+  case "$1" in ''|0*|*[!0-9]*) return 1 ;; esac
+  pid_running "$1" || return 1
+  if [ -r "/proc/$1/cmdline" ]; then
+    state_server_command=$(tr '\000' ' ' <"/proc/$1/cmdline" 2>/dev/null) || return 1
+    # /proc ends every argument with a NUL, which is now a trailing space.
+    state_server_command=${state_server_command% }
+  else
+    state_server_command=$(ps -p "$1" -o command= 2>/dev/null) || return 1
+  fi
+  case "$state_server_command" in
+    *" serve --host 127.0.0.1 --port $2 --base-dir $SERVER_HOME") return 0 ;;
+  esac
+  return 1
+}
+clear_state_files() {
+  [ "$(cat "$PID_FILE" 2>/dev/null || true)" = "$1" ] || return 0
+  rm -f "$PID_FILE" "$PORT_FILE" "$MANAGED_FILE"
+}
+write_state_file() {
+  printf '%s\n' "$2" >"$1.tmp"
+  mv -f "$1.tmp" "$1"
+}
+"#
+    };
+}
+/// Remote script that mints the one-time SSH bootstrap pairing credential.
+///
+/// It travels on stdin to `sh -s --`, like the launch and stop scripts, so the
+/// remote login shell only ever parses `sh -s --` (OpenSSH joins the remote
+/// argv with spaces and hands the result to the login shell). It runs under
+/// the same non-login `sh` and `PATH` as the launch script, so it uses the
+/// `bibcode` that serves the environment. It must target the same
+/// `--base-dir` the launch script passes to `serve` (`SERVER_HOME`), and must
+/// print a JSON line with a `credential` field — see
+/// `parse_remote_pairing_credential`.
+///
+/// The desktop runs it as `sh -s -- <bound>`, the pairing deadline plus
+/// `SSH_PAIRING_WATCHDOG_MARGIN` in whole seconds (`pairing_watchdog_bound`).
+/// sshd does not signal a command without a PTY when the client goes away, so
+/// the script, not the desktop, ends a `pairing issue` that outlives it: at
+/// the bound it sends TERM, then KILL 2 s later, and exits 124. Otherwise it
+/// passes the command's output and status through.
+pub const REMOTE_PAIRING_SCRIPT: &str = concat!(
+    remote_script_header!("pairing"),
+    "set -eu\n",
+    remote_wait_functions!(),
+    remote_run_bounded_function!(),
+    r#"if ! command -v bibcode >/dev/null 2>&1; then
+  printf 'Remote host is missing the native BiBCode CLI. Install the Rust bibcode binary before connecting.\n' >&2
+  exit 1
+fi
+run_bounded "$1" bibcode pairing issue --base-dir "$HOME/.bibcode" --json
+"#
+);
 const ASKPASS_POSIX_SCRIPT: &str = r#"#!/bin/sh
 if [ "${BIBCODE_SSH_AUTH_SECRET+x}" = "x" ]; then
   printf "%s\n" "$BIBCODE_SSH_AUTH_SECRET"
@@ -60,15 +242,34 @@ if ($null -ne $env:BIBCODE_SSH_AUTH_SECRET) {
 exit 1
 "#;
 
-const REMOTE_LAUNCH_SCRIPT: &str = r#"set -eu
-STATE_KEY="$1"
-STATE_DIR="$HOME/.bibcode-ssh-launch/$STATE_KEY"
-SERVER_HOME="$HOME/.bibcode"
-PORT_FILE="$STATE_DIR/port"
-PID_FILE="$STATE_DIR/pid"
-MANAGED_FILE="$STATE_DIR/managed"
-LOG_FILE="$STATE_DIR/server.log"
+/// Starts or reuses this environment's managed `bibcode serve`, as
+/// `sh -s -- <state key>`, and prints `{"remotePort":…,"serverKind":"managed"}`.
+///
+/// Every wait is bounded on the host's clock: a recorded server gets
+/// `REMOTE_REUSE_READY_TIMEOUT_SECS` to answer and a new one
+/// `REMOTE_READY_TIMEOUT_SECS`, each probe at most about a second. A recorded
+/// server that is alive but silent is stopped before a replacement starts, so
+/// two managed servers never share the data root; a server the script gave up
+/// on is stopped (TERM, then KILL after 2 s) before any report is written.
+/// SIGPIPE is ignored and every report is allowed to fail, because the channel
+/// may already be closed when the script reaches it.
+const REMOTE_LAUNCH_SCRIPT: &str = concat!(
+    remote_script_header!("launch"),
+    "set -eu\n",
+    "trap '' PIPE\n",
+    remote_wait_functions!(),
+    remote_launch_state!(),
+    remote_run_bounded_function!(),
+    r#"LOG_FILE="$STATE_DIR/server.log"
 RUNNER_FILE="$STATE_DIR/run-bibcode.sh"
+if command -v curl >/dev/null 2>&1; then
+  READY_PROBE=curl
+elif command -v wget >/dev/null 2>&1; then
+  READY_PROBE=wget
+else
+  printf 'Remote host requires curl or wget for readiness checks.\n' >&2 || true
+  exit 1
+fi
 mkdir -p "$STATE_DIR"
 cat >"$RUNNER_FILE" <<'SH'
 #!/bin/sh
@@ -79,25 +280,33 @@ printf 'Remote host is missing the native BiBCode CLI. Install the Rust bibcode 
 exit 1
 SH
 chmod 700 "$RUNNER_FILE"
+probe_ready() {
+  if [ "$READY_PROBE" = curl ]; then
+    curl --fail --silent --show-error --max-time 1 \
+      "http://127.0.0.1:$1/.well-known/bibcode/environment" >/dev/null 2>&1
+  else
+    # wget retries a timed-out read many times; the watchdog caps the probe.
+    run_bounded 2 wget --quiet --timeout=1 --output-document=/dev/null \
+      "http://127.0.0.1:$1/.well-known/bibcode/environment" >/dev/null 2>&1
+  fi
+}
+# Succeeds once port $1 answers. Gives up after at least $2 and at most $2 + 1
+# seconds on the host's whole-second clock, plus the probe under way.
 wait_ready() {
-  port="$1"
-  attempts=$(($2 / 100))
-  [ "$attempts" -gt 0 ] || attempts=1
-  while [ "$attempts" -gt 0 ]; do
-    if command -v curl >/dev/null 2>&1; then
-      curl --fail --silent --show-error --max-time 1 \
-        "http://127.0.0.1:$port/.well-known/bibcode/environment" >/dev/null 2>&1 && return 0
-    elif command -v wget >/dev/null 2>&1; then
-      wget --quiet --timeout=1 --output-document=/dev/null \
-        "http://127.0.0.1:$port/.well-known/bibcode/environment" >/dev/null 2>&1 && return 0
-    else
-      printf 'Remote host requires curl or wget for readiness checks.\n' >&2
-      return 1
-    fi
-    attempts=$((attempts - 1))
+  ready_started=$(date +%s)
+  while ! probe_ready "$1"; do
+    [ $(( $(date +%s) - ready_started )) -le "$2" ] || return 1
     sleep 0.1
   done
-  return 1
+  return 0
+}
+# Stops pid $1, this state's server on port $2: TERM, then KILL after 2 s.
+# Fails only if it is still running afterwards.
+stop_state_server() {
+  kill -TERM "$1" 2>/dev/null || return 0
+  wait_while 2 is_state_server "$1" "$2" && return 0
+  kill -KILL "$1" 2>/dev/null || true
+  wait_while 2 is_state_server "$1" "$2"
 }
 port_in_use() {
   port="$1"
@@ -110,8 +319,9 @@ port_in_use() {
     '$2 ~ suffix "$" && $4 == "0A" { found = 1 } END { exit found ? 0 : 1 }' \
     /proc/net/tcp /proc/net/tcp6 2>/dev/null
 }
+# Prints the first free port from $1 (or the default) on.
 pick_port() {
-  start=$(cat "$PORT_FILE" 2>/dev/null || true)
+  start="$1"
   case "$start" in
     ''|*[!0-9]*) start="@@DEFAULT_REMOTE_PORT@@" ;;
   esac
@@ -128,45 +338,74 @@ pick_port() {
 }
 REMOTE_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
 REMOTE_PORT="$(cat "$PORT_FILE" 2>/dev/null || true)"
-REMOTE_MANAGED="$(cat "$MANAGED_FILE" 2>/dev/null || true)"
-if [ "$REMOTE_MANAGED" = "managed" ] && [ -n "$REMOTE_PID" ] && [ -n "$REMOTE_PORT" ] && kill -0 "$REMOTE_PID" 2>/dev/null && wait_ready "$REMOTE_PORT" "@@REMOTE_REUSE_READY_TIMEOUT_MS@@"; then
-  printf '{"remotePort":%s,"serverKind":"managed"}\n' "$REMOTE_PORT"
-  exit 0
+if is_state_server "$REMOTE_PID" "$REMOTE_PORT"; then
+  if wait_ready "$REMOTE_PORT" "@@REMOTE_REUSE_READY_TIMEOUT@@"; then
+    printf '{"remotePort":%s,"serverKind":"managed"}\n' "$REMOTE_PORT" || true
+    exit 0
+  fi
+  if ! stop_state_server "$REMOTE_PID" "$REMOTE_PORT"; then
+    printf 'Remote BiBCode server %s does not answer and did not stop; not starting another beside it.\n' "$REMOTE_PID" >&2 || true
+    exit 1
+  fi
 fi
-REMOTE_PORT="$(pick_port)" || true
+clear_state_files "$REMOTE_PID"
+REMOTE_PORT="$(pick_port "$REMOTE_PORT")" || true
 if [ -z "$REMOTE_PORT" ]; then
-  printf 'Failed to find an available port on the remote host.\n' >&2
+  printf 'Failed to find an available port on the remote host.\n' >&2 || true
   exit 1
 fi
-nohup env BIBCODE_NO_BROWSER=1 "$RUNNER_FILE" serve --host 127.0.0.1 --port "$REMOTE_PORT" --base-dir "$SERVER_HOME" >>"$LOG_FILE" 2>&1 < /dev/null &
+# The port is recorded before the server starts, and the server records its
+# own pid before it becomes `bibcode serve`, so no running server is ever
+# unrecorded or recorded with another port, however this script is cut short.
+write_state_file "$PORT_FILE" "$REMOTE_PORT"
+nohup sh -c 'printf "%s\n" "$$" >"$1.tmp" && mv -f "$1.tmp" "$1" && shift && exec "$@"' \
+  bibcode-launch "$PID_FILE" "$RUNNER_FILE" serve --host 127.0.0.1 --port "$REMOTE_PORT" --base-dir "$SERVER_HOME" >>"$LOG_FILE" 2>&1 < /dev/null &
 REMOTE_PID="$!"
-printf '%s\n' "$REMOTE_PID" >"$PID_FILE"
-printf '%s\n' "$REMOTE_PORT" >"$PORT_FILE"
-printf 'managed\n' >"$MANAGED_FILE"
-if ! wait_ready "$REMOTE_PORT" "@@REMOTE_READY_TIMEOUT_MS@@"; then
-  printf 'Remote BiBCode server did not become ready on 127.0.0.1:%s.\n' "$REMOTE_PORT" >&2
+write_state_file "$MANAGED_FILE" managed
+if ! wait_ready "$REMOTE_PORT" "@@REMOTE_READY_TIMEOUT@@"; then
+  if stop_state_server "$REMOTE_PID" "$REMOTE_PORT"; then
+    clear_state_files "$REMOTE_PID"
+  fi
+  printf 'Remote BiBCode server did not become ready on 127.0.0.1:%s.\n' "$REMOTE_PORT" >&2 || true
   tail -n 80 "$LOG_FILE" >&2 2>/dev/null || true
-  kill "$REMOTE_PID" 2>/dev/null || true
-  rm -f "$PID_FILE" "$PORT_FILE" "$MANAGED_FILE"
   exit 1
 fi
-printf '{"remotePort":%s,"serverKind":"managed"}\n' "$REMOTE_PORT"
-"#;
+printf '{"remotePort":%s,"serverKind":"managed"}\n' "$REMOTE_PORT" || true
+"#
+);
 
-const REMOTE_STOP_SCRIPT: &str = r#"set -eu
-STATE_KEY="$1"
-STATE_DIR="$HOME/.bibcode-ssh-launch/$STATE_KEY"
-PID_FILE="$STATE_DIR/pid"
-PORT_FILE="$STATE_DIR/port"
-MANAGED_FILE="$STATE_DIR/managed"
-REMOTE_MANAGED="$(cat "$MANAGED_FILE" 2>/dev/null || true)"
+/// Stops this environment's managed server, as `sh -s -- <state key>`. It
+/// sends TERM only, and only to a pid that is still this state's server,
+/// then waits up to `REMOTE_STOP_WAIT_SECS` for it to exit and clears the
+/// state files only once it has: a launch that followed at once would
+/// otherwise find no record and start a second server beside one still
+/// shutting down. A server that outlives the wait is left running, never
+/// killed mid-work, and keeps its record, so the next launch finds it and
+/// stops it (TERM, then KILL) before starting a replacement. Prints
+/// `{"stopped":true}`, or `{"stopped":false}` for such a server.
+///
+/// It still honours an `external` marker, which older host state may hold;
+/// no current script writes one.
+const REMOTE_STOP_SCRIPT: &str = concat!(
+    remote_script_header!("stop"),
+    "set -eu\n",
+    "trap '' PIPE\n",
+    remote_wait_functions!(),
+    remote_launch_state!(),
+    r#"REMOTE_MANAGED="$(cat "$MANAGED_FILE" 2>/dev/null || true)"
 REMOTE_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
-if [ "$REMOTE_MANAGED" != "external" ] && [ -n "$REMOTE_PID" ] && kill -0 "$REMOTE_PID" 2>/dev/null; then
-  kill "$REMOTE_PID" 2>/dev/null || true
+REMOTE_PORT="$(cat "$PORT_FILE" 2>/dev/null || true)"
+if [ "$REMOTE_MANAGED" != "external" ] && is_state_server "$REMOTE_PID" "$REMOTE_PORT"; then
+  kill -TERM "$REMOTE_PID" 2>/dev/null || true
+  if ! wait_while "@@REMOTE_STOP_WAIT@@" is_state_server "$REMOTE_PID" "$REMOTE_PORT"; then
+    printf '{"stopped":false}\n' || true
+    exit 0
+  fi
 fi
-rm -f "$PID_FILE" "$PORT_FILE" "$MANAGED_FILE"
-printf '{"stopped":true}\n'
-"#;
+clear_state_files "$REMOTE_PID"
+printf '{"stopped":true}\n' || true
+"#
+);
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -358,12 +597,58 @@ struct ManagedSshTunnel {
     bootstrap: SshEnvironmentBootstrap,
 }
 
+/// Per-operation deadlines for the remote scripts the manager runs over SSH.
+/// On expiry the SSH child is terminated and reaped, and the operation fails
+/// with a `[ssh_timeout:<operation>]` error the renderer classifies as
+/// transient.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SshOperationDeadlines {
+    pub pairing: Duration,
+    pub launch: Duration,
+    pub stop: Duration,
+}
+
+impl SshOperationDeadlines {
+    /// The remote pairing watchdog's bound for these deadlines: the pairing
+    /// deadline plus 5 s, rounded up to whole seconds. A host-side
+    /// `bibcode pairing issue` gets TERM at this bound and KILL 2 s later
+    /// (see `REMOTE_PAIRING_SCRIPT`).
+    pub fn pairing_watchdog_bound(&self) -> Duration {
+        Duration::from_secs(pairing_watchdog_bound(self.pairing))
+    }
+}
+
+impl Default for SshOperationDeadlines {
+    fn default() -> Self {
+        Self {
+            pairing: SSH_PAIRING_DEADLINE,
+            launch: SSH_LAUNCH_DEADLINE,
+            stop: SSH_STOP_DEADLINE,
+        }
+    }
+}
+
 pub struct SshEnvironmentManager {
     tunnels: Mutex<HashMap<String, ManagedSshTunnel>>,
     auth_secrets: Mutex<HashMap<String, String>>,
     askpass_temporary_base: PathBuf,
     askpass_launcher: Mutex<Weak<SshAskpassLauncherInner>>,
     child_reaper: SshChildReaper,
+    ssh_program: String,
+    #[cfg(test)]
+    ssh_config_file_for_test: Option<PathBuf>,
+    deadlines: SshOperationDeadlines,
+    /// One async lock per target connection key. `ensure_environment` and
+    /// `disconnect_environment` hold it for their whole remote sequence, so
+    /// preparation and stop of one target never interleave. It is the only
+    /// lock held across an await.
+    target_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Where SSH children are spawned, fed, drained and reaped. Only
+    /// `shutdown()` reaps every SSH child before stopping it. On a plain drop
+    /// the tunnels above (declared first, so dropped first) are handed to the
+    /// reaper, but this runtime then stops in the background and discards the
+    /// reap tasks, so those children are killed (`kill_on_drop`), not awaited.
+    io_runtime: SshIoRuntime,
 }
 
 impl Default for SshEnvironmentManager {
@@ -374,22 +659,71 @@ impl Default for SshEnvironmentManager {
 
 impl SshEnvironmentManager {
     pub fn new() -> Self {
-        Self::with_askpass_temp_base_internal(env::temp_dir())
+        Self::with_options(
+            env::temp_dir(),
+            ssh_command().to_string(),
+            SshOperationDeadlines::default(),
+        )
     }
 
-    fn with_askpass_temp_base_internal(askpass_temporary_base: PathBuf) -> Self {
+    /// A manager that runs `ssh_program` instead of the platform `ssh` and
+    /// uses `deadlines` for remote scripts. For test harnesses that stand in
+    /// for OpenSSH without changing `PATH`; the application uses `new`.
+    #[doc(hidden)]
+    pub fn with_ssh_program(
+        ssh_program: impl Into<String>,
+        deadlines: SshOperationDeadlines,
+    ) -> Self {
+        Self::with_options(env::temp_dir(), ssh_program.into(), deadlines)
+    }
+
+    fn with_options(
+        askpass_temporary_base: PathBuf,
+        ssh_program: String,
+        deadlines: SshOperationDeadlines,
+    ) -> Self {
         Self {
             tunnels: Mutex::new(HashMap::new()),
             auth_secrets: Mutex::new(HashMap::new()),
             askpass_temporary_base,
             askpass_launcher: Mutex::new(Weak::new()),
             child_reaper: SshChildReaper::new(),
+            ssh_program,
+            #[cfg(test)]
+            ssh_config_file_for_test: None,
+            deadlines,
+            target_locks: Mutex::new(HashMap::new()),
+            io_runtime: SshIoRuntime::new(SSH_IO_MAX_BLOCKING_THREADS),
         }
     }
 
     #[cfg(test)]
     fn with_askpass_temp_base(askpass_temporary_base: PathBuf) -> Self {
-        Self::with_askpass_temp_base_internal(askpass_temporary_base)
+        Self::with_options(
+            askpass_temporary_base,
+            ssh_command().to_string(),
+            SshOperationDeadlines::default(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_ssh_config_file_for_test(mut self, path: PathBuf) -> Self {
+        self.ssh_config_file_for_test = Some(path);
+        self
+    }
+
+    fn remote_runner(&self, operation: RemoteOperation) -> Result<RemoteScriptRunner, String> {
+        Ok(RemoteScriptRunner {
+            program: self.ssh_program.clone(),
+            #[cfg(test)]
+            ssh_config_file_for_test: self.ssh_config_file_for_test.clone(),
+            deadline: match operation {
+                RemoteOperation::Pairing => self.deadlines.pairing,
+                RemoteOperation::Launch => self.deadlines.launch,
+                RemoteOperation::Stop => self.deadlines.stop,
+            },
+            io_runtime: self.io_runtime.handle()?,
+        })
     }
 
     fn askpass_launcher(&self) -> Result<SshAskpassLauncher, String> {
@@ -435,6 +769,9 @@ impl SshEnvironmentManager {
             tunnel.child.terminate_and_reap().await;
         }
         self.child_reaper.wait().await;
+        // Every SSH child is reaped, so the I/O runtime has nothing left to
+        // drive. It stops in the background: this runs inside async code.
+        self.io_runtime.stop();
     }
 
     pub async fn ensure_environment<R: Runtime>(
@@ -449,18 +786,55 @@ impl SshEnvironmentManager {
         }
         let target = normalize_ssh_environment_target(target)?;
         let key = target_connection_key(&target);
-        if let Some(existing) = self.take_existing_bootstrap_if_running(&key)? {
-            return Ok(existing);
+        let issue_pairing_token = options
+            .as_ref()
+            .and_then(|options| options.issue_pairing_token)
+            .unwrap_or(false);
+        // Serialise the whole probe, launch-or-reuse, tunnel and publish
+        // sequence per target: a second caller waits here and then finds the
+        // first caller's tunnel on the cache-hit path. The wait is bounded
+        // because everything the holder awaits is:
+        // - the probe: one request of at most 2 s;
+        // - each remote script: its deadline (launch 60 s, pairing 30 s,
+        //   stop 30 s), which also covers draining its output; after ssh
+        //   exits, the drain also stops once the pipes are idle for 2 s, even
+        //   if a descendant holds them open;
+        // - the tunnel: 30 s of readiness polling (each request at most 2 s),
+        //   and at most 10 s (2 s idle) to collect an exited tunnel's stderr;
+        // - each terminate-and-reap: 1.5 s, then the retained reaper owns it;
+        // - each password prompt: 3 min, at most two per step, so a step runs
+        //   at most three times.
+        let target_lock = self.target_lock(&key)?;
+        let _serialised = target_lock.lock().await;
+        if !self.child_reaper.accepting() {
+            return Err("SSH process owner is shutting down.".to_string());
+        }
+        if let Some(cached) = self.take_existing_bootstrap_if_running(&key)? {
+            // A live ssh process does not prove a live remote server: probe it
+            // through the tunnel so a server that stopped under a live SSH
+            // session is relaunched by the full path below.
+            if tunnel_endpoint_responds(&cached.http_base_url).await {
+                return self
+                    .reuse_cached_tunnel(app, prompts, &key, &target, cached, issue_pairing_token)
+                    .await;
+            }
+            tracing::info!("cached SSH tunnel endpoint did not respond; reconnecting");
+            self.drop_cached_tunnel(&key).await;
         }
 
         let local_port = portpicker::pick_unused_port()
             .ok_or_else(|| "Could not find an available local SSH tunnel port.".to_string())?;
         let askpass_launcher = self.askpass_launcher()?;
+        let launch_runner = self.remote_runner(RemoteOperation::Launch)?;
+        let io_runtime = launch_runner.io_runtime.clone();
         let remote_launch = self
             .run_with_ssh_auth(app, prompts, &key, &target, |auth| {
                 let target = target.clone();
                 let askpass_launcher = askpass_launcher.clone();
-                async move { launch_or_reuse_remote_server(&target, &auth, askpass_launcher).await }
+                let runner = launch_runner.clone();
+                async move {
+                    launch_or_reuse_remote_server(&runner, &target, &auth, askpass_launcher).await
+                }
             })
             .await?;
         let tunnel_result = self
@@ -468,14 +842,30 @@ impl SshEnvironmentManager {
                 let target = target.clone();
                 let askpass_launcher = askpass_launcher.clone();
                 let remote_launch = remote_launch.clone();
+                let ssh_program = self.ssh_program.clone();
+                #[cfg(test)]
+                let ssh_config_file_for_test = self.ssh_config_file_for_test.clone();
+                let io_runtime = io_runtime.clone();
                 async move {
-                    let plan = SshEnvironmentLaunchPlan::forward_with_auth(
+                    let mut plan = SshEnvironmentLaunchPlan::forward_with_auth(
                         target,
                         local_port,
                         remote_launch,
                         &auth,
                     )?;
-                    let child = start_ssh_tunnel(&plan, &auth, askpass_launcher).await?;
+                    plan.program = ssh_program;
+                    #[cfg(test)]
+                    if let Some(path) = ssh_config_file_for_test {
+                        plan.args.splice(
+                            0..0,
+                            ["-F".to_string(), path.to_string_lossy().into_owned()],
+                        );
+                    }
+                    let tunnel_plan = plan.clone();
+                    let child = run_on_ssh_io(&io_runtime, async move {
+                        start_ssh_tunnel(&tunnel_plan, &auth, askpass_launcher).await
+                    })
+                    .await?;
                     Ok((plan, child))
                 }
             })
@@ -487,25 +877,19 @@ impl SshEnvironmentManager {
                     .cached_auth_secret(&key)
                     .map(SshAuthOptions::with_secret)
                     .unwrap_or_else(SshAuthOptions::batch);
-                let _ = stop_remote_server(&target, &cleanup_auth, askpass_launcher).await;
+                if let Ok(stop_runner) = self.remote_runner(RemoteOperation::Stop) {
+                    let _ =
+                        stop_remote_server(&stop_runner, &target, &cleanup_auth, askpass_launcher)
+                            .await;
+                }
                 return Err(error);
             }
         };
 
-        let pairing_token = if options
-            .as_ref()
-            .and_then(|options| options.issue_pairing_token)
-            .unwrap_or(false)
-        {
+        let pairing_token = if issue_pairing_token {
             Some(
-                self.run_with_ssh_auth(app, prompts, &key, &target, |auth| {
-                    let target = target.clone();
-                    let askpass_launcher = askpass_launcher.clone();
-                    async move {
-                        issue_remote_pairing_token(&target, &auth, askpass_launcher).await
-                    }
-                })
-                .await?,
+                self.mint_pairing_token(app, prompts, &key, &target, &askpass_launcher)
+                    .await?,
             )
         } else {
             None
@@ -525,6 +909,71 @@ impl SshEnvironmentManager {
         Ok(bootstrap)
     }
 
+    fn target_lock(&self, key: &str) -> Result<Arc<tokio::sync::Mutex<()>>, String> {
+        let mut locks = self
+            .target_locks
+            .lock()
+            .map_err(|error| format!("Could not access SSH target locks: {error}"))?;
+        Ok(locks.entry(key.to_string()).or_default().clone())
+    }
+
+    /// Returns a cached, responding tunnel. Cached bootstraps never carry a
+    /// token; every request for one mints a fresh one-time credential.
+    async fn reuse_cached_tunnel<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        prompts: &SshPasswordPromptManager,
+        key: &str,
+        target: &SshEnvironmentTarget,
+        cached: SshEnvironmentBootstrap,
+        issue_pairing_token: bool,
+    ) -> Result<SshEnvironmentBootstrap, String> {
+        if !issue_pairing_token {
+            return Ok(cached);
+        }
+        let askpass_launcher = self.askpass_launcher()?;
+        let pairing_token = self
+            .mint_pairing_token(app, prompts, key, target, &askpass_launcher)
+            .await?;
+        Ok(SshEnvironmentBootstrap {
+            pairing_token: Some(pairing_token),
+            ..cached
+        })
+    }
+
+    async fn mint_pairing_token<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        prompts: &SshPasswordPromptManager,
+        key: &str,
+        target: &SshEnvironmentTarget,
+        askpass_launcher: &SshAskpassLauncher,
+    ) -> Result<String, String> {
+        let runner = self.remote_runner(RemoteOperation::Pairing)?;
+        self.run_with_ssh_auth(app, prompts, key, target, |auth| {
+            let target = target.clone();
+            let askpass_launcher = askpass_launcher.clone();
+            let runner = runner.clone();
+            async move { issue_remote_pairing_token(&runner, &target, &auth, askpass_launcher).await }
+        })
+        .await
+    }
+
+    /// Removes and reaps the cached tunnel for `key`. Callers hold the
+    /// target lock, so the entry is the one they inspected.
+    async fn drop_cached_tunnel(&self, key: &str) {
+        let stale = match self.tunnels.lock() {
+            Ok(mut tunnels) => tunnels.remove(key),
+            Err(error) => {
+                tracing::warn!(%error, "could not access SSH tunnels to drop a stale tunnel");
+                None
+            }
+        };
+        if let Some(mut stale) = stale {
+            stale.child.terminate_and_reap().await;
+        }
+    }
+
     pub async fn disconnect_environment<R: Runtime>(
         &self,
         app: &AppHandle<R>,
@@ -533,6 +982,10 @@ impl SshEnvironmentManager {
     ) -> Result<(), String> {
         let target = normalize_ssh_environment_target(target)?;
         let key = target_connection_key(&target);
+        // Same lock as `ensure_environment`: a stop never interleaves with a
+        // preparation of this target.
+        let target_lock = self.target_lock(&key)?;
+        let _serialised = target_lock.lock().await;
         let tunnel = self
             .tunnels
             .lock()
@@ -546,10 +999,12 @@ impl SshEnvironmentManager {
             }
             None => self.askpass_launcher()?,
         };
+        let stop_runner = self.remote_runner(RemoteOperation::Stop)?;
         self.run_with_ssh_auth(app, prompts, &key, &target, |auth| {
             let target = target.clone();
             let askpass_launcher = askpass_launcher.clone();
-            async move { stop_remote_server(&target, &auth, askpass_launcher).await }
+            let runner = stop_runner.clone();
+            async move { stop_remote_server(&runner, &target, &auth, askpass_launcher).await }
         })
         .await?;
         Ok(())
@@ -596,7 +1051,7 @@ impl SshEnvironmentManager {
                 },
             )
             .await
-            .map_err(|error| error.to_string())
+            .map_err(password_prompt_failure)
     }
 
     async fn run_with_ssh_auth<R: Runtime, T, F, Fut>(
@@ -669,12 +1124,19 @@ impl SshEnvironmentManager {
         }
     }
 
+    /// Records a live tunnel. Callers hold the target lock, so the slot is
+    /// empty or holds a tunnel this caller has already dropped.
+    ///
+    /// The cached bootstrap never keeps a pairing token: one-time credentials
+    /// are consumed by the first exchange, so a cached copy could only ever be
+    /// rejected.
     fn publish_tunnel(
         &self,
         key: String,
         child: ManagedSshChild,
-        bootstrap: SshEnvironmentBootstrap,
+        mut bootstrap: SshEnvironmentBootstrap,
     ) -> Result<(), (String, Box<ManagedSshChild>)> {
+        bootstrap.pairing_token = None;
         let mut tunnels = match self.tunnels.lock() {
             Ok(tunnels) => tunnels,
             Err(error) => {
@@ -690,7 +1152,10 @@ impl SshEnvironmentManager {
                 Box::new(child),
             ));
         }
-        tunnels.insert(key, ManagedSshTunnel { child, bootstrap });
+        let replaced = tunnels.insert(key, ManagedSshTunnel { child, bootstrap });
+        drop(tunnels);
+        // Dropping hands a replaced child to the retained reaper.
+        drop(replaced);
         Ok(())
     }
 }
@@ -1079,45 +1544,106 @@ impl ManagedSshChild {
         self.transfer_to_reaper();
     }
 
-    async fn wait_with_output(&mut self) -> io::Result<std::process::Output> {
+    /// Waits for the child and collects its output. Both pipes are read while
+    /// the child runs, keeping the last `SSH_OUTPUT_CAP` bytes of each. After
+    /// the child exits, reading continues until end of file or until the
+    /// pipes have been idle for `SSH_OUTPUT_DRAIN_GRACE`. Output cut short is
+    /// marked at the end of stderr.
+    ///
+    /// At `deadline` it fails with `WaitError::DeadlinePassed` and leaves the
+    /// still-running child to the caller. Whenever reading stops short, any pipe read still in
+    /// flight is settled first (`settle_unfinished_reads`).
+    async fn wait_with_output(
+        &mut self,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<std::process::Output, WaitError> {
+        enum FirstDone<S, D> {
+            Status(S),
+            Drained(D),
+        }
+
         let mut stdout = self.child_mut().stdout.take();
         let mut stderr = self.child_mut().stderr.take();
-        let stdout_task = async move {
-            let mut bytes = Vec::new();
-            if let Some(stdout) = stdout.as_mut() {
-                stdout.read_to_end(&mut bytes).await?;
-            }
-            Ok::<Vec<u8>, io::Error>(bytes)
-        };
-        let stderr_task = async move {
-            let mut bytes = Vec::new();
-            if let Some(stderr) = stderr.as_mut() {
-                stderr.read_to_end(&mut bytes).await?;
-            }
-            Ok::<Vec<u8>, io::Error>(bytes)
-        };
+        let mut stdout_bytes = CappedOutput::default();
+        let mut stderr_bytes = CappedOutput::default();
+        let activity = OutputActivity::new();
         let mut shutdown = self
             .reaper_permit
             .as_ref()
             .expect("managed SSH child retains bounded cleanup ownership")
             .shutdown_receiver();
-        let status_task = async {
-            tokio::select! {
-                status = self.child_mut().wait() => status.map(|status| (status, false)),
-                _ = wait_for_ssh_shutdown(&mut shutdown) => {
-                    let _ = self.child_mut().start_kill();
-                    self.child_mut().wait().await.map(|status| (status, true))
+        // The drain after exit honours the same shutdown signal as the wait.
+        let mut drain_shutdown = shutdown.clone();
+        let child = self.child.as_mut().expect("managed SSH child is live");
+        let finished = {
+            let status_task = async {
+                tokio::select! {
+                    status = child.wait() => status.map(|status| (status, false)),
+                    _ = wait_for_ssh_shutdown(&mut shutdown) => {
+                        let _ = child.start_kill();
+                        child.wait().await.map(|status| (status, true))
+                    }
                 }
-            }
+            };
+            let drain = async {
+                tokio::try_join!(
+                    stdout_bytes.read_to_end(stdout.as_mut(), &activity),
+                    stderr_bytes.read_to_end(stderr.as_mut(), &activity),
+                )
+            };
+            tokio::pin!(status_task, drain);
+            let run = async {
+                let first = tokio::select! {
+                    status = &mut status_task => FirstDone::Status(status),
+                    drained = &mut drain => FirstDone::Drained(drained),
+                };
+                match first {
+                    FirstDone::Status(status) => tokio::select! {
+                        drained = drain_until_idle(&mut drain, &activity, None) => {
+                            (status, drained, false)
+                        }
+                        _ = wait_for_ssh_shutdown(&mut drain_shutdown) => (status, None, true),
+                    },
+                    FirstDone::Drained(drained) => ((&mut status_task).await, Some(drained), false),
+                }
+            };
+            run_before_deadline(deadline, run).await
         };
-        let ((status, interrupted), stdout, stderr) =
-            tokio::try_join!(status_task, stdout_task, stderr_task,)?;
+        // The readers are gone. A read they left in flight would keep a
+        // Windows pool thread until a descendant holding the pipe exits.
+        let mut unfinished: Vec<&mut dyn CancellablePipe> = Vec::new();
+        if !stdout_bytes.finished
+            && let Some(pipe) = stdout.as_mut()
+        {
+            unfinished.push(pipe);
+        }
+        if !stderr_bytes.finished
+            && let Some(pipe) = stderr.as_mut()
+        {
+            unfinished.push(pipe);
+        }
+        settle_unfinished_reads(unfinished).await;
+        let Some((status, drained, drain_interrupted)) = finished else {
+            return Err(WaitError::DeadlinePassed);
+        };
+        let (status, interrupted) = status?;
+        let interrupted = interrupted || drain_interrupted;
         self.release_reaped();
         if interrupted {
-            return Err(io::Error::new(
+            return Err(WaitError::Io(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "SSH process owner is shutting down",
-            ));
+            )));
+        }
+        let reached_end = match drained {
+            Some(Ok(_)) => true,
+            Some(Err(error)) => return Err(error.into()),
+            None => false,
+        };
+        let (stdout, stdout_truncated) = stdout_bytes.finish();
+        let (mut stderr, stderr_truncated) = stderr_bytes.finish();
+        if !reached_end || stdout_truncated || stderr_truncated {
+            stderr.extend_from_slice(format!("\n{SSH_OUTPUT_CUT_OFF}").as_bytes());
         }
         Ok(std::process::Output {
             status,
@@ -1208,24 +1734,107 @@ fn write_askpass_file(path: &Path, contents: &str, mode: Option<u32>) -> Result<
     Ok(())
 }
 
+/// The launch script's readiness limits, in whole seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RemoteLaunchLimits {
+    /// How long a server the script started gets to answer.
+    ready: u64,
+    /// How long a live recorded server gets to answer before it is replaced.
+    reuse: u64,
+}
+
+const REMOTE_LAUNCH_LIMITS: RemoteLaunchLimits = RemoteLaunchLimits {
+    ready: REMOTE_READY_TIMEOUT_SECS,
+    reuse: REMOTE_REUSE_READY_TIMEOUT_SECS,
+};
+
 fn build_remote_launch_script() -> String {
+    build_remote_launch_script_with(REMOTE_LAUNCH_LIMITS, DEFAULT_REMOTE_PORT)
+}
+
+/// The launch script with `limits`, scanning for a free port from
+/// `default_port` when no port is recorded.
+fn build_remote_launch_script_with(limits: RemoteLaunchLimits, default_port: u16) -> String {
     REMOTE_LAUNCH_SCRIPT
-        .replace("@@DEFAULT_REMOTE_PORT@@", &DEFAULT_REMOTE_PORT.to_string())
+        .replace("@@DEFAULT_REMOTE_PORT@@", &default_port.to_string())
         .replace(
             "@@REMOTE_PORT_SCAN_WINDOW@@",
             &REMOTE_PORT_SCAN_WINDOW.to_string(),
         )
-        .replace(
-            "@@REMOTE_REUSE_READY_TIMEOUT_MS@@",
-            &REMOTE_REUSE_READY_TIMEOUT_MS.to_string(),
-        )
-        .replace(
-            "@@REMOTE_READY_TIMEOUT_MS@@",
-            &REMOTE_READY_TIMEOUT_MS.to_string(),
-        )
+        .replace("@@REMOTE_REUSE_READY_TIMEOUT@@", &limits.reuse.to_string())
+        .replace("@@REMOTE_READY_TIMEOUT@@", &limits.ready.to_string())
+}
+
+/// The remote pairing watchdog's bound for a local pairing `deadline`: the
+/// deadline plus `SSH_PAIRING_WATCHDOG_MARGIN`, rounded up to whole seconds,
+/// the resolution of the host clock the script reads. It is capped at
+/// `i32::MAX` seconds (68 years), so the script's shell arithmetic can add it
+/// to the current time without overflowing.
+fn pairing_watchdog_bound(deadline: Duration) -> u64 {
+    let bound = deadline.saturating_add(SSH_PAIRING_WATCHDOG_MARGIN);
+    bound
+        .as_secs()
+        .saturating_add(u64::from(bound.subsec_nanos() > 0))
+        .min(i32::MAX as u64)
+}
+
+fn build_remote_stop_script() -> String {
+    build_remote_stop_script_with(REMOTE_STOP_WAIT_SECS)
+}
+
+/// The stop script, waiting up to `wait` seconds for the server to exit.
+fn build_remote_stop_script_with(wait: u64) -> String {
+    REMOTE_STOP_SCRIPT.replace("@@REMOTE_STOP_WAIT@@", &wait.to_string())
+}
+
+/// The remote scripts the manager runs, each with its own deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteOperation {
+    Pairing,
+    Launch,
+    Stop,
+}
+
+/// The SSH program and deadline for one remote script operation.
+#[derive(Debug, Clone)]
+struct RemoteScriptRunner {
+    program: String,
+    #[cfg(test)]
+    ssh_config_file_for_test: Option<PathBuf>,
+    deadline: Duration,
+    /// The SSH I/O runtime, where the script's child runs.
+    io_runtime: tokio::runtime::Handle,
+}
+
+enum RemoteScriptFailure {
+    /// The SSH child is still running and must be terminated.
+    Write(String),
+    /// Waiting failed; the child is already reaped, or goes to the retained
+    /// reaper when dropped.
+    Wait(String),
+    TimedOut,
+}
+
+/// The error for a remote script that outlived its deadline. The
+/// `[ssh_timeout:<operation>]` prefix is part of the bridge contract: the
+/// renderer classifies it as transient and owns the user-facing copy.
+fn remote_script_timeout_error(operation: &str, deadline: Duration) -> String {
+    let limit = if deadline.subsec_millis() == 0 && deadline.as_secs() > 0 {
+        format!("{} seconds", deadline.as_secs())
+    } else {
+        format!("{} ms", deadline.as_millis())
+    };
+    let what = match operation {
+        "pairing" => "issue a pairing credential",
+        "launch" => "start BiBCode",
+        "stop" => "stop BiBCode",
+        _ => "finish the SSH command",
+    };
+    format!("[ssh_timeout:{operation}] The remote host did not {what} within {limit}.")
 }
 
 async fn run_remote_ssh_script(
+    runner: &RemoteScriptRunner,
     target: &SshEnvironmentTarget,
     script: &str,
     script_args: &[String],
@@ -1235,56 +1844,147 @@ async fn run_remote_ssh_script(
 ) -> Result<String, String> {
     let host_spec = build_ssh_host_spec(target)?;
     let mut args = base_ssh_args_with_auth(target, auth);
+    #[cfg(test)]
+    if let Some(path) = &runner.ssh_config_file_for_test {
+        args.splice(
+            0..0,
+            ["-F".to_string(), path.to_string_lossy().into_owned()],
+        );
+    }
     args.push(host_spec);
     args.extend(["sh".to_string(), "-s".to_string(), "--".to_string()]);
     args.extend(script_args.iter().cloned());
-
-    let mut command = Command::new(ssh_command());
-    configure_background_command(&mut command);
-    command
-        .args(args)
-        .envs(build_ssh_child_environment(auth, askpass_launcher.path()))
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    let mut child = spawn_managed_ssh_child(
-        command,
-        askpass_launcher,
-        &format!("run SSH {operation} command"),
-    )?;
-    let mut stdin = child
-        .child_mut()
-        .stdin
-        .take()
-        .ok_or_else(|| format!("SSH {operation} command did not expose stdin."))?;
-    let mut shutdown = child.shutdown_receiver();
-    let write_result = tokio::select! {
-        result = stdin.write_all(script.as_bytes()) => result
-            .map_err(|error| format!("Failed to write SSH {operation} script: {error}")),
-        _ = wait_for_ssh_shutdown(&mut shutdown) => {
-            Err("SSH process owner is shutting down.".to_string())
-        }
+    let exchange = RemoteScriptExchange {
+        program: runner.program.clone(),
+        deadline: runner.deadline,
+        args,
+        environment: build_ssh_child_environment(auth, askpass_launcher.path()),
+        script: script.to_string(),
+        operation: operation.to_string(),
     };
-    drop(stdin);
-    if let Err(error) = write_result {
-        child.terminate_and_reap().await;
-        return Err(error);
-    }
+    run_on_ssh_io(&runner.io_runtime, exchange.run(askpass_launcher)).await
+}
 
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|error| format!("Failed to wait for SSH {operation} command: {error}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "SSH {operation} command failed with status {}: {}",
-            output.status,
-            stderr.trim()
-        ));
+/// Why `ManagedSshChild::wait_with_output` returned no output.
+#[derive(Debug)]
+enum WaitError {
+    /// The caller's deadline passed first; the child is still running. The
+    /// only source of `[ssh_timeout:…]`: an I/O error of the `TimedOut` kind
+    /// is not a deadline (on Windows a cancelled pipe read decodes to it).
+    DeadlinePassed,
+    /// Waiting or reading failed, or (`Interrupted`) the owner is shutting
+    /// down.
+    Io(io::Error),
+}
+
+impl From<io::Error> for WaitError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
     }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// How a failed wait for a remote script is reported, whatever the error's
+/// kind: only `WaitError::DeadlinePassed` becomes a timeout.
+fn wait_failure(error: io::Error, operation: &str) -> RemoteScriptFailure {
+    RemoteScriptFailure::Wait(format!(
+        "Failed to wait for SSH {operation} command: {error}"
+    ))
+}
+
+/// One remote script over SSH, owned so it can run on the SSH I/O runtime.
+struct RemoteScriptExchange {
+    program: String,
+    deadline: Duration,
+    args: Vec<String>,
+    environment: HashMap<String, String>,
+    script: String,
+    operation: String,
+}
+
+impl RemoteScriptExchange {
+    /// Starts ssh, writes the script to its stdin, and returns its stdout.
+    /// At the deadline the SSH child is terminated and reaped, and the error
+    /// is `remote_script_timeout_error`.
+    async fn run(self, askpass_launcher: SshAskpassLauncher) -> Result<String, String> {
+        let Self {
+            program,
+            deadline,
+            args,
+            environment,
+            script,
+            operation,
+        } = self;
+        // `None` only for a deadline too far away to represent: no limit.
+        let expires_at = tokio::time::Instant::now().checked_add(deadline);
+        let mut command = Command::new(&program);
+        configure_background_command(&mut command);
+        command
+            .args(args)
+            .envs(environment)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = spawn_managed_ssh_child(
+            command,
+            askpass_launcher,
+            &format!("run SSH {operation} command"),
+        )?;
+        let mut stdin = child
+            .child_mut()
+            .stdin
+            .take()
+            .ok_or_else(|| format!("SSH {operation} command did not expose stdin."))?;
+        let mut shutdown = child.shutdown_receiver();
+        let written = tokio::select! {
+            result = run_before_deadline(expires_at, stdin.write_all(script.as_bytes())) => match result {
+                // ssh stopped reading its stdin, usually because it exited
+                // (it could not connect): its status and stderr say why.
+                Some(Err(error)) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+                Some(result) => result.map_err(|error| {
+                    RemoteScriptFailure::Write(format!(
+                        "Failed to write SSH {operation} script: {error}"
+                    ))
+                }),
+                None => Err(RemoteScriptFailure::TimedOut),
+            },
+            _ = wait_for_ssh_shutdown(&mut shutdown) => Err(RemoteScriptFailure::Write(
+                "SSH process owner is shutting down.".to_string(),
+            )),
+        };
+        drop(stdin);
+        let output = match written {
+            Ok(()) => child
+                .wait_with_output(expires_at)
+                .await
+                .map_err(|error| match error {
+                    WaitError::DeadlinePassed => RemoteScriptFailure::TimedOut,
+                    WaitError::Io(error) => wait_failure(error, &operation),
+                }),
+            Err(failure) => Err(failure),
+        };
+        let output = match output {
+            Ok(output) => output,
+            Err(RemoteScriptFailure::Write(error)) => {
+                child.terminate_and_reap().await;
+                return Err(error);
+            }
+            Err(RemoteScriptFailure::Wait(error)) => return Err(error),
+            Err(RemoteScriptFailure::TimedOut) => {
+                child.terminate_and_reap().await;
+                return Err(remote_script_timeout_error(&operation, deadline));
+            }
+        };
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "SSH {operation} command failed with status {}: {}",
+                output.status,
+                stderr.trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
 }
 
 fn last_non_empty_line(output: &str) -> Option<&str> {
@@ -1334,13 +2034,25 @@ pub fn parse_remote_launch_result(output: &str) -> Result<RemoteLaunchResult, St
     })
 }
 
+fn parse_remote_stop_result(output: &str) -> Result<bool, &'static str> {
+    let line = last_non_empty_line(output).ok_or("SSH stop did not return a result.")?;
+    let value: Value =
+        serde_json::from_str(line).map_err(|_| "SSH stop returned unparseable output.")?;
+    value
+        .get("stopped")
+        .and_then(Value::as_bool)
+        .ok_or("SSH stop returned an invalid stopped result.")
+}
+
 async fn launch_or_reuse_remote_server(
+    runner: &RemoteScriptRunner,
     target: &SshEnvironmentTarget,
     auth: &SshAuthOptions,
     askpass_launcher: SshAskpassLauncher,
 ) -> Result<RemoteLaunchResult, String> {
     let state_key = remote_state_key(target);
     let output = run_remote_ssh_script(
+        runner,
         target,
         &build_remote_launch_script(),
         &[state_key],
@@ -1353,59 +2065,55 @@ async fn launch_or_reuse_remote_server(
 }
 
 async fn stop_remote_server(
+    runner: &RemoteScriptRunner,
     target: &SshEnvironmentTarget,
     auth: &SshAuthOptions,
     askpass_launcher: SshAskpassLauncher,
 ) -> Result<(), String> {
     let state_key = remote_state_key(target);
-    run_remote_ssh_script(
+    let output = run_remote_ssh_script(
+        runner,
         target,
-        REMOTE_STOP_SCRIPT,
+        &build_remote_stop_script(),
         &[state_key],
         auth,
         askpass_launcher,
         "stop",
     )
-    .await
-    .map(|_| ())
+    .await?;
+    match parse_remote_stop_result(&output) {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(
+            environment = %target.alias,
+            "The remote BiBCode server is still running; its record was kept for the next launch."
+        ),
+        Err(error) => tracing::warn!(
+            environment = %target.alias,
+            error,
+            "Could not confirm whether the remote BiBCode server stopped."
+        ),
+    }
+    Ok(())
 }
 
 async fn issue_remote_pairing_token(
+    runner: &RemoteScriptRunner,
     target: &SshEnvironmentTarget,
     auth: &SshAuthOptions,
     askpass_launcher: SshAskpassLauncher,
 ) -> Result<String, String> {
-    let host_spec = build_ssh_host_spec(target)?;
-    let mut args = base_ssh_args_with_auth(target, auth);
-    args.push(host_spec);
-    args.extend([
-        "sh".to_string(),
-        "-lc".to_string(),
-        REMOTE_PAIRING_ISSUE_COMMAND.to_string(),
-    ]);
-    let mut command = Command::new(ssh_command());
-    configure_background_command(&mut command);
-    command
-        .args(args)
-        .envs(build_ssh_child_environment(auth, askpass_launcher.path()))
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    let mut child = spawn_managed_ssh_child(command, askpass_launcher, "run SSH pairing command")?;
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|error| format!("Failed to run SSH pairing command: {error}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "SSH pairing command failed with status {}: {}",
-            output.status,
-            stderr.trim()
-        ));
-    }
-    parse_remote_pairing_credential(&String::from_utf8_lossy(&output.stdout))
+    let bound = pairing_watchdog_bound(runner.deadline).to_string();
+    let output = run_remote_ssh_script(
+        runner,
+        target,
+        REMOTE_PAIRING_SCRIPT,
+        &[bound],
+        auth,
+        askpass_launcher,
+        "pairing",
+    )
+    .await?;
+    parse_remote_pairing_credential(&output)
 }
 
 async fn start_ssh_tunnel(
@@ -1437,6 +2145,27 @@ async fn start_ssh_tunnel(
     }
 
     Ok(child)
+}
+
+/// One readiness probe of the remote server through a cached tunnel.
+async fn tunnel_endpoint_responds(http_base_url: &str) -> bool {
+    let Ok(mut url) = url::Url::parse(http_base_url) else {
+        return false;
+    };
+    url.set_path(SSH_READY_PATH);
+    url.set_query(None);
+    url.set_fragment(None);
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(SSH_READY_REQUEST_TIMEOUT)
+        .build()
+    else {
+        return false;
+    };
+    client
+        .get(url)
+        .send()
+        .await
+        .is_ok_and(|response| response.status().is_success())
 }
 
 async fn wait_for_ssh_tunnel_ready(child: &mut Child, http_base_url: &str) -> Result<(), String> {
@@ -1477,15 +2206,349 @@ async fn wait_for_ssh_tunnel_ready(child: &mut Child, http_base_url: &str) -> Re
     ))
 }
 
+/// Collects an exited child's stderr for an error message: reading stops at
+/// end of file, after `SSH_OUTPUT_DRAIN_GRACE` without new bytes, or after
+/// `SSH_STDERR_COLLECT_LIMIT` in all, and keeps the last `SSH_OUTPUT_CAP`
+/// bytes. Output cut short is marked.
 async fn read_child_stderr(child: &mut Child) -> String {
     let Some(mut stderr) = child.stderr.take() else {
         return String::new();
     };
-    let mut output = String::new();
-    if stderr.read_to_string(&mut output).await.is_err() {
-        return String::new();
+    let mut output = CappedOutput::default();
+    let activity = OutputActivity::new();
+    let limit = tokio::time::Instant::now() + SSH_STDERR_COLLECT_LIMIT;
+    let reached_end = {
+        let read = output.read_to_end(Some(&mut stderr), &activity);
+        tokio::pin!(read);
+        matches!(
+            drain_until_idle(&mut read, &activity, Some(limit)).await,
+            Some(Ok(()))
+        )
+    };
+    if !output.finished {
+        settle_unfinished_reads(vec![&mut stderr]).await;
     }
-    output.trim().to_string()
+    let (bytes, truncated) = output.finish();
+    let text = String::from_utf8_lossy(&bytes);
+    let text = text.trim();
+    match (reached_end && !truncated, text.is_empty()) {
+        (true, _) => text.to_string(),
+        (false, true) => SSH_OUTPUT_CUT_OFF.to_string(),
+        (false, false) => format!("{text}\n{SSH_OUTPUT_CUT_OFF}"),
+    }
+}
+
+/// When a child's pipes last delivered bytes, shared by its pipe readers.
+struct OutputActivity {
+    started: tokio::time::Instant,
+    last_millis: AtomicU64,
+}
+
+impl OutputActivity {
+    fn new() -> Self {
+        Self {
+            started: tokio::time::Instant::now(),
+            last_millis: AtomicU64::new(0),
+        }
+    }
+
+    fn touch(&self) {
+        let elapsed = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_millis.fetch_max(elapsed, Ordering::Relaxed);
+    }
+
+    fn last(&self) -> tokio::time::Instant {
+        self.started + Duration::from_millis(self.last_millis.load(Ordering::Relaxed))
+    }
+}
+
+/// Polls `drain` (pipe readers that report to `activity`) until it finishes,
+/// or until the pipes have been idle for `SSH_OUTPUT_DRAIN_GRACE`, or until
+/// `limit`. The idle window starts no earlier than the call, so a read still
+/// being scheduled when the child exits gets a full window. Bytes read before
+/// giving up stay with the readers. Returns `None` when it gave up.
+async fn drain_until_idle<F: std::future::Future + Unpin>(
+    drain: &mut F,
+    activity: &OutputActivity,
+    limit: Option<tokio::time::Instant>,
+) -> Option<F::Output> {
+    activity.touch();
+    loop {
+        let idle_deadline = activity.last() + SSH_OUTPUT_DRAIN_GRACE;
+        let wake = limit.map_or(idle_deadline, |limit| idle_deadline.min(limit));
+        if let Ok(output) = tokio::time::timeout_at(wake, &mut *drain).await {
+            return Some(output);
+        }
+        let still_arriving = activity.last() + SSH_OUTPUT_DRAIN_GRACE > idle_deadline;
+        let within_limit = limit.is_none_or(|limit| tokio::time::Instant::now() < limit);
+        if !still_arriving || !within_limit {
+            return None;
+        }
+    }
+}
+
+/// The tail of a child's output. It keeps the last `SSH_OUTPUT_CAP` bytes and
+/// discards older ones while still reading, so a chatty child neither grows
+/// memory without bound nor blocks on a full pipe.
+#[derive(Default)]
+struct CappedOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+    /// Whether `read_to_end` returned (end of file or an error). While it is
+    /// false after the future was dropped, a read may still be in flight.
+    finished: bool,
+}
+
+impl CappedOutput {
+    /// Reads `reader` to end of file. Cancel-safe: every chunk read before the
+    /// future is dropped has already been kept.
+    async fn read_to_end<R: tokio::io::AsyncRead + Unpin>(
+        &mut self,
+        reader: Option<&mut R>,
+        activity: &OutputActivity,
+    ) -> io::Result<()> {
+        let result = match reader {
+            Some(reader) => self.read_chunks(reader, activity).await,
+            None => Ok(()),
+        };
+        self.finished = true;
+        result
+    }
+
+    async fn read_chunks<R: tokio::io::AsyncRead + Unpin>(
+        &mut self,
+        reader: &mut R,
+        activity: &OutputActivity,
+    ) -> io::Result<()> {
+        let mut chunk = vec![0_u8; 8 * 1024];
+        loop {
+            let read = reader.read(&mut chunk).await?;
+            if read == 0 {
+                return Ok(());
+            }
+            activity.touch();
+            self.bytes.extend_from_slice(&chunk[..read]);
+            // Trim in batches so a long stream costs amortised O(1) per byte.
+            if self.bytes.len() > 2 * SSH_OUTPUT_CAP {
+                self.keep_tail();
+            }
+        }
+    }
+
+    fn keep_tail(&mut self) {
+        if self.bytes.len() > SSH_OUTPUT_CAP {
+            let excess = self.bytes.len() - SSH_OUTPUT_CAP;
+            self.bytes.drain(..excess);
+            self.truncated = true;
+        }
+    }
+
+    /// The kept bytes and whether older output was discarded.
+    fn finish(mut self) -> (Vec<u8>, bool) {
+        self.keep_tail();
+        (self.bytes, self.truncated)
+    }
+}
+
+/// A child pipe whose pending read the OS can cancel.
+trait CancellablePipe: tokio::io::AsyncRead + Unpin + Send {
+    /// Asks the OS to end the read pending on this pipe, if there is one.
+    fn cancel_pending_read(&self);
+}
+
+impl CancellablePipe for tokio::process::ChildStdout {
+    fn cancel_pending_read(&self) {
+        cancel_pending_pipe_read(self);
+    }
+}
+
+impl CancellablePipe for tokio::process::ChildStderr {
+    fn cancel_pending_read(&self) {
+        cancel_pending_pipe_read(self);
+    }
+}
+
+/// `CancelIoEx` on the pipe's handle, which completes every read this
+/// process has pending on it with `ERROR_OPERATION_ABORTED`. The standard
+/// library opens child pipes for overlapped I/O, and the blocking read Tokio
+/// runs on a pool thread waits on the handle, so it returns once its read is
+/// cancelled. A read not issued yet is unaffected (`ERROR_NOT_FOUND`), which
+/// is why `settle_pipe_reads` repeats the call.
+#[cfg(windows)]
+fn cancel_pending_pipe_read(pipe: &impl std::os::windows::io::AsRawHandle) {
+    // SAFETY: the caller holds a reference to the pipe, so its handle stays
+    // open for this call; `CancelIoEx` only marks this process's pending I/O
+    // on that handle as cancelled and touches no memory of ours.
+    unsafe {
+        windows_sys::Win32::System::IO::CancelIoEx(pipe.as_raw_handle(), std::ptr::null());
+    }
+}
+
+/// Outside Windows a pending pipe read belongs to the I/O driver, and
+/// dropping it ends it: there is nothing to cancel.
+#[cfg(not(windows))]
+fn cancel_pending_pipe_read<T>(_pipe: &T) {}
+
+/// Settles the pipe reads a drain left in flight when it stopped short (the
+/// pipes went idle, the deadline passed, or the owner is shutting down).
+///
+/// On Windows a child pipe read occupies a blocking-pool thread until it
+/// returns, and dropping the read does not end it, so a descendant that keeps
+/// the pipe open would hold that thread until it exits. Elsewhere reads use
+/// the I/O driver, dropping them is enough, and this returns at once.
+async fn settle_unfinished_reads(pipes: Vec<&mut dyn CancellablePipe>) {
+    if SETTLE_PIPE_READS && !pipes.is_empty() {
+        settle_pipe_reads(pipes, SSH_PIPE_SETTLE_LIMIT).await;
+    }
+}
+
+/// Cancels each pipe's pending read and polls it until it returns, repeating
+/// the cancel every `SSH_PIPE_SETTLE_INTERVAL` for up to `limit`: a read still
+/// queued for a pool thread has no pending I/O to cancel until it starts, and
+/// then it would block until end of file. A pipe whose read has returned (cut
+/// off, at end of file, or with bytes nobody reads any more) is never polled
+/// again, which would start a new read. Returns how many reads were still
+/// pending at the limit.
+async fn settle_pipe_reads(mut pipes: Vec<&mut dyn CancellablePipe>, limit: Duration) -> usize {
+    let limit = tokio::time::Instant::now() + limit;
+    let mut scratch = [0_u8; 1024];
+    while !pipes.is_empty() {
+        for pipe in &pipes {
+            pipe.cancel_pending_read();
+        }
+        let mut pending = Vec::with_capacity(pipes.len());
+        for pipe in pipes {
+            let read = tokio::time::timeout(SSH_PIPE_SETTLE_INTERVAL, pipe.read(&mut scratch));
+            if read.await.is_err() {
+                pending.push(pipe);
+            }
+        }
+        pipes = pending;
+        if tokio::time::Instant::now() >= limit {
+            break;
+        }
+    }
+    if !pipes.is_empty() {
+        tracing::warn!(
+            pending = pipes.len(),
+            "SSH pipe reads were still pending after cancellation"
+        );
+    }
+    pipes.len()
+}
+
+/// The runtime that owns SSH child I/O.
+///
+/// On Windows Tokio reads and writes child pipes on its blocking pool. On the
+/// shared Tauri runtime that pool also serves the in-process server's
+/// blocking work and its provider and Git pipes, so a busy pool could delay
+/// SSH output past the drain's idle window and cut it off. Script children
+/// are spawned, fed, drained, waited on and reaped here instead, on one worker
+/// thread and a blocking pool of their own, and tunnels are spawned and their
+/// stderr read here. A published tunnel's terminate-and-reap is awaited on
+/// the caller's runtime; a child wait needs no blocking-pool thread (a
+/// registered wait on Windows, this runtime's driver elsewhere). Prompts and
+/// events stay on the caller's runtime. It starts on first use and stops with
+/// `SshEnvironmentManager::shutdown`, or when dropped, without blocking, since
+/// a runtime dropped inside async code panics.
+struct SshIoRuntime {
+    max_blocking_threads: usize,
+    state: Mutex<SshIoRuntimeState>,
+}
+
+enum SshIoRuntimeState {
+    NotStarted,
+    Running(tokio::runtime::Runtime),
+    Stopped,
+}
+
+impl SshIoRuntime {
+    fn new(max_blocking_threads: usize) -> Self {
+        Self {
+            max_blocking_threads,
+            state: Mutex::new(SshIoRuntimeState::NotStarted),
+        }
+    }
+
+    /// The runtime's handle, starting it on first use. Fails once stopped.
+    fn handle(&self) -> Result<tokio::runtime::Handle, String> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(*state, SshIoRuntimeState::NotStarted) {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .max_blocking_threads(self.max_blocking_threads)
+                .thread_name("bibcode-ssh-io")
+                .enable_all()
+                .build()
+                .map_err(|error| format!("Could not start the SSH I/O runtime: {error}"))?;
+            *state = SshIoRuntimeState::Running(runtime);
+        }
+        match &*state {
+            SshIoRuntimeState::Running(runtime) => Ok(runtime.handle().clone()),
+            _ => Err("SSH process owner is shutting down.".to_string()),
+        }
+    }
+
+    /// Stops the runtime for good without waiting for its threads, which is
+    /// safe inside async code. Tasks still on it are dropped.
+    fn stop(&self) {
+        let previous = std::mem::replace(
+            &mut *self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            SshIoRuntimeState::Stopped,
+        );
+        if let SshIoRuntimeState::Running(runtime) = previous {
+            runtime.shutdown_background();
+        }
+    }
+}
+
+impl Drop for SshIoRuntime {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Runs `future` to completion, or until `deadline` when there is one;
+/// `None` when the deadline came first.
+async fn run_before_deadline<F: std::future::Future>(
+    deadline: Option<tokio::time::Instant>,
+    future: F,
+) -> Option<F::Output> {
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, future).await.ok(),
+        None => Some(future.await),
+    }
+}
+
+/// Aborts the task when the waiting future is dropped.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Runs `operation` on the SSH I/O runtime and waits for it. Dropping the
+/// returned future aborts the operation, whose SSH child then goes to the
+/// retained reaper as on any other cancellation. An operation the stopped
+/// runtime never ran fails like a refused spawn.
+async fn run_on_ssh_io<T: Send + 'static>(
+    io_runtime: &tokio::runtime::Handle,
+    operation: impl std::future::Future<Output = Result<T, String>> + Send + 'static,
+) -> Result<T, String> {
+    let mut task = AbortOnDrop(io_runtime.spawn(operation));
+    match (&mut task.0).await {
+        Ok(result) => result,
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(_cancelled) => Err("SSH process owner is shutting down.".to_string()),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1559,6 +2622,17 @@ impl std::fmt::Display for SshPasswordPromptRequestError {
 }
 
 impl std::error::Error for SshPasswordPromptRequestError {}
+
+/// The bridge error for a failed password prompt. A cancellation carries the
+/// `[ssh_cancelled]` prefix, part of the bridge contract like
+/// `[ssh_http:<status>]`, so the renderer can tell the user's own cancel from
+/// any other failure without matching words that a host name could contain.
+fn password_prompt_failure(error: SshPasswordPromptRequestError) -> String {
+    match error {
+        SshPasswordPromptRequestError::Cancelled { .. } => format!("[ssh_cancelled] {error}"),
+        error => error.to_string(),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SshPasswordPromptResolveError {
@@ -2084,7 +3158,10 @@ mod tests {
                 let mut child =
                     spawn_managed_ssh_child(command, launcher, "probe SSH child environment")
                         .expect("SSH child should start");
-                let output = child.wait_with_output().await.expect("SSH child output");
+                let output = child
+                    .wait_with_output(None)
+                    .await
+                    .expect("SSH child output");
                 assert!(output.status.success());
                 let environment = output
                     .stdout
@@ -2427,7 +3504,7 @@ mod tests {
             .await
             .expect("active SSH child readiness");
         assert_eq!(&readiness, b"ready!");
-        let owner = tokio::spawn(async move { child.wait_with_output().await });
+        let owner = tokio::spawn(async move { child.wait_with_output(None).await });
 
         if tokio::time::timeout(Duration::from_secs(3), async {
             tokio::join!(manager.shutdown(), manager.shutdown());
@@ -2445,7 +3522,10 @@ mod tests {
             .expect("retained SSH waiter should join")
             .expect_err("manager shutdown should interrupt the SSH wait");
 
-        assert_eq!(wait_error.kind(), io::ErrorKind::Interrupted);
+        assert!(
+            matches!(&wait_error, WaitError::Io(error) if error.kind() == io::ErrorKind::Interrupted),
+            "{wait_error:?}"
+        );
         assert!(!root.exists(), "shutdown must release the askpass root");
         assert!(!process_is_alive(pid), "shutdown must reap the exact child");
         tokio::time::timeout(Duration::from_secs(1), manager.shutdown())
@@ -2605,15 +3685,17 @@ mod tests {
         use tauri::test::{mock_builder, mock_context, noop_assets};
 
         let askpass_temporary_base = tempfile::tempdir().expect("askpass temporary base");
+        let ssh_config = tempfile::NamedTempFile::new().expect("empty SSH config");
         let app = mock_builder()
             .build(mock_context(noop_assets()))
             .expect("mock Tauri app");
         let manager = SshEnvironmentManager::with_askpass_temp_base(
             askpass_temporary_base.path().to_path_buf(),
-        );
+        )
+        .with_ssh_config_file_for_test(ssh_config.path().to_path_buf());
         let prompts = SshPasswordPromptManager::with_timeout(Duration::ZERO);
         let target = SshEnvironmentTarget {
-            alias: "unreachable-localhost".to_string(),
+            alias: String::new(),
             hostname: "127.0.0.1".to_string(),
             username: None,
             port: Some(1),
@@ -3231,6 +4313,2620 @@ mod tests {
         }
         assert!(REMOTE_LAUNCH_SCRIPT.contains("command -v bibcode"));
         assert!(REMOTE_LAUNCH_SCRIPT.contains("native BiBCode CLI"));
+    }
+
+    #[test]
+    fn only_a_cancelled_password_prompt_carries_the_cancellation_marker() {
+        let cancelled = SshPasswordPromptRequestError::Cancelled {
+            request_id: "id".to_string(),
+            destination: "cancelbox".to_string(),
+        };
+        assert_eq!(
+            password_prompt_failure(cancelled),
+            "[ssh_cancelled] SSH authentication cancelled for cancelbox."
+        );
+        let timed_out = SshPasswordPromptRequestError::TimedOut {
+            request_id: "id".to_string(),
+            destination: "cancelbox".to_string(),
+        };
+        assert_eq!(
+            password_prompt_failure(timed_out),
+            "SSH authentication timed out for cancelbox."
+        );
+    }
+
+    /// Test stand-ins for ssh classify each script by its first line.
+    #[test]
+    fn remote_scripts_start_with_a_header_naming_their_kind() {
+        for (script, kind) in [
+            (REMOTE_PAIRING_SCRIPT.to_string(), "pairing"),
+            (build_remote_launch_script(), "launch"),
+            (build_remote_stop_script(), "stop"),
+        ] {
+            assert_eq!(
+                script.lines().next(),
+                Some(format!("{}{kind}", remote_script_header_prefix!()).as_str())
+            );
+            assert_eq!(script.lines().nth(1), Some("set -eu"), "{kind}");
+        }
+        let launch = build_remote_launch_script();
+        assert!(!launch.contains("@@"), "every placeholder is filled");
+        assert!(launch.contains("\ntrap '' PIPE\n"));
+        let stop = build_remote_stop_script();
+        assert!(!stop.contains("@@"), "every placeholder is filled");
+        assert!(stop.contains("\ntrap '' PIPE\n"));
+    }
+
+    #[test]
+    fn launch_script_runs_serve_without_environment_assignments() {
+        let script = build_remote_launch_script();
+        let launch = script
+            .lines()
+            .skip_while(|line| !line.starts_with("nohup "))
+            .take(2)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(launch.starts_with("nohup sh -c "), "{launch}");
+        assert!(
+            launch.contains(
+                r#"bibcode-launch "$PID_FILE" "$RUNNER_FILE" serve --host 127.0.0.1 --port "$REMOTE_PORT" --base-dir "$SERVER_HOME" >>"#
+            ),
+            "serve must start without environment assignments: {launch}"
+        );
+        assert!(!script.contains("BIBCODE_NO_BROWSER"));
+    }
+
+    /// The remote scripts run directly, without SSH, under every POSIX shell
+    /// a host may use for `sh -s`, with a stand-in `bibcode` first on `PATH`
+    /// and a private `HOME`. These pin the scripts' own process handling.
+    #[cfg(unix)]
+    mod remote_scripts {
+        use super::*;
+        use std::io::Write as _;
+        use std::process::{Command as StdCommand, Stdio};
+
+        const STATE_KEY: &str = "0123456789abcdef";
+        const CREDENTIAL_LINE: &str = r#"{"credential":"fixture-credential"}"#;
+
+        /// A stand-in `bibcode`. `serve` records its pid and runs
+        /// `serve.py`; `pairing` records its pid and behaves as
+        /// `FIXTURE_PAIRING` says.
+        const FAKE_BIBCODE: &str = r#"#!/bin/sh
+dir='@@DIR@@'
+case "$1" in
+  serve)
+    printf '%s\n' "$$" >>"$dir/serve.pids"
+    if [ -n "${FIXTURE_OLD_PID:-}" ]; then
+      case "$(ps -o stat= -p "$FIXTURE_OLD_PID" 2>/dev/null)" in
+        ''|Z*) echo old-gone ;;
+        *) echo old-alive ;;
+      esac >>"$dir/serve-starts.log"
+    fi
+    if [ -n "${FIXTURE_REWRITE_PID_FILE:-}" ]; then
+      (sleep 0.5; printf '4242\n' >"$FIXTURE_REWRITE_PID_FILE") &
+    fi
+    exec python3 "$dir/serve.py" "$@"
+    ;;
+  pairing)
+    printf '%s\n' "$$" >>"$dir/pairing.pids"
+    case "${FIXTURE_PAIRING:-ok}" in
+      hang) exec sleep 600 ;;
+      ignore-term)
+        exec python3 -c 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(600)'
+        ;;
+      fail) printf '{"credential":"fixture-credential"}\n'; exit 7 ;;
+      *) printf '{"credential":"fixture-credential"}\n'; exit 0 ;;
+    esac
+    ;;
+esac
+printf 'fixture: unexpected bibcode %s\n' "$*" >&2
+exit 97
+"#;
+
+        /// A stand-in `bibcode serve`: it listens on `--port` and answers
+        /// every request with `200 {}`, or with `FIXTURE_SERVE_MODE=silent`
+        /// accepts connections and never answers.
+        /// `FIXTURE_IGNORE_TERM=1` makes it ignore SIGTERM, and
+        /// `FIXTURE_TERM_DELAY=<s>` makes it exit that long after SIGTERM,
+        /// still listening meanwhile, like a graceful shutdown.
+        const SERVE_PY: &str = r#"import os, signal, socket, sys, time
+if os.environ.get("FIXTURE_IGNORE_TERM") == "1":
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+term_delay = float(os.environ.get("FIXTURE_TERM_DELAY", "0"))
+if term_delay:
+    def shut_down_slowly(signum, frame):
+        time.sleep(term_delay)
+        os._exit(0)
+    signal.signal(signal.SIGTERM, shut_down_slowly)
+args = sys.argv[1:]
+port = int(args[args.index("--port") + 1])
+silent = os.environ.get("FIXTURE_SERVE_MODE") == "silent"
+listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind(("127.0.0.1", port))
+listener.listen(16)
+held = []
+while True:
+    connection, _ = listener.accept()
+    if silent:
+        held.append(connection)
+        continue
+    try:
+        connection.recv(4096)
+        connection.sendall(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}")
+    except OSError:
+        pass
+    connection.close()
+"#;
+
+        /// Prepended to a script under test: every `kill` it makes is
+        /// recorded in `kill.log`, and only signal 0 is delivered, so a test
+        /// can prove no signal would be sent without ever sending one.
+        const KILL_SHIM: &str = r#"kill() {
+  printf '%s\n' "$*" >>'@@DIR@@/kill.log'
+  case "$1" in
+    -0) command kill "$@" ;;
+    *) return 0 ;;
+  esac
+}
+"#;
+
+        /// Recorded pids a corrupt or hand-edited pid file could hold. "-1"
+        /// would reach every process the user owns.
+        const MALFORMED_PIDS: [&str; 7] = ["", "0", "-1", "12a", " 12", "1 2", "007"];
+
+        /// `/bin/sh` (dash on Debian and Ubuntu, where CI runs), plus
+        /// `dash`, `bash --posix` and `busybox sh` when installed, each shell
+        /// binary once: where `/bin/sh` is bash (Fedora) or dash (Ubuntu), the
+        /// matching entry would only run every test twice in the same shell.
+        fn shells() -> Vec<Vec<String>> {
+            let mut shells = Vec::new();
+            let mut binaries = Vec::new();
+            let candidates = [
+                (Some(PathBuf::from("/bin/sh")), &[][..]),
+                (find_on_path("dash"), &[][..]),
+                (find_on_path("bash"), &["--posix"][..]),
+                (find_on_path("busybox"), &["sh"][..]),
+            ];
+            for (program, args) in candidates {
+                // An absolute path, because some tests narrow the child's PATH.
+                let Some(program) = program else {
+                    continue;
+                };
+                let binary = fs::canonicalize(&program).unwrap_or_else(|_| program.clone());
+                if binaries.contains(&binary) {
+                    continue;
+                }
+                binaries.push(binary);
+                let mut shell = vec![program.display().to_string()];
+                shell.extend(args.iter().map(|part| part.to_string()));
+                shells.push(shell);
+            }
+            shells
+        }
+
+        fn find_on_path(program: &str) -> Option<PathBuf> {
+            env::split_paths(&env::var_os("PATH")?)
+                .map(|directory| directory.join(program))
+                .find(|candidate| candidate.is_file())
+        }
+
+        fn free_port() -> u16 {
+            crate::test_support::free_test_port()
+        }
+
+        fn write_executable(path: &Path, contents: &str) {
+            crate::test_support::write_executable_fixture(path, contents, 0o755);
+        }
+
+        async fn wait_until_gone(pid: u32, limit: Duration) -> bool {
+            let deadline = std::time::Instant::now() + limit;
+            loop {
+                if fixture_process_is_gone(pid) {
+                    return true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        enum ScriptOutput {
+            /// stdout and stderr go to files the test reads afterwards.
+            Files,
+            /// stdout and stderr are pipes whose read ends are already
+            /// closed, as after the SSH channel went away.
+            Closed,
+        }
+
+        struct ScriptRun {
+            shell: String,
+            status: Option<std::process::ExitStatus>,
+            stdout: String,
+            stderr: String,
+            elapsed: Duration,
+        }
+
+        impl ScriptRun {
+            fn code(&self) -> Option<i32> {
+                self.status.and_then(|status| status.code())
+            }
+        }
+
+        impl std::fmt::Debug for ScriptRun {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(
+                    formatter,
+                    "`{}` ended with {:?} after {:?}\n--- stdout\n{}\n--- stderr\n{}",
+                    self.shell, self.status, self.elapsed, self.stdout, self.stderr
+                )
+            }
+        }
+
+        /// A private "remote host": a HOME, a `bin` holding the stand-in
+        /// `bibcode`, and the files the stand-ins record.
+        struct ScriptHost {
+            dir: tempfile::TempDir,
+            /// How long a script may run before the test kills it.
+            limit: Duration,
+            /// Where the launch script's port scan starts when no port is
+            /// recorded: a free port, never the 3773 a local BiBCode uses.
+            default_port: u16,
+        }
+
+        impl ScriptHost {
+            fn new() -> Self {
+                let dir = tempfile::tempdir().expect("script host directory");
+                let root = dir.path().display().to_string();
+                fs::create_dir_all(dir.path().join("home")).expect("fixture home");
+                fs::create_dir_all(dir.path().join("bin")).expect("fixture bin");
+                write_executable(
+                    &dir.path().join("bin/bibcode"),
+                    &FAKE_BIBCODE.replace("@@DIR@@", &root),
+                );
+                fs::write(dir.path().join("serve.py"), SERVE_PY).expect("fixture server");
+                Self {
+                    dir,
+                    limit: Duration::from_secs(60),
+                    default_port: free_port(),
+                }
+            }
+
+            fn launch_script(&self, limits: RemoteLaunchLimits) -> String {
+                build_remote_launch_script_with(limits, self.default_port)
+            }
+
+            /// `script` with `KILL_SHIM` in front of it.
+            fn with_kill_shim(&self, script: &str) -> String {
+                let root = self.dir.path().display().to_string();
+                format!("{}{script}", KILL_SHIM.replace("@@DIR@@", &root))
+            }
+
+            /// Records `pid` verbatim, however malformed, with `port`.
+            fn seed_raw_state(&self, pid: &str, port: u16) {
+                self.seed_state(None, port);
+                fs::write(self.state_dir().join("pid"), format!("{pid}\n"))
+                    .expect("seed raw pid file");
+                fs::write(self.state_dir().join("managed"), "managed\n")
+                    .expect("seed managed file");
+            }
+
+            /// Recorded servers still running.
+            fn live_servers(&self) -> Vec<u32> {
+                self.pids("serve.pids")
+                    .into_iter()
+                    .filter(|pid| !fixture_process_is_gone(*pid))
+                    .collect()
+            }
+
+            fn with_limit(limit: Duration) -> Self {
+                Self {
+                    limit,
+                    ..Self::new()
+                }
+            }
+
+            fn home(&self) -> PathBuf {
+                self.dir.path().join("home")
+            }
+
+            fn server_home(&self) -> String {
+                self.home().join(".bibcode").display().to_string()
+            }
+
+            fn state_dir(&self) -> PathBuf {
+                self.home().join(".bibcode-ssh-launch").join(STATE_KEY)
+            }
+
+            fn state_file(&self, name: &str) -> Option<String> {
+                fs::read_to_string(self.state_dir().join(name))
+                    .ok()
+                    .map(|contents| contents.trim().to_string())
+            }
+
+            /// Records a managed server as an earlier launch would: `pid`
+            /// (when given), `port`, and the `managed` marker.
+            fn seed_state(&self, pid: Option<u32>, port: u16) {
+                fs::create_dir_all(self.state_dir()).expect("fixture state directory");
+                if let Some(pid) = pid {
+                    fs::write(self.state_dir().join("pid"), format!("{pid}\n"))
+                        .expect("seed pid file");
+                    fs::write(self.state_dir().join("managed"), "managed\n")
+                        .expect("seed managed file");
+                }
+                fs::write(self.state_dir().join("port"), format!("{port}\n"))
+                    .expect("seed port file");
+            }
+
+            fn recorded(&self, name: &str) -> Vec<String> {
+                fs::read_to_string(self.dir.path().join(name))
+                    .unwrap_or_default()
+                    .lines()
+                    .map(str::to_string)
+                    .collect()
+            }
+
+            fn pids(&self, name: &str) -> Vec<u32> {
+                self.recorded(name)
+                    .iter()
+                    .filter_map(|pid| pid.trim().parse().ok())
+                    .collect()
+            }
+
+            /// Kills every stand-in this host started, even when a test
+            /// panics.
+            fn cleanup(&self) -> [BackgroundedFixtureProcesses; 2] {
+                [
+                    BackgroundedFixtureProcesses {
+                        pids_file: self.dir.path().join("serve.pids"),
+                        marker: "serve.py",
+                    },
+                    BackgroundedFixtureProcesses {
+                        pids_file: self.dir.path().join("pairing.pids"),
+                        marker: "600",
+                    },
+                ]
+            }
+
+            /// Starts a `bibcode serve` stand-in outside the script, with
+            /// the command line the launch script gives its server.
+            fn spawn_recorded_server(&self, port: u16, env: &[(&str, &str)]) -> RecordedServer {
+                let mut command = StdCommand::new("python3");
+                command
+                    .arg(self.dir.path().join("serve.py"))
+                    .args(["serve", "--host", "127.0.0.1", "--port"])
+                    .arg(port.to_string())
+                    .arg("--base-dir")
+                    .arg(self.server_home())
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                for (name, value) in env {
+                    command.env(name, value);
+                }
+                let mut child = command.spawn().expect("recorded server stand-in");
+                let pid = child.id();
+                // Reap it as soon as it exits, so `kill -0` stops seeing it.
+                let reaper = std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                let listening = std::time::Instant::now() + Duration::from_secs(10);
+                while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                    assert!(
+                        std::time::Instant::now() < listening,
+                        "recorded server never listened on {port}"
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                RecordedServer {
+                    pid,
+                    reaper: Some(reaper),
+                }
+            }
+
+            fn run(
+                &self,
+                shell: &[String],
+                script: &str,
+                args: &[&str],
+                env: &[(&str, String)],
+                output: ScriptOutput,
+            ) -> ScriptRun {
+                self.run_with_path(shell, script, args, env, output, None)
+            }
+
+            fn run_with_path(
+                &self,
+                shell: &[String],
+                script: &str,
+                args: &[&str],
+                env: &[(&str, String)],
+                output: ScriptOutput,
+                search_path: Option<String>,
+            ) -> ScriptRun {
+                let bin = self.dir.path().join("bin").display().to_string();
+                let search_path = search_path
+                    .unwrap_or_else(|| format!("{bin}:{}", env::var("PATH").unwrap_or_default()));
+                let stdout_path = self.dir.path().join("script.stdout");
+                let stderr_path = self.dir.path().join("script.stderr");
+                let mut command = StdCommand::new(&shell[0]);
+                command
+                    .args(&shell[1..])
+                    .args(["-s", "--"])
+                    .args(args)
+                    .env_clear()
+                    .env("HOME", self.home())
+                    .env("PATH", search_path)
+                    .current_dir(self.home())
+                    .stdin(Stdio::piped());
+                match output {
+                    ScriptOutput::Files => {
+                        command
+                            .stdout(fs::File::create(&stdout_path).expect("stdout file"))
+                            .stderr(fs::File::create(&stderr_path).expect("stderr file"));
+                    }
+                    ScriptOutput::Closed => {
+                        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+                    }
+                }
+                for (name, value) in env {
+                    command.env(name, value);
+                }
+                let started = std::time::Instant::now();
+                let mut child = command.spawn().expect("script shell");
+                drop(child.stdout.take());
+                drop(child.stderr.take());
+                child
+                    .stdin
+                    .take()
+                    .expect("script stdin")
+                    .write_all(script.as_bytes())
+                    .expect("write the script");
+                let limit = started + self.limit;
+                let status = loop {
+                    if let Some(status) = child.try_wait().expect("script status") {
+                        break Some(status);
+                    }
+                    if std::time::Instant::now() >= limit {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break None;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                };
+                ScriptRun {
+                    shell: shell.join(" "),
+                    status,
+                    stdout: fs::read_to_string(&stdout_path).unwrap_or_default(),
+                    stderr: fs::read_to_string(&stderr_path).unwrap_or_default(),
+                    elapsed: started.elapsed(),
+                }
+            }
+
+            async fn assert_servers_gone(&self, run: &ScriptRun) {
+                let servers = self.pids("serve.pids");
+                assert!(!servers.is_empty(), "{run:?}: the script started no server");
+                for pid in servers {
+                    assert!(
+                        wait_until_gone(pid, Duration::from_secs(3)).await,
+                        "{run:?}: server {pid} was left running"
+                    );
+                }
+            }
+        }
+
+        /// A stand-in server started by the test; killed on drop if still
+        /// running.
+        struct RecordedServer {
+            pid: u32,
+            reaper: Option<std::thread::JoinHandle<()>>,
+        }
+
+        impl Drop for RecordedServer {
+            fn drop(&mut self) {
+                if !fixture_process_is_gone(self.pid) {
+                    // SAFETY: signals the test's own child, which the reaper
+                    // thread has not reaped yet, so the pid is still its own.
+                    unsafe {
+                        libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
+                    }
+                }
+                if let Some(reaper) = self.reaper.take() {
+                    let _ = reaper.join();
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn pairing_watchdog_ends_a_command_that_never_exits() {
+            for shell in shells() {
+                // `hang` dies on TERM; `ignore-term` needs the KILL 2 s later.
+                for (mode, least, most) in [("hang", 0, 3), ("ignore-term", 2, 5)] {
+                    let host = ScriptHost::with_limit(Duration::from_secs(10));
+                    let _cleanup = host.cleanup();
+                    let run = host.run(
+                        &shell,
+                        REMOTE_PAIRING_SCRIPT,
+                        &["1"],
+                        &[("FIXTURE_PAIRING", mode.to_string())],
+                        ScriptOutput::Files,
+                    );
+                    assert_eq!(run.code(), Some(124), "{mode}: {run:?}");
+                    assert!(
+                        run.elapsed >= Duration::from_secs(least)
+                            && run.elapsed < Duration::from_secs(most),
+                        "{mode}: {run:?}"
+                    );
+                    let stand_ins = host.pids("pairing.pids");
+                    assert_eq!(stand_ins.len(), 1, "{mode}: {run:?}");
+                    for pid in stand_ins {
+                        assert!(
+                            wait_until_gone(pid, Duration::from_millis(500)).await,
+                            "{mode}: {run:?}: stand-in {pid} was left behind"
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn pairing_watchdog_passes_the_command_output_and_status_through() {
+            for shell in shells() {
+                for (mode, code) in [("ok", 0), ("fail", 7)] {
+                    let host = ScriptHost::new();
+                    let _cleanup = host.cleanup();
+                    let run = host.run(
+                        &shell,
+                        REMOTE_PAIRING_SCRIPT,
+                        &["35"],
+                        &[("FIXTURE_PAIRING", mode.to_string())],
+                        ScriptOutput::Files,
+                    );
+                    assert_eq!(run.code(), Some(code), "{mode}: {run:?}");
+                    assert_eq!(run.stdout.trim(), CREDENTIAL_LINE, "{mode}: {run:?}");
+                    assert!(run.elapsed < Duration::from_secs(3), "{mode}: {run:?}");
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn launch_readiness_ends_at_its_wall_clock_limit_when_every_probe_hangs() {
+            let limits = RemoteLaunchLimits { ready: 2, reuse: 2 };
+            for shell in shells() {
+                let host = ScriptHost::new();
+                let script = host.launch_script(limits);
+                let _cleanup = host.cleanup();
+                host.seed_state(None, free_port());
+                let run = host.run(
+                    &shell,
+                    &script,
+                    &[STATE_KEY],
+                    &[("FIXTURE_SERVE_MODE", "silent".to_string())],
+                    ScriptOutput::Files,
+                );
+                assert_eq!(run.code(), Some(1), "{run:?}");
+                assert!(run.stderr.contains("did not become ready"), "{run:?}");
+                // At least the limit; at most the limit, the clock's whole
+                // second, one probe and the stop.
+                assert!(
+                    run.elapsed >= Duration::from_secs(2) && run.elapsed < Duration::from_secs(8),
+                    "{run:?}"
+                );
+                host.assert_servers_gone(&run).await;
+                assert_eq!(host.state_file("pid"), None, "{run:?}");
+                assert_eq!(host.state_file("port"), None, "{run:?}");
+            }
+        }
+
+        /// The readiness wait with only `wget` on `PATH`. GNU wget retries a
+        /// timed-out read many times, so each probe runs under the watchdog.
+        #[tokio::test]
+        async fn launch_readiness_with_wget_ends_at_its_wall_clock_limit() {
+            let Some(_) = find_on_path("wget") else {
+                eprintln!("skipped: wget is not installed");
+                return;
+            };
+            let limits = RemoteLaunchLimits { ready: 2, reuse: 2 };
+            for shell in shells() {
+                let host = ScriptHost::new();
+                let script = host.launch_script(limits);
+                let _cleanup = host.cleanup();
+                // A PATH with the stand-in `bibcode` and the tools the
+                // scripts use, but no curl.
+                let tools = host.dir.path().join("tools");
+                fs::create_dir_all(&tools).expect("tools directory");
+                for tool in [
+                    "awk", "cat", "chmod", "date", "grep", "mkdir", "mv", "nohup", "ps", "python3",
+                    "rm", "sh", "sleep", "ss", "tail", "tr", "wget",
+                ] {
+                    if let Some(found) = find_on_path(tool) {
+                        std::os::unix::fs::symlink(found, tools.join(tool)).expect("link tool");
+                    }
+                }
+                let search_path = format!(
+                    "{}:{}",
+                    host.dir.path().join("bin").display(),
+                    tools.display()
+                );
+                host.seed_state(None, free_port());
+                let run = host.run_with_path(
+                    &shell,
+                    &script,
+                    &[STATE_KEY],
+                    &[("FIXTURE_SERVE_MODE", "silent".to_string())],
+                    ScriptOutput::Files,
+                    Some(search_path),
+                );
+                assert_eq!(run.code(), Some(1), "{run:?}");
+                assert!(run.stderr.contains("did not become ready"), "{run:?}");
+                assert!(
+                    run.elapsed >= Duration::from_secs(2) && run.elapsed < Duration::from_secs(10),
+                    "{run:?}"
+                );
+                host.assert_servers_gone(&run).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn launch_not_ready_stops_its_server_even_when_its_output_is_closed() {
+            let limits = RemoteLaunchLimits { ready: 1, reuse: 1 };
+            for shell in shells() {
+                let host = ScriptHost::new();
+                let script = host.launch_script(limits);
+                let _cleanup = host.cleanup();
+                host.seed_state(None, free_port());
+                let run = host.run(
+                    &shell,
+                    &script,
+                    &[STATE_KEY],
+                    &[("FIXTURE_SERVE_MODE", "silent".to_string())],
+                    ScriptOutput::Closed,
+                );
+                assert!(run.status.is_some(), "{run:?}");
+                host.assert_servers_gone(&run).await;
+                assert_eq!(host.state_file("pid"), None, "{run:?}");
+                assert_eq!(host.state_file("port"), None, "{run:?}");
+                assert_eq!(host.state_file("managed"), None, "{run:?}");
+            }
+        }
+
+        #[tokio::test]
+        async fn launch_stops_a_live_silent_recorded_server_before_starting_one_replacement() {
+            let limits = RemoteLaunchLimits {
+                ready: 10,
+                reuse: 2,
+            };
+            for shell in shells() {
+                let host = ScriptHost::new();
+                let script = host.launch_script(limits);
+                let _cleanup = host.cleanup();
+                let port = free_port();
+                let old = host.spawn_recorded_server(port, &[("FIXTURE_SERVE_MODE", "silent")]);
+                host.seed_state(Some(old.pid), port);
+                let run = host.run(
+                    &shell,
+                    &script,
+                    &[STATE_KEY],
+                    &[("FIXTURE_OLD_PID", old.pid.to_string())],
+                    ScriptOutput::Files,
+                );
+                assert_eq!(run.code(), Some(0), "{run:?}");
+                let launched = parse_remote_launch_result(&run.stdout).expect("launch result");
+                assert_eq!(
+                    host.recorded("serve-starts.log"),
+                    ["old-gone"],
+                    "{run:?}: exactly one replacement, started after the old server stopped"
+                );
+                assert!(fixture_process_is_gone(old.pid), "{run:?}");
+                let replacement = host.pids("serve.pids");
+                assert_eq!(
+                    host.state_file("pid"),
+                    replacement.first().map(u32::to_string),
+                    "{run:?}"
+                );
+                assert_eq!(
+                    host.state_file("port"),
+                    Some(launched.remote_port.to_string()),
+                    "{run:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn launch_never_kills_a_recorded_pid_that_is_not_its_server() {
+            let limits = RemoteLaunchLimits {
+                ready: 10,
+                reuse: 2,
+            };
+            for shell in shells() {
+                let host = ScriptHost::new();
+                let script = host.launch_script(limits);
+                let _cleanup = host.cleanup();
+                let mut stale = StdCommand::new("sleep")
+                    .arg("60")
+                    .spawn()
+                    .expect("unrelated process");
+                host.seed_state(Some(stale.id()), free_port());
+                let run = host.run(&shell, &script, &[STATE_KEY], &[], ScriptOutput::Files);
+                let survived = stale
+                    .try_wait()
+                    .expect("unrelated process status")
+                    .is_none();
+                let _ = stale.kill();
+                let _ = stale.wait();
+                assert_eq!(run.code(), Some(0), "{run:?}");
+                assert!(survived, "{run:?}: the unrelated process was killed");
+                assert_eq!(
+                    host.state_file("pid"),
+                    host.pids("serve.pids").first().map(u32::to_string),
+                    "{run:?}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn launch_keeps_state_files_that_name_another_pid() {
+            let limits = RemoteLaunchLimits { ready: 2, reuse: 2 };
+            for shell in shells() {
+                let host = ScriptHost::new();
+                let script = host.launch_script(limits);
+                let _cleanup = host.cleanup();
+                let port = free_port();
+                host.seed_state(None, port);
+                let pid_file = host.state_dir().join("pid").display().to_string();
+                let run = host.run(
+                    &shell,
+                    &script,
+                    &[STATE_KEY],
+                    &[
+                        ("FIXTURE_SERVE_MODE", "silent".to_string()),
+                        ("FIXTURE_REWRITE_PID_FILE", pid_file),
+                    ],
+                    ScriptOutput::Files,
+                );
+                assert_eq!(run.code(), Some(1), "{run:?}");
+                host.assert_servers_gone(&run).await;
+                assert_eq!(host.state_file("pid").as_deref(), Some("4242"), "{run:?}");
+                assert!(host.state_file("port").is_some(), "{run:?}");
+            }
+        }
+
+        #[test]
+        fn stop_never_kills_a_recorded_pid_that_is_not_its_server() {
+            for shell in shells() {
+                let host = ScriptHost::new();
+                let mut stale = StdCommand::new("sleep")
+                    .arg("60")
+                    .spawn()
+                    .expect("unrelated process");
+                host.seed_state(Some(stale.id()), free_port());
+                let run = host.run(
+                    &shell,
+                    &build_remote_stop_script_with(2),
+                    &[STATE_KEY],
+                    &[],
+                    ScriptOutput::Files,
+                );
+                std::thread::sleep(Duration::from_millis(200));
+                let survived = stale
+                    .try_wait()
+                    .expect("unrelated process status")
+                    .is_none();
+                let _ = stale.kill();
+                let _ = stale.wait();
+                assert_eq!(run.code(), Some(0), "{run:?}");
+                assert_eq!(run.stdout.trim(), r#"{"stopped":true}"#, "{run:?}");
+                assert!(survived, "{run:?}: the unrelated process was killed");
+                assert_eq!(host.state_file("pid"), None, "{run:?}");
+                assert_eq!(host.state_file("port"), None, "{run:?}");
+            }
+        }
+
+        #[tokio::test]
+        async fn stop_terminates_its_recorded_server_and_never_forces_it() {
+            for shell in shells() {
+                for ignores_term in [false, true] {
+                    let host = ScriptHost::new();
+                    let port = free_port();
+                    let mut env = vec![("FIXTURE_SERVE_MODE", "silent")];
+                    if ignores_term {
+                        env.push(("FIXTURE_IGNORE_TERM", "1"));
+                    }
+                    let server = host.spawn_recorded_server(port, &env);
+                    host.seed_state(Some(server.pid), port);
+                    let run = host.run(
+                        &shell,
+                        &build_remote_stop_script_with(2),
+                        &[STATE_KEY],
+                        &[],
+                        ScriptOutput::Files,
+                    );
+                    assert_eq!(run.code(), Some(0), "{run:?}");
+                    let gone = wait_until_gone(server.pid, Duration::from_secs(3)).await;
+                    assert_eq!(
+                        gone, !ignores_term,
+                        "{run:?}: TERM stops the server; nothing forces one that ignores it"
+                    );
+                    if ignores_term {
+                        assert_eq!(run.stdout.trim(), r#"{"stopped":false}"#, "{run:?}");
+                        assert_eq!(
+                            host.state_file("pid"),
+                            Some(server.pid.to_string()),
+                            "{run:?}: a server still running keeps its record"
+                        );
+                    } else {
+                        assert_eq!(run.stdout.trim(), r#"{"stopped":true}"#, "{run:?}");
+                        assert_eq!(host.state_file("pid"), None, "{run:?}");
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn launch_never_signals_or_trusts_a_malformed_recorded_pid() {
+            let limits = RemoteLaunchLimits {
+                ready: 10,
+                reuse: 2,
+            };
+            for shell in shells() {
+                for pid in MALFORMED_PIDS {
+                    let host = ScriptHost::new();
+                    let _cleanup = host.cleanup();
+                    host.seed_raw_state(pid, free_port());
+                    let script = host.with_kill_shim(&host.launch_script(limits));
+                    let run = host.run(&shell, &script, &[STATE_KEY], &[], ScriptOutput::Files);
+                    assert_eq!(run.code(), Some(0), "{pid:?}: {run:?}");
+                    assert_eq!(
+                        host.recorded("kill.log"),
+                        Vec::<String>::new(),
+                        "{pid:?}: {run:?}: no kill may be attempted"
+                    );
+                    let started = host.pids("serve.pids");
+                    assert_eq!(
+                        started.len(),
+                        1,
+                        "{pid:?}: {run:?}: one new server replaces the untrusted record"
+                    );
+                    assert_eq!(
+                        host.state_file("pid"),
+                        started.first().map(u32::to_string),
+                        "{pid:?}: {run:?}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn stop_never_signals_a_malformed_recorded_pid() {
+            for shell in shells() {
+                for pid in MALFORMED_PIDS {
+                    let host = ScriptHost::new();
+                    host.seed_raw_state(pid, free_port());
+                    let script = host.with_kill_shim(&build_remote_stop_script_with(2));
+                    let run = host.run(&shell, &script, &[STATE_KEY], &[], ScriptOutput::Files);
+                    assert_eq!(run.code(), Some(0), "{pid:?}: {run:?}");
+                    assert_eq!(run.stdout.trim(), r#"{"stopped":true}"#, "{pid:?}: {run:?}");
+                    assert_eq!(
+                        host.recorded("kill.log"),
+                        Vec::<String>::new(),
+                        "{pid:?}: {run:?}: no kill may be attempted"
+                    );
+                    assert_eq!(
+                        host.state_file("pid"),
+                        None,
+                        "{pid:?}: {run:?}: the untrusted record is dropped"
+                    );
+                }
+            }
+        }
+
+        /// Disconnect, then Connect: the launch that follows a stop must not
+        /// start a server beside one that is still shutting down.
+        #[tokio::test]
+        async fn a_launch_right_after_stop_never_runs_beside_the_stopping_server() {
+            let limits = RemoteLaunchLimits {
+                ready: 10,
+                reuse: 2,
+            };
+            for shell in shells() {
+                let host = ScriptHost::new();
+                let _cleanup = host.cleanup();
+                let port = free_port();
+                let old = host.spawn_recorded_server(port, &[("FIXTURE_TERM_DELAY", "2")]);
+                host.seed_state(Some(old.pid), port);
+
+                let stop = host.run(
+                    &shell,
+                    &build_remote_stop_script_with(5),
+                    &[STATE_KEY],
+                    &[],
+                    ScriptOutput::Files,
+                );
+                let launch = host.run(
+                    &shell,
+                    &host.launch_script(limits),
+                    &[STATE_KEY],
+                    &[("FIXTURE_OLD_PID", old.pid.to_string())],
+                    ScriptOutput::Files,
+                );
+
+                assert_eq!(stop.code(), Some(0), "{stop:?}");
+                assert_eq!(stop.stdout.trim(), r#"{"stopped":true}"#, "{stop:?}");
+                assert_eq!(launch.code(), Some(0), "{launch:?}");
+                assert_eq!(
+                    host.recorded("serve-starts.log"),
+                    ["old-gone"],
+                    "{stop:?}\n{launch:?}: one replacement, started after the stopped server exited"
+                );
+            }
+        }
+
+        /// Stop never forces a server; one that outlives its wait keeps its
+        /// record, and the next launch stops it (TERM, then KILL) before it
+        /// starts exactly one replacement.
+        #[tokio::test]
+        async fn a_server_that_outlives_stop_is_replaced_by_the_next_launch_alone() {
+            let limits = RemoteLaunchLimits {
+                ready: 10,
+                reuse: 2,
+            };
+            for shell in shells() {
+                let host = ScriptHost::new();
+                let _cleanup = host.cleanup();
+                let port = free_port();
+                let old = host.spawn_recorded_server(
+                    port,
+                    &[
+                        ("FIXTURE_SERVE_MODE", "silent"),
+                        ("FIXTURE_IGNORE_TERM", "1"),
+                    ],
+                );
+                host.seed_state(Some(old.pid), port);
+
+                let stop = host.run(
+                    &shell,
+                    &build_remote_stop_script_with(2),
+                    &[STATE_KEY],
+                    &[],
+                    ScriptOutput::Files,
+                );
+                assert_eq!(stop.code(), Some(0), "{stop:?}");
+                assert_eq!(stop.stdout.trim(), r#"{"stopped":false}"#, "{stop:?}");
+                assert!(
+                    !fixture_process_is_gone(old.pid),
+                    "{stop:?}: stop never forces it"
+                );
+                assert_eq!(
+                    host.state_file("pid"),
+                    Some(old.pid.to_string()),
+                    "{stop:?}"
+                );
+
+                let launch = host.run(
+                    &shell,
+                    &host.launch_script(limits),
+                    &[STATE_KEY],
+                    &[("FIXTURE_OLD_PID", old.pid.to_string())],
+                    ScriptOutput::Files,
+                );
+                assert_eq!(launch.code(), Some(0), "{launch:?}");
+                assert_eq!(
+                    host.recorded("serve-starts.log"),
+                    ["old-gone"],
+                    "{launch:?}: exactly one replacement, after the old server was killed"
+                );
+                assert!(
+                    wait_until_gone(old.pid, Duration::from_secs(3)).await,
+                    "{launch:?}"
+                );
+            }
+        }
+
+        /// A launch cut short while it records its server (here a state
+        /// write fails) must never leave a running server unrecorded, or
+        /// recorded with another port: the next launch would not recognise it
+        /// and would start a second server beside it. Case "state directory":
+        /// the first state write fails. Case "pid record": the server's own
+        /// pid write fails.
+        #[tokio::test]
+        async fn a_launch_cut_short_while_recording_its_server_leaves_one_server() {
+            use std::os::unix::fs::PermissionsExt;
+
+            // SAFETY: `geteuid` only reads this process's effective user id.
+            if unsafe { libc::geteuid() } == 0 {
+                eprintln!("skipped: permissions do not stop root");
+                return;
+            }
+            let limits = RemoteLaunchLimits { ready: 2, reuse: 2 };
+            for shell in shells() {
+                for case in ["state directory", "pid record"] {
+                    let host = ScriptHost::new();
+                    let _cleanup = host.cleanup();
+                    let state_dir = host.state_dir();
+                    fs::create_dir_all(&state_dir).expect("state directory");
+                    let blocked = state_dir.join("pid.tmp");
+                    if case == "state directory" {
+                        // Files the launch rewrites in place stay writable;
+                        // creating any new file in the directory fails.
+                        fs::write(state_dir.join("run-bibcode.sh"), "").expect("runner file");
+                        fs::write(state_dir.join("server.log"), "").expect("log file");
+                        fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o555))
+                            .expect("read-only state directory");
+                    } else {
+                        fs::create_dir(&blocked).expect("block the pid record");
+                    }
+
+                    let cut_short = host.run(
+                        &shell,
+                        &host.launch_script(limits),
+                        &[STATE_KEY],
+                        &[],
+                        ScriptOutput::Files,
+                    );
+                    fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o755))
+                        .expect("writable state directory");
+                    let _ = fs::remove_dir(&blocked);
+                    let next = host.run(
+                        &shell,
+                        &host.launch_script(limits),
+                        &[STATE_KEY],
+                        &[],
+                        ScriptOutput::Files,
+                    );
+
+                    assert_ne!(cut_short.code(), Some(0), "{case}: {cut_short:?}");
+                    assert_eq!(next.code(), Some(0), "{case}: {next:?}");
+                    assert_eq!(
+                        host.live_servers().len(),
+                        1,
+                        "{case}: {cut_short:?}\n{next:?}: never two servers on one data root"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Stand-ins for the OpenSSH client. Each fake records the remote command
+    /// line it receives (options stripped, the rest joined with spaces, as
+    /// `ssh(1)` sends it) and then runs a shell body. Nothing leaves the host.
+    #[cfg(unix)]
+    mod fake_ssh {
+        use super::*;
+
+        const PRELUDE: &str = r#"#!/bin/sh
+dir='@@DIR@@'
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -L) forward="$2"; shift 2 ;;
+    -o|-p) shift 2 ;;
+    -n|-N|-T) shift ;;
+    -*) printf 'fake ssh: unsupported option %s\n' "$1" >&2; exit 255 ;;
+    *) break ;;
+  esac
+done
+shift
+printf '%s\n' "$*" >>"$dir/invocations.log"
+"#;
+
+        /// `sshd(8)` semantics: the joined command runs under `/bin/sh -c`
+        /// with the fixture's remote HOME and a PATH holding only the
+        /// recording `bibcode`.
+        const JOINING_BODY: &str = r#"exec env -i HOME="$dir/remote-home" PATH="$dir/remote-bin:/usr/bin:/bin" /bin/sh -c "$*"
+"#;
+
+        const RECORDING_BIBCODE: &str = r#"#!/bin/sh
+dir='@@DIR@@'
+if [ "$#" -eq 0 ]; then
+  printf 'fixture: bare bibcode would start a foreground server\n' >&2
+  exit 97
+fi
+{
+  for arg in "$@"; do printf '[%s] ' "$arg"; done
+  printf '\n'
+} >>"$dir/bibcode-argv.log"
+count=$(wc -l <"$dir/bibcode-argv.log" | tr -d ' ')
+printf '{"credential":"fixture-credential-%s"}\n' "$count"
+"#;
+
+        pub(super) struct FakeSsh {
+            pub(super) dir: tempfile::TempDir,
+            pub(super) program: PathBuf,
+        }
+
+        impl FakeSsh {
+            pub(super) fn joining() -> Self {
+                Self::with_body(JOINING_BODY)
+            }
+
+            pub(super) fn with_body(body: &str) -> Self {
+                let dir = tempfile::tempdir().expect("fake ssh directory");
+                let root = dir.path().display().to_string();
+                fs::create_dir_all(dir.path().join("remote-home")).expect("fake remote home");
+                fs::create_dir_all(dir.path().join("remote-bin")).expect("fake remote bin");
+                let program = dir.path().join("ssh");
+                write_executable(
+                    &program,
+                    &format!("{PRELUDE}{body}").replace("@@DIR@@", &root),
+                );
+                write_executable(
+                    &dir.path().join("remote-bin/bibcode"),
+                    &RECORDING_BIBCODE.replace("@@DIR@@", &root),
+                );
+                Self { dir, program }
+            }
+
+            pub(super) fn manager(
+                &self,
+                deadlines: SshOperationDeadlines,
+            ) -> SshEnvironmentManager {
+                SshEnvironmentManager::with_options(
+                    self.dir.path().to_path_buf(),
+                    self.program.display().to_string(),
+                    deadlines,
+                )
+            }
+
+            pub(super) fn invocations(&self) -> Vec<String> {
+                read_lines(&self.dir.path().join("invocations.log"))
+            }
+
+            pub(super) fn bibcode_argv(&self) -> Vec<String> {
+                read_lines(&self.dir.path().join("bibcode-argv.log"))
+            }
+
+            pub(super) fn remote_home(&self) -> PathBuf {
+                self.dir.path().join("remote-home")
+            }
+
+            pub(super) fn path(&self, name: &str) -> PathBuf {
+                self.dir.path().join(name)
+            }
+        }
+
+        fn read_lines(path: &Path) -> Vec<String> {
+            fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .map(|line| line.trim_end().to_string())
+                .filter(|line| !line.is_empty())
+                .collect()
+        }
+
+        fn write_executable(path: &Path, contents: &str) {
+            crate::test_support::write_executable_fixture(path, contents, 0o755);
+        }
+    }
+
+    fn fixture_target() -> SshEnvironmentTarget {
+        SshEnvironmentTarget {
+            alias: "fixture-host".to_string(),
+            hostname: "fixture-host".to_string(),
+            username: None,
+            port: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Default)]
+    struct StopWarningRecorder(Arc<Mutex<Vec<String>>>);
+
+    #[cfg(unix)]
+    impl tracing::Subscriber for StopWarningRecorder {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() == tracing::Level::WARN
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = String::new();
+            event.record(
+                &mut |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
+                    use std::fmt::Write as _;
+                    write!(&mut fields, "{}={value:?} ", field.name()).expect("record warning");
+                },
+            );
+            self.0.lock().expect("stop warnings").push(fields);
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[cfg(unix)]
+    async fn disconnect_with_stop_output(output: &str) -> Vec<String> {
+        use tracing::instrument::WithSubscriber as _;
+
+        let fake = fake_ssh::FakeSsh::with_body("cat >/dev/null\ncat \"$dir/stop-output\"\n");
+        fs::write(fake.path("stop-output"), output).expect("stop script output");
+        let manager = fake.manager(SshOperationDeadlines::default());
+        let app = mock_app();
+        let warnings = StopWarningRecorder::default();
+        let target = fixture_target();
+        manager
+            .remember_auth_secret(
+                &target_connection_key(&target),
+                "fixture-password".to_string(),
+            )
+            .expect("cache fixture authentication");
+
+        let result = manager
+            .disconnect_environment(app.handle(), &SshPasswordPromptManager::new(), target)
+            .with_subscriber(warnings.clone())
+            .await;
+        manager.shutdown().await;
+
+        assert_eq!(result, Ok(()), "a stop result must not fail Disconnect");
+        let warnings = warnings.0.lock().expect("stop warnings").clone();
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| !warning.contains("fixture-password"))
+        );
+        warnings
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disconnect_warns_once_when_remote_stop_reports_a_surviving_server() {
+        let warnings = disconnect_with_stop_output("banner\n{\"stopped\":false}\n\n").await;
+
+        assert_eq!(warnings.len(), 1, "a surviving server needs one warning");
+        assert!(warnings[0].contains("fixture-host"), "{warnings:?}");
+        assert!(warnings[0].contains("still running"), "{warnings:?}");
+        assert!(warnings[0].contains("record was kept"), "{warnings:?}");
+        assert!(warnings[0].contains("next launch"), "{warnings:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disconnect_warns_once_when_remote_stop_output_is_unparseable() {
+        let warnings = disconnect_with_stop_output("garbage fixture-output-secret").await;
+
+        assert_eq!(warnings.len(), 1, "an unparseable result needs one warning");
+        assert!(warnings[0].contains("fixture-host"), "{warnings:?}");
+        assert!(warnings[0].contains("stop"), "{warnings:?}");
+        assert!(warnings[0].contains("unparseable"), "{warnings:?}");
+        assert!(
+            !warnings[0].contains("fixture-output-secret"),
+            "{warnings:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disconnect_succeeds_without_warning_when_remote_stop_reports_success() {
+        let warnings = disconnect_with_stop_output("banner\n{\"stopped\":true}\n\n").await;
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn parses_remote_stop_result_from_last_non_empty_line() {
+        assert_eq!(
+            parse_remote_stop_result("banner\n{\"stopped\":true}\n\n"),
+            Ok(true)
+        );
+        assert_eq!(
+            parse_remote_stop_result("banner\n{\"stopped\":false}\n\n"),
+            Ok(false)
+        );
+        for output in [
+            "garbage",
+            "",
+            "{}",
+            "{\"stopped\":\"false\"}",
+            "{\"stopped\":null}",
+        ] {
+            assert!(parse_remote_stop_result(output).is_err(), "{output}");
+        }
+    }
+
+    #[cfg(unix)]
+    fn mock_app() -> tauri::App<tauri::test::MockRuntime> {
+        use tauri::test::{mock_builder, mock_context, noop_assets};
+        mock_builder()
+            .build(mock_context(noop_assets()))
+            .expect("mock Tauri app")
+    }
+
+    /// A loopback endpoint that answers every request with `200 {}`, standing
+    /// in for the remote server behind a live tunnel.
+    #[cfg(unix)]
+    async fn spawn_ready_endpoint() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fixture endpoint");
+        let port = listener
+            .local_addr()
+            .expect("fixture endpoint address")
+            .port();
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut request = [0_u8; 2048];
+                    let _ = stream.read(&mut request).await;
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+                        )
+                        .await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        (format!("http://127.0.0.1:{port}/"), server)
+    }
+
+    /// Publishes a live stand-in tunnel (a sleeping child) whose bootstrap
+    /// points at `http_base_url`, as a completed `ensure_environment` would.
+    #[cfg(unix)]
+    fn publish_fixture_tunnel(
+        manager: &SshEnvironmentManager,
+        http_base_url: &str,
+        pairing_token: Option<&str>,
+    ) -> (String, u32) {
+        let launcher = manager.askpass_launcher().expect("askpass launcher");
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "exec sleep 60"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let child = spawn_managed_ssh_child(command, launcher, "start fixture tunnel")
+            .expect("fixture tunnel child");
+        let pid = child
+            .child
+            .as_ref()
+            .and_then(Child::id)
+            .expect("fixture tunnel pid");
+        let target = normalize_ssh_environment_target(fixture_target()).expect("fixture target");
+        let key = target_connection_key(&target);
+        let bootstrap = SshEnvironmentBootstrap::new(
+            target,
+            4000,
+            http_base_url.to_string(),
+            http_base_url.replace("http://", "ws://"),
+            pairing_token.map(str::to_string),
+            "managed",
+        );
+        if manager
+            .publish_tunnel(key.clone(), child, bootstrap)
+            .is_err()
+        {
+            panic!("fixture tunnel should publish");
+        }
+        (key, pid)
+    }
+
+    /// The remote command line of a pairing script with default deadlines:
+    /// `sh -s --` and the watchdog bound, 30 s + 5 s.
+    #[cfg(unix)]
+    fn pairing_invocation() -> String {
+        format!(
+            "sh -s -- {}",
+            pairing_watchdog_bound(SshOperationDeadlines::default().pairing)
+        )
+    }
+
+    /// Only the operation's own deadline may produce `[ssh_timeout:…]`. An
+    /// I/O error that merely has the `TimedOut` kind (on Windows a cancelled
+    /// pipe read, `ERROR_OPERATION_ABORTED`, decodes to it) is a failure.
+    #[test]
+    fn an_io_error_of_the_timed_out_kind_is_not_the_deadline() {
+        let failure = wait_failure(
+            io::Error::new(io::ErrorKind::TimedOut, "pipe read cancelled"),
+            "pairing",
+        );
+        match failure {
+            RemoteScriptFailure::Wait(message) => {
+                assert!(!message.starts_with("[ssh_timeout:"), "{message}");
+                assert!(message.contains("pipe read cancelled"), "{message}");
+            }
+            RemoteScriptFailure::Write(message) => panic!("not a write failure: {message}"),
+            RemoteScriptFailure::TimedOut => {
+                panic!("a TimedOut-kind I/O error must not be reported as the deadline")
+            }
+        }
+    }
+
+    #[test]
+    fn pairing_watchdog_bound_sits_above_the_deadline_in_whole_seconds() {
+        assert_eq!(pairing_watchdog_bound(SSH_PAIRING_DEADLINE), 35);
+        assert_eq!(pairing_watchdog_bound(Duration::from_millis(300)), 6);
+        assert_eq!(pairing_watchdog_bound(Duration::from_secs(3)), 8);
+        assert_eq!(pairing_watchdog_bound(Duration::MAX), i32::MAX as u64);
+        assert_eq!(
+            SshOperationDeadlines::default().pairing_watchdog_bound(),
+            Duration::from_secs(35)
+        );
+    }
+
+    #[cfg(unix)]
+    async fn wait_until_exited(pid: u32) -> bool {
+        for _ in 0..60 {
+            if !process_is_alive(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pairing_script_survives_openssh_argument_joining() {
+        let fake = fake_ssh::FakeSsh::joining();
+        let manager = fake.manager(SshOperationDeadlines::default());
+        let launcher = manager.askpass_launcher().expect("askpass launcher");
+
+        let credential = tokio::time::timeout(
+            Duration::from_secs(10),
+            issue_remote_pairing_token(
+                &manager
+                    .remote_runner(RemoteOperation::Pairing)
+                    .expect("SSH runner"),
+                &fixture_target(),
+                &SshAuthOptions::batch(),
+                launcher,
+            ),
+        )
+        .await
+        .expect("pairing must finish");
+
+        assert_eq!(
+            fake.bibcode_argv(),
+            vec![format!(
+                "[pairing] [issue] [--base-dir] [{}/.bibcode] [--json]",
+                fake.remote_home().display()
+            )],
+            "the remote login shell must run the full pairing command (invocations: {:?})",
+            fake.invocations()
+        );
+        assert_eq!(credential.as_deref(), Ok("fixture-credential-1"));
+        assert_eq!(fake.invocations(), vec![pairing_invocation()]);
+        manager.shutdown().await;
+    }
+
+    /// A pipe stand-in for `settle_pipe_reads`. Its read stays pending until
+    /// it has been cancelled more than `ignored_cancels` times, as a Windows
+    /// read still queued for a pool thread ignores a cancel, and then returns
+    /// the cancellation error.
+    struct PendingPipe {
+        ignored_cancels: usize,
+        cancels: AtomicUsize,
+        returned: AtomicBool,
+        polls_after_return: AtomicUsize,
+        waker: Mutex<Option<std::task::Waker>>,
+    }
+
+    impl PendingPipe {
+        fn new(ignored_cancels: usize) -> Self {
+            Self {
+                ignored_cancels,
+                cancels: AtomicUsize::new(0),
+                returned: AtomicBool::new(false),
+                polls_after_return: AtomicUsize::new(0),
+                waker: Mutex::new(None),
+            }
+        }
+    }
+
+    impl tokio::io::AsyncRead for PendingPipe {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            if self.returned.load(Ordering::SeqCst) {
+                self.polls_after_return.fetch_add(1, Ordering::SeqCst);
+            }
+            if self.cancels.load(Ordering::SeqCst) > self.ignored_cancels {
+                self.returned.store(true, Ordering::SeqCst);
+                return std::task::Poll::Ready(Err(io::Error::from(io::ErrorKind::Interrupted)));
+            }
+            *self.waker.lock().expect("pending pipe waker") = Some(context.waker().clone());
+            std::task::Poll::Pending
+        }
+    }
+
+    impl CancellablePipe for PendingPipe {
+        fn cancel_pending_read(&self) {
+            self.cancels.fetch_add(1, Ordering::SeqCst);
+            if let Some(waker) = self.waker.lock().expect("pending pipe waker").take() {
+                waker.wake();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn settling_repeats_the_cancel_until_each_read_returns_and_never_polls_it_again() {
+        let mut issued = PendingPipe::new(0);
+        let mut queued = PendingPipe::new(2);
+        let started = tokio::time::Instant::now();
+
+        let pending =
+            settle_pipe_reads(vec![&mut issued, &mut queued], Duration::from_secs(5)).await;
+
+        assert_eq!(pending, 0);
+        assert_eq!(issued.cancels.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            queued.cancels.load(Ordering::SeqCst),
+            3,
+            "a read that ignores a cancel gets another"
+        );
+        assert_eq!(
+            issued.polls_after_return.load(Ordering::SeqCst)
+                + queued.polls_after_return.load(Ordering::SeqCst),
+            0,
+            "a read that returned is never polled again: that would start a new one"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn settling_gives_up_on_a_read_that_never_returns() {
+        let mut stuck = PendingPipe::new(usize::MAX);
+        let started = tokio::time::Instant::now();
+
+        let pending = settle_pipe_reads(vec![&mut stuck], Duration::from_millis(200)).await;
+
+        let elapsed = started.elapsed();
+        assert_eq!(pending, 1);
+        assert!(
+            elapsed >= Duration::from_millis(200) && elapsed < Duration::from_secs(2),
+            "{elapsed:?}"
+        );
+        assert!(
+            stuck.cancels.load(Ordering::SeqCst) > 1,
+            "the cancel repeats"
+        );
+    }
+
+    /// Outside Windows pipe reads belong to the I/O driver: a drain that gives
+    /// up cancels nothing and adds no delay.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn outside_windows_a_drain_that_gives_up_settles_nothing() {
+        let mut stuck = PendingPipe::new(usize::MAX);
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            settle_unfinished_reads(vec![&mut stuck]),
+        )
+        .await
+        .expect("returns at once");
+        assert_eq!(stuck.cancels.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(unix)]
+    fn io_runtime_state(manager: &SshEnvironmentManager) -> &'static str {
+        match *manager
+            .io_runtime
+            .state
+            .lock()
+            .expect("SSH I/O runtime state")
+        {
+            SshIoRuntimeState::NotStarted => "not started",
+            SshIoRuntimeState::Running(_) => "running",
+            SshIoRuntimeState::Stopped => "stopped",
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ssh_io_runtime_starts_on_first_use_and_stops_with_the_manager() {
+        let fake = fake_ssh::FakeSsh::joining();
+        let manager = fake.manager(SshOperationDeadlines::default());
+        assert_eq!(io_runtime_state(&manager), "not started");
+
+        let runner = manager
+            .remote_runner(RemoteOperation::Pairing)
+            .expect("SSH runner");
+        assert_eq!(io_runtime_state(&manager), "running");
+        let worker = run_on_ssh_io(&runner.io_runtime, async {
+            Ok(std::thread::current().name().map(str::to_owned))
+        })
+        .await;
+        assert_eq!(worker, Ok(Some("bibcode-ssh-io".to_string())));
+        let credential = issue_remote_pairing_token(
+            &runner,
+            &fixture_target(),
+            &SshAuthOptions::batch(),
+            manager.askpass_launcher().expect("askpass launcher"),
+        )
+        .await;
+        assert_eq!(credential.as_deref(), Ok("fixture-credential-1"));
+
+        manager.shutdown().await;
+        assert_eq!(io_runtime_state(&manager), "stopped");
+        assert_eq!(
+            manager.remote_runner(RemoteOperation::Pairing).err(),
+            Some("SSH process owner is shutting down.".to_string())
+        );
+        assert_eq!(
+            run_on_ssh_io(&runner.io_runtime, async { Ok(()) }).await,
+            Err("SSH process owner is shutting down.".to_string()),
+            "a handle taken earlier runs nothing once the runtime has stopped"
+        );
+    }
+
+    /// A Tokio runtime dropped inside async code panics; the manager's drop
+    /// must stop its I/O runtime in the background instead.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_a_manager_inside_async_code_stops_its_io_runtime() {
+        let fake = fake_ssh::FakeSsh::joining();
+        let manager = fake.manager(SshOperationDeadlines::default());
+        let runner = manager
+            .remote_runner(RemoteOperation::Pairing)
+            .expect("SSH runner");
+        issue_remote_pairing_token(
+            &runner,
+            &fixture_target(),
+            &SshAuthOptions::batch(),
+            manager.askpass_launcher().expect("askpass launcher"),
+        )
+        .await
+        .expect("pairing on the I/O runtime");
+
+        drop(manager);
+
+        assert_eq!(
+            run_on_ssh_io(&runner.io_runtime, async { Ok(()) }).await,
+            Err("SSH process owner is shutting down.".to_string())
+        );
+    }
+
+    /// The operation runs on the I/O runtime; abandoning the caller's future
+    /// must still end it and reap its SSH child, as before the move.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_abandoned_remote_script_reaps_its_ssh_child() {
+        let fake =
+            fake_ssh::FakeSsh::with_body("printf '%s\\n' \"$$\" >\"$dir/pid\"\nexec sleep 60\n");
+        let manager = fake.manager(SshOperationDeadlines::default());
+        let runner = manager
+            .remote_runner(RemoteOperation::Pairing)
+            .expect("SSH runner");
+        let launcher = manager.askpass_launcher().expect("askpass launcher");
+        let operation = tokio::spawn(async move {
+            issue_remote_pairing_token(
+                &runner,
+                &fixture_target(),
+                &SshAuthOptions::batch(),
+                launcher,
+            )
+            .await
+        });
+        let recorded = tokio::time::Instant::now() + Duration::from_secs(10);
+        let pid = loop {
+            if let Some(pid) = fs::read_to_string(fake.path("pid"))
+                .ok()
+                .and_then(|pid| pid.trim().parse::<u32>().ok())
+            {
+                break pid;
+            }
+            assert!(
+                tokio::time::Instant::now() < recorded,
+                "the fake ssh never started"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+
+        operation.abort();
+        let _ = operation.await;
+
+        assert!(
+            wait_until_exited(pid).await,
+            "the abandoned operation's SSH child must be killed and reaped"
+        );
+        tokio::time::timeout(Duration::from_secs(3), manager.child_reaper.wait())
+            .await
+            .expect("its cleanup ownership is released");
+        manager.shutdown().await;
+    }
+
+    /// Windows reads and writes child pipes on a Tokio blocking pool. These
+    /// run a stand-in ssh while the caller's pool is saturated, and check
+    /// that SSH child I/O neither waits for it nor leaves a read parked on its
+    /// own pool (Part 3 of the 2026-09-26 SSH watchdog design).
+    #[cfg(windows)]
+    mod windows_drain {
+        use super::*;
+
+        /// A stand-in ssh: a `.cmd` that reads its stdin to end of file, as
+        /// ssh does, and prints a pairing line. With `hold_pipes` it first starts a
+        /// PowerShell descendant that inherits stdout and stderr, records its
+        /// pid, and keeps them open for 30 s.
+        struct WindowsFakeSsh {
+            dir: tempfile::TempDir,
+            program: PathBuf,
+        }
+
+        impl WindowsFakeSsh {
+            fn new(hold_pipes: bool) -> Self {
+                let dir = tempfile::tempdir().expect("fake ssh directory");
+                let program = dir.path().join("ssh.cmd");
+                let mut script = String::from("@echo off\r\n");
+                if hold_pipes {
+                    script.push_str(
+                        "start \"\" /b powershell -NoProfile -NonInteractive -Command \
+                         \"Set-Content -LiteralPath '%~dp0descendant.pid' -Value $PID; \
+                         Start-Sleep -Seconds 30\"\r\n",
+                    );
+                }
+                // Read the script to end of file, as ssh does, before answering.
+                script.push_str("findstr \"^\" >nul\r\n");
+                script.push_str("echo {\"credential\":\"fixture-credential\"}\r\n");
+                fs::write(&program, script).expect("write fake ssh");
+                Self { dir, program }
+            }
+
+            fn manager(&self) -> SshEnvironmentManager {
+                SshEnvironmentManager::with_options(
+                    self.dir.path().to_path_buf(),
+                    self.program.display().to_string(),
+                    SshOperationDeadlines::default(),
+                )
+            }
+
+            fn descendant_pid(&self) -> Option<u32> {
+                fs::read_to_string(self.dir.path().join("descendant.pid"))
+                    .ok()?
+                    .trim()
+                    .parse()
+                    .ok()
+            }
+        }
+
+        impl Drop for WindowsFakeSsh {
+            fn drop(&mut self) {
+                if let Some(pid) = self.descendant_pid() {
+                    let _ = std::process::Command::new("taskkill")
+                        .args(["/PID", &pid.to_string(), "/T", "/F"])
+                        .status();
+                }
+            }
+        }
+
+        async fn issue(
+            manager: &SshEnvironmentManager,
+            runner: &RemoteScriptRunner,
+        ) -> Result<String, String> {
+            issue_remote_pairing_token(
+                runner,
+                &fixture_target(),
+                &SshAuthOptions::batch(),
+                manager.askpass_launcher().expect("askpass launcher"),
+            )
+            .await
+        }
+
+        #[test]
+        fn pairing_output_is_parsed_while_the_callers_blocking_pool_is_saturated() {
+            let caller = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .max_blocking_threads(1)
+                .enable_all()
+                .build()
+                .expect("single-slot blocking runtime");
+            caller.block_on(async {
+                let (held_tx, held_rx) = std::sync::mpsc::sync_channel(1);
+                let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+                let blocker = tokio::task::spawn_blocking(move || {
+                    held_tx.send(()).expect("signal the held slot");
+                    let _ = release_rx.recv_timeout(Duration::from_secs(30));
+                });
+                held_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("the caller's only blocking slot is held");
+
+                let fake = WindowsFakeSsh::new(false);
+                let manager = fake.manager();
+                let runner = manager
+                    .remote_runner(RemoteOperation::Pairing)
+                    .expect("SSH runner");
+                let started = std::time::Instant::now();
+                let credential = issue(&manager, &runner).await;
+                let elapsed = started.elapsed();
+
+                let _ = release_tx.send(());
+                blocker.await.expect("the blocker joins");
+                manager.shutdown().await;
+                assert_eq!(
+                    credential.as_deref(),
+                    Ok("fixture-credential"),
+                    "SSH output must not queue behind the caller's blocking pool"
+                );
+                assert!(elapsed < Duration::from_secs(10), "took {elapsed:?}");
+            });
+        }
+
+        #[test]
+        fn a_descendant_holding_the_pipes_leaves_no_read_parked() {
+            let caller = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("caller runtime");
+            caller.block_on(async {
+                let holding = WindowsFakeSsh::new(true);
+                let mut manager = holding.manager();
+                // Two pool threads: exactly what a descendant holding stdout
+                // and stderr could park.
+                manager.io_runtime = SshIoRuntime::new(2);
+                let runner = manager
+                    .remote_runner(RemoteOperation::Pairing)
+                    .expect("SSH runner");
+
+                let started = std::time::Instant::now();
+                let first = issue(&manager, &runner).await;
+                let first_elapsed = started.elapsed();
+                assert_eq!(first.as_deref(), Ok("fixture-credential"));
+                assert!(
+                    first_elapsed >= SSH_OUTPUT_DRAIN_GRACE,
+                    "the descendant must hold the pipes until the drain gives up \
+                     (took {first_elapsed:?})"
+                );
+                let recorded = std::time::Instant::now() + Duration::from_secs(10);
+                while holding.descendant_pid().is_none() && std::time::Instant::now() < recorded {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+
+                // A read still parked on either pipe would leave this run's
+                // write and reads queued, and its output would be cut off.
+                let plain = WindowsFakeSsh::new(false);
+                let runner = RemoteScriptRunner {
+                    program: plain.program.display().to_string(),
+                    ..runner
+                };
+                let started = std::time::Instant::now();
+                let second = issue(&manager, &runner).await;
+                let second_elapsed = started.elapsed();
+
+                manager.shutdown().await;
+                assert_eq!(
+                    second.as_deref(),
+                    Ok("fixture-credential"),
+                    "no pipe read may stay parked after the drain gives up"
+                );
+                assert!(
+                    second_elapsed < Duration::from_secs(10),
+                    "took {second_elapsed:?}"
+                );
+            });
+        }
+    }
+
+    /// ssh that fails before reading its stdin (it could not connect) closes
+    /// the pipe the script is being written to. Its exit status and stderr
+    /// say why; a broken pipe must not replace them.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ssh_that_exits_before_reading_its_script_reports_its_own_error() {
+        let fake = fake_ssh::FakeSsh::with_body(
+            "printf 'fake ssh: connection refused\\n' >&2\nexit 255\n",
+        );
+        let manager = fake.manager(SshOperationDeadlines::default());
+        // More than a pipe buffer holds, so the write cannot finish before
+        // ssh exits.
+        let script = format!(
+            "{}#{}\n",
+            remote_script_header!("pairing"),
+            "x".repeat(256 * 1024)
+        );
+
+        let error = run_remote_ssh_script(
+            &manager
+                .remote_runner(RemoteOperation::Pairing)
+                .expect("SSH runner"),
+            &fixture_target(),
+            &script,
+            &[],
+            &SshAuthOptions::batch(),
+            manager.askpass_launcher().expect("askpass launcher"),
+            "pairing",
+        )
+        .await
+        .expect_err("ssh failed");
+
+        assert!(
+            error.starts_with("SSH pairing command failed with status"),
+            "{error}"
+        );
+        assert!(error.contains("fake ssh: connection refused"), "{error}");
+        manager.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_deadline_too_far_away_to_represent_means_no_limit() {
+        let fake = fake_ssh::FakeSsh::joining();
+        let manager = fake.manager(SshOperationDeadlines {
+            pairing: Duration::MAX,
+            ..SshOperationDeadlines::default()
+        });
+        let credential = issue_remote_pairing_token(
+            &manager
+                .remote_runner(RemoteOperation::Pairing)
+                .expect("SSH runner"),
+            &fixture_target(),
+            &SshAuthOptions::batch(),
+            manager.askpass_launcher().expect("askpass launcher"),
+        )
+        .await;
+
+        assert_eq!(credential.as_deref(), Ok("fixture-credential-1"));
+        assert_eq!(fake.invocations(), vec![format!("sh -s -- {}", i32::MAX)]);
+        manager.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn never_exiting_ssh_fails_at_the_deadline_and_is_reaped() {
+        let fake =
+            fake_ssh::FakeSsh::with_body("printf '%s\\n' \"$$\" >\"$dir/pid\"\nexec sleep 60\n");
+        let manager = fake.manager(SshOperationDeadlines {
+            pairing: Duration::from_millis(300),
+            ..SshOperationDeadlines::default()
+        });
+        let launcher = manager.askpass_launcher().expect("askpass launcher");
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            issue_remote_pairing_token(
+                &manager
+                    .remote_runner(RemoteOperation::Pairing)
+                    .expect("SSH runner"),
+                &fixture_target(),
+                &SshAuthOptions::batch(),
+                launcher,
+            ),
+        )
+        .await;
+        let pid = fs::read_to_string(fake.path("pid"))
+            .ok()
+            .and_then(|pid| pid.trim().parse::<u32>().ok())
+            .expect("the fake ssh recorded its pid");
+
+        let error = result
+            .expect("the pairing deadline must end the operation")
+            .expect_err("a never-exiting ssh must fail");
+        assert!(
+            error.starts_with("[ssh_timeout:pairing] "),
+            "unexpected error: {error}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(
+            !process_is_alive(pid),
+            "the SSH child must be terminated and reaped at the deadline"
+        );
+        assert_eq!(manager.child_reaper.active(), 0);
+        manager.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cached_tunnel_bootstrap_never_carries_a_pairing_token() {
+        let fake = fake_ssh::FakeSsh::joining();
+        let manager = fake.manager(SshOperationDeadlines::default());
+        let (endpoint, server) = spawn_ready_endpoint().await;
+        publish_fixture_tunnel(&manager, &endpoint, Some("already-exchanged"));
+        let app = mock_app();
+        let prompts = SshPasswordPromptManager::with_timeout(Duration::ZERO);
+
+        for options in [
+            None,
+            Some(SshEnvironmentEnsureOptions {
+                issue_pairing_token: Some(false),
+            }),
+        ] {
+            let bootstrap = manager
+                .ensure_environment(app.handle(), &prompts, fixture_target(), options)
+                .await
+                .expect("a live tunnel is reused");
+            assert_eq!(bootstrap.http_base_url, endpoint);
+            assert_eq!(bootstrap.pairing_token, None);
+        }
+        assert!(
+            fake.invocations().is_empty(),
+            "reusing a live tunnel without a token must not run SSH: {:?}",
+            fake.invocations()
+        );
+        server.abort();
+        manager.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn issue_pairing_token_on_a_live_tunnel_mints_a_fresh_token() {
+        let fake = fake_ssh::FakeSsh::joining();
+        let manager = fake.manager(SshOperationDeadlines::default());
+        let (endpoint, server) = spawn_ready_endpoint().await;
+        publish_fixture_tunnel(&manager, &endpoint, Some("already-exchanged"));
+        let app = mock_app();
+        let prompts = SshPasswordPromptManager::with_timeout(Duration::ZERO);
+        let issue = || {
+            Some(SshEnvironmentEnsureOptions {
+                issue_pairing_token: Some(true),
+            })
+        };
+
+        let first = manager
+            .ensure_environment(app.handle(), &prompts, fixture_target(), issue())
+            .await
+            .expect("first mint on the live tunnel");
+        let second = manager
+            .ensure_environment(app.handle(), &prompts, fixture_target(), issue())
+            .await
+            .expect("second mint on the live tunnel");
+        let reused = manager
+            .ensure_environment(app.handle(), &prompts, fixture_target(), None)
+            .await
+            .expect("reuse after minting");
+
+        assert_eq!(first.pairing_token.as_deref(), Some("fixture-credential-1"));
+        assert_eq!(
+            second.pairing_token.as_deref(),
+            Some("fixture-credential-2")
+        );
+        assert_eq!(first.http_base_url, endpoint);
+        assert_eq!(reused.pairing_token, None, "a minted token is never cached");
+        assert_eq!(
+            fake.invocations(),
+            vec![pairing_invocation(), pairing_invocation()],
+            "each mint runs one pairing script and nothing else"
+        );
+        server.abort();
+        manager.shutdown().await;
+    }
+
+    /// Records each remote script's kind in `kinds.log`. A launch waits for
+    /// `$dir/gate`; a stop answers at once; a `-N` tunnel answers every
+    /// request on its forwarded local port with `200 {}`.
+    #[cfg(unix)]
+    const GATED_LAUNCH_AND_SERVING_TUNNEL: &str = concat!(
+        r##"if [ -z "$*" ]; then
+  printf 'tunnel\n' >>"$dir/kinds.log"
+  exec python3 -c 'import http.server, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("content-length", "2")
+        self.end_headers()
+        self.wfile.write(b"{}")
+    def log_message(self, *args):
+        pass
+http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()' "${forward%%:*}"
+fi
+script=$(cat)
+case "$script" in
+  ""##,
+        remote_script_header_prefix!(),
+        r##"launch"*)
+    printf 'launch\n' >>"$dir/kinds.log"
+    while [ ! -e "$dir/gate" ]; do sleep 0.05; done
+    printf '{"remotePort":4000,"serverKind":"managed"}\n'
+    ;;
+  ""##,
+        remote_script_header_prefix!(),
+        r##"stop"*)
+    printf 'stop\n' >>"$dir/kinds.log"
+    printf '{"stopped":true}\n'
+    ;;
+  *)
+    printf 'other\n' >>"$dir/kinds.log"
+    exit 1
+    ;;
+esac
+"##
+    );
+
+    #[cfg(unix)]
+    fn cached_http_base_url(manager: &SshEnvironmentManager, key: &str) -> Option<String> {
+        manager
+            .tunnels
+            .lock()
+            .expect("tunnels")
+            .get(key)
+            .map(|tunnel| tunnel.bootstrap.http_base_url.clone())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_ensures_on_one_target_launch_once_and_share_the_tunnel() {
+        let fake = fake_ssh::FakeSsh::with_body(GATED_LAUNCH_AND_SERVING_TUNNEL);
+        let manager = fake.manager(SshOperationDeadlines::default());
+        let app = mock_app();
+        let prompts = SshPasswordPromptManager::with_timeout(Duration::ZERO);
+        let kinds = || {
+            fs::read_to_string(fake.path("kinds.log"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+
+        // Both callers find no tunnel. The first launch waits at the gate long
+        // enough for an unserialised second caller to start its own launch.
+        let (first, second, ()) = tokio::join!(
+            tokio::time::timeout(
+                Duration::from_secs(20),
+                manager.ensure_environment(app.handle(), &prompts, fixture_target(), None),
+            ),
+            tokio::time::timeout(
+                Duration::from_secs(20),
+                manager.ensure_environment(app.handle(), &prompts, fixture_target(), None),
+            ),
+            async {
+                while !kinds().iter().any(|kind| kind == "launch") {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                fs::write(fake.path("gate"), "").expect("open the launch gate");
+            }
+        );
+
+        let first = first.expect("first caller finishes").expect("first tunnel");
+        let second = second
+            .expect("second caller finishes")
+            .expect("second tunnel");
+        assert_eq!(
+            kinds(),
+            ["launch", "tunnel"],
+            "one launch, one tunnel, no stop"
+        );
+        assert_eq!(first.http_base_url, second.http_base_url);
+        let key =
+            target_connection_key(&normalize_ssh_environment_target(fixture_target()).unwrap());
+        assert_eq!(
+            cached_http_base_url(&manager, &key),
+            Some(first.http_base_url)
+        );
+        manager.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disconnect_waits_for_an_in_flight_preparation_of_the_same_target() {
+        let fake = fake_ssh::FakeSsh::with_body(GATED_LAUNCH_AND_SERVING_TUNNEL);
+        let manager = fake.manager(SshOperationDeadlines::default());
+        let app = mock_app();
+        let prompts = SshPasswordPromptManager::with_timeout(Duration::ZERO);
+        let kinds = || {
+            fs::read_to_string(fake.path("kinds.log"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+
+        let (prepared, disconnected, ()) = tokio::join!(
+            tokio::time::timeout(
+                Duration::from_secs(20),
+                manager.ensure_environment(app.handle(), &prompts, fixture_target(), None),
+            ),
+            async {
+                while !kinds().iter().any(|kind| kind == "launch") {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                tokio::time::timeout(
+                    Duration::from_secs(20),
+                    manager.disconnect_environment(app.handle(), &prompts, fixture_target()),
+                )
+                .await
+            },
+            async {
+                while !kinds().iter().any(|kind| kind == "launch") {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                fs::write(fake.path("gate"), "").expect("open the launch gate");
+            }
+        );
+
+        prepared
+            .expect("prepare finishes")
+            .expect("prepared tunnel");
+        disconnected
+            .expect("disconnect finishes")
+            .expect("disconnected");
+        assert_eq!(
+            kinds(),
+            ["launch", "tunnel", "stop"],
+            "the stop runs only after the preparation it would otherwise interleave with"
+        );
+        let key =
+            target_connection_key(&normalize_ssh_environment_target(fixture_target()).unwrap());
+        assert_eq!(cached_http_base_url(&manager, &key), None);
+        manager.shutdown().await;
+    }
+
+    /// The fake ssh exits at once while a background subshell it leaves
+    /// behind writes five stdout chunks 700 ms apart, longer in total than
+    /// the 2 s idle grace but never idle that long.
+    #[cfg(unix)]
+    const SLOW_STDOUT_AFTER_EXIT: &str = r#"cat >/dev/null
+(
+  for chunk in 1 2 3 4 5; do
+    sleep 0.7
+    printf 'chunk-%s\n' "$chunk"
+  done
+) &
+exit 0
+"#;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn output_still_arriving_after_ssh_exits_is_kept() {
+        let fake = fake_ssh::FakeSsh::with_body(SLOW_STDOUT_AFTER_EXIT);
+        let manager = fake.manager(SshOperationDeadlines::default());
+        let launcher = manager.askpass_launcher().expect("askpass launcher");
+
+        let stdout = tokio::time::timeout(
+            Duration::from_secs(20),
+            run_remote_ssh_script(
+                &manager
+                    .remote_runner(RemoteOperation::Pairing)
+                    .expect("SSH runner"),
+                &fixture_target(),
+                "exit 0\n",
+                &[],
+                &SshAuthOptions::batch(),
+                launcher,
+                "pairing",
+            ),
+        )
+        .await
+        .expect("the drain is bounded")
+        .expect("the script succeeds");
+
+        assert_eq!(
+            stdout.lines().collect::<Vec<_>>(),
+            ["chunk-1", "chunk-2", "chunk-3", "chunk-4", "chunk-5"],
+            "every chunk written after ssh exited must be kept"
+        );
+        manager.shutdown().await;
+    }
+
+    /// `ps -o stat=` for `pid` (Linux and macOS); empty when there is no
+    /// such process.
+    #[cfg(unix)]
+    fn fixture_process_state(pid: u32) -> String {
+        std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .unwrap_or_default()
+    }
+
+    /// Whether a fixture process that is not this test's child has ended. A
+    /// zombie counts as ended: an orphan is reaped by PID 1 or a subreaper,
+    /// which some environments lack. A live process never counts as ended.
+    #[cfg(unix)]
+    fn fixture_process_is_gone(pid: u32) -> bool {
+        let state = fixture_process_state(pid);
+        state.is_empty() || state.starts_with('Z') || state.starts_with('X')
+    }
+
+    #[cfg(unix)]
+    async fn wait_until_fixture_gone(pid: u32) -> bool {
+        for _ in 0..60 {
+            if fixture_process_is_gone(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fixture_liveness_counts_a_zombie_as_gone_but_not_a_live_process() {
+        // An unreaped child is a zombie: `kill(pid, 0)` still succeeds, which
+        // is why orphaned fixtures cannot be checked with it where no PID 1
+        // reaps them.
+        let mut exited = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("short-lived child");
+        let zombie = exited.id();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !fixture_process_state(zombie).starts_with('Z') {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child never became a zombie"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            process_is_alive(zombie),
+            "kill(pid, 0) succeeds for a zombie"
+        );
+        assert!(fixture_process_is_gone(zombie), "a zombie is gone");
+        exited.wait().expect("reap the zombie");
+        assert!(fixture_process_is_gone(zombie), "a reaped process is gone");
+
+        let mut sleeping = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("live child");
+        let live = sleeping.id();
+        assert!(!fixture_process_is_gone(live), "a live process is not gone");
+        let _ = sleeping.kill();
+        sleeping.wait().expect("reap the live child");
+    }
+
+    /// A fake remote step that fails after leaving a backgrounded `sleep`
+    /// holding its inherited output pipes, as a ProxyCommand helper or an
+    /// older ControlPersist master can. `@@FAILING@@` selects the step
+    /// (`tunnel` or `launch`); the other steps succeed.
+    #[cfg(unix)]
+    const FAILS_WITH_HELD_PIPES: &str = concat!(
+        r##"hold_pipes_and_fail() {
+  # The helper leads its own process group so cleanup can kill all of it.
+  python3 -c 'import os; os.setpgid(0, 0); os.execvp("sleep", ["sleep", "600"])' &
+  printf '%s\n' "$!" >>"$dir/background.pids"
+  printf 'fake ssh: %s failed while a helper kept stderr open\n' "$1" >&2
+  exit 255
+}
+if [ -z "$*" ]; then
+  [ '@@FAILING@@' = tunnel ] && hold_pipes_and_fail tunnel
+  exec sleep 60
+fi
+script=$(cat)
+case "$script" in
+  ""##,
+        remote_script_header_prefix!(),
+        r##"launch"*)
+    [ '@@FAILING@@' = launch ] && hold_pipes_and_fail launch
+    printf '{"remotePort":4000,"serverKind":"managed"}\n'
+    ;;
+  ""##,
+        remote_script_header_prefix!(),
+        r##"stop"*) printf '{"stopped":true}\n' ;;
+  *) exit 1 ;;
+esac
+"##
+    );
+
+    /// Kills the backgrounded fixture processes a fake recorded in
+    /// `background.pids`, even when the test panics. Only a pid whose command
+    /// line still contains `marker` is signalled, so a recycled pid is safe;
+    /// when it leads its own process group, the whole group is killed.
+    #[cfg(unix)]
+    struct BackgroundedFixtureProcesses {
+        pids_file: PathBuf,
+        /// Text the recorded process's command line must still contain.
+        marker: &'static str,
+    }
+
+    #[cfg(unix)]
+    impl BackgroundedFixtureProcesses {
+        fn pids(&self) -> Vec<u32> {
+            fs::read_to_string(&self.pids_file)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|pid| pid.trim().parse::<u32>().ok())
+                .collect()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for BackgroundedFixtureProcesses {
+        fn drop(&mut self) {
+            for pid in self.pids() {
+                let command = std::process::Command::new("ps")
+                    .args(["-o", "command=", "-p", &pid.to_string()])
+                    .output()
+                    .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+                    .unwrap_or_default();
+                if !command.contains(self.marker) {
+                    continue;
+                }
+                let group = std::process::Command::new("ps")
+                    .args(["-o", "pgid=", "-p", &pid.to_string()])
+                    .output()
+                    .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+                    .unwrap_or_default();
+                let target = if group == pid.to_string() {
+                    -(pid as libc::pid_t)
+                } else {
+                    pid as libc::pid_t
+                };
+                // SAFETY: signals only the fixture's own recorded process, or
+                // the process group it leads.
+                unsafe {
+                    libc::kill(target, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    /// The fake ssh exits at once, leaving a writer in its own process group
+    /// that prints to the inherited stdout every 200 ms, so the post-exit
+    /// drain never goes idle.
+    #[cfg(unix)]
+    const ENDLESS_STDOUT_AFTER_EXIT: &str = r#"cat >/dev/null
+python3 -c 'import os, sys, time
+os.setpgid(0, 0)
+while True:
+    sys.stdout.write("tick\n")
+    sys.stdout.flush()
+    time.sleep(0.2)' fixture-writer &
+printf '%s\n' "$!" >>"$dir/background.pids"
+exit 0
+"#;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_interrupts_a_post_exit_drain_that_never_goes_idle() {
+        let fake = fake_ssh::FakeSsh::with_body(ENDLESS_STDOUT_AFTER_EXIT);
+        let writer = BackgroundedFixtureProcesses {
+            pids_file: fake.path("background.pids"),
+            marker: "fixture-writer",
+        };
+        let manager = fake.manager(SshOperationDeadlines::default());
+        let runner = manager
+            .remote_runner(RemoteOperation::Launch)
+            .expect("SSH runner");
+        let launcher = manager.askpass_launcher().expect("askpass launcher");
+        let operation = tokio::spawn(async move {
+            run_remote_ssh_script(
+                &runner,
+                &fixture_target(),
+                "exit 0\n",
+                &[],
+                &SshAuthOptions::batch(),
+                launcher,
+                "launch",
+            )
+            .await
+        });
+        while writer.pids().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // The fake has exited; the drain is now following the writer.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let shutdown = tokio::time::timeout(Duration::from_secs(2), manager.shutdown()).await;
+        let result = tokio::time::timeout(Duration::from_secs(2), operation).await;
+
+        assert!(
+            shutdown.is_ok(),
+            "shutdown must not wait for the drain to reach the launch deadline"
+        );
+        let error = result
+            .expect("the operation ends with the shutdown")
+            .expect("operation task")
+            .expect_err("a drain cut short by shutdown fails");
+        assert!(
+            error.contains("SSH process owner is shutting down"),
+            "{error}"
+        );
+        let pids = writer.pids();
+        drop(writer);
+        for pid in pids {
+            assert!(
+                wait_until_fixture_gone(pid).await,
+                "writer {pid} must be gone"
+            );
+        }
+    }
+
+    /// Runs `ensure_environment` twice on one target whose `failing` step
+    /// leaves its pipes held open, and checks that each call fails fast with
+    /// the step's own stderr, so the target lock is never held indefinitely.
+    #[cfg(unix)]
+    async fn assert_held_pipes_fail_fast(failing: &str) {
+        let fake =
+            fake_ssh::FakeSsh::with_body(&FAILS_WITH_HELD_PIPES.replace("@@FAILING@@", failing));
+        let background = BackgroundedFixtureProcesses {
+            pids_file: fake.path("background.pids"),
+            marker: "sleep 600",
+        };
+        let manager = fake.manager(SshOperationDeadlines::default());
+        let app = mock_app();
+        let prompts = SshPasswordPromptManager::with_timeout(Duration::ZERO);
+
+        for attempt in ["first", "second"] {
+            let started = std::time::Instant::now();
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                manager.ensure_environment(app.handle(), &prompts, fixture_target(), None),
+            )
+            .await;
+            let elapsed = started.elapsed();
+            let error = result
+                .unwrap_or_else(|_| {
+                    panic!("{attempt} {failing} failure must not wait for the held pipes to close")
+                })
+                .expect_err("the step fails");
+            assert!(
+                error.contains(&format!(
+                    "fake ssh: {failing} failed while a helper kept stderr open"
+                )),
+                "{attempt}: {error}"
+            );
+            assert!(error.contains("[output cut off]"), "{attempt}: {error}");
+            assert!(
+                elapsed < Duration::from_secs(6),
+                "{attempt} took {elapsed:?}"
+            );
+        }
+
+        assert_eq!(
+            background.pids().len(),
+            2,
+            "each attempt left one held pipe"
+        );
+        let pids = background.pids();
+        drop(background);
+        for pid in pids {
+            assert!(
+                wait_until_fixture_gone(pid).await,
+                "backgrounded sleep {pid} must be gone"
+            );
+        }
+        manager.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exited_tunnel_with_held_stderr_fails_fast_and_releases_the_target() {
+        assert_held_pipes_fail_fast("tunnel").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exited_remote_script_with_held_pipes_fails_fast_and_releases_the_target() {
+        assert_held_pipes_fail_fast("launch").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dead_tunnel_endpoint_drops_the_cached_tunnel() {
+        let fake = fake_ssh::FakeSsh::with_body(
+            "printf 'fake ssh: connection refused\\n' >&2\nexit 255\n",
+        );
+        let manager = fake.manager(SshOperationDeadlines::default());
+        let closed_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .expect("reserve a closed port")
+            .port();
+        let (key, tunnel_pid) =
+            publish_fixture_tunnel(&manager, &format!("http://127.0.0.1:{closed_port}/"), None);
+        let app = mock_app();
+        let prompts = SshPasswordPromptManager::with_timeout(Duration::ZERO);
+
+        let error = manager
+            .ensure_environment(app.handle(), &prompts, fixture_target(), None)
+            .await
+            .expect_err("a dead endpoint must not be reused; the full path then fails here");
+
+        assert!(error.contains("SSH launch command failed"), "{error}");
+        assert_eq!(
+            manager
+                .take_existing_bootstrap_if_running(&key)
+                .expect("inspect tunnels"),
+            None
+        );
+        assert!(
+            wait_until_exited(tunnel_pid).await,
+            "the dropped tunnel child must be reaped"
+        );
+        assert_eq!(fake.invocations().len(), 1, "{:?}", fake.invocations());
+        manager.shutdown().await;
     }
 
     #[test]

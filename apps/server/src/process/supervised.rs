@@ -157,7 +157,7 @@ where
         }
     };
     #[cfg(not(windows))]
-    let child = spawn_wrapped_until(&mut command, overall_deadline)
+    let child = spawn_retrying_busy_executable(&mut command, overall_deadline)
         .await
         .map_err(SupervisedRunError::Spawn)?;
     let mut guard = SupervisedChildGuard::arm(child);
@@ -515,11 +515,13 @@ const SPAWN_BUSY_RETRY_BUDGET: Duration = Duration::from_secs(1);
 /// when the writer is still closing it, or when another thread of this
 /// process forked between the writer's open and close and the child has not
 /// exec'd yet. The condition clears within milliseconds, so the spawn retries
-/// for at most one second inside the run's own deadline; every other error,
+/// for at most one second inside the caller's deadline; every other error,
 /// and a deadline that would be crossed by the next retry, returns
 /// immediately.
+///
+/// Shared by the supervised runner and provider-terminal helper launchers.
 #[cfg(not(windows))]
-async fn spawn_wrapped_until(
+pub(crate) async fn spawn_retrying_busy_executable(
     command: &mut CommandWrap,
     deadline: tokio::time::Instant,
 ) -> io::Result<Box<dyn ChildWrapper>> {
@@ -1233,11 +1235,12 @@ mod tests {
         assert_eq!(wait_calls.load(Ordering::SeqCst), 0);
     }
 
-    /// As a subreaper, this isolated test process adopts the descendants a
-    /// dropped run leaves behind, so it can observe the whole cleanup: the
-    /// guard kills the process group, tokio reaps the root, and the adopter
-    /// (here the test, in production init or the session subreaper) reaps the
-    /// killed descendant.
+    /// This isolated subreaper adopts the double-forked helper as soon as its
+    /// intermediate shell exits, so only this process can reap it. A parent
+    /// shell can reap a killed helper while waiting for any child, even `mv`
+    /// after publishing the PIDs, leaving the adopter nothing to observe.
+    /// Killing the adopted helper proves the guard signals the whole process
+    /// group; tokio must also reap the root.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_dropped_run_kills_its_process_group_and_leaves_no_zombie_root() {
@@ -1259,7 +1262,7 @@ mod tests {
             command
                 .args([
                     "-c",
-                    "sleep 30 & printf '%s %s' \"$$\" \"$!\" > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; wait",
+                    "helper=$(sleep 30 >/dev/null 2>&1 & echo $!); printf '%s %s' \"$$\" \"$helper\" > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; exec sleep 30",
                     "tree",
                 ])
                 .arg(&pids_path)
@@ -1295,8 +1298,9 @@ mod tests {
             let helper_status = loop {
                 let mut status = 0;
                 // SAFETY: waitpid targets only the fixture helper and writes a
-                // valid status. Until the killed root exits, the helper is not
-                // this process's child yet and waitpid reports ECHILD.
+                // valid status. The helper becomes this process's child once its
+                // intermediate shell finishes exiting; until then waitpid may
+                // report ECHILD.
                 let waited = unsafe { libc::waitpid(helper, &mut status, libc::WNOHANG) };
                 if waited == helper {
                     break status;

@@ -19,10 +19,7 @@ import {
   PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
   PROVIDER_SEND_TURN_MAX_ATTACHMENT_BYTES,
 } from "@bibcode/contracts";
-import {
-  connectionStatusText,
-  type EnvironmentConnectionPresentation,
-} from "@bibcode/client-runtime/connection";
+import { type EnvironmentConnectionPresentation } from "@bibcode/client-runtime/connection";
 import { createModelSelection, normalizeModelSlug } from "@bibcode/shared/model";
 import {
   memo,
@@ -113,7 +110,6 @@ import {
 } from "lucide-react";
 import { proposedPlanTitle } from "../../proposedPlan";
 import {
-  getProviderDisplayName,
   getProviderInteractionModeToggle,
   type ProviderControlAvailability,
 } from "../../providerModels";
@@ -938,14 +934,14 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   );
   const activeThreadProviderDisplayName = useMemo(() => {
     if (!activeThreadModelSelection) return null;
-    const entry = providerStatuses.find(
-      (p) => p.instanceId === activeThreadModelSelection.instanceId,
+    const entry = providerInstanceEntries.find(
+      (entry) => entry.instanceId === activeThreadModelSelection.instanceId,
     );
     if (entry) {
-      return getProviderDisplayName(providerStatuses, entry.driver);
+      return entry.displayName;
     }
     return formatProviderDisplayName(activeThreadModelSelection.instanceId);
-  }, [providerStatuses, activeThreadModelSelection]);
+  }, [providerInstanceEntries, activeThreadModelSelection]);
 
   // ------------------------------------------------------------------
   // Composer-local state
@@ -2651,9 +2647,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                         : showPlanFollowUpPrompt && activeProposedPlan
                           ? "Add feedback to refine the plan, or leave this blank to implement it"
                           : environmentUnavailable
-                            ? `${environmentUnavailable.label}: ${connectionStatusText(
-                                environmentUnavailable.connection,
-                              )}`
+                            ? // The composer banner states the reason; this only names the state.
+                              `${environmentUnavailable.label} is not connected`
                             : phase === "disconnected"
                               ? "Ask for follow-up changes or attach files"
                               : "Ask anything, @ files, : BiBCode actions, or a provider-native command"

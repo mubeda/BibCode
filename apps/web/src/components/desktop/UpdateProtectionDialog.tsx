@@ -1,12 +1,22 @@
-import type {
-  DesktopBridge,
-  DesktopUpdateProtection,
-  DesktopUpdateState,
+import {
+  EnvironmentId,
+  type DesktopBackendRecovery,
+  type DesktopBridge,
+  type DesktopUpdateActionResult,
+  type DesktopUpdateProtection,
+  type DesktopUpdateState,
 } from "@bibcode/contracts";
-import { useEffect, useMemo, useState } from "react";
+import { runAtomCommand } from "@bibcode/client-runtime/state/runtime";
+import { useEffect, useId, useRef, useState } from "react";
 
+import { appAtomRegistry } from "../../rpc/atomRegistry";
+import {
+  getDesktopBackendRecoveryMessage,
+  getDesktopUpdateErrorMessage,
+} from "../desktopUpdate.logic";
 import { Button } from "../ui/button";
 import { Checkbox } from "../ui/checkbox";
+import { stackedThreadToast, toastManager } from "../ui/toast";
 import {
   Dialog,
   DialogDescription,
@@ -18,6 +28,50 @@ import {
 } from "../ui/dialog";
 
 type InstallUpdate = Pick<DesktopBridge, "installUpdate">["installUpdate"];
+
+// Dialog instances and their retained toast actions share native operation admission.
+let desktopUpdateActionInFlight = false;
+let recoveryToastId: ReturnType<typeof toastManager.add> | null = null;
+
+function closeRecoveryToast(): void {
+  if (recoveryToastId === null) return;
+  toastManager.close(recoveryToastId);
+  recoveryToastId = null;
+}
+
+function addRecoveryToast(toast: Parameters<typeof toastManager.add>[0]): void {
+  closeRecoveryToast();
+  recoveryToastId = toastManager.add(toast);
+}
+
+async function runDesktopUpdateAction(
+  setBusy: (busy: boolean) => void,
+  action: () => Promise<void>,
+): Promise<void> {
+  if (desktopUpdateActionInFlight) return;
+  desktopUpdateActionInFlight = true;
+  try {
+    setBusy(true);
+    await action();
+  } finally {
+    desktopUpdateActionInFlight = false;
+    setBusy(false);
+  }
+}
+
+async function retryEnvironment(environmentId: string): Promise<void> {
+  try {
+    const { environmentAvailabilityCommands } = await import("../../state/shell");
+    await runAtomCommand(
+      appAtomRegistry,
+      environmentAvailabilityCommands.retry,
+      EnvironmentId.make(environmentId),
+      { label: environmentAvailabilityCommands.retry.label, reportFailure: false },
+    );
+  } catch {
+    // Reconnection is best-effort and must also work from a toast after unmount.
+  }
+}
 
 interface UpdateProtectionDialogProps {
   readonly open: boolean;
@@ -86,10 +140,23 @@ export function UpdateProtectionDialog({
   );
   const [submitting, setSubmitting] = useState(false);
   const [skipProtectionAcknowledged, setSkipProtectionAcknowledged] = useState(false);
+  const [restarting, setRestarting] = useState<"server" | "app" | null>(null);
+  const [restartError, setRestartError] = useState<string | null>(null);
+  const [appRestartError, setAppRestartError] = useState<string | null>(null);
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const latestState = useRef(state);
+  const retryReasonId = useId();
+  const detailsId = useId();
+  const bridge = typeof window === "undefined" ? undefined : window.desktopBridge;
+  const recovery = state.backendRecovery ?? [];
+  const recovering = recovery.length > 0;
+  const canRestartApp = restartError !== null && bridge?.restartApp !== undefined;
   const protection = state.protection ?? [];
   const phase = state.phase ?? "idle";
   const protecting = phase === "protecting";
-  const working = protecting || phase === "installing" || submitting;
+  const choosingProtection = open && !protecting;
+  const [wasChoosingProtection, setWasChoosingProtection] = useState(choosingProtection);
+  const working = protecting || phase === "installing" || submitting || restarting !== null;
   const primaryFailure = protection.find(
     (entry) => entry.environmentId === "primary" && entry.status === "failed",
   );
@@ -102,71 +169,208 @@ export function UpdateProtectionDialog({
   );
 
   useEffect(() => {
-    if (!open || protecting) {
+    latestState.current = state;
+  }, [state]);
+
+  useEffect(() => {
+    if (!recovering) closeRecoveryToast();
+  }, [recovering]);
+
+  if (wasChoosingProtection !== choosingProtection) {
+    setWasChoosingProtection(choosingProtection);
+    if (!choosingProtection) {
       setExcludedEnvironmentIds(new Set());
-      setSubmitting(false);
       setSkipProtectionAcknowledged(false);
     }
-  }, [open, protecting]);
+  }
 
-  const installLabel = useMemo(() => {
+  const installLabel = (() => {
+    if (restarting === "server") return "Restarting server…";
+    if (restarting === "app") return "Restarting BiBCode…";
     if (working) return protecting ? "Protecting projects…" : "Installing update…";
     if (primaryFailure) return "Retry protection";
     if (failedSecondaries.length > 0) return "Install with exclusions";
     if (phase === "failed") return "Retry installation";
     return "Protect projects and install";
-  }, [failedSecondaries.length, phase, primaryFailure, protecting, working]);
+  })();
 
-  const startInstall = async () => {
-    if (working || (failedSecondaries.length > 0 && !exclusionsComplete)) return;
-    setSubmitting(true);
-    try {
-      const exclusions = [...excludedEnvironmentIds];
-      const result = await installUpdate(
-        exclusions.length > 0 ? { excludedEnvironmentIds: exclusions } : undefined,
-      );
-      if (!result.completed && result.state.message) {
-        onError?.(result.state.message);
-      }
-    } catch (error) {
-      onError?.(error instanceof Error ? error.message : "An unexpected error occurred.");
-    } finally {
-      setSubmitting(false);
+  const restartBiBCode = async (fromToast = false) => {
+    const restartApp = bridge?.restartApp;
+    if (!restartApp) return;
+    await runDesktopUpdateAction(
+      (busy) => setRestarting(busy ? "app" : null),
+      async () => {
+        setAppRestartError(null);
+        try {
+          await restartApp();
+        } catch (error) {
+          const message = getDesktopUpdateErrorMessage(
+            error,
+            "BiBCode couldn't restart. Try again.",
+          );
+          setAppRestartError(message);
+          if (fromToast) {
+            toastManager.add(
+              stackedThreadToast({
+                type: "error",
+                title: "Could not restart BiBCode",
+                description: message,
+              }),
+            );
+          }
+        }
+      },
+    );
+  };
+
+  const showRecoveryToast = (entries: readonly DesktopBackendRecovery[], retryFailed = false) => {
+    const actionProps = retryFailed
+      ? bridge?.restartApp
+        ? { children: "Restart BiBCode", onClick: () => void restartBiBCode(true) }
+        : undefined
+      : { children: "Restart server", onClick: () => void restartServers(entries, true) };
+    addRecoveryToast(
+      stackedThreadToast({
+        type: "error",
+        title: "Update not installed",
+        timeout: 0,
+        description: entries.map(getDesktopBackendRecoveryMessage).join("\n"),
+        ...(actionProps ? { actionProps } : {}),
+      }),
+    );
+  };
+
+  const restartServers = async (entries: readonly DesktopBackendRecovery[], fromToast = false) => {
+    await runDesktopUpdateAction(
+      (busy) => setRestarting(busy ? "server" : null),
+      async () => {
+        setRestartError(null);
+        setAppRestartError(null);
+        const errors: string[] = [];
+        if (!bridge?.retryProjectData) {
+          errors.push("Restart server is unavailable. Restart BiBCode and try again.");
+        } else {
+          // The native host admits only one project-data operation at a time.
+          for (const entry of entries) {
+            try {
+              await bridge.retryProjectData(entry.environmentId);
+              void retryEnvironment(entry.environmentId);
+            } catch (error) {
+              errors.push(
+                getDesktopUpdateErrorMessage(error, "BiBCode's local server couldn't restart."),
+              );
+            }
+          }
+        }
+        setRestartError(errors.length > 0 ? errors.join("\n") : null);
+        if (errors.length === 0) closeRecoveryToast();
+        if (fromToast) {
+          if (errors.length === 0) {
+            toastManager.add({ type: "success", title: "Server restarted" });
+          } else {
+            // The supervisor publishes recovery before the retry returns; read its latest classification.
+            const settled = await bridge?.getUpdateState().catch(() => latestState.current);
+            const currentEntries = settled?.backendRecovery ?? latestState.current.backendRecovery;
+            showRecoveryToast(currentEntries?.length ? currentEntries : entries, true);
+          }
+        }
+      },
+    );
+  };
+
+  const handleInstallResult = (result: DesktopUpdateActionResult) => {
+    if (result.completed) return;
+    if (result.state.backendRecovery?.length) {
+      showRecoveryToast(result.state.backendRecovery);
+    } else if (result.state.message) {
+      onError?.(result.state.message);
     }
   };
 
-  const startUnprotectedInstall = async () => {
-    if (working || !hasProtectionFailure || !skipProtectionAcknowledged) return;
-    setSubmitting(true);
-    try {
-      const result = await installUpdate({ skipProtection: true });
-      if (!result.completed && result.state.message) {
-        onError?.(result.state.message);
+  const startInstall = async () => {
+    if (working || recovering || (failedSecondaries.length > 0 && !exclusionsComplete)) return;
+    await runDesktopUpdateAction(setSubmitting, async () => {
+      setRestartError(null);
+      setAppRestartError(null);
+      setDetailsOpen(false);
+      try {
+        const exclusions = [...excludedEnvironmentIds];
+        const result = await installUpdate(
+          exclusions.length > 0 ? { excludedEnvironmentIds: exclusions } : undefined,
+        );
+        handleInstallResult(result);
+      } catch (error) {
+        onError?.(error instanceof Error ? error.message : "An unexpected error occurred.");
       }
-    } catch (error) {
-      onError?.(error instanceof Error ? error.message : "An unexpected error occurred.");
-    } finally {
-      setSubmitting(false);
-    }
+    });
+  };
+
+  const startUnprotectedInstall = async () => {
+    if (working || recovering || !hasProtectionFailure || !skipProtectionAcknowledged) return;
+    await runDesktopUpdateAction(setSubmitting, async () => {
+      setRestartError(null);
+      setAppRestartError(null);
+      setDetailsOpen(false);
+      try {
+        const result = await installUpdate({ skipProtection: true });
+        handleInstallResult(result);
+      } catch (error) {
+        onError?.(error instanceof Error ? error.message : "An unexpected error occurred.");
+      }
+    });
   };
 
   return (
     <Dialog
       open={open}
       onOpenChange={(nextOpen) => {
-        if (!working) onOpenChange(nextOpen);
+        if (!working && !desktopUpdateActionInFlight) onOpenChange(nextOpen);
       }}
     >
       <DialogPopup className="max-w-lg" showCloseButton={!working}>
         <DialogHeader>
-          <DialogTitle>Protect projects before updating</DialogTitle>
+          <DialogTitle>
+            {recovering ? "Update not installed" : "Protect projects before updating"}
+          </DialogTitle>
           <DialogDescription>
-            BiBCode creates a verified project database backup by default before stopping each
-            included local backend. Running tasks will be interrupted.
+            {recovering
+              ? recovery.map((entry) => (
+                  <span key={entry.environmentId} className="block">
+                    {getDesktopBackendRecoveryMessage(entry)}
+                  </span>
+                ))
+              : "BiBCode creates a verified project database backup by default before stopping each included local backend. Running tasks will be interrupted."}
           </DialogDescription>
         </DialogHeader>
-        <DialogPanel className="space-y-3">
-          {protection.length === 0 ? (
+        <DialogPanel className="space-y-3" data-text-surface="card">
+          {recovering ? (
+            <>
+              <Button
+                variant="outline"
+                disabled={working}
+                aria-expanded={detailsOpen}
+                aria-controls={detailsId}
+                onClick={() => setDetailsOpen((current) => !current)}
+              >
+                Details
+              </Button>
+              {detailsOpen ? (
+                <div id={detailsId} className="max-h-48 overflow-y-auto rounded-md border">
+                  <p
+                    data-text-surface="card"
+                    className="whitespace-pre-wrap break-words p-3 text-xs"
+                  >
+                    {restartError ?? state.message}
+                  </p>
+                </div>
+              ) : null}
+              {appRestartError ? (
+                <p role="alert" className="text-sm text-destructive">
+                  {appRestartError}
+                </p>
+              ) : null}
+            </>
+          ) : protection.length === 0 ? (
             <p className="text-sm text-muted-foreground">
               The primary project store will be protected before installation begins.
             </p>
@@ -205,7 +409,7 @@ export function UpdateProtectionDialog({
               ))}
             </ul>
           )}
-          {hasProtectionFailure ? (
+          {!recovering && hasProtectionFailure ? (
             <div
               aria-label="Continue without a backup"
               className="rounded-lg border border-destructive/40 bg-destructive/5 p-3 text-sm"
@@ -238,20 +442,57 @@ export function UpdateProtectionDialog({
           ) : null}
         </DialogPanel>
         <DialogFooter>
-          <Button variant="outline" disabled={working} onClick={() => onOpenChange(false)}>
-            Cancel
-          </Button>
-          {primaryFailure ? (
-            <Button variant="outline" disabled={working} onClick={onDiagnostics}>
-              Diagnostics
-            </Button>
-          ) : null}
-          <Button
-            disabled={working || (failedSecondaries.length > 0 && !exclusionsComplete)}
-            onClick={() => void startInstall()}
-          >
-            {installLabel}
-          </Button>
+          {recovering ? (
+            <div className="flex w-full flex-col gap-3">
+              {restartError !== null ? (
+                <p role="alert" className="text-sm text-destructive">
+                  {recovery.length === 1
+                    ? "The server still couldn't restart."
+                    : "The servers still couldn't restart."}
+                </p>
+              ) : null}
+              <p id={retryReasonId} className="text-xs text-muted-foreground">
+                Restart the server before retrying the installation.
+              </p>
+              <div className="flex flex-wrap justify-end gap-2">
+                <Button variant="outline" disabled={working} onClick={() => onOpenChange(false)}>
+                  Close
+                </Button>
+                <Button variant="outline" disabled aria-describedby={retryReasonId}>
+                  Retry installation
+                </Button>
+                <Button
+                  variant={canRestartApp ? "outline" : "default"}
+                  disabled={working}
+                  onClick={() => void restartServers(recovery)}
+                >
+                  {restarting === "server" ? "Restarting server…" : "Restart server"}
+                </Button>
+                {canRestartApp ? (
+                  <Button disabled={working} onClick={() => void restartBiBCode()}>
+                    {restarting === "app" ? "Restarting BiBCode…" : "Restart BiBCode"}
+                  </Button>
+                ) : null}
+              </div>
+            </div>
+          ) : (
+            <>
+              <Button variant="outline" disabled={working} onClick={() => onOpenChange(false)}>
+                Cancel
+              </Button>
+              {primaryFailure ? (
+                <Button variant="outline" disabled={working} onClick={onDiagnostics}>
+                  Diagnostics
+                </Button>
+              ) : null}
+              <Button
+                disabled={working || (failedSecondaries.length > 0 && !exclusionsComplete)}
+                onClick={() => void startInstall()}
+              >
+                {installLabel}
+              </Button>
+            </>
+          )}
         </DialogFooter>
       </DialogPopup>
     </Dialog>

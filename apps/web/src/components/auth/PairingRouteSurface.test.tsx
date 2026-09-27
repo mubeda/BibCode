@@ -178,6 +178,14 @@ function render(element: React.ReactElement): string {
   return renderToStaticMarkup(element);
 }
 
+function renderWithStateUpdates(element: React.ReactElement): string {
+  const updates = new Map(harness.setStateCalls.map(({ initial, applied }) => [initial, applied]));
+  for (const [initial, value] of updates) {
+    harness.seedState((candidate) => candidate === initial, value);
+  }
+  return render(element);
+}
+
 const flush = async () => {
   await Promise.resolve();
   await Promise.resolve();
@@ -386,11 +394,18 @@ describe("HostedPairingRouteSurface", () => {
     label: "My Backend",
   };
 
-  it("reports a missing pairing link when no request is present", () => {
+  it("reports a missing pairing link without an empty action row", () => {
     testState.hostedRequest = null;
     const markup = render(<HostedPairingRouteSurface />);
     expect(markup).toContain("Pairing failed");
-    expect(markup).toContain("missing its backend host or token");
+    expect
+      .soft(markup)
+      .toContain(
+        "This pairing link is missing its backend host or token. Open the complete link again, or create a new pairing link on the backend.",
+      );
+    expect.soft(markup).not.toContain("Verify the backend is reachable");
+    expect(markup).not.toContain('class="mt-6 flex flex-wrap gap-2"');
+    expect(testState.connect).not.toHaveBeenCalled();
     // No host row and no retry button.
     expect(ui.filter("Button", (props) => props.children === "Try again")).toHaveLength(0);
   });
@@ -401,7 +416,17 @@ describe("HostedPairingRouteSurface", () => {
     expect(markup).toContain("Pair this backend");
     expect(markup).toContain("xn--pple-43d.com");
     expect(markup).not.toContain("https://xn--pple-43d.com/");
+    expect(markup).toContain('<div class="mt-6 flex flex-wrap gap-2"><button');
     expect(ui.filter("Button", (props) => props.children === "Pair this backend")).toHaveLength(1);
+  });
+
+  it("keeps the action row while pairing with its disabled button", () => {
+    testState.hostedRequest = request;
+    harness.seedState((initial) => initial === "confirm", "pairing");
+    const markup = render(<HostedPairingRouteSurface />);
+
+    expect(markup).toContain('<div class="mt-6 flex flex-wrap gap-2"><button');
+    expect(ui.find("Button", (props) => props.children === "Pairing...").disabled).toBe(true);
   });
 
   it("strips the token on mount but connects only after confirmation", async () => {
@@ -428,7 +453,7 @@ describe("HostedPairingRouteSurface", () => {
     ).toBe(true);
   });
 
-  it("marks an error and enables retry when the connection fails", async () => {
+  it("shows connection troubleshooting when the connection fails", async () => {
     testState.hostedRequest = request;
     testState.connect.mockResolvedValue({ _tag: "Failure", error: "nope" });
     testState.squashError = new Error("backend unreachable");
@@ -438,39 +463,43 @@ describe("HostedPairingRouteSurface", () => {
     const confirm = ui.find("Button", (props) => props.children === "Pair this backend");
     (confirm.onClick as () => void)();
     await flush();
-    expect(harness.setStateCalls.some((call) => call.applied === "error")).toBe(true);
-    expect(
-      harness.setStateCalls.some(
-        (call) => typeof call.applied === "string" && call.applied.includes("backend unreachable"),
-      ),
-    ).toBe(true);
+    const markup = renderWithStateUpdates(<HostedPairingRouteSurface />);
+    expect(markup).toContain("Pairing failed");
+    expect(markup).toContain("backend unreachable");
+    expect(markup).toContain("Verify the backend is reachable");
+    expect(markup).toContain("supports CORS for hosted clients");
+    expect(markup).toContain("served over HTTPS");
+    expect(markup).not.toContain('class="mt-6 flex flex-wrap gap-2"');
     expect(ui.filter("Button", (props) => props.children === "Try again")).toHaveLength(0);
   });
 
   it("renders the paired state with an Open app button that navigates home", () => {
     testState.hostedRequest = request;
     harness.seedState((initial) => initial === "confirm", "paired");
-    render(<HostedPairingRouteSurface />);
+    const markup = render(<HostedPairingRouteSurface />);
+    expect(markup).toContain('<div class="mt-6 flex flex-wrap gap-2"><button');
     const openApp = ui.find("Button", (props) => props.children === "Open app");
     (openApp.onClick as () => void)();
     expect(locationHref).toBe("/");
   });
 
-  it("rejects a token that was already submitted", async () => {
+  it("rejects a second submit without showing connection troubleshooting", async () => {
     testState.hostedRequest = request;
+    testState.connect.mockResolvedValue({ _tag: "Failure", error: "nope" });
     render(<HostedPairingRouteSurface />);
-    // tokenSubmittedRef is the third captured ref; force it to true.
-    const tokenSubmittedRef = harness.refs[2]!;
-    tokenSubmittedRef.current = true;
 
     const confirm = ui.find("Button", (props) => props.children === "Pair this backend");
     (confirm.onClick as () => void)();
     await flush();
-    expect(
-      harness.setStateCalls.some(
-        (call) => typeof call.applied === "string" && call.applied.includes("already submitted"),
-      ),
-    ).toBe(true);
-    expect(testState.connect).not.toHaveBeenCalled();
+    (confirm.onClick as () => void)();
+    await flush();
+
+    const markup = renderWithStateUpdates(<HostedPairingRouteSurface />);
+    expect(markup).toContain(
+      "This one-time pairing token was already submitted. Request a new pairing link.",
+    );
+    expect(markup).not.toContain("Verify the backend is reachable");
+    expect(markup).not.toContain('class="mt-6 flex flex-wrap gap-2"');
+    expect(testState.connect).toHaveBeenCalledOnce();
   });
 });

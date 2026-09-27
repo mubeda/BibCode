@@ -26,7 +26,7 @@ export async function installDesktopUiMotionGuard(): Promise<void> {
       display: none !important;
     }`,
         `
-    [data-slot="sidebar-group"]:has([data-testid="new-main-chat-button"])
+    [data-slot="sidebar-group"][data-testid="sidebar-projects-group"]
       ul[data-sidebar="menu"] > li {
       opacity: 1 !important;
       transform: none !important;

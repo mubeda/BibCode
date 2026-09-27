@@ -66,18 +66,21 @@ vi.mock("../../hooks/useTheme", () => ({ useTheme: () => ({ resolvedTheme: "ligh
 vi.mock("../../state/query", () => ({
   useEnvironmentQuery: (atom: { kind: string; args: unknown } | null) => {
     const [, publish] = useReducer((n: number) => n + 1, 0);
+    const refresh = () => {
+      if (!atom) return;
+      h.dispatch(atom.kind, atom.args);
+      // A fresh receipt lets the real usePullRequestsQuery release cached data.
+      if (h.data[atom.kind]) h.data[atom.kind] = { ...(h.data[atom.kind] as object) };
+      publish();
+    };
     return {
       data: atom ? (h.data[atom.kind] ?? null) : null,
       emission: { _tag: "Initial" },
       error: null,
       isPending: false,
-      refresh: () => {
-        if (!atom) return;
-        h.dispatch(atom.kind, atom.args);
-        // A fresh receipt lets the real usePullRequestsQuery release cached data.
-        if (h.data[atom.kind]) h.data[atom.kind] = { ...(h.data[atom.kind] as object) };
-        publish();
-      },
+      refresh,
+      revalidate: refresh,
+      requiresRetry: false,
     };
   },
 }));

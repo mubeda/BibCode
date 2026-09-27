@@ -447,7 +447,6 @@ interface CapturedCommandProps {
   value?: string;
   autoHighlight?: boolean | "always";
   onValueChange?: (value: string) => void;
-  onItemHighlighted?: (value: unknown) => void;
 }
 
 interface FakeInputKeyEvent {
@@ -466,7 +465,6 @@ interface CapturedCommandInputProps {
 
 interface CapturedResultsProps {
   groups: ReadonlyArray<CommandPaletteGroup>;
-  highlightedItemValue: string | null;
   isActionsOnly: boolean;
   onExecuteItem: (item: CommandPaletteActionItem | CommandPaletteSubmenuItem) => void;
   emptyStateMessage?: string;

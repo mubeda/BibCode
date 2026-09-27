@@ -5,6 +5,12 @@ instance binds a driver to its configured executable, options, readiness state,
 and instance metadata. Commands identify the instance rather than
 reconstructing driver state in the client.
 
+Built-in provider settings defaults come from one server table. Both the control
+plane and the runtime settings reader fill missing fields from it, so a partial
+`providers.<driver>` object means the same thing everywhere. Codex, Claude,
+Cursor, and OpenCode are enabled by default; Grok is disabled. Explicitly saved
+values, including `enabled: false`, are preserved.
+
 `supportsContextWindowUsage` is provider-inventory metadata, not a UI guess or
 a property of an individual usage event. Codex and Claude are the only initial
 providers that advertise this capability; an absent capability means that the
@@ -32,6 +38,59 @@ ordering and recovery semantics across reconnects and process failures. Busy
 submissions stay in its durable queue without starting work; a ready settle
 promotes one eligible head. Explicit steering uses the same delivery owner and
 `ProviderDriver::steer`, gated by `supportsTurnSteer`.
+
+A durable turn is replayed unchanged, so a launch that fails because the
+selected model or session refuses the turn's own options
+(`ProviderRuntimeError::InvalidOption`) fails that delivery once. Every other
+launch failure, such as a spawn error, stays definitely not sent and is retried.
+`InvalidOption` comes from every deterministic option check:
+
+- the shape checks of Claude, Codex and OpenCode: an option without an id, and a
+  value of the wrong shape (Claude's and OpenCode's fast mode must be a boolean,
+  Codex's options and OpenCode's variant a non-empty string). OpenCode also
+  refuses fast mode combined with a variant, and options without a selected
+  provider/model;
+- Claude's Fast Mode check;
+- the checks Codex (`model/list`, which must also offer the session's model),
+  Cursor (the advertised config options) and OpenCode (the advertised variants)
+  make against the selected model or session. As in the catalog, Codex also
+  offers the instance's custom models, with the options of the first listed
+  model. A Cursor session configuration BiBCode can't work with, such as an
+  advertised option of an unexpected category or type, is refused too, because
+  a relaunch advertises the same configuration, and so is a switch of a live
+  Cursor session to a default model the session does not advertise;
+- Grok, which accepts no option.
+
+At launch, a failed request inside those checks, such as `model/list` or an
+unreachable server, and a Cursor update that was rolled back stay retryable. In
+a live session the same checks run when a turn changes the model or its options
+(`reconcile_model_selection`), and any failure there, refusal or not, takes the
+frozen delivery's `Rejected` arm, so the delivery fails once.
+
+Every delivery detail, the text an undelivered or uncertain turn shows, comes
+from one formatter: plain words that name the provider by the instance's label
+(its trimmed display name; otherwise, for an instance that is not its driver's
+default, its id in words — `codex_personal` reads "Codex Personal"; otherwise
+the driver's name from contracts' `PROVIDER_DISPLAY_NAMES`), never by a driver
+id. The server stamps the same label as `displayName` in every provider
+snapshot, so the web shows the server's name and never derives its own. The
+field stays optional for older servers, whose unnamed instances then show the
+driver's name. A refusal is its plain
+sentence, such as "Fast Mode is not supported by the selected model." or "gpt-5
+is not available in Work Codex.", built from shared helpers that name an option
+by the label its descriptor shows, and by its id only for an option the driver
+does not take. A Cursor configuration BiBCode can't work with reads "BiBCode
+can't apply these options to the selected model. Choose another model, or turn
+these options off." The error text, logs and runtime rows keep the internal
+detail. The instance's label is read from the persisted settings without their
+secrets, so a missing secret can't cost an instance its name.
+
+The static Claude catalog used when the CLI reports no models offers only
+options the Claude session applies (`effort` and `fastMode`; `agent` comes from
+the discovered agents). A launch decides Fast Mode from the model's entry in the
+published provider inventory, which carries what the CLI reported for aliases
+such as `opus`, and uses the static catalog only for a model the inventory does
+not list. Fast Mode off asks for nothing and is never refused.
 
 Each driver translates between the common orchestration model and its native
 protocol:
@@ -113,7 +172,12 @@ settles an abandoned active turn only if one remains. Native runtimes can keep
 their event senders alive after process loss; recovery does not wait for channel
 closure. OpenCode's explicit-stop notice (`Session stopped.`) is excluded from
 the fatal-exit trigger, and intentional stop/idle suspension cancels and joins
-the supervisor event pump before shutting down any driver. The next start delivery,
+the supervisor event pump before shutting down any driver. Each completion reserves
+an idle deadline generation before `ready` is published; successful projection of a
+non-failed completion arms it. When a current deadline finds a busy session (an
+admitted delivery, a `running` or `starting` projection, or an active turn), it
+immediately re-arms for one idle timeout, and the next completion supersedes that
+re-arm. The next start delivery,
 including **Send now** on a held queued message, detaches the dead session and
 releases its activity and process ownership through normal session cleanup.
 It retains the persisted resume cursor and follows the existing missing-session
@@ -332,6 +396,28 @@ missing versions are not cached. They produce a visible unknown advisory with a
 retry prompt but do not change provider readiness or discard inventory data.
 The advisory timestamp records the registry result or attempt; the provider's
 top-level `checkedAt` continues to record the executable and capability probe.
+
+A `subscribeServerConfig` subscription starts a full provider refresh only when
+no full refresh has completed yet, or the last completed one is more than five
+minutes old, and it never duplicates a full refresh already in progress.
+`server.refreshProviders` runs immediately. It finishes and publishes even if the
+requesting client disconnects, and a full refresh also records its completion. A
+settings change discards every result it makes stale and starts a full refresh at
+once; if a full refresh is already running, that refresh probes again with the
+new settings instead. The settings-triggered refresh continues even if the RPC
+that changed the settings disconnects.
+
+Refreshes a user triggers (`server.refreshProviders`, full or per instance)
+always publish `providerStatuses`, even when only timestamps changed. If a newer
+probe has already committed under the same settings, the request publishes the
+current inventory without overwriting it or renewing the five-minute window.
+Automatic refreshes (subscriptions, background checks and settings changes) and
+the re-probe after `server.updateProvider` publish `providerStatuses` only when
+the merged provider array changed, ignoring each provider's `checkedAt` and
+`versionAdvisory.checkedAt`. Those timestamps are still stored, so connected
+clients keep their previous `checkedAt` until a content change or a
+user-triggered refresh publishes, or until they reconnect and receive a fresh
+snapshot.
 
 An update reservation is bound to the complete maintenance target and settings
 generation. After acquiring the per-command lock, the server rereads settings,

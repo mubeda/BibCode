@@ -5,27 +5,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 
 /**
  * toast.tsx is a heavy SSR-only React surface. We render it with
- * `renderToStaticMarkup`, using a partial `react` mock to (a) seed `useState`
- * so expandable branches render and (b) capture `useEffect` bodies so the
- * `ThreadToastVisibleAutoDismiss` timer machinery can be exercised against a
- * fake window/document. Base UI's `Toast.*` primitives are replaced with
- * capture-mocks that render their children, so the whole nested body tree
- * executes and interactive host elements (dismiss button, disclosure toggle,
- * copy button) can be located and invoked directly.
+ * `renderToStaticMarkup`, using a partial `react` mock to capture `useEffect`
+ * bodies so the `ThreadToastVisibleAutoDismiss` timer machinery can be
+ * exercised against a fake window/document. Base UI's `Toast.*` primitives are
+ * replaced with capture-mocks that render their children, so the whole nested
+ * body tree executes and interactive host elements (dismiss button, copy
+ * button) can be located and invoked directly.
  */
 const harness = vi.hoisted(() => {
-  type Matcher = (initial: unknown) => boolean;
   const state = {
-    stateSeeds: [] as Array<{ match: Matcher; value: unknown }>,
-    setStateCalls: [] as Array<{ initial: unknown; next: unknown; applied: unknown }>,
     effects: [] as Array<() => void | (() => void)>,
     reset() {
-      state.stateSeeds.length = 0;
-      state.setStateCalls.length = 0;
       state.effects.length = 0;
-    },
-    seedState(match: Matcher, value: unknown) {
-      state.stateSeeds.push({ match, value });
     },
     runEffects(): Array<() => void> {
       const cleanups: Array<() => void> = [];
@@ -68,25 +59,11 @@ const testState = vi.hoisted(() => ({
 
 vi.mock("react", async (importOriginal) => {
   const actual = await importOriginal<typeof import("react")>();
-  const resolveInitial = (initial: unknown): unknown =>
-    typeof initial === "function" ? (initial as () => unknown)() : initial;
-  const useState = (initial?: unknown) => {
-    const resolved = resolveInitial(initial);
-    const seedIndex = harness.stateSeeds.findIndex((seed) => seed.match(resolved));
-    const value = seedIndex >= 0 ? harness.stateSeeds.splice(seedIndex, 1)[0]!.value : resolved;
-    const setValue = (next: unknown) => {
-      const applied =
-        typeof next === "function" ? (next as (value: unknown) => unknown)(value) : next;
-      harness.setStateCalls.push({ initial: resolved, next, applied });
-    };
-    return [value, setValue];
-  };
   const useEffect = (effect: () => void | (() => void)) => {
     harness.effects.push(effect);
   };
   return {
     ...actual,
-    useState: useState as typeof actual.useState,
     useEffect: useEffect as typeof actual.useEffect,
   };
 });
@@ -266,7 +243,6 @@ function makeToast(overrides: Record<string, unknown> = {}): Record<string, unkn
 
 function renderProvider(element: React.ReactElement): string {
   ui.reset();
-  harness.setStateCalls.length = 0;
   harness.effects.length = 0;
   return renderToStaticMarkup(element);
 }
@@ -394,106 +370,6 @@ describe("ToastProvider positions", () => {
       expect(markup).toContain(`data-position="${position}"`);
     },
   );
-});
-
-describe("expandable content", () => {
-  it("renders a chevron disclosure section (collapsed and expanded)", () => {
-    testState.toasts = [
-      makeToast({
-        type: "info",
-        description: "summary",
-        data: { expandableContent: <div data-testid="panel">details</div> },
-      }),
-    ];
-    // Collapsed: the panel is not rendered, the expand label is shown.
-    let markup = renderProvider(<ToastProvider />);
-    expect(markup).toContain("Show details");
-    expect(markup).not.toContain('data-testid="panel"');
-
-    // Seed the disclosure's open state → expanded panel renders. Two seeds:
-    // ToastDescriptionAndExpandable's own `open` state is created first (unused
-    // in this branch), then ToastExpandableSection's `open` drives the panel.
-    harness.seedState((initial) => initial === false, true);
-    harness.seedState((initial) => initial === false, true);
-    testState.toasts = [
-      makeToast({
-        type: "info",
-        description: "summary",
-        data: {
-          expandableContent: <div data-testid="panel">details</div>,
-          expandableLabels: { expand: "More", collapse: "Less" },
-        },
-      }),
-    ];
-    markup = renderProvider(<ToastProvider />);
-    expect(markup).toContain('data-testid="panel"');
-    expect(markup).toContain("Less");
-  });
-
-  it("renders the description-trigger disclosure and toggles via handlers", () => {
-    testState.toasts = [
-      makeToast({
-        type: "error",
-        description: "why it failed",
-        data: {
-          expandableContent: <div data-testid="rpcs">rpc list</div>,
-          expandableDescriptionTrigger: true,
-        },
-      }),
-    ];
-    const markup = renderProvider(<ToastProvider />);
-    // Collapsed by default → chevron-down + "Show details" label present, panel hidden.
-    expect(markup).not.toContain('data-testid="rpcs"');
-
-    // The disclosure element is passed as `render` to a TooltipTrigger; find it.
-    const triggers = ui.filter("TooltipTrigger");
-    const disclosureTrigger = triggers.find((props) => {
-      const render = props["render"] as React.ReactElement | undefined;
-      return (
-        React.isValidElement(render) &&
-        (render.props as Record<string, unknown>)["role"] === "button"
-      );
-    });
-    expect(disclosureTrigger).toBeDefined();
-    const render = disclosureTrigger!["render"] as React.ReactElement;
-    const renderProps = render.props as {
-      onClick: () => void;
-      onKeyDown: (event: { key: string; preventDefault: () => void }) => void;
-    };
-    harness.setStateCalls.length = 0;
-    renderProps.onClick();
-    expect(harness.setStateCalls.some((call) => call.applied === true)).toBe(true);
-
-    const enter = { key: "Enter", preventDefault: vi.fn() };
-    renderProps.onKeyDown(enter);
-    expect(enter.preventDefault).toHaveBeenCalled();
-
-    const space = { key: " ", preventDefault: vi.fn() };
-    renderProps.onKeyDown(space);
-    expect(space.preventDefault).toHaveBeenCalled();
-
-    const other = { key: "a", preventDefault: vi.fn() };
-    renderProps.onKeyDown(other);
-    expect(other.preventDefault).not.toHaveBeenCalled();
-  });
-
-  it("renders the expanded description-trigger panel when seeded open", () => {
-    harness.seedState((initial) => initial === false, true);
-    testState.toasts = [
-      makeToast({
-        type: "error",
-        description: "why it failed",
-        data: {
-          expandableContent: <div data-testid="rpcs">rpc list</div>,
-          expandableDescriptionTrigger: true,
-          expandableLabels: { collapse: "Hide it" },
-        },
-      }),
-    ];
-    const markup = renderProvider(<ToastProvider />);
-    expect(markup).toContain('data-testid="rpcs"');
-    expect(markup).toContain("Hide it");
-  });
 });
 
 describe("dismiss + copy handlers", () => {

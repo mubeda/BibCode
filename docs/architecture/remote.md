@@ -60,12 +60,12 @@ environment identity.
 The connection runtime defines four target types in
 [`connection/model.ts`](../../packages/client-runtime/src/connection/model.ts).
 
-| Target                    | Use                                                                                    |
-| ------------------------- | -------------------------------------------------------------------------------------- |
-| `PrimaryConnectionTarget` | The server supplied by the current browser or desktop host.                            |
-| `BearerConnectionTarget`  | A manually saved HTTP/WSS endpoint plus a separately stored pairing credential.        |
-| `RelayConnectionTarget`   | An environment discovered through BiBCode Connect and authorized with Clerk plus DPoP. |
-| `SshConnectionTarget`     | A desktop-managed SSH profile that prepares a remote server and local forwarding.      |
+| Target                    | Use                                                                                                    |
+| ------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `PrimaryConnectionTarget` | The server supplied by the current browser or desktop host.                                            |
+| `BearerConnectionTarget`  | A manually saved HTTP/WSS endpoint plus a separately stored pairing credential.                        |
+| `RelayConnectionTarget`   | An environment discovered through BiBCode Connect and authorized with Clerk plus DPoP.                 |
+| `SshConnectionTarget`     | A desktop-managed SSH profile plus a saved standard-scope bearer, used through a desktop-owned tunnel. |
 
 Only bearer, relay, and SSH targets are persisted as saved connection targets.
 `EnvironmentRegistry` creates one scoped supervisor per catalog entry and keeps
@@ -147,6 +147,17 @@ policy) and carries the `NSLocalNetworkUsageDescription` shown by the macOS
 Local Network prompt. The hardening test pins those keys and rejects the
 broader `NSAllowsArbitraryLoads`.
 
+### Served web UI script policy
+
+`bibcode serve` sends `script-src 'self'`, so the served page runs only
+same-origin scripts. The static `/theme-bootstrap.js` runs before first paint.
+Only content-hashed build assets under `/assets/` are immutable. Other non-HTML
+static files, such as `/theme-bootstrap.js` and the icons, use `no-cache` with an
+ETag so browsers revalidate them and receive 304 when unchanged. The build still
+versions the bootstrap URL with a content hash and rejects inline scripts in
+the built `index.html`. The desktop webview has the same `script-src 'self'`
+policy, and Tauri ignores the query string when resolving the static asset.
+
 ### Direct-connection E2EE
 
 New direct pairings pin a server identity and carry RPC over an encrypted
@@ -216,7 +227,11 @@ credential authenticates anywhere; when it is absent the credential is already
 active — which is also how a new client interoperates with servers that
 predate the confirmation flow. A returning device sends
 `{"type":"e2ee_auth","bearer":"<stored credential>"}` and receives an
-`e2ee_authenticated` acknowledgement. Invalid credentials receive
+`e2ee_authenticated` acknowledgement. Either form may carry
+`"features":["interleave-v1"]`; the server then confirms the same list in
+`e2ee_authenticated` and may send stand-alone `0x02` control records between
+the records of a large message. Without the confirmation, control messages
+overtake queued data only between whole messages. Invalid credentials receive
 `e2ee_error/unauthorized`; malformed protocol receives `e2ee_error/protocol`;
 both paths close the socket.
 
@@ -226,7 +241,14 @@ tokens without a transport claim decode as `plain` for compatibility. Client
 preparation also sets `httpAuthorization` to `null` for a pinned profile, so an
 E2EE-only credential is not exposed as a usable HTTP authorization capability.
 File transfers use token-in-path URLs for the same reason asset previews do,
-so they work on every profile.
+so they work on every profile. On a pinned (E2EE) profile whose endpoint is
+plain `http://`, Files panel downloads and uploads (`/api/transfers/<token>`)
+and asset previews (`/api/assets/<capability>/<path>`: chat images, project
+icons, and HTML or PDF files opened in the integrated browser) travel outside
+the Noise channel, and only the RPC that issues their URLs is encrypted, so
+anyone on the network path can read and alter their contents, read the
+workspace paths encoded in those URLs, and reuse a captured URL until it
+expires (five minutes for transfers, one hour for previews).
 
 Pre-auth work is bounded independently of normal RPC traffic. The complete
 upgrade, handshake, and authentication sequence has one 10-second deadline;
@@ -311,15 +333,20 @@ frame owns those permits
 through Noise record encryption and every successful or failed WebSocket
 write;
 generic queue capacity therefore cannot hide additional plaintext. Unary
-results, stream chunks, handler-error terminals, RPC ping/pong control
-messages, protocol errors, and defects use the same admission path. Interrupts
-bypass byte admission through a non-blocking control lane, and when a budgeted
-terminal or unary response loses its admission deadline the session delivers an
-explicit unbudgeted `RpcOutboundAdmissionError` terminal instead of ending the
-request silently; both bypasses are bounded by the 64-request in-flight cap at
-one small control message per request. WebSocket-level ping/pong frames are
+results, stream chunks, handler-error terminals, and defects use the same
+admission path. RPC `Pong`, interrupt exits, `RpcOutboundAdmissionError`
+terminals, and client protocol errors bypass byte admission through the
+connection writer's bounded control lane, which holds one small control message
+per in-flight request plus room for Pongs; a full lane drops a `Pong` instead
+of ending the read loop. When a budgeted terminal or unary response loses its
+admission deadline, the session delivers that explicit `RpcOutboundAdmissionError`
+terminal instead of ending the request silently. A control message larger than
+one record keeps ordinary byte admission on the data queue and still never
+counts as write progress. WebSocket-level ping/pong frames are
 transport control and carry no RPC plaintext. A response larger than the
-64 MiB connection cap fails the session closed immediately; otherwise both
+64 MiB connection cap fails only its own request with a typed
+`RpcResponseTooLargeError { method, bytes, limitBytes }`, and the session stays
+open; otherwise both
 connection and process byte admission plus the bounded 64-entry response queue
 share one absolute five-second admission deadline. Granting is push-based:
 waiters sleep on their own grant channel and every release runs one fit-first
@@ -331,12 +358,19 @@ traffic therefore cannot starve a large response, and the resulting pause for
 younger waiters is bounded by the front waiter's own size rather than being an
 open-ended blockade. Cancellation removes the waiter and refunds both a
 concurrently granted reservation and any accumulated aged-head reservation
-exactly once. Each Noise record then receives a fresh five-second
-WebSocket-sink progress deadline, while the whole logical message is bounded
-by five seconds plus one second per 64 KiB of plaintext. Records remain
-serialized, and the pump retains its one-second join bound.
+exactly once. The connection's one writer task encrypts and writes one record
+at a time: each Noise record must be accepted by the socket within 20 seconds,
+and the whole logical message within 30 seconds plus its size at 16 KiB/s. When
+either deadline passes, the writer ends the session at once.
 Dropping a queued, cancelled, rejected, serialization-failed, encryption-failed,
 or write-failed frame releases its single permit set without double accounting.
+
+An E2EE socket follows the shared heartbeat rule in
+[RPC and orchestration](./rpc-and-orchestration.md#wire-protocol) once
+`e2ee_authenticated` is sent (pre-auth keeps its 10-second deadline): a
+WebSocket Ping every 15 seconds between records, and reaping after 45 seconds
+without an inbound frame or a data write that waited on the peer, checked every 5 seconds. Reaping
+an E2EE session frees its permits, live-connection row, and subscriptions.
 
 Together, these limits preserve the 65,535-byte ciphertext record ceiling,
 65,518-byte plaintext chunk size, and 64 MiB logical-message contract.
@@ -472,18 +506,30 @@ after deletion actually succeeds.
 
 ### Remote server updates
 
-The typed update surface consists of `updater.status`, `updater.check`, and
-`updater.install`. Each successful call returns a snapshot containing
+The typed update surface consists of `updater.activeWork`, `updater.status`,
+`updater.check`, and `updater.install`. `updater.activeWork` returns
+`{runningTurns, liveTerminals, queuedMessages}` counted across all clients through
+its own read method so the one-second status poll never waits on the store; a
+failed count answers the typed `RemoteUpdateActiveWorkError`.
+Successful status, check, and install calls return a snapshot containing
 `serverVersion`, nullable `latestVersion`, lifecycle `state`, nullable `error`,
-and `support` (`installMode` plus `reason`). A server that cannot install on
-behalf of the caller rejects `updater.install` with
+and `support` (`installMode`, `reason`, and `installKind`: `archive`,
+`system-package`, or `unknown`). The additive snapshot fields `downloadPercent`,
+`targetVersion`, and `installStage` decode-default to `null`, and
+`support.installKind` decode-defaults to `unknown`. Stages and kinds decode as
+plain strings; unknown stages get a generic label. No new `state` literal was
+added because an older client's literal decode would reject it. A server that
+cannot install on behalf of the caller rejects `updater.install` with
 `RemoteUpdateInstallError` code `remote_update_manual_required`. The TypeScript
 wire contract is `packages/contracts/src/remoteUpdate.ts`; its Rust mirror and
 state owner are in `apps/server/src/remote_update.rs`.
 
 The well-known descriptor, `server.getConfig`, and the Connect/relay descriptor
 all embed `remoteUpdateSupport`. Clients render update controls only when the
-additive, default-false `remoteUpdateControl` capability is true. The Remote
+additive, default-false `remoteUpdateControl` capability is true. All three
+descriptor producers also publish `bootId` and the default-false
+`remoteUpdateProgress` capability, which advertises the snapshot's progress
+fields, `bootId`, and `updater.activeWork`. The Remote
 Servers settings page checks all capable saved environments through
 `packages/client-runtime/src/state/remoteUpdates.ts`, with at most two requests
 in flight. Each environment check has one 30-second Effect deadline around the
@@ -515,6 +561,20 @@ apart the states that used to share one label:
   host's message as a tooltip and the same **Check again**.
 - **Manual updates** for a `manual` host, and **Up to date**, **Update to v…**,
   or **Updating…** (downloading or installing) for the rest.
+
+The `run` family in `createRemoteUpdateEnvironmentAtoms` retains one single-flight
+update run per environment, owned by the Atom runtime, so closing a view does not
+cancel it. At most two runs execute at once; a third shows **Queued**. The `update`
+command drives `packages/client-runtime/src/state/remoteUpdateCoordinator.ts`
+through a scoped follower that tracks both supervisor identity and connection
+generation through a restart, with no RPC spanning it. Identity comes from the
+current connection's initial config. The coordinator caps reads at 10 seconds,
+the install request at 30 seconds, download at 10 minutes, installation at
+2 minutes, and restart at 3 minutes. It asks the supervisor to retry only in
+backoff, at most every 5 seconds; a blocked connection ends the run with its
+failure message. It never reconnects an environment the user disconnected:
+an unreachable host ends as "hasn't come back". `dismiss` clears a terminal run
+and leaves an active run alone.
 
 `createRemoteUpdateEnvironmentAtoms` in
 `packages/client-runtime/src/state/remoteUpdates.ts` owns the check state: the
@@ -556,11 +616,13 @@ and install flow in the background and answers with the host updater's current
 state, never a predicted `installing`. If the feed has nothing newer the host
 records `up-to-date`, and a failed download records `error` with the updater's
 message; clients see both through `updater.status`
-(`apps/desktop/src-tauri/src/remote_update_delegate.rs`). Known gap: when the
-update is already downloaded, the client's first status read after an install
-request can still report `update-available` before the host enters update
-protection, and that state is not polled; the badge catches up when the
-restarted host reconnects.
+(`apps/desktop/src-tauri/src/remote_update_delegate.rs`). The desktop keeps the
+requester as `requestedBy` on its update state while the flow runs, clears it
+when the flow ends, and joins a second remote request to the running flow.
+The delegate fills `downloadPercent`, `targetVersion`, and `installStage`; a remote
+install stopped by a secondary environment's protection says "Finish the update
+on the host." A client following a run keeps polling `updater.status` through
+`update-available` until the flow settles.
 Plain authenticated WebSockets enter the live-client
 registry only after the HTTP upgrade completes, and unregister from the same
 upgrade-owned lifecycle.
@@ -716,10 +778,9 @@ whose restart, process, firewall, and cleanup operations own their own bounded
 deadlines. This prevents the UI from reporting a failed transition while an
 uncancelable desktop command later commits a wide topology.
 
-A wide-bound native primary does not expose the desktop-only maintenance API.
-Update protection therefore degrades while sharing until exposure returns to
-loopback; update preparation must not assume maintenance routes exist in that
-state.
+The HTTP maintenance API stays hidden on a wide-bound native primary. The
+desktop protects its in-process primary directly, so update protection works
+the same while sharing.
 
 Pairing links converge on that Add Server flow. Web clients accept
 `/pair?code=...`; desktop bundles register `bibcode://pair?code=...` with the
@@ -776,18 +837,121 @@ provider state. See [BiBCode Connect auth flow](../cloud/bibcode-connect-auth-fl
 
 The Tauri host owns SSH, not the server or React app. It validates the SSH
 profile, probes or launches `bibcode` remotely, establishes local forwarding,
-and returns a local HTTP/WSS bootstrap plus bearer credential to the connection
-runtime. The resulting `SshConnectionTarget` enters the same authorization and
+and returns a local HTTP/WSS bootstrap to the connection runtime. The bootstrap
+carries a one-time pairing credential only when the caller asks for one
+(`issuePairingToken: true`); the renderer exchanges it at `/oauth/token` for a
+bearer. The resulting `SshConnectionTarget` enters the same authorization and
 RPC pipeline as other targets.
 
-Fresh setup mints its bootstrap credential by running
-`bibcode pairing issue --base-dir "$HOME/.bibcode" --json` on the remote host
-(the same data root the launched `serve` uses). The command writes a one-time
-administrative pairing link into that root's auth store and prints one JSON
-line whose `credential` field the desktop exchanges at `/oauth/token`. Because
-the server consumes pairing links from the database and the store runtime lock
-is shared, the command works beside the already-running remote server without
-a restart.
+Every remote step is a script written to the stdin of `ssh … sh -s --`, so the
+remote login shell parses only `sh -s --` (OpenSSH joins the remote argv with
+spaces and hands it to that shell, whatever it is). The launch script starts
+`serve` as `nohup "$RUNNER_FILE" serve …` with no environment assignments;
+`serve` already implies no browser. Each script has a deadline — pairing 30 s,
+launch 60 s, stop 30 s — after which the desktop terminates and reaps the SSH
+child and fails with a `[ssh_timeout:<operation>]` error the renderer treats as
+transient: the supervisor keeps retrying, so its message ends "Check the
+connection; BiBCode keeps trying." and asks the user for nothing. Remote API refusals reach the renderer as `[ssh_http:<status>]`:
+401 blocks with `authentication`, 403 with `permission`, 400 with
+`configuration`; network failures and 5xx stay transient.
+
+**Remote bounds.** A deadline ends only the local `ssh`: `sshd` does not signal
+a command without a PTY when the client goes away. The pairing script bounds
+`bibcode pairing issue` itself. The desktop runs it as `sh -s -- <bound>`, the
+pairing deadline plus 5 s (35 s by default), and at the bound the script sends
+TERM, then KILL 2 s later. A host-side pairing command therefore ends within
+about 37 s even with no client left, and the user still sees only
+`[ssh_timeout:pairing]`. The launch script bounds its own waits on the host's
+clock: a recorded server gets 10 s to answer and a new one 15 s. Curl probes
+have a 1 s timeout; wget's own 1 s timeout runs under a 2 s watchdog (TERM after
+1–2 s, then KILL 2 s later), bounding a stuck wget to about 4 s. It thus
+ends well inside its 60 s deadline. Before it trusts, reuses, or stops a
+recorded pid, it checks that the pid still runs this state's
+`bibcode serve --port <port>` (`/proc/<pid>/cmdline`, or
+`ps -p <pid> -o command=` on macOS), and it leaves any other process alone. A
+live but silent recorded server is stopped (TERM, then KILL after 2 s) before
+exactly one replacement starts, so two managed servers never share a data root;
+if it survives KILL, the launch fails rather than start a second server beside
+it. A server the script started and gave up on is stopped the same way before any
+error is reported; SIGPIPE is ignored and every report may fail, so a closed
+channel cannot leave that server running. The launch records the port before
+the server starts, and the server records its own pid before it becomes
+`bibcode serve`, so a launch cut short never leaves a running server
+unrecorded or recorded with another port. The pid and port files are removed
+only while they still name that pid.
+
+The stop script sends TERM only, to a verified pid, then waits up to 10 s for
+the server to exit and clears its state files only once it has. A launch that
+follows at once therefore never starts a second server beside one still
+shutting down. The stop never forces a server that outlives the wait: it
+reports `{"stopped":false}` and keeps the record, and the desktop logs a warning.
+The next launch finds that server and stops it (TERM, then KILL) before it starts
+exactly one replacement.
+
+**Credentials.** Add runs launch, tunnel, and the pairing script
+`REMOTE_PAIRING_SCRIPT` (`bibcode pairing issue --base-dir "$HOME/.bibcode"
+--json`, the data root the launched `serve` uses), fetches the descriptor, and
+only then exchanges the credential, requesting `AuthStandardClientScopes`. The
+command writes a one-time pairing link into that root's auth store; the server
+consumes pairing links from the database and shares the store runtime lock, so
+it works beside the running remote server without a restart. The resulting
+bearer is saved in the connection catalog beside the SSH profile, in the same
+update, and removed with the entry.
+
+A reconnect calls `ensureTunnel` (no token) and authorizes with the saved
+bearer, like a bearer target; no SSH command runs while the tunnel lives.
+When the credential is missing, or the host rejects it (authentication), the
+runtime mints once: pairing script, exchange, save, retry. A refreshed
+credential is written only while the entry still exists. A rejection of the
+freshly minted bearer blocks with `authentication` ("<host> rejected a new
+pairing credential. Connect again; …") instead of looping.
+
+The desktop never caches a pairing token: a live tunnel's bootstrap has none,
+and `issuePairingToken: true` on a live tunnel always mints a fresh one. On a
+cache hit it probes `/.well-known/bibcode/environment` through the tunnel
+(2 s); if that fails it drops the tunnel and takes the full launch-or-reuse
+path, which relaunches a managed server that stopped under a live SSH session.
+
+Preparation is serialised per target. The desktop holds one async lock per
+target connection key for the whole probe, launch-or-reuse, tunnel, and publish
+sequence, and disconnect takes the same lock, so two preparations never launch
+twice or overwrite each other's remote pid and port files, and a stop never
+interleaves with a preparation. A second caller waits and then takes the
+cache-hit path (probe, reuse, and a fresh mint if it asked for a token). The
+wait is bounded by the holder's own limits: the 2 s probe; each script's
+deadline, which also covers draining its output; 30 s of tunnel readiness
+polling (each request at most 2 s); 1.5 s per terminate-and-reap before the
+retained reaper takes over; and the 3-minute password prompt, at most twice
+per step. After `ssh` exits, its output is read until end of file or until
+the pipes have been idle for 2 s (a remote script's deadline bounds that
+drain; an exited tunnel's stderr gets at most 10 s), and only the last 64 KiB
+is kept, because a descendant that inherited the pipes (a ProxyCommand helper,
+a ControlPersist master on older OpenSSH, a backgrounded process) can keep
+them open indefinitely. Errors built from such output end with
+`[output cut off]`.
+
+SSH children run on a private Tokio runtime owned by `SshEnvironmentManager`:
+one worker thread and at most 128 blocking threads. It starts on first use and
+stops in the background at the end of `shutdown()`, after every SSH child is
+reaped. Script children are spawned, fed, drained, waited on, and reaped
+there, and tunnels are spawned there and their stderr read there. A published
+tunnel is terminated and reaped from the caller's runtime, which needs no
+blocking-pool thread: on Windows a child wait is a registered wait, and
+elsewhere it runs on the I/O runtime's driver. Password prompts and events stay
+on Tauri's runtime. On Windows, Tokio
+runs child pipe I/O on a blocking pool, so this keeps SSH output from queueing
+behind the in-process server's blocking work. When a drain gives up (idle
+pipes, the deadline, or shutdown), each pipe read still in flight is cancelled
+with `CancelIoEx`. The cancel repeats while the read is polled, for up to 1 s,
+so no pool thread stays parked on a pipe that a descendant holds open.
+
+**Revocation.** SSH access is the authority for a desktop-managed environment.
+A bearer revoked on the host's Share tab is replaced on the next connection by
+a new mint over SSH; to cut a desktop off, remove its SSH access or remove the
+environment on that desktop. The bearer has standard scopes only, so a leaked
+saved credential cannot create pairing links or offers, manage access, or
+install relay clients; an SSH connection therefore cannot use those host
+features either.
 
 `bibcode pairing offer` uses the same database-as-authority pattern for
 encrypted offers: it writes a share-shaped grant (`one-time-token` subject,
@@ -834,11 +998,16 @@ separate steps internally:
 
 ```mermaid
 flowchart LR
-  Profile["SSH profile"] --> Probe["probe or launch remote bibcode"]
+  Profile["SSH profile"] --> Tunnel["live tunnel responds?"]
+  Tunnel -- no --> Probe["launch or reuse remote bibcode"]
   Probe --> Forward["establish local forwarding"]
-  Forward --> Bootstrap["return endpoint + bootstrap"]
-  Bootstrap --> Auth["environment token exchange"]
-  Auth --> RPC["Effect RPC session"]
+  Tunnel -- yes --> Endpoint["local endpoint (no token)"]
+  Forward --> Endpoint
+  Endpoint --> Saved["authorize with saved bearer"]
+  Saved -- missing or rejected --> Mint["mint once over SSH, exchange, save"]
+  Mint --> Auth["authorize"]
+  Saved -- accepted --> RPC["Effect RPC session"]
+  Auth --> RPC
 ```
 
 Keeping launch separate prevents connection code from assuming that every
@@ -879,7 +1048,23 @@ performed on the machine that owns that server and filesystem.
 ## Current limitations
 
 - OS-backed protection for the desktop connection catalog is implemented on
-  Windows; other platforms currently use renderer storage fallback.
+  Windows; other platforms currently use renderer storage fallback, which also
+  holds saved SSH bearers.
+- Desktop-managed SSH still runs its first preparation after a desktop restart
+  (launch and tunnel, possibly a password prompt) inside the supervisor's
+  attempt window, and the bridge command cannot be cancelled. Preparation is
+  serialised per target, but two windows that both see a rejected bearer still
+  each ask for a token, so each mints once on the live tunnel (one extra host
+  session). Sessions
+  minted for SSH expire after 30 days; a standard-scope bearer cannot revoke
+  them.
+- The remote bounds cannot end a process stuck in uninterruptible I/O. A
+  recorded server stuck that way blocks new launches of its environment until
+  it exits.
+- The stop script never forces a managed server that ignores TERM, because
+  killing it could orphan its provider children. Such a server keeps running,
+  still recorded, until the next launch of its environment stops it; if the
+  environment is never launched again, it runs until the host ends it.
 - Desktop SSH and some advertised endpoint providers are host capabilities and
   are unavailable in an ordinary browser.
 - Endpoint availability is advisory. The connection supervisor still verifies

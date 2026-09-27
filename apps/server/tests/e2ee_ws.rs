@@ -26,6 +26,12 @@ use tokio_tungstenite::{
     },
 };
 
+#[path = "support/websocket_frames.rs"]
+mod websocket_frames;
+use websocket_frames::next_frame_past_heartbeat;
+#[path = "support/hermetic_providers.rs"]
+mod hermetic_providers;
+
 const NOISE_NK_PARAMS: &str = "Noise_NK_25519_ChaChaPoly_SHA256";
 const MAX_CIPHERTEXT_BYTES: usize = 65_535;
 const MAX_CHUNK_BYTES: usize = 65_518;
@@ -45,9 +51,9 @@ static TEST_PERMIT: Semaphore = Semaphore::const_new(1);
 type TestSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 async fn start_server(temp: &TempDir) -> ServerHandle {
-    ServerRuntime::start(ServerConfig::new(temp.path()).with_bind("127.0.0.1", 0))
-        .await
-        .expect("server starts")
+    let config = ServerConfig::new(temp.path()).with_bind("127.0.0.1", 0);
+    hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
+    ServerRuntime::start(config).await.expect("server starts")
 }
 
 fn ws_url(address: SocketAddr, path: &str) -> String {
@@ -916,9 +922,12 @@ async fn oversized_binary_frame_closes_the_connection() {
         .send(Message::Binary(vec![0_u8; MAX_CIPHERTEXT_BYTES + 1].into()))
         .await
         .expect("send oversized frame");
-    let outcome = timeout(Duration::from_secs(3), socket.next())
-        .await
-        .expect("oversized authenticated frame reaches a terminal outcome");
+    let outcome = timeout(
+        Duration::from_secs(3),
+        next_frame_past_heartbeat(&mut socket),
+    )
+    .await
+    .expect("oversized authenticated frame reaches a terminal outcome");
     assert!(matches!(
         outcome,
         None | Some(Ok(Message::Close(_))) | Some(Err(_))
@@ -984,9 +993,12 @@ async fn authenticated_empty_continuation_is_rejected() {
         .send(Message::Binary(frame.into()))
         .await
         .expect("send empty continuation");
-    let outcome = timeout(Duration::from_secs(3), socket.next())
-        .await
-        .expect("server rejects invalid fragmentation");
+    let outcome = timeout(
+        Duration::from_secs(3),
+        next_frame_past_heartbeat(&mut socket),
+    )
+    .await
+    .expect("server rejects invalid fragmentation");
     assert!(matches!(
         outcome,
         None | Some(Ok(Message::Close(_))) | Some(Err(_))
@@ -1008,9 +1020,12 @@ async fn incomplete_authenticated_message_closes_after_ten_seconds_without_progr
         .send(Message::Binary(frame.into()))
         .await
         .expect("send incomplete encrypted message");
-    let outcome = timeout(Duration::from_secs(12), socket.next())
-        .await
-        .expect("incomplete-message progress deadline");
+    let outcome = timeout(
+        Duration::from_secs(12),
+        next_frame_past_heartbeat(&mut socket),
+    )
+    .await
+    .expect("incomplete-message progress deadline");
     assert!(matches!(
         outcome,
         None | Some(Ok(Message::Close(_))) | Some(Err(_))
@@ -1238,9 +1253,12 @@ async fn inbound_plaintext_capacity_backpressures_by_principal_and_releases_on_c
     )
     .await;
     assert!(
-        timeout(Duration::from_millis(100), waiting.next())
-            .await
-            .is_err(),
+        timeout(
+            Duration::from_millis(100),
+            next_frame_past_heartbeat(&mut waiting)
+        )
+        .await
+        .is_err(),
         "principal pressure must backpressure without closing the waiting socket"
     );
 
@@ -1326,4 +1344,36 @@ async fn minted_pairing_offer_pins_the_host_key_and_opens_the_e2ee_channel() {
         Some(payload.storage_instance_id.as_str())
     );
     assert_get_config(&mut socket, &mut transport).await;
+}
+
+#[tokio::test]
+async fn interleave_v1_is_confirmed_only_when_the_client_lists_it() {
+    let _permit = TEST_PERMIT.acquire().await.expect("test permit");
+    let temp = TempDir::new().expect("temporary base directory");
+    let handle = start_server(&temp).await;
+    let startup = handle.startup_access().expect("startup pairing");
+    let credential = mint_e2ee_credential(&handle, temp.path(), &startup.credential).await;
+    let host_key = read_host_public_key(temp.path());
+
+    let (mut socket, mut transport) = noise_connect(handle.local_addr(), &host_key).await;
+    send_encrypted(
+        &mut socket,
+        &mut transport,
+        json!({ "type": "e2ee_auth", "bearer": credential, "features": ["interleave-v1"] })
+            .to_string()
+            .as_bytes(),
+    )
+    .await;
+    let reply = recv_encrypted_json(&mut socket, &mut transport).await;
+    assert_eq!(reply["type"], "e2ee_authenticated");
+    assert_eq!(reply["features"], json!(["interleave-v1"]));
+    assert_get_config(&mut socket, &mut transport).await;
+
+    let (_socket, _transport, reply) =
+        open_authenticated_bearer_socket(&handle, &host_key, &credential).await;
+    assert_eq!(reply["type"], "e2ee_authenticated");
+    assert!(
+        reply.get("features").is_none(),
+        "no features without the request: {reply}"
+    );
 }

@@ -626,9 +626,18 @@ fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// Every desktop-mode runtime with a bootstrap token owns an update-maintenance
+/// coordinator, whatever its bind; the desktop calls it in process.
+#[must_use]
+pub(crate) fn update_maintenance_owner_enabled(config: &ServerConfig) -> bool {
+    config.mode == ServerMode::Desktop && config.desktop_bootstrap_token.is_some()
+}
+
+/// The HTTP maintenance routes stay loopback-or-WSL only (overview "Desktop update
+/// protection"); a wildcard native bind answers 404.
 #[must_use]
 pub(crate) fn maintenance_routes_enabled(config: &ServerConfig) -> bool {
-    if config.mode != ServerMode::Desktop || config.desktop_bootstrap_token.is_none() {
+    if !update_maintenance_owner_enabled(config) {
         return false;
     }
     let local_bind = config

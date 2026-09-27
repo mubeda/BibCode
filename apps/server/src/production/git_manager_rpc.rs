@@ -117,6 +117,9 @@ pub struct ConfiguredGitManagerRpcServices {
     pull_requests: PullRequestService,
 }
 
+/// For tests and stand-alone registration: its repository has no shared host
+/// observation, so provider reads name only hosts identified by name. The server
+/// passes its shared repository to `GitManagerRpcServices::with_dependencies`.
 impl Default for ConfiguredGitManagerRpcServices {
     fn default() -> Self {
         let repository = Arc::new(GitRepository::default());

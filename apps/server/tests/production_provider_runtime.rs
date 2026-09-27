@@ -4,6 +4,12 @@
 // Fixture snapshot guards are explicitly dropped before async shutdown, which this lint
 // does not model reliably.
 
+#[path = "support/hermetic_providers.rs"]
+mod hermetic_providers;
+
+#[path = "support/executable_fixture.rs"]
+mod executable_fixture;
+
 use bibcode_server::production::provider_runtime;
 
 use std::{
@@ -85,6 +91,10 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::time::{timeout, timeout_at};
 use tokio::{net::TcpListener, sync::mpsc};
 use tokio_tungstenite::{WebSocketStream, connect_async, tungstenite::Message};
+
+#[path = "support/websocket_frames.rs"]
+mod websocket_frames;
+use websocket_frames::next_frame_past_heartbeat;
 
 const NOW: &str = "2026-07-10T10:00:00.000Z";
 const CHECKPOINT_RPC_INTEGRATION_DEADLINE: Duration = Duration::from_secs(30);
@@ -186,17 +196,9 @@ fn executable_fixture(
 ) -> PathBuf {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-
         let _ = windows_contents;
         let executable = temp.path().join(format!("{name}.sh"));
-        std::fs::write(&executable, unix_contents).expect("provider fixture should write");
-        let mut permissions = std::fs::metadata(&executable)
-            .expect("provider fixture metadata")
-            .permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&executable, permissions)
-            .expect("provider fixture should be executable");
+        executable_fixture::write_executable(&executable, unix_contents);
         executable
     }
     #[cfg(windows)]
@@ -818,6 +820,7 @@ fn launch() -> ProviderLaunchRequest {
         interaction_mode: "default".to_owned(),
         model: Some("gpt-5".to_owned()),
         options: Vec::new(),
+        custom_models: Vec::new(),
         service_tier: None,
         effort: None,
         agent: None,
@@ -1432,7 +1435,7 @@ async fn rpc_response<S>(socket: &mut WebSocketStream<S>, id: &str) -> Result<Va
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let frame = timeout(Duration::from_secs(10), socket.next())
+    let frame = timeout(Duration::from_secs(10), next_frame_past_heartbeat(socket))
         .await
         .expect("orchestration RPC response timeout")
         .expect("WebSocket remains open")
@@ -1511,7 +1514,7 @@ where
     .map_err(|_| format!("unary RPC {tag} send deadline elapsed"))?
     .map_err(|error| format!("failed to send unary RPC {tag}: {error}"))?;
 
-    let frame = timeout_at(deadline, socket.next())
+    let frame = timeout_at(deadline, next_frame_past_heartbeat(socket))
         .await
         .map_err(|_| format!("unary RPC {tag} response deadline elapsed"))?
         .ok_or_else(|| format!("unary RPC {tag} WebSocket closed before response"))?
@@ -1590,7 +1593,7 @@ async fn stream_rpc_message<S>(socket: &mut WebSocketStream<S>) -> ServerMessage
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let frame = timeout(Duration::from_secs(10), socket.next())
+    let frame = timeout(Duration::from_secs(10), next_frame_past_heartbeat(socket))
         .await
         .expect("stream RPC response timeout")
         .expect("stream WebSocket remains open")
@@ -1608,7 +1611,7 @@ async fn stream_rpc_message_until<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let frame = timeout_at(deadline, socket.next())
+    let frame = timeout_at(deadline, next_frame_past_heartbeat(socket))
         .await
         .map_err(|_| "Activity stream deadline elapsed".to_owned())?
         .ok_or_else(|| "Activity stream closed before convergence".to_owned())?
@@ -2926,11 +2929,13 @@ async fn durable_delivery_classifies_launch_failure_as_definitely_not_sent() {
         "launch-failure-key".to_owned(),
     )
     .await;
-    assert!(matches!(
+    // The retried delivery's detail names the provider as the user does, not by driver id.
+    assert_eq!(
         outcome,
-        ProviderDeliveryOutcome::DefinitelyNotSent { detail }
-            if detail.contains("fixture launch failed")
-    ));
+        ProviderDeliveryOutcome::DefinitelyNotSent {
+            detail: "Codex could not start: fixture launch failed".to_owned()
+        }
+    );
     let state = state.lock().unwrap();
     assert_eq!(state.starts, 1);
     assert!(state.sends.is_empty());
@@ -2940,6 +2945,466 @@ async fn durable_delivery_classifies_launch_failure_as_definitely_not_sent() {
 
     supervisor.shutdown().await.expect("supervisor shutdown");
     engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn durable_claude_turn_with_an_option_the_session_refuses_fails_once_instead_of_retrying() {
+    let temp = TempDir::new().expect("attachments");
+    let (engine, database) = engine_and_database().await;
+    let settings = TempDir::new().expect("settings");
+    // Nothing is spawned: the Claude session refuses the options before it launches a process.
+    write_live_retry_settings(&settings, "claudeAgent", "route-claude");
+    let command_id = "claude-refused-option".to_owned();
+    let mut row = delivery_row("claudeAgent", "claude-refused-option-key");
+    row.command_id = command_id.clone();
+    row.message_id = format!("message-{command_id}");
+    row.provider_instance_id = "route-claude".to_owned();
+    // A thread that picked Claude Fable 5 from the static fallback catalog persisted every select
+    // option at its default, including `contextWindow`, which the Claude session never applies.
+    row.payload = json!({
+        "type":"thread.turn.start", "commandId":command_id, "threadId":"t1",
+        "message":{
+            "messageId":row.message_id, "role":"user", "text":"hello", "attachments":[]
+        },
+        "modelSelection":{
+            "instanceId":"route-claude", "model":"claude-fable-5",
+            "options":[{"id":"effort","value":"high"},{"id":"contextWindow","value":"200k"}]
+        },
+        "runtimeMode":"full-access", "interactionMode":"default", "createdAt":NOW
+    });
+    freeze_row_route(&engine, &settings, &mut row).await;
+    seed_pending_delivery(&database, row).await;
+    let supervisor = Arc::new(ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(NativeProviderDriverFactory::new(
+            temp.path().join("attachments"),
+        )),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    ));
+    let service = TurnDeliveryService::start(
+        engine.clone(),
+        supervisor.clone(),
+        settings.path().to_path_buf(),
+    );
+    let read_delivery = || async {
+        engine
+            .repositories()
+            .get_provider_turn_delivery(command_id.clone())
+            .await
+            .expect("delivery row")
+            .expect("durable delivery")
+    };
+
+    let settled = timeout(Duration::from_secs(10), async {
+        loop {
+            let delivery = read_delivery().await;
+            // A retried refusal keeps claiming new attempts while it stays pending.
+            if delivery.state == TurnDeliveryState::Failed || delivery.attempts >= 3 {
+                break delivery;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the refused delivery fails or keeps retrying");
+    assert_eq!(
+        (settled.state, settled.attempts),
+        (TurnDeliveryState::Failed, 1),
+        "a refused option must end the turn instead of retrying it: {:?}",
+        settled.last_error
+    );
+    // The undelivered turn states the refusal plainly, without the driver's internal id.
+    let refusal = "contextWindow is not supported by the selected model.";
+    assert_eq!(settled.last_error.as_deref(), Some(refusal));
+    // A failed row is terminal: the worker claims only pending rows. Stopping the service drains
+    // its in-flight work, so the row read afterwards is final and the check needs no timing bound.
+    service.shutdown().await;
+    let later = read_delivery().await;
+    assert_eq!(
+        (later.state, later.attempts),
+        (TurnDeliveryState::Failed, 1)
+    );
+    let (unresolved_state, unresolved_detail) = database
+        .call(|connection| {
+            connection
+                .query_row(
+                    "SELECT unresolved_delivery_state, unresolved_delivery_detail FROM projection_threads WHERE thread_id = 't1'",
+                    [],
+                    |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .map_err(Into::into)
+        })
+        .await
+        .expect("thread shell");
+    assert_eq!(unresolved_state.as_deref(), Some("failed"));
+    assert_eq!(unresolved_detail.as_deref(), Some(refusal));
+
+    supervisor.shutdown().await.expect("supervisor shutdown");
+    engine.shutdown().await;
+}
+
+/// A turn with an option, driven through a real driver and the production delivery loop.
+/// `refusal` is the plain detail a refused turn fails with; `None` means the turn is delivered.
+struct OptionCase {
+    provider: &'static str,
+    instance_config: Value,
+    binary_path: Option<PathBuf>,
+    endpoint: Option<String>,
+    environment: Vec<(String, String)>,
+    model: &'static str,
+    option: Value,
+    refusal: Option<&'static str>,
+}
+
+/// Runs `case` until its delivery settles, and asserts it settles once: failed with the refusal,
+/// or delivered, after a single launch.
+async fn assert_option_case_settles_once(case: OptionCase) {
+    let temp = TempDir::new().expect("provider fixture directory");
+    let (engine, database) = engine_and_database().await;
+    let settings = TempDir::new().expect("settings");
+    let instance_id = format!("refusing-{}", case.provider);
+    let mut instances = serde_json::Map::new();
+    instances.insert(instance_id.clone(), case.instance_config);
+    std::fs::write(
+        settings.path().join("settings.json"),
+        serde_json::to_vec(&json!({ "providerInstances": instances })).expect("settings json"),
+    )
+    .expect("write settings");
+    let command_id = format!("refused-option-{}", case.provider);
+    let mut row = delivery_row(case.provider, &format!("{command_id}-key"));
+    row.command_id = command_id.clone();
+    row.message_id = format!("message-{command_id}");
+    row.provider_instance_id = instance_id.clone();
+    row.payload = json!({
+        "type":"thread.turn.start", "commandId":command_id, "threadId":"t1",
+        "message":{
+            "messageId":row.message_id, "role":"user", "text":"hello", "attachments":[]
+        },
+        "modelSelection":{"instanceId":instance_id, "model":case.model, "options":[case.option]},
+        "runtimeMode":"full-access", "interactionMode":"default", "createdAt":NOW
+    });
+    freeze_row_route(&engine, &settings, &mut row).await;
+    seed_pending_delivery(&database, row).await;
+    let launches = Arc::new(StdMutex::new(Vec::new()));
+    let supervisor = Arc::new(ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(NativeFixtureFactory {
+            inner: NativeProviderDriverFactory::new(temp.path().join("attachments")),
+            binary_path: case.binary_path,
+            endpoint: case.endpoint,
+            cwd: Some(temp.path().to_path_buf()),
+            environment: case.environment,
+            launches: launches.clone(),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    ));
+    let service = TurnDeliveryService::start(
+        engine.clone(),
+        supervisor.clone(),
+        settings.path().to_path_buf(),
+    );
+    let read_delivery = || async {
+        engine
+            .repositories()
+            .get_provider_turn_delivery(command_id.clone())
+            .await
+            .expect("delivery row")
+            .expect("durable delivery")
+    };
+
+    let Ok(settled) = timeout(Duration::from_secs(20), async {
+        loop {
+            let delivery = read_delivery().await;
+            if matches!(
+                delivery.state,
+                TurnDeliveryState::Failed | TurnDeliveryState::Delivered
+            ) || delivery.attempts >= 3
+            {
+                break delivery;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    else {
+        let delivery = read_delivery().await;
+        panic!(
+            "{}: the delivery neither settled nor retried: {:?} at attempt {}, {:?}",
+            case.provider, delivery.state, delivery.attempts, delivery.last_error
+        );
+    };
+    let expected = if case.refusal.is_some() {
+        TurnDeliveryState::Failed
+    } else {
+        TurnDeliveryState::Delivered
+    };
+    assert_eq!(
+        (settled.state, settled.attempts),
+        (expected, 1),
+        "{}: the turn must settle once instead of retrying: {:?}",
+        case.provider,
+        settled.last_error
+    );
+    assert_eq!(
+        settled.last_error.as_deref(),
+        case.refusal,
+        "{}",
+        case.provider
+    );
+    // A failed or delivered row is terminal: the worker claims only pending rows. Stopping the
+    // service drains its in-flight work, so what is read afterwards is final and the check needs
+    // no timing bound.
+    service.shutdown().await;
+    let later = read_delivery().await;
+    assert_eq!(
+        (later.state, later.attempts),
+        (expected, 1),
+        "{}",
+        case.provider
+    );
+    assert_eq!(
+        launches.lock().unwrap().len(),
+        1,
+        "{}: the turn launches its provider once",
+        case.provider
+    );
+
+    supervisor.shutdown().await.expect("supervisor shutdown");
+    engine.shutdown().await;
+}
+
+/// A Codex App Server whose model list advertises `gpt-5` with only `high` reasoning, or, with
+/// `BIBCODE_TEST_UNLISTED_MODEL` set, lists another model only. Its session runs
+/// `BIBCODE_TEST_SESSION_MODEL`, `gpt-5` by default, and it accepts every turn.
+#[cfg(unix)]
+const MODEL_LIST_CODEX_FIXTURE: &str = r#"#!/bin/sh
+session_model=${BIBCODE_TEST_SESSION_MODEL:-gpt-5}
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"id":%s,"result":{"userAgent":"fixture"}}\n' "$id" ;;
+    *'"method":"thread/start"'*|*'"method":"thread/resume"'*) printf '{"id":%s,"result":{"cwd":"/tmp","model":"%s","thread":{"id":"native-codex-thread"}}}\n' "$id" "$session_model" ;;
+    *'"method":"turn/start"'*) printf '{"id":%s,"result":{"turn":{"id":"native-codex-turn"}}}\n' "$id" ;;
+    *'"method":"mcpServerStatus/list"'*) printf '{"id":%s,"result":{"data":[],"nextCursor":null}}\n' "$id" ;;
+    *'"method":"model/list"'*)
+      if [ -n "$BIBCODE_TEST_UNLISTED_MODEL" ]; then
+        printf '{"id":%s,"result":{"data":[{"model":"gpt-other","serviceTiers":[],"supportedReasoningEfforts":[{"reasoningEffort":"high"}]}],"nextCursor":null}}\n' "$id"
+      else
+        printf '{"id":%s,"result":{"data":[{"model":"gpt-5","serviceTiers":[],"supportedReasoningEfforts":[{"reasoningEffort":"high"}]}],"nextCursor":null}}\n' "$id"
+      fi ;;
+    *'"method":"shutdown"'*) printf '{"id":%s,"result":null}\n' "$id" ;;
+  esac
+done
+"#;
+
+/// A Cursor agent whose session advertises only a model option, or, with
+/// `BIBCODE_TEST_FAST_WRONG_CATEGORY` set, a `fast` option in a category BiBCode does not use.
+#[cfg(unix)]
+const REFUSING_CURSOR_FIXTURE: &str = r#"#!/bin/sh
+if [ -n "$BIBCODE_TEST_FAST_WRONG_CATEGORY" ]; then
+  options='[{"id":"model","category":"model"},{"id":"fast","category":"model","type":"select","options":[{"value":"false"},{"value":"true"}]}]'
+else
+  options='[{"id":"model","category":"model"}]'
+fi
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*|*'"method":"authenticate"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+    *'"method":"session/new"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"cursor-session","configOptions":%s,"modes":{"currentModeId":"ask","availableModes":[{"id":"ask","name":"Ask"},{"id":"code","name":"Agent"},{"id":"architect","name":"Plan"}]}}}\n' "$id" "$options" ;;
+    *'"method":"session/set_config_option"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"configOptions":%s}}\n' "$id" "$options" ;;
+    *'"method":"session/set_mode"'*|*'"method":"session/set_model"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+  esac
+done
+"#;
+
+/// A Codex instance with one custom model, `gpt-custom`, driving [`MODEL_LIST_CODEX_FIXTURE`].
+#[cfg(unix)]
+fn codex_case(fixtures: &TempDir, display_name: Option<&str>) -> OptionCase {
+    let mut instance_config = json!({
+        "driver":"codex", "enabled":true,
+        "config":{
+            "binaryPath":"refusing-codex-route",
+            "homePath":fixtures.path().join("codex-home"),
+            "shadowHomePath":fixtures.path().join("codex-shadow"),
+            "customModels":["gpt-custom"]
+        }
+    });
+    if let Some(display_name) = display_name {
+        instance_config["displayName"] = json!(display_name);
+    }
+    OptionCase {
+        provider: "codex",
+        instance_config,
+        binary_path: Some(executable_fixture(
+            fixtures,
+            "model-list-codex",
+            MODEL_LIST_CODEX_FIXTURE,
+            "",
+        )),
+        endpoint: None,
+        environment: Vec::new(),
+        model: "gpt-5",
+        option: json!({"id":"reasoningEffort","value":"xhigh"}),
+        refusal: None,
+    }
+}
+
+#[cfg(unix)]
+fn cursor_case(fixtures: &TempDir) -> OptionCase {
+    OptionCase {
+        provider: "cursor",
+        instance_config: json!({
+            "driver":"cursor", "enabled":true, "config":{"binaryPath":"refusing-cursor-route"}
+        }),
+        binary_path: Some(executable_fixture(
+            fixtures,
+            "refusing-cursor",
+            REFUSING_CURSOR_FIXTURE,
+            "",
+        )),
+        endpoint: None,
+        environment: Vec::new(),
+        model: "gpt-5",
+        option: json!({"id":"fastMode","value":true}),
+        refusal: None,
+    }
+}
+
+/// Codex checks a turn's options against its model list after it starts. An option value the
+/// model does not advertise ends the durable turn after one launch.
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_option_the_model_does_not_advertise_fails_the_turn_once() {
+    let fixtures = TempDir::new().expect("fixture directory");
+    assert_option_case_settles_once(OptionCase {
+        refusal: Some("Reasoning Extra High is not supported by the selected model."),
+        ..codex_case(&fixtures, None)
+    })
+    .await;
+}
+
+/// A model that is neither on Codex's model list nor one of the instance's custom models cannot
+/// be checked, and never will be for the same turn, so the turn ends once, naming the instance as
+/// the user does.
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_model_missing_from_the_model_list_fails_the_turn_once() {
+    let fixtures = TempDir::new().expect("fixture directory");
+    assert_option_case_settles_once(OptionCase {
+        environment: vec![("BIBCODE_TEST_UNLISTED_MODEL".to_owned(), "1".to_owned())],
+        refusal: Some("gpt-5 is not available in Work Codex."),
+        ..codex_case(&fixtures, Some("Work Codex"))
+    })
+    .await;
+}
+
+/// The catalog offers an instance's custom models with the options of the first listed model, so
+/// a custom model with one of those efforts validates the same way and the turn is delivered.
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_custom_model_with_an_effort_is_delivered() {
+    let fixtures = TempDir::new().expect("fixture directory");
+    assert_option_case_settles_once(OptionCase {
+        environment: vec![(
+            "BIBCODE_TEST_SESSION_MODEL".to_owned(),
+            "gpt-custom".to_owned(),
+        )],
+        model: "gpt-custom",
+        option: json!({"id":"reasoningEffort","value":"high"}),
+        ..codex_case(&fixtures, None)
+    })
+    .await;
+}
+
+/// Cursor checks a turn's options against the session's advertised config options. An option the
+/// session does not advertise ends the durable turn after one launch.
+#[cfg(unix)]
+#[tokio::test]
+async fn cursor_option_the_session_does_not_advertise_fails_the_turn_once() {
+    let fixtures = TempDir::new().expect("fixture directory");
+    assert_option_case_settles_once(OptionCase {
+        refusal: Some("Fast is not supported by the selected model."),
+        ..cursor_case(&fixtures)
+    })
+    .await;
+}
+
+/// A session that advertises an option in a shape BiBCode does not use offers it the same way on
+/// every launch, so the turn ends once, with a plain detail instead of Cursor's protocol text.
+#[cfg(unix)]
+#[tokio::test]
+async fn cursor_option_in_an_unsupported_shape_fails_the_turn_once_in_plain_words() {
+    let fixtures = TempDir::new().expect("fixture directory");
+    assert_option_case_settles_once(OptionCase {
+        environment: vec![(
+            "BIBCODE_TEST_FAST_WRONG_CATEGORY".to_owned(),
+            "1".to_owned(),
+        )],
+        refusal: Some(
+            "BiBCode can't apply these options to the selected model. Choose another model, or turn these options off.",
+        ),
+        ..cursor_case(&fixtures)
+    })
+    .await;
+}
+
+/// OpenCode checks a turn's options against the model's advertised variants. An option the model
+/// does not offer ends the durable turn after one launch.
+#[cfg(unix)]
+#[tokio::test]
+async fn opencode_option_the_model_does_not_advertise_fails_the_turn_once() {
+    let app = Router::new()
+        .route(
+            "/session",
+            post(|| async { Json(json!({"id":"opencode-refusal-session"})) }),
+        )
+        .route(
+            "/session/{session_id}",
+            get(|| async { Json(json!({"id":"opencode-refusal-session"})) }),
+        )
+        .route(
+            "/event",
+            get(|| async { Sse::new(stream::pending::<Result<Event, Infallible>>()) }),
+        )
+        .route(
+            "/session/{session_id}/message",
+            get(|| async { Json(json!({"data":[]})) }),
+        )
+        .route(
+            "/provider",
+            get(|| async {
+                Json(json!({
+                    "connected": ["openai"],
+                    "all": [{"id":"openai", "models":{"gpt-5":{"variants":{"high":{}}}}}]
+                }))
+            }),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("OpenCode fixture bind");
+    let endpoint = format!("http://{}", listener.local_addr().expect("fixture address"));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("OpenCode fixture serve");
+    });
+    assert_option_case_settles_once(OptionCase {
+        provider: "opencode",
+        instance_config: json!({
+            "driver":"opencode", "enabled":true,
+            "config":{"binaryPath":"refusing-opencode-route", "serverUrl":endpoint}
+        }),
+        binary_path: None,
+        endpoint: Some(endpoint.clone()),
+        environment: Vec::new(),
+        model: "openai/gpt-5",
+        option: json!({"id":"fastMode","value":true}),
+        refusal: Some("Fast is not supported by the selected model."),
+    })
+    .await;
+    server.abort();
 }
 
 #[tokio::test]
@@ -3976,27 +4441,28 @@ async fn registered_dispatch_rpc_proves_one_mixed_attachment_delivery_for_every_
         activity_projection(&engine),
         SupervisorOptions::default(),
     ));
-    for (thread_id, _, provider, model) in providers {
-        supervisor
-            .launch(launch_for_provider(thread_id, provider, model))
-            .await
-            .expect("provider launch");
-    }
     let settings = TempDir::new().expect("settings");
-    std::fs::write(
-        settings.path().join("settings.json"),
-        serde_json::to_vec(&json!({
+    let binary_path = hermetic_providers::missing_provider_executable(settings.path());
+    hermetic_providers::write_hermetic_settings(
+        settings.path(),
+        json!({
             "providerInstances": {
                 "cursor": {
                     "driver": "cursor",
                     "enabled": true,
-                    "config": {"binaryPath": "cursor-agent"}
+                    "config": {"binaryPath": binary_path}
                 }
             }
-        }))
-        .expect("mixed provider settings"),
-    )
-    .expect("write mixed provider settings");
+        }),
+    );
+    for (thread_id, _, provider, model) in providers {
+        let mut request = launch_for_provider(thread_id, provider, model);
+        request.binary_path = binary_path
+            .to_str()
+            .expect("fixture path is UTF-8")
+            .to_owned();
+        supervisor.launch(request).await.expect("provider launch");
+    }
     let delivery = Arc::new(TurnDeliveryService::start(
         engine.clone(),
         supervisor.clone(),
@@ -4160,6 +4626,123 @@ async fn registered_dispatch_rpc_proves_one_mixed_attachment_delivery_for_every_
     socket.close(None).await.expect("websocket close");
     runtime.shutdown();
     runtime.join().await.expect("runtime shutdown");
+    delivery.shutdown().await;
+    supervisor.shutdown().await.expect("provider shutdown");
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn registered_dispatch_rpc_refuses_an_attachment_id_from_another_thread() {
+    let engine = engine().await;
+    engine
+        .dispatch(
+            serde_json::from_value(json!({
+                "type":"thread.create", "commandId":"thread-2", "threadId":"t2", "projectId":"p1",
+                "title":"Other thread", "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                "runtimeMode":"full-access", "branch":null, "worktreePath":null, "createdAt":NOW
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let state = Arc::new(StdMutex::new(DriverState::default()));
+    let (_events_tx, events_rx) = mpsc::channel(8);
+    let (_other_events_tx, other_events_rx) = mpsc::channel(8);
+    let supervisor = Arc::new(ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(VecDeque::from([events_rx, other_events_rx])),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    ));
+    supervisor.launch(launch()).await.unwrap();
+    let settings = TempDir::new().unwrap();
+    let mut registry = RpcRegistry::empty();
+    let delivery = Arc::new(TurnDeliveryService::start(
+        engine.clone(),
+        supervisor.clone(),
+        settings.path().to_path_buf(),
+    ));
+    register_orchestration_rpc_with_delivery(
+        &mut registry,
+        engine.clone(),
+        supervisor.clone(),
+        settings.path().to_path_buf(),
+        delivery.clone(),
+    );
+    let handle = ServerRuntime::start_with_registry(test_config(&settings), registry)
+        .await
+        .unwrap();
+    let (mut socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .unwrap();
+    let turn = |command_id: &str, thread_id: &str, attachment: Value| {
+        json!({
+            "type":"thread.turn.start", "commandId":command_id, "threadId":thread_id,
+            "message":{
+                "messageId":format!("message-{command_id}"), "role":"user", "text":"review",
+                "attachments":[attachment]
+            },
+            "createdAt":NOW
+        })
+    };
+    let reference = json!({
+        "type":"file", "id":"notes-1", "name":"notes.txt", "mimeType":"text/plain", "sizeBytes":5
+    });
+    let mut upload = reference.clone();
+    upload["dataUrl"] = json!("data:text/plain;base64,bm90ZXM=");
+
+    rpc_request(&mut socket, "801", turn("t1-upload", "t1", upload)).await;
+    rpc_response(&mut socket, "801")
+        .await
+        .expect("the upload is admitted on its own thread");
+
+    // The id exists and its size matches, but another thread's command attached it.
+    rpc_request(
+        &mut socket,
+        "802",
+        turn("t2-reuse", "t2", reference.clone()),
+    )
+    .await;
+    let cause = rpc_response(&mut socket, "802")
+        .await
+        .expect_err("another thread's attachment id is refused");
+    assert_eq!(cause[0]["error"]["_tag"], "InvalidRequest", "{cause}");
+    assert!(
+        cause[0]["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("notes-1")),
+        "{cause}"
+    );
+    assert!(
+        engine
+            .repositories()
+            .get_provider_turn_delivery("t2-reuse".to_owned())
+            .await
+            .expect("delivery lookup")
+            .is_none()
+    );
+    assert!(
+        !engine
+            .read_events(0)
+            .await
+            .expect("events")
+            .iter()
+            .any(|event| event.event.command_id.as_deref() == Some("t2-reuse")),
+        "a refused reference persists nothing"
+    );
+
+    // The thread that first received the attachment can still send it again by id.
+    rpc_request(&mut socket, "803", turn("t1-reuse", "t1", reference)).await;
+    rpc_response(&mut socket, "803")
+        .await
+        .expect("a thread may reuse its own attachment by id");
+
+    socket.close(None).await.expect("websocket close");
+    handle.shutdown();
+    handle.join().await.expect("runtime shutdown");
     delivery.shutdown().await;
     supervisor.shutdown().await.expect("provider shutdown");
     engine.shutdown().await;
@@ -4442,11 +5025,9 @@ async fn activity_only_provider_events_project_graph_mutations_without_root_payl
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
-            if snapshot
-                .activities
-                .iter()
-                .any(|entry| entry.thread_id == "t1" && entry.summary == "pump.barrier")
-            {
+            if snapshot.activities.iter().any(|entry| {
+                entry.thread_id == "t1" && entry.payload["eventType"] == "pump.barrier"
+            }) {
                 break;
             }
             tokio::task::yield_now().await;
@@ -4474,7 +5055,7 @@ async fn activity_only_provider_events_project_graph_mutations_without_root_payl
     assert!(
         root.activities
             .iter()
-            .all(|entry| entry.summary != "activity.native"),
+            .all(|entry| entry.payload["eventType"] != "activity.native"),
         "activity-only provider events must not append root thread activity"
     );
     assert!(root.messages.is_empty());
@@ -4555,7 +5136,7 @@ async fn mcp_complete_snapshots_project_in_order_for_the_selected_provider_insta
             if snapshot
                 .activities
                 .iter()
-                .filter(|activity| activity.summary == "mcp.status.updated")
+                .filter(|activity| activity.payload["eventType"] == "mcp.status.updated")
                 .count()
                 == 2
             {
@@ -4569,16 +5150,16 @@ async fn mcp_complete_snapshots_project_in_order_for_the_selected_provider_insta
     let ordinary = snapshot
         .activities
         .iter()
-        .find(|activity| activity.summary == "provider.note")
+        .find(|activity| activity.payload["eventType"] == "provider.note")
         .expect("ordinary provider activity");
     assert_eq!(
         ordinary.payload,
-        json!({ "providerInstanceId": "source-owned" })
+        json!({ "providerInstanceId": "source-owned", "eventType": "provider.note" })
     );
     let mcp_payloads = snapshot
         .activities
         .iter()
-        .filter(|activity| activity.summary == "mcp.status.updated")
+        .filter(|activity| activity.payload["eventType"] == "mcp.status.updated")
         .map(|activity| activity.payload.clone())
         .collect::<Vec<_>>();
     assert_eq!(
@@ -4586,14 +5167,16 @@ async fn mcp_complete_snapshots_project_in_order_for_the_selected_provider_insta
         vec![
             json!({
                 "servers": [{ "name": "old-only", "state": "connected" }],
-                "providerInstanceId": "codex-work"
+                "providerInstanceId": "codex-work",
+                "eventType": "mcp.status.updated"
             }),
             json!({
                 "servers": [
                     { "name": "new-a", "state": "error", "detail": "failed" },
                     { "name": "new-b", "state": "connected" }
                 ],
-                "providerInstanceId": "codex-work"
+                "providerInstanceId": "codex-work",
+                "eventType": "mcp.status.updated"
             }),
         ]
     );
@@ -4788,7 +5371,9 @@ async fn agent_activity_toggle_keeps_session_ready_and_fences_native_event_gener
                 .expect("orchestration snapshot")
                 .activities
                 .iter()
-                .any(|entry| entry.thread_id == "t1" && entry.summary == "pump.barrier")
+                .any(|entry| {
+                    entry.thread_id == "t1" && entry.payload["eventType"] == "pump.barrier"
+                })
             {
                 break;
             }
@@ -5234,7 +5819,7 @@ async fn provider_session_exit_does_not_treat_opencode_explicit_stop_as_loss() {
                 .unwrap()
                 .activities
                 .iter()
-                .any(|activity| activity.summary == "session.exited")
+                .any(|activity| activity.payload["eventType"] == "session.exited")
             {
                 break;
             }
@@ -5377,7 +5962,7 @@ async fn assert_provider_loss_relaunch(signal: ProviderLossSignal) {
             events
                 .iter()
                 .filter(|event| event.event.event_type == "thread.activity-appended"
-                    && event.event.payload["activity"]["summary"] == "session.exited")
+                    && event.event.payload["activity"]["payload"]["eventType"] == "session.exited")
                 .count(),
             usize::from(retained_sender.is_some()),
             "session.exited remains projected exactly once"
@@ -6912,7 +7497,7 @@ async fn invalid_native_ids_drop_only_activity_without_leaking_sensitive_text() 
                 .unwrap()
                 .activities
                 .iter()
-                .filter(|event| event.summary == "activity.invalid-native-id")
+                .filter(|event| event.payload["eventType"] == "activity.invalid-native-id")
                 .count();
             if ordinary_count == 3 {
                 break;
@@ -7003,7 +7588,9 @@ async fn mismatched_event_thread_cannot_contaminate_launch_activity_scope() {
                 .unwrap()
                 .activities
                 .iter()
-                .any(|event| event.thread_id == "t2" && event.summary == "activity.cross-thread")
+                .any(|event| {
+                    event.thread_id == "t2" && event.payload["eventType"] == "activity.cross-thread"
+                })
             {
                 break;
             }
@@ -7095,7 +7682,7 @@ async fn activity_scope_ensure_failure_is_diagnostic_only() {
                 .unwrap()
                 .activities
                 .iter()
-                .any(|event| event.summary == "provider.scope-unavailable")
+                .any(|event| event.payload["eventType"] == "provider.scope-unavailable")
             {
                 break;
             }
@@ -7175,7 +7762,7 @@ async fn activity_apply_failure_is_diagnostic_only() {
                 .unwrap()
                 .activities
                 .iter()
-                .any(|event| event.summary == "provider.activity-apply-failed")
+                .any(|event| event.payload["eventType"] == "provider.activity-apply-failed")
             {
                 break;
             }
@@ -10571,7 +11158,7 @@ async fn projects_distinct_provider_messages_and_settles_the_completed_turn() {
             let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
             if snapshot.activities.iter().any(|activity| {
                 activity.thread_id == "t1"
-                    && activity.summary == "turn.completed"
+                    && activity.payload["eventType"] == "turn.completed"
                     && activity.payload["state"] == "completed"
             }) {
                 break;
@@ -10771,7 +11358,7 @@ async fn unidentified_provider_chunks_share_one_settled_turn_message() {
             let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
             if snapshot.activities.iter().any(|activity| {
                 activity.thread_id == "t1"
-                    && activity.summary == "turn.completed"
+                    && activity.payload["eventType"] == "turn.completed"
                     && activity.payload["state"] == "completed"
             }) {
                 break;
@@ -10878,7 +11465,7 @@ async fn completion_without_assistant_text_does_not_create_a_message() {
             let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
             if snapshot.activities.iter().any(|activity| {
                 activity.thread_id == "t1"
-                    && activity.summary == "turn.completed"
+                    && activity.payload["eventType"] == "turn.completed"
                     && activity.payload["state"] == "completed"
             }) {
                 break;
@@ -10985,7 +11572,7 @@ async fn failed_and_interrupted_turns_settle_existing_assistant_messages() {
                 let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
                 if snapshot.activities.iter().any(|activity| {
                     activity.thread_id == "t1"
-                        && activity.summary == "turn.completed"
+                        && activity.payload["eventType"] == "turn.completed"
                         && activity.payload["state"] == terminal_state
                 }) {
                     break snapshot;
@@ -11174,7 +11761,7 @@ async fn project_terminal_with_completion_failures(
             let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
             if snapshot.activities.iter().any(|activity| {
                 activity.thread_id == "t1"
-                    && activity.summary == "session.updated"
+                    && activity.payload["eventType"] == "session.updated"
                     && activity.payload["sentinel"] == true
             }) {
                 break;
@@ -11767,9 +12354,10 @@ case "$1" in
   --version) printf '%s\n' '2.1.218'; exit 0;;
   --help) printf '%s\n' '--include-hook-events --forward-subagent-text'; exit 0;;
 esac
+# Short lines keep all stderr below one 4 KiB pipe page, regardless of pipe size.
 index=0
 while [ "$index" -lt 512 ]; do
-  printf 'queued stderr event %s\n' "$index" >&2
+  printf 'e%s\n' "$index" >&2
   index=$((index + 1))
 done
 : > "$BIBCODE_TEST_OUTPUT_WRITTEN"
@@ -11796,21 +12384,29 @@ cat >/dev/null
     })
     .await
     .expect("fixture writes enough events to saturate the provider event queue");
+    // This current-thread runtime runs stderr only while the test awaits. All
+    // 512 lines are readable before the marker, so after settling the task must
+    // be parked on the full 128-slot queue: nothing has consumed any events.
+    // Receiving fewer than 512 below proves shutdown ended that blocked producer.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     timeout(Duration::from_secs(1), driver.shutdown())
         .await
         .expect("shutdown must cancel producers blocked on a full event queue")
         .unwrap();
-    loop {
-        if timeout(Duration::from_secs(1), driver.next_event())
-            .await
-            .expect("event channel must close after queued events drain")
-            .is_none()
-        {
-            break;
+    let mut stderr_event_count = 0;
+    while let Some(event) = timeout(Duration::from_secs(1), driver.next_event())
+        .await
+        .expect("event channel must close after queued events drain")
+    {
+        if event.event_type == "session.stderr" {
+            stderr_event_count += 1;
         }
     }
+    assert!(
+        stderr_event_count > 0 && stderr_event_count < 512,
+        "shutdown must end a producer blocked on the full queue before all 512 stderr events are delivered; received {stderr_event_count}"
+    );
 }
 
 #[cfg(unix)]
@@ -12502,7 +13098,7 @@ async fn claude_activity_probe_invalidates_on_executable_metadata_and_version_ch
         "#!/bin/sh\nprintf x >> '{}'\n# changed executable metadata and output\ncase \"$1\" in\n  --version) printf '%s\\n' '2.1.219';;\n  --help) printf '%s\\n' '--unrelated-flag';;\n  *) exit 1;;\nesac\n",
         count_path.display()
     );
-    std::fs::write(&executable, second_script).expect("changed probe fixture should write");
+    executable_fixture::write_executable(&executable, second_script);
     let changed = probe_context
         .probe(executable.to_string_lossy().as_ref())
         .await;
@@ -13627,10 +14223,9 @@ done
     );
     let executable = executable_fixture(&state, "codex-targeted-rpc", &script, "");
     let config = test_config(&state);
-    std::fs::create_dir_all(config.state_dir()).expect("state directory");
-    std::fs::write(
-        config.state_dir().join("settings.json"),
-        serde_json::to_vec(&json!({
+    hermetic_providers::write_hermetic_settings(
+        &config.state_dir(),
+        json!({
             "providerInstances": {
                 "codex-targeted": {
                     "driver": "codex",
@@ -13638,10 +14233,8 @@ done
                     "config": { "binaryPath": executable }
                 }
             }
-        }))
-        .expect("settings json"),
-    )
-    .expect("provider settings");
+        }),
+    );
     let workspace = state.path().join("workspace");
     std::fs::create_dir(&workspace).expect("workspace");
     let handle = ServerRuntime::start(config.clone())
@@ -14095,10 +14688,9 @@ async fn targeted_activity_rpc_writes_only_the_selected_claude_stop_task_subtree
         .canonicalize()
         .expect("stable Claude targeted RPC fixture");
     let config = test_config(&state);
-    std::fs::create_dir_all(config.state_dir()).expect("state directory");
-    std::fs::write(
-        config.state_dir().join("settings.json"),
-        serde_json::to_vec(&json!({
+    hermetic_providers::write_hermetic_settings(
+        &config.state_dir(),
+        json!({
             "providerInstances": {
                 "claude-targeted": {
                     "driver": "claudeAgent",
@@ -14106,10 +14698,8 @@ async fn targeted_activity_rpc_writes_only_the_selected_claude_stop_task_subtree
                     "config": { "binaryPath": executable }
                 }
             }
-        }))
-        .expect("settings json"),
-    )
-    .expect("provider settings");
+        }),
+    );
     let handle = ServerRuntime::start(config.clone())
         .await
         .expect("production RPC server");
@@ -14615,10 +15205,9 @@ async fn targeted_activity_rpc_keeps_ambiguous_claude_children_unsupported_witho
         .canonicalize()
         .expect("stable ambiguous Claude targeted RPC fixture");
     let config = test_config(&state);
-    std::fs::create_dir_all(config.state_dir()).expect("state directory");
-    std::fs::write(
-        config.state_dir().join("settings.json"),
-        serde_json::to_vec(&json!({
+    hermetic_providers::write_hermetic_settings(
+        &config.state_dir(),
+        json!({
             "providerInstances": {
                 "claude-targeted-ambiguous": {
                     "driver": "claudeAgent",
@@ -14626,10 +15215,8 @@ async fn targeted_activity_rpc_keeps_ambiguous_claude_children_unsupported_witho
                     "config": { "binaryPath": executable }
                 }
             }
-        }))
-        .expect("settings json"),
-    )
-    .expect("provider settings");
+        }),
+    );
     let handle = ServerRuntime::start(config.clone())
         .await
         .expect("production RPC server");

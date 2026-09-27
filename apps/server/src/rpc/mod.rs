@@ -3,6 +3,7 @@ mod e2ee;
 mod message;
 mod methods;
 mod session;
+mod transport;
 
 pub use message::{
     CauseItem, ClientMessage, InvalidRequestId, RequestId, RpcExit, RpcRequest, ServerMessage,
@@ -19,5 +20,6 @@ pub(crate) use methods::{MethodMutability, method_mutability};
 pub(crate) use session::PairingConfirmationLatch;
 pub(crate) use session::{
     PreparedRpcResponse, RpcResponseEnqueueGuard, RpcResponseEnqueuePermit, RpcSessionContext,
-    RpcUnaryResult, encoded_server_message_len, run_session,
+    RpcUnaryResult, encoded_server_message_len, response_too_large_failure, run_session,
 };
+pub(crate) use transport::{CHUNKED_RPC_SUBPROTOCOL, MAX_RECORDED_MESSAGE_BYTES};

@@ -1,13 +1,15 @@
 use bibcode_server::orchestration::TurnDeliveryState;
 use bibcode_server::persistence::{
     AuthPairingLink, AuthSessionClient, AuthSessionDeliveryState, CheckpointDiffBlob,
-    CommandReceipt, Database, NewAuthPairingOffer, NewAuthSession, NewOrchestrationEvent,
-    ProjectionCheckpoint, ProjectionPendingApproval, ProjectionPendingTurnStart, ProjectionProject,
-    ProjectionState, ProjectionThread, ProjectionThreadActivity, ProjectionThreadMessage,
-    ProjectionThreadProposedPlan, ProjectionThreadSession, ProjectionTurnById,
-    ProviderSessionRuntime, Repositories, WorktreeRemovalReceipt, WorktreeRepositoryPinOutcome,
-    run_migrations,
+    CommandReceipt, Database, EVENT_PAGE_SIZE, NewAuthPairingOffer, NewAuthSession,
+    NewOrchestrationEvent, ProjectionCheckpoint, ProjectionPendingApproval,
+    ProjectionPendingTurnStart, ProjectionProject, ProjectionState, ProjectionThread,
+    ProjectionThreadActivity, ProjectionThreadMessage, ProjectionThreadProposedPlan,
+    ProjectionThreadSession, ProjectionTurnById, ProviderSessionRuntime, Repositories,
+    WorktreeRemovalReceipt, WorktreeRepositoryPinOutcome, run_migrations,
 };
+use std::collections::HashMap;
+
 use serde::Serialize;
 use serde_json::json;
 use tempfile::TempDir;
@@ -305,6 +307,7 @@ fn public_repository_api_inventory_is_explicit() {
 
     let mut expected = vec![
         "append_event",
+        "event_pages",
         "auth_authority_revision",
         "can_promote_queued_provider_turn",
         "claim_provider_turn",
@@ -312,6 +315,7 @@ fn public_repository_api_inventory_is_explicit() {
         "consume_auth_pairing_link",
         "complete_auth_pairing_offer",
         "confirm_pending_auth_session",
+        "count_active_work",
         "create_auth_pairing_link",
         "create_auth_pairing_link_with_offer",
         "create_auth_session",
@@ -359,12 +363,14 @@ fn public_repository_api_inventory_is_explicit() {
         "list_provider_turn_deliveries",
         "list_queued_provider_turn_heads",
         "list_referenced_attachment_ids",
+        "thread_attachment_digests",
         "list_thread_sessions_by_status",
         "list_threads_by_project",
         "load_worktree_catalog_projection",
         "list_turns_by_thread",
         "load_auth_authority_snapshot",
         "max_event_sequence",
+        "next_page",
         "min_last_applied_sequence",
         "pin_project_worktree_repository_key",
         "prepare_reserved_command_receipt",
@@ -527,6 +533,60 @@ async fn orchestration_event_writer_round_trips_json() {
         .expect("event 1");
     assert!(inserted_first.sequence > 0);
     assert_row_eq(&inserted_first.event, &first);
+}
+
+#[tokio::test]
+async fn event_pages_walk_the_log_after_a_cursor_one_bounded_page_at_a_time() {
+    let repositories = migrated_repositories().await;
+    let mut sequences = Vec::new();
+    for index in 0..EVENT_PAGE_SIZE + 2 {
+        let event = repositories
+            .append_event(NewOrchestrationEvent {
+                event_id: format!("paged-{index}"),
+                event_type: "thread.updated".to_owned(),
+                aggregate_kind: "thread".to_owned(),
+                aggregate_id: "thread-1".to_owned(),
+                occurred_at: T0.to_owned(),
+                command_id: None,
+                causation_event_id: None,
+                correlation_id: None,
+                payload: json!({}),
+                metadata: json!({}),
+            })
+            .await
+            .expect("event");
+        sequences.push(event.sequence);
+    }
+
+    let mut pages = repositories.event_pages(sequences[0]);
+    let first = pages
+        .next_page()
+        .await
+        .expect("first page")
+        .expect("events");
+    assert_eq!(first.len(), EVENT_PAGE_SIZE);
+    assert_eq!(first[0].sequence, sequences[1]);
+    let second = pages
+        .next_page()
+        .await
+        .expect("second page")
+        .expect("events");
+    assert_eq!(
+        second
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        sequences[EVENT_PAGE_SIZE + 1..]
+    );
+    assert!(pages.next_page().await.expect("end").is_none());
+    assert!(
+        repositories
+            .event_pages(*sequences.last().unwrap())
+            .next_page()
+            .await
+            .expect("empty tail")
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -771,6 +831,31 @@ async fn provider_turn_delivery_repositories_fetch_filter_reference_and_claim() 
             .await
             .expect("reference list"),
         vec!["attachment-a", "attachment-z"]
+    );
+    assert_eq!(
+        repositories
+            .thread_attachment_digests(
+                "thread-1".to_owned(),
+                vec![
+                    "attachment-z".to_owned(),
+                    "attachment-a".to_owned(),
+                    "attachment-unreferenced".to_owned(),
+                ],
+            )
+            .await
+            .expect("thread attachment digests"),
+        HashMap::from([
+            ("attachment-z".to_owned(), Some("digest-z".to_owned())),
+            ("attachment-a".to_owned(), None),
+        ])
+    );
+    assert!(
+        repositories
+            .thread_attachment_digests("thread-2".to_owned(), vec!["attachment-z".to_owned()])
+            .await
+            .expect("another thread's digests")
+            .is_empty(),
+        "an attachment belongs only to the thread whose command attached it"
     );
     let claimed = repositories
         .claim_provider_turn("command-a".to_owned(), "2026-08-01T00:00:04Z".to_owned())
@@ -1113,6 +1198,8 @@ async fn conversation_projection_repositories_round_trip_order_and_delete() {
     let repositories = migrated_repositories().await;
 
     let message_a = ProjectionThreadMessage {
+        delivery_reason: None,
+        delivery_provider_instance_id: None,
         delivery_mode: None,
         delivery_held: None,
         message_id: "message-a".to_owned(),
@@ -1133,6 +1220,8 @@ async fn conversation_projection_repositories_round_trip_order_and_delete() {
         updated_at: T1.to_owned(),
     };
     let message_b = ProjectionThreadMessage {
+        delivery_reason: None,
+        delivery_provider_instance_id: None,
         message_id: "message-b".to_owned(),
         created_at: T2.to_owned(),
         updated_at: T2.to_owned(),
@@ -2531,6 +2620,40 @@ async fn pending_auth_sessions_confirm_by_id_and_startup_cleanup_is_selective() 
             .as_deref(),
         Some(TIME_3),
     );
+}
+
+#[tokio::test]
+async fn active_work_counts_running_sessions_and_every_queued_message() {
+    let repositories = migrated_repositories().await;
+    assert_eq!(repositories.count_active_work().await.unwrap(), (0, 0));
+    for (thread_id, status) in [
+        ("busy", "running"),
+        ("booting", "starting"),
+        ("waiting", "ready"),
+    ] {
+        repositories
+            .upsert_thread_session(ProjectionThreadSession {
+                thread_id: thread_id.into(),
+                status: status.into(),
+                provider_name: Some("codex".into()),
+                provider_instance_id: Some("codex".into()),
+                runtime_mode: "approval-required".into(),
+                active_turn_id: None,
+                last_error: None,
+                last_error_class: None,
+                updated_at: T0.into(),
+            })
+            .await
+            .unwrap();
+    }
+    repositories.database().call(|connection| {
+        for (command, state) in [("q1", "queued"), ("q2", "queued"), ("sent", "delivered")] {
+            connection.execute("INSERT INTO orchestration_command_receipts (command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status) VALUES (?, 'thread', 'busy', ?, 0, 'accepted')", [command, T0])?;
+            connection.execute("INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, delivery_key, payload_json, state, mode, held, attempts, last_error, created_at, updated_at) VALUES (?, 'busy', ?, 'codex', 'codex', ?, '{}', ?, 'start', 0, 0, NULL, ?, ?)", [command, command, command, state, T0, T1])?;
+        }
+        Ok(())
+    }).await.unwrap();
+    assert_eq!(repositories.count_active_work().await.unwrap(), (2, 2));
 }
 
 #[tokio::test]

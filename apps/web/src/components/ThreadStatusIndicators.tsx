@@ -12,14 +12,18 @@ import { useEnvironmentQuery } from "../state/query";
 import { useThreadRunningTerminalIds } from "../state/terminalSessions";
 import { vcsEnvironment } from "../state/vcs";
 import { useUiStateStore } from "../uiStateStore";
-import { resolveChangeRequestPresentation } from "../sourceControlPresentation";
+import {
+  formatChangeRequestNumber,
+  resolveChangeRequestPresentation,
+} from "../sourceControlPresentation";
 import { resolveThreadStatusPill, type ThreadStatusPill } from "./Sidebar.logic";
 import type { SidebarThreadSummary } from "../types";
-import { formatWorktreePathForDisplay } from "../worktreeCleanup";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
 
 export interface PrStatusIndicator {
   label: string;
+  /** The number as its host writes it: "!57" on GitLab, "#12" elsewhere. */
+  numberLabel: string;
   colorClass: string;
   tooltip: string;
   url: string;
@@ -28,7 +32,6 @@ export interface PrStatusIndicator {
 export interface TerminalStatusIndicator {
   label: "Terminal process running";
   colorClass: string;
-  pulse: boolean;
 }
 
 type ThreadVcsStatus = VcsStatusResult | VcsStatusSummary;
@@ -40,28 +43,32 @@ export function prStatusIndicator(
 ): PrStatusIndicator | null {
   if (!pr) return null;
   const presentation = resolveChangeRequestPresentation(provider);
+  const numberLabel = formatChangeRequestNumber(provider?.kind, pr.number);
 
   if (pr.state === "open") {
     return {
       label: `${presentation.shortName} open`,
+      numberLabel,
       colorClass: "text-emerald-600 dark:text-emerald-300/90",
-      tooltip: `#${pr.number} ${presentation.shortName} open: ${pr.title}`,
+      tooltip: `${numberLabel} ${presentation.shortName} open: ${pr.title}`,
       url: pr.url,
     };
   }
   if (pr.state === "closed") {
     return {
       label: `${presentation.shortName} closed`,
+      numberLabel,
       colorClass: "text-zinc-500 dark:text-zinc-400/80",
-      tooltip: `#${pr.number} ${presentation.shortName} closed: ${pr.title}`,
+      tooltip: `${numberLabel} ${presentation.shortName} closed: ${pr.title}`,
       url: pr.url,
     };
   }
   if (pr.state === "merged") {
     return {
       label: `${presentation.shortName} merged`,
+      numberLabel,
       colorClass: "text-violet-600 dark:text-violet-300/90",
-      tooltip: `#${pr.number} ${presentation.shortName} merged: ${pr.title}`,
+      tooltip: `${numberLabel} ${presentation.shortName} merged: ${pr.title}`,
       url: pr.url,
     };
   }
@@ -101,89 +108,21 @@ export function terminalStatusFromRunningIds(
   if (runningTerminalIds.length === 0) {
     return null;
   }
+  // Muted and static: a running terminal is context, not an alert.
   return {
     label: "Terminal process running",
-    colorClass: "text-teal-600 dark:text-teal-300/90",
-    pulse: true,
+    colorClass: "text-muted-foreground",
   };
 }
 
-/**
- * Names the worktree a thread runs in, as muted text next to the title. It is
- * deliberately not an icon: the folder-git glyph is the sidebar's "New
- * worktree" action, and a status glyph in the trailing column read as a stray
- * button.
- */
-export function ThreadWorktreeIndicator({
-  thread,
-}: {
-  thread: Pick<SidebarThreadSummary, "id" | "branch" | "worktreePath">;
-}) {
-  const worktreePath = thread.worktreePath?.trim();
-  if (!worktreePath) {
-    return null;
-  }
-
-  const displayPath = formatWorktreePathForDisplay(worktreePath);
-  const tooltip = thread.branch
-    ? `Worktree: ${displayPath} (${thread.branch})`
-    : `Worktree: ${displayPath}`;
-  const label = thread.branch ?? displayPath;
-
-  return (
-    <Tooltip>
-      <TooltipTrigger
-        render={
-          <span
-            aria-label={tooltip}
-            data-testid={`thread-worktree-${thread.id}`}
-            className="max-w-24 shrink-0 truncate font-mono text-[10px] leading-none text-muted-foreground/70"
-          />
-        }
-      >
-        {label}
-      </TooltipTrigger>
-      <TooltipPopup side="top">{tooltip}</TooltipPopup>
-    </Tooltip>
-  );
-}
-
-export function ThreadStatusLabel({
-  status,
-  compact = false,
-}: {
-  status: ThreadStatusPill;
-  compact?: boolean;
-}) {
-  if (compact) {
-    return (
-      <Tooltip>
-        <TooltipTrigger
-          render={
-            <span
-              aria-label={status.label}
-              className={`inline-flex size-3.5 shrink-0 items-center justify-center ${status.colorClass}`}
-            />
-          }
-        >
-          <span
-            className={`size-[9px] rounded-full ${status.dotClass} ${
-              status.pulse ? "animate-pulse" : ""
-            }`}
-          />
-        </TooltipTrigger>
-        <TooltipPopup side="top">{status.label}</TooltipPopup>
-      </Tooltip>
-    );
-  }
-
+export function ThreadStatusLabel({ status }: { status: ThreadStatusPill }) {
   return (
     <Tooltip>
       <TooltipTrigger
         render={
           <span
             aria-label={status.label}
-            className={`inline-flex items-center gap-1 text-[10px] ${status.colorClass}`}
+            className={`inline-flex items-center gap-1 text-xs ${status.colorClass}`}
           />
         }
       >
@@ -295,7 +234,7 @@ export function ThreadRowTrailingStatus({ thread }: { thread: SidebarThreadSumma
               />
             }
           >
-            <TerminalIcon className={`size-3 ${terminalStatus.pulse ? "animate-pulse" : ""}`} />
+            <TerminalIcon className="size-3" />
           </TooltipTrigger>
           <TooltipPopup side="top">{terminalStatus.label}</TooltipPopup>
         </Tooltip>

@@ -21,7 +21,7 @@ use crate::{
         ChangeRequest, CreateWorktreeInput, GitCommandError, GitProcessRunner, GitRepository,
         GitStatusSummaryService, OutputPolicy, ProcessRequest, ProcessRunner,
         STATUS_SAFETY_INTERVAL, StatusBroadcaster, StatusReadFence, VcsStatusLocalResult,
-        VcsStatusRemoteResult, VcsStatusStreamEvent, validate_pathspecs,
+        VcsStatusRemoteResult, VcsStatusStreamEvent, clone_destination_leaf, validate_pathspecs,
     },
     maintenance::RpcPermit,
     persistence::{Repositories, WorktreeRemovalReceipt},
@@ -36,6 +36,7 @@ use crate::{
     worktree_catalog::{WorkspaceAdmissionLease, WorkspaceAvailabilityRegistry},
 };
 
+use super::clone_operations::{CloneRequest, CloneRuntime};
 use super::host_paths::resolve_host_directory;
 
 const STREAM_CAPACITY: usize = 8;
@@ -174,6 +175,7 @@ pub const GIT_VCS_UNARY_METHODS: &[&str] = &[
     "vcs.listRefs",
     "vcs.listCommits",
     "vcs.clone",
+    "vcs.cancelClone",
     "vcs.createRef",
     "vcs.switchRef",
     "vcs.init",
@@ -208,11 +210,14 @@ pub struct GitVcsRpcServices {
     /// `pullRequests.runAction` and its list-totals invalidation.
     created_request_observer: Option<Arc<dyn CreatedRequestObserver>>,
     github_command: PathBuf,
+    gitlab_command: PathBuf,
     github_runner: Arc<dyn GitProcessRunner>,
     availability_registry: Option<WorkspaceAvailabilityRegistry>,
     terminal: Option<TerminalManager>,
     repositories: Option<Repositories>,
     worktree_removal_tasks: WorktreeRemovalTaskTracker,
+    /// Server-owned clones, keyed by destination.
+    clone_operations: CloneRuntime,
     #[cfg(test)]
     status_stream_enrichment_test_hook: Option<Arc<StatusStreamEnrichmentTestHook>>,
 }
@@ -363,6 +368,7 @@ impl GitVcsRpcServices {
             let cwd = cwd.to_path_buf();
             handle.spawn(async move { summary.notify_local_change(&cwd).await });
         });
+        let clone_operations = CloneRuntime::new(Arc::clone(&repository));
         Self {
             broadcaster,
             summary,
@@ -372,14 +378,45 @@ impl GitVcsRpcServices {
             pull_requests,
             created_request_observer: None,
             github_command: PathBuf::from("gh"),
+            gitlab_command: PathBuf::from("glab"),
             github_runner: Arc::new(ProcessRunner),
             availability_registry: None,
             terminal,
             repositories,
             worktree_removal_tasks: WorktreeRemovalTaskTracker::default(),
+            clone_operations,
             #[cfg(test)]
             status_stream_enrichment_test_hook: None,
         }
+    }
+
+    /// Pin discovery, repository lookup, and pull requests (including passive
+    /// summaries) to test-owned executables before starting subscriptions.
+    /// Git remains the real executable; other probes use this directory.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_hosting_executable_dir_for_integration_test(mut self, directory: PathBuf) -> Self {
+        self.discovery =
+            SourceControlDiscovery::with_executable_dir_for_integration_test(directory.clone());
+        self.github_command = directory.join("gh");
+        self.gitlab_command = directory.join("glab");
+        self.pull_requests = PullRequestService::with_provider_commands(
+            self.github_command.to_string_lossy().into_owned(),
+            self.gitlab_command.to_string_lossy().into_owned(),
+            directory.join("az").to_string_lossy().into_owned(),
+        );
+        self.summary =
+            GitStatusSummaryService::new(Arc::clone(&self.repository), self.pull_requests.clone());
+        let observed_summary = self.summary.clone();
+        self.broadcaster.set_local_change_observer(move |cwd| {
+            let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                return;
+            };
+            let summary = observed_summary.clone();
+            let cwd = cwd.to_path_buf();
+            handle.spawn(async move { summary.notify_local_change(&cwd).await });
+        });
+        self
     }
 
     #[cfg(all(test, unix))]
@@ -432,6 +469,10 @@ impl GitVcsRpcServices {
 
     pub(crate) fn worktree_removal_tasks(&self) -> WorktreeRemovalTaskTracker {
         self.worktree_removal_tasks.clone()
+    }
+
+    pub(crate) fn clone_operations(&self) -> CloneRuntime {
+        self.clone_operations.clone()
     }
 
     pub(crate) fn status_broadcaster(&self) -> StatusBroadcaster {
@@ -855,21 +896,51 @@ impl GitVcsRpcServices {
             }
             "vcs.clone" => {
                 let input: CloneInput = decode(request.payload, "vcs.clone")?;
+                // One validated folder name before anything reads the disk or the runtime.
+                let leaf = clone_destination_leaf(&input.url, input.directory_name.as_deref())
+                    .map_err(|error| {
+                        vcs_error("vcs.clone", &input.parent_dir, &error.to_string())
+                    })?;
                 let parent_dir = resolve_host_directory(&input.parent_dir, false)
                     .await
                     .map_err(|error| {
                         vcs_error("vcs.clone", &input.parent_dir, &error.to_string())
                     })?;
-                let result = self
-                    .repository
-                    .clone_repository(
-                        &input.url,
-                        &parent_dir,
-                        input.directory_name.as_deref(),
+                // The starter's permit rides with the clone, so an update drain names a
+                // detached clone until Git has stopped and its cleanup has finished.
+                let path = self
+                    .clone_operations
+                    .start_or_join(
+                        CloneRequest {
+                            url: input.url,
+                            parent_dir,
+                            leaf,
+                            attach: input.attach,
+                            detach: input.detach,
+                        },
+                        context.admission_permit(),
                         &cancellation,
                     )
+                    .await?;
+                Ok(json!({ "path": display_path(path) }))
+            }
+            "vcs.cancelClone" => {
+                let input: CancelCloneInput = decode(request.payload, "vcs.cancelClone")?;
+                // A path as the folder name could alias another clone's destination key.
+                let leaf = clone_destination_leaf(&input.url, input.directory_name.as_deref())
+                    .map_err(|error| {
+                        vcs_error("vcs.cancelClone", &input.parent_dir, &error.to_string())
+                    })?;
+                let parent_dir = resolve_host_directory(&input.parent_dir, false)
+                    .await
+                    .map_err(|error| {
+                        vcs_error("vcs.cancelClone", &input.parent_dir, &error.to_string())
+                    })?;
+                let cancelled = self
+                    .clone_operations
+                    .cancel(&input.url, &parent_dir, &leaf)
                     .await;
-                encode_result(result.map(|path| json!({ "path": display_path(path) })))
+                Ok(json!({ "cancelled": cancelled }))
             }
             "vcs.generateCommitMessage" => {
                 let input: CommitMessageInput =
@@ -909,7 +980,8 @@ impl GitVcsRpcServices {
             "sourceControl.cloneRepository" => {
                 let input: CloneRepositoryInput =
                     decode(request.payload, "sourceControl.cloneRepository")?;
-                self.clone_source_repository(input, &cancellation).await
+                self.clone_source_repository(input, context.admission_permit(), &cancellation)
+                    .await
             }
             _ => Err(request_error(
                 &request.tag,
@@ -1239,7 +1311,14 @@ impl GitVcsRpcServices {
                     }
                     _ = cancellation.cancelled() => break,
                     publication = subscription.recv_publication() => {
-                        let Some(publication) = publication else { break };
+                        let publication = match publication {
+                            Some(Ok(publication)) => publication,
+                            Some(Err(error)) => {
+                                let _ = sender.send(Err(serialize_error(error))).await;
+                                break;
+                            }
+                            None => break,
+                        };
                         stop_status_stream_enrichment(&mut enrichment).await;
                         let enrichment_remote = match &publication.value {
                             VcsStatusStreamEvent::Snapshot { remote, .. }
@@ -1579,7 +1658,7 @@ impl GitVcsRpcServices {
                 ],
             ),
             "gitlab" => (
-                Path::new("glab"),
+                self.gitlab_command.as_path(),
                 vec!["repo", "view", &input.repository, "--output", "json"],
             ),
             provider => {
@@ -1604,6 +1683,7 @@ impl GitVcsRpcServices {
     async fn clone_source_repository(
         &self,
         input: CloneRepositoryInput,
+        admission: Option<RpcPermit>,
         cancellation: &CancellationToken,
     ) -> RpcResult {
         let remote_url = input
@@ -1623,19 +1703,48 @@ impl GitVcsRpcServices {
                 "Destination has no parent directory.",
             )
         })?;
-        tokio::fs::create_dir_all(parent).await.map_err(|error| {
-            source_control_error(
-                input.provider.as_deref().unwrap_or("unknown"),
-                "cloneRepository",
-                &error.to_string(),
-            )
-        })?;
+        let provider = input
+            .provider
+            .clone()
+            .unwrap_or_else(|| "unknown".to_owned());
+        // One validated folder name before the parent folder is created.
         let directory_name = destination.file_name().and_then(|value| value.to_str());
-        let cwd = self
-            .repository
-            .clone_repository(&remote_url, parent, directory_name, cancellation)
+        let leaf = clone_destination_leaf(&remote_url, directory_name).map_err(|error| {
+            source_control_error(&provider, "cloneRepository", &error.to_string())
+        })?;
+        tokio::fs::create_dir_all(parent).await.map_err(|error| {
+            source_control_error(&provider, "cloneRepository", &error.to_string())
+        })?;
+        // Destination keys use the canonical parent, so a symlinked or `..` alias of a running
+        // clone's folder joins it instead of meeting its half-written folder.
+        let parent_dir = resolve_host_directory(parent, false)
             .await
-            .map_err(serialize_error)?;
+            .map_err(|error| {
+                source_control_error(&provider, "cloneRepository", &error.to_string())
+            })?;
+        let cwd = self
+            .clone_operations
+            .start_or_join(
+                CloneRequest {
+                    url: remote_url.clone(),
+                    parent_dir,
+                    leaf,
+                    attach: false,
+                    detach: false,
+                },
+                admission,
+                cancellation,
+            )
+            .await
+            .map_err(|error| {
+                // The declared union is [SourceControlRepositoryError, EnvironmentRpcError], so
+                // every runtime failure travels as a SourceControlRepositoryError.
+                let detail = error["detail"]
+                    .as_str()
+                    .or_else(|| error["message"].as_str())
+                    .unwrap_or("The clone failed.");
+                source_control_error(&provider, "cloneRepository", detail)
+            })?;
         Ok(json!({ "cwd": display_path(cwd), "remoteUrl": remote_url, "repository": Value::Null }))
     }
 
@@ -2001,6 +2110,19 @@ struct RemoveWorktree {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CloneInput {
+    url: String,
+    parent_dir: PathBuf,
+    directory_name: Option<String>,
+    /// Join-only; sent only by clients that saw `vcsCloneReattach`.
+    #[serde(default)]
+    attach: bool,
+    /// The caller leaving does not stop a clone it started.
+    #[serde(default)]
+    detach: bool,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CancelCloneInput {
     url: String,
     parent_dir: PathBuf,
     directory_name: Option<String>,
@@ -3089,6 +3211,7 @@ mod mutation_ownership_tests {
                 VcsStatusStreamEvent::LocalUpdated {
                     local: VcsStatusLocalResult {
                         is_repo: true,
+                        repository_unavailable_reason: None,
                         source_control_provider: None,
                         has_primary_remote: false,
                         is_default_ref: false,
@@ -4144,7 +4267,10 @@ mod tests {
         let repository = Arc::new(GitRepository::with_runner_for_test(Arc::new(
             CapturedGitRunner::new(&sandbox),
         )));
-        let services = GitVcsRpcServices::with_repository(repository, Arc::default());
+        let services = GitVcsRpcServices::with_repository(repository, Arc::default())
+            .with_hosting_executable_dir_for_integration_test(
+                crate::test_support::hermetic_providers::missing_hosting_executable_dir(&cwd),
+            );
         let mut summaries = services
             .summary
             .subscribe(cwd.clone())
@@ -4163,6 +4289,67 @@ mod tests {
         )
         .await;
         assert!(!refreshed.stale);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hosting_fixture_directory_also_pins_passive_summary_pull_requests() {
+        let sandbox = crate::test_support::TestSandbox::new("summary-hosting-fixture");
+        let cwd = sandbox.root().to_path_buf();
+        git(&sandbox, &cwd, &["init", "-b", "main"]).await;
+        git(&sandbox, &cwd, &["config", "user.name", "Summary Test"]).await;
+        git(
+            &sandbox,
+            &cwd,
+            &["config", "user.email", "summary@example.test"],
+        )
+        .await;
+        git(&sandbox, &cwd, &["commit", "--allow-empty", "-m", "base"]).await;
+        git(
+            &sandbox,
+            &cwd,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/repo.git",
+            ],
+        )
+        .await;
+        let fixture = sandbox.executable_script(
+            "gh",
+            r#"test "$1" = pr && test "$2" = list && test "$4" = main || exit 1
+printf '%s\n' '[{"number":42,"title":"Fixture PR","url":"https://github.com/acme/repo/pull/42","baseRefName":"base","headRefName":"main","state":"OPEN"}]'"#,
+            "",
+        );
+        std::fs::rename(fixture, cwd.join("gh")).expect("hosting fixture name");
+        let repository = Arc::new(GitRepository::with_runner_for_test(Arc::new(
+            CapturedGitRunner::new(&sandbox),
+        )));
+        let services = GitVcsRpcServices::with_repository(repository, Arc::default())
+            .with_hosting_executable_dir_for_integration_test(cwd.clone());
+        let mut summaries = services
+            .summary
+            .subscribe(cwd)
+            .await
+            .expect("summary subscription");
+        let pr = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(Ok(summary)) = summaries.borrow_and_update().as_ref()
+                    && let Some(pr) = &summary.pr
+                {
+                    break pr.clone();
+                }
+                summaries
+                    .changed()
+                    .await
+                    .expect("summary producer stays alive");
+            }
+        })
+        .await
+        .expect("the summary must resolve its PR through the hosting fixture");
+        assert_eq!(pr.number, 42);
+        assert_eq!(pr.title, "Fixture PR");
     }
 
     #[tokio::test]
@@ -5200,12 +5387,61 @@ esac
         assert!(local.has_working_tree_changes, "nothing was committed");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hosting_fixture_directory_pins_discovery_lookup_and_pull_request_commands() {
+        let sandbox = tempfile::tempdir().expect("hosting sandbox");
+        let directory =
+            crate::test_support::hermetic_providers::missing_hosting_executable_dir(sandbox.path());
+        let services =
+            GitVcsRpcServices::with_repository(Arc::new(GitRepository::default()), Arc::default())
+                .with_hosting_executable_dir_for_integration_test(directory.clone());
+        assert_eq!(services.github_command, directory.join("gh"));
+        assert_eq!(services.gitlab_command, directory.join("glab"));
+        for (provider, executable) in [
+            (ProviderKind::Github, "gh"),
+            (ProviderKind::Gitlab, "glab"),
+            (ProviderKind::AzureDevops, "az"),
+        ] {
+            assert_eq!(
+                services
+                    .pull_requests
+                    .current_provider_command(provider)
+                    .unwrap()
+                    .executable,
+                directory.join(executable),
+                "pull-request commands must use the same hosting directory"
+            );
+        }
+        let discovery = unary(&services, "server.discoverSourceControl", json!({}))
+            .await
+            .expect("discovery");
+        for provider in ["github", "gitlab"] {
+            let discovered = discovery["sourceControlProviders"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["kind"] == provider)
+                .expect("hosting probe");
+            assert_eq!(discovered["status"], "missing");
+            let error = unary(
+                &services,
+                "sourceControl.lookupRepository",
+                json!({"provider":provider,"repository":"acme/repo","cwd":sandbox.path()}),
+            )
+            .await
+            .expect_err("missing hosting executable");
+            assert_eq!(error["_tag"], "SourceControlRepositoryError");
+            assert_eq!(error["provider"], provider);
+            assert_eq!(error["operation"], "lookupRepository");
+        }
+    }
+
     /// Only an explicit Settings scan records hosts: a background discovery read,
     /// such as the publish dialog's, leaves the host observation untouched.
     #[cfg(unix)]
     #[tokio::test]
     async fn only_an_explicit_source_control_discovery_records_hosts() {
-        use std::os::unix::fs::PermissionsExt;
         let sandbox = crate::test_support::TestSandbox::new("git-vcs-discovery-hosts");
         let bin = sandbox.root().join("bin");
         std::fs::create_dir_all(&bin).expect("bin directory");
@@ -5216,17 +5452,17 @@ esac
             "git.acme.example\n  Logged in to git.acme.example as alice\n",
         )
         .expect("authenticated fixture");
-        std::fs::write(
+        crate::test_support::executable_fixture::write_executable(
             &glab,
-            format!("#!/bin/sh\ncase \"$1\" in\n  --version) echo 'glab 1.114.0' ;;\n  auth) cat '{}' >&2 ;;\nesac\n", auth_output.display()),
-        )
-        .expect("glab script");
-        std::fs::set_permissions(&glab, std::fs::Permissions::from_mode(0o755))
-            .expect("glab permissions");
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'glab 1.114.0' ;;\n  auth) cat '{}' >&2 ;;\nesac\n",
+                auth_output.display()
+            ),
+        );
         let hosts = Arc::new(ProviderHosts::default());
         let repository = Arc::new(GitRepository::default().with_provider_hosts(hosts.clone()));
         let services = GitVcsRpcServices {
-            discovery: SourceControlDiscovery::with_executable_dir_for_test(bin),
+            discovery: SourceControlDiscovery::with_executable_dir_for_integration_test(bin),
             ..GitVcsRpcServices::with_repository(repository, hosts.clone())
         };
         let discover = |payload: Value| {
@@ -5361,7 +5597,6 @@ esac
             ENVIRONMENT_CASES, assert_child_environment, check_inherited_environment,
         };
         use crate::test_support::reexec;
-        use std::os::unix::fs::PermissionsExt;
 
         const CAPTURE: &str = "BIBCODE_FILE_MANAGER_ENVIRONMENT_CAPTURE";
         const TEST: &str =
@@ -5404,13 +5639,10 @@ esac
             for opener in ["xdg-open", "gio"] {
                 let directory = tempfile::tempdir().expect("file-manager fixture directory");
                 let executable = directory.path().join(opener);
-                std::fs::write(
+                crate::test_support::executable_fixture::write_executable(
                     &executable,
                     "#!/bin/sh\nfor target; do :; done\nprintf '%s' \"$$\" > \"$target.pid.tmp\" && /bin/mv \"$target.pid.tmp\" \"$target.pid\"\n/usr/bin/env -0 > \"$target.tmp\" && /bin/mv \"$target.tmp\" \"$target\"\nexit 9\n",
-                )
-                .expect("opener fixture");
-                std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
-                    .expect("executable opener fixture");
+                );
                 let capture = directory.path().join("environment");
                 reexec::run(TEST, "file-manager", None, |command| {
                     command.env(CAPTURE, &capture).env("PATH", directory.path());

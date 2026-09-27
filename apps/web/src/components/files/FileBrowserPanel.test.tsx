@@ -4,6 +4,8 @@ import { renderToStaticMarkup } from "react-dom/server";
 import * as React from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
+import { textSizesBelowTextXs } from "~/test/uiTypography";
+
 /**
  * FileBrowserPanel is rendered with `renderToStaticMarkup`. React's stateful
  * hooks are partially mocked: `useState` can be seeded and its setter calls are
@@ -73,10 +75,16 @@ const testState = vi.hoisted(() => ({
     error: null as string | null,
     isPending: false,
     refresh: (() => {}) as () => void,
+  } as {
+    data: { entries: ReadonlyArray<unknown>; truncated?: boolean } | null;
+    error: string | null;
+    isPending: boolean;
+    refresh: () => void;
   },
   primaryEnvironmentId: null as string | null,
   environmentHttpBaseUrl: null as string | null,
   environment: null as Record<string, unknown> | null,
+  connectionPhase: "connected" as string | null,
   preferredEditor: null as string | null,
   isPreviewSupported: true,
   isBrowserPreviewFile: (() => false) as (path: string) => boolean,
@@ -210,6 +218,9 @@ vi.mock("~/state/environments", () => ({
   useEnvironment: () => testState.environment,
   usePrimaryEnvironmentId: () => testState.primaryEnvironmentId,
   useEnvironmentHttpBaseUrl: () => testState.environmentHttpBaseUrl,
+  useEnvironmentConnectionState: () => ({
+    data: testState.connectionPhase === null ? null : { phase: testState.connectionPhase },
+  }),
 }));
 
 vi.mock("~/state/preview", () => ({
@@ -286,9 +297,21 @@ vi.mock("./FileTreeContextMenu", () => ({
   },
 }));
 
-vi.mock("./projectFilesQueryState", () => ({
-  useProjectEntriesQuery: () => testState.entriesQuery,
+vi.mock("../ui/button", () => ({
+  Button: (props: { children?: unknown; onClick?: () => void }) => {
+    ui.record("Button", props);
+    return <button type="button">{props.children as never}</button>;
+  },
 }));
+
+vi.mock("./projectFilesQueryState", () => {
+  // Automatic re-reads measure through the spy each test installs as `refresh`; one stable
+  // function keeps the entry-signal effect's dependency unchanged across renders.
+  const revalidate = () => testState.entriesQuery.refresh();
+  return {
+    useProjectEntriesQuery: () => ({ ...testState.entriesQuery, revalidate }),
+  };
+});
 
 import type { FileTreeMenuActions } from "./FileTreeContextMenu";
 import FileBrowserPanel, {
@@ -451,6 +474,7 @@ beforeEach(() => {
   testState.primaryEnvironmentId = environmentId;
   testState.environmentHttpBaseUrl = null;
   testState.environment = null;
+  testState.connectionPhase = "connected";
   testState.preferredEditor = null;
   testState.isPreviewSupported = true;
   testState.isBrowserPreviewFile = vi.fn(() => false);
@@ -488,6 +512,36 @@ describe("header rendering", () => {
     expect(markup).toContain(">demo</div>");
   });
 
+  it("shows no file count while the list has failed", () => {
+    testState.entriesQuery = {
+      data: null,
+      error: "Workspace query failed.",
+      isPending: false,
+      refresh: vi.fn(),
+    };
+    const markup = renderPanel();
+    expect(markup).toContain("Workspace query failed.");
+    expect(markup).not.toMatch(/\d files/);
+    expect(markup).not.toContain("Indexing…");
+  });
+
+  it("shows no file count before any list has loaded", () => {
+    testState.entriesQuery = { data: null, error: null, isPending: false, refresh: vi.fn() };
+    expect(renderPanel()).not.toMatch(/\d files/);
+  });
+
+  it("shows Indexing… and no file count while a failed list is read again", () => {
+    testState.entriesQuery = {
+      data: null,
+      error: "The connection dropped before the result arrived.",
+      isPending: true,
+      refresh: vi.fn(),
+    };
+    const markup = renderPanel();
+    expect(markup).toContain("Indexing…");
+    expect(markup).not.toMatch(/\d files/);
+  });
+
   it("shows the file count and the partial suffix when truncated", () => {
     setEntries([entry("a.ts", "file"), entry("b.ts", "file"), entry("dir", "directory")], {
       truncated: true,
@@ -498,6 +552,15 @@ describe("header rendering", () => {
     expect(markup).toContain('data-file-browser-panel="environment-1:/workspace/demo"');
     expect(markup).toContain("Collapse all folders");
     expect(markup).toContain("Expand all folders");
+  });
+
+  it("sets the header text at 12 px or larger (UI.md typography)", () => {
+    setEntries([entry("a.ts", "file")], { truncated: true });
+    const markup = renderPanel();
+    expect(markup).toContain("1 files · partial");
+    expect(textSizesBelowTextXs(markup)).toEqual([]);
+    // UI.md: the secondary color is solid; text never alpha-reduces it.
+    expect(markup).not.toMatch(/text-muted-foreground\/\d/);
   });
 
   it("shows and disables a user-initiated rescan while it is pending", () => {
@@ -524,6 +587,70 @@ describe("header rendering", () => {
     expect(markup).toContain("Workspace query failed.");
     expect(markup).toContain("text-destructive");
     expect(ui.filter("FileTree")).toHaveLength(0);
+  });
+
+  it("offers Retry for a cut-off list", () => {
+    const refresh = vi.fn();
+    testState.entriesQuery = {
+      data: null,
+      error: "The connection dropped before the result arrived.",
+      isPending: false,
+      refresh,
+    };
+    const markup = renderPanel();
+    expect(markup).toContain("The connection dropped before the result arrived.");
+    const retry = ui.filter("Button").find((props) => props.children === "Retry");
+    if (retry === undefined) throw new Error("Retry was not rendered.");
+    (retry.onClick as () => void)();
+    expect(refresh).toHaveBeenCalledOnce();
+  });
+
+  it("offers Retry for any failed list, not only a cut-off", () => {
+    const refresh = vi.fn();
+    testState.entriesQuery = {
+      data: null,
+      error: "Workspace query failed.",
+      isPending: false,
+      refresh,
+    };
+    renderPanel();
+    const retry = ui.filter("Button").find((props) => props.children === "Retry");
+    if (retry === undefined) throw new Error("Retry was not rendered.");
+    expect(retry["aria-disabled"]).toBeUndefined();
+    (retry.onClick as () => void)();
+    expect(refresh).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the failure on screen and disables Retry while the list is read again", () => {
+    testState.entriesQuery = {
+      data: null,
+      error: "The connection dropped before the result arrived.",
+      isPending: true,
+      refresh: vi.fn(),
+    };
+    const markup = renderPanel();
+    expect(markup).toContain("The connection dropped before the result arrived.");
+    const retry = ui.filter("Button").find((props) => props.children === "Retrying…");
+    if (retry === undefined) throw new Error("Retrying… was not rendered.");
+    expect(retry["aria-disabled"]).toBe(true);
+  });
+
+  it("waits for the connection instead of offering Retry while the environment is disconnected", () => {
+    const refresh = vi.fn();
+    testState.connectionPhase = "backoff";
+    testState.entriesQuery = {
+      data: null,
+      error: "The connection dropped before the result arrived.",
+      isPending: false,
+      refresh,
+    };
+    renderPanel();
+    const waiting = ui
+      .filter("Button")
+      .find((props) => props.children === "Waiting for the connection…");
+    if (waiting === undefined) throw new Error("Waiting for the connection… was not rendered.");
+    expect(waiting["aria-disabled"]).toBe(true);
+    expect(ui.filter("Button").some((props) => props.children === "Retry")).toBe(false);
   });
 
   it("wires the search and refresh buttons", () => {

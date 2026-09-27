@@ -9,6 +9,7 @@ commands.allow = [
   "desktop_bridge_restore_project_data",
   "desktop_bridge_start_empty_project_data",
   "desktop_bridge_retry_project_data",
+  "desktop_bridge_restart_app",
   "desktop_bridge_open_project_data_path",
   "desktop_bridge_export_project_data_diagnostics",
   "desktop_bridge_get_client_settings",

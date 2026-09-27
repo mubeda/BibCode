@@ -6002,7 +6002,7 @@ Record `Task 10 <tree> rpc::transport/session/e2ee + rpc_liveness (5) + rpc_wire
 - Test: `packages/contracts/src/rpcTransport.test.ts`
 - Modify: `packages/contracts/src/index.ts` (export)
 - Modify: `packages/contracts/scripts/export-rust-rpc-fixtures.ts` (static fixture)
-- Test: `packages/contracts/scripts/export-rust-rpc-fixtures.test.ts` (390 fixtures)
+- Test: `packages/contracts/scripts/export-rust-rpc-fixtures.test.ts` (+1 fixture relative to the tree this task runs on: 393 after the clone-reconnect plan, 390 before it)
 - Generated: `packages/contracts/fixtures/rpc-wire/exit-response-too-large.json`, `packages/contracts/fixtures/rpc-wire/manifest.json`
 - Create: `packages/client-runtime/src/rpc/transportErrors.ts`
 - Test: `packages/client-runtime/src/rpc/transportErrors.test.ts`
@@ -6098,15 +6098,23 @@ Expected: PASS.
 
 - [ ] **Step 2: Static wire fixture**
 
-First update `packages/contracts/scripts/export-rust-rpc-fixtures.test.ts` (current line 114), adding the presence assertion beside the count:
+This task adds exactly **one** fixture, relative to the tree it runs on. The clone-reconnect plan (`2026-09-24-clone-reconnect.md`, Tasks 1 and 5) adds its own fixtures to the same manifest, so read the current counts first:
+
+```bash
+node -e 'const m=require("./packages/contracts/fixtures/rpc-wire/manifest.json");console.log(m.methods.length,m.typedFailureFixtures.length,m.fixtures.length,Object.keys(m.schemaFingerprints).length)'
+```
+
+Expected after the clone-reconnect plan: `132 291 392 362`. Before it: `131 288 389 359`. With a partial landing, clone-reconnect Task 1 alone gives `131 289 390 360`. Whatever you read, the fixture count gains exactly 1. The method, typed-failure, and fingerprint counts stay exactly as read: this is a static wire fixture.
+
+Then update `packages/contracts/scripts/export-rust-rpc-fixtures.test.ts` (the `manifest.fixtures` length line), adding the presence assertion beside the count. The value shown is the expected one after the clone-reconnect plan (392 + 1); if you read another fixture count above, use that count + 1 instead:
 
 ```ts
-    expect(manifest.fixtures).toHaveLength(390);
+    expect(manifest.fixtures).toHaveLength(393);
     expect(manifest.fixtures).toContain("exit-response-too-large.json");
 ```
 
 Run: `vp test run packages/contracts/scripts/export-rust-rpc-fixtures.test.ts`
-Expected: FAIL (389 fixtures before the new fixture is exported). Method count, typed-failure count and schema fingerprint count do not change: this is a static wire fixture.
+Expected: FAIL (392 fixtures before the new fixture is exported, or the count you read). The method (132), typed-failure (291), and schema-fingerprint (362) pins do not change.
 
 In `packages/contracts/scripts/export-rust-rpc-fixtures.ts`:
 1. Add `import { RpcResponseTooLargeError } from "../src/rpcTransport.ts";` after the `../src/rpc.ts` import.
@@ -8230,7 +8238,7 @@ In `page`, replace everything from `let has_more = commits.len() > limit;` throu
 
 - [ ] **Step 3: Implement the review source bound**
 
-In `apps/server/src/production/runtime.rs` (current anchors: `GitReviewBackend` at 781, `run_review_diff` at 885, `untracked_review_diff` at 932):
+In `apps/server/src/production/runtime.rs` (current anchors: `GitReviewBackend` at 788, `run_review_diff` at 892, `untracked_review_diff` at 939; re-anchored after the clone-reconnect commit db847393):
 
 1. Add these helpers after `MAX_UNTRACKED_REVIEW_TOTAL_BYTES`. The capture owns at most the cap plus one EOF/overflow probe byte and stops reading immediately on overflow:
 
@@ -8373,7 +8381,7 @@ with:
 Keep the existing total/file-count caps. Update each existing
 `untracked_review_diff(cwd)` test call to
 `untracked_review_diff(cwd, MAX_REVIEW_SOURCE_DIFF_BYTES)`; the helper is local
-to this review backend. In `review_diff_commands_ignore_appimage_environment` (re-verified declaration at line 2708; tracked-diff expectation at line 2727), change `.expect("tracked review diff"),` to `.expect("tracked review diff").diff,` for the new capture result. No source captures an entire oversized git diff first.
+to this review backend. In `review_diff_commands_ignore_appimage_environment` (re-verified declaration at line 2715; tracked-diff expectation at line 2734, re-anchored after db847393), change `.expect("tracked review diff"),` to `.expect("tracked review diff").diff,` for the new capture result. No source captures an entire oversized git diff first.
 
 This file carries the PR-panel agent's uncommitted runtime edits. Re-read `GitReviewBackend` and `review_diff_commands_ignore_appimage_environment` before applying this task; touch only that review backend region.
 

@@ -99,6 +99,11 @@ cargo test -p bibcode-server --lib rpc::session::tests -j 2
 cargo test -p bibcode-server --test production_server_terminal_rpc -j 2
 ```
 
+Root runs leave these web tests uncompiled: confirm
+[compiler-sensitive](./README.md#web-unit-tests-and-the-react-compiler)
+happy-dom files from `apps/web` with `vp test run --project unit` and the same
+paths without the `apps/web/` prefix.
+
 Use delayed acknowledgements to prove that multiple ordered frames are sent
 before the first reply while the legacy path remains serialized. Include two
 input callers, Unicode paste boundaries, connection-wide saturation with
@@ -126,6 +131,11 @@ vp test run apps/web/src/components/ThreadTerminalPanel apps/web/src/components/
 cargo test -p bibcode-server --lib terminal -j 2
 cargo test -p bibcode-server --test production_server_terminal_rpc -j 2
 ```
+
+Root runs leave these web tests uncompiled: confirm
+[compiler-sensitive](./README.md#web-unit-tests-and-the-react-compiler)
+happy-dom files from `apps/web` with `vp test run --project unit` and the same
+paths without the `apps/web/` prefix.
 
 Open the same disposable terminal in two windows with different sizes, including
 a desktop host and remote browser when available. Use tmux and a supported
@@ -204,6 +214,9 @@ cargo test -p bibcode-server --test repositories -j 2
 cargo test -p bibcode-server migrations -j 2
 ```
 
+Deliver a queued message at completion and let its turn run past the idle timeout;
+the session must stay live until one idle timeout after that turn completes.
+
 Verify enqueue without a turn-start event or working projection, oldest-first
 promotion once per settle, explicit Send now clearing only its row's hold,
 interrupt/error holds, approval and user-input gates, and withdrawal without
@@ -214,7 +227,12 @@ must become the promotion time and place it after that reply, including after
 projection replay. Transaction rollback must preserve the original timestamps;
 steering and still-queued messages retain enqueue times. Dismissing a rejected head
 must unblock its tail; dismissing sending or uncertain work must preserve the
-barrier against automatic delivery before settlement. Exercise an older-client pending start
+barrier against automatic delivery before settlement. For a head refused for its
+model or options, verify that it offers only **Dismiss**, later pending messages
+show **Waiting for an earlier message**, and the queued head card shows
+**Waiting for an earlier message** with **Send now** and **Steer** disabled and
+the reason explained; dismissing the refused head releases them.
+Exercise an older-client pending start
 while running/starting and prove it is claimed only after ready, including
 the SQLite claim boundary. Migration coverage must preserve rows and indexes;
 recovery must preserve queued state, payload, mode, and existing holds without
@@ -374,6 +392,11 @@ cargo test -p bibcode-server discovery -j 2
 cargo test -p bibcode-server --test git_rpc source_control_discovery_uses_structured_bounded_probes -j 2
 ```
 
+Root runs leave these web tests uncompiled: confirm
+[compiler-sensitive](./README.md#web-unit-tests-and-the-react-compiler)
+happy-dom files from `apps/web` with `vp test run --project unit` and the same
+paths without the `apps/web/` prefix.
+
 Auth schema changes also require regenerated RPC fixtures and contract parity
 checks. A sandbox denial of TCP binding is a blocked validation result; record
 the exact error and rerun the affected target on a capable host. Do not report
@@ -505,6 +528,9 @@ loads, and it fails with an install instruction when dependencies are missing.
 Exact subprocess tests may select a single thread only when the subprocess
 intentionally owns isolated process-global state, as documented in the
 repository scripts reference.
+
+Root `vp test` runs web tests without the React Compiler; see
+[Web unit tests and the React Compiler](./README.md#web-unit-tests-and-the-react-compiler).
 
 A focused suite must cover the changed success behavior and its material
 failure, cancellation, retry, restart, and cleanup seams. For cross-platform
@@ -817,6 +843,11 @@ node scripts/run-msvc.mjs cargo test -p bibcode-server --test production_git_man
 node scripts/run-msvc.mjs cargo test -p bibcode-server --test git_rpc -- --nocapture
 vp test run packages/client-runtime/src/state/vcs.test.ts packages/client-runtime/src/state/gitManager.test.ts packages/client-runtime/src/state/gitManagerRefresh.test.ts apps/web/src/connection/platform.test.ts apps/web/src/components/GitActionsControl.test.tsx
 ```
+
+Root runs leave these web tests uncompiled: confirm
+[compiler-sensitive](./README.md#web-unit-tests-and-the-react-compiler)
+happy-dom files from `apps/web` with `vp test run --project unit` and the same
+paths without the `apps/web/` prefix.
 
 `vp run check:contracts` regenerates the RPC wire fixtures and ends by failing
 when the regenerated tree differs from the committed one, so a contract change
@@ -1139,8 +1170,150 @@ sending after a few megabytes while keeping the connection open. Clone through
    the folder is kept. Opening that repository in the Git Manager shows **No
    commits yet** and offers Fetch.
 
+Steps 5-8 need the clone to still be running when the outage, the Cancel, or
+the restart reaches the host. Either use a fixture whose clone lasts at least
+three times the longest outage (for example 120 MB or more of incompressible
+data at about 600 KB/s, over 200 seconds), or switch the throttled server to a
+slow rate during the event. Keep that rate above 1 KB/s, or Git's stall guard
+ends the clone. Record which method was used.
+
+5. Connection drop during a throttled clone: after the clone has run for about
+   ten seconds, drop the client's connection for at least 40 seconds (take the
+   network offline, or stop a TCP proxy between client and server). The form
+   keeps **Cloning…** and shows "Lost the connection to <host>. The clone
+   continues on the server; reconnecting…". The destination folder keeps
+   growing on the server. After the connection returns, the line clears, the
+   clone completes, and the dialog closes once the project appears. If the
+   clone finished during the outage, the re-attach finds the finished clone
+   and adds it the same way.
+6. Cancel across a reconnect: start a throttled clone and drop the connection.
+   Press **Cancel clone** while disconnected. The form shows **Cancelling…**
+   and "The clone stops when <host> reconnects.". Restore the connection. The
+   line clears while the cancel reaches the host, and the result depends on
+   where the clone stood:
+   - partial clone (Git still running when the Cancel reached the host): the
+     form shows "Clone cancelled." and the folder is removed;
+   - completed clone (Git finished first): the form shows "The clone finished
+     before it could be cancelled. It is in <path> and was not added as a
+     project. Press Clone to add it."; the folder keeps its full checkout, is
+     not added as a project, and the next **Clone** into it adds it.
+
+   Repeat with the connection restored before pressing Cancel, with the same
+   two outcomes. Then press **Cancel clone** while connected and drop the
+   connection at once: the form stays **Cancelling…** and shows "The clone
+   stops when <host> reconnects." until the connection returns. Close the
+   dialog while it shows the reconnecting line: it closes; after the
+   connection returns the clone is cancelled and its folder removed, and a new
+   Clone of that URL into that folder waits for the cancel, then starts. State
+   which outcome occurred in each variant.
+
+7. Server restart mid-clone: stop the server gracefully during a throttled
+   clone and start it again. For a partial clone, the destination folder is
+   removed during shutdown, and after reconnecting the form shows "No clone is
+   in progress for <path>. Press Clone to start again.". A clone that
+   completed before the stop is found again after reconnecting, and the
+   project is added.
+8. Window closed mid-clone (orphan policy): close the client window during a
+   throttled clone against a remote host. The cancel is best effort, so the
+   clone may keep running on the host. Reopen the client, and clone the same
+   URL into the same folder: it joins the running clone or adds the finished
+   repository. It must never report an incomplete clone while the orphan runs.
+
 Record each duration and the exact messages. SSH remotes have no stall guard;
 record SSH coverage separately if tested.
+
+## Slow-link liveness scenario
+
+Run this against an isolated development server (its own `BIBCODE_HOME`) or a
+standalone server reached from a browser, never against user data. Create a
+disposable repository whose newest commit adds a text file of about 4 MB, below
+the 4.375 MB patch bound, so Git Manager returns the whole patch:
+
+```sh
+node -e "require('fs').writeFileSync('big.txt', ('0123456789abcdef'.repeat(4)+'\n').repeat(61500))"
+git add big.txt && git commit -q -m "big diff"
+```
+
+Put `scripts/throttle-proxy.ts` between the browser and the server:
+
+1. Start the web client and note `webPort` from its `[dev-runner] mode=dev:web …`
+   line: `BIBCODE_PORT_OFFSET=81 vp run dev:web`. It targets server port
+   13854 (13773 + 81), where the proxy will listen.
+2. Start the server on another offset and allow the web origin:
+   `BIBCODE_PORT_OFFSET=80 BIBCODE_HOME=<disposable> vp run dev:server -- --dev-url http://localhost:<webPort>`.
+3. Start the proxy:
+   `node scripts/throttle-proxy.ts --listen 127.0.0.1:13854 --target 127.0.0.1:13853 --control 127.0.0.1:13855`.
+4. Pair through the server's startup token (`/pair#token=…` on the web port) and
+   add the repository.
+
+Before the establishment checks, open a thread in the environment so the
+composer shows its connection banner. Reconnect by reloading the page: the web
+client is served directly, so only the environment's HTTP and RPC traffic
+crosses the proxy.
+
+First record the size of the first config snapshot: the data the RPC WebSocket
+receives before the banner disappears, shown in the browser's network-panel
+frames. The checks exercise the old 15-second limit only when size ÷ rate
+exceeds 15 seconds (about 250 KB on a host with many Claude skills).
+
+Check establishment before the large-diff transfers:
+
+1. `curl "http://127.0.0.1:13855/set?down=16384&up=16384"`, then reload. The
+   environment must connect on its first attempt: one RPC WebSocket, no retry.
+   The banner reads "<environment>: Connecting…"; about 5 seconds after the
+   socket connects, its second line reads "Receiving settings from
+   <environment> over a slow connection…". The banner disappears when the
+   environment connects, after about 16 seconds plus preparation for a 255 KB
+   snapshot. "did not respond during connection setup." must not appear. A
+   remote environment reached through a proxy shows the same line on its
+   context card.
+2. Repeat at `down=8192&up=8192`: first-attempt connection after about 31 seconds
+   plus preparation.
+3. Repeat at `down=4096&up=4096` and record which bound decides the attempt:
+   connection after about 62 seconds when the path buffers the snapshot, or
+   the server ending the session at its write deadline when writes block.
+4. At 8 KiB/s, reload and freeze the link with
+   `curl "http://127.0.0.1:13855/set?freeze=1"` once the "Receiving settings…"
+   line shows. Within 33 seconds of the freeze the banner reads
+   "<environment>: Reconnecting…" with "No data from <environment> for 30
+   seconds. The connection is too slow or was lost." Record it within 15
+   seconds (the next attempt can replace it), then thaw with `freeze=0`.
+
+Then check liveness during large-diff transfers:
+
+1. `curl "http://127.0.0.1:13855/set?down=65536&up=65536"`, then open the big
+   commit's diff in Git Manager History. The transfer takes about a minute and
+   must finish without a disconnect. The socket must show
+   `Sec-WebSocket-Protocol: bibcode.rpc.chunked.v1`, and the large response must
+   arrive as binary frames. About 15 seconds in, the status bar shows a warning
+   such as **1 slow request**; clicking it lists `gitManager.getDiff` with its
+   start time. No toast covers the panel, and the warning clears when the
+   transfer finishes.
+2. Repeat at `down=262144&up=262144`.
+3. With the page idle, `curl "http://127.0.0.1:13855/set?freeze=1"`. Within 33
+   seconds the socket closes with code 4408, and Git Manager shows "Reconnecting
+   to <environment>. Git Manager loads when the connection is back." A remote
+   environment's context card shows "No data from <environment> for 30 seconds.
+   The connection is too slow or was lost. Reconnecting…". Record that text
+   within 15 seconds of the close. After that, keep the link frozen: the next
+   attempt must fail within 15 seconds of starting because the setup deadline
+   still applies before the socket connects. The descriptor request's own
+   10-second limit usually reports first as "Remote environment endpoint <url>
+   timed out after 10000ms." Record its time and text. Thaw with
+   `freeze=0` and confirm the connection returns.
+4. Freeze an idle connection and record the freeze-start timestamp. While it
+   remains frozen, verify the server ends that session within 50 seconds of
+   freeze start ("RPC peer silent past the heartbeat limit; ending the session",
+   with its `silent_for` and `limit` fields). Record the
+   timestamp and duration before thawing. A later end is a failed check;
+   accepted writes never move this measurement's origin.
+5. Thaw after the idle assertion. Start another large transfer, freeze it after the first record, and keep it
+   frozen. Verify server-side teardown within 33 seconds of freeze start,
+   before thawing. Record subscription cleanup and the writer-failure log.
+   A post-thaw close is not evidence of teardown within the bound.
+
+Record the rates, transfer durations, close codes, the exact status text, and
+the server log lines.
 
 ## Git Manager validation scenario
 
@@ -1628,6 +1801,11 @@ vp test run apps/web/src/components/pullRequests/pullRequestsTelemetry.test.tsx
 cargo test -p bibcode-server --lib pull_requests::tripwires -j 2
 ```
 
+The root run leaves this web test uncompiled: if a change is
+[compiler-sensitive](./README.md#web-unit-tests-and-the-react-compiler), confirm
+it from `apps/web` with `vp test run --project unit` and the same path without
+the `apps/web/` prefix.
+
 The web test forbids direct fetch/Image/WebSocket/XHR/beacon use and rendered
 images, checks all actor initials, advances an idle hour, and counts explicit
 refresh/action dispatches. Server tripwires inspect every module source,
@@ -1828,7 +2006,8 @@ sizes. Cover relevant:
   context card with its ⋯ menu when a remote environment is selected—verifying
   that switching rail selection filters the projects panel without interrupting
   running sessions on other environments—and the cross-environment **Agents**
-  nav row below Search, whose unread badge aggregates across environments;
+  nav row below Search, whose unread badge aggregates across environments and
+  is hidden when nothing is unread;
   verify that it opens the full Agents view, selecting a row shows its live
   session in the right pane, the back arrow returns to the normal view, and the
   per-row jump-to-workspace action returns to the normal view and re-points the
@@ -1841,6 +2020,34 @@ sizes. Cover relevant:
   while switching to verify that its completion does not replace the new
   selection's usage;
 - discovered and adopted external worktrees;
+- workspace cards and sidebar menus at the 422 px default width, in light and
+  dark: every status glyph (needs approval, waiting for your answer, working,
+  failed, plan ready, finished not opened, idle), the branch line with an open
+  and a merged request, a dirty dot and a running terminal, the session line,
+  **N more chats**, the hidden-worktree line, and the focus ring; **Shift+F10**
+  on a focused card opens exactly one menu at the card; separators between menu
+  groups in the native menus (macOS, Linux) and the in-app menu (Windows,
+  browser), never two in a row and never at an edge; **Pull** and **Copy Branch
+  Name** on worktree and primary cards; **Show Hidden Worktrees (N)** on an
+  expanded project with discovery; while a session runs or starts in a worktree, its
+  card's **Delete Worktree…** is disabled with "Stop the running session before
+  deleting this worktree." (the native menus append it to the label), and the
+  removal dialog, opened from **Settings → Archive → Delete**, shows its delete
+  action disabled with the same visible reason until the session stops;
+  on an isolated server with a fake provider holding a turn open, a scripted
+  `worktree.getRemovalPlan` followed by `worktree.remove` returns
+  `WorktreeRemovalError` with reason `session-running` and leaves the checkout
+  intact; a second client starting the turn after the dialog loads its plan
+  produces the same visible refusal sentence when the server rejects deletion;
+  after the session stops, deletion succeeds; capture the refusal in light and
+  dark; and
+  keyboard operation of the in-app menu;
+- the left panel after the typography sweep: an expanded project without
+  worktrees shows only its primary card; a saved server's project headers show
+  no cloud icon, while a WSL project under **Local** keeps its container icon;
+  the **Projects** label is sentence case; **Settings** matches the nav rows;
+  and no left-panel text is smaller than the cards' 12 px lines or letter-spaced
+  (the stage badge stays uppercase);
 - Create Worktree exact local and remote ref selection: the exact value appears
   once, the derived name remains correct, and a remote-to-local race succeeds
   without duplicate branch creation;
@@ -1884,6 +2091,10 @@ sizes. Cover relevant:
   directory-timestamp fidelity differs across that boundary;
 - Activity subagents and background tasks, including elapsed time and keyboard
   navigation;
+- with **Settings → General → Theme** on **System**, switch the operating system
+  between light and dark while the app shows the home screen and again while it
+  shows a thread: the window follows each switch without a reload; with
+  **Light** or **Dark** selected, the app ignores the switch;
 - responsive menus, overlays, narrow panels, and focus states; and
 - loaded interaction without stale ownership, duplicate events, or runaway
   process growth.

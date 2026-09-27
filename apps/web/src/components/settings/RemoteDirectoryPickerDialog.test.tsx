@@ -70,6 +70,8 @@ const harness = vi.hoisted(() => ({
     error: null as string | null,
     isPending: false,
     refresh: () => {},
+    revalidate: () => {},
+    requiresRetry: false,
   },
   reset() {
     this.browseInput = null;
@@ -81,7 +83,14 @@ const harness = vi.hoisted(() => ({
       .mockReset()
       .mockResolvedValue(AsyncResult.success({ relativePath: "new-folder" }));
     this.setPath.mockReset();
-    this.query = { data: null, error: null, isPending: false, refresh: this.refresh };
+    this.query = {
+      data: null,
+      error: null,
+      isPending: false,
+      refresh: this.refresh,
+      revalidate: this.refresh,
+      requiresRetry: false,
+    };
   },
 }));
 
@@ -215,6 +224,8 @@ describe("RemoteDirectoryPickerDialog", () => {
       error: null,
       isPending: false,
       refresh: harness.refresh,
+      revalidate: harness.refresh,
+      requiresRetry: false,
     };
     const onSelect = vi.fn();
     renderPicker(pickerProps({ initialPath: "~", onSelect }));
@@ -272,6 +283,8 @@ describe("RemoteDirectoryPickerDialog", () => {
       error: "Permission denied",
       isPending: true,
       refresh: harness.refresh,
+      revalidate: harness.refresh,
+      requiresRetry: false,
     };
     const markup = renderPicker(pickerProps({ initialPath: "/repo" }));
 
@@ -288,6 +301,8 @@ describe("RemoteDirectoryPickerDialog", () => {
       error: null,
       isPending: false,
       refresh: harness.refresh,
+      revalidate: harness.refresh,
+      requiresRetry: false,
     };
     expect(renderPicker(pickerProps({ initialPath: "/repo" }))).toContain("New folder");
     expect(button("New folder").disabled).toBe(false);
@@ -349,6 +364,8 @@ describe("RemoteDirectoryPickerDialog", () => {
       error: null,
       isPending: true,
       refresh: harness.refresh,
+      revalidate: harness.refresh,
+      requiresRetry: false,
     };
     expect(renderPicker(pickerProps())).toContain("Loading folders");
 
@@ -361,6 +378,8 @@ describe("RemoteDirectoryPickerDialog", () => {
       error: null,
       isPending: false,
       refresh: harness.refresh,
+      revalidate: harness.refresh,
+      requiresRetry: false,
     };
     const markup = renderPicker(pickerProps({ initialPath: "~" }));
     expect(markup).toContain("No visible folders");
@@ -373,6 +392,8 @@ describe("RemoteDirectoryPickerDialog", () => {
       error: "Directory is unavailable",
       isPending: false,
       refresh: harness.refresh,
+      revalidate: harness.refresh,
+      requiresRetry: false,
     };
     const props = pickerProps({ initialPath: "/inaccessible" });
     renderPicker(props);
@@ -391,6 +412,8 @@ describe("RemoteDirectoryPickerDialog", () => {
       error: null,
       isPending: false,
       refresh: harness.refresh,
+      revalidate: harness.refresh,
+      requiresRetry: false,
     };
     renderPicker(props);
     expect(button("Select folder").disabled).toBe(false);

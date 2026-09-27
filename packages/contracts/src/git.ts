@@ -1,7 +1,7 @@
 import * as Schema from "effect/Schema";
 import { NonNegativeInt, PositiveInt, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import { SourceControlProviderError, SourceControlProviderInfo } from "./sourceControl.ts";
-import { VcsDriverKind } from "./vcs.ts";
+import { VcsDriverKind, VcsRepositoryUnavailableReasonField } from "./vcs.ts";
 
 const TrimmedNonEmptyStringSchema = TrimmedNonEmptyString;
 const GIT_LIST_BRANCHES_MAX_LIMIT = 200;
@@ -170,8 +170,24 @@ export const GitCloneInput = Schema.Struct({
   url: TrimmedNonEmptyStringSchema,
   parentDir: TrimmedNonEmptyStringSchema,
   directoryName: Schema.optional(TrimmedNonEmptyStringSchema),
+  /** Join-only: never starts a clone. Sent only when the server advertises `vcsCloneReattach`. */
+  attach: Schema.optional(Schema.Boolean),
+  /** The caller leaving (socket close, Interrupt) does not stop a clone it started. */
+  detach: Schema.optional(Schema.Boolean),
 });
 export type GitCloneInput = typeof GitCloneInput.Type;
+
+export const GitCancelCloneInput = Schema.Struct({
+  url: TrimmedNonEmptyStringSchema,
+  parentDir: TrimmedNonEmptyStringSchema,
+  directoryName: Schema.optional(TrimmedNonEmptyStringSchema),
+});
+export type GitCancelCloneInput = typeof GitCancelCloneInput.Type;
+
+export const GitCancelCloneResult = Schema.Struct({
+  cancelled: Schema.Boolean,
+});
+export type GitCancelCloneResult = typeof GitCancelCloneResult.Type;
 
 export const GitPullRequestRefInput = Schema.Struct({
   cwd: TrimmedNonEmptyStringSchema,
@@ -240,6 +256,7 @@ const VcsStatusChangeRequest = Schema.Struct({
 
 const VcsStatusLocalShape = {
   isRepo: Schema.Boolean,
+  repositoryUnavailableReason: VcsRepositoryUnavailableReasonField,
   sourceControlProvider: Schema.optional(SourceControlProviderInfo),
   hasPrimaryRemote: Schema.Boolean,
   isDefaultRef: Schema.Boolean,
@@ -406,6 +423,28 @@ export class GitCommandError extends Schema.TaggedError<GitCommandError>()("GitC
     return `Git command failed in ${this.operation} (${this.cwd}): ${this.detail}`;
   }
 }
+
+export const GitCloneOperationReason = Schema.Literals([
+  "busy",
+  "capacity",
+  "shutting-down",
+  "not-in-progress",
+  "cancelled",
+]);
+export type GitCloneOperationReason = typeof GitCloneOperationReason.Type;
+
+/**
+ * The server's clone runtime refused or ended a clone. `destination` is the folder the clone
+ * targets; a `busy` error never names the running clone's URL, which may embed credentials.
+ */
+export class GitCloneOperationError extends Schema.TaggedError<GitCloneOperationError>()(
+  "GitCloneOperationError",
+  {
+    reason: GitCloneOperationReason,
+    destination: Schema.String,
+    message: Schema.String,
+  },
+) {}
 
 export class TextGenerationError extends Schema.TaggedError<TextGenerationError>()(
   "TextGenerationError",

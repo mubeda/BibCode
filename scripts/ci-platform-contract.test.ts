@@ -102,6 +102,21 @@ describe("cross-platform CI contract", () => {
     }
   });
 
+  it("runs the ignored SSH environment integration after building bibcode", () => {
+    const { workflow } = readWorkflow(CI_WORKFLOW_PATH);
+    const steps = requireJob(workflow, "test").steps ?? [];
+    const names = steps.map((step) => step.name);
+    const sshStep = steps.find((step) => step.name === "SSH environment integration");
+
+    expect(names.indexOf("SSH environment integration")).toBeGreaterThan(
+      names.indexOf("Rust workspace tests"),
+    );
+    expect(sshStep?.run?.trim().split("\n")).toEqual([
+      "cargo build -p bibcode-server --bin bibcode -j 2",
+      "cargo test -p bibcode-desktop --test ssh_environment -j 2 -- --ignored",
+    ]);
+  });
+
   it("allows the full test job to finish a cold Rust workspace build", () => {
     const { workflow } = readWorkflow(CI_WORKFLOW_PATH);
 

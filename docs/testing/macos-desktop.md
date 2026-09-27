@@ -131,6 +131,17 @@ still the primary action, the no-backup action requires acknowledgement, a
 forged first-attempt bypass is rejected by the native host, and an installer
 failure restarts the exact pre-update backend set.
 
+With the same isolated test instance, arrange an installer failure and have a
+test-owned listener acquire its backend port after shutdown, keeping it bound
+past the 3 s restart window. Confirm **Update not installed** names that port
+as in use, offers **Restart server**, and disables **Retry installation** with
+the visible restart explanation. Keep an unsent composer draft and verify it
+survives the outage. Release only the test listener, choose **Restart server**,
+and confirm the same backend port reconnects, the draft remains, and **Retry
+installation** becomes available without reopening the dialog. Record the
+listener/installer fixture and observed port in the execution report; never use
+the user's running instance for this check.
+
 ## Application and DMG build inspection
 
 Build the host-native artifact:
@@ -229,6 +240,10 @@ retained after reload. Record unavailable fixture/host states separately from
 that pass. The packaged Pierre spec's sibling checks route entry only; the
 shared procedure owns authenticated list/detail/files evidence.
 
+Include the shared [slow-link liveness scenario](./cross-platform-validation.md#slow-link-liveness-scenario)
+when a browser client and a development or standalone server are available on
+this platform; otherwise record it as unavailable evidence.
+
 Use Codex Computer Use to operate the packaged executable. Confirm the
 executable path and PID before using any frame as evidence. At normal and
 minimum sizes verify:
@@ -256,17 +271,27 @@ minimum sizes verify:
   (**EB** for **Edge box**). Hover the Settings row's status dot before and after
   saving: it stays **Connected**, with no reconnect during the rename. Reload
   the app, then restart it; after each, confirm the saved name and initials
-  persist;
+  persist. Disconnect reasons also use the saved name: rename the connected server, then
+  close or interrupt its connection and confirm the reconnecting detail names
+  the new alias. Repeat with a liveness timeout. Storage-identity errors still
+  use the server's reported name;
 - With that renamed test server connected, check a stalled connection on a
   macOS remote host: use `pgrep -f "bibcode serve"` or the process list to find
   the test server's PID, then run `kill -STOP <pid>` on that host. Hover the
   Settings row's status dot and wait for
-  `Failed to connect. Reconnecting... Reason: <server's own name> disconnected.`,
+  `No data from <saved name> for 30 seconds. The connection is too slow or was lost. Reconnecting…`,
   followed by
-  `Reason: Remote environment endpoint <base URL>/.well-known/bibcode/environment timed out after 10000ms.`
-  with the test server's endpoint URL. The disconnect reason uses the server's
-  own name, not the saved name. The disconnect appears before a health-check
-  message can become visible. Run `kill -CONT <pid>` on the remote host to resume
+  `Remote environment endpoint <base URL>/.well-known/bibcode/environment timed out after 10000ms. Reconnecting…`
+  with the test server's endpoint URL. The disconnect reason uses the saved
+  name (**Edge box**) and appears 27–33 seconds after the last data from the
+  stopped server, when the client's liveness timeout closes the socket with
+  code 4408. Keep BiBCode visible and focused for the whole stall: the
+  disconnect then appears before a health-check message can become visible. If
+  the window is restored from hidden or minimized during the stall, the
+  application-active health check can report
+  `<saved name> did not respond to a connection health check.` after 15
+  seconds instead; repeat the check with the window kept visible.
+  Run `kill -CONT <pid>` on the remote host to resume
   the same test server and confirm it reconnects;
 - select a saved server within a second of launch and confirm the rail keeps it
   selected for at least ten seconds while provider and settings updates arrive;
@@ -355,6 +380,14 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   without Early Access labels and omit Grok/Grok Terminal;
 - external worktree grouping, full paths, actions, physical identity, and
   restart are correct;
+- sidebar menus: right-click a worktree card, the primary card and a project
+  header, and open the header's **⋯** from the keyboard (Tab to it, then
+  **Enter**). Each native menu separates Open in/Pull, the copy actions,
+  Pin/Unread/Rename and the destructive item, with no doubled separator before
+  **Delete Worktree…** or **Remove Project…**, and **⋯** shows the same items
+  as the header's right-click menu. Tab to a card and press **Shift+F10**
+  (and, on Linux, the **Menu** key): exactly one native menu opens at the card,
+  and no error toast reports a second menu;
 - thread creation/switching, terminal I/O, Activity elapsed time, subagent row
   layout, background tasks, keyboard focus, and Shift+Tab work; and
 - narrow panels, menus, overlays, icons, and focus states remain contained.

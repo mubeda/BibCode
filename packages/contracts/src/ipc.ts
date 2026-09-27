@@ -96,8 +96,13 @@ import type {
   OrchestrationSubscribeThreadInput,
   OrchestrationThreadStreamItem,
 } from "./orchestration.ts";
-import { EnvironmentId, NonNegativeInt } from "./baseSchemas.ts";
-import { AuthAccessTokenResult, AuthSessionState, AuthWebSocketTicketResult } from "./auth.ts";
+import { EnvironmentId, NonNegativeInt, PortSchema } from "./baseSchemas.ts";
+import {
+  AuthAccessTokenResult,
+  type AuthEnvironmentScope,
+  AuthSessionState,
+  AuthWebSocketTicketResult,
+} from "./auth.ts";
 import { AdvertisedEndpoint } from "./remoteAccess.ts";
 import { EditorId } from "./editor.ts";
 import { ExecutionEnvironmentDescriptor } from "./environment.ts";
@@ -112,16 +117,34 @@ import type {
   SourceControlRepositoryLookupInput,
 } from "./sourceControl.ts";
 
+/**
+ * A divider between groups of a context menu. Renderers drop leading, trailing
+ * and repeated separators, so callers can build groups without tracking which
+ * neighbouring items were omitted.
+ */
+export interface ContextMenuSeparator {
+  readonly separator: true;
+}
+
 export interface ContextMenuItem<T extends string = string> {
   id: T;
   label: string;
   destructive?: boolean;
   disabled?: boolean;
+  /** Explains an unavailable action; exposed by renderers to sighted and assistive users. */
+  description?: string;
   /** Renders as a non-interactive section header label. Web fallback only — stripped on desktop native menus. */
   header?: boolean;
   /** Icon keyword resolved by the web fallback. Stripped on desktop native menus. */
   icon?: string;
-  children?: readonly ContextMenuItem<T>[];
+  children?: readonly ContextMenuEntry<T>[];
+}
+
+/** One row of a context menu: an actionable item or a separator. */
+export type ContextMenuEntry<T extends string = string> = ContextMenuItem<T> | ContextMenuSeparator;
+
+export interface ContextMenuSeparatorSchemaType {
+  readonly separator: true;
 }
 
 export interface ContextMenuItemSchemaType {
@@ -129,24 +152,38 @@ export interface ContextMenuItemSchemaType {
   readonly label: string;
   readonly destructive?: boolean;
   readonly disabled?: boolean;
+  readonly description?: string;
   readonly header?: boolean;
   readonly icon?: string;
-  readonly children?: readonly ContextMenuItemSchemaType[];
+  readonly children?: readonly ContextMenuEntrySchemaType[];
 }
+
+export type ContextMenuEntrySchemaType = ContextMenuItemSchemaType | ContextMenuSeparatorSchemaType;
+
+export const ContextMenuSeparatorSchema: Schema.Codec<ContextMenuSeparatorSchemaType> =
+  Schema.Struct({
+    separator: Schema.Literal(true),
+  });
 
 export const ContextMenuItemSchema: Schema.Codec<ContextMenuItemSchemaType> = Schema.Struct({
   id: Schema.String,
   label: Schema.String,
   destructive: Schema.optionalKey(Schema.Boolean),
   disabled: Schema.optionalKey(Schema.Boolean),
+  description: Schema.optionalKey(Schema.String),
   header: Schema.optionalKey(Schema.Boolean),
   icon: Schema.optionalKey(Schema.String),
   children: Schema.optionalKey(
     Schema.Array(
-      Schema.suspend((): Schema.Codec<ContextMenuItemSchemaType> => ContextMenuItemSchema),
+      Schema.suspend((): Schema.Codec<ContextMenuEntrySchemaType> => ContextMenuEntrySchema),
     ),
   ),
 });
+
+export const ContextMenuEntrySchema: Schema.Codec<ContextMenuEntrySchemaType> = Schema.Union([
+  ContextMenuItemSchema,
+  ContextMenuSeparatorSchema,
+]);
 
 export type DesktopUpdateStatus =
   | "disabled"
@@ -195,6 +232,20 @@ export interface DesktopUpdateInstallInput {
   excludedEnvironmentIds?: readonly string[];
   skipProtection?: boolean;
 }
+
+export interface DesktopBackendRecovery {
+  environmentId: string;
+  label: string;
+  reason: "port-in-use" | "other";
+  port: number;
+}
+
+export const DesktopBackendRecoverySchema = Schema.Struct({
+  environmentId: Schema.String,
+  label: Schema.String,
+  reason: Schema.Literals(["port-in-use", "other"]),
+  port: PortSchema,
+});
 
 export type DesktopRuntimeArch = "arm64" | "x64" | "other";
 export type DesktopTheme = "light" | "dark" | "system";
@@ -383,6 +434,11 @@ export const DesktopRuntimeInfoSchema = Schema.Struct({
   runningUnderArm64Translation: Schema.Boolean,
 });
 
+export interface DesktopUpdateRequester {
+  readonly label: string;
+  readonly detail: string | null;
+}
+
 export interface DesktopUpdateState {
   enabled: boolean;
   status: DesktopUpdateStatus;
@@ -399,6 +455,8 @@ export interface DesktopUpdateState {
   canRetry: boolean;
   phase?: DesktopUpdatePhase;
   protection?: ReadonlyArray<DesktopUpdateProtection>;
+  backendRecovery?: ReadonlyArray<DesktopBackendRecovery>;
+  requestedBy?: DesktopUpdateRequester | null;
 }
 
 export const DesktopUpdateStateSchema = Schema.Struct({
@@ -419,6 +477,12 @@ export const DesktopUpdateStateSchema = Schema.Struct({
   protection: Schema.Array(DesktopUpdateProtectionSchema).pipe(
     Schema.withDecodingDefault(Effect.succeed([])),
   ),
+  backendRecovery: Schema.Array(DesktopBackendRecoverySchema).pipe(
+    Schema.withDecodingDefault(Effect.succeed([])),
+  ),
+  requestedBy: Schema.NullOr(
+    Schema.Struct({ label: Schema.String, detail: Schema.NullOr(Schema.String) }),
+  ).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
 });
 
 export interface DesktopUpdateActionResult {
@@ -1224,6 +1288,7 @@ export interface DesktopBridge {
   ) => Promise<DesktopProjectDataRecoveryResult>;
   startEmptyProjectData?: (environmentId: string) => Promise<DesktopProjectDataRecoveryResult>;
   retryProjectData?: (environmentId: string) => Promise<void>;
+  restartApp?: () => Promise<void>;
   openProjectDataPath?: (environmentId: string) => Promise<void>;
   exportProjectDataDiagnostics?: (environmentId: string) => Promise<string | null>;
   discoverSshHosts: () => Promise<readonly DesktopDiscoveredSshHost[]>;
@@ -1233,9 +1298,15 @@ export interface DesktopBridge {
   ) => Promise<DesktopSshEnvironmentBootstrap>;
   disconnectSshEnvironment: (target: DesktopSshEnvironmentTarget) => Promise<void>;
   fetchSshEnvironmentDescriptor: (httpBaseUrl: string) => Promise<ExecutionEnvironmentDescriptor>;
+  /**
+   * Exchanges a one-time SSH pairing credential for a bearer. `scopes` is
+   * sent as the OAuth `scope`; without it the host grants every scope the
+   * bootstrap allows, administrative ones included.
+   */
   bootstrapSshBearerSession: (
     httpBaseUrl: string,
     credential: string,
+    scopes?: ReadonlyArray<AuthEnvironmentScope>,
   ) => Promise<AuthAccessTokenResult>;
   fetchSshSessionState: (httpBaseUrl: string, bearerToken: string) => Promise<AuthSessionState>;
   issueSshWebSocketTicket: (
@@ -1267,7 +1338,7 @@ export interface DesktopBridge {
   confirm: (message: string) => Promise<boolean>;
   setTheme: (theme: DesktopTheme) => Promise<void>;
   showContextMenu: <T extends string>(
-    items: readonly ContextMenuItem<T>[],
+    items: readonly ContextMenuEntry<T>[],
     position?: { x: number; y: number },
   ) => Promise<T | null>;
   openExternal: (url: string) => Promise<boolean>;
@@ -1380,7 +1451,7 @@ export interface LocalApi {
   };
   contextMenu: {
     show: <T extends string>(
-      items: readonly ContextMenuItem<T>[],
+      items: readonly ContextMenuEntry<T>[],
       position?: { x: number; y: number },
     ) => Promise<T | null>;
   };

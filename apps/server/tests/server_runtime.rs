@@ -10,7 +10,7 @@ use bibcode_server::{
     ConfigError, DESKTOP_SHUTDOWN_PATH, DESKTOP_SHUTDOWN_TOKEN_HEADER, ROUTE_INVENTORY,
     RpcRegistry, ServerConfig, ServerError, ServerMode, ServerRuntime, logging,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use reqwest::{Client, StatusCode, redirect::Policy};
 use serde_json::Value;
 use tempfile::TempDir;
@@ -23,12 +23,22 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungsten
 use url::Url;
 use uuid::Uuid;
 
-const PROVIDER_DRIVERS: [&str; 5] = ["codex", "claudeAgent", "cursor", "grok", "opencode"];
+#[path = "support/websocket_frames.rs"]
+mod websocket_frames;
+use websocket_frames::next_frame_past_heartbeat;
+#[path = "support/hermetic_providers.rs"]
+mod hermetic_providers;
+use hermetic_providers::BUILTIN_PROVIDER_DRIVERS;
+
 const SAME_LOG_PATH_CHILD_ENV: &str = "BIBCODE_TEST_SAME_LOG_PATH_CHILD_ROOT";
 const SAME_LOG_PATH_TEST: &str = "public_and_runtime_initializers_share_one_physical_log_writer";
 
 fn test_config(temp: &TempDir) -> ServerConfig {
-    ServerConfig::new(temp.path()).with_bind("127.0.0.1", 0)
+    let config = ServerConfig::new(temp.path()).with_bind("127.0.0.1", 0);
+    // Preserve pre-written fixture overrides while pinning unspecified drivers
+    // and disabling update checks before runtime startup.
+    hermetic_providers::ensure_hermetic_settings(&config.state_dir());
+    config
 }
 
 async fn assert_log_contains(path: &Path, marker: &str) {
@@ -120,6 +130,7 @@ fn write_disabled_provider_settings(temp: &TempDir) -> PathBuf {
     std::fs::write(
         &settings_path,
         serde_json::to_vec(&serde_json::json!({
+            "enableProviderUpdateChecks": false,
             "providers": {
                 "codex": { "enabled": false },
                 "claudeAgent": { "enabled": false },
@@ -164,11 +175,14 @@ async fn fetch_server_config(client: &Client, address: SocketAddr, access_token:
         ))
         .await
         .expect("send server configuration request");
-    let frame = timeout(Duration::from_secs(2), socket.next())
-        .await
-        .expect("server configuration timeout")
-        .expect("configuration WebSocket remains open")
-        .expect("server configuration frame");
+    let frame = timeout(
+        Duration::from_secs(2),
+        next_frame_past_heartbeat(&mut socket),
+    )
+    .await
+    .expect("server configuration timeout")
+    .expect("configuration WebSocket remains open")
+    .expect("server configuration frame");
     let wire: Value = serde_json::from_str(frame.to_text().expect("configuration text frame"))
         .expect("server configuration JSON");
     assert_eq!(wire["_tag"], "Exit");
@@ -206,7 +220,7 @@ async fn next_rpc_wire(
     socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
     context: &str,
 ) -> Value {
-    let frame = timeout(Duration::from_secs(2), socket.next())
+    let frame = timeout(Duration::from_secs(2), next_frame_past_heartbeat(socket))
         .await
         .unwrap_or_else(|_| panic!("{context} timeout"))
         .unwrap_or_else(|| panic!("{context} WebSocket remains open"))
@@ -814,14 +828,20 @@ async fn file_at_state_directory_returns_typed_state_files_error() {
     let state_directory = temp.path().join("userdata");
     std::fs::write(&state_directory, "not a directory").expect("state path fixture");
 
-    let error =
-        match ServerRuntime::start_with_registry(test_config(&temp), RpcRegistry::empty()).await {
-            Ok(handle) => {
-                drop(handle);
-                panic!("file state path must fail startup");
-            }
-            Err(error) => error,
-        };
+    // This custom-registry test must reach startup with an invalid state path;
+    // the normal fixture cannot write settings into that deliberate file.
+    let error = match ServerRuntime::start_with_registry(
+        ServerConfig::new(temp.path()).with_bind("127.0.0.1", 0),
+        RpcRegistry::empty(),
+    )
+    .await
+    {
+        Ok(handle) => {
+            drop(handle);
+            panic!("file state path must fail startup");
+        }
+        Err(error) => error,
+    };
     match error {
         ServerError::StateFiles(message) => {
             assert!(message.contains("failed to create state directory"));
@@ -884,8 +904,8 @@ async fn production_runtime_adapters_serve_snapshot_and_asset_errors() {
     let access_token = exchange_startup_credential(&client, handle.local_addr(), &credential).await;
     let config = fetch_server_config(&client, handle.local_addr(), &access_token).await;
     let providers = config["providers"].as_array().expect("provider snapshots");
-    assert_eq!(providers.len(), PROVIDER_DRIVERS.len());
-    for driver in PROVIDER_DRIVERS {
+    assert_eq!(providers.len(), BUILTIN_PROVIDER_DRIVERS.len());
+    for &driver in BUILTIN_PROVIDER_DRIVERS {
         assert_eq!(config["settings"]["providers"][driver]["enabled"], false);
         let provider = providers
             .iter()
@@ -982,8 +1002,14 @@ async fn streams_static_assets_with_security_and_cache_headers() {
     let temp = TempDir::new().expect("temporary base directory");
     let static_dir = temp.path().join("static");
     std::fs::create_dir_all(static_dir.join("docs")).expect("static directories");
+    std::fs::create_dir_all(static_dir.join("assets")).expect("build asset directory");
     std::fs::write(static_dir.join("index.html"), "<main>spa</main>").expect("SPA index");
     std::fs::write(static_dir.join("app.js"), "console.log('ok')").expect("asset");
+    std::fs::write(
+        static_dir.join("assets/app-AbCd1234.js"),
+        "console.log('hashed')",
+    )
+    .expect("hashed asset");
     std::fs::write(static_dir.join("docs/index.html"), "<main>docs</main>")
         .expect("extensionless index");
 
@@ -998,14 +1024,14 @@ async fn streams_static_assets_with_security_and_cache_headers() {
         .expect("asset response");
     assert_eq!(asset.status(), StatusCode::OK);
     assert_eq!(asset.headers()["x-content-type-options"], "nosniff");
-    assert_eq!(
-        asset.headers()["cache-control"],
-        "public, max-age=31536000, immutable"
-    );
+    assert_eq!(asset.headers()["cache-control"], "no-cache");
+    let etag = asset.headers()["etag"].clone();
+    assert!(etag.to_str().expect("ETag").starts_with("W/\""));
     assert!(asset.headers().contains_key("content-security-policy"));
     let csp = asset.headers()["content-security-policy"]
         .to_str()
-        .expect("CSP header");
+        .expect("CSP header")
+        .to_owned();
     for directive in [
         "object-src 'none'",
         "base-uri 'self'",
@@ -1015,6 +1041,76 @@ async fn streams_static_assets_with_security_and_cache_headers() {
     }
     assert_eq!(asset.text().await.expect("asset body"), "console.log('ok')");
 
+    let hashed = client
+        .get(endpoint(handle.local_addr(), "/assets/app-AbCd1234.js"))
+        .send()
+        .await
+        .expect("hashed asset response");
+    assert_eq!(hashed.status(), StatusCode::OK);
+    assert_eq!(
+        hashed.headers()["cache-control"],
+        "public, max-age=31536000, immutable"
+    );
+    assert!(!hashed.headers().contains_key("etag"));
+    assert_eq!(
+        hashed.text().await.expect("hashed body"),
+        "console.log('hashed')"
+    );
+
+    let conditional = client
+        .get(endpoint(handle.local_addr(), "/app.js"))
+        .header("if-none-match", etag.clone())
+        .send()
+        .await
+        .expect("conditional asset response");
+    assert_eq!(conditional.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(conditional.headers()["etag"], etag);
+    assert_eq!(conditional.headers()["cache-control"], "no-cache");
+    assert_eq!(conditional.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(conditional.headers()["content-security-policy"], csp);
+    assert!(
+        conditional
+            .bytes()
+            .await
+            .expect("conditional body")
+            .is_empty()
+    );
+
+    let head = client
+        .head(endpoint(handle.local_addr(), "/app.js"))
+        .send()
+        .await
+        .expect("HEAD asset response");
+    assert_eq!(head.status(), StatusCode::OK);
+    assert_eq!(head.headers()["cache-control"], "no-cache");
+    assert_eq!(head.headers()["etag"], etag);
+    assert_eq!(head.headers()["content-length"], "17");
+    assert_eq!(head.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(head.headers()["content-security-policy"], csp);
+    assert!(head.bytes().await.expect("HEAD body").is_empty());
+
+    std::fs::write(static_dir.join("app.js"), "console.log('updated')").expect("updated asset");
+    let changed = client
+        .get(endpoint(handle.local_addr(), "/app.js"))
+        .header("if-none-match", etag.clone())
+        .send()
+        .await
+        .expect("changed asset response");
+    assert_eq!(changed.status(), StatusCode::OK);
+    assert_eq!(changed.headers()["cache-control"], "no-cache");
+    assert_ne!(changed.headers()["etag"], etag);
+    assert_eq!(
+        changed.text().await.expect("changed body"),
+        "console.log('updated')"
+    );
+
+    let post = client
+        .post(endpoint(handle.local_addr(), "/app.js"))
+        .send()
+        .await
+        .expect("POST asset response");
+    assert_eq!(post.status(), StatusCode::NOT_FOUND);
+
     let docs = client
         .get(endpoint(handle.local_addr(), "/docs"))
         .send()
@@ -1022,16 +1118,73 @@ async fn streams_static_assets_with_security_and_cache_headers() {
         .expect("docs response");
     assert_eq!(docs.text().await.expect("docs body"), "<main>docs</main>");
 
+    let index = client
+        .get(endpoint(handle.local_addr(), "/"))
+        .send()
+        .await
+        .expect("index response");
+    assert_eq!(index.status(), StatusCode::OK);
+    assert_eq!(index.headers()["cache-control"], "no-cache");
+    assert!(!index.headers().contains_key("etag"));
+    assert_eq!(index.text().await.expect("index body"), "<main>spa</main>");
+
     let fallback = client
         .get(endpoint(handle.local_addr(), "/missing/route"))
         .send()
         .await
         .expect("fallback response");
     assert_eq!(fallback.headers()["cache-control"], "no-cache");
+    assert!(!fallback.headers().contains_key("etag"));
     assert_eq!(
         fallback.text().await.expect("fallback body"),
         "<main>spa</main>"
     );
+
+    let missing_asset = client
+        .get(endpoint(handle.local_addr(), "/assets/missing-AbCd1234.js"))
+        .header("if-none-match", "*")
+        .send()
+        .await
+        .expect("missing asset fallback response");
+    assert_eq!(missing_asset.status(), StatusCode::OK);
+    assert_eq!(missing_asset.headers()["cache-control"], "no-cache");
+    assert!(!missing_asset.headers().contains_key("etag"));
+    assert_eq!(
+        missing_asset.text().await.expect("missing asset body"),
+        "<main>spa</main>"
+    );
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("../app.js", static_dir.join("assets/alias-AbCd1234.js"))
+            .expect("unhashed asset symlink");
+        std::os::unix::fs::symlink("assets/app-AbCd1234.js", static_dir.join("alias.js"))
+            .expect("hashed asset symlink");
+        for (path, cache_control, has_etag, body) in [
+            (
+                "/assets/alias-AbCd1234.js",
+                "no-cache",
+                true,
+                "console.log('updated')",
+            ),
+            (
+                "/alias.js",
+                "public, max-age=31536000, immutable",
+                false,
+                "console.log('hashed')",
+            ),
+        ] {
+            let response = client
+                .get(endpoint(handle.local_addr(), path))
+                .send()
+                .await
+                .expect("symlink response");
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(response.headers()["cache-control"], cache_control, "{path}");
+            assert_eq!(response.headers().contains_key("etag"), has_etag, "{path}");
+            assert_eq!(response.text().await.expect("symlink body"), body, "{path}");
+        }
+    }
 
     handle.shutdown();
     handle.join().await.expect("server joins");
@@ -1059,6 +1212,7 @@ async fn preserves_path_and_query_when_redirecting_loopback_dev_requests() {
     let temp = TempDir::new().expect("temporary base directory");
     let config = test_config(&temp)
         .with_dev_url(Url::parse("http://127.0.0.1:5173/base").expect("valid dev URL"));
+    hermetic_providers::ensure_hermetic_settings(&config.state_dir());
     let handle = ServerRuntime::start(config).await.expect("server starts");
     let client = Client::builder()
         .redirect(Policy::none())
@@ -1075,6 +1229,18 @@ async fn preserves_path_and_query_when_redirecting_loopback_dev_requests() {
         response.headers()["location"],
         "http://127.0.0.1:5173/projects/one?tab=files"
     );
+
+    let head = client
+        .head(endpoint(handle.local_addr(), "/projects/one?tab=files"))
+        .send()
+        .await
+        .expect("HEAD redirect response");
+    assert_eq!(head.status(), StatusCode::FOUND);
+    assert_eq!(
+        head.headers()["location"],
+        "http://127.0.0.1:5173/projects/one?tab=files"
+    );
+    assert!(head.bytes().await.expect("HEAD redirect body").is_empty());
 
     handle.shutdown();
     handle.join().await.expect("server joins");

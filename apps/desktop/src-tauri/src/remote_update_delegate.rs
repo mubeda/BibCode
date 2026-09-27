@@ -5,14 +5,15 @@
 use std::sync::Arc;
 
 use bibcode_server::remote_update::{
-    HostUpdaterFuture, HostUpdaterStatus, RemoteUpdateDelegate, RemoteUpdateInstallMode,
-    RemoteUpdateState, RemoteUpdateSupport, RemoteUpdateSupportReason,
+    HostUpdaterFuture, HostUpdaterStatus, RemoteUpdateDelegate, RemoteUpdateInstallKind,
+    RemoteUpdateInstallMode, RemoteUpdateRequester, RemoteUpdateState, RemoteUpdateSupport,
+    RemoteUpdateSupportReason,
 };
 use serde_json::Value;
 use tauri::{AppHandle, Manager, Runtime};
 
 use crate::backend::BackendSupervisor;
-use crate::updates::{DesktopUpdateInstallInput, DesktopUpdateManager};
+use crate::updates::{DesktopUpdateInstallInput, DesktopUpdateManager, RemoteUpdateRequest};
 
 /// The same facts feed `ServerConfig.remote_update_support` and this delegate, so the
 /// descriptor and the RPC behavior cannot drift.
@@ -22,16 +23,19 @@ pub fn derive_remote_update_support(updater_enabled: bool) -> RemoteUpdateSuppor
         RemoteUpdateSupport {
             install_mode: RemoteUpdateInstallMode::Manual,
             reason: RemoteUpdateSupportReason::UnpackagedBuild,
+            install_kind: RemoteUpdateInstallKind::Unknown,
         }
     } else if updater_enabled {
         RemoteUpdateSupport {
             install_mode: RemoteUpdateInstallMode::Interactive,
             reason: RemoteUpdateSupportReason::Available,
+            install_kind: RemoteUpdateInstallKind::Unknown,
         }
     } else {
         RemoteUpdateSupport {
             install_mode: RemoteUpdateInstallMode::Manual,
             reason: RemoteUpdateSupportReason::UpdaterUnavailable,
+            install_kind: RemoteUpdateInstallKind::Unknown,
         }
     }
 }
@@ -58,10 +62,45 @@ pub fn map_desktop_update_state(state: &Value) -> HostUpdaterStatus {
     } else {
         None
     };
+    let download_percent = (mapped == RemoteUpdateState::Downloading)
+        .then(|| state["downloadPercent"].as_f64())
+        .flatten()
+        .map(|percent| percent.clamp(0.0, 100.0).floor() as u8);
+    let install_stage = match phase {
+        "installing" => Some("installing".to_owned()),
+        "protecting" => state["protection"].as_array().and_then(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry["status"] == "pending")
+                .and_then(|entry| entry["stage"].as_str())
+                .map(str::to_owned)
+        }),
+        _ => None,
+    };
     HostUpdaterStatus {
+        target_version: latest_version.clone(),
         latest_version,
         state: mapped,
         error,
+        download_percent,
+        install_stage,
+    }
+}
+
+#[must_use]
+pub(crate) fn remote_update_request(requester: &RemoteUpdateRequester) -> RemoteUpdateRequest {
+    let detail = match (requester.os.as_deref(), requester.ip_address.as_deref()) {
+        (Some(os), Some(address)) => Some(format!("{os} ({address})")),
+        (Some(os), None) => Some(os.to_owned()),
+        (None, Some(address)) => Some(address.to_owned()),
+        (None, None) => None,
+    };
+    RemoteUpdateRequest {
+        label: requester
+            .label
+            .clone()
+            .unwrap_or_else(|| "Another device".to_owned()),
+        detail,
     }
 }
 
@@ -95,16 +134,29 @@ impl<R: Runtime> RemoteUpdateDelegate for DesktopRemoteUpdateDelegate<R> {
         })
     }
 
-    fn request_install(&self) -> HostUpdaterFuture {
+    fn request_install(&self, requester: RemoteUpdateRequester) -> HostUpdaterFuture {
         let app = self.app.clone();
         Box::pin(async move {
             // Start the full host flow in the background and report the host's own
             // state. Claiming "installing" here would be a guess: the flow may still find
             // nothing to install or fail to download. Remote clients follow the flow
             // through `updater.status`, which they re-read while the host is busy.
-            tauri::async_runtime::spawn(run_remote_install(app.clone()));
-            map_desktop_update_state(&app.state::<DesktopUpdateManager>().state(&app))
+            let updates = app.state::<DesktopUpdateManager>();
+            if updates.begin_remote_request(&app, remote_update_request(&requester)) {
+                tauri::async_runtime::spawn(run_remote_install(app.clone(), requester));
+            }
+            map_desktop_update_state(&updates.state(&app))
         })
+    }
+}
+
+struct RemoteRequestGuard<R: Runtime>(AppHandle<R>);
+
+impl<R: Runtime> Drop for RemoteRequestGuard<R> {
+    fn drop(&mut self) {
+        self.0
+            .state::<DesktopUpdateManager>()
+            .clear_remote_request(&self.0);
     }
 }
 
@@ -114,7 +166,8 @@ impl<R: Runtime> RemoteUpdateDelegate for DesktopRemoteUpdateDelegate<R> {
 /// download records `error` with its message. A step that is not admitted because
 /// another check or download is running leaves that operation's state, which settles
 /// by itself.
-async fn run_remote_install<R: Runtime>(app: AppHandle<R>) {
+async fn run_remote_install<R: Runtime>(app: AppHandle<R>, requester: RemoteUpdateRequester) {
+    let _request = RemoteRequestGuard(app.clone());
     let updates = app.state::<DesktopUpdateManager>();
     let state = updates.state(&app);
     let needs_download = state["downloadedVersion"].as_str().is_none();
@@ -132,6 +185,8 @@ async fn run_remote_install<R: Runtime>(app: AppHandle<R>) {
         let downloaded = updates.download_update(app.clone()).await;
         if downloaded["state"]["downloadedVersion"].as_str().is_none() {
             tracing::warn!(
+                requester_label = requester.label.as_deref().unwrap_or("Another device"),
+                requester_session = requester.session_id_prefix.as_deref().unwrap_or(""),
                 status = downloaded["state"]["status"].as_str().unwrap_or("unknown"),
                 message = downloaded["state"]["message"].as_str().unwrap_or(""),
                 "remote update install stopped before the update was downloaded"
@@ -146,7 +201,10 @@ async fn run_remote_install<R: Runtime>(app: AppHandle<R>) {
         .install_update(&app, backend.inner(), DesktopUpdateInstallInput::default())
         .await;
     if installed["completed"].as_bool() != Some(true) {
+        updates.note_remote_secondary_protection_failure(&app);
         tracing::warn!(
+            requester_label = requester.label.as_deref().unwrap_or("Another device"),
+            requester_session = requester.session_id_prefix.as_deref().unwrap_or(""),
             accepted = installed["accepted"].as_bool().unwrap_or(false),
             status = installed["state"]["status"].as_str().unwrap_or("unknown"),
             message = installed["state"]["message"].as_str().unwrap_or(""),
@@ -223,6 +281,24 @@ mod tests {
         (base_url, server)
     }
 
+    /// Holds the check open so the test can observe the request while its flow runs.
+    fn spawn_gated_no_update_feed() -> (String, std::sync::mpsc::Sender<()>, thread::JoinHandle<()>)
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("update feed should bind");
+        let base_url = format!("http://{}", listener.local_addr().expect("feed address"));
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("feed request should arrive");
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).expect("feed request should read");
+            released.recv().expect("the test releases the feed");
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .expect("feed response should write");
+        });
+        (base_url, release, server)
+    }
+
     fn host_app(feed_url: String) -> tauri::App<MockRuntime> {
         let mut context = mock_context(noop_assets());
         context.config_mut().plugins.0.insert(
@@ -263,12 +339,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_remote_request_is_recorded_once_and_cleared_when_the_flow_ends() {
+        let (base_url, release, feed) = spawn_gated_no_update_feed();
+        let app = host_app(format!("{base_url}/latest.json"));
+        let delegate = DesktopRemoteUpdateDelegate::new(app.handle().clone());
+        let manager = app.state::<DesktopUpdateManager>();
+        let requester = RemoteUpdateRequester {
+            label: Some("Tablet".to_owned()),
+            ..RemoteUpdateRequester::default()
+        };
+
+        delegate.request_install(requester.clone()).await;
+        assert_eq!(
+            manager.state(app.handle())["requestedBy"]["label"],
+            "Tablet",
+            "the host window sees who asked while the flow runs"
+        );
+        assert!(!manager.begin_remote_request(app.handle(), remote_update_request(&requester)));
+        delegate
+            .request_install(RemoteUpdateRequester {
+                label: Some("Laptop".to_owned()),
+                ..RemoteUpdateRequester::default()
+            })
+            .await;
+        assert_eq!(
+            manager.state(app.handle())["requestedBy"]["label"],
+            "Tablet"
+        );
+
+        release.send(()).expect("release the feed");
+        let settled = settled_status(&delegate).await;
+        assert_eq!(settled.state, RemoteUpdateState::UpToDate);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while manager.state(app.handle())["requestedBy"] != Value::Null {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the request clears when the flow ends");
+        feed.join().expect("update feed should stop");
+    }
+
+    #[test]
+    fn requester_becomes_a_host_notice_with_a_generic_fallback() {
+        let full = remote_update_request(&RemoteUpdateRequester {
+            label: Some("BiBCode Desktop".to_owned()),
+            os: Some("MacIntel".to_owned()),
+            ip_address: Some("192.168.1.34".to_owned()),
+            session_id_prefix: Some("0123abcd".to_owned()),
+        });
+        assert_eq!(full.label, "BiBCode Desktop");
+        assert_eq!(full.detail.as_deref(), Some("MacIntel (192.168.1.34)"));
+
+        let os_only = remote_update_request(&RemoteUpdateRequester {
+            label: Some("BiBCode Web".to_owned()),
+            os: Some("Linux x86_64".to_owned()),
+            ..RemoteUpdateRequester::default()
+        });
+        assert_eq!(os_only.detail.as_deref(), Some("Linux x86_64"));
+
+        let address_only = remote_update_request(&RemoteUpdateRequester {
+            ip_address: Some("192.168.1.34".to_owned()),
+            ..RemoteUpdateRequester::default()
+        });
+        assert_eq!(address_only.detail.as_deref(), Some("192.168.1.34"));
+
+        let unknown = remote_update_request(&RemoteUpdateRequester::default());
+        assert_eq!(unknown.label, "Another device");
+        assert_eq!(unknown.detail, None);
+    }
+
+    #[tokio::test]
     async fn install_request_without_an_update_reports_the_host_state_then_up_to_date() {
         let (base_url, feed) = spawn_feed(Feed::NoUpdate);
         let app = host_app(format!("{base_url}/latest.json"));
         let delegate = DesktopRemoteUpdateDelegate::new(app.handle().clone());
 
-        let requested = delegate.request_install().await;
+        let requested = delegate
+            .request_install(RemoteUpdateRequester::default())
+            .await;
         assert!(
             matches!(
                 requested.state,
@@ -289,7 +438,9 @@ mod tests {
         let app = host_app(format!("{base_url}/latest.json"));
         let delegate = DesktopRemoteUpdateDelegate::new(app.handle().clone());
 
-        let requested = delegate.request_install().await;
+        let requested = delegate
+            .request_install(RemoteUpdateRequester::default())
+            .await;
         assert_ne!(
             requested.state,
             RemoteUpdateState::Installing,
@@ -383,6 +534,54 @@ mod tests {
         );
         assert_eq!(available.latest_version.as_deref(), Some("0.5.0"));
         assert_eq!(available.error, None);
+
+        let downloading = map_desktop_update_state(&json!({
+            "status": "downloading", "phase": "available",
+            "availableVersion": "0.6.4", "downloadPercent": 42.7
+        }));
+        assert_eq!(downloading.download_percent, Some(42));
+        assert_eq!(downloading.target_version.as_deref(), Some("0.6.4"));
+        assert_eq!(downloading.install_stage, None);
+
+        for (percent, expected) in [(-1.0, 0), (0.0, 0), (100.0, 100), (101.0, 100)] {
+            let downloading = map_desktop_update_state(&json!({
+                "status": "downloading", "phase": "available", "downloadPercent": percent
+            }));
+            assert_eq!(downloading.download_percent, Some(expected));
+        }
+
+        let downloaded = map_desktop_update_state(&json!({
+            "status": "downloaded", "phase": "available",
+            "availableVersion": "0.6.4", "downloadedVersion": "0.6.4", "downloadPercent": 100.0
+        }));
+        assert_eq!(
+            downloaded.download_percent, None,
+            "percent only while downloading"
+        );
+        assert_eq!(downloaded.target_version.as_deref(), Some("0.6.4"));
+        let available_first = map_desktop_update_state(&json!({
+            "availableVersion": "0.6.4", "downloadedVersion": "0.6.3"
+        }));
+        assert_eq!(available_first.target_version.as_deref(), Some("0.6.4"));
+
+        let protecting = map_desktop_update_state(&json!({
+            "status": "downloaded", "phase": "protecting", "downloadedVersion": "0.6.4",
+            "protection": [
+                {"environmentId": "primary", "status": "protected", "stage": "stopping-backend"},
+                {"environmentId": "wsl:Ubuntu", "status": "pending", "stage": "creating-verified-backup"}
+            ]
+        }));
+        assert_eq!(protecting.target_version.as_deref(), Some("0.6.4"));
+        assert_eq!(
+            protecting.install_stage.as_deref(),
+            Some("creating-verified-backup")
+        );
+
+        let installing = map_desktop_update_state(&json!({
+            "status": "downloaded", "phase": "installing", "downloadedVersion": "0.6.4",
+            "protection": []
+        }));
+        assert_eq!(installing.install_stage.as_deref(), Some("installing"));
 
         let failed = map_desktop_update_state(
             &json!({"status": "error", "phase": "failed", "message": "boom"}),

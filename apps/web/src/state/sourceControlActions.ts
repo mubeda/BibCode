@@ -201,7 +201,7 @@ export function useVcsPullAction(scope: SourceControlActionScope) {
     label: "Pulling latest changes",
     scope,
     action,
-    onSuccess: status.refresh,
+    onSuccess: status.revalidate,
   });
 }
 
@@ -235,7 +235,7 @@ function useVcsFileAction(
     },
     [run, scope, kind],
   );
-  return useAction({ kind, label, scope, action, onSuccess: status.refresh });
+  return useAction({ kind, label, scope, action, onSuccess: status.revalidate });
 }
 
 export function useVcsStageAction(scope: SourceControlActionScope) {
@@ -338,7 +338,7 @@ export function useGitStackedAction(scope: SourceControlActionScope) {
     label: "Running source control action",
     scope,
     action,
-    onSuccess: status.refresh,
+    onSuccess: status.revalidate,
     managedExternally: true,
   });
 }
@@ -390,7 +390,7 @@ export function useSourceControlPublishRepositoryAction(scope: SourceControlActi
     label: "Publishing repository",
     scope,
     action,
-    onSuccess: status.refresh,
+    onSuccess: status.revalidate,
   });
 }
 

@@ -2,6 +2,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Component, Path, PathBuf},
     sync::Arc,
+    time::UNIX_EPOCH,
 };
 
 use axum::{
@@ -10,7 +11,9 @@ use axum::{
     extract::{ConnectInfo, FromRef, Request, State, WebSocketUpgrade},
     http::{
         HeaderMap, Method, StatusCode, Uri,
-        header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, HOST, LOCATION},
+        header::{
+            CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG, HOST, IF_NONE_MATCH, LOCATION,
+        },
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -22,7 +25,7 @@ use serde_json::json;
 use subtle::ConstantTimeEq;
 use tokio::fs::File;
 use tokio_util::{io::ReaderStream, sync::CancellationToken};
-use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+use tower_http::cors::{AllowCredentials, AllowOrigin, Any, CorsLayer};
 
 use crate::{
     auth,
@@ -36,8 +39,8 @@ use crate::{
     production::http_routes::{self, HttpRoutesState},
     remote_update::RemoteUpdateSupport,
     rpc::{
-        E2eePreauthAdmission, MAX_E2EE_CIPHERTEXT_BYTES, RpcRegistry, RpcSessionContext,
-        run_session,
+        CHUNKED_RPC_SUBPROTOCOL, E2eePreauthAdmission, MAX_E2EE_CIPHERTEXT_BYTES, RpcRegistry,
+        RpcSessionContext, run_session,
     },
 };
 
@@ -209,9 +212,13 @@ fn cors_layer(config: &ServerConfig) -> CorsLayer {
             origins.push(origin);
         }
     }
+    // Normal mode already allows every origin for header-authenticated clients.
+    // Preserve that access in dev mode; only this allowlist gets credentialed CORS.
     layer
-        .allow_origin(AllowOrigin::list(origins))
-        .allow_credentials(true)
+        .allow_origin(AllowOrigin::mirror_request())
+        .allow_credentials(AllowCredentials::predicate(move |origin, _| {
+            origins.contains(origin)
+        }))
 }
 
 async fn websocket(
@@ -223,6 +230,7 @@ async fn websocket(
     let session_shutdown = state.shutdown.child_token();
     if state.config.unsafe_no_auth {
         return upgrade
+            .protocols([CHUNKED_RPC_SUBPROTOCOL])
             .max_frame_size(MAX_PLAIN_WEBSOCKET_FRAME_BYTES)
             .max_message_size(MAX_PLAIN_WEBSOCKET_MESSAGE_BYTES)
             .on_upgrade(move |socket| {
@@ -242,6 +250,7 @@ async fn websocket(
             let expires_at_ms = principal.expires_at_ms;
             let rpc_context = RpcSessionContext::authenticated(principal, auth.clone());
             upgrade
+                .protocols([CHUNKED_RPC_SUBPROTOCOL])
                 .max_frame_size(MAX_PLAIN_WEBSOCKET_FRAME_BYTES)
                 .max_message_size(MAX_PLAIN_WEBSOCKET_MESSAGE_BYTES)
                 .on_upgrade(move |socket| async move {
@@ -336,6 +345,7 @@ struct EnvironmentDescriptor {
     platform: PlatformDescriptor,
     server_version: String,
     storage_instance_id: String,
+    boot_id: Option<String>,
     remote_update_support: RemoteUpdateSupport,
     remote_protocol_version: u32,
     min_compatible_remote_protocol: u32,
@@ -353,6 +363,7 @@ struct PlatformDescriptor {
 struct EnvironmentCapabilities {
     repository_identity: bool,
     remote_update_control: bool,
+    remote_update_progress: bool,
     terminal_ordered_input: bool,
     terminal_size_ownership: bool,
 }
@@ -371,12 +382,14 @@ async fn environment_descriptor(State(state): State<AppState>) -> Json<Environme
             .storage_instance_id
             .expect("a running server has a prepared persistent store")
             .to_string(),
+        boot_id: config.boot_id.map(|id| id.to_string()),
         remote_update_support: config.remote_update_support,
         remote_protocol_version: REMOTE_PROTOCOL_VERSION,
         min_compatible_remote_protocol: MIN_COMPATIBLE_REMOTE_PROTOCOL,
         capabilities: EnvironmentCapabilities {
             repository_identity: true,
             remote_update_control: true,
+            remote_update_progress: true,
             terminal_ordered_input: true,
             terminal_size_ownership: true,
         },
@@ -550,7 +563,7 @@ async fn static_or_dev(
     uri: Uri,
     headers: HeaderMap,
 ) -> Response {
-    if method != Method::GET {
+    if method != Method::GET && method != Method::HEAD {
         return (StatusCode::NOT_FOUND, "Not Found").into_response();
     }
 
@@ -574,10 +587,15 @@ async fn static_or_dev(
         )
             .into_response();
     };
-    serve_static(static_dir, uri.path()).await
+    serve_static(static_dir, uri.path(), &method, &headers).await
 }
 
-async fn serve_static(static_dir: &Path, request_path: &str) -> Response {
+async fn serve_static(
+    static_dir: &Path,
+    request_path: &str,
+    method: &Method,
+    headers: &HeaderMap,
+) -> Response {
     let relative = match safe_relative_path(request_path) {
         Ok(path) => path,
         Err(()) => return (StatusCode::BAD_REQUEST, "Invalid static file path").into_response(),
@@ -598,7 +616,10 @@ async fn serve_static(static_dir: &Path, request_path: &str) -> Response {
             None => return (StatusCode::NOT_FOUND, "Not Found").into_response(),
         },
     };
-    stream_file(candidate).await
+    let content_hashed = candidate
+        .strip_prefix(&root)
+        .is_ok_and(is_content_hashed_asset);
+    stream_file(candidate, content_hashed, method, headers).await
 }
 
 fn safe_relative_path(request_path: &str) -> Result<PathBuf, ()> {
@@ -636,32 +657,114 @@ async fn canonical_file_within(root: &Path, candidate: &Path) -> Option<PathBuf>
     metadata.is_file().then_some(canonical)
 }
 
-async fn stream_file(path: PathBuf) -> Response {
+/// Vite emits build outputs into `assetsDir` (`assets/`) as `[name]-[hash].[ext]`
+/// with an 8-character base64url hash; `apps/web/public/` files are copied to the
+/// static root unhashed. The input is the resolved file's path relative to that root.
+fn is_content_hashed_asset(relative: &Path) -> bool {
+    let mut components = relative.components();
+    let (Some(Component::Normal(directory)), Some(Component::Normal(filename)), None) =
+        (components.next(), components.next(), components.next())
+    else {
+        return false;
+    };
+    if directory != "assets" {
+        return false;
+    }
+    let filename = Path::new(filename);
+    if filename
+        .extension()
+        .is_none_or(|extension| extension.is_empty())
+    {
+        return false;
+    }
+    let Some(stem) = filename.file_stem().and_then(|stem| stem.to_str()) else {
+        return false;
+    };
+    let stem = stem.as_bytes();
+    let Some(hash_start) = stem.len().checked_sub(8) else {
+        return false;
+    };
+    hash_start > 0
+        && stem[hash_start - 1] == b'-'
+        && stem[hash_start..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn if_none_match_matches(header: &str, etag: &str) -> bool {
+    let header = header.trim();
+    let etag = etag.strip_prefix("W/").unwrap_or(etag);
+    header == "*"
+        || header.split(',').any(|entry| {
+            let entry = entry.trim();
+            entry.strip_prefix("W/").unwrap_or(entry) == etag
+        })
+}
+
+async fn stream_file(
+    path: PathBuf,
+    content_hashed: bool,
+    method: &Method,
+    headers: &HeaderMap,
+) -> Response {
     let file = match File::open(&path).await {
         Ok(file) => file,
         Err(_) => return internal_server_error(),
     };
-    let length = match file.metadata().await {
-        Ok(metadata) => metadata.len(),
+    let metadata = match file.metadata().await {
+        Ok(metadata) => metadata,
         Err(_) => return internal_server_error(),
     };
     let content_type = mime_guess::from_path(&path).first_or_octet_stream();
-    let cache_control = if content_type.type_() == mime_guess::mime::TEXT
+    let (cache_control, etag) = if content_type.type_() == mime_guess::mime::TEXT
         && content_type.subtype() == mime_guess::mime::HTML
     {
-        HTML_CACHE_CONTROL
+        (HTML_CACHE_CONTROL, None)
+    } else if content_hashed {
+        (IMMUTABLE_CACHE_CONTROL, None)
     } else {
-        IMMUTABLE_CACHE_CONTROL
+        let etag = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map(|modified| {
+                format!(
+                    "W/\"{:x}-{:x}-{:x}\"",
+                    metadata.len(),
+                    modified.as_secs(),
+                    modified.subsec_nanos()
+                )
+            });
+        ("no-cache", etag)
     };
-    let body = Body::from_stream(ReaderStream::new(file));
+    let not_modified = etag.as_deref().is_some_and(|etag| {
+        headers.get_all(IF_NONE_MATCH).iter().any(|value| {
+            value
+                .to_str()
+                .is_ok_and(|value| if_none_match_matches(value, etag))
+        })
+    });
 
-    Response::builder()
-        .status(StatusCode::OK)
+    let mut response = Response::builder()
+        .status(if not_modified {
+            StatusCode::NOT_MODIFIED
+        } else {
+            StatusCode::OK
+        })
         .header(CONTENT_TYPE, content_type.as_ref())
-        .header(CONTENT_LENGTH, length)
+        .header(CONTENT_LENGTH, metadata.len())
         .header(CACHE_CONTROL, cache_control)
         .header("x-content-type-options", "nosniff")
-        .header("content-security-policy", CONTENT_SECURITY_POLICY_VALUE)
+        .header("content-security-policy", CONTENT_SECURITY_POLICY_VALUE);
+    if let Some(etag) = etag {
+        response = response.header(ETAG, etag);
+    }
+    let body = if not_modified || method == Method::HEAD {
+        Body::empty()
+    } else {
+        Body::from_stream(ReaderStream::new(file))
+    };
+    response
         .body(body)
         .unwrap_or_else(|_| internal_server_error())
 }
@@ -707,7 +810,195 @@ fn internal_server_error() -> Response {
 
 #[cfg(test)]
 mod tests {
+    use tower::ServiceExt;
+
     use super::*;
+
+    #[test]
+    fn content_hashed_assets_follow_the_vite_output_convention() {
+        for (path, expected) in [
+            ("assets/index-C0420DUf.js", true),
+            ("assets/actionscript-3--17pq3dv.js", true),
+            ("assets/react-DV3x_TFi.js", true),
+            ("assets/style-AbCd12_-.css", true),
+            ("theme-bootstrap.js", false),
+            ("favicon.ico", false),
+            ("assets/logo.png", false),
+            ("nested/assets/index-C0420DUf.js", false),
+            ("assets/nested/index-C0420DUf.js", false),
+            ("assets/index-C0420DU.js", false),
+            ("assets/index-C0420DUff.js", false),
+            ("assets/index-C0420DUf", false),
+            ("assets/index-C0420DUf.", false),
+            ("assets/index-C0420D+f.js", false),
+            ("assets/index-C0420Déf.js", false),
+            ("/assets/index-C0420DUf.js", false),
+            ("index-C0420DUf.js", false),
+        ] {
+            assert_eq!(is_content_hashed_asset(Path::new(path)), expected, "{path}");
+        }
+    }
+
+    #[test]
+    fn if_none_match_uses_weak_comparison() {
+        for (header, etag, expected) in [
+            ("\"abc\"", "\"abc\"", true),
+            ("W/\"abc\"", "\"abc\"", true),
+            ("\"abc\"", "W/\"abc\"", true),
+            ("W/\"abc\"", "W/\"abc\"", true),
+            (" \"other\", W/\"abc\", \"last\" ", "W/\"abc\"", true),
+            ("*", "W/\"abc\"", true),
+            (" \t* \t", "W/\"abc\"", true),
+            ("\"other\"", "W/\"abc\"", false),
+            ("\"ABC\"", "W/\"abc\"", false),
+            ("", "W/\"abc\"", false),
+            (" \t", "W/\"abc\"", false),
+            ("abc", "W/\"abc\"", false),
+            ("\"other,*,value\"", "W/\"abc\"", false),
+        ] {
+            assert_eq!(if_none_match_matches(header, etag), expected, "{header:?}");
+        }
+    }
+
+    async fn cors_response(
+        config: &ServerConfig,
+        method: Method,
+        origin: Option<&str>,
+    ) -> Response {
+        let app = Router::new()
+            .route("/", get(|| async { StatusCode::OK }))
+            .layer(cors_layer(config));
+        let mut request = Request::builder().uri("/").method(method.clone());
+        if let Some(origin) = origin {
+            request = request.header("origin", origin);
+        }
+        if method == Method::OPTIONS {
+            request = request
+                .header("access-control-request-method", "POST")
+                .header("access-control-request-headers", "authorization");
+        }
+        app.oneshot(request.body(Body::empty()).expect("CORS request"))
+            .await
+            .expect("CORS response")
+    }
+
+    #[tokio::test]
+    async fn cors_normal_mode_preserves_response_headers() {
+        let config = ServerConfig::new("unused-cors-test-root");
+        for (method, expected) in [
+            (Method::GET, vec![("access-control-allow-origin", "*")]),
+            (
+                Method::OPTIONS,
+                vec![
+                    (
+                        "access-control-allow-headers",
+                        "authorization,content-type,b3,traceparent,dpop,idempotency-key,x-bibcode-desktop-bootstrap-token",
+                    ),
+                    ("access-control-allow-methods", "GET,POST,DELETE,OPTIONS"),
+                    ("access-control-allow-origin", "*"),
+                    ("access-control-max-age", "600"),
+                ],
+            ),
+        ] {
+            let response =
+                cors_response(&config, method.clone(), Some("https://client.example.test")).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut actual = response
+                .headers()
+                .iter()
+                .filter(|(name, _)| {
+                    name.as_str().starts_with("access-control-") || name.as_str() == "vary"
+                })
+                .map(|(name, value)| (name.as_str(), value.to_str().expect("CORS header value")))
+                .collect::<Vec<_>>();
+            actual.sort_unstable();
+            assert_eq!(actual, expected, "{method}");
+        }
+    }
+
+    async fn assert_dev_cors_origin(method: Method, origin: &str, credentials: bool) {
+        let config = ServerConfig::new("unused-cors-test-root")
+            .with_dev_url("http://localhost:5733".parse().expect("dev URL"));
+        let response = cors_response(&config, method.clone(), Some(origin)).await;
+        let headers = response.headers();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            headers.get("access-control-allow-origin"),
+            Some(&origin.parse::<axum::http::HeaderValue>().expect("origin")),
+            "{method} from {origin}"
+        );
+        assert_eq!(
+            headers
+                .get("access-control-allow-credentials")
+                .map(|value| value.to_str().expect("credentials header")),
+            credentials.then_some("true"),
+            "{method} from {origin}"
+        );
+        assert!(
+            headers.get_all("vary").iter().any(|value| {
+                value
+                    .to_str()
+                    .expect("Vary header")
+                    .split(',')
+                    .any(|name| name.trim().eq_ignore_ascii_case("origin"))
+            }),
+            "{method} from {origin} must vary by origin"
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_dev_mode_reflects_other_origins_without_credentials_on_get() {
+        for origin in [
+            "https://random.example.test",
+            "http://127.0.0.1:65000",
+            "http://localhost:5734",
+            "bibcode://other",
+            "null",
+        ] {
+            assert_dev_cors_origin(Method::GET, origin, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cors_dev_mode_reflects_other_origins_without_credentials_on_preflight() {
+        for origin in [
+            "https://random.example.test",
+            "http://127.0.0.1:65000",
+            "http://localhost:5734",
+            "bibcode://other",
+            "null",
+        ] {
+            assert_dev_cors_origin(Method::OPTIONS, origin, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cors_dev_mode_preserves_credentials_for_dev_and_desktop_origins() {
+        for origin in [
+            "http://localhost:5733",
+            "bibcode://app",
+            "bibcode-dev://app",
+        ] {
+            for method in [Method::GET, Method::OPTIONS] {
+                assert_dev_cors_origin(method, origin, true).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cors_dev_mode_omits_allow_origin_without_an_origin_header() {
+        let config = ServerConfig::new("unused-cors-test-root")
+            .with_dev_url("http://localhost:5733".parse().expect("dev URL"));
+        for method in [Method::GET, Method::OPTIONS] {
+            let response = cors_response(&config, method, None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                !response
+                    .headers()
+                    .contains_key("access-control-allow-origin")
+            );
+        }
+    }
 
     #[test]
     fn route_helpers_preserve_runtime_methods_and_internal_error_status() {

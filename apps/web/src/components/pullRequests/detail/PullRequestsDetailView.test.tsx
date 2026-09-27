@@ -17,6 +17,7 @@ const h = vi.hoisted(() => ({
   data: {} as Record<string, unknown>,
   errors: {} as Record<string, PullRequestsOperationError>,
   subscribed: new Set<string>(),
+  revalidated: [] as string[],
   pending: false,
   complete: true,
   pendingQueries: new Set<string>(),
@@ -56,22 +57,29 @@ vi.mock("../../../state/query", () => ({
     const [, publish] = useReducer((value: number) => value + 1, 0);
     if (atom) h.subscribed.add(atom.kind);
     const error = atom ? h.errors[atom.kind] : null;
+    // Automatic re-reads (`revalidate`) record through the same refresh.
+    const refresh = () => {
+      if (!atom) return;
+      h.refresh(atom.kind);
+      if (h.complete && h.data[atom.kind]) {
+        h.data[atom.kind] = { ...(h.data[atom.kind] as object) };
+        publish();
+      } else if (!h.complete) {
+        h.pendingQueries.add(atom.kind);
+        publish();
+      }
+    };
     return {
       data: atom ? (h.data[atom.kind] ?? null) : null,
       error: error?.message ?? null,
       isPending: atom !== null && (h.pending || h.pendingQueries.has(atom.kind)),
       emission: error ? { _tag: "Failure", cause: Cause.fail(error) } : { _tag: "Initial" },
-      refresh: () => {
-        if (!atom) return;
-        h.refresh(atom.kind);
-        if (h.complete && h.data[atom.kind]) {
-          h.data[atom.kind] = { ...(h.data[atom.kind] as object) };
-          publish();
-        } else if (!h.complete) {
-          h.pendingQueries.add(atom.kind);
-          publish();
-        }
+      refresh,
+      revalidate: () => {
+        if (atom) h.revalidated.push(atom.kind);
+        refresh();
       },
+      requiresRetry: false,
     };
   },
 }));
@@ -124,6 +132,7 @@ beforeEach(() => {
   };
   h.errors = {};
   h.subscribed.clear();
+  h.revalidated.length = 0;
   h.pending = false;
   h.pendingQueries.clear();
   h.complete = true;
@@ -272,6 +281,7 @@ describe("PullRequestsDetailView", () => {
     };
     await render();
     h.refresh.mockClear();
+    h.revalidated.length = 0;
     await click("Update branch");
     expect(h.refresh.mock.calls.map(([kind]) => kind)).toEqual([
       "get",
@@ -279,6 +289,8 @@ describe("PullRequestsDetailView", () => {
       "getChecks",
       "getFiles",
     ]);
+    // A finished action re-reads automatically; it never clears a cut-off latch.
+    expect(h.revalidated).toEqual(["get"]);
     expect([...h.subscribed]).toEqual(["get", "getTimeline", "catalog"]);
   });
   it.each(["delete", "revert"] as const)(

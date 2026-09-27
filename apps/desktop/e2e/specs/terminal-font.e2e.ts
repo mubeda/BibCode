@@ -133,7 +133,7 @@ describe("packaged terminal font support", () => {
     );
     await expect(project).toBeDisplayed();
     const primaryWorkspace = browser.$(
-      '//a[@data-thread-item="true"][.//span[normalize-space()="main"]]',
+      '//*[@data-thread-item="true"][.//span[normalize-space()="main"]]',
     );
     if (!(await primaryWorkspace.isDisplayed())) {
       await project.click();

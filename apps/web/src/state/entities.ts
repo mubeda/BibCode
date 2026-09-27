@@ -18,9 +18,17 @@ import type { EnvironmentId, ThreadId } from "@bibcode/contracts";
 import { Atom } from "effect/unstable/reactivity";
 import { useMemo } from "react";
 import { appAtomRegistry } from "../rpc/atomRegistry";
+import { readActiveEnvironmentId, setActiveEnvironmentId } from "./activeEnvironment";
 import { environmentProjects } from "./projects";
 import { environmentServerConfigsAtom } from "./server";
 import { environmentThreadDetails, environmentThreadShells } from "./threads";
+
+export {
+  activeEnvironmentIdAtom,
+  readActiveEnvironmentId,
+  setActiveEnvironmentId,
+  useActiveEnvironmentId,
+} from "./activeEnvironment";
 
 const EMPTY_PROJECT_REFS: ReadonlyArray<ScopedProjectRef> = Object.freeze([]);
 const EMPTY_THREAD_REFS: ReadonlyArray<ScopedThreadRef> = Object.freeze([]);
@@ -56,27 +64,10 @@ const EMPTY_SESSION_ATOM = Atom.make<OrchestrationSession | null>(null).pipe(
   Atom.withLabel("web-thread-session:empty"),
 );
 
-export const activeEnvironmentIdAtom = Atom.make<EnvironmentId | null>(null).pipe(
-  Atom.keepAlive,
-  Atom.withLabel("web-active-environment-id"),
-);
-
 const previousPrimaryEnvironmentIdAtom = Atom.make<EnvironmentId | null>(null).pipe(
   Atom.keepAlive,
   Atom.withLabel("web-previous-primary-environment-id"),
 );
-
-export function useActiveEnvironmentId(): EnvironmentId | null {
-  return useAtomValue(activeEnvironmentIdAtom);
-}
-
-export function readActiveEnvironmentId(): EnvironmentId | null {
-  return appAtomRegistry.get(activeEnvironmentIdAtom);
-}
-
-export function setActiveEnvironmentId(environmentId: EnvironmentId | null): void {
-  appAtomRegistry.set(activeEnvironmentIdAtom, environmentId);
-}
 
 /** Read selection at write time; primary history survives auth-gate remounts. */
 export function reconcileEnvironmentSelection(

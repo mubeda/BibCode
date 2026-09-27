@@ -41,6 +41,16 @@ describe("getProviderSummary", () => {
     });
   });
 
+  it("asks to enable a disabled provider before checking its installation", () => {
+    expect(
+      getProviderSummary(provider({ enabled: false, installed: false, status: "disabled" })),
+    ).toEqual({
+      headline: "Disabled",
+      detail:
+        "This provider is disabled for new sessions in BiBCode. Turn it on to check whether it is installed.",
+    });
+  });
+
   it("prefers server detail for disabled and missing providers", () => {
     expect(getProviderSummary(provider({ enabled: false, message: "Disabled by policy" }))).toEqual(
       {
@@ -48,13 +58,21 @@ describe("getProviderSummary", () => {
         detail: "Disabled by policy",
       },
     );
+    expect(
+      getProviderSummary(
+        provider({ enabled: false, installed: false, message: "Disabled by policy" }),
+      ),
+    ).toEqual({
+      headline: "Disabled",
+      detail: "Disabled by policy",
+    });
     expect(getProviderSummary(provider({ installed: false, message: "Binary missing" }))).toEqual({
       headline: "Not found",
       detail: "Binary missing",
     });
-    expect(getProviderSummary(provider({ enabled: false }))).toMatchObject({
+    expect(getProviderSummary(provider({ enabled: false, installed: true }))).toEqual({
       headline: "Disabled",
-      detail: expect.stringContaining("disabled"),
+      detail: "This provider is installed but disabled for new sessions in BiBCode.",
     });
     expect(getProviderSummary(provider({ installed: false }))).toEqual({
       headline: "Not found",

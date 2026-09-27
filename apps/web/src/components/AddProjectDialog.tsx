@@ -24,10 +24,10 @@ export function AddProjectDialog({ open, onOpenChange }: AddProjectDialogProps) 
     <Dialog
       open={open}
       onOpenChange={(nextOpen) => {
-        if (!workflow.busy) onOpenChange(nextOpen);
+        if (workflow.dismissible) onOpenChange(nextOpen);
       }}
     >
-      <DialogPopup className="max-w-lg overflow-hidden" showCloseButton={!workflow.busy}>
+      <DialogPopup className="max-w-lg overflow-hidden" showCloseButton={workflow.dismissible}>
         <DialogTitle className="sr-only">Add a project</DialogTitle>
         <DialogDescription className="sr-only">Choose how to add a project.</DialogDescription>
         <div

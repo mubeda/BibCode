@@ -2048,18 +2048,14 @@ esac
     ) -> PathBuf {
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-
             let path = directory.join(name);
-            std::fs::write(&path, _unix_contents).expect("provider fixture should write");
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                .expect("provider fixture should be executable");
+            crate::test_support::executable_fixture::write_executable(&path, _unix_contents);
             path
         }
         #[cfg(windows)]
         {
             let path = directory.join(format!("{name}.cmd"));
-            std::fs::write(&path, _windows_contents).expect("provider fixture should write");
+            crate::test_support::executable_fixture::write_executable(&path, _windows_contents);
             path
         }
     }

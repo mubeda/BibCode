@@ -136,11 +136,13 @@ struct ProviderProbe {
     install_hint: &'static str,
 }
 
+const GIT_EXECUTABLE: &str = "git";
+
 const VCS_PROBES: &[VcsProbe] = &[
     VcsProbe {
         kind: VcsDiscoveryKind::Git,
         label: "Git",
-        executable: "git",
+        executable: GIT_EXECUTABLE,
         version_args: &["--version"],
         implemented: true,
         install_hint: "Install Git from https://git-scm.com/downloads or with your package manager.",
@@ -192,14 +194,19 @@ pub(crate) fn provider_install_hint(kind: ProviderKind) -> Option<&'static str> 
 #[derive(Clone, Debug, Default)]
 pub struct SourceControlDiscovery {
     runner: ProcessRunner,
-    /// Tests resolve every probed executable inside this directory.
-    #[cfg(test)]
+    /// Tests resolve non-Git probes inside this directory.
     executable_dir: Option<PathBuf>,
 }
 
 impl SourceControlDiscovery {
-    #[cfg(test)]
-    pub(crate) fn with_executable_dir_for_test(executable_dir: PathBuf) -> Self {
+    /// Git always uses the real executable; every other probe is redirected
+    /// into this test-owned directory.
+    #[doc(hidden)]
+    pub fn with_executable_dir_for_integration_test(executable_dir: PathBuf) -> Self {
+        assert!(
+            executable_dir.is_absolute(),
+            "fixture directory must be absolute"
+        );
         Self {
             runner: ProcessRunner,
             executable_dir: Some(executable_dir),
@@ -207,8 +214,9 @@ impl SourceControlDiscovery {
     }
 
     fn command(&self, executable: &str) -> PathBuf {
-        #[cfg(test)]
-        if let Some(directory) = &self.executable_dir {
+        if let Some(directory) = &self.executable_dir
+            && executable != GIT_EXECUTABLE
+        {
             return directory.join(executable);
         }
         PathBuf::from(executable)
@@ -468,7 +476,14 @@ mod tests {
     #[tokio::test]
     async fn discovery_covers_native_probe_inventory() {
         let root = tempfile::tempdir().unwrap();
-        let result = SourceControlDiscovery::with_executable_dir_for_test(root.path().join("bin"))
+        let directory = root.path().join("bin");
+        let discovery =
+            SourceControlDiscovery::with_executable_dir_for_integration_test(directory.clone());
+        assert_eq!(discovery.command("git"), PathBuf::from("git"));
+        for executable in ["jj", "gh", "glab", "az"] {
+            assert_eq!(discovery.command(executable), directory.join(executable));
+        }
+        let result = discovery
             .discover(root.path().to_path_buf(), &CancellationToken::new())
             .await;
         assert_eq!(result.version_control_systems.len(), VCS_PROBES.len());
@@ -480,6 +495,19 @@ mod tests {
             result.source_control_providers.last().unwrap().kind,
             ProviderKind::Bitbucket
         );
+        assert!(
+            result
+                .source_control_providers
+                .iter()
+                .filter(|item| item.executable.is_some())
+                .all(|item| item.status == DiscoveryStatus::Missing)
+        );
+        let jj = result
+            .version_control_systems
+            .iter()
+            .find(|item| item.executable == "jj")
+            .expect("Jujutsu probe");
+        assert_eq!(jj.status, DiscoveryStatus::Missing);
     }
 
     #[test]
@@ -519,6 +547,67 @@ mod tests {
             assert_eq!(auth.status, AuthStatus::Unauthenticated, "{text}");
             assert_eq!(auth.hosts, Some(Vec::new()), "{text}");
         }
+    }
+
+    /// Each glab release family words the full logout differently; the strings are
+    /// verbatim from glab's `auth/status/status.go` at the cited tags.
+    #[test]
+    fn gitlab_logout_recognizes_every_known_glab_phrasing() {
+        for (versions, text) in [
+            (
+                "v1.36.0, v1.39.0",
+                "No GitLab instance has been authenticated with glab. Run `glab auth login` to authenticate.\n",
+            ),
+            (
+                "v1.43.0 to v1.100.0",
+                "No GitLab instances have been authenticated with glab. Run `glab auth login` to authenticate.\n",
+            ),
+            (
+                "v1.110.0, captured with 1.114.0",
+                include_str!("../../tests/fixtures/pull_requests/glab_logged_out.txt"),
+            ),
+        ] {
+            let auth = parse_auth(ProviderKind::Gitlab, Some(&output(1, "", text)));
+            assert_eq!(auth.status, AuthStatus::Unauthenticated, "{versions}");
+            assert_eq!(auth.hosts, Some(Vec::new()), "{versions}");
+        }
+
+        // One host's refusal (`auth status --hostname`) is not a full logout.
+        let one_host = parse_auth(
+            ProviderKind::Gitlab,
+            Some(&output(
+                1,
+                "",
+                "x gitlab.invalid has not been authenticated with glab; run `glab auth login --hostname gitlab.invalid` to authenticate\n",
+            )),
+        );
+        assert_eq!(one_host.status, AuthStatus::Unknown);
+        assert_eq!(one_host.hosts, None);
+    }
+
+    #[test]
+    fn gitlab_configured_host_without_token_is_unauthenticated_not_logged_out() {
+        // glab 1.114.0 captured offline: a user and network namespace, an isolated
+        // GLAB_CONFIG_DIR that configures `gitlab.invalid` without a token, and no
+        // reachable keyring. The host stays listed, unauthenticated.
+        let auth = parse_auth(
+            ProviderKind::Gitlab,
+            Some(&output(
+                1,
+                "",
+                include_str!("../../tests/fixtures/pull_requests/glab_no_token.txt"),
+            )),
+        );
+        assert_eq!(auth.status, AuthStatus::Unauthenticated);
+        assert_eq!(auth.account, WireOption::none());
+        assert_eq!(
+            auth.hosts,
+            Some(vec![SourceControlProviderAuthHost {
+                host: "gitlab.invalid".to_owned(),
+                account: None,
+                authenticated: false,
+            }])
+        );
     }
 
     #[test]

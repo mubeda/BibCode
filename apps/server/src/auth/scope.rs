@@ -54,6 +54,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "server.getProviderUsage"
         | "server.getSettings"
         | "server.getTraceDiagnostics"
+        | "updater.activeWork"
         | "updater.status"
         | "sourceControl.lookupRepository"
         | "subscribeDiscoveredLocalServers"
@@ -113,6 +114,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "shell.openInEditor"
         | "sourceControl.cloneRepository"
         | "sourceControl.publishRepository"
+        | "vcs.cancelClone"
         | "vcs.clone"
         | "vcs.createRef"
         | "vcs.discardFiles"
@@ -204,6 +206,10 @@ mod tests {
             required_scope("updater.status"),
             Some(SCOPE_ORCHESTRATION_READ)
         );
+        assert_eq!(
+            required_scope("updater.activeWork"),
+            Some(SCOPE_ORCHESTRATION_READ)
+        );
         for method in ["updater.check", "updater.install"] {
             assert_eq!(
                 required_scope(method),
@@ -289,6 +295,11 @@ mod tests {
                 "wrong activity mutation scope for {method}"
             );
         }
+        assert_eq!(
+            required_scope("vcs.cancelClone"),
+            Some(SCOPE_ORCHESTRATION_OPERATE),
+            "cancelling a clone needs the same scope as starting one"
+        );
         assert_eq!(required_scope("unknown.method"), None);
     }
 }

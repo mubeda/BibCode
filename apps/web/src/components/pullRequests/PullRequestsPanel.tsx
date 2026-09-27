@@ -30,6 +30,7 @@ import {
   resolvePullRequestsMutationsDisabledReason,
 } from "./pullRequestsAvailability";
 import { PullRequestsContextRefresh } from "./pullRequestsContextRefresh";
+import { pullRequestsHostAddress } from "./pullRequestsHost.logic";
 import { PullRequestsUnavailableState } from "./PullRequestsUnavailableState";
 import { PullRequestsDetailView } from "./detail/PullRequestsDetailView";
 import { PermissionButton } from "../ui/permission-button";
@@ -69,8 +70,11 @@ function AvailablePullRequests({
   const refresh = () => (number === undefined ? listRef.current?.refresh() : onRescan());
   // This context already identified the host, so the dialog need not wait for status.
   const providerHint = useMemo(
-    () => ({ kind: context.provider, host: context.host }),
-    [context.host, context.provider],
+    () => ({
+      kind: context.provider,
+      baseUrl: pullRequestsHostAddress({ webUrl: context.webUrl, host: context.host }),
+    }),
+    [context.host, context.provider, context.webUrl],
   );
   return (
     <section
@@ -255,13 +259,22 @@ export function PullRequestsPanel({ projectRef, number, tab }: PullRequestsPanel
       usePullRequestsStore.getState().setLastNumber({ environmentId, projectId }, number);
   }, [environmentId, number, projectId]);
   const refreshContext = query.refresh;
+  const revalidateContext = query.revalidate;
   // Rescan and auth recovery bypass the server's bounded context caches; opening the
   // panel and switching checkout reuse them.
-  const rescanContext = useCallback(() => {
+  const requestContextRescan = useCallback(() => {
     if (cwd !== null)
       pullRequestsEnvironment.requestContextRescan({ environmentId, input: { cwd } });
+  }, [cwd, environmentId]);
+  const rescanContext = useCallback(() => {
+    requestContextRescan();
     refreshContext();
-  }, [cwd, environmentId, refreshContext]);
+  }, [refreshContext, requestContextRescan]);
+  // Auth recovery follows a read failure automatically, so it keeps a cut-off latched.
+  const recoverContext = useCallback(() => {
+    requestContextRescan();
+    revalidateContext();
+  }, [requestContextRescan, revalidateContext]);
   const rescan = () => {
     rescanContext();
     catalog.refresh();
@@ -345,7 +358,7 @@ export function PullRequestsPanel({ projectRef, number, tab }: PullRequestsPanel
       </div>
     );
   return (
-    <PullRequestsContextRefresh value={rescanContext}>
+    <PullRequestsContextRefresh value={recoverContext}>
       <AvailablePullRequests
         key={JSON.stringify([
           storeKey,

@@ -1,5 +1,162 @@
 # Changelog
 
+## [v0.7.0] - 2026-09-27
+
+BiBCode v0.7.0 makes remote work more reliable: clones survive reconnects,
+slow connections can finish loading, and shared terminals stay readable
+across windows. The release also brings workspace cards to the left panel,
+faster Git updates, clearer message-delivery errors, and Linux desktop and
+update-recovery fixes.
+
+### Chat and agents
+
+- Failed and uncertain messages explain what happened, name the provider
+  instance, and say how **Retry** and **Dismiss** affect the queue. A refused
+  model or option fails once instead of retrying forever; its notice offers
+  **Dismiss** and explains how to send a corrected message. Later messages
+  say **Waiting for an earlier message** instead of offering a **Send now**
+  that cannot work.
+- A queued turn that starts as the previous turn finishes is no longer cut
+  off by the previous turn's idle timeout. If a workspace disappears during
+  a turn, the conversation stops showing **Working**, keeps the partial
+  reply, and holds queued messages for **Send now** after the workspace
+  returns.
+- Provider instances use the same name in Settings, model pickers, chat
+  headers, context meters and delivery notices. Partially configured
+  providers no longer appear ready in Settings but disabled when sending;
+  Cursor is enabled by default unless you explicitly turned it off. A
+  disabled provider no longer claims to be installed before it is checked.
+- Codex custom models accept their configured reasoning effort, and Claude
+  Fast Mode follows the selected model's capabilities, including aliases.
+  A later multi-select question keeps your selections instead of answering
+  itself after the first pick.
+- The work log uses plain titles such as **Session ready** and **Turn
+  completed**, names tool steps, and shows provider warnings with their
+  explanation. Context-window and question-card text is easier to read.
+
+### Workspace and terminals
+
+- The left panel groups the primary checkout and worktrees into outlined
+  workspace cards, showing status, branch, pull or merge request, local
+  changes, terminals, model, age and other chats. It opens wider on a first
+  launch while respecting smaller windows and your saved width.
+- Card and project menus group their actions and add **Pull**, **Copy Branch
+  Name**, **New Worktree…** and **Show Hidden Worktrees (N)**. Cards and
+  in-app menus support keyboard navigation; disabled menu items remain
+  reachable so you can read or hear why they are unavailable.
+- When several windows share a terminal, the window you use controls its
+  size and the others mirror it without garbling the screen. **Sized for
+  another window** offers **Fit to this window**. Reopening or reloading a
+  terminal no longer replays terminal-query replies into your command line.
+- Tabs visibly mark their selection, and the command palette highlights
+  the action Enter will run after filtering. **Retry** keeps keyboard focus
+  while it works, explains when it is waiting for a connection, and cannot
+  start duplicate reads while busy.
+
+### Git Manager and source control
+
+- Commits, branches, tags, stashes and fetches made from another terminal,
+  including BiBCode's terminal panel, refresh the Git Manager promptly.
+  History decorations stay current, duplicate refreshes are reduced, and
+  long stash lists scroll inside their panel.
+- **Clone from URL** no longer stops after 30 seconds and keeps running on
+  the server through a dropped connection. The dialog reconnects to the
+  same clone, and **Cancel clone** reaches the server after reconnection.
+  Failed or cancelled clones clean up the folder they created; retries
+  refuse incomplete earlier clones instead of adding a broken project.
+- Git transfers allow time for large repositories and report stalled HTTP
+  transfers clearly. Repositories without a commit show **No commits yet**
+  instead of **Detached HEAD**.
+- Changes, History, Tags and the primary workspace card explain whether a
+  folder has no repository, damaged Git metadata, or an ownership trust
+  problem. Unavailable actions show the same reason, and trust commands
+  quote the folder for the server's shell. Repairing HEAD or config is
+  noticed automatically, without leaving stale branches or errors behind.
+- The chosen tab survives Git failures and reconnects. **Retry** stays busy
+  for the checkout it is reading even when you switch tabs or worktrees;
+  a failed History refresh keeps the commits already loaded.
+- **Delete Worktree…** refuses while a session in that checkout is running
+  or starting, including one started by another client. If removal fails
+  after stopping idle sessions, their conversation context remains available
+  for the next message.
+- Self-hosted GitLab instances are recognised through configured `glab`
+  hosts even when their domain has no "gitlab" in it. Pull Requests opens
+  and switches repositories faster, GitLab uses **merge request** and `!N`,
+  and create dialogs show the host's real address. While the host is still
+  loading, the wording stays **change request**.
+
+### Remote servers and sharing
+
+- Large History pages and diffs can finish over slow connections without
+  repeatedly disconnecting. A silent connection is detected and shows why
+  BiBCode is reconnecting; a read interrupted twice waits for **Retry**
+  instead of downloading the same result in a loop.
+- Connecting allows up to two minutes to receive the server's settings
+  after the socket is ready, with **Receiving settings from…** progress in
+  the remote-server row and connection notices. **Slow requests** now lives
+  in the status bar, with request and server names, instead of covering
+  content with a persistent toast.
+- SSH environments launch and pair correctly, reuse their saved credential
+  on reconnect, and restart a server that stopped behind an existing tunnel.
+  Remote steps have time limits and actionable errors; pairing work on the
+  host is also bounded if the client goes away.
+- Hosted pairing links stay open until you choose **Pair this backend**.
+  Incomplete links explain what is missing instead of showing unrelated
+  connection advice.
+- **Rename…** in **Settings → Remote Servers** changes a saved server's
+  name on this device without reconnecting it. Headless `bibcode serve`
+  defaults to its hostname, and selecting a remote server no longer jumps
+  back to Local during startup or background updates. **Share This Host**
+  explains when a private default network route is missing.
+
+### Desktop
+
+- The Linux AppImage follows the system light or dark theme at launch and
+  during live changes, including its native menus. Explicit Light and Dark
+  choices stay in place. System-theme changes also reach every app route,
+  and the browser UI served by `bibcode serve` paints its saved theme without
+  flashing light first.
+- Protected in-app updates work while **Share This Host** is enabled,
+  keeping the pre-update backup and shutdown checks in place.
+- If an update fails and the local server cannot restart, the app explains
+  the failure, including a port already in use, and offers **Restart server**.
+  A failed retry also offers **Restart BiBCode**. The downloaded update and
+  unsent drafts are retained while the server recovers.
+- Restarting an AppImage after an update or from recovery releases the old
+  runtime and mount instead of keeping them alive until the app quits.
+
+### Server reliability and performance
+
+- Reconnecting clients reuse recent provider checks for up to five minutes,
+  reducing repeated CLI launches and unchanged settings traffic. Manual
+  refreshes and settings changes still take effect immediately.
+- Git status resumes automatically after a busy client falls behind.
+  Long-running subscription retries release their old resources, and event
+  recovery reads bounded pages without forwarding events twice. Oversized
+  RPC responses fail their own request while keeping the connection usable.
+- Interrupted Git commands stop their helper processes too. Terminal commands
+  that exit immediately report their exit status reliably, and provider
+  helpers briefly retry an executable that is busy being updated. Attachment
+  reuse is limited to the conversation that attached it.
+
+### Developer and test infrastructure
+
+- Server and desktop tests isolate provider and hosting CLIs, terminal homes
+  and SSH configuration from the developer's machine. Regression coverage
+  exercises slow links, SSH reconnects, process cleanup and React Compiler
+  behavior, with bounded waits and fewer timing-dependent test failures.
+
+### Downloads
+
+On macOS, copy BiBCode.app from the DMG to Applications before launching it.
+
+Desktop installers and standalone server distributions are provided for macOS,
+Linux, and Windows on ARM64 and x64. Linux server `.deb` and `.rpm` packages are
+included for both architectures. Stable desktop updater payloads and signatures
+remain available through `latest.json`.
+
+**Full Changelog**: https://github.com/mubeda/BibCode/compare/v0.6.2...v0.7.0
+
 ## [v0.6.2] - 2026-09-23
 
 BiBCode v0.6.2 fixes terminals and tools on the Linux AppImage. Git, Python and

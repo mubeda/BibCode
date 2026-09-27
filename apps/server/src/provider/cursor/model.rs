@@ -3,6 +3,18 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::provider::{
+    RefusedOption, option_needs_value_refusal, option_on_or_off_refusal, option_without_id_refusal,
+    unsupported_option_refusal,
+};
+
+/// BiBCode's labels for Cursor's options, used when the session gives an option no name of its
+/// own. The option descriptors show them, and the refusal for an option names it the same way.
+pub(crate) const REASONING_LABEL: &str = "Reasoning";
+pub(crate) const CONTEXT_LABEL: &str = "Context";
+pub(crate) const FAST_LABEL: &str = "Fast";
+pub(crate) const THINKING_LABEL: &str = "Thinking";
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CursorAboutResult {
@@ -170,7 +182,7 @@ pub fn build_capabilities_from_config_options(options: &Value) -> Value {
             reasoning
                 .get("name")
                 .and_then(Value::as_str)
-                .unwrap_or("Reasoning"),
+                .unwrap_or(REASONING_LABEL),
             reasoning
                 .get("options")
                 .and_then(Value::as_array)
@@ -189,7 +201,7 @@ pub fn build_capabilities_from_config_options(options: &Value) -> Value {
                 option
                     .get("name")
                     .and_then(Value::as_str)
-                    .unwrap_or("Context"),
+                    .unwrap_or(CONTEXT_LABEL),
                 option
                     .get("options")
                     .and_then(Value::as_array)
@@ -199,7 +211,10 @@ pub fn build_capabilities_from_config_options(options: &Value) -> Value {
             )),
             (Some("model_config"), Some("fast")) => descriptors.push(boolean_descriptor(
                 "fastMode",
-                option.get("name").and_then(Value::as_str).unwrap_or("Fast"),
+                option
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(FAST_LABEL),
                 option.get("currentValue"),
             )),
             (Some("model_config"), Some("thinking")) => descriptors.push(boolean_descriptor(
@@ -207,7 +222,7 @@ pub fn build_capabilities_from_config_options(options: &Value) -> Value {
                 option
                     .get("name")
                     .and_then(Value::as_str)
-                    .unwrap_or("Thinking"),
+                    .unwrap_or(THINKING_LABEL),
                 option.get("currentValue"),
             )),
             _ => {}
@@ -216,12 +231,26 @@ pub fn build_capabilities_from_config_options(options: &Value) -> Value {
     json!({ "optionDescriptors": descriptors })
 }
 
-pub fn resolve_acp_config_updates(options: &Value, updates: &Value) -> Result<Vec<Value>, String> {
+/// Resolves a turn's options into Cursor config updates, checked against what the session
+/// advertises. A refusal names the option by the label the option descriptors show: the session's
+/// own name for it, or BiBCode's default. A problem with the request, such as an option or value
+/// the session does not advertise, gets its own sentence. A session configuration BiBCode can't
+/// work with, such as an advertised option of an unexpected category or type, gets the generic
+/// sentence of [`RefusedOption::unusable`]: a relaunch advertises the same configuration, and the
+/// protocol detail is nothing the user can act on.
+pub fn resolve_acp_config_updates(
+    options: &Value,
+    updates: &Value,
+) -> Result<Vec<Value>, RefusedOption> {
     let Some(options) = options.as_array() else {
-        return Err("Cursor session did not advertise config options".to_owned());
+        return Err(RefusedOption::unusable(
+            "Cursor session did not advertise config options",
+        ));
     };
     let Some(updates) = updates.as_array() else {
-        return Err("Cursor option updates must be an array".to_owned());
+        return Err(RefusedOption::unusable(
+            "Cursor option updates must be an array",
+        ));
     };
     let mut resolved = Vec::new();
     for update in updates {
@@ -236,65 +265,125 @@ pub fn resolve_acp_config_updates(options: &Value, updates: &Value) -> Result<Ve
                 } else {
                     (
                         "reasoning",
-                        expected_config_option(options, "reasoning", "thought_level")?,
+                        requested_config_option(
+                            options,
+                            "reasoning",
+                            "thought_level",
+                            REASONING_LABEL,
+                        )?,
                     )
                 };
-                ensure_select_config_option(descriptor, config_id)?;
-                let value = match update.get("value") {
-                    Some(Value::String(value)) if value == "xhigh" => json!("extra-high"),
-                    Some(Value::String(value)) => json!(value),
-                    None => return Err("Cursor reasoning option is missing a value".to_owned()),
-                    _ => return Err("Cursor reasoning option must be a string".to_owned()),
+                let label = option_label(descriptor, REASONING_LABEL);
+                ensure_select_config_option(descriptor, config_id)
+                    .map_err(RefusedOption::unusable)?;
+                let (requested, value) = match update.get("value") {
+                    Some(Value::String(value)) if value == "xhigh" => (value, json!("extra-high")),
+                    Some(Value::String(value)) => (value, json!(value)),
+                    None => {
+                        return Err(RefusedOption::new(
+                            "Cursor reasoning option is missing a value",
+                            option_needs_value_refusal(label),
+                        ));
+                    }
+                    _ => {
+                        return Err(RefusedOption::new(
+                            "Cursor reasoning option must be a string",
+                            option_needs_value_refusal(label),
+                        ));
+                    }
                 };
-                ensure_advertised_value(descriptor, &value, config_id)?;
+                ensure_requested_value(
+                    descriptor,
+                    &value,
+                    config_id,
+                    &format!("{label} {requested}"),
+                )?;
                 (config_id, value)
             }
             Some("contextWindow") => {
-                let descriptor = expected_config_option(options, "context", "model_config")?;
-                ensure_select_config_option(descriptor, "context")?;
-                let value = update
-                    .get("value")
-                    .and_then(Value::as_str)
-                    .map(|value| json!(value))
-                    .ok_or_else(|| "Cursor context window option is missing a value".to_owned())?;
-                ensure_advertised_value(descriptor, &value, "context")?;
+                let descriptor =
+                    requested_config_option(options, "context", "model_config", CONTEXT_LABEL)?;
+                let label = option_label(descriptor, CONTEXT_LABEL);
+                ensure_select_config_option(descriptor, "context")
+                    .map_err(RefusedOption::unusable)?;
+                let requested = update.get("value").and_then(Value::as_str).ok_or_else(|| {
+                    RefusedOption::new(
+                        "Cursor context window option is missing a value",
+                        option_needs_value_refusal(label),
+                    )
+                })?;
+                let value = json!(requested);
+                ensure_requested_value(
+                    descriptor,
+                    &value,
+                    "context",
+                    &format!("{label} {requested}"),
+                )?;
                 ("context", value)
             }
             Some("fastMode") => {
-                let descriptor = expected_config_option(options, "fast", "model_config")?;
-                ensure_select_config_option(descriptor, "fast")?;
+                let descriptor =
+                    requested_config_option(options, "fast", "model_config", FAST_LABEL)?;
+                let label = option_label(descriptor, FAST_LABEL);
+                ensure_select_config_option(descriptor, "fast").map_err(RefusedOption::unusable)?;
                 let value = update
                     .get("value")
                     .and_then(Value::as_bool)
-                    .ok_or_else(|| "Cursor fast mode must be boolean".to_owned())?;
+                    .ok_or_else(|| {
+                        RefusedOption::new(
+                            "Cursor fast mode must be boolean",
+                            option_on_or_off_refusal(label),
+                        )
+                    })?;
                 let value = json!(value.to_string());
-                ensure_advertised_value(descriptor, &value, "fast")?;
+                ensure_requested_value(descriptor, &value, "fast", label)?;
                 ("fast", value)
             }
             Some("thinking") => {
-                let descriptor = expected_config_option(options, "thinking", "model_config")?;
-                ensure_select_config_option(descriptor, "thinking")?;
+                let descriptor =
+                    requested_config_option(options, "thinking", "model_config", THINKING_LABEL)?;
+                let label = option_label(descriptor, THINKING_LABEL);
+                ensure_select_config_option(descriptor, "thinking")
+                    .map_err(RefusedOption::unusable)?;
                 let value = update
                     .get("value")
                     .and_then(Value::as_bool)
                     .map(|value| json!(value.to_string()))
-                    .ok_or_else(|| "Cursor thinking option is missing a value".to_owned())?;
-                ensure_advertised_value(descriptor, &value, "thinking")?;
+                    .ok_or_else(|| {
+                        RefusedOption::new(
+                            "Cursor thinking option is missing a value",
+                            option_on_or_off_refusal(label),
+                        )
+                    })?;
+                ensure_requested_value(descriptor, &value, "thinking", label)?;
                 ("thinking", value)
             }
-            Some(id) => return Err(format!("Cursor does not support option {id}")),
-            None => return Err("Cursor option is missing an id".to_owned()),
+            Some(id) => {
+                return Err(RefusedOption::new(
+                    format!("Cursor does not support option {id}"),
+                    unsupported_option_refusal(id),
+                ));
+            }
+            None => {
+                return Err(RefusedOption::new(
+                    "Cursor option is missing an id",
+                    option_without_id_refusal(),
+                ));
+            }
         };
         resolved.push(json!({ "configId": config_id, "value": value }));
     }
     Ok(resolved)
 }
 
+/// [`resolve_acp_config_updates`], plus the updates that restore every supported option the turn
+/// leaves out to the session's baseline. Restoring depends only on the session's configuration,
+/// so a failure there is a configuration BiBCode can't work with.
 pub fn resolve_acp_config_updates_with_baseline(
     options: &Value,
     baseline: &Value,
     updates: &Value,
-) -> Result<Vec<Value>, String> {
+) -> Result<Vec<Value>, RefusedOption> {
     let mut resolved = resolve_acp_config_updates(options, updates)?;
     let requested_config_ids = resolved
         .iter()
@@ -305,9 +394,9 @@ pub fn resolve_acp_config_updates_with_baseline(
                 .map(str::to_owned)
         })
         .collect::<Vec<_>>();
-    let baseline = baseline
-        .as_array()
-        .ok_or_else(|| "Cursor session did not advertise baseline config options".to_owned())?;
+    let baseline = baseline.as_array().ok_or_else(|| {
+        RefusedOption::unusable("Cursor session did not advertise baseline config options")
+    })?;
 
     for (config_id, category) in supported_baseline_config_options(baseline) {
         if requested_config_ids
@@ -316,10 +405,13 @@ pub fn resolve_acp_config_updates_with_baseline(
         {
             continue;
         }
-        let descriptor = expected_config_option(baseline, config_id, category)?;
-        ensure_select_config_option(descriptor, config_id)?;
-        let baseline_value = acp_config_option_baseline_value(baseline, config_id)?;
-        ensure_advertised_value(descriptor, &baseline_value, config_id)?;
+        let descriptor = expected_config_option(baseline, config_id, category)
+            .map_err(RefusedOption::unusable)?;
+        ensure_select_config_option(descriptor, config_id).map_err(RefusedOption::unusable)?;
+        let baseline_value = acp_config_option_baseline_value(baseline, config_id)
+            .map_err(RefusedOption::unusable)?;
+        ensure_advertised_value(descriptor, &baseline_value, config_id)
+            .map_err(RefusedOption::unusable)?;
         let current_value = acp_config_option_current_value(options, config_id)?;
         if current_value != baseline_value {
             resolved.push(json!({ "configId": config_id, "value": baseline_value }));
@@ -364,14 +456,23 @@ pub fn resolve_acp_default_model_config(options: &Value) -> Result<(String, Valu
     Ok((config_id, value))
 }
 
-pub fn acp_config_option_current_value(options: &Value, config_id: &str) -> Result<Value, String> {
-    let options = options
-        .as_array()
-        .ok_or_else(|| "Cursor session did not advertise config options".to_owned())?;
+/// The session's current value for an option it advertises, or its advertised default. Its
+/// absence is a session configuration BiBCode can't work with.
+pub fn acp_config_option_current_value(
+    options: &Value,
+    config_id: &str,
+) -> Result<Value, RefusedOption> {
+    let options = options.as_array().ok_or_else(|| {
+        RefusedOption::unusable("Cursor session did not advertise config options")
+    })?;
     let descriptor = options
         .iter()
         .find(|option| option.get("id").and_then(Value::as_str) == Some(config_id))
-        .ok_or_else(|| format!("Cursor session did not advertise config option {config_id}"))?;
+        .ok_or_else(|| {
+            RefusedOption::unusable(format!(
+                "Cursor session did not advertise config option {config_id}"
+            ))
+        })?;
     descriptor
         .get("currentValue")
         .filter(|value| !value.is_null())
@@ -385,7 +486,11 @@ pub fn acp_config_option_current_value(options: &Value, config_id: &str) -> Resu
                 .find(|option| option.get("isDefault") == Some(&Value::Bool(true)))
                 .and_then(advertised_option_value)
         })
-        .ok_or_else(|| format!("Cursor config option {config_id} has no current or default value"))
+        .ok_or_else(|| {
+            RefusedOption::unusable(format!(
+                "Cursor config option {config_id} has no current or default value"
+            ))
+        })
 }
 
 fn supported_baseline_config_options(options: &[Value]) -> Vec<(&'static str, &'static str)> {
@@ -433,6 +538,52 @@ fn acp_config_option_baseline_value(options: &[Value], config_id: &str) -> Resul
         .ok_or_else(|| {
             format!("Cursor config option {config_id} has no advertised default or current value")
         })
+}
+
+/// The descriptor of an option the turn requests. The session not advertising it refuses the
+/// request, naming the option by `label`; an advertised option of another category is a
+/// configuration BiBCode can't work with.
+fn requested_config_option<'a>(
+    options: &'a [Value],
+    config_id: &str,
+    category: &str,
+    label: &str,
+) -> Result<&'a Value, RefusedOption> {
+    let descriptor = options
+        .iter()
+        .find(|option| option.get("id").and_then(Value::as_str) == Some(config_id))
+        .ok_or_else(|| {
+            RefusedOption::new(
+                format!("Cursor session did not advertise config option {config_id}"),
+                unsupported_option_refusal(label),
+            )
+        })?;
+    if descriptor.get("category").and_then(Value::as_str) != Some(category) {
+        return Err(RefusedOption::unusable(format!(
+            "Cursor config option {config_id} has an unsupported category"
+        )));
+    }
+    Ok(descriptor)
+}
+
+/// The label the option descriptors show for an advertised option: the session's name for it, or
+/// BiBCode's `default`.
+fn option_label<'a>(descriptor: &'a Value, default: &'a str) -> &'a str {
+    descriptor
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or(default)
+}
+
+/// Refuses a requested value the session does not advertise, naming it as `option`.
+fn ensure_requested_value(
+    descriptor: &Value,
+    value: &Value,
+    config_id: &str,
+    option: &str,
+) -> Result<(), RefusedOption> {
+    ensure_advertised_value(descriptor, value, config_id)
+        .map_err(|detail| RefusedOption::new(detail, unsupported_option_refusal(option)))
 }
 
 fn expected_config_option<'a>(

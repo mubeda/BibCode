@@ -36,7 +36,15 @@ vi.mock("~/state/filesystem", () => ({
 
 vi.mock("~/state/query", () => ({
   useEnvironmentQuery: (target: unknown) => {
-    if (target === null) return { data: null, error: null, isPending: false, refresh: h.refresh };
+    if (target === null)
+      return {
+        data: null,
+        error: null,
+        isPending: false,
+        refresh: h.refresh,
+        revalidate: h.refresh,
+        requiresRetry: false,
+      };
     const result = h.browseState.result;
     return {
       data:
@@ -57,6 +65,8 @@ vi.mock("~/state/query", () => ({
       error: null,
       isPending: false,
       refresh: h.refresh,
+      revalidate: h.refresh,
+      requiresRetry: false,
     };
   },
 }));

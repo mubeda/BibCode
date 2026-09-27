@@ -9,6 +9,7 @@ import {
   countRunningThreadsForEnvironment,
   describeAddServerFailure,
   describeRenameServerFailure,
+  describeSshEnvironmentAddedToast,
   resolvePairingAddFailureDetail,
   describeCompatBadge,
   formatServerVersionLabel,
@@ -235,5 +236,21 @@ describe("describeRenameServerFailure", () => {
     expect(describeRenameServerFailure(null)).toBe(
       "Couldn't save the name on this device. Try again.",
     );
+  });
+});
+
+describe("describeSshEnvironmentAddedToast", () => {
+  it("says the environment was added and is still connecting", () => {
+    expect(describeSshEnvironmentAddedToast({ label: "devbox", updated: false })).toEqual({
+      title: "Environment added",
+      description: "devbox is connecting over SSH.",
+    });
+  });
+
+  it("says a saved alias was updated", () => {
+    expect(describeSshEnvironmentAddedToast({ label: "GPU box", updated: true })).toEqual({
+      title: "Environment updated",
+      description: "GPU box is connecting over SSH.",
+    });
   });
 });

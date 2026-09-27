@@ -1,6 +1,7 @@
 import {
   ChevronsLeftRightEllipsisIcon,
   EllipsisIcon,
+  LoaderCircleIcon,
   PlusIcon,
   QrCodeIcon,
   RefreshCwIcon,
@@ -115,6 +116,7 @@ import {
   describeAddServerFailure,
   describeCompatBadge,
   describeRenameServerFailure,
+  describeSshEnvironmentAddedToast,
   formatServerVersionLabel,
   isLoopbackAcknowledgementRequired,
   normalizePairingCodeInput,
@@ -173,6 +175,11 @@ function RemoteServerRow({
           ? "bg-destructive"
           : "bg-muted-foreground/40";
   const statusTooltip = connectionStatusText(environment.connection);
+  const statusLine = environment.connection.error
+    ? "error"
+    : environment.connection.notice
+      ? "notice"
+      : null;
   const errorTraceId = environment.connection.traceId;
   const { copyToClipboard: copyTraceIdToClipboard } = useCopyToClipboard<{ traceId: string }>({
     target: "trace ID",
@@ -307,9 +314,18 @@ function RemoteServerRow({
               {versionMismatch.serverVersion}.
             </p>
           ) : null}
-          {environment.connection.error ? (
-            <p className="flex min-w-0 items-center gap-2 text-destructive text-xs">
-              <span className="truncate">{connectionStatusText(environment.connection)}</span>
+          {statusLine === "error" ? (
+            <p className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5 text-destructive text-xs">
+              {/* Wraps so the action half of the message stays readable; the
+                  clamp only bounds an unusually long detail, which the status
+                  dot's tooltip still shows in full. */}
+              <span className="min-w-0 line-clamp-3 wrap-break-word">
+                {connectionStatusText({
+                  phase: connectionState,
+                  error: environment.connection.error,
+                  traceId: errorTraceId,
+                })}
+              </span>
               {errorTraceId ? (
                 <button
                   type="button"
@@ -319,6 +335,20 @@ function RemoteServerRow({
                   Copy trace ID
                 </button>
               ) : null}
+            </p>
+          ) : statusLine === "notice" ? (
+            <p
+              role="status"
+              aria-live="polite"
+              className="flex min-w-0 flex-wrap items-start gap-x-2 gap-y-0.5 text-xs text-muted-foreground"
+            >
+              <LoaderCircleIcon
+                aria-hidden="true"
+                className="mt-px size-3.5 shrink-0 animate-spin"
+              />
+              <span className="min-w-0 flex-1 wrap-break-word">
+                {environment.connection.notice}
+              </span>
             </p>
           ) : null}
           {updateInstructions ? (
@@ -459,23 +489,26 @@ function RemoteServerRowFromSession(
     remoteUpdateControl ? remoteUpdateEnvironment.snapshot({ environmentId, input: {} }) : null,
   );
   const refreshUpdateStatus = updateQuery.refresh;
+  const revalidateUpdateStatus = updateQuery.revalidate;
   const updateCheck = useRemoteUpdateCheckState(remoteUpdateControl ? environmentId : null);
   const runCheck = useAtomCommand(remoteUpdateEnvironment.check, { reportFailure: false });
   const runInstall = useAtomCommand(remoteUpdateEnvironment.install, { reportFailure: false });
   const [installPending, setInstallPending] = useState(false);
   const [manualInstallRequired, setManualInstallRequired] = useState(false);
 
+  // A fan-out check's epoch is an automatic re-read; it keeps a transport cut-off latched.
   useEffect(() => {
     if (remoteUpdateControl && updateRefreshEpoch > 0) {
-      refreshUpdateStatus();
+      revalidateUpdateStatus();
     }
-  }, [refreshUpdateStatus, remoteUpdateControl, updateRefreshEpoch]);
+  }, [revalidateUpdateStatus, remoteUpdateControl, updateRefreshEpoch]);
 
+  // Re-reads after a check or install are automatic; only Retry clears a cut-off latch.
   const checkForUpdate = useCallback(async () => {
     // The check records its own progress and failure in the shared check state.
     await runCheck({ environmentId, input: {} });
-    refreshUpdateStatus();
-  }, [environmentId, refreshUpdateStatus, runCheck]);
+    revalidateUpdateStatus();
+  }, [environmentId, revalidateUpdateStatus, runCheck]);
 
   const installUpdate = useCallback(async () => {
     setInstallPending(true);
@@ -483,7 +516,7 @@ function RemoteServerRowFromSession(
     setInstallPending(false);
     if (result._tag === "Success") {
       setManualInstallRequired(false);
-      refreshUpdateStatus();
+      revalidateUpdateStatus();
       return;
     }
     const error = squashAtomCommandFailure(result);
@@ -494,9 +527,9 @@ function RemoteServerRowFromSession(
       error.code === REMOTE_UPDATE_MANUAL_REQUIRED
     ) {
       setManualInstallRequired(true);
-      refreshUpdateStatus();
+      revalidateUpdateStatus();
     }
-  }, [environmentId, refreshUpdateStatus, runInstall]);
+  }, [environmentId, revalidateUpdateStatus, runInstall]);
 
   const queryStatus = serverUpdateStatusFromQuery(updateQuery, {
     connected: props.environment.connection.phase === "connected",
@@ -508,7 +541,11 @@ function RemoteServerRowFromSession(
           ...queryStatus,
           snapshot: {
             ...queryStatus.snapshot,
-            support: { installMode: "manual", reason: "manual-update-required" },
+            support: {
+              ...queryStatus.snapshot.support,
+              installMode: "manual",
+              reason: "manual-update-required",
+            },
           },
         }
       : queryStatus;
@@ -811,24 +848,6 @@ export function ConnectTab({
         .map((environment) => environment.environmentId),
     [savedEnvironments],
   );
-  const savedDesktopSshEnvironmentsByAlias = useMemo(
-    () =>
-      savedEnvironments.reduce<Record<string, EnvironmentPresentation>>(
-        (accumulator, environment) => {
-          const profile = environment.entry.profile;
-          if (
-            environment.entry.target._tag === "SshConnectionTarget" &&
-            Option.isSome(profile) &&
-            profile.value._tag === "SshConnectionProfile"
-          ) {
-            accumulator[profile.value.target.alias] = environment;
-          }
-          return accumulator;
-        },
-        {},
-      ),
-    [savedEnvironments],
-  );
   const savedDesktopSshEnvironmentKeys = useMemo(() => {
     const keys = new Set<string>();
     for (const environment of savedEnvironments) {
@@ -1027,6 +1046,9 @@ export function ConnectTab({
         return;
       }
 
+      // Captured before connecting: the host decides which environment this
+      // is, and "updated" means it was already saved.
+      const savedBefore = new Set(savedEnvironmentIds);
       const result = await connectSshEnvironment({ target, label: "" });
       if (result._tag === "Failure") {
         if (!isAtomCommandInterrupted(result)) {
@@ -1045,8 +1067,10 @@ export function ConnectTab({
       consumeInitialPairingCode();
       toastManager.add({
         type: "success",
-        title: "Environment connected",
-        description: `${target.alias} is ready over an SSH-managed tunnel.`,
+        ...describeSshEnvironmentAddedToast({
+          label: target.alias,
+          updated: savedBefore.has(result.value),
+        }),
       });
       setIsAddingSavedBackend(false);
       return;
@@ -1115,6 +1139,7 @@ export function ConnectTab({
     savedBackendSshHost,
     savedBackendSshPort,
     savedBackendSshUsername,
+    savedEnvironmentIds,
   ]);
 
   const handleConnectSavedBackend = useCallback(
@@ -1197,6 +1222,7 @@ export function ConnectTab({
       } else {
         setSshConnectionError(null);
       }
+      const savedBefore = new Set(savedEnvironmentIds);
       const result = await connectSshEnvironment({
         target,
         ...(label === undefined ? {} : { label }),
@@ -1210,10 +1236,10 @@ export function ConnectTab({
         consumeInitialPairingCode();
         toastManager.add({
           type: "success",
-          title: savedDesktopSshEnvironmentsByAlias[target.alias]
-            ? "Environment reconnected"
-            : "Environment connected",
-          description: `${label?.trim() || target.alias} is ready over an SSH-managed tunnel.`,
+          ...describeSshEnvironmentAddedToast({
+            label: label?.trim() || target.alias,
+            updated: savedBefore.has(result.value),
+          }),
         });
         return;
       }
@@ -1227,12 +1253,7 @@ export function ConnectTab({
         }
       }
     },
-    [
-      connectSshEnvironment,
-      consumeInitialPairingCode,
-      savedBackendMode,
-      savedDesktopSshEnvironmentsByAlias,
-    ],
+    [connectSshEnvironment, consumeInitialPairingCode, savedBackendMode, savedEnvironmentIds],
   );
   const handleSavedBackendHostChange = useCallback((value: string) => {
     const resolution = tryResolveRemotePairingHostInput(value);

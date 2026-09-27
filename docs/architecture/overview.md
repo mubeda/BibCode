@@ -112,16 +112,21 @@ flowchart TB
 
   One status observation reads porcelain-v2 branch and file state once and runs
   staged or unstaged numstat only for areas that are present. A failed porcelain
-  read becomes the compatible non-repository result only after the existing
-  repository probe confirms that state; malformed metadata, permissions,
-  cancellation, and other actionable failures remain errors. Status and
+  read whose repository probe also refuses the folder becomes the non-repository
+  result, which says, when the server can tell, whether no repository exists, Git
+  cannot read one, or Git refuses to trust it. A readable non-work-tree result
+  carries no reason; a failed read with a work-tree probe or cancellation remains
+  an error. Status and
   background-observation Git reads set `GIT_OPTIONAL_LOCKS=0`; fetch and
   mutations keep the ordinary Git environment.
 
   Passive VCS summaries use a separate latest-value producer per canonical
   worktree. One porcelain-v2 status read supplies repository, named/detached or
-  unborn identity, and dirty state without numstat or file-row materialization;
-  the existing bounded origin-provider read and pull-request service add
+  unborn identity, and dirty state without numstat or file-row materialization.
+  A failed porcelain read is classified like the status observation, carrying
+  optional `repositoryUnavailableReason` when `isRepo: false`, while an
+  operational failure in a working repository keeps the prior summary as stale.
+  The existing bounded origin-provider read and pull-request service add
   provider and matching named-branch PR state. Each producer cycle publishes
   its fresh base before optional PR enrichment. A PR completed in cycle N may
   be carried only into cycle N+1 for the same ref and provider while that
@@ -157,18 +162,24 @@ flowchart TB
   network-transfer variant with a 24-hour safety bound. Transfers nobody can
   cancel run on the bounded variant, capped at 10 minutes: automatic fetch,
   `vcs.pull`, and the stacked-action and publish pushes, wherever they start
-  (chat header, Sidebar Update, Source Control panel, or the Git Manager's
+  (chat header, Sidebar Pull, Source Control panel, or the Git Manager's
   Create PR dialog). SSH transports have no stall guard, so a dead SSH link ends
   only by cancellation, those bounds, or the connection's own keepalive
   settings. The orchestration bootstrap fetch and the Pull Requests checkout
-  fetch run outside the driver with their own budgets and no stall guard. Clone
-  reserves its
-  destination before Git runs, and an owned task removes only a destination
-  that clone created after a failure, timeout, stall, or cancellation
-  (including an interrupted RPC); a new clone into a destination still being
-  cleaned up waits for that cleanup. Reusing an existing destination requires a
-  `HEAD` that resolves to a commit; otherwise the error names the incomplete
-  clone and asks the user to remove it or choose another folder.
+  fetch run outside the driver with their own budgets and no stall guard.
+  Clone runs in a server-owned clone runtime keyed by
+  destination (canonical parent plus leaf). It reserves its destination before
+  Git runs, and its owned task removes only a destination that clone created
+  after a failure, timeout, stall, cancellation, or panic of the transfer,
+  before it reports the outcome. A caller that asked to
+  `detach` can lose its socket without stopping the clone; a later session
+  re-attaches, and `vcs.cancelClone` or shutdown stops it. An orphaned clone runs
+  to completion under the 24-hour bound and, for HTTP(S), the stall guard. A new
+  clone into a destination still being cleaned up waits for that cleanup.
+  Reusing an existing destination requires a `HEAD` that resolves to a commit
+  and an index file (`git rev-parse --git-path index`); otherwise the error
+  names the incomplete clone and asks the user to remove it or choose another
+  folder.
 
   Shared observations never bypass per-caller anchor validation, and final
   view/repository ownership release is atomic against concurrent attachment. A
@@ -202,12 +213,15 @@ flowchart TB
   lifecycle.
 
 - **Git Manager (`apps/server/src/git/manager/`)** owns repository generations,
-  refs and worktree occupancy snapshots, tip-pinned history pages, diff and
+  refs and worktree occupancy snapshots, tip-pinned history pages (at most 100
+  commits and about 1 MiB each), diff and
   patch parsing, server-authored guards, in-progress/conflict inspection, and
   the branch, sync, stash, merge, rewrite, conflict, and tag operation
   primitives. `apps/server/src/production/git_manager_rpc.rs` adapts those
   owners to the typed RPC registry and the worktree catalog's existing mutation
-  arbitration.
+  arbitration. Review preview sources stop capturing git output at the patch
+  cap, discard the last incomplete file, and set `truncated`; History budgets
+  count serialized JSON including escaping.
 
   Git Manager signals reuse the status watcher's lifecycle. The worktree root
   retains one native recursive watch, including its `.git` tree. The notify
@@ -275,7 +289,9 @@ flowchart TB
   `ETXTBSY` (the executable is still open for writing, typically a helper
   that was just installed or rewritten, or a fork of this process that has
   not exec'd yet) every 25 ms for at most one second and never past the run's
-  own deadline. Every other spawn error is returned immediately. A run whose
+  own deadline. Every other spawn error is returned immediately.
+  The OpenCode and Codex provider-terminal helper launchers use the same retry
+  before waiting for readiness. A run whose
   future is dropped before it settles (an interrupted inline RPC, an aborted
   task, runtime shutdown, or a panic) kills its whole process group or Windows
   job while the root is unreaped, without waiting; see the cancellation
@@ -317,7 +333,13 @@ the bundled environment; desktop external-backend launches and the generic
 supervised process runner deliberately do not apply this policy. The login-shell
 PATH probe also inherits the original desktop environment: its output hydrates
 the desktop's own PATH before Tauri starts, so stripping bundled entries there
-would change the desktop's executable ordering.
+would change the desktop's executable ordering. Before any Linux relaunch (an
+update restart or **Restart BiBCode**), the host marks every descriptor above
+stderr close-on-exec (`apps/desktop/src-tauri/src/relaunch.rs`), so the new
+process no longer inherits the old AppImage runtime's keep-alive pipe. The old
+FUSE mount, its daemon and the replaced AppImage therefore end with the old
+process; the relaunched app still inherits the old environment, including stale
+`.mount_*` entries behind the new mount's own paths.
 
 The gate checks a few variables before copying the full environment. A nonempty
 `APPIMAGE` and an absolute, non-root `APPDIR` activate isolation. For an
@@ -341,8 +363,9 @@ Empty entries alongside real host entries, including an explicitly configured
 distribution-specific directories.
 
 The policy also removes `APPDIR`, `APPIMAGE`, `ARGV0`, and `OWD`, plus the
-launcher's forced `GTK_THEME`, `GDK_BACKEND`, `PYTHONDONTWRITEBYTECODE`, and
-`GTK_PATH`. The hook replaces `GTK_PATH` without retaining the user's value, so
+launcher's forced `GDK_BACKEND`, `PYTHONDONTWRITEBYTECODE`, and `GTK_PATH`, and
+the user-only `GTK_THEME` override (inherited or supplied through
+`APPIMAGE_GTK_THEME`). The hook replaces `GTK_PATH` without retaining the user's value, so
 its host directories must also be removed. Terminal shells can reapply user
 settings from their rc files. Command-local overrides and removals participate
 in the effective environment; cleared process commands never recover ambient
@@ -473,8 +496,9 @@ global, exact-peer, IPv4 `/24` or IPv6 `/64`, and loopback-forwarder admission.
 Authenticated assembly uses cancellable fit-first byte pressure, a 10-second
 incomplete-message progress deadline, and releases permits after dispatch rather
 than handler completion. Outbound fit-first admission keeps a five-second
-reservation deadline, gives each record a fresh five-second sink deadline, and
-adds a size-derived aggregate deadline. Desktop exposure remains a privileged
+reservation deadline; the connection writer then gives each record 20 seconds
+to be accepted and each message 30 seconds plus its size at 16 KiB/s, and ends
+the session when either passes. Desktop exposure remains a privileged
 `DesktopBridge` operation: native starts are local-only, WSL exposure is
 externally managed, and only authoritative live grants or an explicit
 legacy-resume action can request a wide native bind. Pairing credentials remain
@@ -482,7 +506,9 @@ pending until the verified client persists local state and confirms the session.
 Desktop discovery advertises only usable IPv4 addresses until a dual-stack
 listener exists; public candidates are labeled, never defaulted, and require an
 explicit warning acknowledgement. Plain `/ws` caps individual frames at 16 MiB
-while retaining the 64 MiB reassembled-message cap.
+while retaining the 64 MiB reassembled-message cap; a client that offers the
+`bibcode.rpc.chunked.v1` subprotocol receives messages over 64 KiB as binary
+records instead.
 Hosted pairing rejects URL userinfo and renders and submits one normalized host;
 legacy query credentials are scrubbed after capture. Saved blank host keys
 normalize to the legacy plain-transport representation. The environment registry
@@ -728,6 +754,16 @@ the current stage, elapsed time, and active-mutation count to the protection
 dialog. A failed status poll does not cancel or replace the authoritative
 prepare request.
 
+Every desktop-mode runtime with a bootstrap token owns the maintenance
+coordinator regardless of its bind. The host obtains the primary's coordinator
+through `ServerHandle::update_maintenance` and calls it in process; WSL and
+other external backends use the loopback HTTP API. Both transports use a 45 s
+prepare bound, poll progress every 250 ms with a 2 s status bound, and allow
+10 s for commit or cancel; either successful finish exits the backend. Both
+report the same failure message text without transport details. The HTTP
+invariant is unchanged: maintenance routes are exposed only on loopback or a
+WSL-owned wildcard bind.
+
 Each in-process server runtime owns a distinct bounded process-attribution
 registry shared by its provider, terminal, provider-helper, and managed-endpoint
 owners. Runtime quiesce closes
@@ -753,13 +789,52 @@ exits as expected, stops every backend from the captured running set, and does
 not invoke the platform installer until every included backend has committed
 and stopped. A prepare, cancel, commit, stop, or installer failure attempts to
 restart the exact prior running set before update coordination is released.
+Any restart onto a port its stopped predecessor held (this update recovery, a
+project-data restart of the target it stopped, a crash restart, or an exposure
+or topology restart that re-plans a held port) lets the in-process server retry
+a bind that finds the port still in use for up to 3 s, backing off from 25 ms
+to 250 ms. First starts and WSL backends fail at once, and an expired window
+reports the original bind error.
+If that recovery restart fails, the supervisor keeps the exact launch plan
+registered as stopped, records a typed update-recovery failure in its slot,
+and withholds its connection bootstrap. In-process `ServerError::Bind` failures
+with `AddrInUse` retain a typed port-in-use reason and the conflicting port;
+other failures retain their original detail and use the plan's port. The update
+manager derives `backendRecovery` from registered, stopped supervisor slots
+with these failures; first-start failures do not create update-recovery entries.
+A supervisor listener re-emits the current update state whenever that derived
+list changes, after the supervisor releases its state lock. A failed installation
+also emits one `desktop:project-data-status-changed` invalidation per current
+recovery entry.
+Checks, downloads, and installations (including protection bypass) pause while
+any recovery entry remains, preserving the downloaded update and recovery state.
+
+The update dialog and toast offer **Restart server**, calling the privileged
+`retryProjectData` bridge command sequentially for each failed environment and
+then requesting its normal connection retry. Any successful restart into a slot,
+including a retry or an exposure/topology restart, clears its recovery entry;
+removing the slot also drops the entry. A failed project-data restart replaces
+an existing entry's typed failure, and an admission failure leaves it intact.
+Once every entry is cleared, **Retry installation** becomes available. A failed
+retry also offers **Restart BiBCode** through the optional `restartApp` bridge command.
+The host rejects that command during an install or exclusive update/project-data
+operation; otherwise it requests the normal application restart, whose exit
+path persists window state, stops backends through `stop_for_exit`, and shuts
+down SSH forwarding. Recovery never automatically retries or selects a new port.
+
+In a desktop renderer, a missing primary bootstrap is a typed topology-read
+failure, never a fallback to the development server or WebView origin. The
+platform poll retains the registered primary and its cached data and composer
+drafts while that bootstrap is withheld, and reuses its registration when the
+same endpoints return. Browser and hosted endpoint fallbacks are unchanged.
+
 Stopping the primary in-process backend never sweeps descendants of the shared
 desktop PID; doing so would terminate the system WebView before the installer
 can take ownership of application restart.
 
 ### Remote server updates
 
-Every server answers the `updater.status`, `updater.check`, and
+Every server answers the `updater.activeWork`, `updater.status`, `updater.check`, and
 `updater.install` RPC methods (contract:
 `packages/contracts/src/remoteUpdate.ts`; Rust mirror:
 `apps/server/src/remote_update.rs`). All three environment-descriptor
@@ -767,8 +842,13 @@ producers—the well-known route (`apps/server/src/http.rs`),
 `server.getConfig` (`apps/server/src/production/control.rs`), and the
 Connect/relay descriptor (`apps/server/src/lifecycle.rs`)—embed
 `remoteUpdateSupport` and advertise the surface with the default-false
-`remoteUpdateControl` capability. Clients therefore know the install mode
-before asking.
+`remoteUpdateControl` capability. All three also publish `bootId` and the
+default-false `remoteUpdateProgress` capability, which advertises the snapshot's
+progress fields, `bootId`, and `updater.activeWork`. Clients therefore know the
+install mode before asking. `updater.activeWork` returns
+`{runningTurns, liveTerminals, queuedMessages}` counted across all clients through
+its own read method so the one-second status poll never waits on the store; a
+failed count answers the typed `RemoteUpdateActiveWorkError`.
 
 - Desktop-hosted in-process servers run in `interactive` mode.
   `updater.install` routes through the host's `DesktopUpdateManager` via the
@@ -776,13 +856,26 @@ before asking.
   (`apps/desktop/src-tauri/src/remote_update_delegate.rs`), so remote install
   uses the same update-protection drain as local install and cannot skip backup
   protection.
+  `updater.install` passes the caller's paired-client metadata (label, OS, address
+  when known, and an 8-character session prefix), looked up through
+  `AuthService::list_clients`, to `RemoteUpdateDelegate::request_install`; it
+  never crosses `DesktopBridge`.
+  The desktop keeps the requester as `requestedBy` on its update state while the
+  flow runs and clears it when the flow ends; a second remote request joins that
+  flow, and the delegate fills `downloadPercent`, `targetVersion`, and `installStage`.
+  A remote install stopped by a secondary environment's protection says
+  "Finish the update on the host."
 - Headless `bibcode serve` and WSL/external desktop backends run in `manual`
   mode. `updater.check` refreshes the server's own version,
   `latestVersion` remains `null` because the server has no update feed, and
   `updater.install` fails with `remote_update_manual_required`. Clients render
   copyable operator instructions instead of an install action.
+  `installKind` is derived from the static asset layout: a sibling `web/` means
+  `archive`, `share/bibcode/web` means `system-package`, and an explicit
+  `--static-dir` or no resolved directory means `unknown`; desktop hosts report
+  `unknown`.
 
-`updater.status` requires `orchestration:read`; `updater.check` and
+`updater.activeWork` and `updater.status` require `orchestration:read`; `updater.check` and
 `updater.install` require `orchestration:operate`
 (`apps/server/src/auth/scope.rs`).
 Desktop delegate calls and each client-side per-environment update check are
@@ -963,9 +1056,10 @@ for local, release, and packaged UI builds.
 `scripts/tauri/linuxdeploy-plugin-gtk.sh` delegates to the pinned plugin and
 preserves discovery calls without an AppDir. After a successful deployment it
 validates that `apprun-hooks/linuxdeploy-plugin-gtk.sh` exists and contains
-exactly one line beginning `export GDK_BACKEND=x11`. A missing hook, absent
-export, or duplicate export fails packaging before post-processing changes the
-AppDir, making upstream drift visible.
+exactly one line each for `export GDK_BACKEND=x11`, the `gsettings` GTK theme
+lookup, the `APPIMAGE_GTK_THEME` default, and the `GTK_THEME` export. A missing
+hook, absent line, or duplicate line fails packaging before post-processing
+changes the AppDir, making upstream drift visible.
 
 The wrapper removes bundled `libwayland-client.so*` files and symlinks under
 `usr/lib*` and verifies their absence, keeping the system Wayland client with
@@ -974,8 +1068,36 @@ the system Mesa/EGL stack. It then rewrites the hook's export to
 first and falls back to X11; the override is evaluated when the AppImage
 launches. `BIBCODE_GDK_BACKEND=x11` restores the previous backend selection.
 Preferring native Wayland avoids oversized rendering from integer GTK scaling
-under Xwayland on fractionally scaled Hyprland/Omarchy desktops. Both packaging
-steps run before AppImage assembly and updater signing.
+under Xwayland on fractionally scaled Hyprland/Omarchy desktops.
+
+The wrapper also removes the GTK theme lookup and default, and replaces the
+forced `GTK_THEME` export with a conditional export only for a nonempty,
+user-supplied `APPIMAGE_GTK_THEME`. An inherited `GTK_THEME` otherwise passes
+through unchanged. It verifies that no forced export remains and exactly one
+conditional override exists. All post-processing runs before AppImage
+assembly and updater signing.
+
+On Linux AppImage startup (`APPIMAGE` set), the host keeps the bundled,
+known-good Adwaita theme through a process-only `gtk-theme-name` GtkSettings
+override, unless the user supplied a nonempty `GTK_THEME` or
+`APPIMAGE_GTK_THEME`. Application-set GtkSettings outrank session XSETTINGS
+without changing the user's desktop settings. Unlike `GTK_THEME`, this keeps
+the light/dark variant free to follow `gtk-application-prefer-dark-theme`.
+
+The async `DesktopBridge.setTheme` command resolves **System** on Linux through
+the portal settings `Read` method on a blocking worker, then applies that
+scheme explicitly to avoid tao's `SetTheme(None)` forcing light. It uses the
+existing GTK/GIO dependency: `WebviewWindow::theme()` would dispatch the
+blocking portal call back to Tauri's main thread, even from an async command.
+The direct read is independent of any explicit window theme and uses tao's
+five-second call timeout and light fallback if the portal is unavailable.
+Tao's portal subscription continues to update the variant live. Linux managed state remembers
+the last requested choice and serializes theme commands; a main-thread
+GtkSettings notification handler reasserts **Light** or **Dark** if a portal
+change conflicts with that explicit choice. **System** never reasserts, and an
+already-matching notification is a no-op. The webview and native menubar/dialogs
+therefore share the selected variant, subject to user environment overrides.
+Other platforms retain `set_theme(None)` for **System**.
 
 ### Linux webview text rendering
 
@@ -1023,7 +1145,9 @@ wrapper. Any new scrollable reading surface must add one.
 
 1. The client runtime resolves a connection target and obtains any required
    bearer, DPoP, relay, or SSH authorization.
-2. `RpcSessionFactory` opens a WebSocket and synchronizes `server.getConfig`.
+2. `RpcSessionFactory` opens a WebSocket and starts the connection's one
+   `subscribeServerConfig` stream; its first snapshot is the session's initial
+   configuration, and later config subscribers replay the same stream.
 3. Effect RPC schemas encode requests and decode unary results or streams.
 4. The Rust `RpcRegistry` authorizes and routes each method.
 5. Orchestration commands are admitted and persisted before provider delivery.

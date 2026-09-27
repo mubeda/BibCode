@@ -20,11 +20,95 @@ function createStorage(overrides: Partial<Storage> = {}): Storage {
   };
 }
 
+const openWindows: Window[] = [];
+
+/**
+ * A browser with a controllable OS colour scheme. Stubs the globals the theme
+ * module reads at import, so import the module after calling this.
+ */
+function installThemeBrowser({
+  stored = null,
+  prefersDark = false,
+}: { stored?: string | null; prefersDark?: boolean } = {}) {
+  const browserWindow = new Window({ url: "https://bibcode.test/" });
+  openWindows.push(browserWindow);
+  const storage = createStorage();
+  if (stored !== null) storage.setItem("bibcode:theme", stored);
+  let matches = prefersDark;
+  const mediaListeners = new Set<() => void>();
+  const media = {
+    get matches() {
+      return matches;
+    },
+    addEventListener: (_type: string, listener: () => void) => mediaListeners.add(listener),
+    removeEventListener: (_type: string, listener: () => void) => mediaListeners.delete(listener),
+  };
+  const storageListeners = new Set<(event: StorageEvent) => void>();
+  Object.defineProperties(browserWindow, {
+    localStorage: { configurable: true, value: storage },
+    matchMedia: { configurable: true, value: () => media },
+  });
+  const addEventListener = browserWindow.addEventListener.bind(browserWindow);
+  const removeEventListener = browserWindow.removeEventListener.bind(browserWindow);
+  vi.spyOn(browserWindow, "addEventListener").mockImplementation((type, listener) => {
+    if (type === "storage") {
+      storageListeners.add(listener as unknown as (event: StorageEvent) => void);
+    }
+    addEventListener(type, listener);
+  });
+  vi.spyOn(browserWindow, "removeEventListener").mockImplementation((type, listener) => {
+    if (type === "storage") {
+      storageListeners.delete(listener as unknown as (event: StorageEvent) => void);
+    }
+    removeEventListener(type, listener);
+  });
+  vi.stubGlobal("window", browserWindow);
+  vi.stubGlobal("document", browserWindow.document);
+  vi.stubGlobal("getComputedStyle", browserWindow.getComputedStyle.bind(browserWindow));
+  vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+    callback(0);
+    return 1;
+  });
+  return {
+    browserWindow,
+    storage,
+    isDark: () => browserWindow.document.documentElement.classList.contains("dark"),
+    mediaListenerCount: () => mediaListeners.size,
+    storageListenerCount: () => storageListeners.size,
+    switchOs: (dark: boolean) => {
+      matches = dark;
+      for (const listener of mediaListeners) listener();
+    },
+    fireStorage: (key: string) => {
+      for (const listener of storageListeners) listener({ key } as StorageEvent);
+    },
+  };
+}
+
+/** Lets tests call `useTheme()` outside React; every call subscribes like a mounted component. */
+function mockReactForHookCalls(
+  onSubscribe: (unsubscribe: () => void) => void,
+  listener = () => {},
+) {
+  vi.doMock("react", () => ({
+    useCallback: <A>(callback: A) => callback,
+    useEffect: (effect: () => void) => effect(),
+    useSyncExternalStore: (
+      subscribe: (listener: () => void) => () => void,
+      getSnapshot: () => unknown,
+    ) => {
+      onSubscribe(subscribe(listener));
+      return getSnapshot();
+    },
+  }));
+}
+
 afterEach(() => {
   vi.doUnmock("react");
   vi.resetModules();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  for (const browserWindow of openWindows.splice(0)) browserWindow.close();
 });
 
 describe("theme failure handling", () => {
@@ -110,16 +194,11 @@ describe("theme failure handling", () => {
     });
     const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
     let readSnapshot: (() => unknown) | undefined;
-    let subscribeToTheme: ((listener: () => void) => () => void) | undefined;
     let storageHandler: ((event: StorageEvent) => void) | undefined;
     vi.doMock("react", () => ({
       useCallback: <A>(callback: A) => callback,
       useEffect: () => undefined,
-      useSyncExternalStore: (
-        subscribe: (listener: () => void) => () => void,
-        getSnapshot: () => unknown,
-      ) => {
-        subscribeToTheme = subscribe;
+      useSyncExternalStore: (_subscribe: unknown, getSnapshot: () => unknown) => {
         readSnapshot = getSnapshot;
         return getSnapshot();
       },
@@ -136,6 +215,11 @@ describe("theme failure handling", () => {
       }),
       removeEventListener: () => undefined,
     });
+    vi.stubGlobal("document", {
+      documentElement: {
+        classList: { toggle: vi.fn() },
+      },
+    });
 
     const { useTheme } = await import("./useTheme");
     useTheme();
@@ -145,13 +229,15 @@ describe("theme failure handling", () => {
     expect(getItem).toHaveBeenCalledTimes(1);
     expect(errorLog).toHaveBeenCalledTimes(1);
 
-    const unsubscribe = subscribeToTheme?.(() => undefined);
+    storageHandler?.({ key: "unrelated" } as StorageEvent);
+    readSnapshot?.();
+    expect(getItem).toHaveBeenCalledTimes(1);
+
     storageHandler?.({ key: "bibcode:theme" } as StorageEvent);
     readSnapshot?.();
 
     expect(getItem).toHaveBeenCalledTimes(2);
     expect(errorLog).toHaveBeenCalledTimes(2);
-    unsubscribe?.();
   });
 
   it("preserves desktop sync causes and retries after a failed cosmetic sync", async () => {
@@ -249,60 +335,22 @@ describe("theme failure handling", () => {
   });
 
   it("applies system changes, storage events, and successful desktop sync through the hook", async () => {
-    const browserWindow = new Window({ url: "https://bibcode.test/" });
-    const storage = createStorage();
-    storage.setItem("bibcode:theme", "system");
+    const browser = installThemeBrowser({ stored: "system", prefersDark: true });
     const setTheme = vi.fn().mockResolvedValue(undefined);
-    const mediaListeners = new Set<() => void>();
-    const storageListeners = new Set<(event: StorageEvent) => void>();
-    const removeStorageListener = vi.fn();
-    const media = {
-      matches: true,
-      addEventListener: (_type: string, listener: () => void) => mediaListeners.add(listener),
-      removeEventListener: (_type: string, listener: () => void) => mediaListeners.delete(listener),
-    };
+    Object.defineProperty(browser.browserWindow, "desktopBridge", {
+      configurable: true,
+      value: { setTheme },
+    });
     let unsubscribe: (() => void) | undefined;
     let emitCount = 0;
-    vi.doMock("react", () => ({
-      useCallback: <A>(callback: A) => callback,
-      useEffect: (effect: () => void) => effect(),
-      useSyncExternalStore: (
-        subscribe: (listener: () => void) => () => void,
-        getSnapshot: () => unknown,
-      ) => {
-        unsubscribe = subscribe(() => {
-          emitCount += 1;
-        });
-        return getSnapshot();
+    mockReactForHookCalls(
+      (next) => {
+        unsubscribe = next;
       },
-    }));
-    Object.defineProperties(browserWindow, {
-      localStorage: { configurable: true, value: storage },
-      desktopBridge: { configurable: true, value: { setTheme } },
-      matchMedia: { configurable: true, value: () => media },
-    });
-    const addEventListener = browserWindow.addEventListener.bind(browserWindow);
-    const removeEventListener = browserWindow.removeEventListener.bind(browserWindow);
-    vi.spyOn(browserWindow, "addEventListener").mockImplementation((type, listener) => {
-      if (type === "storage") {
-        storageListeners.add(listener as unknown as (event: StorageEvent) => void);
-      }
-      addEventListener(type, listener);
-    });
-    vi.spyOn(browserWindow, "removeEventListener").mockImplementation((type, listener) => {
-      if (type === "storage") {
-        storageListeners.delete(listener as unknown as (event: StorageEvent) => void);
-        removeStorageListener();
-      }
-      removeEventListener(type, listener);
-    });
-    vi.stubGlobal("window", browserWindow);
-    vi.stubGlobal("document", browserWindow.document);
-    vi.stubGlobal("getComputedStyle", browserWindow.getComputedStyle.bind(browserWindow));
-    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
-      callback(0);
-      return 1;
-    });
+      () => {
+        emitCount += 1;
+      },
+    );
 
     const { useTheme } = await import("./useTheme");
     const theme = useTheme();
@@ -310,21 +358,21 @@ describe("theme failure handling", () => {
     await Promise.resolve();
     expect(setTheme).toHaveBeenCalledWith("system");
 
-    mediaListeners.forEach((listener) => listener());
-    storageListeners.forEach((listener) => listener({ key: "unrelated" } as StorageEvent));
-    storage.setItem("bibcode:theme", "dark");
-    storageListeners.forEach((listener) => listener({ key: "bibcode:theme" } as StorageEvent));
+    browser.switchOs(true);
+    browser.fireStorage("unrelated");
+    browser.storage.setItem("bibcode:theme", "dark");
+    browser.fireStorage("bibcode:theme");
     expect(emitCount).toBe(2);
 
     theme.setTheme("light");
-    expect(storage.getItem("bibcode:theme")).toBe("light");
-    expect(browserWindow.document.documentElement.classList.contains("dark")).toBe(false);
+    expect(browser.storage.getItem("bibcode:theme")).toBe("light");
+    expect(browser.isDark()).toBe(false);
     expect(emitCount).toBe(3);
 
+    // Components come and go; the app-wide OS and storage listeners stay installed.
     unsubscribe?.();
-    expect(mediaListeners.size).toBe(0);
-    expect(removeStorageListener).toHaveBeenCalledOnce();
-    browserWindow.close();
+    expect(browser.mediaListenerCount()).toBe(1);
+    expect(browser.storageListenerCount()).toBe(1);
   });
 
   it("logs hook-level storage write failures without changing the current theme", async () => {
@@ -352,5 +400,80 @@ describe("theme failure handling", () => {
       "Failed to write theme preference for bibcode:theme.",
       expect.objectContaining({ operation: "write", storageKey: "bibcode:theme", theme: "dark" }),
     );
+  });
+});
+
+// main.tsx loads this module at boot, so these listeners serve every route,
+// including routes (such as the home route) that render no `useTheme` consumer.
+describe("app-wide theme subscription", () => {
+  it("sends the stored choice to a desktop bridge installed after the module loaded", async () => {
+    const browser = installThemeBrowser({ stored: "dark" });
+    const { applyStoredTheme } = await import("./useTheme");
+    expect(browser.isDark()).toBe(true);
+
+    const setTheme = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(browser.browserWindow, "desktopBridge", {
+      configurable: true,
+      value: { setTheme },
+    });
+    applyStoredTheme();
+
+    expect(setTheme).toHaveBeenCalledOnce();
+    expect(setTheme).toHaveBeenCalledWith("dark");
+    expect(browser.isDark()).toBe(true);
+  });
+
+  it("follows OS light/dark switches with no useTheme consumer mounted", async () => {
+    const browser = installThemeBrowser();
+    await import("./useTheme");
+    expect(browser.isDark()).toBe(false);
+
+    browser.switchOs(true);
+    expect(browser.isDark()).toBe(true);
+
+    browser.switchOs(false);
+    expect(browser.isDark()).toBe(false);
+  });
+
+  it("follows a theme chosen in another tab with no useTheme consumer mounted", async () => {
+    const browser = installThemeBrowser();
+    await import("./useTheme");
+
+    browser.storage.setItem("bibcode:theme", "dark");
+    browser.fireStorage("bibcode:theme");
+    expect(browser.isDark()).toBe(true);
+  });
+
+  it.each(["light", "dark"] as const)(
+    "keeps an explicit %s choice while the OS switches",
+    async (choice) => {
+      const expectedDark = choice === "dark";
+      const browser = installThemeBrowser({ stored: choice, prefersDark: !expectedDark });
+      await import("./useTheme");
+      expect(browser.isDark()).toBe(expectedDark);
+
+      browser.switchOs(expectedDark);
+      expect(browser.isDark()).toBe(expectedDark);
+      browser.switchOs(!expectedDark);
+      expect(browser.isDark()).toBe(expectedDark);
+    },
+  );
+
+  it("installs one OS listener and one storage listener however many components read the theme", async () => {
+    const browser = installThemeBrowser();
+    const unsubscribers: Array<() => void> = [];
+    mockReactForHookCalls((unsubscribe) => unsubscribers.push(unsubscribe));
+    const { useTheme } = await import("./useTheme");
+    useTheme();
+    useTheme();
+    useTheme();
+
+    expect(unsubscribers).toHaveLength(3);
+    expect(browser.mediaListenerCount()).toBe(1);
+    expect(browser.storageListenerCount()).toBe(1);
+
+    for (const unsubscribe of unsubscribers) unsubscribe();
+    browser.switchOs(true);
+    expect(browser.isDark()).toBe(true);
   });
 });

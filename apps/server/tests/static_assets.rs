@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use bibcode_server::remote_update::RemoteUpdateInstallKind;
 use bibcode_server::{StaticDirError, StaticDirSource, resolve_static_dir};
 
 #[test]
@@ -17,6 +18,7 @@ fn packaged_web_is_resolved_beside_the_executable() {
 
     assert_eq!(resolved.source, StaticDirSource::Packaged);
     assert_eq!(resolved.path, root.path().join("web"));
+    assert_eq!(resolved.install_kind, RemoteUpdateInstallKind::Archive);
 }
 
 #[test]
@@ -36,6 +38,10 @@ fn installed_web_is_resolved_from_the_executable_prefix() {
 
     assert_eq!(resolved.source, StaticDirSource::Packaged);
     assert_eq!(resolved.path, web);
+    assert_eq!(
+        resolved.install_kind,
+        RemoteUpdateInstallKind::SystemPackage
+    );
 }
 
 #[test]
@@ -70,4 +76,5 @@ fn explicit_web_wins_over_packaged_assets() {
 
     assert_eq!(resolved.source, StaticDirSource::Explicit);
     assert_eq!(resolved.path, explicit);
+    assert_eq!(resolved.install_kind, RemoteUpdateInstallKind::Unknown);
 }

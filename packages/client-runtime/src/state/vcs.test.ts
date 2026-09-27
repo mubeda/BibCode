@@ -1,11 +1,14 @@
 import {
   EnvironmentId,
+  GitCommandError,
   GitManagerError,
   WS_METHODS,
   type VcsStatusSummary,
 } from "@bibcode/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Clock from "effect/Clock";
+import * as Cause from "effect/Cause";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -13,11 +16,15 @@ import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import * as TestClock from "effect/testing/TestClock";
 import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
+import { RpcClientError } from "effect/unstable/rpc";
 
+import { AVAILABLE_CONNECTION_STATE, type SupervisorConnectionState } from "../connection/model.ts";
+import type { ConnectionCatalogEntry } from "../connection/catalog.ts";
 import { EnvironmentRegistry } from "../connection/registry.ts";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import type { RpcSession } from "../rpc/session.ts";
+import { isAtomCommandInterrupted, runAtomCommand } from "./runtime.ts";
 import { createVcsEnvironmentAtoms } from "./vcs.ts";
 
 const ENVIRONMENT_ID = EnvironmentId.make("environment-1");
@@ -115,6 +122,178 @@ function waitFor(predicate: () => boolean, message: string) {
     return yield* Effect.die(message);
   });
 }
+
+describe("VCS status atoms", () => {
+  const fellBehind = new GitCommandError({
+    operation: "GitStatusBroadcaster.fellBehind",
+    command: "git",
+    cwd: "/repo",
+    detail: "The Git status stream fell behind. Subscribe again.",
+  });
+
+  it.effect(
+    "retains its last status through a fell-behind retry and replaces it with the snapshot",
+    () =>
+      Effect.gen(function* () {
+        let calls = 0;
+        const failure = yield* Deferred.make<never, GitCommandError>();
+        const recovered = {
+          ...legacySnapshot,
+          local: {
+            ...legacySnapshot.local,
+            refName: "recovered/main",
+            hasWorkingTreeChanges: true,
+          },
+        };
+        const client = {
+          [WS_METHODS.subscribeVcsStatus]: () => {
+            calls += 1;
+            return calls === 1
+              ? Stream.make(legacySnapshot).pipe(
+                  Stream.concat(Stream.fromEffect(Deferred.await(failure))),
+                )
+              : Stream.make(recovered);
+          },
+        } as unknown as WsRpcProtocolClient;
+        const harness = yield* makeHarness(session(client, true));
+        const atom = harness.vcs.status(TARGET);
+        const unmount = harness.atomRegistry.mount(atom);
+        const initial = yield* readRefName(harness.atomRegistry, atom, "legacy/main");
+        const observed: string[] = [];
+        const unsubscribe = harness.atomRegistry.subscribe(atom, (value) =>
+          observed.push(value._tag),
+        );
+
+        yield* Deferred.fail(failure, fellBehind);
+        for (let attempt = 0; attempt < 10; attempt += 1) yield* Effect.yieldNow;
+        yield* TestClock.adjust(249);
+        expect(calls).toBe(1);
+        const retained = harness.atomRegistry.get(atom);
+        expect(AsyncResult.isSuccess(retained) ? retained.value : null).toBe(initial);
+        yield* TestClock.adjust(1);
+        const value = yield* readRefName(harness.atomRegistry, atom, "recovered/main");
+        expect(value.hasWorkingTreeChanges).toBe(true);
+        expect(calls).toBe(2);
+        expect(observed.length).toBeGreaterThan(0);
+        expect(observed.every((tag) => tag === "Success")).toBe(true);
+        yield* TestClock.adjust("1 minute");
+        expect(calls).toBe(2);
+
+        unsubscribe();
+        unmount();
+        harness.atomRegistry.dispose();
+      }),
+  );
+
+  it.effect.each(["Git.status", "GitStatusBroadcaster.subscribe"])(
+    "fails without resubscribing for %s",
+    (operation) =>
+      Effect.gen(function* () {
+        let calls = 0;
+        const error = new GitCommandError({
+          operation,
+          command: "git",
+          cwd: "/repo",
+          detail: "failed",
+        });
+        const client = {
+          [WS_METHODS.subscribeVcsStatus]: () => {
+            calls += 1;
+            return Stream.fail(error);
+          },
+        } as unknown as WsRpcProtocolClient;
+        const harness = yield* makeHarness(session(client, true));
+        const atom = harness.vcs.status(TARGET);
+        const unmount = harness.atomRegistry.mount(atom);
+        yield* waitFor(
+          () => AsyncResult.isFailure(harness.atomRegistry.get(atom)),
+          "status did not fail",
+        );
+        const result = harness.atomRegistry.get(atom);
+        expect(AsyncResult.isFailure(result) ? Cause.squash(result.cause) : null).toBe(error);
+        yield* TestClock.adjust("1 minute");
+        expect(calls).toBe(1);
+        unmount();
+        harness.atomRegistry.dispose();
+      }),
+  );
+
+  it.effect("does not resubscribe after a clean status stream end", () =>
+    Effect.gen(function* () {
+      let calls = 0;
+      const client = {
+        [WS_METHODS.subscribeVcsStatus]: () => {
+          calls += 1;
+          return Stream.make(legacySnapshot);
+        },
+      } as unknown as WsRpcProtocolClient;
+      const harness = yield* makeHarness(session(client, true));
+      const atom = harness.vcs.status(TARGET);
+      const unmount = harness.atomRegistry.mount(atom);
+      yield* readRefName(harness.atomRegistry, atom, "legacy/main");
+      yield* TestClock.adjust("2 minutes");
+      expect(calls).toBe(1);
+      expect(AsyncResult.isSuccess(harness.atomRegistry.get(atom))).toBe(true);
+      unmount();
+      harness.atomRegistry.dispose();
+    }),
+  );
+
+  it.effect("doubles fell-behind waits up to 30 seconds and resets after 30 seconds up", () =>
+    Effect.gen(function* () {
+      const failures: Deferred.Deferred<never, GitCommandError>[] = [];
+      const client = {
+        [WS_METHODS.subscribeVcsStatus]: () =>
+          Stream.unwrap(
+            Effect.gen(function* () {
+              const failure = yield* Deferred.make<never, GitCommandError>();
+              failures.push(failure);
+              return Stream.make({
+                ...legacySnapshot,
+                local: { ...legacySnapshot.local, refName: `attempt-${failures.length}` },
+              }).pipe(Stream.concat(Stream.fromEffect(Deferred.await(failure))));
+            }),
+          ),
+      } as unknown as WsRpcProtocolClient;
+      const harness = yield* makeHarness(session(client, true));
+      const atom = harness.vcs.status(TARGET);
+      const unmount = harness.atomRegistry.mount(atom);
+      yield* readRefName(harness.atomRegistry, atom, "attempt-1");
+
+      for (const [index, delay] of [
+        250, 500, 1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000,
+      ].entries()) {
+        yield* Deferred.fail(failures[index]!, fellBehind);
+        for (let attempt = 0; attempt < 10; attempt += 1) yield* Effect.yieldNow;
+        yield* TestClock.adjust(delay - 1);
+        expect(failures).toHaveLength(index + 1);
+        expect(AsyncResult.isSuccess(harness.atomRegistry.get(atom))).toBe(true);
+        yield* TestClock.adjust(1);
+        yield* readRefName(harness.atomRegistry, atom, `attempt-${index + 2}`);
+        expect(failures).toHaveLength(index + 2);
+      }
+
+      yield* TestClock.adjust(29_999);
+      yield* Deferred.fail(failures[9]!, fellBehind);
+      for (let attempt = 0; attempt < 10; attempt += 1) yield* Effect.yieldNow;
+      yield* TestClock.adjust(29_999);
+      expect(failures).toHaveLength(10);
+      yield* TestClock.adjust(1);
+      yield* readRefName(harness.atomRegistry, atom, "attempt-11");
+
+      yield* TestClock.adjust(30_000);
+      yield* Deferred.fail(failures[10]!, fellBehind);
+      for (let attempt = 0; attempt < 10; attempt += 1) yield* Effect.yieldNow;
+      yield* TestClock.adjust(249);
+      expect(failures).toHaveLength(11);
+      yield* TestClock.adjust(1);
+      yield* readRefName(harness.atomRegistry, atom, "attempt-12");
+      expect(failures).toHaveLength(12);
+      unmount();
+      harness.atomRegistry.dispose();
+    }),
+  );
+});
 
 describe("VCS summary atoms", () => {
   it.effect("retries an expected summary failure once at the passive freshness boundary", () =>
@@ -524,6 +703,238 @@ describe("VCS summary atoms", () => {
         active: { count: 1, maximum: 1 },
         finalized: { status: 1, summary: 0 },
       });
+    }),
+  );
+});
+
+const LOST_SOCKET = new RpcClientError.RpcClientError({
+  reason: new RpcClientError.RpcClientDefect({
+    message: "socket closed",
+    cause: new Error("socket closed"),
+  }),
+});
+
+function cloneSession(
+  client: Record<string, (input: unknown) => Effect.Effect<unknown, unknown>>,
+): RpcSession {
+  return {
+    client: client as unknown as WsRpcProtocolClient,
+    initialConfig: Effect.succeed({
+      environment: { capabilities: { vcsCloneReattach: true } },
+    } as never),
+    ready: Effect.void,
+    probe: Effect.void,
+    closed: Effect.never,
+    e2eeAuthenticated: Effect.succeed(null),
+  };
+}
+
+const makeCommandHarness = Effect.fn("TestVcs.makeCommandHarness")(function* (initial: RpcSession) {
+  const sessionRef = yield* SubscriptionRef.make<Option.Option<RpcSession>>(Option.some(initial));
+  const stateRef = yield* SubscriptionRef.make<SupervisorConnectionState>({
+    ...AVAILABLE_CONNECTION_STATE,
+    desired: true,
+    phase: "connected",
+  });
+  const target = { environmentId: ENVIRONMENT_ID, label: "Environment" };
+  const supervisor = EnvironmentSupervisor.of({
+    target,
+    session: sessionRef,
+    state: stateRef,
+  } as never);
+  const run: EnvironmentRegistry["Service"]["run"] = (_environmentId, effect) =>
+    Effect.provideService(effect, EnvironmentSupervisor, supervisor);
+  // The clone loops follow the registry's current supervisor; here it never changes.
+  const followStream: EnvironmentRegistry["Service"]["followStream"] = (_environmentId, stream) =>
+    Stream.provideService(stream, EnvironmentSupervisor, supervisor);
+  const entries = yield* SubscriptionRef.make<ReadonlyMap<EnvironmentId, ConnectionCatalogEntry>>(
+    new Map([[ENVIRONMENT_ID, { target } as ConnectionCatalogEntry]]),
+  );
+  const environmentRegistry = EnvironmentRegistry.of({ run, followStream, entries } as never);
+  const vcs = createVcsEnvironmentAtoms(
+    Atom.runtime(Layer.succeed(EnvironmentRegistry, environmentRegistry)),
+  );
+  return { atomRegistry: AtomRegistry.make(), sessionRef, vcs };
+});
+
+describe("clone commands", () => {
+  it.effect("cancels on its own lane while the clone holds the destination's lane", () =>
+    Effect.gen(function* () {
+      let cancelInput: unknown = null;
+      const harness = yield* makeCommandHarness(
+        cloneSession({
+          [WS_METHODS.vcsClone]: () => Effect.never,
+          [WS_METHODS.vcsCancelClone]: (input) => {
+            cancelInput = input;
+            return Effect.succeed({ cancelled: true });
+          },
+        }),
+      );
+      const controller = new AbortController();
+      const input = { url: "https://example.test/demo.git", parentDir: "/code" };
+      let cloneSettled = false;
+      const clone = runAtomCommand(
+        harness.atomRegistry,
+        harness.vcs.clone,
+        { environmentId: ENVIRONMENT_ID, input },
+        { signal: controller.signal },
+      ).then((result) => {
+        cloneSettled = true;
+        return result;
+      });
+
+      const cancelled = yield* Effect.promise(() =>
+        runAtomCommand(harness.atomRegistry, harness.vcs.cancelClone, {
+          environmentId: ENVIRONMENT_ID,
+          input,
+        }),
+      );
+
+      expect(AsyncResult.isSuccess(cancelled) ? cancelled.value : null).toEqual({
+        cancelled: true,
+      });
+      expect(cancelInput).toEqual(input);
+      expect(cloneSettled).toBe(false);
+      controller.abort();
+      expect(isAtomCommandInterrupted(yield* Effect.promise(() => clone))).toBe(true);
+      harness.atomRegistry.dispose();
+    }),
+  );
+
+  it.effect(
+    "a retry after a lost cancel acknowledgement and a remount waits for that cancel and is not cancelled",
+    () =>
+      Effect.gen(function* () {
+        const events: Array<string> = [];
+        const input = { url: "https://example.test/demo.git", parentDir: "/code" };
+        const harness = yield* makeCommandHarness(
+          cloneSession({
+            [WS_METHODS.vcsClone]: () => {
+              events.push("clone");
+              return Effect.never;
+            },
+            // The host cancels the clone, but the answer is lost with the socket.
+            [WS_METHODS.vcsCancelClone]: () => {
+              events.push("cancel sent, answer lost");
+              return Effect.fail(LOST_SOCKET);
+            },
+          }),
+        );
+        const firstDialog = new AbortController();
+        const first = runAtomCommand(
+          harness.atomRegistry,
+          harness.vcs.clone,
+          { environmentId: ENVIRONMENT_ID, input },
+          { signal: firstDialog.signal },
+        );
+        yield* waitFor(() => events.includes("clone"), "the first clone was not dispatched");
+        const cancel = runAtomCommand(harness.atomRegistry, harness.vcs.cancelClone, {
+          environmentId: ENVIRONMENT_ID,
+          input,
+        });
+        yield* waitFor(
+          () => events.includes("cancel sent, answer lost"),
+          "the cancel was not sent",
+        );
+
+        // The dialog unmounts: its clone wait ends; the cancel stays registered and keeps retrying.
+        firstDialog.abort();
+        expect(isAtomCommandInterrupted(yield* Effect.promise(() => first))).toBe(true);
+
+        // A remounted dialog retries into the same folder: the retry waits for the pending cancel.
+        const secondDialog = new AbortController();
+        const retry = runAtomCommand(
+          harness.atomRegistry,
+          harness.vcs.clone,
+          { environmentId: ENVIRONMENT_ID, input },
+          { signal: secondDialog.signal },
+        );
+        for (let attempt = 0; attempt < 50; attempt += 1) yield* Effect.yieldNow;
+        expect(events).toEqual(["clone", "cancel sent, answer lost"]);
+
+        // The host is reachable again: the cancel goes out once more and is acknowledged, and
+        // only then does the retry dispatch. Nothing cancels the retry.
+        yield* SubscriptionRef.set(
+          harness.sessionRef,
+          Option.some(
+            cloneSession({
+              [WS_METHODS.vcsClone]: () => {
+                events.push("retry");
+                return Effect.never;
+              },
+              [WS_METHODS.vcsCancelClone]: () => {
+                events.push("cancel acknowledged");
+                return Effect.succeed({ cancelled: true });
+              },
+            }),
+          ),
+        );
+        const acknowledged = yield* Effect.promise(() => cancel);
+        expect(AsyncResult.isSuccess(acknowledged) ? acknowledged.value : null).toEqual({
+          cancelled: true,
+        });
+        yield* waitFor(() => events.includes("retry"), "the retry was not dispatched");
+        expect(events).toEqual([
+          "clone",
+          "cancel sent, answer lost",
+          "cancel acknowledged",
+          "retry",
+        ]);
+
+        secondDialog.abort();
+        yield* Effect.promise(() => retry);
+        harness.atomRegistry.dispose();
+      }),
+  );
+
+  it.effect("a cancel the host refuses releases its pending record at once", () =>
+    Effect.gen(function* () {
+      const events: Array<string> = [];
+      const input = {
+        url: "https://example.test/demo.git",
+        parentDir: "/code",
+        directoryName: "a/../b",
+      };
+      const harness = yield* makeCommandHarness(
+        cloneSession({
+          [WS_METHODS.vcsClone]: () => {
+            events.push("clone");
+            return Effect.succeed({ path: "/code/b" });
+          },
+          // The server refuses a path as the folder name with a typed failure.
+          [WS_METHODS.vcsCancelClone]: () => {
+            events.push("cancel refused");
+            return Effect.fail(
+              new GitCommandError({
+                operation: "vcs.cancelClone",
+                command: "git",
+                cwd: "/code",
+                detail: 'The folder name "a/../b" must be a single name, without slashes or "..".',
+              }),
+            );
+          },
+        }),
+      );
+
+      const refused = yield* Effect.promise(() =>
+        runAtomCommand(
+          harness.atomRegistry,
+          harness.vcs.cancelClone,
+          { environmentId: ENVIRONMENT_ID, input },
+          { reportFailure: false },
+        ),
+      );
+      expect(refused._tag).toBe("Failure");
+      // The refused cancel left no pending record, so a clone into the folder dispatches at once.
+      const cloned = yield* Effect.promise(() =>
+        runAtomCommand(harness.atomRegistry, harness.vcs.clone, {
+          environmentId: ENVIRONMENT_ID,
+          input,
+        }),
+      );
+      expect(AsyncResult.isSuccess(cloned) ? cloned.value : null).toEqual({ path: "/code/b" });
+      expect(events).toEqual(["cancel refused", "clone"]);
+      harness.atomRegistry.dispose();
     }),
   );
 });

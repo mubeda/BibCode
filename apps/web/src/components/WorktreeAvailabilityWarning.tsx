@@ -56,7 +56,7 @@ export function WorktreeAvailabilityWarning({
         </div>
         <div>
           <dt className="sr-only">Full path</dt>
-          <dd className="break-all font-mono text-[11px]">{status.path}</dd>
+          <dd className="break-all font-mono text-xs">{status.path}</dd>
         </div>
         <div>
           <dt className="inline font-medium">Git registration: </dt>

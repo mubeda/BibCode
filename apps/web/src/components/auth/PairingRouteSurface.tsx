@@ -24,7 +24,7 @@ export function PairingPendingSurface() {
       </div>
 
       <section className="relative w-full max-w-xl rounded-2xl border border-border/80 bg-card/90 p-6 shadow-2xl shadow-black/20 backdrop-blur-md sm:p-8">
-        <p className="text-[11px] font-semibold tracking-[0.18em] text-muted-foreground uppercase">
+        <p className="text-xs font-semibold tracking-[0.18em] text-muted-foreground uppercase">
           {APP_DISPLAY_NAME}
         </p>
         <h1 className="mt-3 text-2xl font-semibold tracking-tight sm:text-3xl">
@@ -51,10 +51,8 @@ export function PairingRouteSurface({
   onInitialCredentialConsumed?: () => void;
   onAuthenticated: () => void;
 }) {
-  const autoPairTokenRef = useRef<string | null>(
-    peekPairingTokenFromUrl() ?? initialCredential ?? null,
-  );
-  const [credential, setCredential] = useState(() => autoPairTokenRef.current ?? "");
+  const [autoPairToken] = useState(() => peekPairingTokenFromUrl() ?? initialCredential ?? null);
+  const [credential, setCredential] = useState(autoPairToken ?? "");
   const [errorMessage, setErrorMessage] = useState(initialErrorMessage ?? "");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const autoSubmitAttemptedRef = useRef(false);
@@ -92,7 +90,7 @@ export function PairingRouteSurface({
   );
 
   useEffect(() => {
-    const token = autoPairTokenRef.current;
+    const token = autoPairToken;
     if (!token || autoSubmitAttemptedRef.current) {
       return;
     }
@@ -101,7 +99,7 @@ export function PairingRouteSurface({
     stripPairingTokenFromUrl();
     onInitialCredentialConsumed?.();
     void submitCredential(token);
-  }, [onInitialCredentialConsumed, submitCredential]);
+  }, [autoPairToken, onInitialCredentialConsumed, submitCredential]);
 
   return (
     <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-background px-4 py-10 text-foreground sm:px-6">
@@ -112,7 +110,7 @@ export function PairingRouteSurface({
       </div>
 
       <section className="relative w-full max-w-xl rounded-2xl border border-border/80 bg-card/90 p-6 shadow-2xl shadow-black/20 backdrop-blur-md sm:p-8">
-        <p className="text-[11px] font-semibold tracking-[0.18em] text-muted-foreground uppercase">
+        <p className="text-xs font-semibold tracking-[0.18em] text-muted-foreground uppercase">
           {APP_DISPLAY_NAME}
         </p>
         <h1 className="mt-3 text-2xl font-semibold tracking-tight sm:text-3xl">
@@ -170,38 +168,45 @@ export function PairingRouteSurface({
   );
 }
 
+const MISSING_HOSTED_PAIRING_MESSAGE =
+  "This pairing link is missing its backend host or token. Open the complete link again, or create a new pairing link on the backend.";
+
 export function HostedPairingRouteSurface() {
   const connectPairingEnvironment = useAtomCommand(connectPairing, {
     reportFailure: false,
   });
-  const hostedPairingRequestRef = useRef(readHostedPairingRequest());
+  const [request] = useState(readHostedPairingRequest);
   const [status, setStatus] = useState<"confirm" | "pairing" | "paired" | "error">(() =>
-    hostedPairingRequestRef.current ? "confirm" : "error",
+    request ? "confirm" : "error",
+  );
+  const [errorKind, setErrorKind] = useState<"missing" | "resubmitted" | "connection" | null>(() =>
+    request ? null : "missing",
   );
   const [message, setMessage] = useState(() =>
-    hostedPairingRequestRef.current
+    request
       ? "Review the backend address before submitting this one-time pairing token."
-      : "This pairing link is missing its backend host or token.",
+      : MISSING_HOSTED_PAIRING_MESSAGE,
   );
   const tokenStrippedRef = useRef(false);
   const tokenSubmittedRef = useRef(false);
 
   const submitHostedPairingRequest = useCallback(async () => {
-    const request = hostedPairingRequestRef.current;
-
     if (!request) {
       setStatus("error");
-      setMessage("This pairing link is missing its backend host or token.");
+      setErrorKind("missing");
+      setMessage(MISSING_HOSTED_PAIRING_MESSAGE);
       return;
     }
 
     if (tokenSubmittedRef.current) {
       setStatus("error");
+      setErrorKind("resubmitted");
       setMessage("This one-time pairing token was already submitted. Request a new pairing link.");
       return;
     }
 
     setStatus("pairing");
+    setErrorKind(null);
     setMessage("Connecting to this backend.");
     tokenSubmittedRef.current = true;
 
@@ -216,10 +221,11 @@ export function HostedPairingRouteSurface() {
     }
 
     setStatus("error");
+    setErrorKind("connection");
     setMessage(
       `${errorMessageFromUnknown(squashAtomCommandFailure(result))} This one-time token may already have been accepted; request a new pairing link before trying again.`,
     );
-  }, [connectPairingEnvironment]);
+  }, [connectPairingEnvironment, request]);
 
   useEffect(() => {
     if (tokenStrippedRef.current) {
@@ -230,8 +236,6 @@ export function HostedPairingRouteSurface() {
     stripPairingTokenFromUrl();
   }, []);
 
-  const request = hostedPairingRequestRef.current;
-
   return (
     <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-background px-4 py-10 text-foreground sm:px-6">
       <div className="pointer-events-none absolute inset-0 opacity-80">
@@ -241,7 +245,7 @@ export function HostedPairingRouteSurface() {
       </div>
 
       <section className="relative w-full max-w-xl rounded-2xl border border-border/80 bg-card/90 p-6 shadow-2xl shadow-black/20 backdrop-blur-md sm:p-8">
-        <p className="text-[11px] font-semibold tracking-[0.18em] text-muted-foreground uppercase">
+        <p className="text-xs font-semibold tracking-[0.18em] text-muted-foreground uppercase">
           {APP_DISPLAY_NAME}
         </p>
         <h1 className="mt-3 text-2xl font-semibold tracking-tight sm:text-3xl">
@@ -261,29 +265,31 @@ export function HostedPairingRouteSurface() {
           </div>
         ) : null}
 
-        {status === "error" ? (
+        {status === "error" && errorKind === "connection" ? (
           <div className="mt-5 rounded-lg border border-destructive/30 bg-destructive/6 px-3 py-2 text-sm text-destructive">
             Verify the backend is reachable from this browser, supports CORS for hosted clients, and
             is served over HTTPS when opening this page from HTTPS.
           </div>
         ) : null}
 
-        <div className="mt-6 flex flex-wrap gap-2">
-          {status === "confirm" ? (
-            <Button size="sm" onClick={() => void submitHostedPairingRequest()}>
-              Pair this backend
-            </Button>
-          ) : status === "pairing" ? (
-            <Button disabled size="sm">
-              Pairing...
-            </Button>
-          ) : null}
-          {status === "paired" ? (
-            <Button size="sm" variant="outline" onClick={() => (window.location.href = "/")}>
-              Open app
-            </Button>
-          ) : null}
-        </div>
+        {status !== "error" ? (
+          <div className="mt-6 flex flex-wrap gap-2">
+            {status === "confirm" ? (
+              <Button size="sm" onClick={() => void submitHostedPairingRequest()}>
+                Pair this backend
+              </Button>
+            ) : status === "pairing" ? (
+              <Button disabled size="sm">
+                Pairing...
+              </Button>
+            ) : null}
+            {status === "paired" ? (
+              <Button size="sm" variant="outline" onClick={() => (window.location.href = "/")}>
+                Open app
+              </Button>
+            ) : null}
+          </div>
+        ) : null}
       </section>
     </div>
   );

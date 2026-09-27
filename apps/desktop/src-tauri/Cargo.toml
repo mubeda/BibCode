@@ -1,6 +1,6 @@
 [package]
 name = "bibcode-desktop"
-version = "0.6.2"
+version = "0.7.0"
 description = "BiBCode Tauri desktop shell"
 authors = ["BiBCode"]
 edition.workspace = true
@@ -48,7 +48,11 @@ url.workspace = true
 uuid.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+windows-sys = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_Security_Cryptography",
+  "Win32_System_IO",
+] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true

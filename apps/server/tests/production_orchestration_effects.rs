@@ -295,9 +295,12 @@ async fn bootstrap_admission_does_not_use_the_injected_workspace_before_delivery
             .canonicalize()
             .expect("canonical workspace"),
     );
-    let repository = Arc::new(GitRepository::with_worktree_settings(Arc::new(
-        StaticWorktreeBaseDirectory(Some(workspace.path().to_path_buf())),
-    )));
+    let repository = Arc::new(GitRepository::with_worktree_settings(
+        Arc::new(StaticWorktreeBaseDirectory(Some(
+            workspace.path().to_path_buf(),
+        ))),
+        Arc::default(),
+    ));
     let engine = engine(source.path()).await;
     let callbacks = Arc::new(CallbackState::default());
     let effects = OrchestrationEffects::start(

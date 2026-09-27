@@ -8,1151 +8,96 @@
  * data-testid / aria-label) and invoke them directly with fake events, which
  * exercises the component's callback bodies without a DOM.
  */
+import {
+  ENV_MAIN,
+  ENV_REMOTE,
+  ENV_WSL,
+  baseScenario,
+  byAriaLabel,
+  byTestId,
+  captured,
+  cardDataProps,
+  collectElements,
+  environmentFixture,
+  failureResult,
+  fakeLocalApi,
+  findProps,
+  flush,
+  groupedScenario,
+  h,
+  invoke,
+  iso,
+  keyboardEvent,
+  makeProject,
+  makeThread,
+  mouseEvent,
+  mustFindProps,
+  projectA,
+  render,
+  staticDescribe,
+  threadActive,
+  threadDefault,
+  threadIdle,
+  threadKeyOf,
+} from "./Sidebar.testHarness";
 import * as Cause from "effect/Cause";
-import { renderToStaticMarkup } from "react-dom/server";
-import { createRoot, type Root } from "react-dom/client";
+import * as Schema from "effect/Schema";
 import * as React from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
-
+import { beforeEach, expect, it, vi } from "vite-plus/test";
 import {
   DEFAULT_SERVER_SETTINGS,
-  EnvironmentId,
   ProjectId,
   ProviderInstanceId,
   ThreadId,
+  VcsStatusSummary,
   WorktreeKey,
   WorktreeRepositoryKey,
 } from "@bibcode/contracts";
 import { DEFAULT_CLIENT_SETTINGS } from "@bibcode/contracts/settings";
 import { createModelSelection } from "@bibcode/shared/model";
-import {
-  scopedThreadKey,
-  scopeProjectRef,
-  scopeThreadRef,
-} from "@bibcode/client-runtime/environment";
+import { scopeThreadRef } from "@bibcode/client-runtime/environment";
 import { createEnvironmentPresentationPolicy } from "../connection/environmentPresentationPolicy";
 import { derivePhysicalProjectKey } from "../logicalProject";
-import type {
-  EnvironmentProject,
-  EnvironmentThreadShell,
-} from "@bibcode/client-runtime/state/shell";
-
-const browserRuntime =
-  typeof document !== "undefined" && typeof document.createElement === "function";
-const staticDescribe = browserRuntime ? describe.skip : describe;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Hoisted harness state shared with every vi.mock factory.
-// ─────────────────────────────────────────────────────────────────────────────
-
-const h = vi.hoisted(() => {
-  interface Captured {
-    readonly name: string;
-    readonly props: Record<string, unknown>;
-  }
-
-  const state: any = {
-    React: null,
-    captures: [] as Captured[],
-    // data
-    projects: [],
-    threads: [],
-    environments: [],
-    primaryEnvironmentId: null,
-    activeEnvironmentId: null,
-    serverConfigs: new Map(),
-    clientSettings: null,
-    atomValues: {},
-    vcsStatusByCwd: {},
-    vcsQueries: [] as Array<{ __q?: string; args?: { input?: { cwd?: string } } }>,
-    worktreeCatalogs: new Map<string, unknown>(),
-    discoveryCatalogSubscriptions: [] as Array<unknown>,
-    discoveryFocusRefreshCalls: [] as Array<ReadonlyArray<unknown>>,
-    runningTerminalIds: [],
-    discoveredPortsByThreadId: {},
-    desktopBootstraps: [],
-    desktopUpdateState: null,
-    shellSummary: {
-      catalogReady: false,
-      desiredEnvironmentCount: 0,
-      statuses: [],
-      canShowEmptyProjects: false,
-      hasSnapshot: false,
-      hasSynchronizingShell: false,
-      hasCachedShell: false,
-      hasLiveShell: false,
-      firstError: null,
-      latestSnapshotUpdatedAt: null,
-    },
-    updateBtnDisabled: false,
-    updateBtnAction: "none",
-    showArmWarning: false,
-    isMobile: false,
-    sidebarCtx: null,
-    pathname: "/",
-    routeParams: {},
-    localApi: null,
-    isDesktopHost: true,
-    copyShouldFail: false,
-    openDiscoveredPortResult: { _tag: "Success", value: undefined },
-    commandResults: {},
-    commandCalls: [],
-    shortcutLabels: {},
-    shortcutLabelOptions: [] as unknown[],
-    showJumpHintModifiers: false,
-    terminalSurfaceOpen: false,
-    presentationPolicy: null as unknown,
-    // mock stores
-    ui: null,
-    selection: null,
-    meta: null,
-  };
-
-  const capture = (name: string, props: Record<string, unknown>) => {
-    state.captures.push({ name, props });
-  };
-
-  const mk = (name: string, tag = "div") => {
-    const Comp = (props: Record<string, unknown>) => {
-      capture(name, props);
-      const R = state.React as typeof import("react");
-      const { children, render } = props as { children?: unknown; render?: unknown };
-      const passthrough: Record<string, unknown> = {
-        "data-mock": name,
-      };
-      const domProps = new Set([
-        "aria-label",
-        "autoFocus",
-        "className",
-        "disabled",
-        "id",
-        "onBlur",
-        "onBlurCapture",
-        "onChange",
-        "onClick",
-        "onContextMenu",
-        "onDoubleClick",
-        "onFocus",
-        "onKeyDown",
-        "onMouseLeave",
-        "onPointerDown",
-        "placeholder",
-        "readOnly",
-        "role",
-        "tabIndex",
-        "title",
-        "type",
-        "value",
-      ]);
-      for (const [key, value] of Object.entries(props)) {
-        if (key.startsWith("data-") || domProps.has(key)) {
-          passthrough[key] = value;
-        }
-      }
-      if (render !== undefined && R.isValidElement(render)) {
-        return children === undefined
-          ? R.cloneElement(render as never, passthrough as never)
-          : R.cloneElement(render as never, passthrough as never, children as never);
-      }
-      return R.createElement(tag, passthrough, children as never);
-    };
-    Comp.displayName = name;
-    return Comp;
-  };
-
-  const makeStore = <T extends object>(init: () => T) => {
-    let current = init();
-    const hook = (selector?: (s: T) => unknown) =>
-      selector ? selector(current) : (current as unknown);
-    hook.getState = () => current;
-    hook.setState = (partial: Partial<T>) => {
-      current = { ...current, ...partial };
-    };
-    hook.reset = () => {
-      current = init();
-    };
-    return hook;
-  };
-
-  const spies = {
-    navigate: vi.fn(),
-    routerNavigate: vi.fn(),
-    openPrLink: vi.fn(),
-    openAddProject: vi.fn(),
-    newThreadHandler: vi.fn(),
-    updateSettings: vi.fn(),
-    archiveThread: vi.fn(),
-    deleteThread: vi.fn(),
-    requestWorktreeRemoval: vi.fn(),
-    closeWorktreeRemovalDialog: vi.fn(),
-    completeWorktreeRemoval: vi.fn(),
-    contextMenuShow: vi.fn(),
-    dialogConfirm: vi.fn(),
-    toastAdd: vi.fn(),
-    toastClose: vi.fn(),
-    stackedThreadToast: vi.fn((toast: unknown) => toast),
-    setOpenMobile: vi.fn(),
-    markRead: vi.fn(),
-    markUnread: vi.fn(),
-    togglePinned: vi.fn(),
-    markThreadUnread: vi.fn(),
-    setProjectExpanded: vi.fn(),
-    reorderProjects: vi.fn(),
-    toggleThread: vi.fn(),
-    rangeSelectTo: vi.fn(),
-    clearSelection: vi.fn(),
-    removeFromSelection: vi.fn(),
-    setAnchor: vi.fn(),
-    getDraftThreadByProjectRef: vi.fn(),
-    clearDraftThread: vi.fn(),
-    clearProjectDraftThreadId: vi.fn(),
-    openDiscoveredPort: vi.fn(),
-    useEnvironmentThread: vi.fn(),
-    autoAnimate: vi.fn(),
-    pointerWithin: vi.fn(),
-    closestCorners: vi.fn(),
-    copyToClipboard: vi.fn(),
-    windowConfirm: vi.fn(),
-    openProjectDataRecovery: vi.fn(async () => undefined),
-  };
-
-  const runCommand = (command: { label?: string }, input: unknown) => {
-    const label = command?.label ?? "unknown";
-    state.commandCalls.push({ label, input });
-    const impl = state.commandResults[label] as ((value: unknown) => unknown) | undefined;
-    return Promise.resolve(impl ? impl(input) : { _tag: "Success", value: undefined });
-  };
-
-  const uiStore = makeStore(() => ({
-    projectExpandedById: {} as Record<string, boolean>,
-    projectOrder: [] as string[],
-    threadLastVisitedAtById: {} as Record<string, string>,
-    markThreadVisited: vi.fn(),
-    markThreadUnread: spies.markThreadUnread,
-    setThreadChangedFilesExpanded: vi.fn(),
-    setDefaultAdvertisedEndpointKey: vi.fn(),
-    setProjectExpanded: spies.setProjectExpanded,
-    reorderProjects: spies.reorderProjects,
-  }));
-
-  const selectionStore = makeStore(() => ({
-    selectedThreadKeys: new Set<string>(),
-    anchorThreadKey: null as string | null,
-    toggleThread: spies.toggleThread,
-    rangeSelectTo: spies.rangeSelectTo,
-    clearSelection: spies.clearSelection,
-    removeFromSelection: spies.removeFromSelection,
-    setAnchor: spies.setAnchor,
-    hasSelection: () =>
-      (selectionStore.getState() as { selectedThreadKeys: Set<string> }).selectedThreadKeys.size >
-      0,
-    selectedProjectKey: null as string | null,
-    selectedProjectRouteThreadKey: null as string | null,
-    selectProject: (projectKey: string, routeThreadKey: string | null) => {
-      selectionStore.setState({
-        selectedThreadKeys: new Set<string>(),
-        anchorThreadKey: null,
-        selectedProjectKey: projectKey,
-        selectedProjectRouteThreadKey: routeThreadKey,
-      });
-    },
-    clearProjectSelection: () => {
-      selectionStore.setState({ selectedProjectKey: null, selectedProjectRouteThreadKey: null });
-    },
-  }));
-
-  const metaStore = makeStore(() => ({
-    pinnedThreadKeys: [] as string[],
-    unreadThreadKeys: [] as string[],
-    togglePinned: spies.togglePinned,
-    markUnread: spies.markUnread,
-    markRead: spies.markRead,
-  }));
-
-  state.ui = uiStore;
-  state.selection = selectionStore;
-  state.meta = metaStore;
-  return {
-    state,
-    spies,
-    capture,
-    mk,
-    runCommand,
-    uiStore,
-    selectionStore,
-    metaStore,
-  };
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Module mocks
-// ─────────────────────────────────────────────────────────────────────────────
-
-vi.mock("@tanstack/react-router", () => ({
-  Link: h.mk("Link", "a"),
-  useNavigate: () => h.spies.navigate,
-  useRouter: () => ({ navigate: h.spies.routerNavigate }),
-  useLocation: (opts?: { select?: (loc: { pathname: string }) => unknown }) =>
-    opts?.select ? opts.select({ pathname: h.state.pathname }) : { pathname: h.state.pathname },
-  useParams: (opts?: { select?: (params: Record<string, string>) => unknown }) =>
-    opts?.select ? opts.select(h.state.routeParams) : h.state.routeParams,
-}));
-
-vi.mock("@effect/atom-react", () => ({
-  useAtomValue: (atom: { id?: string }) => h.state.atomValues[atom?.id ?? ""] ?? null,
-  useAtomRefresh: () => () => {},
-  RegistryContext: null,
-}));
-
-vi.mock("@formkit/auto-animate", () => ({
-  autoAnimate: h.spies.autoAnimate,
-}));
-
-vi.mock("@dnd-kit/core", () => ({
-  DndContext: h.mk("DndContext"),
-  PointerSensor: function PointerSensor() {},
-  useSensor: (sensor: unknown, options: unknown) => ({ sensor, options }),
-  useSensors: (...sensors: unknown[]) => sensors,
-  pointerWithin: h.spies.pointerWithin,
-  closestCorners: h.spies.closestCorners,
-}));
-
-vi.mock("@dnd-kit/sortable", () => ({
-  SortableContext: h.mk("SortableContext"),
-  verticalListSortingStrategy: {},
-  useSortable: () => ({
-    attributes: { "data-sortable": true },
-    listeners: {},
-    setActivatorNodeRef: vi.fn(),
-    setNodeRef: vi.fn(),
-    transform: null,
-    transition: undefined,
-    isDragging: false,
-    isOver: false,
-  }),
-}));
-
-vi.mock("@dnd-kit/modifiers", () => ({
-  restrictToFirstScrollableAncestor: () => ({}),
-  restrictToVerticalAxis: () => ({}),
-}));
-
-vi.mock("@dnd-kit/utilities", () => ({
-  CSS: { Translate: { toString: () => "" } },
-}));
-
-vi.mock("../env", () => ({
-  get isDesktopHost() {
-    return h.state.isDesktopHost as boolean;
-  },
-}));
-
-vi.mock("../connection/currentEnvironmentPresentation", () => ({
-  readCurrentEnvironmentPresentationPolicy: () => h.state.presentationPolicy,
-}));
-
-vi.mock("../state/entities", () => ({
-  useProjects: () => h.state.projects,
-  useThreadShells: () => h.state.threads,
-  useActiveEnvironmentId: () => h.state.activeEnvironmentId,
-  setActiveEnvironmentId: (environmentId: unknown) => {
-    h.state.activeEnvironmentId = environmentId;
-  },
-  useThreadShellsForProjectRefs: (
-    refs: ReadonlyArray<{ environmentId: string; projectId: string }>,
-  ) =>
-    (h.state.threads as Array<{ environmentId: string; projectId: string }>).filter((thread) =>
-      refs.some(
-        (ref) => ref.environmentId === thread.environmentId && ref.projectId === thread.projectId,
-      ),
-    ),
-  useProject: (ref: { environmentId: string; projectId: string } | null) =>
-    ref
-      ? ((h.state.projects as Array<{ environmentId: string; id: string }>).find(
-          (project) => project.environmentId === ref.environmentId && project.id === ref.projectId,
-        ) ?? null)
-      : null,
-  useServerConfigs: () => h.state.serverConfigs,
-  readThreadShell: () => null,
-}));
-
-vi.mock("../state/environments", () => ({
-  useEnvironments: () => ({ environments: h.state.environments }),
-  usePrimaryEnvironmentId: () => h.state.primaryEnvironmentId,
-  useEnvironment: (environmentId: string) =>
-    (h.state.environments as Array<{ environmentId: string }>).find(
-      (environment) => environment.environmentId === environmentId,
-    ) ?? null,
-}));
-
-vi.mock("../state/query", () => ({
-  useEnvironmentQuery: (
-    atom: {
-      __q?: string;
-      args?: { environmentId?: string; input?: { cwd?: string; projectId?: string } };
-    } | null,
-  ) => {
-    if (atom?.__q?.startsWith("vcs.")) {
-      h.state.vcsQueries.push(atom);
-    }
-    return {
-      data:
-        atom?.__q === "worktree.catalog"
-          ? (h.state.worktreeCatalogs.get(
-              `${atom.args?.environmentId}:${atom.args?.input?.projectId}`,
-            ) ?? null)
-          : atom
-            ? (h.state.vcsStatusByCwd[atom.args?.input?.cwd ?? ""] ?? null)
-            : null,
-      error: null,
-      isPending: false,
-      refresh: () => {},
-    };
-  },
-}));
-
-vi.mock("../state/terminalSessions", () => ({
-  useThreadRunningTerminalIds: () => h.state.runningTerminalIds,
-}));
-
-vi.mock("../portDiscoveryState", () => ({
-  useThreadDiscoveredPorts: (ref: { threadId: string }) =>
-    h.state.discoveredPortsByThreadId[ref.threadId] ?? [],
-}));
-
-vi.mock("./preview/openDiscoveredPort", () => ({
-  openDiscoveredPort: h.spies.openDiscoveredPort,
-}));
-
-vi.mock("../state/use-atom-command", () => ({
-  useAtomCommand: (command: { label?: string }) => (input: unknown) => h.runCommand(command, input),
-}));
-
-vi.mock("../state/preview", () => ({
-  previewEnvironment: { open: { label: "preview.open" } },
-}));
-
-vi.mock("../state/projects", () => ({
-  projectEnvironment: {
-    delete: { label: "project.delete" },
-    update: { label: "project.update" },
-  },
-}));
-
-vi.mock("../state/shell", () => ({
-  shellEnvironment: { openInEditor: { label: "shell.openInEditor" } },
-  environmentAvailabilityCommands: {
-    retry: { label: "environment.retry" },
-    adoptStorage: { label: "environment.adoptStorage" },
-  },
-  useEnvironmentShellSummary: () => h.state.shellSummary,
-}));
-
-vi.mock("../state/threads", () => ({
-  threadEnvironment: {
-    updateMetadata: { label: "thread.updateMetadata" },
-    create: { label: "thread.create" },
-  },
-  useEnvironmentThread: h.spies.useEnvironmentThread,
-}));
-
-vi.mock("../state/vcs", () => ({
-  vcsEnvironment: {
-    status: (args: unknown) => ({ __q: "vcs.status", args }),
-    summary: (args: unknown) => ({ __q: "vcs.summary", args }),
-    pull: { label: "vcs.pull" },
-    refreshStatus: { label: "vcs.refreshStatus" },
-  },
-}));
-
-vi.mock("../state/server", () => ({
-  primaryServerConfigAtom: { id: "primaryServerConfig" },
-  primaryServerKeybindingsAtom: { id: "primaryServerKeybindings" },
-}));
-
-vi.mock("../state/desktopUpdate", () => ({
-  useDesktopUpdateState: () => h.state.desktopUpdateState,
-}));
-
-vi.mock("../state/worktrees", () => ({
-  worktreeEnvironment: {
-    catalog: (args: unknown) => {
-      h.state.discoveryCatalogSubscriptions.push(args);
-      return { __q: "worktree.catalog", args };
-    },
-    refresh: { label: "worktree.refresh" },
-    updatePolicy: { label: "worktree.updatePolicy" },
-    addOne: { label: "worktree.addOne" },
-    addAll: { label: "worktree.addAll" },
-  },
-  useWorktreeCatalogFocusRefresh: (projects: ReadonlyArray<unknown>) => {
-    h.state.discoveryFocusRefreshCalls.push([...projects]);
-  },
-}));
-
-vi.mock("../state/projectDataSafety", () => ({
-  projectDataSafetyStore: {
-    open: h.spies.openProjectDataRecovery,
-  },
-}));
-
-vi.mock("./desktopUpdate.logic", () => ({
-  isDesktopUpdateButtonDisabled: () => h.state.updateBtnDisabled,
-  resolveDesktopUpdateButtonAction: () => h.state.updateBtnAction,
-  shouldShowArm64IntelBuildWarning: () => h.state.showArmWarning,
-  getArm64IntelBuildWarningDescription: () => "Running the Intel build on Apple Silicon.",
-  getDesktopUpdateInstallConfirmationMessage: () => "Install the update now?",
-  getDesktopUpdateActionError: (result: { error?: string } | null | undefined) =>
-    result?.error ?? null,
-  shouldToastDesktopUpdateActionResult: (result: { toast?: boolean } | null | undefined) =>
-    result?.toast === true,
-}));
-
-vi.mock("../hooks/useThreadActions", () => ({
-  useThreadActions: () => ({
-    archiveThread: h.spies.archiveThread,
-    deleteThread: h.spies.deleteThread,
-    worktreeRemovalTarget: null,
-    requestWorktreeRemoval: h.spies.requestWorktreeRemoval,
-    closeWorktreeRemovalDialog: h.spies.closeWorktreeRemovalDialog,
-    completeWorktreeRemoval: h.spies.completeWorktreeRemoval,
-  }),
-}));
-
-vi.mock("./WorktreeAvailabilityWarning", () => ({
-  WorktreeAvailabilityWarning: ({ status, onRetry, onRemove }: any) => {
-    h.capture("WorktreeAvailabilityWarning", { status, onRetry, onRemove });
-    return (
-      <div data-testid={`availability-warning-${status.threadId}`}>
-        <span>{status.availability}</span>
-        <span>{status.path}</span>
-        <button type="button" onClick={onRetry}>
-          Retry detection
-        </button>
-        <button type="button" onClick={onRemove}>
-          Remove from BiBCode
-        </button>
-      </div>
-    );
-  },
-}));
-
-vi.mock("./WorktreeRemovalDialog", () => ({
-  WorktreeRemovalDialog: (props: Record<string, unknown>) => {
-    h.capture("WorktreeRemovalDialog", props);
-    return null;
-  },
-}));
-
-vi.mock("../hooks/useHandleNewThread", () => ({
-  useNewThreadHandler: () => h.spies.newThreadHandler,
-}));
-
-vi.mock("~/hooks/useSettings", () => ({
-  usePrimarySettings: (selector: (settings: unknown) => unknown) =>
-    selector({ ...h.state.clientSettings }),
-  useClientSettings: (selector: (settings: unknown) => unknown) => selector(h.state.clientSettings),
-  useUpdateClientSettings: () => h.spies.updateSettings,
-}));
-
-vi.mock("~/hooks/useCopyToClipboard", () => ({
-  useCopyToClipboard: (opts?: {
-    onCopy?: (ctx: unknown) => void;
-    onError?: (error: Error, ctx: unknown) => void;
-  }) => ({
-    copyToClipboard: vi.fn((value: string, ctx: unknown) => {
-      h.spies.copyToClipboard(value, ctx);
-      if (h.state.copyShouldFail) {
-        opts?.onError?.(new Error("copy failed"), ctx);
-      } else {
-        opts?.onCopy?.(ctx);
-      }
-    }),
-  }),
-}));
-
-vi.mock("~/hooks/useMediaQuery", () => ({
-  useIsMobile: () => h.state.isMobile,
-}));
-
-vi.mock("../connection/useDesktopLocalBootstraps", () => ({
-  useDesktopLocalBootstraps: () => h.state.desktopBootstraps,
-}));
-
-vi.mock("../lib/openPullRequestLink", () => ({
-  useOpenPrLink: () => h.spies.openPrLink,
-}));
-
-vi.mock("../commandPaletteContext", () => ({
-  useOpenAddProjectCommandPalette: () => h.spies.openAddProject,
-}));
-
-vi.mock("../localApi", () => ({
-  readLocalApi: () => h.state.localApi,
-}));
-
-vi.mock("../keybindings", () => ({
-  resolveShortcutCommand: () => null,
-  shortcutLabelForCommand: (_config: unknown, command: string, options: unknown) => {
-    h.state.shortcutLabelOptions.push(options);
-    const labels = h.state.shortcutLabels as Record<string, string | null>;
-    return command in labels ? labels[command] : "Mod+K";
-  },
-  shouldShowThreadJumpHintsForModifiers: () => h.state.showJumpHintModifiers,
-  threadJumpCommandForIndex: (index: number) => (index < 9 ? `thread.jump.${index + 1}` : null),
-  threadJumpIndexFromCommand: (command: string) => {
-    const match = /^thread\.jump\.([1-9])$/u.exec(command);
-    return match ? Number(match[1]) - 1 : null;
-  },
-  threadTraversalDirectionFromCommand: (command: string | null) =>
-    command === "thread.previous" ? "previous" : command === "thread.next" ? "next" : null,
-}));
-
-vi.mock("../uiStateStore", async (importOriginal) => {
-  const actual = await importOriginal<Record<string, unknown>>();
-  return { ...actual, useUiStateStore: h.uiStore };
-});
-
-vi.mock("../threadSelectionStore", () => ({
-  useThreadSelectionStore: h.selectionStore,
-}));
-
-vi.mock("../sidebarWorkspaceMetaStore", async (importOriginal) => {
-  const actual = await importOriginal<Record<string, unknown>>();
-  return { ...actual, useSidebarWorkspaceMetaStore: h.metaStore };
-});
-
-vi.mock("../terminalSurfaceState", () => ({
-  useThreadHasTerminalSurface: () => h.state.terminalSurfaceOpen,
-}));
-
-vi.mock("../composerDraftStore", () => ({
-  DraftId: { make: (value: string) => value },
-  useComposerDraftStore: {
-    getState: () => ({
-      getDraftThreadByProjectRef: h.spies.getDraftThreadByProjectRef,
-      clearDraftThread: h.spies.clearDraftThread,
-      clearProjectDraftThreadId: h.spies.clearProjectDraftThreadId,
-    }),
-  },
-}));
-
-vi.mock("./ThreadStatusIndicators", () => ({
-  ChangeRequestStatusIcon: h.mk("ChangeRequestStatusIcon", "span"),
-  ThreadWorktreeIndicator: h.mk("ThreadWorktreeIndicator", "span"),
-  ThreadStatusLabel: (props: { status: { label: string }; compact?: boolean }) => {
-    h.capture("ThreadStatusLabel", props as unknown as Record<string, unknown>);
-    const R = h.state.React as typeof import("react");
-    return R.createElement("span", { "data-mock": "ThreadStatusLabel" }, props.status.label);
-  },
-  resolveThreadPr: (branch: string | null, data: { pr?: unknown } | null) =>
-    branch && data?.pr ? data.pr : null,
-  prStatusIndicator: (pr: { url: string } | null) =>
-    pr ? { url: pr.url, tooltip: "PR open", colorClass: "pr-color" } : null,
-  terminalStatusFromRunningIds: (ids: readonly string[]) =>
-    ids.length > 0
-      ? { label: `${ids.length} terminal running`, colorClass: "term-color", pulse: true }
-      : null,
-}));
-
-vi.mock("./ProjectFavicon", () => ({ ProjectFavicon: h.mk("ProjectFavicon", "span") }));
-vi.mock("./CreateWorktreeDialog", () => ({
-  CreateWorktreeDialog: h.mk("CreateWorktreeDialog"),
-}));
-vi.mock("./settings/SettingsSidebarNav", () => ({
-  SettingsSidebarNav: h.mk("SettingsSidebarNav"),
-}));
-vi.mock("./sidebar/EnvironmentContextCard", () => ({
-  EnvironmentContextCard: h.mk("EnvironmentContextCard"),
-}));
-vi.mock("./sidebar/SidebarUpdatePill", () => ({
-  SidebarUpdatePill: h.mk("SidebarUpdatePill", "span"),
-}));
-vi.mock("./sidebar/SidebarProviderUpdatePill", () => ({
-  SidebarProviderUpdatePill: h.mk("SidebarProviderUpdatePill", "span"),
-}));
-
-vi.mock("./ui/toast", () => ({
-  toastManager: {
-    add: h.spies.toastAdd,
-    close: h.spies.toastClose,
-  },
-  stackedThreadToast: h.spies.stackedThreadToast,
-}));
-
-vi.mock("./ui/alert", () => ({
-  Alert: h.mk("Alert"),
-  AlertAction: h.mk("AlertAction"),
-  AlertDescription: h.mk("AlertDescription"),
-  AlertTitle: h.mk("AlertTitle"),
-}));
-
-vi.mock("./ui/button", () => ({ Button: h.mk("Button", "button") }));
-vi.mock("./ui/input", () => ({ Input: h.mk("Input", "input") }));
-vi.mock("./ui/kbd", () => ({ Kbd: h.mk("Kbd", "kbd") }));
-vi.mock("./ui/command", () => ({ CommandDialogTrigger: h.mk("CommandDialogTrigger") }));
-
-vi.mock("./ui/dialog", () => ({
-  Dialog: h.mk("Dialog"),
-  DialogDescription: h.mk("DialogDescription"),
-  DialogFooter: h.mk("DialogFooter"),
-  DialogHeader: h.mk("DialogHeader"),
-  DialogPanel: h.mk("DialogPanel"),
-  DialogPopup: h.mk("DialogPopup"),
-  DialogTitle: h.mk("DialogTitle"),
-}));
-
-vi.mock("./ui/menu", () => ({
-  Menu: h.mk("Menu"),
-  MenuGroup: h.mk("MenuGroup"),
-  MenuPopup: h.mk("MenuPopup"),
-  MenuRadioGroup: h.mk("MenuRadioGroup"),
-  MenuRadioItem: h.mk("MenuRadioItem"),
-  MenuSeparator: h.mk("MenuSeparator"),
-  MenuTrigger: h.mk("MenuTrigger", "button"),
-}));
-
-vi.mock("./ui/number-field", () => ({
-  NumberField: h.mk("NumberField"),
-  NumberFieldDecrement: h.mk("NumberFieldDecrement", "button"),
-  NumberFieldGroup: h.mk("NumberFieldGroup"),
-  NumberFieldIncrement: h.mk("NumberFieldIncrement", "button"),
-  NumberFieldInput: h.mk("NumberFieldInput", "input"),
-}));
-
-vi.mock("./ui/select", () => ({
-  Select: h.mk("Select"),
-  SelectItem: h.mk("SelectItem"),
-  SelectPopup: h.mk("SelectPopup"),
-  SelectTrigger: h.mk("SelectTrigger", "button"),
-  SelectValue: h.mk("SelectValue", "span"),
-}));
-
-vi.mock("./ui/tooltip", () => ({
-  Tooltip: h.mk("Tooltip", "span"),
-  TooltipPopup: h.mk("TooltipPopup", "span"),
-  TooltipTrigger: h.mk("TooltipTrigger", "span"),
-}));
-
-vi.mock("./ui/sidebar", () => ({
-  SidebarContent: h.mk("SidebarContent"),
-  SidebarFooter: h.mk("SidebarFooter"),
-  SidebarGroup: h.mk("SidebarGroup"),
-  SidebarHeader: h.mk("SidebarHeader"),
-  SidebarMenu: h.mk("SidebarMenu", "ul"),
-  SidebarMenuButton: h.mk("SidebarMenuButton", "button"),
-  SidebarMenuItem: h.mk("SidebarMenuItem", "li"),
-  SidebarMenuSub: h.mk("SidebarMenuSub", "ul"),
-  SidebarMenuSubButton: h.mk("SidebarMenuSubButton", "button"),
-  SidebarMenuSubItem: h.mk("SidebarMenuSubItem", "li"),
-  SidebarSeparator: h.mk("SidebarSeparator", "hr"),
-  SidebarTrigger: h.mk("SidebarTrigger", "button"),
-  useSidebar: () => h.state.sidebarCtx,
-}));
-
-// The module under test must be imported after all mocks.
+import type { EnvironmentThreadShell } from "@bibcode/client-runtime/state/shell";
 import Sidebar, {
   SidebarBrandContent,
   SidebarThreadRow,
   handleSidebarNavigationKeyDown,
   handleSidebarSelectionMouseDown,
 } from "./Sidebar";
+import { WORKSPACE_CARD_STATUS } from "./Sidebar.logic";
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Fixtures
-// ─────────────────────────────────────────────────────────────────────────────
+const decodeStatusSummary = Schema.decodeUnknownSync(VcsStatusSummary);
 
-const ENV_MAIN = EnvironmentId.make("env-main");
-const ENV_REMOTE = EnvironmentId.make("env-remote");
-const ENV_WSL = EnvironmentId.make("env-wsl");
-
-const NOW = Date.parse("2026-07-06T12:00:00.000Z");
-const iso = (minutesAgo: number) => new Date(NOW - minutesAgo * 60_000).toISOString();
-
-function makeProject(
-  id: string,
-  overrides: Partial<Omit<EnvironmentProject, "id">> = {},
-): EnvironmentProject {
-  return {
-    id: ProjectId.make(id),
-    title: "Repo A",
-    workspaceRoot: "C:/repo-a",
-    repositoryIdentity: null,
-    defaultModelSelection: null,
-    scripts: [],
-    worktreeDiscovery: { visibility: "hidden", initialPromptDismissedAt: null, baselinePaths: [] },
-    createdAt: iso(600),
-    updatedAt: iso(60),
-    environmentId: ENV_MAIN,
-    ...overrides,
-  };
-}
-
-function makeThread(
-  id: string,
-  overrides: Partial<Omit<EnvironmentThreadShell, "id">> = {},
-): EnvironmentThreadShell {
-  return {
-    id: ThreadId.make(id),
-    projectId: ProjectId.make("project-a"),
-    title: `Thread ${id}`,
-    modelSelection: createModelSelection(ProviderInstanceId.make("codex"), "gpt-5-codex"),
-    runtimeMode: "full-access",
-    interactionMode: "default",
-    branch: null,
-    worktreePath: null,
-    latestTurn: null,
-    createdAt: iso(500),
-    updatedAt: iso(50),
-    archivedAt: null,
-    session: null,
-    latestUserMessageAt: iso(40),
-    hasPendingApprovals: false,
-    hasPendingUserInput: false,
-    hasActionableProposedPlan: false,
-    environmentId: ENV_MAIN,
-    ...overrides,
-  };
-}
-
-function environmentFixture(overrides: {
-  environmentId: EnvironmentId;
-  label?: string | null;
-  connectionId?: string;
-  primary?: boolean;
-  displayUrl?: string | null;
-  phase?: string;
-  error?: string | null;
-}) {
-  return {
-    environmentId: overrides.environmentId,
-    label: overrides.label ?? null,
-    entry: {
-      target: overrides.primary
-        ? { _tag: "PrimaryConnectionTarget" }
-        : {
-            _tag: "BearerConnectionTarget",
-            connectionId: overrides.connectionId ?? "plain",
-          },
-    },
-    displayUrl: overrides.displayUrl ?? null,
-    connection: { phase: overrides.phase ?? "connected", error: overrides.error ?? null },
-  };
-}
-
-const threadKeyOf = (thread: EnvironmentThreadShell) =>
-  scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id));
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Render + capture helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-function render(element: React.ReactElement): string {
-  h.state.captures.length = 0;
-  return renderToStaticMarkup(element);
-}
-
-interface Captured {
-  readonly name: string;
-  readonly props: Record<string, unknown>;
-}
-
-function captured(name: string): Captured[] {
-  return (h.state.captures as Captured[]).filter((entry) => entry.name === name);
-}
-
-function collectElements(node: unknown, out: React.ReactElement[]): void {
-  if (node === null || node === undefined) return;
-  if (typeof node !== "object") return;
-  if (Array.isArray(node)) {
-    for (const child of node) collectElements(child, out);
-    return;
-  }
-  if (React.isValidElement(node)) {
-    out.push(node);
-    const props = node.props as Record<string, unknown>;
-    collectElements(props["children"], out);
-    collectElements(props["render"], out);
-  }
-}
-
-type PropsPredicate = (props: Record<string, unknown>) => boolean;
-
-function findProps(predicate: PropsPredicate): Record<string, unknown> | null {
-  for (const entry of h.state.captures as Captured[]) {
-    if (predicate(entry.props)) return entry.props;
-    const elements: React.ReactElement[] = [];
-    collectElements(entry.props["children"], elements);
-    collectElements(entry.props["render"], elements);
-    for (const element of elements) {
-      const props = element.props as Record<string, unknown>;
-      if (predicate(props)) return props;
-    }
-  }
-  return null;
-}
-
-function mustFindProps(predicate: PropsPredicate, label: string): Record<string, unknown> {
-  const props = findProps(predicate);
-  if (!props) throw new Error(`Could not find captured element: ${label}`);
-  return props;
-}
-
-const byTestId =
-  (id: string): PropsPredicate =>
-  (props) =>
-    props["data-testid"] === id;
-const byAriaLabel =
-  (label: string): PropsPredicate =>
-  (props) =>
-    props["aria-label"] === label;
-
-function invoke<TEvent>(props: Record<string, unknown>, handler: string, event: TEvent): void {
-  const fn = props[handler];
-  if (typeof fn !== "function") {
-    throw new Error(`Captured element has no ${handler} handler`);
-  }
-  fn(event);
-}
-
-function mouseEvent(overrides: Record<string, unknown> = {}): React.MouseEvent<HTMLButtonElement> {
-  return {
-    preventDefault: vi.fn(),
-    stopPropagation: vi.fn(),
-    metaKey: false,
-    ctrlKey: false,
-    shiftKey: false,
-    altKey: false,
-    detail: 1,
-    button: 0,
-    clientX: 11,
-    clientY: 22,
-    target: { closest: () => null },
-    currentTarget: { contains: () => false },
-    ...overrides,
-  } as unknown as React.MouseEvent<HTMLButtonElement>;
-}
-
-function keyboardEvent(
-  key: string,
-  overrides: Record<string, unknown> = {},
-): React.KeyboardEvent<HTMLButtonElement> {
-  return {
-    key,
-    preventDefault: vi.fn(),
-    stopPropagation: vi.fn(),
-    ...overrides,
-  } as unknown as React.KeyboardEvent<HTMLButtonElement>;
-}
-
-const flush = async () => {
-  for (let i = 0; i < 6; i += 1) {
-    await new Promise<void>((resolve) => {
-      setTimeout(resolve, 0);
-    });
-  }
+/** A card menu item as `api.contextMenu.show` receives it. */
+type CardMenuItem = {
+  id?: string;
+  label?: string;
+  disabled?: boolean;
+  description?: string;
+  separator?: true;
 };
 
-function failureResult(message: string) {
-  return { _tag: "Failure", cause: Cause.fail(new Error(message)) };
+/** Sets the session status of the worktree fixture, whose own session is running. */
+function setWorktreeSessionStatus(
+  status: NonNullable<EnvironmentThreadShell["session"]>["status"],
+): void {
+  h.state.threads = h.state.threads.map((thread: EnvironmentThreadShell) =>
+    thread.id === threadActive.id
+      ? { ...threadActive, session: { ...threadActive.session!, status } }
+      : thread,
+  );
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Scenario setup
-// ─────────────────────────────────────────────────────────────────────────────
-
-const projectA = makeProject("project-a");
-
-const threadDefault = makeThread("thread-default", {
-  kind: "default",
-  title: "Repo A",
-});
-const threadActive = makeThread("thread-active", {
-  title: "Active worktree",
-  branch: "feat/x",
-  worktreePath: "C:/wt/x",
-  session: {
-    threadId: ThreadId.make("thread-active"),
-    status: "running",
-    providerName: "Claude Code",
-    activeTurnId: null,
-    lastError: null,
-    updatedAt: iso(90),
-    runtimeMode: "full-access",
-  },
-  latestUserMessageAt: iso(5),
-});
-const threadIdle = makeThread("thread-idle", { title: "Idle thread" });
-const threadPanel = makeThread("thread-panel", { kind: "panel", title: "Panel thread" });
-const threadArchived = makeThread("thread-archived", {
-  archivedAt: iso(10),
-  title: "Archived thread",
-});
-
-function baseScenario() {
-  h.state.projects = [projectA];
-  h.state.threads = [threadDefault, threadActive, threadIdle, threadPanel, threadArchived];
-  h.state.environments = [
-    environmentFixture({ environmentId: ENV_MAIN, label: "Main", connectionId: "primary" }),
-  ];
-  h.state.primaryEnvironmentId = ENV_MAIN;
-  h.state.routeParams = { environmentId: ENV_MAIN, threadId: "thread-active" };
-  h.state.vcsStatusByCwd = {
-    "C:/repo-a": { refName: "main" },
-    "C:/wt/x": { refName: "feat/x", pr: { url: "https://example.com/pr/1" } },
-  };
+/** Makes the card menu choose Delete; `current` is the Delete item the menu was built with. */
+function chooseDeleteFromCardMenu(): { current: CardMenuItem | undefined } {
+  const deleteItem: { current: CardMenuItem | undefined } = { current: undefined };
+  h.spies.contextMenuShow.mockImplementation(async (items: CardMenuItem[]) => {
+    deleteItem.current = items.find((item) => item.id === "delete");
+    return "delete";
+  });
+  return deleteItem;
 }
-
-const groupedRepoIdentity = {
-  canonicalKey: "github.com/acme/repo-a",
-  locator: {
-    source: "git-remote" as const,
-    remoteName: "origin",
-    remoteUrl: "https://github.com/acme/repo-a.git",
-  },
-  rootPath: "C:/repo-a",
-  displayName: "Repo A",
-  name: "repo-a",
-};
-
-function groupedScenario() {
-  const localMember = makeProject("project-a", {
-    repositoryIdentity: groupedRepoIdentity,
-  });
-  const remoteMember = makeProject("project-a-remote", {
-    workspaceRoot: "C:/remote/repo-a",
-    repositoryIdentity: { ...groupedRepoIdentity, rootPath: "C:/remote/repo-a" },
-    environmentId: ENV_REMOTE,
-  });
-  const remoteThread = makeThread("thread-remote", {
-    projectId: ProjectId.make("project-a-remote"),
-    environmentId: ENV_REMOTE,
-    title: "Remote thread",
-  });
-  h.state.projects = [localMember, remoteMember];
-  h.state.threads = [threadDefault, threadIdle, remoteThread];
-  h.state.environments = [
-    environmentFixture({ environmentId: ENV_MAIN, label: "Main", connectionId: "primary" }),
-    environmentFixture({
-      environmentId: ENV_REMOTE,
-      label: "Remote Box",
-      connectionId: "remote",
-    }),
-  ];
-  return { remoteThread };
-}
-
-function fakeLocalApi() {
-  const api = {
-    contextMenu: { show: h.spies.contextMenuShow },
-    dialogs: { confirm: h.spies.dialogConfirm },
-  };
-  h.state.localApi = api;
-  return api;
-}
-
-beforeEach(() => {
-  vi.clearAllMocks();
-  h.state.React = React;
-  h.uiStore.reset();
-  h.selectionStore.reset();
-  h.metaStore.reset();
-  h.state.captures.length = 0;
-  h.state.projects = [];
-  h.state.threads = [];
-  h.state.environments = [];
-  h.state.primaryEnvironmentId = ENV_MAIN;
-  h.state.activeEnvironmentId = null;
-  h.state.serverConfigs = new Map();
-  h.state.clientSettings = { ...DEFAULT_CLIENT_SETTINGS };
-  h.state.atomValues = {
-    primaryServerConfig: {
-      availableEditors: ["vscode"],
-      environment: { serverVersion: "0.1.0" },
-    },
-    primaryServerKeybindings: {},
-  };
-  h.state.vcsStatusByCwd = {};
-  h.state.vcsQueries = [];
-  h.state.worktreeCatalogs = new Map();
-  h.state.discoveryCatalogSubscriptions = [];
-  h.state.discoveryFocusRefreshCalls = [];
-  h.state.runningTerminalIds = [];
-  h.state.discoveredPortsByThreadId = {};
-  h.state.desktopBootstraps = [];
-  h.state.desktopUpdateState = null;
-  h.state.shellSummary = {
-    catalogReady: false,
-    desiredEnvironmentCount: 0,
-    statuses: [],
-    canShowEmptyProjects: false,
-    hasSnapshot: false,
-    hasSynchronizingShell: false,
-    hasCachedShell: false,
-    hasLiveShell: false,
-    firstError: null,
-    latestSnapshotUpdatedAt: null,
-  };
-  h.state.updateBtnDisabled = false;
-  h.state.updateBtnAction = "none";
-  h.state.showArmWarning = false;
-  h.state.isMobile = false;
-  h.state.sidebarCtx = { isMobile: false, setOpenMobile: h.spies.setOpenMobile };
-  h.state.pathname = "/";
-  h.state.routeParams = {};
-  h.state.localApi = null;
-  h.state.isDesktopHost = true;
-  h.state.copyShouldFail = false;
-  h.state.openDiscoveredPortResult = { _tag: "Success", value: undefined };
-  h.state.commandResults = {};
-  h.state.commandCalls = [];
-  h.state.shortcutLabels = {};
-  h.state.shortcutLabelOptions = [];
-  h.state.showJumpHintModifiers = false;
-  h.state.terminalSurfaceOpen = false;
-  h.state.presentationPolicy = createEnvironmentPresentationPolicy({
-    surface: "browser",
-    platform: "unknown",
-  });
-  h.spies.contextMenuShow.mockResolvedValue(null);
-  h.spies.dialogConfirm.mockResolvedValue(true);
-  h.spies.toastAdd.mockReturnValue("toast-1");
-  h.spies.archiveThread.mockResolvedValue({ _tag: "Success", value: undefined });
-  h.spies.deleteThread.mockResolvedValue({ _tag: "Success", value: undefined });
-  h.spies.completeWorktreeRemoval.mockResolvedValue({ _tag: "Success", value: undefined });
-  h.spies.getDraftThreadByProjectRef.mockReturnValue(null);
-  h.spies.openDiscoveredPort.mockImplementation(async () => h.state.openDiscoveredPortResult);
-  h.spies.pointerWithin.mockReturnValue([]);
-  h.spies.closestCorners.mockReturnValue([]);
-  h.spies.windowConfirm.mockReturnValue(true);
-
-  if (!browserRuntime) {
-    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
-      callback(0);
-      return 0;
-    });
-    vi.stubGlobal("document", { activeElement: null, querySelector: () => null });
-    vi.stubGlobal("window", {
-      setTimeout: (callback: () => void) => {
-        callback();
-        return 0;
-      },
-      clearTimeout: () => {},
-      confirm: h.spies.windowConfirm,
-      desktopBridge: undefined,
-      addEventListener: () => {},
-      removeEventListener: () => {},
-    });
-  }
-});
-
-afterEach(() => {
-  vi.unstubAllGlobals();
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Tests
-// ─────────────────────────────────────────────────────────────────────────────
 
 staticDescribe("Sidebar global event helpers", () => {
   function navigationEvent(overrides: { defaultPrevented?: boolean; repeat?: boolean } = {}) {
@@ -1287,10 +232,59 @@ staticDescribe("SidebarBrandContent", () => {
     const markup = render(<SidebarBrandContent appBaseName="BiBCode" stageLabel="Dev" />);
     expect(markup).toContain("BiBCode");
     expect(markup).toContain("Dev");
+    // UI.md: no letter-spacing; the stage badge keeps its capitals.
+    expect(markup).not.toContain("tracking-");
+    expect(markup).toContain("uppercase");
   });
 });
 
 staticDescribe("Sidebar full render", () => {
+  it("renders the Projects label and Settings in the nav rows' type", () => {
+    baseScenario();
+    const markup = render(<Sidebar />);
+    expect(markup).toContain(
+      '<span class="text-xs font-medium text-muted-foreground">Projects</span>',
+    );
+    expect(markup).toContain('<span class="text-[13px] font-medium">Settings</span>');
+    expect(markup).not.toContain("uppercase tracking-wider");
+  });
+
+  it("summarises a collapsed project and the hidden cards with the card glyphs", () => {
+    baseScenario();
+    h.state.threads = [
+      threadDefault,
+      threadActive,
+      makeThread("thread-idle", { title: "Idle thread", hasPendingApprovals: true }),
+    ];
+    h.state.clientSettings = { ...DEFAULT_CLIENT_SETTINGS, sidebarThreadPreviewCount: 1 };
+    const expanded = render(<Sidebar />);
+    // thread-idle sorts below thread-active, so it is hidden behind Show more.
+    expect(expanded).toMatch(/aria-label="Needs approval"[\s\S]*Show more/);
+
+    h.uiStore.setState({
+      projectExpandedById: { [derivePhysicalProjectKey(projectA)]: false },
+    });
+    h.state.routeParams = {};
+    const collapsed = render(<Sidebar />);
+    expect(collapsed).toContain('aria-label="Needs approval"');
+    expect(collapsed).not.toContain('data-testid="thread-row-thread-idle"');
+  });
+
+  it("collects lookup data once for the actual project list, not once per card", () => {
+    baseScenario();
+    h.state.threads = [
+      threadDefault,
+      ...Array.from({ length: 6 }, (_, i) =>
+        makeThread("lookup-" + i, { title: "Workspace " + i }),
+      ),
+    ];
+    h.spies.cardLookupPass.mockClear();
+    render(<Sidebar />);
+    expect(h.spies.cardLookupPass).toHaveBeenCalledTimes(1);
+    const input = h.spies.cardLookupPass.mock.calls[0]![0] as { threads: readonly unknown[] };
+    expect(input.threads.length).toBeGreaterThan(1);
+  });
+
   it("passes active terminal surfaces to shortcut label resolution", () => {
     baseScenario();
     h.state.terminalSurfaceOpen = true;
@@ -1328,8 +322,8 @@ staticDescribe("Sidebar full render", () => {
     ];
     const markup = render(<Sidebar />);
 
-    expect(markup).toContain("thread-agent-row-thread-failed");
-    expect(markup).toContain("Failed");
+    expect(markup).toContain('aria-label="Failed"');
+    expect(markup).toContain("Claude Code");
     expect(markup).not.toContain("Connecting");
   });
 
@@ -1344,10 +338,10 @@ staticDescribe("Sidebar full render", () => {
     // Panel and archived threads never render as workspace rows.
     expect(markup).not.toContain("thread-row-thread-panel");
     expect(markup).not.toContain("thread-row-thread-archived");
-    // Running session renders the nested agent sub-row.
-    expect(markup).toContain("thread-agent-row-thread-active");
+    // A running session shows the Working glyph; line 3 names the provider.
+    expect(markup).toContain('aria-label="Working"');
     expect(markup).toContain("Claude Code");
-    expect(markup).toContain("Running");
+    expect(markup).not.toContain("thread-agent-row-");
     // The live branch from vcs.status becomes the primary row title.
     expect(markup).toContain("main");
     // Search entry + shortcut label.
@@ -1597,12 +591,13 @@ staticDescribe("Sidebar full render", () => {
     });
   });
 
-  it("shows the empty-thread state for an expanded project without workspace threads", () => {
+  it("shows only the primary card for an expanded project without workspace threads", () => {
     h.state.projects = [projectA];
     h.state.threads = [threadDefault];
     h.state.environments = [environmentFixture({ environmentId: ENV_MAIN, label: "Main" })];
     const markup = render(<Sidebar />);
-    expect(markup).toContain("No threads yet");
+    expect(markup).toContain('data-testid="primary-card-project-a"');
+    expect(markup).not.toContain("No threads yet");
   });
 
   it("collapses a project but keeps the active thread row visible", () => {
@@ -2024,6 +1019,37 @@ staticDescribe("Sidebar environment scoping", () => {
     expect(markup).not.toContain("Remote Repo");
   });
 
+  it("drops the cloud from a saved server's project headers", () => {
+    seedTwoEnvironments();
+    h.state.activeEnvironmentId = ENV_REMOTE;
+    const markup = render(<Sidebar />);
+    expect(markup).toContain("Remote Repo");
+    expect(markup).not.toContain('aria-label="Remote project"');
+    expect(markup).not.toContain("lucide-cloud");
+  });
+
+  it("keeps the container badge on a WSL project's header", () => {
+    seedTwoEnvironments();
+    h.state.environments.push(
+      environmentFixture({
+        environmentId: ENV_WSL,
+        label: "Ubuntu",
+        connectionId: "local:wsl-ubuntu",
+      }),
+    );
+    h.state.projects.push(
+      makeProject("project-wsl", {
+        environmentId: ENV_WSL,
+        title: "WSL Repo",
+        workspaceRoot: "/home/user/wsl-repo",
+      }),
+    );
+    h.state.activeEnvironmentId = ENV_MAIN;
+    const markup = render(<Sidebar />);
+    expect(markup).toContain('aria-label="Local sandbox project"');
+    expect(markup).toContain("lucide-container");
+  });
+
   it("mounts the environment context card under the brand row", () => {
     seedTwoEnvironments();
     h.state.activeEnvironmentId = ENV_REMOTE;
@@ -2206,7 +1232,7 @@ staticDescribe("project header context menu", () => {
     const header = projectHeaderProps();
     fakeLocalApi();
     h.spies.contextMenuShow.mockImplementation(async (items: Array<{ id: string }>) => {
-      const copy = items.find((item) => item.id.startsWith("copy-path:"));
+      const copy = items.find((item) => item.id?.startsWith("copy-path:"));
       return copy!.id;
     });
     invoke(header, "onContextMenu", mouseEvent());
@@ -2239,7 +1265,7 @@ staticDescribe("project header context menu", () => {
     h.spies.contextMenuShow.mockImplementation(
       async (items: Array<{ id: string; label: string }>) => {
         const visibility = items.find((item) => item.id === "worktree-discovery-visibility");
-        expect(visibility?.label).toBe("Show hidden worktrees");
+        expect(visibility?.label).toBe("Show Hidden Worktrees");
         return visibility!.id;
       },
     );
@@ -2276,7 +1302,7 @@ staticDescribe("project header context menu", () => {
     h.spies.contextMenuShow.mockImplementation(
       async (items: Array<{ id: string; label: string }>) => {
         const visibility = items.find((item) => item.id === "worktree-discovery-visibility");
-        expect(visibility?.label).toBe("Hide discovered worktrees");
+        expect(visibility?.label).toBe("Hide Discovered Worktrees");
         return visibility!.id;
       },
     );
@@ -2304,13 +1330,13 @@ staticDescribe("project header context menu", () => {
     const header = projectHeaderProps();
     fakeLocalApi();
     h.spies.contextMenuShow.mockImplementationOnce(async (items: Array<{ id: string }>) => {
-      return items.find((item) => item.id.startsWith("rename:"))!.id;
+      return items.find((item) => item.id?.startsWith("rename:"))!.id;
     });
     invoke(header, "onContextMenu", mouseEvent());
     await flush();
 
     h.spies.contextMenuShow.mockImplementationOnce(async (items: Array<{ id: string }>) => {
-      return items.find((item) => item.id.startsWith("grouping:"))!.id;
+      return items.find((item) => item.id?.startsWith("grouping:"))!.id;
     });
     invoke(header, "onContextMenu", mouseEvent());
     await flush();
@@ -2329,7 +1355,7 @@ staticDescribe("project header context menu", () => {
     fakeLocalApi();
     h.spies.getDraftThreadByProjectRef.mockReturnValue({ draftId: "draft-1" });
     h.spies.contextMenuShow.mockImplementation(async (items: Array<{ id: string }>) => {
-      return items.find((item) => item.id.startsWith("delete:"))!.id;
+      return items.find((item) => item.id?.startsWith("delete:"))!.id;
     });
     invoke(header, "onContextMenu", mouseEvent());
     await flush();
@@ -2354,7 +1380,7 @@ staticDescribe("project header context menu", () => {
     fakeLocalApi();
     h.spies.dialogConfirm.mockResolvedValue(false);
     h.spies.contextMenuShow.mockImplementation(async (items: Array<{ id: string }>) => {
-      return items.find((item) => item.id.startsWith("delete:"))!.id;
+      return items.find((item) => item.id?.startsWith("delete:"))!.id;
     });
     invoke(header, "onContextMenu", mouseEvent());
     await flush();
@@ -2375,7 +1401,7 @@ staticDescribe("project header context menu", () => {
     fakeLocalApi();
     h.state.commandResults["project.delete"] = () => failureResult("delete blew up");
     h.spies.contextMenuShow.mockImplementation(async (items: Array<{ id: string }>) => {
-      return items.find((item) => item.id.startsWith("delete:"))!.id;
+      return items.find((item) => item.id?.startsWith("delete:"))!.id;
     });
     invoke(header, "onContextMenu", mouseEvent());
     await flush();
@@ -2391,7 +1417,7 @@ staticDescribe("project header context menu", () => {
     const header = projectHeaderProps();
     fakeLocalApi();
     h.spies.contextMenuShow.mockImplementation(async (items: Array<{ id: string }>) => {
-      return items.find((item) => item.id.startsWith("delete:"))!.id;
+      return items.find((item) => item.id?.startsWith("delete:"))!.id;
     });
     invoke(header, "onContextMenu", mouseEvent());
     await flush();
@@ -2408,6 +1434,40 @@ staticDescribe("project header context menu", () => {
     expect(h.state.commandCalls.map((call: { label: string }) => call.label)).toContain(
       "project.delete",
     );
+  });
+
+  it("opens the same menu from the ⋯ button, anchored below it", async () => {
+    baseScenario();
+    render(<Sidebar />);
+    fakeLocalApi();
+    const actions = mustFindProps(byTestId("project-actions-button"), "project actions button");
+    const click = mouseEvent({
+      currentTarget: {
+        getBoundingClientRect: () => ({ left: 300.4, top: 96, right: 324, bottom: 120.6 }),
+      },
+    });
+    invoke(actions, "onClick", click);
+    await flush();
+
+    expect(click.preventDefault).toHaveBeenCalled();
+    expect(click.stopPropagation).toHaveBeenCalled();
+    const [items, position] = h.spies.contextMenuShow.mock.calls[0]!;
+    expect(position).toEqual({ x: 300, y: 121 });
+    expect(
+      (items as Array<{ label?: string; separator?: true }>).map((entry) =>
+        entry.separator ? "---" : entry.label,
+      ),
+    ).toEqual([
+      "New Worktree…",
+      "---",
+      "Rename…",
+      "Group into…",
+      "Copy Path",
+      "---",
+      "Archived Threads",
+      "---",
+      "Remove Project…",
+    ]);
   });
 });
 
@@ -2477,7 +1537,7 @@ staticDescribe("worktree discovery integration", () => {
       [{ environmentId: ENV_MAIN, projectId: projectA.id }],
     ]);
     expect(
-      captured("SidebarMenuSubButton").some(
+      captured("SidebarMenuSubItem").some(
         (entry) => entry.props["data-testid"] === "thread-row-thread-idle",
       ),
     ).toBe(true);
@@ -2515,6 +1575,7 @@ staticDescribe("worktree discovery integration", () => {
     expect(markup).toContain("feature/local");
     expect(markup).not.toContain("feature/remote");
     expect(h.state.discoveryCatalogSubscriptions).toEqual([
+      { environmentId: ENV_MAIN, input: { projectId: projectA.id } },
       { environmentId: ENV_MAIN, input: { projectId: projectA.id } },
     ]);
     expect(h.state.discoveryFocusRefreshCalls).toEqual([
@@ -2557,15 +1618,28 @@ staticDescribe("worktree discovery integration", () => {
     );
 
     fakeLocalApi();
-    let menuItems: Array<{ id: string; disabled?: boolean; children?: unknown[] }> = [];
+    let menuItems: Array<{
+      id: string;
+      disabled?: boolean;
+      description?: string;
+      children?: unknown[];
+    }> = [];
     h.spies.contextMenuShow.mockImplementation(async (items) => {
       menuItems = items;
       return null;
     });
     invoke(row, "onContextMenu", mouseEvent());
     await flush();
-    expect(menuItems.find((item) => item.id === "update")?.disabled).toBe(true);
-    expect(menuItems.find((item) => item.id === "open-in")?.disabled).toBe(true);
+    const missingReason =
+      "The worktree directory is missing. Use Retry detection or Remove from BiBCode on its card.";
+    expect(menuItems.find((item) => item.id === "pull")).toMatchObject({
+      disabled: true,
+      description: missingReason,
+    });
+    expect(menuItems.find((item) => item.id === "open-in")).toMatchObject({
+      disabled: true,
+      description: missingReason,
+    });
 
     const warning = captured("WorktreeAvailabilityWarning").find(
       (entry) => (entry.props.status as { threadId: string }).threadId === threadActive.id,
@@ -2634,12 +1708,14 @@ staticDescribe("worktree discovery integration", () => {
     invoke(row, "onContextMenu", mouseEvent());
     await flush();
 
-    expect(menuItems.find((item) => item.id === "update")?.disabled).toBe(false);
+    expect(menuItems.some((item) => item.id === "pull")).toBe(true);
+    expect(menuItems.find((item) => item.id === "pull")?.disabled).not.toBe(true);
     expect(menuItems.find((item) => item.id === "open-in")?.disabled).not.toBe(true);
   });
 
   it("starts no row subscription and uses direct legacy detach when capability is false", async () => {
     baseScenario();
+    setWorktreeSessionStatus("ready");
     h.state.serverConfigs = new Map([
       [ENV_MAIN, { environment: { capabilities: { worktreeCatalog: false } } }],
     ]);
@@ -2657,6 +1733,27 @@ staticDescribe("worktree discovery integration", () => {
       threadId: threadActive.id,
     });
     expect(h.spies.requestWorktreeRemoval).not.toHaveBeenCalled();
+  });
+
+  it("holds legacy detach too while the worktree's session runs", async () => {
+    baseScenario();
+    h.state.serverConfigs = new Map([
+      [ENV_MAIN, { environment: { capabilities: { worktreeCatalog: false } } }],
+    ]);
+
+    render(<Sidebar />);
+    fakeLocalApi();
+    const deleteItem = chooseDeleteFromCardMenu();
+    const row = mustFindProps(byTestId("thread-row-thread-active"), "legacy worktree row");
+    invoke(row, "onContextMenu", mouseEvent());
+    await flush();
+
+    expect(deleteItem.current).toMatchObject({
+      disabled: true,
+      description: "Stop the running session before deleting this worktree.",
+    });
+    expect(h.spies.dialogConfirm).not.toHaveBeenCalled();
+    expect(h.spies.deleteThread).not.toHaveBeenCalled();
   });
 
   it("keeps false-capability bulk deletion on detach-only thread actions", async () => {
@@ -2778,24 +1875,77 @@ staticDescribe("thread rows in the full sidebar", () => {
     expect(h.spies.routerNavigate).not.toHaveBeenCalled();
   });
 
-  it("navigates via keyboard activation", () => {
+  it("activates from the card button and opens exactly one menu with Shift+F10", async () => {
     baseScenario();
     render(<Sidebar />);
-    const row = renderedRow("thread-idle");
-
-    invoke(row, "onKeyDown", keyboardEvent("Enter"));
+    fakeLocalApi();
+    // Enter and Space on the card's <button> dispatch a click with detail 0.
+    invoke(renderedRow("thread-idle"), "onClick", mouseEvent({ detail: 0 }));
     expect(h.spies.routerNavigate).toHaveBeenCalled();
-    h.spies.routerNavigate.mockClear();
-    invoke(row, "onKeyDown", keyboardEvent("x"));
-    expect(h.spies.routerNavigate).not.toHaveBeenCalled();
 
-    invoke(row, "onKeyDown", keyboardEvent(" "));
-    expect(h.spies.routerNavigate).toHaveBeenCalled();
+    const button = mustFindProps(byTestId("thread-card-button-thread-idle"), "card button");
+    const enter = keyboardEvent("Enter");
+    invoke(button, "onKeyDown", enter);
+    expect(enter.preventDefault).not.toHaveBeenCalled();
+
+    const shiftF10 = keyboardEvent("F10", {
+      shiftKey: true,
+      ctrlKey: false,
+      altKey: false,
+      metaKey: false,
+      currentTarget: {
+        getBoundingClientRect: () => ({ left: 40.4, top: 100, right: 380, bottom: 152.6 }),
+      },
+    });
+    invoke(button, "onKeyDown", shiftF10);
+    expect(shiftF10.preventDefault).toHaveBeenCalled();
+    // Chromium and WebView2 follow the key with a contextmenu event; it must not open a second menu.
+    invoke(renderedRow("thread-idle"), "onContextMenu", mouseEvent());
+    await flush();
+    expect(h.spies.contextMenuShow).toHaveBeenCalledTimes(1);
+    expect(h.spies.contextMenuShow.mock.calls[0]![1]).toEqual({ x: 40, y: 153 });
+  });
+
+  it("keeps the pointer position for a right-click after the keyboard echo window", async () => {
+    baseScenario();
+    render(<Sidebar />);
+    fakeLocalApi();
+    const now = vi.spyOn(performance, "now").mockReturnValue(10_000);
+    try {
+      const button = mustFindProps(byTestId("thread-card-button-thread-idle"), "card button");
+      invoke(
+        button,
+        "onKeyDown",
+        keyboardEvent("ContextMenu", {
+          shiftKey: false,
+          ctrlKey: false,
+          altKey: false,
+          metaKey: false,
+          currentTarget: {
+            getBoundingClientRect: () => ({ left: 8, top: 0, right: 300, bottom: 60 }),
+          },
+        }),
+      );
+      now.mockReturnValue(11_500);
+      invoke(
+        renderedRow("thread-idle"),
+        "onContextMenu",
+        mouseEvent({ clientX: 120, clientY: 90 }),
+      );
+      await flush();
+      expect(h.spies.contextMenuShow).toHaveBeenCalledTimes(2);
+      expect(h.spies.contextMenuShow.mock.calls[0]![1]).toEqual({ x: 8, y: 60 });
+      expect(h.spies.contextMenuShow.mock.calls[1]![1]).toEqual({ x: 120, y: 90 });
+    } finally {
+      now.mockRestore();
+    }
   });
 
   it("archives immediately when confirmation is disabled", async () => {
     baseScenario();
-    render(<Sidebar />);
+    const markup = render(<Sidebar />);
+    // The captured-tree walk also sees unrendered slot props; prove the control renders.
+    expect(markup).toContain('data-testid="thread-archive-thread-idle"');
     const archive = mustFindProps(byTestId("thread-archive-thread-idle"), "archive button");
     const pointer = mouseEvent();
     invoke(archive, "onPointerDown", pointer);
@@ -2808,7 +1958,9 @@ staticDescribe("thread rows in the full sidebar", () => {
   it("toasts when archiving fails", async () => {
     baseScenario();
     h.spies.archiveThread.mockResolvedValue(failureResult("archive nope"));
-    render(<Sidebar />);
+    const markup = render(<Sidebar />);
+    // The captured-tree walk also sees unrendered slot props; prove the control renders.
+    expect(markup).toContain('data-testid="thread-archive-thread-idle"');
     const archive = mustFindProps(byTestId("thread-archive-thread-idle"), "archive button");
     invoke(archive, "onClick", mouseEvent());
     await flush();
@@ -2820,7 +1972,9 @@ staticDescribe("thread rows in the full sidebar", () => {
   it("enters archive-confirmation mode when the setting is enabled", () => {
     baseScenario();
     h.state.clientSettings = { ...DEFAULT_CLIENT_SETTINGS, confirmThreadArchive: true };
-    render(<Sidebar />);
+    const markup = render(<Sidebar />);
+    // The captured-tree walk also sees unrendered slot props; prove the control renders.
+    expect(markup).toContain('data-testid="thread-archive-thread-idle"');
     const archive = mustFindProps(byTestId("thread-archive-thread-idle"), "archive button");
     invoke(archive, "onClick", mouseEvent());
     expect(h.spies.archiveThread).not.toHaveBeenCalled();
@@ -2877,6 +2031,18 @@ staticDescribe("thread rows in the full sidebar", () => {
 });
 
 staticDescribe("thread context menu", () => {
+  /** Opens a card's menu and returns the items it was built with, choosing nothing. */
+  async function openCardMenu(rowTestId: string): Promise<CardMenuItem[]> {
+    let menuItems: CardMenuItem[] = [];
+    h.spies.contextMenuShow.mockImplementation(async (items: CardMenuItem[]) => {
+      menuItems = items;
+      return null;
+    });
+    invoke(mustFindProps(byTestId(rowTestId), rowTestId), "onContextMenu", mouseEvent());
+    await flush();
+    return menuItems;
+  }
+
   function setupMenu(clickedId: string | null) {
     baseScenario();
     h.state.serverConfigs.set(ENV_MAIN, {
@@ -2901,8 +2067,8 @@ staticDescribe("thread context menu", () => {
     expect(h.spies.contextMenuShow).not.toHaveBeenCalled();
   });
 
-  it("runs vcs pull for 'Update' and refreshes the status", async () => {
-    const row = setupMenu("update");
+  it("runs vcs pull for 'Pull' and refreshes the status", async () => {
+    const row = setupMenu("pull");
     invoke(row, "onContextMenu", mouseEvent());
     await flush();
     const labels = h.state.commandCalls.map((call: { label: string }) => call.label);
@@ -2910,13 +2076,13 @@ staticDescribe("thread context menu", () => {
     expect(labels).toContain("vcs.refreshStatus");
   });
 
-  it("toasts when 'Update' fails", async () => {
-    const row = setupMenu("update");
+  it("toasts when 'Pull' fails", async () => {
+    const row = setupMenu("pull");
     h.state.commandResults["vcs.pull"] = () => failureResult("pull failed");
     invoke(row, "onContextMenu", mouseEvent());
     await flush();
     expect(h.spies.toastAdd).toHaveBeenCalledWith(
-      expect.objectContaining({ title: "Failed to update", description: "pull failed" }),
+      expect.objectContaining({ title: "Failed to pull", description: "pull failed" }),
     );
   });
 
@@ -3120,6 +2286,75 @@ staticDescribe("thread context menu", () => {
     );
   });
 
+  it("copies the branch shown on the row, grouped with the other copy actions", async () => {
+    baseScenario();
+    render(<Sidebar />);
+    fakeLocalApi();
+    let menuItems: Array<{ id?: string; label?: string; separator?: true }> = [];
+    h.spies.contextMenuShow.mockImplementation(async (items) => {
+      menuItems = items;
+      return "copy-branch-name";
+    });
+    const row = mustFindProps(byTestId("thread-row-thread-active"), "active worktree row");
+    invoke(row, "onContextMenu", mouseEvent());
+    await flush();
+
+    expect(menuItems.map((item) => (item.separator ? "---" : item.id))).toEqual([
+      "open-in",
+      "pull",
+      "---",
+      "copy-path",
+      "copy-branch-name",
+      "copy-thread-id",
+      "---",
+      "toggle-pin",
+      "mark-unread",
+      "rename",
+      "---",
+      "delete",
+    ]);
+    expect(h.spies.copyToClipboard).toHaveBeenCalledWith("feat/x", { branch: "feat/x" });
+    expect(h.spies.toastAdd).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Branch name copied", description: "feat/x" }),
+    );
+  });
+
+  it("switches branch display and copy together to the fresh live ref", async () => {
+    baseScenario();
+    h.state.vcsStatusByCwd["C:/wt/x"] = { refName: "fresh-displayed" };
+    const markup = render(<Sidebar />);
+    fakeLocalApi();
+    h.spies.contextMenuShow.mockResolvedValue("copy-branch-name");
+    expect(markup).toContain(">fresh-displayed<");
+    invoke(
+      mustFindProps(byTestId("thread-row-thread-active"), "row"),
+      "onContextMenu",
+      mouseEvent(),
+    );
+    await flush();
+    expect(h.spies.copyToClipboard).toHaveBeenCalledWith("fresh-displayed", {
+      branch: "fresh-displayed",
+    });
+  });
+
+  it("omits Copy Branch Name when the row shows no branch", async () => {
+    baseScenario();
+    h.state.vcsStatusByCwd[projectA.workspaceRoot] = { refName: null, detachedHead: null };
+    render(<Sidebar />);
+    fakeLocalApi();
+    const row = mustFindProps(byTestId("thread-row-thread-idle"), "idle row");
+    let menuItems: Array<{ id?: string; label?: string; separator?: true }> = [];
+    h.spies.contextMenuShow.mockImplementation(async (items) => {
+      menuItems = items;
+      return null;
+    });
+    invoke(row, "onContextMenu", mouseEvent());
+    await flush();
+
+    expect(menuItems.some((item) => item.id === "copy-branch-name")).toBe(false);
+    expect(menuItems.at(-1)).toMatchObject({ id: "delete", label: "Delete Thread…" });
+  });
+
   it("toasts when copying the thread id fails", async () => {
     const row = setupMenu("copy-thread-id");
     h.state.copyShouldFail = true;
@@ -3153,14 +2388,17 @@ staticDescribe("thread context menu", () => {
 
   it("opens the typed removal dialog for a worktree instead of native delete confirmation", async () => {
     baseScenario();
+    setWorktreeSessionStatus("ready");
     render(<Sidebar />);
     fakeLocalApi();
-    h.spies.contextMenuShow.mockResolvedValue("delete");
+    const deleteItem = chooseDeleteFromCardMenu();
     const row = mustFindProps(byTestId("thread-row-thread-active"), "worktree row");
 
     invoke(row, "onContextMenu", mouseEvent());
     await flush();
 
+    expect(deleteItem.current).toMatchObject({ label: "Delete Worktree…" });
+    expect(deleteItem.current?.disabled).not.toBe(true);
     expect(h.spies.requestWorktreeRemoval).toHaveBeenCalledWith(
       expect.objectContaining({
         projectId: projectA.id,
@@ -3170,6 +2408,55 @@ staticDescribe("thread context menu", () => {
     );
     expect(h.spies.dialogConfirm).not.toHaveBeenCalled();
     expect(h.spies.deleteThread).not.toHaveBeenCalled();
+  });
+
+  it("disables Delete Worktree, saying how to proceed, while the worktree's session runs", async () => {
+    baseScenario();
+    // An editor keeps Open in enabled, so only the session can disable an item.
+    h.state.serverConfigs.set(ENV_MAIN, {
+      availableEditors: ["vscode"],
+      environment: { capabilities: { worktreeCatalog: true } },
+    });
+    render(<Sidebar />);
+    fakeLocalApi();
+    const items = await openCardMenu("thread-row-thread-active");
+
+    expect(items.find((item) => item.id === "delete")).toEqual({
+      id: "delete",
+      label: "Delete Worktree…",
+      destructive: true,
+      icon: "trash",
+      disabled: true,
+      description: "Stop the running session before deleting this worktree.",
+    });
+    // Only Delete waits for the session; the card's other actions stay usable.
+    expect(items.filter((item) => item.disabled === true).map((item) => item.id)).toEqual([
+      "delete",
+    ]);
+  });
+
+  it("disables Delete Worktree while another chat open in the worktree runs, not one elsewhere", async () => {
+    const runningChat = (id: string, worktreePath: string) =>
+      makeThread(id, {
+        kind: "panel",
+        worktreePath,
+        session: { ...threadActive.session!, threadId: ThreadId.make(id) },
+      });
+    baseScenario();
+    setWorktreeSessionStatus("ready");
+    h.state.threads = [...h.state.threads, runningChat("chat-elsewhere", "C:/wt/other")];
+    render(<Sidebar />);
+    fakeLocalApi();
+    let items = await openCardMenu("thread-row-thread-active");
+    expect(items.find((item) => item.id === "delete")?.disabled).not.toBe(true);
+
+    h.state.threads = [...h.state.threads, runningChat("chat-here", "C:/wt/x")];
+    render(<Sidebar />);
+    items = await openCardMenu("thread-row-thread-active");
+    expect(items.find((item) => item.id === "delete")).toMatchObject({
+      disabled: true,
+      description: "Stop the running session before deleting this worktree.",
+    });
   });
 
   it("shows the multi-select menu when the row is part of a selection", async () => {
@@ -3255,13 +2542,135 @@ staticDescribe("thread context menu", () => {
 });
 
 staticDescribe("primary row", () => {
+  const primaryCard = () => mustFindProps(byTestId("primary-card-project-a"), "primary card");
+
+  it.each([
+    {
+      reason: "unreadable",
+      label: "Repository unreadable",
+      message:
+        "Git can't read this repository. Check its .git folder, for example a damaged HEAD or config file.",
+    },
+    {
+      reason: "absent",
+      label: "Not a Git repository",
+      message: "This folder isn't a Git repository. Run git init to create one.",
+    },
+    {
+      reason: "untrusted",
+      label: "Repository not trusted",
+      message:
+        "Git doesn't trust this repository because another user owns it. Run git config --global --add safe.directory C:/repo-a to trust it.",
+    },
+    {
+      reason: undefined,
+      label: "Repository unavailable",
+      message:
+        "Git can't read this folder as a repository. Run git init to create one, or check its .git folder if it already is one.",
+    },
+  ])("explains an unavailable primary checkout: $label", ({ reason, label, message }) => {
+    baseScenario();
+    h.state.threads = [{ ...threadDefault, branch: "main" }];
+    h.state.vcsStatusByCwd[projectA.workspaceRoot] = {
+      isRepo: false,
+      ...(reason === undefined ? {} : { repositoryUnavailableReason: reason }),
+      refName: null,
+      detachedHead: null,
+      pr: null,
+      sourceControlProvider: null,
+      hasWorkingTreeChanges: false,
+      stale: false,
+    };
+    const markup = render(<Sidebar />);
+    expect(markup.match(/data-testid="primary-card-title-project-a"[^>]*>([^<]+)/)?.[1]).toBe(
+      "Repo A",
+    );
+    expect(markup).toContain(`>${label}</span>`);
+    expect(markup).toContain(`<span class="sr-only">${message.replaceAll("'", "&#x27;")}</span>`);
+    const cardMarkup = markup.match(/data-testid="primary-card-project-a"[\s\S]*?<\/li>/)?.[0];
+    expect(cardMarkup).toBeDefined();
+    expect(cardMarkup).not.toContain("lucide-git-branch");
+    expect(markup).not.toContain('aria-label="Uncommitted changes"');
+    const button = mustFindProps(byTestId("primary-card-button-project-a"), "primary button");
+    expect(button["aria-describedby"]).toContain("-branch");
+  });
+
+  it("renders generic primary-card copy for an unknown reason decoded from a newer server", () => {
+    baseScenario();
+    h.state.threads = [{ ...threadDefault, branch: "main" }];
+    h.state.vcsStatusByCwd[projectA.workspaceRoot] = decodeStatusSummary({
+      isRepo: false,
+      repositoryUnavailableReason: "futureReason",
+      refName: null,
+      detachedHead: null,
+      pr: null,
+      sourceControlProvider: null,
+      hasWorkingTreeChanges: false,
+      observedAt: iso(0),
+      stale: false,
+    });
+
+    const markup = render(<Sidebar />);
+    const cardMarkup = markup.match(/data-testid="primary-card-project-a"[\s\S]*?<\/li>/)?.[0];
+    expect(cardMarkup).toBeDefined();
+    expect(cardMarkup).toContain(">Repository unavailable</span>");
+    expect(cardMarkup).toContain(
+      '<span class="sr-only">Git can&#x27;t read this folder as a repository. Run git init to create one, or check its .git folder if it already is one.</span>',
+    );
+  });
+
+  it("keeps a stale unavailable summary visible instead of the recorded branch", () => {
+    baseScenario();
+    h.state.threads = [{ ...threadDefault, branch: "main" }];
+    h.state.vcsStatusByCwd[projectA.workspaceRoot] = {
+      isRepo: false,
+      repositoryUnavailableReason: "unreadable",
+      stale: true,
+    };
+    const markup = render(<Sidebar />);
+    expect(markup.match(/data-testid="primary-card-title-project-a"[^>]*>([^<]+)/)?.[1]).toBe(
+      "Repo A",
+    );
+    expect(markup).toContain(">Repository unreadable</span>");
+  });
+
+  it("keeps terminal and port indicators on an unavailable primary card", () => {
+    baseScenario();
+    h.state.threads = [threadDefault];
+    h.state.vcsStatusByCwd[projectA.workspaceRoot] = {
+      isRepo: false,
+      repositoryUnavailableReason: "absent",
+    };
+    h.state.runningTerminalIds = ["terminal-1"];
+    h.state.discoveredPortsByThreadId[threadDefault.id] = [{ port: 3000 }];
+    const markup = render(<Sidebar />);
+    expect(markup).toContain(">Not a Git repository</span>");
+    expect(markup).toContain("lucide-terminal");
+    expect(markup).toContain('aria-label="Open localhost:3000"');
+  });
+
+  it("passes no branch to the unavailable primary card's context menu", async () => {
+    baseScenario();
+    h.state.threads = [{ ...threadDefault, branch: "main" }];
+    h.state.vcsStatusByCwd[projectA.workspaceRoot] = {
+      isRepo: false,
+      repositoryUnavailableReason: "unreadable",
+    };
+    render(<Sidebar />);
+    fakeLocalApi();
+    h.spies.contextMenuShow.mockResolvedValue("copy-branch-name");
+    invoke(primaryCard(), "onContextMenu", mouseEvent());
+    await flush();
+    expect(h.spies.contextMenuShow).toHaveBeenCalledOnce();
+    const items = h.spies.contextMenuShow.mock.calls[0]![0] as CardMenuItem[];
+    expect(items.some((item) => item.id === "copy-branch-name")).toBe(false);
+    expect(h.spies.copyToClipboard).not.toHaveBeenCalled();
+  });
+
   it("navigates to the default thread on click", () => {
     baseScenario();
     render(<Sidebar />);
-    const primaryRow = captured("SidebarMenuSubButton").find(
-      (entry) =>
-        entry.props["data-thread-item"] !== undefined && entry.props["render"] === undefined,
-    )!;
+    const primaryRow = { props: primaryCard() };
     expect(primaryRow).toBeDefined();
     invoke(primaryRow.props, "onClick", mouseEvent());
     expect(h.spies.routerNavigate).toHaveBeenCalledWith(
@@ -3361,10 +2770,7 @@ staticDescribe("primary row", () => {
       ],
     ]);
     render(<Sidebar />);
-    const primaryRow = captured("SidebarMenuSubButton").find(
-      (entry) =>
-        entry.props["data-thread-item"] !== undefined && entry.props["render"] === undefined,
-    )!;
+    const primaryRow = { props: primaryCard() };
     invoke(primaryRow.props, "onClick", mouseEvent());
     await flush();
 
@@ -3387,10 +2793,7 @@ staticDescribe("primary row", () => {
     h.state.threads = [];
     h.state.environments = [environmentFixture({ environmentId: ENV_MAIN, label: "Main" })];
     render(<Sidebar />);
-    const primaryRow = captured("SidebarMenuSubButton").find(
-      (entry) =>
-        entry.props["data-thread-item"] !== undefined && entry.props["render"] === undefined,
-    )!;
+    const primaryRow = { props: primaryCard() };
     invoke(primaryRow.props, "onClick", mouseEvent());
     await flush();
     const createCall = h.state.commandCalls.find(
@@ -3405,16 +2808,13 @@ staticDescribe("primary row", () => {
     h.state.environments = [environmentFixture({ environmentId: ENV_MAIN, label: "Main" })];
     h.state.commandResults["thread.create"] = () => failureResult("create failed");
     render(<Sidebar />);
-    const primaryRow = captured("SidebarMenuSubButton").find(
-      (entry) =>
-        entry.props["data-thread-item"] !== undefined && entry.props["render"] === undefined,
-    )!;
+    const primaryRow = { props: primaryCard() };
     invoke(primaryRow.props, "onClick", mouseEvent());
     await flush();
     expect(h.spies.routerNavigate).not.toHaveBeenCalled();
   });
 
-  it("shows the primary-row context menu and handles update / copy / pin actions", async () => {
+  it("shows the primary-row context menu and handles pull / copy / pin actions", async () => {
     baseScenario();
     h.state.serverConfigs.set(ENV_MAIN, {
       availableEditors: ["vscode"],
@@ -3422,12 +2822,9 @@ staticDescribe("primary row", () => {
     });
     render(<Sidebar />);
     fakeLocalApi();
-    const primaryRow = captured("SidebarMenuSubButton").find(
-      (entry) =>
-        entry.props["data-thread-item"] !== undefined && entry.props["render"] === undefined,
-    )!;
+    const primaryRow = { props: primaryCard() };
 
-    h.spies.contextMenuShow.mockResolvedValue("update");
+    h.spies.contextMenuShow.mockResolvedValue("pull");
     invoke(primaryRow.props, "onContextMenu", mouseEvent());
     await flush();
     expect(h.state.commandCalls.map((call: { label: string }) => call.label)).toContain("vcs.pull");
@@ -3461,6 +2858,32 @@ staticDescribe("primary row", () => {
     );
   });
 
+  it("offers and copies the live checkout branch from the primary row", async () => {
+    baseScenario();
+    render(<Sidebar />);
+    fakeLocalApi();
+    const primaryRow = { props: primaryCard() };
+    let menuItems: Array<{ id?: string; separator?: true }> = [];
+    h.spies.contextMenuShow.mockImplementation(async (items) => {
+      menuItems = items;
+      return "copy-branch-name";
+    });
+    invoke(primaryRow.props, "onContextMenu", mouseEvent());
+    await flush();
+
+    expect(menuItems.map((item) => (item.separator ? "---" : item.id))).toEqual([
+      "open-in",
+      "pull",
+      "---",
+      "copy-path",
+      "copy-branch-name",
+      "---",
+      "toggle-pin",
+      "mark-unread",
+    ]);
+    expect(h.spies.copyToClipboard).toHaveBeenCalledWith("main", { branch: "main" });
+  });
+
   it("opens the local primary checkout in File Explorer even when no editor is available", async () => {
     baseScenario();
     h.state.serverConfigs.set(ENV_MAIN, {
@@ -3473,10 +2896,7 @@ staticDescribe("primary row", () => {
     };
     render(<Sidebar />);
     fakeLocalApi();
-    const primaryRow = captured("SidebarMenuSubButton").find(
-      (entry) =>
-        entry.props["data-thread-item"] !== undefined && entry.props["render"] === undefined,
-    )!;
+    const primaryRow = { props: primaryCard() };
     h.spies.contextMenuShow.mockImplementation(
       async (
         items: Array<{ id: string; disabled?: boolean; children?: Array<{ id: string }> }>,
@@ -3498,10 +2918,7 @@ staticDescribe("primary row", () => {
   it("keeps the primary-row menu inert without a local API or a matching editor", async () => {
     baseScenario();
     render(<Sidebar />);
-    const primaryRow = captured("SidebarMenuSubButton").find(
-      (entry) =>
-        entry.props["data-thread-item"] !== undefined && entry.props["render"] === undefined,
-    )!;
+    const primaryRow = { props: primaryCard() };
 
     invoke(primaryRow.props, "onContextMenu", mouseEvent());
     await flush();
@@ -3522,12 +2939,9 @@ staticDescribe("primary row", () => {
     });
     render(<Sidebar />);
     fakeLocalApi();
-    const primaryRow = captured("SidebarMenuSubButton").find(
-      (entry) =>
-        entry.props["data-thread-item"] !== undefined && entry.props["render"] === undefined,
-    )!;
+    const primaryRow = { props: primaryCard() };
 
-    h.spies.contextMenuShow.mockResolvedValue("update");
+    h.spies.contextMenuShow.mockResolvedValue("pull");
     h.state.commandResults["vcs.pull"] = () => ({
       _tag: "Failure",
       cause: Cause.interrupt(1),
@@ -3557,13 +2971,10 @@ staticDescribe("primary row", () => {
     h.state.environments = [environmentFixture({ environmentId: ENV_MAIN, label: "Main" })];
     render(<Sidebar />);
     fakeLocalApi();
-    const primaryRow = captured("SidebarMenuSubButton").find(
-      (entry) =>
-        entry.props["data-thread-item"] !== undefined && entry.props["render"] === undefined,
-    )!;
+    const primaryRow = { props: primaryCard() };
 
     h.spies.contextMenuShow.mockImplementation(async (items: Array<{ id: string }>) => {
-      expect(items.some((item) => item.id.startsWith("remove-project"))).toBe(false);
+      expect(items.some((item) => item.id?.startsWith("delete") === true)).toBe(false);
       return null;
     });
     invoke(primaryRow.props, "onContextMenu", mouseEvent());
@@ -3573,40 +2984,113 @@ staticDescribe("primary row", () => {
       expect.objectContaining({ title: "Project is not empty" }),
     );
   });
+
+  it.each([
+    { label: "fresh passive summary", status: { stale: false }, showsIndicators: true },
+    { label: "full status result", status: {}, showsIndicators: true },
+    { label: "stale passive summary", status: { stale: true }, showsIndicators: false },
+  ])("reads primary PR/dirty state directly from $label", ({ status, showsIndicators }) => {
+    baseScenario();
+    h.state.threads = [threadDefault];
+    h.state.vcsStatusByCwd[projectA.workspaceRoot] = {
+      refName: "main",
+      hasWorkingTreeChanges: true,
+      pr: { url: "https://example.invalid/pr/1" },
+      ...status,
+    };
+    const markup = render(<Sidebar />);
+    expect(threadDefault.branch).toBeNull();
+    expect(markup.includes("#1")).toBe(showsIndicators);
+    expect(markup.includes('aria-label="Uncommitted changes"')).toBe(showsIndicators);
+    expect(markup.includes("h-[18px]")).toBe(showsIndicators);
+  });
+
+  it("hides the primary branch line when the title already shows its branch and there are no indicators", () => {
+    baseScenario();
+    h.state.threads = [threadDefault];
+    h.state.vcsStatusByCwd[projectA.workspaceRoot] = {
+      refName: "main",
+      stale: false,
+      pr: null,
+      hasWorkingTreeChanges: false,
+    };
+    expect(render(<Sidebar />)).not.toContain("h-[18px]");
+  });
+
+  it("renders the primary card first in the project's one list", () => {
+    baseScenario();
+    const markup = render(<Sidebar />);
+    expect(captured("SidebarMenuSub")).toHaveLength(1);
+    // 6 px between outlined cards, so neighbouring borders never merge.
+    expect(String(captured("SidebarMenuSub")[0]!.props["className"])).toContain("gap-1.5");
+    expect(String(captured("SidebarMenuSub")[0]!.props["className"])).not.toContain("gap-0.5");
+    // The list clips overflow, so it keeps the primitive's 2 px vertical padding:
+    // the first and last card's 2 px focus ring reaches past the card border.
+    expect(String(captured("SidebarMenuSub")[0]!.props["className"])).not.toMatch(
+      /(^|\s)py-0(\s|$)/,
+    );
+    // The primary card is outlined like the workspace cards.
+    expect(
+      String(mustFindProps(byTestId("primary-card-project-a"), "primary card")["className"]),
+    ).toContain("border-border");
+    expect(markup.indexOf('data-testid="primary-card-project-a"')).toBeLessThan(
+      markup.indexOf('data-testid="thread-row-thread-active"'),
+    );
+    expect(markup).toContain('data-testid="primary-card-button-project-a"');
+  });
+
+  it("shows the primary card's unseen completion once the default thread was visited", () => {
+    baseScenario();
+    h.state.threads = [
+      makeThread("thread-default", {
+        kind: "default",
+        title: "Repo A",
+        latestTurn: {
+          turnId: "turn-default",
+          state: "completed",
+          requestedAt: iso(12),
+          startedAt: iso(12),
+          completedAt: iso(10),
+          assistantMessageId: null,
+        } as EnvironmentThreadShell["latestTurn"],
+      }),
+    ];
+    h.uiStore.setState({
+      threadLastVisitedAtById: { [threadKeyOf(threadDefault)]: iso(20) },
+    });
+    const markup = render(<Sidebar />);
+    expect(markup).toContain('aria-label="Finished, not opened yet"');
+  });
+
+  it("counts panel chats on the worktree card and on the primary card", () => {
+    baseScenario();
+    h.state.threads = [
+      ...h.state.threads,
+      makeThread("panel-on-worktree", { kind: "panel", worktreePath: "C:/wt/x" }),
+      makeThread("panel-main", { kind: "panel" }),
+      makeThread("panel-archived", { kind: "panel", archivedAt: iso(3) }),
+    ];
+    const markup = render(<Sidebar />);
+    // The base scenario's own panel thread has no path, so the primary card counts two.
+    expect(markup).toContain("2 more chats");
+    expect(markup).toContain("1 more chat<");
+  });
 });
 
 staticDescribe("new thread entry points", () => {
-  it("keeps the main-chat action invisible and uses the worktree icon", () => {
+  it("leads the hover strip with project actions and uses + for New worktree", () => {
     baseScenario();
     const markup = render(<Sidebar />);
 
-    const mainChat = mustFindProps(byTestId("new-main-chat-button"), "new main chat button");
-    expect(mainChat["className"]).toContain("invisible");
-    expect(markup).toContain("lucide-folder-git-2");
-    expect(markup).not.toContain("lucide-square-pen");
-  });
-
-  it("creates a main-branch chat for a single-member project", () => {
-    baseScenario();
-    render(<Sidebar />);
-    const newThread = mustFindProps(byTestId("new-main-chat-button"), "new main chat button");
-    const click = mouseEvent();
-    invoke(newThread, "onClick", click);
-    expect(click.preventDefault).toHaveBeenCalled();
-    expect(click.stopPropagation).toHaveBeenCalled();
-    expect(h.spies.newThreadHandler).toHaveBeenCalledWith(
-      expect.objectContaining({ environmentId: ENV_MAIN, projectId: projectA.id }),
-      { branch: null, worktreePath: null, envMode: "local" },
-    );
-  });
-
-  it("closes the mobile sheet before creating a main-branch chat", () => {
-    baseScenario();
-    h.state.sidebarCtx = { isMobile: true, setOpenMobile: h.spies.setOpenMobile };
-    render(<Sidebar />);
-    const newThread = mustFindProps(byTestId("new-main-chat-button"), "new main chat button");
-    invoke(newThread, "onClick", mouseEvent());
-    expect(h.spies.setOpenMobile).toHaveBeenCalledWith(false);
+    expect(findProps(byTestId("new-main-chat-button"))).toBeNull();
+    const actions = mustFindProps(byTestId("project-actions-button"), "project actions button");
+    expect(actions["aria-label"]).toBe("Project actions for Repo A");
+    expect(actions["aria-haspopup"]).toBe("menu");
+    expect(markup).toContain("lucide-ellipsis");
+    expect(markup).toContain("lucide-plus");
+    expect(markup).not.toContain("lucide-folder-git-2");
+    expect(markup.indexOf("lucide-ellipsis")).toBeLessThan(markup.indexOf("lucide-plus"));
+    expect(markup).toContain('data-testid="sidebar-projects-group"');
   });
 
   it("closes the mobile sheet before creating a worktree from its project row", () => {
@@ -3622,15 +3106,14 @@ staticDescribe("new thread entry points", () => {
     expect(h.spies.setOpenMobile).toHaveBeenCalledWith(false);
   });
 
-  it("renders both actions in the project row and removes them from the Projects toolbar", () => {
+  it("renders the project actions in the project row and not in the Projects toolbar", () => {
     baseScenario();
     render(<Sidebar />);
 
     expect(findProps(byTestId("sidebar-new-main-chat-trigger"))).toBeNull();
     expect(findProps(byTestId("sidebar-new-worktree-trigger"))).toBeNull();
-    expect(
-      mustFindProps(byAriaLabel("New main-branch chat in Repo A"), "row main chat"),
-    ).toBeDefined();
+    expect(findProps(byAriaLabel("New main-branch chat in Repo A"))).toBeNull();
+    expect(mustFindProps(byAriaLabel("Project actions for Repo A"), "row actions")).toBeDefined();
     expect(mustFindProps(byAriaLabel("New worktree in Repo A"), "row worktree")).toBeDefined();
     expect(mustFindProps(byAriaLabel("Git Manager for Repo A"), "row Git Manager")).toBeDefined();
   });
@@ -3759,29 +3242,12 @@ staticDescribe("new thread entry points", () => {
 });
 
 staticDescribe("grouped and remote projects", () => {
-  it("groups projects by repository and renders remote thread markers", () => {
+  it("groups projects by repository across environments", () => {
     groupedScenario();
     const markup = render(<Sidebar />);
     expect(markup).toContain("2 projects");
     expect(markup).toContain("thread-row-thread-remote");
-    expect(markup).toContain("Remote Box");
-  });
-
-  it("uses a member picker when creating a main-branch chat in a grouped project", async () => {
-    groupedScenario();
-    render(<Sidebar />);
-    fakeLocalApi();
-    h.spies.contextMenuShow.mockImplementation(
-      async (items: Array<{ id: string }>) => items[1]!.id,
-    );
-    const newThread = mustFindProps(byTestId("new-main-chat-button"), "new main chat button");
-    invoke(newThread, "onClick", mouseEvent());
-    await flush();
-    expect(h.spies.contextMenuShow).toHaveBeenCalled();
-    expect(h.spies.newThreadHandler).toHaveBeenCalledWith(
-      expect.objectContaining({ environmentId: ENV_REMOTE }),
-      { branch: null, worktreePath: null, envMode: "local" },
-    );
+    expect(markup).not.toContain("lucide-cloud");
   });
 
   it("uses the chosen grouped-project member for worktree creation", async () => {
@@ -3837,22 +3303,22 @@ staticDescribe("grouped and remote projects", () => {
     });
   });
 
-  it("does not create a grouped-project chat when its picker is unavailable or cancelled", async () => {
+  it("does not navigate when the grouped-project picker is unavailable or cancelled", async () => {
     groupedScenario();
     render(<Sidebar />);
-    const newThread = mustFindProps(byTestId("new-main-chat-button"), "new main chat button");
-    invoke(newThread, "onClick", mouseEvent());
+    const gitManager = mustFindProps(byTestId("git-manager-button"), "Git Manager button");
+    invoke(gitManager, "onClick", mouseEvent());
     await flush();
-    expect(h.spies.newThreadHandler).not.toHaveBeenCalled();
+    expect(h.spies.navigate).not.toHaveBeenCalled();
 
     fakeLocalApi();
     h.spies.contextMenuShow.mockResolvedValue(null);
-    invoke(newThread, "onClick", mouseEvent());
+    invoke(gitManager, "onClick", mouseEvent());
     await flush();
     h.spies.contextMenuShow.mockResolvedValue("missing-member");
-    invoke(newThread, "onClick", mouseEvent());
+    invoke(gitManager, "onClick", mouseEvent());
     await flush();
-    expect(h.spies.newThreadHandler).not.toHaveBeenCalled();
+    expect(h.spies.navigate).not.toHaveBeenCalled();
   });
 
   it("uses workspace paths when grouped members have no environment label", async () => {
@@ -3864,7 +3330,7 @@ staticDescribe("grouped and remote projects", () => {
       expect(items.every((item) => item.label.includes("C:/"))).toBe(true);
       return null;
     });
-    const newThread = mustFindProps(byTestId("new-main-chat-button"), "new main chat button");
+    const newThread = mustFindProps(byTestId("git-manager-button"), "Git Manager button");
     invoke(newThread, "onClick", mouseEvent());
     await flush();
     expect(h.spies.contextMenuShow).toHaveBeenCalled();
@@ -3875,7 +3341,7 @@ staticDescribe("grouped and remote projects", () => {
     render(<Sidebar />);
     fakeLocalApi();
     h.spies.contextMenuShow.mockRejectedValue("opaque picker failure");
-    const newThread = mustFindProps(byTestId("new-main-chat-button"), "new main chat button");
+    const newThread = mustFindProps(byTestId("git-manager-button"), "Git Manager button");
     invoke(newThread, "onClick", mouseEvent());
     await flush();
     expect(h.spies.toastAdd).toHaveBeenCalledWith(
@@ -3888,7 +3354,7 @@ staticDescribe("grouped and remote projects", () => {
     render(<Sidebar />);
     fakeLocalApi();
     h.spies.contextMenuShow.mockRejectedValue(new Error("picker broke"));
-    const newThread = mustFindProps(byTestId("new-main-chat-button"), "new main chat button");
+    const newThread = mustFindProps(byTestId("git-manager-button"), "Git Manager button");
     invoke(newThread, "onClick", mouseEvent());
     await flush();
     expect(h.spies.toastAdd).toHaveBeenCalledWith(
@@ -3944,6 +3410,10 @@ staticDescribe("SidebarThreadRow direct rendering", () => {
       cancelRename: vi.fn(),
       attemptArchiveThread: vi.fn(async () => {}),
       openPrLink: vi.fn(),
+      ...cardDataProps(thread),
+      modelLabel: "gpt-5-codex",
+      moreChatsCount: 0,
+      moreChatsStatus: null,
       ...overrides,
     };
   }
@@ -3965,7 +3435,8 @@ staticDescribe("SidebarThreadRow direct rendering", () => {
       unreadThreadKeys: [threadKeyOf(thread)],
     });
     const markup = render(<SidebarThreadRow {...rowProps(thread, { jumpLabel: "⌘1" })} />);
-    expect(markup).toContain("thread-unread-thread-a");
+    expect(markup).toContain('data-unread="true"');
+    expect(markup).toContain(">unread, pinned</span>");
     expect(markup).toContain("thread-pinned-thread-a");
     expect(markup).toContain("⌘1");
   });
@@ -3983,7 +3454,7 @@ staticDescribe("SidebarThreadRow direct rendering", () => {
     expect(h.state.vcsQueries.at(-1)?.__q).toBe("vcs.status");
   });
 
-  it("keeps failure and unresolved-delivery subrows visible with summary updates", () => {
+  it("folds failure and unresolved delivery into the glyph and the session line", () => {
     const failed = makeThread("thread-provider-failed", {
       branch: "feature/failure",
       worktreePath: "C:/wt/failure",
@@ -3998,7 +3469,9 @@ staticDescribe("SidebarThreadRow direct rendering", () => {
       } as EnvironmentThreadShell["session"],
     });
     h.state.vcsStatusByCwd["C:/wt/failure"] = { refName: "feature/failure" };
-    expect(render(<SidebarThreadRow {...rowProps(failed)} />)).toContain("Claude Code – Failed");
+    const failedMarkup = render(<SidebarThreadRow {...rowProps(failed)} />);
+    expect(failedMarkup).toContain('aria-label="Failed"');
+    expect(failedMarkup).not.toContain("Claude Code – Failed");
 
     const unresolved = makeThread("thread-delivery-uncertain", {
       branch: "feature/delivery",
@@ -4017,20 +3490,18 @@ staticDescribe("SidebarThreadRow direct rendering", () => {
     h.state.vcsStatusByCwd["C:/wt/delivery"] = { refName: "feature/updated" };
     const unresolvedMarkup = render(<SidebarThreadRow {...rowProps(unresolved)} />);
     expect(unresolvedMarkup).toContain("Delivery uncertain");
-    expect(unresolvedMarkup).toContain("OpenCode – Connecting");
+    expect(unresolvedMarkup).toContain('aria-label="Connecting"');
     expect(h.state.vcsQueries.at(-1)?.__q).toBe("vcs.summary");
   });
 
-  it("labels a remote thread with the cloud icon and falls back to 'Remote'", () => {
-    const thread = makeThread("thread-remote-b", { environmentId: ENV_REMOTE });
-    const markup = render(<SidebarThreadRow {...rowProps(thread)} />);
-    expect(markup).toContain('aria-label="Remote"');
-  });
-
-  it("labels a desktop-local thread as 'Local' without the cloud icon", () => {
-    const thread = makeThread("thread-wsl", { environmentId: ENV_WSL });
-    const markup = render(<SidebarThreadRow {...rowProps(thread)} />);
-    expect(markup).not.toContain('aria-label="WSL"');
+  it("shows no environment icon on cards, even for remote threads", () => {
+    const markup = render(
+      <SidebarThreadRow
+        {...rowProps(makeThread("thread-remote-b", { environmentId: ENV_REMOTE }))}
+      />,
+    );
+    expect(markup).not.toContain('aria-label="Remote"');
+    expect(markup).not.toContain("lucide-cloud");
   });
 
   it("shows a running terminal indicator", () => {
@@ -4040,7 +3511,7 @@ staticDescribe("SidebarThreadRow direct rendering", () => {
     expect(markup).toContain("2 terminal running");
   });
 
-  it("renders the agent sub-row for a starting session without a parsable timestamp", () => {
+  it("shows Connecting for a starting session without a provider name", () => {
     const thread = makeThread("thread-a", {
       session: {
         threadId: ThreadId.make("thread-a"),
@@ -4053,8 +3524,8 @@ staticDescribe("SidebarThreadRow direct rendering", () => {
       },
     });
     const markup = render(<SidebarThreadRow {...rowProps(thread)} />);
-    expect(markup).toContain("Agent");
-    expect(markup).toContain("Connecting");
+    expect(markup).toContain('aria-label="Connecting"');
+    expect(markup).not.toContain("Agent –");
   });
 
   it("hides the archive button while a turn is actively running", () => {
@@ -4071,7 +3542,7 @@ staticDescribe("SidebarThreadRow direct rendering", () => {
     });
     const markup = render(<SidebarThreadRow {...rowProps(thread)} />);
     expect(markup).not.toContain("thread-archive-thread-a");
-    expect(markup).toContain("thread-agent-row-thread-a");
+    expect(markup).toContain('aria-label="Working"');
   });
 
   it("renders the confirm-archive button and archives on confirm", async () => {
@@ -4115,7 +3586,9 @@ staticDescribe("SidebarThreadRow direct rendering", () => {
       appSettingsConfirmThreadArchive: true,
       setConfirmingArchiveThreadKey: setConfirming,
     });
-    render(<SidebarThreadRow {...props} />);
+    const markup = render(<SidebarThreadRow {...props} />);
+    // The captured-tree walk also sees unrendered slot props; prove the control renders.
+    expect(markup).toContain('data-testid="thread-archive-thread-a"');
     const archive = mustFindProps(byTestId("thread-archive-thread-a"), "archive");
     invoke(archive, "onClick", mouseEvent());
     expect(setConfirming).toHaveBeenCalledWith(threadKeyOf(thread));
@@ -4135,7 +3608,9 @@ staticDescribe("SidebarThreadRow direct rendering", () => {
       cancelRename,
       renamingCommittedRef,
     });
-    render(<SidebarThreadRow {...props} />);
+    const markup = render(<SidebarThreadRow {...props} />);
+    // The captured-tree walk also sees unrendered slot props; prove the input renders.
+    expect(markup).toContain('value="Edited title"');
 
     const input = mustFindProps(
       (candidate) =>
@@ -4196,6 +3671,118 @@ staticDescribe("SidebarThreadRow direct rendering", () => {
     const mobileRow = mustFindProps(byTestId("thread-row-thread-a"), "row");
     invoke(mobileRow, "onDoubleClick", mouseEvent());
     expect(startThreadRename).not.toHaveBeenCalled();
+  });
+
+  it("observes detached worktrees and shows their detached HEAD and dirty indicator", () => {
+    const thread = makeThread("thread-detached", { branch: null, worktreePath: "C:/wt/detached" });
+    h.state.vcsStatusByCwd["C:/wt/detached"] = {
+      refName: null,
+      detachedHead: "abc1234",
+      hasWorkingTreeChanges: true,
+    };
+    const markup = render(<SidebarThreadRow {...rowProps(thread)} />);
+    expect(h.state.vcsQueries.at(-1)?.args?.input?.cwd).toBe("C:/wt/detached");
+    expect(markup).toContain(">abc1234<");
+    expect(markup).toContain('aria-label="Uncommitted changes"');
+  });
+
+  it.each([false, true])(
+    "never offers Archive for a running session with no active turn (approval=%s)",
+    (approval) => {
+      const thread = makeThread("running-no-turn", {
+        hasPendingApprovals: approval,
+        session: { ...threadActive.session!, status: "running", activeTurnId: null },
+      });
+      const markup = render(<SidebarThreadRow {...rowProps(thread)} />);
+      expect(markup).not.toContain("thread-archive-running-no-turn");
+      expect(markup).not.toContain("thread-archive-confirm-running-no-turn");
+    },
+  );
+
+  it("omits line 2 when the branch equals the title and there are no indicators", () => {
+    const thread = makeThread("same-title", {
+      title: "feature/x",
+      branch: "feature/x",
+      worktreePath: "C:/wt/same",
+    });
+    h.state.vcsStatusByCwd["C:/wt/same"] = { refName: "feature/x" };
+    const markup = render(<SidebarThreadRow {...rowProps(thread)} />);
+    expect(markup).not.toContain("h-[18px]");
+  });
+
+  it("renders the worktree card's three lines and the more-chats row", () => {
+    const thread = makeThread("thread-card", {
+      title: "Fix invoice date format",
+      branch: "fix-TRI-150",
+      worktreePath: "C:/wt/fix",
+      session: {
+        threadId: ThreadId.make("thread-card"),
+        status: "running",
+        providerName: "claudeAgent",
+        activeTurnId: "turn-1",
+        lastError: null,
+        updatedAt: iso(6),
+        runtimeMode: "full-access",
+      } as EnvironmentThreadShell["session"],
+      latestTurn: {
+        turnId: "turn-1",
+        state: "running",
+        requestedAt: iso(6),
+        startedAt: iso(6),
+        completedAt: null,
+        assistantMessageId: null,
+      } as EnvironmentThreadShell["latestTurn"],
+      conversationPreview: {
+        prompt: "Fix the export date format",
+        tool: "Editing src/export/invoiceDates.ts",
+        assistantMessage: null,
+      },
+    } as never);
+    h.state.vcsStatusByCwd["C:/wt/fix"] = {
+      refName: "fix-TRI-150",
+      hasWorkingTreeChanges: true,
+      pr: { url: "https://example.com/pr/57" },
+    };
+    h.state.runningTerminalIds = ["term-1"];
+    const markup = render(
+      <SidebarThreadRow
+        {...rowProps(thread, {
+          modelLabel: "opus",
+          moreChatsCount: 2,
+          moreChatsStatus: WORKSPACE_CARD_STATUS.done,
+        })}
+      />,
+    );
+    expect(markup).toContain('aria-label="Working"');
+    expect(markup).toContain(">fix-TRI-150<");
+    expect(markup).toContain("#1");
+    expect(markup).toContain('aria-label="Uncommitted changes"');
+    expect(markup).toContain('aria-label="1 terminal running"');
+    expect(markup).toContain("Editing src/export/invoiceDates.ts");
+    expect(markup).toContain(">opus<");
+    expect(markup).toContain("2 more chats");
+  });
+
+  it("names the card button by status, title and flags and describes it by its lines", () => {
+    const thread = makeThread("thread-a11y", {
+      title: "Upgrade PDF renderer",
+      branch: "chore/pdf-renderer",
+      worktreePath: "C:/wt/pdf",
+    });
+    h.state.vcsStatusByCwd["C:/wt/pdf"] = { refName: "chore/pdf-renderer" };
+    h.metaStore.setState({
+      unreadThreadKeys: [threadKeyOf(thread)],
+      pinnedThreadKeys: [threadKeyOf(thread)],
+    });
+    const markup = render(<SidebarThreadRow {...rowProps(thread, { isActive: true })} />);
+    const button = mustFindProps(byTestId("thread-card-button-thread-a11y"), "card button");
+    const labelledBy = String(button["aria-labelledby"]).split(" ");
+    expect(labelledBy).toHaveLength(3);
+    for (const id of labelledBy) {
+      expect(markup).toContain(`id="${id}"`);
+    }
+    expect(button["aria-current"]).toBe("page");
+    expect(String(button["aria-describedby"]).split(" ")).toHaveLength(1);
   });
 });
 
@@ -4262,254 +3849,3 @@ staticDescribe("project rename and grouping dialogs", () => {
     expect(markup).toContain("own sidebar row");
   });
 });
-
-if (browserRuntime) {
-  describe("SidebarThreadRow browser interactions", () => {
-    type ThreadRowProps = React.ComponentProps<typeof SidebarThreadRow>;
-
-    beforeEach(() => {
-      h.state.environments = [
-        environmentFixture({ environmentId: ENV_MAIN, label: "Main", connectionId: "primary" }),
-      ];
-      h.state.primaryEnvironmentId = ENV_MAIN;
-      h.state.projects = [projectA];
-      (
-        globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }
-      ).IS_REACT_ACT_ENVIRONMENT = true;
-    });
-
-    function requiredElement<T extends Element>(container: ParentNode, selector: string): T {
-      const element = container.querySelector<T>(selector);
-      if (!element) throw new Error(`Missing DOM element: ${selector}`);
-      return element;
-    }
-
-    function rowProps(
-      thread: EnvironmentThreadShell,
-      overrides: Partial<ThreadRowProps> = {},
-    ): ThreadRowProps {
-      return {
-        thread,
-        projectCwd: "C:/repo-a",
-        orderedProjectThreadKeys: [threadKeyOf(thread)],
-        isActive: false,
-        jumpLabel: null,
-        appSettingsConfirmThreadArchive: false,
-        renamingThreadKey: null,
-        renamingTitle: "",
-        setRenamingTitle: vi.fn(),
-        startThreadRename: vi.fn(),
-        renamingInputRef: { current: null },
-        renamingCommittedRef: { current: false },
-        confirmingArchiveThreadKey: null,
-        setConfirmingArchiveThreadKey: vi.fn(),
-        confirmArchiveButtonRefs: { current: new Map<string, HTMLButtonElement>() },
-        handleThreadClick: vi.fn(),
-        navigateToThread: vi.fn(),
-        handleMultiSelectContextMenu: vi.fn(async () => {}),
-        handleThreadContextMenu: vi.fn(async () => {}),
-        clearSelection: vi.fn(),
-        commitRename: vi.fn(async () => {}),
-        cancelRename: vi.fn(),
-        attemptArchiveThread: vi.fn(async () => {}),
-        openPrLink: vi.fn(),
-        ...overrides,
-      };
-    }
-
-    async function mount(element: React.ReactElement): Promise<{
-      container: HTMLDivElement;
-      root: Root;
-    }> {
-      const container = document.createElement("div");
-      document.body.append(container);
-      const root = createRoot(container);
-      await React.act(async () => {
-        root.render(element);
-      });
-      return { container, root };
-    }
-
-    async function dispatch(element: Element, event: Event): Promise<void> {
-      await React.act(async () => {
-        element.dispatchEvent(event);
-      });
-    }
-
-    async function nextFrame(): Promise<void> {
-      await React.act(
-        () =>
-          new Promise<void>((resolve) => {
-            requestAnimationFrame(() => resolve());
-          }),
-      );
-    }
-
-    async function unmount(root: Root, container: HTMLElement): Promise<void> {
-      await React.act(async () => root.unmount());
-      container.remove();
-    }
-
-    it("opens the dialog for the clicked worktree row project", async () => {
-      const projectB = makeProject("project-browser-b", {
-        title: "Repo B",
-        workspaceRoot: "C:/repo-b",
-      });
-      baseScenario();
-      h.state.projects = [projectA, projectB];
-      h.state.sidebarCtx = { isMobile: true, setOpenMobile: h.spies.setOpenMobile };
-      const { container, root } = await mount(<Sidebar />);
-
-      h.state.captures.length = 0;
-      const worktree = requiredElement<HTMLButtonElement>(
-        container,
-        "[aria-label='New worktree in Repo B']",
-      );
-      const click = new MouseEvent("click", { bubbles: true, cancelable: true });
-      await dispatch(worktree, click);
-
-      expect(click.defaultPrevented).toBe(true);
-      expect(h.spies.setOpenMobile).toHaveBeenCalledWith(false);
-      expect(captured("CreateWorktreeDialog").at(-1)?.props["defaultProjectRef"]).toEqual(
-        scopeProjectRef(projectB.environmentId, projectB.id),
-      );
-      await unmount(root, container);
-    });
-
-    it("opens the dialog for the remote member chosen from a grouped worktree row", async () => {
-      groupedScenario();
-      fakeLocalApi();
-      h.spies.contextMenuShow.mockImplementation(
-        async (items: Array<{ id: string }>) => items[1]!.id,
-      );
-      const { container, root } = await mount(<Sidebar />);
-
-      h.state.captures.length = 0;
-      const worktree = requiredElement<HTMLButtonElement>(
-        container,
-        "[data-testid='new-worktree-button']",
-      );
-      await dispatch(worktree, new MouseEvent("click", { bubbles: true, cancelable: true }));
-      await React.act(async () => flush());
-
-      expect(h.spies.contextMenuShow).toHaveBeenCalled();
-      expect(captured("CreateWorktreeDialog").at(-1)?.props["defaultProjectRef"]).toEqual(
-        scopeProjectRef(ENV_REMOTE, ProjectId.make("project-a-remote")),
-      );
-      await unmount(root, container);
-    });
-
-    it("starts inline rename only for an unmodified row-body double-click", async () => {
-      const thread = makeThread("thread-browser-rename", { title: "Rename me" });
-      const startThreadRename = vi.fn();
-
-      function Harness() {
-        const [renamingThreadKey, setRenamingThreadKey] = React.useState<string | null>(null);
-        const [renamingTitle, setRenamingTitle] = React.useState("");
-        const renamingInputRef = React.useRef<HTMLInputElement | null>(null);
-        const renamingCommittedRef = React.useRef(false);
-        const beginRename = React.useCallback((threadKey: string, title: string) => {
-          startThreadRename(threadKey, title);
-          setRenamingThreadKey(threadKey);
-          setRenamingTitle(title);
-        }, []);
-        return (
-          <SidebarThreadRow
-            {...rowProps(thread, {
-              renamingThreadKey,
-              renamingTitle,
-              setRenamingTitle,
-              startThreadRename: beginRename,
-              renamingInputRef,
-              renamingCommittedRef,
-            })}
-          />
-        );
-      }
-
-      const { container, root } = await mount(<Harness />);
-      const row = requiredElement<HTMLElement>(
-        container,
-        "[data-testid='thread-row-thread-browser-rename']",
-      );
-      for (const modifier of ["metaKey", "ctrlKey", "shiftKey", "altKey"] as const) {
-        await dispatch(
-          row,
-          new MouseEvent("dblclick", { bubbles: true, cancelable: true, [modifier]: true }),
-        );
-        expect(startThreadRename, `${modifier} must not start rename`).not.toHaveBeenCalled();
-        expect(container.querySelector("input")).toBeNull();
-      }
-
-      const archive = requiredElement<HTMLButtonElement>(
-        container,
-        "[data-testid='thread-archive-thread-browser-rename']",
-      );
-      await dispatch(archive, new MouseEvent("dblclick", { bubbles: true, cancelable: true }));
-      expect(startThreadRename, "nested controls must not start rename").not.toHaveBeenCalled();
-      expect(container.querySelector("input")).toBeNull();
-
-      await dispatch(row, new MouseEvent("dblclick", { bubbles: true, cancelable: true }));
-      expect(startThreadRename).toHaveBeenCalledOnce();
-      expect(startThreadRename).toHaveBeenCalledWith(threadKeyOf(thread), "Rename me");
-      const input = requiredElement<HTMLInputElement>(container, "input");
-      expect(input.value).toBe("Rename me");
-      expect(document.activeElement).toBe(input);
-      await unmount(root, container);
-    });
-
-    it("retains archive confirmation for focus inside the row and clears it after focus leaves", async () => {
-      const thread = makeThread("thread-browser-archive", { title: "Archive me" });
-
-      function Harness() {
-        const [confirmingArchiveThreadKey, setConfirmingArchiveThreadKey] = React.useState<
-          string | null
-        >(null);
-        const confirmArchiveButtonRefs = React.useRef(new Map<string, HTMLButtonElement>());
-        return (
-          <SidebarThreadRow
-            {...rowProps(thread, {
-              appSettingsConfirmThreadArchive: true,
-              confirmingArchiveThreadKey,
-              setConfirmingArchiveThreadKey,
-              confirmArchiveButtonRefs,
-            })}
-          />
-        );
-      }
-
-      const outside = document.createElement("button");
-      outside.textContent = "Outside";
-      document.body.append(outside);
-      const { container, root } = await mount(<Harness />);
-      const archive = requiredElement<HTMLButtonElement>(
-        container,
-        "[data-testid='thread-archive-thread-browser-archive']",
-      );
-      await dispatch(archive, new MouseEvent("click", { bubbles: true, cancelable: true }));
-      await nextFrame();
-
-      const confirmSelector = "[data-testid='thread-archive-confirm-thread-browser-archive']";
-      const confirm = requiredElement<HTMLButtonElement>(container, confirmSelector);
-      expect(confirm.textContent).toBe("Confirm");
-      expect(document.activeElement).toBe(confirm);
-
-      const row = requiredElement<HTMLElement>(
-        container,
-        "[data-testid='thread-row-thread-browser-archive']",
-      );
-      await React.act(async () => row.focus());
-      await nextFrame();
-      expect(requiredElement<HTMLButtonElement>(container, confirmSelector).textContent).toBe(
-        "Confirm",
-      );
-
-      await React.act(async () => outside.focus());
-      await nextFrame();
-      expect(container.querySelector(confirmSelector)).toBeNull();
-
-      await unmount(root, container);
-      outside.remove();
-    });
-  });
-}

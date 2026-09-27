@@ -1,5 +1,11 @@
 #![allow(dead_code)]
 
+#[path = "support/hermetic_providers.rs"]
+mod hermetic_providers;
+
+#[path = "support/executable_fixture.rs"]
+mod executable_fixture;
+
 use bibcode_server::{git, production::host_paths::process_compatible_path, source_control, vcs};
 
 use std::{
@@ -36,7 +42,10 @@ impl WorktreeBaseDirectoryProvider for StaticWorktreeBaseDirectory {
 }
 
 fn repository_with_workspace(path: Option<PathBuf>) -> GitRepository {
-    GitRepository::with_worktree_settings(Arc::new(StaticWorktreeBaseDirectory(path)))
+    GitRepository::with_worktree_settings(
+        Arc::new(StaticWorktreeBaseDirectory(path)),
+        Arc::default(),
+    )
 }
 
 #[test]
@@ -224,8 +233,6 @@ async fn observe_initial_remote(
 fn provider_cli_fixture(directory: &Path, command: &str) -> std::path::PathBuf {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-
         let path = directory.join(command);
         let script = r#"#!/bin/sh
 case "$*" in
@@ -240,10 +247,7 @@ case "$(basename "$0"):$*" in
   az:*) printf '%s\n' '{"pullRequestId":44,"title":"Azure PR","url":"https://azure.test/44","targetRefName":"refs/heads/main","sourceRefName":"refs/heads/feature","status":"active"}' ;;
 esac
 "#;
-        fs::write(&path, script).expect("provider fixture should write");
-        let mut permissions = fs::metadata(&path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&path, permissions).unwrap();
+        executable_fixture::write_executable(&path, script);
         path
     }
     #[cfg(windows)]
@@ -278,7 +282,7 @@ echo {"pullRequestId":44,"title":"Azure PR","url":"https://azure.test/44","targe
              )\r\n\
              {success}\r\n"
         );
-        fs::write(&path, script).expect("provider fixture should write");
+        executable_fixture::write_executable(&path, script);
         path
     }
 }
@@ -1958,7 +1962,11 @@ fn pull_request_json_parsers_match_provider_cli_shapes() {
 
 #[tokio::test]
 async fn source_control_discovery_uses_structured_bounded_probes() {
-    let discovery = source_control::SourceControlDiscovery::default()
+    let temp = TempDir::new().expect("discovery fixture");
+    let discovery =
+        source_control::SourceControlDiscovery::with_executable_dir_for_integration_test(
+            hermetic_providers::missing_hosting_executable_dir(temp.path()),
+        )
         .discover(
             std::env::current_dir().expect("current directory"),
             &cancellation(),

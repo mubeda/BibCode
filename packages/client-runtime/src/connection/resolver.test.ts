@@ -27,6 +27,7 @@ import {
 import * as ConnectionCredentialStore from "./credentialStore.ts";
 import {
   BearerConnectionTarget,
+  ConnectionBlockedError,
   ConnectionTransientError,
   PrimaryConnectionTarget,
   RelayConnectionTarget,
@@ -51,6 +52,7 @@ const DESCRIPTOR = {
   },
   serverVersion: "0.0.0-test",
   storageInstanceId: "store-current",
+  bootId: null,
   remoteUpdateSupport: null,
   remoteProtocolVersion: 1,
   minCompatibleRemoteProtocol: 1,
@@ -96,13 +98,19 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
   readonly authorizeBearer?: RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization["Service"]["authorizeBearer"];
   readonly authorizeDpop?: RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization["Service"]["authorizeDpop"];
   readonly primaryBearerToken?: string;
-  readonly prepareSsh?: ClientCapabilities.SshEnvironmentGateway["Service"]["prepare"];
+  readonly ensureSshTunnel?: ClientCapabilities.SshEnvironmentGateway["Service"]["ensureTunnel"];
+  readonly mintSshBearer?: ClientCapabilities.SshEnvironmentGateway["Service"]["mintBearer"];
   readonly descriptor?: ExecutionEnvironmentDescriptor;
+  /** Shared with the test to observe credential writes. */
+  readonly credentialMap?: Map<string, ConnectionCredential>;
+  /** Connection ids still saved in the catalog; defaults to every profile. */
+  readonly savedConnectionIds?: ReadonlySet<string>;
 }) => {
   const profiles = new Map(
     (options?.profiles ?? []).map((profile) => [profile.connectionId, profile]),
   );
-  const credentials = new Map(options?.credentials ?? []);
+  const credentials = options?.credentialMap ?? new Map(options?.credentials ?? []);
+  const savedConnectionIds = options?.savedConnectionIds ?? new Set(profiles.keys());
 
   const profileStore = ConnectionProfileStore.ConnectionProfileStore.of({
     get: (connectionId) => Effect.succeed(Option.fromNullishOr(profiles.get(connectionId))),
@@ -114,6 +122,12 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
     put: (connectionId, credential) =>
       Effect.sync(() => void credentials.set(connectionId, credential)),
     remove: (connectionId) => Effect.sync(() => void credentials.delete(connectionId)),
+    putIfSaved: (connectionId, credential) =>
+      Effect.sync(() => {
+        if (!savedConnectionIds.has(connectionId)) return false;
+        credentials.set(connectionId, credential);
+        return true;
+      }),
   });
   const remote = RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization.of({
     authorizeBearer:
@@ -151,15 +165,24 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
   });
   const ssh = ClientCapabilities.SshEnvironmentGateway.of({
     provision: () => Effect.die("unused"),
-    prepare:
-      options?.prepareSsh ??
-      (() =>
+    ensureTunnel:
+      options?.ensureSshTunnel ??
+      ((input) =>
+        Effect.succeed({
+          target: input.target,
+          httpBaseUrl: "http://127.0.0.1:4010",
+          wsBaseUrl: "ws://127.0.0.1:4010",
+          pairingToken: null,
+        })),
+    mintBearer:
+      options?.mintSshBearer ??
+      ((input) =>
         Effect.succeed({
           bootstrap: {
-            target: SSH_TARGET,
+            target: input.target,
             httpBaseUrl: "http://127.0.0.1:4010",
             wsBaseUrl: "ws://127.0.0.1:4010",
-            pairingToken: null,
+            pairingToken: "pairing-token",
           },
           bearerToken: "ssh-bearer",
         })),
@@ -446,43 +469,6 @@ describe("ConnectionResolver", () => {
     }),
   );
 
-  it.effect("delegates SSH launch to the platform gateway before remote authorization", () =>
-    Effect.gen(function* () {
-      const preparedTargets = yield* Ref.make<ReadonlyArray<DesktopSshEnvironmentTarget>>([]);
-      const target = new SshConnectionTarget({
-        environmentId: ENVIRONMENT_ID,
-        label: "SSH",
-        connectionId: "ssh-1",
-      });
-      const profile = new SshConnectionProfile({
-        connectionId: "ssh-1",
-        environmentId: ENVIRONMENT_ID,
-        label: "SSH",
-        target: SSH_TARGET,
-      });
-      const brokerLayer = yield* makeDependencies({
-        prepareSsh: (input) =>
-          Ref.update(preparedTargets, (values) => [...values, input.target]).pipe(
-            Effect.as({
-              bootstrap: {
-                target: input.target,
-                httpBaseUrl: "http://127.0.0.1:4010",
-                wsBaseUrl: "ws://127.0.0.1:4010",
-                pairingToken: null,
-              },
-              bearerToken: "ssh-bearer",
-            }),
-          ),
-      });
-      const broker = yield* ConnectionResolver.ConnectionResolver.pipe(Effect.provide(brokerLayer));
-
-      const prepared = yield* broker.prepare(catalogEntry(target, Option.some(profile)));
-      expect(prepared.socketUrl).toContain("wsTicket=bearer");
-      expect(prepared.descriptor).toEqual(DESCRIPTOR);
-      expect(yield* Ref.get(preparedTargets)).toEqual([SSH_TARGET]);
-    }),
-  );
-
   it.effect("classifies relay request timeouts as retryable connection failures", () =>
     Effect.gen(function* () {
       const target = new RelayConnectionTarget({
@@ -503,6 +489,190 @@ describe("ConnectionResolver", () => {
 
       expect(error).toBeInstanceOf(ConnectionTransientError);
       expect(error).toMatchObject({ reason: "timeout" });
+    }),
+  );
+});
+
+describe("ConnectionResolver SSH credentials", () => {
+  const target = new SshConnectionTarget({
+    environmentId: ENVIRONMENT_ID,
+    label: "SSH",
+    connectionId: "ssh-1",
+  });
+  const profile = new SshConnectionProfile({
+    connectionId: "ssh-1",
+    environmentId: ENVIRONMENT_ID,
+    label: "SSH",
+    target: SSH_TARGET,
+  });
+  const rejected = () =>
+    new ConnectionBlockedError({
+      reason: "authentication",
+      detail: "The environment credential is invalid.",
+    });
+
+  const setup = Effect.fn("TestConnectionResolver.ssh.setup")(function* (options: {
+    readonly saved?: string;
+    readonly rejectTokens?: (token: string) => boolean;
+    readonly ensureSshTunnel?: ClientCapabilities.SshEnvironmentGateway["Service"]["ensureTunnel"];
+    readonly savedConnectionIds?: ReadonlySet<string>;
+  }) {
+    const credentialMap = new Map<string, ConnectionCredential>(
+      options.saved === undefined
+        ? []
+        : [["ssh-1", new BearerConnectionCredential({ token: options.saved })]],
+    );
+    const tunnels = yield* Ref.make<ReadonlyArray<DesktopSshEnvironmentTarget>>([]);
+    const mints = yield* Ref.make(0);
+    const authorized = yield* Ref.make<ReadonlyArray<string>>([]);
+    const layer = yield* makeDependencies({
+      profiles: [profile],
+      credentialMap,
+      ...(options.savedConnectionIds === undefined
+        ? {}
+        : { savedConnectionIds: options.savedConnectionIds }),
+      ensureSshTunnel:
+        options.ensureSshTunnel ??
+        ((input) =>
+          Ref.update(tunnels, (values) => [...values, input.target]).pipe(
+            Effect.as({
+              target: input.target,
+              httpBaseUrl: "http://127.0.0.1:4010",
+              wsBaseUrl: "ws://127.0.0.1:4010",
+              pairingToken: null,
+            }),
+          )),
+      mintSshBearer: (input) =>
+        Ref.updateAndGet(mints, (count) => count + 1).pipe(
+          Effect.map((count) => ({
+            bootstrap: {
+              target: input.target,
+              httpBaseUrl: "http://127.0.0.1:4010",
+              wsBaseUrl: "ws://127.0.0.1:4010",
+              pairingToken: `pairing-${count}`,
+            },
+            bearerToken: `minted-${count}`,
+          })),
+        ),
+      authorizeBearer: (input) =>
+        Ref.update(authorized, (values) => [...values, input.bearerToken]).pipe(
+          Effect.andThen(
+            options.rejectTokens?.(input.bearerToken) === true
+              ? Effect.fail(rejected())
+              : Effect.succeed({
+                  descriptor: DESCRIPTOR,
+                  environmentId: input.expectedEnvironmentId,
+                  label: "Authorized SSH environment",
+                  httpBaseUrl: input.httpBaseUrl,
+                  socketUrl: "wss://authorized.example.test/ws?wsTicket=bearer",
+                  httpAuthorization: { _tag: "Bearer" as const, token: input.bearerToken },
+                  e2ee: null,
+                }),
+          ),
+        ),
+    });
+    const broker = yield* ConnectionResolver.ConnectionResolver.pipe(Effect.provide(layer));
+    return {
+      prepare: broker.prepare(catalogEntry(target, Option.some(profile))),
+      savedToken: () => {
+        const credential = credentialMap.get("ssh-1");
+        return credential === undefined ? null : credential.token;
+      },
+      tunnels: Ref.get(tunnels),
+      mints: Ref.get(mints),
+      authorized: Ref.get(authorized),
+    };
+  });
+
+  it.effect("connects with the saved bearer through the tunnel without minting", () =>
+    Effect.gen(function* () {
+      const ssh = yield* setup({ saved: "saved-bearer" });
+
+      const prepared = yield* ssh.prepare;
+
+      expect(prepared.socketUrl).toContain("wsTicket=bearer");
+      expect(yield* ssh.tunnels).toEqual([SSH_TARGET]);
+      expect(yield* ssh.authorized).toEqual(["saved-bearer"]);
+      expect(yield* ssh.mints).toBe(0);
+    }),
+  );
+
+  it.effect("mints once and saves the bearer when no credential is saved", () =>
+    Effect.gen(function* () {
+      const ssh = yield* setup({});
+
+      yield* ssh.prepare;
+
+      expect(yield* ssh.mints).toBe(1);
+      expect(yield* ssh.authorized).toEqual(["minted-1"]);
+      expect(ssh.savedToken()).toBe("minted-1");
+    }),
+  );
+
+  it.effect("mints once and retries when the saved bearer is rejected", () =>
+    Effect.gen(function* () {
+      const ssh = yield* setup({
+        saved: "revoked-bearer",
+        rejectTokens: (token) => token === "revoked-bearer",
+      });
+
+      yield* ssh.prepare;
+
+      expect(yield* ssh.authorized).toEqual(["revoked-bearer", "minted-1"]);
+      expect(yield* ssh.mints).toBe(1);
+      expect(ssh.savedToken()).toBe("minted-1");
+    }),
+  );
+
+  it.effect(
+    "blocks until the user connects again when the freshly minted bearer is rejected too",
+    () =>
+      Effect.gen(function* () {
+        const ssh = yield* setup({ saved: "revoked-bearer", rejectTokens: () => true });
+
+        const error = yield* Effect.flip(ssh.prepare);
+
+        expect(error).toBeInstanceOf(ConnectionBlockedError);
+        expect(error).toMatchObject({
+          reason: "authentication",
+          detail:
+            "development rejected a new pairing credential. Connect again; if it keeps failing, remove the environment and add it again.",
+        });
+        expect(yield* ssh.mints).toBe(1);
+        expect(yield* ssh.authorized).toEqual(["revoked-bearer", "minted-1"]);
+      }),
+  );
+
+  it.effect("keeps the saved bearer when the tunnel fails transiently", () =>
+    Effect.gen(function* () {
+      const ssh = yield* setup({
+        saved: "saved-bearer",
+        ensureSshTunnel: () =>
+          Effect.fail(
+            new ConnectionTransientError({
+              reason: "remote-unavailable",
+              detail: "Could not prepare the SSH environment: connection refused",
+            }),
+          ),
+      });
+
+      const error = yield* Effect.flip(ssh.prepare);
+
+      expect(error).toBeInstanceOf(ConnectionTransientError);
+      expect(ssh.savedToken()).toBe("saved-bearer");
+      expect(yield* ssh.mints).toBe(0);
+      expect(yield* ssh.authorized).toEqual([]);
+    }),
+  );
+
+  it.effect("does not save a minted bearer for an environment removed meanwhile", () =>
+    Effect.gen(function* () {
+      const ssh = yield* setup({ savedConnectionIds: new Set() });
+
+      yield* ssh.prepare;
+
+      expect(yield* ssh.mints).toBe(1);
+      expect(ssh.savedToken()).toBeNull();
     }),
   );
 });

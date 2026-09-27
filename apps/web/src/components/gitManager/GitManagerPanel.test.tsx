@@ -11,6 +11,7 @@ import type {
   VcsStatusResult,
 } from "@bibcode/contracts";
 import { makeTestExecutionEnvironmentCapabilities } from "@bibcode/shared/testSupport";
+import * as Cause from "effect/Cause";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -62,6 +63,8 @@ const h = vi.hoisted(() => ({
   tagsViewProps: [] as Array<Record<string, unknown>>,
   refsSnapshot: null as GitManagerRefsSnapshot | null,
   status: null as VcsStatusResult | null,
+  /** A failed status read: its message, with `status` left at its last answer. */
+  statusError: null as string | null,
   stashes: null as ReadonlyArray<GitManagerStashEntry> | null,
   refreshed: [] as string[],
   signalGeneration: 1 as number | null,
@@ -87,6 +90,7 @@ vi.mock("../../state/entities", () => ({
 
 vi.mock("../../state/environments", () => ({
   useEnvironmentConnectionState: () => ({ data: h.connectionState }),
+  useEnvironment: () => ({ label: "Local" }),
 }));
 
 vi.mock("../../state/query", () => ({
@@ -112,14 +116,24 @@ vi.mock("../../state/query", () => ({
               : atom?.kind === "stashes"
                 ? h.stashes
                 : null;
+    // Automatic re-reads record the same way as refreshes.
+    const refresh = () => {
+      if (atom !== null) h.refreshed.push(atom.kind);
+    };
+    const error = atom?.kind === "status" ? h.statusError : null;
     return {
       data,
-      error: null,
+      error,
       isPending: atom?.kind === "catalog" && h.catalogPending,
-      refresh: () => {
-        if (atom !== null) h.refreshed.push(atom.kind);
-      },
-      emission: data === null ? { _tag: "Initial" } : { _tag: "Success", value: data },
+      refresh,
+      revalidate: refresh,
+      requiresRetry: false,
+      emission:
+        error !== null
+          ? { _tag: "Failure", cause: Cause.fail(new Error(error)) }
+          : data === null
+            ? { _tag: "Initial" }
+            : { _tag: "Success", value: data },
     };
   },
 }));
@@ -328,6 +342,7 @@ beforeEach(() => {
   h.activeSubscriptions = 0;
   h.refsSnapshot = refsSnapshot();
   h.status = vcsStatus(false);
+  h.statusError = null;
   h.stashes = null;
   h.refreshed.length = 0;
   h.signalGeneration = 1;
@@ -367,7 +382,7 @@ describe("GitManagerPanel", () => {
     expect(markup).toContain("This environment is disconnected.");
     expect(h.catalogAtom).not.toHaveBeenCalled();
     expect(h.signalAtom).not.toHaveBeenCalled();
-    expect(h.queryAtoms).toEqual([null, null]);
+    expect(h.queryAtoms).toEqual([null, null, null]);
   });
 
   it("renders tabs and targets the selected checkout only while ready", () => {
@@ -467,16 +482,24 @@ describe("GitManagerPanel", () => {
   });
 
   it.each([
-    ["github", "pull requests", "Pull requests"],
-    ["gitlab", "merge requests", "Merge requests"],
+    [
+      "a GitHub host",
+      { kind: "github", name: "Forge", baseUrl: "https://forge.invalid" },
+      "pull requests",
+      "Pull requests",
+    ],
+    [
+      "a GitLab host",
+      { kind: "gitlab", name: "Forge", baseUrl: "https://forge.invalid" },
+      "merge requests",
+      "Merge requests",
+    ],
+    ["a status without a provider", undefined, "pull requests", "Pull requests"],
   ] as const)(
-    "toggles the %s provider pane using its vocabulary without requesting data",
-    async (kind, plural, title) => {
+    "toggles the provider pane for %s using its vocabulary without requesting data",
+    async (_label, sourceControlProvider, plural, title) => {
       (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-      h.status = {
-        ...vcsStatus(false),
-        sourceControlProvider: { kind, name: "Forge", baseUrl: "https://forge.invalid" },
-      };
+      h.status = { ...vcsStatus(false), sourceControlProvider };
       const container = document.createElement("div");
       document.body.append(container);
       const root = createRoot(container);
@@ -509,6 +532,44 @@ describe("GitManagerPanel", () => {
         expect(toggle?.textContent).toBe(`Show ${plural}`);
         expect(container.querySelector(`section[aria-label="${title} and checks"]`)).toBeNull();
         expect(h.listPullRequests).toHaveBeenCalledOnce();
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+        (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
+      }
+    },
+  );
+
+  it.each([
+    ["has not answered", null],
+    ["failed", "Git status failed."],
+  ] as const)(
+    "names requests neutrally in the toggle and the pane while status %s",
+    async (_state, statusError) => {
+      (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+      h.status = null;
+      h.statusError = statusError;
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+
+      try {
+        await act(async () => root.render(<GitManagerPanel projectRef={projectRef} />));
+
+        const toggle = container.querySelector<HTMLButtonElement>(
+          'button[aria-label="Show change requests and checks"]',
+        );
+        expect(toggle?.textContent).toBe("Show change requests");
+        await act(async () => toggle!.click());
+
+        expect(toggle?.getAttribute("aria-label")).toBe("Hide change requests and checks");
+        expect(toggle?.textContent).toBe("Hide change requests");
+        const pane = container.querySelector('section[aria-label="Change requests and checks"]');
+        expect(pane?.querySelector("h2")?.textContent).toBe("Change requests and checks");
+        expect(pane?.textContent).toContain("Create change request");
+        // The host is still unnamed, so no surface in the panel uses a host's noun.
+        expect(container.textContent).not.toMatch(/pull requests?|merge requests?/i);
+        expect(h.listPullRequests).not.toHaveBeenCalled();
       } finally {
         await act(async () => root.unmount());
         container.remove();

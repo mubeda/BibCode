@@ -2196,14 +2196,7 @@ impl TerminalManager {
         let process_has_exited = exit.borrow().is_some();
         let attribution_registration = if process_has_exited {
             None
-        } else {
-            let Some(identity) = process.process_identity() else {
-                uncommitted_process.cleanup().await;
-                return Err(TerminalError::Spawn {
-                    attempted,
-                    message: "spawned terminal process has no stable process identity".to_owned(),
-                });
-            };
+        } else if let Some(identity) = process.process_identity() {
             match self.inner.attribution.register_identity(
                 identity,
                 ProcessRegistrationMetadata {
@@ -2226,6 +2219,29 @@ impl TerminalManager {
                     });
                 }
             }
+        } else {
+            // The portable backend captures identity at spawn and reaps an already
+            // exited root. Its waiter publishes the exit only after cleaning the
+            // process group (Unix) or Job (Windows). A missing identity followed by
+            // that exit is an ordinary fast exit already cleaned by its owner, so
+            // the manager registers nothing and kills nothing.
+            let mut exit_observer = exit.clone();
+            let exit_reported = matches!(
+                tokio::time::timeout(
+                    TERMINAL_CLOSE_WAIT_TIMEOUT,
+                    exit_observer.wait_for(Option::is_some),
+                )
+                .await,
+                Ok(Ok(_))
+            );
+            if !exit_reported {
+                uncommitted_process.cleanup().await;
+                return Err(TerminalError::Spawn {
+                    attempted,
+                    message: "spawned terminal process has no stable process identity".to_owned(),
+                });
+            }
+            None
         };
         let history = TerminalHistory::new(self.inner.options.history_line_limit);
         debug_assert_eq!(
@@ -3397,6 +3413,21 @@ impl TerminalManager {
         }
     }
 
+    /// Terminal sessions whose process is starting or running.
+    pub async fn live_session_count(&self) -> usize {
+        let sessions = self.inner.sessions.read().await;
+        let mut live = 0;
+        for session in sessions.values() {
+            if matches!(
+                session.lock().await.summary().status,
+                TerminalStatus::Starting | TerminalStatus::Running
+            ) {
+                live += 1;
+            }
+        }
+        live
+    }
+
     pub async fn subscribe_metadata(&self) -> TerminalMetadataAttachment {
         let events = self.inner.metadata.subscribe();
         let sessions = self.inner.sessions.read().await;
@@ -4146,6 +4177,7 @@ mod tests {
         pid: u32,
         process_identity: Option<crate::diagnostics::ProcessIdentity>,
         exit_on_identity_read: std::sync::Mutex<Option<PtyExit>>,
+        exit_after_identity_read: std::sync::Mutex<Option<(Duration, PtyExit)>>,
         output: broadcast::Sender<String>,
         exit: tokio::sync::watch::Sender<Option<PtyExit>>,
         killed: std::sync::atomic::AtomicBool,
@@ -4168,6 +4200,7 @@ mod tests {
                 pid,
                 process_identity: Some(crate::diagnostics::ProcessIdentity { pid, started_at: 0 }),
                 exit_on_identity_read: std::sync::Mutex::new(None),
+                exit_after_identity_read: std::sync::Mutex::new(None),
                 output,
                 exit,
                 killed: std::sync::atomic::AtomicBool::new(false),
@@ -4248,6 +4281,18 @@ mod tests {
                 .take()
             {
                 self.exit.send_replace(Some(exit));
+            }
+            if let Some((delay, exit)) = self
+                .exit_after_identity_read
+                .lock()
+                .expect("exit-after-identity-read lock")
+                .take()
+            {
+                let exit_sender = self.exit.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(delay);
+                    exit_sender.send_replace(Some(exit));
+                });
             }
             self.process_identity
         }
@@ -4430,6 +4475,28 @@ mod tests {
             .await
             .unwrap();
         (root, backend, manager)
+    }
+
+    #[tokio::test]
+    async fn live_session_count_counts_open_sessions_until_they_close() {
+        let (root, _backend, manager) = size_fixture(80, 24).await;
+        assert_eq!(manager.live_session_count().await, 1);
+        manager
+            .open(TerminalOpenInput::new(
+                "sizing",
+                "term-2",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(manager.live_session_count().await, 2);
+        manager.close("sizing", Some("term")).await.unwrap();
+        assert_eq!(manager.live_session_count().await, 1);
+        manager.close("sizing", Some("term-2")).await.unwrap();
+        assert_eq!(manager.live_session_count().await, 0);
+        manager.shutdown().await;
     }
 
     async fn next_attachment_event(attachment: &mut TerminalAttachment) -> TerminalEvent {
@@ -4954,13 +5021,27 @@ mod tests {
         manager.shutdown().await;
     }
 
-    #[derive(Debug, Default)]
+    #[derive(Debug)]
     struct HistoryTestBackend {
         processes: std::sync::Mutex<Vec<Arc<HistoryTestPty>>>,
         spawns: std::sync::Mutex<Vec<PtySpawnInput>>,
         fail_spawns: bool,
         expose_process_identity: bool,
         exit_on_identity_read: Option<PtyExit>,
+        exit_after_identity_read: Option<(Duration, PtyExit)>,
+    }
+
+    impl Default for HistoryTestBackend {
+        fn default() -> Self {
+            Self {
+                processes: std::sync::Mutex::new(Vec::new()),
+                spawns: std::sync::Mutex::new(Vec::new()),
+                fail_spawns: false,
+                expose_process_identity: true,
+                exit_on_identity_read: None,
+                exit_after_identity_read: None,
+            }
+        }
     }
 
     impl HistoryTestBackend {
@@ -4988,12 +5069,18 @@ mod tests {
             let process = if self.expose_process_identity {
                 HistoryTestPty::with_identity(processes.len() as u32 + 1)
             } else {
-                HistoryTestPty::new(processes.len() as u32 + 1)
+                let mut process = HistoryTestPty::new(processes.len() as u32 + 1);
+                process.process_identity = None;
+                process
             };
             *process
                 .exit_on_identity_read
                 .lock()
                 .expect("exit-on-identity-read lock") = self.exit_on_identity_read.clone();
+            *process
+                .exit_after_identity_read
+                .lock()
+                .expect("exit-after-identity-read lock") = self.exit_after_identity_read.clone();
             let process = Arc::new(process);
             processes.push(process.clone());
             Ok(process)
@@ -7613,6 +7700,103 @@ mod tests {
             }
         ));
         assert!(terminal_claims(&registry, &[pid]).is_empty());
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_terminal_that_exits_after_identity_read_opens_and_reports_its_exit() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend {
+            expose_process_identity: false,
+            exit_after_identity_read: Some((
+                Duration::from_millis(100),
+                PtyExit {
+                    exit_code: Some(17),
+                    signal: None,
+                },
+            )),
+            ..HistoryTestBackend::default()
+        });
+        let registry = ProcessAttributionRegistry::new();
+        let manager = attributed_manager(backend.clone(), registry.clone());
+        let mut events = manager.subscribe_events();
+        manager
+            .open(TerminalOpenInput::new(
+                "thread-exited-after-identity-read",
+                "term-exited-after-identity-read",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .expect("an already exited terminal must open");
+
+        let exit_event = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(event @ TerminalEvent::Exited { .. }) = events.recv().await {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("exit published after identity read must be supervised");
+        assert!(matches!(
+            exit_event,
+            TerminalEvent::Exited {
+                exit_code: Some(17),
+                ..
+            }
+        ));
+        let process = backend.latest();
+        assert!(
+            !process.is_killed(),
+            "natural exit must not kill the process tree"
+        );
+        assert!(terminal_claims(&registry, &[process.pid()]).is_empty());
+        manager.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_live_terminal_without_a_process_identity_is_refused_and_killed() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend {
+            expose_process_identity: false,
+            ..HistoryTestBackend::default()
+        });
+        let registry = ProcessAttributionRegistry::new();
+        let manager = attributed_manager(backend.clone(), registry.clone());
+
+        let started = tokio::time::Instant::now();
+        let result = manager
+            .open(TerminalOpenInput::new(
+                "thread-missing-identity",
+                "term-missing-identity",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await;
+
+        assert!(started.elapsed() >= TERMINAL_CLOSE_WAIT_TIMEOUT);
+        assert!(matches!(
+            result,
+            Err(TerminalError::Spawn { message, .. })
+                if message == "spawned terminal process has no stable process identity"
+        ));
+        let process = backend.latest();
+        assert!(
+            process.is_killed(),
+            "unattributed live process must be killed"
+        );
+        assert!(process.subscribe_exit().borrow().is_some());
+        assert!(terminal_claims(&registry, &[process.pid()]).is_empty());
+        assert!(
+            manager
+                .require_session("thread-missing-identity", "term-missing-identity")
+                .await
+                .is_err(),
+            "an unattributed live process must never be published"
+        );
         manager.shutdown().await;
     }
 

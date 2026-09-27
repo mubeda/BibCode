@@ -28,6 +28,7 @@ import { useRightPanelStore } from "~/rightPanelStore";
 import { assetEnvironment } from "~/state/assets";
 import {
   useEnvironment,
+  useEnvironmentConnectionState,
   useEnvironmentHttpBaseUrl,
   usePrimaryEnvironmentId,
 } from "~/state/environments";
@@ -40,6 +41,7 @@ import { useAtomQueryRunner } from "~/state/use-atom-query-runner";
 import { vcsEnvironment } from "~/state/vcs";
 import { resolveProviderSessionSelectionForInstance } from "~/providerSessionSelection";
 
+import { RetryButton } from "../ui/retry-button";
 import { stackedThreadToast, toastManager } from "../ui/toast";
 import FileEntryDialog, { type FileEntryDialogRequest } from "./FileEntryDialog";
 import type { FilePathMutationLease, FilePathMutationRequest } from "./filePathMutationLease";
@@ -167,6 +169,20 @@ export function currentlyExpandedTreePaths(
   });
 }
 
+/**
+ * The header's second line: rescan or load progress, or the size of the list on screen.
+ * Without a loaded list (still loading, or failed) there is no count to show.
+ */
+function fileListStatus(input: {
+  readonly rescanning: boolean;
+  readonly pending: boolean;
+  readonly fileCount: number | null;
+}): string | null {
+  if (input.rescanning) return "Refreshing…";
+  if (input.fileCount !== null) return `${input.fileCount.toLocaleString()} files`;
+  return input.pending ? "Indexing…" : null;
+}
+
 export function collapseDirectoryTreePaths(
   model: CollapsibleTreeModel,
   directoryTreePaths: ReadonlyArray<string>,
@@ -214,6 +230,9 @@ export default function FileBrowserPanel({
 
   const primaryEnvironmentId = usePrimaryEnvironmentId();
   const environment = useEnvironment(environmentId);
+  // A read cannot reach a disconnected environment; the list reads again once it reconnects.
+  const connectionPhase = useEnvironmentConnectionState(environmentId).data?.phase ?? null;
+  const waitingForConnection = connectionPhase !== null && connectionPhase !== "connected";
   const isPrimaryEnv = primaryEnvironmentId === environmentId;
   const hasWorkspaceRoot = cwd.length > 0;
 
@@ -291,7 +310,7 @@ export default function FileBrowserPanel({
       workspaceUnavailable,
       showMutationError,
       setDialogRequest,
-      refreshEntries: entriesQuery.refresh,
+      refreshEntries: entriesQuery.revalidate,
     });
 
   useEffect(() => {
@@ -389,7 +408,7 @@ export default function FileBrowserPanel({
               }
               return;
             }
-            entriesQuery.refresh();
+            entriesQuery.revalidate();
             if (isFile) onOpenFile(result.value.relativePath);
           })();
         },
@@ -436,7 +455,7 @@ export default function FileBrowserPanel({
               }
               lease?.commitRename(result.value.relativePath);
               remapFileSurfaces(threadRef, relativePath, result.value.relativePath);
-              entriesQuery.refresh();
+              entriesQuery.revalidate();
             } catch (error) {
               showMutationError(error, `Failed to rename "${currentName}"`);
             } finally {
@@ -486,7 +505,7 @@ export default function FileBrowserPanel({
               }
               lease?.commitDelete();
               closeFileSurfacesUnder(threadRef, relativePath);
-              entriesQuery.refresh();
+              entriesQuery.revalidate();
             } catch (error) {
               showMutationError(error, `Failed to delete "${name}"`);
             } finally {
@@ -525,7 +544,7 @@ export default function FileBrowserPanel({
             }
             return;
           }
-          entriesQuery.refresh();
+          entriesQuery.revalidate();
           onOpenFile(result.value.relativePath);
         } catch (error) {
           showMutationError(error, `Failed to duplicate "${entryName(relativePath)}"`);
@@ -592,7 +611,7 @@ export default function FileBrowserPanel({
   const moveDroppedEntries = useCallback(
     (event: FileTreeDropResult) => {
       if (workspaceUnavailableRef.current) {
-        entriesQuery.refresh();
+        entriesQuery.revalidate();
         return;
       }
       const targetDir =
@@ -629,7 +648,7 @@ export default function FileBrowserPanel({
             lease?.release();
           }
         }
-        entriesQuery.refresh();
+        entriesQuery.revalidate();
       })();
     },
     [
@@ -650,7 +669,7 @@ export default function FileBrowserPanel({
   const reportDropError = useCallback(
     (error: string) => {
       showMutationError(new Error(error), "Failed to move files");
-      entriesQuery.refresh();
+      entriesQuery.revalidate();
     },
     [entriesQuery, showMutationError],
   );
@@ -706,21 +725,27 @@ export default function FileBrowserPanel({
   // Recording it is what makes the effect idempotent. `entriesQuery` is a fresh object on every
   // render, so an effect depending on it re-runs constantly; without this the refresh it triggers
   // re-renders, re-runs the effect, and refreshes again in a hot loop. Depend on the stable
-  // `refresh` callback rather than the wrapper object for the same reason.
+  // `revalidate` callback rather than the wrapper object for the same reason; a signal is an
+  // automatic read, so it keeps a transport cut-off latched until the user rescans.
   const handledEntryChangeRef = useRef<typeof entryChangeSignal>(null);
-  const refreshEntries = entriesQuery.refresh;
+  const revalidateEntries = entriesQuery.revalidate;
   useEffect(() => {
     if (entryChangeSignal === null || entryChangeSignal === handledEntryChangeRef.current) {
       return;
     }
     handledEntryChangeRef.current = entryChangeSignal;
-    refreshEntries();
-  }, [entryChangeSignal, refreshEntries]);
+    revalidateEntries();
+  }, [entryChangeSignal, revalidateEntries]);
 
   const fileCount = useMemo(
     () => entries.reduce((count, entry) => count + (entry.kind === "file" ? 1 : 0), 0),
     [entries],
   );
+  const listStatus = fileListStatus({
+    rescanning: isRescanning,
+    pending: entriesQuery.isPending,
+    fileCount: entriesQuery.data === null ? null : fileCount,
+  });
 
   // The menu model decides which actions show for a file vs a directory, so the full handler set is
   // supplied for every row. New File/Folder target the clicked folder itself, or a file's parent
@@ -794,14 +819,12 @@ export default function FileBrowserPanel({
       <div className="flex h-9 shrink-0 items-center gap-2 border-b border-panel-separator px-3">
         <div className="min-w-0 flex-1">
           <div className="truncate text-xs font-medium text-foreground">{projectName}</div>
-          <div className="truncate text-[10px] leading-none text-muted-foreground">
-            {isRescanning
-              ? "Refreshing…"
-              : entriesQuery.isPending && entriesQuery.data === null
-                ? "Indexing…"
-                : `${fileCount.toLocaleString()} files`}
-            {entriesQuery.data?.truncated ? " · partial" : ""}
-          </div>
+          {listStatus === null ? null : (
+            <div className="truncate text-xs text-muted-foreground">
+              {listStatus}
+              {entriesQuery.data?.truncated ? " · partial" : ""}
+            </div>
+          )}
         </div>
         <button
           type="button"
@@ -841,7 +864,14 @@ export default function FileBrowserPanel({
         </button>
       </div>
       {entriesQuery.error && entriesQuery.data === null ? (
-        <div className="p-4 text-xs leading-relaxed text-destructive">{entriesQuery.error}</div>
+        <div className="space-y-2 p-4">
+          <p className="text-xs leading-relaxed text-destructive">{entriesQuery.error}</p>
+          <RetryButton
+            retrying={entriesQuery.isPending}
+            waitingForConnection={waitingForConnection}
+            onRetry={entriesQuery.refresh}
+          />
+        </div>
       ) : (
         <FileTree
           model={model}

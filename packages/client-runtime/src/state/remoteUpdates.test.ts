@@ -17,7 +17,11 @@ import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
 import { RpcClientError } from "effect/unstable/rpc";
 
 import { EnvironmentRegistry } from "../connection/registry.ts";
-import { RelayConnectionTarget } from "../connection/model.ts";
+import {
+  ConnectionBlockedError,
+  RelayConnectionTarget,
+  type SupervisorConnectionState,
+} from "../connection/model.ts";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import { EnvironmentRpcUnavailableError } from "../rpc/client.ts";
 import type { RpcSession } from "../rpc/session.ts";
@@ -50,7 +54,10 @@ const CHECKED_SNAPSHOT: RemoteUpdateSnapshot = {
   latestVersion: "0.5.0",
   state: "update-available",
   error: null,
-  support: { installMode: "interactive", reason: "available" },
+  support: { installMode: "interactive", reason: "available", installKind: "unknown" },
+  downloadPercent: null,
+  targetVersion: null,
+  installStage: null,
 };
 
 const makeRemoteUpdateCommandHarness = Effect.fn("TestRemoteUpdates.makeCommandHarness")(
@@ -298,6 +305,7 @@ function snapshotIn(
     support: {
       installMode,
       reason: installMode === "manual" ? "manual-update-required" : "available",
+      installKind: "unknown",
     },
   };
 }
@@ -399,6 +407,474 @@ const drainAtoms = Effect.promise(async () => {
   for (let turn = 0; turn < 50; turn += 1) {
     await new Promise<void>((resolve) => setImmediate(resolve));
   }
+});
+
+const UPDATE_ENVIRONMENT_IDS = ["env-a", "env-b", "env-c"].map((id) => EnvironmentId.make(id));
+const UPDATE_ENVIRONMENT_ID = UPDATE_ENVIRONMENT_IDS[0]!;
+const UPDATE_TARGET = { environmentId: UPDATE_ENVIRONMENT_ID, input: {} };
+const UP_TO_DATE_SNAPSHOT: RemoteUpdateSnapshot = { ...CHECKED_SNAPSHOT, state: "up-to-date" };
+const UPDATE_CONNECTED_STATE: SupervisorConnectionState = {
+  desired: true,
+  network: "online",
+  phase: "connected",
+  stage: null,
+  attempt: 0,
+  generation: 1,
+  lastFailure: null,
+  retryAt: null,
+};
+
+const makeUpdateHarness = Effect.fn("TestRemoteUpdates.makeUpdateHarness")(function* (
+  options: {
+    readonly statusSequence?: ReadonlyArray<RemoteUpdateSnapshot["state"]>;
+    readonly deferFollower?: boolean;
+  } = {},
+) {
+  const clock = yield* TestClock.make({ warningDelay: "1 hour" });
+  const atomRegistry = AtomRegistry.make();
+  yield* Effect.addFinalizer(() => Effect.sync(() => atomRegistry.dispose()));
+  const installs = new Map<EnvironmentId, number>();
+  const statusReads = new Map<EnvironmentId, number>();
+  const activeWorkReads = new Map<EnvironmentId, number>();
+  const activeWorkCounts = { runningTurns: 2, liveTerminals: 3, queuedMessages: 1 };
+  const configRequests = new Map<EnvironmentId, number>();
+  const retries = new Map<EnvironmentId, number>();
+  const followers = { active: 0 };
+  const gates = new Map<EnvironmentId, Deferred.Deferred<void>>();
+  const installations = new Map<
+    EnvironmentId,
+    SubscriptionRef.SubscriptionRef<EnvironmentSupervisor["Service"]>
+  >();
+  const followerReady = yield* Deferred.make<void>();
+  if (!options.deferFollower) yield* Deferred.succeed(followerReady, undefined);
+
+  const makeSupervisor = Effect.fn("TestRemoteUpdates.makeUpdateSupervisor")(function* (
+    environmentId: EnvironmentId,
+    bootId: string,
+    serverVersion: string,
+  ) {
+    const initialConfig = Effect.succeed({
+      environment: { bootId, serverVersion, capabilities: { remoteUpdateProgress: true } },
+    });
+    const session = {
+      initialConfig,
+      client: {
+        [WS_METHODS.serverGetConfig]: () =>
+          Effect.sync(() => {
+            configRequests.set(environmentId, (configRequests.get(environmentId) ?? 0) + 1);
+          }).pipe(Effect.andThen(initialConfig)),
+        [WS_METHODS.updaterInstall]: () =>
+          Effect.sync(() => {
+            installs.set(environmentId, (installs.get(environmentId) ?? 0) + 1);
+          }).pipe(
+            Effect.andThen(Deferred.await(gates.get(environmentId)!)),
+            Effect.as(
+              options.statusSequence === undefined
+                ? UP_TO_DATE_SNAPSHOT
+                : { ...CHECKED_SNAPSHOT, state: "downloading" as const, downloadPercent: 25 },
+            ),
+          ),
+        [WS_METHODS.updaterStatus]: () =>
+          Effect.sync((): RemoteUpdateSnapshot => {
+            const read = statusReads.get(environmentId) ?? 0;
+            statusReads.set(environmentId, read + 1);
+            const sequence = options.statusSequence ?? ["up-to-date"];
+            return { ...CHECKED_SNAPSHOT, state: sequence[Math.min(read, sequence.length - 1)]! };
+          }),
+        [WS_METHODS.updaterActiveWork]: () =>
+          Effect.sync(() => {
+            activeWorkReads.set(environmentId, (activeWorkReads.get(environmentId) ?? 0) + 1);
+            return { ...activeWorkCounts };
+          }),
+      },
+    } as unknown as RpcSession;
+    return EnvironmentSupervisor.of({
+      target: new RelayConnectionTarget({ environmentId, label: `Environment ${environmentId}` }),
+      session: yield* SubscriptionRef.make(Option.some(session)),
+      state: yield* SubscriptionRef.make(UPDATE_CONNECTED_STATE),
+    } as EnvironmentSupervisor["Service"]);
+  });
+  for (const environmentId of UPDATE_ENVIRONMENT_IDS) {
+    gates.set(environmentId, yield* Deferred.make<void>());
+    installations.set(
+      environmentId,
+      yield* SubscriptionRef.make(yield* makeSupervisor(environmentId, "boot-1", "0.4.2")),
+    );
+  }
+
+  const run: EnvironmentRegistry["Service"]["run"] = (environmentId, effect) =>
+    SubscriptionRef.get(installations.get(environmentId)!).pipe(
+      Effect.flatMap((supervisor) =>
+        Effect.provideService(effect, EnvironmentSupervisor, supervisor),
+      ),
+    );
+  const followStream: EnvironmentRegistry["Service"]["followStream"] = (environmentId, stream) =>
+    Stream.unwrap(
+      Effect.acquireRelease(
+        Effect.sync(() => {
+          followers.active += 1;
+        }),
+        () =>
+          Effect.sync(() => {
+            followers.active -= 1;
+          }),
+      ).pipe(
+        Effect.andThen(Deferred.await(followerReady)),
+        Effect.as(
+          SubscriptionRef.changes(installations.get(environmentId)!).pipe(
+            Stream.switchMap((supervisor) =>
+              Stream.provideService(stream, EnvironmentSupervisor, supervisor),
+            ),
+          ),
+        ),
+      ),
+    );
+  const environment: Pick<
+    EnvironmentRegistry["Service"],
+    "run" | "state" | "stateChanges" | "followStream" | "retryNow"
+  > = {
+    run,
+    state: (environmentId) =>
+      run(
+        environmentId,
+        EnvironmentSupervisor.pipe(
+          Effect.flatMap((supervisor) => SubscriptionRef.get(supervisor.state)),
+        ),
+      ),
+    stateChanges: (environmentId) =>
+      followStream(
+        environmentId,
+        Stream.unwrap(
+          EnvironmentSupervisor.pipe(
+            Effect.map((supervisor) => SubscriptionRef.changes(supervisor.state)),
+          ),
+        ),
+      ),
+    followStream,
+    retryNow: (environmentId) =>
+      Effect.sync(() => {
+        retries.set(environmentId, (retries.get(environmentId) ?? 0) + 1);
+      }),
+  };
+  const runtime = Atom.runtime(
+    Layer.merge(
+      Layer.succeed(EnvironmentRegistry, environment as EnvironmentRegistry["Service"]),
+      Layer.succeed(Clock.Clock, clock),
+    ),
+  );
+  return {
+    atomRegistry,
+    atoms: createRemoteUpdateEnvironmentAtoms(runtime),
+    clock,
+    installs,
+    statusReads,
+    activeWorkReads,
+    activeWorkCounts,
+    configRequests,
+    retries,
+    followers,
+    release: (environmentId: EnvironmentId) =>
+      Deferred.succeed(gates.get(environmentId)!, undefined),
+    setState: (state: SupervisorConnectionState) =>
+      run(
+        UPDATE_ENVIRONMENT_ID,
+        EnvironmentSupervisor.pipe(
+          Effect.flatMap((supervisor) => SubscriptionRef.set(supervisor.state, state)),
+        ),
+      ),
+    replaceSupervisor: Effect.gen(function* () {
+      const replacement = yield* makeSupervisor(UPDATE_ENVIRONMENT_ID, "boot-2", "0.5.0");
+      yield* SubscriptionRef.set(installations.get(UPDATE_ENVIRONMENT_ID)!, replacement);
+      yield* drainAtoms;
+    }),
+  };
+});
+
+describe("remote update active work", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it.effect("reads the active work when a view asks for it", () =>
+    Effect.gen(function* () {
+      const h = yield* makeUpdateHarness();
+      const atom = h.atoms.activeWork(UPDATE_TARGET);
+      yield* drainAtoms;
+      expect(h.activeWorkReads.get(UPDATE_ENVIRONMENT_ID)).toBeUndefined();
+
+      const unmount = h.atomRegistry.mount(atom);
+      yield* drainAtoms;
+      const result = h.atomRegistry.get(atom);
+      expect(AsyncResult.isSuccess(result) && result.value).toEqual({
+        runningTurns: 2,
+        liveTerminals: 3,
+        queuedMessages: 1,
+      });
+      expect(h.activeWorkReads.get(UPDATE_ENVIRONMENT_ID)).toBe(1);
+      unmount();
+    }),
+  );
+
+  it.effect("re-reads active work on every open", () =>
+    Effect.gen(function* () {
+      const h = yield* makeUpdateHarness();
+      const atom = h.atoms.activeWork(UPDATE_TARGET);
+      const unmount = h.atomRegistry.mount(atom);
+      yield* drainAtoms;
+      const first = h.atomRegistry.get(atom);
+      expect(AsyncResult.isSuccess(first) && first.value).toEqual({
+        runningTurns: 2,
+        liveTerminals: 3,
+        queuedMessages: 1,
+      });
+      expect(h.activeWorkReads.get(UPDATE_ENVIRONMENT_ID)).toBe(1);
+
+      unmount();
+      yield* drainAtoms;
+      h.activeWorkCounts.liveTerminals = 4;
+
+      const unmountAgain = h.atomRegistry.mount(atom);
+      const reopened = h.atomRegistry.get(atom);
+      expect(AsyncResult.isInitial(reopened) || reopened.waiting).toBe(true);
+
+      yield* drainAtoms;
+      const second = h.atomRegistry.get(atom);
+      expect(AsyncResult.isSuccess(second) && second.value).toEqual({
+        runningTurns: 2,
+        liveTerminals: 4,
+        queuedMessages: 1,
+      });
+      expect(h.activeWorkReads.get(UPDATE_ENVIRONMENT_ID)).toBe(2);
+      unmountAgain();
+    }),
+  );
+
+  it.effect("never polls active work", () =>
+    Effect.gen(function* () {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const h = yield* makeUpdateHarness();
+      const unmount = h.atomRegistry.mount(h.atoms.activeWork(UPDATE_TARGET));
+      yield* drainAtoms;
+      expect(h.activeWorkReads.get(UPDATE_ENVIRONMENT_ID)).toBe(1);
+
+      yield* h.clock.adjust(60_000);
+      yield* advance(60_000);
+      expect(h.activeWorkReads.get(UPDATE_ENVIRONMENT_ID)).toBe(1);
+      unmount();
+    }),
+  );
+});
+
+describe("remote update runs", () => {
+  it.effect("runs at most two at once and shows a third as queued", () =>
+    Effect.gen(function* () {
+      const h = yield* makeUpdateHarness();
+      const [a, b, c] = UPDATE_ENVIRONMENT_IDS as [EnvironmentId, EnvironmentId, EnvironmentId];
+      for (const environmentId of [a, b, c]) {
+        void h.atoms.update.run(h.atomRegistry, { environmentId, input: {} });
+      }
+      yield* drainAtoms;
+      expect(h.installs.get(a)).toBe(1);
+      expect(h.installs.get(b)).toBe(1);
+      expect(h.installs.get(c)).toBeUndefined();
+      expect(h.atomRegistry.get(h.atoms.run(c))).toEqual({ phase: "queued" });
+      expect(h.followers.active).toBe(2);
+
+      yield* h.release(a);
+      yield* drainAtoms;
+      expect(h.atomRegistry.get(h.atoms.run(a))).toEqual({ phase: "up-to-date" });
+      expect(h.installs.get(c)).toBe(1);
+      expect(h.followers.active).toBe(2);
+      yield* h.release(b);
+      yield* h.release(c);
+      yield* drainAtoms;
+      expect(h.followers.active).toBe(0);
+    }),
+  );
+
+  it.effect("joins a second request for the same environment instead of installing twice", () =>
+    Effect.gen(function* () {
+      const h = yield* makeUpdateHarness();
+      const first = h.atoms.update.run(h.atomRegistry, UPDATE_TARGET);
+      const second = h.atoms.update.run(h.atomRegistry, UPDATE_TARGET);
+      yield* drainAtoms;
+      expect(h.installs.get(UPDATE_ENVIRONMENT_ID)).toBe(1);
+      yield* h.release(UPDATE_ENVIRONMENT_ID);
+      const result = yield* Effect.promise(() => first);
+      expect(result).toMatchObject({ _tag: "Success", value: { phase: "up-to-date" } });
+      expect(yield* Effect.promise(() => second)).toEqual(result);
+    }),
+  );
+
+  it.effect("keeps running after the view that started it unmounts", () =>
+    Effect.gen(function* () {
+      const h = yield* makeUpdateHarness();
+      const unmount = h.atomRegistry.mount(h.atoms.run(UPDATE_ENVIRONMENT_ID));
+      void h.atoms.update.run(h.atomRegistry, UPDATE_TARGET);
+      yield* drainAtoms;
+      unmount();
+      yield* h.release(UPDATE_ENVIRONMENT_ID);
+      yield* drainAtoms;
+      expect(h.atomRegistry.get(h.atoms.run(UPDATE_ENVIRONMENT_ID))).toEqual({
+        phase: "up-to-date",
+      });
+      expect(h.followers.active).toBe(0);
+    }),
+  );
+
+  it.effect("never shows Restarting before the host actually disconnects", () =>
+    Effect.gen(function* () {
+      const h = yield* makeUpdateHarness({
+        statusSequence: ["downloading", "downloading", "up-to-date"],
+        deferFollower: true,
+      });
+      const seen: Array<string> = [];
+      const unmount = h.atomRegistry.subscribe(h.atoms.run(UPDATE_ENVIRONMENT_ID), (state) => {
+        if (state !== null) seen.push(state.phase);
+      });
+      yield* Effect.addFinalizer(() => Effect.sync(unmount));
+      void h.atoms.update.run(h.atomRegistry, UPDATE_TARGET);
+      yield* h.release(UPDATE_ENVIRONMENT_ID);
+      yield* drainAtoms;
+      expect(seen.at(-1)).toBe("downloading");
+      for (let second = 0; second < 4; second += 1) {
+        yield* h.clock.adjust("1 second");
+        yield* drainAtoms;
+      }
+      expect(seen).not.toContain("restarting");
+      expect(seen.at(-1)).toBe("up-to-date");
+    }),
+  );
+
+  it.effect("verifies a rebuilt supervisor even when its generation restarts at one", () =>
+    Effect.gen(function* () {
+      const h = yield* makeUpdateHarness({ statusSequence: ["downloading"] });
+      void h.atoms.update.run(h.atomRegistry, UPDATE_TARGET);
+      yield* h.release(UPDATE_ENVIRONMENT_ID);
+      yield* drainAtoms;
+      yield* h.setState({ ...UPDATE_CONNECTED_STATE, phase: "backoff" });
+      yield* drainAtoms;
+      yield* h.clock.adjust("1 second");
+      yield* drainAtoms;
+      expect(h.atomRegistry.get(h.atoms.run(UPDATE_ENVIRONMENT_ID))).toMatchObject({
+        phase: "restarting",
+      });
+
+      yield* h.replaceSupervisor;
+      yield* h.clock.adjust("1 second");
+      yield* drainAtoms;
+      expect(h.atomRegistry.get(h.atoms.run(UPDATE_ENVIRONMENT_ID))).toEqual({
+        phase: "succeeded",
+        version: "0.5.0",
+      });
+      expect(h.installs.get(UPDATE_ENVIRONMENT_ID)).toBe(1);
+      expect(h.followers.active).toBe(0);
+    }),
+  );
+
+  it.effect("ends a blocked run with the supervisor's failure message", () =>
+    Effect.gen(function* () {
+      const h = yield* makeUpdateHarness({ statusSequence: ["downloading"] });
+      void h.atoms.update.run(h.atomRegistry, UPDATE_TARGET);
+      yield* h.release(UPDATE_ENVIRONMENT_ID);
+      yield* drainAtoms;
+      yield* h.setState({
+        ...UPDATE_CONNECTED_STATE,
+        phase: "blocked",
+        lastFailure: new ConnectionBlockedError({ reason: "authentication", detail: "X" }),
+      });
+      yield* drainAtoms;
+      yield* h.clock.adjust("1 second");
+      yield* drainAtoms;
+      expect(h.atomRegistry.get(h.atoms.run(UPDATE_ENVIRONMENT_ID))).toEqual({
+        phase: "failed",
+        failure: { kind: "blocked", message: "X" },
+      });
+      expect(h.retries.get(UPDATE_ENVIRONMENT_ID)).toBeUndefined();
+      expect(h.followers.active).toBe(0);
+    }),
+  );
+
+  it.effect("reads identity from the session config without requesting server.getConfig", () =>
+    Effect.gen(function* () {
+      const h = yield* makeUpdateHarness({ statusSequence: ["downloading"] });
+      void h.atoms.update.run(h.atomRegistry, UPDATE_TARGET);
+      yield* h.release(UPDATE_ENVIRONMENT_ID);
+      yield* drainAtoms;
+      yield* h.replaceSupervisor;
+      yield* h.clock.adjust("1 second");
+      yield* drainAtoms;
+      expect(h.atomRegistry.get(h.atoms.run(UPDATE_ENVIRONMENT_ID))).toEqual({
+        phase: "succeeded",
+        version: "0.5.0",
+      });
+      expect(h.configRequests.size).toBe(0);
+    }),
+  );
+
+  it.effect("dismisses terminal runs and leaves active runs alone", () =>
+    Effect.gen(function* () {
+      const h = yield* makeUpdateHarness();
+      expect(h.atomRegistry.get(h.atoms.run(UPDATE_ENVIRONMENT_ID))).toBeNull();
+      void h.atoms.update.run(h.atomRegistry, UPDATE_TARGET);
+      yield* drainAtoms;
+      h.atoms.dismiss(h.atomRegistry, UPDATE_ENVIRONMENT_ID);
+      expect(h.atomRegistry.get(h.atoms.run(UPDATE_ENVIRONMENT_ID))).toEqual({ phase: "starting" });
+      yield* h.release(UPDATE_ENVIRONMENT_ID);
+      yield* drainAtoms;
+      expect(h.atomRegistry.get(h.atoms.run(UPDATE_ENVIRONMENT_ID))).toEqual({
+        phase: "up-to-date",
+      });
+      h.atoms.dismiss(h.atomRegistry, UPDATE_ENVIRONMENT_ID);
+      expect(h.atomRegistry.get(h.atoms.run(UPDATE_ENVIRONMENT_ID))).toBeNull();
+    }),
+  );
+
+  it.effect("retries only in backoff and no more often than every five seconds", () =>
+    Effect.gen(function* () {
+      const h = yield* makeUpdateHarness({ statusSequence: ["downloading"] });
+      void h.atoms.update.run(h.atomRegistry, UPDATE_TARGET);
+      yield* h.release(UPDATE_ENVIRONMENT_ID);
+      yield* drainAtoms;
+      yield* h.setState({ ...UPDATE_CONNECTED_STATE, phase: "backoff" });
+      yield* drainAtoms;
+      yield* h.clock.adjust("1 second");
+      yield* drainAtoms;
+      expect(h.retries.get(UPDATE_ENVIRONMENT_ID)).toBe(1);
+      yield* h.clock.adjust("4 seconds");
+      yield* drainAtoms;
+      expect(h.retries.get(UPDATE_ENVIRONMENT_ID)).toBe(1);
+      yield* h.clock.adjust("1 second");
+      yield* drainAtoms;
+      expect(h.retries.get(UPDATE_ENVIRONMENT_ID)).toBe(2);
+      yield* h.setState({ ...UPDATE_CONNECTED_STATE, phase: "connecting", stage: "opening" });
+      yield* drainAtoms;
+      yield* h.clock.adjust("10 seconds");
+      yield* drainAtoms;
+      expect(h.retries.get(UPDATE_ENVIRONMENT_ID)).toBe(2);
+    }),
+  );
+
+  it.effect("does not reconnect a user-disconnected host and ends as not back", () =>
+    Effect.gen(function* () {
+      const h = yield* makeUpdateHarness({ statusSequence: ["downloading"] });
+      void h.atoms.update.run(h.atomRegistry, UPDATE_TARGET);
+      yield* h.release(UPDATE_ENVIRONMENT_ID);
+      yield* drainAtoms;
+      yield* h.setState({ ...UPDATE_CONNECTED_STATE, phase: "available", desired: false });
+      yield* drainAtoms;
+      yield* h.clock.adjust("1 second");
+      yield* drainAtoms;
+      yield* h.clock.adjust("3 minutes");
+      yield* drainAtoms;
+      expect(h.atomRegistry.get(h.atoms.run(UPDATE_ENVIRONMENT_ID))).toEqual({
+        phase: "failed",
+        failure: { kind: "not-back" },
+      });
+      expect(h.retries.get(UPDATE_ENVIRONMENT_ID)).toBeUndefined();
+      expect(h.followers.active).toBe(0);
+    }),
+  );
 });
 
 const advance = (milliseconds: number) =>

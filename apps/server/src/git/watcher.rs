@@ -33,11 +33,99 @@ const READINESS_DIRECTORY_PREFIX: &str = "bibcode-git-watch-ready";
 static NEXT_READINESS_DIRECTORY_ID: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(test)]
-static NATIVE_WATCHER_TEST_PERMIT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static NATIVE_WATCHER_TEST_PERMIT: NativeWatcherTestLock = NativeWatcherTestLock::new();
 
 #[cfg(test)]
-pub(crate) async fn acquire_native_watcher_test_permit() -> tokio::sync::MutexGuard<'static, ()> {
-    NATIVE_WATCHER_TEST_PERMIT.lock().await
+pub(crate) async fn acquire_native_watcher_test_permit() -> NativeWatcherTestPermit<'static> {
+    NATIVE_WATCHER_TEST_PERMIT
+        .acquire(Duration::from_secs(300))
+        .await
+}
+
+#[cfg(test)]
+struct NativeWatcherTestLock {
+    permit: tokio::sync::Mutex<()>,
+    holder: Mutex<Option<(String, std::time::Instant)>>,
+}
+
+#[cfg(test)]
+impl NativeWatcherTestLock {
+    const fn new() -> Self {
+        Self {
+            permit: tokio::sync::Mutex::const_new(()),
+            holder: Mutex::new(None),
+        }
+    }
+
+    async fn acquire(&self, timeout: Duration) -> NativeWatcherTestPermit<'_> {
+        let test_name = std::thread::current()
+            .name()
+            .unwrap_or("unnamed test thread")
+            .to_owned();
+        // Tokio time may be paused by the caller. Short real sleeps also ensure
+        // dropping this wait cannot leave a 300-second blocking task at shutdown.
+        let deadline = async {
+            let started = std::time::Instant::now();
+            while started.elapsed() < timeout {
+                let remaining = timeout.saturating_sub(started.elapsed());
+                tokio::task::spawn_blocking(move || {
+                    std::thread::sleep(remaining.min(Duration::from_millis(25)));
+                })
+                .await
+                .expect("native watcher permit wall-clock wait joins");
+            }
+        };
+        let guard = tokio::select! {
+            biased;
+            guard = self.permit.lock() => guard,
+            () = deadline => {
+                let holder = self.holder.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let detail = holder.as_ref().map_or_else(
+                    || "holder released during timeout reporting".to_owned(),
+                    |(name, started)| format!("held by {name} for {:?}", started.elapsed()),
+                );
+                drop(holder);
+                panic!("native watcher test permit timed out after {timeout:?} for {test_name}; {detail}");
+            }
+        };
+        *self
+            .holder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((test_name, std::time::Instant::now()));
+        NativeWatcherTestPermit {
+            lock: self,
+            _guard: guard,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct NativeWatcherTestPermit<'a> {
+    lock: &'a NativeWatcherTestLock,
+    _guard: tokio::sync::MutexGuard<'a, ()>,
+}
+
+#[cfg(test)]
+impl Drop for NativeWatcherTestPermit<'_> {
+    fn drop(&mut self) {
+        // Clear the diagnostic while still holding the async permit.
+        self.lock
+            .holder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+}
+
+#[cfg(test)]
+pub(super) async fn test_timeout<T>(
+    context: &str,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    tokio::time::timeout(Duration::from_secs(10), future)
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {context}"))
 }
 
 #[derive(Clone, Debug)]
@@ -215,13 +303,12 @@ impl GitWatchSetupGate {
     fn block(&self) {
         self.entered.store(true, Ordering::Release);
         self.entered_notify.notify_waiters();
-        let mut released = self.released.lock().expect("setup-gate release lock");
-        while !*released {
-            released = self
-                .release_notify
-                .wait(released)
-                .expect("setup-gate release wait");
-        }
+        let released = self.released.lock().expect("setup-gate release lock");
+        let (released, _) = self
+            .release_notify
+            .wait_timeout_while(released, Duration::from_secs(10), |released| !*released)
+            .expect("setup-gate release wait");
+        assert!(*released, "timed out waiting for setup-gate release");
     }
 
     pub(super) async fn wait_until_entered(&self) {
@@ -335,6 +422,27 @@ impl GitWatchService {
             .expect("new watcher service is uniquely owned")
             .backend_factory = backend_factory;
         service
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_exhausted_backend_for_test() -> Self {
+        struct ExhaustedBackendFactory;
+
+        impl GitWatcherBackendFactory for ExhaustedBackendFactory {
+            fn create(
+                &self,
+                _callback: BackendCallback,
+                _config: Config,
+            ) -> notify::Result<Box<dyn GitWatcherBackend>> {
+                #[cfg(unix)]
+                let error = io::Error::from_raw_os_error(libc::EMFILE);
+                #[cfg(not(unix))]
+                let error = io::Error::other("too many open files (EMFILE)");
+                Err(notify::Error::io(error))
+            }
+        }
+
+        Self::with_backend_factory(Arc::new(ExhaustedBackendFactory))
     }
 
     #[cfg(test)]
@@ -1421,6 +1529,63 @@ mod tests {
     use super::*;
     use crate::git::HostPathPlatform;
 
+    #[tokio::test(start_paused = true)]
+    async fn native_watcher_permit_timeout_uses_wall_clock_and_names_the_holder() {
+        let lock = Arc::new(NativeWatcherTestLock::new());
+        let holder_name = std::thread::current()
+            .name()
+            .expect("named test thread")
+            .to_owned();
+        let held = lock.acquire(Duration::from_secs(1)).await;
+        let started = std::time::Instant::now();
+        let timeout = Duration::from_millis(250);
+        let waiting = {
+            let lock = Arc::clone(&lock);
+            tokio::spawn(async move {
+                let _permit = lock.acquire(timeout).await;
+            })
+        };
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(301)).await;
+        assert!(
+            !waiting.is_finished(),
+            "paused Tokio time cannot expire a permit wait"
+        );
+
+        let error = waiting
+            .await
+            .expect_err("a held permit has a real deadline");
+        assert!(
+            started.elapsed() >= timeout,
+            "deadline uses elapsed wall-clock time"
+        );
+        let message = *error
+            .into_panic()
+            .downcast::<String>()
+            .expect("permit timeout diagnostic");
+        assert!(
+            message.contains(&format!("held by {holder_name} for ")),
+            "{message}"
+        );
+        assert!(message.contains("timed out after"), "{message}");
+
+        drop(held);
+        let _next = lock.acquire(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_watcher_permit_waiter_acquires_after_release_with_paused_time() {
+        let lock = NativeWatcherTestLock::new();
+        let held = lock.acquire(Duration::from_secs(300)).await;
+        let waiting = lock.acquire(Duration::from_secs(300));
+        tokio::pin!(waiting);
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+        tokio::time::advance(Duration::from_secs(301)).await;
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+        drop(held);
+        assert!(futures_util::poll!(&mut waiting).is_ready());
+    }
+
     #[test]
     fn ref_metadata_is_distinct_from_index_and_config() {
         let roots =
@@ -1888,6 +2053,7 @@ mod tests {
         created: AtomicUsize,
         dropped: AtomicUsize,
         fail_watch_at: AtomicUsize,
+        max_files_watch: AtomicBool,
         suppress_readiness_callback: AtomicBool,
         readiness_probe_writes: AtomicUsize,
         readiness_probe_written: Notify,
@@ -1915,13 +2081,12 @@ mod tests {
         fn block(&self) {
             self.entered.store(true, Ordering::Release);
             self.entered_notify.notify_waiters();
-            let mut released = self.released.lock().expect("barrier release lock");
-            while !*released {
-                released = self
-                    .release_notify
-                    .wait(released)
-                    .expect("barrier release wait");
-            }
+            let released = self.released.lock().expect("barrier release lock");
+            let (released, _) = self
+                .release_notify
+                .wait_timeout_while(released, Duration::from_secs(10), |released| !*released)
+                .expect("barrier release wait");
+            assert!(*released, "timed out waiting for barrier release");
         }
 
         async fn wait_until_entered(&self) {
@@ -2098,6 +2263,9 @@ mod tests {
                 barrier.block();
             }
             if self.state.fail_watch_at.load(Ordering::Relaxed) == self.watch_calls {
+                if self.state.max_files_watch.load(Ordering::Relaxed) {
+                    return Err(notify::Error::new(notify::ErrorKind::MaxFilesWatch));
+                }
                 return Err(notify::Error::generic("injected watch failure"));
             }
             self.state
@@ -2365,7 +2533,7 @@ mod tests {
         rename_source: PathBuf,
         readiness: Arc<NativeReadinessState>,
         _root: tempfile::TempDir,
-        _native_test_guard: tokio::sync::MutexGuard<'static, ()>,
+        _native_test_guard: NativeWatcherTestPermit<'static>,
     }
 
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
@@ -2395,10 +2563,13 @@ mod tests {
             let service = GitWatchService::with_backend_factory(Arc::new(
                 NativeReadinessBackendFactory::new(Arc::clone(&readiness)),
             ));
-            let mut subscription = service
-                .subscribe(request(&worktree, &git_dir, &common_dir))
-                .await
-                .expect("native watch subscription");
+            let mut subscription = test_timeout(
+                "native watch subscription setup",
+                service.subscribe(request(&worktree, &git_dir, &common_dir)),
+            )
+            .await
+            .expect("native watch subscription");
+            assert_native_watching_available(&subscription);
             let registrations = readiness.registrations();
             for root in [&worktree, &git_dir, &common_dir, &common_dir.join("refs")] {
                 let canonical = std::fs::canonicalize(root).expect("canonical watched directory");
@@ -2462,6 +2633,15 @@ mod tests {
                 .filter(|registration| registration.readiness.observed.load(Ordering::Acquire))
                 .count()
         }
+    }
+
+    #[cfg(any(unix, target_os = "windows"))]
+    fn assert_native_watching_available(subscription: &GitWatchSubscription) {
+        assert_eq!(
+            subscription.health(),
+            GitWatcherHealth::Healthy,
+            "native watching is unavailable: subscription requires fallback; native watcher creation, registration, or readiness failed (check inotify instance/watch limits on Linux)"
+        );
     }
 
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
@@ -3300,6 +3480,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exhausted_backend_creation_returns_fallback_promptly() {
+        let root = tempfile::tempdir().expect("watch fixture");
+        let git_dir = root.path().join(".git");
+        fs::create_dir(&git_dir).expect("Git directory");
+        let service = GitWatchService::with_exhausted_backend_for_test();
+
+        let mut subscription = tokio::time::timeout(
+            Duration::from_secs(2),
+            service.subscribe(request(root.path(), &git_dir, &git_dir)),
+        )
+        .await
+        .expect("EMFILE must return before the native readiness deadline")
+        .expect("EMFILE must preserve the subscription");
+
+        assert_eq!(subscription.health(), GitWatcherHealth::FallbackRequired);
+        expect_fake_event(
+            &mut subscription,
+            GitWatchEvent::Unavailable,
+            "EMFILE fallback",
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(2), service.shutdown())
+            .await
+            .expect("EMFILE fallback shuts down promptly");
+    }
+
+    #[tokio::test]
+    async fn exhausted_watch_registration_returns_fallback_promptly() {
+        let root = tempfile::tempdir().expect("watch fixture");
+        let worktree = root.path().join("worktree");
+        let git_dir = root.path().join("git-dir");
+        for path in [&worktree, &git_dir] {
+            fs::create_dir(path).expect("watch root");
+        }
+        let backend = FakeWatcherBackendFactory::failing_on_watch(2);
+        backend.state.max_files_watch.store(true, Ordering::Relaxed);
+        let service = GitWatchService::with_backend_factory(Arc::new(backend.clone()));
+
+        let mut subscription = tokio::time::timeout(
+            Duration::from_secs(2),
+            service.subscribe(request(&worktree, &git_dir, &git_dir)),
+        )
+        .await
+        .expect("MaxFilesWatch must return before the native readiness deadline")
+        .expect("MaxFilesWatch must preserve the subscription");
+
+        assert_eq!(subscription.health(), GitWatcherHealth::FallbackRequired);
+        expect_fake_event(
+            &mut subscription,
+            GitWatchEvent::Unavailable,
+            "watch-limit fallback",
+        )
+        .await;
+        assert_eq!(
+            backend
+                .state
+                .unwatches
+                .lock()
+                .expect("unwatches lock")
+                .len(),
+            1
+        );
+        assert_eq!(
+            backend.dropped(),
+            1,
+            "partial registration releases the backend"
+        );
+        tokio::time::timeout(Duration::from_secs(2), service.shutdown())
+            .await
+            .expect("watch-limit fallback shuts down promptly");
+    }
+
+    #[tokio::test]
     async fn backend_creation_failure_publishes_unavailable() {
         struct UnavailableBackendFactory;
 
@@ -3562,10 +3815,13 @@ mod tests {
         let service = GitWatchService::with_backend_factory(Arc::new(
             NativeReadinessBackendFactory::new(Arc::clone(&readiness)),
         ));
-        let mut subscription = service
-            .subscribe(request(&worktree, &git_dir, &git_dir))
-            .await
-            .expect("nested native watch subscription");
+        let mut subscription = test_timeout(
+            "nested native watch subscription setup",
+            service.subscribe(request(&worktree, &git_dir, &git_dir)),
+        )
+        .await
+        .expect("nested native watch subscription");
+        assert_native_watching_available(&subscription);
         let registrations = readiness.registrations();
         assert_eq!(
             registrations.len(),
@@ -3700,10 +3956,13 @@ mod tests {
         }
         symlink(&outside, worktree.join("outside-link")).expect("outside symlink");
         let service = GitWatchService::new();
-        let mut subscription = service
-            .subscribe(request(&worktree, &git_dir, &common_dir))
-            .await
-            .expect("native watch subscription");
+        let mut subscription = test_timeout(
+            "native symlink watch subscription setup",
+            service.subscribe(request(&worktree, &git_dir, &common_dir)),
+        )
+        .await
+        .expect("native watch subscription");
+        assert_native_watching_available(&subscription);
 
         std::fs::write(outside.join("not-in-worktree.txt"), b"outside")
             .expect("outside target write");

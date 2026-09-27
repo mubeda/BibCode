@@ -6,22 +6,27 @@
       "_tag": "localUpdated",
       "local": {
         "isRepo": true,
+        "repositoryUnavailableReason": "unreadable",
         "hasPrimaryRemote": false,
         "isDefaultRef": true,
-        "refName": "4*",
+        "refName": null,
         "hasWorkingTreeChanges": false,
         "workingTree": {
           "files": [
             {
-              "path": "lb$i\"$6PB",
+              "path": "iz %ulen",
+              "insertions": 10,
+              "deletions": 43343597,
+              "status": "modified"
+            },
+            {
+              "path": "k",
               "insertions": 20,
-              "deletions": 1775097976,
-              "status": "modified",
-              "area": "staged"
+              "deletions": 8
             }
           ],
-          "insertions": 5,
-          "deletions": 10
+          "insertions": 2147483621,
+          "deletions": 21
         }
       }
     }

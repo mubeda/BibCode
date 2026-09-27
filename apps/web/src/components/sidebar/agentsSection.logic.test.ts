@@ -12,6 +12,7 @@ import {
   resolveAgentGroup,
   resolveAgentPreviewLine,
   resolveAgentProvider,
+  resolveConversationPreviewLine,
 } from "./agentsSection.logic";
 
 const ENVIRONMENT_A = EnvironmentId.make("environment-a");
@@ -126,6 +127,18 @@ describe("resolveAgentPreviewLine", () => {
     ).toBeNull();
     expect(resolveAgentPreviewLine(completedPill, null)).toBeNull();
     expect(resolveAgentPreviewLine(completedPill, undefined)).toBeNull();
+  });
+});
+
+describe("resolveConversationPreviewLine", () => {
+  const preview = { prompt: "p", tool: "Bash: ls", assistantMessage: "a" };
+
+  it("shows the tool only while working, then the reply, then the prompt", () => {
+    expect(resolveConversationPreviewLine(true, preview)).toBe("Bash: ls");
+    expect(resolveConversationPreviewLine(false, preview)).toBe("a");
+    expect(resolveConversationPreviewLine(true, { ...preview, tool: null })).toBe("a");
+    expect(resolveConversationPreviewLine(false, { ...preview, assistantMessage: null })).toBe("p");
+    expect(resolveConversationPreviewLine(false, null)).toBeNull();
   });
 });
 

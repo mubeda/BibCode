@@ -11,6 +11,8 @@ use tokio::{
 };
 use uuid::Uuid;
 
+use crate::provider::{OptionRefusal, RefusedOption, default_model_unavailable_refusal};
+
 use super::{
     acp::{
         AcpJsonRpcConnection, AcpProtocolError, IncomingEvent, JsonRpcErrorShape, acp_error_class,
@@ -107,8 +109,16 @@ pub enum CursorRuntimeError {
     MissingProviderSessionId,
     #[error("Unknown pending request id {request_id}")]
     PendingRequestNotFound { request_id: String },
-    #[error("Cursor option update is unsupported: {detail}")]
-    UnsupportedOption { detail: String },
+    /// The session refuses a turn's options, checked against what it advertises: an option or
+    /// value it does not advertise, a configuration BiBCode can't work with, or a switch to the
+    /// default model when the session advertises none. The same request is refused again on
+    /// every retry.
+    #[error("Cursor option update is unsupported: {0}")]
+    UnsupportedOption(RefusedOption),
+    /// A config update failed and every update applied before it was rolled back. The failure may
+    /// be transient, so a retry may succeed.
+    #[error("Cursor option update failed and was rolled back: {application}")]
+    ConfigUpdateRolledBack { application: String },
     #[error("Cursor config update acknowledgement omitted configOptions")]
     MalformedConfigAcknowledgement,
     #[error("Cursor config update failed: {application}; compensation failed: {compensation}")]
@@ -118,6 +128,15 @@ pub enum CursorRuntimeError {
     },
     #[error("Cursor session configuration is uncertain: {detail}")]
     ConfigurationUncertain { detail: String },
+}
+
+impl OptionRefusal for CursorRuntimeError {
+    fn refused_option(&self) -> Option<&RefusedOption> {
+        match self {
+            Self::UnsupportedOption(refused) => Some(refused),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -266,9 +285,11 @@ impl CursorSessionRuntime {
                 .lock()
                 .await
                 .clone()
-                .ok_or_else(|| CursorRuntimeError::UnsupportedOption {
-                    detail: "Cursor session did not advertise a reversible default model selection"
-                        .to_owned(),
+                .ok_or_else(|| {
+                    CursorRuntimeError::UnsupportedOption(RefusedOption::new(
+                        "Cursor session did not advertise a reversible default model selection",
+                        default_model_unavailable_refusal(),
+                    ))
                 })?
         } else {
             let config_id = self
@@ -302,7 +323,7 @@ impl CursorSessionRuntime {
             &Value::Array(baseline),
             &Value::Array(options),
         )
-        .map_err(|detail| CursorRuntimeError::UnsupportedOption { detail })?;
+        .map_err(CursorRuntimeError::UnsupportedOption)?;
         let session_id = self.provider_session_id().await?;
         let mut applied = Vec::new();
         for update in updates {
@@ -311,7 +332,7 @@ impl CursorSessionRuntime {
                 .expect("resolved ACP config updates have a string config id");
             let previous_value =
                 acp_config_option_current_value(&Value::Array(current.clone()), config_id)
-                    .map_err(|detail| CursorRuntimeError::UnsupportedOption { detail })?;
+                    .map_err(CursorRuntimeError::UnsupportedOption)?;
             match self
                 .set_config_option(&session_id, config_id, update["value"].clone())
                 .await
@@ -387,9 +408,7 @@ impl CursorSessionRuntime {
                 }
             }
         }
-        CursorRuntimeError::UnsupportedOption {
-            detail: format!("Cursor config update failed: {application}"),
-        }
+        CursorRuntimeError::ConfigUpdateRolledBack { application }
     }
 
     pub async fn set_runtime_mode(&self, mode: &str) -> Result<(), CursorRuntimeError> {

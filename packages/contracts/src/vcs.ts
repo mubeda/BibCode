@@ -1,3 +1,4 @@
+import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { IsoDateTime, NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import { ChangeRequest, SourceControlProviderInfo } from "./sourceControl.ts";
@@ -59,6 +60,22 @@ export const VcsListRemotesResult = Schema.Struct({
 });
 export type VcsListRemotesResult = typeof VcsListRemotesResult.Type;
 
+/** Why Git cannot use a folder as a working repository, when the server can tell. */
+export const VcsRepositoryUnavailableReason = Schema.Literals([
+  "absent",
+  "unreadable",
+  "untrusted",
+]);
+export type VcsRepositoryUnavailableReason = typeof VcsRepositoryUnavailableReason.Type;
+
+/**
+ * Present only when isRepo is false and the server can tell why; absent from older servers.
+ * A reason this client does not know, from a newer server, decodes as absent.
+ */
+export const VcsRepositoryUnavailableReasonField = Schema.optionalKey(
+  VcsRepositoryUnavailableReason.pipe(Schema.catchDecoding(() => Effect.succeedNone)),
+);
+
 const VcsStatusSummarySharedFields = {
   observedAt: IsoDateTime,
   stale: Schema.Boolean,
@@ -72,6 +89,7 @@ const VcsRepositorySummarySharedFields = {
 export const VcsStatusSummary = Schema.Union([
   Schema.Struct({
     isRepo: Schema.Literal(false),
+    repositoryUnavailableReason: VcsRepositoryUnavailableReasonField,
     refName: Schema.Null,
     detachedHead: Schema.Null,
     hasWorkingTreeChanges: Schema.Literal(false),

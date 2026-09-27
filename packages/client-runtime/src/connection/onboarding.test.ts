@@ -234,7 +234,8 @@ describe("connection onboarding", () => {
                 },
                 bearerToken: "bearer-token",
               }),
-            prepare: () => Effect.die("unused"),
+            ensureTunnel: () => Effect.die("unused"),
+            mintBearer: () => Effect.die("unused"),
             disconnect: () => Effect.die("unused"),
           }),
         ),
@@ -253,6 +254,7 @@ describe("connection onboarding", () => {
           connectionId: "ssh:environment-ssh",
           target,
         },
+        credential: { _tag: "BearerConnectionCredential", token: "bearer-token" },
       });
     }),
   );

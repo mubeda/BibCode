@@ -235,3 +235,11 @@ runs it after `cargo build -p bibcode-server --bin bibcode`, and so does the run
 - **Unchanged:** research item 8 (one askpass answer for every prompt), no detection of an
   externally started server, and the fixed `~/.bibcode` data root. **Spike limits:** no live
   SSH host; OpenSSH emulated from its manual pages; askpass and Windows `ssh.exe` untested.
+
+## Copy refined by the user (2026-09-25)
+
+Blocked mint: "<host> rejected a new pairing credential. Connect again; if it keeps failing, remove the environment and add it again." Pairing timeout: "The remote host did not issue a pairing credential within 30 seconds. Check the connection and connect again."
+
+Second refinement (2026-09-25): a pairing timeout is transient and BiBCode retries on its own, so the timeout copy asks for nothing: "The remote host did not issue a pairing credential within 30 seconds. Check the connection; BiBCode keeps trying."
+
+Banner and notice (2026-09-25): a failed remote environment's reason appears once, in the chat banner's body (its title keeps only the state, the composer says "<label> is not connected", and the sidebar notice names the environment and keeps the reason in a tooltip); for remote targets on desktop, the banner and the notice offer **Open Remote Servers** instead of Reconnect.

@@ -187,6 +187,8 @@ vi.mock("~/state/query", () => ({
       error: testState.refsError,
       isPending: false,
       refresh: testState.refreshRefs,
+      revalidate: testState.refreshRefs,
+      requiresRetry: false,
     };
   },
 }));

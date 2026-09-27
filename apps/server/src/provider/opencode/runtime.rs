@@ -26,11 +26,18 @@ use crate::activity::{
     ActivitySectionHealth, ProviderActivityMutation,
 };
 
+use crate::provider::{
+    OptionRefusal, RefusedOption, option_needs_value_refusal, option_on_or_off_refusal,
+    option_without_id_refusal, options_conflict_refusal, options_need_model_refusal,
+    unsupported_option_refusal,
+};
+
 use super::{
     activity::{MAX_LINEAGE_DEPTH, OpenCodeActivityTracker, TEXT_COALESCE_MS, valid_key},
     model::{
-        OpenCodeChildSessionDto, OpenCodeMessageDto, OpenCodeSessionStatusDto,
-        OpenCodeStatusMapDto, infer_default_variant, merge_assistant_text, parse_model_slug,
+        FAST_MODE_LABEL, OpenCodeChildSessionDto, OpenCodeMessageDto, OpenCodeSessionStatusDto,
+        OpenCodeStatusMapDto, VARIANT_LABEL, infer_default_variant, merge_assistant_text,
+        parse_model_slug,
     },
     sse::OpenCodeSseDecoder,
 };
@@ -117,12 +124,31 @@ pub enum OpenCodeRuntimeError {
     Http(String),
     #[error("OpenCode response was invalid: {0}")]
     InvalidResponse(String),
+    /// The session refuses a turn's options: their shape, or a value the selected model does not
+    /// advertise. The same request is refused again on every retry.
+    #[error("{0}")]
+    UnsupportedOption(RefusedOption),
     #[error("Unknown pending question id {0}")]
     UnknownQuestion(String),
     #[error("Unknown pending permission id {0}")]
     UnknownPermission(String),
     #[error("Session is not started")]
     MissingSession,
+}
+
+impl OptionRefusal for OpenCodeRuntimeError {
+    fn refused_option(&self) -> Option<&RefusedOption> {
+        match self {
+            Self::UnsupportedOption(refused) => Some(refused),
+            _ => None,
+        }
+    }
+}
+
+impl OpenCodeRuntimeError {
+    fn refused(detail: impl Into<String>, refusal: impl Into<String>) -> Self {
+        Self::UnsupportedOption(RefusedOption::new(detail, refusal))
+    }
 }
 
 #[derive(Clone)]
@@ -822,14 +848,18 @@ impl OpenCodeSessionRuntime {
         let mut requested_variant = None;
         for option in options {
             let id = option.get("id").and_then(Value::as_str).ok_or_else(|| {
-                OpenCodeRuntimeError::InvalidResponse("option id must be a string".to_owned())
+                OpenCodeRuntimeError::refused(
+                    "option id must be a string",
+                    option_without_id_refusal(),
+                )
             })?;
             match id {
                 "fastMode" if fast_mode.is_none() => {
                     fast_mode = Some(option.get("value").and_then(Value::as_bool).ok_or_else(
                         || {
-                            OpenCodeRuntimeError::InvalidResponse(
-                                "option fastMode requires a boolean value".to_owned(),
+                            OpenCodeRuntimeError::refused(
+                                "option fastMode requires a boolean value",
+                                option_on_or_off_refusal(FAST_MODE_LABEL),
                             )
                         },
                     )?);
@@ -842,16 +872,18 @@ impl OpenCodeSessionRuntime {
                             .filter(|value| !value.is_empty())
                             .map(str::to_owned)
                             .ok_or_else(|| {
-                                OpenCodeRuntimeError::InvalidResponse(
-                                    "option variant requires a non-empty string value".to_owned(),
+                                OpenCodeRuntimeError::refused(
+                                    "option variant requires a non-empty string value",
+                                    option_needs_value_refusal(VARIANT_LABEL),
                                 )
                             })?,
                     );
                 }
                 _ => {
-                    return Err(OpenCodeRuntimeError::InvalidResponse(format!(
-                        "option {id} is not supported by the selected model/session"
-                    )));
+                    return Err(OpenCodeRuntimeError::refused(
+                        format!("option {id} is not supported by the selected model/session"),
+                        unsupported_option_refusal(id),
+                    ));
                 }
             }
         }
@@ -861,13 +893,15 @@ impl OpenCodeSessionRuntime {
         let selected = match fast_mode {
             Some(true) => {
                 if requested_variant.is_some() {
-                    return Err(OpenCodeRuntimeError::InvalidResponse(
-                        "fastMode=true conflicts with variant".to_owned(),
+                    return Err(OpenCodeRuntimeError::refused(
+                        "fastMode=true conflicts with variant",
+                        options_conflict_refusal(FAST_MODE_LABEL, VARIANT_LABEL),
                     ));
                 }
                 if !has_variant("fast") {
-                    return Err(OpenCodeRuntimeError::InvalidResponse(
-                        "option fastMode is not supported by the selected model/session".to_owned(),
+                    return Err(OpenCodeRuntimeError::refused(
+                        "option fastMode is not supported by the selected model/session",
+                        unsupported_option_refusal(FAST_MODE_LABEL),
                     ));
                 }
                 Some("fast".to_owned())
@@ -875,9 +909,10 @@ impl OpenCodeSessionRuntime {
             Some(false) | None => match requested_variant {
                 Some(variant) if variant != "fast" && has_variant(&variant) => Some(variant),
                 Some(variant) => {
-                    return Err(OpenCodeRuntimeError::InvalidResponse(format!(
-                        "variant {variant} is not advertised by the selected model"
-                    )));
+                    return Err(OpenCodeRuntimeError::refused(
+                        format!("variant {variant} is not advertised by the selected model"),
+                        unsupported_option_refusal(&format!("{VARIANT_LABEL} {variant}")),
+                    ));
                 }
                 None => self
                     .inner
@@ -903,8 +938,9 @@ impl OpenCodeSessionRuntime {
 
     async fn advertised_variants(&self) -> Result<(String, Vec<String>), OpenCodeRuntimeError> {
         let (provider_id, model_id) = self.inner.model.lock().await.clone().ok_or_else(|| {
-            OpenCodeRuntimeError::InvalidResponse(
-                "options require a selected provider/model".to_owned(),
+            OpenCodeRuntimeError::refused(
+                "options require a selected provider/model",
+                options_need_model_refusal(),
             )
         })?;
         let response = self

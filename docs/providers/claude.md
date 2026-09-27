@@ -155,6 +155,26 @@ configured Claude home. Prefer the provider instance that created the thread;
 the UI does not guarantee that switching to another Claude instance can resume
 the same provider session.
 
+## Model options
+
+The Claude session applies three model options:
+
+- **Reasoning** (`effort`), passed to Claude as `--effort`;
+- **Fast Mode** (`fastMode`), passed in the session settings. Turning it on
+  needs a model that offers it: one Claude reported with Fast Mode, including
+  aliases such as `opus`, or, for a model Claude did not report, one BiBCode's
+  built-in catalog offers it for. Turning it off is always accepted;
+- **Agent** (`agent`), passed as `--agent` and listed from the agents Claude
+  reports.
+
+Models and their options normally come from Claude's session initialization.
+When Claude reports no models there, BiBCode offers its built-in catalog, which
+lists only the options above. A turn whose options the session refuses, for
+example one saved while an older catalog offered another option, is not retried:
+its delivery fails once and the thread shows **Delivery failed** with the
+reason, such as "Fast Mode is not supported by the selected model." Choose
+another model or option, then send the message again.
+
 ## Steering a running turn
 
 Steer sends the head queued message to Claude while it is working. Claude can

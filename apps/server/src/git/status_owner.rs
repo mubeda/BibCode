@@ -568,7 +568,7 @@ impl StatusReadOwner {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(observer);
     }
 
-    fn observe_local_change(&self, canonical_cwd: &Path) {
+    pub(crate) fn observe_local_change(&self, canonical_cwd: &Path) {
         let observer = self
             .inner
             .local_change_observer
@@ -1219,6 +1219,14 @@ fn read_error(key: &StatusReadKey, detail: &str) -> GitCommandError {
     status_owner_error(&key.canonical_cwd, detail)
 }
 
+pub(crate) fn is_retired_read_error(error: &GitCommandError) -> bool {
+    error.operation.as_ref() == "GitVcsDriver.statusReadOwner"
+        && matches!(
+            error.detail.as_ref(),
+            "status read was retired by a mutation" | "status read was retired before publication"
+        )
+}
+
 fn status_owner_error(canonical_cwd: &Path, detail: &str) -> GitCommandError {
     GitCommandError {
         tag: "GitCommandError",
@@ -1247,6 +1255,32 @@ mod tests {
 
     use super::*;
     use crate::git::{VcsStatusLocalResult, VcsStatusRemoteResult, VcsStatusResult};
+
+    #[test]
+    fn retired_read_error_requires_status_owner_retirement() {
+        let cwd = Path::new("/repo");
+        for detail in [
+            "status read was retired by a mutation",
+            "status read was retired before publication",
+        ] {
+            let mut error = status_owner_error(cwd, detail);
+            assert!(is_retired_read_error(&error));
+
+            error.operation = "GitVcsDriver.statusDetailsLocal.status".into();
+            assert!(
+                !is_retired_read_error(&error),
+                "Git failures are not retirements"
+            );
+        }
+        for detail in [
+            "status read owner stopped",
+            "status read caller was cancelled",
+            "status read was cancelled",
+            "controlled local failure",
+        ] {
+            assert!(!is_retired_read_error(&status_owner_error(cwd, detail)));
+        }
+    }
 
     struct TestSignalSource {
         receiver: mpsc::UnboundedReceiver<GitWatchEvent>,

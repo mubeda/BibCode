@@ -8,22 +8,22 @@ codebase and UI.
 ### Project
 
 The top-level workspace record in an environment. A project points at a
-workspace root and owns the visible primary/worktree rows in the left panel.
+workspace root and owns the visible primary and worktree cards in the left panel.
 
 ### Workspace Root
 
 The filesystem path for a project checkout. Git, file, terminal, and provider
 operations run relative to this root unless a thread has a worktree path.
 
-### Primary Workspace Row
+### Primary Workspace Card
 
-The left-panel row for a project's live checkout. It is backed by the project's
-default thread, shows the live checkout branch, and cannot be deleted as a
-normal thread.
+The left-panel card for a project's live checkout. It is backed by the project's
+default thread, is titled with the live checkout branch, and cannot be deleted
+as a normal thread.
 
 ### Default Thread
 
-The undeletable thread that backs a project primary row. Removing it is modeled
+The undeletable thread that backs a project's primary card. Removing it is modeled
 as removing the project, not deleting a thread.
 
 ### Worktree
@@ -42,17 +42,26 @@ workspace metadata.
 
 A hidden sibling thread with `kind: "panel"`. Panel threads share the host
 thread's project, branch, and worktree but own an isolated provider session and
-transcript. They appear as center-panel tabs, not left-panel rows.
+transcript. They appear as center-panel tabs, not left-panel cards; the host's card counts them as **N more chats**.
 
 ## UI Surfaces
 
 ### Left Panel
 
 The navigator for Search, the cross-environment Agents nav row, and
-environment-scoped project/worktree rows. The Agents row's unread badge
-aggregates across environments, and selecting it opens the full-screen Agents
-view. The panel also shows project groups, primary rows, worktree rows,
-pin/unread state, context menus, and running agent sub-rows.
+environment-scoped projects with their workspace cards. The Agents row's unread
+badge aggregates across environments and is hidden when nothing is unread;
+selecting the row opens the full-screen Agents view. The panel also shows
+project groups, the primary card and worktree cards, pin/unread state, and
+grouped context menus.
+
+### Workspace Card
+
+One checkout in the left panel: the primary card for the live checkout or a
+worktree card. The shape of its status glyph carries the thread's state; its
+second line shows the branch, the pull or merge request, uncommitted changes
+and a running terminal; its third line shows the provider, what the agent is
+doing, the model and how long ago.
 
 ### Agents View
 

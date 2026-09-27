@@ -14,11 +14,10 @@ import { APP_BASE_NAME, APP_DISPLAY_NAME, APP_STAGE_LABEL } from "../branding";
 import { resolveServerBackedAppDisplayName } from "../branding.logic";
 import { AppSidebarLayout } from "../components/AppSidebarLayout";
 import { CommandPalette } from "../components/CommandPalette";
-import { AppStatusBar } from "../components/status-bar/AppStatusBar";
+import { AppStatusBar, SlowRequestsStatusBar } from "../components/status-bar/AppStatusBar";
 import { RelayClientInstallDialog } from "../components/cloud/RelayClientInstallDialog";
 import { SshPasswordPromptDialog } from "../components/desktop/SshPasswordPromptDialog";
 import { ProviderUpdateLaunchNotification } from "../components/ProviderUpdateLaunchNotification";
-import { SlowRpcRequestToastCoordinator } from "../components/SlowRpcRequestToastCoordinator";
 import { Button } from "../components/ui/button";
 import {
   AnchoredToastProvider,
@@ -60,7 +59,13 @@ import {
 
 export const Route = createRootRoute({
   beforeLoad: async ({ location }) => {
-    if (location.pathname === "/pair" && hasHostedPairingRequest(new URL(window.location.href))) {
+    const url = new URL(window.location.href);
+    const hostedStatic = isHostedStaticApp(url);
+    // The pairing surface retains the token in memory and removes it from the
+    // URL. Keep that route active when the history replacement reloads the gate.
+    const hostedPairingHost =
+      hostedStatic && url.searchParams.has("host") && !url.searchParams.has("code");
+    if (location.pathname === "/pair" && (hasHostedPairingRequest(url) || hostedPairingHost)) {
       return {
         authGateState: {
           status: "hosted-pairing",
@@ -68,7 +73,7 @@ export const Route = createRootRoute({
       };
     }
 
-    if (isHostedStaticApp(new URL(window.location.href))) {
+    if (hostedStatic) {
       return {
         authGateState: {
           status: "hosted-static",
@@ -128,7 +133,7 @@ function RootRouteView() {
           <div className="min-h-0 min-w-0 flex-1">
             <Outlet />
           </div>
-          {primaryEnvironmentAuthenticated ? <AppStatusBar /> : null}
+          {primaryEnvironmentAuthenticated ? <AppStatusBar /> : <SlowRequestsStatusBar />}
         </div>
       </AppSidebarLayout>
     </CommandPalette>
@@ -140,7 +145,6 @@ function RootRouteView() {
         <DocumentTitleSync />
         {presentation.showRemoteDeviceControls ? <RelayClientInstallDialog /> : null}
         {presentation.showRemoteDeviceControls ? <SshPasswordPromptDialog /> : null}
-        <SlowRpcRequestToastCoordinator />
         <DesktopDeepLinkRouter />
         <HostedStaticEnvironmentBootstrap />
         {primaryEnvironmentAuthenticated ? <EventRouter /> : null}
@@ -203,7 +207,7 @@ function RootRouteErrorView({ error, reset }: ErrorComponentProps) {
       </div>
 
       <section className="relative w-full max-w-xl rounded-2xl border border-border/80 bg-card/90 p-6 shadow-2xl shadow-black/20 backdrop-blur-md sm:p-8">
-        <p className="text-[11px] font-semibold tracking-[0.18em] text-muted-foreground uppercase">
+        <p className="text-xs font-semibold tracking-[0.18em] text-muted-foreground uppercase">
           {APP_DISPLAY_NAME}
         </p>
         <h1 className="mt-3 text-2xl font-semibold tracking-tight sm:text-3xl">

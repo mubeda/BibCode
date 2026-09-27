@@ -3,7 +3,8 @@ pub mod engine;
 
 pub use delivery::{
     AttachmentReference, CommandAdmission, NewProviderTurnDelivery, ProviderTurnDelivery,
-    TurnDeliveryMode, TurnDeliveryState, TurnDeliveryTransition, canonical_command_digest,
+    TurnDeliveryFailureReason, TurnDeliveryMode, TurnDeliveryState, TurnDeliveryTransition,
+    canonical_command_digest,
 };
 pub use engine::{
     EngineOptions, OrchestrationCommand, OrchestrationEngine, OrchestrationError, Snapshot,

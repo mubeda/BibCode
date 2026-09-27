@@ -20,9 +20,11 @@ import * as ConnectionCredentialStore from "./credentialStore.ts";
 import {
   credentialMissingError,
   environmentMismatchError,
+  isAuthenticationRejection,
   mapManagedRelayError,
   mapRemoteEnvironmentError,
   profileMissingError,
+  sshCredentialRejectedError,
 } from "./errors.ts";
 import type {
   BearerConnectionTarget,
@@ -209,6 +211,7 @@ const makeRelayBroker = Effect.fn("clientRuntime.connection.broker.makeRelay")(f
 
 const makeSshBroker = Effect.fn("clientRuntime.connection.broker.makeSsh")(function* () {
   const profiles = yield* ConnectionProfileStore.ConnectionProfileStore;
+  const credentials = yield* ConnectionCredentialStore.ConnectionCredentialStore;
   const ssh = yield* ClientCapabilities.SshEnvironmentGateway;
   const remote = yield* RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization;
 
@@ -232,25 +235,53 @@ const makeSshBroker = Effect.fn("clientRuntime.connection.broker.makeSsh")(funct
         actual: profile.environmentId,
       });
     }
-    const prepared = yield* ssh.prepare({
+    const input = {
       connectionId: target.connectionId,
       expectedEnvironmentId: target.environmentId,
       target: profile.target,
-    });
+    };
+    // A live tunnel is reused without running SSH; the pairing token that
+    // came with it is spent, so the saved bearer authenticates instead.
+    const bootstrap = yield* ssh.ensureTunnel(input);
     yield* profiles.put(
       new SshConnectionProfile({
         connectionId: profile.connectionId,
         environmentId: profile.environmentId,
         label: profile.label,
-        target: prepared.bootstrap.target,
+        target: bootstrap.target,
       }),
     );
-    const authorized = yield* remote.authorizeBearer({
-      expectedEnvironmentId: target.environmentId,
-      httpBaseUrl: prepared.bootstrap.httpBaseUrl,
-      wsBaseUrl: prepared.bootstrap.wsBaseUrl,
-      bearerToken: prepared.bearerToken,
+    const authorize = (endpoint: typeof bootstrap, bearerToken: string) =>
+      remote.authorizeBearer({
+        expectedEnvironmentId: target.environmentId,
+        httpBaseUrl: endpoint.httpBaseUrl,
+        wsBaseUrl: endpoint.wsBaseUrl,
+        bearerToken,
+      });
+    const host = profile.target.alias || profile.target.hostname;
+    const blockOnRejection = (error: ConnectionAttemptError): ConnectionAttemptError =>
+      isAuthenticationRejection(error) ? sshCredentialRejectedError(host, error.traceId) : error;
+    // One mint per attempt: SSH access is the authority, so a missing or
+    // rejected bearer is replaced, but a rejection of the replacement blocks.
+    const mintAndAuthorize = Effect.gen(function* () {
+      // The gateway classifies its own failures: a cancelled password prompt
+      // stays as it is, and it reports a refused exchange with the same copy.
+      const minted = yield* ssh.mintBearer(input);
+      yield* credentials.putIfSaved(
+        target.connectionId,
+        new BearerConnectionCredential({ token: minted.bearerToken }),
+      );
+      return yield* authorize(minted.bootstrap, minted.bearerToken).pipe(
+        Effect.mapError(blockOnRejection),
+      );
     });
+    const saved = yield* credentials.get(target.connectionId);
+    const authorized =
+      Option.isSome(saved) && isBearerCredential(saved.value)
+        ? yield* authorize(bootstrap, saved.value.token).pipe(
+            Effect.catchIf(isAuthenticationRejection, () => mintAndAuthorize),
+          )
+        : yield* mintAndAuthorize;
     return {
       environmentId: authorized.environmentId,
       label: authorized.label,

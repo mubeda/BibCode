@@ -212,7 +212,9 @@ describe("WorktreeDiscoverySection presentation logic", () => {
   });
 
   it("uses the inverse discovery visibility action in project menus", () => {
-    expect(getDiscoveryVisibilityMenuLabel("hidden")).toBe("Show hidden worktrees");
-    expect(getDiscoveryVisibilityMenuLabel("shown")).toBe("Hide discovered worktrees");
+    expect(getDiscoveryVisibilityMenuLabel("hidden")).toBe("Show Hidden Worktrees");
+    expect(getDiscoveryVisibilityMenuLabel("hidden", 0)).toBe("Show Hidden Worktrees (0)");
+    expect(getDiscoveryVisibilityMenuLabel("hidden", 2)).toBe("Show Hidden Worktrees (2)");
+    expect(getDiscoveryVisibilityMenuLabel("shown", 2)).toBe("Hide Discovered Worktrees");
   });
 });

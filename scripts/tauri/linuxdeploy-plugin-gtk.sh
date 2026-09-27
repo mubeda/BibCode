@@ -63,6 +63,21 @@ if [[ "$backend_line_count" != 1 ]]; then
   exit 1
 fi
 
+theme_patterns=(
+  '^gsettings get org\.gnome\.desktop\.interface gtk-theme'
+  '^APPIMAGE_GTK_THEME="\${APPIMAGE_GTK_THEME:-'
+  '^export GTK_THEME="\$APPIMAGE_GTK_THEME"'
+)
+theme_labels=('gsettings gtk-theme' 'APPIMAGE_GTK_THEME default' 'GTK_THEME export')
+for index in "${!theme_patterns[@]}"; do
+  theme_line_count="$(grep -c "${theme_patterns[index]}" "$gtk_hook" || true)"
+  if [[ "$theme_line_count" != 1 ]]; then
+    printf 'BiBCode AppImage packaging error: expected exactly one %s line in %s; found %s.\n' \
+      "${theme_labels[index]}" "$gtk_hook" "$theme_line_count" >&2
+    exit 1
+  fi
+done
+
 shopt -s nullglob
 library_roots=("$appdir"/usr/lib*)
 if ((${#library_roots[@]} > 0)); then
@@ -84,5 +99,19 @@ if ((${#library_roots[@]} > 0)); then
   fi
 fi
 
-sed -i 's/^export GDK_BACKEND=x11.*/export GDK_BACKEND="${BIBCODE_GDK_BACKEND:-wayland,x11}"/' \
+# GTK_THEME pins a variant and prevents GTK/WebKitGTK following prefer-dark.
+# Leave inherited GTK_THEME alone; only an explicit AppImage override replaces it.
+sed -i \
+  -e 's/^export GDK_BACKEND=x11.*/export GDK_BACKEND="${BIBCODE_GDK_BACKEND:-wayland,x11}"/' \
+  -e '/^gsettings get org\.gnome\.desktop\.interface gtk-theme/d' \
+  -e '/^APPIMAGE_GTK_THEME="\${APPIMAGE_GTK_THEME:-/d' \
+  -e 's/^export GTK_THEME="\$APPIMAGE_GTK_THEME".*/if [ -n "${APPIMAGE_GTK_THEME:-}" ]; then export GTK_THEME="$APPIMAGE_GTK_THEME"; fi/' \
   "$gtk_hook"
+
+theme_override_line='if [ -n "${APPIMAGE_GTK_THEME:-}" ]; then export GTK_THEME="$APPIMAGE_GTK_THEME"; fi'
+theme_override_count="$(grep -Fxc "$theme_override_line" "$gtk_hook" || true)"
+if grep -q '^[[:space:]]*export GTK_THEME=' "$gtk_hook" || [[ "$theme_override_count" != 1 ]]; then
+  printf 'BiBCode AppImage packaging error: GTK theme rewrite failed in %s; expected only one conditional APPIMAGE_GTK_THEME override.\n' \
+    "$gtk_hook" >&2
+  exit 1
+fi

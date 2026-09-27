@@ -77,7 +77,7 @@ esac
         cwd: s.root().into(),
         host: "gitlab.com".into(),
         repository: "gitlab-org/cli".into(),
-        provider: ProviderKind::Gitlab,
+        provider: PullRequestsProvider::Gitlab,
     };
     (s, host, scope)
 }

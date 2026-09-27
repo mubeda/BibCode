@@ -39,6 +39,7 @@ import * as Persistence from "../platform/persistence.ts";
 import * as EnvironmentSupervisor from "./supervisor.ts";
 import * as ConnectionDriver from "./driver.ts";
 import * as ConnectionWakeups from "./wakeups.ts";
+import { EnvironmentSelection } from "./selection.ts";
 
 const isSshConnectionProfile = Schema.is(SshConnectionProfile);
 
@@ -173,6 +174,7 @@ export const make = Effect.gen(function* () {
   const connectivity = yield* Connectivity.Connectivity;
   const driver = yield* ConnectionDriver.ConnectionDriver;
   const wakeups = yield* ConnectionWakeups.ConnectionWakeups;
+  const selection = yield* EnvironmentSelection;
   const ssh = yield* ClientCapabilities.SshEnvironmentGateway;
   const persistedTargets = yield* storage.list;
   const initialEntries = new Map(
@@ -330,6 +332,8 @@ export const make = Effect.gen(function* () {
     yield* Scope.close(lease.scope, Exit.void);
   });
 
+  // A supervisor is built with the stored intent, so the first state it publishes already
+  // carries that intent: a desired replacement never reads as disconnected, even briefly.
   const createServiceScope = Effect.fn("EnvironmentRegistry.createServiceScope")(
     (entry: ConnectionCatalogEntry, desired: boolean) =>
       Effect.uninterruptible(
@@ -339,17 +343,15 @@ export const make = Effect.gen(function* () {
           const targetRef = yield* Ref.make(entry.target);
           const supervisor = yield* EnvironmentSupervisor.make(entry, {
             targetRef,
-            initiallyDesired: false,
+            initiallyDesired: desired,
           }).pipe(
             Effect.provideService(Connectivity.Connectivity, connectivity),
             Effect.provideService(ConnectionDriver.ConnectionDriver, driver),
             Effect.provideService(ConnectionWakeups.ConnectionWakeups, wakeups),
+            Effect.provideService(EnvironmentSelection, selection),
             Scope.provide(scope),
             Effect.onError(() => Scope.close(scope, Exit.void)),
           );
-          if (desired) {
-            yield* supervisor.connect;
-          }
           yield* SubscriptionRef.update(serviceScopes, (current) => {
             const next = new Map(current);
             next.set(environmentId, { entry, supervisor, scope, targetRef });

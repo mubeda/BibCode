@@ -25,6 +25,8 @@ export interface EnvironmentConnectionPresentation {
   readonly phase: EnvironmentConnectionPhase;
   readonly error: string | null;
   readonly traceId: string | null;
+  /** Progress copy for the current attempt; status text uses it instead of phase and error. */
+  readonly notice?: string;
 }
 
 export interface EnvironmentPresentation {
@@ -87,12 +89,23 @@ export function presentConnectionState(
       return { phase: "available", error: null, traceId: null };
     case "offline":
       return { phase: "offline", error: null, traceId: null };
-    case "connecting":
+    case "connecting": {
+      const phase =
+        state.attempt <= 1 && state.lastFailure === null ? "connecting" : "reconnecting";
+      if (state.notice !== undefined) {
+        return {
+          phase,
+          error: null,
+          traceId: null,
+          notice: state.notice,
+        };
+      }
       return {
-        phase: state.attempt <= 1 && state.lastFailure === null ? "connecting" : "reconnecting",
+        phase,
         error: state.lastFailure?.message ?? null,
         traceId: failureTraceId(state),
       };
+    }
     case "connected":
       return { phase: "connected", error: null, traceId: null };
     case "backoff":
@@ -110,6 +123,20 @@ export function presentConnectionState(
   }
 }
 
+/**
+ * Whether an environment's connection is unusable: every phase but
+ * "connected". The chat banner and the sidebar notice share this rule.
+ */
+export function isConnectionUnavailable(connection: EnvironmentConnectionPresentation): boolean {
+  return connection.phase !== "connected";
+}
+
+/** Ends `text` with sentence punctuation so a follow-on sentence reads cleanly. */
+function asSentence(text: string): string {
+  const trimmed = text.trim();
+  return /[.!?…]$/.test(trimmed) ? trimmed : `${trimmed}.`;
+}
+
 export function connectionStatusText(connection: EnvironmentConnectionPresentation): string {
   switch (connection.phase) {
     case "available":
@@ -117,11 +144,12 @@ export function connectionStatusText(connection: EnvironmentConnectionPresentati
     case "offline":
       return "Offline";
     case "connecting":
-      return "Connecting...";
+      return connection.notice ?? "Connecting…";
     case "reconnecting":
-      return connection.error
-        ? `Failed to connect. Reconnecting... Reason: ${connection.error}`
-        : "Reconnecting...";
+      return (
+        connection.notice ??
+        (connection.error ? `${asSentence(connection.error)} Reconnecting…` : "Reconnecting…")
+      );
     case "connected":
       return "Connected";
     case "error":

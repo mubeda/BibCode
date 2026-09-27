@@ -290,3 +290,8 @@ its labels (`sidebar/agentsSection.logic.ts:52-65`). Rows are in priority order;
 - **macOS keyboard:** macOS has no Menu key. Shift+F10 works in the app but is not a macOS convention,
   and VoiceOver users have VO+Shift+M. Is a card ⋯ wanted later?
 - **Server work:** `hostThreadId` for nesting, a check rollup for CI colours, and a PR draft state.
+
+## Refined by the user (2026-09-25)
+
+- **Model label:** line 3 shows the catalog short name, else the model slug (for example `sonnet`); the descriptive model name is no longer used there.
+- **Card outlines:** every card has a visible 1 px `border-border` outline (the active card `border-foreground/25` on `bg-accent`, multi-selected cards `border-primary/40`, selected and active `border-primary/60`), and cards sit 6 px apart (`gap-1.5`).

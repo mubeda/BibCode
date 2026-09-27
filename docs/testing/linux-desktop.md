@@ -123,9 +123,10 @@ Run the AppImage GTK wrapper regression on Linux:
 vp test scripts/tauri-linuxdeploy-plugin-gtk.test.ts
 ```
 
-It covers Wayland library removal, the generated backend export, missing and
-drifted hooks failing without post-processing mutations, discovery passthrough,
-and upstream failure propagation.
+It covers Wayland library removal, the generated backend export, removal of
+forced theme selection, user theme overrides, missing and drifted hooks failing
+without post-processing mutations, discovery passthrough, and upstream failure
+propagation.
 
 Do not run `vp run test` and a separate broad Cargo command concurrently. Do
 not replace the normal Rust test harness with a serial harness.
@@ -139,6 +140,17 @@ failure, verify that normal retry is still the primary action, the no-backup
 action requires acknowledgement, a forged first-attempt bypass is rejected by
 the native host, and an installer failure restarts the exact pre-update backend
 set.
+
+With the same isolated test instance, arrange an installer failure and have a
+test-owned listener acquire its backend port after shutdown, keeping it bound
+past the 3 s restart window. Confirm **Update not installed** names that port
+as in use, offers **Restart server**, and disables **Retry installation** with
+the visible restart explanation. Keep an unsent composer draft and verify it
+survives the outage. Release only the test listener, choose **Restart server**,
+and confirm the same backend port reconnects, the draft remains, and **Retry
+installation** becomes available without reopening the dialog. Record the
+listener/installer fixture and observed port in the execution report; never use
+the user's running instance for this check.
 
 ## AppImage build and inspection
 
@@ -276,12 +288,40 @@ is required and available. Isolate BiBCode application data and XDG config,
 cache, and data roots for the test process without changing the parent shell or
 user profile globally.
 
+With that isolated instance running from the absolute `BIBCODE_E2E_APP_PATH`
+on a FUSE-capable test host, perform an update relaunch or **Restart BiBCode**.
+Once the replacement window is ready, require exactly one `.mount_` entry for
+this AppImage in `/proc/mounts` and one AppImage runtime process. Use a host
+where this is the only running BiBCode AppImage; the runtime's mount prefix uses
+the first six characters of the artifact name. Both checks below must exit zero
+and print exactly one entry; extraction mode cannot supply this FUSE evidence.
+
+```sh
+appimage_mount_prefix="/.mount_$(basename "$BIBCODE_E2E_APP_PATH" | cut -c1-6)"
+awk -v prefix="$appimage_mount_prefix" '
+  index($2, prefix) { print; mounts++ }
+  END { exit (mounts != 1) }
+' /proc/mounts &&
+  ps -ww -eo pid=,args= | awk -v appimage="$BIBCODE_E2E_APP_PATH" '
+    { pid = $1; sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "") }
+    $0 == appimage || index($0, appimage " ") == 1 { print pid, $0; runtimes++ }
+    END { exit (runtimes != 1) }
+  '
+```
+
 ### GTK backend and fractional scaling
 
 Inspect an extracted copy of the built AppImage: no `libwayland-client.so*`
 files or symlinks may remain under `usr/lib*`, and
 `apprun-hooks/linuxdeploy-plugin-gtk.sh` must contain exactly one
-`export GDK_BACKEND="${BIBCODE_GDK_BACKEND:-wayland,x11}"` line.
+`export GDK_BACKEND="${BIBCODE_GDK_BACKEND:-wayland,x11}"` line. The hook must
+contain no `gsettings get org.gnome.desktop.interface gtk-theme` line, no
+`APPIMAGE_GTK_THEME="${APPIMAGE_GTK_THEME:-` default, and no unconditional
+`export GTK_THEME=` line. Require exactly one conditional override:
+
+```sh
+if [ -n "${APPIMAGE_GTK_THEME:-}" ]; then export GTK_THEME="$APPIMAGE_GTK_THEME"; fi
+```
 
 Record the backend actually used by the packaged BiBCode window, alongside the
 desktop session, monitor scale, `GDK_SCALE`, `GDK_DPI_SCALE`, and any
@@ -316,6 +356,31 @@ without the override on an X11-only session (or Xvfb with `WAYLAND_DISPLAY`
 unset) to verify automatic X11 fallback. Report unavailable desktop sessions
 separately; Xvfb evidence alone does not validate native Wayland scaling.
 
+### GTK light/dark theme
+
+Use an isolated test session with a working desktop portal settings backend.
+Record its `org.freedesktop.appearance` `color-scheme` and GTK theme name;
+Xvfb alone does not provide a portal. Launch the AppImage with `GTK_THEME` and
+`APPIMAGE_GTK_THEME` unset for the system-following checks:
+
+- With **Settings → General → Theme** on **System**, launch once with a dark
+  system scheme and once with a light scheme. Switch both ways while each
+  instance runs. The webview, native menubar, and native dialogs must match at
+  launch and after every switch.
+- Include a light system scheme with the legacy GTK theme `Adwaita-dark`, and
+  a dark system scheme with GTK theme `Adwaita`. The portal color scheme must
+  determine the variant; the AppImage's process-local theme name stays Adwaita.
+- Select **Light**, then **Dark**, and switch the system scheme both ways for
+  each. The webview and native menubar/dialogs must retain the explicit choice.
+  Return to **System** and verify immediate adoption and subsequent live changes.
+- Separately launch with a user `GTK_THEME` override, then with a nonempty
+  `APPIMAGE_GTK_THEME` override. Confirm those values are honored; the latter
+  takes precedence if both are set. Explicit environment overrides may pin a
+  variant and are excluded from the system-following acceptance checks.
+
+Record screenshots at launch and after changes, the portal/backend setup, and
+any unavailable native sessions. Restore settings only within the test session.
+
 ## Packaged UI scenarios
 
 Include the shared [Pull Requests smoke](./cross-platform-validation.md#pull-requests-web-shell-validation):
@@ -324,6 +389,10 @@ request, and render a real text patch on Files changed/Changes with `tab=files`
 retained after reload. Record unavailable fixture/host states separately from
 that pass. The packaged Pierre spec's sibling checks route entry only; the
 shared procedure owns authenticated list/detail/files evidence.
+
+Include the shared [slow-link liveness scenario](./cross-platform-validation.md#slow-link-liveness-scenario)
+when a browser client and a development or standalone server are available on
+this platform; otherwise record it as unavailable evidence.
 
 Use Codex Computer Use to operate the packaged executable. Capture the actual
 X11/Wayland and desktop environment in the report. At normal and minimum sizes
@@ -352,17 +421,27 @@ verify:
   (**EB** for **Edge box**). Hover the Settings row's status dot before and after
   saving: it stays **Connected**, with no reconnect during the rename. Reload
   the app, then restart it; after each, confirm the saved name and initials
-  persist;
+  persist. Disconnect reasons also use the saved name: rename the connected server, then
+  close or interrupt its connection and confirm the reconnecting detail names
+  the new alias. Repeat with a liveness timeout. Storage-identity errors still
+  use the server's reported name;
 - With that renamed test server connected, check a stalled connection on a
   Linux remote host: use `pgrep -f "bibcode serve"` or the process list to find
   the test server's PID, then run `kill -STOP <pid>` on that host. Hover the
   Settings row's status dot and wait for
-  `Failed to connect. Reconnecting... Reason: <server's own name> disconnected.`,
+  `No data from <saved name> for 30 seconds. The connection is too slow or was lost. Reconnecting…`,
   followed by
-  `Reason: Remote environment endpoint <base URL>/.well-known/bibcode/environment timed out after 10000ms.`
-  with the test server's endpoint URL. The disconnect reason uses the server's
-  own name, not the saved name. The disconnect appears before a health-check
-  message can become visible. Run `kill -CONT <pid>` on the remote host to resume
+  `Remote environment endpoint <base URL>/.well-known/bibcode/environment timed out after 10000ms. Reconnecting…`
+  with the test server's endpoint URL. The disconnect reason uses the saved
+  name (**Edge box**) and appears 27–33 seconds after the last data from the
+  stopped server, when the client's liveness timeout closes the socket with
+  code 4408. Keep BiBCode visible and focused for the whole stall: the
+  disconnect then appears before a health-check message can become visible. If
+  the window is restored from hidden or minimized during the stall, the
+  application-active health check can report
+  `<saved name> did not respond to a connection health check.` after 15
+  seconds instead; repeat the check with the window kept visible.
+  Run `kill -CONT <pid>` on the remote host to resume
   the same test server and confirm it reconnects;
 - select a saved server within a second of launch and confirm the rail keeps it
   selected for at least ten seconds while provider and settings updates arrive;
@@ -459,6 +538,14 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
 - AppImage window identity, icon, launcher, and taskbar grouping are correct;
 - external worktree grouping, paths, actions, physical identity, and restart
   are correct;
+- sidebar menus: right-click a worktree card, the primary card and a project
+  header, and open the header's **⋯** from the keyboard (Tab to it, then
+  **Enter**). Each native menu separates Open in/Pull, the copy actions,
+  Pin/Unread/Rename and the destructive item, with no doubled separator before
+  **Delete Worktree…** or **Remove Project…**, and **⋯** shows the same items
+  as the header's right-click menu. Tab to a card and press **Shift+F10**
+  (and, on Linux, the **Menu** key): exactly one native menu opens at the card,
+  and no error toast reports a second menu;
 - thread switching, terminal I/O, Activity elapsed time, keyboard focus, and
   responsive overlays work, including reopening the global right panel after
   a sibling chat suppresses a previously active Activity surface; and

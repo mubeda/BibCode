@@ -147,13 +147,23 @@ pub fn parse_gitlab_auth_status(text: &str) -> Vec<GitLabAuthStatusHost> {
     result
 }
 
-/// Recognize glab's full-logout answer independently of wrapping or its login hint.
+/// glab's full-logout sentence, lowercased: v1.36 and v1.39 print the singular
+/// form; v1.43 onward print the plural (v1.110 made it a lowercase error).
+const GITLAB_LOGGED_OUT_PHRASES: [&str; 2] = [
+    "no gitlab instance has been authenticated with glab",
+    "no gitlab instances have been authenticated with glab",
+];
+
+/// Recognize glab's full-logout answer independently of wrapping, case or its login hint.
 pub(crate) fn gitlab_auth_status_is_logged_out(text: &str) -> bool {
-    text.split_whitespace()
+    let normalized = text
+        .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
-        .to_ascii_lowercase()
-        .contains("no gitlab instances have been authenticated with glab")
+        .to_ascii_lowercase();
+    GITLAB_LOGGED_OUT_PHRASES
+        .iter()
+        .any(|phrase| normalized.contains(phrase))
 }
 
 /// The provider a remote's host name identifies on its own. Only the host is

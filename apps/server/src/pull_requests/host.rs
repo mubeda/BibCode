@@ -19,12 +19,15 @@ use crate::{
     source_control::{ProviderCommandSpec, ProviderHosts, ProviderKind},
 };
 
+/// One admitted repository: every hosted read and write runs against this scope.
 #[derive(Clone, Debug)]
 pub struct HostScope {
     pub cwd: PathBuf,
     pub host: String,
     pub repository: String,
-    pub provider: ProviderKind,
+    /// Decided once, when the scope is admitted (`context::scope_from_remote` or
+    /// CLI discovery); an unsupported provider never becomes a scope.
+    pub provider: PullRequestsProvider,
 }
 
 impl HostScope {
@@ -44,6 +47,11 @@ pub struct HostCommandRunner {
     state_dir: PathBuf,
     probes: Arc<super::cache::ContextCache<ProbeKey, CommandOutput>>,
     /// The server's host observation: scope resolution records and forgets hosts here.
+    /// `new` starts with a private one, so the runner records and forgets hosts for
+    /// itself only: status never sees them and Settings discovery never helps it,
+    /// while resolution still works through CLI discovery. Tests rely on that
+    /// isolation; the server shares one observation through `with_provider_hosts`
+    /// (`production/runtime.rs`).
     provider_hosts: Arc<ProviderHosts>,
 }
 
@@ -178,17 +186,17 @@ impl HostCommandRunner {
     }
 
     /// Discovery and presence/auth probes retain the read cap with a shorter deadline.
+    /// The probe runs the scope's provider CLI.
     pub(super) async fn probe(
         &self,
         scope: &HostScope,
-        provider: PullRequestsProvider,
         args: &[impl AsRef<OsStr>],
         c: &CancellationToken,
     ) -> Result<CommandOutput, ProcessFailure> {
-        let mut request = self.provider_request(scope, provider, args, Budget::Read, None);
+        let mut request = self.provider_request(scope, scope.provider, args, Budget::Read, None);
         request.timeout = Duration::from_secs(5);
         let key = (
-            provider == PullRequestsProvider::Github,
+            scope.provider == PullRequestsProvider::Github,
             scope.host.to_ascii_lowercase(),
             scope.repository.clone(),
             request.args.clone(),
@@ -609,7 +617,7 @@ mod trait_tests {
             cwd: PathBuf::new(),
             host: "github.com".into(),
             repository: "example/repository".into(),
-            provider: ProviderKind::Github,
+            provider: PullRequestsProvider::Github,
         };
         let c = CancellationToken::new();
         let context = HostContext {
@@ -686,7 +694,7 @@ mod tests {
             cwd: sandbox.root().into(),
             host: "git.acme.example".into(),
             repository: "team/sub/repo".into(),
-            provider: ProviderKind::Gitlab,
+            provider: PullRequestsProvider::Gitlab,
         }
     }
 
@@ -841,11 +849,12 @@ mod tests {
         let runner =
             HostCommandRunner::new(s.path("state")).with_commands(&script, &script, &script);
         let c = CancellationToken::new();
+        let github = HostScope {
+            provider: PullRequestsProvider::Github,
+            ..scope(&s)
+        };
         for _ in 0..2 {
-            runner
-                .probe(&scope(&s), PullRequestsProvider::Github, &["--version"], &c)
-                .await
-                .unwrap();
+            runner.probe(&github, &["--version"], &c).await.unwrap();
         }
         assert_eq!(
             std::fs::read_to_string(s.path("calls"))
@@ -856,10 +865,7 @@ mod tests {
         );
         c.cancel();
         assert!(
-            runner
-                .probe(&scope(&s), PullRequestsProvider::Github, &["--version"], &c)
-                .await
-                .is_err(),
+            runner.probe(&github, &["--version"], &c).await.is_err(),
             "cached probes still respect cancellation"
         );
     }

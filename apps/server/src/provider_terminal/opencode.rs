@@ -34,6 +34,8 @@ use super::{
     TerminalAgentActivityTransition, TerminalGenerationActivityPublisher,
     TerminalObserverWorkerContext,
 };
+#[cfg(not(windows))]
+use crate::process::supervised::spawn_retrying_busy_executable;
 #[cfg(test)]
 use crate::provider::opencode::sse::OPENCODE_SSE_EVENT_LIMIT;
 use crate::{
@@ -1940,6 +1942,14 @@ impl OpenCodeHelperLauncher for SystemOpenCodeHelperLauncher {
                 crate::provider::environment::sanitize_provider_subprocess_environment(command);
             });
             configure_supervised_background_command_wrap(&mut command);
+            #[cfg(not(windows))]
+            let mut child = spawn_retrying_busy_executable(
+                &mut command,
+                tokio::time::Instant::now() + self.readiness_timeout,
+            )
+            .await
+            .map_err(|error| format!("failed to start OpenCode helper: {error}"))?;
+            #[cfg(windows)]
             let mut child = command
                 .spawn()
                 .map_err(|error| format!("failed to start OpenCode helper: {error}"))?;
@@ -1952,7 +1962,9 @@ impl OpenCodeHelperLauncher for SystemOpenCodeHelperLauncher {
                     return Err(error);
                 }
                 race.spawned.publish();
-                race.release.wait_after(0).await;
+                race.release
+                    .wait_after_bounded(0, "the test to release the admission-race helper")
+                    .await;
             }
             let identity = child
                 .id()
@@ -2022,7 +2034,10 @@ impl OpenCodeHelperLauncher for SystemOpenCodeHelperLauncher {
                     process.terminate_and_reap().await;
                     return Err(error);
                 }
-                events.release.wait_after(0).await;
+                events
+                    .release
+                    .wait_after_bounded(0, "the test to release the spawned helper")
+                    .await;
             }
             #[cfg(test)]
             if let Some(stdout_join) = self
@@ -2033,7 +2048,10 @@ impl OpenCodeHelperLauncher for SystemOpenCodeHelperLauncher {
                 let stdout_join = stdout_join.clone();
                 let stdout_task = tokio::spawn(async move {
                     stdout_join.join_started.publish();
-                    stdout_join.join_release.wait_after(0).await;
+                    stdout_join
+                        .join_release
+                        .wait_after_bounded(0, "the test to release the retained stdout join")
+                        .await;
                 });
                 *process
                     .stdout_task
@@ -2803,7 +2821,10 @@ impl OpenCodeRetainedReaper {
                 .and_then(|events| events.reap_timeout.as_ref())
             {
                 reap_timeout.background_wait_started.publish();
-                reap_timeout.foreground_return_release.wait_after(0).await;
+                reap_timeout
+                    .foreground_return_release
+                    .wait_after_bounded(0, "the test to release the foreground reap return")
+                    .await;
             }
             foreground_done.send_replace(true);
             #[cfg(test)]
@@ -2811,7 +2832,10 @@ impl OpenCodeRetainedReaper {
                 .as_ref()
                 .and_then(|events| events.reap_timeout.as_ref())
             {
-                reap_timeout.background_wait_release.wait_after(0).await;
+                reap_timeout
+                    .background_wait_release
+                    .wait_after_bounded(0, "the test to release the background reap wait")
+                    .await;
             }
             loop {
                 if wait_failed {
@@ -3429,8 +3453,146 @@ mod tests {
     use futures_util::{StreamExt, stream};
 
     use super::*;
+    use crate::test_support::within_fixture_deadline;
     #[cfg(unix)]
     use crate::test_support::{FixtureEvent, TestSandbox};
+
+    #[cfg(unix)]
+    type OpenCodeHelperStart = JoinHandle<Result<OpenCodeHelperReady, String>>;
+
+    /// Waits for `event` to pass `checkpoint` while the helper start task
+    /// runs. A start that ends first, for example because the helper could
+    /// not spawn, fails the test with its own result instead of leaving the
+    /// wait to hang.
+    #[cfg(unix)]
+    async fn wait_during_start(
+        start: &mut OpenCodeHelperStart,
+        event: &FixtureEvent,
+        checkpoint: u64,
+        what: &str,
+    ) {
+        within_fixture_deadline(what, async {
+            tokio::select! {
+                biased;
+                () = event.wait_after(checkpoint) => {}
+                result = &mut *start => {
+                    panic!("the OpenCode helper start task ended before {what}: {result:?}")
+                }
+            }
+        })
+        .await;
+    }
+
+    #[cfg(unix)]
+    async fn join_start(start: OpenCodeHelperStart) -> Result<OpenCodeHelperReady, String> {
+        within_fixture_deadline("the OpenCode helper start task to finish", start)
+            .await
+            .expect("OpenCode helper start task")
+    }
+
+    /// Builds a launch that executes a sandbox script directly.
+    #[cfg(unix)]
+    fn sandbox_script_launch(
+        sandbox: &TestSandbox,
+        script: &Path,
+        process_attribution: ProcessAttributionRegistry,
+    ) -> OpenCodeHelperLaunch {
+        OpenCodeHelperLaunch {
+            executable: script.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            cwd: sandbox.root().to_path_buf(),
+            env: sandbox.environment(std::iter::empty::<(String, String)>()),
+            process_attribution,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn system_helper_launcher_retries_while_its_executable_is_busy() {
+        let sandbox = TestSandbox::new("opencode-helper-busy-executable");
+        let script = sandbox.executable_script(
+            "helper",
+            "printf 'opencode server listening on http://127.0.0.1:43127\\n'\nexec sleep 3600",
+            "",
+        );
+        let writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&script)
+            .expect("hold the helper executable open for writing");
+        let launcher = Arc::new(SystemOpenCodeHelperLauncher::default());
+        let launch = sandbox_script_launch(&sandbox, &script, ProcessAttributionRegistry::new());
+        let start = tokio::spawn({
+            let launcher = launcher.clone();
+            async move { launcher.start(launch).await }
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !start.is_finished(),
+            "spawn must keep retrying while the script is busy: {:?}",
+            join_start(start).await
+        );
+        drop(writer);
+
+        let ready = join_start(start)
+            .await
+            .expect("spawn must succeed once the writer closes");
+        within_fixture_deadline(
+            "the retried OpenCode helper to be reaped",
+            ready.process.terminate_and_reap(),
+        )
+        .await;
+        within_fixture_deadline(
+            "the retried OpenCode helper launcher to shut down",
+            launcher.shutdown(),
+        )
+        .await;
+        assert_eq!(ready.endpoint, "http://127.0.0.1:43127");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn system_helper_launcher_stops_retrying_a_permanently_busy_executable() {
+        let sandbox = TestSandbox::new("opencode-helper-permanently-busy-executable");
+        let script = sandbox.executable_script(
+            "helper",
+            "printf 'opencode server listening on http://127.0.0.1:43127\\n'\nexec sleep 3600",
+            "",
+        );
+        let _writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&script)
+            .expect("keep the helper executable open for writing");
+        let launcher = SystemOpenCodeHelperLauncher::default();
+        let launch = sandbox_script_launch(&sandbox, &script, ProcessAttributionRegistry::new());
+        let started = std::time::Instant::now();
+        let error = within_fixture_deadline(
+            "the permanently busy OpenCode helper to exhaust its spawn retry budget",
+            tokio::time::timeout(Duration::from_secs(2), launcher.start(launch)),
+        )
+        .await
+        .expect("spawn retries must stop before the three-second readiness timeout")
+        .expect_err("a permanently busy executable must not spawn");
+        let elapsed = started.elapsed();
+        within_fixture_deadline(
+            "the busy OpenCode helper launcher to shut down",
+            launcher.shutdown(),
+        )
+        .await;
+
+        assert!(
+            error.starts_with("failed to start OpenCode helper:")
+                && error.contains("Text file busy"),
+            "unexpected spawn error: {error}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(500),
+            "spawn must retry a busy executable before failing: {elapsed:?}; {error}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "spawn retries must use the one-second budget: {elapsed:?}"
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -3467,18 +3629,28 @@ mod tests {
                 );
                 crate::test_support::run_on_current_thread(async {
                     let launcher = SystemOpenCodeHelperLauncher::default();
-                    let ready = launcher
-                        .start(OpenCodeHelperLaunch {
+                    let ready = within_fixture_deadline(
+                        "the system OpenCode helper to become ready",
+                        launcher.start(OpenCodeHelperLaunch {
                             executable: executable.to_string_lossy().into_owned(),
                             args: vec![output_path.to_string_lossy().into_owned()],
                             cwd: sandbox.root().to_path_buf(),
                             env: BTreeMap::new(),
                             process_attribution: ProcessAttributionRegistry::new(),
-                        })
-                        .await
-                        .expect("OpenCode system helper launcher");
-                    ready.process.terminate_and_reap().await;
-                    launcher.shutdown().await;
+                        }),
+                    )
+                    .await
+                    .expect("OpenCode system helper launcher");
+                    within_fixture_deadline(
+                        "the system OpenCode helper to be reaped",
+                        ready.process.terminate_and_reap(),
+                    )
+                    .await;
+                    within_fixture_deadline(
+                        "the system OpenCode helper launcher to shut down",
+                        launcher.shutdown(),
+                    )
+                    .await;
                     assert_eq!(ready.endpoint, "http://127.0.0.1:43127");
                 });
                 assert_child_environment(
@@ -3597,27 +3769,33 @@ mod tests {
             None,
         );
 
-        while !*wait_started.borrow_and_update() {
-            wait_started
-                .changed()
-                .await
-                .expect("wait-start publisher remains live");
-        }
+        within_fixture_deadline("the fake child wait to start", async {
+            while !*wait_started.borrow_and_update() {
+                wait_started
+                    .changed()
+                    .await
+                    .expect("wait-start publisher remains live");
+            }
+        })
+        .await;
         tokio::time::advance(OPENCODE_HELPER_TERM_GRACE).await;
         assert_eq!(state.wait_calls.load(Ordering::SeqCst), 1);
         tokio::time::advance(OPENCODE_HELPER_REAP_TIMEOUT).await;
-        while !*foreground_done.borrow_and_update() {
-            foreground_done
-                .changed()
-                .await
-                .expect("foreground completion publisher remains live");
-        }
+        within_fixture_deadline("the foreground reap budget to complete", async {
+            while !*foreground_done.borrow_and_update() {
+                foreground_done
+                    .changed()
+                    .await
+                    .expect("foreground completion publisher remains live");
+            }
+        })
+        .await;
 
         assert_eq!(state.wait_calls.load(Ordering::SeqCst), 1);
         assert_eq!(state.cancelled_waits.load(Ordering::SeqCst), 0);
 
         state.release.send_replace(true);
-        reaper.shutdown().await;
+        within_fixture_deadline("the retained reaper to shut down", reaper.shutdown()).await;
         assert_eq!(state.cancelled_waits.load(Ordering::SeqCst), 0);
     }
 
@@ -3667,37 +3845,40 @@ mod tests {
                 OPENCODE_HELPER_READY_TIMEOUT,
                 self.events.clone(),
             );
-            let launch = OpenCodeHelperLaunch {
-                executable: self.executable.to_string_lossy().into_owned(),
-                args: Vec::new(),
-                cwd: self.sandbox.root().to_path_buf(),
-                env: self
-                    .sandbox
-                    .environment(std::iter::empty::<(String, String)>()),
-                process_attribution: ProcessAttributionRegistry::new(),
-            };
-            let start = tokio::spawn(async move { launcher.start(launch).await });
-            tokio::time::timeout(Duration::from_secs(10), self.events.spawned.wait_after(0))
-                .await
-                .expect("OpenCode PID publication outer watchdog");
+            let launch = sandbox_script_launch(
+                &self.sandbox,
+                &self.executable,
+                ProcessAttributionRegistry::new(),
+            );
+            let mut start = tokio::spawn(async move { launcher.start(launch).await });
+            wait_during_start(
+                &mut start,
+                &self.events.spawned,
+                0,
+                "the invalid-readiness helper PID publication",
+            )
+            .await;
             let pid = std::fs::read_to_string(&self.pid_path)
                 .expect("OpenCode helper PID")
                 .parse::<i32>()
                 .expect("numeric OpenCode helper PID");
-            self.pair_started.wait().await;
+            within_fixture_deadline(
+                "the paired invalid-readiness helper to publish its PID",
+                self.pair_started.wait(),
+            )
+            .await;
             self.events.release.publish();
-            let error = tokio::time::timeout(Duration::from_secs(10), start)
+            let error = join_start(start)
                 .await
-                .expect("OpenCode invalid readiness outer watchdog")
-                .expect("OpenCode helper start task")
                 .expect_err("invalid OpenCode readiness must fail");
             (error, pid)
         }
 
         async fn wait_reaped(&self) {
-            tokio::time::timeout(Duration::from_secs(10), self.events.reaped.wait_after(0))
-                .await
-                .expect("OpenCode helper reap outer watchdog");
+            self.events
+                .reaped
+                .wait_after_bounded(0, "the invalid-readiness helper to be reaped")
+                .await;
         }
     }
 
@@ -3748,13 +3929,8 @@ mod tests {
             OPENCODE_HELPER_READY_TIMEOUT,
             events.clone(),
         ));
-        let launch = OpenCodeHelperLaunch {
-            executable: executable.to_string_lossy().into_owned(),
-            args: Vec::new(),
-            cwd: sandbox.root().to_path_buf(),
-            env: sandbox.environment(std::iter::empty::<(String, String)>()),
-            process_attribution: ProcessAttributionRegistry::new(),
-        };
+        let launch =
+            sandbox_script_launch(&sandbox, &executable, ProcessAttributionRegistry::new());
         RetainedReapFixture {
             _sandbox: sandbox,
             pid_path,
@@ -3810,14 +3986,12 @@ mod tests {
         async fn prepare_retained_submission_waiting_for_permit(
             &self,
         ) -> PreparedRetainedSubmission {
-            let permit = self
-                .launcher
-                .reaper
-                .permits
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("retained submission semaphore remains open");
+            let permit = within_fixture_deadline(
+                "a retained cleanup permit to return",
+                self.launcher.reaper.permits.clone().acquire_owned(),
+            )
+            .await
+            .expect("retained submission semaphore remains open");
             self.spawn_prepared_retained_submission(permit)
         }
 
@@ -3879,34 +4053,41 @@ mod tests {
         ) {
             let launcher = self.launcher.clone();
             let launch = self.launch.clone();
-            let start = tokio::spawn(async move { launcher.start(launch).await });
-            tokio::time::timeout(Duration::from_secs(10), self.events.spawned.wait_after(0))
-                .await
-                .expect("OpenCode PID publication outer watchdog");
+            let mut start = tokio::spawn(async move { launcher.start(launch).await });
+            wait_during_start(
+                &mut start,
+                &self.events.spawned,
+                0,
+                "the retained helper PID publication",
+            )
+            .await;
             let pid = std::fs::read_to_string(&self.pid_path)
                 .expect("OpenCode helper PID")
                 .parse::<u32>()
                 .expect("numeric OpenCode helper PID");
             self.events.release.publish();
-            tokio::time::timeout(
-                Duration::from_secs(10),
-                self.timeout_events.foreground_wait_started.wait_after(0),
+            wait_during_start(
+                &mut start,
+                &self.timeout_events.foreground_wait_started,
+                0,
+                "the foreground reap attempt to start",
             )
-            .await
-            .expect("foreground reap attempt outer watchdog");
-            tokio::time::timeout(
-                Duration::from_secs(10),
-                self.timeout_events.background_wait_started.wait_after(0),
+            .await;
+            wait_during_start(
+                &mut start,
+                &self.timeout_events.background_wait_started,
+                0,
+                "the retained reaper to take ownership",
             )
-            .await
-            .expect("retained reaper ownership outer watchdog");
+            .await;
             (start, pid)
         }
 
         async fn assert_reaped(&self, pid: u32) {
-            tokio::time::timeout(Duration::from_secs(10), self.events.reaped.wait_after(0))
-                .await
-                .expect("retained reap completion outer watchdog");
+            self.events
+                .reaped
+                .wait_after_bounded(0, "the retained helper to be reaped")
+                .await;
             assert!(matches!(
                 waitid_child_once(pid),
                 Err(error) if error.raw_os_error() == Some(libc::ECHILD)
@@ -3935,44 +4116,53 @@ mod tests {
 
     #[cfg(unix)]
     async fn next_active_drain_epoch(epoch: &mut watch::Receiver<Option<u64>>) -> u64 {
-        loop {
-            if let Some(epoch) = *epoch.borrow_and_update() {
-                return epoch;
-            }
-            epoch
-                .changed()
-                .await
-                .expect("drain epoch sender remains live");
-        }
+        within_fixture_deadline(
+            "the retained reaper to publish an active drain epoch",
+            async {
+                loop {
+                    if let Some(epoch) = *epoch.borrow_and_update() {
+                        return epoch;
+                    }
+                    epoch
+                        .changed()
+                        .await
+                        .expect("drain epoch sender remains live");
+                }
+            },
+        )
+        .await
     }
 
     #[cfg(unix)]
     async fn next_completed_join_owner(
         reaper: &Arc<OpenCodeRetainedReaper>,
     ) -> (u64, Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>) {
-        loop {
-            let notified = reaper.changed.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            let completed = {
-                let registry = reaper
-                    .registry
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                registry.entries.iter().find_map(|(task_id, entry)| {
-                    let OpenCodeRetainedReaperEntry::Running(task) = entry else {
-                        return None;
-                    };
-                    task.completed
-                        .load(Ordering::Acquire)
-                        .then(|| (*task_id, task.join.clone()))
-                })
-            };
-            if let Some(completed) = completed {
-                return completed;
+        within_fixture_deadline("a retained reaper task to complete", async {
+            loop {
+                let notified = reaper.changed.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let completed = {
+                    let registry = reaper
+                        .registry
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    registry.entries.iter().find_map(|(task_id, entry)| {
+                        let OpenCodeRetainedReaperEntry::Running(task) = entry else {
+                            return None;
+                        };
+                        task.completed
+                            .load(Ordering::Acquire)
+                            .then(|| (*task_id, task.join.clone()))
+                    })
+                };
+                if let Some(completed) = completed {
+                    return completed;
+                }
+                notified.await;
             }
-            notified.await;
-        }
+        })
+        .await
     }
 
     #[cfg(unix)]
@@ -4003,26 +4193,31 @@ mod tests {
                 "each normal reservation keeps retained records within live capacity"
             );
             let mut foreground_done = fixture.submit_reserved_real_child(registration, prepared);
-            fixture.events.reaped.wait_after(reaped_checkpoint).await;
+            fixture
+                .events
+                .reaped
+                .wait_after_bounded(reaped_checkpoint, "the retained submission to be reaped")
+                .await;
             reaped_checkpoint = fixture.events.reaped.checkpoint();
-            while !*foreground_done.borrow_and_update() {
-                foreground_done
-                    .changed()
-                    .await
-                    .expect("retained foreground completion sender remains live");
-            }
+            within_fixture_deadline("the retained foreground reap to complete", async {
+                while !*foreground_done.borrow_and_update() {
+                    foreground_done
+                        .changed()
+                        .await
+                        .expect("retained foreground completion sender remains live");
+                }
+            })
+            .await;
         }
         let mut returned_permits = Vec::with_capacity(OPENCODE_HELPER_REAPER_CAPACITY);
         for _ in 0..OPENCODE_HELPER_REAPER_CAPACITY {
             returned_permits.push(
-                fixture
-                    .launcher
-                    .reaper
-                    .permits
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .expect("all retained cleanup permits return"),
+                within_fixture_deadline(
+                    "every retained cleanup permit to return",
+                    fixture.launcher.reaper.permits.clone().acquire_owned(),
+                )
+                .await
+                .expect("all retained cleanup permits return"),
             );
         }
 
@@ -4056,7 +4251,9 @@ mod tests {
         let registration = fixture.launcher.reaper.reserve_pending();
         let _foreground_done = fixture.submit_reserved_real_child(registration, prepared);
         let (task_id, join_owner) = next_completed_join_owner(&fixture.launcher.reaper).await;
-        let join_guard = join_owner.lock().await;
+        let join_guard =
+            within_fixture_deadline("the completed task's join owner lock", join_owner.lock())
+                .await;
         assert!(join_guard.is_some(), "registry owns the terminal task join");
 
         let mut cancelled_shutdown = Box::pin(fixture.launcher.reaper.shutdown());
@@ -4094,7 +4291,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         for shutdown in shutdowns {
-            shutdown
+            within_fixture_deadline("a concurrent replacement shutdown to finish", shutdown)
                 .await
                 .expect("concurrent replacement shutdown task");
         }
@@ -4130,15 +4327,23 @@ mod tests {
 
         let _foreground_done = fixture.submit_reserved_real_child(registration, prepared);
         fixture.release_foreground_and_background_waits();
-        wait_error.injected.wait_after(0).await;
-        wait_error.retry_started.wait_after(0).await;
+        wait_error
+            .injected
+            .wait_after_bounded(0, "the first injected wait failure")
+            .await;
+        wait_error
+            .retry_started
+            .wait_after_bounded(0, "the drain-epoch retry to start")
+            .await;
         assert_eq!(
             wait_error.retry_started.checkpoint(),
             1,
             "a task promoted after epoch publication consumes that epoch once"
         );
 
-        shutdown.await.expect("retained reaper shutdown task");
+        within_fixture_deadline("the retained reaper shutdown to finish", shutdown)
+            .await
+            .expect("retained reaper shutdown task");
         fixture.assert_reaped(pid).await;
     }
 
@@ -4161,7 +4366,9 @@ mod tests {
         );
 
         drop(registration);
-        shutdown.await.expect("pending rollback shutdown task");
+        within_fixture_deadline("the pending-rollback shutdown to finish", shutdown)
+            .await
+            .expect("pending rollback shutdown task");
         assert_eq!(
             *epoch.borrow(),
             None,
@@ -4169,7 +4376,7 @@ mod tests {
         );
 
         drop(prepared);
-        tokio::time::timeout(Duration::from_secs(10), async {
+        within_fixture_deadline("the rolled-back prepared child to be reaped", async {
             loop {
                 if matches!(
                     waitid_child_once(pid),
@@ -4177,11 +4384,12 @@ mod tests {
                 ) {
                     return;
                 }
-                tokio::task::yield_now().await;
+                // Tokio reaps dropped children from its orphan queue only after a driver turn.
+                // A yield_now loop cannot complete one while an idle worker holds the driver.
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await
-        .expect("rolled-back prepared child reap outer watchdog");
+        .await;
         assert_eq!(
             fixture.launcher.reaper.permits.available_permits(),
             OPENCODE_HELPER_REAPER_CAPACITY,
@@ -4207,7 +4415,10 @@ mod tests {
         let registration = fixture.launcher.reaper.reserve_pending();
         let _foreground_done = fixture.submit_reserved_real_child(registration, prepared);
 
-        wait_error.injected.wait_after(0).await;
+        wait_error
+            .injected
+            .wait_after_bounded(0, "the foreground injected wait failure")
+            .await;
         assert_eq!(
             wait_error.injected.checkpoint(),
             1,
@@ -4221,8 +4432,14 @@ mod tests {
         );
 
         tokio::time::advance(Duration::from_millis(1)).await;
-        wait_error.retry_started.wait_after(0).await;
-        wait_error.injected.wait_after(1).await;
+        wait_error
+            .retry_started
+            .wait_after_bounded(0, "the 100 ms wait retry to start")
+            .await;
+        wait_error
+            .injected
+            .wait_after_bounded(1, "the retried injected wait failure")
+            .await;
         assert_eq!(
             wait_error.injected.checkpoint(),
             2,
@@ -4231,7 +4448,11 @@ mod tests {
 
         wait_error.fail_persistently.store(false, Ordering::Release);
         tokio::time::advance(Duration::from_millis(100)).await;
-        fixture.launcher.shutdown().await;
+        within_fixture_deadline(
+            "the launcher shutdown to drain the retained child",
+            fixture.launcher.shutdown(),
+        )
+        .await;
         fixture.assert_reaped(pid).await;
     }
 
@@ -4243,19 +4464,19 @@ mod tests {
         assert_eq!(fixture.events.reaped.checkpoint(), 0);
         fixture.timeout_events.foreground_return_release.publish();
 
-        let error = tokio::time::timeout(Duration::from_secs(10), start)
+        let error = join_start(start)
             .await
-            .expect("bounded OpenCode readiness error return")
-            .expect("OpenCode start task")
             .expect_err("invalid endpoint must fail");
         assert!(
             error == "OpenCode helper advertised an invalid endpoint"
                 || error == "OpenCode helper readiness timed out"
         );
         fixture.timeout_events.background_wait_release.publish();
-        tokio::time::timeout(Duration::from_secs(10), fixture.launcher.shutdown())
-            .await
-            .expect("retained reaper shutdown outer watchdog");
+        within_fixture_deadline(
+            "the retained reaper shutdown to finish",
+            fixture.launcher.shutdown(),
+        )
+        .await;
         fixture.assert_reaped(pid).await;
     }
 
@@ -4266,7 +4487,7 @@ mod tests {
         let (start, pid) = fixture.reach_background_owner().await;
         start.abort();
         assert!(
-            start
+            within_fixture_deadline("the aborted foreground waiter to finish", start)
                 .await
                 .expect_err("foreground waiter is aborted")
                 .is_cancelled()
@@ -4274,9 +4495,11 @@ mod tests {
 
         fixture.timeout_events.foreground_return_release.publish();
         fixture.timeout_events.background_wait_release.publish();
-        tokio::time::timeout(Duration::from_secs(10), fixture.launcher.shutdown())
-            .await
-            .expect("retained reaper drain after waiter abort");
+        within_fixture_deadline(
+            "the retained reaper to drain after the waiter abort",
+            fixture.launcher.shutdown(),
+        )
+        .await;
         fixture.assert_reaped(pid).await;
     }
 
@@ -4286,7 +4509,7 @@ mod tests {
         let fixture = retained_reap_fixture("opencode-shutdown-drain");
         let (start, pid) = fixture.reach_background_owner().await;
         fixture.timeout_events.foreground_return_release.publish();
-        let _ = start.await.expect("OpenCode start task");
+        let _ = join_start(start).await;
 
         let shutdown = fixture.launcher.shutdown();
         tokio::pin!(shutdown);
@@ -4298,9 +4521,11 @@ mod tests {
             "shutdown must retain the pending reap"
         );
         fixture.timeout_events.background_wait_release.publish();
-        tokio::time::timeout(Duration::from_secs(10), shutdown)
-            .await
-            .expect("launcher shutdown drains retained child");
+        within_fixture_deadline(
+            "the launcher shutdown to drain the retained child",
+            shutdown,
+        )
+        .await;
         fixture.assert_reaped(pid).await;
     }
 
@@ -4316,40 +4541,50 @@ mod tests {
             .with_stdout_join(stdout_join.clone());
         let launcher = fixture.launcher.clone();
         let launch = fixture.launch.clone();
-        let start = tokio::spawn(async move { launcher.start(launch).await });
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            fixture.events.spawned.wait_after(0),
+        let mut start = tokio::spawn(async move { launcher.start(launch).await });
+        wait_during_start(
+            &mut start,
+            &fixture.events.spawned,
+            0,
+            "the stdout-join helper PID publication",
         )
-        .await
-        .expect("OpenCode PID publication outer watchdog");
+        .await;
         let pid = std::fs::read_to_string(&fixture.pid_path)
             .expect("OpenCode helper PID")
             .parse::<u32>()
             .expect("numeric OpenCode helper PID");
         fixture.events.release.publish();
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            stdout_join.ownership_registered.wait_after(0),
+        wait_during_start(
+            &mut start,
+            &stdout_join.ownership_registered,
+            0,
+            "registry ownership before the stdout join",
         )
-        .await
-        .expect("registry ownership before stdout join");
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            stdout_join.join_started.wait_after(0),
+        .await;
+        wait_during_start(
+            &mut start,
+            &stdout_join.join_started,
+            0,
+            "the retained stdout join to begin",
         )
-        .await
-        .expect("retained stdout join begins");
+        .await;
 
         start.abort();
-        assert!(start.await.expect_err("launch waiter abort").is_cancelled());
+        assert!(
+            within_fixture_deadline("the aborted launch waiter to finish", start)
+                .await
+                .expect_err("launch waiter abort")
+                .is_cancelled()
+        );
         assert_eq!(fixture.events.reaped.checkpoint(), 0);
         stdout_join.join_release.publish();
         fixture.timeout_events.foreground_return_release.publish();
         fixture.timeout_events.background_wait_release.publish();
-        tokio::time::timeout(Duration::from_secs(10), fixture.launcher.shutdown())
-            .await
-            .expect("shutdown drains stdout-join transfer");
+        within_fixture_deadline(
+            "the shutdown to drain the stdout-join transfer",
+            fixture.launcher.shutdown(),
+        )
+        .await;
         fixture.assert_reaped(pid).await;
     }
 
@@ -4367,10 +4602,16 @@ mod tests {
             .with_wait_error(wait_error.clone());
         let (start, pid) = fixture.reach_background_owner().await;
         fixture.timeout_events.foreground_return_release.publish();
-        let _ = start.await.expect("OpenCode launch task");
+        let _ = join_start(start).await;
         fixture.timeout_events.background_wait_release.publish();
-        wait_error.injected.wait_after(0).await;
-        wait_error.recorded.wait_after(0).await;
+        wait_error
+            .injected
+            .wait_after_bounded(0, "the transient injected wait failure")
+            .await;
+        wait_error
+            .recorded
+            .wait_after_bounded(0, "the transient wait failure to be recorded")
+            .await;
 
         assert_eq!(fixture.events.reaped.checkpoint(), 0);
         tokio::time::advance(Duration::from_millis(99)).await;
@@ -4380,8 +4621,15 @@ mod tests {
             "retry must not hot-loop before its backoff expires"
         );
         tokio::time::advance(Duration::from_millis(1)).await;
-        wait_error.retry_started.wait_after(0).await;
-        fixture.launcher.shutdown().await;
+        wait_error
+            .retry_started
+            .wait_after_bounded(0, "the 100 ms wait retry to start")
+            .await;
+        within_fixture_deadline(
+            "the launcher shutdown to drain the retained child",
+            fixture.launcher.shutdown(),
+        )
+        .await;
         fixture.assert_reaped(pid).await;
         assert_eq!(
             wait_error.retry_started.checkpoint(),
@@ -4404,10 +4652,16 @@ mod tests {
             .with_wait_error(wait_error.clone());
         let (start, pid) = fixture.reach_background_owner().await;
         fixture.timeout_events.foreground_return_release.publish();
-        let _ = start.await.expect("OpenCode launch task");
+        let _ = join_start(start).await;
         fixture.timeout_events.background_wait_release.publish();
-        wait_error.injected.wait_after(0).await;
-        wait_error.recorded.wait_after(0).await;
+        wait_error
+            .injected
+            .wait_after_bounded(0, "the first persistent injected wait failure")
+            .await;
+        wait_error
+            .recorded
+            .wait_after_bounded(0, "the first persistent wait failure to be recorded")
+            .await;
 
         let mut epoch = fixture.launcher.reaper.drain_epoch.subscribe();
         let launcher = fixture.launcher.clone();
@@ -4417,9 +4671,18 @@ mod tests {
             active_epoch > 0,
             "shutdown publishes a positive drain epoch"
         );
-        wait_error.retry_started.wait_after(0).await;
-        wait_error.injected.wait_after(1).await;
-        wait_error.recorded.wait_after(1).await;
+        wait_error
+            .retry_started
+            .wait_after_bounded(0, "the immediate drain-epoch retry to start")
+            .await;
+        wait_error
+            .injected
+            .wait_after_bounded(1, "the immediate retry's injected wait failure")
+            .await;
+        wait_error
+            .recorded
+            .wait_after_bounded(1, "the immediate retry's wait failure to be recorded")
+            .await;
         assert_eq!(
             wait_error.injected.checkpoint(),
             2,
@@ -4435,9 +4698,18 @@ mod tests {
         assert_eq!(wait_error.injected.checkpoint(), 2);
         let retry_checkpoint = wait_error.retry_started.checkpoint();
         tokio::time::advance(Duration::from_millis(1)).await;
-        wait_error.retry_started.wait_after(retry_checkpoint).await;
-        wait_error.injected.wait_after(2).await;
-        wait_error.recorded.wait_after(2).await;
+        wait_error
+            .retry_started
+            .wait_after_bounded(retry_checkpoint, "the 100 ms cadence retry to start")
+            .await;
+        wait_error
+            .injected
+            .wait_after_bounded(2, "the cadence retry's injected wait failure")
+            .await;
+        wait_error
+            .recorded
+            .wait_after_bounded(2, "the cadence retry's wait failure to be recorded")
+            .await;
         assert_eq!(
             wait_error.injected.checkpoint(),
             3,
@@ -4446,7 +4718,9 @@ mod tests {
 
         wait_error.fail_persistently.store(false, Ordering::Release);
         tokio::time::advance(Duration::from_millis(100)).await;
-        shutdown.await.expect("retained reaper shutdown task");
+        within_fixture_deadline("the retained reaper shutdown to finish", shutdown)
+            .await
+            .expect("retained reaper shutdown task");
         fixture.assert_reaped(pid).await;
     }
 
@@ -4469,22 +4743,40 @@ mod tests {
         let first_pid = first.pid;
         let first_registration = fixture.launcher.reaper.reserve_pending();
         let _first_foreground = fixture.submit_reserved_real_child(first_registration, first);
-        wait_error.injected.wait_after(0).await;
-        wait_error.recorded.wait_after(0).await;
+        wait_error
+            .injected
+            .wait_after_bounded(0, "the first submission's injected wait failure")
+            .await;
+        wait_error
+            .recorded
+            .wait_after_bounded(0, "the first submission's wait failure to be recorded")
+            .await;
 
         let first_shutdown = tokio::spawn({
             let launcher = fixture.launcher.clone();
             async move { launcher.shutdown().await }
         });
         let first_epoch = next_active_drain_epoch(&mut epoch).await;
-        wait_error.retry_started.wait_after(0).await;
-        wait_error.injected.wait_after(1).await;
-        wait_error.recorded.wait_after(1).await;
+        wait_error
+            .retry_started
+            .wait_after_bounded(0, "the first drain epoch's retry to start")
+            .await;
+        wait_error
+            .injected
+            .wait_after_bounded(1, "the first drain epoch's injected wait failure")
+            .await;
+        wait_error
+            .recorded
+            .wait_after_bounded(1, "the first drain epoch's wait failure to be recorded")
+            .await;
         wait_error.fail_persistently.store(false, Ordering::Release);
         tokio::time::advance(Duration::from_millis(100)).await;
-        first_shutdown
-            .await
-            .expect("first retained reaper shutdown task");
+        within_fixture_deadline(
+            "the first retained reaper shutdown to finish",
+            first_shutdown,
+        )
+        .await
+        .expect("first retained reaper shutdown task");
         fixture.assert_reaped(first_pid).await;
         assert_eq!(
             *epoch.borrow(),
@@ -4500,8 +4792,20 @@ mod tests {
         let recorded_before_second = wait_error.recorded.checkpoint();
         let retry_before_second = wait_error.retry_started.checkpoint();
         let _second_foreground = fixture.submit_reserved_real_child(second_registration, second);
-        wait_error.injected.wait_after(injected_before_second).await;
-        wait_error.recorded.wait_after(recorded_before_second).await;
+        wait_error
+            .injected
+            .wait_after_bounded(
+                injected_before_second,
+                "the second submission's injected wait failure",
+            )
+            .await;
+        wait_error
+            .recorded
+            .wait_after_bounded(
+                recorded_before_second,
+                "the second submission's wait failure to be recorded",
+            )
+            .await;
 
         let second_shutdown = tokio::spawn({
             let launcher = fixture.launcher.clone();
@@ -4514,15 +4818,24 @@ mod tests {
         );
         wait_error
             .retry_started
-            .wait_after(retry_before_second)
+            .wait_after_bounded(
+                retry_before_second,
+                "the second drain epoch's retry to start",
+            )
             .await;
         wait_error
             .injected
-            .wait_after(injected_before_second + 1)
+            .wait_after_bounded(
+                injected_before_second + 1,
+                "the second drain epoch's injected wait failure",
+            )
             .await;
         wait_error
             .recorded
-            .wait_after(recorded_before_second + 1)
+            .wait_after_bounded(
+                recorded_before_second + 1,
+                "the second drain epoch's wait failure to be recorded",
+            )
             .await;
         let injected_after_immediate_retry = wait_error.injected.checkpoint();
 
@@ -4553,13 +4866,16 @@ mod tests {
         tokio::time::advance(Duration::from_millis(1)).await;
         wait_error
             .retry_started
-            .wait_after(retry_before_cadence)
+            .wait_after_bounded(retry_before_cadence, "the 100 ms cadence retry to start")
             .await;
-        second_shutdown
-            .await
-            .expect("second retained reaper shutdown task");
+        within_fixture_deadline(
+            "the second retained reaper shutdown to finish",
+            second_shutdown,
+        )
+        .await
+        .expect("second retained reaper shutdown task");
         for shutdown in repeated_shutdowns {
-            shutdown.await;
+            within_fixture_deadline("a repeated shutdown caller to finish", shutdown).await;
         }
         fixture.assert_reaped(second_pid).await;
     }
@@ -4578,10 +4894,16 @@ mod tests {
             .with_wait_error(wait_error.clone());
         let (start, pid) = fixture.reach_background_owner().await;
         fixture.timeout_events.foreground_return_release.publish();
-        let _ = start.await.expect("OpenCode launch task");
+        let _ = join_start(start).await;
         fixture.timeout_events.background_wait_release.publish();
-        wait_error.injected.wait_after(0).await;
-        wait_error.recorded.wait_after(0).await;
+        wait_error
+            .injected
+            .wait_after_bounded(0, "the first persistent injected wait failure")
+            .await;
+        wait_error
+            .recorded
+            .wait_after_bounded(0, "the first persistent wait failure to be recorded")
+            .await;
 
         let mut epoch = fixture.launcher.reaper.drain_epoch.subscribe();
         let mut initial_shutdown = Box::pin(fixture.launcher.reaper.shutdown());
@@ -4591,9 +4913,18 @@ mod tests {
         .await;
         assert!(first_poll.is_pending(), "persistent wait keeps drain live");
         let active_epoch = next_active_drain_epoch(&mut epoch).await;
-        wait_error.retry_started.wait_after(0).await;
-        wait_error.injected.wait_after(1).await;
-        wait_error.recorded.wait_after(1).await;
+        wait_error
+            .retry_started
+            .wait_after_bounded(0, "the immediate drain-epoch retry to start")
+            .await;
+        wait_error
+            .injected
+            .wait_after_bounded(1, "the immediate retry's injected wait failure")
+            .await;
+        wait_error
+            .recorded
+            .wait_after_bounded(1, "the immediate retry's wait failure to be recorded")
+            .await;
         assert_eq!(
             wait_error.injected.checkpoint(),
             2,
@@ -4625,9 +4956,18 @@ mod tests {
         );
         let retry_checkpoint = wait_error.retry_started.checkpoint();
         tokio::time::advance(Duration::from_millis(1)).await;
-        wait_error.retry_started.wait_after(retry_checkpoint).await;
-        wait_error.injected.wait_after(2).await;
-        wait_error.recorded.wait_after(2).await;
+        wait_error
+            .retry_started
+            .wait_after_bounded(retry_checkpoint, "the 100 ms cadence retry to start")
+            .await;
+        wait_error
+            .injected
+            .wait_after_bounded(2, "the cadence retry's injected wait failure")
+            .await;
+        wait_error
+            .recorded
+            .wait_after_bounded(2, "the cadence retry's wait failure to be recorded")
+            .await;
         assert_eq!(
             wait_error.injected.checkpoint(),
             3,
@@ -4636,9 +4976,13 @@ mod tests {
 
         wait_error.fail_persistently.store(false, Ordering::Release);
         tokio::time::advance(Duration::from_millis(100)).await;
-        fixture.events.reaped.wait_after(0).await;
+        fixture
+            .events
+            .reaped
+            .wait_after_bounded(0, "the retained helper to be reaped")
+            .await;
         for shutdown in repeated_shutdowns {
-            shutdown.await;
+            within_fixture_deadline("a repeated shutdown caller to finish", shutdown).await;
         }
         fixture.assert_reaped(pid).await;
     }
@@ -4837,7 +5181,11 @@ mod tests {
         .expect("system helper exit becomes observable");
 
         let waitable_before_cleanup = exited_child_remains_waitable(process_id);
-        helper.terminate_and_reap().await;
+        within_fixture_deadline(
+            "the exited helper's group cleanup to reap it",
+            helper.terminate_and_reap(),
+        )
+        .await;
         let waitable_after_cleanup = exited_child_remains_waitable(process_id);
 
         assert!(
@@ -4876,27 +5224,35 @@ mod tests {
             .stderr(Stdio::null());
         let exited_child = exited_command.spawn().expect("exited helper leader");
         let exited_process_id = exited_child.id().expect("exited helper process ID");
-        let mut status = 0;
-        loop {
-            // SAFETY: the PID belongs to the direct child created immediately
-            // above, and `status` points to writable wait-status storage.
-            let result = unsafe {
-                libc::waitpid(
-                    exited_process_id as libc::pid_t,
-                    std::ptr::addr_of_mut!(status),
-                    0,
-                )
-            };
-            if result == exited_process_id as libc::pid_t {
-                break;
+        within_fixture_deadline("the exited helper leader to be reaped manually", async {
+            let mut status = 0;
+            loop {
+                // SAFETY: the PID belongs to the direct child created
+                // immediately above, and `status` points to writable
+                // wait-status storage.
+                let result = unsafe {
+                    libc::waitpid(
+                        exited_process_id as libc::pid_t,
+                        std::ptr::addr_of_mut!(status),
+                        libc::WNOHANG,
+                    )
+                };
+                if result == exited_process_id as libc::pid_t {
+                    return;
+                }
+                if result == 0 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    continue;
+                }
+                let error = std::io::Error::last_os_error();
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted,
+                    "manual reap of the helper leader failed: {error}"
+                );
             }
-            let error = std::io::Error::last_os_error();
-            assert_eq!(
-                error.kind(),
-                std::io::ErrorKind::Interrupted,
-                "manual reap of the helper leader failed: {error}"
-            );
-        }
+        })
+        .await;
 
         let reaper = Arc::new(OpenCodeRetainedReaper::default());
         let helper = SystemOpenCodeHelperProcess {
@@ -4933,9 +5289,13 @@ mod tests {
                 .is_ok();
         if !sentinel_was_signaled {
             let _ = sentinel.start_kill();
-            let _ = sentinel.wait().await;
+            let _ = within_fixture_deadline("the killed sentinel to exit", sentinel.wait()).await;
         }
-        helper.reaper.shutdown().await;
+        within_fixture_deadline(
+            "the replacement helper's retained reap to drain",
+            helper.reaper.shutdown(),
+        )
+        .await;
 
         assert!(
             observed_exited,
@@ -4962,12 +5322,16 @@ mod tests {
         let cleanup = tokio::spawn(async move {
             cleanup_resources.cleanup_helper().await;
         });
-        cleanup_started.await;
+        within_fixture_deadline(
+            "helper cleanup to start terminate-and-reap",
+            cleanup_started,
+        )
+        .await;
 
         let completed_before_reap =
             resources.cleanup_state.load(Ordering::Acquire) == OPENCODE_CLEANUP_REAPED;
         cleanup.abort();
-        let _ = cleanup.await;
+        let _ = within_fixture_deadline("the aborted cleanup task to finish", cleanup).await;
         drop(resources);
 
         assert!(
@@ -5000,7 +5364,11 @@ mod tests {
         generation.request_cancellation(
             super::super::TerminalObserverCancellationReason::PreparationRejected,
         );
-        monitor_opencode_pre_spawn(resources.clone(), generation.observation()).await;
+        within_fixture_deadline(
+            "the pre-spawn monitor to observe the ownership transfer",
+            monitor_opencode_pre_spawn(resources.clone(), generation.observation()),
+        )
+        .await;
 
         assert!(
             !helper.terminated.load(Ordering::Acquire),
@@ -5139,15 +5507,16 @@ mod tests {
             .await
             .expect("long-lived OpenCode SSE");
         assert_eq!(
-            stream
-                .next_data()
+            within_fixture_deadline("the oversized SSE event", stream.next_data())
                 .await
                 .expect_err("oversized OpenCode SSE"),
             "OpenCode SSE event exceeded its bound"
         );
         assert_eq!(
             serde_json::from_slice::<Value>(
-                &stream.next_data().await.expect("long-lived OpenCode SSE"),
+                &within_fixture_deadline("the server.connected SSE event", stream.next_data())
+                    .await
+                    .expect("long-lived OpenCode SSE"),
             )
             .expect("OpenCode SSE JSON")["type"],
             "server.connected"
@@ -5187,7 +5556,7 @@ mod tests {
             );
         }
         server.abort();
-        let _ = server.await;
+        let _ = within_fixture_deadline("the aborted fixture server to stop", server).await;
     }
 
     #[test]
@@ -5285,15 +5654,15 @@ mod tests {
             OPENCODE_HELPER_READY_TIMEOUT,
             events,
         );
-        let launch = OpenCodeHelperLaunch {
-            executable: executable.to_string_lossy().into_owned(),
-            args: Vec::new(),
-            cwd: sandbox.root().to_path_buf(),
-            env: sandbox.environment(std::iter::empty::<(String, String)>()),
-            process_attribution: registry.clone(),
-        };
-        let start = tokio::spawn(async move { launcher.start(launch).await });
-        admission_race.spawned.wait_after(0).await;
+        let launch = sandbox_script_launch(&sandbox, &executable, registry.clone());
+        let mut start = tokio::spawn(async move { launcher.start(launch).await });
+        wait_during_start(
+            &mut start,
+            &admission_race.spawned,
+            0,
+            "the admission-race helper PID publication",
+        )
+        .await;
         let pid = std::fs::read_to_string(&pid_path)
             .expect("OpenCode helper PID")
             .parse::<u32>()
@@ -5302,9 +5671,8 @@ mod tests {
 
         assert!(registry.freeze_and_snapshot_identities().is_empty());
         admission_race.release.publish();
-        let error = start
+        let error = join_start(start)
             .await
-            .expect("OpenCode helper start task")
             .expect_err("frozen runtime rejects inflight helper admission");
         assert!(
             error.contains("closed for shutdown"),
@@ -5321,6 +5689,45 @@ mod tests {
             waitid_child_once(pid),
             Err(error) if error.raw_os_error() == Some(libc::ECHILD)
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[should_panic(
+        expected = "the OpenCode helper start task ended before the helper PID publication: Ok(Err(\"failed to start OpenCode helper"
+    )]
+    async fn fixture_wait_reports_a_helper_start_failure_instead_of_hanging() {
+        let sandbox = TestSandbox::new("opencode-helper-start-failure");
+        let admission_race = Arc::new(OpenCodeHelperAdmissionRace {
+            spawned: FixtureEvent::default(),
+            release: FixtureEvent::default(),
+        });
+        let launcher = SystemOpenCodeHelperLauncher::with_fixture_events(
+            OPENCODE_HELPER_READY_TIMEOUT,
+            OpenCodeHelperFixtureEvents {
+                spawned: Arc::new(FixtureEvent::default()),
+                release: Arc::new(FixtureEvent::default()),
+                admission_race: Some(admission_race.clone()),
+                reaped: Arc::new(FixtureEvent::default()),
+                pid_path: sandbox.path("helper.pid"),
+                reap_timeout: None,
+                stdout_join: None,
+                wait_error: None,
+            },
+        );
+        let launch = sandbox_script_launch(
+            &sandbox,
+            &sandbox.path("missing-opencode-helper"),
+            ProcessAttributionRegistry::new(),
+        );
+        let mut start = tokio::spawn(async move { launcher.start(launch).await });
+        wait_during_start(
+            &mut start,
+            &admission_race.spawned,
+            0,
+            "the helper PID publication",
+        )
+        .await;
     }
 
     #[cfg(unix)]

@@ -301,13 +301,25 @@ export type TurnDeliveryState = typeof TurnDeliveryState.Type;
 export const TurnDeliveryMode = Schema.Literals(["start", "steer"]);
 export type TurnDeliveryMode = typeof TurnDeliveryMode.Type;
 
+export const TurnDeliveryFailureReason = Schema.Literals(["modelSelectionRefused"]);
+export type TurnDeliveryFailureReason = typeof TurnDeliveryFailureReason.Type;
+
 export const TurnDelivery = Schema.Struct({
   state: TurnDeliveryState,
   provider: ProviderDriverKind,
+  /** The provider instance the delivery is routed to; absent from older servers. */
+  providerInstanceId: Schema.optionalKey(ProviderInstanceId),
   // An absent mode means "start" for deliveries from older servers.
   mode: Schema.optional(TurnDeliveryMode),
   held: Schema.optional(Schema.Boolean),
   detail: Schema.optional(TrimmedNonEmptyString),
+  /**
+   * Set only while state is failed. The provider refused the turn's model or one
+   * of its options, so the unchanged turn is refused again on every attempt.
+   */
+  reason: Schema.optionalKey(
+    TurnDeliveryFailureReason.pipe(Schema.catchDecoding(() => Effect.succeedNone)),
+  ),
 });
 export type TurnDelivery = typeof TurnDelivery.Type;
 
@@ -1510,10 +1522,22 @@ export type OrchestrationGetFullThreadDiffResult = typeof OrchestrationGetFullTh
 
 export const OrchestrationReplayEventsInput = Schema.Struct({
   fromSequenceExclusive: NonNegativeInt,
+  paged: Schema.optionalKey(Schema.Literal(true)),
 });
 export type OrchestrationReplayEventsInput = typeof OrchestrationReplayEventsInput.Type;
 
-const OrchestrationReplayEventsResult = Schema.Array(OrchestrationEvent);
+export const OrchestrationReplayEventsPage = Schema.Struct({
+  events: Schema.Array(OrchestrationEvent),
+  exhausted: Schema.Boolean,
+});
+export type OrchestrationReplayEventsPage = typeof OrchestrationReplayEventsPage.Type;
+
+/** A paged request gets a page; an old server ignoring `paged` returns an array,
+ * which the caller treats as one exhausted page. */
+const OrchestrationReplayEventsResult = Schema.Union([
+  Schema.Array(OrchestrationEvent),
+  OrchestrationReplayEventsPage,
+]);
 export type OrchestrationReplayEventsResult = typeof OrchestrationReplayEventsResult.Type;
 
 export const OrchestrationRpcSchemas = {

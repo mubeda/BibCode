@@ -8,6 +8,7 @@ import {
   getArm64IntelBuildWarningDescription,
   getDesktopUpdateActionError,
   getDesktopUpdateButtonTooltip,
+  hasDesktopBackendRecovery,
   isDesktopUpdateButtonDisabled,
   resolveDesktopUpdateButtonAction,
   shouldShowArm64IntelBuildWarning,
@@ -24,7 +25,9 @@ export function SidebarUpdatePill() {
   const [dismissed, setDismissed] = useState(false);
   const [updateDialogOpen, setUpdateDialogOpen] = useState(false);
 
-  const visible = isDesktopHost && shouldShowDesktopUpdateButton(state) && !dismissed;
+  const recovering = hasDesktopBackendRecovery(state);
+  const visible =
+    isDesktopHost && shouldShowDesktopUpdateButton(state) && (recovering || !dismissed);
   const tooltip = state ? getDesktopUpdateButtonTooltip(state) : "Update available";
   const disabled = isDesktopUpdateButtonDisabled(state);
   const action = state ? resolveDesktopUpdateButtonAction(state) : "none";
@@ -107,7 +110,12 @@ export function SidebarUpdatePill() {
                     className="update-main relative flex h-full flex-1 items-center gap-2 px-2 enabled:cursor-pointer"
                     onClick={handleAction}
                   >
-                    {action === "install" ? (
+                    {recovering ? (
+                      <>
+                        <TriangleAlertIcon className="size-3.5" />
+                        <span>Update not installed</span>
+                      </>
+                    ) : action === "install" ? (
                       <>
                         <RotateCwIcon className="size-3.5" />
                         <span>Restart to update</span>

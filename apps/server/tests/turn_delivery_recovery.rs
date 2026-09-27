@@ -2,16 +2,23 @@
 // These subprocess recovery tests intentionally hold a process-wide serialization guard
 // across their async lifecycle so environment variables and child processes cannot overlap.
 
+#[path = "support/hermetic_providers.rs"]
+mod hermetic_providers;
+
+#[cfg(target_os = "linux")]
+#[path = "support/reexec.rs"]
+mod reexec;
+
 use std::{
     fs::OpenOptions,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output, Stdio},
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bibcode_server::{
@@ -42,12 +49,16 @@ use bibcode_server::{
     provider_usage,
     terminal::{PortablePtyBackend, TerminalManager, TerminalManagerOptions},
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use serde_json::Value;
 use tempfile::TempDir;
 use tokio::sync::{Notify, mpsc};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
+
+#[path = "support/websocket_frames.rs"]
+mod websocket_frames;
+use websocket_frames::next_frame_past_heartbeat;
 
 const ATTACHMENT_ABORT_CHILD_STATE: &str = "BIBCODE_TURN_DELIVERY_ATTACHMENT_ABORT_CHILD_STATE";
 const ATTACHMENT_ABORT_CHILD_READY: &str = "BIBCODE_TURN_DELIVERY_ATTACHMENT_ABORT_CHILD_READY";
@@ -57,6 +68,9 @@ const CRASH_BOUNDARY_CHILD_PROVIDER: &str = "BIBCODE_TURN_DELIVERY_CRASH_PROVIDE
 const CRASH_BOUNDARY_CHILD_MODE: &str = "BIBCODE_TURN_DELIVERY_CRASH_MODE";
 const CRASH_BOUNDARY_CHILD_SENDS: &str = "BIBCODE_TURN_DELIVERY_CRASH_SENDS";
 const BOOTSTRAP_RECOVERY_INTEGRATION_DEADLINE: Duration = Duration::from_secs(30);
+const CHILD_PROCESS_DEADLINE: Duration = Duration::from_secs(30);
+#[cfg(target_os = "linux")]
+const DETACHED_PIPE_HOLDER_PID: &str = "BIBCODE_TURN_DELIVERY_DETACHED_PIPE_HOLDER_PID";
 
 fn child_process_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -67,6 +81,291 @@ fn child_process_guard() -> std::sync::MutexGuard<'static, ()> {
     child_process_lock()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn run_child_with_deadline(command: &mut Command, context: &str, timeout: Duration) -> Output {
+    fn drain(pipe: impl Read + Send + 'static) -> std::sync::mpsc::Receiver<Vec<u8>> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut pipe = pipe;
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes).expect("drain child output");
+            drop(pipe);
+            let _ = sender.send(bytes);
+        });
+        receiver
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|error| panic!("spawn {context} child: {error}"));
+    let pid = child.id();
+    let stdout = drain(child.stdout.take().expect("piped child stdout"));
+    let stderr = drain(child.stderr.take().expect("piped child stderr"));
+    let (status, timed_out) = loop {
+        if let Some(status) = child.try_wait().expect("poll child exit") {
+            break (status, false);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            #[cfg(unix)]
+            {
+                let pgid = libc::pid_t::try_from(pid).expect("child PID fits pid_t");
+                // SAFETY: spawn gave this child its own process group. The child
+                // has not been reaped, so its PID cannot have been reused.
+                if unsafe { libc::kill(-pgid, libc::SIGKILL) } == -1 {
+                    let error = std::io::Error::last_os_error();
+                    assert_eq!(
+                        error.raw_os_error(),
+                        Some(libc::ESRCH),
+                        "kill timed-out child process group: {error}"
+                    );
+                }
+            }
+            #[cfg(not(unix))]
+            child.kill().expect("kill timed-out child");
+            break (child.wait().expect("reap timed-out child"), true);
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(10)));
+    };
+    // Both readers share one cleanup budget. A descendant that escaped the
+    // process group must not turn timeout diagnostics into an unbounded wait.
+    let drain_deadline = timed_out.then(|| Instant::now() + Duration::from_secs(1));
+    let collect = |reader: std::sync::mpsc::Receiver<Vec<u8>>| match drain_deadline {
+        Some(deadline) => {
+            match reader.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(bytes) => bytes,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    b"output unavailable: a descendant still holds the pipe".to_vec()
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    b"output unavailable: child output reader failed".to_vec()
+                }
+            }
+        }
+        None => reader.recv().expect("read complete child output"),
+    };
+    let output = Output {
+        status,
+        stdout: collect(stdout),
+        stderr: collect(stderr),
+    };
+    let elapsed = started.elapsed();
+    assert!(
+        !timed_out,
+        "{context} child (pid={pid}) timed out after {elapsed:?} (deadline {timeout:?})\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    eprintln!("{context} child finished after {elapsed:?}");
+    output
+}
+
+#[cfg(unix)]
+#[test]
+fn child_deadline_kills_and_reaps_a_stalled_child_and_reports_timeout() {
+    let _guard = child_process_guard();
+    #[cfg(target_os = "linux")]
+    let phase = {
+        const TEST: &str = "child_deadline_kills_and_reaps_a_stalled_child_and_reports_timeout";
+        let Some(phase) = reexec::enter(TEST, "subreaper") else {
+            reexec::run(TEST, "subreaper", None, |_| {});
+            return;
+        };
+        // SAFETY: only this isolated test process adopts the orphaned descendant,
+        // so the assertion does not depend on the host's init reaping promptly.
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+        phase
+    };
+    let started = Instant::now();
+    let result = std::panic::catch_unwind(|| {
+        run_child_with_deadline(
+            Command::new("sh").args([
+                "-c",
+                "sleep 30 & printf 'descendant=%s\\n' \"$!\"; printf 'stalled child\\n' >&2; wait",
+            ]),
+            "sleep-timeout-fixture",
+            Duration::from_millis(100),
+        )
+    });
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the helper must report the timeout before the descendant exits naturally"
+    );
+    let panic = result.expect_err("a stalled child must time out instead of returning output");
+    let report = panic.downcast_ref::<String>().expect("timeout diagnostic");
+    assert!(report.contains("sleep-timeout-fixture"), "{report}");
+    assert!(report.contains("timed out after"), "{report}");
+    assert!(report.contains("stdout:\n"), "{report}");
+    assert!(report.contains("stderr:\n"), "{report}");
+    assert!(report.contains("stalled child\n"), "{report}");
+    let descendant = report
+        .split_once("descendant=")
+        .and_then(|(_, rest)| rest.lines().next())
+        .expect("timeout includes descendant PID")
+        .parse::<libc::pid_t>()
+        .expect("numeric descendant PID");
+    loop {
+        #[cfg(target_os = "linux")]
+        {
+            let mut status = 0;
+            // SAFETY: only reap the fixture descendant adopted by this subreaper;
+            // WNOHANG exposes a surviving descendant instead of waiting for it.
+            let waited = unsafe { libc::waitpid(descendant, &mut status, libc::WNOHANG) };
+            if waited == descendant {
+                assert!(libc::WIFSIGNALED(status));
+                assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
+            } else {
+                assert!(
+                    waited == 0
+                        || std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD),
+                    "wait for the fixture descendant"
+                );
+            }
+        }
+        // SAFETY: signal zero only checks the fixture descendant's existence.
+        if unsafe { libc::kill(descendant, 0) } == -1 {
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "descendant still exists after the child timed out"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let pid = report
+        .split_once("(pid=")
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .expect("timeout includes child PID")
+        .0
+        .parse::<libc::pid_t>()
+        .expect("numeric child PID");
+    // SAFETY: signal zero only checks this test child's existence.
+    assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "child still exists");
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+    let mut status = 0;
+    // SAFETY: status is writable and WNOHANG cannot block if the helper failed to reap.
+    assert_eq!(
+        unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+    #[cfg(target_os = "linux")]
+    phase.complete();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn detached_pipe_holder_child() {
+    let Some(pid_path) = std::env::var_os(DETACHED_PIPE_HOLDER_PID) else {
+        return;
+    };
+    // SAFETY: this fixture runs only in an isolated descendant and deliberately
+    // escapes the shell's process group while retaining both output pipes.
+    assert!(unsafe { libc::setsid() } > 0);
+    std::fs::write(pid_path, std::process::id().to_string()).expect("detached descendant PID");
+    std::thread::sleep(Duration::from_secs(3));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn child_deadline_bounds_output_collection_when_a_descendant_escapes() {
+    let _guard = child_process_guard();
+    const TEST: &str = "child_deadline_bounds_output_collection_when_a_descendant_escapes";
+    let Some(phase) = reexec::enter(TEST, "subreaper") else {
+        reexec::run(TEST, "subreaper", None, |_| {});
+        return;
+    };
+    // SAFETY: only this isolated test process adopts and reaps the fixture.
+    assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+    let state = TempDir::new().expect("detached descendant state");
+    let pid_path = state.path().join("pid");
+    let started = Instant::now();
+    let result = std::panic::catch_unwind(|| {
+        run_child_with_deadline(
+            Command::new("sh")
+                .args([
+                    "-c",
+                    "\"$1\" --exact detached_pipe_holder_child --nocapture --test-threads=1 & wait",
+                    "detached-pipe-holder",
+                ])
+                .arg(std::env::current_exe().expect("test executable"))
+                .env(DETACHED_PIPE_HOLDER_PID, &pid_path),
+            "escaped-descendant-fixture",
+            Duration::from_millis(250),
+        )
+    });
+    let elapsed = started.elapsed();
+    let descendant = std::fs::read_to_string(pid_path)
+        .expect("descendant escaped before the timeout")
+        .parse::<libc::pid_t>()
+        .expect("numeric descendant PID");
+    // SAFETY: clean up only the known fixture process that escaped the group.
+    assert_eq!(unsafe { libc::kill(descendant, libc::SIGKILL) }, 0);
+    let reap_deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let mut status = 0;
+        // SAFETY: status is writable and this subreaper owns the descendant.
+        let waited = unsafe { libc::waitpid(descendant, &mut status, libc::WNOHANG) };
+        if waited == descendant {
+            break;
+        }
+        assert_eq!(waited, 0, "wait for escaped descendant");
+        assert!(Instant::now() < reap_deadline, "reap escaped descendant");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(elapsed < Duration::from_secs(2), "timeout took {elapsed:?}");
+    let panic = result.expect_err("the shell must time out");
+    let report = panic.downcast_ref::<String>().expect("timeout diagnostic");
+    assert!(report.contains("escaped-descendant-fixture"), "{report}");
+    assert!(report.contains("timed out after"), "{report}");
+    for stream in ["stdout", "stderr"] {
+        assert!(
+            report.contains(&format!(
+                "{stream}:\noutput unavailable: a descendant still holds the pipe"
+            )),
+            "{report}"
+        );
+    }
+    phase.complete();
+}
+
+#[cfg(unix)]
+#[test]
+fn child_deadline_returns_complete_output_on_normal_exit() {
+    let _guard = child_process_guard();
+    let output = run_child_with_deadline(
+        Command::new("sh").args([
+            "-c",
+            "i=0; while [ \"$i\" -lt 10000 ]; do printf 'stdout line\\n'; printf 'stderr line\\n' >&2; i=$((i + 1)); done; exit 7",
+        ]),
+        "complete-output-fixture",
+        Duration::from_secs(5),
+    );
+    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(output.stdout, b"stdout line\n".repeat(10000));
+    assert_eq!(output.stderr, b"stderr line\n".repeat(10000));
 }
 
 fn attachment_upload_stages_absent(attachments_dir: &Path) -> bool {
@@ -250,7 +549,7 @@ async fn attachment_abort_child() {
                 break;
             }
             tokio::select! {
-                frame = socket.next() => {
+                frame = next_frame_past_heartbeat(&mut socket) => {
                     panic!("attachment RPC completed before publication: {frame:?}");
                 }
                 _ = tokio::time::sleep(Duration::from_millis(5)) => {}
@@ -288,19 +587,22 @@ async fn attachment_startup_recovery_removes_finals_left_by_an_aborted_process()
     let _process_guard = child_process_guard();
     let state = TempDir::new().expect("state directory");
     let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
+    hermetic_providers::write_hermetic_settings(&config.state_dir(), serde_json::json!({}));
     let attachments_dir = config.state_dir().join("attachments");
     let ready = state.path().join("published");
-    let output = Command::new(std::env::current_exe().expect("test executable"))
-        .args([
-            "--exact",
-            "attachment_abort_child",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env(ATTACHMENT_ABORT_CHILD_STATE, state.path())
-        .env(ATTACHMENT_ABORT_CHILD_READY, &ready)
-        .output()
-        .expect("run crash child");
+    let output = run_child_with_deadline(
+        Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "attachment_abort_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(ATTACHMENT_ABORT_CHILD_STATE, state.path())
+            .env(ATTACHMENT_ABORT_CHILD_READY, &ready),
+        "attachment-abort",
+        CHILD_PROCESS_DEADLINE,
+    );
     assert!(
         ready.exists(),
         "the child published its final\nstdout:\n{}\nstderr:\n{}",
@@ -347,6 +649,17 @@ fn crash_model(provider: &str) -> &'static str {
     }
 }
 
+fn crash_binary_path(provider: &str, state: &Path) -> String {
+    match provider {
+        "cursor" => hermetic_providers::missing_provider_executable(state)
+            .to_str()
+            .expect("crash fixture path is UTF-8")
+            .to_owned(),
+        "claudeAgent" => "claude".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
 fn crash_launch(provider: &str, state: &Path) -> ProviderLaunchRequest {
     ProviderLaunchRequest {
         thread_id: "crash-thread".to_owned(),
@@ -354,17 +667,13 @@ fn crash_launch(provider: &str, state: &Path) -> ProviderLaunchRequest {
         provider: provider.to_owned(),
         provider_label: provider.to_owned(),
         provider_instance_id: Some(provider.to_owned()),
-        binary_path: match provider {
-            "claudeAgent" => "claude",
-            "cursor" => "cursor-agent",
-            other => other,
-        }
-        .to_owned(),
+        binary_path: crash_binary_path(provider, state),
         cwd: state.to_path_buf(),
         runtime_mode: "full-access".to_owned(),
         interaction_mode: "default".to_owned(),
         model: Some(crash_model(provider).to_owned()),
         options: Vec::new(),
+        custom_models: Vec::new(),
         service_tier: None,
         effort: None,
         agent: None,
@@ -389,20 +698,35 @@ fn configure_crash_provider(state: &Path, provider: &str) {
     if provider != "cursor" {
         return;
     }
-    std::fs::write(
-        state.join("settings.json"),
-        serde_json::to_vec(&serde_json::json!({
+    hermetic_providers::write_hermetic_settings(
+        state,
+        serde_json::json!({
             "providerInstances": {
                 "cursor": {
                     "driver": "cursor",
                     "enabled": true,
-                    "config": {"binaryPath": "cursor-agent"}
+                    "config": {"binaryPath": crash_binary_path(provider, state)}
                 }
             }
-        }))
-        .expect("crash provider settings"),
-    )
-    .expect("write crash provider settings");
+        }),
+    );
+}
+
+#[tokio::test]
+async fn cursor_crash_launch_matches_the_persisted_provider_route() {
+    let state = TempDir::new().expect("crash settings");
+    configure_crash_provider(state.path(), "cursor");
+    let settings = bibcode_server::server_settings::ProviderSettingsStore::new(state.path())
+        .get()
+        .await
+        .expect("persisted crash settings");
+    assert_eq!(
+        crash_launch("cursor", state.path()).binary_path,
+        settings.provider_instances["cursor"].config["binaryPath"]
+            .as_str()
+            .expect("cursor route binary"),
+        "the pre-launched crash driver must use the admitted executable destination"
+    );
 }
 
 async fn seed_crash_delivery(engine: &OrchestrationEngine, state: &Path, provider: &str) {
@@ -532,8 +856,7 @@ async fn durable_boundary_crash_child() {
         .await
         .expect("crash RPC request");
     if matches!(mode.as_str(), "after-db-commit" | "queued-after-db-commit") {
-        let frame = socket
-            .next()
+        let frame = next_frame_past_heartbeat(&mut socket)
             .await
             .expect("crash RPC response")
             .expect("valid crash RPC response");
@@ -559,19 +882,21 @@ async fn durable_boundary_crash_child() {
 fn run_durable_boundary_child(state: &Path, provider: &str, mode: &str, sends: &Path) {
     let output = {
         let _guard = child_process_guard();
-        Command::new(std::env::current_exe().expect("test executable"))
-            .args([
-                "--exact",
-                "durable_boundary_crash_child",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(CRASH_BOUNDARY_CHILD_STATE, state)
-            .env(CRASH_BOUNDARY_CHILD_PROVIDER, provider)
-            .env(CRASH_BOUNDARY_CHILD_MODE, mode)
-            .env(CRASH_BOUNDARY_CHILD_SENDS, sends)
-            .output()
-            .expect("run durable crash child")
+        run_child_with_deadline(
+            Command::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "--exact",
+                    "durable_boundary_crash_child",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CRASH_BOUNDARY_CHILD_STATE, state)
+                .env(CRASH_BOUNDARY_CHILD_PROVIDER, provider)
+                .env(CRASH_BOUNDARY_CHILD_MODE, mode)
+                .env(CRASH_BOUNDARY_CHILD_SENDS, sends),
+            &format!("{provider} {mode}"),
+            CHILD_PROCESS_DEADLINE,
+        )
     };
     assert!(
         !output.status.success(),
@@ -958,6 +1283,7 @@ impl ProviderDriver for CrashBoundaryDriver {
 }
 
 struct RecoveryCallbacks {
+    terminal_home: PathBuf,
     terminals: ServerTerminalServices,
     setup_launches: AtomicUsize,
     setup_entered: Notify,
@@ -1002,8 +1328,16 @@ impl OrchestrationEffectCallbacks for RecoveryCallbacks {
         Box::pin(async move { Ok(self.terminals.terminal_exists(thread_id, terminal_id).await) })
     }
 
-    fn launch_setup_script<'a>(&'a self, input: SetupScriptLaunch) -> BoxEffectFuture<'a, ()> {
+    fn launch_setup_script<'a>(&'a self, mut input: SetupScriptLaunch) -> BoxEffectFuture<'a, ()> {
         Box::pin(async move {
+            input.env.insert(
+                "HOME".to_owned(),
+                self.terminal_home.to_string_lossy().into_owned(),
+            );
+            input.env.insert(
+                "USERPROFILE".to_owned(),
+                self.terminal_home.to_string_lossy().into_owned(),
+            );
             self.terminals.launch_setup_script(input).await?;
             if self.setup_launches.fetch_add(1, Ordering::SeqCst) == 0 {
                 self.setup_entered.notify_one();
@@ -1106,6 +1440,7 @@ async fn bootstrap_restart_after_setup_launch_reuses_worktree_and_terminal_for_p
         TerminalManagerOptions::default(),
     );
     let callbacks = Arc::new(RecoveryCallbacks {
+        terminal_home: hermetic_providers::isolated_terminal_home(state.path()),
         terminals: terminal_services(terminal.clone()),
         setup_launches: AtomicUsize::new(0),
         setup_entered: Notify::new(),
@@ -1290,10 +1625,9 @@ async fn bootstrap_restart_after_setup_launch_reuses_worktree_and_terminal_for_p
                     .expect("row");
                 if row.state == TurnDeliveryState::Pending
                     && row.attempts == 1
-                    && row
-                        .last_error
-                        .as_deref()
-                        .is_some_and(|detail| detail.contains("provider codex is not supported"))
+                    && row.last_error.as_deref().is_some_and(|detail| {
+                        detail.starts_with("Codex is turned off or not set up.")
+                    })
                 {
                     break;
                 }
@@ -1347,17 +1681,19 @@ fn missing_origin_keeps_durable_delivery_pending_without_provider_route() {
     let trace_path = state.path().join("git-trace.json");
     let output = {
         let _guard = child_process_guard();
-        Command::new(std::env::current_exe().expect("test executable"))
-            .args([
-                "--exact",
-                "missing_origin_delivery_child",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(MISSING_ORIGIN_CHILD_TRACE, &trace_path)
-            .env("GIT_TRACE2_EVENT", &trace_path)
-            .output()
-            .expect("run isolated missing-origin child")
+        run_child_with_deadline(
+            Command::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "--exact",
+                    "missing_origin_delivery_child",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(MISSING_ORIGIN_CHILD_TRACE, &trace_path)
+                .env("GIT_TRACE2_EVENT", &trace_path),
+            "missing-origin",
+            CHILD_PROCESS_DEADLINE,
+        )
     };
     let trace = std::fs::read_to_string(&trace_path).unwrap_or_else(|error| error.to_string());
     assert!(
@@ -1530,6 +1866,7 @@ async fn missing_origin_delivery_child() {
         TerminalManagerOptions::default(),
     );
     let callbacks = Arc::new(RecoveryCallbacks {
+        terminal_home: hermetic_providers::isolated_terminal_home(state.path()),
         terminals: terminal_services(terminal.clone()),
         setup_launches: AtomicUsize::new(0),
         setup_entered: Notify::new(),
@@ -1624,6 +1961,7 @@ async fn pre_39_migration_is_restart_idempotent_without_synthesizing_historical_
     let config = ServerConfig::new(state.path())
         .with_bind("127.0.0.1", 0)
         .with_unsafe_no_auth();
+    hermetic_providers::write_hermetic_settings(&config.state_dir(), serde_json::json!({}));
     let database_path = config.database_path();
     let legacy_attachment_path = config.state_dir().join("attachments/legacy-notes");
     let legacy_attachments = r#"[{"type":"file","id":"legacy-notes","name":"notes.txt","mimeType":"text/plain","sizeBytes":5}]"#;

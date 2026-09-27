@@ -1,19 +1,32 @@
+import { scopeProjectRef, scopeThreadRef } from "@bibcode/client-runtime/environment";
+import type { EnvironmentThreadShell } from "@bibcode/client-runtime/state/shell";
 import { squashAtomCommandFailure } from "@bibcode/client-runtime/state/runtime";
-import type {
-  AdoptedWorktreeAvailability,
-  EnvironmentId,
-  ProjectId,
-  ThreadId,
-  VcsWorktreeRegistrationState,
-  WorktreeRemovalMode,
-  WorktreeRemovalPlan,
-  WorktreeRemovalResult,
+import {
+  WorktreeRemovalError,
+  type AdoptedWorktreeAvailability,
+  type EnvironmentId,
+  type ProjectId,
+  type ScopedProjectRef,
+  type ThreadId,
+  type VcsWorktreeRegistrationState,
+  type WorktreeRemovalMode,
+  type WorktreeRemovalPlan,
+  type WorktreeRemovalResult,
 } from "@bibcode/contracts";
-import { useCallback, useEffect, useRef, useState } from "react";
+import * as Schema from "effect/Schema";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 
 import { newCommandId } from "../lib/utils";
+import {
+  readEnvironmentThreadRefs,
+  readThreadShell,
+  useThreadShell,
+  useThreadShellsForProjectRefs,
+} from "../state/entities";
 import { worktreeEnvironment } from "../state/worktrees";
 import { useAtomCommand } from "../state/use-atom-command";
+import { isWorktreeSessionRunning } from "./Sidebar.logic";
+import { WORKTREE_DELETE_BLOCKED_REASON } from "./sidebar/sidebarMenus.logic";
 import { Button } from "./ui/button";
 import {
   Dialog,
@@ -47,8 +60,18 @@ export interface WorktreeRemovalDialogProps {
 
 type ConfirmationStep = "choices" | "dirty" | "prune";
 
+const isWorktreeRemovalError = Schema.is(WorktreeRemovalError);
+
+function isSessionRunningRefusal(result: { readonly cause: unknown }): boolean {
+  const error = squashAtomCommandFailure(result as never);
+  return isWorktreeRemovalError(error) && error.reason === "session-running";
+}
+
 function failureMessage(result: { readonly cause: unknown }): string {
   const error = squashAtomCommandFailure(result as never);
+  if (isWorktreeRemovalError(error) && error.reason === "session-running") {
+    return WORKTREE_DELETE_BLOCKED_REASON;
+  }
   return error instanceof Error && error.message.trim().length > 0
     ? error.message
     : "The removal request failed.";
@@ -56,6 +79,44 @@ function failureMessage(result: { readonly cause: unknown }): string {
 
 function plural(count: number, singular: string, pluralValue = `${singular}s`): string {
   return `${count} ${count === 1 ? singular : pluralValue}`;
+}
+
+const NO_PROJECT_REFS: ReadonlyArray<ScopedProjectRef> = [];
+
+type WorktreeSessionCard = Pick<
+  EnvironmentThreadShell,
+  "environmentId" | "projectId" | "worktreePath" | "archivedAt" | "session"
+>;
+
+/**
+ * The target as `isWorktreeSessionRunning`'s card: its live thread or, for an
+ * archived thread, which the live store leaves out (Settings → Archived
+ * Threads), its checkout without a session of its own, since archiving requires
+ * no active turn. The rule never reads the card's own `archivedAt`.
+ */
+function worktreeSessionCard(
+  target: WorktreeRemovalTarget,
+  liveThread: EnvironmentThreadShell | null,
+): WorktreeSessionCard {
+  return (
+    liveThread ?? {
+      environmentId: target.environmentId,
+      projectId: target.projectId,
+      worktreePath: target.path,
+      archivedAt: null,
+      session: null,
+    }
+  );
+}
+
+/** The same rule over the store as it is now, for the click-time re-check. */
+function readWorktreeSessionRunning(target: WorktreeRemovalTarget): boolean {
+  const projectThreads = readEnvironmentThreadRefs(target.environmentId).flatMap((ref) => {
+    const thread = readThreadShell(ref);
+    return thread !== null && thread.projectId === target.projectId ? [thread] : [];
+  });
+  const liveThread = projectThreads.find((thread) => thread.id === target.threadId) ?? null;
+  return isWorktreeSessionRunning(worktreeSessionCard(target, liveThread), projectThreads);
 }
 
 export function WorktreeRemovalDialog({
@@ -76,14 +137,43 @@ export function WorktreeRemovalDialog({
   const [isLoadingPlan, setIsLoadingPlan] = useState(false);
   const [isRemoving, setIsRemoving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [serverRefusedRunning, setServerRefusedRunning] = useState(false);
   const [planChanged, setPlanChanged] = useState(false);
   const [completed, setCompleted] = useState<WorktreeRemovalResult | null>(null);
   const asyncEpochRef = useRef(0);
+  const deletionBlockedReasonId = useId();
+
+  // Deletion waits while a session runs in the worktree, by the card menu's
+  // rule. The store re-renders the dialog, so it re-enables once the session
+  // stops; the rule runs only when the target or the project's threads change.
+  const targetThreadRef = useMemo(
+    () => (target === null ? null : scopeThreadRef(target.environmentId, target.threadId)),
+    [target],
+  );
+  const targetProjectRefs = useMemo(
+    () =>
+      target === null ? NO_PROJECT_REFS : [scopeProjectRef(target.environmentId, target.projectId)],
+    [target],
+  );
+  const liveTargetThread = useThreadShell(targetThreadRef);
+  const projectThreads = useThreadShellsForProjectRefs(targetProjectRefs);
+  const worktreeSessionRunning = useMemo(
+    () =>
+      target !== null &&
+      isWorktreeSessionRunning(worktreeSessionCard(target, liveTargetThread), projectThreads),
+    [liveTargetThread, projectThreads, target],
+  );
+
+  // Once the store catches up, the reason follows live state through session stop.
+  if (serverRefusedRunning && worktreeSessionRunning) {
+    setServerRefusedRunning(false);
+  }
 
   const loadPlanForTarget = useCallback(
     async (requestTarget: WorktreeRemovalTarget, epoch: number) => {
       setIsLoadingPlan(true);
       setError(null);
+      setServerRefusedRunning(false);
       const result = await getRemovalPlan({
         environmentId: requestTarget.environmentId,
         input: { projectId: requestTarget.projectId, threadId: requestTarget.threadId },
@@ -107,6 +197,7 @@ export function WorktreeRemovalDialog({
     setIsLoadingPlan(false);
     setIsRemoving(false);
     setError(null);
+    setServerRefusedRunning(false);
     setPlanChanged(false);
     setCompleted(null);
     if (open && target && target.availability !== "removing") {
@@ -145,6 +236,7 @@ export function WorktreeRemovalDialog({
     asyncEpochRef.current = epoch;
     setIsRemoving(true);
     setError(null);
+    setServerRefusedRunning(false);
     const result = await removeFromBibCode({
       environmentId: requestTarget.environmentId,
       input: {
@@ -165,12 +257,15 @@ export function WorktreeRemovalDialog({
   const executeDestructiveRemoval = useCallback(
     async (mode: WorktreeRemovalMode, forceDirty: boolean, confirmPrune: boolean) => {
       if (!target || !plan || isRemoving) return;
+      // Re-check at click time: a session may have started since this render.
+      if (readWorktreeSessionRunning(target)) return;
       const requestTarget = target;
       const requestPlan = plan;
       const epoch = asyncEpochRef.current + 1;
       asyncEpochRef.current = epoch;
       setIsRemoving(true);
       setError(null);
+      setServerRefusedRunning(false);
       setPlanChanged(false);
       const result = await remove({
         environmentId: requestTarget.environmentId,
@@ -188,7 +283,13 @@ export function WorktreeRemovalDialog({
       const isCurrent = epoch === asyncEpochRef.current;
       if (isCurrent) setIsRemoving(false);
       if (result._tag === "Failure") {
-        if (isCurrent) setError(failureMessage(result));
+        if (isCurrent) {
+          if (isSessionRunningRefusal(result)) {
+            setServerRefusedRunning(true);
+          } else {
+            setError(failureMessage(result));
+          }
+        }
         return;
       }
       if (result.value._tag === "PlanChanged") {
@@ -257,6 +358,10 @@ export function WorktreeRemovalDialog({
     !plan.locked &&
     (plan.availability === "present" ||
       (plan.availability === "missing-registered" && plan.registered));
+  // Only a destructive button on screen waits, so only then is the reason shown.
+  const deletionBlocked =
+    worktreeSessionRunning && completed === null && (step !== "choices" || destructiveEligible);
+  const showDeletionBlockedReason = deletionBlocked || (serverRefusedRunning && completed === null);
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
@@ -364,6 +469,11 @@ export function WorktreeRemovalDialog({
               </ul>
             </div>
           ) : null}
+          {showDeletionBlockedReason ? (
+            <p id={deletionBlockedReasonId} role="status" className="text-sm text-warning">
+              {WORKTREE_DELETE_BLOCKED_REASON}
+            </p>
+          ) : null}
         </DialogPanel>
         <DialogFooter>
           {completed ? (
@@ -383,7 +493,8 @@ export function WorktreeRemovalDialog({
               <Button
                 type="button"
                 variant="destructive"
-                disabled={isRemoving}
+                disabled={isRemoving || deletionBlocked}
+                aria-describedby={showDeletionBlockedReason ? deletionBlockedReasonId : undefined}
                 onClick={confirmDirty}
               >
                 Delete dirty worktree
@@ -402,7 +513,8 @@ export function WorktreeRemovalDialog({
               <Button
                 type="button"
                 variant="destructive"
-                disabled={isRemoving}
+                disabled={isRemoving || deletionBlocked}
+                aria-describedby={showDeletionBlockedReason ? deletionBlockedReasonId : undefined}
                 onClick={() =>
                   void executeDestructiveRemoval(
                     plan.availability === "missing-registered"
@@ -433,7 +545,8 @@ export function WorktreeRemovalDialog({
                 <Button
                   type="button"
                   variant="destructive"
-                  disabled={isRemoving}
+                  disabled={isRemoving || deletionBlocked}
+                  aria-describedby={showDeletionBlockedReason ? deletionBlockedReasonId : undefined}
                   onClick={beginDestructiveRemoval}
                 >
                   {destructiveLabel}

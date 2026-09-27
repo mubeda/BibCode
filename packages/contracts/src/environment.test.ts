@@ -90,6 +90,10 @@ describe("execution environment contracts", () => {
   it("defaults ordered terminal input support to false when omitted", () => {
     expect(decodeTerminalCapabilities({}).terminalOrderedInput).toBe(false);
   });
+  it("defaults clone re-attach off for older servers and preserves advertised support", () => {
+    expect(decodeTerminalCapabilities({}).vcsCloneReattach).toBe(false);
+    expect(decodeTerminalCapabilities({ vcsCloneReattach: true }).vcsCloneReattach).toBe(true);
+  });
   it("pins the remote protocol window constants", () => {
     expect(REMOTE_PROTOCOL_VERSION).toBe(1);
     expect(MIN_COMPATIBLE_REMOTE_PROTOCOL).toBe(1);
@@ -350,6 +354,25 @@ describe("execution environment contracts", () => {
 });
 
 describe("remote update descriptor surface", () => {
+  it("defaults bootId and remoteUpdateProgress for an older server", () => {
+    const decoded = decodeExecutionEnvironmentDescriptor({
+      ...descriptor,
+      capabilities: {},
+    });
+    expect(decoded.bootId).toBeNull();
+    expect(decoded.capabilities.remoteUpdateProgress).toBe(false);
+  });
+
+  it("preserves an advertised bootId and remote update progress support", () => {
+    const decoded = decodeExecutionEnvironmentDescriptor({
+      ...descriptor,
+      bootId: "00000000-0000-4000-8000-000000000003",
+      capabilities: { remoteUpdateProgress: true },
+    });
+    expect(decoded.bootId).toBe("00000000-0000-4000-8000-000000000003");
+    expect(decoded.capabilities.remoteUpdateProgress).toBe(true);
+  });
+
   it("defaults remoteUpdateControl to false and remoteUpdateSupport to null for older servers", () => {
     const decoded = decodeExecutionEnvironmentDescriptor({
       ...descriptor,
@@ -369,6 +392,7 @@ describe("remote update descriptor surface", () => {
     expect(decoded.remoteUpdateSupport).toEqual({
       installMode: "manual",
       reason: "manual-update-required",
+      installKind: "unknown",
     });
   });
 });

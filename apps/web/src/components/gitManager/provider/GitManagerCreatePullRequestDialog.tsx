@@ -25,7 +25,6 @@ import { Label } from "~/components/ui/label";
 import { Textarea } from "~/components/ui/textarea";
 import {
   formatChangeRequestNumber,
-  getChangeRequestTerminology,
   resolveChangeRequestPresentation,
 } from "@bibcode/shared/sourceControl";
 import { capitalize } from "effect/String";
@@ -42,6 +41,7 @@ import {
   presentCreatePullRequestProgress,
   reduceCreatePullRequestProgress,
   resolveCreatePullRequestReview,
+  resolveStatusChangeRequestPresentation,
   REVIEW_PROGRESS,
   type CreatePullRequestProgress,
   type CreatePullRequestProviderHint,
@@ -111,7 +111,8 @@ export const GitManagerCreatePullRequestDialog = memo(function GitManagerCreateP
     [latestCommit, providerHint, status],
   );
   const provider = review === null ? hintedProvider(providerHint) : review.provider;
-  const noun = getChangeRequestTerminology(provider).singular;
+  // Until status answers, only a caller's hint names the host; without one stay neutral.
+  const noun = resolveStatusChangeRequestPresentation(provider, review !== null).longName;
   const waitReason = `Wait for the ${noun} to finish.`;
 
   const [title, setTitle] = useState("");
@@ -279,7 +280,7 @@ export const GitManagerCreatePullRequestDialog = memo(function GitManagerCreateP
                   className="min-w-0 justify-self-end break-all rounded-md bg-background px-2 py-1 text-right font-mono text-xs"
                   data-testid="create-pr-head"
                 >
-                  {review?.head ?? "No branch checked out"}
+                  {review === null ? "…" : (review.head ?? "No branch checked out")}
                 </dd>
               </div>
             </dl>

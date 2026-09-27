@@ -194,6 +194,15 @@ describe("AgentsNavRow", () => {
     expect(getNavRow(container).textContent).toBe("Agents2");
   });
 
+  it("hides the unread badge when nothing is unread", async () => {
+    h.shells = [makeShell({ id: ThreadId.make("thread-read") })];
+    h.unreadThreadKeys = [];
+
+    const { container } = await mountNavRow();
+
+    expect(getNavRow(container).textContent).toBe("Agents");
+  });
+
   it("navigates to the full Agents view when clicked", async () => {
     const { container } = await mountNavRow();
 

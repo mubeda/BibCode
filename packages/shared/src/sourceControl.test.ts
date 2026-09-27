@@ -7,14 +7,35 @@ import {
   formatCreateChangeRequestPhrase,
   getChangeRequestTerminology,
   getChangeRequestTerminologyForKind,
+  NEUTRAL_CHANGE_REQUEST_PRESENTATION,
   resolveChangeRequestPresentation,
   resolveChangeRequestPresentationForKind,
 } from "./sourceControl.ts";
 
 describe("source control presentation", () => {
+  it("names one neutral vocabulary for a host that isn't known yet", () => {
+    expect(NEUTRAL_CHANGE_REQUEST_PRESENTATION).toMatchObject({
+      shortName: "change request",
+      longName: "change request",
+      pluralLongName: "change requests",
+      numberPrefix: "#",
+    });
+    // One table entry: an explicitly unrecognised provider gets the same nouns.
+    expect(resolveChangeRequestPresentationForKind("unknown")).toBe(
+      NEUTRAL_CHANGE_REQUEST_PRESENTATION,
+    );
+  });
+
   it("formats request numbers using the shared provider terminology", () => {
     expect(formatChangeRequestNumber("gitlab", 14)).toBe("!14");
-    for (const provider of ["github", "azure-devops", "bitbucket", "unknown", null] as const) {
+    for (const provider of [
+      "github",
+      "azure-devops",
+      "bitbucket",
+      "unknown",
+      null,
+      undefined,
+    ] as const) {
       expect(formatChangeRequestNumber(provider, 14)).toBe("#14");
     }
     expect(getChangeRequestTerminology(null).singular).toBe("pull request");
