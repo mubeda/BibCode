@@ -128,6 +128,16 @@ package: from `apps/web`, run `vp test run --project unit src/<path>.test.tsx`.
 Where a global `vp` may shadow the workspace copy (native Windows, Parallels),
 run `node ../../scripts/run-local-vp.mjs` with the same arguments.
 
+`apps/web/src/reactEffectEventStaleness.test.tsx` pins the react-dom 19.2 defect
+where Effect Events retain their first render's values in `memo(C)` without a
+compare function, `forwardRef(C)`, and `memo(forwardRef(C), compare)`, despite a
+committed prop update; plain functions and `memo(C, compare)` are controls.
+The error rule `bibcode/no-effect-event-in-memo-or-forward-ref` refuses these
+patterns in same-file components and hooks only; imported hooks and components
+are not followed. Run the probe in the web package's compiled lane. If it fails
+after a react-dom upgrade because a prohibited form starts returning the new
+value, re-check every form and remove the rule only once all of them recover.
+
 `apps/web/src/reactCompiler.test.tsx` guards the compiled lane. It fails when
 happy-dom files stop running through the compiler, or when the compiler stops
 caching the fixture's read by its arguments, for example after an upgrade of

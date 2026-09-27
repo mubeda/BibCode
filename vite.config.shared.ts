@@ -166,6 +166,7 @@ export default defineConfig({
           ],
         },
       ],
+      "bibcode/no-effect-event-in-memo-or-forward-ref": "error",
       "bibcode/no-global-process-runtime": "error",
       "bibcode/no-inline-schema-compile": "warn",
       "bibcode/no-manual-effect-runtime-in-tests": "error",
