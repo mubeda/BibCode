@@ -163,7 +163,6 @@ export interface GitManagerToolbarProps {
   readonly branchSyncDisabledReason: string | null;
   readonly stashMergeDisabledReason: string | null;
   readonly tagDisabledReason: string | null;
-  readonly liveSignalAvailable: boolean;
   readonly onSelectedWorktreeChange: (cwd: string) => void;
 }
 
@@ -177,7 +176,6 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
   branchSyncDisabledReason,
   stashMergeDisabledReason,
   tagDisabledReason,
-  liveSignalAvailable,
   onSelectedWorktreeChange,
 }: GitManagerToolbarProps) {
   const registry = useContext(RegistryContext);
@@ -220,24 +218,9 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
       }),
     [environmentId, selectedWorktreeCwd],
   );
-  const signalAtom = useMemo(
-    () =>
-      liveSignalAvailable
-        ? gitManagerEnvironment.signalWithDegradedFocusRefresh({
-            environmentId,
-            input: { cwd: selectedWorktreeCwd },
-          })
-        : null,
-    [environmentId, liveSignalAvailable, selectedWorktreeCwd],
-  );
   const refsQuery = useEnvironmentQuery(refsAtom);
-  const signalQuery = useEnvironmentQuery(signalAtom);
-  // Signals and finished operations are automatic reads: they keep a cut-off latched.
+  // Finished operations revalidate without clearing a transport cut-off.
   const revalidateRefs = refsQuery.revalidate;
-  const signalGeneration = signalQuery.data?.generation ?? null;
-  useEffect(() => {
-    if (signalGeneration !== null) revalidateRefs();
-  }, [revalidateRefs, signalGeneration]);
 
   const snapshot: GitManagerRefsSnapshot | null = refsQuery.data ?? null;
   const localBranches = snapshot?.localBranches ?? EMPTY_BRANCHES;

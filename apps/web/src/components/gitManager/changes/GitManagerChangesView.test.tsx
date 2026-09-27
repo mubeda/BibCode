@@ -385,9 +385,7 @@ describe("GitManagerChangesView", () => {
     h.statusEmission = AsyncResult.failure(Cause.fail(new Error(h.statusError)));
 
     await renderView();
-    // Mounting revalidates refs for the live signal; only Retry's reads count here.
-    expect(h.revalidateRefs).toHaveBeenCalled();
-    h.revalidateRefs.mockClear();
+    expect(h.revalidateRefs).not.toHaveBeenCalled();
 
     expect(container.textContent).toContain("Could not load changes");
     await act(async () => buttonWithText("Retry").click());

@@ -293,13 +293,22 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
   // Manual Refresh/Retry use refresh; automatic reads (signals, finished operations) revalidate.
   const refreshRefs = refsQuery.refresh;
   const revalidateRefs = refsQuery.revalidate;
+  const refsPending = refsQuery.isPending;
   const revalidateStashes = stashesQuery.revalidate;
-  // History relies on this refs refresh: every signal change re-reads refs, so
-  // the repository generation it receives reports any change the signal carries.
+  // This is the sole owner of signal-driven refs revalidation. The first generation
+  // per checkout/subscription re-reads only idle refs; an in-flight read covers it.
+  // Every later step, including 0 -> 1, re-reads refs so History sees changed commits.
+  const refsSignalGenerationRef = useRef<{
+    readonly cwd: string;
+    readonly generation: number | null;
+  } | null>(null);
   useEffect(() => {
+    const baseline = refsSignalGenerationRef.current;
+    const previous = baseline?.cwd === cwd ? baseline.generation : null;
+    refsSignalGenerationRef.current = { cwd, generation: signalGeneration };
     if (signalGeneration === null) return;
-    revalidateRefs();
-  }, [revalidateRefs, signalGeneration]);
+    if (previous === null ? !refsPending : signalGeneration !== previous) revalidateRefs();
+  }, [cwd, refsPending, revalidateRefs, signalGeneration]);
   // Opening the pane mounts a fresh stash query, and a signal that (re)subscribes
   // starts from null while the mounted query reads anyway, so only a step from
   // one signal generation to the next while the pane is open re-reads the list.
@@ -1243,7 +1252,6 @@ export const GitManagerPanel = memo(function GitManagerPanel({ projectRef }: Git
           worktrees={worktrees}
           catalogPending={catalog.isPending && catalog.data === null}
           catalogError={catalog.error}
-          liveSignalAvailable={capabilityDisabledReasons.liveSignal === null}
           stashMergeDisabledReason={capabilityDisabledReasons.stashMerge}
           tagDisabledReason={capabilityDisabledReasons.tag}
           onSelectedWorktreeChange={handleWorktreeChange}

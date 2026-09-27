@@ -160,7 +160,6 @@ function renderToolbar(
       catalogPending={false}
       catalogError={null}
       branchSyncDisabledReason={null}
-      liveSignalAvailable
       stashMergeDisabledReason={null}
       tagDisabledReason={null}
       onSelectedWorktreeChange={() => undefined}
@@ -240,7 +239,6 @@ describe("GitManagerToolbar", () => {
             catalogPending={false}
             catalogError={null}
             branchSyncDisabledReason={null}
-            liveSignalAvailable
             stashMergeDisabledReason={null}
             tagDisabledReason={null}
             onSelectedWorktreeChange={() => undefined}
@@ -360,7 +358,7 @@ describe("GitManagerToolbar", () => {
   it("skips the live signal subscription without disabling explicit repository reads", () => {
     h.snapshot = refsSnapshot();
 
-    const markup = renderToolbar({ liveSignalAvailable: false });
+    const markup = renderToolbar();
 
     expect(h.signalAtom).not.toHaveBeenCalled();
     expect(h.refsAtom).toHaveBeenCalledOnce();
