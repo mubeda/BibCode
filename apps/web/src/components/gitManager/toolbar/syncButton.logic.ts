@@ -1,4 +1,5 @@
 export type SyncStateKind =
+  | "unavailable"
   | "running"
   | "no-remote"
   | "fetch-unborn"
@@ -10,6 +11,7 @@ export type SyncStateKind =
   | "push";
 
 export interface SyncStateInput {
+  readonly repositoryUnavailableReason?: string | null;
   readonly isOperationRunning: boolean;
   readonly hasRemote: boolean;
   readonly isUnborn: boolean;
@@ -28,6 +30,15 @@ export interface SyncState {
 }
 
 export function resolveSyncState(input: SyncStateInput): SyncState {
+  if (input.repositoryUnavailableReason != null) {
+    return {
+      kind: "unavailable",
+      label: "Sync unavailable",
+      ahead: 0,
+      behind: 0,
+      disabledReason: input.repositoryUnavailableReason,
+    };
+  }
   const remote = input.remote ?? "origin";
   const visibleAhead = input.aheadBehind?.ahead ?? 0;
   if (input.isOperationRunning) {

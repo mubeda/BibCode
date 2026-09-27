@@ -38,6 +38,7 @@ import {
 } from "./toolbar/GitManagerSyncButton";
 import { resolveSyncState, type SyncState } from "./toolbar/syncButton.logic";
 import { GitManagerTagDialog } from "./tags/GitManagerTagDialog";
+import type { RepositoryUnavailable } from "./gitManagerRepositoryUnavailable";
 import {
   Menu,
   MenuItem,
@@ -149,6 +150,7 @@ function guardedOperation(kind: SyncState["kind"]): string | null {
     case "running":
     case "no-remote":
     case "detached":
+    case "unavailable":
       return null;
   }
 }
@@ -160,6 +162,7 @@ export interface GitManagerToolbarProps {
   readonly worktrees: ReadonlyArray<VcsWorktreeDescriptor>;
   readonly catalogPending: boolean;
   readonly catalogError: string | null;
+  readonly repositoryUnavailable: RepositoryUnavailable;
   readonly branchSyncDisabledReason: string | null;
   readonly stashMergeDisabledReason: string | null;
   readonly tagDisabledReason: string | null;
@@ -173,6 +176,7 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
   worktrees,
   catalogPending,
   catalogError,
+  repositoryUnavailable,
   branchSyncDisabledReason,
   stashMergeDisabledReason,
   tagDisabledReason,
@@ -222,7 +226,8 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
   // Finished operations revalidate without clearing a transport cut-off.
   const revalidateRefs = refsQuery.revalidate;
 
-  const snapshot: GitManagerRefsSnapshot | null = refsQuery.data ?? null;
+  const snapshot: GitManagerRefsSnapshot | null =
+    repositoryUnavailable === null ? refsQuery.data : null;
   const localBranches = snapshot?.localBranches ?? EMPTY_BRANCHES;
   const currentBranch = useMemo(
     () => localBranches.find((branch) => branch.current) ?? null,
@@ -235,25 +240,42 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
   // No commit behind HEAD: an unborn branch, or a HEAD naming no valid ref (an
   // interrupted clone's placeholder), which has no branch name to show either.
   const isUnborn = snapshot !== null && snapshot.detachedSha === null && currentBranch === null;
-  const noBranchLabel = isUnborn && currentBranchName === null ? "No commits yet" : "Detached HEAD";
+  const noBranchLabel =
+    repositoryUnavailable !== null
+      ? "No branch"
+      : isUnborn && currentBranchName === null
+        ? "No commits yet"
+        : "Detached HEAD";
   const ahead = currentBranch?.ahead ?? 0;
   const behind = currentBranch?.behind ?? 0;
   const hasUpstream = currentBranch?.upstream !== null && currentBranch?.upstream !== undefined;
   const [isOperationRunning, setIsOperationRunning] = useState(false);
   const syncState = useMemo(
     () =>
-      snapshot === null
+      snapshot === null && repositoryUnavailable === null
         ? LOADING_SYNC_STATE
         : resolveSyncState({
+            repositoryUnavailableReason:
+              repositoryUnavailable === null ? null : branchSyncDisabledReason,
             isOperationRunning,
-            hasRemote: snapshot.remotes.length > 0,
+            hasRemote: (snapshot?.remotes.length ?? 0) > 0,
             isUnborn,
-            isDetached: snapshot.detachedSha !== null,
+            isDetached: snapshot?.detachedSha != null,
             aheadBehind: hasUpstream ? { ahead, behind } : null,
             forcePushRecommended: hasUpstream && ahead > 0 && behind > 0,
             remote,
           }),
-    [ahead, behind, hasUpstream, isOperationRunning, isUnborn, remote, snapshot],
+    [
+      ahead,
+      behind,
+      branchSyncDisabledReason,
+      hasUpstream,
+      isOperationRunning,
+      isUnborn,
+      remote,
+      repositoryUnavailable,
+      snapshot,
+    ],
   );
   const syncGuardOperation = guardedOperation(syncState.kind);
   const syncBlockedReason: GitManagerBlockedReason | null =
@@ -623,6 +645,7 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
             currentBranchName={currentBranchName}
             mergeDisabledReason={stashMergeDisabledReason}
             noBranchLabel={noBranchLabel}
+            triggerDisabledReason={repositoryUnavailable === null ? null : branchSyncDisabledReason}
             projectRef={stableProjectRef}
             recentNames={recentNames}
             refs={localBranches}

@@ -159,6 +159,7 @@ function renderToolbar(
       worktrees={worktrees}
       catalogPending={false}
       catalogError={null}
+      repositoryUnavailable={null}
       branchSyncDisabledReason={null}
       stashMergeDisabledReason={null}
       tagDisabledReason={null}
@@ -238,6 +239,7 @@ describe("GitManagerToolbar", () => {
             worktrees={worktrees}
             catalogPending={false}
             catalogError={null}
+            repositoryUnavailable={null}
             branchSyncDisabledReason={null}
             stashMergeDisabledReason={null}
             tagDisabledReason={null}
@@ -307,6 +309,31 @@ describe("GitManagerToolbar", () => {
     const detached = renderToolbar();
     expect(detached).toContain("Detached HEAD");
     expect(detached).not.toContain("No commits yet");
+  });
+
+  it("uses the outer panel's unavailable state ahead of cached branch and sync data", () => {
+    h.snapshot = refsSnapshot();
+    const reason =
+      "Git can't read this repository. Check its .git folder, for example a damaged HEAD or config file.";
+    const container = document.createElement("div");
+    container.innerHTML = renderToolbar({
+      repositoryUnavailable: "unreadable",
+      branchSyncDisabledReason: reason,
+      stashMergeDisabledReason: reason,
+      tagDisabledReason: reason,
+    });
+    const branch = container.querySelector<HTMLButtonElement>('[aria-label="Choose branch"]');
+    expect(branch?.textContent).toBe("No branch");
+    expect(branch?.disabled).toBe(true);
+    expect(branch?.title).toBe(
+      "Git can't read this repository. Check its .git folder, for example a damaged HEAD or config file.",
+    );
+    expect(container.textContent).toContain("Sync unavailable");
+    expect(container.textContent).not.toContain("Detached HEAD");
+    expect(container.textContent).not.toContain("Fetch origin");
+    expect(container.querySelector<HTMLButtonElement>('[aria-label="Worktree"]')?.disabled).toBe(
+      false,
+    );
   });
 
   it("does not advertise local tags as pending pushes without remote tag state", () => {

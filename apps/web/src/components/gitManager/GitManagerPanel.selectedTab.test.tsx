@@ -365,7 +365,10 @@ describe("GitManagerPanel selected tab", () => {
     expect(isInactive(retryButton())).toBe(true);
 
     await act(async () => tab("History").click());
-    expect(container.querySelector('[role="alert"]')).toBeNull();
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+      "Could not load history",
+    );
+    expect(retryButton().textContent).toBe("Retrying…");
     await act(async () => tab("Changes").click());
     expect(retryButton().textContent).toBe("Retrying…");
     expect(isInactive(retryButton())).toBe(true);
@@ -391,7 +394,10 @@ describe("GitManagerPanel selected tab", () => {
     expect(retryButton().textContent).toBe("Retrying…");
 
     await act(async () => tab("History").click());
-    expect(container.querySelector('[role="alert"]')).toBeNull();
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+      "Could not load history",
+    );
+    expect(retryButton().textContent).toBe("Retrying…");
     await act(async () => tab("Changes").click());
     expect(retryButton().textContent).toBe("Retrying…");
     expect(isInactive(retryButton())).toBe(true);
