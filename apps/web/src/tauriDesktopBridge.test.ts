@@ -1152,6 +1152,15 @@ describe("tauriDesktopBridge", () => {
     });
   });
 
+  it("restarts BiBCode through the guarded desktop command", async () => {
+    const harness = installTauriHarness();
+    const bridge = await installBridge();
+
+    expect(bridge.restartApp).toBeTypeOf("function");
+    await bridge.restartApp!();
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_restart_app", undefined);
+  });
+
   it("forwards project data status invalidations and disposes the native listener", async () => {
     const harness = installTauriHarness();
     const bridge = await installBridge();

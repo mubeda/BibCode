@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::backend::{
     BackendLaunchPlan, BackendLaunchTarget, BackendProjectDataOperation, BackendProjectDataTarget,
-    BackendSupervisor,
+    BackendStartFailure, BackendSupervisor,
 };
 
 const WSL_PROGRAM: &str = "wsl.exe";
@@ -65,7 +65,7 @@ fn wsl_storage_invocation(
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-enum ProjectDataError {
+pub(crate) enum ProjectDataError {
     #[error("the selected project-data environment or backup is no longer available")]
     InvalidSelection,
     #[error("project-data inspection failed: {0}")]
@@ -74,6 +74,8 @@ enum ProjectDataError {
     Stop(String),
     #[error("project-data recovery failed: {0}")]
     Recovery(String),
+    #[error("BiBCode's local server couldn't restart: {0}")]
+    Restart(BackendStartFailure),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -581,7 +583,11 @@ async fn run_recovery(
         } => recover_wsl(distro, binary, root, action).await,
     }
     .map_err(|error| error.to_string())?;
-    let restart_error = operation.restart_after_commit().await.err();
+    let restart_error = operation
+        .restart_after_commit()
+        .await
+        .err()
+        .map(String::from);
     Ok(DesktopProjectDataRecoveryResult {
         environment_id: environment_id.to_owned(),
         action: match commit.action {
@@ -619,18 +625,18 @@ pub(crate) async fn start_empty_project_data(
 pub(crate) async fn retry_project_data(
     backend: &BackendSupervisor,
     environment_id: &str,
-) -> Result<(), String> {
+) -> Result<(), ProjectDataError> {
     let operation = backend
         .begin_project_data_operation(environment_id)
         .await
-        .map_err(|error| ProjectDataError::Inspection(error).to_string())?;
+        .map_err(ProjectDataError::Inspection)?;
     if operation.target().running {
         return Ok(());
     }
     operation
         .restart_after_commit()
         .await
-        .map_err(|error| format!("The selected project-data backend could not restart: {error}"))
+        .map_err(ProjectDataError::Restart)
 }
 
 pub(crate) async fn project_data_root(
@@ -711,6 +717,26 @@ mod tests {
 
     fn local_plan(path: &std::path::Path) -> BackendLaunchPlan {
         local_plan_for(path, "primary", "Local")
+    }
+
+    #[test]
+    fn retry_error_preserves_classification_and_generalizes_restart_wording() {
+        let error = ProjectDataError::Restart(BackendStartFailure::PortInUse {
+            port: 43117,
+            detail: "listener is occupied".to_owned(),
+        });
+        assert_eq!(
+            error.to_string(),
+            "BiBCode's local server couldn't restart: listener is occupied"
+        );
+        assert!(matches!(
+            error,
+            ProjectDataError::Restart(BackendStartFailure::PortInUse { port: 43117, .. })
+        ));
+        assert_eq!(
+            ProjectDataError::Inspection("busy".to_owned()).to_string(),
+            "project-data inspection failed: busy"
+        );
     }
 
     #[test]

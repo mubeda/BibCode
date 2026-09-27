@@ -14,6 +14,7 @@ macro_rules! desktop_bridge_commands {
             desktop_bridge_restore_project_data,
             desktop_bridge_start_empty_project_data,
             desktop_bridge_retry_project_data,
+            desktop_bridge_restart_app,
             desktop_bridge_open_project_data_path,
             desktop_bridge_export_project_data_diagnostics,
             desktop_bridge_get_client_settings,
@@ -132,6 +133,12 @@ pub fn run() {
                     update_app.updater().is_ok(),
                 ),
             );
+            let recovery_app = update_app.clone();
+            backend.install_recovery_listener(std::sync::Arc::new(move || {
+                recovery_app
+                    .state::<updates::DesktopUpdateManager>()
+                    .emit_current_state(&recovery_app);
+            }));
         }
         tauri::async_runtime::spawn(updates::run_background_update_checks(update_app));
 
@@ -166,6 +173,7 @@ pub fn run() {
         bridge::desktop_bridge_restore_project_data,
         bridge::desktop_bridge_start_empty_project_data,
         bridge::desktop_bridge_retry_project_data,
+        bridge::desktop_bridge_restart_app,
         bridge::desktop_bridge_open_project_data_path,
         bridge::desktop_bridge_export_project_data_diagnostics,
         bridge::desktop_bridge_get_client_settings,

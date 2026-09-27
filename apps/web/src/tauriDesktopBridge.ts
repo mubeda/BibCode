@@ -515,6 +515,7 @@ function createTauriDesktopBridge(
       tauriInvokeDesktop("desktop_bridge_start_empty_project_data", { environmentId }),
     retryProjectData: (environmentId) =>
       tauriInvokeDesktop("desktop_bridge_retry_project_data", { environmentId }),
+    restartApp: () => tauriInvokeDesktop("desktop_bridge_restart_app", undefined),
     openProjectDataPath: (environmentId) =>
       tauriInvokeDesktop("desktop_bridge_open_project_data_path", { environmentId }),
     exportProjectDataDiagnostics: (environmentId) =>

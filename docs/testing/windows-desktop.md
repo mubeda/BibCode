@@ -311,6 +311,17 @@ action, the no-backup action requires acknowledgement, a forged first-attempt
 bypass is rejected by the native host, and an installer failure restarts the
 exact pre-update native and WSL backend set.
 
+With the same isolated test instance, arrange an installer failure and have a
+test-owned listener acquire the native backend port after shutdown, keeping it
+bound past the 3 s restart window. Confirm **Update not installed** names that
+port as in use, offers **Restart server**, and disables **Retry installation**
+with the visible restart explanation. Keep an unsent composer draft and verify
+it survives the outage in the packaged WebView. Release only the test listener,
+choose **Restart server**, and confirm the same backend port reconnects, the
+draft remains, and **Retry installation** becomes available without reopening
+the dialog. Record the listener/installer fixture and observed port in the
+execution report; never use the user's running instance for this check.
+
 ## Native tests and static gates
 
 Follow the shared focused and broad gates. Root workspace scripts already use

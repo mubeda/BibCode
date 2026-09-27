@@ -216,7 +216,43 @@ describe("Desktop update protection contract", () => {
       ...legacyUpdateState,
       phase: "idle",
       protection: [],
+      backendRecovery: [],
     });
+  });
+
+  it("decodes stopped backends with typed recovery reasons and their original ports", () => {
+    const backendRecovery = [
+      { environmentId: "primary", label: "Local", reason: "port-in-use", port: 14373 },
+      { environmentId: "wsl:Ubuntu", label: "WSL (Ubuntu)", reason: "other", port: 14374 },
+    ];
+    expect(decodeDesktopUpdateState({ ...legacyUpdateState, backendRecovery })).toMatchObject({
+      backendRecovery,
+    });
+  });
+
+  it.each([1, 65535])("accepts backend recovery port boundary %s", (port) => {
+    expect(
+      decodeDesktopUpdateState({
+        ...legacyUpdateState,
+        backendRecovery: [{ environmentId: "primary", label: "Local", reason: "other", port }],
+      }),
+    ).toMatchObject({ backendRecovery: [{ port }] });
+  });
+
+  it.each([-1, 0, 65536, 1.5])("rejects invalid backend recovery port %s", (port) => {
+    expect(() =>
+      decodeDesktopUpdateState({
+        ...legacyUpdateState,
+        backendRecovery: [{ environmentId: "primary", label: "Local", reason: "other", port }],
+      }),
+    ).toThrow();
+  });
+
+  it("exposes application restart as an optional desktop bridge capability", async () => {
+    const legacyBridge: Pick<DesktopBridge, "restartApp"> = {};
+    const bridge: Pick<DesktopBridge, "restartApp"> = { restartApp: async () => undefined };
+    expect(legacyBridge.restartApp).toBeUndefined();
+    await expect(bridge.restartApp!()).resolves.toBeUndefined();
   });
 
   it("exposes explicit named exclusions on the asynchronous install command", async () => {

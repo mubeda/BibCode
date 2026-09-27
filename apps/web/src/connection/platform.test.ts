@@ -1194,3 +1194,76 @@ describe("connectionPlatformLayer connection source", () => {
     }).pipe(Effect.provide(Layer.mergeAll(connectionPlatformLayer, TestClock.layer())));
   });
 });
+
+describe("connectionPlatformLayer withheld desktop primary", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it.effect("keeps the primary in every poll and reuses it when its bootstrap returns", () => {
+    const primary = {
+      id: "primary",
+      label: "Local",
+      httpBaseUrl: "http://127.0.0.1:14373/",
+      wsBaseUrl: "ws://127.0.0.1:14373/",
+    };
+    let bootstraps: ReturnType<DesktopBridge["getLocalEnvironmentBootstraps"]> = [primary];
+    stubBrowser({
+      desktopBridge: {
+        ...makeBridge([]),
+        getLocalEnvironmentBootstraps: () => bootstraps,
+      },
+    });
+    Object.assign(window, { location: new URL("http://tauri.localhost") });
+    pf.descriptor = { environmentId: EnvironmentId.make("primary"), label: "Local" };
+
+    return Effect.gen(function* () {
+      const targetModule = yield* Effect.promise(() => import("../environments/primary/target"));
+      const actualTargetModule = yield* Effect.promise(() =>
+        vi.importActual<typeof import("../environments/primary/target")>(
+          "../environments/primary/target",
+        ),
+      );
+      // Keep earlier tests' topology mock local to them; exercise the real bridge reader here.
+      vi.spyOn(targetModule, "readPrimaryEnvironmentTarget").mockImplementation(
+        actualTargetModule.readPrimaryEnvironmentTarget,
+      );
+
+      const source = yield* PlatformConnectionSource;
+      const pull = yield* Stream.toPull(source.registrations);
+      const [initial] = yield* pull;
+
+      bootstraps = [];
+      const withheldPoll = yield* Effect.forkChild(pull);
+      yield* TestClock.adjust("3 seconds");
+      const [withheld] = yield* Fiber.join(withheldPoll);
+
+      bootstraps = [primary];
+      const returnedPoll = yield* Effect.forkChild(pull);
+      yield* TestClock.adjust("3 seconds");
+      const [returned] = yield* Fiber.join(returnedPoll);
+
+      // packages/client-runtime/src/connection/registry.test.ts:
+      // "retains shell and thread caches for a desired unavailable platform environment until disable"
+      // covers present-keeps/absent-clears. Every poll must include the primary so
+      // reconcilePlatform never removes it or clears its composer drafts.
+      for (const registrations of [initial, withheld, returned]) {
+        expect(registrations).toHaveLength(1);
+        expect(registrations[0]).toMatchObject({
+          _tag: "PrimaryConnectionRegistration",
+          target: {
+            environmentId: "primary",
+            httpBaseUrl: "http://127.0.0.1:14373/",
+            wsBaseUrl: "ws://127.0.0.1:14373/",
+          },
+        });
+      }
+      expect(withheld[0]).toBe(initial[0]);
+      expect(returned[0]).toBe(initial[0]);
+      expect(pf.descriptorCalls).toEqual(["http://127.0.0.1:14373/"]);
+    }).pipe(
+      Effect.provide(Layer.mergeAll(connectionPlatformLayer, TestClock.layer())),
+      Effect.scoped,
+    );
+  });
+});
