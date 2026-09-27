@@ -49,6 +49,13 @@ function parseSnapshot(payload: unknown): McpStatusSnapshot | null {
   return { servers };
 }
 
+function isMcpStatusActivity(activity: OrchestrationThreadActivity): boolean {
+  const eventType = asRecord(activity.payload)?.eventType;
+  return eventType === undefined
+    ? activity.summary === "mcp.status.updated"
+    : eventType === "mcp.status.updated";
+}
+
 export function deriveMcpStatusSnapshot(
   activities: ReadonlyArray<OrchestrationThreadActivity>,
   activeInstanceId: string | null | undefined,
@@ -58,7 +65,7 @@ export function deriveMcpStatusSnapshot(
 
   for (let index = activities.length - 1; index >= 0; index -= 1) {
     const activity = activities[index];
-    if (!activity || activity.summary !== "mcp.status.updated") continue;
+    if (!activity || !isMcpStatusActivity(activity)) continue;
 
     const payload = asRecord(activity.payload);
     if (payload?.providerInstanceId !== activeInstanceId) continue;

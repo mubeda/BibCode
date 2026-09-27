@@ -5030,11 +5030,9 @@ async fn activity_only_provider_events_project_graph_mutations_without_root_payl
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
-            if snapshot
-                .activities
-                .iter()
-                .any(|entry| entry.thread_id == "t1" && entry.summary == "pump.barrier")
-            {
+            if snapshot.activities.iter().any(|entry| {
+                entry.thread_id == "t1" && entry.payload["eventType"] == "pump.barrier"
+            }) {
                 break;
             }
             tokio::task::yield_now().await;
@@ -5062,7 +5060,7 @@ async fn activity_only_provider_events_project_graph_mutations_without_root_payl
     assert!(
         root.activities
             .iter()
-            .all(|entry| entry.summary != "activity.native"),
+            .all(|entry| entry.payload["eventType"] != "activity.native"),
         "activity-only provider events must not append root thread activity"
     );
     assert!(root.messages.is_empty());
@@ -5143,7 +5141,7 @@ async fn mcp_complete_snapshots_project_in_order_for_the_selected_provider_insta
             if snapshot
                 .activities
                 .iter()
-                .filter(|activity| activity.summary == "mcp.status.updated")
+                .filter(|activity| activity.payload["eventType"] == "mcp.status.updated")
                 .count()
                 == 2
             {
@@ -5157,16 +5155,16 @@ async fn mcp_complete_snapshots_project_in_order_for_the_selected_provider_insta
     let ordinary = snapshot
         .activities
         .iter()
-        .find(|activity| activity.summary == "provider.note")
+        .find(|activity| activity.payload["eventType"] == "provider.note")
         .expect("ordinary provider activity");
     assert_eq!(
         ordinary.payload,
-        json!({ "providerInstanceId": "source-owned" })
+        json!({ "providerInstanceId": "source-owned", "eventType": "provider.note" })
     );
     let mcp_payloads = snapshot
         .activities
         .iter()
-        .filter(|activity| activity.summary == "mcp.status.updated")
+        .filter(|activity| activity.payload["eventType"] == "mcp.status.updated")
         .map(|activity| activity.payload.clone())
         .collect::<Vec<_>>();
     assert_eq!(
@@ -5174,14 +5172,16 @@ async fn mcp_complete_snapshots_project_in_order_for_the_selected_provider_insta
         vec![
             json!({
                 "servers": [{ "name": "old-only", "state": "connected" }],
-                "providerInstanceId": "codex-work"
+                "providerInstanceId": "codex-work",
+                "eventType": "mcp.status.updated"
             }),
             json!({
                 "servers": [
                     { "name": "new-a", "state": "error", "detail": "failed" },
                     { "name": "new-b", "state": "connected" }
                 ],
-                "providerInstanceId": "codex-work"
+                "providerInstanceId": "codex-work",
+                "eventType": "mcp.status.updated"
             }),
         ]
     );
@@ -5376,7 +5376,9 @@ async fn agent_activity_toggle_keeps_session_ready_and_fences_native_event_gener
                 .expect("orchestration snapshot")
                 .activities
                 .iter()
-                .any(|entry| entry.thread_id == "t1" && entry.summary == "pump.barrier")
+                .any(|entry| {
+                    entry.thread_id == "t1" && entry.payload["eventType"] == "pump.barrier"
+                })
             {
                 break;
             }
@@ -5822,7 +5824,7 @@ async fn provider_session_exit_does_not_treat_opencode_explicit_stop_as_loss() {
                 .unwrap()
                 .activities
                 .iter()
-                .any(|activity| activity.summary == "session.exited")
+                .any(|activity| activity.payload["eventType"] == "session.exited")
             {
                 break;
             }
@@ -5965,7 +5967,7 @@ async fn assert_provider_loss_relaunch(signal: ProviderLossSignal) {
             events
                 .iter()
                 .filter(|event| event.event.event_type == "thread.activity-appended"
-                    && event.event.payload["activity"]["summary"] == "session.exited")
+                    && event.event.payload["activity"]["payload"]["eventType"] == "session.exited")
                 .count(),
             usize::from(retained_sender.is_some()),
             "session.exited remains projected exactly once"
@@ -7500,7 +7502,7 @@ async fn invalid_native_ids_drop_only_activity_without_leaking_sensitive_text() 
                 .unwrap()
                 .activities
                 .iter()
-                .filter(|event| event.summary == "activity.invalid-native-id")
+                .filter(|event| event.payload["eventType"] == "activity.invalid-native-id")
                 .count();
             if ordinary_count == 3 {
                 break;
@@ -7591,7 +7593,9 @@ async fn mismatched_event_thread_cannot_contaminate_launch_activity_scope() {
                 .unwrap()
                 .activities
                 .iter()
-                .any(|event| event.thread_id == "t2" && event.summary == "activity.cross-thread")
+                .any(|event| {
+                    event.thread_id == "t2" && event.payload["eventType"] == "activity.cross-thread"
+                })
             {
                 break;
             }
@@ -7683,7 +7687,7 @@ async fn activity_scope_ensure_failure_is_diagnostic_only() {
                 .unwrap()
                 .activities
                 .iter()
-                .any(|event| event.summary == "provider.scope-unavailable")
+                .any(|event| event.payload["eventType"] == "provider.scope-unavailable")
             {
                 break;
             }
@@ -7763,7 +7767,7 @@ async fn activity_apply_failure_is_diagnostic_only() {
                 .unwrap()
                 .activities
                 .iter()
-                .any(|event| event.summary == "provider.activity-apply-failed")
+                .any(|event| event.payload["eventType"] == "provider.activity-apply-failed")
             {
                 break;
             }
@@ -11159,7 +11163,7 @@ async fn projects_distinct_provider_messages_and_settles_the_completed_turn() {
             let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
             if snapshot.activities.iter().any(|activity| {
                 activity.thread_id == "t1"
-                    && activity.summary == "turn.completed"
+                    && activity.payload["eventType"] == "turn.completed"
                     && activity.payload["state"] == "completed"
             }) {
                 break;
@@ -11359,7 +11363,7 @@ async fn unidentified_provider_chunks_share_one_settled_turn_message() {
             let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
             if snapshot.activities.iter().any(|activity| {
                 activity.thread_id == "t1"
-                    && activity.summary == "turn.completed"
+                    && activity.payload["eventType"] == "turn.completed"
                     && activity.payload["state"] == "completed"
             }) {
                 break;
@@ -11466,7 +11470,7 @@ async fn completion_without_assistant_text_does_not_create_a_message() {
             let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
             if snapshot.activities.iter().any(|activity| {
                 activity.thread_id == "t1"
-                    && activity.summary == "turn.completed"
+                    && activity.payload["eventType"] == "turn.completed"
                     && activity.payload["state"] == "completed"
             }) {
                 break;
@@ -11573,7 +11577,7 @@ async fn failed_and_interrupted_turns_settle_existing_assistant_messages() {
                 let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
                 if snapshot.activities.iter().any(|activity| {
                     activity.thread_id == "t1"
-                        && activity.summary == "turn.completed"
+                        && activity.payload["eventType"] == "turn.completed"
                         && activity.payload["state"] == terminal_state
                 }) {
                     break snapshot;
@@ -11762,7 +11766,7 @@ async fn project_terminal_with_completion_failures(
             let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
             if snapshot.activities.iter().any(|activity| {
                 activity.thread_id == "t1"
-                    && activity.summary == "session.updated"
+                    && activity.payload["eventType"] == "session.updated"
                     && activity.payload["sentinel"] == true
             }) {
                 break;
