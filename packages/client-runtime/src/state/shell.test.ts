@@ -196,6 +196,30 @@ describe("environment shell projections", () => {
     ).toBe("unavailable");
   });
 
+  it("treats configuring as starting without a snapshot and degraded with cached data", () => {
+    const connection: SupervisorConnectionState = {
+      ...AVAILABLE_CONNECTION_STATE,
+      desired: true,
+      network: "online",
+      phase: "connecting",
+      stage: "configuring",
+    };
+    expect(
+      resolveEnvironmentAvailabilityStatus({
+        connection,
+        snapshot: Option.none(),
+        currentStatus: "starting",
+      }),
+    ).toBe("starting");
+    expect(
+      resolveEnvironmentAvailabilityStatus({
+        connection,
+        snapshot: shellState({ status: "live", updatedAt: "2026-07-01T00:00:00.000Z" }).snapshot,
+        currentStatus: "live",
+      }),
+    ).toBe("degraded");
+  });
+
   it("summarizes shell state and preserves identity when only irrelevant snapshot data changes", () => {
     const harness = makeHarness();
     const summary = harness.registry.get(harness.summaryAtom);

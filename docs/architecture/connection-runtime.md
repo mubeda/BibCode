@@ -18,12 +18,13 @@ public package has no root export; callers use focused subpaths such as
   `storageInstanceId`, rather than reducing it to a label and logical ID.
 - `ConnectionDriver` reports `preparing`, atomically verifies and if necessary
   persists the prepared descriptor's storage identity, then reports `opening`
-  and creates an `RpcSession`. After the session is ready it verifies the
-  descriptor from the first `subscribeServerConfig` snapshot through the same
-  identity owner. Only
-  then does it report `synchronizing` and return a live lease. A prepared
-  mismatch cannot open a socket, and a backend restart between HTTP preparation
-  and WebSocket configuration cannot publish synchronization or a live lease.
+  and creates an `RpcSession`. It reports `configuring` after the socket connects
+  (for E2EE, after authentication), before the first snapshot and identity check.
+  After the session is ready it verifies the descriptor from the first
+  `subscribeServerConfig` snapshot through the same identity owner. Only then
+  does it report `synchronizing` and return a live lease. A prepared mismatch
+  cannot open a socket, and a backend restart between HTTP preparation and
+  WebSocket configuration cannot publish synchronization or a live lease.
 - `EnvironmentSupervisor` owns desired state, connectivity, retries, the
   prepared connection, and the live RPC session for one environment.
 - `EnvironmentRegistry` owns catalog entries and their scoped supervisors. It
@@ -364,12 +365,23 @@ The supervisor publishes these phases:
 
 - `available`: disconnected and not requested;
 - `offline`: requested while network state is offline;
-- `connecting`: preparing, opening, or synchronizing;
+- `connecting`: preparing, opening, configuring, or synchronizing;
 - `backoff`: a transient failure is waiting for retry;
 - `connected`: the WebSocket is open and the first `subscribeServerConfig`
   snapshot arrived;
 - `blocked`: configuration, authentication, permission, capability, or a
   changed persistent store requires an explicit wakeup or user action.
+
+Establishment has 15 seconds from the attempt's start to a connected socket
+(for E2EE, an authenticated one). In `configuring`, the first snapshot and
+identity check can take up to 120 seconds while the liveness monitor keeps the
+socket alive. After 5 seconds, status reads "Receiving settings from <environment>
+over a slow connection…". At the ceiling, the attempt fails with "<environment>
+took more than 2 minutes to send its settings." and follows the normal retry
+ladder. A dead link during `configuring` ends under the liveness rule below,
+with "No data from <environment> for 30 seconds. The connection is too slow or
+was lost." The slow-setup notice replaces any previous attempt's error in
+connection status and clears when the attempt advances or ends.
 
 Transient failures retry after 1, 2, 4, 8, then 16 seconds, with 16 seconds as
 the cap, and every delay moves by up to ±15 % so reconnecting clients spread
@@ -431,7 +443,9 @@ for its first snapshot, and every later config subscription on that session
 replays the same stream (a snapshot of the current config, then live events),
 so the roughly 250 KB config crosses the wire once per connection. The stream
 starts once the socket is connected (for E2EE, authenticated), so a session
-that ends earlier never sends it. The `application-active` health probe sends
+that ends earlier never sends it. Its first snapshot is bounded by inbound
+progress (liveness) and the 120-second configuring ceiling, not the 15-second
+setup deadline. The `application-active` health probe sends
 an RPC `Ping` and succeeds at the next inbound message instead of re-fetching
 the config.
 

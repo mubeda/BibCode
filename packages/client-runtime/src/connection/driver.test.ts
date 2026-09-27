@@ -2,19 +2,23 @@ import { EnvironmentId, type ServerConfig } from "@bibcode/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Result from "effect/Result";
+import * as TestClock from "effect/testing/TestClock";
 import { makeTestExecutionEnvironmentCapabilities } from "@bibcode/shared/testSupport";
 
 import * as Persistence from "../platform/persistence.ts";
-import type { RpcSession } from "../rpc/session.ts";
+import type { EstablishingRpcSession } from "../rpc/session.ts";
 import * as RpcSessionFactory from "../rpc/session.ts";
 import type { ConnectionCatalogEntry } from "./catalog.ts";
 import * as ConnectionDriver from "./driver.ts";
 import {
   ConnectionStorageChangedError,
+  ConnectionTransientError,
   PrimaryConnectionTarget,
+  type ConnectionAttemptError,
   type PreparedConnection,
 } from "./model.ts";
 import * as ConnectionResolver from "./resolver.ts";
@@ -177,6 +181,11 @@ const makeDriver = Effect.fn("TestConnectionDriver.make")(function* (
   reportedByEnvironment: ReadonlyMap<string, string | null>,
   sessionReportedByEnvironment: ReadonlyMap<string, string | null>,
   identities: Persistence.AcceptedStorageIdentityStore["Service"],
+  options?: {
+    readonly connected?: Effect.Effect<void, ConnectionAttemptError>;
+    readonly ready?: Effect.Effect<void, ConnectionAttemptError>;
+    readonly initialConfig?: Effect.Effect<ServerConfig, ConnectionAttemptError>;
+  },
 ) {
   const sessionCount = yield* Ref.make(0);
   const sessionReleaseCount = yield* Ref.make(0);
@@ -194,18 +203,21 @@ const makeDriver = Effect.fn("TestConnectionDriver.make")(function* (
       Effect.acquireRelease(
         Ref.update(sessionCount, (count) => count + 1).pipe(
           Effect.as({
-            client: {} as RpcSession["client"],
-            initialConfig: Effect.succeed(
-              serverConfig(
-                connection,
-                sessionReportedByEnvironment.get(connection.environmentId) ?? null,
+            client: {} as EstablishingRpcSession["client"],
+            connected: options?.connected ?? Effect.void,
+            initialConfig:
+              options?.initialConfig ??
+              Effect.succeed(
+                serverConfig(
+                  connection,
+                  sessionReportedByEnvironment.get(connection.environmentId) ?? null,
+                ),
               ),
-            ),
-            ready: Effect.void,
+            ready: options?.ready ?? Effect.void,
             probe: Effect.void,
             closed: Effect.never,
             e2eeAuthenticated: Effect.succeed(null),
-          } satisfies RpcSession),
+          } satisfies EstablishingRpcSession),
         ),
         () => Ref.update(sessionReleaseCount, (count) => count + 1),
       ),
@@ -219,6 +231,83 @@ const makeDriver = Effect.fn("TestConnectionDriver.make")(function* (
 });
 
 describe("ConnectionDriver storage identity", () => {
+  it.effect(
+    "reports configuring only after connection and synchronizing only after verified config",
+    () =>
+      Effect.gen(function* () {
+        const connectionTarget = target("progress");
+        const store = yield* makeIdentityStore(new Map([["platform:primary", "store-a"]]));
+        const connected = yield* Deferred.make<void>();
+        const ready = yield* Deferred.make<void>();
+        const initialConfig = yield* Deferred.make<ServerConfig>();
+        const harness = yield* makeDriver(
+          new Map([[connectionTarget.environmentId, "store-a"]]),
+          new Map([[connectionTarget.environmentId, "store-a"]]),
+          store.identities,
+          {
+            connected: Deferred.await(connected),
+            ready: Deferred.await(ready),
+            initialConfig: Deferred.await(initialConfig),
+          },
+        );
+        const stages = yield* Ref.make<ReadonlyArray<string>>([]);
+        const connecting = yield* harness.driver
+          .connect(entry(connectionTarget), (progress) =>
+            Ref.update(stages, (current) => [...current, progress.stage]),
+          )
+          .pipe(Effect.forkChild);
+
+        yield* TestClock.adjust(0);
+        expect(yield* Ref.get(stages)).toEqual(["preparing", "opening"]);
+        yield* Deferred.succeed(connected, undefined);
+        yield* TestClock.adjust(0);
+        expect(yield* Ref.get(stages)).toEqual(["preparing", "opening", "configuring"]);
+        yield* Deferred.succeed(ready, undefined);
+        yield* TestClock.adjust(0);
+        expect(yield* Ref.get(stages)).toEqual(["preparing", "opening", "configuring"]);
+        yield* Deferred.succeed(
+          initialConfig,
+          serverConfig(prepared(connectionTarget, "store-a"), "store-a"),
+        );
+        yield* Fiber.join(connecting);
+        expect(yield* Ref.get(stages)).toEqual([
+          "preparing",
+          "opening",
+          "configuring",
+          "synchronizing",
+        ]);
+      }),
+  );
+
+  it.effect("releases a failed connection without reporting configuring", () =>
+    Effect.gen(function* () {
+      const connectionTarget = target("failed-connect");
+      const store = yield* makeIdentityStore(new Map([["platform:primary", "store-a"]]));
+      const failure = new ConnectionTransientError({
+        reason: "transport",
+        detail: "Socket closed before opening.",
+      });
+      const harness = yield* makeDriver(
+        new Map([[connectionTarget.environmentId, "store-a"]]),
+        new Map([[connectionTarget.environmentId, "store-a"]]),
+        store.identities,
+        { connected: Effect.fail(failure) },
+      );
+      const stages = yield* Ref.make<ReadonlyArray<string>>([]);
+      const result = yield* Effect.scoped(
+        harness.driver
+          .connect(entry(connectionTarget), (progress) =>
+            Ref.update(stages, (current) => [...current, progress.stage]),
+          )
+          .pipe(Effect.result),
+      );
+
+      expect(result).toEqual(Result.fail(failure));
+      expect(yield* Ref.get(stages)).toEqual(["preparing", "opening"]);
+      expect(yield* Ref.get(harness.sessionReleaseCount)).toBe(1);
+    }),
+  );
+
   it.effect("allows only one concurrent bootstrap winner to open a session", () =>
     Effect.gen(function* () {
       const firstTarget = target("first");
@@ -290,6 +379,7 @@ describe("ConnectionDriver storage identity", () => {
         expect((yield* Ref.get(stages)).map((progress) => progress.stage)).toEqual([
           "preparing",
           "opening",
+          "configuring",
         ]);
         expect(yield* Ref.get(harness.sessionCount)).toBe(1);
         expect(yield* Ref.get(harness.sessionReleaseCount)).toBe(1);
@@ -321,6 +411,7 @@ describe("ConnectionDriver storage identity", () => {
       expect((yield* Ref.get(stages)).map((progress) => progress.stage)).toEqual([
         "preparing",
         "opening",
+        "configuring",
         "synchronizing",
       ]);
       expect(yield* Ref.get(harness.sessionCount)).toBe(1);

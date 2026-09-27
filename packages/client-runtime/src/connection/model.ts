@@ -206,7 +206,11 @@ export type SupervisorConnectionPhase =
   | "connected"
   | "blocked";
 
-export type ConnectionAttemptStage = "preparing" | "opening" | "synchronizing";
+/**
+ * `configuring` means the socket is connected (and authenticated for E2EE),
+ * awaiting the first config snapshot and identity check.
+ */
+export type ConnectionAttemptStage = "preparing" | "opening" | "configuring" | "synchronizing";
 
 export interface SupervisorConnectionState {
   readonly desired: boolean;
@@ -217,6 +221,8 @@ export interface SupervisorConnectionState {
   readonly generation: number;
   readonly lastFailure: ConnectionAttemptError | null;
   readonly retryAt: number | null;
+  /** Set by the supervisor while configuring is slow; absent otherwise. */
+  readonly notice?: string;
 }
 
 export type ConnectionProjectionPhase = "disconnected" | "synchronizing" | "ready";

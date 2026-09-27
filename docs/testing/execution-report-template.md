@@ -154,6 +154,7 @@ Delete the unused result values above. Do not leave an ambiguous status.
 | Explicit pull-request/check refresh and no idle provider refresh          |        |                                      |                                   |
 | Disconnect/reconnect and one missing-capability degradation               |        |                                      |                                   |
 | Slow-link liveness: no disconnect; 4408 within 33 s when frozen           |        |                                      |                                   |
+| Slow-link establishment: 16/8/4 KiB/s, notice, and deadlines              |        |                                      |                                   |
 | Local-only author identity and no external image source                   |        |                                      |                                   |
 | Two-project selection, filter, tab, and repository-data isolation         |        |                                      |                                   |
 | Three-project visit with two-entry least-recently-used eviction           |        |                                      |                                   |
@@ -229,9 +230,15 @@ Delete the unused result values above. Do not leave an ambiguous status.
 ## Slow-link liveness scenario
 
 - Server, web, and proxy ports; fixture diff size:
+- First config snapshot size in bytes (network panel); size ÷ rate exceeds 15 seconds at the tested rates:
+- 16 KiB/s: time to connected, attempt count, setup timeout seen (none expected):
+- 8 KiB/s: time to connected, attempt count, setup timeout seen (none expected):
+- 4 KiB/s: time to connected or session end, attempt count, deciding bound (buffered delivery or server write deadline):
+- Slow-setup text after 5 seconds receiving settings, and whether it cleared on connection:
+- Freeze during configuring: seconds from the freeze until the 'No data from' status (at most 33), exact banner text, reconnect after thawing:
 - 64 KiB/s: transfer duration, negotiated subprotocol, binary frames seen, disconnects (none expected), slow-request warning text and whether it cleared:
 - 256 KiB/s: transfer duration, disconnects (none expected):
-- Frozen link: seconds until the 4408 close, exact status text, reconnect after thawing:
+- Frozen link: seconds until the 4408 close, exact status text, reconnect after thawing; the next attempt's failure time (at most 15 seconds after it starts) and text:
 - Idle freeze: freeze-start and server teardown timestamps; elapsed seconds (at most 50), observed before thaw:
 - Transfer freeze: freeze-start and server teardown timestamps; elapsed seconds (at most 33), observed before thaw; subscription cleanup evidence:
 

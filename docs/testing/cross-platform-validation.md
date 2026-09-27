@@ -1238,7 +1238,40 @@ Put `scripts/throttle-proxy.ts` between the browser and the server:
 4. Pair through the server's startup token (`/pair#token=…` on the web port) and
    add the repository.
 
-With the browser's network panel on the RPC WebSocket:
+Before the establishment checks, open a thread in the environment so the
+composer shows its connection banner. Reconnect by reloading the page: the web
+client is served directly, so only the environment's HTTP and RPC traffic
+crosses the proxy.
+
+First record the size of the first config snapshot: the data the RPC WebSocket
+receives before the banner disappears, shown in the browser's network-panel
+frames. The checks exercise the old 15-second limit only when size ÷ rate
+exceeds 15 seconds (about 250 KB on a host with many Claude skills).
+
+Check establishment before the large-diff transfers:
+
+1. `curl "http://127.0.0.1:13855/set?down=16384&up=16384"`, then reload. The
+   environment must connect on its first attempt: one RPC WebSocket, no retry.
+   The banner reads "<environment>: Connecting…"; about 5 seconds after the
+   socket connects, its second line reads "Receiving settings from
+   <environment> over a slow connection…". The banner disappears when the
+   environment connects, after about 16 seconds plus preparation for a 255 KB
+   snapshot. "did not respond during connection setup." must not appear. A
+   remote environment reached through a proxy shows the same line on its
+   context card.
+2. Repeat at `down=8192&up=8192`: first-attempt connection after about 31 seconds
+   plus preparation.
+3. Repeat at `down=4096&up=4096` and record which bound decides the attempt:
+   connection after about 62 seconds when the path buffers the snapshot, or
+   the server ending the session at its write deadline when writes block.
+4. At 8 KiB/s, reload and freeze the link with
+   `curl "http://127.0.0.1:13855/set?freeze=1"` once the "Receiving settings…"
+   line shows. Within 33 seconds of the freeze the banner reads
+   "<environment>: Reconnecting…" with "No data from <environment> for 30
+   seconds. The connection is too slow or was lost." Record it within 15
+   seconds (the next attempt can replace it), then thaw with `freeze=0`.
+
+Then check liveness during large-diff transfers:
 
 1. `curl "http://127.0.0.1:13855/set?down=65536&up=65536"`, then open the big
    commit's diff in Git Manager History. The transfer takes about a minute and
@@ -1254,8 +1287,11 @@ With the browser's network panel on the RPC WebSocket:
    to <environment>. Git Manager loads when the connection is back." A remote
    environment's context card shows "No data from <environment> for 30 seconds.
    The connection is too slow or was lost. Reconnecting…". Record that text
-   within 15 seconds of the close. After that, a reconnect attempt through the
-   frozen link can time out and show its own failure instead. Thaw with
+   within 15 seconds of the close. After that, keep the link frozen: the next
+   attempt must fail within 15 seconds of starting because the setup deadline
+   still applies before the socket connects. The descriptor request's own
+   10-second limit usually reports first as "Remote environment endpoint <url>
+   timed out after 10000ms." Record its time and text. Thaw with
    `freeze=0` and confirm the connection returns.
 4. Freeze an idle connection and record the freeze-start timestamp. While it
    remains frozen, verify the server ends that session within 50 seconds of
