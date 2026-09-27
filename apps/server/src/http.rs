@@ -22,7 +22,7 @@ use serde_json::json;
 use subtle::ConstantTimeEq;
 use tokio::fs::File;
 use tokio_util::{io::ReaderStream, sync::CancellationToken};
-use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+use tower_http::cors::{AllowCredentials, AllowOrigin, Any, CorsLayer};
 
 use crate::{
     auth,
@@ -209,9 +209,13 @@ fn cors_layer(config: &ServerConfig) -> CorsLayer {
             origins.push(origin);
         }
     }
+    // Normal mode already allows every origin for header-authenticated clients.
+    // Preserve that access in dev mode; only this allowlist gets credentialed CORS.
     layer
-        .allow_origin(AllowOrigin::list(origins))
-        .allow_credentials(true)
+        .allow_origin(AllowOrigin::mirror_request())
+        .allow_credentials(AllowCredentials::predicate(move |origin, _| {
+            origins.contains(origin)
+        }))
 }
 
 async fn websocket(
@@ -709,7 +713,149 @@ fn internal_server_error() -> Response {
 
 #[cfg(test)]
 mod tests {
+    use tower::ServiceExt;
+
     use super::*;
+
+    async fn cors_response(
+        config: &ServerConfig,
+        method: Method,
+        origin: Option<&str>,
+    ) -> Response {
+        let app = Router::new()
+            .route("/", get(|| async { StatusCode::OK }))
+            .layer(cors_layer(config));
+        let mut request = Request::builder().uri("/").method(method.clone());
+        if let Some(origin) = origin {
+            request = request.header("origin", origin);
+        }
+        if method == Method::OPTIONS {
+            request = request
+                .header("access-control-request-method", "POST")
+                .header("access-control-request-headers", "authorization");
+        }
+        app.oneshot(request.body(Body::empty()).expect("CORS request"))
+            .await
+            .expect("CORS response")
+    }
+
+    #[tokio::test]
+    async fn cors_normal_mode_preserves_response_headers() {
+        let config = ServerConfig::new("unused-cors-test-root");
+        for (method, expected) in [
+            (Method::GET, vec![("access-control-allow-origin", "*")]),
+            (
+                Method::OPTIONS,
+                vec![
+                    (
+                        "access-control-allow-headers",
+                        "authorization,content-type,b3,traceparent,dpop,idempotency-key,x-bibcode-desktop-bootstrap-token",
+                    ),
+                    ("access-control-allow-methods", "GET,POST,DELETE,OPTIONS"),
+                    ("access-control-allow-origin", "*"),
+                    ("access-control-max-age", "600"),
+                ],
+            ),
+        ] {
+            let response =
+                cors_response(&config, method.clone(), Some("https://client.example.test")).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut actual = response
+                .headers()
+                .iter()
+                .filter(|(name, _)| {
+                    name.as_str().starts_with("access-control-") || name.as_str() == "vary"
+                })
+                .map(|(name, value)| (name.as_str(), value.to_str().expect("CORS header value")))
+                .collect::<Vec<_>>();
+            actual.sort_unstable();
+            assert_eq!(actual, expected, "{method}");
+        }
+    }
+
+    async fn assert_dev_cors_origin(method: Method, origin: &str, credentials: bool) {
+        let config = ServerConfig::new("unused-cors-test-root")
+            .with_dev_url("http://localhost:5733".parse().expect("dev URL"));
+        let response = cors_response(&config, method.clone(), Some(origin)).await;
+        let headers = response.headers();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            headers.get("access-control-allow-origin"),
+            Some(&origin.parse::<axum::http::HeaderValue>().expect("origin")),
+            "{method} from {origin}"
+        );
+        assert_eq!(
+            headers
+                .get("access-control-allow-credentials")
+                .map(|value| value.to_str().expect("credentials header")),
+            credentials.then_some("true"),
+            "{method} from {origin}"
+        );
+        assert!(
+            headers.get_all("vary").iter().any(|value| {
+                value
+                    .to_str()
+                    .expect("Vary header")
+                    .split(',')
+                    .any(|name| name.trim().eq_ignore_ascii_case("origin"))
+            }),
+            "{method} from {origin} must vary by origin"
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_dev_mode_reflects_other_origins_without_credentials_on_get() {
+        for origin in [
+            "https://random.example.test",
+            "http://127.0.0.1:65000",
+            "http://localhost:5734",
+            "bibcode://other",
+            "null",
+        ] {
+            assert_dev_cors_origin(Method::GET, origin, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cors_dev_mode_reflects_other_origins_without_credentials_on_preflight() {
+        for origin in [
+            "https://random.example.test",
+            "http://127.0.0.1:65000",
+            "http://localhost:5734",
+            "bibcode://other",
+            "null",
+        ] {
+            assert_dev_cors_origin(Method::OPTIONS, origin, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cors_dev_mode_preserves_credentials_for_dev_and_desktop_origins() {
+        for origin in [
+            "http://localhost:5733",
+            "bibcode://app",
+            "bibcode-dev://app",
+        ] {
+            for method in [Method::GET, Method::OPTIONS] {
+                assert_dev_cors_origin(method, origin, true).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cors_dev_mode_omits_allow_origin_without_an_origin_header() {
+        let config = ServerConfig::new("unused-cors-test-root")
+            .with_dev_url("http://localhost:5733".parse().expect("dev URL"));
+        for method in [Method::GET, Method::OPTIONS] {
+            let response = cors_response(&config, method, None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                !response
+                    .headers()
+                    .contains_key("access-control-allow-origin")
+            );
+        }
+    }
 
     #[test]
     fn route_helpers_preserve_runtime_methods_and_internal_error_status() {
