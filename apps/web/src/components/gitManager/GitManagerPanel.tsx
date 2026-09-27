@@ -88,6 +88,7 @@ import {
 import { GitManagerTagDialog } from "./tags/GitManagerTagDialog";
 import { GitManagerTagsView, type GitManagerTagRowAction } from "./tags/GitManagerTagsView";
 import { GitManagerOperationBanner } from "./toolbar/GitManagerOperationBanner";
+import { useCheckoutStatusRereads } from "./useCheckoutStatusRereads";
 
 const EMPTY_WORKTREES: ReadonlyArray<VcsWorktreeDescriptor> = Object.freeze([]);
 const EMPTY_REFS: ReadonlyArray<GitManagerRefEntry> = Object.freeze([]);
@@ -222,6 +223,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
 }: GitManagerRepositorySurfacesProps) {
   const registry = useContext(RegistryContext);
   const { environmentId, cwd } = scope;
+  const { retrying, onRetry } = useCheckoutStatusRereads(scope);
   const { projectId } = projectRef;
   const storeKey = projectKey(projectRef);
   const selectSelectedStashSha = useCallback(
@@ -1074,7 +1076,12 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
           </TabsList>
         </div>
         <TabsPanel className="min-h-0 flex-1 gap-0 p-4" value="changes">
-          <GitManagerChangesView scope={scope} projectRef={projectRef} />
+          <GitManagerChangesView
+            scope={scope}
+            projectRef={projectRef}
+            retrying={retrying}
+            onRetry={onRetry}
+          />
         </TabsPanel>
         <TabsPanel className="min-h-0 flex-1 gap-0 p-4" value="history">
           {activeTab === "history" ? (

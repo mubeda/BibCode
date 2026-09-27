@@ -46,6 +46,8 @@ import {
 export interface GitManagerChangesViewProps {
   readonly scope: { readonly environmentId: EnvironmentId; readonly cwd: string };
   readonly projectRef: ScopedProjectRef;
+  readonly retrying: boolean;
+  readonly onRetry: () => void;
 }
 
 type ChangeContextAction =
@@ -162,6 +164,8 @@ function gitManagerMutationErrorMessage(error: unknown): string {
 export const GitManagerChangesView = memo(function GitManagerChangesView({
   scope,
   projectRef,
+  retrying,
+  onRetry,
 }: GitManagerChangesViewProps) {
   const { environmentId, cwd } = scope;
   const { projectId } = projectRef;
@@ -221,18 +225,6 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
     reportFailure: false,
   });
   const refreshStatus = useAtomCommand(vcsEnvironment.refreshStatus, { reportFailure: false });
-  // Retry while Git cannot read the repository: the server reads the status again and
-  // publishes a changed result to the status stream this view shows. Busy covers that read,
-  // and only for the checkout it reads.
-  const checkoutKey = `${environmentId}\u0000${cwd}`;
-  const [rereadingCheckout, setRereadingCheckout] = useState<string | null>(null);
-  const statusRereading = rereadingCheckout === checkoutKey;
-  const rereadStatus = useCallback(() => {
-    setRereadingCheckout(checkoutKey);
-    void refreshStatus({ environmentId, input: { cwd } }).finally(() =>
-      setRereadingCheckout((current) => (current === checkoutKey ? null : current)),
-    );
-  }, [checkoutKey, cwd, environmentId, refreshStatus]);
   const stageFiles = useAtomCommand(vcsEnvironment.stageFiles, { reportFailure: false });
   const unstageFiles = useAtomCommand(vcsEnvironment.unstageFiles, { reportFailure: false });
   const commit = useAtomCommand(gitManagerEnvironment.commit, { reportFailure: false });
@@ -551,8 +543,8 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
   // than "No local changes"; a refs failure at the same time is only its consequence.
   if (statusQuery.error === null && statusQuery.data?.isRepo === false && !refsUnavailable) {
     return errorPanel("Could not load changes", REPOSITORY_UNREADABLE_MESSAGE, {
-      retrying: statusRereading,
-      onRetry: rereadStatus,
+      retrying,
+      onRetry,
     });
   }
   if (statusQuery.error !== null || refsQuery.error !== null) {
