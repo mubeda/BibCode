@@ -84,6 +84,7 @@ pub struct ServerConfig {
     pub remote_update_support: RemoteUpdateSupport,
     pub(crate) update_maintenance_drain_timeout: Duration,
     pub(crate) update_maintenance_lease: Duration,
+    pub(crate) hosting_executable_dir_for_integration_test: Option<PathBuf>,
     /// How long the listener bind keeps retrying while its port is still in
     /// use. `None`, the default, fails the bind at once.
     pub(crate) listener_bind_retry: Option<Duration>,
@@ -118,6 +119,7 @@ impl ServerConfig {
             remote_update_support: RemoteUpdateSupport::manual(),
             update_maintenance_drain_timeout: Duration::from_secs(30),
             update_maintenance_lease: Duration::from_secs(90),
+            hosting_executable_dir_for_integration_test: None,
             listener_bind_retry: None,
         }
     }
@@ -185,6 +187,14 @@ impl ServerConfig {
     ) -> Self {
         self.update_maintenance_drain_timeout = drain_timeout;
         self.update_maintenance_lease = lease;
+        self
+    }
+
+    /// Pins hosting commands to a test-owned directory; Git remains on PATH.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_hosting_executable_dir_for_integration_test(mut self, dir: PathBuf) -> Self {
+        self.hosting_executable_dir_for_integration_test = Some(dir);
         self
     }
 

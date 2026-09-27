@@ -4025,6 +4025,7 @@ mod tests {
         use tauri::test::{INVOKE_KEY, get_ipc_response, mock_builder};
 
         let temp = tempfile::tempdir().expect("isolated desktop data root");
+        let ssh_config = tempfile::NamedTempFile::new().expect("empty SSH config");
         // Use the generated application context so IPC exercises the same command
         // permissions as the production desktop shell.
         let mut context = crate::desktop_context();
@@ -4036,7 +4037,10 @@ mod tests {
             .manage(ServerExposureCoordinator::default())
             .manage(ConnectionCatalogCoordinator::new())
             .manage(NativeContextMenuManager::new())
-            .manage(SshEnvironmentManager::new())
+            .manage(
+                SshEnvironmentManager::new()
+                    .with_ssh_config_file_for_test(ssh_config.path().to_path_buf()),
+            )
             .manage(SshPasswordPromptManager::new())
             .manage(DesktopUpdateManager::new())
             .plugin(tauri_plugin_updater::Builder::new().build())
@@ -4304,7 +4308,7 @@ mod tests {
             .is_err()
         );
         let unreachable_target = json!({
-            "alias":"unreachable-localhost",
+            "alias":"",
             "hostname":"127.0.0.1",
             "username":null,
             "port":1,

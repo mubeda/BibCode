@@ -101,8 +101,14 @@ setup-script environment. Do not mutate
 process-global PATH or HOME to isolate parallel tests. SSH fixtures must use
 test-owned SSH configuration and hosts.
 
+Desktop in-process test runtimes pin hosting executables to a missing directory
+under their isolated data root through
+`ServerConfig::with_hosting_executable_dir_for_integration_test`. Desktop SSH
+unreachable-target tests use an empty temporary SSH config (`-F`) and a literal
+loopback destination with an empty alias, avoiding user config and DNS.
+
 The server harnesses, including the library's `control.rs` and lifecycle tests,
-follow these rules; the desktop harnesses are still to come. The
+and the desktop harnesses follow these rules. The
 [approved hermetic test guard](../superpowers/specs/2026-09-26-hermetic-test-guard-design.md)
 will enforce the no-host-provider-or-hosting-CLI rule across tests; it is not
 implemented yet.

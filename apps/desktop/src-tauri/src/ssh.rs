@@ -635,6 +635,8 @@ pub struct SshEnvironmentManager {
     askpass_launcher: Mutex<Weak<SshAskpassLauncherInner>>,
     child_reaper: SshChildReaper,
     ssh_program: String,
+    #[cfg(test)]
+    ssh_config_file_for_test: Option<PathBuf>,
     deadlines: SshOperationDeadlines,
     /// One async lock per target connection key. `ensure_environment` and
     /// `disconnect_environment` hold it for their whole remote sequence, so
@@ -687,6 +689,8 @@ impl SshEnvironmentManager {
             askpass_launcher: Mutex::new(Weak::new()),
             child_reaper: SshChildReaper::new(),
             ssh_program,
+            #[cfg(test)]
+            ssh_config_file_for_test: None,
             deadlines,
             target_locks: Mutex::new(HashMap::new()),
             io_runtime: SshIoRuntime::new(SSH_IO_MAX_BLOCKING_THREADS),
@@ -702,9 +706,17 @@ impl SshEnvironmentManager {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_ssh_config_file_for_test(mut self, path: PathBuf) -> Self {
+        self.ssh_config_file_for_test = Some(path);
+        self
+    }
+
     fn remote_runner(&self, operation: RemoteOperation) -> Result<RemoteScriptRunner, String> {
         Ok(RemoteScriptRunner {
             program: self.ssh_program.clone(),
+            #[cfg(test)]
+            ssh_config_file_for_test: self.ssh_config_file_for_test.clone(),
             deadline: match operation {
                 RemoteOperation::Pairing => self.deadlines.pairing,
                 RemoteOperation::Launch => self.deadlines.launch,
@@ -831,6 +843,8 @@ impl SshEnvironmentManager {
                 let askpass_launcher = askpass_launcher.clone();
                 let remote_launch = remote_launch.clone();
                 let ssh_program = self.ssh_program.clone();
+                #[cfg(test)]
+                let ssh_config_file_for_test = self.ssh_config_file_for_test.clone();
                 let io_runtime = io_runtime.clone();
                 async move {
                     let mut plan = SshEnvironmentLaunchPlan::forward_with_auth(
@@ -840,6 +854,13 @@ impl SshEnvironmentManager {
                         &auth,
                     )?;
                     plan.program = ssh_program;
+                    #[cfg(test)]
+                    if let Some(path) = ssh_config_file_for_test {
+                        plan.args.splice(
+                            0..0,
+                            ["-F".to_string(), path.to_string_lossy().into_owned()],
+                        );
+                    }
                     let tunnel_plan = plan.clone();
                     let child = run_on_ssh_io(&io_runtime, async move {
                         start_ssh_tunnel(&tunnel_plan, &auth, askpass_launcher).await
@@ -1778,6 +1799,8 @@ enum RemoteOperation {
 #[derive(Debug, Clone)]
 struct RemoteScriptRunner {
     program: String,
+    #[cfg(test)]
+    ssh_config_file_for_test: Option<PathBuf>,
     deadline: Duration,
     /// The SSH I/O runtime, where the script's child runs.
     io_runtime: tokio::runtime::Handle,
@@ -1821,6 +1844,13 @@ async fn run_remote_ssh_script(
 ) -> Result<String, String> {
     let host_spec = build_ssh_host_spec(target)?;
     let mut args = base_ssh_args_with_auth(target, auth);
+    #[cfg(test)]
+    if let Some(path) = &runner.ssh_config_file_for_test {
+        args.splice(
+            0..0,
+            ["-F".to_string(), path.to_string_lossy().into_owned()],
+        );
+    }
     args.push(host_spec);
     args.extend(["sh".to_string(), "-s".to_string(), "--".to_string()]);
     args.extend(script_args.iter().cloned());
@@ -3655,15 +3685,17 @@ mod tests {
         use tauri::test::{mock_builder, mock_context, noop_assets};
 
         let askpass_temporary_base = tempfile::tempdir().expect("askpass temporary base");
+        let ssh_config = tempfile::NamedTempFile::new().expect("empty SSH config");
         let app = mock_builder()
             .build(mock_context(noop_assets()))
             .expect("mock Tauri app");
         let manager = SshEnvironmentManager::with_askpass_temp_base(
             askpass_temporary_base.path().to_path_buf(),
-        );
+        )
+        .with_ssh_config_file_for_test(ssh_config.path().to_path_buf());
         let prompts = SshPasswordPromptManager::with_timeout(Duration::ZERO);
         let target = SshEnvironmentTarget {
-            alias: "unreachable-localhost".to_string(),
+            alias: String::new(),
             hostname: "127.0.0.1".to_string(),
             username: None,
             port: Some(1),

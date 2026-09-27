@@ -337,6 +337,11 @@ impl ProductionRuntime {
         )
         .with_created_request_observer(Arc::new(pull_requests.service.clone()))
         .with_availability_registry(workspace_availability.clone());
+        let git_vcs = if let Some(dir) = &config.hosting_executable_dir_for_integration_test {
+            git_vcs.with_hosting_executable_dir_for_integration_test(dir.clone())
+        } else {
+            git_vcs
+        };
         let worktree_removal_tasks = git_vcs.worktree_removal_tasks();
         let clone_operations = git_vcs.clone_operations();
         let status_broadcaster = git_vcs.status_broadcaster();

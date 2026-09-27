@@ -2047,10 +2047,15 @@ async fn start_managed_backend(
 ) -> Result<(BackendRunConfig, ManagedBackend, Option<u32>), BackendStartFailure> {
     match &plan.target {
         BackendLaunchTarget::InProcess { data_root, .. } => {
-            #[cfg(test)]
-            prepare_isolated_test_server_settings(&data_root.effective)
-                .map_err(BackendStartFailure::other)?;
             let mut server_config = server_config_for_launch(data_root.clone(), &plan.config);
+            #[cfg(test)]
+            {
+                prepare_isolated_test_server_settings(&data_root.effective)
+                    .map_err(BackendStartFailure::other)?;
+                server_config = server_config.with_hosting_executable_dir_for_integration_test(
+                    data_root.effective.join("missing-hosting-bin"),
+                );
+            }
             if let Some(support) = remote_update_support {
                 server_config = server_config.with_remote_update_support(support);
             }
@@ -3775,7 +3780,10 @@ exit /b 9
             .expect("isolated desktop test settings should write");
         let mut config = local_test_config(0);
         let handle = ServerRuntime::start_with_ui_process_observer(
-            server_config_for_launch(test_cli_data_root(base_dir), &config),
+            server_config_for_launch(test_cli_data_root(base_dir), &config)
+                .with_hosting_executable_dir_for_integration_test(
+                    base_dir.join("missing-hosting-bin"),
+                ),
             Arc::new(UnavailableDesktopUiProcessObserver),
         )
         .await
@@ -3790,8 +3798,9 @@ exit /b 9
         prepare_isolated_test_server_settings(base_dir)
             .expect("isolated desktop test settings should write");
         let mut config = local_test_config(0);
-        let server_config =
-            server_config_for_launch(test_cli_data_root(base_dir), &config).with_unsafe_no_auth();
+        let server_config = server_config_for_launch(test_cli_data_root(base_dir), &config)
+            .with_hosting_executable_dir_for_integration_test(base_dir.join("missing-hosting-bin"))
+            .with_unsafe_no_auth();
         let handle = ServerRuntime::start_with_ui_process_observer(
             server_config,
             Arc::new(UnavailableDesktopUiProcessObserver),

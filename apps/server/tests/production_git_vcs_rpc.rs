@@ -2462,6 +2462,91 @@ fn with_flags(payload: &Value, attach: bool, detach: bool) -> Value {
 }
 
 #[tokio::test]
+async fn production_runtime_pins_hosting_discovery_to_the_configured_directory() {
+    let _parallelism_permit = acquire_git_rpc_fixture().await;
+    if relaunch_with_isolated_git_config(
+        "production_runtime_pins_hosting_discovery_to_the_configured_directory",
+    ) {
+        return;
+    }
+
+    // The optional audit fakes log one file per process. This test runs alone
+    // in a child, so its PID excludes calls from parallel tests and binaries.
+    let hosting_call_count = || {
+        let calls = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/fakes/calls");
+        let entries = match fs::read_dir(calls) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return 0,
+            Err(error) => panic!("read hosting audit directory: {error}"),
+        };
+        let parent = format!("ppid={}", std::process::id());
+        entries
+            .map(|entry| {
+                let contents = fs::read_to_string(entry.expect("audit entry").path())
+                    .expect("read hosting audit record");
+                contents
+                    .lines()
+                    .filter(|line| {
+                        line.split('\t').any(|field| field == parent)
+                            && line.split('\t').any(|field| {
+                                ["name=gh", "name=glab", "name=az", "name=jj"].contains(&field)
+                            })
+                    })
+                    .count()
+            })
+            .sum::<usize>()
+    };
+    let calls_before = hosting_call_count();
+    let temp = TempDir::new().expect("temporary server directory");
+    let config = test_config(&temp).with_hosting_executable_dir_for_integration_test(
+        hermetic_providers::missing_hosting_executable_dir(temp.path()),
+    );
+    let handle = ServerRuntime::start(config)
+        .await
+        .expect("production server starts");
+    let (mut socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .expect("WebSocket connects");
+    request(&mut socket, "1", "server.discoverSourceControl", json!({})).await;
+    let discovery = success_value(&mut socket, "1").await;
+    socket.close(None).await.expect("close WebSocket");
+    handle.shutdown();
+    handle.join().await.expect("server joins");
+
+    assert_eq!(
+        hosting_call_count(),
+        calls_before,
+        "production runtime must not execute hosting CLIs from PATH"
+    );
+    for (collection, executable) in [
+        ("versionControlSystems", "jj"),
+        ("sourceControlProviders", "gh"),
+        ("sourceControlProviders", "glab"),
+        ("sourceControlProviders", "az"),
+    ] {
+        let item = discovery[collection]
+            .as_array()
+            .expect("discovery entries")
+            .iter()
+            .find(|item| item["executable"] == executable)
+            .expect("hosting discovery entry");
+        assert_eq!(item["status"], "missing", "{executable}");
+        assert_eq!(item["version"]["_tag"], "None", "{executable}");
+        assert_eq!(
+            item["detail"]["_tag"], "Some",
+            "{executable} was not spawned"
+        );
+    }
+    let git = discovery["versionControlSystems"]
+        .as_array()
+        .expect("VCS discovery entries")
+        .iter()
+        .find(|item| item["kind"] == "git")
+        .expect("Git discovery entry");
+    assert_eq!(git["status"], "available", "real Git remains available");
+}
+
+#[tokio::test]
 async fn source_control_discovery_and_typed_errors_are_deterministic() {
     let parallelism_permit = acquire_git_rpc_fixture().await;
     if relaunch_with_isolated_git_config(
