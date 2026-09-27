@@ -30,7 +30,7 @@ use super::{
     },
 };
 use crate::{
-    auth::{AuthService, Principal, authorization_error, required_scope},
+    auth::{AuthService, ClientMetadata, Principal, authorization_error, required_scope},
     diagnostics::TraceDiagnosticsStore,
     json_size::encoded_json_len,
     maintenance::{RpcAdmissionGate, RpcPermit, rpc_mutability},
@@ -340,6 +340,19 @@ impl RpcSessionContext {
         self.principal
             .as_ref()
             .map(|principal| principal.session_id.as_str())
+    }
+
+    /// The paired-client metadata of this connection's session, for audit and host
+    /// notices. `None` on an unauthenticated server or for an unknown session.
+    pub(crate) async fn current_client_metadata(&self) -> Option<ClientMetadata> {
+        let (Some(principal), Some(auth)) = (&self.principal, &self.auth) else {
+            return None;
+        };
+        auth.list_clients(&principal.session_id)
+            .await
+            .into_iter()
+            .find(|client| client.current)
+            .map(|client| client.client)
     }
 
     pub(crate) fn connection_id(&self) -> uuid::Uuid {

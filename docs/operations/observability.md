@@ -51,6 +51,14 @@ from retargeting or tearing down another runtime's logging without accumulating
 completed entries. `BIBCODE_LOG` controls the filter and falls back to the
 standard `RUST_LOG` behavior, then `info`.
 
+Each interactive `updater.install` request writes one `info` line,
+`remote update install requested`, after the host delegate replies, with the
+requester's label, OS, address (`unknown` when absent), 8-character session
+prefix, and server and target versions. An `error` snapshot adds a `warn` line,
+`remote update install request failed`, with the same fields and the error.
+Both use the `bibcode_server::remote_update` target and contain no credentials
+or full session IDs. Manual install refusals emit neither line.
+
 In headless mode, run the native server from a terminal, or install the
 per-user service (`bibcode service install`) whose stdout and stderr go to the
 service manager's log (the journal on Linux, `~/Library/Logs/bibcode-server.log`
