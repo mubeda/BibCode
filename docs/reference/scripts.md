@@ -174,6 +174,17 @@ preservation in the documented native-architecture containers.
 
 ## Repository Maintenance
 
+- `cargo run -p bibcode-server --example remote_update_fake_host -- <base-dir> <port 4800-4899> <server-version> [label]`:
+  development-only, loopback-only scripted interactive host for remote-update
+  live checks (default label: `Fake-host`). Stdin accepts one JSON object per
+  line: `{"status":{...}}` replaces the camelCase update status,
+  `{"restart":{"serverVersion":"9.9.1","afterMs":2000}}` restarts on the same
+  data root and port with a fresh boot ID and idle status (`afterMs` defaults to
+  2000), `{"stop":true}` stops serving permanently while the process stays alive,
+  and `{"exit":true}` or EOF shuts down and exits. Pair through
+  `bibcode pairing offer --base-dir <base-dir> --endpoint http://127.0.0.1:<port> --reach this-computer --json`;
+  the example prints only a `started` JSON event with `port`, `serverVersion`,
+  and `bootId`, without pairing credentials.
 - `bash scripts/test-linux-git-compatibility.sh TEST_BINARY [IMAGE ...]`: run the
   compiled Linux Git-runner regression in disposable Debian, Ubuntu, Fedora,
   and Arch containers. Build the executable on the Ubuntu 22.04 glibc baseline;
