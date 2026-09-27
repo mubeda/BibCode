@@ -211,7 +211,6 @@ function OpenCommandPaletteDialog(props: {
   const [query, setQuery] = useState("");
   const deferredQuery = useDeferredValue(query);
   const isActionsOnly = deferredQuery.startsWith(">");
-  const [highlightedItemValue, setHighlightedItemValue] = useState<string | null>(null);
   const clientSettings = useClientSettings();
   const { activeDraftThread, activeThread, defaultProjectRef, handleNewThread } =
     useHandleNewThread();
@@ -338,7 +337,6 @@ function OpenCommandPaletteDialog(props: {
         ...(view.initialQuery ? { initialQuery: view.initialQuery } : {}),
       },
     ]);
-    setHighlightedItemValue(null);
     setQuery(view.initialQuery ?? "");
   }
 
@@ -352,12 +350,10 @@ function OpenCommandPaletteDialog(props: {
 
   function popView(): void {
     setViewStack((previousViews) => previousViews.slice(0, -1));
-    setHighlightedItemValue(null);
     setQuery("");
   }
 
   function handleQueryChange(nextQuery: string): void {
-    setHighlightedItemValue(null);
     setQuery(nextQuery);
     if (nextQuery === "" && currentView?.initialQuery) {
       popView();
@@ -506,9 +502,6 @@ function OpenCommandPaletteDialog(props: {
         aria-label="Command palette"
         autoHighlight="always"
         mode="none"
-        onItemHighlighted={(value) => {
-          setHighlightedItemValue(typeof value === "string" ? value : null);
-        }}
         onValueChange={handleQueryChange}
         value={query}
       >
@@ -538,7 +531,6 @@ function OpenCommandPaletteDialog(props: {
         <CommandPanel className="max-h-[min(28rem,70vh)]">
           <CommandPaletteResults
             groups={displayedGroups}
-            highlightedItemValue={highlightedItemValue}
             isActionsOnly={isActionsOnly}
             keybindings={keybindings}
             onExecuteItem={executeItem}

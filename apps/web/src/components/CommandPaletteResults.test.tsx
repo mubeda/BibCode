@@ -102,7 +102,6 @@ describe("CommandPaletteResults", () => {
     const markup = renderToStaticMarkup(
       <CommandPaletteResults
         groups={[{ value: "group", label: "Commands", items: harness.items } as never]}
-        highlightedItemValue="enabled-description"
         isActionsOnly={false}
         keybindings={keybindings}
         onExecuteItem={onExecuteItem}
