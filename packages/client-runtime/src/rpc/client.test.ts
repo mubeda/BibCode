@@ -1,17 +1,20 @@
 import {
   EnvironmentId,
+  GitCommandError,
   type RelayClientInstallProgressEvent,
   ThreadId,
   WS_METHODS,
 } from "@bibcode/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import * as TestClock from "effect/testing/TestClock";
@@ -439,6 +442,204 @@ describe("environment RPC", () => {
         expect(Cause.hasDies(exit.cause)).toBe(true);
       }
       expect(expectedFailureCount).toBe(0);
+    }),
+  );
+
+  it.effect("retries only matching expected failures with bounded exponential backoff", () =>
+    Effect.gen(function* () {
+      const error = new GitCommandError({
+        operation: "retryable",
+        command: "git",
+        cwd: "/repo",
+        detail: "retry",
+      });
+      let subscriptions = 0;
+      let observedFailures = 0;
+      const client = {
+        [WS_METHODS.subscribeVcsStatus]: () => {
+          subscriptions += 1;
+          return Stream.fail(error);
+        },
+      } as unknown as WsRpcProtocolClient;
+      const subscriptionFiber = yield* subscribeInSession(
+        session(client),
+        TARGET.environmentId,
+        WS_METHODS.subscribeVcsStatus,
+        { cwd: "/repo" },
+        {
+          onExpectedFailure: () =>
+            Effect.sync(() => {
+              observedFailures += 1;
+            }),
+          retryExpectedFailure: {
+            when: (failure) =>
+              failure._tag === "GitCommandError" && failure.operation === "retryable",
+            initialDelay: "10 millis",
+            maxDelay: "40 millis",
+            resetAfter: "100 millis",
+          },
+        },
+      ).pipe(Stream.runDrain, Effect.forkChild);
+
+      yield* TestClock.adjust(0);
+      expect(subscriptions).toBe(1);
+      for (const [index, delay] of [10, 20, 40, 40].entries()) {
+        yield* TestClock.adjust(delay - 1);
+        expect(subscriptions).toBe(index + 1);
+        yield* TestClock.adjust(1);
+        expect(subscriptions).toBe(index + 2);
+        expect(observedFailures).toBe(subscriptions);
+      }
+      yield* Fiber.interrupt(subscriptionFiber);
+      yield* TestClock.adjust("1 second");
+      expect(subscriptions).toBe(5);
+    }),
+  );
+
+  it.effect("propagates unmatched expected failures without handling or retrying them", () =>
+    Effect.gen(function* () {
+      const error = new GitCommandError({
+        operation: "fatal",
+        command: "git",
+        cwd: "/repo",
+        detail: "do not retry",
+      });
+      let subscriptions = 0;
+      let observedFailures = 0;
+      const client = {
+        [WS_METHODS.subscribeVcsStatus]: () => {
+          subscriptions += 1;
+          return Stream.fail(error);
+        },
+      } as unknown as WsRpcProtocolClient;
+      const exit = yield* subscribeInSession(
+        session(client),
+        TARGET.environmentId,
+        WS_METHODS.subscribeVcsStatus,
+        { cwd: "/repo" },
+        {
+          onExpectedFailure: () =>
+            Effect.sync(() => {
+              observedFailures += 1;
+            }),
+          retryExpectedFailure: {
+            when: (failure) =>
+              failure._tag === "GitCommandError" && failure.operation === "retryable",
+            initialDelay: "10 millis",
+            maxDelay: "40 millis",
+            resetAfter: "100 millis",
+          },
+        },
+      ).pipe(Stream.runDrain, Effect.exit);
+
+      expect(Exit.isFailure(exit)).toBe(true);
+      if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBe(error);
+      yield* TestClock.adjust("1 minute");
+      expect(subscriptions).toBe(1);
+      expect(observedFailures).toBe(0);
+    }),
+  );
+
+  it.effect("releases retry bookkeeping scopes between repeated failures", () =>
+    Effect.gen(function* () {
+      const clock = yield* Clock.Clock;
+      const liveScopes = new Set<Scope.Scope>();
+      const trackedTime = clock.currentTimeMillis.pipe(
+        Effect.tap(
+          Effect.gen(function* () {
+            const scope = yield* Effect.serviceOption(Scope.Scope);
+            if (Option.isSome(scope) && !liveScopes.has(scope.value)) {
+              liveScopes.add(scope.value);
+              yield* Scope.addFinalizer(
+                scope.value,
+                Effect.sync(() => {
+                  liveScopes.delete(scope.value);
+                }),
+              );
+            }
+          }),
+        ),
+      );
+      let subscriptions = 0;
+      const client = {
+        [WS_METHODS.subscribeVcsStatus]: () => {
+          subscriptions += 1;
+          return Stream.fail(
+            new GitCommandError({
+              operation: "retryable",
+              command: "git",
+              cwd: "/repo",
+              detail: "retry",
+            }),
+          );
+        },
+      } as unknown as WsRpcProtocolClient;
+      const fiber = yield* subscribeInSession(
+        session(client),
+        TARGET.environmentId,
+        WS_METHODS.subscribeVcsStatus,
+        { cwd: "/repo" },
+        {
+          retryExpectedFailure: {
+            when: () => true,
+            initialDelay: 1,
+            maxDelay: 1,
+            resetAfter: "30 seconds",
+          },
+        },
+      ).pipe(
+        Stream.runDrain,
+        Effect.scoped,
+        Effect.provideService(Clock.Clock, { ...clock, currentTimeMillis: trackedTime }),
+        Effect.forkChild,
+      );
+      yield* TestClock.adjust(100);
+      expect(subscriptions).toBe(101);
+      expect(liveScopes.size).toBeGreaterThan(0);
+      expect(liveScopes.size).toBeLessThanOrEqual(2);
+      yield* Fiber.interrupt(fiber);
+      expect(liveScopes.size).toBe(0);
+    }),
+  );
+
+  it.effect("leaves transport failures dormant even when the retry predicate matches", () =>
+    Effect.gen(function* () {
+      let subscriptions = 0;
+      let observedFailures = 0;
+      const client = {
+        [WS_METHODS.subscribeVcsStatus]: () => {
+          subscriptions += 1;
+          return Stream.fail(
+            new RpcClientError.RpcClientError({
+              reason: new RpcClientError.RpcClientDefect({
+                message: "socket closed",
+                cause: new Error("socket closed"),
+              }),
+            }),
+          );
+        },
+      } as unknown as WsRpcProtocolClient;
+      yield* subscribeInSession(
+        session(client),
+        TARGET.environmentId,
+        WS_METHODS.subscribeVcsStatus,
+        { cwd: "/repo" },
+        {
+          onExpectedFailure: () =>
+            Effect.sync(() => {
+              observedFailures += 1;
+            }),
+          retryExpectedFailure: {
+            when: () => true,
+            initialDelay: "10 millis",
+            maxDelay: "40 millis",
+            resetAfter: "100 millis",
+          },
+        },
+      ).pipe(Stream.runDrain);
+      yield* TestClock.adjust("1 minute");
+      expect(subscriptions).toBe(1);
+      expect(observedFailures).toBe(0);
     }),
   );
 });

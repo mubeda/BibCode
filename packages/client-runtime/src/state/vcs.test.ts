@@ -7,6 +7,8 @@ import {
 } from "@bibcode/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Clock from "effect/Clock";
+import * as Cause from "effect/Cause";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -120,6 +122,178 @@ function waitFor(predicate: () => boolean, message: string) {
     return yield* Effect.die(message);
   });
 }
+
+describe("VCS status atoms", () => {
+  const fellBehind = new GitCommandError({
+    operation: "GitStatusBroadcaster.fellBehind",
+    command: "git",
+    cwd: "/repo",
+    detail: "The Git status stream fell behind. Subscribe again.",
+  });
+
+  it.effect(
+    "retains its last status through a fell-behind retry and replaces it with the snapshot",
+    () =>
+      Effect.gen(function* () {
+        let calls = 0;
+        const failure = yield* Deferred.make<never, GitCommandError>();
+        const recovered = {
+          ...legacySnapshot,
+          local: {
+            ...legacySnapshot.local,
+            refName: "recovered/main",
+            hasWorkingTreeChanges: true,
+          },
+        };
+        const client = {
+          [WS_METHODS.subscribeVcsStatus]: () => {
+            calls += 1;
+            return calls === 1
+              ? Stream.make(legacySnapshot).pipe(
+                  Stream.concat(Stream.fromEffect(Deferred.await(failure))),
+                )
+              : Stream.make(recovered);
+          },
+        } as unknown as WsRpcProtocolClient;
+        const harness = yield* makeHarness(session(client, true));
+        const atom = harness.vcs.status(TARGET);
+        const unmount = harness.atomRegistry.mount(atom);
+        const initial = yield* readRefName(harness.atomRegistry, atom, "legacy/main");
+        const observed: string[] = [];
+        const unsubscribe = harness.atomRegistry.subscribe(atom, (value) =>
+          observed.push(value._tag),
+        );
+
+        yield* Deferred.fail(failure, fellBehind);
+        for (let attempt = 0; attempt < 10; attempt += 1) yield* Effect.yieldNow;
+        yield* TestClock.adjust(249);
+        expect(calls).toBe(1);
+        const retained = harness.atomRegistry.get(atom);
+        expect(AsyncResult.isSuccess(retained) ? retained.value : null).toBe(initial);
+        yield* TestClock.adjust(1);
+        const value = yield* readRefName(harness.atomRegistry, atom, "recovered/main");
+        expect(value.hasWorkingTreeChanges).toBe(true);
+        expect(calls).toBe(2);
+        expect(observed.length).toBeGreaterThan(0);
+        expect(observed.every((tag) => tag === "Success")).toBe(true);
+        yield* TestClock.adjust("1 minute");
+        expect(calls).toBe(2);
+
+        unsubscribe();
+        unmount();
+        harness.atomRegistry.dispose();
+      }),
+  );
+
+  it.effect.each(["Git.status", "GitStatusBroadcaster.subscribe"])(
+    "fails without resubscribing for %s",
+    (operation) =>
+      Effect.gen(function* () {
+        let calls = 0;
+        const error = new GitCommandError({
+          operation,
+          command: "git",
+          cwd: "/repo",
+          detail: "failed",
+        });
+        const client = {
+          [WS_METHODS.subscribeVcsStatus]: () => {
+            calls += 1;
+            return Stream.fail(error);
+          },
+        } as unknown as WsRpcProtocolClient;
+        const harness = yield* makeHarness(session(client, true));
+        const atom = harness.vcs.status(TARGET);
+        const unmount = harness.atomRegistry.mount(atom);
+        yield* waitFor(
+          () => AsyncResult.isFailure(harness.atomRegistry.get(atom)),
+          "status did not fail",
+        );
+        const result = harness.atomRegistry.get(atom);
+        expect(AsyncResult.isFailure(result) ? Cause.squash(result.cause) : null).toBe(error);
+        yield* TestClock.adjust("1 minute");
+        expect(calls).toBe(1);
+        unmount();
+        harness.atomRegistry.dispose();
+      }),
+  );
+
+  it.effect("does not resubscribe after a clean status stream end", () =>
+    Effect.gen(function* () {
+      let calls = 0;
+      const client = {
+        [WS_METHODS.subscribeVcsStatus]: () => {
+          calls += 1;
+          return Stream.make(legacySnapshot);
+        },
+      } as unknown as WsRpcProtocolClient;
+      const harness = yield* makeHarness(session(client, true));
+      const atom = harness.vcs.status(TARGET);
+      const unmount = harness.atomRegistry.mount(atom);
+      yield* readRefName(harness.atomRegistry, atom, "legacy/main");
+      yield* TestClock.adjust("2 minutes");
+      expect(calls).toBe(1);
+      expect(AsyncResult.isSuccess(harness.atomRegistry.get(atom))).toBe(true);
+      unmount();
+      harness.atomRegistry.dispose();
+    }),
+  );
+
+  it.effect("doubles fell-behind waits up to 30 seconds and resets after 30 seconds up", () =>
+    Effect.gen(function* () {
+      const failures: Deferred.Deferred<never, GitCommandError>[] = [];
+      const client = {
+        [WS_METHODS.subscribeVcsStatus]: () =>
+          Stream.unwrap(
+            Effect.gen(function* () {
+              const failure = yield* Deferred.make<never, GitCommandError>();
+              failures.push(failure);
+              return Stream.make({
+                ...legacySnapshot,
+                local: { ...legacySnapshot.local, refName: `attempt-${failures.length}` },
+              }).pipe(Stream.concat(Stream.fromEffect(Deferred.await(failure))));
+            }),
+          ),
+      } as unknown as WsRpcProtocolClient;
+      const harness = yield* makeHarness(session(client, true));
+      const atom = harness.vcs.status(TARGET);
+      const unmount = harness.atomRegistry.mount(atom);
+      yield* readRefName(harness.atomRegistry, atom, "attempt-1");
+
+      for (const [index, delay] of [
+        250, 500, 1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000,
+      ].entries()) {
+        yield* Deferred.fail(failures[index]!, fellBehind);
+        for (let attempt = 0; attempt < 10; attempt += 1) yield* Effect.yieldNow;
+        yield* TestClock.adjust(delay - 1);
+        expect(failures).toHaveLength(index + 1);
+        expect(AsyncResult.isSuccess(harness.atomRegistry.get(atom))).toBe(true);
+        yield* TestClock.adjust(1);
+        yield* readRefName(harness.atomRegistry, atom, `attempt-${index + 2}`);
+        expect(failures).toHaveLength(index + 2);
+      }
+
+      yield* TestClock.adjust(29_999);
+      yield* Deferred.fail(failures[9]!, fellBehind);
+      for (let attempt = 0; attempt < 10; attempt += 1) yield* Effect.yieldNow;
+      yield* TestClock.adjust(29_999);
+      expect(failures).toHaveLength(10);
+      yield* TestClock.adjust(1);
+      yield* readRefName(harness.atomRegistry, atom, "attempt-11");
+
+      yield* TestClock.adjust(30_000);
+      yield* Deferred.fail(failures[10]!, fellBehind);
+      for (let attempt = 0; attempt < 10; attempt += 1) yield* Effect.yieldNow;
+      yield* TestClock.adjust(249);
+      expect(failures).toHaveLength(11);
+      yield* TestClock.adjust(1);
+      yield* readRefName(harness.atomRegistry, atom, "attempt-12");
+      expect(failures).toHaveLength(12);
+      unmount();
+      harness.atomRegistry.dispose();
+    }),
+  );
+});
 
 describe("VCS summary atoms", () => {
   it.effect("retries an expected summary failure once at the passive freshness boundary", () =>

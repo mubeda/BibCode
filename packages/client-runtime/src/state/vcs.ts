@@ -50,6 +50,9 @@ import {
 
 export type VcsPassiveStatus = VcsStatusSummary | VcsStatusResult;
 
+// Matches GIT_STATUS_FELL_BEHIND_OPERATION in apps/server/src/git/broadcaster.rs.
+const GIT_STATUS_FELL_BEHIND_OPERATION = "GitStatusBroadcaster.fellBehind";
+
 type VcsSummaryStreamFailure = EnvironmentRpcStreamFailure<
   typeof WS_METHODS.subscribeVcsStatusSummary
 >;
@@ -159,7 +162,22 @@ export function createVcsEnvironmentAtoms<R, E>(
   const status = createEnvironmentSubscriptionAtomFamily(runtime, {
     label: "environment-data:vcs:status",
     subscribe: (input: EnvironmentRpcInput<typeof WS_METHODS.subscribeVcsStatus>) =>
-      reduceStatusEvents(subscribe(WS_METHODS.subscribeVcsStatus, input)),
+      reduceStatusEvents(
+        subscribe(WS_METHODS.subscribeVcsStatus, input, {
+          onExpectedFailure: (cause) =>
+            Effect.logWarning("The Git status stream fell behind; resubscribing.").pipe(
+              Effect.annotateLogs({ ...safeErrorLogAttributes(Cause.squash(cause)) }),
+            ),
+          retryExpectedFailure: {
+            when: (error) =>
+              error._tag === "GitCommandError" &&
+              error.operation === GIT_STATUS_FELL_BEHIND_OPERATION,
+            initialDelay: "250 millis",
+            maxDelay: "30 seconds",
+            resetAfter: "30 seconds",
+          },
+        }),
+      ),
     idleTtlMs: 0,
   });
   const summaryFamily = Atom.family((key: string) => {

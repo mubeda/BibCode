@@ -2,7 +2,10 @@ use std::{
     collections::{HashMap, HashSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -96,7 +99,10 @@ struct RepositoryState {
 }
 
 enum RepositorySubscriber {
-    Status(mpsc::Sender<StatusPublication<VcsStatusStreamEvent>>),
+    Status {
+        sender: mpsc::Sender<StatusPublication<VcsStatusStreamEvent>>,
+        fell_behind: Arc<AtomicBool>,
+    },
     GitManager,
 }
 
@@ -121,6 +127,7 @@ impl Drop for RepositoryRetirementFence {
 
 pub struct StatusSubscription {
     receiver: mpsc::Receiver<StatusPublication<VcsStatusStreamEvent>>,
+    fell_behind: Arc<AtomicBool>,
     cancellation: CancellationToken,
     broadcaster: StatusBroadcaster,
     cwd: PathBuf,
@@ -439,6 +446,7 @@ impl StatusBroadcaster {
             let initial_read_duration = initial_read_started.elapsed();
             let fence = read.fence();
             let (sender, receiver) = mpsc::channel(self.inner.subscriber_capacity);
+            let fell_behind = Arc::new(AtomicBool::new(false));
             #[cfg(test)]
             let retirement_sentinel_finished = Arc::clone(&self.inner.retirement_sentinel_finished);
 
@@ -504,7 +512,10 @@ impl StatusBroadcaster {
                 entry.subscribers.insert(
                     subscriber_id,
                     match kind {
-                        SubscriptionKind::Status => RepositorySubscriber::Status(sender),
+                        SubscriptionKind::Status => RepositorySubscriber::Status {
+                            sender,
+                            fell_behind: Arc::clone(&fell_behind),
+                        },
                         SubscriptionKind::GitManager => RepositorySubscriber::GitManager,
                     },
                 );
@@ -513,10 +524,10 @@ impl StatusBroadcaster {
                     && entry.remote_ref_name.as_ref() == Some(&local.ref_name))
                 .then(|| entry.remote.clone().flatten())
                 .flatten();
-                if let Some(RepositorySubscriber::Status(subscriber)) =
+                if let Some(RepositorySubscriber::Status { sender, .. }) =
                     entry.subscribers.get(&subscriber_id)
                 {
-                    subscriber
+                    sender
                         .try_send(StatusPublication {
                             value: VcsStatusStreamEvent::Snapshot {
                                 local: local.clone(),
@@ -597,6 +608,7 @@ impl StatusBroadcaster {
             let subscription = match kind {
                 SubscriptionKind::Status => BroadcasterSubscription::Status(StatusSubscription {
                     receiver,
+                    fell_behind,
                     cancellation: subscriber_cancellation.clone(),
                     broadcaster: self.clone(),
                     cwd: cwd.clone(),
@@ -1289,7 +1301,7 @@ impl StatusBroadcaster {
             .repositories
             .values()
             .flat_map(|entry| entry.subscribers.values())
-            .filter(|subscriber| matches!(subscriber, RepositorySubscriber::Status(_)))
+            .filter(|subscriber| matches!(subscriber, RepositorySubscriber::Status { .. }))
             .count()
     }
 
@@ -1991,15 +2003,23 @@ impl StatusSubscription {
     pub async fn recv(&mut self) -> Option<VcsStatusStreamEvent> {
         self.recv_publication()
             .await
+            .and_then(Result::ok)
             .map(|publication| publication.value)
     }
 
     pub(crate) async fn recv_publication(
         &mut self,
-    ) -> Option<StatusPublication<VcsStatusStreamEvent>> {
+    ) -> Option<Result<StatusPublication<VcsStatusStreamEvent>, GitCommandError>> {
         tokio::select! {
+            biased;
             _ = self.cancellation.cancelled() => None,
-            event = self.receiver.recv() => event,
+            event = self.receiver.recv() => match event {
+                Some(publication) => Some(Ok(publication)),
+                None if self.fell_behind.swap(false, Ordering::Acquire) => {
+                    Some(Err(fell_behind_error(&self.cwd)))
+                }
+                None => None,
+            },
         }
     }
 }
@@ -2086,10 +2106,24 @@ fn broadcaster_shutdown_error(cwd: &Path) -> GitCommandError {
     }
 }
 
+/// The client runtime matches this exact value and resubscribes.
+pub(crate) const GIT_STATUS_FELL_BEHIND_OPERATION: &str = "GitStatusBroadcaster.fellBehind";
+
+fn fell_behind_error(cwd: &Path) -> GitCommandError {
+    GitCommandError {
+        tag: "GitCommandError",
+        operation: GIT_STATUS_FELL_BEHIND_OPERATION.into(),
+        command: "git".into(),
+        cwd: cwd.to_string_lossy().into_owned().into_boxed_str(),
+        diagnostics: None,
+        detail: "The Git status stream fell behind. Subscribe again.".into(),
+    }
+}
+
 fn setup_admission_error(cwd: &Path) -> GitCommandError {
     GitCommandError {
         tag: "GitCommandError",
-        operation: "GitStatusBroadcaster.subscribe".into(),
+        operation: GIT_STATUS_FELL_BEHIND_OPERATION.into(),
         command: "git".into(),
         cwd: cwd.to_string_lossy().into_owned().into_boxed_str(),
         diagnostics: None,
@@ -2106,10 +2140,17 @@ fn publish(entry: &mut RepositoryState, event: VcsStatusStreamEvent, fence: &Sta
         fence: fence.clone(),
     };
     entry.subscribers.retain(|_, subscriber| match subscriber {
-        RepositorySubscriber::Status(subscriber) => {
-            match subscriber.try_send(publication.clone()) {
+        RepositorySubscriber::Status {
+            sender,
+            fell_behind,
+        } => {
+            match sender.try_send(publication.clone()) {
                 Ok(()) => true,
-                Err(mpsc::error::TrySendError::Full(_)) => false,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    // Publish the terminal before dropping the sender closes the bounded queue.
+                    fell_behind.store(true, Ordering::Release);
+                    false
+                }
                 Err(mpsc::error::TrySendError::Closed(_)) => false,
             }
         }
@@ -3849,6 +3890,117 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn live_status_backpressure_drains_before_terminal_error_and_preserves_peers() {
+        let fixture = SetupAdmissionFixture::new().await;
+        let mut slow = fixture
+            .broadcaster
+            .subscribe(fixture.cwd.clone(), CancellationToken::new())
+            .await
+            .expect("slow subscriber finishes setup");
+        let mut healthy = fixture
+            .broadcaster
+            .subscribe(fixture.cwd.clone(), CancellationToken::new())
+            .await
+            .expect("healthy subscriber finishes setup");
+        for subscription in [&mut slow, &mut healthy] {
+            assert!(matches!(
+                subscription.recv().await,
+                Some(VcsStatusStreamEvent::Snapshot { .. })
+            ));
+        }
+
+        for branch in ["queued-first", "queued-second", "pruned", "after-prune"] {
+            fixture.runner.inner.set_branch(branch);
+            fixture
+                .broadcaster
+                .refresh_local(&fixture.cwd, &CancellationToken::new())
+                .await
+                .expect("live local update");
+            assert!(matches!(
+                healthy.recv().await,
+                Some(VcsStatusStreamEvent::LocalUpdated { local })
+                    if local.ref_name.as_deref() == Some(branch)
+            ));
+        }
+        assert!(
+            !fixture.broadcaster.lock_state().repositories[&fixture.cwd]
+                .subscribers
+                .contains_key(&slow.subscriber_id)
+        );
+        for branch in ["queued-first", "queued-second"] {
+            assert!(matches!(
+                slow.recv_publication().await,
+                Some(Ok(StatusPublication {
+                    value: VcsStatusStreamEvent::LocalUpdated { local }, ..
+                }))
+                    if local.ref_name.as_deref() == Some(branch)
+            ));
+        }
+        let Some(Err(error)) = slow.recv_publication().await else {
+            panic!(
+                "a pruned subscriber must receive a terminal error after its queued publications"
+            );
+        };
+        assert_eq!(error.tag, "GitCommandError");
+        assert_eq!(error.operation.as_ref(), "GitStatusBroadcaster.fellBehind");
+        assert_eq!(error.command.as_ref(), "git");
+        assert_eq!(error.cwd.as_ref(), fixture.cwd.to_string_lossy());
+        assert_eq!(
+            error.detail.as_ref(),
+            "The Git status stream fell behind. Subscribe again."
+        );
+        assert!(slow.recv_publication().await.is_none());
+        assert!(slow.recv_publication().await.is_none());
+        fixture.broadcaster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_status_subscription_ends_without_terminal_error() {
+        let fixture = SetupAdmissionFixture::new().await;
+        let mut subscription = fixture
+            .broadcaster
+            .subscribe(fixture.cwd.clone(), CancellationToken::new())
+            .await
+            .expect("status subscription");
+        assert!(subscription.recv().await.is_some());
+        fixture.broadcaster.shutdown().await;
+        assert!(subscription.recv_publication().await.is_none());
+        assert!(subscription.recv_publication().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_status_subscription_ends_without_terminal_error() {
+        let fixture = SetupAdmissionFixture::new().await;
+        let cancellation = CancellationToken::new();
+        let mut subscription = fixture
+            .broadcaster
+            .subscribe(fixture.cwd.clone(), cancellation.clone())
+            .await
+            .expect("status subscription");
+        assert!(subscription.recv().await.is_some());
+        cancellation.cancel();
+        assert!(subscription.recv_publication().await.is_none());
+        assert!(subscription.recv_publication().await.is_none());
+        fixture.broadcaster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn released_status_subscription_ends_without_terminal_error() {
+        let fixture = SetupAdmissionFixture::new().await;
+        let mut subscription = fixture
+            .broadcaster
+            .subscribe(fixture.cwd.clone(), CancellationToken::new())
+            .await
+            .expect("status subscription");
+        assert!(subscription.recv().await.is_some());
+        fixture
+            .broadcaster
+            .release(&fixture.cwd, subscription.subscriber_id);
+        assert!(subscription.recv_publication().await.is_none());
+        fixture.broadcaster.shutdown().await;
+    }
+
     async fn assert_setup_admission_retries(after_attachment: bool) {
         let fixture = SetupAdmissionFixture::new().await;
         let gate = fixture.gate(after_attachment);
@@ -3960,7 +4112,7 @@ mod tests {
         })
         .await
         .expect("retired setup reads exhaust their bound");
-        assert_eq!(error.operation.as_ref(), "GitStatusBroadcaster.subscribe");
+        assert_eq!(error.operation.as_ref(), "GitStatusBroadcaster.fellBehind");
         assert_eq!(
             error.detail.as_ref(),
             "The Git status subscription fell behind while it was being set up. Subscribe again."
@@ -4097,7 +4249,7 @@ mod tests {
         })
         .await
         .expect("stale setup exhausts its bound");
-        assert_eq!(error.operation.as_ref(), "GitStatusBroadcaster.subscribe");
+        assert_eq!(error.operation.as_ref(), "GitStatusBroadcaster.fellBehind");
         assert_eq!(
             error.detail.as_ref(),
             "The Git status subscription fell behind while it was being set up. Subscribe again."
@@ -4148,7 +4300,7 @@ mod tests {
             .expect("subscription task joins")
             .err()
             .expect("persistently backpressured setup has a bounded failure");
-        assert_eq!(error.operation.as_ref(), "GitStatusBroadcaster.subscribe");
+        assert_eq!(error.operation.as_ref(), "GitStatusBroadcaster.fellBehind");
         assert_eq!(
             error.detail.as_ref(),
             "The Git status subscription fell behind while it was being set up. Subscribe again."
@@ -6052,7 +6204,13 @@ mod tests {
                 git_manager_signal,
                 git_manager_read_lock: Arc::new(AsyncMutex::new(())),
                 git_manager_common_dir: Some(cwd.join(".git")),
-                subscribers: HashMap::from([(lifecycle_id, RepositorySubscriber::Status(sender))]),
+                subscribers: HashMap::from([(
+                    lifecycle_id,
+                    RepositorySubscriber::Status {
+                        sender,
+                        fell_behind: Arc::new(AtomicBool::new(false)),
+                    },
+                )]),
                 poller_cancellation: CancellationToken::new(),
                 retirement_cancellation,
                 tasks,
