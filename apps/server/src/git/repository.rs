@@ -151,7 +151,7 @@ pub struct GitRepository {
     command_timeout: Duration,
     /// `-c` configuration placed before the subcommand of every command this variant runs.
     command_config: &'static [&'static str],
-    /// Read only on failed status discovery; tests replace this without changing process state.
+    /// Read only on failed Git discovery; tests replace this without changing process state.
     discovery_environment: fn(&str) -> Option<OsString>,
     /// Hosts identified by explicit provider probes; status reads only read it.
     /// `default()` starts with a private, empty observation, so status names only
@@ -1665,6 +1665,39 @@ impl GitRepository {
             git_dir,
             common_dir,
         })
+    }
+
+    /// Watch an ordinary checkout that Git could not resolve, without using the
+    /// filesystem evidence as a Git Manager identity or fetch attachment.
+    pub(crate) async fn fallback_watch_roots(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Option<GitWatchRoots> {
+        bounded_repository_discovery(
+            async {
+                let (cwd, across_filesystems) =
+                    repository_discovery_start(cwd, self.discovery_environment).await?;
+                let RepositoryDiscovery::Directory(worktree_root) =
+                    discover_repository_from_ancestors(cwd, across_filesystems, |path| {
+                        tokio::fs::symlink_metadata(path)
+                    })
+                    .await?
+                else {
+                    return None;
+                };
+                let git_dir = tokio::fs::canonicalize(worktree_root.join(".git"))
+                    .await
+                    .ok()?;
+                Some(GitWatchRoots {
+                    worktree_root,
+                    common_dir: git_dir.clone(),
+                    git_dir,
+                })
+            },
+            cancellation,
+        )
+        .await
     }
 
     pub async fn worktree_inventory(
@@ -7193,10 +7226,17 @@ async fn bounded_repository_classification(
     classification: impl Future<Output = Option<VcsRepositoryUnavailableReason>>,
     cancellation: &CancellationToken,
 ) -> Option<VcsRepositoryUnavailableReason> {
+    bounded_repository_discovery(classification, cancellation).await
+}
+
+async fn bounded_repository_discovery<T>(
+    discovery: impl Future<Output = Option<T>>,
+    cancellation: &CancellationToken,
+) -> Option<T> {
     tokio::select! {
         biased;
         () = cancellation.cancelled() => None,
-        result = tokio::time::timeout(REPOSITORY_CLASSIFICATION_TIMEOUT, classification) => result.ok().flatten(),
+        result = tokio::time::timeout(REPOSITORY_CLASSIFICATION_TIMEOUT, discovery) => result.ok().flatten(),
     }
 }
 
@@ -7211,6 +7251,17 @@ async fn classify_repository_unavailable(
     if stderr.contains("detected dubious ownership") {
         return Some(VcsRepositoryUnavailableReason::Untrusted);
     }
+    let (cwd, across_filesystems) = repository_discovery_start(cwd, environment).await?;
+    repository_reason_from_ancestors(cwd, across_filesystems, |path| {
+        tokio::fs::symlink_metadata(path)
+    })
+    .await
+}
+
+async fn repository_discovery_start(
+    cwd: &Path,
+    environment: impl Fn(&str) -> Option<OsString>,
+) -> Option<(PathBuf, bool)> {
     if environment("GIT_DIR").is_some() || environment("GIT_CEILING_DIRECTORIES").is_some() {
         return None;
     }
@@ -7219,17 +7270,40 @@ async fn classify_repository_unavailable(
         .as_deref()
         .and_then(|value| value.to_str())
         .is_some_and(git_boolean_is_true);
-    repository_reason_from_ancestors(cwd, across_filesystems, |path| {
-        tokio::fs::symlink_metadata(path)
-    })
-    .await
+    Some((cwd, across_filesystems))
 }
 
 async fn repository_reason_from_ancestors<F, Fut>(
-    mut cwd: PathBuf,
+    cwd: PathBuf,
     across_filesystems: bool,
     symlink_metadata: F,
 ) -> Option<VcsRepositoryUnavailableReason>
+where
+    F: Fn(PathBuf) -> Fut,
+    Fut: Future<Output = io::Result<fs::Metadata>>,
+{
+    discover_repository_from_ancestors(cwd, across_filesystems, symlink_metadata)
+        .await
+        .map(|discovery| match discovery {
+            RepositoryDiscovery::Absent => VcsRepositoryUnavailableReason::Absent,
+            RepositoryDiscovery::Directory(_)
+            | RepositoryDiscovery::GitFile
+            | RepositoryDiscovery::DanglingLink => VcsRepositoryUnavailableReason::Unreadable,
+        })
+}
+
+enum RepositoryDiscovery {
+    Absent,
+    Directory(PathBuf),
+    GitFile,
+    DanglingLink,
+}
+
+async fn discover_repository_from_ancestors<F, Fut>(
+    mut cwd: PathBuf,
+    across_filesystems: bool,
+    symlink_metadata: F,
+) -> Option<RepositoryDiscovery>
 where
     F: Fn(PathBuf) -> Fut,
     Fut: Future<Output = io::Result<fs::Metadata>>,
@@ -7259,7 +7333,7 @@ where
                                 io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
                             ) =>
                         {
-                            return Some(VcsRepositoryUnavailableReason::Unreadable);
+                            return Some(RepositoryDiscovery::DanglingLink);
                         }
                         Err(_) => return None,
                     }
@@ -7267,12 +7341,12 @@ where
                     metadata
                 };
                 if metadata.is_file() {
-                    return Some(VcsRepositoryUnavailableReason::Unreadable);
+                    return Some(RepositoryDiscovery::GitFile);
                 }
                 if metadata.is_dir() {
                     for marker in ["HEAD", "config", "objects", "refs"] {
                         match symlink_metadata(git_dir.join(marker)).await {
-                            Ok(_) => return Some(VcsRepositoryUnavailableReason::Unreadable),
+                            Ok(_) => return Some(RepositoryDiscovery::Directory(cwd)),
                             Err(error)
                                 if matches!(
                                     error.kind(),
@@ -7291,13 +7365,13 @@ where
             Err(_) => return None,
         }
         let Some(parent) = cwd.parent() else {
-            return Some(VcsRepositoryUnavailableReason::Absent);
+            return Some(RepositoryDiscovery::Absent);
         };
         #[cfg(unix)]
         if let Some(device) = starting_device
             && tokio::fs::metadata(parent).await.ok()?.dev() != device
         {
-            return Some(VcsRepositoryUnavailableReason::Absent);
+            return Some(RepositoryDiscovery::Absent);
         }
         cwd = parent.to_path_buf();
     }
@@ -7915,6 +7989,187 @@ mod tests {
         let nested = root.path().join("nested/deep");
         fs::create_dir_all(&nested).expect("nested folder");
         assert_repository_reason(&GitRepository::default(), &nested, Some("unreadable")).await;
+    }
+
+    async fn assert_fallback_watch_roots(cwd: &Path, worktree: &Path) {
+        let roots = GitRepository::default()
+            .fallback_watch_roots(cwd, &CancellationToken::new())
+            .await
+            .expect("damaged repository has fallback watch roots");
+        assert_eq!(roots.worktree_root, fs::canonicalize(worktree).unwrap());
+        assert_eq!(
+            roots.git_dir,
+            fs::canonicalize(worktree.join(".git")).unwrap()
+        );
+        assert_eq!(roots.common_dir, roots.git_dir);
+    }
+
+    #[tokio::test]
+    async fn repository_unavailable_fallback_watch_roots_for_damaged_head() {
+        let root = tempfile::tempdir().expect("damaged repository");
+        repository_fixture_git(root.path(), &["init", "-q", "-b", "main"]);
+        fs::write(root.path().join(".git/HEAD"), "not a ref").expect("damage HEAD");
+        assert_fallback_watch_roots(root.path(), root.path()).await;
+    }
+
+    #[tokio::test]
+    async fn repository_unavailable_fallback_watch_roots_for_malformed_config() {
+        let root = tempfile::tempdir().expect("damaged repository");
+        repository_fixture_git(root.path(), &["init", "-q", "-b", "main"]);
+        fs::write(root.path().join(".git/config"), "[invalid").expect("damage config");
+        assert_fallback_watch_roots(root.path(), root.path()).await;
+    }
+
+    #[tokio::test]
+    async fn repository_unavailable_fallback_watch_roots_use_the_damaged_ancestor() {
+        let root = tempfile::tempdir().expect("damaged repository");
+        repository_fixture_git(root.path(), &["init", "-q", "-b", "main"]);
+        fs::write(root.path().join(".git/HEAD"), "not a ref").expect("damage HEAD");
+        let nested = root.path().join("nested/deep");
+        fs::create_dir_all(&nested).expect("nested folder");
+        assert_fallback_watch_roots(&nested, root.path()).await;
+
+        fs::create_dir(nested.join(".git")).expect("marker-less nested git directory");
+        fs::write(nested.join(".git/unrelated"), "not metadata").expect("unrelated file");
+        assert_fallback_watch_roots(&nested, root.path()).await;
+    }
+
+    #[tokio::test]
+    async fn repository_unavailable_fallback_watch_roots_require_a_repository_marker() {
+        let Some(root) = plain_folder_fixture(
+            "repository_unavailable_fallback_watch_roots_require_a_repository_marker",
+        ) else {
+            return;
+        };
+        let repository = GitRepository::default();
+        assert!(
+            repository
+                .fallback_watch_roots(root.path(), &CancellationToken::new())
+                .await
+                .is_none()
+        );
+        fs::create_dir(root.path().join(".git")).expect("marker-less git directory");
+        fs::write(root.path().join(".git/unrelated"), "not metadata").expect("unrelated file");
+        assert!(
+            repository
+                .fallback_watch_roots(root.path(), &CancellationToken::new())
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_unavailable_fallback_watch_roots_accept_each_repository_marker() {
+        let root = tempfile::tempdir().expect("repository markers");
+        for marker in ["HEAD", "config", "objects", "refs"] {
+            let worktree = root.path().join(marker);
+            fs::create_dir_all(worktree.join(".git")).expect("git directory");
+            fs::write(worktree.join(".git").join(marker), "").expect("repository marker");
+            assert_fallback_watch_roots(&worktree, &worktree).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn repository_unavailable_fallback_watch_roots_reject_gitfiles() {
+        let root = tempfile::tempdir().expect("damaged repository");
+        repository_fixture_git(root.path(), &["init", "-q", "-b", "main"]);
+        fs::write(root.path().join(".git/HEAD"), "not a ref").expect("damage HEAD");
+        let nested = root.path().join("nested");
+        fs::create_dir(&nested).expect("nested folder");
+        fs::write(nested.join(".git"), "gitdir: missing-admin\n").expect("dangling gitfile");
+        assert!(
+            GitRepository::default()
+                .fallback_watch_roots(&nested, &CancellationToken::new())
+                .await
+                .is_none(),
+            "a gitfile must stop discovery before the damaged parent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repository_unavailable_fallback_watch_roots_reject_dangling_git_links() {
+        let root = tempfile::tempdir().expect("dangling git entry");
+        std::os::unix::fs::symlink(root.path().join("missing"), root.path().join(".git"))
+            .expect("dangling git link");
+        assert!(
+            GitRepository::default()
+                .fallback_watch_roots(root.path(), &CancellationToken::new())
+                .await
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repository_unavailable_fallback_watch_roots_canonicalize_git_directory_links() {
+        let root = tempfile::tempdir().expect("symlinked git directory");
+        let worktree = root.path().join("worktree");
+        let git_dir = root.path().join("metadata");
+        fs::create_dir(&worktree).expect("worktree directory");
+        fs::create_dir(&git_dir).expect("git directory");
+        fs::write(git_dir.join("HEAD"), "not a ref").expect("damaged HEAD");
+        std::os::unix::fs::symlink(&git_dir, worktree.join(".git")).expect("git directory link");
+        assert_fallback_watch_roots(&worktree, &worktree).await;
+    }
+
+    #[tokio::test]
+    async fn repository_unavailable_fallback_watch_roots_reject_discovery_overrides() {
+        let root = tempfile::tempdir().expect("damaged repository");
+        fs::create_dir(root.path().join(".git")).expect("git directory");
+        fs::write(root.path().join(".git/HEAD"), "not a ref").expect("damaged HEAD");
+        for environment in [
+            (|name: &str| (name == "GIT_DIR").then(OsString::new)) as fn(&str) -> Option<OsString>,
+            |name: &str| (name == "GIT_CEILING_DIRECTORIES").then(|| OsString::from("/")),
+        ] {
+            let repository = GitRepository {
+                discovery_environment: environment,
+                ..GitRepository::default()
+            };
+            assert!(
+                repository
+                    .fallback_watch_roots(root.path(), &CancellationToken::new())
+                    .await
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn repository_unavailable_fallback_watch_roots_are_cancellable() {
+        let root = tempfile::tempdir().expect("damaged repository");
+        fs::create_dir(root.path().join(".git")).expect("git directory");
+        fs::write(root.path().join(".git/HEAD"), "not a ref").expect("damaged HEAD");
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        assert!(
+            GitRepository::default()
+                .fallback_watch_roots(root.path(), &cancellation)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_unavailable_fallback_watch_roots_reject_metadata_errors() {
+        let root = tempfile::tempdir().expect("missing worktree");
+        assert!(
+            GitRepository::default()
+                .fallback_watch_roots(&root.path().join("missing"), &CancellationToken::new())
+                .await
+                .is_none()
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.path().join(".git"), root.path().join(".git"))
+                .expect("git symlink loop");
+            assert!(
+                GitRepository::default()
+                    .fallback_watch_roots(root.path(), &CancellationToken::new())
+                    .await
+                    .is_none()
+            );
+        }
     }
 
     #[tokio::test]

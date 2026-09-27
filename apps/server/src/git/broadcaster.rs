@@ -381,12 +381,21 @@ impl StatusBroadcaster {
                 .repository
                 .resolve_watch_roots(&cwd, &setup_cancellation)
                 .await;
+            let resolved_common_dir = roots.as_ref().ok().map(|roots| roots.common_dir.clone());
+            let roots = match roots {
+                Ok(roots) => Some(roots),
+                Err(_) => {
+                    self.inner
+                        .repository
+                        .fallback_watch_roots(&cwd, &setup_cancellation)
+                        .await
+                }
+            };
             if self.lock_state().closed {
                 return Err(broadcaster_shutdown_error(&cwd));
             }
-            let resolved_common_dir = roots.as_ref().ok().map(|roots| roots.common_dir.clone());
             let watcher = match roots {
-                Ok(roots) => match self
+                Some(roots) => match self
                     .inner
                     .watcher
                     .subscribe(GitWatchRequest {
@@ -400,7 +409,7 @@ impl StatusBroadcaster {
                     Err(GitWatchError::Shutdown) => return Err(broadcaster_shutdown_error(&cwd)),
                     Err(GitWatchError::Root { .. }) => WatcherSignalSource::new(None),
                 },
-                Err(_) => WatcherSignalSource::new(None),
+                None => WatcherSignalSource::new(None),
             };
             let repository = Arc::clone(&self.inner.repository);
             let load_cwd = cwd.clone();
@@ -3089,6 +3098,193 @@ mod tests {
         let broadcaster =
             StatusBroadcaster::new(Arc::new(GitRepository::default()), Duration::ZERO, 0);
         assert_eq!(broadcaster.inner.subscriber_capacity, 1);
+    }
+
+    struct IsolatedGitRunner {
+        command: PathBuf,
+        environment: Vec<(OsString, OsString)>,
+    }
+
+    impl GitProcessRunner for IsolatedGitRunner {
+        fn run<'a>(
+            &'a self,
+            mut request: ProcessRequest,
+            cancellation: &'a CancellationToken,
+        ) -> BoxGitProcessFuture<'a> {
+            request.command.clone_from(&self.command);
+            let mut environment = self.environment.iter().cloned().collect::<BTreeMap<_, _>>();
+            environment.extend(request.env);
+            request.env = environment.into_iter().collect();
+            Box::pin(async move {
+                ProcessRunner
+                    .run_with_clean_environment_for_test(request, cancellation)
+                    .await
+            })
+        }
+    }
+
+    async fn assert_broken_repository_repair_is_watched(metadata: &str, damaged: &str) {
+        let _native_watcher_permit = super::super::acquire_native_watcher_test_permit().await;
+        let sandbox = TestSandbox::new("git-broadcaster-broken-repository-watch");
+        let command = sandbox.executable_on_path("git");
+        let (_, environment) = isolated_git_environment(&sandbox);
+        let cwd = sandbox.path("repository");
+        fs::create_dir(&cwd).expect("repository directory");
+        let output = Command::new(&command)
+            .args(["init", "--quiet", "-b", "main"])
+            .current_dir(&cwd)
+            .env_clear()
+            .envs(environment.iter().cloned())
+            .output()
+            .expect("fixture Git starts");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let cwd = fs::canonicalize(cwd).expect("canonical repository");
+        let metadata_path = cwd.join(".git").join(metadata);
+        let original = fs::read(&metadata_path).expect("original Git metadata");
+        fs::write(&metadata_path, damaged).expect("damage Git metadata");
+        let repository = GitRepository::with_runner_for_test(Arc::new(IsolatedGitRunner {
+            command,
+            environment,
+        }));
+        let broadcaster =
+            StatusBroadcaster::new(Arc::new(repository), Duration::from_secs(3_600), 4);
+        let fetch_finished = broadcaster.inner.fetch_attachment_finished.notified();
+        tokio::pin!(fetch_finished);
+        fetch_finished.as_mut().enable();
+        let mut subscription = broadcaster
+            .subscribe(cwd.clone(), CancellationToken::new())
+            .await
+            .expect("broken repository status subscription");
+        let Some(VcsStatusStreamEvent::Snapshot { local, .. }) = subscription.recv().await else {
+            panic!("initial status snapshot");
+        };
+        assert!(!local.is_repo);
+        assert_eq!(
+            local.repository_unavailable_reason,
+            Some(VcsRepositoryUnavailableReason::Unreadable)
+        );
+        tokio::time::timeout(Duration::from_secs(5), fetch_finished)
+            .await
+            .expect("initial fetch attachment finishes before the repair");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = subscription
+                    .recv()
+                    .await
+                    .expect("initial remote observation");
+                if matches!(event, VcsStatusStreamEvent::RemoteUpdated { remote: None }) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect(
+            "initial remote observation settles before repair so it cannot request a local read",
+        );
+        {
+            let state = broadcaster.lock_state();
+            let entry = state.repositories.get(&cwd).expect("active lifecycle");
+            assert!(
+                entry.git_manager_common_dir.is_none(),
+                "watch fallback is not a Git Manager identity"
+            );
+            assert!(
+                entry.repository_key.is_none(),
+                "watch fallback does not attach automatic fetch"
+            );
+        }
+        assert_eq!(
+            broadcaster.active_watcher_count_for_test(),
+            1,
+            "damaged repository is watched"
+        );
+        assert_eq!(
+            broadcaster.inner.watcher.only_health_for_test(),
+            GitWatcherHealth::Healthy
+        );
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            broadcaster.wait_for_status_scheduler_started_for_test(),
+        )
+        .await
+        .expect("status scheduler starts before repair");
+
+        fs::write(&metadata_path, original).expect("repair Git metadata");
+        let repaired = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = subscription
+                    .recv()
+                    .await
+                    .expect("status subscription remains open");
+                if let VcsStatusStreamEvent::LocalUpdated { local } = event
+                    && local.is_repo
+                {
+                    break local;
+                }
+            }
+        })
+        .await
+        .expect("native watcher notices repair without Retry, refresh, or the hourly safety read");
+        assert!(repaired.repository_unavailable_reason.is_none());
+        assert!(
+            broadcaster.lock_state().repositories[&cwd]
+                .repository_key
+                .is_none(),
+            "repair retains the existing automatic-fetch attachment behavior"
+        );
+        drop(subscription);
+        broadcaster.shutdown().await;
+        assert_eq!(broadcaster.active_watcher_count_for_test(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn broken_repository_head_repair_is_watched() {
+        assert_broken_repository_repair_is_watched("HEAD", "not a ref").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn broken_repository_config_repair_is_watched() {
+        assert_broken_repository_repair_is_watched("config", "[invalid").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn broken_repository_watch_fallback_keeps_plain_folders_degraded() {
+        let _native_watcher_permit = super::super::acquire_native_watcher_test_permit().await;
+        let sandbox = TestSandbox::new("git-broadcaster-plain-folder-watch");
+        let command = sandbox.executable_on_path("git");
+        let (_, environment) = isolated_git_environment(&sandbox);
+        let cwd = fs::canonicalize(sandbox.root()).expect("canonical plain folder");
+        let repository = GitRepository::with_runner_for_test(Arc::new(IsolatedGitRunner {
+            command,
+            environment,
+        }));
+        let broadcaster =
+            StatusBroadcaster::new(Arc::new(repository), Duration::from_secs(3_600), 4);
+        let mut subscription = broadcaster
+            .subscribe(cwd.clone(), CancellationToken::new())
+            .await
+            .expect("plain folder status subscription");
+        let Some(VcsStatusStreamEvent::Snapshot { local, .. }) = subscription.recv().await else {
+            panic!("initial status snapshot");
+        };
+        assert!(!local.is_repo);
+        assert_eq!(
+            local.repository_unavailable_reason,
+            Some(VcsRepositoryUnavailableReason::Absent)
+        );
+        assert_eq!(broadcaster.active_watcher_count_for_test(), 0);
+        assert!(
+            broadcaster.lock_state().repositories[&cwd]
+                .git_manager_signal
+                .borrow()
+                .watcher_degraded
+        );
+        drop(subscription);
+        broadcaster.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
