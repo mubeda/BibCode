@@ -860,6 +860,11 @@ failed count answers the typed `RemoteUpdateActiveWorkError`.
   when known, and an 8-character session prefix), looked up through
   `AuthService::list_clients`, to `RemoteUpdateDelegate::request_install`; it
   never crosses `DesktopBridge`.
+  The desktop keeps the requester as `requestedBy` on its update state while the
+  flow runs and clears it when the flow ends; a second remote request joins that
+  flow, and the delegate fills `downloadPercent`, `targetVersion`, and `installStage`.
+  A remote install stopped by a secondary environment's protection says
+  "Finish the update on the host."
 - Headless `bibcode serve` and WSL/external desktop backends run in `manual`
   mode. `updater.check` refreshes the server's own version,
   `latestVersion` remains `null` because the server has no update feed, and

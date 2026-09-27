@@ -217,7 +217,24 @@ describe("Desktop update protection contract", () => {
       phase: "idle",
       protection: [],
       backendRecovery: [],
+      requestedBy: null,
     });
+  });
+
+  it("defaults requestedBy for an older desktop host and decodes a remote request", () => {
+    expect(decodeDesktopUpdateState(legacyUpdateState).requestedBy).toBeNull();
+    expect(
+      decodeDesktopUpdateState({
+        ...legacyUpdateState,
+        requestedBy: { label: "BiBCode Desktop", detail: "MacIntel (192.168.1.34)" },
+      }).requestedBy,
+    ).toEqual({ label: "BiBCode Desktop", detail: "MacIntel (192.168.1.34)" });
+    expect(
+      decodeDesktopUpdateState({
+        ...legacyUpdateState,
+        requestedBy: { label: "Another device", detail: null },
+      }).requestedBy,
+    ).toEqual({ label: "Another device", detail: null });
   });
 
   it("decodes stopped backends with typed recovery reasons and their original ports", () => {

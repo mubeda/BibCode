@@ -616,11 +616,13 @@ and install flow in the background and answers with the host updater's current
 state, never a predicted `installing`. If the feed has nothing newer the host
 records `up-to-date`, and a failed download records `error` with the updater's
 message; clients see both through `updater.status`
-(`apps/desktop/src-tauri/src/remote_update_delegate.rs`). Known gap: when the
-update is already downloaded, the client's first status read after an install
-request can still report `update-available` before the host enters update
-protection, and that state is not polled; the badge catches up when the
-restarted host reconnects.
+(`apps/desktop/src-tauri/src/remote_update_delegate.rs`). The desktop keeps the
+requester as `requestedBy` on its update state while the flow runs, clears it
+when the flow ends, and joins a second remote request to the running flow.
+The delegate fills `downloadPercent`, `targetVersion`, and `installStage`; a remote
+install stopped by a secondary environment's protection says "Finish the update
+on the host." A client following a run keeps polling `updater.status` through
+`update-available` until the flow settles.
 Plain authenticated WebSockets enter the live-client
 registry only after the HTTP upgrade completes, and unregister from the same
 upgrade-owned lifecycle.

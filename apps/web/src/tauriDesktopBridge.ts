@@ -401,6 +401,7 @@ function defaultUpdateState(): DesktopUpdateState {
     message: null,
     errorContext: null,
     canRetry: false,
+    requestedBy: null,
   };
 }
 

@@ -235,6 +235,13 @@ struct PreparedBackend {
     operation_id: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RemoteUpdateRequest {
+    pub label: String,
+    pub detail: Option<String>,
+}
+
 #[derive(Default)]
 struct DesktopUpdateInner {
     available_update: Option<Update>,
@@ -252,6 +259,7 @@ struct DesktopUpdateInner {
     install_in_flight: bool,
     phase: UpdatePhase,
     protection: Vec<DesktopUpdateProtection>,
+    requested_by: Option<RemoteUpdateRequest>,
 }
 
 #[cfg(test)]
@@ -356,6 +364,64 @@ impl DesktopUpdateManager {
             Ok(_) => update_state_value(app, true, &inner),
             Err(error) if is_updater_disabled(&error) => disabled_update_state(app),
             Err(error) => error_update_state(app, "check", error.to_string()),
+        }
+    }
+
+    /// Records the first remote requester; later clients join without another notice.
+    pub(crate) fn begin_remote_request<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        request: RemoteUpdateRequest,
+    ) -> bool {
+        let mut began = false;
+        let state = self.replace_inner(|inner| {
+            if inner.requested_by.is_none() {
+                inner.requested_by = Some(request);
+                began = true;
+            }
+        });
+        if began {
+            state.emit(app);
+        }
+        began
+    }
+
+    pub(crate) fn clear_remote_request<R: Runtime>(&self, app: &AppHandle<R>) {
+        self.replace_inner(|inner| inner.requested_by = None)
+            .emit(app);
+    }
+
+    pub(crate) fn note_remote_secondary_protection_failure<R: Runtime>(&self, app: &AppHandle<R>) {
+        const FINISH_ON_HOST: &str = "Finish the update on the host.";
+        let mut changed = false;
+        let state = self.replace_inner(|inner| {
+            if inner.phase != UpdatePhase::Failed
+                || !inner
+                    .protection
+                    .iter()
+                    .any(|entry| !entry.primary && entry.status == ProtectionStatus::Failed)
+                || inner
+                    .protection
+                    .iter()
+                    .any(|entry| entry.primary && entry.status == ProtectionStatus::Failed)
+            {
+                return;
+            }
+            let message = inner.message.get_or_insert_with(String::new);
+            if message.ends_with(FINISH_ON_HOST) {
+                return;
+            }
+            if !message.is_empty() {
+                if !message.ends_with(['.', '!', '?']) {
+                    message.push('.');
+                }
+                message.push(' ');
+            }
+            message.push_str(FINISH_ON_HOST);
+            changed = true;
+        });
+        if changed {
+            state.emit(app);
         }
     }
 
@@ -1022,10 +1088,12 @@ impl DesktopUpdateInner {
             install_in_flight: false,
             phase: self.phase,
             protection: self.protection.clone(),
+            requested_by: self.requested_by.clone(),
         }
     }
 
     fn restore_visible_state(&mut self, prior_state: &DesktopUpdateInner) {
+        // Only begin_remote_request and clear_remote_request change requested_by.
         self.available_version = prior_state.available_version.clone();
         self.downloaded_version = prior_state.downloaded_version.clone();
         self.status = prior_state.status.clone();
@@ -1552,6 +1620,7 @@ pub fn disabled_update_state<R: Runtime>(app: &AppHandle<R>) -> Value {
         "phase": UpdatePhase::Idle,
         "protection": [],
         "backendRecovery": [],
+        "requestedBy": null,
     })
 }
 
@@ -1578,6 +1647,7 @@ fn error_update_state<R: Runtime>(
         "phase": UpdatePhase::Failed,
         "protection": [],
         "backendRecovery": [],
+        "requestedBy": null,
     })
 }
 
@@ -1603,6 +1673,7 @@ fn update_state_value<R: Runtime>(
         "canRetry": inner.can_retry,
         "phase": inner.phase,
         "protection": inner.protection,
+        "requestedBy": inner.requested_by,
         "backendRecovery": backend_recovery(app).into_iter().map(DesktopBackendRecovery::from).collect::<Vec<_>>(),
     })
 }
@@ -2089,6 +2160,75 @@ mod tests {
     }
 
     #[test]
+    fn remote_secondary_protection_notice_requires_a_settled_secondary_only_failure() {
+        let app = updater_test_app("http://127.0.0.1:9/latest.json".to_string());
+        let manager = DesktopUpdateManager::new();
+        let message = "The secondary environment WSL (Ubuntu) must be protected or explicitly excluded by name.";
+        for (phase, primary_status, secondary_status) in [
+            (
+                UpdatePhase::Failed,
+                ProtectionStatus::Failed,
+                ProtectionStatus::Failed,
+            ),
+            (
+                UpdatePhase::Failed,
+                ProtectionStatus::Failed,
+                ProtectionStatus::Protected,
+            ),
+            (
+                UpdatePhase::Protecting,
+                ProtectionStatus::Protected,
+                ProtectionStatus::Failed,
+            ),
+            (
+                UpdatePhase::Failed,
+                ProtectionStatus::Protected,
+                ProtectionStatus::Protected,
+            ),
+        ] {
+            manager.replace_inner(|inner| {
+                inner.phase = phase;
+                inner.message = Some(message.to_owned());
+                inner.protection = [(true, primary_status), (false, secondary_status)]
+                    .into_iter()
+                    .map(|(primary, status)| DesktopUpdateProtection {
+                        environment_id: if primary { "primary" } else { "wsl:Ubuntu" }.to_owned(),
+                        label: if primary { "Local" } else { "WSL (Ubuntu)" }.to_owned(),
+                        primary,
+                        status,
+                        message: None,
+                        stage: None,
+                        elapsed_ms: None,
+                        blocked_operation_count: None,
+                    })
+                    .collect();
+            });
+            manager.note_remote_secondary_protection_failure(app.handle());
+            assert_eq!(manager.state(app.handle())["message"], message);
+        }
+
+        let recovery_message =
+            append_recovery_error(message.to_owned(), Some("port in use".to_owned()));
+        manager.replace_inner(|inner| {
+            inner.protection[1].status = ProtectionStatus::Failed;
+            inner.message = Some(recovery_message.clone());
+        });
+        manager.note_remote_secondary_protection_failure(app.handle());
+        assert_eq!(
+            manager.state(app.handle())["message"],
+            format!("{recovery_message}. Finish the update on the host.")
+        );
+        for message in ["Protection failed!", "Protection failed?"] {
+            manager.replace_inner(|inner| inner.message = Some(message.to_owned()));
+            manager.note_remote_secondary_protection_failure(app.handle());
+            assert_eq!(
+                manager.state(app.handle())["message"],
+                format!("{message} Finish the update on the host.")
+            );
+        }
+    }
+
+    #[test]
     fn update_state_serializes_protecting_before_installing() {
         let app = updater_test_app("http://127.0.0.1:9/latest.json".to_string());
         let handle = app.handle();
@@ -2360,6 +2500,21 @@ mod tests {
             "primary protection should succeed: {blocked}"
         );
         assert_eq!(blocked["state"]["protection"][1]["status"], "failed");
+        assert!(
+            !blocked["state"]["message"]
+                .as_str()
+                .expect("host install should explain the protection failure")
+                .contains("Finish the update on the host.")
+        );
+        manager.note_remote_secondary_protection_failure(handle);
+        let remote_message = manager.state(handle)["message"].clone();
+        assert!(
+            remote_message
+                .as_str()
+                .is_some_and(|message| message.ends_with(". Finish the update on the host."))
+        );
+        manager.note_remote_secondary_protection_failure(handle);
+        assert_eq!(manager.state(handle)["message"], remote_message);
         let after_blocked = supervisor.snapshot_for_update();
         assert!(
             after_blocked
@@ -3474,6 +3629,66 @@ mod tests {
         let retry = manager.check_for_update(app.handle().clone()).await;
         assert_eq!(retry["checked"], true);
         assert_eq!(retry["state"]["status"], STATUS_UP_TO_DATE);
+        server.join().expect("update server should stop");
+    }
+
+    #[tokio::test]
+    async fn an_aborted_check_keeps_a_remote_request_recorded_during_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("update server should bind");
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("update server address")
+        );
+        let check_started = Arc::new(FixtureEvent::default());
+        let check_started_checkpoint = check_started.checkpoint();
+        let server_check_started = check_started.clone();
+        let (release_check_sender, release_check_receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("check should arrive");
+            assert_request_read(&mut stream, "check should read");
+            server_check_started.publish();
+            release_check_receiver
+                .recv()
+                .expect("test should release the check");
+            let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
+        });
+        let app = updater_test_app(format!("{base_url}/latest.json"));
+        let manager = Arc::new(DesktopUpdateManager::new());
+        let check_manager = manager.clone();
+        let check_handle = app.handle().clone();
+        let check = tokio::spawn(async move { check_manager.check_for_update(check_handle).await });
+        wait_for_fixture_event(
+            &check_started,
+            check_started_checkpoint,
+            "check should become active",
+        )
+        .await;
+
+        assert!(manager.begin_remote_request(
+            app.handle(),
+            RemoteUpdateRequest {
+                label: "Tablet".to_owned(),
+                detail: None
+            },
+        ));
+        check.abort();
+        assert!(
+            check
+                .await
+                .expect_err("check should be cancelled")
+                .is_cancelled()
+        );
+        release_check_sender
+            .send(())
+            .expect("server should still await the check release");
+
+        assert_eq!(manager.state(app.handle())["status"], STATUS_IDLE);
+        assert_eq!(
+            manager.state(app.handle())["requestedBy"]["label"],
+            "Tablet"
+        );
+        manager.clear_remote_request(app.handle());
+        assert_eq!(manager.state(app.handle())["requestedBy"], Value::Null);
         server.join().expect("update server should stop");
     }
 
