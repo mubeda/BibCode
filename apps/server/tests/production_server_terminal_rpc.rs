@@ -573,10 +573,14 @@ async fn workspace_loss_fences_inflight_terminal_spawn_before_publication() {
     release_tx.send(()).expect("release terminal spawn");
     let error = failure_value(next_message(client).await);
     assert_eq!(error["_tag"], "WorkspaceUnavailableError");
-    assert!(
-        process.killed.load(Ordering::Acquire),
-        "the uncommitted PTY must be killed when spawn returns after loss",
-    );
+    // The loss error can arrive before the blocking spawn returns and drops its PTY.
+    tokio::time::timeout(TERMINAL_RPC_INTEGRATION_DEADLINE, async {
+        while !process.killed.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the uncommitted PTY must be killed when spawn returns after loss");
     assert!(
         !quiescer
             .terminal_exists("panel-racing", "terminal-racing")
