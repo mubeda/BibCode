@@ -77,11 +77,13 @@ mod linux {
     /// parent environment and future spawn decisions unchanged.
     ///
     /// linuxdeploy's AppRun.wrapped C runtime forces PYTHONDONTWRITEBYTECODE; its
-    /// GTK hook (apprun-hooks/linuxdeploy-plugin-gtk.sh) overwrites GTK_THEME and
-    /// GDK_BACKEND. GTK_PATH is also overwritten with bundled and host paths, not
+    /// packaged GTK hook (apprun-hooks/linuxdeploy-plugin-gtk.sh) overwrites
+    /// GDK_BACKEND, but exports GTK_THEME only for a nonempty user-supplied
+    /// APPIMAGE_GTK_THEME. An inherited GTK_THEME otherwise passes through.
+    /// GTK_PATH is also overwritten with bundled and host paths, not
     /// appended to the user value: even its surviving host directories must be removed.
-    /// Remove these launcher settings so shells can reapply their rc settings as
-    /// in SSH, without forcing GTK apps into Adwaita.
+    /// Remove these settings, including inherited or overridden GTK_THEME, from
+    /// user-facing children so shells can reapply their rc settings as in SSH.
     const LAUNCHER_VARIABLES: [&str; 8] = [
         "APPDIR",
         "APPIMAGE",
