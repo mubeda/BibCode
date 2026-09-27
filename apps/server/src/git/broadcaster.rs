@@ -466,6 +466,7 @@ impl StatusBroadcaster {
             #[cfg(test)]
             let retirement_sentinel_finished = Arc::clone(&self.inner.retirement_sentinel_finished);
 
+            let mut previous_local = None;
             let registration = self.inner.status_owner.publish_if_current(read, |local| {
                 let mut state = self.lock_state();
                 if state.closed {
@@ -513,7 +514,7 @@ impl StatusBroadcaster {
                 });
                 if entry.local != *local {
                     let ref_changed = entry.local.ref_name != local.ref_name;
-                    entry.local = local.clone();
+                    previous_local = Some(std::mem::replace(&mut entry.local, local.clone()));
                     reconcile_remote_after_local_publication(entry, ref_changed);
                     publish(
                         entry,
@@ -577,6 +578,7 @@ impl StatusBroadcaster {
                 }
                 Err(error) => return Err(error),
             };
+            self.observe_repository_availability_change(&cwd, previous_local.as_ref(), &local);
             let registration = match registration {
                 None => return Err(broadcaster_shutdown_error(&cwd)),
                 Some(Err(())) => {
@@ -794,6 +796,7 @@ impl StatusBroadcaster {
         let mut state = self.lock_state();
         let mut remove_repository = false;
         let mut accepted = false;
+        let mut previous_local = None;
         if let Some(entry) = state
             .repositories
             .get_mut(cwd)
@@ -802,7 +805,7 @@ impl StatusBroadcaster {
             accepted = true;
             if entry.local != *local {
                 let ref_changed = entry.local.ref_name != local.ref_name;
-                entry.local = local.clone();
+                previous_local = Some(std::mem::replace(&mut entry.local, local.clone()));
                 reconcile_remote_after_local_publication(entry, ref_changed);
                 publish(entry, event, fence);
                 remove_repository = entry.subscribers.is_empty();
@@ -819,12 +822,27 @@ impl StatusBroadcaster {
             None
         };
         drop(state);
+        self.observe_repository_availability_change(cwd, previous_local.as_ref(), local);
         if accepted {
             self.inner
                 .fetch_owner
                 .update_worktree_ref(cwd, local.ref_name.clone());
         }
         retirement
+    }
+
+    fn observe_repository_availability_change(
+        &self,
+        cwd: &Path,
+        previous: Option<&VcsStatusLocalResult>,
+        local: &VcsStatusLocalResult,
+    ) {
+        if previous.is_some_and(|previous| {
+            previous.is_repo != local.is_repo
+                || previous.repository_unavailable_reason != local.repository_unavailable_reason
+        }) {
+            self.inner.status_owner.observe_local_change(cwd);
+        }
     }
 
     pub async fn notify_local_change(&self, cwd: &Path) {
@@ -856,9 +874,10 @@ impl StatusBroadcaster {
     }
 
     /// Registers the observer that runs after a finished mutation or a
-    /// reported local change (`notify_local_change`). Watcher-driven reads do
-    /// not reach it. It receives the canonical worktree path and must only
-    /// schedule work, never block.
+    /// reported local change (`notify_local_change`). Status reads, including
+    /// watcher-driven reads, also reach it when repository availability changes.
+    /// It receives the canonical worktree path and must only schedule work,
+    /// never block.
     pub fn set_local_change_observer(&self, observer: impl Fn(&Path) + Send + Sync + 'static) {
         self.inner
             .status_owner
@@ -1283,9 +1302,10 @@ impl StatusBroadcaster {
         };
         let mut state = self.lock_state();
         let mut remove_repository = false;
+        let mut previous_local = None;
         if let Some(entry) = state.repositories.get_mut(cwd) {
             let changed = entry.local != status.local || entry.remote.as_ref() != Some(&remote);
-            entry.local = status.local.clone();
+            previous_local = Some(std::mem::replace(&mut entry.local, status.local.clone()));
             entry.remote = Some(remote);
             entry.remote_fence = Some(fence.clone());
             entry.remote_ref_name = Some(status.local.ref_name.clone());
@@ -1294,14 +1314,17 @@ impl StatusBroadcaster {
             }
             remove_repository = entry.subscribers.is_empty();
         }
-        if remove_repository {
+        let retirement = if remove_repository {
             state
                 .repositories
                 .remove(cwd)
                 .map(|entry| Self::retire_repository(&mut state, cwd, entry))
         } else {
             None
-        }
+        };
+        drop(state);
+        self.observe_repository_availability_change(cwd, previous_local.as_ref(), &status.local);
+        retirement
     }
 
     #[must_use]
@@ -6092,6 +6115,194 @@ mod tests {
             events.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
+        broadcaster.shutdown().await;
+    }
+
+    fn record_availability_nudges(broadcaster: &StatusBroadcaster) -> Arc<Mutex<Vec<PathBuf>>> {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed_calls = Arc::clone(&calls);
+        let inner = Arc::downgrade(&broadcaster.inner);
+        broadcaster.set_local_change_observer(move |cwd| {
+            let inner = inner.upgrade().expect("broadcaster remains alive");
+            assert!(
+                inner.state.try_lock().is_ok(),
+                "availability observer must run outside the broadcaster state lock"
+            );
+            observed_calls.lock().unwrap().push(cwd.to_path_buf());
+        });
+        calls
+    }
+
+    async fn assert_repository_availability_publications_nudge(publish_full: bool) {
+        let root = tempfile::tempdir().expect("repository folder");
+        let cwd = fs::canonicalize(root.path()).expect("canonical folder");
+        let (broadcaster, mut events, fence) =
+            unavailable_repository_broadcaster(&cwd, VcsRepositoryUnavailableReason::Unreadable)
+                .await;
+        let calls = record_availability_nudges(&broadcaster);
+        let mut healthy = VcsStatusLocalResult::non_repository();
+        healthy.is_repo = true;
+        healthy.ref_name = Some("main".to_owned());
+        let mut branch_changed = healthy.clone();
+        branch_changed.ref_name = Some("topic".to_owned());
+        let mut dirty = branch_changed.clone();
+        dirty.has_working_tree_changes = true;
+        let unreadable = VcsStatusLocalResult::non_repository_with_reason(
+            VcsRepositoryUnavailableReason::Unreadable,
+        );
+        let transitions = [
+            ("repair", healthy.clone(), 1),
+            ("branch change", branch_changed, 1),
+            ("dirty change", dirty.clone(), 1),
+            ("unchanged healthy", dirty, 1),
+            ("break", unreadable.clone(), 2),
+            ("unchanged unreadable", unreadable, 2),
+            (
+                "reason changes to absent",
+                VcsStatusLocalResult::non_repository_with_reason(
+                    VcsRepositoryUnavailableReason::Absent,
+                ),
+                3,
+            ),
+            (
+                "reason changes to untrusted",
+                VcsStatusLocalResult::non_repository_with_reason(
+                    VcsRepositoryUnavailableReason::Untrusted,
+                ),
+                4,
+            ),
+            ("reason clears", VcsStatusLocalResult::non_repository(), 5),
+            ("only is_repo changes", healthy, 6),
+        ];
+        for (description, local, expected_calls) in transitions {
+            if publish_full {
+                broadcaster.publish_status(
+                    &cwd,
+                    &VcsStatusResult {
+                        local: local.clone(),
+                        remote: VcsStatusRemoteResult {
+                            has_upstream: false,
+                            ahead_count: 0,
+                            behind_count: 0,
+                            ahead_of_default_count: None,
+                            pr: None,
+                        },
+                    },
+                    &fence,
+                );
+            } else {
+                broadcaster.publish_local(&cwd, 1, &local, &fence);
+            }
+            assert_eq!(
+                *calls.lock().unwrap(),
+                vec![cwd.clone(); expected_calls],
+                "{description}"
+            );
+            while events.try_recv().is_ok() {}
+        }
+        broadcaster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn repository_availability_local_publications_nudge_only_on_changes() {
+        assert_repository_availability_publications_nudge(false).await;
+    }
+
+    #[tokio::test]
+    async fn repository_availability_full_publications_nudge_only_on_changes() {
+        assert_repository_availability_publications_nudge(true).await;
+    }
+
+    fn availability_broadcaster() -> StatusBroadcaster {
+        let (ref_started, _) = mpsc::unbounded_channel();
+        let (remote_started, _) = mpsc::unbounded_channel();
+        let runner = Arc::new(EpochGitRunner {
+            branch: Mutex::new("main".to_owned()),
+            ref_calls: AtomicUsize::new(0),
+            remote_calls: AtomicUsize::new(0),
+            ref_started,
+            remote_started,
+            release_ref: Arc::new(Semaphore::new(16)),
+            release_remote: Arc::new(Semaphore::new(16)),
+        });
+        StatusBroadcaster::new(
+            Arc::new(GitRepository::with_runner_for_test(runner)),
+            Duration::from_secs(3_600),
+            4,
+        )
+    }
+
+    async fn assert_repository_availability_recovery_nudges(subscribe: bool) {
+        let root = tempfile::tempdir().expect("repository folder");
+        let cwd = fs::canonicalize(root.path()).expect("canonical folder");
+        let broadcaster = availability_broadcaster();
+        let mut events = install_epoch_repository(&broadcaster, &cwd);
+        broadcaster
+            .lock_state()
+            .repositories
+            .get_mut(&cwd)
+            .unwrap()
+            .local = VcsStatusLocalResult::non_repository_with_reason(
+            VcsRepositoryUnavailableReason::Unreadable,
+        );
+        let calls = record_availability_nudges(&broadcaster);
+        // Both public entry points must notify the canonical path, not this alias.
+        let alias = cwd.join(".");
+        let mut subscription = if subscribe {
+            Some(
+                broadcaster
+                    .subscribe(alias, CancellationToken::new())
+                    .await
+                    .expect("repaired repository subscription"),
+            )
+        } else {
+            let local = broadcaster
+                .refresh_local(&alias, &CancellationToken::new())
+                .await
+                .expect("repaired local status");
+            assert!(local.is_repo);
+            None
+        };
+        assert_eq!(*calls.lock().unwrap(), vec![cwd.clone()]);
+        assert!(matches!(
+            events.try_recv().expect("recovery is published").value,
+            VcsStatusStreamEvent::LocalUpdated { local } if local.is_repo
+        ));
+        if let Some(subscription) = &mut subscription {
+            assert!(matches!(
+                subscription.recv().await,
+                Some(VcsStatusStreamEvent::Snapshot { local, .. }) if local.is_repo
+            ));
+        }
+        drop(subscription);
+        broadcaster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn repository_availability_local_refresh_nudges_canonical_cwd() {
+        assert_repository_availability_recovery_nudges(false).await;
+    }
+
+    #[tokio::test]
+    async fn repository_availability_subscriber_read_nudges_canonical_cwd() {
+        assert_repository_availability_recovery_nudges(true).await;
+    }
+
+    #[tokio::test]
+    async fn repository_availability_first_and_unchanged_subscriptions_do_not_nudge() {
+        let root = tempfile::tempdir().expect("repository folder");
+        let broadcaster = availability_broadcaster();
+        let calls = record_availability_nudges(&broadcaster);
+        let first = broadcaster
+            .subscribe(root.path().to_path_buf(), CancellationToken::new())
+            .await
+            .expect("first subscription");
+        let second = broadcaster
+            .subscribe(root.path().to_path_buf(), CancellationToken::new())
+            .await
+            .expect("unchanged subscription");
+        assert!(calls.lock().unwrap().is_empty());
+        drop((first, second));
         broadcaster.shutdown().await;
     }
 

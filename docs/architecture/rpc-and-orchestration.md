@@ -150,7 +150,9 @@ Clients decode a reason they do not know, in either stream, as absent.
 A finished local mutation or a reported local change (a terminal
 command exiting) for the same worktree starts a fresh cycle at once, so passive
 labels such as the sidebar branch follow a checkout without waiting for the
-deadline; watcher-driven reads of the active status stream do not nudge it.
+deadline; status reads, including watcher-driven reads, also nudge it when
+repository availability (`isRepo` or `repositoryUnavailableReason`) changes, so
+the sidebar follows a break or repair at once.
 Each successful base cycle publishes current local and provider state. A same-ref/provider PR from the immediately prior cycle may be carried
 only into cycle N+1 while enrichment runs or fails, preserving its original
 `observedAt` with `stale: true`; cycle N+2 expires it unless enrichment refreshes
