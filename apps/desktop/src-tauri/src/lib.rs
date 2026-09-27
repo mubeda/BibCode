@@ -244,6 +244,10 @@ pub fn run() {
             {
                 tracing::warn!("failed to stop Tauri desktop runtime during exit: {error}");
             }
+            if matches!(event, tauri::RunEvent::Exit) {
+                // Mark after backend shutdown, at the last callback before Tauri's relaunch spawn.
+                crate::relaunch::prepare_descriptors_for_relaunch();
+            }
         });
 }
 
@@ -311,6 +315,7 @@ mod linux_text_rendering;
 mod linux_theme;
 mod network_interfaces;
 mod preview;
+mod relaunch;
 mod remote_update_delegate;
 mod security;
 mod server_exposure;

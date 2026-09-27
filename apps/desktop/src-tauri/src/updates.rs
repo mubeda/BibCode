@@ -804,6 +804,8 @@ impl DesktopUpdateManager {
                     "state": update_state,
                 });
                 if restart_required_after_install(std::env::consts::OS) {
+                    // A main-thread restart skips RunEvent::Exit.
+                    crate::relaunch::prepare_descriptors_for_relaunch();
                     app.restart();
                 }
                 result

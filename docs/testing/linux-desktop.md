@@ -288,6 +288,27 @@ is required and available. Isolate BiBCode application data and XDG config,
 cache, and data roots for the test process without changing the parent shell or
 user profile globally.
 
+With that isolated instance running from the absolute `BIBCODE_E2E_APP_PATH`
+on a FUSE-capable test host, perform an update relaunch or **Restart BiBCode**.
+Once the replacement window is ready, require exactly one `.mount_` entry for
+this AppImage in `/proc/mounts` and one AppImage runtime process. Use a host
+where this is the only running BiBCode AppImage; the runtime's mount prefix uses
+the first six characters of the artifact name. Both checks below must exit zero
+and print exactly one entry; extraction mode cannot supply this FUSE evidence.
+
+```sh
+appimage_mount_prefix="/.mount_$(basename "$BIBCODE_E2E_APP_PATH" | cut -c1-6)"
+awk -v prefix="$appimage_mount_prefix" '
+  index($2, prefix) { print; mounts++ }
+  END { exit (mounts != 1) }
+' /proc/mounts &&
+  ps -ww -eo pid=,args= | awk -v appimage="$BIBCODE_E2E_APP_PATH" '
+    { pid = $1; sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "") }
+    $0 == appimage || index($0, appimage " ") == 1 { print pid, $0; runtimes++ }
+    END { exit (runtimes != 1) }
+  '
+```
+
 ### GTK backend and fractional scaling
 
 Inspect an extracted copy of the built AppImage: no `libwayland-client.so*`
