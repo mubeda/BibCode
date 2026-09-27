@@ -2047,6 +2047,34 @@ manual request per environment.
 
 ## Worktree removal flow
 
+`worktree.remove` refuses with `WorktreeRemovalError { reason: "session-running" }`
+and "Stop the running session before deleting this worktree." when any session
+it would stop has projected status `running` or `starting` **and** the provider
+supervisor holds a live session for that thread. The check asks the supervisor
+only about threads with those projected statuses; a liveness lookup failure
+also refuses removal with `session-running`. A stale projection without a live
+session no longer blocks deletion. This includes workspace-loss cleanup, whose
+`stop_session` does not settle the projected status. After resolving
+workspace ownership, an early check verifies the known checkout threads before
+marking the workspace `Removing`. Prepared retries skip this early check so
+their verified post-Git state can be resolved.
+
+After plan validation and Git preflight, the authoritative check waits up to
+five seconds for existing workspace admissions to drain while `Removing`
+refuses new admissions. A drain timeout returns the same typed refusal. The
+check resolves the quiescer's full thread set, including other projects sharing
+the repository, and checks their projected statuses and provider liveness before
+durable removal preparation, quiesce, or Git mutation. Refusal drops the removal guard and
+restores availability without stopping sessions or deleting the checkout.
+
+The authoritative check is bypassed only for a prepared retry in
+`delete-git-worktree` mode whose target is verified `missing-unregistered`:
+Git already succeeded, and durable detach must finish even with a running
+session row. Accepted receipts replay before either check. Idle sessions still
+stop through quiesce, and `worktree.removeFromBibCode` retains its detach-only
+behavior, including stopping running sessions. Pending, queued, and uncertain
+deliveries alone do not cause the session refusal.
+
 `vcs.removeWorktree` is a server-held terminal, persistence, and filesystem
 critical section. `ownerThreadId` identifies the workspace owner, and the
 production server verifies its persisted project and worktree path. `threadIds`

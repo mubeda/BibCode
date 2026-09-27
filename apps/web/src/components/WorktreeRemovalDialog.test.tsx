@@ -4,9 +4,11 @@ import {
   EnvironmentId,
   ProjectId,
   ThreadId,
+  WorktreeRemovalError,
   WorktreeRemovalPlanToken,
   type WorktreeRemovalPlan,
 } from "@bibcode/contracts";
+import * as Cause from "effect/Cause";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
@@ -226,6 +228,88 @@ afterEach(async () => {
 });
 
 describe("WorktreeRemovalDialog", () => {
+  it("shows a session-running refusal once as a status without an error or plan retry", async () => {
+    const onRemoved = vi.fn();
+    h.commands.set("remove", async () => ({
+      _tag: "Failure",
+      cause: Cause.fail(
+        new WorktreeRemovalError({ reason: "session-running", message: "Server session is busy." }),
+      ),
+    }));
+    await renderDialog({ onRemoved });
+
+    await click("Delete Git worktree and remove");
+
+    expect(container.textContent?.split(DELETE_BLOCKED_REASON)).toHaveLength(2);
+    const reason = container.querySelector('[role="status"]');
+    expect(reason?.textContent).toBe(DELETE_BLOCKED_REASON);
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    expect(container.textContent).not.toContain("Retry removal details");
+    const deleteButton = button("Delete Git worktree and remove");
+    expect(deleteButton.disabled).toBe(false);
+    expect(deleteButton.getAttribute("aria-describedby")).toBe(reason?.id);
+    expect(onRemoved).not.toHaveBeenCalled();
+    expect(button("Cancel").disabled).toBe(false);
+    expect(h.calls.filter((call) => call.label === "remove")).toHaveLength(1);
+  });
+
+  it("hands a server refusal over to live session state and clears it when the session stops", async () => {
+    h.commands.set("remove", async () => ({
+      _tag: "Failure",
+      cause: Cause.fail(
+        new WorktreeRemovalError({ reason: "session-running", message: "Server session is busy." }),
+      ),
+    }));
+    await renderDialog();
+    await click("Delete Git worktree and remove");
+
+    h.threads = [threadShell(target.threadId, { session: RUNNING })];
+    await updateDialog();
+
+    expect(container.textContent?.split(DELETE_BLOCKED_REASON)).toHaveLength(2);
+    const reason = container.querySelector('[role="status"]');
+    expect(reason?.textContent).toBe(DELETE_BLOCKED_REASON);
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    expect(container.textContent).not.toContain("Retry removal details");
+    expect(button("Delete Git worktree and remove").disabled).toBe(true);
+    expect(button("Delete Git worktree and remove").getAttribute("aria-describedby")).toBe(
+      reason?.id,
+    );
+
+    h.threads = [threadShell(target.threadId, { session: READY })];
+    await updateDialog();
+
+    expect(container.textContent).not.toContain(DELETE_BLOCKED_REASON);
+    expect(container.querySelector('[role="status"]')).toBeNull();
+    expect(button("Delete Git worktree and remove").disabled).toBe(false);
+    expect(button("Delete Git worktree and remove").hasAttribute("aria-describedby")).toBe(false);
+  });
+
+  it("keeps other removal failures in an alert with a plan retry", async () => {
+    const onRemoved = vi.fn();
+    h.commands.set("remove", async () => ({
+      _tag: "Failure",
+      cause: Cause.fail(
+        new WorktreeRemovalError({
+          reason: "git-failed",
+          message: "Git could not remove the worktree.",
+        }),
+      ),
+    }));
+    await renderDialog({ onRemoved });
+
+    await click("Delete Git worktree and remove");
+
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+      "Git could not remove the worktree.",
+    );
+    expect(button("Retry removal details").disabled).toBe(false);
+    expect(container.textContent).not.toContain(DELETE_BLOCKED_REASON);
+    expect(onRemoved).not.toHaveBeenCalled();
+    expect(button("Cancel").disabled).toBe(false);
+    expect(h.calls.filter((call) => call.label === "remove")).toHaveLength(1);
+  });
+
   it("loads the plan and presents explicit present-worktree choices without a path payload", async () => {
     await renderDialog();
 

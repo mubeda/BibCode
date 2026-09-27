@@ -172,14 +172,18 @@ Menus separate their groups:
   Name**, **Copy Thread ID** · **Pin** or **Unpin**, **Mark as Unread** or
   **Mark as Read**, **Rename…** · **Delete Worktree…**. A thread without a
   worktree offers **Delete Thread** instead, with an ellipsis when deletion
-  asks for confirmation. While a session in the worktree is running, on the
+  asks for confirmation. While a session in the worktree is running or starting, on the
   card or in one of its other chats, **Delete Worktree…** is disabled with
   "Stop the running session before deleting this worktree." (the card hides
   **Archive** while its session runs, too). The removal dialog follows the same
   rule however it opens (this menu, a missing worktree's **Remove from
   BiBCode**, or **Delete** on an archived worktree in **Settings → Archive**):
   its delete buttons stay disabled, with that sentence shown, until the session
-  stops.
+  stops. The server also refuses deletion while a session is running or
+  starting, so a turn started by another client is protected even before this
+  window updates. A server refusal shows the same sentence and keeps the
+  worktree. **Remove from BiBCode** remains available without deleting the
+  checkout.
 - **Primary card (the main checkout):** **Open in ›**, **Pull** · **Copy Path**,
   **Copy Branch Name** · **Pin** or **Unpin**, **Mark as Unread** or **Mark as
   Read**. It can't be deleted; remove the project from its header instead.

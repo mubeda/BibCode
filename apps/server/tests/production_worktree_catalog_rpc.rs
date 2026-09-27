@@ -4433,6 +4433,13 @@ struct CapacityRejectingQuiescer {
 }
 
 impl WorktreeRemovalQuiescer for CapacityRejectingQuiescer {
+    fn live_session_thread_ids(
+        &self,
+        _thread_ids: Vec<String>,
+    ) -> bibcode_server::production::worktree_catalog_rpc::WorktreeRemovalLiveSessionsFuture {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     fn admit_cleanup(&self) -> WorktreeRemovalCleanupAdmissionFuture {
         Box::pin(async { Err(WorktreeRemovalCleanupAdmissionError::Capacity) })
     }
@@ -4468,6 +4475,13 @@ impl RecordingPendingQuiescer {
 }
 
 impl WorktreeRemovalQuiescer for RecordingPendingQuiescer {
+    fn live_session_thread_ids(
+        &self,
+        _thread_ids: Vec<String>,
+    ) -> bibcode_server::production::worktree_catalog_rpc::WorktreeRemovalLiveSessionsFuture {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     fn quiesce(
         &self,
         _admission: WorktreeRemovalCleanupAdmission,
@@ -4742,6 +4756,13 @@ fn catalog_rpc_fixture_parallelism() -> Arc<Semaphore> {
 struct TestNoopQuiescer;
 
 impl WorktreeRemovalQuiescer for TestNoopQuiescer {
+    fn live_session_thread_ids(
+        &self,
+        _thread_ids: Vec<String>,
+    ) -> bibcode_server::production::worktree_catalog_rpc::WorktreeRemovalLiveSessionsFuture {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     fn quiesce(
         &self,
         _admission: WorktreeRemovalCleanupAdmission,
@@ -4756,6 +4777,13 @@ struct SwitchingAnchorQuiescer {
 }
 
 impl WorktreeRemovalQuiescer for SwitchingAnchorQuiescer {
+    fn live_session_thread_ids(
+        &self,
+        _thread_ids: Vec<String>,
+    ) -> bibcode_server::production::worktree_catalog_rpc::WorktreeRemovalLiveSessionsFuture {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     fn quiesce(
         &self,
         _admission: WorktreeRemovalCleanupAdmission,

@@ -49,6 +49,13 @@ const PRODUCTION_REMOVAL_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 pub(crate) type WorktreeRuntimeFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
 pub(crate) trait WorktreeRuntimeActions: Send + Sync + 'static {
+    fn live_session_thread_ids(
+        &self,
+        _thread_ids: Vec<String>,
+    ) -> WorktreeRuntimeFuture<Result<Vec<String>, String>> {
+        Box::pin(async { Err("removal provider liveness lookup is unavailable".to_owned()) })
+    }
+
     fn affected_thread_ids(
         &self,
         transition: WorkspaceLossTransition,
@@ -394,6 +401,13 @@ impl CatalogWorkspaceLossObserver for WorktreeRuntime {
 }
 
 impl WorktreeRemovalQuiescer for WorktreeRuntime {
+    fn live_session_thread_ids(
+        &self,
+        thread_ids: Vec<String>,
+    ) -> WorktreeRuntimeFuture<Result<Vec<String>, String>> {
+        self.inner.actions.live_session_thread_ids(thread_ids)
+    }
+
     fn admit_cleanup(&self) -> WorktreeRemovalCleanupAdmissionFuture {
         let slots = self.inner.removal_cleanup_slots.clone();
         Box::pin(async move {
@@ -991,6 +1005,24 @@ struct ProductionWorktreeRuntimeActions {
 }
 
 impl WorktreeRuntimeActions for ProductionWorktreeRuntimeActions {
+    fn live_session_thread_ids(
+        &self,
+        thread_ids: Vec<String>,
+    ) -> WorktreeRuntimeFuture<Result<Vec<String>, String>> {
+        let provider = self.provider.clone();
+        Box::pin(async move {
+            let mut live_thread_ids = Vec::new();
+            for thread_id in thread_ids {
+                match provider.capture_session_identity(&thread_id).await {
+                    Ok(Some(_)) => live_thread_ids.push(thread_id),
+                    Ok(None) | Err(ProviderRuntimeError::SessionNotFound { .. }) => {}
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+            Ok(live_thread_ids)
+        })
+    }
+
     fn affected_thread_ids(
         &self,
         transition: WorkspaceLossTransition,
@@ -1254,7 +1286,7 @@ async fn workspace_thread_ids(
     Ok(thread_ids)
 }
 
-async fn removal_thread_ids(
+pub(crate) async fn removal_thread_ids(
     repositories: Repositories,
     request: &WorktreeRemovalQuiesceRequest,
 ) -> Result<Vec<String>, String> {
@@ -1332,6 +1364,7 @@ mod tests {
         WorkspaceRemovalIdentity,
     };
     use crate::{
+        activity::{ActivityProjection, ActivityRepository},
         cloud::{RelayClientInstallEvent, RelayClientService, RelayClientStatus},
         diagnostics::{
             DiagnosticsMonitor, NativeProcessSampler, NativeResourceSampler,
@@ -1339,6 +1372,11 @@ mod tests {
         },
         orchestration::{EngineOptions, OrchestrationCommand, OrchestrationEngine, load_snapshot},
         persistence::{Database, Repositories, run_migrations},
+        production::provider_runtime::{
+            BoxRuntimeFuture, ProviderDriver, ProviderDriverFactory, ProviderEvent,
+            ProviderLaunchRequest, ProviderRuntimeError, ProviderRuntimeSupervisor, StartedSession,
+            SupervisorOptions,
+        },
         production::server_terminal::{
             JsonFuture, JsonStream, ProductionServerControl, ServerTerminalServices,
         },
@@ -1553,6 +1591,205 @@ mod tests {
                 Ok(())
             }))
         }
+    }
+
+    struct RuntimeTestProvider;
+
+    impl ProviderDriverFactory for RuntimeTestProvider {
+        fn create(
+            &self,
+            _request: ProviderLaunchRequest,
+        ) -> BoxRuntimeFuture<'_, Result<Arc<dyn ProviderDriver>, ProviderRuntimeError>> {
+            Box::pin(async { Ok(Arc::new(Self) as Arc<dyn ProviderDriver>) })
+        }
+    }
+
+    impl ProviderDriver for RuntimeTestProvider {
+        fn start(&self) -> BoxRuntimeFuture<'_, Result<StartedSession, ProviderRuntimeError>> {
+            Box::pin(ready(Ok(StartedSession::default())))
+        }
+
+        fn send(
+            &self,
+            _text: String,
+            _attachments: Vec<Value>,
+            _interaction_mode: String,
+        ) -> BoxRuntimeFuture<'_, Result<Option<String>, ProviderRuntimeError>> {
+            Box::pin(ready(Ok(None)))
+        }
+
+        fn interrupt(
+            &self,
+            _turn_id: Option<String>,
+        ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(ready(Ok(())))
+        }
+
+        fn approve(
+            &self,
+            _request_id: String,
+            _decision: String,
+        ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(ready(Ok(())))
+        }
+
+        fn answer(
+            &self,
+            _request_id: String,
+            _answers: Value,
+        ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(ready(Ok(())))
+        }
+
+        fn set_mode(
+            &self,
+            _mode: String,
+        ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(ready(Ok(())))
+        }
+
+        fn set_model(
+            &self,
+            _model: String,
+        ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(ready(Ok(())))
+        }
+
+        fn set_options(
+            &self,
+            _options: Vec<Value>,
+        ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(ready(Ok(())))
+        }
+
+        fn rollback(
+            &self,
+            _turn_count: i64,
+        ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(ready(Ok(())))
+        }
+
+        fn next_event(&self) -> BoxRuntimeFuture<'_, Option<ProviderEvent>> {
+            Box::pin(pending())
+        }
+
+        fn shutdown(&self) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(ready(Ok(())))
+        }
+    }
+
+    #[tokio::test]
+    async fn production_liveness_reports_only_captured_provider_sessions() {
+        let root = tempfile::tempdir().expect("provider root");
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let activity = ActivityProjection::new(ActivityRepository::new(database.clone()));
+        let engine = OrchestrationEngine::start(database, EngineOptions::default())
+            .await
+            .expect("engine starts");
+        for command in [
+            json!({
+                "type":"project.create", "commandId":"project", "projectId":"project-1",
+                "title":"Project", "workspaceRoot":root.path(),
+                "createdAt":"2026-09-27T00:00:00Z"
+            }),
+            json!({
+                "type":"thread.create", "commandId":"thread", "threadId":"live-thread",
+                "projectId":"project-1", "title":"Thread", "kind":"workspace",
+                "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                "runtimeMode":"full-access", "interactionMode":"default",
+                "branch":null, "worktreePath":null, "createdAt":"2026-09-27T00:00:00Z"
+            }),
+        ] {
+            engine
+                .dispatch(serde_json::from_value(command).expect("command"))
+                .await
+                .expect("fixture created");
+        }
+        let provider = Arc::new(ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(RuntimeTestProvider),
+            activity,
+            SupervisorOptions::default(),
+        ));
+        let terminals = TerminalManager::new(
+            Arc::new(RuntimeTestPtyBackend::default()),
+            TerminalManagerOptions::default(),
+        );
+        let runtime = WorktreeRuntime::start(
+            engine.clone(),
+            provider.clone(),
+            runtime_terminal_services(terminals.clone()),
+            WorkspaceAvailabilityRegistry::new(),
+        );
+        provider
+            .launch(ProviderLaunchRequest {
+                thread_id: "live-thread".to_owned(),
+                activity_causal_revision: 0,
+                provider: "codex".to_owned(),
+                provider_label: "Codex".to_owned(),
+                provider_instance_id: Some("codex".to_owned()),
+                binary_path: "in-memory-test-provider".to_owned(),
+                cwd: root.path().to_path_buf(),
+                runtime_mode: "full-access".to_owned(),
+                interaction_mode: "default".to_owned(),
+                model: Some("gpt-5".to_owned()),
+                options: Vec::new(),
+                custom_models: Vec::new(),
+                service_tier: None,
+                effort: None,
+                agent: None,
+                resume_cursor: None,
+                environment: Default::default(),
+                endpoint: None,
+                server_password: None,
+                mcp: None,
+                codex_home: None,
+            })
+            .await
+            .expect("provider launches");
+        let thread_ids = vec!["absent-thread".to_owned(), "live-thread".to_owned()];
+        assert_eq!(
+            runtime
+                .live_session_thread_ids(thread_ids.clone())
+                .await
+                .expect("capture live sessions"),
+            ["live-thread"]
+        );
+        assert!(
+            runtime
+                .live_session_thread_ids(vec!["absent-thread".to_owned()])
+                .await
+                .expect("only requested threads")
+                .is_empty()
+        );
+        let identity = provider
+            .capture_session_identity("live-thread")
+            .await
+            .expect("session capture")
+            .expect("live session");
+        provider
+            .stop_session_if_current(identity)
+            .await
+            .expect("provider stops");
+        assert!(
+            runtime
+                .live_session_thread_ids(thread_ids.clone())
+                .await
+                .expect("stopped sessions are not live")
+                .is_empty()
+        );
+        provider.shutdown().await.expect("provider shutdown");
+        assert!(runtime.live_session_thread_ids(thread_ids).await.is_err());
+        runtime.shutdown().await;
+        terminals.shutdown().await;
+        engine.shutdown().await;
     }
 
     #[derive(Debug)]
