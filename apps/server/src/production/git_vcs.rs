@@ -3204,6 +3204,7 @@ mod mutation_ownership_tests {
                 VcsStatusStreamEvent::LocalUpdated {
                     local: VcsStatusLocalResult {
                         is_repo: true,
+                        repository_unavailable_reason: None,
                         source_control_provider: None,
                         has_primary_remote: false,
                         is_default_ref: false,

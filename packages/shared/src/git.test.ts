@@ -163,6 +163,53 @@ describe("isTemporaryWorktreeBranch", () => {
 });
 
 describe("applyGitStatusStreamEvent", () => {
+  it.each(["absent", "unreadable", "untrusted"] as const)(
+    "preserves the %s repository reason through every event kind",
+    (repositoryUnavailableReason) => {
+      const local = {
+        isRepo: false,
+        repositoryUnavailableReason,
+        hasPrimaryRemote: false,
+        isDefaultRef: false,
+        refName: null,
+        hasWorkingTreeChanges: false,
+        workingTree: { files: [], insertions: 0, deletions: 0 },
+      };
+      const snapshot = applyGitStatusStreamEvent(null, { _tag: "snapshot", local, remote: null });
+      const updated = applyGitStatusStreamEvent(snapshot, { _tag: "localUpdated", local });
+      const remoteUpdated = applyGitStatusStreamEvent(updated, {
+        _tag: "remoteUpdated",
+        remote: null,
+      });
+      for (const status of [snapshot, updated, remoteUpdated]) {
+        expect(status).toHaveProperty("repositoryUnavailableReason", repositoryUnavailableReason);
+      }
+    },
+  );
+
+  it("keeps an omitted repository reason absent through every event kind and recovery", () => {
+    const snapshot = applyGitStatusStreamEvent(null, {
+      _tag: "snapshot",
+      local: localStatus,
+      remote: null,
+    });
+    const updated = applyGitStatusStreamEvent(snapshot, {
+      _tag: "localUpdated",
+      local: localStatus,
+    });
+    const remoteUpdated = applyGitStatusStreamEvent(updated, {
+      _tag: "remoteUpdated",
+      remote: remoteStatus,
+    });
+    const recovered = applyGitStatusStreamEvent(
+      { ...snapshot, isRepo: false, repositoryUnavailableReason: "unreadable" },
+      { _tag: "localUpdated", local: localStatus },
+    );
+    for (const status of [snapshot, updated, remoteUpdated, recovered]) {
+      expect(Object.hasOwn(status, "repositoryUnavailableReason")).toBe(false);
+    }
+  });
+
   it("treats a remote-only update as a repository when local state is missing", () => {
     const remote: VcsStatusRemoteResult = {
       hasUpstream: true,

@@ -6,47 +6,44 @@
       "_tag": "snapshot",
       "local": {
         "isRepo": false,
-        "sourceControlProvider": {
-          "kind": "gitlab",
-          "name": "CyT2wdGPfl^y",
-          "baseUrl": "f~yX"
-        },
-        "hasPrimaryRemote": true,
+        "repositoryUnavailableReason": "unreadable",
+        "hasPrimaryRemote": false,
         "isDefaultRef": false,
-        "refName": null,
-        "defaultRefName": "@",
-        "hasWorkingTreeChanges": true,
+        "refName": "^va",
+        "hasWorkingTreeChanges": false,
         "workingTree": {
           "files": [
             {
-              "path": "70$8>}x3]#",
-              "insertions": 11,
-              "deletions": 1576334567,
-              "status": "deleted",
-              "area": "staged"
-            },
-            {
-              "path": "YKx",
-              "insertions": 17,
-              "deletions": 29
-            },
-            {
-              "path": "}_Y",
-              "insertions": 13,
-              "deletions": 2147483621,
+              "path": "fF `@[",
+              "insertions": 188559808,
+              "deletions": 645032281,
               "area": "untracked"
             },
             {
-              "path": "numeran",
-              "insertions": 435754498,
-              "deletions": 415710238
+              "path": ">}x3]#[:G-",
+              "insertions": 1576334567,
+              "deletions": 804454918,
+              "status": "renamed",
+              "area": "untracked"
+            },
+            {
+              "path": "YKx",
+              "insertions": 860898350,
+              "deletions": 1053638277,
+              "status": "modified"
             }
           ],
-          "insertions": 995438101,
-          "deletions": 1734523376
+          "insertions": 874630947,
+          "deletions": 2063773623
         }
       },
-      "remote": null
+      "remote": {
+        "hasUpstream": true,
+        "aheadCount": 944040310,
+        "behindCount": 16,
+        "aheadOfDefaultCount": 310915791,
+        "pr": null
+      }
     }
   ]
 }

@@ -112,9 +112,11 @@ flowchart TB
 
   One status observation reads porcelain-v2 branch and file state once and runs
   staged or unstaged numstat only for areas that are present. A failed porcelain
-  read becomes the compatible non-repository result only after the existing
-  repository probe confirms that state; malformed metadata, permissions,
-  cancellation, and other actionable failures remain errors. Status and
+  read whose repository probe also refuses the folder becomes the non-repository
+  result, which says, when the server can tell, whether no repository exists, Git
+  cannot read one, or Git refuses to trust it. A readable non-work-tree result
+  carries no reason; a failed read with a work-tree probe or cancellation remains
+  an error. Status and
   background-observation Git reads set `GIT_OPTIONAL_LOCKS=0`; fetch and
   mutations keep the ordinary Git environment.
 

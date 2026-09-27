@@ -254,8 +254,18 @@ const VcsStatusChangeRequest = Schema.Struct({
   state: VcsStatusChangeRequestState,
 });
 
+/** Why Git cannot use a folder as a working repository, when the server can tell. */
+export const VcsRepositoryUnavailableReason = Schema.Literals([
+  "absent",
+  "unreadable",
+  "untrusted",
+]);
+export type VcsRepositoryUnavailableReason = typeof VcsRepositoryUnavailableReason.Type;
+
 const VcsStatusLocalShape = {
   isRepo: Schema.Boolean,
+  /** Present only when isRepo is false and the server can tell why; absent from older servers. */
+  repositoryUnavailableReason: Schema.optional(VcsRepositoryUnavailableReason),
   sourceControlProvider: Schema.optional(SourceControlProviderInfo),
   hasPrimaryRemote: Schema.Boolean,
   isDefaultRef: Schema.Boolean,
