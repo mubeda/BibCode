@@ -33,6 +33,7 @@ const DESCRIPTOR = {
   },
   serverVersion: "0.0.0-test",
   storageInstanceId: "store-current",
+  bootId: null,
   remoteUpdateSupport: null,
   remoteProtocolVersion: 1,
   minCompatibleRemoteProtocol: 1,

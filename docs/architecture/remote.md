@@ -526,7 +526,10 @@ state owner are in `apps/server/src/remote_update.rs`.
 
 The well-known descriptor, `server.getConfig`, and the Connect/relay descriptor
 all embed `remoteUpdateSupport`. Clients render update controls only when the
-additive, default-false `remoteUpdateControl` capability is true. The Remote
+additive, default-false `remoteUpdateControl` capability is true. All three
+descriptor producers also publish `bootId` and the default-false
+`remoteUpdateProgress` capability, which advertises the snapshot's progress
+fields, `bootId`, and `updater.activeWork`. The Remote
 Servers settings page checks all capable saved environments through
 `packages/client-runtime/src/state/remoteUpdates.ts`, with at most two requests
 in flight. Each environment check has one 30-second Effect deadline around the

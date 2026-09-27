@@ -79,6 +79,7 @@ const descriptor = (
   platform: { os: "linux", arch: "x64" },
   serverVersion: "0.0.0-test",
   storageInstanceId: STORAGE_IDENTITY,
+  bootId: null,
   remoteUpdateSupport: null,
   remoteProtocolVersion: REMOTE_PROTOCOL_VERSION,
   minCompatibleRemoteProtocol: MIN_COMPATIBLE_REMOTE_PROTOCOL,

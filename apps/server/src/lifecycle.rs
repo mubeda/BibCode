@@ -55,12 +55,14 @@ fn connect_environment_descriptor(config: &ServerConfig) -> serde_json::Value {
             .storage_instance_id
             .expect("a running server has a prepared persistent store")
             .to_string(),
+        "bootId": config.boot_id.map(|id| id.to_string()),
         "remoteUpdateSupport": config.remote_update_support,
         "remoteProtocolVersion": crate::http::REMOTE_PROTOCOL_VERSION,
         "minCompatibleRemoteProtocol": crate::http::MIN_COMPATIBLE_REMOTE_PROTOCOL,
         "capabilities": {
             "repositoryIdentity": true,
             "remoteUpdateControl": true,
+            "remoteUpdateProgress": true,
             "terminalOrderedInput": true,
             "terminalSizeOwnership": true,
             "vcsCloneReattach": true,
@@ -228,6 +230,7 @@ impl ServerRuntime {
             .await
             .map_err(|error| ServerError::PersistenceInitialize(error.to_string()))?;
         config.storage_instance_id = Some(prepared_store.storage_instance_id);
+        config.boot_id = Some(uuid::Uuid::new_v4());
         let storage_instance_id = prepared_store.storage_instance_id;
         let store_classification = prepared_store.classification;
         let database = prepared_store.database;
@@ -1003,9 +1006,12 @@ mod tests {
         config.storage_instance_id = Some(crate::persistence::StorageInstanceId::from_uuid(
             uuid::Uuid::nil(),
         ));
+        config.boot_id = Some(uuid::Uuid::nil());
         let descriptor = connect_environment_descriptor(&config);
+        assert_eq!(descriptor["bootId"], "00000000-0000-0000-0000-000000000000");
         assert_eq!(descriptor["capabilities"]["repositoryIdentity"], true);
         assert_eq!(descriptor["capabilities"]["remoteUpdateControl"], true);
+        assert_eq!(descriptor["capabilities"]["remoteUpdateProgress"], true);
         assert_eq!(descriptor["capabilities"]["terminalOrderedInput"], true);
         assert_eq!(descriptor["capabilities"]["terminalSizeOwnership"], true);
         assert_eq!(descriptor["capabilities"]["vcsCloneReattach"], true);

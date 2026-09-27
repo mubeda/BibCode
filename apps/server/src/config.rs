@@ -79,6 +79,8 @@ pub struct ServerConfig {
     pub environment_label: String,
     pub server_version: String,
     pub storage_instance_id: Option<StorageInstanceId>,
+    /// Random per start; set by `ServerRuntime`; never persisted.
+    pub boot_id: Option<uuid::Uuid>,
     /// How this server can be updated remotely (spec section 4.5). Headless
     /// default is manual; the desktop host overrides at launch.
     pub remote_update_support: RemoteUpdateSupport,
@@ -116,6 +118,7 @@ impl ServerConfig {
             environment_label: LOCAL_ENVIRONMENT_LABEL.to_owned(),
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
             storage_instance_id: None,
+            boot_id: None,
             remote_update_support: RemoteUpdateSupport::manual(),
             update_maintenance_drain_timeout: Duration::from_secs(30),
             update_maintenance_lease: Duration::from_secs(90),

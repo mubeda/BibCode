@@ -2297,6 +2297,7 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
             .storage_instance_id
             .expect("a running server has a prepared persistent store")
             .to_string(),
+        "bootId": config.boot_id.map(|id| id.to_string()),
         "remoteUpdateSupport": config.remote_update_support,
         "remoteProtocolVersion": crate::http::REMOTE_PROTOCOL_VERSION,
         "minCompatibleRemoteProtocol": crate::http::MIN_COMPATIBLE_REMOTE_PROTOCOL,
@@ -2318,6 +2319,7 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
             "pullRequestsMutations": true,
             "activityProtocolVersion": activity_protocol_registered.then_some(2),
             "remoteUpdateControl": true,
+            "remoteUpdateProgress": true,
             "terminalOrderedInput": true,
             "terminalSizeOwnership": true,
             "vcsCloneReattach": true,
@@ -6053,9 +6055,12 @@ mod tests {
     #[test]
     fn environment_descriptor_advertises_remote_update_control_and_support() {
         let temp = tempfile::tempdir().expect("state directory");
-        let config = running_test_config(temp.path());
+        let mut config = running_test_config(temp.path());
+        config.boot_id = Some(uuid::Uuid::nil());
         let descriptor = environment_descriptor(&config, false);
+        assert_eq!(descriptor["bootId"], "00000000-0000-0000-0000-000000000000");
         assert_eq!(descriptor["capabilities"]["remoteUpdateControl"], true);
+        assert_eq!(descriptor["capabilities"]["remoteUpdateProgress"], true);
         assert_eq!(descriptor["capabilities"]["terminalOrderedInput"], true);
         assert_eq!(descriptor["capabilities"]["terminalSizeOwnership"], true);
         assert_eq!(descriptor["capabilities"]["vcsCloneReattach"], true);

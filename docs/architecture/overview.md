@@ -826,8 +826,10 @@ producers—the well-known route (`apps/server/src/http.rs`),
 `server.getConfig` (`apps/server/src/production/control.rs`), and the
 Connect/relay descriptor (`apps/server/src/lifecycle.rs`)—embed
 `remoteUpdateSupport` and advertise the surface with the default-false
-`remoteUpdateControl` capability. Clients therefore know the install mode
-before asking. `updater.activeWork` returns
+`remoteUpdateControl` capability. All three also publish `bootId` and the
+default-false `remoteUpdateProgress` capability, which advertises the snapshot's
+progress fields, `bootId`, and `updater.activeWork`. Clients therefore know the
+install mode before asking. `updater.activeWork` returns
 `{runningTurns, liveTerminals, queuedMessages}` counted across all clients through
 its own read method so the one-second status poll never waits on the store; a
 failed count answers the typed `RemoteUpdateActiveWorkError`.
