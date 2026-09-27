@@ -166,7 +166,13 @@ status-owner entry once active mutations and cancellation-ignoring physical
 reads finish, so paths that are never reattached do not accumulate owner state.
 
 The first active status subscriber resolves worktree, Git directory, and common
-directory with one bounded, cancellation-aware Git command. The server installs
+directory with one bounded, cancellation-aware Git command. When Git cannot
+resolve them, the watcher uses the nearest `.git` directory with a repository
+marker found by the classifier's bounded discovery walk, with its parent as the
+worktree root, so a repaired HEAD or config triggers a read. These fallback
+roots feed only the watcher; Git Manager identity and fetch attachment still
+resolve through Git. Plain folders, gitfiles, and trust changes still converge
+through the safety read or **Retry**. The server installs
 native watches for those admitted execution-host paths before the initial local
 read. Watcher readiness is proved by a final, test-owned-style sentinel watch in
 a unique temporary directory outside all user and Git roots. Setup attempts

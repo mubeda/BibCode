@@ -490,7 +490,9 @@ or checking an existing repository's `.git` folder. The toolbar shows **No
 branch** and **Sync unavailable**; branch, tag, sync, stash, merge and rebase
 actions are disabled with that reason. Tabs and Worktree stay usable.
 Everything reloads automatically once status reports that Git can read the
-repository again; **Retry** asks the server to check at once.
+repository again; a repaired HEAD or config file is noticed within a moment,
+while after `git init` or trusting the folder the manager rechecks within about
+a minute, or at once with **Retry**.
 
 The **Tags** tab lists local tags newest first, then one collapsible section
 per remote with the tags that remote currently advertises, queried with
