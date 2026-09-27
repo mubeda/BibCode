@@ -12,11 +12,13 @@ import type {
 } from "@bibcode/contracts";
 import { applyGitStatusStreamEvent } from "@bibcode/shared/git";
 import { makeTestExecutionEnvironmentCapabilities } from "@bibcode/shared/testSupport";
+import * as AsyncResult from "effect/unstable/reactivity/AsyncResult";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import { useGitManagerStore } from "../../gitManagerStore";
+import type { GitManagerChangesViewProps } from "./changes/GitManagerChangesView";
 
 // Queries publish through a tiny external store, so a new value re-renders only the
 // components that read it, as a live atom subscription does.
@@ -27,6 +29,8 @@ const h = vi.hoisted(() => {
     statusByCwd: new Map<string, VcsStatusResult | null>(),
     refs: null as GitManagerRefsSnapshot | null,
     connection: null as SupervisorConnectionState | null,
+    realChangesView: false,
+    refreshStatus: vi.fn(),
     /** The latest toolbar props, whose callback switches the checkout. */
     toolbar: null as { onSelectedWorktreeChange: (cwd: string) => void } | null,
     subscribe: (listener: () => void) => {
@@ -123,8 +127,15 @@ vi.mock("../../state/worktrees", () => ({
 vi.mock("../../state/vcs", () => ({
   vcsEnvironment: {
     status: ({ input }: { input: { cwd: string } }) => ({ kind: "status", cwd: input.cwd }),
+    refreshStatus: "cmd:refresh-status",
   },
 }));
+
+vi.mock("../../state/use-atom-command", () => ({
+  useAtomCommand: (command: unknown) =>
+    command === "cmd:refresh-status" ? h.refreshStatus : h.noop,
+}));
+vi.mock("../../editorPreferences", () => ({ useOpenInPreferredEditor: () => h.noop }));
 
 vi.mock("../../state/gitManager", () => ({
   gitManagerEnvironment: {
@@ -141,9 +152,14 @@ vi.mock("./GitManagerToolbar", () => ({
     return null;
   },
 }));
-vi.mock("./changes/GitManagerChangesView", () => ({
-  GitManagerChangesView: () => <div data-testid="changes-view" />,
-}));
+vi.mock("./changes/GitManagerChangesView", async (importOriginal) => {
+  const { GitManagerChangesView } =
+    await importOriginal<typeof import("./changes/GitManagerChangesView")>();
+  return {
+    GitManagerChangesView: (props: GitManagerChangesViewProps) =>
+      h.realChangesView ? <GitManagerChangesView {...props} /> : <div data-testid="changes-view" />,
+  };
+});
 vi.mock("./history/GitManagerHistoryView", () => ({
   GitManagerHistoryView: () => <div data-testid="history-view" />,
 }));
@@ -242,6 +258,14 @@ const MERGING_REFS: GitManagerRefsSnapshot = {
 let container: HTMLDivElement;
 let root: Root;
 
+function deferredRead() {
+  let resolve!: (result: unknown) => void;
+  const promise = new Promise<unknown>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
 /** Applies each frame as its own emission, the way the status stream delivers them. */
 async function deliver(
   frames: ReadonlyArray<VcsStatusStreamEvent>,
@@ -267,6 +291,16 @@ function selectedTab(): string | null {
   return container.querySelector('[role="tab"][aria-selected="true"]')?.textContent?.trim() ?? null;
 }
 
+function retryButton(): HTMLButtonElement {
+  const button = container.querySelector<HTMLButtonElement>('[role="alert"] button');
+  if (button === null) throw new Error("Missing Retry button");
+  return button;
+}
+
+function isInactive(button: HTMLButtonElement): boolean {
+  return button.getAttribute("aria-disabled") === "true";
+}
+
 async function openManagerOn(name: "Changes" | "History" | "Tags"): Promise<void> {
   await act(async () => root.render(<GitManagerPanel projectRef={projectRef} />));
   await act(async () => tab(name).click());
@@ -277,6 +311,8 @@ beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   useGitManagerStore.setState({ byProjectKey: {} });
   h.statusByCwd.clear();
+  h.realChangesView = false;
+  h.refreshStatus.mockReset();
   h.refs = REFS;
   h.connection = {
     ...AVAILABLE_CONNECTION_STATE,
@@ -296,6 +332,76 @@ afterEach(async () => {
 });
 
 describe("GitManagerPanel selected tab", () => {
+  it("keeps each checkout's Retry busy across checkout and tab switches", async () => {
+    h.realChangesView = true;
+    const readA = deferredRead();
+    const readB = deferredRead();
+    h.refreshStatus.mockReturnValueOnce(readA.promise).mockReturnValueOnce(readB.promise);
+    await deliver(UNREADABLE);
+    await deliver(UNREADABLE, "/opaque/feature");
+    await openManagerOn("Changes");
+
+    expect(retryButton().textContent).toBe("Retry");
+    await act(async () => retryButton().click());
+    expect(retryButton().textContent).toBe("Retrying…");
+    expect(isInactive(retryButton())).toBe(true);
+
+    await act(async () => h.toolbar?.onSelectedWorktreeChange("/opaque/feature"));
+    expect(retryButton().textContent).toBe("Retry");
+    expect(isInactive(retryButton())).toBe(false);
+    await act(async () => retryButton().click());
+    expect(retryButton().textContent).toBe("Retrying…");
+    expect(h.refreshStatus).toHaveBeenNthCalledWith(1, {
+      environmentId: "environment-1",
+      input: { cwd: "/opaque/main" },
+    });
+    expect(h.refreshStatus).toHaveBeenNthCalledWith(2, {
+      environmentId: "environment-1",
+      input: { cwd: "/opaque/feature" },
+    });
+
+    await act(async () => h.toolbar?.onSelectedWorktreeChange("/opaque/main"));
+    expect(retryButton().textContent).toBe("Retrying…");
+    expect(isInactive(retryButton())).toBe(true);
+
+    await act(async () => tab("History").click());
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    await act(async () => tab("Changes").click());
+    expect(retryButton().textContent).toBe("Retrying…");
+    expect(isInactive(retryButton())).toBe(true);
+
+    await act(async () => readB.resolve(AsyncResult.success(h.statusByCwd.get("/opaque/feature"))));
+    expect(retryButton().textContent).toBe("Retrying…");
+    await act(async () => readA.resolve(AsyncResult.success(h.statusByCwd.get("/opaque/main"))));
+    expect(retryButton().textContent).toBe("Retry");
+    expect(isInactive(retryButton())).toBe(false);
+
+    await act(async () => h.toolbar?.onSelectedWorktreeChange("/opaque/feature"));
+    expect(retryButton().textContent).toBe("Retry");
+    expect(h.refreshStatus).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps Retry busy when Changes unmounts for History and mounts again", async () => {
+    h.realChangesView = true;
+    const read = deferredRead();
+    h.refreshStatus.mockReturnValueOnce(read.promise);
+    await deliver(UNREADABLE);
+    await openManagerOn("Changes");
+    await act(async () => retryButton().click());
+    expect(retryButton().textContent).toBe("Retrying…");
+
+    await act(async () => tab("History").click());
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    await act(async () => tab("Changes").click());
+    expect(retryButton().textContent).toBe("Retrying…");
+    expect(isInactive(retryButton())).toBe(true);
+
+    await act(async () => read.resolve(AsyncResult.success(h.statusByCwd.get("/opaque/main"))));
+    expect(retryButton().textContent).toBe("Retry");
+    expect(isInactive(retryButton())).toBe(false);
+    expect(h.refreshStatus).toHaveBeenCalledOnce();
+  });
+
   it("stays on Changes while Git cannot read the repository and after it recovers", async () => {
     await deliver([
       {

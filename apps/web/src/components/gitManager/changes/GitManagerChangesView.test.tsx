@@ -42,6 +42,7 @@ const h = vi.hoisted(() => ({
     ): Promise<string | null> => Promise.resolve(null),
   ),
   openInEditor: vi.fn(() => Promise.resolve({ _tag: "Success" })),
+  onRetry: vi.fn(),
   refreshStatus: vi.fn(),
   stageFiles: vi.fn(),
   unstageFiles: vi.fn(),
@@ -223,12 +224,14 @@ function unreadableStatus() {
 let container: HTMLDivElement;
 let root: Root | null;
 
-async function renderView(cwd = "/repo/main") {
+async function renderView(cwd = "/repo/main", retrying = false) {
   await act(async () =>
     root?.render(
       <GitManagerChangesView
         scope={{ environmentId: "environment-1" as never, cwd }}
         projectRef={projectRef}
+        retrying={retrying}
+        onRetry={h.onRetry}
       />,
     ),
   );
@@ -242,6 +245,10 @@ function buttonWithText(text: string): HTMLButtonElement {
   );
   if (!(button instanceof HTMLButtonElement)) throw new Error(`Missing button: ${text}`);
   return button;
+}
+
+function isInactive(button: HTMLButtonElement): boolean {
+  return button.getAttribute("aria-disabled") === "true";
 }
 
 function checkboxLabelWithText(text: string): HTMLLabelElement {
@@ -292,6 +299,7 @@ beforeEach(() => {
   h.revalidateCommits.mockClear();
   h.contextMenuShow.mockClear();
   h.openInEditor.mockClear();
+  h.onRetry.mockClear();
   h.refreshStatus.mockReset();
   h.refreshStatus.mockImplementation(() =>
     Promise.resolve(AsyncResult.success(h.freshStatus ?? h.status)),
@@ -435,58 +443,49 @@ describe("GitManagerChangesView", () => {
     );
     expect(container.textContent).not.toContain("No local changes");
     expect(container.querySelector("#git-manager-summary")).toBeNull();
-    expect(buttonWithText("Retry").disabled).toBe(false);
+    expect(buttonWithText("Retry").textContent).toBe("Retry");
+    expect(isInactive(buttonWithText("Retry"))).toBe(false);
   });
 
-  it("asks the server to read the status again on Retry, and is busy while that read runs", async () => {
+  it("calls onRetry for an unreadable repository and shows busy from its props", async () => {
     h.status = unreadableStatus();
-    let finishRead: (result: unknown) => void = () => undefined;
-    h.refreshStatus.mockImplementation(
-      () =>
-        new Promise((resolve) => {
-          finishRead = resolve;
-        }),
-    );
     await renderView();
     h.revalidateRefs.mockClear();
 
     await act(async () => buttonWithText("Retry").click());
 
-    expect(h.refreshStatus).toHaveBeenCalledOnce();
-    expect(h.refreshStatus).toHaveBeenCalledWith({
-      environmentId: "environment-1",
-      input: { cwd: "/repo/main" },
-    });
+    expect(h.onRetry).toHaveBeenCalledOnce();
+    expect(h.refreshStatus).not.toHaveBeenCalled();
+    expect(buttonWithText("Retry").textContent).toBe("Retry");
+
+    await renderView("/repo/main", true);
+    expect(buttonWithText("Retrying…").textContent).toBe("Retrying…");
     expect(buttonWithText("Retrying…").getAttribute("aria-disabled")).toBe("true");
     // The status stream itself is healthy, and the refs keep their last good answer.
     expect(h.refreshStatusQuery).not.toHaveBeenCalled();
     expect(h.refreshRefs).not.toHaveBeenCalled();
     expect(h.revalidateRefs).not.toHaveBeenCalled();
 
-    await act(async () => finishRead(AsyncResult.success(unreadableStatus())));
+    await renderView("/repo/main", false);
 
     expect(container.textContent).toContain("Git can't read this folder as a repository.");
-    expect(buttonWithText("Retry").disabled).toBe(false);
+    expect(buttonWithText("Retry").textContent).toBe("Retry");
+    expect(isInactive(buttonWithText("Retry"))).toBe(false);
   });
 
-  it("shows another checkout idle while the earlier checkout's status is read again", async () => {
+  it("uses the retry state supplied for the selected checkout", async () => {
     h.status = unreadableStatus();
-    let finishRead: (result: unknown) => void = () => undefined;
-    h.refreshStatus.mockImplementation(
-      () =>
-        new Promise((resolve) => {
-          finishRead = resolve;
-        }),
-    );
-    await renderView("/repo/main");
-    await act(async () => buttonWithText("Retry").click());
+    await renderView("/repo/main", true);
+    expect(buttonWithText("Retrying…").textContent).toBe("Retrying…");
     expect(buttonWithText("Retrying…").getAttribute("aria-disabled")).toBe("true");
 
-    await renderView("/repo/other");
-    expect(buttonWithText("Retry").disabled).toBe(false);
+    await renderView("/repo/other", false);
+    expect(buttonWithText("Retry").textContent).toBe("Retry");
+    expect(isInactive(buttonWithText("Retry"))).toBe(false);
 
-    await act(async () => finishRead(AsyncResult.success(unreadableStatus())));
-    expect(buttonWithText("Retry").disabled).toBe(false);
+    await renderView("/repo/main", true);
+    expect(buttonWithText("Retrying…").textContent).toBe("Retrying…");
+    expect(isInactive(buttonWithText("Retrying…"))).toBe(true);
   });
 
   it("explains the unreadable repository rather than the refs failure it causes", async () => {

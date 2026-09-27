@@ -1034,7 +1034,7 @@ describe("GitManagerHistoryView repository generation tracking", () => {
       "Couldn’t refresh history: The environment request failed. Your loaded commits are still available.",
     );
     expect(retryButton()?.textContent).toBe("Retry");
-    expect(retryButton()?.disabled).toBe(false);
+    expect(retryButton()?.getAttribute("aria-disabled")).toBeNull();
     await act(async () => retryButton()?.click());
     expect(h.refreshCommits).toHaveBeenCalledOnce();
 
