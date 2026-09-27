@@ -14,7 +14,7 @@ import * as Cause from "effect/Cause";
 import * as Schema from "effect/Schema";
 import * as AsyncResult from "effect/unstable/reactivity/AsyncResult";
 import { SearchIcon, XIcon } from "lucide-react";
-import { memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useDeferredValue, useMemo, useRef, useState } from "react";
 
 import { Button } from "~/components/ui/button";
 import { RetryButton, type RetryButtonProps } from "~/components/ui/retry-button";
@@ -193,7 +193,6 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
   const readsAvailable = typeof gitManagerEnvironment.getRefs === "function";
   const project = useProject(stableProjectRef);
   const serverConfig = useServerConfigs().get(environmentId) ?? null;
-  const liveSignalAvailable = serverConfig?.environment?.capabilities.gitManagerLiveSignal === true;
 
   const statusAtom = useMemo(
     () => (readsAvailable ? vcsEnvironment.status({ environmentId, input: { cwd } }) : null),
@@ -203,13 +202,6 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
     const getRefs = gitManagerEnvironment.getRefs;
     return typeof getRefs === "function" ? getRefs({ environmentId, input: { cwd } }) : null;
   }, [cwd, environmentId]);
-  const signalAtom = useMemo(
-    () =>
-      readsAvailable && liveSignalAvailable
-        ? gitManagerEnvironment.signalWithDegradedFocusRefresh({ environmentId, input: { cwd } })
-        : null,
-    [cwd, environmentId, liveSignalAvailable, readsAvailable],
-  );
   const latestCommitAtom = useMemo(() => {
     const getCommits = gitManagerEnvironment.getCommits;
     return typeof getCommits === "function"
@@ -218,15 +210,10 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
   }, [cwd, environmentId]);
   const statusQuery = useEnvironmentQuery(statusAtom);
   const refsQuery = useEnvironmentQuery(refsAtom);
-  const signalQuery = useEnvironmentQuery(signalAtom);
   const latestCommitQuery = useEnvironmentQuery(latestCommitAtom);
-  const signalGeneration = signalQuery.data?.generation ?? null;
-  // Signals and finished mutations are automatic reads: they keep a cut-off latched.
+  // Finished mutations revalidate without clearing a transport cut-off.
   const revalidateRefs = refsQuery.revalidate;
   const revalidateLatestCommit = latestCommitQuery.revalidate;
-  useEffect(() => {
-    if (signalGeneration !== null) revalidateRefs();
-  }, [revalidateRefs, signalGeneration]);
 
   const availableEditors = serverConfig?.availableEditors ?? EMPTY_EDITORS;
   const openInPreferredEditor = useOpenInPreferredEditor(environmentId, availableEditors);
