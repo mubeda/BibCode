@@ -1,5 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { textSizesBelowTextXs } from "../../test/uiTypography";
 
 const harness = vi.hoisted(() => ({
   popovers: 0,
@@ -66,6 +67,23 @@ beforeEach(() => {
 });
 
 describe("ContextWindowMeter", () => {
+  it.each([
+    { state: "awaiting data", contextWindowUsage: null },
+    {
+      state: "a known maximum, processed total, and automatic compaction",
+      contextWindowUsage: usage({ totalProcessedTokens: 12_500, compactsAutomatically: true }),
+    },
+    {
+      state: "an unknown maximum",
+      contextWindowUsage: usage({ maxTokens: null, usedPercentage: null }),
+    },
+  ])("follows UI.md typography in the popover with $state", ({ contextWindowUsage }) => {
+    const markup = render({ contextWindowUsage });
+
+    expect.soft(textSizesBelowTextXs(markup)).toEqual([]);
+    expect.soft(markup).not.toMatch(/text-muted-foreground\/\d+/);
+  });
+
   it("renders a disabled tooltip-only control when context usage is unavailable", () => {
     const markup = render({ supported: false, contextWindowUsage: null });
 
