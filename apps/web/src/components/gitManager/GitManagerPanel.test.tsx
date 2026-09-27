@@ -382,7 +382,7 @@ describe("GitManagerPanel", () => {
     expect(markup).toContain("This environment is disconnected.");
     expect(h.catalogAtom).not.toHaveBeenCalled();
     expect(h.signalAtom).not.toHaveBeenCalled();
-    expect(h.queryAtoms).toEqual([null, null]);
+    expect(h.queryAtoms).toEqual([null, null, null]);
   });
 
   it("renders tabs and targets the selected checkout only while ready", () => {

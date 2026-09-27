@@ -1,5 +1,6 @@
 import { RegistryContext } from "@effect/atom-react";
 import { projectKey } from "@bibcode/client-runtime/state/entities";
+import { isQueryTransportCutoff } from "@bibcode/client-runtime/state/runtime";
 import type {
   GitManagerInProgressOperation,
   GitManagerConflictState,
@@ -89,6 +90,12 @@ import { GitManagerTagDialog } from "./tags/GitManagerTagDialog";
 import { GitManagerTagsView, type GitManagerTagRowAction } from "./tags/GitManagerTagsView";
 import { GitManagerOperationBanner } from "./toolbar/GitManagerOperationBanner";
 import { useCheckoutStatusRereads } from "./useCheckoutStatusRereads";
+import { GitManagerRepositoryUnavailable } from "./GitManagerRepositoryUnavailable";
+import {
+  gitManagerRepositoryUnavailableCopy,
+  resolveGitManagerRepositoryUnavailable,
+  type RepositoryUnavailable,
+} from "./gitManagerRepositoryUnavailable";
 
 const EMPTY_WORKTREES: ReadonlyArray<VcsWorktreeDescriptor> = Object.freeze([]);
 const EMPTY_REFS: ReadonlyArray<GitManagerRefEntry> = Object.freeze([]);
@@ -187,6 +194,7 @@ interface GitManagerTabTransitionBaseline {
 }
 
 interface GitManagerRepositorySurfacesProps {
+  readonly repositoryUnavailable: RepositoryUnavailable;
   readonly scope: {
     readonly environmentId: ScopedProjectRef["environmentId"];
     readonly cwd: string;
@@ -209,6 +217,7 @@ interface GitManagerRepositorySurfacesProps {
 const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces({
   scope,
   projectRef,
+  repositoryUnavailable,
   signalGeneration,
   signalPending,
   branchSyncDisabledReason,
@@ -314,30 +323,84 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
   const revalidateRefs = refsQuery.revalidate;
   const refsPending = refsQuery.isPending;
   const revalidateStashes = stashesQuery.revalidate;
-  // This is the sole owner of signal-driven refs revalidation. The first generation
+  const checkout = `${environmentId}\u0000${cwd}`;
+  const repositoryReadable = statusQuery.error === null && statusQuery.data?.isRepo === true;
+  const refsFailure = refsQuery.emission?._tag === "Failure" ? refsQuery.emission.cause : null;
+  const [unavailableRefsFailure, setUnavailableRefsFailure] = useState<{
+    readonly checkout: string;
+    readonly cause: Cause.Cause<unknown>;
+  } | null>(null);
+  if (
+    repositoryUnavailable !== null &&
+    refsFailure !== null &&
+    (unavailableRefsFailure?.checkout !== checkout || unavailableRefsFailure.cause !== refsFailure)
+  ) {
+    setUnavailableRefsFailure({ checkout, cause: refsFailure });
+  }
+  // Keep the failed observation above the tabs so entering Changes mid-recovery cannot
+  // present it as current. Transport cut-offs still need their explicit Retry.
+  const refsRecovering =
+    repositoryReadable &&
+    refsFailure !== null &&
+    !refsQuery.requiresRetry &&
+    !Cause.hasInterruptsOnly(refsFailure) &&
+    !isQueryTransportCutoff(Cause.squash(refsFailure)) &&
+    unavailableRefsFailure?.checkout === checkout &&
+    unavailableRefsFailure.cause === refsFailure;
+  // This is the sole owner of signal/recovery-driven refs revalidation. The first generation
   // per checkout/subscription re-reads only idle refs; an in-flight read covers it.
   // Every later step, including 0 -> 1, re-reads refs so History sees changed commits.
   const refsSignalGenerationRef = useRef<{
+    readonly environmentId: typeof environmentId;
     readonly cwd: string;
     readonly generation: number | null;
+    readonly unavailable: boolean;
   } | null>(null);
   useEffect(() => {
     const baseline = refsSignalGenerationRef.current;
-    const previous = baseline?.cwd === cwd ? baseline.generation : null;
-    refsSignalGenerationRef.current = { cwd, generation: signalGeneration };
-    if (signalGeneration === null) return;
-    if (previous === null ? !refsPending : signalGeneration !== previous) revalidateRefs();
-  }, [cwd, refsPending, revalidateRefs, signalGeneration]);
-  // Opening the pane mounts a fresh stash query, and a signal that (re)subscribes
-  // starts from null while the mounted query reads anyway, so only a step from
-  // one signal generation to the next while the pane is open re-reads the list.
-  const stashSignalGenerationRef = useRef(signalGeneration);
+    const previous =
+      baseline?.cwd === cwd && baseline.environmentId === environmentId ? baseline : null;
+    const recovered = previous?.unavailable === true && repositoryReadable;
+    refsSignalGenerationRef.current = {
+      environmentId,
+      cwd,
+      generation: signalGeneration,
+      unavailable:
+        repositoryUnavailable !== null || (previous?.unavailable === true && !repositoryReadable),
+    };
+    if (repositoryUnavailable !== null) return;
+    const signalChanged =
+      signalGeneration !== null &&
+      (previous?.generation == null ? !refsPending : signalGeneration !== previous.generation);
+    // A repair and its signal may arrive together; one read covers both.
+    if (recovered || signalChanged) revalidateRefs();
+  }, [
+    cwd,
+    environmentId,
+    refsPending,
+    repositoryReadable,
+    repositoryUnavailable,
+    revalidateRefs,
+    signalGeneration,
+  ]);
+
+  // Mounting (including recovery) reads the list. Only later signal steps while
+  // this checkout's query is mounted need an additional read.
+  const stashesEnabled = stashPaneOpen && stashMergeDisabledReason === null;
+  const stashSignalGenerationRef = useRef<{
+    readonly checkout: string;
+    readonly generation: number | null;
+  } | null>(null);
   useEffect(() => {
-    const previous = stashSignalGenerationRef.current;
-    stashSignalGenerationRef.current = signalGeneration;
-    if (!stashPaneOpen || previous === null || signalGeneration === null) return;
+    const baseline = stashSignalGenerationRef.current;
+    const previous = baseline?.checkout === checkout ? baseline.generation : null;
+    stashSignalGenerationRef.current = {
+      checkout,
+      generation: stashesEnabled ? signalGeneration : null,
+    };
+    if (!stashesEnabled || previous === null || signalGeneration === null) return;
     if (signalGeneration !== previous) revalidateStashes();
-  }, [revalidateStashes, signalGeneration, stashPaneOpen]);
+  }, [checkout, revalidateStashes, signalGeneration, stashesEnabled]);
 
   const snapshot: GitManagerRefsSnapshot | null = refsQuery.data ?? null;
   const localBranches = snapshot?.localBranches ?? EMPTY_REFS;
@@ -943,7 +1006,10 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
           onClick={toggleStashPane}
         >
           <ArchiveIcon aria-hidden="true" />
-          Stashes{stashesQuery.data === null ? "" : ` (${stashes.length})`}
+          Stashes
+          {repositoryUnavailable !== null || stashesQuery.data === null
+            ? ""
+            : ` (${stashes.length})`}
         </Button>
         {stashMergeDisabledReason === null ? null : (
           <span className="sr-only" id="git-manager-stash-disabled-reason">
@@ -1079,12 +1145,22 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
           <GitManagerChangesView
             scope={scope}
             projectRef={projectRef}
+            repositoryUnavailable={repositoryUnavailable}
+            refsRecovering={refsRecovering}
             retrying={retrying}
             onRetry={onRetry}
           />
         </TabsPanel>
         <TabsPanel className="min-h-0 flex-1 gap-0 p-4" value="history">
-          {activeTab === "history" ? (
+          {repositoryUnavailable !== null ? (
+            <GitManagerRepositoryUnavailable
+              title="Could not load history"
+              reason={repositoryUnavailable}
+              cwd={cwd}
+              retrying={retrying}
+              onRetry={onRetry}
+            />
+          ) : activeTab === "history" ? (
             <GitManagerHistoryView
               blockedReasons={repositoryBlockedReasons}
               branchSyncDisabledReason={branchSyncDisabledReason}
@@ -1100,7 +1176,15 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
           ) : null}
         </TabsPanel>
         <TabsPanel className="min-h-0 flex-1 gap-0 p-4" value="tags">
-          {activeTab === "tags" ? (
+          {repositoryUnavailable !== null ? (
+            <GitManagerRepositoryUnavailable
+              title="Could not load tags"
+              reason={repositoryUnavailable}
+              cwd={cwd}
+              retrying={retrying}
+              onRetry={onRetry}
+            />
+          ) : activeTab === "tags" ? (
             <GitManagerTagsView
               collapsedSections={collapsedTagSections}
               remotes={snapshot?.remotes ?? EMPTY_REMOTES}
@@ -1223,6 +1307,28 @@ export const GitManagerPanel = memo(function GitManagerPanel({ projectRef }: Git
     () => ({ environmentId, cwd: activeCwd ?? "" }),
     [activeCwd, environmentId],
   );
+  const environmentReady = availability.kind === "ready";
+  const statusAtom = useMemo(
+    () =>
+      environmentReady && activeCwd !== null
+        ? vcsEnvironment.status({ environmentId, input: { cwd: activeCwd } })
+        : null,
+    [activeCwd, environmentId, environmentReady],
+  );
+  const statusQuery = useEnvironmentQuery(statusAtom);
+  const repositoryUnavailable = resolveGitManagerRepositoryUnavailable(
+    statusQuery.error === null ? statusQuery.data : null,
+  );
+  const repositoryDisabledReason =
+    repositoryUnavailable === null
+      ? null
+      : gitManagerRepositoryUnavailableCopy(repositoryUnavailable, activeScope.cwd).message;
+  const effectiveDisabledReasons = {
+    branchSync: repositoryDisabledReason ?? capabilityDisabledReasons.branchSync,
+    stashMerge: repositoryDisabledReason ?? capabilityDisabledReasons.stashMerge,
+    rewrite: repositoryDisabledReason ?? capabilityDisabledReasons.rewrite,
+    tag: repositoryDisabledReason ?? capabilityDisabledReasons.tag,
+  };
   const signalAtom = useMemo(
     () =>
       availability.kind === "ready" &&
@@ -1268,29 +1374,31 @@ export const GitManagerPanel = memo(function GitManagerPanel({ projectRef }: Git
     <GitManagerImageDiffModeProvider projectRef={stableProjectRef}>
       <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col bg-background">
         <GitManagerToolbar
-          branchSyncDisabledReason={capabilityDisabledReasons.branchSync}
+          repositoryUnavailable={repositoryUnavailable}
+          branchSyncDisabledReason={effectiveDisabledReasons.branchSync}
           projectRef={stableProjectRef}
           mainCheckoutCwd={mainCheckoutCwd}
           selectedWorktreeCwd={activeCwd}
           worktrees={worktrees}
           catalogPending={catalog.isPending && catalog.data === null}
           catalogError={catalog.error}
-          stashMergeDisabledReason={capabilityDisabledReasons.stashMerge}
-          tagDisabledReason={capabilityDisabledReasons.tag}
+          stashMergeDisabledReason={effectiveDisabledReasons.stashMerge}
+          tagDisabledReason={effectiveDisabledReasons.tag}
           onSelectedWorktreeChange={handleWorktreeChange}
         />
         <GitManagerRepositorySurfaces
+          repositoryUnavailable={repositoryUnavailable}
           activeTab={viewState.activeTab}
-          branchSyncDisabledReason={capabilityDisabledReasons.branchSync}
+          branchSyncDisabledReason={effectiveDisabledReasons.branchSync}
           liveSignalDisabledReason={capabilityDisabledReasons.liveSignal}
           projectRef={stableProjectRef}
           pullRequestsDisabledReason={capabilityDisabledReasons.pullRequests}
-          rewriteDisabledReason={capabilityDisabledReasons.rewrite}
+          rewriteDisabledReason={effectiveDisabledReasons.rewrite}
           scope={activeScope}
           signalGeneration={signalGeneration}
           signalPending={signalPending}
-          stashMergeDisabledReason={capabilityDisabledReasons.stashMerge}
-          tagDisabledReason={capabilityDisabledReasons.tag}
+          stashMergeDisabledReason={effectiveDisabledReasons.stashMerge}
+          tagDisabledReason={effectiveDisabledReasons.tag}
           tabTransitionBaselineRef={tabTransitionBaselineRef}
           onTabChange={handleTabChange}
         />

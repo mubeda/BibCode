@@ -27,7 +27,9 @@ vi.mock("@legendapp/list/react", () => ({
 
 vi.mock("~/components/ui/popover", () => ({
   Popover: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
-  PopoverTrigger: ({ children }: { children: React.ReactNode }) => <button>{children}</button>,
+  PopoverTrigger: ({ children, ...props }: React.ComponentProps<"button">) => (
+    <button {...props}>{children}</button>
+  ),
   PopoverPopup: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
 }));
 
@@ -80,6 +82,7 @@ async function renderDropdown(
         currentBranchName="main"
         branchDisabledReason={null}
         mergeDisabledReason={null}
+        triggerDisabledReason={null}
         noBranchLabel="Detached HEAD"
         projectRef={projectRef}
         recentNames={[]}
@@ -109,6 +112,20 @@ afterEach(async () => {
 });
 
 describe("GitManagerBranchDropdown", () => {
+  it("disables its trigger with an accessible explanation while the repository is unavailable", async () => {
+    const reason =
+      "Git can't read this repository. Check its .git folder, for example a damaged HEAD or config file.";
+    await renderDropdown([], {
+      currentBranchName: null,
+      noBranchLabel: "No branch",
+      triggerDisabledReason: reason,
+    });
+    const trigger = container.querySelector<HTMLButtonElement>('[aria-label="Choose branch"]');
+    expect(trigger).toMatchObject({ disabled: true, title: reason, textContent: "No branch" });
+    expect(document.getElementById(trigger!.getAttribute("aria-describedby")!)?.textContent).toBe(
+      reason,
+    );
+  });
   it("keeps filter updates isolated from the panel view-state subscription", () => {
     useGitManagerStore.getState().touchProject(projectRef);
     const panelViewState = useGitManagerStore.getState().selectViewState(projectRef);

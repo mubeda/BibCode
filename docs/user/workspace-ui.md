@@ -474,14 +474,18 @@ pending; otherwise the chosen tab stays. The manager also returns to History
 when a checkout with pending changes becomes clean, for example after a commit
 or discard, and selects Changes when a merge starts, since the merge is
 finished there. A clean checkout never pulls the user off the **Tags** tab,
-which is unrelated to the working tree. A repository Git cannot read (for
-example a broken `.git/HEAD` or `.git/config`) is not a clean checkout: the
-chosen tab stays while Git fails and after the repository is repaired.
-Meanwhile **Changes** explains that Git can't read the folder as a repository
-and suggests `git init`, or checking the `.git` folder of an existing
-repository, instead of listing no changes; its **Retry** asks the server to
-read the status again, and the changes load again as soon as Git can read the
-repository.
+which is unrelated to the working tree. A repository Git cannot read is not
+a clean checkout: the chosen tab stays during the failure and after repair.
+**Changes**, **History** and **Tags** show the same explanation with **Retry**:
+no repository (run `git init`); Git can't read it (check `.git`, for example
+HEAD or config); or Git doesn't trust another user's repository (run
+`git config --global --add safe.directory <folder>` with the selected checkout's
+path). When an older server omits the reason, the message suggests `git init`
+or checking an existing repository's `.git` folder. The toolbar shows **No
+branch** and **Sync unavailable**; branch, tag, sync, stash, merge and rebase
+actions are disabled with that reason. Tabs and Worktree stay usable.
+Everything reloads automatically once status reports that Git can read the
+repository again; **Retry** asks the server to check at once.
 
 The **Tags** tab lists local tags newest first, then one collapsible section
 per remote with the tags that remote currently advertises, queried with

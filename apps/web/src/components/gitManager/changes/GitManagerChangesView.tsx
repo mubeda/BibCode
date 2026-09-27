@@ -14,7 +14,7 @@ import * as Cause from "effect/Cause";
 import * as Schema from "effect/Schema";
 import * as AsyncResult from "effect/unstable/reactivity/AsyncResult";
 import { SearchIcon, XIcon } from "lucide-react";
-import { memo, useCallback, useDeferredValue, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 
 import { Button } from "~/components/ui/button";
 import { RetryButton, type RetryButtonProps } from "~/components/ui/retry-button";
@@ -29,6 +29,8 @@ import { useEnvironmentQuery } from "../../../state/query";
 import { shellEnvironment } from "../../../state/shell";
 import { useAtomCommand } from "../../../state/use-atom-command";
 import { vcsEnvironment } from "../../../state/vcs";
+import { GitManagerRepositoryUnavailable } from "../GitManagerRepositoryUnavailable";
+import type { RepositoryUnavailable } from "../gitManagerRepositoryUnavailable";
 import { joinWorkspacePath, parentRelativePath } from "../../files/FileTreeContextMenu.logic";
 import { GitManagerAgentActivity } from "./GitManagerAgentActivity";
 import { GitManagerCommitBox, type GitManagerCommitSubmission } from "./GitManagerCommitBox";
@@ -46,6 +48,9 @@ import {
 export interface GitManagerChangesViewProps {
   readonly scope: { readonly environmentId: EnvironmentId; readonly cwd: string };
   readonly projectRef: ScopedProjectRef;
+  readonly repositoryUnavailable: RepositoryUnavailable;
+  /** The persistent surfaces owner is replacing the refs failure observed during the break. */
+  readonly refsRecovering: boolean;
   readonly retrying: boolean;
   readonly onRetry: () => void;
 }
@@ -73,12 +78,6 @@ const FILTER_NAMES: ReadonlyArray<keyof ChangeFilters> = Object.freeze([
 ]);
 const isEnvironmentRpcUnavailableError = Schema.is(EnvironmentRpcUnavailableError);
 const isGitManagerOperationError = Schema.is(GitManagerOperationError);
-// The status reports both a folder that is no repository and a repository Git cannot read
-// (a broken HEAD or config) as isRepo false, so the copy offers the way out of each. No
-// visible control initializes a repository (the Git Manager performs no repository
-// lifecycle), so it names git init.
-const REPOSITORY_UNREADABLE_MESSAGE =
-  "Git can't read this folder as a repository. Run git init to create one, or check its .git folder if it already is one.";
 
 interface PendingDiscard {
   readonly paths: ReadonlyArray<string>;
@@ -164,6 +163,8 @@ function gitManagerMutationErrorMessage(error: unknown): string {
 export const GitManagerChangesView = memo(function GitManagerChangesView({
   scope,
   projectRef,
+  repositoryUnavailable,
+  refsRecovering,
   retrying,
   onRetry,
 }: GitManagerChangesViewProps) {
@@ -218,6 +219,35 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
   // Finished mutations revalidate without clearing a transport cut-off.
   const revalidateRefs = refsQuery.revalidate;
   const revalidateLatestCommit = latestCommitQuery.revalidate;
+  const repositoryReadable =
+    repositoryUnavailable === null &&
+    statusQuery.error === null &&
+    statusQuery.data?.isRepo === true;
+  const latestCommitFailed = latestCommitQuery.emission?._tag === "Failure";
+  const latestCommitPending = latestCommitQuery.isPending;
+  const retriedLatestCommitRef = useRef(false);
+  useEffect(() => {
+    // Allow one automatic retry per mount or recovery, even if that retry also fails.
+    if (repositoryUnavailable !== null) {
+      retriedLatestCommitRef.current = false;
+      return;
+    }
+    if (
+      !repositoryReadable ||
+      !latestCommitFailed ||
+      latestCommitPending ||
+      retriedLatestCommitRef.current
+    )
+      return;
+    retriedLatestCommitRef.current = true;
+    revalidateLatestCommit();
+  }, [
+    latestCommitFailed,
+    latestCommitPending,
+    repositoryReadable,
+    repositoryUnavailable,
+    revalidateLatestCommit,
+  ]);
 
   const availableEditors = serverConfig?.availableEditors ?? EMPTY_EDITORS;
   const openInPreferredEditor = useOpenInPreferredEditor(environmentId, availableEditors);
@@ -538,16 +568,22 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
 
   const statusUnavailable = isEnvironmentUnavailable(statusQuery.emission);
   const refsUnavailable = isEnvironmentUnavailable(refsQuery.emission);
-  // A healthy status stream reports a folder Git cannot read as a repository (a broken
-  // HEAD or config, or no repository at all) as isRepo false with no files. Say so rather
-  // than "No local changes"; a refs failure at the same time is only its consequence.
-  if (statusQuery.error === null && statusQuery.data?.isRepo === false && !refsUnavailable) {
-    return errorPanel("Could not load changes", REPOSITORY_UNREADABLE_MESSAGE, {
-      retrying,
-      onRetry,
-    });
+  // Changes owns this panel to preserve environment-error precedence; History and Tags unmount.
+  if (repositoryUnavailable !== null && !refsUnavailable) {
+    return (
+      <GitManagerRepositoryUnavailable
+        title="Could not load changes"
+        reason={repositoryUnavailable}
+        cwd={cwd}
+        retrying={retrying}
+        onRetry={onRetry}
+      />
+    );
   }
-  if (statusQuery.error !== null || refsQuery.error !== null) {
+  if (
+    statusQuery.error !== null ||
+    (refsQuery.error !== null && (!refsRecovering || refsUnavailable))
+  ) {
     const message = statusQuery.error ?? refsQuery.error ?? "The environment request failed.";
     // Retry reads again only what failed, through the explicit refresh that clears a cut-off.
     // Without a session no read can run; both resume by themselves once it is back.
@@ -565,7 +601,7 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
       ? errorPanel("Environment unavailable", message, retry)
       : errorPanel("Could not load changes", message, retry);
   }
-  if (statusQuery.data === null || refsQuery.data === null) {
+  if (statusQuery.data === null || refsQuery.data === null || refsRecovering) {
     return (
       <div
         className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground"

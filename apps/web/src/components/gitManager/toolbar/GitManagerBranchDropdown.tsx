@@ -249,6 +249,7 @@ export interface GitManagerBranchDropdownProps {
   readonly currentBranchName: string | null;
   /** Shown instead of a branch name when none is checked out. */
   readonly noBranchLabel: string;
+  readonly triggerDisabledReason: string | null;
   readonly selectedWorktreeCwd: string;
   readonly branchDisabledReason: string | null;
   readonly mergeDisabledReason: string | null;
@@ -266,6 +267,7 @@ export const GitManagerBranchDropdown = memo(function GitManagerBranchDropdown({
   recentNames,
   currentBranchName,
   noBranchLabel,
+  triggerDisabledReason,
   selectedWorktreeCwd,
   branchDisabledReason,
   mergeDisabledReason,
@@ -407,15 +409,28 @@ export const GitManagerBranchDropdown = memo(function GitManagerBranchDropdown({
   );
 
   return (
-    <Popover open={openDropdown === "branch"} onOpenChange={handleOpenChange}>
+    <Popover
+      open={triggerDisabledReason === null && openDropdown === "branch"}
+      onOpenChange={handleOpenChange}
+    >
       <PopoverTrigger
+        aria-describedby={
+          triggerDisabledReason === null ? undefined : "git-manager-branch-trigger-reason"
+        }
         aria-label="Choose branch"
-        className="inline-flex min-w-0 flex-1 items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm outline-none hover:bg-accent focus-visible:ring-2"
+        className="inline-flex min-w-0 flex-1 items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm outline-none hover:bg-accent focus-visible:ring-2 disabled:opacity-60"
+        disabled={triggerDisabledReason !== null}
+        title={triggerDisabledReason ?? undefined}
       >
         <GitBranchIcon aria-hidden="true" className="size-4 shrink-0" />
         <span className="min-w-0 flex-1 truncate">{currentBranchName ?? noBranchLabel}</span>
         <ChevronDownIcon aria-hidden="true" className="size-3.5 shrink-0 opacity-60" />
       </PopoverTrigger>
+      {triggerDisabledReason === null ? null : (
+        <span className="sr-only" id="git-manager-branch-trigger-reason">
+          {triggerDisabledReason}
+        </span>
+      )}
       <PopoverPopup align="start" className="w-[32rem] max-w-[calc(100vw-2rem)] p-0" sideOffset={2}>
         <div className="border-b border-border p-2">
           <label className="relative block">

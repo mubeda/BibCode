@@ -20,7 +20,10 @@ import {
 
 import type { SyncState, SyncStateKind } from "./syncButton.logic";
 
-export type SyncOperationKind = Exclude<SyncStateKind, "running" | "no-remote" | "detached">;
+export type SyncOperationKind = Exclude<
+  SyncStateKind,
+  "running" | "no-remote" | "detached" | "unavailable"
+>;
 
 /** Options confirmed in the push dialog; fetch and pull carry the defaults. */
 export interface SyncOperationOptions {
@@ -101,7 +104,12 @@ export const GitManagerSyncButton = memo(function GitManagerSyncButton({
   const descriptionId = disabled ? "git-manager-sync-disabled-reason" : undefined;
   const activate = useCallback(() => {
     if (disabled) return;
-    if (state.kind === "running" || state.kind === "no-remote" || state.kind === "detached") {
+    if (
+      state.kind === "running" ||
+      state.kind === "no-remote" ||
+      state.kind === "detached" ||
+      state.kind === "unavailable"
+    ) {
       return;
     }
     if (isPushOperation(state.kind)) {
