@@ -1,6 +1,9 @@
 #![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 // Windows compile-checks shared observer fixtures whose integration tests are Unix-only.
 
+#[path = "support/hermetic_providers.rs"]
+mod hermetic_providers;
+
 use std::{
     collections::{BTreeMap, VecDeque},
     future::Future,
@@ -8559,6 +8562,7 @@ async fn agent_activity_hung_factory_does_not_block_terminal_disable_or_later_se
     let configured = fixture.path().join("configured-codex");
     std::fs::write(&configured, b"configured").expect("configured binary");
     let mut config = ServerConfig::new(fixture.path());
+    hermetic_providers::write_hermetic_settings(&config.state_dir(), serde_json::json!({}));
     config.storage_instance_id = Some(StorageInstanceId::from_uuid(Uuid::from_u128(
         0x00000000000040008000000000000005,
     )));

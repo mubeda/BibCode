@@ -1069,6 +1069,10 @@ mod tests {
     async fn startup_removes_a_final_left_by_a_process_aborted_after_publication() {
         let state = TempDir::new().expect("state dir");
         let config = crate::ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
+        crate::test_support::hermetic_providers::write_hermetic_settings(
+            &config.state_dir(),
+            json!({}),
+        );
         let attachments_dir = config.state_dir().join("attachments");
         let ready = state.path().join("published");
         let output = Command::new(std::env::current_exe().expect("test executable"))

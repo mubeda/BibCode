@@ -18,6 +18,17 @@ use tokio::{
     time::timeout,
 };
 
+#[path = "support/hermetic_providers.rs"]
+mod hermetic_providers;
+
+/// Writes hermetic provider settings into `root`'s state directory before any
+/// boot (in-process or the spawned `bibcode` binary) reads it, so neither
+/// probes a real host provider CLI. A later boot from the same `--base-dir`
+/// only reads this file; nothing here re-writes it.
+fn seed_hermetic_settings(root: &std::path::Path) {
+    hermetic_providers::write_hermetic_settings(&ServerConfig::new(root).state_dir(), json!({}));
+}
+
 async fn exchange_startup_admin(handle: &bibcode_server::ServerHandle) -> String {
     let startup = handle.startup_access().expect("startup pairing");
     let exchange = reqwest::Client::new()
@@ -73,6 +84,7 @@ fn headless_binary_exposes_the_compatible_serve_flags() {
 #[tokio::test]
 async fn storage_inspect_prints_one_json_document_for_an_offline_store() {
     let root = TempDir::new().expect("temporary storage root");
+    seed_hermetic_settings(root.path());
     let handle = ServerRuntime::start(ServerConfig::new(root.path()).with_bind("127.0.0.1", 0))
         .await
         .expect("seed inspectable store");
@@ -187,6 +199,7 @@ async fn storage_restore_prints_json_and_restores_the_selected_verified_generati
 #[tokio::test]
 async fn storage_start_empty_exits_nonzero_without_mutating_a_running_store() {
     let root = TempDir::new().expect("temporary active storage root");
+    seed_hermetic_settings(root.path());
     let handle = ServerRuntime::start(ServerConfig::new(root.path()).with_bind("127.0.0.1", 0))
         .await
         .expect("start active storage owner");
@@ -225,6 +238,7 @@ async fn storage_start_empty_exits_nonzero_without_mutating_a_running_store() {
 #[tokio::test]
 async fn pairing_issue_prints_a_credential_the_running_server_exchanges() {
     let root = TempDir::new().expect("temporary storage root");
+    seed_hermetic_settings(root.path());
     let handle = ServerRuntime::start(ServerConfig::new(root.path()).with_bind("127.0.0.1", 0))
         .await
         .expect("start pairing storage owner");
@@ -495,6 +509,7 @@ fn headless_configuration_reads_an_inherited_nonzero_bootstrap_fd() {
 #[tokio::test]
 async fn headless_binary_reads_desktop_bootstrap_and_shuts_down_over_http() {
     let temp = TempDir::new().expect("temporary base directory");
+    seed_hermetic_settings(temp.path());
     let mut child = TokioCommand::new(env!("CARGO_BIN_EXE_bibcode"))
         .args([
             "serve",
@@ -565,6 +580,7 @@ async fn headless_binary_reads_desktop_bootstrap_and_shuts_down_over_http() {
 #[tokio::test]
 async fn pairing_offer_prints_a_code_the_running_server_redeems() {
     let root = TempDir::new().expect("temporary storage root");
+    seed_hermetic_settings(root.path());
     let handle = ServerRuntime::start(ServerConfig::new(root.path()).with_bind("127.0.0.1", 0))
         .await
         .expect("start pairing storage owner");
@@ -665,6 +681,7 @@ fn pairing_offer_fails_closed_without_a_data_store() {
 #[tokio::test]
 async fn pairing_offer_rejects_a_loopback_endpoint_for_another_device() {
     let root = TempDir::new().expect("temporary storage root");
+    seed_hermetic_settings(root.path());
     let handle = ServerRuntime::start(ServerConfig::new(root.path()).with_bind("127.0.0.1", 0))
         .await
         .expect("start pairing storage owner");
@@ -688,6 +705,7 @@ async fn pairing_offer_rejects_a_loopback_endpoint_for_another_device() {
 #[tokio::test]
 async fn serve_on_loopback_prints_no_startup_pairing_code() {
     let temp = TempDir::new().expect("temporary base directory");
+    seed_hermetic_settings(temp.path());
     let mut child = TokioCommand::new(env!("CARGO_BIN_EXE_bibcode"))
         .args(["serve", "--host", "127.0.0.1", "--port", "0", "--base-dir"])
         .arg(temp.path())

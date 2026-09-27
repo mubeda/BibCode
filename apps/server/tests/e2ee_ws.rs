@@ -29,6 +29,8 @@ use tokio_tungstenite::{
 #[path = "support/websocket_frames.rs"]
 mod websocket_frames;
 use websocket_frames::next_frame_past_heartbeat;
+#[path = "support/hermetic_providers.rs"]
+mod hermetic_providers;
 
 const NOISE_NK_PARAMS: &str = "Noise_NK_25519_ChaChaPoly_SHA256";
 const MAX_CIPHERTEXT_BYTES: usize = 65_535;
@@ -49,9 +51,9 @@ static TEST_PERMIT: Semaphore = Semaphore::const_new(1);
 type TestSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 async fn start_server(temp: &TempDir) -> ServerHandle {
-    ServerRuntime::start(ServerConfig::new(temp.path()).with_bind("127.0.0.1", 0))
-        .await
-        .expect("server starts")
+    let config = ServerConfig::new(temp.path()).with_bind("127.0.0.1", 0);
+    hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
+    ServerRuntime::start(config).await.expect("server starts")
 }
 
 fn ws_url(address: SocketAddr, path: &str) -> String {

@@ -1,3 +1,6 @@
+#[path = "support/hermetic_providers.rs"]
+mod hermetic_providers;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
@@ -130,7 +133,13 @@ async fn ordered_input_rpc_delivers_in_order_and_binds_lease_to_physical_socket(
             &mut socket,
             "1",
             "terminal.open",
-            json!({"threadId":"ordered", "terminalId":"term", "cwd":temp.path().to_string_lossy()}),
+            json!({
+                "threadId":"ordered", "terminalId":"term", "cwd":temp.path().to_string_lossy(),
+                "env": {
+                    "HOME": hermetic_providers::isolated_terminal_home(temp.path()),
+                    "USERPROFILE": hermetic_providers::isolated_terminal_home(temp.path()),
+                }
+            }),
         )
         .await,
     );
@@ -321,6 +330,10 @@ async fn workspace_unavailable_rejects_terminal_starts_and_write_but_allows_clos
         "threadId":"thread-guarded",
         "terminalId":"terminal-1",
         "cwd":temp.path().to_string_lossy(),
+        "env": {
+                    "HOME": hermetic_providers::isolated_terminal_home(temp.path()),
+                    "USERPROFILE": hermetic_providers::isolated_terminal_home(temp.path()),
+                },
         "cols":80,
         "rows":24,
     });
@@ -342,6 +355,10 @@ async fn workspace_unavailable_rejects_terminal_starts_and_write_but_allows_clos
                 "threadId":"thread-guarded",
                 "terminalId":"terminal-1",
                 "cwd":temp.path().to_string_lossy(),
+                "env": {
+                    "HOME": hermetic_providers::isolated_terminal_home(temp.path()),
+                    "USERPROFILE": hermetic_providers::isolated_terminal_home(temp.path()),
+                },
                 "restartIfNotRunning":true,
             }),
         ),
@@ -390,6 +407,10 @@ async fn workspace_unavailable_quiesce_retains_transcript_for_read_only_attach()
                 "threadId":"thread-history",
                 "terminalId":"terminal-history",
                 "cwd":temp.path().to_string_lossy(),
+                "env": {
+                    "HOME": hermetic_providers::isolated_terminal_home(temp.path()),
+                    "USERPROFILE": hermetic_providers::isolated_terminal_home(temp.path()),
+                },
                 "cols":80,
                 "rows":24,
             }),
@@ -507,6 +528,10 @@ async fn workspace_loss_fences_inflight_terminal_spawn_before_publication() {
             "threadId":"panel-racing",
             "terminalId":"terminal-racing",
             "cwd":temp.path().to_string_lossy(),
+            "env": {
+                    "HOME": hermetic_providers::isolated_terminal_home(temp.path()),
+                    "USERPROFILE": hermetic_providers::isolated_terminal_home(temp.path()),
+                },
             "cols":80,
             "rows":24,
         }),
@@ -567,6 +592,10 @@ async fn workspace_loss_fences_inflight_terminal_spawn_before_publication() {
                 "threadId":"panel-racing",
                 "terminalId":"terminal-after-loss",
                 "cwd":temp.path().to_string_lossy(),
+                "env": {
+                    "HOME": hermetic_providers::isolated_terminal_home(temp.path()),
+                    "USERPROFILE": hermetic_providers::isolated_terminal_home(temp.path()),
+                },
                 "cols":80,
                 "rows":24,
             }),
@@ -584,13 +613,11 @@ async fn workspace_loss_fences_inflight_terminal_spawn_before_publication() {
 async fn independent_agent_activity_settings_control_routed_rpc_gates_and_trace() {
     let temp = TempDir::new().expect("temporary directory");
     let config = test_config(&temp);
-    std::fs::create_dir_all(config.state_dir()).expect("state directory");
     let trace_path = config.state_dir().join("logs/server.trace.ndjson");
-    std::fs::write(
-        config.state_dir().join("settings.json"),
-        br#"{"enableAgentActivity":false}"#,
-    )
-    .expect("disabled settings fixture");
+    hermetic_providers::write_hermetic_settings(
+        &config.state_dir(),
+        json!({"enableAgentActivity": false}),
+    );
     let handle = ServerRuntime::start(config)
         .await
         .expect("production server starts");
@@ -824,7 +851,10 @@ async fn registrar_serves_concrete_server_and_terminal_metadata_rpcs() {
             "cwd": temp.path().to_string_lossy(),
             "cols": 120,
             "rows": 30,
-            "env": {}
+            "env": {
+                    "HOME": hermetic_providers::isolated_terminal_home(temp.path()),
+                    "USERPROFILE": hermetic_providers::isolated_terminal_home(temp.path()),
+                }
         });
         send_request(socket, "4", "terminal.open", terminal_payload.clone()).await;
         let first = next_message(socket).await;
@@ -1118,7 +1148,10 @@ async fn terminal_rpc_attach_tracks_activity_and_cleans_up_running_child_process
                 "cwd": temp.path().to_string_lossy(),
                 "cols": 120,
                 "rows": 30,
-                "env": {}
+                "env": {
+                    "HOME": hermetic_providers::isolated_terminal_home(temp.path()),
+                    "USERPROFILE": hermetic_providers::isolated_terminal_home(temp.path()),
+                }
             }),
         )
         .await;
@@ -1292,7 +1325,10 @@ async fn terminal_rpc_clear_resize_restart_exit_and_restart_if_not_running_round
                     "cwd": temp.path().to_string_lossy(),
                     "cols": 151,
                     "rows": 50,
-                    "env": {}
+                    "env": {
+                    "HOME": hermetic_providers::isolated_terminal_home(temp.path()),
+                    "USERPROFILE": hermetic_providers::isolated_terminal_home(temp.path()),
+                }
                 }),
             )
             .await,
@@ -1439,7 +1475,10 @@ async fn terminal_rpc_clear_resize_restart_exit_and_restart_if_not_running_round
                     "terminalId": "term-restart",
                     "cwd": temp.path().to_string_lossy(),
                     "rows": 24,
-                    "env": {}
+                    "env": {
+                    "HOME": hermetic_providers::isolated_terminal_home(temp.path()),
+                    "USERPROFILE": hermetic_providers::isolated_terminal_home(temp.path()),
+                }
                 }),
             )
             .await,
@@ -1457,7 +1496,10 @@ async fn terminal_rpc_clear_resize_restart_exit_and_restart_if_not_running_round
                     "cwd": temp.path().to_string_lossy(),
                     "cols": 80,
                     "rows": 20,
-                    "env": {}
+                    "env": {
+                    "HOME": hermetic_providers::isolated_terminal_home(temp.path()),
+                    "USERPROFILE": hermetic_providers::isolated_terminal_home(temp.path()),
+                }
                 }),
             )
             .await,
@@ -1595,6 +1637,10 @@ async fn terminal_rpc_clear_resize_restart_exit_and_restart_if_not_running_round
                 "terminalId": "term-restart",
                 "cwd": temp.path().to_string_lossy(),
                 "restartIfNotRunning": true,
+                "env": {
+                    "HOME": hermetic_providers::isolated_terminal_home(temp.path()),
+                    "USERPROFILE": hermetic_providers::isolated_terminal_home(temp.path()),
+                },
                 "cols": 90,
                 "rows": 25,
             }),
@@ -1750,7 +1796,10 @@ async fn server_terminal_auxiliary_rpcs_surface_runtime_state_validation_and_int
                 "cwd": temp.path().to_string_lossy(),
                 "cols": 120,
                 "rows": 30,
-                "env": {}
+                "env": {
+                    "HOME": hermetic_providers::isolated_terminal_home(temp.path()),
+                    "USERPROFILE": hermetic_providers::isolated_terminal_home(temp.path()),
+                }
             }),
         )
         .await;

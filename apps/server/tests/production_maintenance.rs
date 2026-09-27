@@ -1,3 +1,6 @@
+#[path = "support/hermetic_providers.rs"]
+mod hermetic_providers;
+
 use std::time::Duration;
 
 use bibcode_server::{
@@ -25,23 +28,15 @@ fn desktop_config(root: &std::path::Path, token: &str) -> ServerConfig {
 }
 
 fn disable_provider_processes(root: &std::path::Path) {
-    let settings = root.join("userdata/settings.json");
-    std::fs::create_dir_all(settings.parent().expect("settings parent"))
-        .expect("settings directory");
-    std::fs::write(
-        settings,
-        serde_json::to_vec(&json!({
-            "providers": {
-                "codex": {"enabled": false},
-                "claudeAgent": {"enabled": false},
-                "cursor": {"enabled": false},
-                "grok": {"enabled": false},
-                "opencode": {"enabled": false}
-            }
-        }))
-        .expect("settings JSON"),
-    )
-    .expect("settings fixture");
+    // Maintenance fixtures keep providers disabled as well as pinning their executables.
+    let providers = hermetic_providers::BUILTIN_PROVIDER_DRIVERS
+        .iter()
+        .map(|driver| ((*driver).to_owned(), json!({"enabled": false})))
+        .collect::<serde_json::Map<String, Value>>();
+    hermetic_providers::write_hermetic_settings(
+        &ServerConfig::new(root).state_dir(),
+        json!({"providers": providers}),
+    );
 }
 
 #[tokio::test]
@@ -431,6 +426,10 @@ async fn desktop_prepare_is_authenticated_single_flight_and_cancel_is_identity_b
 #[tokio::test]
 async fn maintenance_routes_are_hidden_outside_local_desktop_mode() {
     let web_root = tempfile::tempdir().expect("web data root");
+    hermetic_providers::write_hermetic_settings(
+        &ServerConfig::new(web_root.path()).state_dir(),
+        json!({}),
+    );
     let web = ServerRuntime::start(ServerConfig::new(web_root.path()).with_bind("127.0.0.1", 0))
         .await
         .expect("web runtime");
@@ -449,6 +448,10 @@ async fn maintenance_routes_are_hidden_outside_local_desktop_mode() {
     web.join().await.expect("web join");
 
     let exposed_root = tempfile::tempdir().expect("exposed data root");
+    hermetic_providers::write_hermetic_settings(
+        &ServerConfig::new(exposed_root.path()).state_dir(),
+        json!({}),
+    );
     let exposed = ServerRuntime::start(
         ServerConfig::new(exposed_root.path())
             .with_bind("0.0.0.0", 0)

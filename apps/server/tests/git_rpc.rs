@@ -1,5 +1,8 @@
 #![allow(dead_code)]
 
+#[path = "support/hermetic_providers.rs"]
+mod hermetic_providers;
+
 use bibcode_server::{git, production::host_paths::process_compatible_path, source_control, vcs};
 
 use std::{
@@ -1958,7 +1961,11 @@ fn pull_request_json_parsers_match_provider_cli_shapes() {
 
 #[tokio::test]
 async fn source_control_discovery_uses_structured_bounded_probes() {
-    let discovery = source_control::SourceControlDiscovery::default()
+    let temp = TempDir::new().expect("discovery fixture");
+    let discovery =
+        source_control::SourceControlDiscovery::with_executable_dir_for_integration_test(
+            hermetic_providers::missing_hosting_executable_dir(temp.path()),
+        )
         .discover(
             std::env::current_dir().expect("current directory"),
             &cancellation(),
