@@ -7,41 +7,44 @@
       "local": {
         "isRepo": false,
         "repositoryUnavailableReason": "unreadable",
-        "hasPrimaryRemote": false,
+        "hasPrimaryRemote": true,
         "isDefaultRef": false,
-        "refName": "^va",
-        "hasWorkingTreeChanges": false,
+        "refName": "ref",
+        "hasWorkingTreeChanges": true,
         "workingTree": {
           "files": [
             {
-              "path": "fF `@[",
-              "insertions": 188559808,
-              "deletions": 645032281,
-              "area": "untracked"
+              "path": "f&[\"Vy>$~\"P",
+              "insertions": 2147483626,
+              "deletions": 13,
+              "status": "renamed"
             },
             {
-              "path": ">}x3]#[:G-",
-              "insertions": 1576334567,
-              "deletions": 804454918,
-              "status": "renamed",
-              "area": "untracked"
+              "path": "VcbBMW",
+              "insertions": 2063773623,
+              "deletions": 1949265014,
+              "area": "unstaged"
             },
             {
-              "path": "YKx",
-              "insertions": 860898350,
-              "deletions": 1053638277,
-              "status": "modified"
+              "path": "Y}%",
+              "insertions": 2147483640,
+              "deletions": 12
+            },
+            {
+              "path": "N[:oNI;Y",
+              "insertions": 1021885809,
+              "deletions": 29,
+              "status": "added"
             }
           ],
-          "insertions": 874630947,
-          "deletions": 2063773623
+          "insertions": 1126509057,
+          "deletions": 2
         }
       },
       "remote": {
-        "hasUpstream": true,
-        "aheadCount": 944040310,
-        "behindCount": 16,
-        "aheadOfDefaultCount": 310915791,
+        "hasUpstream": false,
+        "aheadCount": 1976854562,
+        "behindCount": 2147483621,
         "pr": null
       }
     }

@@ -942,6 +942,7 @@ mod tests {
     fn retains_the_last_summary_as_stale_on_git_or_provider_failure() {
         let initial = VcsStatusSummary {
             is_repo: true,
+            repository_unavailable_reason: None,
             ref_name: Some("feature/test".to_owned()),
             detached_head: None,
             has_working_tree_changes: true,
@@ -1322,6 +1323,7 @@ mod tests {
         };
         let mut named = VcsStatusSummary {
             is_repo: true,
+            repository_unavailable_reason: None,
             ref_name: Some("feature/test".to_owned()),
             detached_head: None,
             has_working_tree_changes: false,

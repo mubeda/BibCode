@@ -122,8 +122,11 @@ flowchart TB
 
   Passive VCS summaries use a separate latest-value producer per canonical
   worktree. One porcelain-v2 status read supplies repository, named/detached or
-  unborn identity, and dirty state without numstat or file-row materialization;
-  the existing bounded origin-provider read and pull-request service add
+  unborn identity, and dirty state without numstat or file-row materialization.
+  A failed porcelain read is classified like the status observation, carrying
+  optional `repositoryUnavailableReason` when `isRepo: false`, while an
+  operational failure in a working repository keeps the prior summary as stale.
+  The existing bounded origin-provider read and pull-request service add
   provider and matching named-branch PR state. Each producer cycle publishes
   its fresh base before optional PR enrichment. A PR completed in cycle N may
   be carried only into cycle N+1 for the same ref and provider while that

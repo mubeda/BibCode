@@ -177,6 +177,8 @@ pub struct VcsSummaryChangeRequest {
 #[serde(rename_all = "camelCase")]
 pub struct VcsStatusSummary {
     pub is_repo: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository_unavailable_reason: Option<VcsRepositoryUnavailableReason>,
     pub ref_name: Option<String>,
     pub detached_head: Option<String>,
     pub has_working_tree_changes: bool,
@@ -184,6 +186,25 @@ pub struct VcsStatusSummary {
     pub pr: Option<VcsSummaryChangeRequest>,
     pub observed_at: String,
     pub stale: bool,
+}
+
+impl VcsStatusSummary {
+    pub(crate) fn non_repository(
+        reason: Option<VcsRepositoryUnavailableReason>,
+        observed_at: String,
+    ) -> Self {
+        Self {
+            is_repo: false,
+            repository_unavailable_reason: reason,
+            ref_name: None,
+            detached_head: None,
+            has_working_tree_changes: false,
+            source_control_provider: None,
+            pr: None,
+            observed_at,
+            stale: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

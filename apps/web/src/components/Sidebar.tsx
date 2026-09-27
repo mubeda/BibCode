@@ -160,6 +160,10 @@ import {
 } from "../threadRoutes";
 import { stackedThreadToast, toastManager } from "./ui/toast";
 import { SettingsSidebarNav } from "./settings/SettingsSidebarNav";
+import {
+  gitManagerRepositoryUnavailableCopy,
+  resolveGitManagerRepositoryUnavailable,
+} from "./gitManager/gitManagerRepositoryUnavailable";
 import { AgentsNavRow } from "./sidebar/AgentsNavRow";
 import { EnvironmentContextCard } from "./sidebar/EnvironmentContextCard";
 import { ServerUpdateBadge, serverUpdateStatusFromQuery } from "./settings/ServerUpdateBadge";
@@ -1229,9 +1233,15 @@ const SidebarPrimaryCard = memo(function SidebarPrimaryCard(props: SidebarPrimar
     }),
   );
   const summary = gitStatus.data;
+  const unavailable = resolveGitManagerRepositoryUnavailable(summary ?? null);
+  const unavailableCopy = unavailable
+    ? gitManagerRepositoryUnavailableCopy(unavailable, project.workspaceRoot)
+    : null;
   const liveBranch = resolveWorkspaceBranchLabel(summary, null);
-  const title = liveBranch ?? primaryThread?.branch ?? project.displayName;
-  const branchName = liveBranch ?? primaryThread?.branch ?? null;
+  const title = unavailable
+    ? project.displayName
+    : (liveBranch ?? primaryThread?.branch ?? project.displayName);
+  const branchName = unavailable ? null : (liveBranch ?? primaryThread?.branch ?? null);
   const primaryThreadRef = useMemo(
     () => (primaryThread ? scopeThreadRef(primaryThread.environmentId, primaryThread.id) : null),
     [primaryThread],
@@ -1254,6 +1264,7 @@ const SidebarPrimaryCard = memo(function SidebarPrimaryCard(props: SidebarPrimar
   const terminalStatus = terminalStatusFromRunningIds(runningTerminalIds);
   const showBranchText = shouldShowWorkspaceBranchText(branchName, title);
   const hasBranchLine =
+    unavailableCopy !== null ||
     showBranchText ||
     prStatus !== null ||
     dirty ||
@@ -1364,6 +1375,11 @@ const SidebarPrimaryCard = memo(function SidebarPrimaryCard(props: SidebarPrimar
         <WorkspaceCardBranchLine
           id={cardIds.branch}
           branch={showBranchText ? branchName : null}
+          notice={
+            unavailableCopy
+              ? { label: unavailableCopy.shortLabel, description: unavailableCopy.message }
+              : null
+          }
           branchTooltip={
             showBranchText
               ? resolveWorkspaceCardBranchTooltip({

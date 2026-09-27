@@ -142,7 +142,12 @@ invalidation, and explicit full refresh all use this owner.
 latest-value stream shares one 30-second producer per canonical cwd and emits
 only repository identity, dirty, provider, matching named-branch PR,
 observation time, and stale state. It performs no numstat, full-file storage,
-or fetch. A finished local mutation or a reported local change (a terminal
+or fetch. After a failed status read, the shared repository probe and bounded
+classifier decide the same optional `repositoryUnavailableReason` as the status
+stream: malformed config or an ownership refusal becomes `isRepo: false`
+instead of an error, with a reason only when the server can tell.
+Clients decode a reason they do not know, in either stream, as absent.
+A finished local mutation or a reported local change (a terminal
 command exiting) for the same worktree starts a fresh cycle at once, so passive
 labels such as the sidebar branch follow a checkout without waiting for the
 deadline; watcher-driven reads of the active status stream do not nudge it.
