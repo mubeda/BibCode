@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use bibcode_server::remote_update::{
     HostUpdaterFuture, HostUpdaterStatus, RemoteUpdateDelegate, RemoteUpdateInstallKind,
-    RemoteUpdateInstallMode, RemoteUpdateState, RemoteUpdateSupport, RemoteUpdateSupportReason,
+    RemoteUpdateInstallMode, RemoteUpdateRequester, RemoteUpdateState, RemoteUpdateSupport,
+    RemoteUpdateSupportReason,
 };
 use serde_json::Value;
 use tauri::{AppHandle, Manager, Runtime};
@@ -99,7 +100,7 @@ impl<R: Runtime> RemoteUpdateDelegate for DesktopRemoteUpdateDelegate<R> {
         })
     }
 
-    fn request_install(&self) -> HostUpdaterFuture {
+    fn request_install(&self, _requester: RemoteUpdateRequester) -> HostUpdaterFuture {
         let app = self.app.clone();
         Box::pin(async move {
             // Start the full host flow in the background and report the host's own
@@ -272,7 +273,9 @@ mod tests {
         let app = host_app(format!("{base_url}/latest.json"));
         let delegate = DesktopRemoteUpdateDelegate::new(app.handle().clone());
 
-        let requested = delegate.request_install().await;
+        let requested = delegate
+            .request_install(RemoteUpdateRequester::default())
+            .await;
         assert!(
             matches!(
                 requested.state,
@@ -293,7 +296,9 @@ mod tests {
         let app = host_app(format!("{base_url}/latest.json"));
         let delegate = DesktopRemoteUpdateDelegate::new(app.handle().clone());
 
-        let requested = delegate.request_install().await;
+        let requested = delegate
+            .request_install(RemoteUpdateRequester::default())
+            .await;
         assert_ne!(
             requested.state,
             RemoteUpdateState::Installing,

@@ -834,6 +834,10 @@ failed count answers the typed `RemoteUpdateActiveWorkError`.
   (`apps/desktop/src-tauri/src/remote_update_delegate.rs`), so remote install
   uses the same update-protection drain as local install and cannot skip backup
   protection.
+  `updater.install` passes the caller's paired-client metadata (label, OS, address
+  when known, and an 8-character session prefix), looked up through
+  `AuthService::list_clients`, to `RemoteUpdateDelegate::request_install`; it
+  never crosses `DesktopBridge`.
 - Headless `bibcode serve` and WSL/external desktop backends run in `manual`
   mode. `updater.check` refreshes the server's own version,
   `latestVersion` remains `null` because the server has no update feed, and
