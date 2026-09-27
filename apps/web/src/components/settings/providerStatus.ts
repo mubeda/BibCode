@@ -39,7 +39,10 @@ export function getProviderSummary(provider: ServerProvider | undefined) {
     return {
       headline: "Disabled",
       detail:
-        provider.message ?? "This provider is installed but disabled for new sessions in BiBCode.",
+        provider.message ??
+        (provider.installed
+          ? "This provider is installed but disabled for new sessions in BiBCode."
+          : "This provider is disabled for new sessions in BiBCode. Turn it on to check whether it is installed."),
     };
   }
   if (!provider.installed) {
