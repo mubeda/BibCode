@@ -30,7 +30,7 @@ import { shellEnvironment } from "../../../state/shell";
 import { useAtomCommand } from "../../../state/use-atom-command";
 import { vcsEnvironment } from "../../../state/vcs";
 import { GitManagerRepositoryUnavailable } from "../GitManagerRepositoryUnavailable";
-import type { RepositoryUnavailable } from "../gitManagerRepositoryUnavailable";
+import type { RepositoryUnavailable } from "../gitManagerRepositoryAvailability";
 import { joinWorkspacePath, parentRelativePath } from "../../files/FileTreeContextMenu.logic";
 import { GitManagerAgentActivity } from "./GitManagerAgentActivity";
 import { GitManagerCommitBox, type GitManagerCommitSubmission } from "./GitManagerCommitBox";
