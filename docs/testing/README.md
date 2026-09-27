@@ -68,6 +68,10 @@ perform real provider update checks, or use the user's HOME, shell rc files,
 or `~/.ssh`. Use test-owned executables, configuration, and temporary roots.
 Real Git may operate on disposable repositories with isolated Git configuration.
 
+Write executable fixtures with `tests/support/executable_fixture.rs` (lib tests:
+`TestSandbox::write_executable`), never in-process `fs::write`/`fs::copy`, to prevent
+fork-inherited writable descriptors from causing `ETXTBSY`.
+
 Harnesses that start a production runtime or `NativeServerControl` with the
 default provider registry use
 [`tests/support/hermetic_providers.rs`](../../apps/server/tests/support/hermetic_providers.rs).

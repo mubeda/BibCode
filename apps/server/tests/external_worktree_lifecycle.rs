@@ -1,6 +1,9 @@
 #[path = "support/hermetic_providers.rs"]
 mod hermetic_providers;
 
+#[path = "support/executable_fixture.rs"]
+mod executable_fixture;
+
 use std::{fs, path::Path, process::Command, time::Duration};
 
 #[cfg(unix)]
@@ -948,8 +951,6 @@ fn write_cwd_recording_codex_fixture(
     cwd_fifo: &Path,
     shutdown_log: &Path,
 ) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-
     let executable = directory.join("codex-cwd-fixture.sh");
     let script = r#"#!/bin/sh
 if [ "$1" = "--version" ]; then
@@ -975,12 +976,7 @@ done
         "__BIBCODE_SHUTDOWN_LOG__",
         &shutdown_log.to_string_lossy(),
     );
-    fs::write(&executable, script).expect("write provider fixture");
-    let mut permissions = fs::metadata(&executable)
-        .expect("provider fixture metadata")
-        .permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(&executable, permissions).expect("provider fixture executable");
+    executable_fixture::write_executable(&executable, script);
     executable
 }
 

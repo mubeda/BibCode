@@ -1090,8 +1090,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn update_command_applies_the_same_case_variant_path_used_for_resolution() {
-        use std::os::unix::fs::PermissionsExt;
-
         let root = tempfile::tempdir().expect("update PATH root");
         let first = root.path().join("first");
         let second = root.path().join("second");
@@ -1099,16 +1097,10 @@ mod tests {
         std::fs::create_dir_all(&second).expect("second PATH directory");
         for (directory, label) in [(&first, "first"), (&second, "second")] {
             let executable = directory.join("manager");
-            std::fs::write(
+            crate::test_support::executable_fixture::write_executable(
                 &executable,
                 format!("#!/bin/sh\nprintf '%s:%s' '{label}' \"$PATH\" > \"$PATH_MARKER\"\n"),
-            )
-            .expect("write manager fixture");
-            let mut permissions = std::fs::metadata(&executable)
-                .expect("manager metadata")
-                .permissions();
-            permissions.set_mode(0o700);
-            std::fs::set_permissions(&executable, permissions).expect("make manager executable");
+            );
         }
         let marker = root.path().join("effective-path");
         let target = ProviderMaintenanceTarget {
@@ -1161,16 +1153,14 @@ mod tests {
         let directory = tempfile::tempdir().expect("update shim directory");
         let winget_capture = directory.path().join("winget-args.txt");
         let npm_capture = directory.path().join("npm-args.txt");
-        std::fs::write(
-            directory.path().join("winget.cmd"),
+        crate::test_support::executable_fixture::write_executable(
+            &directory.path().join("winget.cmd"),
             "@echo off\r\n> \"%WINGET_CAPTURE%\" echo %*\r\nexit /b 0\r\n",
-        )
-        .expect("WinGet shim");
-        std::fs::write(
-            directory.path().join("npm.cmd"),
+        );
+        crate::test_support::executable_fixture::write_executable(
+            &directory.path().join("npm.cmd"),
             "@echo off\r\n> \"%NPM_CAPTURE%\" echo %*\r\nexit /b 0\r\n",
-        )
-        .expect("npm shim");
+        );
         let target = ProviderMaintenanceTarget {
             instance_id: "claude-windows".to_owned(),
             driver: "claudeAgent".to_owned(),

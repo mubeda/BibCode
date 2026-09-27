@@ -1,3 +1,6 @@
+#[path = "support/executable_fixture.rs"]
+mod executable_fixture;
+
 use std::{
     path::{Path, PathBuf},
     time::Duration,
@@ -175,21 +178,7 @@ async fn write_provider_fixture(directory: &TempDir) -> PathBuf {
         "#!/bin/sh\nif [ \"$1\" = \"about\" ]; then\n  echo '{\"cliVersion\":\"9.8.7\",\"userEmail\":\"dev@example.com\",\"subscriptionTier\":\"pro\"}'\nelse\n  echo 'provider 1.0.0'\nfi\n",
     );
     let path = directory.path().join(name);
-    tokio::fs::write(&path, contents)
-        .await
-        .expect("write provider fixture");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let mut permissions = tokio::fs::metadata(&path)
-            .await
-            .expect("provider fixture metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        tokio::fs::set_permissions(&path, permissions)
-            .await
-            .expect("make provider fixture executable");
-    }
+    executable_fixture::write_executable(&path, contents);
     path
 }
 
@@ -247,21 +236,7 @@ async fn write_claude_fixture(directory: &TempDir, version: &str) -> PathBuf {
         ),
     );
     let path = directory.path().join(name);
-    tokio::fs::write(&path, contents)
-        .await
-        .expect("write Claude fixture");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let mut permissions = tokio::fs::metadata(&path)
-            .await
-            .expect("Claude fixture metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        tokio::fs::set_permissions(&path, permissions)
-            .await
-            .expect("make Claude fixture executable");
-    }
+    executable_fixture::write_executable(&path, contents);
     path
 }
 
@@ -354,21 +329,7 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line
         "#!/bin/sh\nexec node \"$(dirname \"$0\")/claude-fixture.mjs\" \"$@\"\n",
     );
     let path = directory.path().join(name);
-    tokio::fs::write(&path, launcher)
-        .await
-        .expect("write discovering Claude launcher");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let mut permissions = tokio::fs::metadata(&path)
-            .await
-            .expect("discovering Claude fixture metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        tokio::fs::set_permissions(&path, permissions)
-            .await
-            .expect("make discovering Claude fixture executable");
-    }
+    executable_fixture::write_executable(&path, launcher);
     path
 }
 

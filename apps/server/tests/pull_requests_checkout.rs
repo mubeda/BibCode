@@ -1,5 +1,8 @@
 #![cfg(unix)]
 //! Checkout tests use real local Git repositories and recording provider stubs.
+#[path = "support/executable_fixture.rs"]
+mod executable_fixture;
+
 use bibcode_server::{
     RequestId, RpcRequest,
     git::{GitRepository, StatusBroadcaster},
@@ -17,7 +20,6 @@ use bibcode_server::{
 use serde_json::{Value, json};
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
@@ -39,8 +41,7 @@ fn git(cwd: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 fn script(path: &Path, source: &str) {
-    fs::write(path, source).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    executable_fixture::write_executable(path, source);
 }
 struct Fixture {
     root: TempDir,

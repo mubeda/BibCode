@@ -10,7 +10,7 @@ use std::{
 #[cfg(unix)]
 use std::{
     ffi::OsStr,
-    io::{Read, Write},
+    io::Read,
     process::{Command, Output, Stdio},
     time::{Duration, Instant},
 };
@@ -193,42 +193,9 @@ impl TestSandbox {
         input
     }
 
-    /// Linux refuses to exec a file held open for writing by any process (`ETXTBSY`).
-    /// A fork on another test thread inherits every open descriptor until exec, so
-    /// writing here can leave a script busy when the test runs it. A short-lived
-    /// child writes the file; this process only sets its mode. A temporary name
-    /// followed by rename cannot help: inherited descriptors refer to the same inode.
     #[cfg(unix)]
     pub(crate) fn write_executable(path: &Path, contents: &str) {
-        use std::os::unix::fs::PermissionsExt;
-
-        let mut child = Command::new("/bin/sh")
-            .args(["-c", "exec cat > \"$1\"", "sh"])
-            .arg(path)
-            .stdin(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap_or_else(|error| {
-                panic!("spawn test fixture writer for {}: {error}", path.display())
-            });
-        let mut stdin = child.stdin.take().expect("test fixture writer stdin");
-        let write_result = stdin.write_all(contents.as_bytes());
-        drop(stdin);
-        let output = child.wait_with_output().unwrap_or_else(|error| {
-            panic!(
-                "wait for test fixture writer for {}: {error}",
-                path.display()
-            )
-        });
-        assert!(
-            output.status.success() && write_result.is_ok(),
-            "write test fixture script {} failed: status {}; stdin: {write_result:?}; stderr:\n{}",
-            path.display(),
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        );
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-            .expect("set test fixture script permissions");
+        super::executable_fixture::write_executable(path, contents);
     }
 
     #[cfg(unix)]
@@ -252,7 +219,7 @@ impl TestSandbox {
         windows_body: &str,
     ) -> PathBuf {
         let path = self.path(format!("{name}.cmd"));
-        std::fs::write(&path, format!("{windows_body}\r\n")).expect("write test fixture script");
+        super::executable_fixture::write_executable(&path, format!("{windows_body}\r\n"));
         path
     }
 
@@ -284,24 +251,27 @@ mod tests {
     use std::{
         io::ErrorKind,
         os::unix::process::CommandExt,
+        panic::RefUnwindSafe,
+        path::{Path, PathBuf},
         process::Command,
         sync::{
             Barrier,
             atomic::{AtomicBool, Ordering},
         },
         thread,
+        time::{Duration, Instant},
     };
 
     use super::TestSandbox;
 
-    #[test]
-    fn executable_scripts_run_during_concurrent_forks() {
-        const CASE: &str = "executable-scripts-concurrent-forks";
-        const TEST_NAME: &str =
-            "test_support::sandbox::tests::executable_scripts_run_during_concurrent_forks";
-
-        let sandbox = TestSandbox::new("executable-scripts-concurrent-forks");
-        if TestSandbox::is_isolated_case(CASE, TEST_NAME) {
+    fn assert_fixtures_run_during_fork_storm(
+        case: &str,
+        test_name: &str,
+        label: &str,
+        make_fixture: impl Fn(&TestSandbox, usize) -> PathBuf + RefUnwindSafe,
+    ) {
+        let sandbox = TestSandbox::new(case);
+        if TestSandbox::is_isolated_case(case, test_name) {
             let stop = AtomicBool::new(false);
             let start = Barrier::new(5);
             thread::scope(|scope| {
@@ -328,21 +298,25 @@ mod tests {
                 start.wait();
 
                 let result = std::panic::catch_unwind(|| {
+                    // Leave room for cleanup before the isolated-case deadline under load.
+                    let deadline = Instant::now() + Duration::from_secs(2);
                     for index in 0..1000 {
-                        let script =
-                            sandbox.executable_script(&format!("fixture-{index}"), "exit 0", "");
-                        match Command::new(&script).status() {
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        let fixture = make_fixture(&sandbox, index);
+                        match Command::new(&fixture).status() {
                             Ok(status) => assert!(
                                 status.success(),
                                 "fixture {} failed: {status}",
-                                script.display()
+                                fixture.display()
                             ),
                             Err(error) if error.kind() == ErrorKind::ExecutableFileBusy => {
                                 panic!(
-                                    "fixture {index} execution hit ETXTBSY: a concurrent fork inherited a writable script descriptor"
+                                    "fixture {index} execution hit ETXTBSY after {index} fixtures executed: a concurrent fork inherited a writable {label} descriptor"
                                 );
                             }
-                            Err(error) => panic!("execute fixture {}: {error}", script.display()),
+                            Err(error) => panic!("execute fixture {}: {error}", fixture.display()),
                         }
                     }
                 });
@@ -355,12 +329,39 @@ mod tests {
             return;
         }
 
-        let output = sandbox.run_isolated_case(CASE, TEST_NAME, &[]);
+        let output = sandbox.run_isolated_case(case, test_name, &[]);
         assert!(
             output.status.success(),
-            "isolated executable-script fork storm failed:\nstdout:\n{}\nstderr:\n{}",
+            "isolated {label} fork storm failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn executable_scripts_run_during_concurrent_forks() {
+        assert_fixtures_run_during_fork_storm(
+            "executable-scripts-concurrent-forks",
+            "test_support::sandbox::tests::executable_scripts_run_during_concurrent_forks",
+            "script",
+            |sandbox, index| sandbox.executable_script(&format!("fixture-{index}"), "exit 0", ""),
+        );
+    }
+
+    #[test]
+    fn copied_executables_run_during_concurrent_forks() {
+        assert_fixtures_run_during_fork_storm(
+            "copied-executables-concurrent-forks",
+            "test_support::sandbox::tests::copied_executables_run_during_concurrent_forks",
+            "copied executable",
+            |sandbox, index| {
+                let fixture = sandbox.path(format!("fixture-{index}"));
+                crate::test_support::executable_fixture::copy_executable(
+                    Path::new("/bin/true"),
+                    &fixture,
+                );
+                fixture
+            },
         );
     }
 }

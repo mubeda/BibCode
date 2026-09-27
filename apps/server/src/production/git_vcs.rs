@@ -5435,7 +5435,6 @@ esac
     #[cfg(unix)]
     #[tokio::test]
     async fn only_an_explicit_source_control_discovery_records_hosts() {
-        use std::os::unix::fs::PermissionsExt;
         let sandbox = crate::test_support::TestSandbox::new("git-vcs-discovery-hosts");
         let bin = sandbox.root().join("bin");
         std::fs::create_dir_all(&bin).expect("bin directory");
@@ -5446,13 +5445,13 @@ esac
             "git.acme.example\n  Logged in to git.acme.example as alice\n",
         )
         .expect("authenticated fixture");
-        std::fs::write(
+        crate::test_support::executable_fixture::write_executable(
             &glab,
-            format!("#!/bin/sh\ncase \"$1\" in\n  --version) echo 'glab 1.114.0' ;;\n  auth) cat '{}' >&2 ;;\nesac\n", auth_output.display()),
-        )
-        .expect("glab script");
-        std::fs::set_permissions(&glab, std::fs::Permissions::from_mode(0o755))
-            .expect("glab permissions");
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'glab 1.114.0' ;;\n  auth) cat '{}' >&2 ;;\nesac\n",
+                auth_output.display()
+            ),
+        );
         let hosts = Arc::new(ProviderHosts::default());
         let repository = Arc::new(GitRepository::default().with_provider_hosts(hosts.clone()));
         let services = GitVcsRpcServices {
@@ -5591,7 +5590,6 @@ esac
             ENVIRONMENT_CASES, assert_child_environment, check_inherited_environment,
         };
         use crate::test_support::reexec;
-        use std::os::unix::fs::PermissionsExt;
 
         const CAPTURE: &str = "BIBCODE_FILE_MANAGER_ENVIRONMENT_CAPTURE";
         const TEST: &str =
@@ -5634,13 +5632,10 @@ esac
             for opener in ["xdg-open", "gio"] {
                 let directory = tempfile::tempdir().expect("file-manager fixture directory");
                 let executable = directory.path().join(opener);
-                std::fs::write(
+                crate::test_support::executable_fixture::write_executable(
                     &executable,
                     "#!/bin/sh\nfor target; do :; done\nprintf '%s' \"$$\" > \"$target.pid.tmp\" && /bin/mv \"$target.pid.tmp\" \"$target.pid\"\n/usr/bin/env -0 > \"$target.tmp\" && /bin/mv \"$target.tmp\" \"$target\"\nexit 9\n",
-                )
-                .expect("opener fixture");
-                std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
-                    .expect("executable opener fixture");
+                );
                 let capture = directory.path().join("environment");
                 reexec::run(TEST, "file-manager", None, |command| {
                     command.env(CAPTURE, &capture).env("PATH", directory.path());

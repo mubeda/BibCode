@@ -7,6 +7,9 @@
 #[path = "support/hermetic_providers.rs"]
 mod hermetic_providers;
 
+#[path = "support/executable_fixture.rs"]
+mod executable_fixture;
+
 use bibcode_server::production::provider_runtime;
 
 use std::{
@@ -193,17 +196,9 @@ fn executable_fixture(
 ) -> PathBuf {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-
         let _ = windows_contents;
         let executable = temp.path().join(format!("{name}.sh"));
-        std::fs::write(&executable, unix_contents).expect("provider fixture should write");
-        let mut permissions = std::fs::metadata(&executable)
-            .expect("provider fixture metadata")
-            .permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&executable, permissions)
-            .expect("provider fixture should be executable");
+        executable_fixture::write_executable(&executable, unix_contents);
         executable
     }
     #[cfg(windows)]
@@ -13103,7 +13098,7 @@ async fn claude_activity_probe_invalidates_on_executable_metadata_and_version_ch
         "#!/bin/sh\nprintf x >> '{}'\n# changed executable metadata and output\ncase \"$1\" in\n  --version) printf '%s\\n' '2.1.219';;\n  --help) printf '%s\\n' '--unrelated-flag';;\n  *) exit 1;;\nesac\n",
         count_path.display()
     );
-    std::fs::write(&executable, second_script).expect("changed probe fixture should write");
+    executable_fixture::write_executable(&executable, second_script);
     let changed = probe_context
         .probe(executable.to_string_lossy().as_ref())
         .await;

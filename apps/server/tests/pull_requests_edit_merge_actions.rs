@@ -4,7 +4,7 @@
 mod pull_request_action_fixture;
 
 use bibcode_server::pull_requests::model::{ActionResult, PullRequestsProvider};
-use pull_request_action_fixture::Fixture;
+use pull_request_action_fixture::{Fixture, executable_fixture};
 use serde_json::{Value, json};
 use std::fs;
 use tokio_util::sync::CancellationToken;
@@ -26,15 +26,14 @@ async fn pull_requests_context_auth_probes_can_follow_all_context_reads() {
         // order must not change which prepared response each command receives.
         let script = f.root.path().join("cli");
         let source = fs::read_to_string(&script).unwrap();
-        fs::write(
-            script,
+        executable_fixture::write_executable(
+            &script,
             source.replacen(
                 "#!/bin/sh\n",
                 "#!/bin/sh\nif [ \"$1\" = --version ]; then\n  until [ -f call-4.argv ]; do sleep 0.01; done\nfi\n",
                 1,
             ),
-        )
-        .unwrap();
+        );
 
         let service = PullRequestsService::with_runner(f.runner.clone());
         let context = service

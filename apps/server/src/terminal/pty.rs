@@ -2218,12 +2218,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn portable_backend_discovers_a_relative_executable_from_the_terminal_cwd() {
-        use std::os::unix::fs::PermissionsExt;
-
         let cwd = tempfile::tempdir().unwrap();
         let executable = cwd.path().join("provider-fixture");
-        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::executable_fixture::write_executable(
+            &executable,
+            "#!/bin/sh\nexit 0\n",
+        );
 
         let process = PortablePtyBackend
             .spawn(&PtySpawnInput {
