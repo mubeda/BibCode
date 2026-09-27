@@ -1092,6 +1092,8 @@ pub fn desktop_bridge_restart_app(
         backend.update_coordination_in_progress(),
         updates.install_in_flight(),
     )?;
+    // If requesting exit fails, Tauri restarts without RunEvent::Exit.
+    crate::relaunch::prepare_descriptors_for_relaunch();
     app.request_restart();
     Ok(())
 }

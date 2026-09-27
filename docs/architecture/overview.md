@@ -333,7 +333,13 @@ the bundled environment; desktop external-backend launches and the generic
 supervised process runner deliberately do not apply this policy. The login-shell
 PATH probe also inherits the original desktop environment: its output hydrates
 the desktop's own PATH before Tauri starts, so stripping bundled entries there
-would change the desktop's executable ordering.
+would change the desktop's executable ordering. Before any Linux relaunch (an
+update restart or **Restart BiBCode**), the host marks every descriptor above
+stderr close-on-exec (`apps/desktop/src-tauri/src/relaunch.rs`), so the new
+process no longer inherits the old AppImage runtime's keep-alive pipe. The old
+FUSE mount, its daemon and the replaced AppImage therefore end with the old
+process; the relaunched app still inherits the old environment, including stale
+`.mount_*` entries behind the new mount's own paths.
 
 The gate checks a few variables before copying the full environment. A nonempty
 `APPIMAGE` and an absolute, non-root `APPDIR` activate isolation. For an
