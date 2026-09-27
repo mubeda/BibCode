@@ -17,9 +17,13 @@ use super::{
     repository::GitManagerSignalHead,
     status_owner::{
         StatusMutationGuard, StatusOutputKind, StatusReadFence, StatusReadKey, StatusReadOwner,
-        StatusSignalCallbacks, WatcherSignalSource, run_status_signal_scheduler,
+        StatusSignalCallbacks, WatcherSignalSource, is_retired_read_error,
+        run_status_signal_scheduler,
     },
 };
+
+// Bound setup retries for pruned or superseded subscribers and stale or retired reads.
+const SETUP_ADMISSION_ATTEMPTS: usize = 3;
 
 #[derive(Clone)]
 pub struct StatusBroadcaster {
@@ -58,6 +62,8 @@ struct Inner {
     retirement_sentinel_finished: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     post_retirement_wait_gate: Mutex<Option<Arc<SubscribeAttemptGate>>>,
+    #[cfg(test)]
+    post_initial_read_gate: Mutex<Option<Arc<SubscribeAttemptGate>>>,
     #[cfg(test)]
     registration_outcome_probe: Mutex<Option<Arc<RegistrationOutcomeProbe>>>,
 }
@@ -241,6 +247,8 @@ impl StatusBroadcaster {
                 #[cfg(test)]
                 post_retirement_wait_gate: Mutex::new(None),
                 #[cfg(test)]
+                post_initial_read_gate: Mutex::new(None),
+                #[cfg(test)]
                 registration_outcome_probe: Mutex::new(None),
             }),
         }
@@ -293,8 +301,10 @@ impl StatusBroadcaster {
         let broadcaster = self.clone();
         let error_cwd = cwd.clone();
         let join_error_cwd = cwd.clone();
-        let caller_cancellation = cancellation.clone();
+        let caller_cancellation = cancellation.child_token();
+        let _caller_lifetime = caller_cancellation.clone().drop_guard();
         let caller_setup_cancellation = setup_cancellation.clone();
+        let subscriber_cancellation = cancellation.clone();
         let setup = {
             let state = self.lock_state();
             if state.closed {
@@ -310,16 +320,21 @@ impl StatusBroadcaster {
                     result = broadcaster.subscribe_inner(
                         cwd,
                         setup_cancellation,
-                        cancellation,
+                        subscriber_cancellation,
                         kind,
                     ) => result,
                 };
                 result
             })
         };
-        setup
+        let result = setup
             .await
-            .unwrap_or_else(|_| Err(broadcaster_shutdown_error(&join_error_cwd)))
+            .unwrap_or_else(|_| Err(broadcaster_shutdown_error(&join_error_cwd)));
+        if self.lock_state().closed || cancellation.is_cancelled() {
+            Err(broadcaster_shutdown_error(&join_error_cwd))
+        } else {
+            result
+        }
     }
 
     async fn subscribe_inner(
@@ -330,6 +345,7 @@ impl StatusBroadcaster {
         kind: SubscriptionKind,
     ) -> Result<BroadcasterSubscription, GitCommandError> {
         let cwd = tokio::fs::canonicalize(&cwd).await.unwrap_or(cwd);
+        let mut admission_attempts = 0;
         loop {
             self.await_retired_lifecycle(&cwd).await;
             #[cfg(test)]
@@ -343,8 +359,14 @@ impl StatusBroadcaster {
             if let Some(gate) = post_retirement_wait_gate {
                 gate.block().await;
             }
-            if self.lock_state().closed {
+            if self.lock_state().closed
+                || setup_cancellation.is_cancelled()
+                || subscriber_cancellation.is_cancelled()
+            {
                 return Err(broadcaster_shutdown_error(&cwd));
+            }
+            if admission_attempts == SETUP_ADMISSION_ATTEMPTS {
+                return Err(setup_admission_error(&cwd));
             }
             let local_refresh_requests = self.inner.status_owner.subscribe_local_refresh(&cwd);
             let roots = self
@@ -376,7 +398,7 @@ impl StatusBroadcaster {
             let repository = Arc::clone(&self.inner.repository);
             let load_cwd = cwd.clone();
             let initial_read_started = tokio::time::Instant::now();
-            let read = self
+            let read = match self
                 .inner
                 .status_owner
                 .read_local(
@@ -391,7 +413,26 @@ impl StatusBroadcaster {
                             .await
                     },
                 )
-                .await?;
+                .await
+            {
+                Ok(read) => read,
+                Err(error) if is_retired_read_error(&error) => {
+                    admission_attempts += 1;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            #[cfg(test)]
+            let post_initial_read_gate = self
+                .inner
+                .post_initial_read_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            #[cfg(test)]
+            if let Some(gate) = post_initial_read_gate {
+                gate.block().await;
+            }
             if self.lock_state().closed {
                 return Err(broadcaster_shutdown_error(&cwd));
             }
@@ -401,106 +442,114 @@ impl StatusBroadcaster {
             #[cfg(test)]
             let retirement_sentinel_finished = Arc::clone(&self.inner.retirement_sentinel_finished);
 
-            let (local, registration) =
-                self.inner.status_owner.publish_if_current(read, |local| {
-                    let mut state = self.lock_state();
-                    if state.closed {
-                        return None;
-                    }
-                    if state.retiring.contains_key(&cwd) {
-                        return Some(Err(()));
-                    }
-                    let subscriber_id = state.next_subscriber_id;
-                    state.next_subscriber_id = state.next_subscriber_id.wrapping_add(1);
-                    let start_poller = !state.repositories.contains_key(&cwd);
-                    let entry = state.repositories.entry(cwd.clone()).or_insert_with(|| {
-                        let (remote_refresh_requests, _) = watch::channel(0);
-                        let (git_manager_signal, _) = watch::channel(GitManagerSignal {
-                            generation: 0,
-                            watcher_degraded: watcher.current_health()
-                                == GitWatcherHealth::FallbackRequired,
-                        });
-                        let tasks = TaskTracker::new();
-                        let retirement_cancellation = CancellationToken::new();
-                        let retirement_wait = retirement_cancellation.clone();
-                        tasks.spawn(async move {
-                            retirement_wait.cancelled().await;
-                            #[cfg(test)]
-                            retirement_sentinel_finished.notify_waiters();
-                        });
-                        RepositoryState {
-                            lifecycle_id: subscriber_id,
-                            repository_key: None,
-                            local: local.clone(),
-                            remote: None,
-                            remote_fence: None,
-                            remote_ref_name: None,
-                            pending_local_reconcile: false,
-                            remote_refresh_requests,
-                            git_manager_signature: None,
-                            git_manager_signal,
-                            git_manager_read_lock: Arc::new(AsyncMutex::new(())),
-                            git_manager_common_dir: resolved_common_dir.clone(),
-                            subscribers: HashMap::new(),
-                            poller_cancellation: CancellationToken::new(),
-                            retirement_cancellation,
-                            tasks,
-                        }
+            let registration = self.inner.status_owner.publish_if_current(read, |local| {
+                let mut state = self.lock_state();
+                if state.closed {
+                    return None;
+                }
+                if state.retiring.contains_key(&cwd) {
+                    return Some(Err(()));
+                }
+                let subscriber_id = state.next_subscriber_id;
+                state.next_subscriber_id = state.next_subscriber_id.wrapping_add(1);
+                let start_poller = !state.repositories.contains_key(&cwd);
+                let entry = state.repositories.entry(cwd.clone()).or_insert_with(|| {
+                    let (remote_refresh_requests, _) = watch::channel(0);
+                    let (git_manager_signal, _) = watch::channel(GitManagerSignal {
+                        generation: 0,
+                        watcher_degraded: watcher.current_health()
+                            == GitWatcherHealth::FallbackRequired,
                     });
-                    if entry.local != *local {
-                        let ref_changed = entry.local.ref_name != local.ref_name;
-                        entry.local = local.clone();
-                        reconcile_remote_after_local_publication(entry, ref_changed);
-                        publish(
-                            entry,
-                            VcsStatusStreamEvent::LocalUpdated {
-                                local: local.clone(),
-                            },
-                            &fence,
-                        );
-                    } else {
-                        reconcile_remote_after_local_publication(entry, false);
+                    let tasks = TaskTracker::new();
+                    let retirement_cancellation = CancellationToken::new();
+                    let retirement_wait = retirement_cancellation.clone();
+                    tasks.spawn(async move {
+                        retirement_wait.cancelled().await;
+                        #[cfg(test)]
+                        retirement_sentinel_finished.notify_waiters();
+                    });
+                    RepositoryState {
+                        lifecycle_id: subscriber_id,
+                        repository_key: None,
+                        local: local.clone(),
+                        remote: None,
+                        remote_fence: None,
+                        remote_ref_name: None,
+                        pending_local_reconcile: false,
+                        remote_refresh_requests,
+                        git_manager_signature: None,
+                        git_manager_signal,
+                        git_manager_read_lock: Arc::new(AsyncMutex::new(())),
+                        git_manager_common_dir: resolved_common_dir.clone(),
+                        subscribers: HashMap::new(),
+                        poller_cancellation: CancellationToken::new(),
+                        retirement_cancellation,
+                        tasks,
                     }
-                    entry.subscribers.insert(
-                        subscriber_id,
-                        match kind {
-                            SubscriptionKind::Status => RepositorySubscriber::Status(sender),
-                            SubscriptionKind::GitManager => RepositorySubscriber::GitManager,
+                });
+                if entry.local != *local {
+                    let ref_changed = entry.local.ref_name != local.ref_name;
+                    entry.local = local.clone();
+                    reconcile_remote_after_local_publication(entry, ref_changed);
+                    publish(
+                        entry,
+                        VcsStatusStreamEvent::LocalUpdated {
+                            local: local.clone(),
                         },
+                        &fence,
                     );
-                    let lifecycle_insertion_reservation = start_poller.then(|| entry.tasks.token());
-                    let initial_remote = (entry.remote_fence.as_ref() == Some(&fence)
-                        && entry.remote_ref_name.as_ref() == Some(&local.ref_name))
-                    .then(|| entry.remote.clone().flatten())
-                    .flatten();
-                    if let Some(RepositorySubscriber::Status(subscriber)) =
-                        entry.subscribers.get(&subscriber_id)
-                    {
-                        subscriber
-                            .try_send(StatusPublication {
-                                value: VcsStatusStreamEvent::Snapshot {
-                                    local: local.clone(),
-                                    remote: initial_remote,
-                                },
+                } else {
+                    reconcile_remote_after_local_publication(entry, false);
+                }
+                entry.subscribers.insert(
+                    subscriber_id,
+                    match kind {
+                        SubscriptionKind::Status => RepositorySubscriber::Status(sender),
+                        SubscriptionKind::GitManager => RepositorySubscriber::GitManager,
+                    },
+                );
+                let lifecycle_insertion_reservation = start_poller.then(|| entry.tasks.token());
+                let initial_remote = (entry.remote_fence.as_ref() == Some(&fence)
+                    && entry.remote_ref_name.as_ref() == Some(&local.ref_name))
+                .then(|| entry.remote.clone().flatten())
+                .flatten();
+                if let Some(RepositorySubscriber::Status(subscriber)) =
+                    entry.subscribers.get(&subscriber_id)
+                {
+                    subscriber
+                        .try_send(StatusPublication {
+                            value: VcsStatusStreamEvent::Snapshot {
                                 local: local.clone(),
-                                fence: fence.clone(),
-                            })
-                            .expect("new bounded subscription has capacity for its snapshot");
-                    }
-                    Some(Ok((
-                        subscriber_id,
-                        start_poller,
-                        entry.poller_cancellation.clone(),
-                        local_refresh_requests,
-                        entry.remote_refresh_requests.subscribe(),
-                        entry.remote_refresh_requests.clone(),
-                        entry.git_manager_signal.subscribe(),
-                        entry.lifecycle_id,
-                        entry.repository_key.clone(),
-                        entry.tasks.clone(),
-                        lifecycle_insertion_reservation,
-                    )))
-                })?;
+                                remote: initial_remote,
+                            },
+                            local: local.clone(),
+                            fence: fence.clone(),
+                        })
+                        .expect("new bounded subscription has capacity for its snapshot");
+                }
+                Some(Ok((
+                    subscriber_id,
+                    start_poller,
+                    entry.poller_cancellation.clone(),
+                    local_refresh_requests,
+                    entry.remote_refresh_requests.subscribe(),
+                    entry.remote_refresh_requests.clone(),
+                    entry.git_manager_signal.subscribe(),
+                    entry.lifecycle_id,
+                    entry.repository_key.clone(),
+                    entry.tasks.clone(),
+                    lifecycle_insertion_reservation,
+                )))
+            });
+            let (local, registration) = match registration {
+                Ok(registration) => registration,
+                Err(error) if is_retired_read_error(&error) => {
+                    // A rejected read never invokes the registration callback.
+                    admission_attempts += 1;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let registration = match registration {
                 None => return Err(broadcaster_shutdown_error(&cwd)),
                 Some(Err(())) => {
@@ -543,6 +592,27 @@ impl StatusBroadcaster {
                 lifecycle_tasks,
                 lifecycle_insertion_reservation,
             ) = registration;
+            admission_attempts += 1;
+            // Own release() cleanup across every setup await, retry, and cancellation.
+            let subscription = match kind {
+                SubscriptionKind::Status => BroadcasterSubscription::Status(StatusSubscription {
+                    receiver,
+                    cancellation: subscriber_cancellation.clone(),
+                    broadcaster: self.clone(),
+                    cwd: cwd.clone(),
+                    subscriber_id,
+                }),
+                SubscriptionKind::GitManager => {
+                    BroadcasterSubscription::GitManager(GitManagerSignalSubscription {
+                        receiver: git_manager_signal,
+                        pending_initial: true,
+                        cancellation: subscriber_cancellation.clone(),
+                        broadcaster: self.clone(),
+                        cwd: cwd.clone(),
+                        subscriber_id,
+                    })
+                }
+            };
             #[cfg(test)]
             let registration_gate = self
                 .inner
@@ -554,17 +624,14 @@ impl StatusBroadcaster {
             if let Some(gate) = registration_gate {
                 gate.block(&lifecycle_tasks).await;
             }
-            {
+            let admitted = {
                 let state = self.lock_state();
                 let admitted = !state.closed
                     && state.repositories.get(&cwd).is_some_and(|entry| {
                         entry.lifecycle_id == lifecycle_id
                             && entry.subscribers.contains_key(&subscriber_id)
                     });
-                if !admitted {
-                    return Err(broadcaster_shutdown_error(&cwd));
-                }
-                if let Some(repository_key) = repository_key {
+                if admitted && let Some(repository_key) = repository_key {
                     self.inner.fetch_owner.attach(
                         repository_key,
                         cwd.clone(),
@@ -573,6 +640,10 @@ impl StatusBroadcaster {
                         remote_reconcile,
                     );
                 }
+                admitted
+            };
+            if !admitted {
+                continue;
             }
             #[cfg(test)]
             let insertion_gate = self
@@ -620,27 +691,9 @@ impl StatusBroadcaster {
                     })
             };
             if !admitted {
-                return Err(broadcaster_shutdown_error(&cwd));
+                continue;
             }
-            return Ok(match kind {
-                SubscriptionKind::Status => BroadcasterSubscription::Status(StatusSubscription {
-                    receiver,
-                    cancellation: subscriber_cancellation,
-                    broadcaster: self.clone(),
-                    cwd,
-                    subscriber_id,
-                }),
-                SubscriptionKind::GitManager => {
-                    BroadcasterSubscription::GitManager(GitManagerSignalSubscription {
-                        receiver: git_manager_signal,
-                        pending_initial: true,
-                        cancellation: subscriber_cancellation,
-                        broadcaster: self.clone(),
-                        cwd,
-                        subscriber_id,
-                    })
-                }
-            });
+            return Ok(subscription);
         }
     }
 
@@ -1341,6 +1394,17 @@ impl StatusBroadcaster {
     }
 
     #[cfg(test)]
+    fn install_post_initial_read_gate_for_test(&self) -> Arc<SubscribeAttemptGate> {
+        let gate = Arc::new(SubscribeAttemptGate::default());
+        *self
+            .inner
+            .post_initial_read_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&gate));
+        gate
+    }
+
+    #[cfg(test)]
     fn install_registration_outcome_probe_for_test(&self) -> Arc<RegistrationOutcomeProbe> {
         let probe = Arc::new(RegistrationOutcomeProbe::default());
         *self
@@ -2019,6 +2083,19 @@ fn broadcaster_shutdown_error(cwd: &Path) -> GitCommandError {
         cwd: cwd.to_string_lossy().into_owned().into_boxed_str(),
         diagnostics: None,
         detail: "Git status broadcaster is shut down.".into(),
+    }
+}
+
+fn setup_admission_error(cwd: &Path) -> GitCommandError {
+    GitCommandError {
+        tag: "GitCommandError",
+        operation: "GitStatusBroadcaster.subscribe".into(),
+        command: "git".into(),
+        cwd: cwd.to_string_lossy().into_owned().into_boxed_str(),
+        diagnostics: None,
+        detail:
+            "The Git status subscription fell behind while it was being set up. Subscribe again."
+                .into(),
     }
 }
 
@@ -3470,7 +3547,14 @@ mod tests {
         let result = second
             .await
             .expect("post-registration subscriber must not panic");
-        assert!(result.is_err(), "shutdown rejects the in-flight subscriber");
+        assert_eq!(
+            result
+                .err()
+                .expect("shutdown rejects the in-flight subscriber")
+                .detail
+                .as_ref(),
+            "Git status broadcaster is shut down."
+        );
         shutdown.await.expect("shutdown task joins");
         while existing.recv().await.is_some() {}
         assert_eq!(
@@ -3530,15 +3614,739 @@ mod tests {
         }
 
         gate.release();
-        assert!(
+        assert_eq!(
             subscription
                 .await
                 .expect("subscription task joins")
-                .is_err(),
-            "shutdown rejects the first subscriber"
+                .err()
+                .expect("shutdown rejects the first subscriber")
+                .detail
+                .as_ref(),
+            "Git status broadcaster is shut down."
         );
         shutdown.await.expect("shutdown task joins");
         assert_eq!(broadcaster.active_poller_count(), 0);
+    }
+
+    struct SetupAdmissionGitRunner {
+        inner: EpochGitRunner,
+        local_calls: AtomicUsize,
+        fail_next_local_read: AtomicBool,
+        local_read_gate: Mutex<Option<Arc<SubscribeAttemptGate>>>,
+    }
+
+    impl SetupAdmissionGitRunner {
+        fn new(inner: EpochGitRunner) -> Self {
+            Self {
+                inner,
+                local_calls: AtomicUsize::new(0),
+                fail_next_local_read: AtomicBool::new(false),
+                local_read_gate: Mutex::new(None),
+            }
+        }
+
+        fn gate_local_read(&self) -> Arc<SubscribeAttemptGate> {
+            let gate = Arc::new(SubscribeAttemptGate::default());
+            *self.local_read_gate.lock().expect("local read gate lock") = Some(Arc::clone(&gate));
+            gate
+        }
+    }
+
+    impl GitProcessRunner for SetupAdmissionGitRunner {
+        fn run<'a>(
+            &'a self,
+            request: ProcessRequest,
+            cancellation: &'a CancellationToken,
+        ) -> BoxGitProcessFuture<'a> {
+            Box::pin(async move {
+                if request.operation == "GitVcsDriver.statusDetailsLocal.status" {
+                    self.local_calls.fetch_add(1, Ordering::SeqCst);
+                    let gate = self
+                        .local_read_gate
+                        .lock()
+                        .expect("local read gate lock")
+                        .take();
+                    if let Some(gate) = gate {
+                        tokio::select! {
+                            biased;
+                            () = cancellation.cancelled() => {
+                                return Err(ProcessError::Cancelled {
+                                    operation: request.operation,
+                                });
+                            }
+                            () = gate.block() => {}
+                        }
+                    }
+                    if self.fail_next_local_read.swap(false, Ordering::SeqCst) {
+                        return Err(ProcessError::NonZeroExit {
+                            operation: request.operation,
+                            exit_code: 1,
+                            stdout_length: 0,
+                            stderr_length: 24,
+                            stdout: String::new().into_boxed_str(),
+                            stderr: "controlled local failure".into(),
+                        });
+                    }
+                }
+                // Only the test's explicit local refreshes may fill the setup channel.
+                if request.operation == "GitVcsDriver.statusDetailsRemote.status" {
+                    cancellation.cancelled().await;
+                    return Err(ProcessError::Cancelled {
+                        operation: request.operation,
+                    });
+                }
+                self.inner.run(request, cancellation).await
+            })
+        }
+    }
+
+    enum SetupAdmissionGate {
+        BeforeAttachment(Arc<SubscriptionRegistrationGate>),
+        AfterAttachment(Arc<LifecycleInsertionGate>),
+    }
+
+    impl SetupAdmissionGate {
+        async fn wait(&self) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                match self {
+                    Self::BeforeAttachment(gate) => gate.wait_until_entered().await,
+                    Self::AfterAttachment(gate) => gate.wait_until_entered().await,
+                }
+            })
+            .await
+            .expect("subscription reaches the setup admission gate");
+        }
+
+        fn release(&self) {
+            match self {
+                Self::BeforeAttachment(gate) => gate.release(),
+                Self::AfterAttachment(gate) => gate.release(),
+            }
+        }
+    }
+
+    struct SetupAdmissionFixture {
+        _sandbox: TestSandbox,
+        cwd: PathBuf,
+        runner: Arc<SetupAdmissionGitRunner>,
+        broadcaster: StatusBroadcaster,
+        keeper: Option<GitManagerSignalSubscription>,
+    }
+
+    impl SetupAdmissionFixture {
+        async fn new() -> Self {
+            let sandbox = TestSandbox::new("git-broadcaster-setup-admission");
+            let cwd = sandbox.path("repository");
+            fs::create_dir_all(&cwd).expect("repository fixture");
+            let cwd = fs::canonicalize(cwd).expect("canonical repository fixture");
+            let (ref_started, _) = mpsc::unbounded_channel();
+            let (remote_started, _) = mpsc::unbounded_channel();
+            let runner = Arc::new(SetupAdmissionGitRunner::new(EpochGitRunner {
+                branch: Mutex::new("main".to_owned()),
+                ref_calls: AtomicUsize::new(0),
+                remote_calls: AtomicUsize::new(0),
+                ref_started,
+                remote_started,
+                release_ref: Arc::new(Semaphore::new(16)),
+                release_remote: Arc::new(Semaphore::new(16)),
+            }));
+            let broadcaster = StatusBroadcaster::new(
+                Arc::new(GitRepository::with_runner_for_test(runner.clone())),
+                Duration::from_secs(3_600),
+                2,
+            );
+            let keeper = broadcaster
+                .subscribe_git_manager_signal(cwd.clone(), CancellationToken::new())
+                .await
+                .expect("keeper keeps the lifecycle alive without status backpressure");
+            broadcaster
+                .inner
+                .fetch_owner
+                .wait_for_worktree_count_for_test(1)
+                .await;
+            Self {
+                _sandbox: sandbox,
+                cwd,
+                runner,
+                broadcaster,
+                keeper: Some(keeper),
+            }
+        }
+
+        fn gate(&self, after_attachment: bool) -> SetupAdmissionGate {
+            if after_attachment {
+                SetupAdmissionGate::AfterAttachment(
+                    self.broadcaster.install_lifecycle_insertion_gate_for_test(),
+                )
+            } else {
+                SetupAdmissionGate::BeforeAttachment(
+                    self.broadcaster
+                        .install_subscription_registration_gate_for_test(),
+                )
+            }
+        }
+
+        fn subscribe(
+            &self,
+            cancellation: CancellationToken,
+        ) -> tokio::task::JoinHandle<Result<StatusSubscription, GitCommandError>> {
+            let broadcaster = self.broadcaster.clone();
+            let cwd = self.cwd.clone();
+            tokio::spawn(async move { broadcaster.subscribe(cwd, cancellation).await })
+        }
+
+        fn latest_subscriber_id(&self) -> u64 {
+            self.broadcaster.lock_state().next_subscriber_id - 1
+        }
+
+        fn is_attached(&self, subscriber_id: u64) -> bool {
+            self.broadcaster
+                .inner
+                .fetch_owner
+                .has_subscriber_for_test(&self.cwd, subscriber_id)
+        }
+
+        async fn prune(&self) -> u64 {
+            let subscriber_id = self.latest_subscriber_id();
+            for branch in ["abandoned-event", "current"] {
+                self.runner.inner.set_branch(branch);
+                self.broadcaster
+                    .refresh_local(&self.cwd, &CancellationToken::new())
+                    .await
+                    .expect("local update fills then prunes the setup subscriber");
+            }
+            assert!(
+                !self.broadcaster.lock_state().repositories[&self.cwd]
+                    .subscribers
+                    .contains_key(&subscriber_id)
+            );
+            subscriber_id
+        }
+
+        async fn assert_fresh_stream(&self, subscription: &mut StatusSubscription) {
+            assert!(matches!(
+                subscription.recv().await,
+                Some(VcsStatusStreamEvent::Snapshot { local, .. })
+                    if local.ref_name.as_deref() == Some("current")
+            ));
+            assert!(
+                matches!(
+                    subscription.receiver.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ),
+                "abandoned snapshots and events must not reach the fresh stream"
+            );
+            self.runner.inner.set_branch("after-setup");
+            self.broadcaster
+                .refresh_local(&self.cwd, &CancellationToken::new())
+                .await
+                .expect("healthy stream refreshes");
+            assert!(matches!(
+                subscription.recv().await,
+                Some(VcsStatusStreamEvent::LocalUpdated { local })
+                    if local.ref_name.as_deref() == Some("after-setup")
+            ));
+        }
+    }
+
+    async fn assert_setup_admission_retries(after_attachment: bool) {
+        let fixture = SetupAdmissionFixture::new().await;
+        let gate = fixture.gate(after_attachment);
+        let subscribing = fixture.subscribe(CancellationToken::new());
+        gate.wait().await;
+        let abandoned_id = fixture.prune().await;
+        assert_eq!(fixture.is_attached(abandoned_id), after_attachment);
+        fixture
+            .broadcaster
+            .inner
+            .subscription_registration_gate
+            .lock()
+            .expect("registration gate lock")
+            .take();
+        gate.release();
+        let mut subscription = subscribing
+            .await
+            .expect("subscription task joins")
+            .expect("backpressure during setup retries instead of reporting shutdown");
+        assert_ne!(subscription.subscriber_id, abandoned_id);
+        assert!(!fixture.is_attached(abandoned_id));
+        assert!(fixture.is_attached(subscription.subscriber_id));
+        fixture.assert_fresh_stream(&mut subscription).await;
+        drop(subscription);
+        fixture.broadcaster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn setup_admission_retries_before_fetch_attachment() {
+        assert_setup_admission_retries(false).await;
+    }
+
+    #[tokio::test]
+    async fn setup_admission_retries_after_fetch_attachment_without_leaking() {
+        assert_setup_admission_retries(true).await;
+    }
+
+    #[tokio::test]
+    async fn setup_retired_read_retries_after_final_subscriber_retires() {
+        let mut fixture = SetupAdmissionFixture::new().await;
+        let next_subscriber_id = fixture.broadcaster.lock_state().next_subscriber_id;
+        let local_calls = fixture.runner.local_calls.load(Ordering::SeqCst);
+        let gate = fixture.runner.gate_local_read();
+        let subscribing = fixture.subscribe(CancellationToken::new());
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_until_entered())
+            .await
+            .expect("subscription's setup read is running");
+
+        // Final release advances the epoch and cancels this physical read before
+        // it can return, so read_local itself reports the retirement.
+        fixture.runner.inner.set_branch("current");
+        drop(fixture.keeper.take());
+        assert_eq!(fixture.broadcaster.active_poller_count(), 0);
+
+        let mut subscription = tokio::time::timeout(Duration::from_secs(5), subscribing)
+            .await
+            .expect("retired setup read retry settles")
+            .expect("subscription task joins")
+            .expect("a read retired during setup retries with a fresh snapshot");
+        assert_eq!(
+            fixture.runner.local_calls.load(Ordering::SeqCst),
+            local_calls + 2
+        );
+        assert_eq!(
+            subscription.subscriber_id, next_subscriber_id,
+            "the retired read must not register a subscriber"
+        );
+        fixture.assert_fresh_stream(&mut subscription).await;
+        drop(subscription);
+        fixture.broadcaster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn setup_retired_read_exhaustion_reports_backpressure_without_registering() {
+        let fixture = SetupAdmissionFixture::new().await;
+        let next_subscriber_id = fixture.broadcaster.lock_state().next_subscriber_id;
+        let local_calls = fixture.runner.local_calls.load(Ordering::SeqCst);
+        let mut gate = fixture.runner.gate_local_read();
+        let mut subscribing = fixture.subscribe(CancellationToken::new());
+        for attempt in 1..=3 {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::select! {
+                    result = &mut subscribing => panic!(
+                        "setup stopped before retired-read attempt {attempt}: {:?}",
+                        result.expect("subscription task joins").err()
+                    ),
+                    () = gate.wait_until_entered() => {}
+                }
+            })
+            .await
+            .expect("each setup read starts before retirement");
+            let next_gate = fixture.runner.gate_local_read();
+            fixture
+                .broadcaster
+                .inner
+                .status_owner
+                .cancel_reads(&fixture.cwd);
+            gate = next_gate;
+        }
+
+        let error = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = &mut subscribing => result
+                    .expect("subscription task joins")
+                    .err()
+                    .expect("persistently retired setup reads have a bounded failure"),
+                () = gate.wait_until_entered() => panic!("setup must stop after three retired reads"),
+            }
+        })
+        .await
+        .expect("retired setup reads exhaust their bound");
+        assert_eq!(error.operation.as_ref(), "GitStatusBroadcaster.subscribe");
+        assert_eq!(
+            error.detail.as_ref(),
+            "The Git status subscription fell behind while it was being set up. Subscribe again."
+        );
+        assert_eq!(
+            fixture.runner.local_calls.load(Ordering::SeqCst),
+            local_calls + 3
+        );
+        assert_eq!(
+            fixture.broadcaster.lock_state().next_subscriber_id,
+            next_subscriber_id
+        );
+        assert_eq!(
+            fixture
+                .broadcaster
+                .active_status_subscriber_count_for_test(),
+            0
+        );
+        assert!(!fixture.is_attached(next_subscriber_id));
+        fixture.broadcaster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn setup_git_read_failure_is_returned_without_retrying() {
+        let fixture = SetupAdmissionFixture::new().await;
+        let next_subscriber_id = fixture.broadcaster.lock_state().next_subscriber_id;
+        let local_calls = fixture.runner.local_calls.load(Ordering::SeqCst);
+        fixture
+            .runner
+            .fail_next_local_read
+            .store(true, Ordering::SeqCst);
+
+        let error = fixture
+            .subscribe(CancellationToken::new())
+            .await
+            .expect("subscription task joins")
+            .err()
+            .expect("a genuine Git failure must be returned without retrying");
+        assert_eq!(
+            error.operation.as_ref(),
+            "GitVcsDriver.statusDetailsLocal.status"
+        );
+        assert!(error.detail.contains("controlled local failure"));
+        assert_eq!(
+            fixture.runner.local_calls.load(Ordering::SeqCst),
+            local_calls + 1
+        );
+        assert_eq!(
+            fixture.broadcaster.lock_state().next_subscriber_id,
+            next_subscriber_id
+        );
+        assert!(!fixture.is_attached(next_subscriber_id));
+        fixture.broadcaster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn setup_stale_read_retries_after_final_subscriber_retires() {
+        let mut fixture = SetupAdmissionFixture::new().await;
+        let next_subscriber_id = fixture.broadcaster.lock_state().next_subscriber_id;
+        let gate = fixture
+            .broadcaster
+            .install_post_initial_read_gate_for_test();
+        let subscribing = fixture.subscribe(CancellationToken::new());
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_until_entered())
+            .await
+            .expect("subscription completes its read before registration");
+
+        // Like dropping the retried first subscriber during reattachment, final
+        // release retires the epoch after this read but before its publication.
+        drop(fixture.keeper.take());
+        assert_eq!(fixture.broadcaster.active_poller_count(), 0);
+        fixture.runner.inner.set_branch("current");
+        gate.release();
+
+        let mut subscription = tokio::time::timeout(Duration::from_secs(5), subscribing)
+            .await
+            .expect("stale setup retry settles")
+            .expect("subscription task joins")
+            .expect("a read retired before registration retries with a fresh snapshot");
+        assert_eq!(
+            subscription.subscriber_id, next_subscriber_id,
+            "the rejected publication must not register a subscriber"
+        );
+        fixture.assert_fresh_stream(&mut subscription).await;
+        drop(subscription);
+        fixture.broadcaster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn setup_stale_read_exhaustion_reports_backpressure_without_registering() {
+        let fixture = SetupAdmissionFixture::new().await;
+        let next_subscriber_id = fixture.broadcaster.lock_state().next_subscriber_id;
+        let mut gate = fixture
+            .broadcaster
+            .install_post_initial_read_gate_for_test();
+        let mut subscribing = fixture.subscribe(CancellationToken::new());
+        for attempt in 1..=3 {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::select! {
+                    result = &mut subscribing => panic!(
+                        "setup stopped before stale-read attempt {attempt}: {:?}",
+                        result.expect("subscription task joins").err()
+                    ),
+                    () = gate.wait_until_entered() => {}
+                }
+            })
+            .await
+            .expect("subscription completes each read before registration");
+            assert_eq!(
+                fixture.broadcaster.lock_state().next_subscriber_id,
+                next_subscriber_id
+            );
+            fixture
+                .broadcaster
+                .begin_mutation(&fixture.cwd)
+                .await
+                .finish()
+                .await;
+            let next_gate = fixture
+                .broadcaster
+                .install_post_initial_read_gate_for_test();
+            gate.release();
+            gate = next_gate;
+        }
+
+        let error = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = &mut subscribing => result
+                    .expect("subscription task joins")
+                    .err()
+                    .expect("persistently stale setup has a bounded failure"),
+                () = gate.wait_until_entered() => panic!("setup must stop after three stale reads"),
+            }
+        })
+        .await
+        .expect("stale setup exhausts its bound");
+        assert_eq!(error.operation.as_ref(), "GitStatusBroadcaster.subscribe");
+        assert_eq!(
+            error.detail.as_ref(),
+            "The Git status subscription fell behind while it was being set up. Subscribe again."
+        );
+        assert_eq!(
+            fixture.broadcaster.lock_state().next_subscriber_id,
+            next_subscriber_id
+        );
+        assert_eq!(
+            fixture
+                .broadcaster
+                .active_status_subscriber_count_for_test(),
+            0
+        );
+        assert_eq!(
+            fixture
+                .broadcaster
+                .inner
+                .fetch_owner
+                .worktree_count_for_test(),
+            1
+        );
+        fixture.broadcaster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn setup_admission_exhaustion_reports_backpressure_and_detaches_every_attempt() {
+        let fixture = SetupAdmissionFixture::new().await;
+        let mut gate = fixture.gate(true);
+        let subscribing = fixture.subscribe(CancellationToken::new());
+        let mut abandoned = Vec::new();
+        for attempt in 0..3 {
+            gate.wait().await;
+            for &subscriber_id in &abandoned {
+                assert!(!fixture.is_attached(subscriber_id));
+            }
+            let subscriber_id = fixture.prune().await;
+            assert!(fixture.is_attached(subscriber_id));
+            abandoned.push(subscriber_id);
+            let next_gate = (attempt < 2).then(|| fixture.gate(true));
+            gate.release();
+            if let Some(next_gate) = next_gate {
+                gate = next_gate;
+            }
+        }
+        let error = subscribing
+            .await
+            .expect("subscription task joins")
+            .err()
+            .expect("persistently backpressured setup has a bounded failure");
+        assert_eq!(error.operation.as_ref(), "GitStatusBroadcaster.subscribe");
+        assert_eq!(
+            error.detail.as_ref(),
+            "The Git status subscription fell behind while it was being set up. Subscribe again."
+        );
+        assert_eq!(fixture.broadcaster.lock_state().next_subscriber_id, 4);
+        assert_eq!(
+            fixture.broadcaster.lock_state().repositories[&fixture.cwd]
+                .subscribers
+                .len(),
+            1
+        );
+        for subscriber_id in abandoned {
+            assert!(!fixture.is_attached(subscriber_id));
+        }
+        fixture.broadcaster.shutdown().await;
+    }
+
+    async fn assert_setup_admission_retries_a_superseded_lifecycle(kind: SubscriptionKind) {
+        let mut fixture = SetupAdmissionFixture::new().await;
+        let gate = fixture.gate(true);
+        let subscribing = {
+            let broadcaster = fixture.broadcaster.clone();
+            let cwd = fixture.cwd.clone();
+            tokio::spawn(async move {
+                broadcaster
+                    .subscribe_kind(cwd, CancellationToken::new(), kind)
+                    .await
+            })
+        };
+        gate.wait().await;
+        let abandoned_id = fixture.latest_subscriber_id();
+        let old_lifecycle =
+            fixture.broadcaster.lock_state().repositories[&fixture.cwd].lifecycle_id;
+        fixture.broadcaster.release(&fixture.cwd, abandoned_id);
+        drop(fixture.keeper.take());
+        fixture.keeper = Some(
+            fixture
+                .broadcaster
+                .subscribe_git_manager_signal(fixture.cwd.clone(), CancellationToken::new())
+                .await
+                .expect("replacement lifecycle starts"),
+        );
+        let new_lifecycle =
+            fixture.broadcaster.lock_state().repositories[&fixture.cwd].lifecycle_id;
+        assert_ne!(new_lifecycle, old_lifecycle);
+        gate.release();
+        let mut subscription = subscribing
+            .await
+            .expect("subscription task joins")
+            .expect("superseded setup retries in the current lifecycle");
+        assert!(!fixture.is_attached(abandoned_id));
+        assert_eq!(
+            fixture.broadcaster.lock_state().repositories[&fixture.cwd].lifecycle_id,
+            new_lifecycle
+        );
+        match &mut subscription {
+            BroadcasterSubscription::Status(subscription) => assert!(matches!(
+                subscription.recv().await,
+                Some(VcsStatusStreamEvent::Snapshot { .. })
+            )),
+            BroadcasterSubscription::GitManager(subscription) => {
+                assert!(subscription.recv().await.is_some());
+            }
+        }
+        drop(subscription);
+        fixture.broadcaster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn setup_admission_retries_a_superseded_lifecycle() {
+        assert_setup_admission_retries_a_superseded_lifecycle(SubscriptionKind::Status).await;
+    }
+
+    #[tokio::test]
+    async fn setup_admission_retries_a_superseded_git_manager_lifecycle() {
+        assert_setup_admission_retries_a_superseded_lifecycle(SubscriptionKind::GitManager).await;
+    }
+
+    async fn assert_setup_admission_cancellation(drop_caller: bool) {
+        let mut fixture = SetupAdmissionFixture::new().await;
+        let cancellation = CancellationToken::new();
+        let first_gate = fixture.gate(true);
+        let subscribing = fixture.subscribe(cancellation.clone());
+        first_gate.wait().await;
+        let first_id = fixture.prune().await;
+        let second_gate = fixture.gate(true);
+        first_gate.release();
+        second_gate.wait().await;
+        let second_id = fixture.latest_subscriber_id();
+        assert!(fixture.is_attached(second_id));
+        if drop_caller {
+            subscribing.abort();
+            assert!(matches!(subscribing.await, Err(error) if error.is_cancelled()));
+        } else {
+            cancellation.cancel();
+            assert!(subscribing.await.expect("cancelled caller joins").is_err());
+        }
+        fixture.broadcaster.inner.subscription_setups.close();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            fixture.broadcaster.inner.subscription_setups.wait(),
+        )
+        .await
+        .expect("caller cancellation stops setup without releasing its gate");
+        assert_eq!(
+            fixture.latest_subscriber_id(),
+            second_id,
+            "cancellation starts no further attempt"
+        );
+        assert!(!fixture.is_attached(first_id));
+        assert!(!fixture.is_attached(second_id));
+        drop(fixture.keeper.take());
+        assert!(fixture.broadcaster.lock_state().repositories.is_empty());
+        assert_eq!(
+            fixture
+                .broadcaster
+                .inner
+                .fetch_owner
+                .worktree_count_for_test(),
+            0
+        );
+        fixture.broadcaster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn setup_admission_cancellation_during_retry_cleans_up() {
+        assert_setup_admission_cancellation(false).await;
+    }
+
+    #[tokio::test]
+    async fn setup_admission_dropped_caller_during_retry_cleans_up() {
+        assert_setup_admission_cancellation(true).await;
+    }
+
+    async fn assert_setup_admission_shutdown_wins(failed_attempts: usize) {
+        let fixture = SetupAdmissionFixture::new().await;
+        let mut gate = fixture.gate(true);
+        let subscribing = fixture.subscribe(CancellationToken::new());
+        for _ in 1..failed_attempts {
+            gate.wait().await;
+            fixture.prune().await;
+            let next_gate = fixture.gate(true);
+            gate.release();
+            gate = next_gate;
+        }
+        gate.wait().await;
+        let abandoned_id = fixture.prune().await;
+        let between_retries = fixture
+            .broadcaster
+            .install_post_retirement_wait_gate_for_test();
+        gate.release();
+        tokio::time::timeout(Duration::from_secs(5), between_retries.wait_until_entered())
+            .await
+            .expect("retry reaches the boundary before registration");
+        assert!(!fixture.is_attached(abandoned_id));
+        let shutdown = {
+            let broadcaster = fixture.broadcaster.clone();
+            tokio::spawn(async move { broadcaster.shutdown().await })
+        };
+        fixture
+            .broadcaster
+            .wait_for_subscription_setup_wait_started_for_test()
+            .await;
+        between_retries.release();
+        let error = subscribing
+            .await
+            .expect("subscription task joins")
+            .err()
+            .expect("shutdown rejects the pending retry");
+        assert_eq!(
+            error.detail.as_ref(),
+            "Git status broadcaster is shut down."
+        );
+        assert_eq!(
+            fixture.latest_subscriber_id(),
+            abandoned_id,
+            "shutdown starts no further attempt"
+        );
+        shutdown.await.expect("shutdown joins");
+        assert!(fixture.broadcaster.lock_state().repositories.is_empty());
+        assert_eq!(
+            fixture
+                .broadcaster
+                .inner
+                .fetch_owner
+                .worktree_count_for_test(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn setup_admission_shutdown_between_retries_wins() {
+        assert_setup_admission_shutdown_wins(1).await;
+    }
+
+    #[tokio::test]
+    async fn setup_admission_shutdown_at_the_retry_bound_wins() {
+        assert_setup_admission_shutdown_wins(3).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3549,7 +4357,7 @@ mod tests {
         let cwd = fs::canonicalize(cwd).expect("canonical repository fixture");
         let (ref_started, _) = mpsc::unbounded_channel();
         let (remote_started, _) = mpsc::unbounded_channel();
-        let runner = Arc::new(EpochGitRunner {
+        let runner = Arc::new(SetupAdmissionGitRunner::new(EpochGitRunner {
             branch: Mutex::new("main".to_owned()),
             ref_calls: AtomicUsize::new(0),
             remote_calls: AtomicUsize::new(0),
@@ -3557,7 +4365,7 @@ mod tests {
             remote_started,
             release_ref: Arc::new(Semaphore::new(16)),
             release_remote: Arc::new(Semaphore::new(16)),
-        });
+        }));
         let broadcaster = StatusBroadcaster::new(
             Arc::new(GitRepository::with_runner_for_test(runner)),
             Duration::from_secs(3_600),
@@ -3570,6 +4378,12 @@ mod tests {
             tokio::spawn(async move { broadcaster.subscribe(cwd, CancellationToken::new()).await })
         };
         registration_gate.wait_until_entered().await;
+        broadcaster
+            .inner
+            .subscription_registration_gate
+            .lock()
+            .expect("registration gate lock")
+            .take();
         let old_fence = broadcaster
             .acquire_read_fence(&cwd, &CancellationToken::new())
             .await
@@ -3615,13 +4429,20 @@ mod tests {
         retirement_gate.release();
         finish.await.expect("retirement joins");
         registration_gate.release();
+        let mut subscription = subscription
+            .await
+            .expect("subscription task joins")
+            .expect("backpressure-pruned first subscriber retries after retirement");
+        assert!(matches!(
+            subscription.recv().await,
+            Some(VcsStatusStreamEvent::Snapshot { .. })
+        ));
         assert!(
-            subscription
-                .await
-                .expect("subscription task joins")
-                .is_err(),
-            "backpressure-pruned first subscriber is rejected"
+            broadcaster
+                .publish_if_fence_current(&old_fence, || ())
+                .is_err()
         );
+        drop(subscription);
         broadcaster.shutdown().await;
     }
 
@@ -3742,10 +4563,15 @@ mod tests {
         );
 
         insertion_gate.release();
-        assert!(
-            first.await.expect("first subscription task joins").is_err(),
-            "backpressure-pruned first subscriber is rejected"
-        );
+        let mut first = first
+            .await
+            .expect("first subscription task joins")
+            .expect("backpressure-pruned first subscriber retries after insertion settles");
+        assert!(matches!(
+            first.recv().await,
+            Some(VcsStatusStreamEvent::Snapshot { .. })
+        ));
+        drop(first);
         let mut reattached = reattaching
             .await
             .expect("reattachment task joins")
