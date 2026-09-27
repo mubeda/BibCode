@@ -42,6 +42,7 @@ const EXPECTED_EXCLUDE = [
   "**/target/**",
   "**/.{idea,git,cache,output,temp}/**",
   "apps/web/public/mockServiceWorker.js",
+  "apps/web/public/theme-bootstrap.js",
   "apps/web/src/lib/vendor/qrcodegen.ts",
   "apps/web/src/routeTree.gen.ts",
 ] as const;
@@ -186,6 +187,10 @@ function findRepositorySubtractionReason(path: string): string | null {
 }
 
 function findBootstrapExclusionReason(path: string): string | null {
+  if (path === "apps/web/public/theme-bootstrap.js") {
+    // The classic browser script is evaluated in node:vm by scripts/lib/theme-bootstrap.test.ts.
+    return "vm-evaluated-browser-bootstrap";
+  }
   return findViteShim(path) ? "vite-shim" : null;
 }
 
@@ -297,6 +302,41 @@ describe("root coverage policy", () => {
 
     expect(isRepositoryInfrastructurePath(syntheticPath)).toBe(false);
     expect(findRepositorySubtractionReason(syntheticPath)).toBeNull();
+    expect(classifyCoveragePath(syntheticPath, include, exclude)).toEqual({ kind: "unmatched" });
+  });
+
+  it("requires an explicit exclusion for the VM-evaluated theme bootstrap", async () => {
+    const viteModule = await loadRootViteModule();
+    const include = viteModule.default.test?.coverage?.include ?? [];
+    const exclude = viteModule.default.test?.coverage?.exclude ?? [];
+    const bootstrapPath = "apps/web/public/theme-bootstrap.js";
+
+    expect(findRepositorySubtractionReason(bootstrapPath)).toBeNull();
+    expect(classifyCoveragePath(bootstrapPath, include, exclude)).toEqual({
+      kind: "bootstrap-excluded",
+      reason: "vm-evaluated-browser-bootstrap",
+    });
+    expect(
+      classifyCoveragePath(
+        bootstrapPath,
+        include,
+        exclude.filter((path) => path !== bootstrapPath),
+      ),
+    ).toEqual({
+      kind: "missing-bootstrap-exclusion",
+      reason: "vm-evaluated-browser-bootstrap",
+    });
+  });
+
+  it("rejects an unrelated public script until the coverage policy adopts it", async () => {
+    const viteModule = await loadRootViteModule();
+    const include = viteModule.default.test?.coverage?.include ?? [];
+    const exclude = viteModule.default.test?.coverage?.exclude ?? [];
+    const syntheticPath = "apps/web/public/new-feature.js";
+
+    expect(isRepositoryInfrastructurePath(syntheticPath)).toBe(false);
+    expect(findRepositorySubtractionReason(syntheticPath)).toBeNull();
+    expect(findBootstrapExclusionReason(syntheticPath)).toBeNull();
     expect(classifyCoveragePath(syntheticPath, include, exclude)).toEqual({ kind: "unmatched" });
   });
 
