@@ -1882,6 +1882,107 @@ async fn shell_and_thread_streams_refresh_on_relevant_events_and_interrupt_clean
 }
 
 #[tokio::test]
+async fn replay_events_pages_are_byte_bounded_and_match_unpaged_replay() {
+    let harness = harness().await;
+    let outcome = AssertUnwindSafe(async {
+        let repositories = harness.engine.repositories();
+        let text = "replay text ".repeat(36);
+        for index in 0..3_000 {
+            repositories
+                .append_event(NewOrchestrationEvent {
+                    event_id: format!("replay-page-event-{index}"),
+                    event_type: "thread.message-sent".to_owned(),
+                    aggregate_kind: "thread".to_owned(),
+                    aggregate_id: "replay-thread".to_owned(),
+                    occurred_at: CREATED_AT.to_owned(),
+                    command_id: None,
+                    causation_event_id: None,
+                    correlation_id: None,
+                    payload: json!({
+                        "threadId": "replay-thread",
+                        "messageId": format!("replay-message-{index}"),
+                        "role": "assistant",
+                        "text": text,
+                        "turnId": null,
+                        "streaming": false,
+                        "createdAt": CREATED_AT,
+                        "updatedAt": CREATED_AT,
+                    }),
+                    metadata: json!({}),
+                })
+                .await
+                .expect("append replay event");
+        }
+
+        // This harness uses whole frames without a connection message limit;
+        // the unpaged ceiling is covered with smaller budgets in the unit tests.
+        let mut socket = harness.connect().await;
+        let mut events = Vec::new();
+        let mut cursor = 0;
+        let mut page_count = 0;
+        loop {
+            page_count += 1;
+            assert!(page_count <= 3_000, "every page must advance the cursor");
+            let page = unary_success(
+                &mut socket,
+                &page_count.to_string(),
+                "orchestration.replayEvents",
+                json!({ "fromSequenceExclusive": cursor, "paged": true }),
+            )
+            .await;
+            let page_events = page["events"].as_array().expect("paged events array");
+            let exhausted = page["exhausted"].as_bool().expect("exhausted flag");
+            assert!(!page_events.is_empty());
+            let page_bytes = serde_json::to_vec(page_events).expect("encode page").len();
+            assert!(page_bytes <= 1024 * 1024 || page_events.len() == 1);
+            for event in page_events {
+                let sequence = event["sequence"].as_i64().expect("event sequence");
+                assert!(
+                    sequence > cursor,
+                    "sequences increase within and across pages"
+                );
+                cursor = sequence;
+            }
+            events.extend(page_events.iter().cloned());
+            assert_eq!(exhausted, events.len() == 3_000);
+            if exhausted {
+                break;
+            }
+        }
+        assert!(page_count >= 3);
+        assert!(serde_json::to_vec(&events).expect("encode replay").len() >= 5 * 1024 * 1024 / 2);
+        let unpaged = unary_success(
+            &mut socket,
+            "4000",
+            "orchestration.replayEvents",
+            json!({ "fromSequenceExclusive": 0 }),
+        )
+        .await;
+        assert_eq!(Value::Array(events), unpaged);
+        let tail = unary_success(
+            &mut socket,
+            "4001",
+            "orchestration.replayEvents",
+            json!({ "fromSequenceExclusive": cursor, "paged": true }),
+        )
+        .await;
+        assert_eq!(tail, json!({ "events": [], "exhausted": true }));
+        let explicitly_unpaged = unary_success(
+            &mut socket,
+            "4002",
+            "orchestration.replayEvents",
+            json!({ "fromSequenceExclusive": 0, "paged": false }),
+        )
+        .await;
+        assert_eq!(explicitly_unpaged, unpaged);
+        socket.close(None).await.expect("close WebSocket");
+    })
+    .catch_unwind()
+    .await;
+    finish_test(harness, outcome).await;
+}
+
+#[tokio::test]
 async fn negative_replay_sequence_is_rejected_instead_of_replaying_from_the_start() {
     let harness = harness().await;
     let outcome = AssertUnwindSafe(async {
@@ -1898,6 +1999,19 @@ async fn negative_replay_sequence_is_rejected_instead_of_replaying_from_the_star
         let replay_error = expect_failure(&mut socket, "1").await;
         assert_invalid_request(
             &replay_error,
+            "orchestration.replayEvents",
+            "fromSequenceExclusive must be a non-negative integer",
+        );
+        rpc_request(
+            &mut socket,
+            "2",
+            "orchestration.replayEvents",
+            json!({ "fromSequenceExclusive": -1, "paged": true }),
+        )
+        .await;
+        let paged_error = expect_failure(&mut socket, "2").await;
+        assert_invalid_request(
+            &paged_error,
             "orchestration.replayEvents",
             "fromSequenceExclusive must be a non-negative integer",
         );

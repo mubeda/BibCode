@@ -18,6 +18,8 @@ import {
   OrchestrationThreadShell,
   OrchestrationGetFullThreadDiffInput,
   OrchestrationGetTurnDiffInput,
+  OrchestrationReplayEventsInput,
+  OrchestrationRpcSchemas,
   OrchestrationLatestTurn,
   ProjectCreatedPayload,
   ProjectMetaUpdatedPayload,
@@ -61,6 +63,67 @@ const decodeDeliveryResolutionAction = Schema.decodeUnknownSync(TurnDeliveryReso
 const decodeOrchestrationEventSync = Schema.decodeUnknownSync(OrchestrationEvent);
 const encodeOrchestrationEventSync = Schema.encodeSync(OrchestrationEvent);
 const decodeClientOrchestrationCommandSync = Schema.decodeUnknownSync(ClientOrchestrationCommand);
+const decodeReplayEventsInput = Schema.decodeUnknownSync(OrchestrationReplayEventsInput);
+const decodeReplayEventsResult = Schema.decodeUnknownSync(
+  OrchestrationRpcSchemas.replayEvents.output,
+);
+
+describe("replay event pagination contracts", () => {
+  const event = {
+    sequence: 1,
+    eventId: "replay-event-1",
+    type: "thread.message-sent",
+    aggregateKind: "thread",
+    aggregateId: "thread-1",
+    occurredAt: "2026-09-26T00:00:00.000Z",
+    commandId: null,
+    causationEventId: null,
+    correlationId: null,
+    metadata: {},
+    payload: {
+      threadId: "thread-1",
+      messageId: "message-1",
+      role: "assistant",
+      text: "replayed message",
+      turnId: null,
+      streaming: false,
+      createdAt: "2026-09-26T00:00:00.000Z",
+      updatedAt: "2026-09-26T00:00:00.000Z",
+    },
+  };
+
+  it("decodes an unpaged replay input", () => {
+    expect(decodeReplayEventsInput({ fromSequenceExclusive: 0 })).toEqual({
+      fromSequenceExclusive: 0,
+    });
+  });
+
+  it("preserves the paged replay opt-in", () => {
+    const input = { fromSequenceExclusive: 42, paged: true };
+    expect(decodeReplayEventsInput(input)).toEqual(input);
+  });
+
+  it("rejects paged false", () => {
+    expect(() => decodeReplayEventsInput({ fromSequenceExclusive: 0, paged: false })).toThrow();
+  });
+
+  it.each([{}, { paged: true }])("rejects a negative replay cursor %j", (flags) => {
+    expect(() => decodeReplayEventsInput({ fromSequenceExclusive: -1, ...flags })).toThrow();
+  });
+
+  it("decodes the legacy replay array", () => {
+    expect(decodeReplayEventsResult([event])).toEqual([event]);
+  });
+
+  it.each([false, true])("decodes a replay page with exhausted %j", (exhausted) => {
+    const page = { events: [event], exhausted };
+    expect(decodeReplayEventsResult(page)).toEqual(page);
+  });
+
+  it("requires the exhausted flag on a replay page", () => {
+    expect(() => decodeReplayEventsResult({ events: [event] })).toThrow();
+  });
+});
 
 describe("message queue contracts", () => {
   const createdAt = "2026-09-22T12:00:00.000Z";

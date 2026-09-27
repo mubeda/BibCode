@@ -90,6 +90,9 @@ record-framed plain sockets) fails only its own request with a typed
 open. Clients decode it for every method through the client-runtime
 `RpcTransportErrors` middleware, and its message reads "This result is too large
 to send (<size>; limit 64 MiB)."
+An unpaged `orchestration.replayEvents` stops reading and fails with the same
+error as soon as its events pass 64 MiB, on every framing, so `bytes` is a lower
+bound there.
 
 ## Server composition
 
@@ -1502,12 +1505,16 @@ sequenceDiagram
 
 Unary command acceptance is not a promise that an external provider process
 will finish successfully. Provider delivery and completion are reflected by
-subsequent durable orchestration events. Streaming subscriptions can be
-re-established after reconnect from snapshots or replay methods rather than
-depending on connection-local push caches. `subscribeThread` and
+subsequent durable orchestration events. Resync after reconnect is snapshot-first:
+`subscribeShell` and `subscribeThread` send a whole snapshot. `subscribeThread` and
 `subscribeShell` register their durable-event receiver before reading the
 initial snapshot, so a commit concurrent with that read is queued and then
 projected instead of being lost between snapshot and live delivery.
+`orchestration.replayEvents` with `paged: true` returns about 1 MiB pages
+`{ events, exhausted }`, keeping at least one event when any remain. Replay
+resumes from the last applied `sequence` with no server state; the cursor is
+scoped to the environment and storage instance. An array answer from an old
+server is one exhausted page.
 `orchestration.replayEvents` refuses a negative `fromSequenceExclusive` with
 `InvalidRequest`, as the contract's non-negative integer requires.
 

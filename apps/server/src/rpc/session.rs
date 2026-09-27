@@ -1534,7 +1534,7 @@ fn check_fits(bytes: usize, limit: Option<usize>) -> Result<(), SendFailure> {
 }
 
 /// `RpcResponseTooLargeError` in `packages/contracts/src/rpcTransport.ts`.
-fn response_too_large_failure(method: &str, bytes: usize, limit_bytes: usize) -> Value {
+pub(crate) fn response_too_large_failure(method: &str, bytes: usize, limit_bytes: usize) -> Value {
     json!({
         "_tag": "RpcResponseTooLargeError",
         "method": method,
