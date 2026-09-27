@@ -12359,9 +12359,10 @@ case "$1" in
   --version) printf '%s\n' '2.1.218'; exit 0;;
   --help) printf '%s\n' '--include-hook-events --forward-subagent-text'; exit 0;;
 esac
+# Short lines keep all stderr below one 4 KiB pipe page, regardless of pipe size.
 index=0
 while [ "$index" -lt 512 ]; do
-  printf 'queued stderr event %s\n' "$index" >&2
+  printf 'e%s\n' "$index" >&2
   index=$((index + 1))
 done
 : > "$BIBCODE_TEST_OUTPUT_WRITTEN"
@@ -12388,21 +12389,29 @@ cat >/dev/null
     })
     .await
     .expect("fixture writes enough events to saturate the provider event queue");
+    // This current-thread runtime runs stderr only while the test awaits. All
+    // 512 lines are readable before the marker, so after settling the task must
+    // be parked on the full 128-slot queue: nothing has consumed any events.
+    // Receiving fewer than 512 below proves shutdown ended that blocked producer.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     timeout(Duration::from_secs(1), driver.shutdown())
         .await
         .expect("shutdown must cancel producers blocked on a full event queue")
         .unwrap();
-    loop {
-        if timeout(Duration::from_secs(1), driver.next_event())
-            .await
-            .expect("event channel must close after queued events drain")
-            .is_none()
-        {
-            break;
+    let mut stderr_event_count = 0;
+    while let Some(event) = timeout(Duration::from_secs(1), driver.next_event())
+        .await
+        .expect("event channel must close after queued events drain")
+    {
+        if event.event_type == "session.stderr" {
+            stderr_event_count += 1;
         }
     }
+    assert!(
+        stderr_event_count > 0 && stderr_event_count < 512,
+        "shutdown must end a producer blocked on the full queue before all 512 stderr events are delivered; received {stderr_event_count}"
+    );
 }
 
 #[cfg(unix)]
