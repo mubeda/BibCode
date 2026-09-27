@@ -435,6 +435,8 @@ const makeUpdateHarness = Effect.fn("TestRemoteUpdates.makeUpdateHarness")(funct
   yield* Effect.addFinalizer(() => Effect.sync(() => atomRegistry.dispose()));
   const installs = new Map<EnvironmentId, number>();
   const statusReads = new Map<EnvironmentId, number>();
+  const activeWorkReads = new Map<EnvironmentId, number>();
+  const activeWorkCounts = { runningTurns: 2, liveTerminals: 3, queuedMessages: 1 };
   const configRequests = new Map<EnvironmentId, number>();
   const retries = new Map<EnvironmentId, number>();
   const followers = { active: 0 };
@@ -478,6 +480,11 @@ const makeUpdateHarness = Effect.fn("TestRemoteUpdates.makeUpdateHarness")(funct
             statusReads.set(environmentId, read + 1);
             const sequence = options.statusSequence ?? ["up-to-date"];
             return { ...CHECKED_SNAPSHOT, state: sequence[Math.min(read, sequence.length - 1)]! };
+          }),
+        [WS_METHODS.updaterActiveWork]: () =>
+          Effect.sync(() => {
+            activeWorkReads.set(environmentId, (activeWorkReads.get(environmentId) ?? 0) + 1);
+            return { ...activeWorkCounts };
           }),
       },
     } as unknown as RpcSession;
@@ -561,6 +568,8 @@ const makeUpdateHarness = Effect.fn("TestRemoteUpdates.makeUpdateHarness")(funct
     clock,
     installs,
     statusReads,
+    activeWorkReads,
+    activeWorkCounts,
     configRequests,
     retries,
     followers,
@@ -579,6 +588,81 @@ const makeUpdateHarness = Effect.fn("TestRemoteUpdates.makeUpdateHarness")(funct
       yield* drainAtoms;
     }),
   };
+});
+
+describe("remote update active work", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it.effect("reads the active work when a view asks for it", () =>
+    Effect.gen(function* () {
+      const h = yield* makeUpdateHarness();
+      const atom = h.atoms.activeWork(UPDATE_TARGET);
+      yield* drainAtoms;
+      expect(h.activeWorkReads.get(UPDATE_ENVIRONMENT_ID)).toBeUndefined();
+
+      const unmount = h.atomRegistry.mount(atom);
+      yield* drainAtoms;
+      const result = h.atomRegistry.get(atom);
+      expect(AsyncResult.isSuccess(result) && result.value).toEqual({
+        runningTurns: 2,
+        liveTerminals: 3,
+        queuedMessages: 1,
+      });
+      expect(h.activeWorkReads.get(UPDATE_ENVIRONMENT_ID)).toBe(1);
+      unmount();
+    }),
+  );
+
+  it.effect("re-reads active work on every open", () =>
+    Effect.gen(function* () {
+      const h = yield* makeUpdateHarness();
+      const atom = h.atoms.activeWork(UPDATE_TARGET);
+      const unmount = h.atomRegistry.mount(atom);
+      yield* drainAtoms;
+      const first = h.atomRegistry.get(atom);
+      expect(AsyncResult.isSuccess(first) && first.value).toEqual({
+        runningTurns: 2,
+        liveTerminals: 3,
+        queuedMessages: 1,
+      });
+      expect(h.activeWorkReads.get(UPDATE_ENVIRONMENT_ID)).toBe(1);
+
+      unmount();
+      yield* drainAtoms;
+      h.activeWorkCounts.liveTerminals = 4;
+
+      const unmountAgain = h.atomRegistry.mount(atom);
+      const reopened = h.atomRegistry.get(atom);
+      expect(AsyncResult.isInitial(reopened) || reopened.waiting).toBe(true);
+
+      yield* drainAtoms;
+      const second = h.atomRegistry.get(atom);
+      expect(AsyncResult.isSuccess(second) && second.value).toEqual({
+        runningTurns: 2,
+        liveTerminals: 4,
+        queuedMessages: 1,
+      });
+      expect(h.activeWorkReads.get(UPDATE_ENVIRONMENT_ID)).toBe(2);
+      unmountAgain();
+    }),
+  );
+
+  it.effect("never polls active work", () =>
+    Effect.gen(function* () {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const h = yield* makeUpdateHarness();
+      const unmount = h.atomRegistry.mount(h.atoms.activeWork(UPDATE_TARGET));
+      yield* drainAtoms;
+      expect(h.activeWorkReads.get(UPDATE_ENVIRONMENT_ID)).toBe(1);
+
+      yield* h.clock.adjust(60_000);
+      yield* advance(60_000);
+      expect(h.activeWorkReads.get(UPDATE_ENVIRONMENT_ID)).toBe(1);
+      unmount();
+    }),
+  );
 });
 
 describe("remote update runs", () => {
