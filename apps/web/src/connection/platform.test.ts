@@ -29,7 +29,10 @@ import {
   Connectivity,
   Wakeups,
 } from "@bibcode/client-runtime/connection";
-import { EnvironmentRpcRequestObserver } from "@bibcode/client-runtime/rpc";
+import {
+  EnvironmentRpcRequestObserver,
+  type EnvironmentRpcRequestObservation,
+} from "@bibcode/client-runtime/rpc";
 
 // ── Controllable mock state ──────────────────────────────────────────
 const pf = vi.hoisted(() => ({
@@ -43,7 +46,7 @@ const pf = vi.hoisted(() => ({
   descriptorCalls: [] as string[],
   bearerBootstrapCalls: [] as string[],
   clearCalls: [] as string[],
-  trackCalls: [] as Array<{ requestId: string; tag: string }>,
+  trackCalls: [] as Array<{ requestId: string; request: EnvironmentRpcRequestObservation }>,
   ackCalls: [] as string[],
 }));
 
@@ -56,8 +59,8 @@ vi.mock("../rpc/atomRegistry", () => ({
 }));
 
 vi.mock("../rpc/requestLatencyState", () => ({
-  trackRpcRequestSent: (requestId: string, tag: string) => {
-    pf.trackCalls.push({ requestId, tag });
+  trackRpcRequestSent: (requestId: string, request: EnvironmentRpcRequestObservation) => {
+    pf.trackCalls.push({ requestId, request });
   },
   acknowledgeRpcRequest: (requestId: string) => {
     pf.ackCalls.push(requestId);
@@ -830,8 +833,12 @@ describe("connectionPlatformLayer environment side effects", () => {
         environmentId: EnvironmentId.make("environment-x"),
         method: "session.start",
       });
-      expect(pf.trackCalls).toHaveLength(1);
-      expect(pf.trackCalls[0]!.tag).toContain("session.start");
+      expect(pf.trackCalls).toEqual([
+        {
+          requestId: expect.any(String),
+          request: { method: "session.start", environmentId: "environment-x" },
+        },
+      ]);
       yield* acknowledge;
       expect(pf.ackCalls).toHaveLength(1);
     }).pipe(Effect.provide(connectionPlatformLayer));

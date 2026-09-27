@@ -13,7 +13,7 @@ import { RefreshCwIcon } from "lucide-react";
 import { useCallback, useContext, useEffect, useRef, useState } from "react";
 
 import { useClientSettings } from "../../hooks/useSettings";
-import { useSlowRpcAckRequests } from "../../rpc/requestLatencyState";
+import { useHasSlowRpcAckRequests } from "../../rpc/requestLatencyState";
 import { useActiveEnvironmentId } from "../../state/entities";
 import { usePrimaryLocalEnvironmentForSelected } from "../../state/environments";
 import { useEnvironmentQuery } from "../../state/query";
@@ -309,7 +309,7 @@ export function AppStatusBarView({
  * region can announce the first slow request.
  */
 export function SlowRequestsStatusBar() {
-  const hasSlowRequests = useSlowRpcAckRequests().length > 0;
+  const hasSlowRequests = useHasSlowRpcAckRequests();
   return (
     <div
       className={`${STATUS_BAR_CLASS_NAME} justify-end data-collapsed:h-0 data-collapsed:min-h-0 data-collapsed:overflow-hidden data-collapsed:border-t-0`}

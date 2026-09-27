@@ -1,13 +1,15 @@
 import type { ClientSettings } from "@bibcode/contracts/settings";
 import { TriangleAlertIcon } from "lucide-react";
-import { memo, useLayoutEffect, useRef } from "react";
+import { memo, useLayoutEffect, useRef, useState } from "react";
 
 import { useClientSettings } from "../../hooks/useSettings";
 import {
   SLOW_RPC_ACK_THRESHOLD_MS,
   type SlowRpcAckRequest,
+  useHasSlowRpcAckRequests,
   useSlowRpcAckRequests,
 } from "../../rpc/requestLatencyState";
+import { useEnvironments } from "../../state/environments";
 import { formatTimestamp } from "../../timestampFormat";
 import {
   Popover,
@@ -49,7 +51,8 @@ function slowThresholdLabel(thresholdMs: number): string {
  * Runs just before the indicator's trigger and list leave the page. If either holds
  * focus, moves it to the next control in the same status bar, or else to the control
  * just before the indicator, so keyboard users keep their place instead of landing on
- * the page body.
+ * the page body. Suppresses scrolling within the always-visible status bar, but
+ * allows a fallback outside the bar to scroll into view.
  */
 function moveFocusOffLeavingIndicator(trigger: HTMLElement, list: HTMLElement | null): void {
   const document = trigger.ownerDocument;
@@ -68,18 +71,32 @@ function moveFocusOffLeavingIndicator(trigger: HTMLElement, list: HTMLElement | 
     .filter((element) => statusBar?.contains(element) === true && canTakeFocus(element));
   const before = tabbable.slice(0, position).filter(canTakeFocus).toReversed();
   for (const candidate of [...nextInStatusBar, ...before]) {
-    candidate.focus({ preventScroll: true });
+    if (statusBar?.contains(candidate)) {
+      candidate.focus({ preventScroll: true });
+    } else {
+      candidate.focus();
+    }
     if (document.activeElement === candidate) return;
   }
 }
 
 function SlowRequestList({ requests }: { readonly requests: ReadonlyArray<SlowRpcAckRequest> }) {
   const timestampFormat = useClientSettings(selectTimestampFormat);
+  const { environments } = useEnvironments();
+  const environmentLabels = new Map<string, string>(
+    environments.map(({ environmentId, label }) => [
+      environmentId,
+      label.trim() ? label : environmentId,
+    ]),
+  );
   return (
     <ul className="space-y-2">
       {requests.map((request) => (
         <li className="min-w-0 border-t border-border pt-2" key={request.requestId}>
-          <div className="wrap-break-word font-medium text-foreground">{request.tag}</div>
+          <div className="wrap-break-word font-medium text-foreground">
+            {request.method} ·{" "}
+            {environmentLabels.get(request.environmentId) ?? request.environmentId}
+          </div>
           <div className="mt-0.5 text-muted-foreground">
             Started{" "}
             <time dateTime={request.startedAt}>
@@ -93,7 +110,9 @@ function SlowRequestList({ requests }: { readonly requests: ReadonlyArray<SlowRp
 }
 
 /** The trigger and its list. Mounted only while at least one request is slow. */
-function SlowRequestsMenu({ requests }: { readonly requests: ReadonlyArray<SlowRpcAckRequest> }) {
+function SlowRequestsMenu() {
+  const requests = useSlowRpcAckRequests();
+  const [open, setOpen] = useState(false);
   const elements = useRef<{ trigger: HTMLButtonElement | null; list: HTMLDivElement | null }>({
     trigger: null,
     list: null,
@@ -108,7 +127,7 @@ function SlowRequestsMenu({ requests }: { readonly requests: ReadonlyArray<SlowR
   }, []);
   const thresholdMs = requests[0]?.thresholdMs ?? SLOW_RPC_ACK_THRESHOLD_MS;
   return (
-    <Popover>
+    <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger
         className="inline-flex h-5 shrink-0 items-center gap-1 rounded px-1 text-xs text-warning-foreground outline-none hover:bg-accent/70 focus-visible:ring-2 focus-visible:ring-ring"
         ref={(node) => {
@@ -138,7 +157,7 @@ function SlowRequestsMenu({ requests }: { readonly requests: ReadonlyArray<SlowR
               Waiting more than {slowThresholdLabel(thresholdMs)} for a response.
             </PopoverDescription>
           </div>
-          <SlowRequestList requests={requests} />
+          {open ? <SlowRequestList requests={requests} /> : null}
         </div>
       </PopoverPopup>
     </Popover>
@@ -147,20 +166,19 @@ function SlowRequestsMenu({ requests }: { readonly requests: ReadonlyArray<SlowR
 
 /**
  * Status bar warning shown while requests wait longer than the slow threshold
- * for a response. It subscribes to the slow-request list itself, so the rest of
- * the status bar does not re-render when that list changes. `memo` keeps the
- * status bar's own frequent re-renders out of it: the React Compiler does not
- * compile `AppStatusBarView`, which reads refs during render.
+ * for a response. This shell subscribes only to whether any request is slow;
+ * the mounted menu owns count and list updates. `memo` keeps the status bar's
+ * own frequent re-renders out of it: the React Compiler does not compile
+ * `AppStatusBarView`, which reads refs during render.
  */
 export const SlowRequestsIndicator = memo(function SlowRequestsIndicator() {
-  const requests = useSlowRpcAckRequests();
-  const hasSlowRequests = requests.length > 0;
+  const hasSlowRequests = useHasSlowRpcAckRequests();
   return (
     <>
       <span aria-atomic="true" aria-live="polite" className="sr-only" role="status">
         {hasSlowRequests ? SLOW_REQUESTS_ANNOUNCEMENT : ""}
       </span>
-      {hasSlowRequests ? <SlowRequestsMenu requests={requests} /> : null}
+      {hasSlowRequests ? <SlowRequestsMenu /> : null}
     </>
   );
 });
