@@ -147,6 +147,15 @@ policy) and carries the `NSLocalNetworkUsageDescription` shown by the macOS
 Local Network prompt. The hardening test pins those keys and rejects the
 broader `NSAllowsArbitraryLoads`.
 
+### Served web UI script policy
+
+`bibcode serve` sends `script-src 'self'`, so the served page runs only
+same-origin scripts. The static `/theme-bootstrap.js` runs before first paint.
+The build versions its URL with a content hash because non-HTML static files
+are cached for a year, and fails if an inline script reaches the built
+`index.html`. The desktop webview has the same `script-src 'self'` policy, and
+Tauri ignores the query string when resolving the static asset.
+
 ### Direct-connection E2EE
 
 New direct pairings pin a server identity and carry RPC over an encrypted
