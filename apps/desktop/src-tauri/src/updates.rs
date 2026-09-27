@@ -1,4 +1,8 @@
-use std::{collections::BTreeSet, sync::Mutex, time::Duration};
+use std::{
+    collections::BTreeSet,
+    sync::{Mutex, MutexGuard},
+    time::Duration,
+};
 
 use bibcode_server::{
     DESKTOP_MAINTENANCE_TOKEN_HEADER, MAINTENANCE_UPDATE_CANCEL_PATH,
@@ -213,6 +217,8 @@ pub struct DesktopUpdateManager {
     #[cfg(test)]
     check_attempts: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
+    panic_next_check: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
     background_check_completion: FixtureEvent,
     #[cfg(test)]
     background_timer_armed: FixtureEvent,
@@ -237,11 +243,7 @@ struct UpdateOperationGuard<'a, R: Runtime> {
 impl<R: Runtime> UpdateOperationGuard<'_, R> {
     fn finish(mut self, update: impl FnOnce(&mut DesktopUpdateInner)) -> DesktopUpdateInner {
         let state = {
-            let mut inner = self
-                .manager
-                .inner
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut inner = self.manager.lock_inner();
             update(&mut inner);
             self.operation.clear_in_flight(&mut inner);
             inner.clone_without_updates()
@@ -257,11 +259,7 @@ impl<R: Runtime> Drop for UpdateOperationGuard<'_, R> {
             return;
         }
         let state = {
-            let mut inner = self
-                .manager
-                .inner
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut inner = self.manager.lock_inner();
             self.operation.clear_in_flight(&mut inner);
             inner.restore_visible_state(&self.prior_state);
             inner.clone_without_updates()
@@ -284,11 +282,19 @@ impl DesktopUpdateManager {
         Self::default()
     }
 
+    fn lock_inner(&self) -> MutexGuard<'_, DesktopUpdateInner> {
+        self.inner.lock().unwrap_or_else(|poisoned| {
+            let inner = poisoned.into_inner();
+            self.inner.clear_poison();
+            tracing::warn!(
+                "desktop update state lock was poisoned by an earlier panic; keeping the last state"
+            );
+            inner
+        })
+    }
+
     pub(crate) fn install_in_flight(&self) -> bool {
-        self.inner
-            .lock()
-            .expect("desktop update mutex poisoned")
-            .install_in_flight
+        self.lock_inner().install_in_flight
     }
 
     pub(crate) fn emit_current_state<R: Runtime>(&self, app: &AppHandle<R>) {
@@ -296,7 +302,7 @@ impl DesktopUpdateManager {
     }
 
     pub fn state<R: Runtime>(&self, app: &AppHandle<R>) -> Value {
-        let inner = self.inner.lock().expect("desktop update mutex poisoned");
+        let inner = self.lock_inner();
         match app.updater() {
             Ok(_) => update_state_value(app, true, &inner),
             Err(error) if is_updater_disabled(&error) => disabled_update_state(app),
@@ -306,11 +312,19 @@ impl DesktopUpdateManager {
 
     pub async fn check_for_update<R: Runtime>(&self, app: AppHandle<R>) -> Value {
         #[cfg(test)]
-        self.check_attempts
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        {
+            self.check_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert!(
+                !self
+                    .panic_next_check
+                    .swap(false, std::sync::atomic::Ordering::SeqCst),
+                "synthetic panic for background_scheduler_survives_a_panicking_check"
+            );
+        }
 
         let busy_state = {
-            let inner = self.inner.lock().expect("desktop update mutex poisoned");
+            let inner = self.lock_inner();
             (!can_begin_check(&app, &inner)).then(|| update_state_value(&app, true, &inner))
         };
         if let Some(state) = busy_state {
@@ -411,7 +425,7 @@ impl DesktopUpdateManager {
 
     pub async fn download_update<R: Runtime>(&self, app: AppHandle<R>) -> Value {
         let busy_state = {
-            let inner = self.inner.lock().expect("desktop update mutex poisoned");
+            let inner = self.lock_inner();
             (!can_begin_download(&app, &inner)).then(|| update_state_value(&app, true, &inner))
         };
         if let Some(state) = busy_state {
@@ -435,7 +449,7 @@ impl DesktopUpdateManager {
         }
 
         let (update, download_guard, state) = {
-            let mut inner = self.inner.lock().expect("desktop update mutex poisoned");
+            let mut inner = self.lock_inner();
             if !can_begin_download(&app, &inner) {
                 return json!({
                     "accepted": false,
@@ -546,7 +560,7 @@ impl DesktopUpdateManager {
         input: DesktopUpdateInstallInput,
     ) -> Value {
         let unavailable_state = {
-            let mut inner = self.inner.lock().expect("desktop update mutex poisoned");
+            let mut inner = self.lock_inner();
             if !backend.backend_recovery().is_empty() {
                 let mut state = update_state_value(app, true, &inner);
                 state["message"] = Value::String(
@@ -591,12 +605,7 @@ impl DesktopUpdateManager {
             });
         }
 
-        let downloaded = self
-            .inner
-            .lock()
-            .expect("desktop update mutex poisoned")
-            .downloaded_update
-            .take();
+        let downloaded = self.lock_inner().downloaded_update.take();
         let Some(downloaded) = downloaded else {
             self.replace_inner(|inner| inner.install_in_flight = false);
             let state = self.record_error_state(
@@ -872,7 +881,7 @@ impl DesktopUpdateManager {
     }
 
     fn replace_inner(&self, update: impl FnOnce(&mut DesktopUpdateInner)) -> DesktopUpdateInner {
-        let mut inner = self.inner.lock().expect("desktop update mutex poisoned");
+        let mut inner = self.lock_inner();
         update(&mut inner);
         inner.clone_without_updates()
     }
@@ -881,7 +890,7 @@ impl DesktopUpdateManager {
         &self,
         app: &AppHandle<R>,
     ) -> Option<(UpdateOperationGuard<'_, R>, DesktopUpdateInner)> {
-        let mut inner = self.inner.lock().expect("desktop update mutex poisoned");
+        let mut inner = self.lock_inner();
         if !can_begin_check(app, &inner) {
             return None;
         }
@@ -907,7 +916,7 @@ impl DesktopUpdateManager {
     }
 
     fn current_state<R: Runtime>(&self, app: &AppHandle<R>) -> Value {
-        let inner = self.inner.lock().expect("desktop update mutex poisoned");
+        let inner = self.lock_inner();
         update_state_value(app, true, &inner)
     }
 
@@ -2196,6 +2205,18 @@ mod tests {
         (base_url, thread)
     }
 
+    fn poison_update_lock(manager: &DesktopUpdateManager) {
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _inner = manager
+                .inner
+                .lock()
+                .expect("update state lock should not already be poisoned");
+            panic!("synthetic panic while holding the update state lock");
+        }));
+        assert!(panic.is_err());
+        assert!(manager.inner.is_poisoned());
+    }
+
     async fn wait_for_fixture_event(event: &FixtureEvent, checkpoint: u64, description: &str) {
         tokio::time::timeout(Duration::from_secs(5), event.wait_after(checkpoint))
             .await
@@ -2364,6 +2385,123 @@ mod tests {
         server.join().expect("update server should stop");
     }
 
+    #[test]
+    fn manager_state_reads_recover_a_poisoned_lock() {
+        let Some(isolated) = crate::test_support::isolated_scenario(
+            "updates::tests::manager_state_reads_recover_a_poisoned_lock",
+        ) else {
+            return;
+        };
+        let app = updater_test_app("http://127.0.0.1:9/latest.json".to_owned());
+        let manager = app.state::<DesktopUpdateManager>();
+        manager.replace_inner(|inner| {
+            inner.status = Some(STATUS_AVAILABLE.to_owned());
+            inner.available_version = Some("99.0.0".to_owned());
+            inner.phase = UpdatePhase::Available;
+        });
+
+        poison_update_lock(&manager);
+        let state = manager.state(app.handle());
+        assert_eq!(state["status"], STATUS_AVAILABLE);
+        assert_eq!(state["availableVersion"], "99.0.0");
+        assert_eq!(state["phase"], "available");
+        assert!(!manager.inner.is_poisoned());
+
+        poison_update_lock(&manager);
+        let bridge_state = crate::bridge::desktop_bridge_get_update_state(
+            app.handle().clone(),
+            app.state::<DesktopUpdateManager>(),
+        )
+        .expect("bridge update state read should recover");
+        assert_eq!(bridge_state, state);
+        assert!(!manager.inner.is_poisoned());
+        isolated.complete();
+    }
+
+    #[test]
+    fn manager_native_reads_recover_a_poisoned_lock() {
+        let Some(isolated) = crate::test_support::isolated_scenario(
+            "updates::tests::manager_native_reads_recover_a_poisoned_lock",
+        ) else {
+            return;
+        };
+        use tauri::Listener;
+
+        let app = updater_test_app("http://127.0.0.1:9/latest.json".to_owned());
+        let manager = app.state::<DesktopUpdateManager>();
+        manager.replace_inner(|inner| {
+            inner.install_in_flight = true;
+            inner.phase = UpdatePhase::Protecting;
+        });
+
+        poison_update_lock(&manager);
+        assert!(manager.install_in_flight());
+        assert!(!manager.inner.is_poisoned());
+
+        let (sender, receiver) = mpsc::channel();
+        app.listen_any(UPDATE_STATE_EVENT, move |event| {
+            sender
+                .send(event.payload().to_owned())
+                .expect("update state event");
+        });
+        poison_update_lock(&manager);
+        manager.emit_current_state(app.handle());
+        let state: Value =
+            serde_json::from_str(&receiver.try_recv().expect("recovered update state event"))
+                .expect("update state JSON");
+        assert_eq!(state["phase"], "protecting");
+        assert!(!manager.inner.is_poisoned());
+        isolated.complete();
+    }
+
+    #[test]
+    fn operation_guard_recovers_a_poisoned_lock() {
+        let Some(isolated) = crate::test_support::isolated_scenario(
+            "updates::tests::operation_guard_recovers_a_poisoned_lock",
+        ) else {
+            return;
+        };
+        let app = updater_test_app("http://127.0.0.1:9/latest.json".to_owned());
+        let manager = app.state::<DesktopUpdateManager>();
+        let (guard, _) = manager.begin_check(app.handle()).expect("first check");
+
+        poison_update_lock(&manager);
+        guard.finish(|inner| inner.status = Some(STATUS_UP_TO_DATE.to_owned()));
+        assert!(!manager.inner.is_poisoned());
+        assert_eq!(manager.state(app.handle())["status"], STATUS_UP_TO_DATE);
+
+        let (guard, _) = manager
+            .begin_check(app.handle())
+            .expect("check after completion");
+        poison_update_lock(&manager);
+        drop(guard);
+        assert!(!manager.inner.is_poisoned());
+        assert_eq!(manager.state(app.handle())["status"], STATUS_UP_TO_DATE);
+        assert!(manager.begin_check(app.handle()).is_some());
+        isolated.complete();
+    }
+
+    #[tokio::test]
+    async fn manager_check_recovers_a_poisoned_lock() {
+        let Some(isolated) = crate::test_support::isolated_scenario(
+            "updates::tests::manager_check_recovers_a_poisoned_lock",
+        ) else {
+            return;
+        };
+        let (base_url, server) = spawn_no_update_server();
+        let app = updater_test_app(format!("{base_url}/latest.json"));
+        let manager = app.state::<DesktopUpdateManager>();
+
+        poison_update_lock(&manager);
+        let check = manager.check_for_update(app.handle().clone()).await;
+        assert_eq!(check["checked"], true);
+        assert_eq!(check["state"]["status"], STATUS_UP_TO_DATE);
+        assert!(!manager.inner.is_poisoned());
+
+        server.join().expect("update server should stop");
+        isolated.complete();
+    }
+
     #[tokio::test]
     async fn manager_handles_up_to_date_and_missing_update_actions() {
         use tauri::test::{mock_builder, mock_context, noop_assets};
@@ -2468,6 +2606,11 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn background_scheduler_survives_a_panicking_check() {
+        let Some(isolated) = crate::test_support::isolated_scenario(
+            "updates::tests::background_scheduler_survives_a_panicking_check",
+        ) else {
+            return;
+        };
         let listener = TcpListener::bind("127.0.0.1:0").expect("update server should bind");
         let base_url = format!(
             "http://{}",
@@ -2489,15 +2632,7 @@ mod tests {
         });
         let app = updater_test_app(format!("{base_url}/latest.json"));
         let manager = app.state::<DesktopUpdateManager>();
-        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _inner = manager
-                .inner
-                .lock()
-                .expect("desktop update mutex should initially lock");
-            panic!("synthetic update-check panic");
-        }));
-        assert!(poison.is_err());
-        assert!(manager.inner.is_poisoned());
+        manager.panic_next_check.store(true, Ordering::SeqCst);
         let task = tokio::spawn(run_background_update_checks(app.handle().clone()));
         wait_for_background_timer(&manager, 1).await;
         tokio::time::advance(STARTUP_UPDATE_CHECK_DELAY).await;
@@ -2505,7 +2640,9 @@ mod tests {
         wait_for_background_check_completion(&manager, 1).await;
         assert_eq!(manager.check_attempts.load(Ordering::SeqCst), 1);
         assert_eq!(manager.background_check_completion.checkpoint(), 1);
-        manager.inner.clear_poison();
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        assert_eq!(manager.state(app.handle())["status"], STATUS_IDLE);
+        assert!(!manager.inner.is_poisoned());
 
         wait_for_background_timer(&manager, 2).await;
         tokio::time::advance(BACKGROUND_UPDATE_CHECK_INTERVAL).await;
@@ -2516,8 +2653,15 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("surviving scheduler should issue a retry request");
         assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(manager.state(app.handle())["status"], STATUS_UP_TO_DATE);
         task.abort();
+        assert!(
+            task.await
+                .expect_err("background scheduler should abort")
+                .is_cancelled()
+        );
         server.join().expect("update server should stop");
+        isolated.complete();
     }
 
     #[tokio::test]
