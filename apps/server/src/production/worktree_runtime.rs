@@ -1050,10 +1050,10 @@ impl WorktreeRuntimeActions for ProductionWorktreeRuntimeActions {
             if !registry.transition_is_current(&transition) {
                 return Ok(());
             }
-            let Some(identity) = identity else {
-                return Ok(());
-            };
-            match provider.stop_session_if_current(identity).await {
+            match provider
+                .settle_session_after_workspace_loss(thread_id, identity)
+                .await
+            {
                 Ok(()) | Err(ProviderRuntimeError::SessionNotFound { .. }) => Ok(()),
                 Err(error) => Err(error.to_string()),
             }
@@ -1788,6 +1788,86 @@ mod tests {
         provider.shutdown().await.expect("provider shutdown");
         assert!(runtime.live_session_thread_ids(thread_ids).await.is_err());
         runtime.shutdown().await;
+        terminals.shutdown().await;
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn production_workspace_loss_settles_without_a_live_provider() {
+        let root = tempfile::tempdir().unwrap();
+        let database = Database::open_in_memory().await.unwrap();
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let activity = ActivityProjection::new(ActivityRepository::new(database.clone()));
+        let engine = OrchestrationEngine::start(database, EngineOptions::default())
+            .await
+            .unwrap();
+        for command in [
+            json!({"type":"project.create", "commandId":"project", "projectId":"p1", "title":"Project", "workspaceRoot":root.path(), "createdAt":"2026-01-01T00:00:00Z"}),
+            json!({"type":"thread.create", "commandId":"thread", "threadId":"thread-1", "projectId":"p1", "title":"Thread", "kind":"workspace", "modelSelection":{"instanceId":"codex","model":"gpt-5"}, "runtimeMode":"full-access", "interactionMode":"default", "branch":null, "worktreePath":null, "createdAt":"2026-01-01T00:00:00Z"}),
+            json!({"type":"thread.session.set", "commandId":"session", "threadId":"thread-1", "session":{"threadId":"thread-1", "status":"running", "providerName":"codex", "activeTurnId":"turn-1", "lastError":null, "updatedAt":"2026-01-01T00:00:00Z"}, "createdAt":"2026-01-01T00:00:00Z"}),
+        ] {
+            engine
+                .dispatch(serde_json::from_value(command).unwrap())
+                .await
+                .unwrap();
+        }
+        let provider = Arc::new(ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(RuntimeTestProvider),
+            activity,
+            SupervisorOptions::default(),
+        ));
+        assert!(
+            provider
+                .capture_session_identity("thread-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let terminals = TerminalManager::new(
+            Arc::new(RuntimeTestPtyBackend::default()),
+            TerminalManagerOptions::default(),
+        );
+        let registry = WorkspaceAvailabilityRegistry::new();
+        let loss = WorkspaceLossTransition {
+            path: root.path().join("missing"),
+            ..transition(1)
+        };
+        registry.mark_unavailable(loss.clone()).await.unwrap();
+        let actions = super::ProductionWorktreeRuntimeActions {
+            orchestration: engine.clone(),
+            provider: provider.clone(),
+            terminals: runtime_terminal_services(terminals.clone()),
+            registry,
+        };
+
+        actions
+            .stop_provider("thread-1".into(), loss)
+            .await
+            .unwrap();
+
+        let session = engine
+            .repositories()
+            .get_thread_session("thread-1".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.status, "error");
+        assert_eq!(session.active_turn_id, None);
+        assert_eq!(session.last_error_class.as_deref(), Some("transport_error"));
+        assert!(
+            session
+                .last_error
+                .unwrap()
+                .contains("workspace became unavailable")
+        );
+        provider.shutdown().await.unwrap();
         terminals.shutdown().await;
         engine.shutdown().await;
     }

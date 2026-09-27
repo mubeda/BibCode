@@ -1429,10 +1429,21 @@ failure is logged but cannot prevent process cleanup.
 
 Provider cleanup captures the supervisor's exact active runtime identity only
 while the loss transition remains current, then asks the supervisor to stop
-that identity. The actor rechecks identity against its current thread session;
-an old cleanup that resumes after exact recovery and provider replacement is a
-no-op. Retry resolution repeats capture only while its transition ownership is
-current, and recovery/newer-loss cancellation still short-circuits the whole
+that identity and settle the thread. The actor rechecks identity against its
+current thread session; a live replacement is neither stopped nor settled.
+When no live session remains and the projection is starting, connecting, or
+running, it uses the shared restart reconciliation function at the loss time:
+streaming assistant text is retained and settled, the active turn is cleared,
+the turn ends as error, and the session reports `transport_error` with
+"Provider session stopped because its workspace became unavailable. Review
+delivery status before continuing." A shutdown error does not skip settlement
+after detach. Cleanup also requests settlement without a captured identity, so
+a later attempt can retry a failed settlement. Ready projections are left alone;
+removal cleanup retains its existing stop-only behavior. A delivery accepted
+after its session's cancellation skips publishing running runtime and session
+state while retaining the accepted delivery outcome. Retry resolution repeats
+capture only while its transition ownership is current, and recovery/newer-loss
+cancellation still short-circuits the whole
 attempt. Terminal cleanup applies the same transition-scoped pattern to every
 session for the affected thread: it captures the exact session, generation, and
 process only while the loss transition is current, then acquires a counted
@@ -1708,6 +1719,17 @@ restart error as `transport_error`. That error settlement holds queued messages
 for explicit **Send now** and releases the pending-start claim gate. Completed
 reconciliation does not dispatch again on a later startup; ready/idle/stopped
 projections without live runtimes retain their existing state.
+
+Workspace-loss settlement uses the same error rule: every queued row is held,
+and pending or sending steer rows latch the hold. The queued head shows
+**Waiting for you**; **Send now** works once no running or starting session
+exists and the workspace admits work again. Settlement wakes the delivery
+worker to re-examine pending, non-queued starts. While the workspace is
+unavailable, admission refuses and delivery retries with backoff; after recovery,
+the existing provider-loss relaunch starts a replacement session. A retry bound
+to the stopped session's native identity can still fail because stopping deleted
+its resume state. The settled turn retains its partial assistant text and ends
+as error.
 
 `ThreadTurnSteer` validates the queued head, a running session with an active
 turn, and the driver-owned capability shared with inventory. It atomically

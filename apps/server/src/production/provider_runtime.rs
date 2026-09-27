@@ -505,6 +505,11 @@ enum SupervisorMessage {
         identity: ProviderSessionIdentity,
         response: oneshot::Sender<Result<(), ProviderRuntimeError>>,
     },
+    SettleSessionAfterWorkspaceLoss {
+        thread_id: String,
+        identity: Option<ProviderSessionIdentity>,
+        response: oneshot::Sender<Result<(), ProviderRuntimeError>>,
+    },
     SessionStreamEnded {
         identity: ProviderSessionIdentity,
         settled: oneshot::Receiver<()>,
@@ -949,6 +954,21 @@ impl ProviderRuntimeSupervisor {
         response_rx
             .await
             .map_err(|_| ProviderRuntimeError::ResponseDropped)?
+    }
+
+    pub async fn settle_session_after_workspace_loss(
+        &self,
+        thread_id: String,
+        identity: Option<ProviderSessionIdentity>,
+    ) -> Result<(), ProviderRuntimeError> {
+        self.request(
+            |response| SupervisorMessage::SettleSessionAfterWorkspaceLoss {
+                thread_id,
+                identity,
+                response,
+            },
+        )
+        .await
     }
 
     pub async fn deliver_turn(
@@ -1849,6 +1869,8 @@ pub async fn reconcile_orchestration_turn(
     }
 }
 
+const WORKSPACE_LOSS_SESSION_ERROR: &str = "Provider session stopped because its workspace became unavailable. Review delivery status before continuing.";
+
 pub async fn reconcile_abandoned_provider_sessions(
     engine: &OrchestrationEngine,
 ) -> Result<(), ProviderRuntimeError> {
@@ -1874,12 +1896,14 @@ pub async fn reconcile_abandoned_provider_sessions(
                     last_error_class: None,
                     updated_at: runtime.last_seen_at.clone(),
                 };
+                let settled_at = session.updated_at.clone();
                 reconcile_abandoned_provider_session(
                     engine,
                     &repositories,
                     session,
                     Some(runtime),
                     RESTART_ERROR,
+                    settled_at,
                 )
                 .await
             }
@@ -1922,6 +1946,7 @@ pub async fn reconcile_abandoned_provider_sessions(
                 // A failed runtime reconciliation remains eligible for the next startup.
                 return Ok(());
             }
+            let settled_at = session.updated_at.clone();
             reconcile_abandoned_provider_session(
                 engine,
                 &repositories,
@@ -1938,6 +1963,7 @@ pub async fn reconcile_abandoned_provider_sessions(
                 },
                 runtime,
                 RESTART_ERROR,
+                settled_at,
             )
             .await
         }
@@ -1988,8 +2014,8 @@ async fn reconcile_abandoned_provider_session(
     mut session: SessionInput,
     runtime: Option<ProviderSessionRuntime>,
     restart_error: &str,
+    settled_at: String,
 ) -> Result<(), ProviderRuntimeError> {
-    let projected_at = session.updated_at.clone();
     let projected_session = repositories
         .get_thread_session(session.thread_id.clone())
         .await
@@ -2005,7 +2031,7 @@ async fn reconcile_abandoned_provider_session(
             && projected.active_turn_id.is_none()
             && projected.last_error.as_deref() == Some(restart_error)
             && projected.last_error_class.as_deref() == Some("transport_error")
-            && projected.updated_at == projected_at
+            && projected.updated_at == settled_at
     });
     if let Some(turn_id) = abandoned_turn_id {
         settle_streaming_assistant_messages(
@@ -2013,7 +2039,7 @@ async fn reconcile_abandoned_provider_session(
             &session.thread_id,
             Some(turn_id),
             &format!("provider-restart-reconcile:{}", Uuid::new_v4()),
-            &projected_at,
+            &settled_at,
         )
         .await?;
     }
@@ -2021,14 +2047,15 @@ async fn reconcile_abandoned_provider_session(
         session.status = "error".to_owned();
         session.active_turn_id = None;
         session.last_error = Some(restart_error.to_owned());
-        // BiBCode restarted; the provider did not fail.
+        // BiBCode stopped the session; the provider did not fail.
         session.last_error_class = Some("transport_error".to_owned());
+        session.updated_at = settled_at.clone();
         engine
             .dispatch(OrchestrationCommand::ThreadSessionSet {
                 command_id: format!("provider-restart-reconcile:{}", Uuid::new_v4()),
                 thread_id: session.thread_id.clone(),
                 session,
-                created_at: projected_at,
+                created_at: settled_at,
             })
             .await
             .map_err(|error| ProviderRuntimeError::Orchestration(error.to_string()))?;
@@ -2043,6 +2070,494 @@ async fn reconcile_abandoned_provider_session(
             .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod workspace_loss_tests {
+    use super::*;
+    use crate::{
+        activity::ActivityRepository,
+        orchestration::{CommandAdmission, NewProviderTurnDelivery, engine::EngineOptions},
+        persistence::{Database, ProjectionThreadSession, run_migrations},
+    };
+    use std::sync::atomic::AtomicUsize;
+    use tokio::sync::Notify;
+
+    const BEFORE_LOSS: &str = "2026-01-01T00:00:00Z";
+    const LOSS_ERROR: &str = "Provider session stopped because its workspace became unavailable. Review delivery status before continuing.";
+
+    #[derive(Clone, Default)]
+    struct LossDriver {
+        shutdowns: Arc<AtomicUsize>,
+        shutdown_fails: Arc<AtomicBool>,
+        delay_acceptance: Arc<AtomicBool>,
+        delivery_entered: Arc<Notify>,
+        delivery_release: Arc<Notify>,
+    }
+
+    impl ProviderDriverFactory for LossDriver {
+        fn create(
+            &self,
+            _: ProviderLaunchRequest,
+        ) -> BoxRuntimeFuture<'_, Result<Arc<dyn ProviderDriver>, ProviderRuntimeError>> {
+            Box::pin(async { Ok(Arc::new(self.clone()) as Arc<dyn ProviderDriver>) })
+        }
+    }
+
+    impl ProviderDriver for LossDriver {
+        fn start(&self) -> BoxRuntimeFuture<'_, Result<StartedSession, ProviderRuntimeError>> {
+            Box::pin(async { Ok(StartedSession::default()) })
+        }
+
+        fn send(
+            &self,
+            _: String,
+            _: Vec<Value>,
+            _: String,
+        ) -> BoxRuntimeFuture<'_, Result<Option<String>, ProviderRuntimeError>> {
+            Box::pin(async {
+                self.delivery_entered.notify_one();
+                if self.delay_acceptance.load(Ordering::SeqCst) {
+                    self.delivery_release.notified().await;
+                }
+                Ok(Some("turn-1".to_owned()))
+            })
+        }
+
+        fn interrupt(
+            &self,
+            _: Option<String>,
+        ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn approve(
+            &self,
+            _: String,
+            _: String,
+        ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn answer(
+            &self,
+            _: String,
+            _: Value,
+        ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn set_mode(&self, _: String) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn set_model(&self, _: String) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn set_options(
+            &self,
+            _: Vec<Value>,
+        ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn rollback(&self, _: i64) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn next_event(&self) -> BoxRuntimeFuture<'_, Option<ProviderEvent>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn shutdown(&self) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(async {
+                self.shutdowns.fetch_add(1, Ordering::SeqCst);
+                if self.shutdown_fails.load(Ordering::SeqCst) {
+                    Err(ProviderRuntimeError::Provider {
+                        provider: "codex".to_owned(),
+                        detail: "shutdown failed".to_owned(),
+                    })
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    }
+
+    struct Fixture {
+        engine: OrchestrationEngine,
+        supervisor: ProviderRuntimeSupervisor,
+        driver: Arc<LossDriver>,
+        launch: ProviderLaunchRequest,
+        _root: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        async fn new(live: bool) -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let database = Database::open_in_memory().await.unwrap();
+            database
+                .call(|connection| {
+                    run_migrations(connection, None)?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            let activity = ActivityProjection::new(ActivityRepository::new(database.clone()));
+            let engine = OrchestrationEngine::start(database, EngineOptions::default())
+                .await
+                .unwrap();
+            for command in [
+                json!({"type":"project.create","commandId":"project","projectId":"p1","title":"Project","workspaceRoot":root.path(),"createdAt":BEFORE_LOSS}),
+                json!({"type":"thread.create","commandId":"thread","threadId":"t1","projectId":"p1","title":"Thread","kind":"workspace","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","interactionMode":"default","branch":null,"worktreePath":null,"createdAt":BEFORE_LOSS}),
+            ] {
+                engine
+                    .dispatch(serde_json::from_value(command).unwrap())
+                    .await
+                    .unwrap();
+            }
+            let driver = Arc::new(LossDriver::default());
+            let supervisor = ProviderRuntimeSupervisor::start(
+                engine.clone(),
+                driver.clone(),
+                activity,
+                SupervisorOptions::default(),
+            );
+            let launch = launch_request_for_command(
+                &engine,
+                &root.path().to_path_buf(),
+                &turn("launch", false),
+                None,
+            )
+            .await
+            .unwrap();
+            if live {
+                supervisor.launch(launch.clone()).await.unwrap();
+            }
+            Self {
+                engine,
+                supervisor,
+                driver,
+                launch,
+                _root: root,
+            }
+        }
+
+        async fn project(&self, status: &str) {
+            self.engine.dispatch(serde_json::from_value(json!({
+                "type":"thread.session.set", "commandId":format!("project-{status}"), "threadId":"t1",
+                "session":{"threadId":"t1", "status":status, "providerName":"codex", "providerInstanceId":"codex",
+                    "runtimeMode":"full-access", "activeTurnId":(status == "running").then_some("turn-1"),
+                    "lastError":null, "updatedAt":BEFORE_LOSS}, "createdAt":BEFORE_LOSS,
+            })).unwrap()).await.unwrap();
+        }
+
+        async fn session(&self) -> ProjectionThreadSession {
+            self.engine
+                .repositories()
+                .get_thread_session("t1".into())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        async fn loss(&self) -> Result<(), ProviderRuntimeError> {
+            let identity = self
+                .supervisor
+                .capture_session_identity("t1")
+                .await
+                .unwrap();
+            self.supervisor
+                .settle_session_after_workspace_loss("t1".into(), identity)
+                .await
+        }
+
+        async fn assert_settled(&self) {
+            let session = self.session().await;
+            assert_eq!(session.status, "error");
+            assert_eq!(session.active_turn_id, None);
+            assert_eq!(session.last_error_class.as_deref(), Some("transport_error"));
+            assert_eq!(session.last_error.as_deref(), Some(LOSS_ERROR));
+            assert_eq!(session.provider_name.as_deref(), Some("codex"));
+            assert_eq!(session.provider_instance_id.as_deref(), Some("codex"));
+            assert_eq!(session.runtime_mode, "full-access");
+            assert_ne!(session.updated_at, BEFORE_LOSS);
+            assert!(
+                self.supervisor
+                    .capture_session_identity("t1")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        async fn shutdown(self) {
+            self.supervisor.shutdown().await.unwrap();
+            self.engine.shutdown().await;
+        }
+    }
+
+    fn turn(id: &str, queued: bool) -> OrchestrationCommand {
+        serde_json::from_value(json!({
+            "type":"thread.turn.start", "commandId":id, "threadId":"t1", "queued":queued,
+            "message":{"messageId":id,"role":"user","text":"continue","attachments":[]},
+            "runtimeMode":"full-access", "interactionMode":"default", "createdAt":BEFORE_LOSS,
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn current_loss_settles_turn_text_and_queue_and_wakes_delivery() {
+        let f = Fixture::new(true).await;
+        f.project("running").await;
+        f.engine.dispatch(serde_json::from_value(json!({
+            "type":"thread.message.assistant.delta", "commandId":"delta", "threadId":"t1",
+            "messageId":"assistant", "turnId":"turn-1", "delta":"partial answer", "createdAt":BEFORE_LOSS,
+        })).unwrap()).await.unwrap();
+        let command = turn("queued", true);
+        let admission = CommandAdmission {
+            payload_digest: canonical_command_digest(&command).unwrap(),
+            attachment_refs: Vec::new(),
+            provider_turn: Some(NewProviderTurnDelivery {
+                command_id: "queued".into(),
+                thread_id: "t1".into(),
+                message_id: "queued".into(),
+                provider_instance_id: "codex".into(),
+                provider_kind: "codex".into(),
+                provider_session_id: None,
+                delivery_key: "queued-key".into(),
+                payload: serde_json::to_value(&command).unwrap(),
+                state: TurnDeliveryState::Queued,
+                mode: TurnDeliveryMode::Start,
+                created_at: BEFORE_LOSS.into(),
+            }),
+        };
+        f.engine
+            .dispatch_with_admission(command, admission, || {})
+            .await
+            .unwrap();
+        let queued = f
+            .engine
+            .repositories()
+            .get_provider_turn_delivery("queued".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(queued.state, TurnDeliveryState::Queued);
+        assert!(!queued.held);
+        let wake = Arc::new(Notify::new());
+        f.engine.set_turn_delivery_waker(wake.clone());
+
+        f.loss().await.unwrap();
+
+        f.assert_settled().await;
+        let session = f.session().await;
+        let repositories = f.engine.repositories();
+        let turns = repositories
+            .list_turns_by_thread("t1".into())
+            .await
+            .unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].state, "error");
+        assert_eq!(
+            turns[0].completed_at.as_deref(),
+            Some(session.updated_at.as_str())
+        );
+        let message = repositories
+            .get_message("assistant".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!message.is_streaming);
+        assert_eq!(message.text, "partial answer");
+        assert_eq!(message.updated_at, session.updated_at);
+        let queued = repositories
+            .list_provider_turn_deliveries(vec![TurnDeliveryState::Queued])
+            .await
+            .unwrap();
+        assert_eq!(queued.len(), 1);
+        assert!(queued[0].held);
+        assert!(
+            repositories
+                .get_provider_session_runtime("t1".into())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(f.driver.shutdowns.load(Ordering::SeqCst), 1);
+        tokio::time::timeout(Duration::from_secs(1), wake.notified())
+            .await
+            .expect("settlement wakes delivery");
+        f.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_error_is_returned_after_settlement() {
+        let f = Fixture::new(true).await;
+        f.project("running").await;
+        f.driver.shutdown_fails.store(true, Ordering::SeqCst);
+        let error = f.loss().await.unwrap_err();
+        assert!(error.to_string().contains("shutdown failed"));
+        f.assert_settled().await;
+        f.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stale_identity_leaves_live_replacement_unchanged() {
+        let f = Fixture::new(true).await;
+        let old = f
+            .supervisor
+            .capture_session_identity("t1")
+            .await
+            .unwrap()
+            .unwrap();
+        f.supervisor
+            .stop_session_if_current(old.clone())
+            .await
+            .unwrap();
+        f.supervisor.launch(f.launch.clone()).await.unwrap();
+        f.project("running").await;
+        let before = f.session().await;
+        let events = f.engine.read_events(0).await.unwrap().len();
+        f.supervisor
+            .settle_session_after_workspace_loss("t1".into(), Some(old))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(f.session().await).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+        assert_eq!(f.engine.read_events(0).await.unwrap().len(), events);
+        assert!(
+            f.supervisor
+                .capture_session_identity("t1")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(f.driver.shutdowns.load(Ordering::SeqCst), 1);
+        f.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn no_live_session_retries_active_projection_settlement() {
+        for status in ["starting", "connecting", "running"] {
+            let f = Fixture::new(false).await;
+            f.project(status).await;
+            f.loss().await.unwrap();
+            f.assert_settled().await;
+            let events = f.engine.read_events(0).await.unwrap().len();
+            f.loss().await.unwrap();
+            assert_eq!(f.engine.read_events(0).await.unwrap().len(), events);
+            f.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_session_stops_without_settlement() {
+        let f = Fixture::new(true).await;
+        let before = f.session().await;
+        let events = f.engine.read_events(0).await.unwrap().len();
+        f.loss().await.unwrap();
+        assert_eq!(
+            serde_json::to_value(f.session().await).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+        assert_eq!(f.engine.read_events(0).await.unwrap().len(), events);
+        assert!(
+            f.supervisor
+                .capture_session_identity("t1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(f.driver.shutdowns.load(Ordering::SeqCst), 1);
+        f.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn acceptance_after_detach_does_not_publish_running_state() {
+        let f = Fixture::new(true).await;
+        f.driver.delay_acceptance.store(true, Ordering::SeqCst);
+        let delivery = f
+            .supervisor
+            .deliver_turn(turn("late", false), "late-key".into())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), f.driver.delivery_entered.notified())
+            .await
+            .unwrap();
+        let identity = f
+            .supervisor
+            .capture_session_identity("t1")
+            .await
+            .unwrap()
+            .unwrap();
+        f.supervisor
+            .stop_session_if_current(identity)
+            .await
+            .unwrap();
+        let before = f.session().await;
+        let events = f.engine.read_events(0).await.unwrap().len();
+
+        f.driver.delivery_release.notify_one();
+        let outcome = tokio::time::timeout(Duration::from_secs(1), delivery.completion())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            ProviderDeliveryOutcome::Accepted {
+                turn_id: Some("turn-1".into())
+            }
+        );
+        assert!(
+            f.engine
+                .repositories()
+                .get_provider_session_runtime("t1".into())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            serde_json::to_value(f.session().await).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+        assert_eq!(f.engine.read_events(0).await.unwrap().len(), events);
+        f.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn removal_stop_does_not_settle_projection() {
+        let f = Fixture::new(true).await;
+        f.project("running").await;
+        let before = f.session().await;
+        let events = f.engine.read_events(0).await.unwrap().len();
+        let identity = f
+            .supervisor
+            .capture_session_identity("t1")
+            .await
+            .unwrap()
+            .unwrap();
+        f.supervisor
+            .stop_session_if_current(identity)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(f.session().await).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+        assert_eq!(f.engine.read_events(0).await.unwrap().len(), events);
+        assert!(
+            f.supervisor
+                .capture_session_identity("t1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        f.shutdown().await;
+    }
 }
 
 async fn launch_request_for_command(
@@ -2663,6 +3178,72 @@ async fn run_supervisor(
                     Ok(())
                 };
                 let _ = response.send(result);
+            }
+            SupervisorMessage::SettleSessionAfterWorkspaceLoss {
+                thread_id,
+                identity,
+                response,
+            } => {
+                let settled_at = now();
+                let repositories = engine.repositories();
+                let is_current = identity.as_ref().is_some_and(|identity| {
+                    identity.thread_id == thread_id
+                        && sessions
+                            .get(&thread_id)
+                            .is_some_and(|entry| Arc::ptr_eq(&entry.driver, &identity.driver))
+                });
+                let stop_result = if is_current {
+                    stop_session(&repositories, &activity, &mut sessions, &thread_id).await
+                } else {
+                    Ok(())
+                };
+                // Detach already ended ownership even if driver shutdown failed. A later
+                // loss attempt can also retry projection with no captured live identity.
+                let settlement_result = async {
+                    if sessions.contains_key(&thread_id) {
+                        return Ok(());
+                    }
+                    let Some(session) = repositories
+                        .get_thread_session(thread_id.clone())
+                        .await
+                        .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?
+                        .filter(|session| {
+                            matches!(
+                                session.status.as_str(),
+                                "starting" | "connecting" | "running"
+                            )
+                        })
+                    else {
+                        return Ok(());
+                    };
+                    let runtime = repositories
+                        .get_provider_session_runtime(thread_id.clone())
+                        .await
+                        .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?;
+                    reconcile_abandoned_provider_session(
+                        &engine,
+                        &repositories,
+                        SessionInput {
+                            thread_id: session.thread_id,
+                            status: session.status,
+                            provider_name: session.provider_name,
+                            provider_instance_id: session.provider_instance_id,
+                            runtime_mode: session.runtime_mode,
+                            active_turn_id: session.active_turn_id,
+                            last_error: session.last_error,
+                            last_error_class: session.last_error_class,
+                            updated_at: session.updated_at,
+                        },
+                        runtime,
+                        WORKSPACE_LOSS_SESSION_ERROR,
+                        settled_at,
+                    )
+                    .await?;
+                    engine.wake_turn_delivery();
+                    Ok(())
+                }
+                .await;
+                let _ = response.send(stop_result.and(settlement_result));
             }
             SupervisorMessage::SessionStreamEnded {
                 identity,
@@ -3320,6 +3901,7 @@ async fn spawn_delivery(
     let launch = entry.launch.clone();
     let resume_cursor = entry.resume_cursor.clone();
     let runtime_payload = entry.runtime_payload.clone();
+    let event_cancellation = entry.event_cancellation.clone();
     let repositories = engine.repositories();
     let engine = engine.clone();
     let (completion_tx, completion) = oneshot::channel();
@@ -3394,6 +3976,7 @@ async fn spawn_delivery(
         // Steer acceptance does not start a turn or overwrite a concurrent settle.
         if let ProviderDeliveryOutcome::Accepted { turn_id } = &outcome
             && steer_delivery.is_none()
+            && !event_cancellation.is_cancelled()
         {
             if let Err(error) = persist_runtime(
                 &repositories,
