@@ -395,6 +395,13 @@ export function createRemoteUpdateEnvironmentAtoms<R, ER>(
       staleTimeMs: 30_000,
       refreshIntervalMs: remoteUpdateStatusRefreshIntervalMs,
     }),
+    activeWork: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:remote-update:active-work",
+      tag: WS_METHODS.updaterActiveWork,
+      staleTimeMs: 0,
+      // Discard counts on close so every confirmation opens with a fresh read.
+      idleTtlMs: 0,
+    }),
     check,
     checkState,
     install: createEnvironmentRpcCommand(runtime, {
