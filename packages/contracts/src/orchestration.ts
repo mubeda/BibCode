@@ -1510,10 +1510,22 @@ export type OrchestrationGetFullThreadDiffResult = typeof OrchestrationGetFullTh
 
 export const OrchestrationReplayEventsInput = Schema.Struct({
   fromSequenceExclusive: NonNegativeInt,
+  paged: Schema.optionalKey(Schema.Literal(true)),
 });
 export type OrchestrationReplayEventsInput = typeof OrchestrationReplayEventsInput.Type;
 
-const OrchestrationReplayEventsResult = Schema.Array(OrchestrationEvent);
+export const OrchestrationReplayEventsPage = Schema.Struct({
+  events: Schema.Array(OrchestrationEvent),
+  exhausted: Schema.Boolean,
+});
+export type OrchestrationReplayEventsPage = typeof OrchestrationReplayEventsPage.Type;
+
+/** A paged request gets a page; an old server ignoring `paged` returns an array,
+ * which the caller treats as one exhausted page. */
+const OrchestrationReplayEventsResult = Schema.Union([
+  Schema.Array(OrchestrationEvent),
+  OrchestrationReplayEventsPage,
+]);
 export type OrchestrationReplayEventsResult = typeof OrchestrationReplayEventsResult.Type;
 
 export const OrchestrationRpcSchemas = {

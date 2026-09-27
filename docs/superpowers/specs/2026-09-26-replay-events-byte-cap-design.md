@@ -2,6 +2,8 @@
 
 Status: **Approved by the user on 2026-09-26** — Option A: opt-in `paged: true` on the existing method (about 1 MiB pages) plus a 64 MiB fail-fast for unpaged calls. Build after the connection-liveness commit (shares the contracts fixture manifest).
 
+Implemented on 2026-09-26; the unpaged ceiling counts event bytes only, with the session size check as the backstop for the `Exit` envelope.
+
 This follows up ruling 11 and controller ruling R11 of the
 [connection liveness plan](../plans/2026-09-24-connection-liveness.md), which left replay
 pagination out of scope. It builds on ruling 5 (the typed `RpcResponseTooLargeError`), Task 14
@@ -129,11 +131,10 @@ after N would get a prefix with no signal that it is behind.
 - **Where it lives.** The page builder goes in the RPC adapter (`production/orchestration_rpc.rs`).
   `engine.read_events` stays as it is, because 27 engine-test call sites and the effects producer
   use it.
-- **How it reads.** It reads `read_events_from_sequence(cursor, 128)` batches
-  (`persistence/repositories.rs:109-132`) and converts each row with `wire_event`.
-- **How it counts.** It counts each row's exact encoded length with a counting writer, so escaping
-  is included (liveness ruling R8). The writer is `JsonLength` (`session.rs:1593-1617`), exposed as
-  `pub(crate)`; it also serves the parked History double-serialization cleanup.
+- **How it reads.** It walks `Repositories::event_pages` in `EVENT_PAGE_SIZE` (128) batches
+  (e90e9ab4) and converts each row with `wire_event`.
+- **How it counts.** It counts each row's exact encoded length with
+  `json_size::encoded_json_len` (54405023), so escaping is included without building a buffer.
 - **Where a page ends.** It stops before the event that would pass `REPLAY_PAGE_TARGET_BYTES`
   (1 MiB, the `COMMIT_PAGE_TARGET_BYTES` value), always keeping one event (`graph.rs:34-45`).
   `exhausted` is true only when a batch comes back short, or a one-row probe finds nothing.
@@ -248,7 +249,7 @@ The unused coordinator already encodes this policy (`deriveReplayRetryDecision`,
   - `exhausted` is set only on the last page;
   - the content equals the unpaged replay;
   - an input without `paged` still decodes;
-  - a negative cursor still clamps.
+  - a negative cursor is refused with `InvalidRequest` (05b0042f).
 - **Contracts:** a vitest decoding both union branches; `vp run check:contracts`.
 - **Gates:** `cargo fmt --all --check`, `cargo clippy -p bibcode-server --all-targets -- -D warnings`,
   `vp check`, `vp run typecheck`, the lib tests and `production_orchestration_rpc`.
@@ -282,13 +283,8 @@ The unused coordinator already encodes this policy (`deriveReplayRetryDecision`,
 
 ## Related findings (not in scope)
 
-- **Effects lag recovery.** The effects producer recovers from broadcast lag with
-  `engine.read_events(last_sequence)`, and `last_sequence` starts at 0
-  (`orchestration_effects.rs:458, 471-481`). So a lag before its first event reads the whole log
-  into memory. Whether re-processing old reactor events is idempotent was not checked.
-- **Negative cursors.** The contract types `fromSequenceExclusive` as non-negative, but the server
-  clamps negative values (`orchestration_rpc.rs:175`), and a test sends −100
-  (`production_orchestration_rpc.rs:1648-1653`).
+- **Effects lag recovery.** Fixed by e90e9ab4: recovery walks bounded event pages.
+- **Negative cursors.** Fixed by 05b0042f: negative cursors are refused with `InvalidRequest`.
 
 ## Open questions for the user
 
