@@ -6,6 +6,7 @@ import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import type { RemoteUpdateSnapshot } from "@bibcode/contracts";
+import type { RemoteUpdateRunState } from "@bibcode/client-runtime/state/remoteUpdateCoordinator";
 import {
   IDLE_REMOTE_UPDATE_CHECK_STATE,
   type RemoteUpdateCheckState,
@@ -420,5 +421,104 @@ describe("manualUpdateInstructions", () => {
     const instructions = manualUpdateInstructions("0.4.2");
     expect(instructions).toContain("bibcode serve");
     expect(instructions).toContain("0.4.2");
+  });
+});
+
+describe("ServerUpdateBadge while an update runs", () => {
+  it.each<[RemoteUpdateRunState, string]>([
+    [{ phase: "queued" }, "Queued"],
+    [{ phase: "starting" }, "Updating…"],
+    [{ phase: "downloading", percent: 42.9, targetVersion: "0.5.0" }, "Downloading 42%"],
+    [
+      { phase: "installing", stage: "creating-verified-backup", targetVersion: "0.5.0" },
+      "Backing up project data…",
+    ],
+    [{ phase: "restarting", targetVersion: "0.5.0" }, "Restarting…"],
+    [{ phase: "verifying", targetVersion: "0.5.0" }, "Checking the new version…"],
+  ])("shows busy progress for %j over a stale snapshot or check error", (run, label) => {
+    const container = mount(
+      <ServerUpdateBadge
+        {...status({
+          snapshot: interactiveSnapshot,
+          checking: true,
+          checkError: "earlier failure",
+        })}
+        run={run}
+        onUpdate={vi.fn()}
+        onCheckAgain={vi.fn()}
+      />,
+    );
+    expect(container.querySelector('[data-variant="busy"]')?.textContent).toBe(label);
+    expect(container.querySelector("button")).toBeNull();
+    expect(container.querySelector('[data-testid="tooltip"]')).toBeNull();
+  });
+
+  it.each<[RemoteUpdateRunState, string]>([
+    [{ phase: "succeeded", version: "0.5.0" }, "Updated to v0.5.0"],
+    [{ phase: "up-to-date" }, "Already up to date"],
+  ])("shows the successful outcome for %j even before a snapshot arrives", (run, label) => {
+    const container = mount(<ServerUpdateBadge {...status({})} run={run} />);
+    expect(container.querySelector('[data-variant="up-to-date"]')?.textContent).toBe(label);
+  });
+
+  it.each(["Ai-server", undefined])(
+    "explains a failed run for %s in the tooltip and accessible text",
+    (name) => {
+      const container = mount(
+        <ServerUpdateBadge
+          {...settled(interactiveSnapshot)}
+          name={name}
+          run={{ phase: "failed", failure: { kind: "not-back" } }}
+          onCheckAgain={vi.fn()}
+        />,
+      );
+      const expected = `${name ?? "The server"} hasn't come back after the update. Check BiBCode on ${name ?? "The server"}; it may be on a different port.`;
+      const badge = container.querySelector('[data-variant="error"]');
+      expect(badge?.textContent).toBe(`Update failed: ${expected}`);
+      expect(badge?.querySelector(".sr-only")?.textContent).toBe(`: ${expected}`);
+      expect(container.querySelector('[data-testid="tooltip"]')?.textContent).toBe(expected);
+      expect(container.querySelector("button")).toBeNull();
+    },
+  );
+
+  it.each([undefined, null])("offers the update action with no run (%s)", (run) => {
+    const onUpdate = vi.fn();
+    const container = mount(
+      <ServerUpdateBadge {...settled(interactiveSnapshot)} run={run} onUpdate={onUpdate} />,
+    );
+    const button = container.querySelector("button");
+    expect(button?.textContent).toBe("Update to v0.5.0…");
+    act(() => button?.click());
+    expect(onUpdate).toHaveBeenCalledOnce();
+  });
+
+  it.each(["manual", "supervised"] as const)(
+    "never offers the update action to a %s host",
+    (installMode) => {
+      const container = mount(
+        <ServerUpdateBadge
+          {...settled({
+            ...interactiveSnapshot,
+            support: { ...manualSnapshot.support, installMode },
+          })}
+          onUpdate={vi.fn()}
+        />,
+      );
+      expect(container.querySelector("button")).toBeNull();
+    },
+  );
+
+  it("keeps the passive label without a target or an update callback", () => {
+    const noTarget = mount(
+      <ServerUpdateBadge
+        {...settled({ ...interactiveSnapshot, latestVersion: null })}
+        onUpdate={vi.fn()}
+      />,
+    );
+    expect(noTarget.querySelector("button")).toBeNull();
+    expect(noTarget.textContent).toBe("Update available");
+    const noCallback = mount(<ServerUpdateBadge {...settled(interactiveSnapshot)} run={null} />);
+    expect(noCallback.querySelector("button")).toBeNull();
+    expect(noCallback.textContent).toBe("Update to v0.5.0");
   });
 });
