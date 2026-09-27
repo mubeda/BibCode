@@ -622,13 +622,13 @@ impl Repositories {
         self.database.call(move |connection| {
             let attachments = row.attachments.as_ref().map(encode_json).transpose()?;
             connection.execute(
-                "INSERT INTO projection_thread_messages (message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, delivery_state, delivery_provider, delivery_detail, created_at, updated_at, delivery_mode, delivery_held) \
-                 VALUES (?, ?, ?, ?, ?, COALESCE(?, (SELECT attachments_json FROM projection_thread_messages WHERE message_id = ?)), ?, ?, ?, ?, ?, ?, ?, ?) \
+                "INSERT INTO projection_thread_messages (message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, delivery_state, delivery_provider, delivery_detail, created_at, updated_at, delivery_mode, delivery_held, delivery_reason, delivery_provider_instance_id) \
+                 VALUES (?, ?, ?, ?, ?, COALESCE(?, (SELECT attachments_json FROM projection_thread_messages WHERE message_id = ?)), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
                  ON CONFLICT (message_id) DO UPDATE SET \
                    thread_id=excluded.thread_id, turn_id=excluded.turn_id, role=excluded.role, text=excluded.text, \
                    attachments_json=COALESCE(excluded.attachments_json, projection_thread_messages.attachments_json), \
-                   is_streaming=excluded.is_streaming, delivery_state=excluded.delivery_state, delivery_provider=excluded.delivery_provider, delivery_detail=excluded.delivery_detail, delivery_mode=excluded.delivery_mode, delivery_held=excluded.delivery_held, created_at=excluded.created_at, updated_at=excluded.updated_at",
-                params![row.message_id,row.thread_id,row.turn_id,row.role,row.text,attachments,row.message_id,i64::from(row.is_streaming),row.delivery_state,row.delivery_provider,row.delivery_detail,row.created_at,row.updated_at,row.delivery_mode,row.delivery_held],
+                   is_streaming=excluded.is_streaming, delivery_state=excluded.delivery_state, delivery_provider=excluded.delivery_provider, delivery_detail=excluded.delivery_detail, delivery_mode=excluded.delivery_mode, delivery_held=excluded.delivery_held, delivery_reason=excluded.delivery_reason, delivery_provider_instance_id=excluded.delivery_provider_instance_id, created_at=excluded.created_at, updated_at=excluded.updated_at",
+                params![row.message_id,row.thread_id,row.turn_id,row.role,row.text,attachments,row.message_id,i64::from(row.is_streaming),row.delivery_state,row.delivery_provider,row.delivery_detail,row.created_at,row.updated_at,row.delivery_mode,row.delivery_held,row.delivery_reason,row.delivery_provider_instance_id],
             )?; Ok(())
         }).await
     }
@@ -2069,7 +2069,9 @@ pub struct ProjectionThreadMessage {
     pub is_streaming: bool,
     pub delivery_state: Option<String>,
     pub delivery_provider: Option<String>,
+    pub delivery_provider_instance_id: Option<String>,
     pub delivery_detail: Option<String>,
+    pub delivery_reason: Option<String>,
     pub delivery_mode: Option<String>,
     pub delivery_held: Option<bool>,
     pub created_at: Timestamp,
@@ -2297,7 +2299,7 @@ pub struct AuthSession {
 }
 
 const THREAD_SELECT: &str = "SELECT thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, unresolved_delivery_state, unresolved_delivery_detail, deleted_at FROM projection_threads";
-const MESSAGE_SELECT: &str = "SELECT message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, delivery_state, delivery_provider, delivery_detail, created_at, updated_at, delivery_mode, delivery_held FROM projection_thread_messages";
+const MESSAGE_SELECT: &str = "SELECT message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, delivery_state, delivery_provider, delivery_detail, created_at, updated_at, delivery_mode, delivery_held, delivery_reason, delivery_provider_instance_id FROM projection_thread_messages";
 const PROVIDER_TURN_DELIVERY_SELECT: &str = "SELECT command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at, mode, held FROM provider_turn_outbox";
 const TURN_SELECT: &str = "SELECT thread_id, turn_id, pending_message_id, source_proposed_plan_thread_id, source_proposed_plan_id, assistant_message_id, state, requested_at, started_at, completed_at, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json FROM projection_turns";
 const TURN_UPSERT_SQL: &str = "INSERT INTO projection_turns (thread_id, turn_id, pending_message_id, source_proposed_plan_thread_id, source_proposed_plan_id, assistant_message_id, state, requested_at, started_at, completed_at, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (thread_id, turn_id) DO UPDATE SET pending_message_id=excluded.pending_message_id, source_proposed_plan_thread_id=excluded.source_proposed_plan_thread_id, source_proposed_plan_id=excluded.source_proposed_plan_id, assistant_message_id=excluded.assistant_message_id, state=excluded.state, requested_at=excluded.requested_at, started_at=excluded.started_at, completed_at=excluded.completed_at, checkpoint_turn_count=excluded.checkpoint_turn_count, checkpoint_ref=excluded.checkpoint_ref, checkpoint_status=excluded.checkpoint_status, checkpoint_files_json=excluded.checkpoint_files_json";
@@ -2536,7 +2538,9 @@ fn decode_message(row: &Row<'_>) -> rusqlite::Result<ProjectionThreadMessage> {
         is_streaming: row.get::<_, i64>(6)? == 1,
         delivery_state: row.get(7)?,
         delivery_provider: row.get(8)?,
+        delivery_provider_instance_id: row.get(15)?,
         delivery_detail: row.get(9)?,
+        delivery_reason: row.get(14)?,
         delivery_mode: row.get(12)?,
         delivery_held: row.get(13)?,
         created_at: row.get(10)?,

@@ -349,6 +349,23 @@ becomes available once the running turn and any pending approval or question are
 done. Cancelling remains available while the message is queued; it is disabled
 while steering is being acknowledged.
 
+If an earlier message has a failed or uncertain delivery, the first queued card
+shows **Waiting for an earlier message**. **Steer** and **Send now** are disabled
+with **Retry or dismiss the earlier message first**, or **Dismiss the earlier
+message first** when its model or options were refused and Retry cannot help.
+Later cards keep their usual **Sends after the messages above** status.
+
+Delivery notices name the provider instance the message was sent to, using its
+configured name when available. If the instance is no longer available or an
+older server supplied no instance identity, the notice uses the provider name.
+A failed delivery whose model or options were refused keeps its failure detail
+and offers only **Dismiss**: **Sending it again unchanged would fail, and later
+messages wait behind it. Dismiss it, then send it again with another model or
+without that option.** The message
+remains in the timeline with its copy button so you can prepare the corrected
+message. Other failed deliveries still offer Retry and Dismiss; uncertain
+deliveries still warn that Retry could send a duplicate.
+
 ### Composer context window
 
 In the normal composer footer, controls remain visible in this order: MCP
@@ -390,8 +407,11 @@ as `Waiting for 3s`. The timer is anchored to the persisted user-message time
 after reload and never moves backward when the provider start time arrives.
 The animation uses the current theme's muted foreground and becomes static when
 reduced motion is requested. A later `pending` delivery blocked behind an
-unresolved failed or uncertain delivery does not appear active; resolve the
-earlier delivery's Retry/Dismiss notice before that pending message can run.
+unresolved failed or uncertain delivery shows the
+muted line **Waiting for an earlier message. Retry or dismiss it to send this
+one.**, or **Waiting for an earlier message. Dismiss it to send this one.** when
+the earlier message's model or options were refused. Resolve that earlier
+delivery's notice before the pending message can run.
 The composer offers `Cancel queued message` for this blocked pending delivery.
 That control cancels an already admitted start; the durable **Queued** cards
 above have their own Cancel action and let you continue composing.

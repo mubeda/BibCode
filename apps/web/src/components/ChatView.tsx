@@ -23,7 +23,6 @@ import {
   OrchestrationThreadActivity,
   ProviderInteractionMode,
   ProviderDriverKind,
-  PROVIDER_DISPLAY_NAMES,
   PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
   RuntimeMode,
 } from "@bibcode/contracts";
@@ -31,6 +30,10 @@ import {
   describeUnavailableEnvironment,
   selectQueuedMessages,
   deriveQueuedCardStatus,
+  deliveryOffersRetry,
+  deliveryProviderLabel,
+  findBlockingDelivery,
+  waitsBehind,
   shouldEnqueueOnSend,
   isQueuedTimelineMessage,
 } from "./ChatView.logic";
@@ -144,7 +147,7 @@ import { isCommandPaletteOpen } from "../commandPaletteContext";
 import { buildTemporaryWorktreeBranchName } from "@bibcode/shared/git";
 import { useMediaQuery } from "../hooks/useMediaQuery";
 import { resolveProviderSessionSelectionForInstance } from "../providerSessionSelection";
-import { formatProviderDriverKindLabel, formatProviderSlugLabel } from "../providerModels";
+import { formatProviderSlugLabel } from "../providerModels";
 import {
   ACTIVITY_DOCK_COMPACT_MEDIA_QUERY,
   RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY,
@@ -173,7 +176,12 @@ import {
   type CenterPanelLayoutPath,
 } from "../centerPanelLayout";
 import { useCenterPanelActions } from "../centerPanelActions";
-import { providerDriverLabel, type ProviderInstanceEntry } from "../providerInstances";
+import {
+  applyProviderInstanceSettings,
+  deriveProviderInstanceEntries,
+  providerDriverLabel,
+  type ProviderInstanceEntry,
+} from "../providerInstances";
 import {
   CenterPanelWorkspace,
   type CenterPanelWorkspaceHandle,
@@ -2320,6 +2328,14 @@ function ChatViewContent(props: ChatViewProps) {
     ? (activeEnvironment?.serverConfig ?? null)
     : (primaryEnvironment?.serverConfig ?? null);
   const providerStatuses = serverConfig?.providers ?? EMPTY_PROVIDERS;
+  const providerInstanceEntries = useMemo(
+    () => applyProviderInstanceSettings(deriveProviderInstanceEntries(providerStatuses), settings),
+    [providerStatuses, settings],
+  );
+  const instanceLabels = useMemo<ReadonlyMap<ProviderInstanceId, string>>(
+    () => new Map(providerInstanceEntries.map((entry) => [entry.instanceId, entry.displayName])),
+    [providerInstanceEntries],
+  );
   const providerBinding = resolveThreadProviderBinding({
     thread: activeThread,
     projectDefaultModelSelection: activeProject?.defaultModelSelection,
@@ -2554,32 +2570,49 @@ function ChatViewContent(props: ChatViewProps) {
     () => selectQueuedMessages(activeThread?.messages ?? []),
     [activeThread?.messages],
   );
+  const blocker = useMemo(
+    () => findBlockingDelivery(activeThread?.messages ?? []),
+    [activeThread?.messages],
+  );
+  const blockingId = blocker?.id ?? null;
+  const blockingCreatedAt = blocker?.createdAt ?? null;
+  const blockingOffersRetry = blocker?.delivery ? deliveryOffersRetry(blocker.delivery) : true;
+  const blockingDelivery = useMemo(
+    () =>
+      blockingId !== null && blockingCreatedAt !== null
+        ? { id: blockingId, createdAt: blockingCreatedAt, offersRetry: blockingOffersRetry }
+        : null,
+    [blockingId, blockingCreatedAt, blockingOffersRetry],
+  );
   const supportsTurnSteer = providerBinding.status?.supportsTurnSteer === true;
   const hasPendingApproval = activePendingApproval !== null;
   const hasPendingUserInput = activePendingUserInput !== null;
   const queueSessionStatus = activeThread?.session?.status ?? null;
-  const queuedStatuses = useMemo(
-    () =>
-      queuedMessages.map((message, index) =>
-        deriveQueuedCardStatus({
-          index,
-          phase,
-          sessionStatus: queueSessionStatus,
-          supportsTurnSteer,
-          delivery: message.delivery!,
-          hasPendingApproval,
-          hasPendingUserInput,
-        }),
-      ),
-    [
-      queuedMessages,
-      phase,
-      queueSessionStatus,
-      supportsTurnSteer,
-      hasPendingApproval,
-      hasPendingUserInput,
-    ],
-  );
+  const queuedStatuses = useMemo(() => {
+    return queuedMessages.map((message, index) =>
+      deriveQueuedCardStatus({
+        index,
+        phase,
+        sessionStatus: queueSessionStatus,
+        supportsTurnSteer,
+        delivery: message.delivery!,
+        hasPendingApproval,
+        hasPendingUserInput,
+        waitingBehind:
+          blockingDelivery !== null && waitsBehind(message, blockingDelivery)
+            ? { offersRetry: blockingDelivery.offersRetry }
+            : null,
+      }),
+    );
+  }, [
+    queuedMessages,
+    phase,
+    queueSessionStatus,
+    supportsTurnSteer,
+    hasPendingApproval,
+    hasPendingUserInput,
+    blockingDelivery,
+  ]);
   const [resolvingQueuedMessageId, setResolvingQueuedMessageId] = useState<MessageId | null>(null);
   const [queuedMessageErrors, setQueuedMessageErrors] = useState<Record<string, string>>({});
   const queuedActionsInFlightRef = useRef(new Set<MessageId>());
@@ -4803,9 +4836,7 @@ function ChatViewContent(props: ChatViewProps) {
       if (action === "retry" && delivery.state === "uncertain") {
         const localApi = readLocalApi();
         if (!localApi) return;
-        const provider =
-          PROVIDER_DISPLAY_NAMES[delivery.provider] ??
-          formatProviderDriverKindLabel(delivery.provider);
+        const provider = deliveryProviderLabel(delivery, instanceLabels);
         const confirmed = await localApi.dialogs.confirm(
           [
             "Retry this message?",
@@ -4836,6 +4867,7 @@ function ChatViewContent(props: ChatViewProps) {
       environmentId,
       resolveTurnDelivery,
       resolvingTurnDeliveryMessageId,
+      instanceLabels,
       setThreadError,
     ],
   );
@@ -6339,6 +6371,8 @@ function ChatViewContent(props: ChatViewProps) {
                       onRevertUserMessage={onRevertUserMessage}
                       onResolveTurnDelivery={onResolveTurnDelivery}
                       resolvingTurnDeliveryMessageId={resolvingTurnDeliveryMessageId}
+                      blockingDelivery={blockingDelivery}
+                      instanceLabels={instanceLabels}
                       isRevertingCheckpoint={isRevertingCheckpoint}
                       onImageExpand={onExpandTimelineImage}
                       markdownCwd={gitCwd ?? undefined}

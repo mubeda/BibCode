@@ -679,6 +679,7 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::new(48, "AuthAuthorityRevision", migration_048),
     Migration::new(49, "AuthPairingDeliveryState", migration_049),
     Migration::new(50, "QueuedTurnDeliveries", migration_050),
+    Migration::new(51, "TurnDeliveryFailureReason", migration_051),
 ];
 
 impl Migration {
@@ -2493,6 +2494,34 @@ fn migration_050(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+fn migration_051(transaction: &Transaction<'_>) -> Result<()> {
+    if table_exists(transaction, "provider_turn_outbox")?
+        && !table_has_column(transaction, "provider_turn_outbox", "failure_reason")?
+    {
+        transaction
+            .execute_batch("ALTER TABLE provider_turn_outbox ADD COLUMN failure_reason TEXT;")?;
+    }
+    if table_exists(transaction, "projection_thread_messages")?
+        && !table_has_column(transaction, "projection_thread_messages", "delivery_reason")?
+    {
+        transaction.execute_batch(
+            "ALTER TABLE projection_thread_messages ADD COLUMN delivery_reason TEXT;",
+        )?;
+    }
+    if table_exists(transaction, "projection_thread_messages")?
+        && !table_has_column(
+            transaction,
+            "projection_thread_messages",
+            "delivery_provider_instance_id",
+        )?
+    {
+        transaction.execute_batch(
+            "ALTER TABLE projection_thread_messages ADD COLUMN delivery_provider_instance_id TEXT;",
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2849,7 +2878,13 @@ mod tests {
                 .find(|column| column.0 == "payload_digest"),
             Some(("payload_digest".to_owned(), "TEXT".to_owned(), 0, None, 0))
         );
-        for name in ["delivery_state", "delivery_provider", "delivery_detail"] {
+        for name in [
+            "delivery_state",
+            "delivery_provider",
+            "delivery_detail",
+            "delivery_reason",
+            "delivery_provider_instance_id",
+        ] {
             assert_eq!(
                 columns("projection_thread_messages")?
                     .into_iter()
@@ -2905,6 +2940,7 @@ mod tests {
                     Some("0".to_owned()),
                     0
                 ),
+                ("failure_reason".to_owned(), "TEXT".to_owned(), 0, None, 0),
             ]
         );
         assert_eq!(
@@ -2935,6 +2971,7 @@ mod tests {
                     "updated_at",
                     "mode",
                     "held",
+                    "failure_reason",
                 ],
             ),
             (
@@ -3097,13 +3134,66 @@ mod tests {
     }
 
     #[test]
+    fn migration_51_preserves_old_deliveries_without_failure_reasons() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(50))?;
+        connection.execute_batch(
+            "INSERT INTO orchestration_command_receipts (command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status)
+             VALUES ('failed-command', 'thread', 'thread-1', 'created', 7, 'accepted');
+             INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at)
+             VALUES ('failed-command', 'thread-1', 'message-1', 'codex', 'codex', 'key', '{}', 'failed', 1, 'refused', 'created', 'updated');
+             INSERT INTO projection_thread_messages (message_id, thread_id, role, text, is_streaming, created_at, updated_at, delivery_state, delivery_provider, delivery_detail, delivery_mode, delivery_held)
+             VALUES ('message-1', 'thread-1', 'user', 'preserved', 0, 'created', 'updated', 'failed', 'codex', 'refused', 'start', 0);",
+        )?;
+
+        run_migrations(&mut connection, None)?;
+        for (table, column) in [
+            ("provider_turn_outbox", "failure_reason"),
+            ("projection_thread_messages", "delivery_reason"),
+            (
+                "projection_thread_messages",
+                "delivery_provider_instance_id",
+            ),
+        ] {
+            let reason =
+                connection.query_row(&format!("SELECT {column} FROM {table}"), [], |row| {
+                    row.get::<_, Option<String>>(0)
+                })?;
+            assert_eq!(reason, None);
+            let column = connection.query_row(
+                &format!("SELECT type, [notnull], dflt_value FROM pragma_table_info('{table}') WHERE name = ?"),
+                [column],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<String>>(2)?)),
+            )?;
+            assert_eq!(column, ("TEXT".to_owned(), 0, None));
+        }
+        assert_eq!(
+            connection.query_row(
+                "SELECT state, last_error FROM provider_turn_outbox",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?,
+            ("failed".to_owned(), "refused".to_owned())
+        );
+        assert_eq!(connection.query_row(
+            "SELECT text, delivery_state, delivery_detail, delivery_mode, delivery_held FROM projection_thread_messages", [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, bool>(4)?)),
+        )?, ("preserved".to_owned(), "failed".to_owned(), "refused".to_owned(), "start".to_owned(), false));
+        assert!(run_migrations(&mut connection, None)?.is_empty());
+        let transaction = connection.transaction()?;
+        super::migration_051(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[test]
     fn exposes_all_ordered_migration_metadata() {
         let ids = MIGRATIONS
             .iter()
             .map(|migration| migration.id)
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, (1..=50).collect::<Vec<_>>());
+        assert_eq!(ids, (1..=51).collect::<Vec<_>>());
         assert_eq!(MIGRATIONS[0].name, "OrchestrationEvents");
         assert_eq!(MIGRATIONS[33].name, "ActivityProjection");
         assert_eq!(MIGRATIONS[34].name, "ActivityJournalEventKeyNamespace");
@@ -3151,7 +3241,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 (49, "AuthPairingDeliveryState"),
-                (50, "QueuedTurnDeliveries")
+                (50, "QueuedTurnDeliveries"),
+                (51, "TurnDeliveryFailureReason")
             ],
         );
         assert_eq!(
@@ -3248,9 +3339,9 @@ mod tests {
         assert_eq!(first[15].id, 16);
 
         let second = run_migrations(&mut connection, None)?;
-        assert_eq!(second.len(), 34);
+        assert_eq!(second.len(), 35);
         assert_eq!(second[0].id, 17);
-        assert_eq!(second[33].id, 50);
+        assert_eq!(second[34].id, 51);
 
         let third = run_migrations(&mut connection, None)?;
         assert!(third.is_empty());
@@ -3357,7 +3448,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50]
+            [40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51]
         );
         let policy = connection.query_row(
             "SELECT worktree_discovery_json FROM projection_projects WHERE project_id = 'project-1'",
@@ -3394,7 +3485,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [41, 42, 43, 44, 45, 46, 47, 48, 49, 50]
+            [41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51]
         );
         let pin = connection.query_row(
             "SELECT worktree_repository_key FROM projection_projects WHERE project_id = 'project-legacy'",
@@ -3422,7 +3513,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [42, 43, 44, 45, 46, 47, 48, 49, 50]
+            [42, 43, 44, 45, 46, 47, 48, 49, 50, 51]
         );
         let pin = connection.query_row(
             "SELECT repository_key FROM project_worktree_repository_pins WHERE project_id = 'project-pinned'",
@@ -3562,7 +3653,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [48, 49, 50]
+            [48, 49, 50, 51]
         );
         assert_eq!(
             connection.query_row(
@@ -3591,7 +3682,7 @@ mod tests {
         )?;
 
         let applied = run_migrations(&mut connection, None)?;
-        assert_eq!(applied.len(), 17);
+        assert_eq!(applied.len(), 18);
         assert_eq!(applied[0].id, 34);
         assert_eq!(applied[1].id, 35);
         assert_eq!(applied[2].id, 36);
@@ -3609,6 +3700,7 @@ mod tests {
         assert_eq!(applied[14].id, 48);
         assert_eq!(applied[15].id, 49);
         assert_eq!(applied[16].id, 50);
+        assert_eq!(applied[17].id, 51);
         let value = connection.query_row("SELECT value FROM legacy_user_data", [], |row| {
             row.get::<_, String>(0)
         })?;

@@ -31,6 +31,7 @@ import {
   ThreadCreatedPayload,
   ThreadTurnDiff,
   ThreadTurnStartRequestedPayload,
+  ThreadTurnDeliveryUpdatedPayload,
   TurnDelivery,
   TurnDeliveryResolutionAction,
 } from "./orchestration.ts";
@@ -58,6 +59,9 @@ const decodeOrchestrationMessageSync = Schema.decodeUnknownSync(OrchestrationMes
 const decodeOrchestrationCommandSync = Schema.decodeUnknownSync(OrchestrationCommand);
 const decodeShell = Schema.decodeUnknownSync(OrchestrationThreadShell);
 const decodeTurnDelivery = Schema.decodeUnknownSync(TurnDelivery);
+const decodeThreadTurnDeliveryUpdatedPayload = Schema.decodeUnknownSync(
+  ThreadTurnDeliveryUpdatedPayload,
+);
 const encodeTurnDelivery = Schema.encodeSync(TurnDelivery);
 const decodeDeliveryResolutionAction = Schema.decodeUnknownSync(TurnDeliveryResolutionAction);
 const decodeOrchestrationEventSync = Schema.decodeUnknownSync(OrchestrationEvent);
@@ -67,6 +71,55 @@ const decodeReplayEventsInput = Schema.decodeUnknownSync(OrchestrationReplayEven
 const decodeReplayEventsResult = Schema.decodeUnknownSync(
   OrchestrationRpcSchemas.replayEvents.output,
 );
+
+describe("delivery failure reasons", () => {
+  const delivery = { state: "failed", provider: "codex" };
+
+  it("preserves a known refusal reason", () => {
+    expect(decodeTurnDelivery({ ...delivery, reason: "modelSelectionRefused" })).toEqual({
+      ...delivery,
+      reason: "modelSelectionRefused",
+    });
+  });
+
+  it("decodes old deliveries without a reason", () => {
+    expect(decodeTurnDelivery(delivery)).toEqual(delivery);
+  });
+
+  it("omits an unknown reason from a newer server", () => {
+    const decoded = decodeTurnDelivery({ ...delivery, reason: "futureReason" });
+    expect(decoded).toEqual(delivery);
+    expect(Object.hasOwn(decoded, "reason")).toBe(false);
+  });
+
+  it("keeps the reason in a delivery update payload", () => {
+    const payload = decodeThreadTurnDeliveryUpdatedPayload({
+      threadId: "thread-1",
+      messageId: "message-1",
+      delivery: { ...delivery, reason: "modelSelectionRefused" },
+      updatedAt: "2026-09-26T00:00:00Z",
+    });
+    expect(payload.delivery).toEqual({ ...delivery, reason: "modelSelectionRefused" });
+  });
+});
+
+describe("delivery provider instances", () => {
+  it("preserves the routed instance separately from the driver", () => {
+    const delivery = {
+      state: "failed",
+      provider: "codex",
+      providerInstanceId: "codex-personal",
+    };
+    expect(decodeTurnDelivery(delivery)).toEqual(delivery);
+  });
+
+  it("decodes older deliveries without an instance", () => {
+    const delivery = { state: "pending", provider: "codex" };
+    const decoded = decodeTurnDelivery(delivery);
+    expect(decoded).toEqual(delivery);
+    expect(Object.hasOwn(decoded, "providerInstanceId")).toBe(false);
+  });
+});
 
 describe("replay event pagination contracts", () => {
   const event = {

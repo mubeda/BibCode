@@ -224,7 +224,12 @@ must become the promotion time and place it after that reply, including after
 projection replay. Transaction rollback must preserve the original timestamps;
 steering and still-queued messages retain enqueue times. Dismissing a rejected head
 must unblock its tail; dismissing sending or uncertain work must preserve the
-barrier against automatic delivery before settlement. Exercise an older-client pending start
+barrier against automatic delivery before settlement. For a head refused for its
+model or options, verify that it offers only **Dismiss**, later pending messages
+show **Waiting for an earlier message**, and the queued head card shows
+**Waiting for an earlier message** with **Send now** and **Steer** disabled and
+the reason explained; dismissing the refused head releases them.
+Exercise an older-client pending start
 while running/starting and prove it is claimed only after ready, including
 the SQLite claim boundary. Migration coverage must preserve rows and indexes;
 recovery must preserve queued state, payload, mode, and existing holds without

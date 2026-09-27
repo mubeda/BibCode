@@ -1198,6 +1198,8 @@ async fn conversation_projection_repositories_round_trip_order_and_delete() {
     let repositories = migrated_repositories().await;
 
     let message_a = ProjectionThreadMessage {
+        delivery_reason: None,
+        delivery_provider_instance_id: None,
         delivery_mode: None,
         delivery_held: None,
         message_id: "message-a".to_owned(),
@@ -1218,6 +1220,8 @@ async fn conversation_projection_repositories_round_trip_order_and_delete() {
         updated_at: T1.to_owned(),
     };
     let message_b = ProjectionThreadMessage {
+        delivery_reason: None,
+        delivery_provider_instance_id: None,
         message_id: "message-b".to_owned(),
         created_at: T2.to_owned(),
         updated_at: T2.to_owned(),

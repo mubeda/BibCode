@@ -1541,7 +1541,9 @@ component writes the provider session, and the field never alters session
 
 A launch refused because the selected model or session does not accept the
 turn's own options fails the delivery once, because the unchanged durable
-payload would be refused on every attempt. Other launch failures, such as a
+payload would be refused on every attempt. Its failed delivery carries the
+optional reason `modelSelectionRefused`, also used when a frozen turn's model
+or options are refused before delivery. Other launch failures, such as a
 spawn error, stay definitely not sent and retry with backoff. The delivery
 detail is what the turn shows, so every one is plain text from a single
 formatter that names the provider by its instance label, never by a driver id:
@@ -1604,6 +1606,31 @@ The outbox persists `queued`, delivery `mode`, and `held` alongside the original
 command receipt and payload. The message projection stores delivery state, mode
 and hold metadata for snapshots and event replay; it is a view of the outbox,
 which remains the queue's source of truth.
+
+The outbox's nullable `failure_reason` and the message projection's nullable
+`delivery_reason` carry the typed delivery reason, set only for a failed
+delivery. The engine writes the reason with the state and delivery event in one
+transaction; `thread.turn-delivery-updated` projects its nested `delivery.reason`
+into messages and snapshots. Retry and dismiss clear it, and every later
+delivery update replaces the projected reason, clearing it when absent. Event
+replay restores the reason. Old rows and events have no reason, and contracts
+decode unknown reason values as an absent key. Delivery events and projected
+messages also carry the delivery's `providerInstanceId`, from the outbox's
+`provider_instance_id` through the nullable `delivery_provider_instance_id`
+projection column into snapshots. The projection keeps it once set; old rows
+and events lack it.
+
+The web decides which deliveries wait behind an unresolved one by comparing
+message `createdAt`, relying on the outbox `created_at` equalling the admitted
+message's `createdAt`; only promotion restamps the message, later.
+
+This W1 order proxy has a blind spot when the failed head was itself promoted:
+its message `createdAt` is the promotion time, while its outbox row retains the
+enqueue time. A pending start admitted between those times sits behind it in
+outbox order, but `waitsBehind` returns false, so that row shows no waiting line.
+Conversely, a promoted pending row whose enqueue time is older than the head's
+can show a transient false waiting line until it is claimed. Both errors are
+permissive or transient; the outbox remains authoritative for delivery order.
 
 The delivery worker examines the oldest queued row per thread before filling
 its available slots. Queue FIFO uses the original command receipt's durable

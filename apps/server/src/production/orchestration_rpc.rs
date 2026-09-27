@@ -1034,6 +1034,9 @@ async fn thread_snapshot(engine: &OrchestrationEngine, thread_id: &str) -> RpcRe
                         (&row.delivery_state, &row.delivery_provider)
                     {
                         let mut delivery = json!({"state": state, "provider": provider});
+                        if let Some(provider_instance_id) = &row.delivery_provider_instance_id {
+                            delivery["providerInstanceId"] = json!(provider_instance_id);
+                        }
                         if let Some(mode) = &row.delivery_mode {
                             delivery["mode"] = json!(mode);
                         }
@@ -1042,6 +1045,9 @@ async fn thread_snapshot(engine: &OrchestrationEngine, thread_id: &str) -> RpcRe
                         }
                         if let Some(detail) = &row.delivery_detail {
                             delivery["detail"] = json!(detail);
+                        }
+                        if let Some(reason) = &row.delivery_reason {
+                            delivery["reason"] = json!(reason);
                         }
                         message["delivery"] = delivery;
                     }
@@ -1542,7 +1548,9 @@ mod tests {
                     is_streaming: false,
                     delivery_state: None,
                     delivery_provider: None,
+                    delivery_provider_instance_id: None,
                     delivery_detail: None,
+                    delivery_reason: None,
                     delivery_mode: None,
                     delivery_held: None,
                     created_at: "2026-07-11T00:00:00.000Z".to_owned(),
@@ -1558,7 +1566,9 @@ mod tests {
                     is_streaming: false,
                     delivery_state: None,
                     delivery_provider: None,
+                    delivery_provider_instance_id: None,
                     delivery_detail: None,
+                    delivery_reason: None,
                     delivery_mode: None,
                     delivery_held: None,
                     created_at: "2026-07-11T00:00:00.001Z".to_owned(),
@@ -1574,7 +1584,9 @@ mod tests {
                     is_streaming: false,
                     delivery_state: None,
                     delivery_provider: None,
+                    delivery_provider_instance_id: None,
                     delivery_detail: None,
+                    delivery_reason: None,
                     delivery_mode: None,
                     delivery_held: None,
                     created_at: "2026-07-11T00:00:00.002Z".to_owned(),
@@ -1590,7 +1602,9 @@ mod tests {
                     is_streaming: false,
                     delivery_state: None,
                     delivery_provider: None,
+                    delivery_provider_instance_id: None,
                     delivery_detail: None,
+                    delivery_reason: None,
                     delivery_mode: None,
                     delivery_held: None,
                     created_at: "2026-07-11T00:00:00.003Z".to_owned(),
@@ -1606,7 +1620,9 @@ mod tests {
                     is_streaming: false,
                     delivery_state: None,
                     delivery_provider: None,
+                    delivery_provider_instance_id: None,
                     delivery_detail: None,
+                    delivery_reason: None,
                     delivery_mode: None,
                     delivery_held: None,
                     created_at: "2026-07-11T00:00:00.004Z".to_owned(),
@@ -1622,7 +1638,9 @@ mod tests {
                     is_streaming: true,
                     delivery_state: None,
                     delivery_provider: None,
+                    delivery_provider_instance_id: None,
                     delivery_detail: None,
+                    delivery_reason: None,
                     delivery_mode: None,
                     delivery_held: None,
                     created_at: "2026-07-11T00:00:00.005Z".to_owned(),
@@ -4836,6 +4854,61 @@ mod tests {
         );
         assert_eq!(snapshot["thread"]["session"]["status"], "running");
         assert_eq!(snapshot["thread"]["latestTurn"]["turnId"], "turn-1");
+        for provider_instance_id in [Some("claude-personal"), None] {
+            let mut message = engine
+                .repositories()
+                .get_message("message-1".to_owned())
+                .await
+                .expect("message lookup")
+                .expect("message");
+            message.delivery_provider_instance_id = provider_instance_id.map(str::to_owned);
+            engine
+                .repositories()
+                .upsert_message(message)
+                .await
+                .expect("store delivery instance");
+            let snapshot = thread_snapshot(&engine, &default_id)
+                .await
+                .expect("snapshot with delivery instance");
+            let message = snapshot["thread"]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|message| message["id"] == "message-1")
+                .unwrap();
+            assert_eq!(
+                message["delivery"].get("providerInstanceId"),
+                provider_instance_id.map(|value| json!(value)).as_ref()
+            );
+        }
+        for reason in [Some("modelSelectionRefused"), None] {
+            let mut message = engine
+                .repositories()
+                .get_message("message-1".to_owned())
+                .await
+                .expect("message lookup")
+                .expect("message");
+            message.delivery_state = Some("failed".to_owned());
+            message.delivery_reason = reason.map(str::to_owned);
+            engine
+                .repositories()
+                .upsert_message(message)
+                .await
+                .expect("store reason");
+            let snapshot = thread_snapshot(&engine, &default_id)
+                .await
+                .expect("snapshot with reason");
+            let message = snapshot["thread"]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|message| message["id"] == "message-1")
+                .unwrap();
+            assert_eq!(
+                message["delivery"].get("reason"),
+                reason.map(|value| json!(value)).as_ref()
+            );
+        }
         engine.shutdown().await;
     }
 

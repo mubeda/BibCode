@@ -2,7 +2,7 @@ import { ProviderDriverKind, type TurnDelivery } from "@bibcode/contracts";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vite-plus/test";
 
-import { TurnDeliveryNotice } from "./TurnDeliveryNotice";
+import { TurnDeliveryNotice, type TurnDeliveryNoticeProps } from "./TurnDeliveryNotice";
 
 function delivery(
   state: TurnDelivery["state"],
@@ -16,9 +16,19 @@ function delivery(
   };
 }
 
-function renderNotice(value: TurnDelivery): string {
+function renderNotice(
+  value: TurnDelivery,
+  props: Partial<Pick<TurnDeliveryNoticeProps, "providerLabel" | "waitingBehind">> = {},
+): string {
   return renderToStaticMarkup(
-    <TurnDeliveryNotice delivery={value} onRetry={vi.fn()} onDismiss={vi.fn()} disabled={false} />,
+    <TurnDeliveryNotice
+      delivery={value}
+      providerLabel="Claude"
+      onRetry={vi.fn()}
+      onDismiss={vi.fn()}
+      disabled={false}
+      {...props}
+    />,
   );
 }
 
@@ -37,6 +47,44 @@ const OPTION_REFUSAL =
   "claudeAgent provider operation failed: option fastMode is not supported by the selected model/session";
 
 describe("TurnDeliveryNotice", () => {
+  it("offers only Dismiss and explains how to resend a refused model selection", () => {
+    const markup = renderNotice({
+      ...delivery("failed", "claudeAgent", OPTION_REFUSAL),
+      reason: "modelSelectionRefused",
+    });
+
+    expect(markup).toContain("Delivery failed");
+    expect(markup).toContain(OPTION_REFUSAL);
+    expect(markup).toContain(
+      "Sending it again unchanged would fail, and later messages wait behind it. Dismiss it, then send it again with another model or without that option.",
+    );
+    expect(markup).not.toContain("Retry");
+    expect(markup).toContain('aria-label="Dismiss and skip this message"');
+    expect(markup.match(/<button[\s>]/gu)).toHaveLength(1);
+  });
+
+  it.each([
+    ["failed", "Codex Personal did not receive this message"],
+    ["uncertain", "Codex Personal may have received this message"],
+  ] as const)("names the routed instance in a %s notice", (state, expected) => {
+    expect(renderNotice(delivery(state, "codex"), { providerLabel: "Codex Personal" })).toContain(
+      expected,
+    );
+  });
+
+  it.each([
+    [true, "Waiting for an earlier message. Retry or dismiss it to send this one."],
+    [false, "Waiting for an earlier message. Dismiss it to send this one."],
+  ] as const)("shows a muted waiting line when the blocker offersRetry=%s", (offersRetry, text) => {
+    const markup = renderNotice(delivery("pending"), { waitingBehind: { offersRetry } });
+
+    expect(markup).toContain(text);
+    expect(markup).toContain('role="status"');
+    expect(paragraphClasses(markup, text)).toContain("text-muted-foreground");
+    expect(markup).not.toMatch(/<button|border-|text-warning|text-destructive/u);
+    expect(markup).not.toContain("connection closed before acknowledgement");
+  });
+
   it("shows why a delivery failed directly under the heading", () => {
     const markup = renderNotice(delivery("failed", "claudeAgent", OPTION_REFUSAL));
 
@@ -98,6 +146,7 @@ describe("TurnDeliveryNotice", () => {
     const markup = renderToStaticMarkup(
       <TurnDeliveryNotice
         delivery={delivery("uncertain")}
+        providerLabel="Claude"
         onRetry={vi.fn()}
         onDismiss={vi.fn()}
         disabled={false}
@@ -117,6 +166,7 @@ describe("TurnDeliveryNotice", () => {
     const markup = renderToStaticMarkup(
       <TurnDeliveryNotice
         delivery={delivery("failed", "opencode")}
+        providerLabel="OpenCode"
         onRetry={vi.fn()}
         onDismiss={vi.fn()}
         disabled
@@ -135,6 +185,7 @@ describe("TurnDeliveryNotice", () => {
         renderToStaticMarkup(
           <TurnDeliveryNotice
             delivery={delivery(state)}
+            providerLabel="Claude"
             onRetry={vi.fn()}
             onDismiss={vi.fn()}
             disabled={false}

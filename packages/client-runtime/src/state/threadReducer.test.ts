@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vite-plus/test";
+import { Schema } from "effect";
 
 import {
   CheckpointRef,
   EventId,
   MessageId,
+  OrchestrationEvent,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -13,6 +15,8 @@ import {
 import type { OrchestrationThread } from "@bibcode/contracts";
 
 import { applyThreadDetailEvent } from "./threadReducer.ts";
+
+const decodeOrchestrationEvent = Schema.decodeUnknownSync(OrchestrationEvent);
 
 const baseEventFields = {
   eventId: EventId.make("event-1"),
@@ -230,6 +234,71 @@ describe("applyThreadDetailEvent", () => {
         ...fields,
       });
       expect(result.thread.messages[0]?.turnId).toBeNull();
+    });
+
+    it("sets the routed provider instance from a decoded delivery update", () => {
+      const update = decodeOrchestrationEvent(
+        event("thread.turn-delivery-updated", {
+          messageId: otherMessage.id,
+          delivery: {
+            state: "failed",
+            provider: "codex",
+            providerInstanceId: "codex-personal",
+          },
+          updatedAt,
+        }),
+      );
+      const result = applyThreadDetailEvent(thread, update);
+      expect(result.kind).toBe("updated");
+      if (result.kind !== "updated") return;
+      expect(result.thread.messages[1]?.delivery).toEqual({
+        state: "failed",
+        provider: "codex",
+        providerInstanceId: "codex-personal",
+      });
+      expect(result.thread.messages[0]).toBe(queuedMessage);
+      expect(thread.messages[1]).toBe(otherMessage);
+    });
+
+    it("sets a refusal reason and clears it on a later delivery update", () => {
+      const failed = applyThreadDetailEvent(
+        thread,
+        event("thread.turn-delivery-updated", {
+          messageId: otherMessage.id,
+          delivery: {
+            state: "failed",
+            provider: "codex",
+            reason: "modelSelectionRefused",
+          },
+          updatedAt,
+        }),
+      );
+      expect(failed.kind).toBe("updated");
+      if (failed.kind !== "updated") return;
+      expect(failed.thread.messages[1]?.delivery).toEqual({
+        state: "failed",
+        provider: "codex",
+        reason: "modelSelectionRefused",
+      });
+
+      const retried = applyThreadDetailEvent(
+        failed.thread,
+        event(
+          "thread.turn-delivery-updated",
+          {
+            messageId: otherMessage.id,
+            delivery: { state: "pending", provider: "codex" },
+            updatedAt,
+          },
+          101,
+        ),
+      );
+      expect(retried.kind).toBe("updated");
+      if (retried.kind !== "updated") return;
+      expect(retried.thread.messages[1]?.delivery).toEqual({
+        state: "pending",
+        provider: "codex",
+      });
     });
 
     it("applies legacy delivery updates without requiring mode, hold, or turn attribution", () => {

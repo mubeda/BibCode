@@ -177,7 +177,7 @@ async fn interrupt_holds_queued_rows_and_ready_does_not_promote_held() {
         assert_eq!(event.event.payload["held"], true);
         assert_eq!(
             event.event.payload["delivery"],
-            json!({"state":"queued", "provider":"codex", "mode":"start", "held":true})
+            json!({"state":"queued", "provider":"codex", "providerInstanceId":"codex", "mode":"start", "held":true})
         );
     }
     session(&engine, "ready", "ready").await;
@@ -711,7 +711,7 @@ async fn steer_row_is_delivered_through_driver_steer_and_attributed_to_the_turn(
     assert_eq!(accepted.event.payload["turnId"], "active");
     assert_eq!(
         accepted.event.payload["delivery"],
-        json!({"state":"delivered","provider":"codex","mode":"steer","held":false})
+        json!({"state":"delivered","provider":"codex","providerInstanceId":"codex","mode":"steer","held":false})
     );
     assert_eq!(fixture.driver.creates.load(Ordering::SeqCst), 1);
     fixture.shutdown(delivery).await;

@@ -301,13 +301,25 @@ export type TurnDeliveryState = typeof TurnDeliveryState.Type;
 export const TurnDeliveryMode = Schema.Literals(["start", "steer"]);
 export type TurnDeliveryMode = typeof TurnDeliveryMode.Type;
 
+export const TurnDeliveryFailureReason = Schema.Literals(["modelSelectionRefused"]);
+export type TurnDeliveryFailureReason = typeof TurnDeliveryFailureReason.Type;
+
 export const TurnDelivery = Schema.Struct({
   state: TurnDeliveryState,
   provider: ProviderDriverKind,
+  /** The provider instance the delivery is routed to; absent from older servers. */
+  providerInstanceId: Schema.optionalKey(ProviderInstanceId),
   // An absent mode means "start" for deliveries from older servers.
   mode: Schema.optional(TurnDeliveryMode),
   held: Schema.optional(Schema.Boolean),
   detail: Schema.optional(TrimmedNonEmptyString),
+  /**
+   * Set only while state is failed. The provider refused the turn's model or one
+   * of its options, so the unchanged turn is refused again on every attempt.
+   */
+  reason: Schema.optionalKey(
+    TurnDeliveryFailureReason.pipe(Schema.catchDecoding(() => Effect.succeedNone)),
+  ),
 });
 export type TurnDelivery = typeof TurnDelivery.Type;
 
