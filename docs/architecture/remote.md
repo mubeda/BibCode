@@ -511,8 +511,13 @@ its own read method so the one-second status poll never waits on the store; a
 failed count answers the typed `RemoteUpdateActiveWorkError`.
 Successful status, check, and install calls return a snapshot containing
 `serverVersion`, nullable `latestVersion`, lifecycle `state`, nullable `error`,
-and `support` (`installMode` plus `reason`). A server that cannot install on
-behalf of the caller rejects `updater.install` with
+and `support` (`installMode`, `reason`, and `installKind`: `archive`,
+`system-package`, or `unknown`). The additive snapshot fields `downloadPercent`,
+`targetVersion`, and `installStage` decode-default to `null`, and
+`support.installKind` decode-defaults to `unknown`. Stages and kinds decode as
+plain strings; unknown stages get a generic label. No new `state` literal was
+added because an older client's literal decode would reject it. A server that
+cannot install on behalf of the caller rejects `updater.install` with
 `RemoteUpdateInstallError` code `remote_update_manual_required`. The TypeScript
 wire contract is `packages/contracts/src/remoteUpdate.ts`; its Rust mirror and
 state owner are in `apps/server/src/remote_update.rs`.

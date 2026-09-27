@@ -49,11 +49,27 @@ const schemaMembers = (ast: SchemaAST.AST): ReadonlyArray<SchemaAST.AST> =>
 const safeMethodName = (method: string): string => method.replaceAll(".", "__");
 
 describe("Rust RPC fixture parity", () => {
-  it("tracks bounded provider terminal activity command wire fixtures", () => {
-    const fixtureDirectory = NodePath.resolve(import.meta.dirname, "../fixtures/rpc-wire");
-    const readFixture = (name: string): unknown =>
-      JSON.parse(NodeFS.readFileSync(NodePath.join(fixtureDirectory, name), "utf8")) as unknown;
+  const fixtureDirectory = NodePath.resolve(import.meta.dirname, "../fixtures/rpc-wire");
+  const readFixture = (name: string): unknown =>
+    JSON.parse(NodeFS.readFileSync(NodePath.join(fixtureDirectory, name), "utf8")) as unknown;
 
+  it("pins the remote update snapshot wire shape the Rust mirror round-trips", () => {
+    const fixture = readFixture("contract-shapes/updater__status-success.json") as {
+      readonly exit: { readonly value: unknown };
+    };
+    expect(fixture.exit.value).toEqual({
+      serverVersion: "0.6.2",
+      latestVersion: "0.6.4",
+      state: "downloading",
+      error: null,
+      support: { installMode: "interactive", reason: "available", installKind: "unknown" },
+      downloadPercent: 42,
+      targetVersion: "0.6.4",
+      installStage: null,
+    });
+  });
+
+  it("tracks bounded provider terminal activity command wire fixtures", () => {
     const hinted = readFixture("contract-shapes/terminal__open-provider-activity-request.json") as {
       readonly payload: {
         readonly env: Readonly<Record<string, string>>;
@@ -93,9 +109,6 @@ describe("Rust RPC fixture parity", () => {
 
   it("tracks client-only targeted cancellation wire fixtures", () => {
     // Mutation caught: serializing provider-native identities or caller-computed descendant sets.
-    const fixtureDirectory = NodePath.resolve(import.meta.dirname, "../fixtures/rpc-wire");
-    const readFixture = (name: string): unknown =>
-      JSON.parse(NodeFS.readFileSync(NodePath.join(fixtureDirectory, name), "utf8")) as unknown;
     const cancel = readFixture("contract-shapes/activity__cancelSubtree-request.json") as {
       readonly tag: string;
       readonly payload: Readonly<Record<string, unknown>>;
@@ -129,9 +142,6 @@ describe("Rust RPC fixture parity", () => {
   });
 
   it("tracks attributed diagnostics and identity-bound signal wire fixtures", () => {
-    const fixtureDirectory = NodePath.resolve(import.meta.dirname, "../fixtures/rpc-wire");
-    const readFixture = (name: string): unknown =>
-      JSON.parse(NodeFS.readFileSync(NodePath.join(fixtureDirectory, name), "utf8")) as unknown;
     const diagnostics = readFixture(
       "contract-shapes/server__getProcessDiagnostics-success.json",
     ) as {
@@ -294,7 +304,6 @@ describe("Rust RPC fixture parity", () => {
   });
 
   it("tracks the executable TypeScript RPC schemas without stale manifests", () => {
-    const fixtureDirectory = NodePath.resolve(import.meta.dirname, "../fixtures/rpc-wire");
     const manifest = JSON.parse(
       NodeFS.readFileSync(NodePath.join(fixtureDirectory, "manifest.json"), "utf8"),
     ) as Manifest;

@@ -26,11 +26,22 @@ pub enum RemoteUpdateSupportReason {
     UpdaterUnavailable,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RemoteUpdateInstallKind {
+    Archive,
+    SystemPackage,
+    #[default]
+    Unknown,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteUpdateSupport {
     pub install_mode: RemoteUpdateInstallMode,
     pub reason: RemoteUpdateSupportReason,
+    #[serde(default)]
+    pub install_kind: RemoteUpdateInstallKind,
 }
 
 impl RemoteUpdateSupport {
@@ -39,13 +50,15 @@ impl RemoteUpdateSupport {
         Self {
             install_mode: RemoteUpdateInstallMode::Manual,
             reason: RemoteUpdateSupportReason::ManualUpdateRequired,
+            install_kind: RemoteUpdateInstallKind::Unknown,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RemoteUpdateState {
+    #[default]
     Idle,
     Checking,
     UpdateAvailable,
@@ -63,15 +76,24 @@ pub struct RemoteUpdateSnapshot {
     pub state: RemoteUpdateState,
     pub error: Option<String>,
     pub support: RemoteUpdateSupport,
+    pub download_percent: Option<u8>,
+    pub target_version: Option<String>,
+    pub install_stage: Option<String>,
 }
 
 /// What the hosting process's updater knows; the service adds `server_version`
 /// and `support` to build the wire snapshot.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HostUpdaterStatus {
     pub latest_version: Option<String>,
     pub state: RemoteUpdateState,
     pub error: Option<String>,
+    /// The host's download percent (0–100) while downloading.
+    pub download_percent: Option<u8>,
+    /// The version this install applies: the available version, then the downloaded one.
+    pub target_version: Option<String>,
+    /// The protection stage of the environment being protected, then `installing`.
+    pub install_stage: Option<String>,
 }
 
 pub type HostUpdaterFuture = Pin<Box<dyn Future<Output = HostUpdaterStatus> + Send>>;
@@ -141,9 +163,8 @@ impl RemoteUpdateService {
 
     fn manual_status() -> HostUpdaterStatus {
         HostUpdaterStatus {
-            latest_version: None,
             state: RemoteUpdateState::Idle,
-            error: None,
+            ..HostUpdaterStatus::default()
         }
     }
 
@@ -154,6 +175,9 @@ impl RemoteUpdateService {
             state: status.state,
             error: status.error,
             support: self.support,
+            download_percent: status.download_percent,
+            target_version: status.target_version,
+            install_stage: status.install_stage,
         }
     }
 
@@ -161,9 +185,9 @@ impl RemoteUpdateService {
         match tokio::time::timeout(self.delegate_timeout, future).await {
             Ok(status) => status,
             Err(_) => HostUpdaterStatus {
-                latest_version: None,
                 state: RemoteUpdateState::Error,
                 error: Some(REMOTE_UPDATE_DELEGATE_TIMEOUT_ERROR.to_owned()),
+                ..HostUpdaterStatus::default()
             },
         }
     }
@@ -204,6 +228,7 @@ mod tests {
         RemoteUpdateSupport {
             install_mode: RemoteUpdateInstallMode::Manual,
             reason: RemoteUpdateSupportReason::ManualUpdateRequired,
+            install_kind: RemoteUpdateInstallKind::Unknown,
         }
     }
 
@@ -211,6 +236,7 @@ mod tests {
         RemoteUpdateSupport {
             install_mode: RemoteUpdateInstallMode::Interactive,
             reason: RemoteUpdateSupportReason::Available,
+            install_kind: RemoteUpdateInstallKind::Unknown,
         }
     }
 
@@ -223,6 +249,7 @@ mod tests {
                     latest_version: Some("9.9.9".to_owned()),
                     state: RemoteUpdateState::UpdateAvailable,
                     error: None,
+                    ..HostUpdaterStatus::default()
                 }
             })
         }
@@ -237,6 +264,7 @@ mod tests {
                     latest_version: Some("9.9.9".to_owned()),
                     state: RemoteUpdateState::Installing,
                     error: None,
+                    ..HostUpdaterStatus::default()
                 }
             })
         }
@@ -266,6 +294,9 @@ mod tests {
             state: RemoteUpdateState::Idle,
             error: None,
             support: manual_support(),
+            download_percent: None,
+            target_version: None,
+            install_stage: None,
         };
         assert_eq!(
             serde_json::to_value(&snapshot).expect("snapshot serializes"),
@@ -274,9 +305,61 @@ mod tests {
                 "latestVersion": null,
                 "state": "idle",
                 "error": null,
-                "support": { "installMode": "manual", "reason": "manual-update-required" }
+                "support": {
+                    "installMode": "manual",
+                    "reason": "manual-update-required",
+                    "installKind": "unknown"
+                },
+                "downloadPercent": null,
+                "targetVersion": null,
+                "installStage": null
             })
         );
+    }
+
+    #[test]
+    fn install_kind_serializes_kebab_case() {
+        assert_eq!(
+            serde_json::to_value(RemoteUpdateInstallKind::SystemPackage).expect("serializes"),
+            json!("system-package")
+        );
+        assert_eq!(
+            serde_json::to_value(RemoteUpdateInstallKind::Archive).expect("serializes"),
+            json!("archive")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_service_carries_the_host_progress_onto_the_snapshot() {
+        struct Downloading;
+        impl RemoteUpdateDelegate for Downloading {
+            fn status(&self) -> HostUpdaterFuture {
+                Box::pin(async {
+                    HostUpdaterStatus {
+                        latest_version: Some("0.6.4".to_owned()),
+                        state: RemoteUpdateState::Downloading,
+                        download_percent: Some(42),
+                        target_version: Some("0.6.4".to_owned()),
+                        ..HostUpdaterStatus::default()
+                    }
+                })
+            }
+            fn check(&self) -> HostUpdaterFuture {
+                self.status()
+            }
+            fn request_install(&self) -> HostUpdaterFuture {
+                self.status()
+            }
+        }
+        let service = RemoteUpdateService::new(
+            "0.6.2".to_owned(),
+            interactive_support(),
+            Some(Arc::new(Downloading)),
+        );
+        let snapshot = service.status().await;
+        assert_eq!(snapshot.download_percent, Some(42));
+        assert_eq!(snapshot.target_version.as_deref(), Some("0.6.4"));
+        assert_eq!(snapshot.install_stage, None);
     }
 
     #[test]

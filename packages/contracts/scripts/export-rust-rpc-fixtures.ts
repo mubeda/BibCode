@@ -21,6 +21,7 @@ import {
   OrchestrationEvent,
   ORCHESTRATION_WS_METHODS,
 } from "../src/orchestration.ts";
+import { RemoteUpdateSnapshot } from "../src/remoteUpdate.ts";
 import { WS_METHODS, WsRpcGroup } from "../src/rpc.ts";
 import { RpcResponseTooLargeError } from "../src/rpcTransport.ts";
 import {
@@ -584,6 +585,29 @@ const stripEffectOptionIds = (value: unknown): unknown =>
   ) as unknown;
 
 const dynamicFixtures = new Map<string, unknown>();
+const fixtureRemoteUpdateSnapshot = {
+  serverVersion: "0.6.2",
+  latestVersion: "0.6.4",
+  state: "downloading",
+  error: null,
+  support: { installMode: "interactive", reason: "available", installKind: "unknown" },
+  downloadPercent: 42,
+  targetVersion: "0.6.4",
+  installStage: null,
+} satisfies typeof RemoteUpdateSnapshot.Type;
+dynamicFixtures.set(
+  "contract-shapes/updater__status-success.json",
+  stripEffectOptionIds(
+    serializeWireFixture({
+      _tag: "Exit",
+      requestId,
+      exit: {
+        _tag: "Success",
+        value: compileUnknownEncoder(RemoteUpdateSnapshot)(fixtureRemoteUpdateSnapshot),
+      },
+    } satisfies RpcMessage.ResponseExitEncoded),
+  ),
+);
 dynamicFixtures.set(
   "contract-shapes/server__getProcessDiagnostics-success.json",
   stripEffectOptionIds(

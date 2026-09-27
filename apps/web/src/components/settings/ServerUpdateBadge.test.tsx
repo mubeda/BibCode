@@ -38,14 +38,17 @@ const manualSnapshot: RemoteUpdateSnapshot = {
   latestVersion: null,
   state: "idle",
   error: null,
-  support: { installMode: "manual", reason: "manual-update-required" },
+  support: { installMode: "manual", reason: "manual-update-required", installKind: "unknown" },
+  downloadPercent: null,
+  targetVersion: null,
+  installStage: null,
 };
 
 const interactiveSnapshot: RemoteUpdateSnapshot = {
   ...manualSnapshot,
   latestVersion: "0.5.0",
   state: "update-available",
-  support: { installMode: "interactive", reason: "available" },
+  support: { installMode: "interactive", reason: "available", installKind: "unknown" },
 };
 
 const idleInteractiveSnapshot: RemoteUpdateSnapshot = {
@@ -146,7 +149,7 @@ describe("serverUpdateBadgeVariant", () => {
       serverUpdateBadgeVariant(
         settled({
           ...idleInteractiveSnapshot,
-          support: { installMode: "supervised", reason: "available" },
+          support: { installMode: "supervised", reason: "available", installKind: "unknown" },
         }),
       ),
     ).toBe("not-checked");

@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+use crate::remote_update::RemoteUpdateInstallKind;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StaticDirSource {
     Explicit,
@@ -21,6 +23,7 @@ impl StaticDirSource {
 pub struct ResolvedStaticDir {
     pub path: PathBuf,
     pub source: StaticDirSource,
+    pub install_kind: RemoteUpdateInstallKind,
 }
 
 #[derive(Debug, Error)]
@@ -46,6 +49,7 @@ pub fn resolve_static_dir(
         return Ok(Some(ResolvedStaticDir {
             path: path.to_path_buf(),
             source: StaticDirSource::Explicit,
+            install_kind: RemoteUpdateInstallKind::Unknown,
         }));
     }
 
@@ -57,6 +61,7 @@ pub fn resolve_static_dir(
         return Ok(Some(ResolvedStaticDir {
             path: sibling,
             source: StaticDirSource::Packaged,
+            install_kind: RemoteUpdateInstallKind::Archive,
         }));
     }
 
@@ -68,6 +73,7 @@ pub fn resolve_static_dir(
         is_valid_static_dir(&installed).then_some(ResolvedStaticDir {
             path: installed,
             source: StaticDirSource::Packaged,
+            install_kind: RemoteUpdateInstallKind::SystemPackage,
         }),
     )
 }

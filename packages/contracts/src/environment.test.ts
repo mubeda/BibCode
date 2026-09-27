@@ -373,6 +373,7 @@ describe("remote update descriptor surface", () => {
     expect(decoded.remoteUpdateSupport).toEqual({
       installMode: "manual",
       reason: "manual-update-required",
+      installKind: "unknown",
     });
   });
 });

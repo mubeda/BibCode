@@ -248,7 +248,10 @@ describe("EnvironmentRail", () => {
       latestVersion: "0.5.0",
       state: "update-available",
       error: null,
-      support: { installMode: "interactive", reason: "available" },
+      support: { installMode: "interactive", reason: "available", installKind: "unknown" },
+      downloadPercent: null,
+      targetVersion: null,
+      installStage: null,
     });
 
     expect(renderRail()).toContain('data-status="attention"');

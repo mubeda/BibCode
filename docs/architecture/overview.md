@@ -806,6 +806,10 @@ failed count answers the typed `RemoteUpdateActiveWorkError`.
   `latestVersion` remains `null` because the server has no update feed, and
   `updater.install` fails with `remote_update_manual_required`. Clients render
   copyable operator instructions instead of an install action.
+  `installKind` is derived from the static asset layout: a sibling `web/` means
+  `archive`, `share/bibcode/web` means `system-package`, and an explicit
+  `--static-dir` or no resolved directory means `unknown`; desktop hosts report
+  `unknown`.
 
 `updater.activeWork` and `updater.status` require `orchestration:read`; `updater.check` and
 `updater.install` require `orchestration:operate`

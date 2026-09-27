@@ -1,0 +1,21 @@
+{
+  "_tag": "Exit",
+  "requestId": "900719925474099312345",
+  "exit": {
+    "_tag": "Success",
+    "value": {
+      "serverVersion": "0.6.2",
+      "latestVersion": "0.6.4",
+      "state": "downloading",
+      "error": null,
+      "support": {
+        "installMode": "interactive",
+        "reason": "available",
+        "installKind": "unknown"
+      },
+      "downloadPercent": 42,
+      "targetVersion": "0.6.4",
+      "installStage": null
+    }
+  }
+}

@@ -71,9 +71,9 @@ pub use maintenance::{
     RpcMutability, UpdateMaintenance, http_mutability, rpc_mutability,
 };
 pub use remote_update::{
-    HostUpdaterFuture, HostUpdaterStatus, RemoteUpdateDelegate, RemoteUpdateInstallMode,
-    RemoteUpdateService, RemoteUpdateSnapshot, RemoteUpdateState, RemoteUpdateSupport,
-    RemoteUpdateSupportReason, remote_update_manual_required_error,
+    HostUpdaterFuture, HostUpdaterStatus, RemoteUpdateDelegate, RemoteUpdateInstallKind,
+    RemoteUpdateInstallMode, RemoteUpdateService, RemoteUpdateSnapshot, RemoteUpdateState,
+    RemoteUpdateSupport, RemoteUpdateSupportReason, remote_update_manual_required_error,
 };
 pub use rpc::{
     ACTIVE_RPC_METHODS, CauseItem, ClientMessage, InvalidRequestId, MethodMode, RequestId, RpcExit,

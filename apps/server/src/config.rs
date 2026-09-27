@@ -15,7 +15,7 @@ use url::Url;
 
 use crate::data_root::{DataRootError, DataRootRequest, DataRootSource, ResolvedDataRoot};
 use crate::persistence::StorageInstanceId;
-use crate::remote_update::RemoteUpdateSupport;
+use crate::remote_update::{RemoteUpdateInstallKind, RemoteUpdateSupport};
 use crate::static_assets::{StaticDirError, StaticDirSource, resolve_static_dir};
 
 pub const DEFAULT_PORT: u16 = 3773;
@@ -238,6 +238,7 @@ mod tests {
             crate::remote_update::RemoteUpdateSupport {
                 install_mode: crate::remote_update::RemoteUpdateInstallMode::Manual,
                 reason: crate::remote_update::RemoteUpdateSupportReason::ManualUpdateRequired,
+                install_kind: RemoteUpdateInstallKind::Unknown,
             }
         );
     }
@@ -387,6 +388,10 @@ mod tests {
 
         assert_eq!(config.static_dir, Some(web));
         assert_eq!(config.static_dir_source, Some(StaticDirSource::Packaged));
+        assert_eq!(
+            config.remote_update_support.install_kind,
+            crate::remote_update::RemoteUpdateInstallKind::Archive
+        );
     }
 
     #[test]
@@ -1041,7 +1046,12 @@ impl Cli {
         config.static_dir = resolved_static_dir
             .as_ref()
             .map(|resolved| resolved.path.clone());
-        config.static_dir_source = resolved_static_dir.map(|resolved| resolved.source);
+        config.static_dir_source = resolved_static_dir.as_ref().map(|resolved| resolved.source);
+        config.remote_update_support.install_kind = resolved_static_dir
+            .as_ref()
+            .map_or(RemoteUpdateInstallKind::Unknown, |resolved| {
+                resolved.install_kind
+            });
         config.dev_url = args.dev_url;
         config.no_browser = headless
             || args.no_browser
