@@ -1415,6 +1415,75 @@ describe("Remote Servers tabs", () => {
     expect(markup).toContain("Copy trace ID");
   });
 
+  it.each(["connecting", "reconnecting"])("shows a visible slow-setup status while %s", (phase) => {
+    stubBrowserWindow();
+    const notice = "Receiving settings from Devbox over a slow connection…";
+    const connection = { phase, notice };
+    h.environments = [environment({ id: "environment-ssh", label: "Devbox", connection })];
+
+    const container = document.createElement("div");
+    container.innerHTML = render(<ConnectTab />);
+
+    const noticeLine = container.querySelector('[role="status"]');
+    expect(noticeLine, "the notice renders outside the tooltip").not.toBeNull();
+    expect(noticeLine?.closest("[data-tooltip-popup]")).toBeNull();
+    expect(noticeLine?.textContent).toBe(notice);
+    expect(noticeLine?.getAttribute("aria-live")).toBe("polite");
+    expect(noticeLine?.classList.contains("text-xs")).toBe(true);
+    expect(noticeLine?.classList.contains("text-muted-foreground")).toBe(true);
+    expect(noticeLine?.classList.contains("text-destructive")).toBe(false);
+    expect(noticeLine?.classList.contains("flex-wrap")).toBe(true);
+    expect(noticeLine?.querySelector(".truncate")).toBeNull();
+    expect(noticeLine?.querySelector(".wrap-break-word")).not.toBeNull();
+    expect(noticeLine?.querySelector(".animate-spin")).not.toBeNull();
+    expect(noticeLine?.querySelector('svg[aria-hidden="true"]')).not.toBeNull();
+    expect(container.textContent).not.toContain("Copy trace ID");
+  });
+
+  it.each(["error", "reconnecting"])(
+    "shows only the error line when a notice is also present while %s",
+    (phase) => {
+      stubBrowserWindow();
+      const notice = "Receiving settings from Devbox over a slow connection…";
+      const connection = {
+        phase,
+        error: "Devbox did not send its settings. Connect again.",
+        notice,
+        traceId: "trace-9",
+      };
+      h.environments = [environment({ id: "environment-ssh", label: "Devbox", connection })];
+
+      const container = document.createElement("div");
+      container.innerHTML = render(<ConnectTab />);
+      for (const tooltip of container.querySelectorAll("[data-tooltip-popup]")) tooltip.remove();
+
+      const errorLines = container.querySelectorAll("p.text-destructive");
+      expect(errorLines).toHaveLength(1);
+      expect(errorLines[0]?.textContent).toContain(connection.error);
+      expect(errorLines[0]?.textContent).toContain("Copy trace ID");
+      expect(container.querySelector('[role="status"]')).toBeNull();
+      expect(container.textContent).not.toContain(notice);
+    },
+  );
+
+  it("shows no connection status line when connected without an error or notice", () => {
+    stubBrowserWindow();
+    h.environments = [
+      environment({
+        id: "environment-ssh",
+        label: "Devbox",
+        connection: { phase: "connected" },
+      }),
+    ];
+
+    const container = document.createElement("div");
+    container.innerHTML = render(<ConnectTab />);
+
+    expect(container.querySelector('[role="status"]')).toBeNull();
+    expect(container.querySelector("p.text-destructive")).toBeNull();
+    expect(container.textContent).not.toContain("Copy trace ID");
+  });
+
   it("lists saved environments with connect, disconnect and error affordances", async () => {
     stubBrowserWindow();
     h.hasCloudConfig = false;

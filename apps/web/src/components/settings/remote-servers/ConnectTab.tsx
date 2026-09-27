@@ -1,6 +1,7 @@
 import {
   ChevronsLeftRightEllipsisIcon,
   EllipsisIcon,
+  LoaderCircleIcon,
   PlusIcon,
   QrCodeIcon,
   RefreshCwIcon,
@@ -174,6 +175,11 @@ function RemoteServerRow({
           ? "bg-destructive"
           : "bg-muted-foreground/40";
   const statusTooltip = connectionStatusText(environment.connection);
+  const statusLine = environment.connection.error
+    ? "error"
+    : environment.connection.notice
+      ? "notice"
+      : null;
   const errorTraceId = environment.connection.traceId;
   const { copyToClipboard: copyTraceIdToClipboard } = useCopyToClipboard<{ traceId: string }>({
     target: "trace ID",
@@ -308,13 +314,17 @@ function RemoteServerRow({
               {versionMismatch.serverVersion}.
             </p>
           ) : null}
-          {environment.connection.error ? (
+          {statusLine === "error" ? (
             <p className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5 text-destructive text-xs">
               {/* Wraps so the action half of the message stays readable; the
                   clamp only bounds an unusually long detail, which the status
                   dot's tooltip still shows in full. */}
               <span className="min-w-0 line-clamp-3 wrap-break-word">
-                {connectionStatusText(environment.connection)}
+                {connectionStatusText({
+                  phase: connectionState,
+                  error: environment.connection.error,
+                  traceId: errorTraceId,
+                })}
               </span>
               {errorTraceId ? (
                 <button
@@ -325,6 +335,20 @@ function RemoteServerRow({
                   Copy trace ID
                 </button>
               ) : null}
+            </p>
+          ) : statusLine === "notice" ? (
+            <p
+              role="status"
+              aria-live="polite"
+              className="flex min-w-0 flex-wrap items-start gap-x-2 gap-y-0.5 text-xs text-muted-foreground"
+            >
+              <LoaderCircleIcon
+                aria-hidden="true"
+                className="mt-px size-3.5 shrink-0 animate-spin"
+              />
+              <span className="min-w-0 flex-1 wrap-break-word">
+                {environment.connection.notice}
+              </span>
             </p>
           ) : null}
           {updateInstructions ? (

@@ -5,6 +5,10 @@ host-sharing controls under **Settings → Remote Servers**. Windows also keeps
 **Settings → Local environment** for WSL. Browser/hosted clients can connect to a
 reachable server but cannot perform desktop-owned listener, firewall, or SSH operations.
 
+Each saved server's row in that list shows its connection state. While a server
+sends its settings slowly, the row reads "Receiving settings from <name> over a
+slow connection…" until it connects.
+
 Remote access connects a browser or another desktop app to the BiBCode server
 running on a different machine. That server owns projects, files, Git state,
 terminals, provider CLIs, credentials, and agent sessions.
